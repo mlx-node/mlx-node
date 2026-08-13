@@ -4,8 +4,10 @@
  * Contains the model structure, forward passes, and core model methods.
  */
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -13,13 +15,22 @@ use tracing::{debug, info, warn};
 
 use crate::array::{MxArray, heavy_cleanup, synchronize_and_clear_cache};
 use crate::engine::backend::{
-    ChatBackend, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs,
-    TrainBackend, TurnOutput, TurnSetup, WholeTurnArgs,
+    ChatBackend, DecodeStep, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs, TrainBackend,
+    TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
 };
+use crate::engine::hybrid_scheduler::{
+    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
+    ScheduledPrefixAdmission, ScheduledRestoreResult, ScheduledTurn, SchedulerOwnerContext,
+    scheduler_max_num_seqs_for, scheduler_per_seq_context,
+};
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
+use crate::engine::scheduler::{
+    RowStepResult, StepExecutor, StepKind, StepPlan, StepResult, TurnState,
+    is_paged_allocation_blocked,
+};
 use crate::model_thread::{ModelThread, ResponseTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{
@@ -29,11 +40,23 @@ use crate::sampling::{
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::training_model::ModelType;
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::{
+    PagedKVCacheAdapter, PagedRaggedRow, PagedRestorePoll, PagedRestoreTicket, PagedTurnAdmission,
+    SeqId,
+};
 use crate::transformer::{KVCache, TransformerBlock};
 
 use super::{BatchGenerationResult, GenerationConfig, GenerationResult, Qwen3Config};
 use crate::engine;
+
+fn scheduler_ragged_step_enabled() -> bool {
+    std::env::var("MLX_SCHED_RAGGED_STEP").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
 
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
@@ -87,6 +110,17 @@ pub(crate) struct Qwen3Inner {
     /// `begin_decode` can bake the streaming profiler relabel
     /// (`"qwen3_chat_stream[_delta]_rust"`) into the stepper.
     turn_is_streaming: Cell<bool>,
+    /// The in-flight turn's cooperative-cancel flag, installed by the
+    /// sync and streaming session wrappers via
+    /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
+    /// turn epilogue on every exit path.
+    /// Polled at the top of each prefill chunk (flat `flat_prefill` and
+    /// paged `run_paged_prefill_chunk_with_size`); `true` aborts the
+    /// prefill with the distinguished `"prefill cancelled"` error, which
+    /// rides the engine's existing fail-closed prefill-`Err` arms.
+    /// Plain non-cancellable calls install a never-flipped flag; single-shot
+    /// prefills remain the documented uncancellable window.
+    turn_cancel: Option<Arc<AtomicBool>>,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -127,12 +161,40 @@ pub(crate) enum Qwen3Cmd {
         save_path: String,
         reply: ResponseTx<()>,
     },
+    SchedulerStats {
+        reply: ResponseTx<engine::SchedulerStatsJs>,
+    },
 }
 
 impl FromChatCmd for Qwen3Cmd {
     #[inline]
     fn from_chat(cmd: ChatCmd) -> Self {
         Qwen3Cmd::Chat(cmd)
+    }
+}
+
+impl HybridSchedulerCommand for Qwen3Cmd {
+    fn as_chat(&self) -> Option<&ChatCmd> {
+        match self {
+            Self::Chat(chat) => Some(chat),
+            _ => None,
+        }
+    }
+
+    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
+        match self {
+            Self::Chat(chat) => Ok(chat),
+            other => Err(other),
+        }
+    }
+
+    fn into_scheduler_stats(
+        self,
+    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
+        match self {
+            Self::SchedulerStats { reply } => Ok(reply),
+            other => Err(other),
+        }
     }
 }
 
@@ -240,6 +302,766 @@ pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
         Qwen3Cmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
         }
+        Qwen3Cmd::SchedulerStats { reply } => {
+            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
+        }
+    }
+}
+
+type QwenScheduledTurn = ScheduledTurn<Qwen3PrefixState>;
+
+pub(crate) struct QwenStepExecutor<'a> {
+    inner: &'a mut Qwen3Inner,
+    ragged_step: bool,
+}
+
+struct PreparedDecodeRow {
+    plan_index: usize,
+    seq_id: SeqId,
+    token_id: u32,
+    terminal: bool,
+    at_length: bool,
+    stops_at_eos: bool,
+    cancelled: bool,
+    repetition: Option<&'static str>,
+}
+
+enum PreparedRaggedKind {
+    Prefill {
+        end: usize,
+        source_len: usize,
+        suppress_sample: bool,
+    },
+    Decode(PreparedDecodeRow),
+}
+
+struct PreparedRaggedRow {
+    plan_index: usize,
+    seq_id: SeqId,
+    kind: PreparedRaggedKind,
+}
+
+impl QwenStepExecutor<'_> {
+    fn blocked(row: &engine::scheduler::StepRow) -> RowStepResult {
+        RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: 0,
+            generated_token: None,
+            finished: false,
+            allocation_blocked: true,
+            prefill_micros: 0,
+        }
+    }
+
+    fn elapsed_micros(started: Instant) -> u64 {
+        started
+            .elapsed()
+            .as_micros()
+            .try_into()
+            .unwrap_or(u64::MAX)
+            .max(1)
+    }
+
+    fn fail(
+        turn: &mut TurnState<QwenScheduledTurn>,
+        row: &engine::scheduler::StepRow,
+        error: Error,
+    ) -> RowStepResult {
+        turn.payload.allocation_failed |= error.reason.contains("could not reserve")
+            || error.reason.contains("failed to record sequence")
+            || error.reason.contains("paged cache capacity");
+        turn.payload.failure = Some(error);
+        turn.payload.profiler.snapshot_memory_after();
+        turn.payload.profiler.report();
+        RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: row.num_tokens,
+            generated_token: None,
+            finished: true,
+            allocation_blocked: false,
+            prefill_micros: 0,
+        }
+    }
+
+    fn stream_token(turn: &mut TurnState<QwenScheduledTurn>, token_id: u32, is_reasoning: bool) {
+        let payload = &mut turn.payload;
+        let text = match tokenizers::tokenizer::step_decode_stream(
+            payload.tokenizer.inner(),
+            vec![token_id],
+            payload.stream_skip_special,
+            &mut payload.decode_ids,
+            &mut payload.decode_prefix,
+            &mut payload.decode_prefix_index,
+        ) {
+            Ok(Some(text)) => text,
+            Ok(None) => String::new(),
+            Err(_) => {
+                payload.decode_ids.clear();
+                payload.decode_prefix.clear();
+                payload.decode_prefix_index = 0;
+                let mut replayed = String::new();
+                for &token in &payload.generated_tokens {
+                    if let Ok(Some(text)) = tokenizers::tokenizer::step_decode_stream(
+                        payload.tokenizer.inner(),
+                        vec![token],
+                        payload.stream_skip_special,
+                        &mut payload.decode_ids,
+                        &mut payload.decode_prefix,
+                        &mut payload.decode_prefix_index,
+                    ) {
+                        replayed.push_str(&text);
+                    }
+                }
+                replayed
+                    .get(payload.streamed_text_len..)
+                    .unwrap_or_default()
+                    .to_string()
+            }
+        };
+        payload.streamed_text_len = payload.streamed_text_len.saturating_add(text.len());
+        if let (Some(sink), Some(emitter)) = (payload.response.sink(), payload.emitter.as_mut()) {
+            emitter.on_token_text(&text, is_reasoning, payload.params.include_reasoning, sink);
+        }
+    }
+
+    /// Apply the request-local sampling and streaming epilogue after a decode
+    /// row's current token has already been staged in `generated_tokens`.
+    fn finish_prepared_decode(
+        row: &PreparedDecodeRow,
+        planned: &engine::scheduler::StepRow,
+        turn: &mut TurnState<QwenScheduledTurn>,
+        mut logits: Option<MxArray>,
+    ) -> RowStepResult {
+        let next_token = if let Some(mut logits) = logits.take() {
+            let sampled = if turn.payload.reasoning_tracker.should_force_think_end() {
+                let forced = match turn.payload.reasoning_tracker.forced_token_id() {
+                    Ok(token) => token as i32,
+                    Err(error) => return Self::fail(turn, planned, error),
+                };
+                match MxArray::from_int32(&[forced], &[1]) {
+                    Ok(sampled) => sampled,
+                    Err(error) => return Self::fail(turn, planned, error),
+                }
+            } else {
+                turn.payload.profiler.begin("rep_penalty");
+                logits = match engine::penalties::apply_all_penalties(
+                    logits,
+                    &turn.token_history,
+                    &turn.payload.params,
+                ) {
+                    Ok(logits) => logits,
+                    Err(error) => return Self::fail(turn, planned, error),
+                };
+                turn.payload.profiler.end();
+                turn.payload.profiler.begin("sample");
+                let sampled = match sample(&logits, turn.payload.params.sampling_config) {
+                    Ok(sampled) => sampled,
+                    Err(error) => return Self::fail(turn, planned, error),
+                };
+                turn.payload.profiler.end();
+                sampled
+            };
+            turn.payload.profiler.begin("schedule_eval");
+            MxArray::async_eval_arrays(&[&sampled, &logits]);
+            turn.payload.profiler.end();
+            sampled.eval();
+            match sampled.item_at_int32(0) {
+                Ok(token) => Some(token as u32),
+                Err(error) => return Self::fail(turn, planned, error),
+            }
+        } else {
+            None
+        };
+
+        turn.payload.profiler.step();
+        turn.payload.profiler.mark_first_token();
+        let is_reasoning = turn.payload.reasoning_tracker.observe_token(row.token_id);
+        turn.payload.last_is_reasoning = is_reasoning;
+        if row.cancelled {
+            turn.payload.finish_reason = String::from("cancelled");
+        } else {
+            if turn.payload.response.sink().is_some() {
+                Self::stream_token(turn, row.token_id, is_reasoning);
+            }
+            if row.stops_at_eos {
+                turn.payload.finish_reason = String::from("stop");
+            } else if let Some(reason) = row.repetition {
+                turn.payload.finish_reason = reason.to_string();
+            }
+        }
+        let finished = row.terminal || row.at_length;
+        if finished {
+            turn.payload.profiler.snapshot_memory_after();
+            turn.payload.profiler.report();
+        }
+        RowStepResult {
+            seq_id: row.seq_id,
+            num_computed_tokens: planned.num_tokens,
+            generated_token: (!finished).then_some(next_token).flatten(),
+            finished,
+            allocation_blocked: false,
+            prefill_micros: 0,
+        }
+    }
+
+    fn execute_ragged(
+        &mut self,
+        plan: &StepPlan,
+        running: &mut [TurnState<QwenScheduledTurn>],
+    ) -> Result<StepResult> {
+        let mut results = Vec::with_capacity(plan.rows.len());
+        results.resize_with(plan.rows.len(), || None);
+        let mut forward_rows = Vec::new();
+        let mut work = Vec::new();
+        let mut terminal_decodes = Vec::new();
+
+        for (plan_index, row) in plan.rows.iter().enumerate() {
+            let adapter_position = self
+                .inner
+                .paged_adapter
+                .as_ref()
+                .and_then(|adapter| adapter.current_token_count_for(row.seq_id));
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Qwen3 scheduler planned missing ragged sequence {}",
+                        row.seq_id
+                    ))
+                })?;
+            if adapter_position != Some(row.token_start) {
+                results[plan_index] = Some(Self::fail(
+                    turn,
+                    row,
+                    Error::from_reason(format!(
+                        "scheduler ragged cursor {} disagrees with adapter cursor {:?} for sequence {}",
+                        row.token_start, adapter_position, row.seq_id
+                    )),
+                ));
+                continue;
+            }
+            match row.kind {
+                StepKind::Prefill => {
+                    if row.cancel_snapshot {
+                        results[plan_index] = Some(Self::fail(
+                            turn,
+                            row,
+                            Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
+                        ));
+                        continue;
+                    }
+                    let start = row.token_start as usize;
+                    let end = start.saturating_add(row.num_tokens as usize);
+                    let source_len = turn
+                        .payload
+                        .preemption_replay
+                        .as_ref()
+                        .map_or(turn.payload.prompt_tokens.len(), |replay| {
+                            replay.tokens.len()
+                        });
+                    if end > source_len {
+                        results[plan_index] = Some(Self::fail(
+                            turn,
+                            row,
+                            Error::from_reason("scheduler prefill slice exceeds prompt"),
+                        ));
+                        continue;
+                    }
+                    let tokens = turn.payload.preemption_replay.as_ref().map_or_else(
+                        || turn.payload.prompt_tokens[start..end].to_vec(),
+                        |replay| replay.tokens[start..end].to_vec(),
+                    );
+                    let suppress_sample = turn
+                        .payload
+                        .preemption_replay
+                        .as_ref()
+                        .is_some_and(|replay| replay.suppress_sample);
+                    turn.payload.profiler.begin_prefill();
+                    forward_rows.push((row.seq_id, tokens));
+                    work.push(PreparedRaggedRow {
+                        plan_index,
+                        seq_id: row.seq_id,
+                        kind: PreparedRaggedKind::Prefill {
+                            end,
+                            source_len,
+                            suppress_sample,
+                        },
+                    });
+                }
+                StepKind::Decode => {
+                    let Some(&token_id) = turn.token_history.last() else {
+                        results[plan_index] = Some(Self::fail(
+                            turn,
+                            row,
+                            Error::from_reason("scheduler decode row has no current token"),
+                        ));
+                        continue;
+                    };
+                    turn.payload.generated_tokens.push(token_id);
+                    let stops_at_eos = token_id == turn.payload.eos_id
+                        || turn.payload.extra_eos_ids.contains(&token_id);
+                    let repetition = check_repetition_cutoff(
+                        &turn.payload.generated_tokens,
+                        turn.payload.params.max_consecutive_tokens,
+                        turn.payload.params.max_ngram_repeats,
+                        turn.payload.params.ngram_size,
+                    );
+                    let terminal = stops_at_eos || row.cancel_snapshot || repetition.is_some();
+                    let at_length = turn.payload.generated_tokens.len()
+                        >= turn.payload.params.max_new_tokens.max(0) as usize;
+                    let prepared = PreparedDecodeRow {
+                        plan_index,
+                        seq_id: row.seq_id,
+                        token_id,
+                        terminal,
+                        at_length,
+                        stops_at_eos,
+                        cancelled: row.cancel_snapshot,
+                        repetition,
+                    };
+                    if terminal || at_length {
+                        terminal_decodes.push(prepared);
+                    } else {
+                        turn.payload.profiler.begin("forward");
+                        forward_rows.push((row.seq_id, vec![token_id]));
+                        work.push(PreparedRaggedRow {
+                            plan_index,
+                            seq_id: row.seq_id,
+                            kind: PreparedRaggedKind::Decode(prepared),
+                        });
+                    }
+                }
+            }
+        }
+
+        let decode_occupancy = work
+            .iter()
+            .filter(|row| matches!(row.kind, PreparedRaggedKind::Decode(_)))
+            .count();
+        if decode_occupancy != 0 {
+            crate::array::maybe_clear_cache_for_paged_step(plan.global_step as i32);
+        }
+        let prefill_count = work
+            .iter()
+            .filter(|row| matches!(row.kind, PreparedRaggedKind::Prefill { .. }))
+            .count();
+        let forward_started = Instant::now();
+        let forward_result = if forward_rows.is_empty() {
+            Ok(None)
+        } else {
+            let first_seq = work
+                .first()
+                .map(|row| row.seq_id)
+                .ok_or_else(|| Error::from_reason("Qwen3 ragged batch has no work row"))?;
+            let stream = running
+                .iter()
+                .find(|turn| turn.seq_id == first_seq)
+                .ok_or_else(|| {
+                    Error::from_reason(format!("Qwen3 scheduler lost ragged sequence {first_seq}"))
+                })?
+                .payload
+                .generation_stream;
+            let _stream_context = StreamContext::new(stream);
+            self.inner
+                .run_paged_ragged_step(&forward_rows, prefill_count != 0)
+                .map(Some)
+        };
+        for row in &work {
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Qwen3 scheduler lost ragged sequence {}",
+                        row.seq_id
+                    ))
+                })?;
+            match row.kind {
+                PreparedRaggedKind::Prefill { .. } => turn.payload.profiler.end_prefill(),
+                PreparedRaggedKind::Decode(_) => turn.payload.profiler.end(),
+            }
+        }
+
+        let allocation_blocked = forward_result
+            .as_ref()
+            .is_err_and(|error| is_paged_allocation_blocked(&error.reason));
+        match &forward_result {
+            Err(_) if allocation_blocked => {
+                for row in &work {
+                    let turn = running
+                        .iter_mut()
+                        .find(|turn| turn.seq_id == row.seq_id)
+                        .ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "Qwen3 scheduler lost ragged sequence {}",
+                                row.seq_id
+                            ))
+                        })?;
+                    if let PreparedRaggedKind::Decode(decode) = &row.kind {
+                        let popped = turn.payload.generated_tokens.pop();
+                        debug_assert_eq!(popped, Some(decode.token_id));
+                    }
+                    results[row.plan_index] = Some(Self::blocked(&plan.rows[row.plan_index]));
+                }
+            }
+            Err(error) => {
+                for row in &work {
+                    let turn = running
+                        .iter_mut()
+                        .find(|turn| turn.seq_id == row.seq_id)
+                        .ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "Qwen3 scheduler lost ragged sequence {}",
+                                row.seq_id
+                            ))
+                        })?;
+                    results[row.plan_index] = Some(Self::fail(
+                        turn,
+                        &plan.rows[row.plan_index],
+                        Error::from_reason(error.reason.clone()),
+                    ));
+                }
+            }
+            Ok(Some(logits)) => {
+                for (logits_index, row) in work.iter().enumerate() {
+                    let planned = &plan.rows[row.plan_index];
+                    let turn = running
+                        .iter_mut()
+                        .find(|turn| turn.seq_id == row.seq_id)
+                        .ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "Qwen3 scheduler lost ragged sequence {}",
+                                row.seq_id
+                            ))
+                        })?;
+                    let row_logits = match logits
+                        .slice_axis(0, logits_index as i64, logits_index as i64 + 1)
+                        .and_then(|logits_row| match &row.kind {
+                            PreparedRaggedKind::Decode(_) => logits_row.squeeze(Some(&[1])),
+                            PreparedRaggedKind::Prefill { .. } => logits_row.squeeze(Some(&[0, 1])),
+                        }) {
+                        Ok(logits) => logits,
+                        Err(error) => {
+                            results[row.plan_index] = Some(Self::fail(turn, planned, error));
+                            continue;
+                        }
+                    };
+                    let result = match &row.kind {
+                        PreparedRaggedKind::Decode(decode) => {
+                            let logits = (!decode.at_length).then_some(row_logits);
+                            Self::finish_prepared_decode(decode, planned, turn, logits)
+                        }
+                        PreparedRaggedKind::Prefill {
+                            end,
+                            source_len,
+                            suppress_sample,
+                        } => {
+                            if end < source_len {
+                                RowStepResult {
+                                    seq_id: row.seq_id,
+                                    num_computed_tokens: planned.num_tokens,
+                                    generated_token: None,
+                                    finished: false,
+                                    allocation_blocked: false,
+                                    prefill_micros: 0,
+                                }
+                            } else if *suppress_sample {
+                                turn.payload.preemption_replay = None;
+                                RowStepResult {
+                                    seq_id: row.seq_id,
+                                    num_computed_tokens: planned.num_tokens,
+                                    generated_token: None,
+                                    finished: false,
+                                    allocation_blocked: false,
+                                    prefill_micros: 0,
+                                }
+                            } else {
+                                turn.payload.preemption_replay = None;
+                                let penalized = match engine::penalties::apply_all_penalties(
+                                    row_logits,
+                                    &turn.token_history,
+                                    &turn.payload.params,
+                                ) {
+                                    Ok(logits) => logits,
+                                    Err(error) => {
+                                        results[row.plan_index] =
+                                            Some(Self::fail(turn, planned, error));
+                                        continue;
+                                    }
+                                };
+                                let sampled =
+                                    match sample(&penalized, turn.payload.params.sampling_config) {
+                                        Ok(sampled) => sampled,
+                                        Err(error) => {
+                                            results[row.plan_index] =
+                                                Some(Self::fail(turn, planned, error));
+                                            continue;
+                                        }
+                                    };
+                                sampled.eval();
+                                if turn.payload.params.report_performance {
+                                    turn.payload.first_token_instant = Some(Instant::now());
+                                }
+                                if turn.payload.params.max_new_tokens == 0 {
+                                    turn.payload.profiler.snapshot_memory_after();
+                                    turn.payload.profiler.report();
+                                    RowStepResult {
+                                        seq_id: row.seq_id,
+                                        num_computed_tokens: planned.num_tokens,
+                                        generated_token: None,
+                                        finished: true,
+                                        allocation_blocked: false,
+                                        prefill_micros: 0,
+                                    }
+                                } else {
+                                    match sampled.item_at_int32(0) {
+                                        Ok(token) => RowStepResult {
+                                            seq_id: row.seq_id,
+                                            num_computed_tokens: planned.num_tokens,
+                                            generated_token: Some(token as u32),
+                                            finished: false,
+                                            allocation_blocked: false,
+                                            prefill_micros: 0,
+                                        },
+                                        Err(error) => Self::fail(turn, planned, error),
+                                    }
+                                }
+                            }
+                        }
+                    };
+                    results[row.plan_index] = Some(result);
+                }
+                synchronize_and_clear_cache();
+                if prefill_count != 0 {
+                    let prefill_micros = Self::elapsed_micros(forward_started)
+                        .div_ceil(prefill_count as u64)
+                        .max(1);
+                    for row in &work {
+                        if matches!(&row.kind, PreparedRaggedKind::Prefill { .. })
+                            && let Some(result) = results[row.plan_index].as_mut()
+                            && !result.allocation_blocked
+                        {
+                            result.prefill_micros = prefill_micros;
+                        }
+                    }
+                }
+            }
+            Ok(None) => {}
+        }
+
+        for decode in terminal_decodes {
+            let planned = &plan.rows[decode.plan_index];
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == decode.seq_id)
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Qwen3 scheduler lost terminal ragged sequence {}",
+                        decode.seq_id
+                    ))
+                })?;
+            results[decode.plan_index] =
+                Some(Self::finish_prepared_decode(&decode, planned, turn, None));
+        }
+
+        Ok(StepResult {
+            rows: results
+                .into_iter()
+                .enumerate()
+                .map(|(index, result)| {
+                    result.ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "Qwen3 scheduler produced no ragged result for plan row {index}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            executed_decode_batch: if allocation_blocked {
+                0
+            } else {
+                decode_occupancy
+            },
+            executed_greedy_epilogue_batch: 0,
+            rows_alloc_evicted: running
+                .iter()
+                .filter(|turn| turn.payload.allocation_failed)
+                .count() as u32,
+        })
+    }
+}
+
+impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
+    type Error = Error;
+
+    fn execute(
+        &mut self,
+        plan: &StepPlan,
+        running: &mut [TurnState<QwenScheduledTurn>],
+    ) -> std::result::Result<StepResult, Self::Error> {
+        if self.ragged_step {
+            self.execute_ragged(plan, running)
+        } else {
+            HybridStepExecutor::new(self.inner).execute(plan, running)
+        }
+    }
+}
+
+pub(crate) type QwenSchedulerState = HybridSchedulerState<Qwen3Inner>;
+
+impl HybridSchedulerBackend for Qwen3Inner {
+    type Command = Qwen3Cmd;
+    type RestoreTicket = PagedRestoreTicket;
+    type OwnerState = Vec<u32>;
+    type StepExecutor<'a> = QwenStepExecutor<'a>;
+
+    const SCHEDULER_NAME: &'static str = "Qwen3";
+
+    fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter> {
+        self.paged_adapter.as_ref()
+    }
+
+    fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter> {
+        self.paged_adapter.as_mut()
+    }
+
+    fn max_position_embeddings(&self) -> i32 {
+        self.config.max_position_embeddings
+    }
+
+    fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        self.activate_paged_seq(seq_id)
+    }
+
+    fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        self.run_paged_decode_step_batched(rows)
+    }
+
+    fn replace_cached_token_history(&mut self, history: Vec<u32>) {
+        self.cached_token_history = history;
+    }
+
+    fn owner_tokens(state: &Self::OwnerState) -> &[u32] {
+        state
+    }
+
+    fn capture_owner_state(&mut self, _seq_id: SeqId) -> Self::OwnerState {
+        self.cached_token_history.clone()
+    }
+
+    fn build_scheduled_prefix(
+        &self,
+        _base: &Self::PrefixState,
+        effective_cached_prefix_len: usize,
+        suffix_len: usize,
+        _full_tokens: Vec<u32>,
+        _first_chunk: bool,
+    ) -> Self::PrefixState {
+        Qwen3PrefixState {
+            effective_cached_prefix_len,
+            suffix_len,
+        }
+    }
+
+    fn prepare_scheduled_prefix(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+        _owner_history: &[u32],
+        reuse_cache: bool,
+        cache_salt: u64,
+        _block_size: u32,
+    ) -> Result<ScheduledPrefixAdmission<Self::PrefixState, Self::RestoreTicket>> {
+        let total_budget = tokens.len() as u32;
+        let admission = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen3 paged adapter is unavailable"))?
+            .prepare_turn_with_async_restore(
+                seq_id,
+                tokens,
+                total_budget,
+                reuse_cache,
+                &[],
+                cache_salt,
+                false,
+                total_budget.saturating_sub(1),
+            )
+            .map_err(Error::from_reason)?;
+        Ok(match admission {
+            PagedTurnAdmission::Ready(plan) => ScheduledPrefixAdmission::Ready(Qwen3PrefixState {
+                effective_cached_prefix_len: plan.cached_prefix_len as usize,
+                suffix_len: plan.suffix_len as usize,
+            }),
+            PagedTurnAdmission::Waiting {
+                provisional,
+                restore,
+            } => ScheduledPrefixAdmission::Waiting {
+                provisional: Qwen3PrefixState {
+                    effective_cached_prefix_len: provisional.cached_prefix_len as usize,
+                    suffix_len: provisional.suffix_len as usize,
+                },
+                restore,
+            },
+        })
+    }
+
+    fn poll_scheduled_restore(
+        &mut self,
+        seq_id: SeqId,
+        restore: &mut Self::RestoreTicket,
+        _prompt_tokens: &[u32],
+        _owner_history: &[u32],
+        _is_preemption_replay: bool,
+    ) -> Result<Option<ScheduledRestoreResult<Self::PrefixState>>> {
+        let outcome = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen3 paged adapter is unavailable"))?
+            .poll_restore(restore)
+            .map_err(Error::from_reason)?;
+        Ok(match outcome {
+            PagedRestorePoll::Pending => None,
+            PagedRestorePoll::Ready {
+                plan,
+                bytes_restored,
+                wait,
+            } => Some(ScheduledRestoreResult {
+                prefix: Qwen3PrefixState {
+                    effective_cached_prefix_len: plan.cached_prefix_len as usize,
+                    suffix_len: plan.suffix_len as usize,
+                },
+                bytes_restored,
+                wait,
+                materialized_blocks: self
+                    .paged_adapter
+                    .as_ref()
+                    .and_then(|adapter| adapter.block_table_for(seq_id))
+                    .map(|table| table.num_blocks() as u32)
+                    .unwrap_or(0),
+                profiler_prefill_tokens: plan.suffix_len,
+                extra_prefill_breaks: Vec::new(),
+            }),
+        })
+    }
+
+    fn restore_reserved_blocks(restore: &Self::RestoreTicket) -> u32 {
+        restore.reserved_blocks()
+    }
+
+    fn step_executor(&mut self) -> Self::StepExecutor<'_> {
+        QwenStepExecutor {
+            inner: self,
+            ragged_step: scheduler_ragged_step_enabled(),
+        }
+    }
+
+    fn execute_barrier(
+        &mut self,
+        command: Self::Command,
+        _owners: SchedulerOwnerContext<'_, Self::OwnerState>,
+    ) {
+        handle_qwen3_cmd(self, command);
     }
 }
 
@@ -343,7 +1165,7 @@ impl Qwen3Inner {
                 // (KvScaleManager); always false here.
                 use_fp8_cache: Some(false),
                 max_seq_len: Some(config.max_position_embeddings as u32),
-                max_batch_size: Some(32),
+                max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
             };
 
             let num_blocks = pa_config.calculate_num_blocks();
@@ -406,9 +1228,96 @@ impl Qwen3Inner {
             turn_cache_idx: 0,
             pending_exact_match_rewind: Cell::new(false),
             turn_is_streaming: Cell::new(false),
+            turn_cancel: None,
             training_state: None,
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
         })
+    }
+
+    /// Rebuild the provisional constructor-time pool after weights are
+    /// materialized, using the scheduler policy and live Metal budget. The
+    /// load-time probe can now see the model weights, so the selected pool is
+    /// capped against the real working set instead of double-budgeting them.
+    pub(crate) fn size_paged_pool_after_weight_load(&mut self) -> Result<()> {
+        if self.paged_adapter.is_none() {
+            return Ok(());
+        }
+        // An explicit pool size is an operator cap, not a sizing hint. The
+        // constructor already built and successfully co-resident-loaded that
+        // exact pool with the weights, so adaptive replacement is reserved for
+        // genuinely uncapped configurations.
+        if self.config.paged_cache_memory_mb.is_some() {
+            return Ok(());
+        }
+        // Drop the provisional pool before sizing/allocating its replacement.
+        // It is still empty here: production calls this immediately after
+        // weight materialization and before cold-tier attachment or inference.
+        self.paged_adapter = None;
+
+        let block_size = self.config.paged_block_size.unwrap_or(16);
+        let trained_context = u32::try_from(self.config.max_position_embeddings)
+            .unwrap_or(1)
+            .max(1);
+        let per_seq_context = trained_context.min(scheduler_per_seq_context());
+        let requested_tokens =
+            per_seq_context.saturating_mul(scheduler_max_num_seqs_for(32) as u32);
+        let requested_blocks = requested_tokens.div_ceil(block_size).max(1);
+        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+        let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
+            requested_blocks,
+            self.config.num_layers as u32,
+            self.config.num_kv_heads as u32,
+            self.config.head_dim as u32,
+            block_size,
+            cache_dtype,
+        )
+        .map_err(|error| {
+            Error::from_reason(format!(
+                "Qwen3 adaptive paged cache sizing failed safely; refusing an uncapped pool request: {error}"
+            ))
+        })?;
+        let selected_mb = sizing.selected_bytes.div_ceil(1024 * 1024).max(1) as u32;
+        let pa_config = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            gpu_memory_mb: selected_mb,
+            head_size: self.config.head_dim as u32,
+            num_kv_heads: self.config.num_kv_heads as u32,
+            num_layers: self.config.num_layers as u32,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(per_seq_context),
+            max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
+        };
+        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            sizing.selected_blocks,
+            block_size,
+        )));
+        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, sizing.selected_blocks, cache_dtype)
+            .map_err(|error| {
+                Error::from_reason(format!("Failed to construct Qwen3 KV pool: {error}"))
+            })?;
+        self.paged_adapter = Some(
+            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|error| {
+                Error::from_reason(format!("Failed to construct Qwen3 paged adapter: {error}"))
+            })?,
+        );
+        info!(
+            "Qwen3 scheduler pool enabled: requested_blocks={}, selected_blocks={}, bytes={:.2} GiB, per_seq_context={}, max_num_seqs={}",
+            requested_blocks,
+            sizing.selected_blocks,
+            sizing.selected_bytes as f64 / (1u64 << 30) as f64,
+            per_seq_context,
+            scheduler_max_num_seqs_for(32),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn paged_pool_allocated_bytes(&self) -> Result<u64> {
+        self.paged_adapter
+            .as_ref()
+            .map(PagedKVCacheAdapter::pool_allocated_bytes)
+            .transpose()
+            .map(|bytes| bytes.unwrap_or(0))
+            .map_err(Error::from_reason)
     }
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
@@ -529,7 +1438,7 @@ impl Qwen3Inner {
         // cache; the EXPLICIT command reset purges them on top of this
         // (`ResetScope::Command` branch of `ChatBackend::reset_caches`).
         if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+            let _ = adapter.release_all_requests();
         }
         Ok(())
     }
@@ -620,6 +1529,17 @@ impl Qwen3Inner {
         let mut last_hidden: Option<MxArray> = None;
         let mut tokens_consumed: u32 = 0;
         for (chunk_idx, chunk) in suffix_tokens.chunks(chunk_size_usize).enumerate() {
+            // Cooperative-cancel checkpoint (H1b): abort at the chunk
+            // boundary instead of running the rest of the prefill. The
+            // Err rides the paged engine's abort arm, which releases the
+            // live request without registering its blocks (fail closed).
+            if self
+                .turn_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                return Err(Error::from_reason("prefill cancelled"));
+            }
             let chunk_start_pos = first_logical_position + tokens_consumed;
             let is_last_chunk = chunk_idx + 1 == total_chunks;
             let hidden =
@@ -638,7 +1558,8 @@ impl Qwen3Inner {
                 synchronize_and_clear_cache();
             }
         }
-        let hidden_states = last_hidden.expect("chunked loop processed at least one chunk");
+        let hidden_states = last_hidden
+            .ok_or_else(|| Error::from_reason("Qwen3 chunked prefill produced no hidden state"))?;
 
         // Final norm + lm_head ONLY on the last chunk's residual stream
         // (we only need the last token's logits to sample the first decode
@@ -833,6 +1754,232 @@ impl Qwen3Inner {
             self.lm_head.forward(&hidden_states)?
         };
         Ok(logits)
+    }
+
+    /// Run one uniform paged decode step for multiple live requests.
+    ///
+    /// `rows` carries `(sequence_id, token_id)` in authoritative batch order.
+    /// The method snapshots each request's write cursor, records exactly one
+    /// token per row, then executes every transformer layer once over
+    /// `[N,1,H]`. A pre-forward record failure rolls back only the rows already
+    /// advanced by this call; forward failures are left for scheduler teardown,
+    /// matching the single-row stepper's abort contract.
+    pub(crate) fn run_paged_decode_step_batched(
+        &mut self,
+        rows: &[(SeqId, u32)],
+    ) -> Result<MxArray> {
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "run_paged_decode_step_batched requires at least one row",
+            ));
+        }
+        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+            Error::from_reason("run_paged_decode_step_batched: paged_adapter is None")
+        })?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut planned_rows = Vec::with_capacity(rows.len());
+        for &(seq_id, _) in rows {
+            if !seen.insert(seq_id) {
+                return Err(Error::from_reason(format!(
+                    "run_paged_decode_step_batched received duplicate sequence {seq_id}"
+                )));
+            }
+            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "run_paged_decode_step_batched: unknown sequence {seq_id}"
+                ))
+            })?;
+            planned_rows.push((seq_id, position));
+        }
+
+        let mut recorded: Vec<SeqId> = Vec::with_capacity(rows.len());
+        for &(seq_id, token) in rows {
+            let result = self
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason("run_paged_decode_step_batched: paged adapter disappeared")
+                })?
+                .record_token_for(seq_id, token);
+            if let Err(error) = result {
+                for &recorded_seq in recorded.iter().rev() {
+                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "run_paged_decode_step_batched: paged adapter disappeared during rollback",
+                        )
+                    })?;
+                    adapter.activate_request(recorded_seq).map_err(|rollback| {
+                        Error::from_reason(format!(
+                            "run_paged_decode_step_batched: record failed for sequence {seq_id}: {error}; rollback activation for sequence {recorded_seq} also failed: {rollback}"
+                        ))
+                    })?;
+                    adapter.rollback_last_tokens(1).map_err(|rollback| {
+                        Error::from_reason(format!(
+                            "run_paged_decode_step_batched: record failed for sequence {seq_id}: {error}; rollback for sequence {recorded_seq} also failed: {rollback}"
+                        ))
+                    })?;
+                }
+                return Err(Error::from_reason(format!(
+                    "run_paged_decode_step_batched: failed to record sequence {seq_id}: {error}"
+                )));
+            }
+            recorded.push(seq_id);
+        }
+
+        let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
+        let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
+        let mut hidden_states = self.embedding.forward(&input_ids)?;
+        for layer_idx in 0..self.layers.len() {
+            let layer: &TransformerBlock = unsafe {
+                let pointer = self.layers.as_ptr().add(layer_idx);
+                &*pointer
+            };
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step_batched: paged_adapter dropped")
+            })?;
+            hidden_states = layer.forward_paged_adapter_batched(
+                &hidden_states,
+                adapter,
+                layer_idx as u32,
+                &planned_rows,
+            )?;
+        }
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        if self.config.tie_word_embeddings {
+            let embedding_weight = self.embedding.get_weight();
+            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)
+        } else {
+            self.lm_head.forward(&hidden_states)
+        }
+    }
+
+    /// Execute the scheduler's mixed token-budget plan as one packed varlen
+    /// model forward. Each tuple carries one request's contiguous scheduled
+    /// token slice; returned logits contain only that slice's final query row,
+    /// in the same request order.
+    pub(crate) fn run_paged_ragged_step(
+        &mut self,
+        rows: &[(SeqId, Vec<u32>)],
+        contains_prefill: bool,
+    ) -> Result<MxArray> {
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "run_paged_ragged_step requires at least one row",
+            ));
+        }
+        let adapter = self
+            .paged_adapter
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("run_paged_ragged_step: paged_adapter is None"))?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut planned_rows = Vec::with_capacity(rows.len());
+        let mut total_queries = 0u32;
+        for (seq_id, tokens) in rows {
+            if !seen.insert(*seq_id) {
+                return Err(Error::from_reason(format!(
+                    "run_paged_ragged_step received duplicate sequence {seq_id}"
+                )));
+            }
+            let query_len = u32::try_from(tokens.len()).map_err(|_| {
+                Error::from_reason(format!(
+                    "run_paged_ragged_step: sequence {seq_id} query length exceeds u32::MAX"
+                ))
+            })?;
+            if query_len == 0 {
+                return Err(Error::from_reason(format!(
+                    "run_paged_ragged_step: sequence {seq_id} has an empty token slice"
+                )));
+            }
+            let position = adapter.current_token_count_for(*seq_id).ok_or_else(|| {
+                Error::from_reason(format!("run_paged_ragged_step: unknown sequence {seq_id}"))
+            })?;
+            total_queries = total_queries
+                .checked_add(query_len)
+                .ok_or_else(|| Error::from_reason("run_paged_ragged_step query count overflow"))?;
+            planned_rows.push(PagedRaggedRow {
+                seq_id: *seq_id,
+                first_logical_position: position,
+                query_len,
+            });
+        }
+
+        let mut recorded: Vec<usize> = Vec::with_capacity(rows.len());
+        for (row_index, (seq_id, tokens)) in rows.iter().enumerate() {
+            let result = self
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason("run_paged_ragged_step: paged adapter disappeared")
+                })?
+                .record_tokens_for(*seq_id, tokens);
+            if let Err(error) = result {
+                for &recorded_index in recorded.iter().rev() {
+                    let recorded_row = planned_rows[recorded_index];
+                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "run_paged_ragged_step: paged adapter disappeared during rollback",
+                        )
+                    })?;
+                    adapter.activate_request(recorded_row.seq_id).map_err(|rollback| {
+                        Error::from_reason(format!(
+                            "run_paged_ragged_step: record failed for sequence {seq_id}: {error}; rollback activation for sequence {} also failed: {rollback}",
+                            recorded_row.seq_id
+                        ))
+                    })?;
+                    adapter
+                        .rollback_last_tokens(recorded_row.query_len)
+                        .map_err(|rollback| {
+                            Error::from_reason(format!(
+                                "run_paged_ragged_step: record failed for sequence {seq_id}: {error}; rollback for sequence {} also failed: {rollback}",
+                                recorded_row.seq_id
+                            ))
+                        })?;
+                }
+                return Err(Error::from_reason(format!(
+                    "run_paged_ragged_step: failed to record sequence {seq_id}: {error}"
+                )));
+            }
+            recorded.push(row_index);
+        }
+
+        let mut token_ids = Vec::with_capacity(total_queries as usize);
+        let mut last_indices = Vec::with_capacity(rows.len());
+        let mut offset = 0u32;
+        for (_, tokens) in rows {
+            token_ids.extend_from_slice(tokens);
+            offset = offset.saturating_add(tokens.len() as u32);
+            last_indices.push((offset - 1) as i32);
+        }
+        let input_ids = MxArray::from_uint32(&token_ids, &[i64::from(total_queries), 1])?;
+        let mut hidden_states = self.embedding.forward(&input_ids)?;
+        for layer_idx in 0..self.layers.len() {
+            let layer: &TransformerBlock = unsafe {
+                let pointer = self.layers.as_ptr().add(layer_idx);
+                &*pointer
+            };
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_ragged_step: paged_adapter dropped")
+            })?;
+            hidden_states = layer.forward_paged_adapter_ragged(
+                &hidden_states,
+                adapter,
+                layer_idx as u32,
+                &planned_rows,
+            )?;
+            if contains_prefill {
+                crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
+            }
+        }
+
+        let last_indices = MxArray::from_int32(&last_indices, &[rows.len() as i64])?;
+        hidden_states = hidden_states.take(&last_indices, 0)?;
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        if self.config.tie_word_embeddings {
+            let embedding_weight = self.embedding.get_weight();
+            hidden_states.matmul(&embedding_weight.transpose(Some(&[1, 0]))?)
+        } else {
+            self.lm_head.forward(&hidden_states)
+        }
     }
 
     /// Generate synchronous (runs on model thread).
@@ -1980,7 +3127,10 @@ impl Qwen3Inner {
             // Skipped steps must still advance the authoritative step counter
             // (H1) and drop the cached generation so the next cycle starts
             // clean.
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self
+                .training_state
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Training state was cleared during training"))?;
             ts.clear_generation_cache();
             ts.step += 1;
             let new_step = ts.step;
@@ -2017,7 +3167,9 @@ impl Qwen3Inner {
                     warn!("Gradient '{}' contains NaN/Inf - SKIPPING STEP", name);
                 }
 
-                let ts = self.training_state.as_mut().unwrap();
+                let ts = self.training_state.as_mut().ok_or_else(|| {
+                    Error::from_reason("Training state was cleared during training")
+                })?;
                 ts.nan_gradient_count += 1;
                 ts.consecutive_nan_count += 1;
 
@@ -2077,7 +3229,10 @@ impl Qwen3Inner {
         };
 
         // Accumulate gradients
-        let ts = self.training_state.as_mut().unwrap();
+        let ts = self
+            .training_state
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Training state was cleared during training"))?;
         // Reset consecutive NaN count on successful gradient computation
         ts.consecutive_nan_count = 0;
 
@@ -2148,7 +3303,12 @@ impl Qwen3Inner {
 
                 debug!(
                     "Applied AdamW update (step={})",
-                    self.training_state.as_ref().unwrap().step
+                    self.training_state
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::from_reason("Training state was cleared during training")
+                        })?
+                        .step
                 );
             } else {
                 // SGD path
@@ -2159,7 +3319,10 @@ impl Qwen3Inner {
                 debug!("Applied SGD gradients with lr: {}", lr);
             }
 
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self
+                .training_state
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Training state was cleared during training"))?;
             ts.accumulated_gradients = None;
             ts.micro_step = 0;
             ts.step += 1;
@@ -2190,7 +3353,10 @@ impl Qwen3Inner {
 
         // Count tokens BEFORE clearing the cache — otherwise total_tokens is
         // always zero on the success path.
-        let ts = self.training_state.as_ref().unwrap();
+        let ts = self
+            .training_state
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Training state was cleared during training"))?;
         let total_tokens: i32 = if let Some(ref ct) = ts.cached_completion_tokens {
             ct.iter()
                 .filter_map(|t| t.shape_at(0).ok())
@@ -2208,7 +3374,10 @@ impl Qwen3Inner {
         // CRITICAL: heavy_cleanup after autograd to clear compiled graph cache
         heavy_cleanup();
 
-        let ts = self.training_state.as_ref().unwrap();
+        let ts = self
+            .training_state
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Training state was cleared during training"))?;
         Ok(crate::training_model::TrainStepPlainMetrics {
             loss: loss_value,
             gradients_applied,
@@ -2280,7 +3449,10 @@ impl Qwen3Inner {
         if loss_value.is_nan() || loss_value.is_infinite() {
             warn!("SFT: Skipping step due to invalid loss: {}", loss_value);
             synchronize_and_clear_cache();
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self
+                .training_state
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Training state was cleared during training"))?;
             ts.nan_gradient_count += 1;
             ts.consecutive_nan_count += 1;
 
@@ -2330,7 +3502,9 @@ impl Qwen3Inner {
                     warn!("SFT: Gradient '{}' contains NaN/Inf - SKIPPING STEP", name);
                 }
 
-                let ts = self.training_state.as_mut().unwrap();
+                let ts = self.training_state.as_mut().ok_or_else(|| {
+                    Error::from_reason("Training state was cleared during training")
+                })?;
                 ts.nan_gradient_count += 1;
                 ts.consecutive_nan_count += 1;
 
@@ -2388,7 +3562,10 @@ impl Qwen3Inner {
         };
 
         // Accumulate gradients
-        let ts = self.training_state.as_mut().unwrap();
+        let ts = self
+            .training_state
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Training state was cleared during training"))?;
         // Reset consecutive NaN count on successful gradient computation
         ts.consecutive_nan_count = 0;
 
@@ -2462,7 +3639,12 @@ impl Qwen3Inner {
 
                 debug!(
                     "SFT: Applied AdamW update (step={})",
-                    self.training_state.as_ref().unwrap().step
+                    self.training_state
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::from_reason("Training state was cleared during training")
+                        })?
+                        .step
                 );
             } else {
                 // SGD path with weight decay
@@ -2497,7 +3679,10 @@ impl Qwen3Inner {
                 debug!("SFT: Applied SGD gradients with lr: {}", lr);
             }
 
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self
+                .training_state
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Training state was cleared during training"))?;
             ts.accumulated_gradients = None;
             ts.micro_step = 0;
             ts.step += 1;
@@ -2519,7 +3704,10 @@ impl Qwen3Inner {
         // CRITICAL: heavy_cleanup after autograd to clear compiled graph cache
         heavy_cleanup();
 
-        let ts = self.training_state.as_ref().unwrap();
+        let ts = self
+            .training_state
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Training state was cleared during training"))?;
         Ok(crate::training_model::TrainStepPlainMetrics {
             loss: loss_value,
             gradients_applied,
@@ -2769,6 +3957,18 @@ impl Qwen3Inner {
         let last_logits = if use_chunked_prefill {
             let mut offset = 0usize;
             while offset + prefill_step_size < total_len {
+                // Cooperative-cancel checkpoint (H1b): abort at the chunk
+                // boundary. The Err rides the flat engine's
+                // `fail_closed_flat_turn` arm — no `save_cache_state`, the
+                // session is invalidated, so the partial turn-KV never
+                // becomes a live prefix.
+                if self
+                    .turn_cancel
+                    .as_ref()
+                    .is_some_and(|f| f.load(Ordering::Relaxed))
+                {
+                    return Err(Error::from_reason("prefill cancelled"));
+                }
                 let chunk_end = offset + prefill_step_size;
                 let chunk = prefill_input.slice(&[0, offset as i64], &[1, chunk_end as i64])?;
                 rope_offsets = MxArray::from_int32(&[self.turn_cache_idx], &[1])?;
@@ -2796,6 +3996,19 @@ impl Qwen3Inner {
                 }
                 synchronize_and_clear_cache();
                 offset = chunk_end;
+            }
+            // The final remainder is a chunk boundary too once at least one
+            // looped chunk ran (always true in this arm): poll before
+            // forwarding it so a cancel landing during the last looped chunk
+            // aborts instead of riding through the remainder. The offset-zero
+            // single-shot arm below stays uncancellable by design.
+            if offset > 0
+                && self
+                    .turn_cancel
+                    .as_ref()
+                    .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                return Err(Error::from_reason("prefill cancelled"));
             }
             let final_chunk = prefill_input.slice(&[0, offset as i64], &[1, total_len as i64])?;
             rope_offsets = MxArray::from_int32(&[self.turn_cache_idx], &[1])?;
@@ -2930,6 +4143,52 @@ impl PagedPrefix for Qwen3PrefixState {
     }
 }
 
+impl Qwen3Inner {
+    fn prime_prefix_state_for(
+        &mut self,
+        seq_id: SeqId,
+        plan: &[u32],
+        reuse_cache: bool,
+        extra_keys: &[u64],
+        cache_salt: u64,
+    ) -> Result<Qwen3PrefixState> {
+        let total_budget = plan.len() as u32;
+        let max_cache_hit_tokens = total_budget.saturating_sub(1);
+        let turn_plan = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "prime_prefix_state: paged_adapter is None — caller must check \
+                     use_block_paged_cache before dispatch",
+                )
+            })?
+            .prepare_turn_with_max_cache_hit_tokens(
+                seq_id,
+                plan,
+                total_budget,
+                reuse_cache,
+                extra_keys,
+                cache_salt,
+                false,
+                max_cache_hit_tokens,
+            )
+            .map_err(Error::from_reason)?;
+        Ok(Qwen3PrefixState {
+            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
+            suffix_len: turn_plan.suffix_len as usize,
+        })
+    }
+
+    fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        self.paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("qwen3 paged adapter is unavailable"))?
+            .activate_request(seq_id)
+            .map_err(Error::from_reason)
+    }
+}
+
 impl PagedBackend for Qwen3Inner {
     type PagedDecode<'a>
         = Qwen3PagedDecode<'a>
@@ -2945,42 +4204,7 @@ impl PagedBackend for Qwen3Inner {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<Self::PrefixState> {
-        // Lazy decode allocation: pass the prompt length only (decode
-        // blocks grow on-demand via `record_tokens`). vLLM-style
-        // exact-prefix cap: leave at least one prompt token to prefill so
-        // the decoder always has something to consume.
-        let total_budget = plan.len() as u32;
-        let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        // Per-turn seq_id: the adapter is single-request and
-        // `reset_for_new_request` makes the previous seq_id irrelevant.
-        let seq_id: u32 = 0;
-        // Adapter-owned warm-continue / cold-start lifecycle (suffix
-        // blocks are allocated inside prepare_turn — do NOT call
-        // `allocate_suffix_blocks` again).
-        let turn_plan = self
-            .paged_adapter
-            .as_mut()
-            .ok_or_else(|| {
-                napi::Error::from_reason(
-                    "prime_prefix_state: paged_adapter is None — caller must check \
-                     use_block_paged_cache before dispatch",
-                )
-            })?
-            .prepare_turn_with_max_cache_hit_tokens(
-                seq_id,
-                plan,
-                total_budget,
-                reuse_cache,
-                extra_keys,
-                cache_salt,
-                false,
-                max_cache_hit_tokens,
-            )
-            .map_err(napi::Error::from_reason)?;
-        Ok(Qwen3PrefixState {
-            effective_cached_prefix_len: turn_plan.cached_prefix_len as usize,
-            suffix_len: turn_plan.suffix_len as usize,
-        })
+        self.prime_prefix_state_for(0, plan, reuse_cache, extra_keys, cache_salt)
     }
 
     fn paged_prefill(
@@ -2998,7 +4222,7 @@ impl PagedBackend for Qwen3Inner {
         )
     }
 
-    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
+    fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
         let positions_dummy = MxArray::from_int32(&[0], &[1])?;
         let num_layers = self.layers.len();
         Ok(Qwen3PagedDecode {
@@ -3008,7 +4232,7 @@ impl PagedBackend for Qwen3Inner {
         })
     }
 
-    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
+    fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
         // Terminal lifecycle for the paged turn. Success: keep the request
         // live across turns when reuse is on so the next turn's
         // `continue_turn` builds on the partial trailing block's live K/V;
@@ -3017,9 +4241,9 @@ impl PagedBackend for Qwen3Inner {
         // result).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             if reuse_cache {
-                let _ = adapter.finalize_turn_keep_live(&[], 0);
+                let _ = adapter.finalize_turn_keep_live(&[], cache_salt);
             } else {
-                let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+                let _ = adapter.register_full_blocks_for_reuse(&[], cache_salt);
                 let _ = adapter.release_request();
             }
         }
@@ -3207,6 +4431,10 @@ impl ChatBackend for Qwen3Inner {
 
     fn family_name(&self) -> &'static str {
         "qwen3"
+    }
+
+    fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.turn_cancel = flag;
     }
 
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
@@ -3446,6 +4674,7 @@ pub struct Qwen3Model {
     /// shrink back. Held as a field rather than consumed because the
     /// guard has no API — only its Drop does useful work.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
 }
 
 #[napi]
@@ -3466,6 +4695,95 @@ impl Qwen3Model {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
+    }
+
+    /// Maximum number of independent sequences admitted to the continuous
+    /// batching scheduler. Flat-cache and forced-serial instances deliberately
+    /// report one so the server retains its exclusive dispatch lane.
+    #[napi]
+    pub fn max_concurrent_sequences(&self) -> u32 {
+        if self.paged_active && !QwenSchedulerState::force_serial() {
+            scheduler_max_num_seqs_for(32) as u32
+        } else {
+            1
+        }
+    }
+
+    /// Snapshot continuous-batching scheduler counters after all commands
+    /// already ahead of this query have drained.
+    #[napi]
+    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
+        send_and_await(&self.thread, |reply| Qwen3Cmd::SchedulerStats { reply }).await
+    }
+
+    // ---------------------------------------------------------------
+    // Test-only helpers: streaming session entry points that bypass
+    // ThreadsafeFunction and expose the mpsc receiver directly. Used
+    // by `crates/mlx-core/tests/qwen3_prefill_cancel.rs` to exercise
+    // the streaming path from a pure-Rust integration test without a
+    // NAPI host. Marked `#[doc(hidden)]` because they're not part of
+    // the public API surface. Mirrors `Lfm2Model`'s equivalents.
+    // ---------------------------------------------------------------
+
+    /// Test-only entry point that dispatches `ChatCmd::StreamSessionStart`
+    /// and returns the raw mpsc receiver the model thread writes into.
+    #[doc(hidden)]
+    pub fn chat_stream_session_start_for_test(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<crate::engine::types::ChatConfig>,
+    ) -> Result<(
+        crate::engine::types::ChatStreamHandle,
+        tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
+    )> {
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
+        self.thread
+            .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionStart {
+                messages,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            }))?;
+        Ok((
+            crate::engine::types::ChatStreamHandle { cancelled },
+            stream_rx,
+        ))
+    }
+
+    /// Test-only entry point that dispatches
+    /// `ChatCmd::StreamSessionContinue` and returns the raw mpsc receiver
+    /// the model thread writes into.
+    #[doc(hidden)]
+    pub fn chat_stream_session_continue_for_test(
+        &self,
+        messages: Vec<ChatMessage>,
+        config: Option<crate::engine::types::ChatConfig>,
+    ) -> Result<(
+        crate::engine::types::ChatStreamHandle,
+        tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
+    )> {
+        let config = config.unwrap_or_default();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_inner = cancelled.clone();
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
+        self.thread
+            .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionContinue {
+                messages,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            }))?;
+        Ok((
+            crate::engine::types::ChatStreamHandle { cancelled },
+            stream_rx,
+        ))
     }
 
     /// Fused forward pass using C++ implementation for maximum performance.
@@ -4113,6 +5431,114 @@ mod tests {
         }
     }
 
+    fn cast_paged_inner_to_bf16(inner: &mut super::Qwen3Inner) {
+        use crate::array::DType;
+        let cast = |array: &MxArray| -> MxArray {
+            array.astype(DType::BFloat16).expect("astype BFloat16")
+        };
+        let weight = inner.embedding.get_weight();
+        inner
+            .embedding
+            .set_weight(&cast(&weight))
+            .expect("set embed");
+        let weight = inner.final_norm.get_weight();
+        inner
+            .final_norm
+            .set_weight(&cast(&weight))
+            .expect("set final_norm");
+        let weight = inner.lm_head.get_weight();
+        inner
+            .lm_head
+            .set_weight(&cast(&weight))
+            .expect("set lm_head");
+        for layer in &mut inner.layers {
+            let weight = layer.get_input_layernorm_weight();
+            layer
+                .set_input_layernorm_weight(&cast(&weight))
+                .expect("set in ln");
+            let weight = layer.get_post_attention_layernorm_weight();
+            layer
+                .set_post_attention_layernorm_weight(&cast(&weight))
+                .expect("set post ln");
+            let weight = layer.self_attn.get_q_proj_weight();
+            layer
+                .self_attn
+                .set_q_proj_weight(&cast(&weight))
+                .expect("set q");
+            let weight = layer.self_attn.get_k_proj_weight();
+            layer
+                .self_attn
+                .set_k_proj_weight(&cast(&weight))
+                .expect("set k");
+            let weight = layer.self_attn.get_v_proj_weight();
+            layer
+                .self_attn
+                .set_v_proj_weight(&cast(&weight))
+                .expect("set v");
+            let weight = layer.self_attn.get_o_proj_weight();
+            layer
+                .self_attn
+                .set_o_proj_weight(&cast(&weight))
+                .expect("set o");
+            if let Some(weight) = layer.self_attn.get_q_norm_weight() {
+                layer
+                    .self_attn
+                    .set_q_norm_weight(&cast(&weight))
+                    .expect("set qn");
+            }
+            if let Some(weight) = layer.self_attn.get_k_norm_weight() {
+                layer
+                    .self_attn
+                    .set_k_norm_weight(&cast(&weight))
+                    .expect("set kn");
+            }
+            let weight = layer.mlp.get_gate_proj_weight();
+            layer
+                .mlp
+                .set_gate_proj_weight(&cast(&weight))
+                .expect("set gate");
+            let weight = layer.mlp.get_up_proj_weight();
+            layer
+                .mlp
+                .set_up_proj_weight(&cast(&weight))
+                .expect("set up");
+            let weight = layer.mlp.get_down_proj_weight();
+            layer
+                .mlp
+                .set_down_proj_weight(&cast(&weight))
+                .expect("set down");
+        }
+    }
+
+    fn prime_paged_request(
+        inner: &mut super::Qwen3Inner,
+        seq_id: SeqId,
+        prompt: &[u32],
+    ) -> Result<()> {
+        {
+            let adapter = inner
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("paged adapter missing"))?;
+            adapter.begin_request(seq_id).map_err(Error::from_reason)?;
+            let prefix = adapter
+                .find_cached_prefix(prompt, &[], 0, false)
+                .map_err(Error::from_reason)?;
+            if prefix.cached_token_count != 0 {
+                return Err(Error::from_reason(format!(
+                    "synthetic request {seq_id} unexpectedly hit {} cached tokens",
+                    prefix.cached_token_count
+                )));
+            }
+            adapter
+                .allocate_suffix_blocks(prompt.len() as u32 + 2)
+                .map_err(Error::from_reason)?;
+        }
+        let positions = MxArray::from_int32(&[0], &[1])?;
+        let _ = inner.run_paged_prefill_chunk(prompt, 0, inner.layers.len(), &positions)?;
+        Ok(())
+    }
+
     /// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged
     /// adapter. Pure path that only relies on the existing MLX runtime
     /// (matches the rest of the `models::qwen3` test suite).
@@ -4128,6 +5554,85 @@ mod tests {
             inner.paged_adapter.is_none(),
             "paged_adapter must be None when use_block_paged_cache is Some(false)"
         );
+    }
+
+    #[test]
+    fn scheduler_cache_owner_release_drops_sequence_and_history() {
+        let inner = super::Qwen3Inner::new(paged_tiny_config(Some(false)))
+            .expect("construct scheduler inner without paged allocation");
+        let mut state = super::QwenSchedulerState::new(inner).expect("construct scheduler state");
+        state.owner_sequences.insert("stateless-owner".into(), 41);
+        state
+            .owner_states
+            .insert("stateless-owner".into(), vec![1, 2, 3]);
+
+        state
+            .release_cache_owner_now("stateless-owner")
+            .expect("release owner");
+
+        assert!(!state.owner_sequences.contains_key("stateless-owner"));
+        assert!(!state.owner_states.contains_key("stateless-owner"));
+        // Idempotent disposal is required by ChatSession.dispose().
+        state
+            .release_cache_owner_now("stateless-owner")
+            .expect("release absent owner");
+    }
+
+    #[test]
+    fn scheduler_cache_owner_release_frees_paged_row_but_preserves_prefix() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping owner-release paged test (paged backend unavailable)");
+            return;
+        }
+        let mut inner = match super::Qwen3Inner::new(paged_tiny_config(Some(true))) {
+            Ok(inner) => inner,
+            Err(error) if error.reason.contains("No Metal device found") => {
+                eprintln!("skipping owner-release paged test (no Metal device)");
+                return;
+            }
+            Err(error) => panic!("construct paged scheduler inner: {error}"),
+        };
+        cast_paged_inner_to_bf16(&mut inner);
+        let prompt = (2..=33).collect::<Vec<u32>>();
+        prime_paged_request(&mut inner, 41, &prompt).expect("prime owner row");
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("paged adapter")
+            .finalize_turn_keep_live(&[], 0)
+            .expect("publish owner prefix");
+
+        let mut state = super::QwenSchedulerState::new(inner).expect("construct scheduler state");
+        state.owner_sequences.insert("stateless-owner".into(), 41);
+        state
+            .owner_states
+            .insert("stateless-owner".into(), prompt.clone());
+        assert!(
+            state
+                .inner
+                .paged_adapter
+                .as_ref()
+                .expect("paged adapter")
+                .block_table_for(41)
+                .is_some()
+        );
+
+        state
+            .release_cache_owner_now("stateless-owner")
+            .expect("release paged owner");
+        let adapter = state.inner.paged_adapter.as_mut().expect("paged adapter");
+        assert!(adapter.block_table_for(41).is_none());
+        adapter.begin_request(42).expect("begin prefix probe");
+        let hit = adapter
+            .find_cached_prefix(&prompt, &[], 0, false)
+            .expect("probe released prefix");
+        assert_eq!(
+            hit.cached_token_count, 32,
+            "owner-private row must be freed without purging content-addressed prefix blocks"
+        );
+        adapter
+            .release_request_for(42)
+            .expect("release prefix probe");
     }
 
     /// Default-flag construction (`None`) must allocate the block-paged
@@ -4251,57 +5756,7 @@ mod tests {
         // would be Float32 and `update_keys_values` would (correctly) reject
         // them. Cast every weight to BFloat16 to match the production
         // configuration the chat path will see at inference time.
-        use crate::array::DType;
-        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
-        // Embedding.
-        let w = inner.embedding.get_weight();
-        inner.embedding.set_weight(&cast(&w)).expect("set embed");
-        // Final norm.
-        let w = inner.final_norm.get_weight();
-        inner
-            .final_norm
-            .set_weight(&cast(&w))
-            .expect("set final_norm");
-        // LM head.
-        let w = inner.lm_head.get_weight();
-        inner.lm_head.set_weight(&cast(&w)).expect("set lm_head");
-        // Per-layer.
-        for layer in inner.layers.iter_mut() {
-            let w = layer.get_input_layernorm_weight();
-            layer
-                .set_input_layernorm_weight(&cast(&w))
-                .expect("set in ln");
-            let w = layer.get_post_attention_layernorm_weight();
-            layer
-                .set_post_attention_layernorm_weight(&cast(&w))
-                .expect("set post ln");
-            let w = layer.self_attn.get_q_proj_weight();
-            layer.self_attn.set_q_proj_weight(&cast(&w)).expect("set q");
-            let w = layer.self_attn.get_k_proj_weight();
-            layer.self_attn.set_k_proj_weight(&cast(&w)).expect("set k");
-            let w = layer.self_attn.get_v_proj_weight();
-            layer.self_attn.set_v_proj_weight(&cast(&w)).expect("set v");
-            let w = layer.self_attn.get_o_proj_weight();
-            layer.self_attn.set_o_proj_weight(&cast(&w)).expect("set o");
-            if let Some(qn) = layer.self_attn.get_q_norm_weight() {
-                layer
-                    .self_attn
-                    .set_q_norm_weight(&cast(&qn))
-                    .expect("set qn");
-            }
-            if let Some(kn) = layer.self_attn.get_k_norm_weight() {
-                layer
-                    .self_attn
-                    .set_k_norm_weight(&cast(&kn))
-                    .expect("set kn");
-            }
-            let w = layer.mlp.get_gate_proj_weight();
-            layer.mlp.set_gate_proj_weight(&cast(&w)).expect("set gate");
-            let w = layer.mlp.get_up_proj_weight();
-            layer.mlp.set_up_proj_weight(&cast(&w)).expect("set up");
-            let w = layer.mlp.get_down_proj_weight();
-            layer.mlp.set_down_proj_weight(&cast(&w)).expect("set down");
-        }
+        cast_paged_inner_to_bf16(&mut inner);
 
         // Drive the adapter lifecycle the same way `paged_turn_sync_core`
         // does. seq_id is arbitrary (per-request scoping).
@@ -4415,6 +5870,332 @@ mod tests {
             let _ = adapter.register_full_blocks_for_reuse(&[], 0);
             adapter.release_request().expect("release_request");
         }
+    }
+
+    #[test]
+    fn uniform_batched_decode_matches_two_serial_request_rows() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+        let config = paged_tiny_config(Some(true));
+        let mut batched = match super::Qwen3Inner::new(config.clone()) {
+            Ok(inner) => inner,
+            Err(error) if error.to_string().contains("No Metal device") => {
+                eprintln!("skipping (no Metal device): {error}");
+                return;
+            }
+            Err(error) => panic!("batched inner construction failed: {error}"),
+        };
+        cast_paged_inner_to_bf16(&mut batched);
+
+        let mut serial = super::Qwen3Inner::new(config.clone()).expect("serial inner");
+        serial.embedding = batched.embedding.clone();
+        serial.layers = batched.layers.clone();
+        serial.final_norm = batched.final_norm.clone();
+        serial.lm_head = batched.lm_head.clone();
+
+        let requests = [
+            (11, vec![10, 20, 30, 40]),
+            (22, vec![7, 8, 9, 10, 11, 12, 13]),
+        ];
+        for (seq_id, prompt) in &requests {
+            if let Err(error) = prime_paged_request(&mut batched, *seq_id, prompt) {
+                let message = error.to_string();
+                if message.contains("Metal GPU not available")
+                    || message.contains("No Metal device")
+                {
+                    eprintln!("skipping uniform batched decode: {message}");
+                    return;
+                }
+                panic!("batched request {seq_id} prime failed: {message}");
+            }
+            prime_paged_request(&mut serial, *seq_id, prompt)
+                .unwrap_or_else(|error| panic!("serial request {seq_id} prime failed: {error}"));
+        }
+
+        let before = [
+            batched
+                .paged_adapter
+                .as_ref()
+                .expect("batched adapter")
+                .current_token_count_for(11),
+            batched
+                .paged_adapter
+                .as_ref()
+                .expect("batched adapter")
+                .current_token_count_for(22),
+        ];
+        assert!(
+            batched
+                .run_paged_decode_step_batched(&[(11, 50), (11, 60)])
+                .is_err(),
+            "duplicate rows must fail before advancing either request"
+        );
+        assert_eq!(
+            [
+                batched
+                    .paged_adapter
+                    .as_ref()
+                    .expect("batched adapter")
+                    .current_token_count_for(11),
+                batched
+                    .paged_adapter
+                    .as_ref()
+                    .expect("batched adapter")
+                    .current_token_count_for(22),
+            ],
+            before
+        );
+
+        let batch_logits = batched
+            .run_paged_decode_step_batched(&[(11, 50), (22, 60)])
+            .expect("batched decode");
+        assert_eq!(
+            batch_logits.shape().expect("batch shape").as_ref(),
+            [2, 1, config.vocab_size as i64]
+        );
+
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let mut serial_rows = Vec::new();
+        for (seq_id, token) in [(11, 50), (22, 60)] {
+            serial
+                .paged_adapter
+                .as_mut()
+                .expect("serial adapter")
+                .activate_request(seq_id)
+                .expect("activate serial row");
+            serial_rows.push(
+                serial
+                    .run_paged_decode_step(token, serial.layers.len(), &positions)
+                    .expect("serial decode row"),
+            );
+        }
+        let serial_logits = MxArray::concatenate_many(serial_rows.iter().collect(), Some(0))
+            .expect("concatenate serial logits");
+        let batch_tokens = batch_logits
+            .argmax(-1, Some(false))
+            .expect("batch argmax")
+            .to_uint32()
+            .expect("batch tokens")
+            .to_vec();
+        let serial_tokens = serial_logits
+            .argmax(-1, Some(false))
+            .expect("serial argmax")
+            .to_uint32()
+            .expect("serial tokens")
+            .to_vec();
+        assert_eq!(batch_tokens, serial_tokens, "batched token rows diverged");
+        assert_eq!(
+            batched
+                .paged_adapter
+                .as_ref()
+                .expect("batched adapter")
+                .current_token_count_for(11),
+            Some(5)
+        );
+        assert_eq!(
+            batched
+                .paged_adapter
+                .as_ref()
+                .expect("batched adapter")
+                .current_token_count_for(22),
+            Some(8)
+        );
+
+        batched
+            .paged_adapter
+            .as_mut()
+            .expect("batched adapter")
+            .release_all_requests()
+            .expect("release batched rows");
+        serial
+            .paged_adapter
+            .as_mut()
+            .expect("serial adapter")
+            .release_all_requests()
+            .expect("release serial rows");
+    }
+
+    #[test]
+    fn ragged_mixed_prefill_and_decode_matches_serial_row_tokens() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+        let config = paged_tiny_config(Some(true));
+        let mut ragged = match super::Qwen3Inner::new(config.clone()) {
+            Ok(inner) => inner,
+            Err(error) if error.to_string().contains("No Metal device") => {
+                eprintln!("skipping (no Metal device): {error}");
+                return;
+            }
+            Err(error) => panic!("ragged inner construction failed: {error}"),
+        };
+        cast_paged_inner_to_bf16(&mut ragged);
+        let mut serial = super::Qwen3Inner::new(config.clone()).expect("serial inner");
+        serial.embedding = ragged.embedding.clone();
+        serial.layers = ragged.layers.clone();
+        serial.final_norm = ragged.final_norm.clone();
+        serial.lm_head = ragged.lm_head.clone();
+
+        let decode_prompt = vec![10, 20, 30, 40];
+        for inner in [&mut ragged, &mut serial] {
+            if let Err(error) = prime_paged_request(inner, 11, &decode_prompt) {
+                let message = error.to_string();
+                if message.contains("Metal GPU not available")
+                    || message.contains("No Metal device")
+                {
+                    eprintln!("skipping ragged mixed step: {message}");
+                    return;
+                }
+                panic!("decode request prime failed: {message}");
+            }
+            let adapter = inner.paged_adapter.as_mut().expect("paged adapter");
+            adapter.begin_request(22).expect("begin prefill row");
+            adapter
+                .allocate_suffix_blocks_for(22, 3)
+                .expect("allocate prefill row");
+        }
+
+        let ragged_started = Instant::now();
+        let ragged_logits = ragged
+            .run_paged_ragged_step(&[(11, vec![50]), (22, vec![7, 8, 9])], true)
+            .expect("one mixed ragged forward");
+        ragged_logits.eval();
+        let ragged_elapsed = ragged_started.elapsed();
+        assert_eq!(
+            ragged_logits.shape().expect("ragged shape").as_ref(),
+            [2, 1, config.vocab_size as i64]
+        );
+
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let serial_started = Instant::now();
+        serial
+            .paged_adapter
+            .as_mut()
+            .expect("serial adapter")
+            .activate_request(11)
+            .expect("activate serial decode");
+        let serial_decode = serial
+            .run_paged_decode_step(50, serial.layers.len(), &positions)
+            .expect("serial decode");
+        serial
+            .paged_adapter
+            .as_mut()
+            .expect("serial adapter")
+            .activate_request(22)
+            .expect("activate serial prefill");
+        let serial_prefill_hidden = serial
+            .run_paged_prefill_one_chunk(&[7, 8, 9], 0, serial.layers.len(), &positions)
+            .expect("serial prefill");
+        let serial_prefill = serial
+            .project_last_token_logits(&serial_prefill_hidden)
+            .expect("serial prefill logits")
+            .reshape(&[1, 1, config.vocab_size as i64])
+            .expect("prefill logits row");
+        let serial_logits = MxArray::concatenate(&serial_decode, &serial_prefill, 0)
+            .expect("concatenate serial rows");
+        serial_logits.eval();
+        let serial_elapsed = serial_started.elapsed();
+        eprintln!(
+            "mixed-step cold wall: ragged_one_forward={:.2}ms serial_two_forwards={:.2}ms speedup={:.2}x",
+            ragged_elapsed.as_secs_f64() * 1_000.0,
+            serial_elapsed.as_secs_f64() * 1_000.0,
+            serial_elapsed.as_secs_f64() / ragged_elapsed.as_secs_f64()
+        );
+        let ragged_tokens = ragged_logits
+            .argmax(-1, Some(false))
+            .expect("ragged argmax")
+            .to_uint32()
+            .expect("ragged tokens")
+            .to_vec();
+        let serial_tokens = serial_logits
+            .argmax(-1, Some(false))
+            .expect("serial argmax")
+            .to_uint32()
+            .expect("serial tokens")
+            .to_vec();
+        assert_eq!(
+            ragged_tokens, serial_tokens,
+            "mixed ragged logits selected the wrong request boundary"
+        );
+        assert_eq!(
+            ragged
+                .paged_adapter
+                .as_ref()
+                .expect("ragged adapter")
+                .current_token_count_for(11),
+            Some(5)
+        );
+        assert_eq!(
+            ragged
+                .paged_adapter
+                .as_ref()
+                .expect("ragged adapter")
+                .current_token_count_for(22),
+            Some(3)
+        );
+
+        // The first call above includes one-time Metal graph/kernel setup.
+        // Time a second equivalent mixed step after both routes are warm so
+        // the log compares executor shape rather than compilation order.
+        let ragged_steady_started = Instant::now();
+        let ragged_steady = ragged
+            .run_paged_ragged_step(&[(11, vec![51]), (22, vec![10, 11, 12])], true)
+            .expect("warm ragged mixed forward");
+        ragged_steady.eval();
+        let ragged_steady_elapsed = ragged_steady_started.elapsed();
+
+        let serial_steady_started = Instant::now();
+        serial
+            .paged_adapter
+            .as_mut()
+            .expect("serial adapter")
+            .activate_request(11)
+            .expect("activate steady serial decode");
+        let serial_steady_decode = serial
+            .run_paged_decode_step(51, serial.layers.len(), &positions)
+            .expect("steady serial decode");
+        serial
+            .paged_adapter
+            .as_mut()
+            .expect("serial adapter")
+            .activate_request(22)
+            .expect("activate steady serial prefill");
+        let serial_steady_prefill_hidden = serial
+            .run_paged_prefill_one_chunk(&[10, 11, 12], 3, serial.layers.len(), &positions)
+            .expect("steady serial prefill");
+        let serial_steady_prefill = serial
+            .project_last_token_logits(&serial_steady_prefill_hidden)
+            .expect("steady serial prefill logits")
+            .reshape(&[1, 1, config.vocab_size as i64])
+            .expect("steady prefill logits row");
+        let serial_steady = MxArray::concatenate(&serial_steady_decode, &serial_steady_prefill, 0)
+            .expect("concatenate steady serial rows");
+        serial_steady.eval();
+        let serial_steady_elapsed = serial_steady_started.elapsed();
+        assert_eq!(
+            ragged_steady
+                .argmax(-1, Some(false))
+                .expect("steady ragged argmax")
+                .to_uint32()
+                .expect("steady ragged tokens")
+                .to_vec(),
+            serial_steady
+                .argmax(-1, Some(false))
+                .expect("steady serial argmax")
+                .to_uint32()
+                .expect("steady serial tokens")
+                .to_vec(),
+            "warm mixed ragged step diverged from serial rows"
+        );
+        eprintln!(
+            "mixed-step warm wall: ragged_one_forward={:.2}ms serial_two_forwards={:.2}ms speedup={:.2}x",
+            ragged_steady_elapsed.as_secs_f64() * 1_000.0,
+            serial_steady_elapsed.as_secs_f64() * 1_000.0,
+            serial_steady_elapsed.as_secs_f64() / ragged_steady_elapsed.as_secs_f64()
+        );
     }
 
     /// `use_block_paged_cache: true` round-trips correctly through serde —
@@ -4639,6 +6420,91 @@ mod tests {
             let adapter = inner.paged_adapter.as_mut().unwrap();
             let _ = adapter.register_full_blocks_for_reuse(&[], 0);
             adapter.release_request().expect("release_request");
+        }
+    }
+
+    #[test]
+    fn real_uniform_batched_decode_matches_serial_rows_in_same_request_table() {
+        let Some(model_path) = std::env::var_os("QWEN3_STAGE1_MODEL_PATH") else {
+            eprintln!("skipping (set QWEN3_STAGE1_MODEL_PATH for the real Qwen3 B3 oracle)");
+            return;
+        };
+        let model_path = std::path::PathBuf::from(model_path);
+        let mut inner = crate::models::qwen3::persistence::load_inner_for_test(&model_path)
+            .unwrap_or_else(|error| panic!("failed to load {}: {error}", model_path.display()));
+        let rows = [
+            (101, vec![9707, 11, 279, 3650]),
+            (202, vec![9707, 374, 264, 1296, 13]),
+        ];
+        for (seq_id, prompt) in &rows {
+            prime_paged_request(&mut inner, *seq_id, prompt)
+                .unwrap_or_else(|error| panic!("request {seq_id} prime failed: {error}"));
+        }
+
+        let decode_rows = [(101, 198), (202, 220)];
+        let batched_logits = inner
+            .run_paged_decode_step_batched(&decode_rows)
+            .expect("real batched decode");
+        let batched_tokens = batched_logits
+            .argmax(-1, Some(false))
+            .expect("batched argmax")
+            .to_uint32()
+            .expect("batched tokens")
+            .to_vec();
+
+        for &(seq_id, _) in decode_rows.iter().rev() {
+            let adapter = inner.paged_adapter.as_mut().expect("paged adapter");
+            adapter
+                .activate_request(seq_id)
+                .expect("activate rollback row");
+            adapter
+                .rollback_last_tokens(1)
+                .expect("rollback batched token");
+        }
+
+        let positions = MxArray::from_int32(&[0], &[1]).expect("positions");
+        let mut serial_rows = Vec::with_capacity(decode_rows.len());
+        for (seq_id, token) in decode_rows {
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("paged adapter")
+                .activate_request(seq_id)
+                .expect("activate serial row");
+            serial_rows.push(
+                inner
+                    .run_paged_decode_step(token, inner.layers.len(), &positions)
+                    .expect("serial decode"),
+            );
+        }
+        let serial_logits = MxArray::concatenate_many(serial_rows.iter().collect(), Some(0))
+            .expect("serial concatenate");
+        let serial_tokens = serial_logits
+            .argmax(-1, Some(false))
+            .expect("serial argmax")
+            .to_uint32()
+            .expect("serial tokens")
+            .to_vec();
+        assert_eq!(
+            batched_tokens, serial_tokens,
+            "real batched rows diverged from scalar replay over the same request table"
+        );
+        for (seq_id, prompt) in &rows {
+            assert_eq!(
+                inner
+                    .paged_adapter
+                    .as_ref()
+                    .expect("paged adapter")
+                    .current_token_count_for(*seq_id),
+                Some(prompt.len() as u32 + 1),
+                "request {seq_id} cursor"
+            );
+            inner
+                .paged_adapter
+                .as_mut()
+                .expect("paged adapter")
+                .release_request_for(*seq_id)
+                .expect("release row");
         }
     }
 

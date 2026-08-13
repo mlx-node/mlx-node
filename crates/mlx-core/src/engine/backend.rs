@@ -4,19 +4,14 @@
 //! [`crate::engine::decode::run_decode_loop`], the generic decode loop.
 //! `ChatBackend` is the per-family seam the session cores drive.
 //!
-//! `ChunkSink` unifies the two streaming-callback shapes the decode
-//! loops use: the per-family `StreamSender(StreamTx)` mpsc wrapper
-//! (e.g. `models/lfm2/model.rs`, `models/qwen3/model.rs`) and the raw
-//! NAPI `ThreadsafeFunction` used by the pump-to-callback helpers — both
-//! expose `.call(napi::Result<ChatStreamChunk>, ThreadsafeFunctionCallMode)`,
-//! and the trait collapses that to a single `send`.
+//! `ChunkSink` exposes the per-request bounded `StreamTx` mailbox to the
+//! model-neutral decode loops.
 
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use napi::bindgen_prelude::*;
-use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
@@ -193,32 +188,17 @@ pub(crate) trait DecodeStep {
 
 /// Streaming-chunk sink driven by the generic decode loop.
 ///
-/// Unifies the two `.call(result, mode)` shapes in use today:
-///   * the per-family `StreamSender(StreamTx<ChatStreamChunk>)` mpsc
-///     wrappers (`models/lfm2/model.rs`, `models/qwen3/model.rs`,
-///     `models/qwen3_5/model.rs`, `models/qwen3_5_moe/model.rs`) whose
-///     `call` forwards to `UnboundedSender::send` and ignores the mode;
-///   * the raw `ThreadsafeFunction<ChatStreamChunk, ()>` used by the
-///     `pump_stream_to_callback` helpers, always invoked `NonBlocking`.
+/// The only production sink is the per-request bounded model-thread mailbox.
 pub(crate) trait ChunkSink {
     fn send(&self, chunk: Result<ChatStreamChunk>);
 }
 
-impl ChunkSink for ThreadsafeFunction<ChatStreamChunk, ()> {
-    fn send(&self, chunk: Result<ChatStreamChunk>) {
-        // Mirrors `pump_stream_to_callback`: always NonBlocking, status
-        // ignored (a torn-down JS callback just drops the chunk).
-        self.call(chunk, ThreadsafeFunctionCallMode::NonBlocking);
-    }
-}
-
 impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
     fn send(&self, chunk: Result<ChatStreamChunk>) {
-        // Explicit path: the inherent `UnboundedSender::send` would
-        // shadow this trait method inside its own impl. A closed
-        // receiver drops the chunk — same policy as the per-family
-        // `StreamSender` wrappers.
-        let _ = tokio::sync::mpsc::UnboundedSender::send(self, chunk);
+        // A closed receiver drops the chunk — same policy as the per-family
+        // `StreamSender` wrappers. A full receiver backpressures the dedicated
+        // model thread, never a Tokio runtime worker.
+        let _ = crate::model_thread::StreamTx::send(self, chunk);
     }
 }
 
@@ -492,32 +472,6 @@ pub(crate) struct TurnSetup<'a> {
     pub total_seq_len: usize,
 }
 
-/// Turn-constant inputs for [`PagedBackend::begin_paged_decode`].
-///
-/// The paged analog of [`TurnSetup`]. The paged decode stepper reaches
-/// its per-token logical-position cursor source through `&mut self`; the
-/// effective cached-prefix / suffix lengths come from
-/// [`PagedBackend::PrefixState`], NOT from here.
-///
-/// `#[allow(dead_code)]`: the paged `PagedBackend` impls are pure-eager
-/// and ignore every field — their decode cursor comes from the adapter.
-/// The fields are kept so the trait surface can carry turn-constant
-/// inputs without an ABI change if a future paged family needs them.
-#[allow(dead_code)]
-pub(crate) struct PagedTurnSetup<'a> {
-    /// The turn's resolved [`ChatParams`] — `params.max_new_tokens` is
-    /// the decode budget (the paged path grows blocks lazily via
-    /// per-token `record_tokens`, so this is informational).
-    pub params: &'a ChatParams,
-    /// Session-delta continuation flag (ignored by the eager paged
-    /// families; their cursor comes from the adapter).
-    pub is_delta: bool,
-    /// Effective cached-prefix length the prefix prime resolved (block-
-    /// granular). The eager paged families ignore it — their decode
-    /// cursor comes from `adapter.current_token_count()`.
-    pub cached_prefix_len: usize,
-}
-
 /// Effective prefix/suffix split a [`PagedBackend::prime_prefix_state`]
 /// resolved for one turn.
 ///
@@ -599,7 +553,10 @@ pub(crate) struct WholeTurnArgs<'a> {
     /// Streaming sink; `None` on the sync core (`cb` at the
     /// `paged_turn_stream_core` call sites).
     pub sink: Option<&'a dyn ChunkSink>,
-    /// Cooperative-cancel flag; `None` on the sync core.
+    /// Cooperative-cancel flag for the WHOLE turn. Populated on both
+    /// streaming AND sync turns (H2) — family cores must route on the
+    /// `(sink, cancelled)` PAIR (a `(None, Some(_))` turn is a sync turn
+    /// whose decode polls are armed), never on `cancelled` alone.
     pub cancelled: Option<&'a AtomicBool>,
     /// Raw media for the model's multimodal preparation layer. Image and
     /// audio are independent, composable inputs; adding another modality
@@ -662,6 +619,14 @@ pub(crate) trait ChatBackend {
     /// never be folded into PagedAttention's cache salt because physical KV
     /// blocks remain safely shareable by exact content hash.
     fn set_cache_owner_id(&mut self, _owner_id: &str, _root_owner_id: Option<&str>) {}
+
+    /// Release model-local state associated with one logical cache owner.
+    /// Scheduler-backed families intercept the command before this generic
+    /// hook; non-scheduler families have no per-owner table and keep the
+    /// no-op default.
+    fn release_cache_owner(&mut self, _owner_id: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Session stop-token id. == the `<|im_end|>` resolution in
     /// the session entries (`tokenizer.im_end_id().ok_or(..)`) for the
@@ -843,6 +808,26 @@ pub(crate) trait ChatBackend {
     /// no-op `Ok(())` — adding a blocking sync here would introduce a
     /// stall their current paths do not pay.
     fn eval_caches(&self) -> Result<()>;
+
+    /// Install the current turn's cancel flag before prefill. Families that
+    /// support mid-prefill cancellation poll it at chunk boundaries; the
+    /// default impl ignores it (single-shot prefills stay uncancellable).
+    ///
+    /// Lifecycle (load-bearing): BOTH the streaming session cores and the
+    /// sync session wrappers (H2) install the flag (`Some`) after their
+    /// cancelled-before-start guard and clear it (`None`) in the turn
+    /// epilogue on EVERY exit path — success, error, and cancel. A stale
+    /// flag left on the backend would spuriously cancel the NEXT turn's
+    /// prefill (the per-turn `Arc<AtomicBool>` stays flipped forever once
+    /// its turn was cancelled).
+    ///
+    /// A poll that observes `true` returns the distinguished error
+    /// `"prefill cancelled"`, which rides the existing prefill-`Err`
+    /// cleanup arms: the paged engine releases the live request without
+    /// registering its blocks (`abort_paged_turn`), the flat engine
+    /// invalidates the session (`fail_closed_flat_turn`) — so a cancelled
+    /// prefill never leaves partial KV registered as a live prefix.
+    fn set_turn_cancel_flag(&mut self, _flag: Option<Arc<AtomicBool>>) {}
 
     /// Run the (chunked) prefill forward over `prompt_tokens` on top of
     /// the live caches and return **sampling-ready last-token logits**
@@ -1220,12 +1205,11 @@ pub(crate) trait PagedBackend: ChatBackend {
     ) -> Result<MxArray>;
 
     /// Build the per-step paged decode stepper (the analog of
-    /// [`ChatBackend::begin_decode`]). Captures the turn constants into
-    /// the returned stepper (qwen3: `num_layers` + its dummy positions
-    /// array; gemma4 adds a diagnostic step counter; the rest just wrap
-    /// `self`), which then drives
+    /// [`ChatBackend::begin_decode`]). The returned stepper derives its
+    /// logical cursor from the live adapter (qwen3 also creates a dummy
+    /// positions array; gemma4 adds a diagnostic step counter), then drives
     /// [`crate::engine::decode::run_decode_loop`].
-    fn begin_paged_decode(&mut self, setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>>;
+    fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>>;
 
     /// Post-turn adapter lifecycle, run by the engine AFTER the decode
     /// scope drops the stepper and BEFORE [`Self::save_paged_history`].
@@ -1233,10 +1217,11 @@ pub(crate) trait PagedBackend: ChatBackend {
     /// == the `match forward_result { Ok => finalize_keep_live |
     /// register+release, Err => release }` block in the forked cores. The
     /// engine passes the turn's (delta-forced) `reuse_cache`; the impl
-    /// owns the `(extra_keys, cache_salt)` it registers with (qwen3:
-    /// `(&[], 0)`). Infallible — the forked cores `let _ =` every
+    /// owns the `(extra_keys, cache_salt)` it registers with (qwen3 uses
+    /// empty extra keys plus the request's cache domain). Infallible — the
+    /// forked cores `let _ =` every
     /// lifecycle call (a teardown failure must not mask the turn result).
-    fn finalize_paged_turn(&mut self, reuse_cache: bool);
+    fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64);
 
     /// Persist the session's token history for the next turn's delta
     /// (paged analog of [`ChatBackend::save_cache_state`]).
@@ -1386,31 +1371,12 @@ pub(crate) trait PagedBackend: ChatBackend {
 
 /// Per-turn setup the engine hands to [`MtpBackend::begin_mtp_decode`].
 ///
-/// Paged analog of [`PagedTurnSetup`] — carries the turn constants the
-/// MTP propose/verify loop needs to construct its per-turn stepper. The
+/// MTP propose/verify turn constants used to construct its per-turn stepper. The
 /// per-cycle scratch (snapshot / GDN tape / stashed replay error) does
 /// NOT live here: it becomes STRUCT FIELDS of the concrete
 /// [`MtpStepper`], so the GDN tape never crosses the trait boundary.
 ///
-/// `depth` is the outer policy's requested draft depth (`params.mtp_depth`
-/// clamped to `[1, 5]`); the stepper still applies its own intra-cycle
-/// adaptive/EV gates on top, exactly as the per-cycle `run_mtp_cycle` does.
-///
-/// `#[allow(dead_code)]`: SCAFFOLD — the engine-owned `run_mtp_turn`
-/// constructs this and `MtpBackend::begin_mtp_decode` consumes it in a
-/// later step; nothing references it yet.
-#[allow(dead_code)]
 pub(crate) struct MtpTurnSetup<'a> {
-    /// The turn's resolved [`ChatParams`] — `params.sampling_config`
-    /// drives the per-cycle accept policy and `params.max_new_tokens` is
-    /// the decode budget.
-    pub params: &'a ChatParams,
-    /// Session-delta continuation flag (the MTP loop primes the same way
-    /// the AR path does; threaded for parity with [`PagedTurnSetup`]).
-    pub is_delta: bool,
-    /// Requested draft depth for this turn (`1..=5`), before the
-    /// stepper's intra-cycle depth gates.
-    pub depth: usize,
     /// Post-final-norm hidden state for every prefilled prompt token,
     /// `[1, prefill_len, hidden]`. `Some` only when the MTP prefill ran the
     /// hidden-emitting forward; consumed ONCE by
@@ -1452,10 +1418,6 @@ pub(crate) struct MtpTurnSetup<'a> {
 /// [`PagedBackend::PagedDecode`] / [`ChatBackend::Decode`]) and holds the
 /// per-cycle snapshot/tape/replay-error as its own fields.
 ///
-/// `#[allow(dead_code)]`: SCAFFOLD — the families implement this and the
-/// engine-owned `run_mtp_turn` drives it in a later step; no impl or
-/// caller exists yet.
-#[allow(dead_code)]
 pub(crate) trait MtpBackend: ChatBackend {
     /// Per-turn MTP propose/verify stepper. Borrows `&mut self` for the
     /// whole decode loop. The per-cycle GDN tape / linear-cache snapshot /
@@ -1507,11 +1469,6 @@ pub(crate) trait MtpBackend: ChatBackend {
 ///   * GDN tape — [`Self::verify_step`] RECORDS, [`Self::rollback`]
 ///     REPLAYS via the snapshot; the tape never leaves the stepper.
 ///
-/// `#[allow(dead_code)]`: SCAFFOLD — exercised by the
-/// `engine::mtp_turn` mock tests; the production family steppers + the
-/// engine-owned `run_mtp_turn` loop that calls these methods land in a
-/// later step.
-#[allow(dead_code)]
 pub(crate) trait MtpStepper {
     /// The model's embedding table (already resolved to the LM head when
     /// `tie_word_embeddings=false`). == the `embedding_weight` arg the
@@ -1679,28 +1636,6 @@ pub(crate) trait MtpStepper {
     fn into_desynced(self) -> bool;
 }
 
-/// Per-turn setup the engine hands to [`DsparkBackend::begin_dspark_decode`].
-///
-/// DSpark analog of [`MtpTurnSetup`] — carries the turn constants the
-/// engine-owned draft/verify loop
-/// ([`crate::engine::dspark_turn::run_dspark_turn`]) needs to construct its
-/// per-turn stepper. Per-cycle scratch (the tapped target hidden states, the
-/// draft-model KV window) lives as STRUCT FIELDS of the concrete
-/// [`DsparkStepper`], never here. Prefill-derived state (the gemma4 draft
-/// context / assistant seed hidden) travels through the family's own stash
-/// (`Gemma4Inner::draft_turn_state`), consumed by `begin_dspark_decode`.
-#[allow(dead_code)]
-pub(crate) struct DsparkTurnSetup<'a> {
-    /// The turn's resolved [`ChatParams`] — `params.sampling_config` drives
-    /// the per-cycle accept policy and `params.max_new_tokens` is the decode
-    /// budget.
-    pub params: &'a ChatParams,
-    /// Draft block size: the hard upper bound on tokens drafted per
-    /// propose/verify cycle. The engine additionally caps each cycle by
-    /// `params.mtp_depth` and by the remaining token budget minus one.
-    pub block_size: usize,
-}
-
 /// Sub-trait of [`ChatBackend`] for families whose DSpark (draft-model)
 /// speculative-decode whole-turn flows through the engine-owned
 /// propose/verify loop [`crate::engine::dspark_turn::run_dspark_turn`].
@@ -1722,10 +1657,7 @@ pub(crate) trait DsparkBackend: ChatBackend {
     /// [`MtpBackend::begin_mtp_decode`]). Captures the turn constants (draft
     /// model handle, target tap, block size) into the returned stepper,
     /// which then drives the engine-owned `run_dspark_turn` loop.
-    fn begin_dspark_decode(
-        &mut self,
-        setup: &DsparkTurnSetup<'_>,
-    ) -> Result<Self::DsparkDecode<'_>>;
+    fn begin_dspark_decode(&mut self, block_size: usize) -> Result<Self::DsparkDecode<'_>>;
 }
 
 /// One cycle's drafted block from [`DsparkStepper::propose`].

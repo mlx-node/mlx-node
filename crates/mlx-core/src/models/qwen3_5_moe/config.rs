@@ -58,7 +58,8 @@ pub struct Qwen3_5MoeConfig {
     #[napi(ts_type = "number[] | undefined")]
     pub mlp_only_layers: Option<Vec<i32>>,
 
-    // Paged attention options (opt-in, mirror Qwen3/Gemma4/LFM2 knobs).
+    // Paged attention options (default on for compatible checkpoints; explicit
+    // false and MLX_QWEN35_PAGED_OVERRIDE retain the rollback path).
     /// GPU memory budget for paged KV cache in megabytes.
     /// Only used when `use_block_paged_cache` is true.
     /// Default: automatically sized for one full-context sequence.
@@ -75,8 +76,8 @@ pub struct Qwen3_5MoeConfig {
 
     /// Use the block-paged KV cache adapter for full-attention layers.
     ///
-    /// **OPT-IN — experimental.** Same semantics as the dense
-    /// `Qwen3_5Config::use_block_paged_cache` field. Selects the eager
+    /// Same semantics as the dense `Qwen3_5Config::use_block_paged_cache`
+    /// field. Selects the eager
     /// paged decode over the eager flat decode: routes full-attention
     /// layers through `PagedKVCacheAdapter` (cross-request prefix reuse);
     /// GDN linear-attention layers stay on `Qwen3_5LayerCache::Linear`
@@ -90,7 +91,8 @@ pub struct Qwen3_5MoeConfig {
     /// runtime; warm image-bearing session continues / cache-hit reuse are
     /// cold-started (no warm GDN two-pass prefix).
     ///
-    /// Default: `None` / `false`.
+    /// Default: enabled for compatible Metal checkpoints. Explicit `false`
+    /// and `MLX_QWEN35_PAGED_OVERRIDE=0` retain the flat rollback path.
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,
@@ -145,6 +147,13 @@ fn default_norm_topk_prob() -> bool {
 }
 
 impl Qwen3_5MoeConfig {
+    /// BF16 bytes for one request's complete GDN conv + recurrent state.
+    /// The MoE feed-forward layers are stateless; full-attention K/V is
+    /// accounted independently by the paged allocator.
+    pub(crate) fn recurrent_state_bytes(&self) -> u64 {
+        self.to_dense_config().recurrent_state_bytes()
+    }
+
     /// Convert to a dense Qwen3_5Config for shared types (attention, GatedDeltaNet)
     /// that expect the dense config struct.
     pub fn to_dense_config(&self) -> crate::models::qwen3_5::Qwen3_5Config {

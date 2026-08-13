@@ -1065,6 +1065,39 @@ describe('mapAnthropicRequest', () => {
     expect(config.maxNewTokens).toBe(512);
   });
 
+  it('maps a non-empty cache_salt to the native prefix-cache security domain', () => {
+    const { config } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 512,
+      cache_salt: 'tenant-a/high-entropy-secret',
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+
+    expect(config.cacheSalt).toBe('tenant-a/high-entropy-secret');
+  });
+
+  it('rejects an empty cache_salt', () => {
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'claude-3-5-sonnet-20241022',
+        max_tokens: 512,
+        cache_salt: '',
+        messages: [{ role: 'user', content: 'Hello' }],
+      }),
+    ).toThrow('cache_salt must not be empty');
+  });
+
+  it('rejects a cache_salt larger than 256 UTF-8 bytes', () => {
+    expect(() =>
+      mapAnthropicRequest({
+        model: 'test',
+        max_tokens: 8,
+        messages: [{ role: 'user', content: 'hello' }],
+        cache_salt: 'é'.repeat(129),
+      }),
+    ).toThrow('cache_salt must be at most 256 UTF-8 bytes');
+  });
+
   it('maps temperature to config', () => {
     const { config } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',

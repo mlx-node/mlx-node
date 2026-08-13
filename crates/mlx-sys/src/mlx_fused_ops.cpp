@@ -274,6 +274,75 @@ void mlx_fused_attention_qkv(
     }
 }
 
+// Fused Q/K/V projection with one RoPE offset per batch row.
+// Returns Q, K, V in attention layout (B, n_heads, L, head_dim).
+void mlx_fused_attention_qkv_with_offsets(
+    mlx_array* x_handle,
+    mlx_array* w_q_handle,
+    mlx_array* w_k_handle,
+    mlx_array* w_v_handle,
+    mlx_array* q_norm_w_handle,
+    mlx_array* k_norm_w_handle,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    float rope_base,
+    int rope_dims,
+    float qk_norm_eps,
+    mlx_array* rope_offsets_handle,
+    mlx_array** q_out,
+    mlx_array** k_out,
+    mlx_array** v_out
+) {
+    try {
+        auto x = reinterpret_cast<array*>(x_handle);
+        auto w_q = reinterpret_cast<array*>(w_q_handle);
+        auto w_k = reinterpret_cast<array*>(w_k_handle);
+        auto w_v = reinterpret_cast<array*>(w_v_handle);
+        auto rope_offsets = reinterpret_cast<array*>(rope_offsets_handle);
+
+        int batch = static_cast<int>(x->shape()[0]);
+        int seq_len = static_cast<int>(x->shape()[1]);
+
+        auto queries = matmul(*x, transpose(*w_q));
+        auto keys = matmul(*x, transpose(*w_k));
+        auto values = matmul(*x, transpose(*w_v));
+
+        queries = reshape(queries, {batch, seq_len, n_heads, head_dim});
+        keys = reshape(keys, {batch, seq_len, n_kv_heads, head_dim});
+        values = reshape(values, {batch, seq_len, n_kv_heads, head_dim});
+
+        if (q_norm_w_handle) {
+            auto q_norm_w = reinterpret_cast<array*>(q_norm_w_handle);
+            queries = mlx::core::fast::rms_norm(queries, *q_norm_w, qk_norm_eps);
+        }
+        if (k_norm_w_handle) {
+            auto k_norm_w = reinterpret_cast<array*>(k_norm_w_handle);
+            keys = mlx::core::fast::rms_norm(keys, *k_norm_w, qk_norm_eps);
+        }
+
+        queries = transpose(queries, {0, 2, 1, 3});
+        keys = transpose(keys, {0, 2, 1, 3});
+        values = transpose(values, {0, 2, 1, 3});
+
+        queries = mlx::core::fast::rope(
+            queries, rope_dims, false, std::optional<float>(rope_base),
+            1.0f, *rope_offsets, std::nullopt, {});
+        keys = mlx::core::fast::rope(
+            keys, rope_dims, false, std::optional<float>(rope_base),
+            1.0f, *rope_offsets, std::nullopt, {});
+
+        *q_out = reinterpret_cast<mlx_array*>(new array(std::move(queries)));
+        *k_out = reinterpret_cast<mlx_array*>(new array(std::move(keys)));
+        *v_out = reinterpret_cast<mlx_array*>(new array(std::move(values)));
+    } catch (const std::exception& e) {
+        std::cerr << "mlx_fused_attention_qkv_with_offsets error: " << e.what() << std::endl;
+        *q_out = nullptr;
+        *k_out = nullptr;
+        *v_out = nullptr;
+    }
+}
+
 // Fused SDPA + output projection for cached attention
 // Takes Q (B, n_heads, L, head_dim) and full cached K/V (B, n_kv_heads, total_len, head_dim)
 // Returns output (B, L, hidden_size)

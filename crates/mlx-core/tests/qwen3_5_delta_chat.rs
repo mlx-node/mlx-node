@@ -90,6 +90,7 @@ fn flat_clone_model_dir(src: &Path, suffix: &str) -> Result<PathBuf, String> {
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
@@ -453,9 +454,7 @@ async fn session_path_keeps_ttft_flat_across_turns() {
 /// helper panics — a partial stream would break the delta-cache
 /// invariants expected by subsequent turns.
 async fn drain_stream_turn(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<
-        napi::Result<mlx_core::engine::types::ChatStreamChunk>,
-    >,
+    mut rx: tokio::sync::mpsc::Receiver<napi::Result<mlx_core::engine::types::ChatStreamChunk>>,
 ) -> (Vec<mlx_core::engine::types::ChatStreamChunk>, f64, bool) {
     let start = Instant::now();
     let mut chunks = Vec::new();
@@ -638,6 +637,7 @@ async fn stream_session_cancellation_preserves_cache_for_next_turn() {
     // Turn 1: run a normal session-start stream to prime the cache.
     // Use 128 tokens so cancellation has room to hit mid-stream.
     let turn1_cfg = ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(128),
@@ -967,6 +967,7 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
 
     // Build a config with an explicit MTP toggle and a given budget.
     let cfg_with = |max_new_tokens: i32, enable_mtp: bool| ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         enable_mtp: Some(enable_mtp),
@@ -1193,6 +1194,7 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
         .chat_session_start(
             vec![user_message("Count from 1 to 12, space separated.")],
             Some(ChatConfig {
+                cache_salt: None,
                 cache_owner_id: None,
                 cache_root_owner_id: None,
                 enable_mtp: Some(true),
@@ -1215,6 +1217,7 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
     }
 
     let turn1_cfg = ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         enable_mtp: Some(true),
@@ -1257,7 +1260,10 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
     );
 
     let (committed_after_turn1, desynced_after_turn1, reprefills_before, rollback_unemitted) =
-        model.mtp_flat_state_for_test().await;
+        model
+            .mtp_flat_state_for_test()
+            .await
+            .expect("read flat MTP state after turn 1");
     assert!(
         committed_after_turn1 > 0,
         "cancelled turn did not preserve any committed history"
@@ -1272,6 +1278,7 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
     // One output token takes the near-tail AR fallback, so this turn isolates
     // the pre-decode heal transition and cannot itself strand a new MTP tail.
     let turn2_cfg = ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         enable_mtp: Some(true),
@@ -1304,8 +1311,10 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
         final2.finish_reason
     );
 
-    let (_, desynced_after_turn2, reprefills_after, turn2_rollback_unemitted) =
-        model.mtp_flat_state_for_test().await;
+    let (_, desynced_after_turn2, reprefills_after, turn2_rollback_unemitted) = model
+        .mtp_flat_state_for_test()
+        .await
+        .expect("read flat MTP state after turn 2");
     println!(
         "cancel: emitted={n_mtp} committed_hist={committed_after_turn1} \
          rollback_unemitted={rollback_unemitted} desynced={desynced_after_turn1} \
@@ -1374,6 +1383,7 @@ async fn desync_heal_reprefills_to_uncancelled() {
     // identically for the heal and warm arms and cannot distinguish them.
     async fn run(model: &Qwen3_5Model, budget: i32, arm_desync: bool) -> (usize, String, bool) {
         let cfg1 = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             enable_mtp: Some(true),
@@ -1397,18 +1407,28 @@ async fn desync_heal_reprefills_to_uncancelled() {
             }
         }
         let turn1_terminal = turn1_terminal.expect("turn 1 missing terminal stream chunk");
-        let (committed, desynced0, reprefills_before, _) = model.mtp_flat_state_for_test().await;
+        let (committed, desynced0, reprefills_before, _) = model
+            .mtp_flat_state_for_test()
+            .await
+            .expect("read clean flat MTP state");
         assert!(
             !desynced0,
             "a clean length-stopped turn 1 must not be desynced"
         );
         if arm_desync {
-            model.force_flat_mtp_desync_for_test().await;
-            let (_, armed, _, _) = model.mtp_flat_state_for_test().await;
+            model
+                .force_flat_mtp_desync_for_test()
+                .await
+                .expect("arm flat MTP desync");
+            let (_, armed, _, _) = model
+                .mtp_flat_state_for_test()
+                .await
+                .expect("read armed flat MTP state");
             assert!(armed, "force_flat_mtp_desync_for_test did not arm the flag");
         }
 
         let cfg2 = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             enable_mtp: Some(true),
@@ -1431,7 +1451,10 @@ async fn desync_heal_reprefills_to_uncancelled() {
         let (chunks2, _ttft, done2) = drain_stream_turn(rx2).await;
         assert!(done2, "turn 2 didn't reach done");
         let text: String = chunks2.iter().map(|c| c.text.as_str()).collect();
-        let (_, desynced_after, reprefills_after, _) = model.mtp_flat_state_for_test().await;
+        let (_, desynced_after, reprefills_after, _) = model
+            .mtp_flat_state_for_test()
+            .await
+            .expect("read flat MTP state after heal");
         // Heal ran iff turn 2 took the discard+re-prefill path (the counter
         // incremented). The streaming chunk's `prompt_tokens`/`cached_tokens`
         // report identically for heal and warm, so the counter is the only

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
@@ -9,8 +9,8 @@ use napi_derive::napi;
 use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{
-    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedTurnSetup,
-    ResetScope, SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
+    ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
+    SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::params::ChatParams;
@@ -31,8 +31,8 @@ use crate::transformer::paged_kv_cache_adapter::{
 };
 use crate::transformer::rotating_kv_cache::RotatingKVCacheSnapshot;
 use crate::transformer::{
-    AttentionKind, KVCacheDType, KVCacheGroup, KVCachePhysicalLayout, LayerKVCacheSpec,
-    derive_layer_kv_cache_routes, group_layer_kv_cache_specs,
+    AttentionKind, KVCacheCoordinator, KVCacheDType, KVCacheGroup, KVCachePhysicalLayout,
+    LayerKVCacheRoute, LayerKVCacheSpec, group_layer_kv_cache_specs,
 };
 
 use super::image_processor::{Gemma4ImageProcessor, ProcessedGemma4Image};
@@ -52,6 +52,10 @@ use super::sliding_sidecar;
 use crate::engine;
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use tracing::info;
+
+#[path = "scheduler.rs"]
+mod scheduler;
+pub(crate) use scheduler::{Gemma4Cmd, Gemma4SchedulerState};
 
 /// PLE (Per-Layer Embeddings) model-level components.
 ///
@@ -74,6 +78,503 @@ pub(crate) struct PleComponents {
     pub num_layers: i32,
     /// PLE vocab size (may be smaller than main vocab_size)
     pub vocab_size_per_layer_input: i32,
+}
+
+/// The runtime manager owned by one model-independent KV cache group.
+///
+/// Full-attention and sliding-window groups each own block-paged storage.
+/// Sliding groups keep absolute logical tables while retired blocks become
+/// null-block sentinels, matching vLLM's hybrid coordinator without compacting
+/// positions that RoPE still addresses absolutely.
+enum Gemma4KVCacheGroupManager {
+    /// Marker keeping the generic coordinator's group ids/routes aligned.
+    /// The full adapter itself is stored directly on
+    /// [`Gemma4KVCacheCoordinator`] so accessing the mandatory group never
+    /// relies on a panic-producing enum invariant.
+    Full,
+    SlidingWindow {
+        sliding_window: u32,
+        max_admission_blocks: u32,
+        adapter: Box<PagedKVCacheAdapter>,
+    },
+}
+
+pub(crate) struct Gemma4KVCacheCoordinator {
+    inner: KVCacheCoordinator<Gemma4KVCacheGroupManager>,
+    full_group_id: usize,
+    full_adapter: Box<PagedKVCacheAdapter>,
+    max_concurrent_sequences: u32,
+}
+
+impl Gemma4KVCacheCoordinator {
+    fn new(
+        specs: &[LayerKVCacheSpec],
+        groups: Vec<KVCacheGroup>,
+        adapters: Vec<PagedKVCacheAdapter>,
+        max_concurrent_sequences: u32,
+    ) -> std::result::Result<Self, String> {
+        if groups.len() != adapters.len() {
+            return Err(format!(
+                "Gemma4 KV group count {} does not match adapter count {}",
+                groups.len(),
+                adapters.len()
+            ));
+        }
+        let mut full_group = None;
+        let mut managers = Vec::with_capacity(groups.len());
+        for (group, adapter) in groups.iter().zip(adapters) {
+            let manager = match group.attention_kind {
+                AttentionKind::Full => {
+                    if full_group
+                        .replace((group.group_id, Box::new(adapter)))
+                        .is_some()
+                    {
+                        return Err(
+                            "Gemma4 runtime currently supports one full-attention KV group"
+                                .to_string(),
+                        );
+                    }
+                    Gemma4KVCacheGroupManager::Full
+                }
+                AttentionKind::SlidingWindow { sliding_window } => {
+                    Gemma4KVCacheGroupManager::SlidingWindow {
+                        sliding_window,
+                        max_admission_blocks: group.max_admission_blocks,
+                        adapter: Box::new(adapter),
+                    }
+                }
+            };
+            managers.push(manager);
+        }
+        let (full_group_id, full_adapter) = full_group
+            .ok_or_else(|| "Gemma4 runtime has no full-attention KV group".to_string())?;
+        let inner = KVCacheCoordinator::from_groups(specs, groups, managers)
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
+            inner,
+            full_group_id,
+            full_adapter,
+            max_concurrent_sequences,
+        })
+    }
+
+    fn routes(&self) -> &[LayerKVCacheRoute] {
+        self.inner.routes()
+    }
+
+    fn sliding_capacity_summary(&self) -> (usize, u32, u32) {
+        self.inner
+            .groups()
+            .iter()
+            .filter_map(|group| match self.inner.manager(group.group_id) {
+                Some(Gemma4KVCacheGroupManager::SlidingWindow {
+                    sliding_window,
+                    max_admission_blocks,
+                    ..
+                }) => Some((1usize, *sliding_window, *max_admission_blocks)),
+                _ => None,
+            })
+            .fold((0, 0, 0), |acc, item| {
+                (acc.0 + item.0, acc.1.max(item.1), acc.2.max(item.2))
+            })
+    }
+
+    pub(crate) fn full_adapter(&self) -> &PagedKVCacheAdapter {
+        &self.full_adapter
+    }
+
+    pub(crate) fn full_adapter_mut(&mut self) -> &mut PagedKVCacheAdapter {
+        &mut self.full_adapter
+    }
+
+    pub(crate) fn max_concurrent_sequences(&self) -> u32 {
+        self.max_concurrent_sequences
+    }
+
+    pub(crate) fn pool_allocated_bytes(&self) -> std::result::Result<u64, String> {
+        (0..self.inner.groups().len()).try_fold(0u64, |total, group_id| {
+            self.adapter(group_id)
+                .and_then(PagedKVCacheAdapter::pool_allocated_bytes)
+                .map(|bytes| total.saturating_add(bytes))
+        })
+    }
+
+    fn prepare_scheduled_request(
+        &mut self,
+        seq_id: u32,
+        tokens: &[u32],
+    ) -> std::result::Result<u32, String> {
+        if self.can_continue_all(seq_id, tokens) {
+            return self.continue_turn_all(seq_id, tokens, tokens.len() as u32);
+        }
+        self.reset_scheduled_request(seq_id)?;
+        Ok(0)
+    }
+
+    fn reset_scheduled_request(&mut self, seq_id: u32) -> std::result::Result<(), String> {
+        let _ = self.release_request_all(seq_id);
+        for group_id in 0..self.inner.groups().len() {
+            let result = self.adapter_mut(group_id)?.begin_request(seq_id);
+            if let Err(error) = result {
+                let _ = self.release_request_all(seq_id);
+                return Err(format!(
+                    "Gemma4 KV group {group_id} request reset failed: {error}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn reset_sliding_requests(&mut self, seq_id: u32) -> std::result::Result<(), String> {
+        for group_id in 0..self.inner.groups().len() {
+            if let Some(Gemma4KVCacheGroupManager::SlidingWindow { adapter, .. }) =
+                self.inner.manager_mut(group_id)
+            {
+                adapter.release_request_for(seq_id)?;
+                adapter.begin_request(seq_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn restore_sliding_groups(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        boundary: u32,
+        layer_kv: &[(MxArray, MxArray)],
+    ) -> std::result::Result<(), String> {
+        let mut offset = 0usize;
+        for group_id in 0..self.inner.groups().len() {
+            let Some(Gemma4KVCacheGroupManager::SlidingWindow { adapter, .. }) =
+                self.inner.manager_mut(group_id)
+            else {
+                continue;
+            };
+            let layers = adapter.layer_kv_pool().num_layers();
+            let end = offset.saturating_add(layers);
+            let group = layer_kv.get(offset..end).ok_or_else(|| {
+                "Gemma4 sliding sidecar has fewer layers than the grouped coordinator".to_string()
+            })?;
+            adapter.restore_sliding_prefix_for(seq_id, prompt_tokens, boundary, group)?;
+            offset = end;
+        }
+        if offset != layer_kv.len() {
+            return Err(format!(
+                "Gemma4 sliding sidecar has {} layers but grouped adapters consumed {offset}",
+                layer_kv.len()
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_sliding_groups_at(
+        &mut self,
+        seq_id: u32,
+        boundary: u32,
+    ) -> std::result::Result<Option<Vec<(MxArray, MxArray)>>, String> {
+        let mut layer_kv = Vec::new();
+        for group_id in 0..self.inner.groups().len() {
+            let Some(Gemma4KVCacheGroupManager::SlidingWindow {
+                sliding_window,
+                adapter,
+                ..
+            }) = self.inner.manager_mut(group_id)
+            else {
+                continue;
+            };
+            adapter.activate_request(seq_id)?;
+            let recorded = adapter.current_token_count();
+            if boundary == 0 || boundary > recorded {
+                return Err(format!(
+                    "Gemma4 sliding checkpoint boundary {boundary} exceeds group cursor {recorded}"
+                ));
+            }
+            let live_tokens = boundary.min(*sliding_window);
+            let start = boundary - live_tokens;
+            if recorded.saturating_sub(start) > *sliding_window {
+                return Ok(None);
+            }
+            for layer in 0..adapter.layer_kv_pool().num_layers() {
+                layer_kv.push(adapter.read_kv_range(layer as u32, start, live_tokens)?);
+            }
+        }
+        Ok(Some(layer_kv))
+    }
+
+    fn adapter(&self, group_id: usize) -> std::result::Result<&PagedKVCacheAdapter, String> {
+        if group_id == self.full_group_id {
+            return Ok(&self.full_adapter);
+        }
+        match self.inner.manager(group_id) {
+            Some(Gemma4KVCacheGroupManager::SlidingWindow { adapter, .. }) => Ok(adapter),
+            Some(Gemma4KVCacheGroupManager::Full) => Err(format!(
+                "Gemma4 KV group {group_id} is marked full but the owned full group is {}",
+                self.full_group_id
+            )),
+            None => Err(format!("Gemma4 KV group {group_id} is missing")),
+        }
+    }
+
+    fn adapter_mut(
+        &mut self,
+        group_id: usize,
+    ) -> std::result::Result<&mut PagedKVCacheAdapter, String> {
+        if group_id == self.full_group_id {
+            return Ok(&mut self.full_adapter);
+        }
+        match self.inner.manager_mut(group_id) {
+            Some(Gemma4KVCacheGroupManager::SlidingWindow { adapter, .. }) => Ok(adapter),
+            Some(Gemma4KVCacheGroupManager::Full) => Err(format!(
+                "Gemma4 KV group {group_id} is marked full but the owned full group is {}",
+                self.full_group_id
+            )),
+            None => Err(format!("Gemma4 KV group {group_id} is missing")),
+        }
+    }
+
+    fn begin_sliding_requests(&mut self, seq_id: u32) -> std::result::Result<(), String> {
+        for group_id in 0..self.inner.groups().len() {
+            if let Some(Gemma4KVCacheGroupManager::SlidingWindow { adapter, .. }) =
+                self.inner.manager_mut(group_id)
+            {
+                adapter.reset_for_new_request(seq_id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn activate_request_all(&mut self, seq_id: u32) -> std::result::Result<(), String> {
+        for group_id in 0..self.inner.groups().len() {
+            self.adapter_mut(group_id)?.activate_request(seq_id)?;
+        }
+        Ok(())
+    }
+
+    fn can_continue_all(&self, seq_id: u32, prompt_tokens: &[u32]) -> bool {
+        (0..self.inner.groups().len()).all(|group_id| {
+            let Ok(adapter) = self.adapter(group_id) else {
+                return false;
+            };
+            adapter.is_live_for_continue_for(seq_id)
+                && adapter.request_tokens_for(seq_id).is_some_and(|live| {
+                    prompt_tokens.len() >= live.len() && prompt_tokens.starts_with(live)
+                })
+        })
+    }
+
+    fn is_live_all(&self, seq_id: u32) -> bool {
+        (0..self.inner.groups().len()).all(|group_id| {
+            self.adapter(group_id)
+                .is_ok_and(|adapter| adapter.is_live_for_continue_for(seq_id))
+        })
+    }
+
+    fn request_token_count_all(&self, seq_id: u32) -> std::result::Result<u32, String> {
+        let mut count = None;
+        for group_id in 0..self.inner.groups().len() {
+            let adapter = self.adapter(group_id)?;
+            let group_count = adapter
+                .request_tokens_for(seq_id)
+                .map(|tokens| tokens.len() as u32)
+                .ok_or_else(|| format!("Gemma4 KV group {group_id} has no sequence {seq_id}"))?;
+            if count
+                .replace(group_count)
+                .is_some_and(|prior| prior != group_count)
+            {
+                return Err(format!(
+                    "Gemma4 hybrid KV groups disagree on sequence {seq_id} token count"
+                ));
+            }
+        }
+        count.ok_or_else(|| "Gemma4 hybrid KV coordinator has no groups".to_string())
+    }
+
+    fn continue_turn_all(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        total_budget: u32,
+    ) -> std::result::Result<u32, String> {
+        let mut boundary = None;
+        for group_id in 0..self.inner.groups().len() {
+            let adapter = self.adapter_mut(group_id)?;
+            adapter.activate_request(seq_id)?;
+            let (group_boundary, _) = adapter.continue_turn(prompt_tokens, total_budget)?;
+            if boundary
+                .replace(group_boundary)
+                .is_some_and(|prior| prior != group_boundary)
+            {
+                return Err(
+                    "Gemma4 hybrid KV groups disagree on live continuation boundary".to_string(),
+                );
+            }
+        }
+        Ok(boundary.unwrap_or(0))
+    }
+
+    fn continue_sliding_all(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        total_budget: u32,
+        expected_boundary: u32,
+    ) -> std::result::Result<(), String> {
+        for group_id in 0..self.inner.groups().len() {
+            let Some(Gemma4KVCacheGroupManager::SlidingWindow { adapter, .. }) =
+                self.inner.manager_mut(group_id)
+            else {
+                continue;
+            };
+            adapter.activate_request(seq_id)?;
+            let (boundary, _) = adapter.continue_turn(prompt_tokens, total_budget)?;
+            if boundary != expected_boundary {
+                return Err(format!(
+                    "Gemma4 sliding group resumed at {boundary}, full group resumed at {expected_boundary}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn record_tokens_all(
+        &mut self,
+        seq_id: u32,
+        tokens: &[u32],
+    ) -> std::result::Result<(), String> {
+        let mut recorded = Vec::new();
+        for group_id in 0..self.inner.groups().len() {
+            let adapter = self.adapter_mut(group_id)?;
+            if let Err(error) = adapter.record_tokens_for(seq_id, tokens) {
+                for recorded_group in recorded.into_iter().rev() {
+                    let recorded_adapter = self.adapter_mut(recorded_group)?;
+                    if recorded_adapter.activate_request(seq_id).is_ok() {
+                        let _ = adapter_rollback(recorded_adapter, tokens.len());
+                    }
+                }
+                return Err(error);
+            }
+            recorded.push(group_id);
+        }
+        Ok(())
+    }
+
+    fn prune_sliding_all(&mut self, seq_id: u32) -> std::result::Result<u32, String> {
+        let mut released = 0u32;
+        for group_id in 0..self.inner.groups().len() {
+            released = released.saturating_add(
+                self.adapter_mut(group_id)?
+                    .prune_sliding_window_for(seq_id)?,
+            );
+        }
+        Ok(released)
+    }
+
+    fn eval_pending_pool_writes_all(&mut self) -> std::result::Result<(), String> {
+        for group_id in 0..self.inner.groups().len() {
+            self.adapter_mut(group_id)?.eval_pending_pool_writes()?;
+        }
+        Ok(())
+    }
+
+    fn finalize_keep_live_all(
+        &mut self,
+        seq_id: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> std::result::Result<(), String> {
+        for group_id in 0..self.inner.groups().len() {
+            let is_full = group_id == self.full_group_id;
+            let adapter = self.adapter_mut(group_id)?;
+            adapter.activate_request(seq_id)?;
+            if is_full {
+                adapter.finalize_turn_keep_live_per_block(extra_keys_per_block, cache_salt)?;
+            } else {
+                adapter.finalize_turn_keep_live_no_prefix()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn register_full_for_cold_capture(
+        &mut self,
+        seq_id: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) -> std::result::Result<(), String> {
+        let adapter = self.full_adapter_mut();
+        adapter.activate_request(seq_id)?;
+        adapter
+            .register_full_blocks_for_reuse_per_block(extra_keys_per_block, cache_salt)
+            .map(|_| ())
+    }
+
+    fn rollback_last_tokens_all(
+        &mut self,
+        seq_id: u32,
+        token_count: u32,
+    ) -> std::result::Result<(), String> {
+        let mut first_error = None;
+        for group_id in 0..self.inner.groups().len() {
+            let adapter = self.adapter_mut(group_id)?;
+            let result = adapter.activate_request(seq_id);
+            let result = result.and_then(|_| adapter.rollback_last_tokens(token_count));
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        first_error.map_or(Ok(()), Err)
+    }
+
+    fn release_request_all(&mut self, seq_id: u32) -> std::result::Result<u32, String> {
+        let mut released = 0u32;
+        let mut first_error = None;
+        for group_id in 0..self.inner.groups().len() {
+            match self.adapter_mut(group_id)?.release_request_for(seq_id) {
+                Ok(count) => released = released.saturating_add(count),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            };
+        }
+        first_error.map_or(Ok(released), Err)
+    }
+
+    fn release_all_and_purge(&mut self) -> std::result::Result<u32, String> {
+        let mut released = 0u32;
+        let mut first_error = None;
+        for group_id in 0..self.inner.groups().len() {
+            let adapter = self.adapter_mut(group_id)?;
+            match adapter.release_request_and_purge_prefix_cache() {
+                Ok(count) => released = released.saturating_add(count),
+                Err(error) => {
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        first_error.map_or(Ok(released), Err)
+    }
+}
+
+fn adapter_rollback(
+    adapter: &mut PagedKVCacheAdapter,
+    token_count: usize,
+) -> std::result::Result<(), String> {
+    adapter.rollback_last_tokens(u32::try_from(token_count).unwrap_or(u32::MAX))
+}
+
+impl std::ops::Deref for Gemma4KVCacheCoordinator {
+    type Target = PagedKVCacheAdapter;
+
+    fn deref(&self) -> &Self::Target {
+        self.full_adapter()
+    }
+}
+
+impl std::ops::DerefMut for Gemma4KVCacheCoordinator {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.full_adapter_mut()
+    }
 }
 
 /// Adapter giving the paged/vision streaming cores a `cb.call(result, mode)`
@@ -166,7 +667,7 @@ impl Gemma4StreamDispatchState {
                         self.pending_reasoning.push_str(&text);
                     }
                 }
-                StreamSegment::ToolCall(_) => {
+                StreamSegment::ToolCall => {
                     self.tool_call_seen = true;
                     self.flush_pending_reasoning(cb);
                     // Accumulated on `parser.tool_calls()` for the terminal chunk.
@@ -312,6 +813,17 @@ impl StreamEmitter for Gemma4Emitter {
 /// No `Arc<RwLock<>>` — the model thread has sole ownership.
 pub(crate) struct Gemma4Inner {
     pub(crate) config: Gemma4Config,
+    /// The in-flight turn's cooperative-cancel flag, installed by the
+    /// sync and streaming session wrappers via
+    /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
+    /// turn epilogue on every exit path.
+    /// Polled at the top of each prefill chunk (flat `prefill_body_gemma4`
+    /// and the paged chunk-plan loop in `run_paged_prefill_chunk`);
+    /// `true` aborts with the distinguished `"prefill cancelled"` error,
+    /// riding the engine's fail-closed prefill-`Err` arms. Speculative
+    /// assistant/DSpark and vision paths thread the same flag; single-shot
+    /// prefills remain the documented residual window.
+    pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     pub(crate) embed_tokens: Embedding,
     pub(crate) layers: Vec<Gemma4DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
@@ -342,6 +854,13 @@ pub(crate) struct Gemma4Inner {
     /// defensively inside [`ChatBackend::prefill`] / the vision cores).
     /// Shared across turns by the session API.
     pub(crate) caches: Option<Vec<Gemma4LayerCache>>,
+    /// Selects the request-local flat target cache lane used by MTP/DSpark.
+    ///
+    /// A loaded draft may coexist with the resident paged pools. The
+    /// scheduler installs exactly one owner's flat caches here while an
+    /// exclusive speculative command runs, then parks them again. Ordinary
+    /// AR/media commands leave this false and use `active_paged_seq`.
+    active_flat_session: bool,
     /// Tokens (post image-expansion) whose KV state is currently live in
     /// `caches`. Maintained in parallel with `caches` for prefix-reuse
     /// verification in Step 5c. Empty when no session is active.
@@ -365,7 +884,7 @@ pub(crate) struct Gemma4Inner {
     /// sidecar so every later registration uses the same image-aware per-block
     /// keys instead of republishing image K/V under token-only hashes.
     cached_paged_image_token_positions: Vec<(u32, u64)>,
-    /// Block-paged KV adapter (vLLM-style refcounted prefix cache).
+    /// Runtime KV-cache group coordinator (vLLM-style grouped ownership).
     ///
     /// **Opt-in via `Gemma4Config::use_block_paged_cache`**. Gemma4's
     /// hybrid sliding+global attention, K=V sharing, KV-shared layers
@@ -375,20 +894,20 @@ pub(crate) struct Gemma4Inner {
     /// global attention layers through this adapter. Defaults to `None`
     /// when the config flag is unset, in which case the model falls
     /// back to the flat `Gemma4LayerCache` path.
-    pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    pub(crate) kv_cache_coordinator: Option<Gemma4KVCacheCoordinator>,
+    /// Sequence selected by the scheduler while model-neutral paged and media
+    /// hooks run. Ownerless legacy turns use sequence zero.
+    active_paged_seq: u32,
     /// Draft model for speculative decoding (`Gemma4LoadOptions::
-    /// draft_model_path`), either [`Gemma4Draft`] variant. Mutually
-    /// exclusive with `paged_adapter`: the load path hard-errors on an
-    /// explicit `use_block_paged_cache: true` conflict and forces the unset
-    /// default to flat, so `draft.is_some()` implies
-    /// `paged_adapter.is_none()`.
+    /// draft_model_path`), either [`Gemma4Draft`] variant. Draft target caches
+    /// use a per-owner flat lane while ordinary text/media owners continue to
+    /// use the resident grouped paged pools.
     pub(crate) draft: Option<Gemma4Draft>,
     /// Per-turn draft handoff: the whole-turn core builds the variant's
     /// prefill-derived state (DSpark fused-context cache / assistant
     /// last-prompt hidden) during prefill and stashes it here;
     /// `DsparkBackend::begin_dspark_decode` TAKES it into the turn's
-    /// stepper (the engine's `DsparkTurnSetup` carries only turn constants,
-    /// so prefill-derived state travels through this seam). Always `None`
+    /// stepper. Always `None`
     /// outside a live draft whole-turn.
     pub(crate) draft_turn_state: Option<super::dspark_decode::Gemma4DraftTurnState>,
     /// Cached result of `compute_layer_kinds_from_kv_cache_specs(&config)`,
@@ -400,45 +919,7 @@ pub(crate) struct Gemma4Inner {
     /// errors out on a `None` adapter before consuming the value.
     pub(crate) layer_kinds: Vec<Gemma4LayerKind>,
     sliding_prefix_checkpoints: VecDeque<Gemma4SlidingPrefixCheckpoint>,
-    sliding_prompt_boundary_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
-    /// Sliding state at [`gemma4_cold_restore_reachable_boundary`] for the
-    /// prompt of the turn currently in flight, when that boundary differs from
-    /// `sliding_prompt_boundary_checkpoint`'s — i.e. exactly when the prompt
-    /// length is a multiple of the block size and the prompt boundary sits one
-    /// block past anything a restore can name.
-    ///
-    /// Deliberately NOT a member of `sliding_prefix_checkpoints`, and read by
-    /// nothing but [`Gemma4Inner::find_gemma4_sliding_capture_checkpoints`]:
-    ///
-    ///  * the retained SET decides which checkpoint a later warm turn resumes
-    ///    from, and that is observable in the emitted tokens, so a persist turn
-    ///    must retain exactly what a persistence-OFF turn retains. Keeping this
-    ///    outside the deque means the ladder, its limit and its eviction order
-    ///    are bit-for-bit what they were;
-    ///  * the ladder's eviction rule takes the oldest NON-anchor first, and this
-    ///    boundary is not on the `block_size * 4^k` grid, so an entry in the
-    ///    deque would be the preferred victim of the very next push — while it
-    ///    is the one boundary the turn's own capture most wants.
-    ///
-    /// Written only on a turn whose caps say [`Gemma4SlidingRetentionCaps::
-    /// wants_ladder`] (a persistence-OFF turn never allocates it), cleared at
-    /// the start of every prefill body that could publish it, so at most one
-    /// window of sliding K/V is held for it.
-    sliding_cold_restore_tail_checkpoint: Option<Gemma4SlidingPrefixCheckpoint>,
-    /// Token length of the prompt the paged text turn in flight planned, i.e.
-    /// `PagedBackend::prime_prefix_state`'s `plan.len()`.
-    ///
-    /// The capture at finalize runs over `adapter.request_tokens()`, which is
-    /// the prompt PLUS everything generated, and so cannot tell where the
-    /// prompt ended. It needs to, because the bound it must respect is
-    /// [`gemma4_cold_restore_reachable_boundary`] of the PROMPT — a later
-    /// restore of this same prompt looks up `prompt[..prompt_len - 1]`, and no
-    /// amount of generated tail widens that.
-    ///
-    /// `0` outside a paged text turn, which fails the capture closed (no
-    /// reachable boundary, so no sidecar) rather than open.
-    paged_turn_prompt_len: u32,
-    sliding_last_history_checkpoint: Option<Gemma4SlidingHistoryCheckpoint>,
+    grouped_sliding_cold_checkpoints: HashMap<u32, VecDeque<Gemma4GroupedSlidingColdCheckpoint>>,
     /// Media kinds causally represented by the current session's live/persisted
     /// prefix. This survives every successful warm text continuation because
     /// those turns extend — rather than replace — the media-derived KV. Cleared
@@ -532,14 +1013,6 @@ fn gemma4_session_media_matches_payloads(
         && cached_audio_key == audio_key
 }
 
-const fn gemma4_vlm_prefix_checkpoint_eligible(
-    has_image: bool,
-    has_audio: bool,
-    reuse_cache: bool,
-) -> bool {
-    has_image && !has_audio && reuse_cache
-}
-
 fn gemma4_carries_image_lineage(
     context_media: MediaCapabilities,
     cached_image_key: Option<u64>,
@@ -552,6 +1025,26 @@ fn gemma4_carries_image_lineage(
         && !cached_image_token_positions.is_empty()
         && !cached_token_history.is_empty()
         && tokens.starts_with(cached_token_history)
+}
+
+/// Request-local metadata parked by the Gemma scheduler beside each owner's
+/// physical cache lane. KV arrays remain in the coordinator (paged lane) or
+/// `Gemma4SchedulerOwnerState::flat_caches` (speculative lane); this value is
+/// intentionally cheap to clone when the scheduler changes the active row.
+#[derive(Clone, Default)]
+pub(crate) struct Gemma4OwnerMetadata {
+    pub(crate) cached_token_history: Vec<u32>,
+    cached_image_key: Option<u64>,
+    cached_audio_key: Option<u64>,
+    cached_paged_image_token_positions: Vec<(u32, u64)>,
+    media_session_context: MediaCapabilities,
+    media_session_continuable: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct Gemma4SchedulerOwnerState {
+    pub(crate) metadata: Gemma4OwnerMetadata,
+    pub(crate) flat_caches: Option<Vec<Gemma4LayerCache>>,
 }
 
 /// Draft-model variant loaded alongside the target for speculative decoding
@@ -607,11 +1100,11 @@ pub struct Gemma4Model {
     /// only `isInitialized` is meaningful. Mirrors the same `Option<..>`
     /// gate used by the OCR models (`VLModel`, `QianfanOCRModel`).
     ///
-    /// Gemma4 is chat-only (no training/generate variants), so the
-    /// thread dispatches the model-neutral [`ChatCmd`] directly via
-    /// `engine::cmd::handle_chat_cmd::<Gemma4Inner>` — no per-family
-    /// command enum.
-    pub(crate) thread: Option<crate::model_thread::ModelThread<ChatCmd>>,
+    /// Gemma4 is chat-only (no training/generate variants). Its family command
+    /// enum adds scheduler telemetry to the model-neutral [`ChatCmd`] surface,
+    /// and `Gemma4SchedulerState` owns admission, preemption, and exclusive
+    /// draft/media barriers on this thread.
+    pub(crate) thread: Option<crate::model_thread::ModelThread<Gemma4Cmd>>,
     pub(crate) model_id: u64,
     /// Whether the loaded config includes `vision_config`. Mirrored here so
     /// the NAPI side can fail fast on image inputs to a text-only model
@@ -630,19 +1123,23 @@ pub struct Gemma4Model {
     /// (its guard is `None`) — running inference on that stub would
     /// under-cap the allocator.
     pub(crate) initialized: bool,
-    /// Snapshot of `Gemma4Inner::paged_adapter.is_some()` captured at
-    /// construction time. Default-OFF on Gemma4 (parity-blocked — see
-    /// `Gemma4Config::use_block_paged_cache` and the WIP per-layer
-    /// numerical-diff tracker), so this is `false` for the entire matrix
-    /// of currently-shipping configs. Stubs from `new(config)` always
-    /// report `false` because no inner was constructed. Surfaced through
-    /// the `hasBlockPagedCache()` NAPI method so server endpoints can
-    /// branch on it without round-tripping through the model thread.
+    /// Snapshot of the grouped paged coordinator captured at construction.
+    /// Gemma4 defaults this on; explicit `use_block_paged_cache: false`
+    /// retains the flat single-owner path. Stubs from `new(config)` report
+    /// false because no inner was constructed. Surfaced through
+    /// `hasBlockPagedCache()` for server-side capacity selection.
     pub(crate) paged_active: bool,
+    /// Native scheduler width after intersecting the configured hybrid pool
+    /// capacity with the process scheduler cap.
+    pub(crate) max_concurrent_sequences: u32,
     /// RAII: unregisters this model's delta from the cache-limit
     /// coordinator on drop. `None` for instances constructed via the
     /// synchronous `new(config)` path that never loaded weights.
     pub(crate) _cache_limit_guard: Option<crate::cache_limit::CacheLimitGuard>,
+    /// RAII registration for the grouped paged-KV pools, whose private Metal
+    /// buffers are outside MLX allocator accounting but consume the same
+    /// unified-memory budget. `None` for flat or uninitialized models.
+    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
     /// Snapshot of `Gemma4Inner::draft.is_some()` captured at load time
     /// (same mirroring pattern as `paged_active`): whether a draft model —
     /// either [`Gemma4Draft`] variant — was loaded via
@@ -662,10 +1159,9 @@ pub struct Gemma4LoadOptions {
     /// alongside the target model for speculative decoding — either a
     /// DSpark draft or a Google assistant draft; the kind is probed from
     /// the draft config.json. When omitted, `<model_path>/draft/` is loaded
-    /// automatically when present. Draft decoding runs only on the flat
-    /// KV-cache path: setting this while the model config explicitly enables
-    /// `use_block_paged_cache` is a hard load error, and an unset
-    /// `use_block_paged_cache` is forced to `false`.
+    /// automatically when present. Draft decoding uses a request-local flat
+    /// target-cache lane. The resident target retains its grouped paged pools,
+    /// so loading an optional proposer does not disable ordinary batching.
     pub draft_model_path: Option<String>,
 }
 
@@ -710,6 +1206,8 @@ const GEMMA4_SLIDING_PREFIX_CHECKPOINT_MAX_DEFAULT_LIMIT: usize = 128;
 const GEMMA4_IMAGE_PREFIX_CHECKPOINT_LIMIT: usize = 2;
 const GEMMA4_SLIDING_CHECKPOINT_MEMORY_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 const GEMMA4_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB: u32 = 256;
+const GEMMA4_PAGED_CACHE_DEFAULT_MEMORY_MB: u32 = 2048;
+const GEMMA4_PAGED_DEFAULT_MAX_SEQUENCES: u32 = 8;
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
 /// Spacing of the cold-sidecar anchor rungs, as a multiple of the paged block
@@ -949,6 +1447,7 @@ impl Gemma4SlidingRetentionCaps {
 /// publishing step needs to know about it. Produced only by
 /// [`gemma4_sliding_decode_boundary_plan`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 struct Gemma4SlidingDecodeBoundary {
     prefix_len: u32,
     block_size: u32,
@@ -983,6 +1482,74 @@ struct Gemma4SlidingPrefixCheckpoint {
     snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
 }
 
+/// Scheduler-owned paged sliding-group checkpoint. These K/V arrays come
+/// directly from the grouped sliding adapters and can be reinstalled without
+/// constructing the legacy flat rotating-cache lane.
+#[derive(Clone)]
+struct Gemma4GroupedSlidingColdCheckpoint {
+    boundary: u32,
+    tokens: Vec<u32>,
+    layer_kv: Vec<(MxArray, MxArray)>,
+}
+
+/// Select the deepest scheduler snapshot covered by the persisted full-K/V
+/// frontier, or reconstruct that same anchor from the still-live grouped
+/// sliding adapters.
+///
+/// The scheduler normally captures every cold anchor before pruning. Finalize
+/// must not depend exclusively on that transient deque, though: a turn can
+/// reach finalize without retaining an intermediate snapshot while the anchor
+/// is still present in the live sliding window. Reading it here is exact (the
+/// adapter addresses absolute token ranges), and returning `None` once it has
+/// rotated out preserves the fail-closed full+sliding restore contract.
+fn resolve_grouped_sliding_cold_checkpoint(
+    checkpoints: Option<&VecDeque<Gemma4GroupedSlidingColdCheckpoint>>,
+    anchors: &[u32],
+    frontier: u32,
+    request_tokens: &[u32],
+    mut read_live_anchor: impl FnMut(
+        u32,
+    )
+        -> std::result::Result<Option<Vec<(MxArray, MxArray)>>, String>,
+) -> std::result::Result<Option<Gemma4GroupedSlidingColdCheckpoint>, String> {
+    if let Some(checkpoint) = checkpoints.and_then(|checkpoints| {
+        checkpoints.iter().rev().find(|checkpoint| {
+            checkpoint.boundary <= frontier
+                && request_tokens
+                    .get(..checkpoint.boundary as usize)
+                    .is_some_and(|tokens| tokens == checkpoint.tokens)
+        })
+    }) {
+        return Ok(Some(checkpoint.clone()));
+    }
+
+    let Some(boundary) = anchors
+        .iter()
+        .rev()
+        .copied()
+        .find(|&boundary| boundary <= frontier && boundary as usize <= request_tokens.len())
+    else {
+        return Ok(None);
+    };
+    let Some(layer_kv) = read_live_anchor(boundary)? else {
+        return Ok(None);
+    };
+    let tokens = request_tokens
+        .get(..boundary as usize)
+        .ok_or_else(|| {
+            format!(
+                "Gemma4 grouped cold anchor {boundary} exceeds request length {}",
+                request_tokens.len()
+            )
+        })?
+        .to_vec();
+    Ok(Some(Gemma4GroupedSlidingColdCheckpoint {
+        boundary,
+        tokens,
+        layer_kv,
+    }))
+}
+
 /// Everything a publishing site honestly knows about a checkpoint it just
 /// produced. `cold_anchor_rung` is deliberately NOT among those fields.
 ///
@@ -1008,20 +1575,6 @@ struct Gemma4SlidingPrefixCheckpointDraft {
     snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
 }
 
-/// Where a checkpoint captured inside a prefill compute chunk is filed.
-///
-/// The distinction is not bookkeeping: `PrefixStore` is the RETAINED set, and
-/// which entry a later warm turn resumes from decides the tokens it emits, so a
-/// persist turn may not put anything there a persistence-OFF turn would not.
-/// `ColdRestoreTail` is read by the cold sidecar capture and by nothing else.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Gemma4SlidingCapturedCheckpointSink {
-    /// `sliding_prefix_checkpoints`, under this turn's retention caps.
-    PrefixStore,
-    /// `sliding_cold_restore_tail_checkpoint`, outside the retained set.
-    ColdRestoreTail,
-}
-
 impl Gemma4SlidingPrefixCheckpointDraft {
     /// Derive the stored entry. The grid that decided this boundary was
     /// published is the same grid that decides retention defers it, so the two
@@ -1037,12 +1590,6 @@ impl Gemma4SlidingPrefixCheckpointDraft {
             snapshots: self.snapshots,
         }
     }
-}
-
-struct Gemma4SlidingHistoryCheckpoint {
-    tokens: Vec<u32>,
-    image_token_positions: Vec<(u32, u64)>,
-    snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
 }
 
 struct Gemma4SlidingPrefixCheckpointHit {
@@ -1077,17 +1624,13 @@ struct Gemma4VlmTurnPreparation {
     suffix_embeds: MxArray,
     layer_kinds: Vec<Gemma4LayerKind>,
     extra_keys_per_block: Vec<Vec<u64>>,
-    publish_prefix_checkpoints: bool,
 }
 
-/// Explicit capture identity for Gemma4's out-of-pool sliding state.
-///
-/// Text turns still source their prompt length from the generic paged lifecycle,
-/// but VLM turns bypass that lifecycle entirely. Carrying the VLM prompt length
-/// and ordered image positions here prevents media capture from accidentally
-/// reading the text-only `paged_turn_prompt_len` ambient field (which is zero on
-/// this path) or stale image lineage from a prior turn.
+/// Test fixture for the retired private sliding-state capture policy. The active
+/// scheduler captures grouped sliding state directly from the KV coordinator;
+/// this fixture remains only to pin the media safety rule independently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 struct Gemma4SlidingColdCaptureContext<'a> {
     prompt_len: u32,
     image_token_positions: &'a [(u32, u64)],
@@ -1095,11 +1638,13 @@ struct Gemma4SlidingColdCaptureContext<'a> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum Gemma4SlidingColdCaptureMedia {
     Text,
     PureImage,
 }
 
+#[cfg(test)]
 impl<'a> Gemma4SlidingColdCaptureContext<'a> {
     fn text(prompt_len: u32, image_token_positions: &'a [(u32, u64)]) -> Self {
         Self {
@@ -1137,10 +1682,6 @@ impl<'a> Gemma4SlidingColdCaptureContext<'a> {
                 .checked_add(1),
         }
     }
-}
-
-const fn gemma4_sliding_cold_sidecar_matches_prefix(boundary: u32, cached_prefix_len: u32) -> bool {
-    boundary > 0 && boundary == cached_prefix_len
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1269,20 +1810,6 @@ fn compute_gemma4_paged_prefix_block_hash_with_keys(
     Some(parent_hash)
 }
 
-fn gemma4_prefix_uses_media_keys(
-    prefix_len: u32,
-    block_size: u32,
-    extra_keys_per_block: &[Vec<u64>],
-) -> bool {
-    if block_size == 0 {
-        return false;
-    }
-    extra_keys_per_block
-        .iter()
-        .take((prefix_len / block_size) as usize)
-        .any(|keys| !keys.is_empty())
-}
-
 fn gemma4_sliding_caches_ready_at(
     config: &Gemma4Config,
     caches: Option<&[Gemma4LayerCache]>,
@@ -1329,88 +1856,6 @@ fn snapshot_gemma4_sliding_caches(
         }
     }
     Ok(Some(snapshots))
-}
-
-fn gemma4_sliding_snapshots_ready_at(
-    config: &Gemma4Config,
-    snapshots: &[Option<RotatingKVCacheSnapshot>],
-    expected_offset: u32,
-) -> bool {
-    if snapshots.len() != config.num_hidden_layers as usize {
-        return false;
-    }
-    snapshots.iter().enumerate().all(|(layer_idx, snapshot)| {
-        if config.is_sliding_layer(layer_idx) && !config.is_kv_shared_layer(layer_idx) {
-            snapshot.as_ref().is_some_and(|snapshot| {
-                snapshot.offset == expected_offset as i32
-                    && snapshot.max_size == config.sliding_window
-            })
-        } else {
-            snapshot.is_none()
-        }
-    })
-}
-
-fn prepare_gemma4_sliding_checkpoint_captures(
-    config: &Gemma4Config,
-    caches: &mut [Gemma4LayerCache],
-    boundaries: &[u32],
-) -> Result<()> {
-    if caches.len() != config.num_hidden_layers as usize {
-        return Err(Error::from_reason(format!(
-            "Gemma4 sliding checkpoint capture cache count mismatch: caches={} layers={}",
-            caches.len(),
-            config.num_hidden_layers
-        )));
-    }
-    for (layer_idx, cache) in caches.iter_mut().enumerate() {
-        if config.is_sliding_layer(layer_idx) && !config.is_kv_shared_layer(layer_idx) {
-            cache.prepare_sliding_checkpoint_capture(boundaries)?;
-        } else {
-            cache.prepare_sliding_checkpoint_capture(&[])?;
-        }
-    }
-    Ok(())
-}
-
-fn take_gemma4_sliding_checkpoint_captures(
-    config: &Gemma4Config,
-    caches: &mut [Gemma4LayerCache],
-    boundaries: &[u32],
-) -> Result<Vec<Vec<Option<RotatingKVCacheSnapshot>>>> {
-    let mut captures = vec![vec![None; caches.len()]; boundaries.len()];
-    for (layer_idx, cache) in caches.iter_mut().enumerate() {
-        let layer_captures = cache.take_sliding_checkpoint_captures();
-        if !config.is_sliding_layer(layer_idx) || config.is_kv_shared_layer(layer_idx) {
-            if !layer_captures.is_empty() {
-                return Err(Error::from_reason(format!(
-                    "Gemma4 non-physical sliding layer {layer_idx} produced checkpoint captures"
-                )));
-            }
-            continue;
-        }
-        if layer_captures.len() != boundaries.len() {
-            return Err(Error::from_reason(format!(
-                "Gemma4 sliding layer {layer_idx} captured {} checkpoints for {} boundaries",
-                layer_captures.len(),
-                boundaries.len()
-            )));
-        }
-        for (boundary_idx, (snapshot, &boundary)) in layer_captures
-            .into_iter()
-            .zip(boundaries.iter())
-            .enumerate()
-        {
-            if snapshot.offset != boundary as i32 {
-                return Err(Error::from_reason(format!(
-                    "Gemma4 sliding layer {layer_idx} checkpoint offset {} != boundary {boundary}",
-                    snapshot.offset
-                )));
-            }
-            captures[boundary_idx][layer_idx] = Some(snapshot);
-        }
-    }
-    Ok(captures)
 }
 
 fn materialize_gemma4_sliding_snapshots(
@@ -1494,6 +1939,17 @@ impl Gemma4Inner {
         let num_layers = config.num_hidden_layers as usize;
         let hidden_size = config.hidden_size as u32;
         let vocab_size = config.vocab_size as u32;
+        let recurrent_state_bytes = config.recurrent_state_bytes();
+        if recurrent_state_bytes != 0 {
+            tracing::debug!(
+                target: "mlx_core::gemma4::paged",
+                event = "gemma4_recurrent_state_budget",
+                recurrent_state_bytes,
+                max_live_units = crate::engine::recurrent_state::HYBRID_LIVE_STATE_UNITS,
+                batching = "grouped_paged",
+                "Gemma4 sliding-state geometry contributes to grouped paged-cache admission"
+            );
+        }
 
         let embed_tokens = Embedding::new(vocab_size, hidden_size)?;
         let final_norm = RMSNorm::new(hidden_size, Some(config.rms_norm_eps))?;
@@ -1602,10 +2058,9 @@ impl Gemma4Inner {
         // The long-term source of truth is the model-independent
         // LayerKVCacheSpec plan: Gemma4 declares full/sliding/shared KV
         // requirements, common transformer code groups those specs, and model
-        // dispatch should consume opaque group metadata. Runtime still uses the
-        // existing single PagedKVCacheAdapter for full-attention groups while
-        // sliding-window groups stay on RotatingKVCache until true paged
-        // sliding eviction is wired.
+        // dispatch consumes opaque group metadata. Runtime creates one
+        // PagedKVCacheAdapter per full/sliding group and keeps their request
+        // cursors atomic through `Gemma4KVCacheCoordinator`.
         //
         // Cache dtype: BFloat16 (Gemma4's production dtype). KV-shared layers
         // are aliases and do not consume physical pool slots; they resolve to
@@ -1615,7 +2070,7 @@ impl Gemma4Inner {
         // stubs. Force flat eager there by leaving the adapter None, so the
         // `paged_adapter.is_some()` routing falls through to the flat path.
         // macOS is unaffected — the probe is always true, so the default wins.
-        let paged_adapter = if config.use_block_paged_cache.unwrap_or(true)
+        let kv_cache_coordinator = if config.use_block_paged_cache.unwrap_or(true)
             && crate::engine::persistence::compiled_forward_backend_available()
         {
             let block_size = config.paged_block_size.unwrap_or(16);
@@ -1656,16 +2111,6 @@ impl Gemma4Inner {
                      paged KV cache requires at least one global attention layer",
                 ));
             };
-            let num_global_layers = physical_full_attention_layer_count(&kv_cache_specs) as u32;
-            if num_global_layers == 0 {
-                return Err(napi::Error::from_reason(
-                    "Gemma4 block-paged adapter: config has no full_attention layers; \
-                     paged KV cache requires at least one global attention layer",
-                ));
-            }
-
-            let head_size = full_group.physical_layout.head_size;
-            let num_kv_heads = full_group.physical_layout.num_kv_heads;
             let max_seq_len = u32::try_from(config.max_position_embeddings).map_err(|_| {
                 napi::Error::from_reason(format!(
                     "Gemma4 block-paged adapter: invalid max_position_embeddings={}",
@@ -1677,73 +2122,205 @@ impl Gemma4Inner {
                     "Gemma4 block-paged adapter: max_position_embeddings must be > 0",
                 ));
             }
-            let default_gpu_memory_mb = gemma4_default_paged_cache_memory_mb(
-                max_seq_len,
-                block_size,
-                head_size,
-                num_kv_heads,
-                num_global_layers,
+            let group_bytes_per_block = kv_cache_groups
+                .iter()
+                .map(|group| {
+                    2u64.saturating_mul(u64::from(group.physical_layout.num_kv_heads))
+                        .saturating_mul(u64::from(group.physical_layout.head_size))
+                        .saturating_mul(u64::from(block_size))
+                        .saturating_mul(2)
+                        .saturating_mul(group.physical_layer_indices.len() as u64)
+                })
+                .collect::<Vec<_>>();
+            let one_sequence_bytes = kv_cache_groups.iter().zip(&group_bytes_per_block).fold(
+                0u64,
+                |sum, (group, bytes_per_block)| {
+                    sum.saturating_add(
+                        u64::from(group.max_admission_blocks).saturating_mul(*bytes_per_block),
+                    )
+                },
             );
+            if one_sequence_bytes == 0 {
+                return Err(napi::Error::from_reason(
+                    "Gemma4 hybrid KV groups require non-zero physical storage",
+                ));
+            }
+            let null_block_bytes = kv_cache_groups
+                .iter()
+                .zip(&group_bytes_per_block)
+                .filter(|(group, _)| {
+                    matches!(group.attention_kind, AttentionKind::SlidingWindow { .. })
+                })
+                .fold(0u64, |sum, (_, bytes_per_block)| {
+                    sum.saturating_add(*bytes_per_block)
+                });
+            let minimum_pool_bytes = one_sequence_bytes.saturating_add(null_block_bytes);
+            let default_gpu_memory_mb = minimum_pool_bytes
+                .div_ceil(BYTES_PER_MIB)
+                .max(u64::from(GEMMA4_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB))
+                .max(u64::from(GEMMA4_PAGED_CACHE_DEFAULT_MEMORY_MB));
+            let default_gpu_memory_mb = u32::try_from(default_gpu_memory_mb).unwrap_or(u32::MAX);
             let (gpu_memory_mb, paged_cache_memory_source) =
                 if let Some(configured_memory_mb) = config.paged_cache_memory_mb {
                     (configured_memory_mb, "config")
                 } else {
-                    (default_gpu_memory_mb, "auto_full_context")
+                    (default_gpu_memory_mb, "auto_hybrid_context")
                 };
-
-            let pa_config = mlx_paged_attn::PagedAttentionConfig {
-                block_size,
-                gpu_memory_mb,
-                head_size,
-                num_kv_heads,
-                // Pool covers only physical full-attention layers. KV-shared
-                // aliases reuse their anchor's slot and do not allocate.
-                num_layers: num_global_layers,
-                use_fp8_cache: Some(false),
-                max_seq_len: Some(max_seq_len),
-                max_batch_size: Some(32),
-            };
-
-            let num_blocks = pa_config.calculate_num_blocks();
-            if num_blocks == 0 {
+            let memory_bytes = u64::from(gpu_memory_mb).saturating_mul(BYTES_PER_MIB);
+            if memory_bytes < minimum_pool_bytes {
                 return Err(napi::Error::from_reason(format!(
-                    "Gemma4 block-paged adapter: gpu_memory_mb={gpu_memory_mb} too small \
-                     (head_size={head_size}, num_kv_heads={num_kv_heads}, \
-                     block_size={block_size}, num_global_layers={num_global_layers})",
+                    "Gemma4 hybrid KV cache: gpu_memory_mb={gpu_memory_mb} is smaller than one \
+                     sequence's coordinated full+sliding requirement plus null blocks ({} MiB)",
+                    minimum_pool_bytes.div_ceil(BYTES_PER_MIB),
                 )));
             }
-
-            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-                num_blocks, block_size,
-            )));
-
+            // vLLM-style shared capacity: do not statically partition one full
+            // `max_position_embeddings` or one complete sliding window per
+            // scheduler slot. Keep enough blocks for one maximum-context
+            // request plus at least one starter block per live row, then let
+            // recompute preemption arbitrate aggregate pressure as rows grow.
+            let required_bytes_for_width = |width: u32| {
+                kv_cache_groups.iter().zip(&group_bytes_per_block).fold(
+                    0u64,
+                    |sum, (group, bytes_per_block)| {
+                        let blocks = gemma4_group_reserved_blocks(
+                            group.attention_kind,
+                            group.max_admission_blocks,
+                            width,
+                        );
+                        sum.saturating_add(u64::from(blocks).saturating_mul(*bytes_per_block))
+                    },
+                )
+            };
+            let mut max_concurrent_sequences = GEMMA4_PAGED_DEFAULT_MAX_SEQUENCES.min(32);
+            while max_concurrent_sequences > 1
+                && required_bytes_for_width(max_concurrent_sequences) > memory_bytes
+            {
+                max_concurrent_sequences -= 1;
+            }
+            let reserved_bytes = required_bytes_for_width(max_concurrent_sequences);
+            if reserved_bytes > memory_bytes {
+                return Err(napi::Error::from_reason(format!(
+                    "Gemma4 hybrid KV cache: gpu_memory_mb={gpu_memory_mb} cannot reserve one \
+                     full-context request plus one sliding-window lane"
+                )));
+            }
+            let mut unassigned_bytes = memory_bytes.saturating_sub(reserved_bytes);
             let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-            let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
-                .map_err(|e| {
+            let mut adapters = Vec::with_capacity(kv_cache_groups.len());
+            let mut total_physical_blocks = 0u32;
+            for (group, bytes_per_block) in kv_cache_groups
+                .iter()
+                .zip(group_bytes_per_block.iter().copied())
+            {
+                let mut desired_blocks = gemma4_group_reserved_blocks(
+                    group.attention_kind,
+                    group.max_admission_blocks,
+                    max_concurrent_sequences,
+                );
+                if matches!(group.attention_kind, AttentionKind::Full) {
+                    let extra_blocks = unassigned_bytes / bytes_per_block;
+                    let extra_blocks = u32::try_from(extra_blocks).unwrap_or(u32::MAX);
+                    desired_blocks = desired_blocks.saturating_add(extra_blocks);
+                    unassigned_bytes = unassigned_bytes
+                        .saturating_sub(u64::from(extra_blocks).saturating_mul(bytes_per_block));
+                }
+                // The config's memory field is validation/telemetry metadata;
+                // this grouped path supplies the authoritative exact block
+                // count below. Keep it above PagedAttentionConfig's legacy
+                // per-pool minimum without turning MiB rounding into extra
+                // physical blocks outside the coordinated total budget.
+                let group_memory_mb = bytes_per_block
+                    .saturating_mul(u64::from(desired_blocks))
+                    .div_ceil(BYTES_PER_MIB)
+                    .max(u64::from(GEMMA4_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB));
+                let group_memory_mb = u32::try_from(group_memory_mb).unwrap_or(u32::MAX);
+                let pa_config = mlx_paged_attn::PagedAttentionConfig {
+                    block_size,
+                    gpu_memory_mb: group_memory_mb,
+                    head_size: group.physical_layout.head_size,
+                    num_kv_heads: group.physical_layout.num_kv_heads,
+                    num_layers: u32::try_from(group.physical_layer_indices.len()).map_err(
+                        |_| {
+                            napi::Error::from_reason(
+                                "Gemma4 hybrid KV physical layer count overflow",
+                            )
+                        },
+                    )?,
+                    use_fp8_cache: Some(false),
+                    max_seq_len: Some(max_seq_len),
+                    max_batch_size: Some(max_concurrent_sequences),
+                };
+                if pa_config.calculate_num_blocks() < desired_blocks {
+                    return Err(napi::Error::from_reason(format!(
+                        "Gemma4 KV group {} calculated fewer blocks than the required \
+                         {desired_blocks}",
+                        group.group_id
+                    )));
+                }
+                total_physical_blocks = total_physical_blocks.saturating_add(desired_blocks);
+                let allocator = Arc::new(std::sync::Mutex::new(
+                    mlx_paged_attn::BlockAllocator::new(desired_blocks, block_size),
+                ));
+                let pool = mlx_paged_attn::LayerKVPool::new(pa_config, desired_blocks, cache_dtype)
+                    .map_err(|error| {
+                        napi::Error::from_reason(format!(
+                            "Failed to construct Gemma4 KV group {} pool: {error}",
+                            group.group_id
+                        ))
+                    })?;
+                let adapter = match group.attention_kind {
+                    AttentionKind::Full => {
+                        PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
+                    }
+                    AttentionKind::SlidingWindow { sliding_window } => {
+                        PagedKVCacheAdapter::new_sliding(
+                            allocator,
+                            Arc::new(pool),
+                            block_size,
+                            sliding_window,
+                            max_seq_len,
+                        )
+                    }
+                }
+                .map_err(|error| {
                     napi::Error::from_reason(format!(
-                        "Failed to construct LayerKVPool for Gemma4 block-paged adapter: {e}"
+                        "Failed to construct Gemma4 KV group {} adapter: {error}",
+                        group.group_id
                     ))
                 })?;
+                adapters.push(adapter);
+            }
+            let full_group_max_admission_blocks = full_group.max_admission_blocks;
 
-            let adapter =
-                PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
-                    napi::Error::from_reason(format!(
-                        "Failed to construct Gemma4 PagedKVCacheAdapter: {e}"
-                    ))
-                })?;
+            let coordinator = Gemma4KVCacheCoordinator::new(
+                &kv_cache_specs,
+                kv_cache_groups,
+                adapters,
+                max_concurrent_sequences,
+            )
+            .map_err(|error| {
+                napi::Error::from_reason(format!(
+                    "Failed to construct Gemma4 KV cache coordinator: {error}"
+                ))
+            })?;
+            let (sliding_groups, max_sliding_window, max_sliding_admission_blocks) =
+                coordinator.sliding_capacity_summary();
 
             tracing::info!(
-                "Gemma4 block-paged adapter enabled: num_blocks={num_blocks}, \
+                "Gemma4 hybrid block-paged cache enabled: total_physical_blocks={total_physical_blocks}, \
                  block_size={block_size}, gpu_memory_mb={gpu_memory_mb}, \
                  paged_cache_memory_source={paged_cache_memory_source}, \
-                 max_seq_len={max_seq_len}, max_cached_tokens={}, \
-                 physical_full_layers={num_global_layers}, kv_groups={}, \
-                 full_group_max_admission_blocks={}, cache_dtype=BFloat16",
-                num_blocks.saturating_mul(block_size),
-                kv_cache_groups.len(),
-                full_group.max_admission_blocks
+                 max_seq_len={max_seq_len}, max_concurrent_sequences={max_concurrent_sequences}, \
+                 kv_groups={}, \
+                 full_group_max_admission_blocks={}, sliding_groups={sliding_groups}, \
+                 max_sliding_window={max_sliding_window}, \
+                 max_sliding_admission_blocks={max_sliding_admission_blocks}, \
+                 cache_dtype=BFloat16",
+                coordinator.inner.groups().len(),
+                full_group_max_admission_blocks
             );
-            Some(adapter)
+            Some(coordinator)
         } else {
             None
         };
@@ -1759,18 +2336,21 @@ impl Gemma4Inner {
         // `paged_adapter` built above, since that already validated a
         // strictly stronger constraint (a single full-attention group) over
         // the same specs.
-        let layer_kinds = if paged_adapter.is_some() {
-            compute_layer_kinds_from_kv_cache_specs(&config).map_err(|e| {
-                Error::from_reason(format!(
-                    "Gemma4Inner::new: failed to derive cached layer-kind routes: {e}"
-                ))
-            })?
+        let layer_kinds = if let Some(coordinator) = kv_cache_coordinator.as_ref() {
+            layer_kinds_from_routes(coordinator.routes(), config.num_hidden_layers as usize)
+                .map_err(|e| {
+                    Error::from_reason(format!(
+                        "Gemma4Inner::new: failed to derive cached layer-kind routes: {e}"
+                    ))
+                })?
         } else {
             Vec::new()
         };
 
+        let active_flat_session = kv_cache_coordinator.is_none();
         Ok(Self {
             config,
+            turn_cancel: None,
             embed_tokens,
             layers,
             final_norm,
@@ -1784,19 +2364,18 @@ impl Gemma4Inner {
             image_processor,
             tokenizer: None,
             caches: None,
+            active_flat_session,
             cached_token_history: Vec::new(),
             cached_image_key: None,
             cached_audio_key: None,
             cached_paged_image_token_positions: Vec::new(),
-            paged_adapter,
+            kv_cache_coordinator,
+            active_paged_seq: 0,
             draft: None,
             draft_turn_state: None,
             layer_kinds,
             sliding_prefix_checkpoints: VecDeque::new(),
-            sliding_prompt_boundary_checkpoint: None,
-            sliding_cold_restore_tail_checkpoint: None,
-            paged_turn_prompt_len: 0,
-            sliding_last_history_checkpoint: None,
+            grouped_sliding_cold_checkpoints: HashMap::new(),
             media_session_context: MediaCapabilities::NONE,
             paged_text_turn_context: MediaCapabilities::NONE,
             media_session_continuable: false,
@@ -1818,7 +2397,7 @@ impl Gemma4Inner {
             self.embed_vision.is_some(),
             self.vision_tower.is_some(),
             self.unified_vision_embedder.is_some(),
-            self.paged_adapter.is_some(),
+            self.kv_cache_coordinator.is_some(),
         )
     }
 
@@ -1842,6 +2421,49 @@ impl Gemma4Inner {
     /// gate; see `mtp_turn`).
     pub(crate) fn has_draft(&self) -> bool {
         self.draft.is_some()
+    }
+
+    pub(crate) fn set_active_paged_owner(&mut self, seq_id: u32) {
+        self.active_flat_session = false;
+        self.active_paged_seq = seq_id;
+        self.caches = None;
+    }
+
+    pub(crate) fn install_flat_owner_caches(&mut self, caches: Option<Vec<Gemma4LayerCache>>) {
+        self.active_flat_session = true;
+        self.active_paged_seq = 0;
+        self.caches = caches;
+    }
+
+    pub(crate) fn select_ownerless_lane(&mut self, flat: bool) {
+        self.active_flat_session = flat;
+        self.active_paged_seq = 0;
+    }
+
+    pub(crate) fn take_flat_owner_caches(&mut self) -> Option<Vec<Gemma4LayerCache>> {
+        self.caches.take()
+    }
+
+    pub(crate) fn owner_metadata(&self) -> Gemma4OwnerMetadata {
+        Gemma4OwnerMetadata {
+            cached_token_history: self.cached_token_history.clone(),
+            cached_image_key: self.cached_image_key,
+            cached_audio_key: self.cached_audio_key,
+            cached_paged_image_token_positions: self.cached_paged_image_token_positions.clone(),
+            media_session_context: self.media_session_context,
+            media_session_continuable: self.media_session_continuable,
+        }
+    }
+
+    pub(crate) fn install_owner_metadata(&mut self, state: Gemma4OwnerMetadata) {
+        self.cached_token_history = state.cached_token_history;
+        self.cached_image_key = state.cached_image_key;
+        self.cached_audio_key = state.cached_audio_key;
+        self.cached_paged_image_token_positions = state.cached_paged_image_token_positions;
+        self.media_session_context = state.media_session_context;
+        self.media_session_continuable = state.media_session_continuable;
+        self.paged_text_turn_context = MediaCapabilities::NONE;
+        self.paged_finalize_failed = false;
     }
 
     /// Initialize the per-turn KV caches in-place.
@@ -1883,6 +2505,350 @@ impl Gemma4Inner {
         Ok(self.layer_kinds.clone())
     }
 
+    /// Prepare a scheduler text turn by finding one common prefix boundary for
+    /// the full-attention and sliding-window cache groups. The full group owns
+    /// the content-addressed hot/SSD lookup; a validated sliding sidecar is the
+    /// joint commit record. Any missing, malformed, or un-installable sidecar
+    /// restarts every group at zero rather than resuming split-brain state.
+    pub(crate) fn prepare_scheduled_text_request(
+        &mut self,
+        seq_id: u32,
+        tokens: &[u32],
+        cache_salt: u64,
+        reuse_cache: bool,
+    ) -> Result<u32> {
+        let total_budget = tokens.len() as u32;
+        let geometry = sliding_sidecar::geometry(&self.config);
+        let coordinator = self
+            .kv_cache_coordinator
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Gemma4 scheduled route requires coordinator"))?;
+        let block_size = coordinator.full_adapter().block_size();
+        let extra_keys = engine::build_paged_extra_keys(tokens.len(), block_size, &[]);
+        let plan = coordinator
+            .full_adapter_mut()
+            .prepare_turn_per_block_with_max_cache_hit_tokens(
+                seq_id,
+                tokens,
+                total_budget,
+                reuse_cache,
+                &extra_keys,
+                cache_salt,
+                false,
+                total_budget.saturating_sub(1),
+            )
+            .map_err(Error::from_reason)?;
+
+        if plan.continued_live_prefix {
+            if let Err(error) = coordinator.continue_sliding_all(
+                seq_id,
+                tokens,
+                total_budget,
+                plan.cached_prefix_len,
+            ) {
+                tracing::warn!(
+                    target: "mlx_core::gemma4::paged",
+                    "Gemma4 hybrid live continuation disagreed across groups; restarting cold: {error}"
+                );
+                coordinator
+                    .full_adapter_mut()
+                    .restart_prepared_turn_cold_per_block(
+                        seq_id,
+                        tokens,
+                        total_budget,
+                        &extra_keys,
+                        cache_salt,
+                    )
+                    .map_err(Error::from_reason)?;
+                coordinator
+                    .reset_sliding_requests(seq_id)
+                    .map_err(Error::from_reason)?;
+                return Ok(0);
+            }
+            return Ok(plan.cached_prefix_len);
+        }
+
+        if plan.cached_prefix_len == 0 {
+            coordinator
+                .reset_sliding_requests(seq_id)
+                .map_err(Error::from_reason)?;
+            return Ok(0);
+        }
+
+        let restored = coordinator.full_adapter_mut().take_restored_sidecar();
+        let installed_boundary = if let Some(geometry) = geometry.as_ref() {
+            let expected_layout = sliding_sidecar::layout_at(geometry, plan.cached_prefix_len);
+            crate::cold_tier::try_install_cold_sidecar(
+                restored,
+                &expected_layout,
+                |tensors, boundary| {
+                    let Some(layer_kv) =
+                        sliding_sidecar::decode_layer_kv(geometry, tensors, boundary)?
+                    else {
+                        return Ok(None);
+                    };
+                    if coordinator
+                        .restore_sliding_groups(seq_id, tokens, boundary, &layer_kv)
+                        .is_err()
+                    {
+                        return Ok(None);
+                    }
+                    Ok(Some(boundary))
+                },
+            )?
+        } else {
+            None
+        };
+        if let Some(boundary) = installed_boundary {
+            return Ok(boundary);
+        }
+
+        // A hot-only full-group hit is deliberately not enough: the sliding
+        // group has no matching state. Discard it and allocate a fresh request
+        // in every group.
+        coordinator
+            .full_adapter_mut()
+            .restart_prepared_turn_cold_per_block(
+                seq_id,
+                tokens,
+                total_budget,
+                &extra_keys,
+                cache_salt,
+            )
+            .map_err(Error::from_reason)?;
+        coordinator
+            .reset_sliding_requests(seq_id)
+            .map_err(Error::from_reason)?;
+        Ok(0)
+    }
+
+    fn remember_grouped_sliding_cold_checkpoint(&mut self, seq_id: u32) -> Result<()> {
+        let candidates = {
+            let Some(coordinator) = self.kv_cache_coordinator.as_ref() else {
+                return Ok(());
+            };
+            let full = coordinator.full_adapter();
+            let cold = full.cold_tier();
+            if !gemma4_sliding_cold_ladder_wanted(cold) {
+                return Ok(());
+            }
+            let Some(recorded) = full.current_token_count_for(seq_id) else {
+                return Ok(());
+            };
+            let block_size = full.block_size();
+            let caps = gemma4_sliding_retention_caps_for_cold_tier(&self.config, cold, block_size);
+            let Some(tokens) = full.request_tokens_for(seq_id) else {
+                return Ok(());
+            };
+            caps.anchors
+                .as_slice()
+                .iter()
+                .copied()
+                .filter(|&boundary| boundary <= recorded)
+                .filter_map(|boundary| {
+                    tokens
+                        .get(..boundary as usize)
+                        .map(|tokens| (boundary, tokens.to_vec(), caps.anchors.len))
+                })
+                .collect::<Vec<_>>()
+        };
+        for (boundary, tokens, max_checkpoints) in candidates {
+            if self
+                .grouped_sliding_cold_checkpoints
+                .get(&seq_id)
+                .is_some_and(|checkpoints| {
+                    checkpoints.iter().any(|checkpoint| {
+                        checkpoint.boundary == boundary && checkpoint.tokens == tokens
+                    })
+                })
+            {
+                continue;
+            }
+            let Some(layer_kv) = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason(
+                        "Gemma4 grouped cold capture lost its KV coordinator".to_string(),
+                    )
+                })?
+                .read_sliding_groups_at(seq_id, boundary)
+                .map_err(Error::from_reason)?
+            else {
+                // The scheduler may first observe an old rung after its rows
+                // have already rotated out. A later rung can still be captured;
+                // missing this one is a cache miss, not an inference failure.
+                continue;
+            };
+            let checkpoints = self
+                .grouped_sliding_cold_checkpoints
+                .entry(seq_id)
+                .or_default();
+            checkpoints.push_back(Gemma4GroupedSlidingColdCheckpoint {
+                boundary,
+                tokens,
+                layer_kv,
+            });
+            while checkpoints.len() > max_checkpoints.max(1) {
+                checkpoints.pop_front();
+            }
+        }
+        Ok(())
+    }
+
+    fn settle_grouped_kv_step(&mut self, seq_id: u32) -> Result<()> {
+        self.kv_cache_coordinator
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
+            .eval_pending_pool_writes_all()
+            .map_err(Error::from_reason)?;
+        self.remember_grouped_sliding_cold_checkpoint(seq_id)?;
+        self.kv_cache_coordinator
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
+            .prune_sliding_all(seq_id)
+            .map(|_| ())
+            .map_err(Error::from_reason)
+    }
+
+    pub(crate) fn scheduled_cold_anchor_rungs(&self) -> Vec<u32> {
+        let Some(coordinator) = self.kv_cache_coordinator.as_ref() else {
+            return Vec::new();
+        };
+        let full = coordinator.full_adapter();
+        gemma4_sliding_retention_caps_for_cold_tier(
+            &self.config,
+            full.cold_tier(),
+            full.block_size(),
+        )
+        .anchors
+        .as_slice()
+        .to_vec()
+    }
+
+    fn capture_grouped_sliding_cold_sidecar(
+        &mut self,
+        seq_id: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+    ) {
+        crate::cold_tier::cold_sidecar_counters().record_capture_reached();
+        let Some((block_size, frontier, request_tokens, anchors)) =
+            self.kv_cache_coordinator.as_ref().and_then(|coordinator| {
+                let full = coordinator.full_adapter();
+                let cold = full.cold_tier()?;
+                if cold
+                    .sidecar_policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.group() != mlx_paged_attn::ColdGroup::SlidingWindow)
+                {
+                    return None;
+                }
+                let block_size = full.block_size();
+                let request_tokens = full.request_tokens_for(seq_id)?.to_vec();
+                let anchors = gemma4_sliding_retention_caps_for_cold_tier(
+                    &self.config,
+                    Some(cold),
+                    block_size,
+                )
+                .anchors
+                .as_slice()
+                .to_vec();
+                Some((
+                    block_size,
+                    full.cold_captured_blocks().saturating_mul(block_size),
+                    request_tokens,
+                    anchors,
+                ))
+            })
+        else {
+            return;
+        };
+        let checkpoints = self.grouped_sliding_cold_checkpoints.get(&seq_id).cloned();
+        let checkpoint = resolve_grouped_sliding_cold_checkpoint(
+            checkpoints.as_ref(),
+            &anchors,
+            frontier,
+            &request_tokens,
+            |boundary| {
+                self.kv_cache_coordinator
+                    .as_mut()
+                    .ok_or_else(|| {
+                        "Gemma4 grouped cold capture lost its KV coordinator".to_string()
+                    })?
+                    .read_sliding_groups_at(seq_id, boundary)
+            },
+        );
+        let Some(checkpoint) = (match checkpoint {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                tracing::debug!(
+                    target: "mlx_core::gemma4::paged",
+                    "Gemma4 grouped sliding live-anchor capture failed: {error}"
+                );
+                None
+            }
+        }) else {
+            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
+            return;
+        };
+        let Some(coordinator) = self.kv_cache_coordinator.as_ref() else {
+            return;
+        };
+        let full = coordinator.full_adapter();
+        let Some(cold) = full.cold_tier() else {
+            return;
+        };
+        let Some(geometry) = sliding_sidecar::geometry(&self.config) else {
+            return;
+        };
+        let Some(key) = gemma4_sliding_cold_sidecar_chain_key(
+            cold.fingerprint,
+            &request_tokens,
+            extra_keys_per_block,
+            block_size,
+            checkpoint.boundary,
+            cache_salt,
+        ) else {
+            return;
+        };
+        if cold
+            .manager
+            .contains_in(&key, mlx_paged_attn::ColdGroup::SlidingWindow)
+        {
+            crate::cold_tier::cold_sidecar_counters().record_already_persisted();
+            return;
+        }
+        let refs = checkpoint
+            .layer_kv
+            .iter()
+            .flat_map(|(keys, values)| [keys, values])
+            .collect::<Vec<_>>();
+        if MxArray::eval_arrays(&refs).is_err() {
+            return;
+        }
+        let Ok(Some(tensors)) =
+            sliding_sidecar::encode_layer_kv(&geometry, &checkpoint.layer_kv, checkpoint.boundary)
+        else {
+            return;
+        };
+        let sidecar = mlx_paged_attn::ColdSidecar {
+            key,
+            fingerprint: cold.fingerprint,
+            layout: sliding_sidecar::layout_at(&geometry, checkpoint.boundary),
+            tensors,
+        };
+        let deadline = std::time::Instant::now() + full.cold_capture_budget().max_walk;
+        match cold.manager.enqueue_sidecar_before(sidecar, deadline) {
+            Ok(true) => crate::cold_tier::cold_sidecar_counters().record_enqueued(),
+            Ok(false) => crate::cold_tier::cold_sidecar_counters().record_queue_drop(),
+            Err(error) => tracing::debug!(
+                target: "mlx_core::gemma4::paged",
+                "Gemma4 grouped sliding sidecar enqueue failed: {error}"
+            ),
+        }
+    }
+
     /// Drop the live KV caches and clear reuse-tracking state.
     ///
     /// `Gemma4LayerCache` has no `reset()` (the inner `KVCache` /
@@ -1911,10 +2877,7 @@ impl Gemma4Inner {
         self.media_session_context = MediaCapabilities::NONE;
         self.paged_text_turn_context = MediaCapabilities::NONE;
         self.sliding_prefix_checkpoints.clear();
-        self.sliding_prompt_boundary_checkpoint = None;
-        self.sliding_cold_restore_tail_checkpoint = None;
-        self.paged_turn_prompt_len = 0;
-        self.sliding_last_history_checkpoint = None;
+        self.grouped_sliding_cold_checkpoints.clear();
         // Covers both reset paths (init_caches_sync + reset_caches_sync): a
         // session that just dropped its media KV can no longer warm-continue.
         self.media_session_continuable = false;
@@ -1936,82 +2899,6 @@ impl Gemma4Inner {
         };
     }
 
-    fn find_gemma4_sliding_history_checkpoint(
-        &self,
-        tokens: &[u32],
-        prefix_len: u32,
-        image_token_positions: &[(u32, u64)],
-    ) -> Result<Option<Vec<Gemma4LayerCache>>> {
-        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return Ok(None);
-        };
-        let Some(checkpoint) = self.sliding_last_history_checkpoint.as_ref() else {
-            return Ok(None);
-        };
-        if checkpoint.tokens.as_slice() != prefix_tokens
-            || checkpoint.image_token_positions.as_slice() != image_token_positions
-        {
-            return Ok(None);
-        }
-        restore_gemma4_sliding_caches(&self.config, &checkpoint.snapshots, prefix_len)
-    }
-
-    fn remember_gemma4_sliding_history_checkpoint(
-        &mut self,
-        history_tokens: &[u32],
-    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
-        let trace_enabled = inference_trace_enabled();
-        let total_start = trace_enabled.then(std::time::Instant::now);
-        let mut trace = Gemma4SlidingCheckpointStoreTrace::default();
-        if history_tokens.is_empty() {
-            self.sliding_last_history_checkpoint = None;
-            return Ok(trace.finish(total_start));
-        }
-
-        let expected_offset = history_tokens.len() as u32;
-        if !gemma4_sliding_caches_ready_at(&self.config, self.caches.as_deref(), expected_offset)? {
-            self.sliding_last_history_checkpoint = None;
-            return Ok(trace.finish(total_start));
-        }
-
-        let eval_start = trace_enabled.then(std::time::Instant::now);
-        eval_gemma4_caches(
-            self.caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Gemma4 sliding checkpoint caches missing"))?,
-        )?;
-        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let snapshot_start = trace_enabled.then(std::time::Instant::now);
-        let Some(snapshots) = snapshot_gemma4_sliding_caches(
-            &self.config,
-            self.caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Gemma4 sliding checkpoint caches missing"))?,
-            expected_offset,
-        )?
-        else {
-            self.sliding_last_history_checkpoint = None;
-            trace.snapshot_ms = snapshot_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
-        };
-        trace.snapshot_ms = snapshot_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let token_clone_start = trace_enabled.then(std::time::Instant::now);
-        let tokens = history_tokens.to_vec();
-        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let update_start = trace_enabled.then(std::time::Instant::now);
-        self.sliding_last_history_checkpoint = Some(Gemma4SlidingHistoryCheckpoint {
-            tokens,
-            image_token_positions: self.cached_paged_image_token_positions.clone(),
-            snapshots,
-        });
-        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
-        trace.stored = true;
-        Ok(trace.finish(total_start))
-    }
-
     /// Retention caps for this turn.
     ///
     /// The whole decision — including whether this turn wants a ladder at all —
@@ -2028,7 +2915,7 @@ impl Gemma4Inner {
     ) -> Gemma4SlidingRetentionCaps {
         gemma4_sliding_retention_caps_for_cold_tier(
             &self.config,
-            self.paged_adapter
+            self.kv_cache_coordinator
                 .as_ref()
                 .and_then(|adapter| adapter.cold_tier()),
             block_size,
@@ -2106,20 +2993,6 @@ impl Gemma4Inner {
         }
 
         let mut best_hit: Option<Gemma4SlidingPrefixCheckpointHit> = None;
-        if let Some(checkpoint) = self.sliding_prompt_boundary_checkpoint.as_ref()
-            && let Some(hit) = try_restore_checkpoint(
-                &self.config,
-                checkpoint,
-                tokens,
-                prefix_len,
-                block_size,
-                extra_keys_per_block,
-                cache_salt,
-            )?
-        {
-            best_hit = Some(hit);
-        }
-
         for checkpoint in self.sliding_prefix_checkpoints.iter().rev() {
             if best_hit
                 .as_ref()
@@ -2144,123 +3017,6 @@ impl Gemma4Inner {
         }
 
         Ok(best_hit)
-    }
-
-    fn remember_gemma4_sliding_prefix_checkpoint(
-        &mut self,
-        tokens: &[u32],
-        prefix_len: u32,
-        block_size: u32,
-        cache_salt: u64,
-    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
-        let extra_keys_per_block = engine::build_paged_extra_keys(
-            tokens.len(),
-            block_size,
-            &self.cached_paged_image_token_positions,
-        );
-        self.remember_gemma4_sliding_prefix_checkpoint_with_keys(
-            tokens,
-            prefix_len,
-            block_size,
-            &extra_keys_per_block,
-            cache_salt,
-        )
-    }
-
-    fn remember_gemma4_sliding_prefix_checkpoint_with_keys(
-        &mut self,
-        tokens: &[u32],
-        prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
-        let trace_enabled = inference_trace_enabled();
-        let total_start = trace_enabled.then(std::time::Instant::now);
-        let mut trace = Gemma4SlidingCheckpointStoreTrace::default();
-        let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash_with_keys(
-            tokens,
-            prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-        ) else {
-            return Ok(trace.finish(total_start));
-        };
-        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return Ok(trace.finish(total_start));
-        };
-        if !gemma4_sliding_caches_ready_at(&self.config, self.caches.as_deref(), prefix_len)? {
-            return Ok(trace.finish(total_start));
-        }
-
-        let eval_start = trace_enabled.then(std::time::Instant::now);
-        eval_gemma4_caches(
-            self.caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Gemma4 sliding prefix caches missing"))?,
-        )?;
-        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let snapshot_start = trace_enabled.then(std::time::Instant::now);
-        let Some(snapshots) = snapshot_gemma4_sliding_caches(
-            &self.config,
-            self.caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Gemma4 sliding prefix caches missing"))?,
-            prefix_len,
-        )?
-        else {
-            trace.snapshot_ms = snapshot_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
-        };
-        trace.snapshot_ms = snapshot_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let token_clone_start = trace_enabled.then(std::time::Instant::now);
-        let prefix_tokens = prefix_tokens.to_vec();
-        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let update_start = trace_enabled.then(std::time::Instant::now);
-        // Hoisted before the `&mut` borrow of the store, as the captured path
-        // already does.
-        let caps = self.gemma4_sliding_retention_caps_for_turn(block_size);
-        upsert_gemma4_sliding_prefix_checkpoint(
-            &mut self.sliding_prefix_checkpoints,
-            Gemma4SlidingPrefixCheckpointDraft {
-                prefix_len,
-                block_size,
-                final_block_hash,
-                protected_image_prompt_boundary: false,
-                tokens: prefix_tokens,
-                snapshots,
-            },
-            caps,
-            trace_enabled,
-        );
-        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
-        trace.stored = true;
-        Ok(trace.finish(total_start))
-    }
-
-    fn remember_gemma4_sliding_materialized_prefix_checkpoint(
-        &mut self,
-        tokens: &[u32],
-        prefix_len: u32,
-        block_size: u32,
-        cache_salt: u64,
-    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
-        let extra_keys_per_block = engine::build_paged_extra_keys(
-            tokens.len(),
-            block_size,
-            &self.cached_paged_image_token_positions,
-        );
-        self.remember_gemma4_sliding_materialized_prefix_checkpoint_with_keys(
-            tokens,
-            prefix_len,
-            block_size,
-            &extra_keys_per_block,
-            cache_salt,
-        )
     }
 
     fn remember_gemma4_sliding_materialized_prefix_checkpoint_with_keys(
@@ -2332,270 +3088,6 @@ impl Gemma4Inner {
         Ok(trace.finish(total_start))
     }
 
-    /// Store a prefix checkpoint captured from inside a larger prefill compute
-    /// chunk. Unlike the live-cache path above, these snapshots describe an
-    /// earlier logical offset and therefore must not be re-read from
-    /// `self.caches`, which has already advanced to the chunk end.
-    fn remember_gemma4_sliding_captured_prefix_checkpoint(
-        &mut self,
-        tokens: &[u32],
-        prefix_len: u32,
-        block_size: u32,
-        cache_salt: u64,
-        mut snapshots: Vec<Option<RotatingKVCacheSnapshot>>,
-        sink: Gemma4SlidingCapturedCheckpointSink,
-    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
-        let trace_enabled = inference_trace_enabled();
-        let total_start = trace_enabled.then(std::time::Instant::now);
-        let mut trace = Gemma4SlidingCheckpointStoreTrace::default();
-        let extra_keys_per_block = engine::build_paged_extra_keys(
-            tokens.len(),
-            block_size,
-            &self.cached_paged_image_token_positions,
-        );
-        let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash_with_keys(
-            tokens,
-            prefix_len,
-            block_size,
-            &extra_keys_per_block,
-            cache_salt,
-        ) else {
-            return Ok(trace.finish(total_start));
-        };
-        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            return Ok(trace.finish(total_start));
-        };
-        if !gemma4_sliding_snapshots_ready_at(&self.config, &snapshots, prefix_len) {
-            return Err(Error::from_reason(format!(
-                "Gemma4 captured sliding snapshots are incomplete at offset {prefix_len}"
-            )));
-        }
-
-        let eval_start = trace_enabled.then(std::time::Instant::now);
-        materialize_gemma4_sliding_snapshots(&mut snapshots)?;
-        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let token_clone_start = trace_enabled.then(std::time::Instant::now);
-        let prefix_tokens = prefix_tokens.to_vec();
-        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let update_start = trace_enabled.then(std::time::Instant::now);
-        let caps = self.gemma4_sliding_retention_caps_for_turn(block_size);
-        let draft = Gemma4SlidingPrefixCheckpointDraft {
-            prefix_len,
-            block_size,
-            final_block_hash,
-            protected_image_prompt_boundary: false,
-            tokens: prefix_tokens,
-            snapshots,
-        };
-        match sink {
-            Gemma4SlidingCapturedCheckpointSink::PrefixStore => {
-                upsert_gemma4_sliding_prefix_checkpoint(
-                    &mut self.sliding_prefix_checkpoints,
-                    draft,
-                    caps,
-                    trace_enabled,
-                );
-            }
-            Gemma4SlidingCapturedCheckpointSink::ColdRestoreTail => {
-                self.sliding_cold_restore_tail_checkpoint = Some(draft.into_checkpoint(caps));
-            }
-        }
-        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
-        trace.stored = true;
-        Ok(trace.finish(total_start))
-    }
-
-    fn remember_gemma4_sliding_materialized_prompt_boundary_checkpoint(
-        &mut self,
-        tokens: &[u32],
-        prefix_len: u32,
-        block_size: u32,
-        cache_salt: u64,
-    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
-        let extra_keys_per_block = engine::build_paged_extra_keys(
-            tokens.len(),
-            block_size,
-            &self.cached_paged_image_token_positions,
-        );
-        self.remember_gemma4_sliding_materialized_prompt_boundary_checkpoint_with_keys(
-            tokens,
-            prefix_len,
-            block_size,
-            &extra_keys_per_block,
-            cache_salt,
-            false,
-        )
-    }
-
-    fn remember_gemma4_sliding_materialized_prompt_boundary_checkpoint_with_keys(
-        &mut self,
-        tokens: &[u32],
-        prefix_len: u32,
-        block_size: u32,
-        extra_keys_per_block: &[Vec<u64>],
-        cache_salt: u64,
-        protect_image_prompt_boundary: bool,
-    ) -> Result<Gemma4SlidingCheckpointStoreTrace> {
-        let trace_enabled = inference_trace_enabled();
-        let total_start = trace_enabled.then(std::time::Instant::now);
-        let mut trace = Gemma4SlidingCheckpointStoreTrace::default();
-        let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash_with_keys(
-            tokens,
-            prefix_len,
-            block_size,
-            extra_keys_per_block,
-            cache_salt,
-        ) else {
-            self.sliding_prompt_boundary_checkpoint = None;
-            return Ok(trace.finish(total_start));
-        };
-        let Some(prefix_tokens) = tokens.get(..prefix_len as usize) else {
-            self.sliding_prompt_boundary_checkpoint = None;
-            return Ok(trace.finish(total_start));
-        };
-        if !gemma4_sliding_caches_ready_at(&self.config, self.caches.as_deref(), prefix_len)? {
-            self.sliding_prompt_boundary_checkpoint = None;
-            return Ok(trace.finish(total_start));
-        }
-
-        let snapshot_start = trace_enabled.then(std::time::Instant::now);
-        let Some(mut snapshots) = snapshot_gemma4_sliding_caches(
-            &self.config,
-            self.caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("Gemma4 sliding prefix caches missing"))?,
-            prefix_len,
-        )?
-        else {
-            self.sliding_prompt_boundary_checkpoint = None;
-            trace.snapshot_ms = snapshot_start.map(elapsed_ms).unwrap_or(0.0);
-            return Ok(trace.finish(total_start));
-        };
-        trace.snapshot_ms = snapshot_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let eval_start = trace_enabled.then(std::time::Instant::now);
-        materialize_gemma4_sliding_snapshots(&mut snapshots)?;
-        trace.eval_ms = eval_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let token_clone_start = trace_enabled.then(std::time::Instant::now);
-        let prefix_tokens = prefix_tokens.to_vec();
-        trace.token_clone_ms = token_clone_start.map(elapsed_ms).unwrap_or(0.0);
-
-        let update_start = trace_enabled.then(std::time::Instant::now);
-        let draft = Gemma4SlidingPrefixCheckpointDraft {
-            prefix_len,
-            block_size,
-            final_block_hash,
-            protected_image_prompt_boundary: protect_image_prompt_boundary
-                && gemma4_prefix_uses_media_keys(prefix_len, block_size, extra_keys_per_block),
-            tokens: prefix_tokens,
-            snapshots,
-        };
-        let caps = self.gemma4_sliding_retention_caps_for_turn(block_size);
-        // The singleton is set first so the store's `&mut` borrow does not span
-        // the assignment; the clone is the same one this path always paid.
-        self.sliding_prompt_boundary_checkpoint = Some(draft.clone().into_checkpoint(caps));
-        upsert_gemma4_sliding_prefix_checkpoint(
-            &mut self.sliding_prefix_checkpoints,
-            draft,
-            caps,
-            trace_enabled,
-        );
-        trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
-        trace.stored = true;
-        Ok(trace.finish(total_start))
-    }
-
-    /// Publish this decode step's sliding checkpoint, if the cursor sits on a
-    /// boundary this turn publishes.
-    ///
-    /// Everything that DECIDES is in [`gemma4_sliding_decode_boundary_plan`];
-    /// this body only reads the adapter's three facts and does the I/O. That
-    /// split exists because the decision is the part that can silently
-    /// disconnect the cold tier (`want_ladder` hard-coded `false` here reverted
-    /// decode to cadence-only while every unit test stayed green), and it is
-    /// the part a test can execute without a GPU or a loaded checkpoint.
-    fn maybe_remember_gemma4_sliding_decode_boundary_checkpoint(
-        &mut self,
-        trace_label: &str,
-        trace_enabled: bool,
-    ) -> Result<()> {
-        let Some(adapter) = self.paged_adapter.as_ref() else {
-            return Ok(());
-        };
-        let Some(boundary) = gemma4_sliding_decode_boundary_plan(
-            &self.config,
-            adapter.cold_tier(),
-            adapter.block_size(),
-            adapter.current_token_count(),
-        ) else {
-            return Ok(());
-        };
-        let request_tokens = adapter.request_tokens().to_vec();
-
-        let store_trace = self.remember_gemma4_sliding_materialized_prefix_checkpoint(
-            &request_tokens,
-            boundary.prefix_len,
-            boundary.block_size,
-            0,
-        )?;
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {trace_label}_sliding_block_checkpoint boundary_tokens={} block_size={} checkpoint_interval={} cold_anchor_rung={} stored={} materialize_ms={:.1} snapshot_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
-                boundary.prefix_len,
-                boundary.block_size,
-                boundary.checkpoint_interval,
-                boundary.on_anchor_rung,
-                store_trace.stored,
-                store_trace.eval_ms,
-                store_trace.snapshot_ms,
-                store_trace.token_clone_ms,
-                store_trace.update_ms,
-                store_trace.total_ms
-            ));
-        }
-        Ok(())
-    }
-
-    fn maybe_remember_gemma4_sliding_prompt_boundary_checkpoint(
-        &mut self,
-        trace_label: &str,
-        tokens: &[u32],
-        boundary_len: u32,
-        trace_enabled: bool,
-    ) -> Result<()> {
-        let Some(adapter) = self.paged_adapter.as_ref() else {
-            return Ok(());
-        };
-        let block_size = adapter.block_size();
-        if boundary_len == 0 || block_size == 0 || !boundary_len.is_multiple_of(block_size) {
-            return Ok(());
-        }
-
-        let store_trace = self.remember_gemma4_sliding_materialized_prompt_boundary_checkpoint(
-            tokens,
-            boundary_len,
-            block_size,
-            0,
-        )?;
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {trace_label}_sliding_prompt_checkpoint boundary_tokens={} block_size={} stored={} materialize_ms={:.1} snapshot_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
-                boundary_len,
-                block_size,
-                store_trace.stored,
-                store_trace.eval_ms,
-                store_trace.snapshot_ms,
-                store_trace.token_clone_ms,
-                store_trace.update_ms,
-                store_trace.total_ms
-            ));
-        }
-        Ok(())
-    }
-
     fn prepare_gemma4_sliding_prefix_state_with_keys(
         &mut self,
         tokens: &[u32],
@@ -2604,6 +3096,7 @@ impl Gemma4Inner {
         extra_keys_per_block: &[Vec<u64>],
         image_token_positions: &[(u32, u64)],
         require_exact_checkpoint: bool,
+        cache_salt: u64,
     ) -> Result<Gemma4SlidingPrefixPreparation> {
         let trace_enabled = inference_trace_enabled();
         let prepare_start = trace_enabled.then(std::time::Instant::now);
@@ -2668,29 +3161,8 @@ impl Gemma4Inner {
             });
         }
 
-        let history_lookup_start = trace_enabled.then(std::time::Instant::now);
-        if let Some(caches) = self.find_gemma4_sliding_history_checkpoint(
-            tokens,
-            cached_prefix_len,
-            image_token_positions,
-        )? {
-            self.caches = Some(caches);
-            if trace_enabled {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 sliding_prefix_prepare_done state=last_history_checkpoint cached_prefix_tokens={} history_lookup_ms={:.1} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    history_lookup_start.map(elapsed_ms).unwrap_or(0.0),
-                    prepare_start.map(elapsed_ms).unwrap_or(0.0)
-                ));
-            }
-            return Ok(Gemma4SlidingPrefixPreparation {
-                state: "last_history_checkpoint",
-                primed_prefix_len: cached_prefix_len,
-            });
-        }
-
         let block_size = self
-            .paged_adapter
+            .kv_cache_coordinator
             .as_ref()
             .map(|adapter| adapter.block_size())
             .unwrap_or(0);
@@ -2700,7 +3172,7 @@ impl Gemma4Inner {
             cached_prefix_len,
             block_size,
             extra_keys_per_block,
-            0,
+            cache_salt,
         )? {
             let hit_prefix_len = hit.prefix_len;
             if require_exact_checkpoint && hit_prefix_len != cached_prefix_len {
@@ -2763,7 +3235,7 @@ impl Gemma4Inner {
             write_inference_trace(format_args!(
                 "[MLX_TRACE] gemma4 sliding_prefix_prepare_done state=replay cached_prefix_tokens={} history_lookup_ms={:.1} prefix_lookup_ms={:.1} elapsed_ms={:.1}",
                 cached_prefix_len,
-                history_lookup_start.map(elapsed_ms).unwrap_or(0.0),
+                0.0,
                 prefix_lookup_start.map(elapsed_ms).unwrap_or(0.0),
                 prepare_start.map(elapsed_ms).unwrap_or(0.0)
             ));
@@ -2785,12 +3257,11 @@ impl Gemma4Inner {
     /// decode.
     ///
     /// `ColdTierWalk::restore_extend` guarantees the sidecar backs EXACTLY the
-    /// prefix the adapter reported, so no boundary re-derivation is needed —
-    /// but every structural precondition is re-checked here anyway (group,
-    /// layout equality against this config's geometry, boundary equal to the
-    /// reported prefix). A contract slip must degrade to a MISS, i.e. a return
-    /// of `None` that falls through to the caller's full replay, never to
-    /// state installed at the wrong offset.
+    /// prefix the adapter reported. The shared cold-tier preparation re-checks
+    /// group, boundary, and loaded-config geometry before this family decodes
+    /// it. A contract slip must degrade to a MISS, i.e. a return of `None` that
+    /// falls through to the caller's full replay, never to state installed at
+    /// the wrong offset.
     ///
     /// Returns `None` when there is no sidecar, or when anything about it
     /// fails to line up. Taking the sidecar is unconditional so a rejected one
@@ -2799,435 +3270,35 @@ impl Gemma4Inner {
         &mut self,
         cached_prefix_len: u32,
     ) -> Result<Option<Gemma4SlidingPrefixPreparation>> {
-        let Some(adapter) = self.paged_adapter.as_mut() else {
-            return Ok(None);
-        };
-        let Some(sidecar) = adapter.take_restored_sidecar() else {
-            return Ok(None);
-        };
-        if sidecar.layout.group != mlx_paged_attn::ColdGroup::SlidingWindow {
-            return Ok(None);
-        }
-        let boundary = sidecar.layout.boundary_tokens;
-        // The walk reconciles the prefix and the state together, so the two
-        // boundaries must be identical. Accepting a shallower sidecar would
-        // create a global/sliding split-brain state; on an image turn it would
-        // also invite replay across real vision embeddings. Refuse every
-        // mismatch and let the caller restart cold.
-        if !gemma4_sliding_cold_sidecar_matches_prefix(boundary, cached_prefix_len) {
-            return Ok(None);
-        }
+        let restored = self
+            .kv_cache_coordinator
+            .as_mut()
+            .and_then(|coordinator| coordinator.take_restored_sidecar());
         let Some(geometry) = sliding_sidecar::geometry(&self.config) else {
             return Ok(None);
         };
-        // `load_sidecar` already compared the layout to the policy's template;
-        // comparing again against the geometry derived from the LOADED config
-        // makes the install independent of that earlier check.
-        if sliding_sidecar::layout_at(&geometry, boundary) != sidecar.layout {
-            return Ok(None);
-        }
-        let Some(snapshots) =
-            sliding_sidecar::decode_snapshots(&self.config, &geometry, &sidecar.tensors, boundary)?
-        else {
-            return Ok(None);
-        };
-        let Some(caches) = restore_gemma4_sliding_caches(&self.config, &snapshots, boundary)?
-        else {
-            return Ok(None);
-        };
-        self.caches = Some(caches);
-        // The one observable that separates "the tier restored the sliding half"
-        // from "the tier read it and every arm above declined". Both produce
-        // identical text, identical `num_tokens` and identical `cached_tokens`;
-        // only the second re-forwards the whole prefix.
-        crate::cold_tier::cold_sidecar_counters().record_install();
-        Ok(Some(Gemma4SlidingPrefixPreparation {
-            state: "cold_sidecar",
-            primed_prefix_len: boundary,
-        }))
-    }
-
-    /// Persist this turn's sliding-window state to the SSD cold tier, so a
-    /// later process can resume from the paged prefix WITHOUT replaying the
-    /// decoder over it (`run_sliding_only_prefill`).
-    ///
-    /// Best-effort and infallible by construction — every failure path is a
-    /// silent skip. A missing sidecar is never a correctness problem: the
-    /// restore walk simply reconciles the candidate prefix down past that
-    /// boundary and the state is recomputed exactly as it is today.
-    ///
-    /// The boundary is the DEEPEST `B` that satisfies all of:
-    ///
-    ///  * `B` is a positive multiple of the paged block size (see
-    ///    `sliding_sidecar::boundary_is_representable` — there is no window
-    ///    floor: the payload carries `min(B, window)` rows, exactly what a live
-    ///    rotating cache holds at that offset);
-    ///  * the persisted K/V chain reaches `B` (`cold_captured_blocks`) — a
-    ///    sidecar past the chain's break can never be selected, so writing one
-    ///    would only burn quota;
-    ///  * an already-materialized in-memory checkpoint sits exactly at `B` and
-    ///    matches this request's tokens AND its per-block cache identity, so
-    ///    the payload costs no extra forward and no extra `eval`.
-    ///
-    /// At most ONE sidecar per turn: the payload is `physical sliding layers ×
-    /// 2 × min(B, window) × kv_heads × head_dim` elements — hundreds of MiB on
-    /// a real checkpoint — and the writer queue is bounded.
-    ///
-    /// Pure-image turns use the same payload and image-aware key chain as their
-    /// global K/V blocks, but apply one additional conservative rule: `B` must
-    /// be at or after the complete expanded image run. This is stricter than the
-    /// causal E2B warm-path policy (which can use an exact checkpoint inside an
-    /// image run), deliberately: the first durable media implementation shares
-    /// one fail-closed rule with unified bidirectional vision and never resumes
-    /// from a half-image boundary.
-    fn capture_gemma4_sliding_cold_sidecar(&self, context: Gemma4SlidingColdCaptureContext<'_>) {
-        crate::cold_tier::cold_sidecar_counters().record_capture_reached();
-        let media = match context.media {
-            Gemma4SlidingColdCaptureMedia::Text => "text",
-            Gemma4SlidingColdCaptureMedia::PureImage => "image",
-        };
-        let Some(minimum_safe_boundary) = context.minimum_safe_boundary() else {
-            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
-            if inference_trace_enabled() {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=unsupported_media_capture_context media={} prompt_tokens={} image_tokens={}",
-                    media,
-                    context.prompt_len,
-                    context.image_token_positions.len(),
-                ));
-            }
-            return;
-        };
-        let Some(adapter) = self.paged_adapter.as_ref() else {
-            return;
-        };
-        let Some(cold) = adapter.cold_tier() else {
-            return;
-        };
-        let Some(policy) = cold.sidecar_policy.as_ref() else {
-            return;
-        };
-        if policy.group() != mlx_paged_attn::ColdGroup::SlidingWindow {
-            return;
-        }
-        let Some(geometry) = sliding_sidecar::geometry(&self.config) else {
-            return;
-        };
-        let block_size = adapter.block_size();
-        // The K/V capture walk that just ran spends its budget waiting for
-        // writer-queue slots, so it hands this sidecar a queue it may well have
-        // filled microseconds ago. A non-blocking offer here loses that race,
-        // and a dropped sidecar is strictly worse than a dropped block: the
-        // restore reconciles down to the deepest boundary a VALIDATED sidecar
-        // backs, so losing it makes the turn's entire persisted K/V chain
-        // unusable. Wait out the same budget the walk did.
-        let sidecar_wait = adapter.cold_capture_budget().max_walk;
-        if block_size == 0 {
-            return;
-        }
-        let request_tokens = adapter.request_tokens();
-        // Ceiling: whole blocks of this request that the persisted K/V chain
-        // actually covers.
-        let full_blocks = request_tokens.len() / block_size as usize;
-        // ...and no deeper than a restore of this prompt could ever ASK for.
-        //
-        // The two sides count different sequences. This capture runs at
-        // finalize, so `request_tokens` is the prompt plus everything the turn
-        // generated; the restore that has to find this object runs at prepare,
-        // over `prompt[..prompt_len - 1]`. Generated tokens do not widen that —
-        // a later turn resends a prompt, not a prompt plus its own completion —
-        // so the honest bound is the deepest boundary a restore of a prompt
-        // ENDING HERE could probe, which is
-        // `gemma4_cold_restore_reachable_boundary(prompt_len)`, not
-        // `request_tokens.len()` rounded down.
-        //
-        // The bound is conservative in the one direction that matters. A
-        // growing conversation (turn N+1's prompt = this turn's prompt plus its
-        // completion plus new user text) could reach one block deeper, and gives
-        // that block up here; a REPLAY of this exact prompt — which is what a
-        // cold tier exists for, since its whole point is a later process — can
-        // reach no further, and under the unclamped ceiling got back nothing at
-        // all whenever `prompt_len` was block-aligned.
-        let reachable_blocks =
-            gemma4_cold_restore_reachable_boundary(context.prompt_len, block_size) as usize
-                / block_size as usize;
-        let chain_blocks = gemma4_sliding_cold_capture_ceiling_blocks(
-            adapter.cold_captured_blocks(),
-            request_tokens.len(),
-            context.prompt_len,
-            block_size,
-        );
-        if chain_blocks == 0 {
-            // A different diagnosis from the checkpoint miss below: the
-            // persisted chain covers no whole block of this request, so no
-            // checkpoint at any depth could have been used. This is the arm a
-            // genuinely cold process hits on its first turns, while the bounded
-            // writer queue is still ratcheting the chain forward.
-            crate::cold_tier::cold_sidecar_counters().record_chain_empty();
-            if inference_trace_enabled() {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=persisted_chain_covers_no_whole_block cold_captured_blocks={} full_blocks={} restore_reachable_blocks={} prompt_tokens={} block_size={} request_tokens={}",
-                    adapter.cold_captured_blocks(),
-                    full_blocks,
-                    reachable_blocks,
-                    context.prompt_len,
-                    block_size,
-                    request_tokens.len()
-                ));
-            }
-            return;
-        }
-        let extra_keys_per_block = engine::build_paged_extra_keys(
-            request_tokens.len(),
-            block_size,
-            context.image_token_positions,
-        );
-
-        // Every representable boundary an in-memory checkpoint backs, deepest
-        // first. A LIST rather than the single deepest, because the deepest one
-        // may already be on disk and this walk has to be able to keep going —
-        // see the descent below.
-        let candidates = self.find_gemma4_sliding_capture_checkpoints(
-            &geometry,
-            request_tokens,
-            block_size,
-            chain_blocks,
-            &extra_keys_per_block,
-            minimum_safe_boundary,
-        );
-        if candidates.is_empty() {
-            // The one silent way this whole feature stays inert: a capture needs
-            // an already-materialized checkpoint sitting exactly on a block
-            // boundary AT OR BELOW the chain's reach, and the chain only
-            // advances one writer-queue's worth of blocks per turn.
-            //
-            // The cadence alone cannot supply one. It fires every
-            // `sliding_window` tokens, so its shallowest entry is one whole
-            // window, and `Gemma4SlidingRetentionPolicy::PreLadder` evicts
-            // oldest-first, so a prompt several windows long ends the prefill
-            // holding only its DEEPEST couple of entries. Measured on
-            // Gemma-4-12B-IT-nvidia-mxfp (window 1024, `limit` 2, 8140-token
-            // prompt): the store finished at `{7168, 8128}` while the chain
-            // reached 1136 — and the entry at 1024 had been born and evicted.
-            //
-            // `gemma4_sliding_cold_anchor_rungs` is what closes that gap on a
-            // persist turn: a fixed `block_size * 4^k` grid, published by the
-            // prefill and deferred by `Ladder` retention. This branch then
-            // means the chain has not yet reached even the SHALLOWEST rung
-            // (turn 1 of a cold process, before the queue has drained), or the
-            // ladder is off. Trace it so that stays visible under MLX_TRACE
-            // instead of looking like a working cache.
-            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
-            if inference_trace_enabled() {
-                let reason = if context.media == Gemma4SlidingColdCaptureMedia::PureImage {
-                    "no_exact_checkpoint_after_complete_image"
-                } else {
-                    "no_representable_checkpoint_at_or_below_chain_reach"
+        let expected_layout = sliding_sidecar::layout_at(&geometry, cached_prefix_len);
+        crate::cold_tier::try_install_cold_sidecar(
+            restored,
+            &expected_layout,
+            |tensors, boundary| {
+                let Some(snapshots) =
+                    sliding_sidecar::decode_snapshots(&self.config, &geometry, tensors, boundary)?
+                else {
+                    return Ok(None);
                 };
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason={} media={} minimum_safe_boundary={} chain_reach_tokens={} chain_blocks={} block_size={} window={} request_tokens={} prompt_boundary={} prefix_checkpoints={} retained={:?} anchor_rungs={:?}",
-                    reason,
-                    media,
-                    minimum_safe_boundary,
-                    chain_blocks as u64 * block_size as u64,
-                    chain_blocks,
-                    block_size,
-                    geometry.window,
-                    request_tokens.len(),
-                    self.sliding_prompt_boundary_checkpoint
-                        .as_ref()
-                        .map_or(0, |checkpoint| checkpoint.prefix_len),
-                    self.sliding_prefix_checkpoints.len(),
-                    self.sliding_prefix_checkpoints
-                        .iter()
-                        .map(|checkpoint| checkpoint.prefix_len)
-                        .collect::<Vec<_>>(),
-                    self.sliding_prefix_checkpoints
-                        .iter()
-                        .filter(|checkpoint| checkpoint.cold_anchor_rung)
-                        .map(|checkpoint| checkpoint.prefix_len)
-                        .collect::<Vec<_>>()
-                ));
-            }
-            return;
-        }
-        // Descend the candidates, deepest first, past every boundary already on
-        // disk, and capture the first one that is not. See
-        // `gemma4_select_cold_capture_candidate` for why stopping at the first
-        // already-persisted one is an absorbing state.
-        //
-        // The sidecar chain is the KV chain recomputed under the
-        // `SlidingWindow` domain tag: identical per-block arguments, different
-        // group (vLLM's `BlockHashWithGroupId`). `ColdTierWalk::
-        // deepest_backed_boundary` derives the identical chain on restore.
-        //
-        // Derived BEFORE the payload is built so the dedup can skip the whole
-        // encode: reading this state back off the GPU is hundreds of MiB on a
-        // real checkpoint, and every later turn on the same prompt would
-        // otherwise redo it and rewrite an object already on disk.
-        let selection = gemma4_select_cold_capture_candidate(candidates, |(boundary, _)| {
-            let Some(key) = gemma4_sliding_cold_sidecar_chain_key(
-                cold.fingerprint,
-                request_tokens,
-                &extra_keys_per_block,
-                block_size,
-                *boundary,
-            ) else {
-                return Gemma4ColdCaptureProbe::Underivable;
-            };
-            if cold
-                .manager
-                .contains_in(&key, mlx_paged_attn::ColdGroup::SlidingWindow)
-            {
-                Gemma4ColdCaptureProbe::Persisted
-            } else {
-                Gemma4ColdCaptureProbe::Missing(key)
-            }
-        });
-        let ((boundary, snapshots), key) = match selection {
-            Gemma4ColdCaptureSelection::Capture { candidate, key, .. } => (candidate, key),
-            // Every candidate is already on disk: nothing to do, and nothing
-            // wrong. Mirrors `ColdTierWalk::capture_chain`'s `contains` dedup,
-            // and `contains_in` is explicitly side-effect free (no hit/miss
-            // accounting), so this arm must do its own — an unrecorded exit here
-            // reads downstream as `enqueued=0`, which is also what a collapsed
-            // rung ladder produces.
-            Gemma4ColdCaptureSelection::AllPersisted { skipped_persisted } => {
-                crate::cold_tier::cold_sidecar_counters().record_already_persisted();
-                if inference_trace_enabled() {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=every_candidate_already_persisted already_persisted={} chain_reach_tokens={} block_size={}",
-                        skipped_persisted,
-                        chain_blocks as u64 * block_size as u64,
-                        block_size
-                    ));
-                }
-                return;
-            }
-            // No candidate's chain derived, so the tier holds nothing here and
-            // `already_persisted` would be a lie. Same diagnosis as an empty
-            // candidate list above: no usable boundary under the chain's reach.
-            Gemma4ColdCaptureSelection::NoChainDerived => {
-                crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
-                if inference_trace_enabled() {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_skipped reason=no_candidate_chain_derives chain_reach_tokens={} block_size={}",
-                        chain_blocks as u64 * block_size as u64,
-                        block_size
-                    ));
-                }
-                return;
-            }
-        };
-
-        let Ok(Some(tensors)) =
-            sliding_sidecar::encode_tensors(&self.config, &geometry, snapshots, boundary)
-        else {
-            return;
-        };
-        let sidecar = mlx_paged_attn::ColdSidecar {
-            key,
-            fingerprint: cold.fingerprint,
-            layout: sliding_sidecar::layout_at(&geometry, boundary),
-            tensors,
-        };
-        match cold
-            .manager
-            .enqueue_sidecar_before(sidecar, std::time::Instant::now() + sidecar_wait)
-        {
-            Ok(true) => {
-                crate::cold_tier::cold_sidecar_counters().record_enqueued();
-                if context.media == Gemma4SlidingColdCaptureMedia::PureImage
-                    && inference_trace_enabled()
-                {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] gemma4 sliding_cold_sidecar_capture_enqueued media=image boundary_tokens={} last_image_exclusive={}",
-                        boundary, minimum_safe_boundary,
-                    ));
-                }
-            }
-            // The bounded writer queue stayed full for the whole capture
-            // budget. Nothing is written and nothing failed, so this turn is
-            // otherwise indistinguishable from a successful capture.
-            Ok(false) => {
-                crate::cold_tier::cold_sidecar_counters().record_queue_drop();
-                tracing::debug!(
-                    target: "mlx_core::gemma4::paged",
-                    "Gemma4 sliding sidecar dropped at boundary {boundary}: cold-cache writer queue full"
-                );
-            }
-            Err(error) => tracing::debug!(
-                target: "mlx_core::gemma4::paged",
-                "Gemma4 sliding sidecar enqueue failed at boundary {boundary}: {error}"
-            ),
-        }
-    }
-
-    /// Every already-materialized sliding checkpoint that can anchor a cold
-    /// sidecar for `request_tokens`, with its snapshots, DEEPEST FIRST and
-    /// deduplicated by boundary.
-    ///
-    /// Candidates must sit at a boundary this layout can express
-    /// (`boundary_is_representable`), be covered by the persisted K/V chain
-    /// (`<= chain_blocks * block_size`), and carry BOTH the exact token prefix
-    /// and the exact per-block cache identity — the same `final_block_hash`
-    /// the in-memory lookup path checks, so a checkpoint recorded under
-    /// different image keys can never anchor a text sidecar.
-    ///
-    /// `sliding_cold_restore_tail_checkpoint` leads the chain because it is the
-    /// deepest boundary a restore of this turn's prompt can name; the prompt
-    /// boundary follows, and it is the SAME boundary except on a block-aligned
-    /// prompt, where it sits one block past the tail and the ceiling below
-    /// filters it out.
-    fn find_gemma4_sliding_capture_checkpoints<'a>(
-        &'a self,
-        geometry: &sliding_sidecar::SlidingSidecarGeometry,
-        request_tokens: &[u32],
-        block_size: u32,
-        chain_blocks: usize,
-        extra_keys_per_block: &[Vec<u64>],
-        minimum_safe_boundary: u32,
-    ) -> Vec<(u32, &'a [Option<RotatingKVCacheSnapshot>])> {
-        let ceiling = (chain_blocks as u64).saturating_mul(block_size as u64);
-        let ceiling = u32::try_from(ceiling).unwrap_or(u32::MAX);
-        let mut found: Vec<(u32, &[Option<RotatingKVCacheSnapshot>])> = Vec::new();
-        let candidates = self
-            .sliding_cold_restore_tail_checkpoint
-            .iter()
-            .chain(self.sliding_prompt_boundary_checkpoint.iter())
-            .chain(self.sliding_prefix_checkpoints.iter());
-        for checkpoint in candidates {
-            let boundary = checkpoint.prefix_len;
-            if boundary < minimum_safe_boundary
-                || boundary > ceiling
-                || checkpoint.block_size != block_size
-                || !sliding_sidecar::boundary_is_representable(geometry, boundary, block_size)
-                || found.iter().any(|(seen, _)| *seen == boundary)
-            {
-                continue;
-            }
-            if request_tokens.get(..boundary as usize) != Some(checkpoint.tokens.as_slice()) {
-                continue;
-            }
-            let Some(final_block_hash) = compute_gemma4_paged_prefix_block_hash_with_keys(
-                request_tokens,
-                boundary,
-                block_size,
-                extra_keys_per_block,
-                0,
-            ) else {
-                continue;
-            };
-            if checkpoint.final_block_hash != final_block_hash {
-                continue;
-            }
-            if !gemma4_sliding_snapshots_ready_at(&self.config, &checkpoint.snapshots, boundary) {
-                continue;
-            }
-            found.push((boundary, checkpoint.snapshots.as_slice()));
-        }
-        found.sort_unstable_by(|(left, _), (right, _)| right.cmp(left));
-        found
+                let Some(caches) =
+                    restore_gemma4_sliding_caches(&self.config, &snapshots, boundary)?
+                else {
+                    return Ok(None);
+                };
+                self.caches = Some(caches);
+                Ok(Some(Gemma4SlidingPrefixPreparation {
+                    state: "cold_sidecar",
+                    primed_prefix_len: boundary,
+                }))
+            },
+        )
     }
 
     /// Build the process-global SSD cold-tier context (manager + COMPLETE
@@ -3259,7 +3330,7 @@ impl Gemma4Inner {
         model_path: &str,
         weights: &crate::array::memory::WeightsResident,
     ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
-        let adapter = self.paged_adapter.as_ref()?;
+        let adapter = self.kv_cache_coordinator.as_ref()?;
         let manager = crate::cold_tier::global_cold_cache()?;
         // No sliding layers means no out-of-pool state — but it also means this
         // is not the hybrid gemma4 the sidecar work validated, so stay off
@@ -3314,7 +3385,7 @@ impl Gemma4Inner {
         ctx: crate::transformer::paged_kv_cache_adapter::ColdTierContext,
         _weights: &crate::array::memory::WeightsResident,
     ) {
-        if let Some(adapter) = self.paged_adapter.as_mut() {
+        if let Some(adapter) = self.kv_cache_coordinator.as_mut() {
             adapter.set_cold_tier(ctx);
         }
     }
@@ -3473,7 +3544,9 @@ impl Gemma4Inner {
 
         // Image scatter @ image_token_id.
         if has_image_features {
-            let ev = self.embed_vision.as_ref().unwrap();
+            let ev = self.embed_vision.as_ref().ok_or_else(|| {
+                Error::from_reason("Gemma4 image features require a vision projector")
+            })?;
             let image_token_id = self.config.image_token_id.unwrap_or(258880);
             let mut all_features: Vec<MxArray> = Vec::new();
             for proc in processed_images {
@@ -3523,9 +3596,14 @@ impl Gemma4Inner {
 
         // Audio scatter @ audio_token_id (CAUSAL; audio features unscaled).
         if has_audio_features {
-            let ea = self.embed_audio.as_ref().unwrap();
+            let ea = self.embed_audio.as_ref().ok_or_else(|| {
+                Error::from_reason("Gemma4 audio features require an audio projector")
+            })?;
             let audio_token_id = self.config.audio_token_id.unwrap_or(258881);
-            let audio_features = ea.forward(audio_frames.unwrap())?.astype(embed_dtype)?;
+            let audio_frames = audio_frames.ok_or_else(|| {
+                Error::from_reason("Gemma4 audio features require prepared audio frames")
+            })?;
+            let audio_features = ea.forward(audio_frames)?.astype(embed_dtype)?;
 
             let audio_token = MxArray::scalar_int(audio_token_id)?;
             let audio_mask = prompt.equal(&audio_token)?;
@@ -3580,8 +3658,8 @@ impl Gemma4Inner {
             && last_image_exclusive
                 .is_some_and(|last_image_exclusive| cached_prefix_len >= last_image_exclusive);
         if image_span_fully_cached {
-            let last_image_exclusive =
-                last_image_exclusive.expect("fully cached image span has an endpoint");
+            let last_image_exclusive = last_image_exclusive
+                .ok_or_else(|| Error::from_reason("Gemma4 cached image span has no endpoint"))?;
             tracing::info!(
                 target: "mlx_core::inference",
                 event = "vlm_vision_tower_skip",
@@ -3628,12 +3706,13 @@ impl Gemma4Inner {
         new_audio_key: Option<u64>,
         image_token_positions: &[(u32, u64)],
         reuse_cache: bool,
+        cache_salt: u64,
     ) -> Result<Gemma4VlmTurnPreparation> {
         let layer_kinds = self.compute_layer_kinds()?;
         let total_budget = u32::try_from(tokens.len())
             .map_err(|_| Error::from_reason("Gemma4 multimodal prompt exceeds u32"))?;
         let block_size = self
-            .paged_adapter
+            .kv_cache_coordinator
             .as_ref()
             .ok_or_else(|| {
                 Error::from_reason("prepare_gemma4_multimodal_paged_turn: paged_adapter is None")
@@ -3676,6 +3755,7 @@ impl Gemma4Inner {
                 image_token_positions,
                 reuse_cache,
                 allow_live_continue,
+                cache_salt,
                 if overlay_active {
                     last_image_exclusive
                 } else {
@@ -3699,18 +3779,10 @@ impl Gemma4Inner {
             // block chain yet. Keep that path deliberately cold and do not
             // publish reusable prefix entries from its finalizer.
             self.media_session_continuable = false;
-            let cold_plan = match self.paged_adapter.as_mut() {
-                Some(adapter) => adapter
-                    .prepare_turn_per_block_with_max_cache_hit_tokens(
-                        0,
-                        tokens,
-                        total_budget,
-                        false,
-                        &extra_keys_per_block,
-                        0,
-                        true,
-                        0,
-                    )
+            let seq_id = self.active_paged_seq;
+            let cold_plan = match self.kv_cache_coordinator.as_mut() {
+                Some(coordinator) => coordinator
+                    .prepare_scheduled_request(seq_id, tokens)
                     .map_err(Error::from_reason),
                 None => Err(Error::from_reason(
                     "prepare_gemma4_multimodal_paged_turn: paged_adapter is None",
@@ -3722,14 +3794,13 @@ impl Gemma4Inner {
                 );
                 return Err(error);
             }
-            self.caches = Some(init_caches_for_config(&self.config));
+            self.caches = None;
             self.cached_token_history.clear();
             self.cached_image_key = None;
             self.cached_audio_key = None;
             self.cached_paged_image_token_positions.clear();
             self.media_session_context = MediaCapabilities::NONE;
             self.paged_text_turn_context = MediaCapabilities::NONE;
-            self.sliding_last_history_checkpoint = None;
             0
         };
 
@@ -3752,11 +3823,6 @@ impl Gemma4Inner {
             suffix_embeds,
             layer_kinds,
             extra_keys_per_block,
-            publish_prefix_checkpoints: gemma4_vlm_prefix_checkpoint_eligible(
-                new_image_key.is_some(),
-                new_audio_key.is_some(),
-                reuse_cache,
-            ),
         })
     }
 
@@ -3825,38 +3891,28 @@ impl Gemma4Inner {
     ///
     /// - **Continuable** (when `media_continuable` — currently a pure image
     ///   turn, including the unified bidirectional-vision image — AND
-    ///   `reuse_cache`, AND `finalize_turn_keep_live_per_block` succeeds, AND the
-    ///   sliding-history checkpoint actually `stored`, AND the adapter is
-    ///   `live_for_continue`): the global paged KV is kept live (full blocks
-    ///   registered for content-addressed reuse) and the marker is set so
-    ///   the next full-history text continuation may reuse the global prefix
-    ///   IN-PLACE (`continue_turn` keeps the block
-    ///   table, `cachedTokens > 0`, only the new suffix is forwarded — it is NOT
-    ///   re-walked) and the sliding caches resolve to `state="live"`
-    ///   (`continued_live_prefix && gemma4_sliding_caches_ready_at`), so
-    ///   `run_sliding_only_prefill` is skipped and no media position is ever
-    ///   re-embedded from a raw `<|image|>`/`<|audio|>` id. Mirrors the
-    ///   qwen3_5_moe two-state finalize.
-    /// - **Non-continuable** (`reuse_cache=false`, a keep-live failure, or the
-    ///   sliding checkpoint did not store / the adapter is not
-    ///   `live_for_continue`): `release_request` only, keep history + media keys
-    ///   live (marker stays false), so the next full-history continuation's
-    ///   prefix verification forces a cold restart. The vision core does NOT
-    ///   `reset_caches_sync` here, unlike the text/MoE path.
+    ///   `reuse_cache`, AND every hybrid group finalizes successfully): both
+    ///   full- and sliding-attention paged requests remain live at the same
+    ///   absolute cursor. The next full-history text continuation forwards only
+    ///   its suffix, so no media position is re-embedded from a raw
+    ///   `<|image|>`/`<|audio|>` id.
+    /// - **Non-continuable** (`reuse_cache=false` or any grouped finalize/live
+    ///   check fails): release every group, keep history + media keys live
+    ///   (marker stays false), and make the next continuation fail closed
+    ///   instead of replaying placeholder ids as media embeddings.
     ///
-    /// ## Why `stored && live_for_continue` is the faithfulness gate
-    /// `gemma4_sliding_caches_ready_at` requires every PHYSICAL non-shared
-    /// sliding anchor cache to be populated. KV-shared alias slots (E2B's
-    /// `SharedOnSliding`) intentionally hold no flat K/V and are skipped; their
-    /// real anchor snapshots carry the state for both layers.
+    /// ## Why all-group liveness is the faithfulness gate
+    /// KV-shared alias slots (E2B's `SharedOnSliding` and `SharedOnGlobal`)
+    /// intentionally own no storage; their physical anchors carry the state
+    /// for both layers. Every physical full/sliding group must therefore agree
+    /// on the request cursor before the media lineage can remain continuable.
     /// A warm media→text continue is only numerically faithful when the media
     /// positions' sliding K/V can be reused IN PLACE: a text token's true
     /// embedding IS `embed_tokens.forward(id)` (replay-safe), but a media
     /// position's is a scattered SigLIP/audio feature that replay CANNOT rebuild
-    /// from the raw special-token id. So the marker is armed ONLY when
-    /// `stored && live_for_continue`: both non-shared checkpoints and E2B's
-    /// physical anchors can store real K/V and warm-continue via `state="live"`.
-    /// Missing/misaligned physical anchors still fail closed.
+    /// from the raw special-token id. So the marker is armed ONLY after every
+    /// physical group finalizes and remains live. Missing/misaligned anchors
+    /// fail closed.
     ///
     /// ## R1 sliding-offset reconciliation (the length-finish materialize)
     /// The vision decode loop never forwards the final sampled token, so after
@@ -3882,7 +3938,9 @@ impl Gemma4Inner {
         image_token_positions: &[(u32, u64)],
         media_continuable: bool,
         reuse_cache: bool,
+        cache_salt: u64,
     ) -> Result<()> {
+        let seq_id = self.active_paged_seq;
         let continuable_eligible = reuse_cache && media_continuable;
         let is_length = finish_reason == "length";
 
@@ -3910,12 +3968,17 @@ impl Gemma4Inner {
                 let _logits = self.run_paged_decode_step(last_token)?;
             }
 
-            let (keep_live_ok, live_for_continue) = match self.paged_adapter.as_mut() {
-                Some(adapter) => {
-                    let total = adapter.request_tokens().len();
-                    let bs = adapter.block_size();
+            let (keep_live_ok, live_for_continue) = match self.kv_cache_coordinator.as_mut() {
+                Some(coordinator) => {
+                    coordinator
+                        .activate_request_all(seq_id)
+                        .map_err(Error::from_reason)?;
+                    let total = coordinator.full_adapter().request_tokens().len();
+                    let bs = coordinator.full_adapter().block_size();
                     let extra = engine::build_paged_extra_keys(total, bs, image_token_positions);
-                    let ok = match adapter.finalize_turn_keep_live_per_block(&extra, 0) {
+                    let ok = match coordinator.eval_pending_pool_writes_all().and_then(|_| {
+                        coordinator.finalize_keep_live_all(seq_id, &extra, cache_salt)
+                    }) {
                         Ok(_) => true,
                         Err(error) => {
                             tracing::warn!(
@@ -3925,74 +3988,24 @@ impl Gemma4Inner {
                             false
                         }
                     };
-                    (ok, adapter.is_live_for_continue())
+                    (ok, coordinator.is_live_all(seq_id))
                 }
                 None => (false, false),
             };
 
             if keep_live_ok {
-                // `finalize_turn_keep_live_per_block` has now published and
-                // offered the image-aware GLOBAL K/V chain to the SSD writer.
-                // Only after that succeeds may the out-of-pool sliding half be
-                // offered, keyed from the same tokens/image positions. Carry the
-                // VLM prompt length explicitly: this path bypasses the generic
-                // text backend's `paged_turn_prompt_len` writer.
-                if new_image_key.is_some()
-                    && new_audio_key.is_none()
-                    && !image_token_positions.is_empty()
-                {
-                    let prompt_len = u32::try_from(expanded_tokens.len()).map_err(|_| {
-                        Error::from_reason("Gemma4 VLM prompt length exceeds u32 at finalize")
-                    })?;
-                    self.capture_gemma4_sliding_cold_sidecar(
-                        Gemma4SlidingColdCaptureContext::pure_image(
-                            prompt_len,
-                            image_token_positions,
-                        ),
-                    );
-                }
-
-                // Publish history FIRST: the checkpoint reads its length, and
-                // the next delta's prefix restore matches against it.
+                // Both physical KV groups now share the same live boundary.
+                // Media embeddings remain available in-place without a
+                // request-private rotating-cache checkpoint.
                 self.cached_token_history = full_history;
                 self.publish_media_session_context(new_image_key, new_audio_key);
                 self.cached_paged_image_token_positions = image_token_positions.to_vec();
-                let history_for_ckpt = self.cached_token_history.clone();
-                let stored =
-                    match self.remember_gemma4_sliding_history_checkpoint(&history_for_ckpt) {
-                        Ok(trace) => trace.stored,
-                        Err(error) => {
-                            self.invalidate_gemma4_hybrid_session(
-                                "VLM sliding-history checkpoint failure",
-                            );
-                            return Err(error);
-                        }
-                    };
-                // Warm continuation is only faithful when the sliding state is
-                // restorable from a stored checkpoint (or the in-place live
-                // caches it implies). A text position's true embedding IS
-                // `embed_tokens.forward(id)`, so REPLAY rebuilds it exactly. A
-                // MEDIA position's true embedding is a scattered SigLIP/audio
-                // feature that replay cannot reconstruct from the raw
-                // `<|image|>`/`<|audio|>` special-token id. KV-shared alias
-                // slots hold no flat K/V, so checkpoint readiness/snapshotting
-                // intentionally skips them and persists only their physical
-                // sliding anchors. If any physical anchor is unavailable,
-                // `stored == false` and the turn downgrades to a clean
-                // non-continuable state rather than replaying media ids.
-                //
-                // `live_for_continue` guards a second gap: a keep-live with zero
-                // FULL blocks (a media turn shorter than `block_size`) returns
-                // Ok without registering the request, so the next delta could
-                // not take the live-continue path and would re-prefill the media
-                // placeholders as text. Unreachable on shipped configs (media
-                // turns far exceed the 16-token block), but cheap to gate.
-                if stored && live_for_continue {
+                if live_for_continue {
                     self.media_session_continuable = true;
                     return Ok(());
                 }
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    let _ = adapter.release_request();
+                if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
+                    let _ = coordinator.release_request_all(seq_id);
                 }
                 self.media_session_continuable = false;
                 return Ok(());
@@ -4004,11 +4017,11 @@ impl Gemma4Inner {
             ));
         }
 
-        // Non-continuable: release the global KV but keep history + media keys
+        // Non-continuable: release every KV group but keep history + media keys
         // so full-history prefix verification forces the next continuation to
         // cold-restart (marker is false).
-        if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+        if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
+            let _ = coordinator.release_request_all(seq_id);
         }
         self.cached_token_history = full_history;
         self.publish_media_session_context(new_image_key, new_audio_key);
@@ -4023,11 +4036,10 @@ impl Gemma4Inner {
     /// Shared multimodal prep (`prepare_multimodal_tokens` to expand
     /// `<|image|>` / `<|audio|>` placeholders, `build_gemma4_multimodal_embeds`
     /// to `masked_scatter` image+audio features into the residual) writes
-    /// full-attention K/V into the paged adapter pool. Sliding layers still use
-    /// the flat rotating caches.
+    /// full- and sliding-attention K/V into their respective paged groups.
     ///
-    /// Image-only prompts use image-aware per-block keys plus exact sliding
-    /// checkpoints. Audio and mixed-media prompts remain deliberately cold.
+    /// Image-only prompts keep every hybrid KV group live at one exact cursor.
+    /// Audio and mixed-media prompts remain deliberately cold.
     fn vision_paged_turn_sync_core(
         &mut self,
         rendered_tokens: &[u32],
@@ -4063,6 +4075,7 @@ impl Gemma4Inner {
 
         let generation_start = std::time::Instant::now();
         let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let cache_salt = engine::cache_salt(config.cache_salt.as_deref());
         let turn = self.prepare_gemma4_multimodal_paged_turn(
             &tokens,
             &prompt,
@@ -4072,8 +4085,13 @@ impl Gemma4Inner {
             new_audio_key,
             &image_token_positions,
             reuse_cache,
+            cache_salt,
         )?;
         let cached_prefix_len = turn.cached_prefix_len;
+
+        // H2: clone the backend-installed per-turn cancel flag before the
+        // closure — the decode loop inside borrows `self` mutably.
+        let turn_cancel = self.turn_cancel.clone();
 
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             let last_logits = {
@@ -4086,7 +4104,7 @@ impl Gemma4Inner {
                     cached_prefix_len,
                     &turn.extra_keys_per_block,
                     &image_token_positions,
-                    turn.publish_prefix_checkpoints,
+                    cache_salt,
                 )?
             };
 
@@ -4101,6 +4119,18 @@ impl Gemma4Inner {
             for step in 0..max_new_tokens {
                 let token_id = y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
+
+                // H2 sync cancel poll — the SAME snapshot point as the
+                // gemma4 vision paged streaming twin
+                // (`vision_paged_turn_stream_core`): right after the token
+                // push, BEFORE the EOS check.
+                if turn_cancel
+                    .as_deref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    finish_reason = "cancelled".to_string();
+                    break;
+                }
 
                 if is_eos_token(token_id, &eos_ids, eos_token_id) {
                     finish_reason = String::from("stop");
@@ -4169,6 +4199,7 @@ impl Gemma4Inner {
             &image_token_positions,
             media_continuable,
             reuse_cache,
+            cache_salt,
         ) {
             self.invalidate_gemma4_hybrid_session("VLM sync finalize failure");
             return Err(e);
@@ -4275,6 +4306,7 @@ impl Gemma4Inner {
 
         let generation_start = std::time::Instant::now();
         let reuse_cache = config.reuse_cache.unwrap_or(true);
+        let cache_salt = engine::cache_salt(config.cache_salt.as_deref());
         let turn = self.prepare_gemma4_multimodal_paged_turn(
             &tokens,
             &prompt,
@@ -4284,6 +4316,7 @@ impl Gemma4Inner {
             new_audio_key,
             &image_token_positions,
             reuse_cache,
+            cache_salt,
         )?;
         let cached_prefix_len = turn.cached_prefix_len;
 
@@ -4306,7 +4339,7 @@ impl Gemma4Inner {
                     cached_prefix_len,
                     &turn.extra_keys_per_block,
                     &image_token_positions,
-                    turn.publish_prefix_checkpoints,
+                    cache_salt,
                 )?
             };
 
@@ -4401,7 +4434,7 @@ impl Gemma4Inner {
         stream_dispatch.finish(&cb);
 
         // Two-state media finalize (identical to the sync core via the shared
-        // helper): keep-live + sliding checkpoint for a continuable pure-causal
+        // helper): keep every hybrid group live for a continuable pure-causal
         // media turn, else release + keep history/keys so the guard rejects.
         let media_continuable =
             gemma4_media_continuable(new_image_key.is_some(), new_audio_key.is_some());
@@ -4414,6 +4447,7 @@ impl Gemma4Inner {
             &image_token_positions,
             media_continuable,
             reuse_cache,
+            cache_salt,
         ) {
             self.invalidate_gemma4_hybrid_session("VLM stream finalize failure");
             return Err(e);
@@ -4485,19 +4519,15 @@ impl Gemma4Inner {
     // =================================================================
     // Block-paged dispatch (paged_turn_sync_core + helpers).
     //
-    // Mirrors Qwen3's `paged_turn_sync_core` and LFM2's `forward_paged_or_flat`
-    // pattern — sliding layers continue to use the existing flat
-    // `Gemma4LayerCache::Sliding` path while global layers route through
-    // `PagedKVCacheAdapter`. KV-shared layers are routed through their
-    // anchor's physical KV slot/stash using routes derived from
-    // `LayerKVCacheSpec`.
+    // Mirrors vLLM's hybrid KV coordinator: global and sliding layers route to
+    // separate `PagedKVCacheAdapter` groups, while KV-shared layers alias their
+    // anchor's physical group through routes derived from `LayerKVCacheSpec`.
     //
     // Lifecycle (mirrors Qwen3 / LFM2):
     // 1. Adapter cold-start (or warm-continue when previous turn
     //    finalize_turn_keep_live'd a strict-prefix request).
-    // 2. Sliding caches are restored from the live turn/checkpoint when
-    //    available; otherwise the cached prefix is replayed through sliding
-    //    layers before suffix prefill.
+    // 2. Every group resumes the same owner cursor. Sliding adapters keep
+    //    absolute logical positions while pruning expired physical blocks.
     // 3. Prefill via `run_paged_prefill_chunk` over the suffix.
     // 4. Decode loop via `run_paged_decode_step`.
     // 5. End-of-turn (success): `finalize_turn_keep_live` so the next
@@ -4505,89 +4535,13 @@ impl Gemma4Inner {
     //    block's K/V (same partial-block carry trick as Qwen3 / LFM2).
     //
     // Caveats / scope:
-    // * Text-only — vision turns dispatch through the flat path.
-    // * Sliding layers still use flat rotating caches; true paged sliding
-    //   storage is a separate kernel/storage step.
-    // * Exact prefix hits are capped at `prompt_len - 1` so the final
+    // * ordinary text rows fuse; media and speculative owners use scheduler
+    //   barriers because their residual/draft shapes are request-specific;
+    // * cross-owner prefix hits fail closed until every hybrid group can name
+    //   the same reusable boundary. Same-owner live continuation is supported;
+    // * exact live-prefix hits are capped at `prompt_len - 1` so the final
     //   prompt token is always recomputed to produce logits.
     // =================================================================
-
-    fn suppress_large_sliding_prefix_reuse_if_needed(
-        &mut self,
-        trace_label: &str,
-        tokens: &[u32],
-        total_budget: u32,
-        seq_id: u32,
-        restore_tokens: u32,
-        trace_enabled: bool,
-    ) -> Result<bool> {
-        let block_size = self
-            .paged_adapter
-            .as_ref()
-            .map(|adapter| adapter.block_size())
-            .unwrap_or(0);
-        let Some(suppression) = gemma4_large_sliding_restore_suppression_limit(
-            &self.config,
-            block_size,
-            restore_tokens,
-        ) else {
-            return Ok(false);
-        };
-
-        // Sliding layers are recursive: without a close sliding checkpoint,
-        // restoring a large paged-prefix hit can be slower than simply
-        // recomputing the prompt. Keep prefix reuse only when the missing
-        // sliding delta fits within the normal checkpoint interval; otherwise
-        // fall back to a coherent cold prefill. Operators can set
-        // MLX_GEMMA4_MAX_SLIDING_RESTORE_TOKENS=off for debugging.
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {}_prefix_reuse_suppressed reason=large_sliding_restore_limit restore_tokens={} limit={} limit_source={} block_size={}",
-                trace_label, restore_tokens, suppression.limit, suppression.source, block_size
-            ));
-        }
-        let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-            Error::from_reason(format!(
-                "{}: paged_adapter is None while suppressing large sliding restore",
-                trace_label
-            ))
-        })?;
-        let _ = adapter.release_request();
-        adapter
-            .reset_for_new_request(seq_id)
-            .map_err(Error::from_reason)?;
-        let prefix = adapter
-            .find_cached_prefix(tokens, &[], 0, true)
-            .map_err(Error::from_reason)?;
-        let allocated = adapter
-            .allocate_suffix_blocks(total_budget)
-            .map_err(Error::from_reason)?;
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {}_adapter_reset_done reason=large_sliding_restore_suppressed cached_prefix_tokens={} cached_blocks={} allocated_blocks={} request_tokens={} blocks={}",
-                trace_label,
-                prefix.cached_token_count,
-                prefix.blocks.len(),
-                allocated,
-                adapter.current_token_count(),
-                adapter.num_allocated_blocks()
-            ));
-        }
-        // Counted at the point of no return, not at the decision: everything
-        // above between here and the `return Ok(false)` can fail the turn with
-        // `?`, and a suppression that errored out is not a suppression that
-        // happened. The trace above fires earlier on purpose — it is the
-        // diagnosis, and it has to survive the failure it might be explaining.
-        //
-        // The counter exists because the trace alone cannot answer the
-        // question. `MLX_TRACE` is opt-in and per-process, so without a number
-        // a suppression firing on every turn is indistinguishable from a cache
-        // that is simply cold: both end with the whole prompt recomputed, both
-        // leave text and token counts identical, and this one is preceded by
-        // real `hits` that make it look like reuse worked.
-        crate::cold_tier::cold_sidecar_counters().record_restore_suppressed();
-        Ok(true)
-    }
 
     fn invalidate_gemma4_hybrid_session(&mut self, reason: &'static str) {
         tracing::warn!(
@@ -4595,9 +4549,11 @@ impl Gemma4Inner {
             reason,
             "invalidating Gemma4 hybrid paged/sliding session"
         );
-        if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+        if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
+            let _ = coordinator.release_request_all(self.active_paged_seq);
         }
+        self.grouped_sliding_cold_checkpoints
+            .remove(&self.active_paged_seq);
         self.caches = None;
         self.clear_reuse_state();
     }
@@ -4612,19 +4568,64 @@ impl Gemma4Inner {
         image_token_positions: &[(u32, u64)],
         reuse_cache: bool,
         allow_live_continue: bool,
+        cache_salt: u64,
         unified_overlay_last_image_exclusive: Option<u32>,
     ) -> Result<engine::VlmPagedPrefixResolution> {
+        let seq_id = self.active_paged_seq;
+        if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
+            let cached_prefix_len = if reuse_cache
+                && allow_live_continue
+                && coordinator.can_continue_all(seq_id, tokens)
+            {
+                coordinator
+                    .continue_turn_all(seq_id, tokens, total_budget)
+                    .map_err(Error::from_reason)?
+            } else {
+                coordinator
+                    .prepare_scheduled_request(seq_id, tokens)
+                    .map_err(Error::from_reason)?;
+                0
+            };
+            let continued_live_prefix = cached_prefix_len != 0;
+            let effective_plan = crate::transformer::paged_kv_cache_adapter::PagedTurnPlan {
+                cached_prefix_len,
+                continued_live_prefix,
+                allocated_blocks: 0,
+                cached_blocks: 0,
+                total_budget,
+                suffix_len: total_budget.saturating_sub(cached_prefix_len),
+                reason: if continued_live_prefix {
+                    crate::transformer::paged_kv_cache_adapter::PagedTurnPlanReason::ContinuedLivePrefix
+                } else {
+                    crate::transformer::paged_kv_cache_adapter::PagedTurnPlanReason::FreshReset
+                },
+            };
+            if !continued_live_prefix {
+                self.cached_token_history.clear();
+                self.cached_image_key = None;
+                self.cached_audio_key = None;
+                self.media_session_context = MediaCapabilities::NONE;
+                self.media_session_continuable = false;
+            }
+            self.cached_paged_image_token_positions = image_token_positions.to_vec();
+            return Ok(engine::VlmPagedPrefixResolution {
+                candidate_cached_prefix_len: cached_prefix_len,
+                effective_plan,
+                gdn_prefix_already_primed: continued_live_prefix,
+                downgraded_to_cold: false,
+            });
+        }
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let candidate_plan_result = match self.paged_adapter.as_mut() {
+        let candidate_plan_result = match self.kv_cache_coordinator.as_mut() {
             Some(adapter) => adapter
                 .prepare_turn_per_block_with_max_cache_hit_tokens(
                     0,
                     tokens,
                     total_budget,
-                    allow_live_continue,
+                    false,
                     extra_keys_per_block,
-                    0,
-                    !reuse_cache,
+                    cache_salt,
+                    true,
                     max_cache_hit_tokens,
                 )
                 .map_err(Error::from_reason),
@@ -4639,6 +4640,11 @@ impl Gemma4Inner {
                 return Err(error);
             }
         };
+        self.kv_cache_coordinator
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
+            .begin_sliding_requests(0)
+            .map_err(Error::from_reason)?;
 
         // Unified image K/V encodes the bidirectional overlay. The existing
         // attention API can consume an already-materialized overlay prefix only
@@ -4659,6 +4665,7 @@ impl Gemma4Inner {
                 extra_keys_per_block,
                 image_token_positions,
                 prefix_policy.require_exact_checkpoint,
+                cache_salt,
             )
         } else {
             self.caches = Some(init_caches_for_config(&self.config));
@@ -4701,7 +4708,7 @@ impl Gemma4Inner {
                     candidate_plan.cached_prefix_len,
                     block_size,
                     extra_keys_per_block,
-                    0,
+                    cache_salt,
                 )?;
                 Ok(())
             })();
@@ -4717,7 +4724,7 @@ impl Gemma4Inner {
 
         let resolution =
             engine::resolve_vlm_paged_prefix(candidate_plan, sliding_prefix_exact, || {
-                self.paged_adapter
+                self.kv_cache_coordinator
                     .as_mut()
                     .ok_or_else(|| {
                         "prepare_gemma4_vlm_paged_prefix: adapter dropped before cold restart"
@@ -4748,7 +4755,6 @@ impl Gemma4Inner {
         self.cached_paged_image_token_positions = image_token_positions.to_vec();
         self.media_session_context = MediaCapabilities::NONE;
         self.paged_text_turn_context = MediaCapabilities::NONE;
-        self.sliding_last_history_checkpoint = None;
         self.media_session_continuable = false;
 
         tracing::info!(
@@ -4776,21 +4782,9 @@ impl Gemma4Inner {
         reuse_cache: bool,
         total_budget: u32,
         seq_id: u32,
-        trace_enabled: bool,
+        cache_salt: u64,
+        _trace_enabled: bool,
     ) -> Result<Gemma4PagedTurnPreparation> {
-        let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
-        let audio_token_id = self.config.audio_token_id.unwrap_or(258881) as u32;
-        let prompt_holds_media =
-            prompt_holds_media_placeholders(tokens, image_token_id, audio_token_id);
-        let block_size = self
-            .paged_adapter
-            .as_ref()
-            .ok_or_else(|| {
-                Error::from_reason(format!(
-                    "{trace_label}: paged_adapter is None while preparing paged turn"
-                ))
-            })?
-            .block_size();
         let carries_image_lineage = gemma4_carries_image_lineage(
             self.paged_text_turn_context,
             self.cached_image_key,
@@ -4798,145 +4792,47 @@ impl Gemma4Inner {
             &self.cached_token_history,
             tokens,
         );
-        let image_token_positions = if carries_image_lineage {
-            self.cached_paged_image_token_positions.clone()
-        } else {
-            Vec::new()
-        };
-        let extra_keys_per_block =
-            engine::build_paged_extra_keys(tokens.len(), block_size, &image_token_positions);
-        let plan = {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason(format!(
-                    "{trace_label}: paged_adapter is None while preparing paged turn"
-                ))
-            })?;
-            let adapter_live = adapter.is_live_for_continue();
-            let adapter_request_tokens = adapter.request_tokens().len();
-            let adapter_common_prefix = tokens
-                .iter()
-                .zip(adapter.request_tokens().iter())
-                .take_while(|(a, b)| a == b)
-                .count();
-            if trace_enabled {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 {trace_label}_adapter_prepare live={} request_tokens={} common_prefix={} total_budget={} reuse_cache={}",
-                    adapter_live,
-                    adapter_request_tokens,
-                    adapter_common_prefix,
-                    total_budget,
-                    reuse_cache
-                ));
-            }
-            let max_cache_hit_tokens = total_budget.saturating_sub(1);
-            // Unknown media placeholders remain lookup-disabled. A warm text
-            // continuation carrying an exact persisted image lineage uses the
-            // same per-block keys as the original image turn, so neither lookup
-            // nor finalize can republish those blocks token-only.
-            let skip_lookup = prompt_holds_media && !carries_image_lineage;
-            let plan = adapter
-                .prepare_turn_per_block_with_max_cache_hit_tokens(
-                    seq_id,
-                    tokens,
-                    total_budget,
-                    reuse_cache && (!prompt_holds_media || carries_image_lineage),
-                    &extra_keys_per_block,
-                    0,
-                    skip_lookup,
-                    max_cache_hit_tokens,
-                )
+        if reuse_cache
+            && self
+                .kv_cache_coordinator
+                .as_ref()
+                .is_some_and(|coordinator| coordinator.can_continue_all(seq_id, tokens))
+        {
+            let cached_prefix_len = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason("Gemma4 hybrid continuation lost its KV coordinator")
+                })?
+                .continue_turn_all(seq_id, tokens, total_budget)
                 .map_err(Error::from_reason)?;
-            if trace_enabled {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 {trace_label}_adapter_prepare_done reason={:?} cached_prefix_tokens={} cached_blocks={} allocated_blocks={} request_tokens={} blocks={} continued_live={}",
-                    plan.reason,
-                    plan.cached_prefix_len,
-                    plan.cached_blocks,
-                    plan.allocated_blocks,
-                    adapter.current_token_count(),
-                    adapter.num_allocated_blocks(),
-                    plan.continued_live_prefix
-                ));
-            }
-            plan
-        };
-
-        let mut cached_prefix_len = plan.cached_prefix_len;
-        let mut sliding_preparation = self.prepare_gemma4_sliding_prefix_state_with_keys(
-            tokens,
-            cached_prefix_len,
-            plan.continued_live_prefix,
-            &extra_keys_per_block,
-            &image_token_positions,
-            carries_image_lineage,
-        )?;
-        if carries_image_lineage && sliding_preparation.primed_prefix_len < cached_prefix_len {
-            if let Some(adapter) = self.paged_adapter.as_mut() {
-                let _ = adapter.release_request();
-            }
+            return Ok(Gemma4PagedTurnPreparation {
+                cached_prefix_len,
+                suffix_len: total_budget.saturating_sub(cached_prefix_len),
+                sliding_primed_prefix_len: cached_prefix_len,
+            });
+        }
+        // A media-derived prefix can only be continued in-place: replaying its
+        // placeholder token IDs cannot recreate the scattered image features.
+        if carries_image_lineage {
             return Err(Error::from_reason(format!(
-                "{}{trace_label} lost the exact image-aware sliding checkpoint",
+                "{}{trace_label} lost the live hybrid media prefix",
                 engine::IMAGE_CHANGE_RESTART_PREFIX
             )));
         }
-        if sliding_preparation.primed_prefix_len < cached_prefix_len {
-            let suppressed = self.suppress_large_sliding_prefix_reuse_if_needed(
-                trace_label,
-                tokens,
-                total_budget,
-                seq_id,
-                cached_prefix_len.saturating_sub(sliding_preparation.primed_prefix_len),
-                trace_enabled,
-            )?;
-            if suppressed {
-                let previous_cached_prefix_len = cached_prefix_len;
-                cached_prefix_len = 0;
-                sliding_preparation = self.prepare_gemma4_sliding_prefix_state_with_keys(
-                    tokens,
-                    cached_prefix_len,
-                    false,
-                    &extra_keys_per_block,
-                    &image_token_positions,
-                    false,
-                )?;
-                if trace_enabled {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] gemma4 {trace_label}_cached_prefix_reset previous_cached_prefix_tokens={} reason=sliding_restore_limit",
-                        previous_cached_prefix_len
-                    ));
-                }
-            }
-        }
-
-        let suffix_len = total_budget.checked_sub(cached_prefix_len).ok_or_else(|| {
-            Error::from_reason(format!(
-                "{trace_label}: cached_prefix_len {cached_prefix_len} exceeds total_budget \
-                 {total_budget}"
-            ))
-        })?;
-        if trace_enabled {
-            let already_primed = sliding_preparation.primed_prefix_len == cached_prefix_len;
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 {trace_label}_sliding_prefix_state state={} cached_prefix_tokens={} sliding_primed_prefix_tokens={} replay_delta_tokens={} suffix_tokens={} already_primed={} continued_live={}",
-                sliding_preparation.state,
-                cached_prefix_len,
-                sliding_preparation.primed_prefix_len,
-                cached_prefix_len.saturating_sub(sliding_preparation.primed_prefix_len),
-                suffix_len,
-                already_primed,
-                plan.continued_live_prefix
-            ));
-        }
-
-        if !carries_image_lineage {
-            self.cached_image_key = None;
-            self.cached_paged_image_token_positions.clear();
-        }
-
+        // Ownerless whole-turn and scheduler-owned text requests share the
+        // same grouped prefix transaction. A full-group hot/SSD candidate is
+        // usable only after every sliding group installs the validated
+        // companion at that exact boundary; otherwise the helper resets all
+        // groups to zero.
+        let cached_prefix_len =
+            self.prepare_scheduled_text_request(seq_id, tokens, cache_salt, reuse_cache)?;
+        self.cached_image_key = None;
+        self.cached_paged_image_token_positions.clear();
         Ok(Gemma4PagedTurnPreparation {
             cached_prefix_len,
-            suffix_len,
-            sliding_primed_prefix_len: sliding_preparation.primed_prefix_len,
+            suffix_len: total_budget.saturating_sub(cached_prefix_len),
+            sliding_primed_prefix_len: cached_prefix_len,
         })
     }
 
@@ -4978,506 +4874,215 @@ impl Gemma4Inner {
         suffix_tokens: &[u32],
         cached_prefix_len: u32,
         sliding_primed_prefix_len: u32,
+        _cache_salt: u64,
     ) -> Result<MxArray> {
         if suffix_tokens.is_empty() {
             return Err(Error::from_reason(
                 "run_paged_prefill_chunk called with empty suffix",
             ));
         }
-        if sliding_primed_prefix_len > cached_prefix_len {
-            return Err(Error::from_reason(format!(
-                "Gemma4 paged prefill sliding_primed_prefix_len {} exceeds cached_prefix_len {}",
-                sliding_primed_prefix_len, cached_prefix_len
-            )));
+        if sliding_primed_prefix_len != cached_prefix_len {
+            return Err(Error::from_reason(
+                "Gemma4 hybrid paged prefill requires the same live boundary in every group",
+            ));
+        }
+        let suffix_start = usize::try_from(cached_prefix_len).unwrap_or(usize::MAX);
+        if full_tokens.get(suffix_start..) != Some(suffix_tokens) {
+            return Err(Error::from_reason(
+                "Gemma4 hybrid paged prefill suffix does not extend the live group boundary",
+            ));
         }
 
-        let suffix_len = suffix_tokens.len() as u32;
         let layer_kinds = self.compute_layer_kinds()?;
-        let trace_enabled = inference_trace_enabled();
-        let trace_start = trace_enabled.then(std::time::Instant::now);
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 paged_prefill_start full_tokens={} cached_prefix_tokens={} suffix_tokens={}",
-                full_tokens.len(),
-                cached_prefix_len,
-                suffix_tokens.len()
-            ));
-        }
-
-        // For sliding layers we need state at position cached_prefix_len.
-        // Sliding layers are restored each turn via reset_caches_sync, so
-        // we need to reprefill any unprimed cached-prefix delta through
-        // them BEFORE the suffix can attend. When a sparse checkpoint hits,
-        // this is only the delta from that checkpoint to cached_prefix_len.
-        if sliding_primed_prefix_len < cached_prefix_len {
-            let prefix =
-                &full_tokens[(sliding_primed_prefix_len as usize)..(cached_prefix_len as usize)];
-            let sliding_trace_start = trace_enabled.then(std::time::Instant::now);
-            self.run_sliding_only_prefill(prefix, sliding_primed_prefix_len, &layer_kinds)?;
-            let block_size = self
-                .paged_adapter
+        let final_index = suffix_tokens.len() - 1;
+        let chunk_size = usize::try_from(gemma4_paged_prefill_group_max_chunk())
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let mut position = 0usize;
+        while position < final_index {
+            if self
+                .turn_cancel
                 .as_ref()
-                .map(|adapter| adapter.block_size())
-                .unwrap_or(0);
-            let store_trace = self.remember_gemma4_sliding_prefix_checkpoint(
-                full_tokens,
-                cached_prefix_len,
-                block_size,
-                0,
-            )?;
-            if trace_enabled {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 paged_prefill_sliding_prefix_done cached_prefix_tokens={} restored_prefix_tokens={} replay_tokens={} checkpoint_stored={} store_eval_ms={:.1} store_snapshot_ms={:.1} store_token_clone_ms={:.1} store_update_ms={:.1} store_ms={:.1} elapsed_ms={:.1}",
-                    cached_prefix_len,
-                    sliding_primed_prefix_len,
-                    prefix.len(),
-                    store_trace.stored,
-                    store_trace.eval_ms,
-                    store_trace.snapshot_ms,
-                    store_trace.token_clone_ms,
-                    store_trace.update_ms,
-                    store_trace.total_ms,
-                    sliding_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                ));
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                return Err(Error::from_reason("prefill cancelled"));
             }
-        } else if cached_prefix_len > 0 && trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 paged_prefill_sliding_prefix_skipped cached_prefix_tokens={} sliding_primed_prefix_tokens={} reason=already_primed",
-                cached_prefix_len, sliding_primed_prefix_len
-            ));
-        }
-        // Sliding-window state now covers the whole cached prefix (either it
-        // already did, or the replay above just extended it to
-        // `cached_prefix_len`). Discharge the adapter's auxiliary-state
-        // obligation before the first `record_tokens` of the turn.
-        if let Some(adapter) = self.paged_adapter.as_mut() {
-            adapter
-                .confirm_aux_prefix_primed(cached_prefix_len)
+            let end = position.saturating_add(chunk_size).min(final_index);
+            let chunk = &suffix_tokens[position..end];
+            self.kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
+                .record_tokens_all(self.active_paged_seq, chunk)
                 .map_err(Error::from_reason)?;
-        }
-
-        crate::models::gemma4::diagnostic::set_path("paged");
-        crate::models::gemma4::diagnostic::set_step(-1);
-
-        // Two-pass split (mirrors flat `prefill_body_gemma4 →
-        // forward_inner`):
-        //   Pass 1: tokens `[..suffix_len-1]` (no-op if suffix_len == 1).
-        //           Run this body in bounded chunks so long-context paged
-        //           prefill does not build a single enormous lazy graph before
-        //           the first cache materialization.
-        //   Pass 2: the FINAL token (length 1). Now
-        //           `cached_prefix_len_for_chunk = cached_prefix_len +
-        //           suffix_len - 1`, which is > 0, so global layers
-        //           take the graph-native single-token paged-attention branch
-        //           used by decode. This aligns the reduction order with the
-        //           paged `forward_inner` dispatch.
-        let configured_chunk_size = crate::array::paged_prefill_chunk_size();
-        let mut pass2_first_position = cached_prefix_len;
-        if suffix_len > 1 {
-            // --- Pass 1: all-but-last suffix tokens, chunked. ---
-            let pass1_tokens = &suffix_tokens[..(suffix_len as usize - 1)];
-            let num_query_heads = u32::try_from(self.config.num_attention_heads).map_err(|_| {
-                Error::from_reason(format!(
-                    "Gemma4 paged prefill invalid num_attention_heads={}",
-                    self.config.num_attention_heads
-                ))
-            })?;
-            let global_head_size =
-                u32::try_from(self.config.effective_head_dim(true)).map_err(|_| {
-                    Error::from_reason(format!(
-                        "Gemma4 paged prefill invalid global head_dim={}",
-                        self.config.effective_head_dim(true)
-                    ))
-                })?;
-            let num_kv_heads =
-                u32::try_from(self.config.effective_kv_heads(true)).map_err(|_| {
-                    Error::from_reason(format!(
-                        "Gemma4 paged prefill invalid global num_kv_heads={}",
-                        self.config.effective_kv_heads(true)
-                    ))
-                })?;
-            let route_policy = gemma4_paged_prefill_route_policy();
-            let block_size = self
-                .paged_adapter
-                .as_ref()
-                .map(|adapter| adapter.block_size())
-                .unwrap_or(0);
-            let full_tokens_len = u32::try_from(full_tokens.len())
-                .map_err(|_| Error::from_reason("Gemma4 paged prefill token count exceeds u32"))?;
-            let prompt_checkpoint_boundary_len = full_tokens_len
-                .checked_div(block_size)
-                .map(|blocks| blocks.saturating_mul(block_size))
-                .unwrap_or(0);
-            // Anchor rungs for the cold sidecar. Derived once for the whole
-            // prefill (they are a pure function of the config and the block
-            // size) and, deliberately, NOT fed to
-            // `gemma4_split_body_chunk_plan_at_position` below: a rung is
-            // snapshotted from the temporal K/V view the chunk already
-            // produced, so publishing one is numerically transparent, while
-            // splitting the chunk at it would change every downstream GEMM's
-            // `M` and with it the accumulation order.
-            let sliding_caps = self.gemma4_sliding_retention_caps_for_turn(block_size);
-            let cold_restore_tail_boundary =
-                gemma4_cold_restore_tail_publish(full_tokens_len, block_size, sliding_caps);
-            // Strictly a per-turn artifact: it costs one window of sliding K/V
-            // and only this turn's capture can use it.
-            self.sliding_cold_restore_tail_checkpoint = None;
-            // Compute chunks follow the configured prefill step directly, as
-            // in the authoritative mlx-lm generator. Sliding checkpoints are
-            // captured from temporal K/V views inside a chunk; they must not
-            // split a 2K matrix-prefill into 1K work.
-            let mut body_chunk_plan = gemma4_paged_prefill_body_chunk_plan(
-                configured_chunk_size,
-                pass1_tokens.len(),
-                pass2_first_position,
-                num_query_heads,
-                num_kv_heads,
-                global_head_size,
-                route_policy,
+            let absolute_position = suffix_start.saturating_add(position);
+            let hidden = self.run_paged_prefill_layer_loop(
+                chunk,
+                absolute_position as u32,
+                absolute_position as u32,
+                &layer_kinds,
             )?;
-            gemma4_split_body_chunk_plan_at_position(
-                &mut body_chunk_plan,
-                prompt_checkpoint_boundary_len,
-            );
-            let total_body_chunks = body_chunk_plan.len();
-            let first_body_chunk_size = body_chunk_plan.first().map(|chunk| chunk.len).unwrap_or(0);
-            let min_body_chunk_size = body_chunk_plan
-                .iter()
-                .map(|chunk| chunk.len)
-                .min()
-                .unwrap_or(0);
-            let max_body_chunk_size = body_chunk_plan
-                .iter()
-                .map(|chunk| chunk.len)
-                .max()
-                .unwrap_or(0);
-            let dynamic_v2_aux_caps = body_chunk_plan
-                .iter()
-                .filter(|chunk| chunk.capped_by_v2_aux_limit)
-                .count();
-            if trace_enabled {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 paged_prefill_body_chunking body_tokens={} chunk_size={} configured_chunk_size={} chunks={} min_chunk_size={} max_chunk_size={} dynamic_v2_aux_caps={} route_policy={:?}",
-                    pass1_tokens.len(),
-                    first_body_chunk_size,
-                    configured_chunk_size,
-                    total_body_chunks,
-                    min_body_chunk_size,
-                    max_body_chunk_size,
-                    dynamic_v2_aux_caps,
-                    route_policy
-                ));
-            }
-            for (chunk_idx, chunk_plan) in body_chunk_plan.iter().enumerate() {
-                let chunk_end = chunk_plan
-                    .start
-                    .checked_add(chunk_plan.len)
-                    .ok_or_else(|| Error::from_reason("Gemma4 paged prefill chunk end overflow"))?;
-                let chunk = pass1_tokens
-                    .get(chunk_plan.start..chunk_end)
-                    .ok_or_else(|| {
-                        Error::from_reason("Gemma4 paged prefill chunk plan out of range")
-                    })?;
-                let chunk_first_position = chunk_plan.first_position;
-                debug_assert_eq!(chunk_first_position, pass2_first_position);
-                let chunk_end_position = chunk_first_position
-                    .checked_add(chunk.len() as u32)
-                    .ok_or_else(|| {
-                        Error::from_reason("Gemma4 paged prefill chunk position overflow")
-                    })?;
-                let checkpoint_interval =
-                    gemma4_sliding_decode_checkpoint_interval(&self.config, block_size);
-                let mut checkpoint_boundaries = gemma4_sliding_chunk_checkpoint_boundaries(
-                    chunk_first_position,
-                    chunk_end_position,
-                    checkpoint_interval,
-                    sliding_caps,
-                );
-                // The prompt boundary is already a real compute endpoint and
-                // is stored by the dedicated protected/prompt checkpoint path.
-                // It leaves the list here, which is why the tail below cannot
-                // use `already_published` to notice that it coincides with the
-                // prompt boundary — `gemma4_cold_restore_tail_publish` screens
-                // that case out instead.
-                checkpoint_boundaries
-                    .retain(|&boundary| boundary != prompt_checkpoint_boundary_len);
-                let chunk_cold_restore_tail = gemma4_chunk_cold_restore_tail(
-                    cold_restore_tail_boundary,
-                    chunk_first_position,
-                    chunk_end_position,
-                    &checkpoint_boundaries,
-                );
-                if let Some(boundary) = chunk_cold_restore_tail {
-                    // `prepare_sliding_checkpoint_capture` rejects offsets that
-                    // are not strictly increasing.
-                    checkpoint_boundaries.push(boundary);
-                    checkpoint_boundaries.sort_unstable();
-                }
-                if !checkpoint_boundaries.is_empty() {
-                    let caches = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason("Gemma4 paged prefill sliding checkpoint caches missing")
-                    })?;
-                    prepare_gemma4_sliding_checkpoint_captures(
-                        &self.config,
-                        caches,
-                        &checkpoint_boundaries,
-                    )?;
-                }
-                let chunk_trace_start = trace_enabled.then(std::time::Instant::now);
-                if trace_enabled {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] gemma4 paged_prefill_body_chunk_start chunk={}/{} first_position={} tokens={} capped_by_v2_aux_limit={} checkpoint_interval={} captured_checkpoint_boundaries={:?} cold_ladder={} anchor_rungs={:?}",
-                        chunk_idx + 1,
-                        total_body_chunks,
-                        chunk_first_position,
-                        chunk.len(),
-                        chunk_plan.capped_by_v2_aux_limit,
-                        checkpoint_interval,
-                        checkpoint_boundaries,
-                        sliding_caps.wants_ladder(),
-                        sliding_caps.anchors.as_slice()
-                    ));
-                }
-                {
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
-                    })?;
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] gemma4 paged_prefill_record_tokens_start chunk={}/{} first_position={} tokens={} current_tokens_before={} blocks_before={}",
-                            chunk_idx + 1,
-                            total_body_chunks,
-                            chunk_first_position,
-                            chunk.len(),
-                            adapter.current_token_count(),
-                            adapter.num_allocated_blocks()
-                        ));
-                    }
-                    adapter.record_tokens(chunk).map_err(Error::from_reason)?;
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] gemma4 paged_prefill_record_tokens_done chunk={}/{} current_tokens_after={} blocks_after={}",
-                            chunk_idx + 1,
-                            total_body_chunks,
-                            adapter.current_token_count(),
-                            adapter.num_allocated_blocks()
-                        ));
-                    }
-                }
-                let layer_loop_start = trace_enabled.then(std::time::Instant::now);
-                if trace_enabled {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] gemma4 paged_prefill_layer_loop_start chunk={}/{} first_position={} cached_prefix_for_chunk={} tokens={}",
-                        chunk_idx + 1,
-                        total_body_chunks,
-                        chunk_first_position,
-                        chunk_first_position,
-                        chunk.len()
-                    ));
-                }
-                let _hidden_pass1 = self.run_paged_prefill_layer_loop(
-                    chunk,
-                    chunk_first_position,
-                    chunk_first_position,
-                    &layer_kinds,
-                )?;
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    adapter
-                        .eval_pending_pool_writes()
-                        .map_err(Error::from_reason)?;
-                }
-                if trace_enabled {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] gemma4 paged_prefill_layer_loop_done chunk={}/{} first_position={} tokens={} elapsed_ms={:.1}",
-                        chunk_idx + 1,
-                        total_body_chunks,
-                        chunk_first_position,
-                        chunk.len(),
-                        layer_loop_start.map(elapsed_ms).unwrap_or(0.0)
-                    ));
-                }
-
-                // Materialize writes from this body chunk before the next
-                // chunk reads through them. Native paged writes are lazy graph
-                // nodes; sliding flat caches are lazy too.
-                if let Some(caches) = self.caches.as_ref() {
-                    eval_gemma4_caches(caches)?;
-                }
-                let captured_checkpoints = if checkpoint_boundaries.is_empty() {
-                    Vec::new()
-                } else {
-                    let caches = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "Gemma4 paged prefill sliding checkpoint caches missing post-forward",
-                        )
-                    })?;
-                    take_gemma4_sliding_checkpoint_captures(
-                        &self.config,
-                        caches,
-                        &checkpoint_boundaries,
-                    )?
-                };
-                for (&boundary, snapshots) in checkpoint_boundaries.iter().zip(captured_checkpoints)
-                {
-                    let is_anchor_rung = sliding_caps.anchors.contains(boundary);
-                    let sink = if chunk_cold_restore_tail == Some(boundary) {
-                        Gemma4SlidingCapturedCheckpointSink::ColdRestoreTail
-                    } else {
-                        Gemma4SlidingCapturedCheckpointSink::PrefixStore
-                    };
-                    let store_trace = self.remember_gemma4_sliding_captured_prefix_checkpoint(
-                        full_tokens,
-                        boundary,
-                        block_size,
-                        0,
-                        snapshots,
-                        sink,
-                    )?;
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] gemma4 paged_prefill_sliding_captured_checkpoint boundary_tokens={} block_size={} checkpoint_interval={} cold_anchor_rung={} cold_restore_tail={} stored={} materialize_ms={:.1} token_clone_ms={:.1} update_ms={:.1} total_ms={:.1}",
-                            boundary,
-                            block_size,
-                            checkpoint_interval,
-                            is_anchor_rung,
-                            sink == Gemma4SlidingCapturedCheckpointSink::ColdRestoreTail,
-                            store_trace.stored,
-                            store_trace.eval_ms,
-                            store_trace.token_clone_ms,
-                            store_trace.update_ms,
-                            store_trace.total_ms
-                        ));
-                    }
-                }
-                crate::array::clear_cache();
-                pass2_first_position = pass2_first_position
-                    .checked_add(chunk.len() as u32)
-                    .ok_or_else(|| {
-                        Error::from_reason("Gemma4 paged prefill token position overflow")
-                    })?;
-                if pass2_first_position == prompt_checkpoint_boundary_len {
-                    self.maybe_remember_gemma4_sliding_prompt_boundary_checkpoint(
-                        "paged_prefill",
-                        full_tokens,
-                        prompt_checkpoint_boundary_len,
-                        trace_enabled,
-                    )?;
-                }
-                if trace_enabled {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] gemma4 paged_prefill_body_chunk_done chunk={}/{} next_position={} elapsed_ms={:.1}",
-                        chunk_idx + 1,
-                        total_body_chunks,
-                        pass2_first_position,
-                        chunk_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                    ));
-                }
-            }
-        }
-
-        // --- Pass 2: the FINAL suffix token (length 1). ---
-        let pass2_tokens = &suffix_tokens[(suffix_len as usize - 1)..];
-        {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
-            })?;
-            if trace_enabled {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 paged_prefill_final_record_tokens_start first_position={} tokens={} current_tokens_before={} blocks_before={}",
-                    pass2_first_position,
-                    pass2_tokens.len(),
-                    adapter.current_token_count(),
-                    adapter.num_allocated_blocks()
-                ));
-            }
-            adapter
-                .record_tokens(pass2_tokens)
+            hidden.eval();
+            let coordinator = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?;
+            coordinator
+                .eval_pending_pool_writes_all()
                 .map_err(Error::from_reason)?;
-            if trace_enabled {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] gemma4 paged_prefill_final_record_tokens_done current_tokens_after={} blocks_after={}",
-                    adapter.current_token_count(),
-                    adapter.num_allocated_blocks()
-                ));
-            }
+            self.remember_grouped_sliding_cold_checkpoint(self.active_paged_seq)?;
+            let coordinator = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?;
+            coordinator
+                .prune_sliding_all(self.active_paged_seq)
+                .map_err(Error::from_reason)?;
+            crate::array::clear_cache();
+            position = end;
         }
-        let pass2_cached_prefix_len = pass2_first_position;
-        let pass2_layer_loop_start = trace_enabled.then(std::time::Instant::now);
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 paged_prefill_final_layer_loop_start first_position={} cached_prefix_for_chunk={} tokens={}",
-                pass2_first_position,
-                pass2_cached_prefix_len,
-                pass2_tokens.len()
-            ));
-        }
+
+        let final_token = &suffix_tokens[final_index..];
+        self.kv_cache_coordinator
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
+            .record_tokens_all(self.active_paged_seq, final_token)
+            .map_err(Error::from_reason)?;
+        let final_position = suffix_start.saturating_add(final_index);
         let mut hidden_states = self.run_paged_prefill_layer_loop(
-            pass2_tokens,
-            pass2_first_position,
-            pass2_cached_prefix_len,
+            final_token,
+            final_position as u32,
+            final_position as u32,
             &layer_kinds,
         )?;
-        if let Some(adapter) = self.paged_adapter.as_mut() {
-            adapter
-                .eval_pending_pool_writes()
-                .map_err(Error::from_reason)?;
-        }
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 paged_prefill_final_layer_loop_done first_position={} tokens={} elapsed_ms={:.1}",
-                pass2_first_position,
-                pass2_tokens.len(),
-                pass2_layer_loop_start.map(elapsed_ms).unwrap_or(0.0)
-            ));
-        }
+        self.kv_cache_coordinator
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
+            .eval_pending_pool_writes_all()
+            .map_err(Error::from_reason)?;
+        self.remember_grouped_sliding_cold_checkpoint(self.active_paged_seq)?;
 
-        self.maybe_remember_gemma4_sliding_prompt_boundary_checkpoint(
-            "paged_prefill",
-            full_tokens,
-            pass2_first_position + pass2_tokens.len() as u32,
-            trace_enabled,
-        )?;
-
-        // Final norm + lm_head + softcap (only for the final token).
         hidden_states = self.final_norm.forward(&hidden_states)?;
-        crate::models::gemma4::diagnostic::dump_norm(0, "post_final_norm", &hidden_states, None);
         let logits = if let Some(ref head) = self.lm_head {
             head.forward(&hidden_states)?
         } else if self.embed_tokens.is_packed_quantized() {
-            // Packed tied lm_head: project through the quantized matmul without
-            // materializing the dense table.
             self.embed_tokens.as_linear(&hidden_states)?
-        } else if let Some(ref w_t) = self.embed_weight_t {
-            hidden_states.matmul(w_t)?
+        } else if let Some(ref weight_t) = self.embed_weight_t {
+            hidden_states.matmul(weight_t)?
         } else {
-            let weight = self.embed_tokens.get_weight();
-            let weight_t = weight.transpose(Some(&[1, 0]))?;
-            hidden_states.matmul(&weight_t)?
+            hidden_states.matmul(&self.embed_tokens.get_weight().transpose(Some(&[1, 0]))?)?
         };
-        crate::models::gemma4::diagnostic::dump_logits("pre_softcap", &logits);
         let logits = if let Some(cap) = self.config.final_logit_softcapping {
             let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
             let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
-            let capped = MxArray::from_handle(handle, "logit_softcap")?;
-            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &capped);
-            capped
+            MxArray::from_handle(handle, "logit_softcap")?
         } else {
-            crate::models::gemma4::diagnostic::dump_logits("post_softcap", &logits);
             logits
         };
-
         let last_seq_len = logits.shape_at(1)?;
-        let last = logits
+        logits
             .slice_axis(1, last_seq_len - 1, last_seq_len)?
-            .squeeze(Some(&[0, 1]))?;
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 paged_prefill_done suffix_tokens={} elapsed_ms={:.1}",
-                suffix_tokens.len(),
-                trace_start.map(elapsed_ms).unwrap_or(0.0)
+            .squeeze(Some(&[0, 1]))
+    }
+
+    /// Execute one scheduler-pinned Gemma 4 prefill slice.
+    ///
+    /// Non-final slices are ordinary multi-token body chunks and do not run
+    /// the vocabulary projection. The final slice keeps Gemma's load-bearing
+    /// last-token split: its body is written first, then the prompt's final
+    /// token is forwarded alone and projected. With pinned boundaries equal
+    /// to the configured paged chunk size this is the same numerical shape as
+    /// [`Self::run_paged_prefill_chunk`], merely interruptible between slices.
+    fn run_scheduled_paged_prefill_slice(
+        &mut self,
+        seq_id: u32,
+        tokens: &[u32],
+        first_logical_position: u32,
+        final_prompt_slice: bool,
+    ) -> Result<Option<MxArray>> {
+        if tokens.is_empty() {
+            return Err(Error::from_reason(
+                "Gemma4 scheduled prefill slice must be non-empty",
             ));
         }
-        Ok(last)
+        if self
+            .turn_cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
+        let layer_kinds = self.compute_layer_kinds()?;
+        let body_len = if final_prompt_slice {
+            tokens.len().saturating_sub(1)
+        } else {
+            tokens.len()
+        };
+        if body_len != 0 {
+            let body = &tokens[..body_len];
+            self.kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
+                .record_tokens_all(seq_id, body)
+                .map_err(Error::from_reason)?;
+            let hidden = self.run_paged_prefill_layer_loop(
+                body,
+                first_logical_position,
+                first_logical_position,
+                &layer_kinds,
+            )?;
+            hidden.eval();
+            let coordinator = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?;
+            coordinator
+                .eval_pending_pool_writes_all()
+                .map_err(Error::from_reason)?;
+            self.remember_grouped_sliding_cold_checkpoint(seq_id)?;
+            let coordinator = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?;
+            coordinator
+                .prune_sliding_all(seq_id)
+                .map_err(Error::from_reason)?;
+        }
+        if !final_prompt_slice {
+            crate::array::clear_cache();
+            return Ok(None);
+        }
+
+        let final_token = &tokens[body_len..];
+        let final_position = first_logical_position.saturating_add(body_len as u32);
+        self.kv_cache_coordinator
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
+            .record_tokens_all(seq_id, final_token)
+            .map_err(Error::from_reason)?;
+        let hidden = self.run_paged_prefill_layer_loop(
+            final_token,
+            final_position,
+            final_position,
+            &layer_kinds,
+        )?;
+        self.kv_cache_coordinator
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
+            .eval_pending_pool_writes_all()
+            .map_err(Error::from_reason)?;
+        let hidden = self.final_norm.forward(&hidden)?;
+        let logits = lm_head_logits(
+            &hidden,
+            &self.embed_tokens,
+            &self.lm_head,
+            self.embed_weight_t.as_ref(),
+            &self.config,
+        )?;
+        Ok(Some(
+            logits
+                .slice_axis(1, logits.shape_at(1)? - 1, logits.shape_at(1)?)?
+                .squeeze(Some(&[0, 1]))?,
+        ))
     }
 
     /// One forward pass through the embed → PLE → layer-loop pipeline
@@ -5554,17 +5159,7 @@ impl Gemma4Inner {
         // not the absolute prompt offset. This mirrors mlx-lm's
         // RotatingKVCache.make_mask behavior and avoids huge long-context masks.
         let seq_len = chunk_len as i64;
-        let sliding_offset = self
-            .caches
-            .as_ref()
-            .and_then(|caches| {
-                caches
-                    .iter()
-                    .enumerate()
-                    .find(|(i, _)| self.config.is_sliding_layer(*i))
-                    .map(|(_, c)| c.get_offset())
-            })
-            .unwrap_or(0);
+        let sliding_offset = first_logical_position as i32;
         let sliding_window = self.config.sliding_window as i64;
         let sliding_mask_offset =
             sliding_mask_offset_for_chunk(seq_len, sliding_offset, sliding_window);
@@ -5582,10 +5177,7 @@ impl Gemma4Inner {
             .map(|offset| create_sliding_mask(seq_len, offset, sliding_window))
             .transpose()?;
 
-        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
         let num_layers = self.layers.len();
-        // Stash for sliding-anchor K/V reused by SharedOnSliding layers.
-        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
 
         #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
@@ -5602,35 +5194,27 @@ impl Gemma4Inner {
                 let ptr = self.layers.as_ptr().add(layer_idx);
                 &*ptr
             };
-            let mask: Option<&MxArray> = if matches!(kind, Gemma4LayerKind::Sliding) {
+            let mask: Option<&MxArray> = if kind.is_sliding() {
                 sliding_mask.as_ref()
             } else {
                 None
             };
 
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason(
-                    "run_paged_prefill_layer_loop: paged_adapter dropped mid-forward",
-                )
-            })?;
-            let flat_cache: Option<&mut Gemma4LayerCache> =
-                if matches!(kind, Gemma4LayerKind::Sliding) {
-                    let caches = unsafe {
-                        let raw = self.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "run_paged_prefill_layer_loop: sliding cache slot missing",
-                            )
-                        })? as *mut Vec<Gemma4LayerCache>;
-                        &mut *raw
-                    };
-                    Some(&mut caches[layer_idx])
-                } else {
-                    None
-                };
+            let adapter = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason(
+                        "run_paged_prefill_layer_loop: paged_adapter dropped mid-forward",
+                    )
+                })?
+                .adapter_mut(kind.group_id())
+                .map_err(Error::from_reason)?;
 
             // Build SharedKvInputs for shared layer kinds.
             let shared_inputs = match kind {
-                Gemma4LayerKind::SharedOnGlobal { .. } => {
+                Gemma4LayerKind::SharedOnGlobal { .. }
+                | Gemma4LayerKind::SharedOnSliding { .. } => {
                     // Anchor's pool currently holds
                     // `cached_prefix_len_for_chunk + chunk_len` tokens
                     // for this layer (the anchor wrote its part of
@@ -5639,35 +5223,10 @@ impl Gemma4Inner {
                     Some(super::decoder_layer::SharedKvInputs {
                         cache_offset: first_logical_position as i32,
                         total_ctx,
-                        keys: None,
-                        values: None,
-                    })
-                }
-                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
-                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "run_paged_prefill_layer_loop: SharedOnSliding anchor {} stash \
-                             missing",
-                            anchor_layer_idx
-                        ))
-                    })?;
-                    let cache_offset =
-                        (first_logical_position as i32 + chunk_len as i32) - seq_len as i32;
-                    Some(super::decoder_layer::SharedKvInputs {
-                        cache_offset,
-                        total_ctx: 0, // unused for SharedOnSliding
-                        keys: Some(k),
-                        values: Some(v),
                     })
                 }
                 _ => None,
             };
-
-            // For Sliding layers that anchor a SharedOnSliding chain,
-            // request the stash so the shared layer can pull K/V.
-            let needs_stash = has_kv_sharing
-                && matches!(kind, Gemma4LayerKind::Sliding)
-                && self.config.should_store_shared_kv(layer_idx);
 
             // Slice the per-layer PLE input ([B, T, num_layers, ple_dim] →
             // [B, T, ple_dim]). Mirrors `forward_body`'s per-layer slice.
@@ -5688,9 +5247,9 @@ impl Gemma4Inner {
                 cached_prefix_len_for_chunk,
                 /* is_prefill */ true,
                 mask,
-                flat_cache,
+                None,
                 ple_input_ref,
-                needs_stash,
+                false,
                 shared_inputs,
             )?;
             if trace_enabled {
@@ -5703,22 +5262,6 @@ impl Gemma4Inner {
             }
             hidden_states = next_hidden_states;
 
-            // After a Sliding anchor's forward, capture its stash so
-            // downstream SharedOnSliding layers can attend over it.
-            if needs_stash {
-                let caches = unsafe {
-                    let raw = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "run_paged_prefill_layer_loop: sliding cache slot missing \
-                             post-forward",
-                        )
-                    })? as *mut Vec<Gemma4LayerCache>;
-                    &mut *raw
-                };
-                if let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
-                    sliding_shared_kv.insert(layer_idx as u32, (k, v));
-                }
-            }
             // Smooth the prefill memory peak: every K layers, materialize the
             // residual stream so MLX can release the upstream graph nodes
             // (embedding + every prior layer's attention/MLP/PLE intermediates)
@@ -5741,8 +5284,8 @@ impl Gemma4Inner {
 
     /// Vision variant of [`Self::run_paged_prefill_layer_loop`]: drives one
     /// contiguous chunk of the merged image+text embeddings through the hybrid
-    /// paged dispatch (global → adapter, sliding → flat rotating cache,
-    /// KV-shared → anchor stash).
+    /// paged dispatch (global/sliding → their cache groups, KV-shared → the
+    /// anchor group's physical slot).
     ///
     /// Identical layer routing to the text loop, with two image-aware seams:
     ///   * the residual stream is seeded from the supplied `chunk_embeds`
@@ -5807,17 +5350,7 @@ impl Gemma4Inner {
         // Sliding mask against the bounded rotating-cache attention view —
         // identical derivation to the text paged loop.
         let seq_len = chunk_len as i64;
-        let sliding_offset = self
-            .caches
-            .as_ref()
-            .and_then(|caches| {
-                caches
-                    .iter()
-                    .enumerate()
-                    .find(|(i, _)| self.config.is_sliding_layer(*i))
-                    .map(|(_, c)| c.get_offset())
-            })
-            .unwrap_or(0);
+        let sliding_offset = first_logical_position as i32;
         let sliding_window = self.config.sliding_window as i64;
         let sliding_mask_offset =
             sliding_mask_offset_for_chunk(seq_len, sliding_offset, sliding_window);
@@ -5832,25 +5365,21 @@ impl Gemma4Inner {
         // boolean keep-mask (true=keep): the global layer's normal None/causal
         // fast path and the sliding layer's possibly-None window mask are
         // replaced by `base | same_image_block`.
-        let overlay_active = overlay_type_ids.is_some() && cached_prefix_len_for_chunk == 0;
-        let overlay_global_mask: Option<MxArray> = if overlay_active {
-            let type_ids = overlay_type_ids.unwrap();
+        let overlay_active = overlay_type_ids.filter(|_| cached_prefix_len_for_chunk == 0);
+        let overlay_global_mask: Option<MxArray> = if let Some(type_ids) = overlay_active {
             let base = create_causal_mask(seq_len as i32, None, None)?;
             let base = base.reshape(&[1, 1, seq_len, seq_len])?;
             Some(apply_bidirectional_vision_overlay(&base, type_ids)?)
         } else {
             None
         };
-        if overlay_active {
-            let type_ids = overlay_type_ids.unwrap();
+        if let Some(type_ids) = overlay_active {
             let base = create_causal_mask(seq_len as i32, None, Some(sliding_window as i32))?;
             let base = base.reshape(&[1, 1, seq_len, seq_len])?;
             sliding_mask = Some(apply_bidirectional_vision_overlay(&base, type_ids)?);
         }
 
-        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
         let num_layers = self.layers.len();
-        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
 
         #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
@@ -5860,7 +5389,7 @@ impl Gemma4Inner {
                 let ptr = self.layers.as_ptr().add(layer_idx);
                 &*ptr
             };
-            let mask: Option<&MxArray> = if matches!(kind, Gemma4LayerKind::Sliding) {
+            let mask: Option<&MxArray> = if kind.is_sliding() {
                 sliding_mask.as_ref()
             } else {
                 // Global/full layers normally pass None (internal causal). When
@@ -5870,59 +5399,28 @@ impl Gemma4Inner {
                 overlay_global_mask.as_ref()
             };
 
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason(
-                    "run_paged_vlm_prefill_layer_loop: paged_adapter dropped mid-forward",
-                )
-            })?;
-            let flat_cache: Option<&mut Gemma4LayerCache> =
-                if matches!(kind, Gemma4LayerKind::Sliding) {
-                    let caches = unsafe {
-                        let raw = self.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "run_paged_vlm_prefill_layer_loop: sliding cache slot missing",
-                            )
-                        })? as *mut Vec<Gemma4LayerCache>;
-                        &mut *raw
-                    };
-                    Some(&mut caches[layer_idx])
-                } else {
-                    None
-                };
+            let adapter = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason(
+                        "run_paged_vlm_prefill_layer_loop: paged_adapter dropped mid-forward",
+                    )
+                })?
+                .adapter_mut(kind.group_id())
+                .map_err(Error::from_reason)?;
 
             let shared_inputs = match kind {
-                Gemma4LayerKind::SharedOnGlobal { .. } => {
+                Gemma4LayerKind::SharedOnGlobal { .. }
+                | Gemma4LayerKind::SharedOnSliding { .. } => {
                     let total_ctx = cached_prefix_len_for_chunk + chunk_len;
                     Some(super::decoder_layer::SharedKvInputs {
                         cache_offset: first_logical_position as i32,
                         total_ctx,
-                        keys: None,
-                        values: None,
-                    })
-                }
-                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
-                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "run_paged_vlm_prefill_layer_loop: SharedOnSliding anchor {} stash \
-                             missing",
-                            anchor_layer_idx
-                        ))
-                    })?;
-                    let cache_offset =
-                        (first_logical_position as i32 + chunk_len as i32) - seq_len as i32;
-                    Some(super::decoder_layer::SharedKvInputs {
-                        cache_offset,
-                        total_ctx: 0,
-                        keys: Some(k),
-                        values: Some(v),
                     })
                 }
                 _ => None,
             };
-
-            let needs_stash = has_kv_sharing
-                && matches!(kind, Gemma4LayerKind::Sliding)
-                && self.config.should_store_shared_kv(layer_idx);
 
             let ple_input = projected_ple.as_ref().map(|p| {
                 p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
@@ -5941,27 +5439,13 @@ impl Gemma4Inner {
                 cached_prefix_len_for_chunk,
                 /* is_prefill */ true,
                 mask,
-                flat_cache,
+                None,
                 ple_input_ref,
-                needs_stash,
+                false,
                 shared_inputs,
             )?;
             hidden_states = next_hidden_states;
 
-            if needs_stash {
-                let caches = unsafe {
-                    let raw = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "run_paged_vlm_prefill_layer_loop: sliding cache slot missing \
-                             post-forward",
-                        )
-                    })? as *mut Vec<Gemma4LayerCache>;
-                    &mut *raw
-                };
-                if let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
-                    sliding_shared_kv.insert(layer_idx as u32, (k, v));
-                }
-            }
             crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
         }
 
@@ -5970,8 +5454,8 @@ impl Gemma4Inner {
 
     /// Cold-start paged prefill over the merged image+text embeddings.
     ///
-    /// Single-shot only: the adapter holds zero tokens and the sliding flat
-    /// caches were freshly built, so `cached_prefix_len == 0` and there is no
+    /// Single-shot only: both grouped adapters hold zero tokens, so
+    /// `cached_prefix_len == 0` and there is no
     /// prefix-cache restore. Splits the merged-embedding body prefill from a
     /// last-token `forward_inner`, a split that is load-bearing — see
     /// [`Self::run_paged_prefill_chunk`] for why
@@ -5989,9 +5473,9 @@ impl Gemma4Inner {
         suffix_embeds: &MxArray,
         layer_kinds: &[Gemma4LayerKind],
         cached_prefix_len: u32,
-        extra_keys_per_block: &[Vec<u64>],
+        _extra_keys_per_block: &[Vec<u64>],
         image_token_positions: &[(u32, u64)],
-        publish_prefix_checkpoints: bool,
+        _cache_salt: u64,
     ) -> Result<MxArray> {
         if expanded_tokens.is_empty() {
             return Err(Error::from_reason(
@@ -6018,7 +5502,7 @@ impl Gemma4Inner {
         // (`cached_prefix_len == 0`). Discharge the adapter's auxiliary-state
         // obligation before the first `record_tokens` of the turn — the same
         // ack `run_paged_prefill_chunk` makes for the text path.
-        if let Some(adapter) = self.paged_adapter.as_mut() {
+        if let Some(adapter) = self.kv_cache_coordinator.as_mut() {
             adapter
                 .confirm_aux_prefix_primed(cached_prefix_len)
                 .map_err(Error::from_reason)?;
@@ -6067,7 +5551,7 @@ impl Gemma4Inner {
         }
 
         let block_size = self
-            .paged_adapter
+            .kv_cache_coordinator
             .as_ref()
             .ok_or_else(|| Error::from_reason("run_paged_vlm_prefill: paged_adapter is None"))?
             .block_size();
@@ -6080,8 +5564,8 @@ impl Gemma4Inner {
         let last_image_exclusive = image_token_positions
             .last()
             .map(|(position, _)| position.saturating_add(1));
-        // SigLIP/E2B is causal, so a changed image may still reuse complete
-        // leading-text blocks. Unified overlay cannot split before its image.
+        // Preserve the established prefill chunk boundaries even though the
+        // retired private rotating-cache checkpoint publisher is gone.
         let leading_text_checkpoint_boundary = if overlay_active {
             0
         } else {
@@ -6098,6 +5582,17 @@ impl Gemma4Inner {
         if pass1_position < pass1_end {
             let configured_chunk_size = crate::array::paged_prefill_chunk_size();
             while pass1_position < pass1_end {
+                // Cooperative-cancel checkpoint (H1b): abort at the chunk
+                // boundary. Both VLM cores fail closed on Err via
+                // `invalidate_gemma4_hybrid_session` — the request is
+                // released, never finalized.
+                if self
+                    .turn_cancel
+                    .as_ref()
+                    .is_some_and(|f| f.load(Ordering::Relaxed))
+                {
+                    return Err(Error::from_reason("prefill cancelled"));
+                }
                 // The first unified chunk must include the complete image
                 // overlay. Boundaries before the end of that span are ignored;
                 // otherwise the later chunk would receive no overlay ids and
@@ -6125,11 +5620,11 @@ impl Gemma4Inner {
                     _ => None,
                 };
                 {
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                    let coordinator = self.kv_cache_coordinator.as_mut().ok_or_else(|| {
                         Error::from_reason("run_paged_vlm_prefill: paged_adapter is None")
                     })?;
-                    adapter
-                        .record_tokens(chunk_tokens)
+                    coordinator
+                        .record_tokens_all(self.active_paged_seq, chunk_tokens)
                         .map_err(Error::from_reason)?;
                 }
                 let _hidden = self.run_paged_vlm_prefill_layer_loop(
@@ -6140,33 +5635,17 @@ impl Gemma4Inner {
                     layer_kinds,
                     chunk_type_ids.as_ref(),
                 )?;
-                if let Some(adapter) = self.paged_adapter.as_mut() {
-                    adapter
-                        .eval_pending_pool_writes()
+                _hidden.eval();
+                if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
+                    coordinator
+                        .eval_pending_pool_writes_all()
+                        .map_err(Error::from_reason)?;
+                    coordinator
+                        .prune_sliding_all(self.active_paged_seq)
                         .map_err(Error::from_reason)?;
                 }
                 if let Some(caches) = self.caches.as_ref() {
                     eval_gemma4_caches(caches)?;
-                }
-                if publish_prefix_checkpoints && chunk_end == prompt_checkpoint_boundary {
-                    self.remember_gemma4_sliding_materialized_prompt_boundary_checkpoint_with_keys(
-                        expanded_tokens,
-                        chunk_end,
-                        block_size,
-                        extra_keys_per_block,
-                        0,
-                        true,
-                    )?;
-                } else if publish_prefix_checkpoints
-                    && chunk_end == leading_text_checkpoint_boundary
-                {
-                    self.remember_gemma4_sliding_materialized_prefix_checkpoint_with_keys(
-                        expanded_tokens,
-                        chunk_end,
-                        block_size,
-                        extra_keys_per_block,
-                        0,
-                    )?;
                 }
                 crate::array::clear_cache();
                 pass1_position = chunk_end;
@@ -6183,11 +5662,11 @@ impl Gemma4Inner {
             pass2_relative_idx as i64 + 1,
         )?;
         {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+            let coordinator = self.kv_cache_coordinator.as_mut().ok_or_else(|| {
                 Error::from_reason("run_paged_vlm_prefill: paged_adapter is None")
             })?;
-            adapter
-                .record_tokens(pass2_tokens)
+            coordinator
+                .record_tokens_all(self.active_paged_seq, pass2_tokens)
                 .map_err(Error::from_reason)?;
         }
         let mut hidden_states = self.run_paged_vlm_prefill_layer_loop(
@@ -6200,9 +5679,9 @@ impl Gemma4Inner {
             // applies to a single-token query.
             None,
         )?;
-        if let Some(adapter) = self.paged_adapter.as_mut() {
-            adapter
-                .eval_pending_pool_writes()
+        if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
+            coordinator
+                .eval_pending_pool_writes_all()
                 .map_err(Error::from_reason)?;
         }
 
@@ -6239,20 +5718,23 @@ impl Gemma4Inner {
             .squeeze(Some(&[0, 1]))
     }
 
-    /// Run one paged decode step: feed `[token_id]` through the model.
-    fn run_paged_decode_step(&mut self, token_id: u32) -> Result<MxArray> {
+    /// Run one paged decode step for a scheduler-owned sequence.
+    fn run_paged_decode_step_for(&mut self, seq_id: u32, token_id: u32) -> Result<MxArray> {
         let first_logical_position = {
-            let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+            let coordinator = self.kv_cache_coordinator.as_mut().ok_or_else(|| {
                 Error::from_reason("run_paged_decode_step: paged_adapter is None")
             })?;
-            adapter.current_token_count()
+            coordinator
+                .activate_request_all(seq_id)
+                .map_err(Error::from_reason)?;
+            coordinator.full_adapter().current_token_count()
         };
         {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+            let coordinator = self.kv_cache_coordinator.as_mut().ok_or_else(|| {
                 Error::from_reason("run_paged_decode_step: paged_adapter dropped")
             })?;
-            adapter
-                .record_tokens(&[token_id])
+            coordinator
+                .record_tokens_all(seq_id, &[token_id])
                 .map_err(Error::from_reason)?;
         }
 
@@ -6273,9 +5755,7 @@ impl Gemma4Inner {
             None
         };
 
-        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
         let num_layers = self.layers.len();
-        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
         crate::models::gemma4::diagnostic::set_path("paged");
         #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
@@ -6285,24 +5765,18 @@ impl Gemma4Inner {
                 let ptr = self.layers.as_ptr().add(layer_idx);
                 &*ptr
             };
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("run_paged_decode_step: paged_adapter dropped mid-forward")
-            })?;
-            let flat_cache: Option<&mut Gemma4LayerCache> =
-                if matches!(kind, Gemma4LayerKind::Sliding) {
-                    let caches = unsafe {
-                        let raw = self.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason("run_paged_decode_step: sliding cache slot missing")
-                        })? as *mut Vec<Gemma4LayerCache>;
-                        &mut *raw
-                    };
-                    Some(&mut caches[layer_idx])
-                } else {
-                    None
-                };
+            let adapter = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason("run_paged_decode_step: paged_adapter dropped mid-forward")
+                })?
+                .adapter_mut(kind.group_id())
+                .map_err(Error::from_reason)?;
 
             let shared_inputs = match kind {
-                Gemma4LayerKind::SharedOnGlobal { .. } => {
+                Gemma4LayerKind::SharedOnGlobal { .. }
+                | Gemma4LayerKind::SharedOnSliding { .. } => {
                     // Anchor's slot already has the new token (it ran
                     // its own forward_paged earlier in this loop, which
                     // wrote K/V via update_keys_values). Read full ctx.
@@ -6310,31 +5784,10 @@ impl Gemma4Inner {
                     Some(super::decoder_layer::SharedKvInputs {
                         cache_offset: first_logical_position as i32,
                         total_ctx,
-                        keys: None,
-                        values: None,
-                    })
-                }
-                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
-                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "run_paged_decode_step: SharedOnSliding anchor {} stash missing",
-                            anchor_layer_idx
-                        ))
-                    })?;
-                    let cache_offset = first_logical_position as i32;
-                    Some(super::decoder_layer::SharedKvInputs {
-                        cache_offset,
-                        total_ctx: 0,
-                        keys: Some(k),
-                        values: Some(v),
                     })
                 }
                 _ => None,
             };
-
-            let needs_stash = has_kv_sharing
-                && matches!(kind, Gemma4LayerKind::Sliding)
-                && self.config.should_store_shared_kv(layer_idx);
 
             // Slice the per-layer PLE input ([B, T, num_layers, ple_dim] →
             // [B, T, ple_dim]).
@@ -6355,25 +5808,11 @@ impl Gemma4Inner {
                 /* cached_prefix_len */ 0,
                 /* is_prefill */ false,
                 /* mask */ None,
-                flat_cache,
+                None,
                 ple_input_ref,
-                needs_stash,
+                false,
                 shared_inputs,
             )?;
-
-            if needs_stash {
-                let caches = unsafe {
-                    let raw = self.caches.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "run_paged_decode_step: sliding cache slot missing post-forward",
-                        )
-                    })? as *mut Vec<Gemma4LayerCache>;
-                    &mut *raw
-                };
-                if let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
-                    sliding_shared_kv.insert(layer_idx as u32, (k, v));
-                }
-            }
         }
 
         hidden_states = self.final_norm.forward(&hidden_states)?;
@@ -6405,6 +5844,123 @@ impl Gemma4Inner {
         Ok(logits)
     }
 
+    /// Run one uniform decode wave for multiple scheduler-owned sequences.
+    /// Full and sliding groups advance atomically for every row, then each
+    /// transformer layer executes once over `[N,1,H]` with request-specific
+    /// RoPE offsets and block tables.
+    fn run_paged_decode_step_batched(&mut self, rows: &[(u32, u32)]) -> Result<MxArray> {
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "run_paged_decode_step_batched requires at least one row",
+            ));
+        }
+        let coordinator = self.kv_cache_coordinator.as_ref().ok_or_else(|| {
+            Error::from_reason("run_paged_decode_step_batched: KV coordinator is unavailable")
+        })?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut planned_rows = Vec::with_capacity(rows.len());
+        for &(seq_id, _) in rows {
+            if !seen.insert(seq_id) {
+                return Err(Error::from_reason(format!(
+                    "run_paged_decode_step_batched received duplicate sequence {seq_id}"
+                )));
+            }
+            let position = coordinator
+                .request_token_count_all(seq_id)
+                .map_err(Error::from_reason)?;
+            planned_rows.push((seq_id, position));
+        }
+
+        let mut recorded = Vec::with_capacity(rows.len());
+        for &(seq_id, token_id) in rows {
+            let result = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason("run_paged_decode_step_batched: KV coordinator disappeared")
+                })?
+                .record_tokens_all(seq_id, &[token_id]);
+            if let Err(error) = result {
+                for &recorded_seq in recorded.iter().rev() {
+                    self.kv_cache_coordinator
+                        .as_mut()
+                        .ok_or_else(|| {
+                            Error::from_reason(
+                                "run_paged_decode_step_batched: KV coordinator disappeared during rollback",
+                            )
+                        })?
+                        .rollback_last_tokens_all(recorded_seq, 1)
+                        .map_err(|rollback| {
+                            Error::from_reason(format!(
+                                "Gemma4 batched record failed for sequence {seq_id}: {error}; \
+                                 rollback for sequence {recorded_seq} failed: {rollback}"
+                            ))
+                        })?;
+                }
+                return Err(Error::from_reason(format!(
+                    "Gemma4 batched record failed for sequence {seq_id}: {error}"
+                )));
+            }
+            recorded.push(seq_id);
+        }
+
+        let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
+        let batch = rows.len() as i64;
+        let input_ids = MxArray::from_uint32(&token_ids, &[batch, 1])?;
+        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
+        hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
+        let projected_ple = if let Some(ref ple) = self.ple {
+            Some(compute_ple(&input_ids, &hidden_states, ple, 1)?)
+        } else {
+            None
+        };
+
+        let layer_kinds = self.compute_layer_kinds()?;
+        for (layer_idx, &kind) in layer_kinds.iter().enumerate() {
+            let layer: &Gemma4DecoderLayer = unsafe { &*self.layers.as_ptr().add(layer_idx) };
+            let adapter = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason(
+                        "run_paged_decode_step_batched: coordinator dropped mid-forward",
+                    )
+                })?
+                .adapter_mut(kind.group_id())
+                .map_err(Error::from_reason)?;
+            let ple_input = projected_ple.as_ref().map(|ple| {
+                ple.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
+                    .and_then(|slice| slice.squeeze(Some(&[2])))
+            });
+            let ple_input = match &ple_input {
+                Some(Ok(input)) => Some(input),
+                Some(Err(error)) => return Err(Error::from_reason(error.reason.clone())),
+                None => None,
+            };
+            hidden_states = layer.forward_paged_batched(
+                &hidden_states,
+                kind,
+                adapter,
+                &planned_rows,
+                ple_input,
+            )?;
+        }
+        hidden_states = self.final_norm.forward(&hidden_states)?;
+        lm_head_logits(
+            &hidden_states,
+            &self.embed_tokens,
+            &self.lm_head,
+            self.embed_weight_t.as_ref(),
+            &self.config,
+        )
+    }
+
+    /// Legacy single-session wrapper. Scheduled turns call the sequence-aware
+    /// form directly.
+    fn run_paged_decode_step(&mut self, token_id: u32) -> Result<MxArray> {
+        self.run_paged_decode_step_for(self.active_paged_seq, token_id)
+    }
+
     /// Replay cached prefix tokens to reconstruct the flat sliding caches.
     /// Used to bring sliding-layer state up to the paged cache's
     /// `cached_prefix_len` boundary before the main `run_paged_prefill_chunk`
@@ -6430,24 +5986,10 @@ impl Gemma4Inner {
     ///                         see below for the case where it is not.
     /// ```
     ///
-    /// On the replay arm with a NON-empty cached prefix the pass-1 loop starts
-    /// at `cached_prefix_len`, and `gemma4_sliding_chunk_checkpoint_boundaries`
-    /// filters `rung > start_offset`, so the rungs below that offset are not
-    /// republished by this turn. That is bounded rather than open-ended:
-    /// [`Self::suppress_large_sliding_prefix_reuse_if_needed`] forces
-    /// `cached_prefix_len := 0` whenever the restore exceeds
-    /// `gemma4_default_sliding_restore_limit` (1024 on the 12B), which sends the
-    /// turn down the fresh arm and republishes the whole ladder from 0. The
-    /// residual is a cached prefix at or below that limit, where the shallow
-    /// rungs the cold tier needs are `<= 1024` anyway and the next turn that
-    /// misses restores them. Do not "fix" this by publishing rungs here: this
-    /// body re-forwards a span the caller already accounted for, and adding
-    /// checkpoints changes the retained set, which changes emitted tokens.
-    ///
-    /// Adding a ladder here would therefore be code no scenario needs. If
-    /// one is ever found, the seam is the same as pass-1's: this loop drives
-    /// `update_and_fetch`, so `prepare_gemma4_sliding_checkpoint_captures` /
-    /// `take_gemma4_sliding_checkpoint_captures` work unchanged.
+    /// This routine is retained only inside the legacy prefill diagnostic
+    /// implementation below. Production grouped text restore installs the
+    /// sliding adapters directly and never reconstructs them through this flat
+    /// replay path.
     fn run_sliding_only_prefill(
         &mut self,
         prefix_tokens: &[u32],
@@ -6514,6 +6056,17 @@ impl Gemma4Inner {
 
         let total_chunks = chunk_plan.len();
         for (chunk_idx, chunk_plan) in chunk_plan.iter().enumerate() {
+            // Cooperative-cancel checkpoint (H1b): abort at the chunk
+            // boundary. Both callers fail closed on Err — the VLM
+            // leading-text replay invalidates the hybrid session, and the
+            // paged chunk driver rides `abort_paged_turn`.
+            if self
+                .turn_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                return Err(Error::from_reason("prefill cancelled"));
+            }
             let chunk_end = chunk_plan
                 .start
                 .checked_add(chunk_plan.len)
@@ -6575,189 +6128,11 @@ impl Gemma4Inner {
         first_logical_position: u32,
         layer_kinds: &[Gemma4LayerKind],
     ) -> Result<()> {
-        let chunk_len = chunk_tokens.len() as u32;
-        if chunk_len == 0 {
-            return Ok(());
-        }
-
-        let input_ids = MxArray::from_uint32(chunk_tokens, &[1, chunk_len as i64])?;
-        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
-        hidden_states = hidden_states.mul_scalar((self.config.hidden_size as f64).sqrt())?;
-
-        let projected_ple_prefix: Option<MxArray> = if let Some(ref ple) = self.ple {
-            let pre_layer_h = hidden_states.clone();
-            Some(compute_ple(
-                &input_ids,
-                &pre_layer_h,
-                ple,
-                chunk_len as i64,
-            )?)
-        } else {
-            None
-        };
-
-        let sliding_offset = self
-            .caches
-            .as_ref()
-            .and_then(|caches| {
-                caches
-                    .iter()
-                    .enumerate()
-                    .find(|(i, _)| self.config.is_sliding_layer(*i))
-                    .map(|(_, c)| c.get_offset())
-            })
-            .unwrap_or(0);
-        if sliding_offset != first_logical_position as i32 {
-            return Err(Error::from_reason(format!(
-                "Gemma4 sliding restore cache offset mismatch: expected {} got {}",
-                first_logical_position, sliding_offset
-            )));
-        }
-
-        let seq_len = chunk_len as i64;
-        let sliding_window = self.config.sliding_window as i64;
-        let sliding_mask_offset =
-            sliding_mask_offset_for_chunk(seq_len, sliding_offset, sliding_window);
-        let sliding_mask = sliding_mask_offset
-            .map(|offset| create_sliding_mask(seq_len, offset, sliding_window))
-            .transpose()?;
-
-        let has_kv_sharing = self.config.num_kv_shared_layers.is_some_and(|n| n > 0);
-        let total_ctx = first_logical_position
-            .checked_add(chunk_len)
-            .ok_or_else(|| Error::from_reason("Gemma4 sliding restore total_ctx overflow"))?;
-        let mut sliding_shared_kv: HashMap<u32, (MxArray, MxArray)> = HashMap::new();
-
-        #[allow(clippy::needless_range_loop)]
-        for layer_idx in 0..self.layers.len() {
-            crate::models::gemma4::diagnostic::set_layer(layer_idx);
-            let kind = layer_kinds[layer_idx];
-            let layer: &Gemma4DecoderLayer = unsafe {
-                let ptr = self.layers.as_ptr().add(layer_idx);
-                &*ptr
-            };
-            let ple_input = projected_ple_prefix.as_ref().map(|p| {
-                p.slice_axis(2, layer_idx as i64, layer_idx as i64 + 1)
-                    .and_then(|s| s.squeeze(Some(&[2])))
-            });
-            let ple_input_ref = match &ple_input {
-                Some(Ok(arr)) => Some(arr),
-                _ => None,
-            };
-
-            let needs_stash = has_kv_sharing
-                && matches!(kind, Gemma4LayerKind::Sliding)
-                && self.config.should_store_shared_kv(layer_idx);
-
-            match kind {
-                Gemma4LayerKind::Sliding => {
-                    let caches = unsafe {
-                        let raw = self.caches.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "run_sliding_prefix_restore_layer_loop: sliding cache missing",
-                            )
-                        })? as *mut Vec<Gemma4LayerCache>;
-                        &mut *raw
-                    };
-                    hidden_states = layer.forward(
-                        &hidden_states,
-                        sliding_mask.as_ref(),
-                        Some(&mut caches[layer_idx]),
-                        ple_input_ref,
-                        needs_stash,
-                    )?;
-                    if needs_stash && let Some((k, v)) = caches[layer_idx].take_stashed_kv() {
-                        sliding_shared_kv.insert(layer_idx as u32, (k, v));
-                    }
-                }
-                Gemma4LayerKind::GlobalPaged { paged_idx } => {
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "run_sliding_prefix_restore_layer_loop: paged_adapter missing",
-                        )
-                    })?;
-                    hidden_states = layer.forward_paged_or_flat(
-                        &hidden_states,
-                        Gemma4LayerKind::SharedOnGlobal {
-                            anchor_paged_idx: paged_idx,
-                        },
-                        adapter,
-                        first_logical_position,
-                        first_logical_position,
-                        /* is_prefill */ true,
-                        /* mask */ None,
-                        /* flat_cache */ None,
-                        ple_input_ref,
-                        /* needs_stash */ false,
-                        Some(super::decoder_layer::SharedKvInputs {
-                            cache_offset: first_logical_position as i32,
-                            total_ctx,
-                            keys: None,
-                            values: None,
-                        }),
-                    )?;
-                }
-                Gemma4LayerKind::SharedOnGlobal { .. } => {
-                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                        Error::from_reason(
-                            "run_sliding_prefix_restore_layer_loop: paged_adapter missing",
-                        )
-                    })?;
-                    hidden_states = layer.forward_paged_or_flat(
-                        &hidden_states,
-                        kind,
-                        adapter,
-                        first_logical_position,
-                        first_logical_position,
-                        /* is_prefill */ true,
-                        /* mask */ None,
-                        /* flat_cache */ None,
-                        ple_input_ref,
-                        /* needs_stash */ false,
-                        Some(super::decoder_layer::SharedKvInputs {
-                            cache_offset: first_logical_position as i32,
-                            total_ctx,
-                            keys: None,
-                            values: None,
-                        }),
-                    )?;
-                }
-                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
-                    let (k, v) = sliding_shared_kv.get(&anchor_layer_idx).ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "run_sliding_prefix_restore_layer_loop: SharedOnSliding anchor {} stash missing",
-                            anchor_layer_idx
-                        ))
-                    })?;
-                    hidden_states = layer.forward_paged_or_flat(
-                        &hidden_states,
-                        kind,
-                        self.paged_adapter.as_mut().ok_or_else(|| {
-                            Error::from_reason(
-                                "run_sliding_prefix_restore_layer_loop: paged_adapter missing",
-                            )
-                        })?,
-                        first_logical_position,
-                        first_logical_position,
-                        /* is_prefill */ true,
-                        /* mask */ None,
-                        /* flat_cache */ None,
-                        ple_input_ref,
-                        /* needs_stash */ false,
-                        Some(super::decoder_layer::SharedKvInputs {
-                            cache_offset: first_logical_position as i32,
-                            total_ctx: 0,
-                            keys: Some(k),
-                            values: Some(v),
-                        }),
-                    )?;
-                }
-            }
-
-            crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
-        }
-
-        Ok(())
+        let _ = (chunk_tokens, first_logical_position, layer_kinds);
+        Err(Error::from_reason(
+            "Gemma4 hybrid paged groups do not replay private sliding state; \
+             prefix admission must intersect all physical cache groups",
+        ))
     }
 
     // =================================================================
@@ -6803,7 +6178,7 @@ impl Gemma4Inner {
     /// non-Metal build, or paged init failure) has no vision path and
     /// returns an error instead of silently falling back.
     fn multimodal_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        if self.paged_adapter.is_none() {
+        if self.kv_cache_coordinator.is_none() {
             return Err(Error::from_reason(
                 "gemma4 image turns require the block-paged KV backend; the model was loaded \
                  without a paged adapter (use_block_paged_cache=false, non-Metal build, or paged \
@@ -6918,14 +6293,14 @@ impl DecodeStep for Gemma4Decode<'_> {
 /// Paged decode stepper for gemma4 (pure-eager — no compiled path, so no
 /// lifecycle/reset guard fields). Drives
 /// [`crate::engine::decode::run_decode_loop`] through
-/// [`Gemma4Inner::run_paged_decode_step`], advancing the per-instance
-/// sliding-window KV checkpoint machinery as a side effect of each
-/// committed decode step.
+/// [`Gemma4Inner::run_paged_decode_step`], advancing every grouped adapter and
+/// pruning physical sliding blocks after their lazy writes materialize.
 pub(crate) struct Gemma4PagedDecode<'a> {
     /// Diagnostic step counter, fed to `set_step` before every paged
     /// forward. The engine loop has no step index in the `DecodeStep`
     /// seam, so the stepper carries its own.
     step: i32,
+    pending_cache_error: Option<String>,
     inner: &'a mut Gemma4Inner,
 }
 
@@ -6946,17 +6321,9 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
     ) -> Result<(MxArray, bool)> {
         crate::models::gemma4::diagnostic::set_step(self.step);
         self.step += 1;
-        let trace_enabled = inference_trace_enabled();
         // `run_paged_decode_step` records the token in the adapter at its
         // top (BEFORE the forward), then returns `[1, 1, vocab]`.
         let logits = self.inner.run_paged_decode_step(token_id)?;
-        // The sliding-window decode-boundary checkpoint runs RIGHT AFTER
-        // the forward, reading the adapter's post-record cursor. It must
-        // NOT move to `maintain_cache` (which runs at the loop TOP, before
-        // this forward, so it would read a stale cursor) — see the engine
-        // loop ordering. Fallible: a checkpoint/eval error aborts the turn.
-        self.inner
-            .maybe_remember_gemma4_sliding_decode_boundary_checkpoint("paged", trace_enabled)?;
         // `run_paged_decode_step` returns `[1, 1, vocab]`; `true` requests
         // the engine's squeeze of axis 1 (the eager convention).
         Ok((logits, true))
@@ -6970,9 +6337,31 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
     }
 
     fn maintain_cache(&mut self, step: i32) {
+        // The loop has materialized the preceding sample before this hook.
+        // That evaluation also completes the preceding KV writes, so blocks
+        // wholly outside the sliding window can now be returned to the pool
+        // without racing lazy Metal work.
+        if self.pending_cache_error.is_none() {
+            let seq_id = self.inner.active_paged_seq;
+            if let Err(error) = self.inner.settle_grouped_kv_step(seq_id) {
+                self.pending_cache_error = Some(error.reason);
+            }
+        }
         // Paged cadence — the per-step
         // `maybe_clear_cache_for_paged_step(step)`.
         crate::array::maybe_clear_cache_for_paged_step(step);
+    }
+
+    fn end_decode(&mut self) -> Result<()> {
+        if self.pending_cache_error.is_none() {
+            let seq_id = self.inner.active_paged_seq;
+            if let Err(error) = self.inner.settle_grouped_kv_step(seq_id) {
+                self.pending_cache_error = Some(error.reason);
+            }
+        }
+        self.pending_cache_error
+            .take()
+            .map_or(Ok(()), |error| Err(Error::from_reason(error)))
     }
 
     fn materialize_final(&mut self, token_id: u32) -> Result<()> {
@@ -6982,28 +6371,21 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         // `request_tokens()` / cursor advances by exactly 1 to equal the
         // saved keep-all history.
         //
-        // Deliberately does NOT fire the sliding decode-boundary checkpoint:
-        // the final length-exit token is not checkpointed at the boundary.
-        // The history checkpoint (in `save_paged_history`) covers the kept
-        // history instead.
         let _logits = self.inner.run_paged_decode_step(token_id)?;
         Ok(())
     }
     // end_decode → default Ok(()).
 }
 
-/// gemma4 paged prefix state — the effective prefix/suffix split from
-/// `prepare_gemma4_paged_turn`. `effective_cached_prefix_len` is the
-/// POST-suppression length (the prepare may zero the plan's cached_len
-/// when a large sliding-prefix reuse is suppressed). `full_tokens`
-/// carries the entire prompt: the engine hands `paged_prefill` only the
-/// suffix, but `run_paged_prefill_chunk` re-prefills the sliding layers
-/// from the prompt start, and `sliding_primed_prefix_len` tells it how
-/// much of the cached prefix the sliding caches already hold.
+/// Gemma4 paged prefix state: the common boundary owned by every physical
+/// full/sliding group plus the suffix that still needs computation.
+/// `full_tokens` retains the prompt so `run_paged_prefill_chunk` can verify that
+/// the supplied suffix starts exactly at the common absolute cursor.
 pub(crate) struct Gemma4PrefixState {
     effective_cached_prefix_len: usize,
     suffix_len: usize,
     sliding_primed_prefix_len: u32,
+    cache_salt: u64,
     full_tokens: Vec<u32>,
 }
 
@@ -7029,21 +6411,14 @@ impl PagedBackend for Gemma4Inner {
         reuse_cache: bool,
         _block_size: usize,
         _extra_keys: &[u64],
-        _cache_salt: u64,
+        cache_salt: u64,
     ) -> Result<Self::PrefixState> {
         let trace_enabled = inference_trace_enabled();
         let total_budget = plan.len() as u32;
-        // The one writer of this field. `finalize_paged_turn` runs the cold
-        // sidecar capture over `request_tokens` = prompt + generated, and the
-        // boundary it may anchor at is bounded by the PROMPT
-        // (`gemma4_cold_restore_reachable_boundary`), so the prompt length has
-        // to survive the decode. `engine::paged_turn::run_paged_turn` calls this
-        // exactly once per turn and always before that finalize.
-        self.paged_turn_prompt_len = total_budget;
         // Per-turn seq_id: the adapter is single-request and the prepare's
         // warm-continue / cold-reset arms make the previous seq_id
         // irrelevant.
-        let seq_id: u32 = 0;
+        let seq_id = self.active_paged_seq;
         // The prepare runs the adapter's warm-continue / cold-reset arms,
         // applies the vLLM `max_cache_hit_tokens = total_budget - 1` cap,
         // and may ZERO the cached prefix mid-prepare when a large
@@ -7056,12 +6431,14 @@ impl PagedBackend for Gemma4Inner {
             reuse_cache,
             total_budget,
             seq_id,
+            cache_salt,
             trace_enabled,
         )?;
         Ok(Gemma4PrefixState {
             effective_cached_prefix_len: prep.cached_prefix_len as usize,
             suffix_len: prep.suffix_len as usize,
             sliding_primed_prefix_len: prep.sliding_primed_prefix_len,
+            cache_salt,
             // Sliding-layer re-prefill needs the FULL prompt, not just the
             // suffix the engine passes to `paged_prefill`.
             full_tokens: plan.to_vec(),
@@ -7083,71 +6460,65 @@ impl PagedBackend for Gemma4Inner {
             suffix_tokens,
             prefix.effective_cached_prefix_len as u32,
             prefix.sliding_primed_prefix_len,
+            prefix.cache_salt,
         )
     }
 
-    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
+    fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
         Ok(Gemma4PagedDecode {
             step: 0,
+            pending_cache_error: None,
             inner: self,
         })
     }
 
-    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
-        // Terminal lifecycle for the paged turn. Success: keep the request
-        // live across turns when reuse is on so the next turn builds on the
-        // partial trailing block's live K/V; otherwise register full blocks
-        // for reuse + release. Infallible (`let _ =` every call — a teardown
-        // failure must not mask the turn result).
+    fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
         self.paged_finalize_failed = false;
-        // The non-reuse branch defers its `release_request` past the sidecar
-        // capture below: releasing clears `request_tokens` and the cold-chain
-        // capture depth, and the sidecar is keyed off exactly those.
-        let mut release_pending = false;
-        let mut finalize_error = match self.paged_adapter.as_mut() {
-            Some(adapter) => {
-                let total_tokens = adapter.request_tokens().len();
-                let block_size = adapter.block_size();
-                let extra_keys = engine::build_paged_extra_keys(
-                    total_tokens,
-                    block_size,
-                    &self.cached_paged_image_token_positions,
-                );
-                if reuse_cache {
-                    adapter
-                        .finalize_turn_keep_live_per_block(&extra_keys, 0)
-                        .err()
-                } else {
-                    release_pending = true;
-                    adapter
-                        .register_full_blocks_for_reuse_per_block(&extra_keys, 0)
-                        .err()
-                }
-            }
-            None => Some("Gemma4 paged adapter missing during finalize".to_string()),
-        };
-        // Persist the out-of-pool sliding state for the SAME chain the adapter
-        // just captured, so a later process can resume from the restored K/V
-        // prefix instead of replaying the decoder over it. Skipped when the
-        // finalize failed: the K/V chain the sidecar would anchor on was not
-        // published, so nothing could ever select it.
-        if finalize_error.is_none() {
-            self.capture_gemma4_sliding_cold_sidecar(Gemma4SlidingColdCaptureContext::text(
-                self.paged_turn_prompt_len,
+        let seq_id = self.active_paged_seq;
+        let finalize_result = (|| -> std::result::Result<Vec<Vec<u64>>, String> {
+            let coordinator = self.kv_cache_coordinator.as_mut().ok_or_else(|| {
+                "Gemma4 hybrid KV coordinator missing during finalize".to_string()
+            })?;
+            coordinator.activate_request_all(seq_id)?;
+            let total_tokens = coordinator.full_adapter().request_tokens().len();
+            let extra_keys = engine::build_paged_extra_keys(
+                total_tokens,
+                coordinator.full_adapter().block_size(),
                 &self.cached_paged_image_token_positions,
-            ));
+            );
+            coordinator.eval_pending_pool_writes_all()?;
+            if reuse_cache {
+                coordinator.finalize_keep_live_all(seq_id, &extra_keys, cache_salt)?;
+            } else {
+                coordinator.register_full_for_cold_capture(seq_id, &extra_keys, cache_salt)?;
+            }
+            Ok(extra_keys)
+        })();
+        if let Ok(extra_keys) = finalize_result.as_ref() {
+            self.capture_grouped_sliding_cold_sidecar(seq_id, extra_keys, cache_salt);
+            if !reuse_cache
+                && let Some(coordinator) = self.kv_cache_coordinator.as_mut()
+                && let Err(error) = coordinator.release_request_all(seq_id)
+            {
+                tracing::warn!(
+                    target: "mlx_core::gemma4::paged",
+                    "Gemma4 paged release after cold capture failed: {error}"
+                );
+                self.paged_finalize_failed = true;
+            }
+            if !reuse_cache {
+                self.grouped_sliding_cold_checkpoints.remove(&seq_id);
+            }
         }
-        if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {
-            finalize_error = finalize_error.or(adapter.release_request().err());
-        }
+        let finalize_error = finalize_result.err();
         if let Some(error) = finalize_error {
             tracing::warn!(
                 target: "mlx_core::gemma4::paged",
                 "Gemma4 paged finalize failed: {error}"
             );
             self.paged_finalize_failed = true;
-            if let Some(adapter) = self.paged_adapter.as_mut() {
-                let _ = adapter.release_request();
+            if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
+                let _ = coordinator.release_request_all(seq_id);
             }
             self.media_session_continuable = false;
         }
@@ -7156,8 +6527,8 @@ impl PagedBackend for Gemma4Inner {
     fn abort_paged_turn(&mut self) {
         // Error-path teardown: release the request fully — partial
         // block_table state is unsafe to keep around. Infallible (`let _ =`).
-        if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+        if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
+            let _ = coordinator.release_request_all(self.active_paged_seq);
         }
         self.caches = None;
         self.clear_reuse_state();
@@ -7172,7 +6543,6 @@ impl PagedBackend for Gemma4Inner {
     ) -> Result<()> {
         if self.paged_finalize_failed {
             self.cached_token_history.clear();
-            self.sliding_last_history_checkpoint = None;
             self.media_session_continuable = false;
             return Err(Error::from_reason(
                 "Gemma4 paged finalize failed; refusing to publish reusable history",
@@ -7215,17 +6585,10 @@ impl PagedBackend for Gemma4Inner {
                 debug_assert!(self.media_session_continuable);
                 self.media_session_context = continued_media_context;
             }
-            // Sliding-window warm-continue checkpoint keyed on the freshly
-            // set history (post-reconcile `request_tokens()` == the trimmed
-            // history). Fallible: a checkpoint/eval error aborts the turn so
-            // reusable state is never published without a materialized
-            // checkpoint.
-            let history_for_checkpoint = self.cached_token_history.clone();
-            let _store_trace =
-                self.remember_gemma4_sliding_history_checkpoint(&history_for_checkpoint)?;
+            // The scheduler-owned sliding group remains live beside the full
+            // group. There is no out-of-pool rotating state to snapshot.
         } else {
             self.cached_token_history.clear();
-            self.sliding_last_history_checkpoint = None;
             // Fresh paged start: a text turn holds no media, so clear any media
             // key a prior turn on this reused model left set (mirrors the flat
             // `save_cache_state` fresh-turn clear). Without the audio clear a
@@ -7256,18 +6619,30 @@ impl PagedBackend for Gemma4Inner {
         // `save_paged_history`; `saturating_sub` makes it a no-op on a length
         // exit (`materialize_final` already recorded the final token) and on
         // a final-step stop (forward never ran).
-        let Some(adapter) = self.paged_adapter.as_mut() else {
+        let Some(coordinator) = self.kv_cache_coordinator.as_mut() else {
             return true;
         };
+        if let Err(error) = coordinator.activate_request_all(self.active_paged_seq) {
+            tracing::warn!(
+                target: "mlx_core::gemma4::paged",
+                "reconcile_paged_request_tokens: activation failed: {error}",
+            );
+            return false;
+        }
         let history_len = if keep_all || generated.is_empty() {
             generated.len()
         } else {
             generated.len() - 1
         };
         let target_len = prompt_len + history_len;
-        let surplus = adapter.request_tokens().len().saturating_sub(target_len);
+        let surplus = coordinator
+            .full_adapter()
+            .request_tokens()
+            .len()
+            .saturating_sub(target_len);
         if surplus > 0
-            && let Err(e) = adapter.rollback_last_tokens(surplus as u32)
+            && let Err(e) =
+                coordinator.rollback_last_tokens_all(self.active_paged_seq, surplus as u32)
         {
             tracing::warn!(
                 target: "mlx_core::gemma4::paged",
@@ -7309,6 +6684,10 @@ impl ChatBackend for Gemma4Inner {
 
     fn family_name(&self) -> &'static str {
         "gemma4"
+    }
+
+    fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.turn_cancel = flag;
     }
 
     fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
@@ -7429,15 +6808,13 @@ impl ChatBackend for Gemma4Inner {
         // prefix cache (cross-request block reuse after a history miss is the
         // paged design's entire point).
         if scope == ResetScope::Command
-            && let Some(adapter) = self.paged_adapter.as_mut()
+            && let Some(coordinator) = self.kv_cache_coordinator.as_mut()
         {
-            adapter
-                .release_request_and_purge_prefix_cache()
-                .map_err(|e| {
-                    Error::from_reason(format!(
-                        "gemma4 reset_caches: paged prefix-cache purge failed: {e}"
-                    ))
-                })?;
+            coordinator.release_all_and_purge().map_err(|e| {
+                Error::from_reason(format!(
+                    "gemma4 reset_caches: paged prefix-cache purge failed: {e}"
+                ))
+            })?;
         }
         Ok(())
     }
@@ -7469,12 +6846,6 @@ impl ChatBackend for Gemma4Inner {
         if !self.session_media().is_empty() && !self.media_session_continuable {
             return 0;
         }
-        // The live KV caches must exist — `cached_token_history` can
-        // carry stale content after a prior `reset_caches_sync` if any
-        // caller forgot to also clear it, so both must line up.
-        if self.caches.is_none() {
-            return 0;
-        }
         let cached = &self.cached_token_history;
         if cached.is_empty() {
             return 0;
@@ -7484,6 +6855,18 @@ impl ChatBackend for Gemma4Inner {
         }
         if tokens[..cached.len()] != cached[..] {
             return 0;
+        }
+        if self.active_flat_session {
+            if self.caches.is_none() {
+                return 0;
+            }
+        } else {
+            let Some(coordinator) = self.kv_cache_coordinator.as_ref() else {
+                return 0;
+            };
+            if !coordinator.can_continue_all(self.active_paged_seq, tokens) {
+                return 0;
+            }
         }
         cached.len()
     }
@@ -7565,6 +6948,7 @@ impl ChatBackend for Gemma4Inner {
                 self.ple.as_ref(),
                 &self.config,
                 None,
+                self.turn_cancel.as_deref(),
             )?;
         }
         eval_gemma4_caches(
@@ -7652,7 +7036,11 @@ impl ChatBackend for Gemma4Inner {
     }
 
     fn execution_plan(&self) -> ExecutionPlan {
-        let paged_available = self.paged_adapter.is_some();
+        // The scheduler selects one physical cache lane before entering the
+        // model-neutral planner. A speculative command temporarily installs
+        // flat target caches, so hide the resident paged pools for that
+        // command; ordinary AR/media commands expose them as usual.
+        let paged_available = self.kv_cache_coordinator.is_some() && !self.active_flat_session;
         let image_components_loaded = self.image_path_loaded();
         let audio_embedder_loaded = self.embed_audio.is_some();
         ExecutionPlan {
@@ -7661,13 +7049,18 @@ impl ChatBackend for Gemma4Inner {
                 audio_embedder_loaded,
                 paged_available,
             ),
-            paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
+            paged_attention: paged_available.then_some(PagedAttentionPlan {
                 supports_delta: true,
             }),
             speculative: self.has_draft().then_some(SpeculativePlan {
                 kind: SpeculativeKind::DraftModel,
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
+                // Proposal/verification uses the request's flat target cache
+                // lane. `execution_plan` hides the resident paged pools while
+                // that lane is installed, so the planner reaches the
+                // speculative whole-turn core without claiming paged draft
+                // support that does not exist.
                 supports_paged_attention: false,
             }),
         }
@@ -7707,9 +7100,14 @@ impl ChatBackend for Gemma4Inner {
     // stay `None` as before.
 
     fn has_live_session(&self) -> bool {
-        // Requires an initialized session: a non-empty
-        // `cached_token_history` AND live `caches`.
-        !self.cached_token_history.is_empty() && self.caches.is_some()
+        !self.cached_token_history.is_empty()
+            && if self.active_flat_session {
+                self.caches.is_some()
+            } else {
+                self.kv_cache_coordinator
+                    .as_ref()
+                    .is_some_and(|coordinator| coordinator.is_live_all(self.active_paged_seq))
+            }
     }
 
     fn session_media(&self) -> MediaCapabilities {
@@ -7744,11 +7142,15 @@ impl ChatBackend for Gemma4Inner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+        if matches!(args.plan.decoder, DecoderPlan::Speculative(_)) {
+            debug_assert!(args.media.is_empty());
+            return self.draft_chat_turn(args);
+        }
         // The execution plan admits every text turn shape (fresh + delta,
         // sync + streaming) when the adapter is loaded. The generic paged
         // engine drives the lifecycle via [`PagedBackend`].
         debug_assert!(args.plan.use_paged_attention);
-        debug_assert!(self.paged_adapter.is_some());
+        debug_assert!(self.kv_cache_coordinator.is_some());
         debug_assert!(matches!(args.plan.decoder, DecoderPlan::Autoregressive));
         debug_assert!(self.paged_text_turn_context.is_empty());
         self.paged_text_turn_context = args.plan.context_media;
@@ -7796,9 +7198,9 @@ impl Gemma4Model {
     /// with a `napi::Error` whose message is exactly
     /// `"Model not initialized. Call Gemma4Model.load() first."` until
     /// `load()` runs and installs the underlying model thread. The
-    /// synchronous `resetCaches()` call is a silent no-op on the stub
-    /// to keep `ChatSession.reset()` idempotent across both runnable
-    /// and stub instances.
+    /// async `resetCaches()` call resolves as a silent no-op on the
+    /// stub to keep `ChatSession.reset()` idempotent across both
+    /// runnable and stub instances.
     ///
     /// A runnable model requires `await Gemma4Model.load(path)`. The
     /// constructor signature is fixed by NAPI-RS; the stub-only behavior is
@@ -7815,7 +7217,9 @@ impl Gemma4Model {
             has_audio,
             initialized: false,
             paged_active: false,
+            max_concurrent_sequences: 1,
             _cache_limit_guard: None,
+            _pool_cache_limit_guard: None,
             draft_active: false,
         }
     }
@@ -7840,6 +7244,24 @@ impl Gemma4Model {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
+    }
+
+    #[napi]
+    pub fn max_concurrent_sequences(&self) -> u32 {
+        if self.paged_active && !Gemma4SchedulerState::force_serial() {
+            self.max_concurrent_sequences.max(1)
+        } else {
+            1
+        }
+    }
+
+    #[napi]
+    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
+        let thread = self.thread.as_ref().ok_or_else(|| {
+            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
+        })?;
+        crate::model_thread::send_and_await(thread, |reply| Gemma4Cmd::SchedulerStats { reply })
+            .await
     }
 
     /// Whether this loaded instance can execute image-bearing chat turns.
@@ -7889,7 +7311,7 @@ impl Gemma4Model {
         config: Option<ChatConfig>,
     ) -> Result<(
         crate::engine::types::ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let thread = self.thread.as_ref().ok_or_else(|| {
             Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
@@ -7897,14 +7319,15 @@ impl Gemma4Model {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        thread.send(ChatCmd::StreamSessionStart {
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
+        thread.send(Gemma4Cmd::Chat(Box::new(ChatCmd::StreamSessionStart {
             messages,
             config,
             stream_tx,
             cancelled: cancelled_inner,
-        })?;
+        })))?;
         Ok((
             crate::engine::types::ChatStreamHandle { cancelled },
             stream_rx,
@@ -7914,7 +7337,7 @@ impl Gemma4Model {
 
 crate::models::chat_napi::chat_napi_surface! {
     class: Gemma4Model,
-    thread_cmd: crate::engine::cmd::ChatCmd,
+    thread_cmd: crate::models::gemma4::model::Gemma4Cmd,
     thread: { option: "Model not initialized. Call Gemma4Model.load() first." },
     image_guard: { vision: has_vision, audio: has_audio },
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null | undefined, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
@@ -8562,20 +7985,15 @@ fn project_per_layer_inputs(
 ///
 /// Returns `Vec<Gemma4LayerKind>` of length `config.num_hidden_layers`
 /// where each entry classifies a layer as:
-/// * `Sliding` — stays on the flat `Gemma4LayerCache::Sliding` path.
-/// * `GlobalPaged { paged_idx }` — routes through the paged adapter
-///   at the given global-layer ordinal.
-/// * `SharedOnGlobal { anchor_paged_idx }` — KV-shared layer whose
-///   anchor is a global layer; reads K/V via the adapter.
-/// * `SharedOnSliding { anchor_layer_idx }` — KV-shared layer whose
-///   anchor is a sliding layer; reads K/V from the anchor's flat
-///   cache stash.
+/// * `SlidingPaged { group_id, paged_idx }` — routes through the bounded
+///   sliding-window cache group.
+/// * `GlobalPaged { group_id, paged_idx }` — routes through a full-attention
+///   cache group.
+/// * `SharedOnGlobal` / `SharedOnSliding` — aliases the anchor's physical
+///   ordinal in the corresponding group without allocating another slot.
 ///
-/// `paged_idx` counts only physical non-shared `full_attention` layers in
-/// their original decoder order — matches the `LayerKVPool` slot count from
-/// `Gemma4Inner::new`. KV-shared layers do NOT consume a paged slot (they
-/// reuse the anchor's K/V); the shared variants carry the anchor's index so
-/// the shared forward path can resolve it.
+/// `paged_idx` counts physical non-shared layers within one group in decoder
+/// order. KV-shared layers do not consume a paged slot.
 ///
 /// Lifted to a free helper so unit tests can drive it without owning a
 /// `Gemma4Inner` (which requires loaded weights). Mirrors LFM2's
@@ -8586,6 +8004,7 @@ pub(crate) fn compute_layer_kinds(config: &Gemma4Config) -> Vec<Gemma4LayerKind>
         .expect("Gemma4 layer kinds must derive from valid KV cache specs")
 }
 
+#[cfg(test)]
 pub(crate) fn compute_layer_kinds_from_kv_cache_specs(
     config: &Gemma4Config,
 ) -> std::result::Result<Vec<Gemma4LayerKind>, String> {
@@ -8598,13 +8017,20 @@ pub(crate) fn compute_layer_kinds_from_kv_cache_specs(
             config.max_position_embeddings
         )
     })?;
-    let routes = derive_layer_kv_cache_routes(
+    let routes = crate::transformer::derive_layer_kv_cache_routes(
         &specs,
         max_model_len,
         gemma4_paged_prefill_group_max_chunk(),
     )
     .map_err(|e| format!("Gemma4 layer kind route derivation failed: {e}"))?;
 
+    layer_kinds_from_routes(&routes, n)
+}
+
+fn layer_kinds_from_routes(
+    routes: &[LayerKVCacheRoute],
+    n: usize,
+) -> std::result::Result<Vec<Gemma4LayerKind>, String> {
     let mut kinds = vec![None; n];
     for route in routes {
         if route.layer_index >= n {
@@ -8621,18 +8047,21 @@ pub(crate) fn compute_layer_kinds_from_kv_cache_specs(
         })?;
         let kind = match (route.shared_kv_anchor, route.attention_kind) {
             (Some(_), AttentionKind::Full) => Gemma4LayerKind::SharedOnGlobal {
+                group_id: route.group_id,
                 anchor_paged_idx: physical_ordinal,
             },
-            (Some(anchor), AttentionKind::SlidingWindow { .. }) => {
-                let anchor_layer_idx = u32::try_from(anchor).map_err(|_| {
-                    format!("Gemma4 shared sliding anchor layer {anchor} does not fit u32")
-                })?;
-                Gemma4LayerKind::SharedOnSliding { anchor_layer_idx }
-            }
+            (Some(_), AttentionKind::SlidingWindow { .. }) => Gemma4LayerKind::SharedOnSliding {
+                group_id: route.group_id,
+                anchor_paged_idx: physical_ordinal,
+            },
             (None, AttentionKind::Full) => Gemma4LayerKind::GlobalPaged {
+                group_id: route.group_id,
                 paged_idx: physical_ordinal,
             },
-            (None, AttentionKind::SlidingWindow { .. }) => Gemma4LayerKind::Sliding,
+            (None, AttentionKind::SlidingWindow { .. }) => Gemma4LayerKind::SlidingPaged {
+                group_id: route.group_id,
+                paged_idx: physical_ordinal,
+            },
         };
         kinds[route.layer_index] = Some(kind);
     }
@@ -8737,6 +8166,20 @@ pub(crate) fn compute_layer_kv_cache_groups(
         .map_err(|e| format!("Gemma4 KV cache grouping failed: {e}"))
 }
 
+fn gemma4_group_reserved_blocks(
+    attention_kind: AttentionKind,
+    max_admission_blocks: u32,
+    scheduler_width: u32,
+) -> u32 {
+    match attention_kind {
+        AttentionKind::Full => max_admission_blocks,
+        AttentionKind::SlidingWindow { .. } => {
+            max_admission_blocks.max(scheduler_width).saturating_add(1)
+        }
+    }
+}
+
+#[cfg(test)]
 fn physical_full_attention_layer_count(specs: &[LayerKVCacheSpec]) -> usize {
     specs
         .iter()
@@ -8746,6 +8189,7 @@ fn physical_full_attention_layer_count(specs: &[LayerKVCacheSpec]) -> usize {
         .count()
 }
 
+#[cfg(test)]
 fn gemma4_default_paged_cache_memory_mb(
     max_seq_len: u32,
     block_size: u32,
@@ -8779,17 +8223,20 @@ fn gemma4_default_paged_cache_memory_mb(
 pub(crate) const GEMMA4_PREFILL_STEP_SIZE: i64 = 512;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum Gemma4SlidingRestoreLimitOverride {
     Cap(u32),
     Uncapped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 struct Gemma4SlidingRestoreSuppression {
     limit: u32,
     source: &'static str,
 }
 
+#[cfg(test)]
 fn parse_gemma4_sliding_restore_limit(value: &str) -> Option<Gemma4SlidingRestoreLimitOverride> {
     let value = value.trim();
     if value.is_empty() {
@@ -8807,6 +8254,7 @@ fn parse_gemma4_sliding_restore_limit(value: &str) -> Option<Gemma4SlidingRestor
         .map(Gemma4SlidingRestoreLimitOverride::Cap)
 }
 
+#[cfg(test)]
 fn gemma4_sliding_restore_limit_override() -> Option<Gemma4SlidingRestoreLimitOverride> {
     static OVERRIDE: OnceLock<Option<Gemma4SlidingRestoreLimitOverride>> = OnceLock::new();
     *OVERRIDE.get_or_init(|| {
@@ -8816,11 +8264,13 @@ fn gemma4_sliding_restore_limit_override() -> Option<Gemma4SlidingRestoreLimitOv
     })
 }
 
+#[cfg(test)]
 fn gemma4_default_sliding_restore_limit(config: &Gemma4Config, block_size: u32) -> Option<u32> {
     let interval = gemma4_sliding_decode_checkpoint_interval(config, block_size);
     (interval > 0).then_some(interval)
 }
 
+#[cfg(test)]
 fn gemma4_large_sliding_restore_suppression_limit_for_override(
     config: &Gemma4Config,
     block_size: u32,
@@ -8838,6 +8288,7 @@ fn gemma4_large_sliding_restore_suppression_limit_for_override(
     (restore_tokens > limit).then_some(Gemma4SlidingRestoreSuppression { limit, source })
 }
 
+#[cfg(test)]
 fn gemma4_large_sliding_restore_suppression_limit(
     config: &Gemma4Config,
     block_size: u32,
@@ -9012,40 +8463,15 @@ fn gemma4_sliding_retention_caps(
     )
 }
 
-/// Whether this turn's cold tier will actually consume a checkpoint ladder.
-///
-/// The anchor rungs exist for ONE consumer:
-/// [`Gemma4Inner::capture_gemma4_sliding_cold_sidecar`], which can only anchor a
-/// sidecar where the persisted K/V chain already reaches. With no
-/// `SlidingWindow` sidecar policy installed nothing can ever read them, so
-/// publishing them is pure cost — extra `RotatingKVCacheSnapshot`s held
-/// resident, and, worse, a different retained SET, which moves the depth a later
-/// warm turn resumes from and therefore the tokens it emits.
-///
-/// Single source of truth for the published rung set
-/// ([`gemma4_sliding_chunk_checkpoint_boundaries`]), retention
-/// ([`gemma4_sliding_retention_caps`]), the decode publish union
-/// ([`gemma4_sliding_decode_publishes_checkpoint`]) and the ladder byte cap
-/// ([`trim_gemma4_sliding_prefix_checkpoints`]), so the four cannot disagree
-/// about whether this is a persist turn. Mirrors
-/// `qwen3_5::paged_forward::gdn_cold_sidecar_ladder_wanted`.
-///
-/// A free function of the cold-tier context rather than a `&Gemma4Inner` method
-/// on purpose: it is the master switch for all four behaviours, and as a method
-/// it was reachable only from a loaded checkpoint on a GPU, i.e. from no test at
-/// all. The one thing left on the `Gemma4Inner` side is the borrow
-/// `paged_adapter -> cold_tier()`, which
-/// `paged_kv_cache_adapter::tests::cold_tier_defaults_none_and_holds_context_across_resets`
-/// already pins.
+/// Whether this turn's cold tier consumes grouped sliding checkpoints. The
+/// scheduler publisher and finalizer use the same predicate so a turn without
+/// a SlidingWindow sidecar never retains state that cannot be restored.
 fn gemma4_sliding_cold_ladder_wanted(cold: Option<&ColdTierContext>) -> bool {
     cold.and_then(|cold| cold.sidecar_policy.as_ref())
         .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::SlidingWindow)
 }
 
-/// Retention caps for a turn whose adapter carries `cold`. THE production
-/// derivation: every publish and retention seam reads its caps from here (via
-/// [`Gemma4Inner::gemma4_sliding_retention_caps_for_turn`]), and nothing else in
-/// production chooses the `want_ladder` boolean.
+/// Retention caps for a turn whose adapter carries `cold`.
 fn gemma4_sliding_retention_caps_for_cold_tier(
     config: &Gemma4Config,
     cold: Option<&ColdTierContext>,
@@ -9054,6 +8480,7 @@ fn gemma4_sliding_retention_caps_for_cold_tier(
     gemma4_sliding_retention_caps(config, block_size, gemma4_sliding_cold_ladder_wanted(cold))
 }
 
+#[cfg(test)]
 fn gemma4_sliding_decode_checkpoint_interval(config: &Gemma4Config, block_size: u32) -> u32 {
     if block_size == 0 {
         return 0;
@@ -9085,6 +8512,7 @@ fn gemma4_sliding_decode_checkpoint_interval(config: &Gemma4Config, block_size: 
 /// cadence, because publishing an extra checkpoint changes the retained set and
 /// therefore the depth a later warm turn resumes from, and that is observable
 /// in the emitted tokens.
+#[cfg(test)]
 fn gemma4_sliding_decode_publishes_checkpoint(
     prefix_len: u32,
     checkpoint_interval: u32,
@@ -9107,6 +8535,7 @@ fn gemma4_sliding_decode_publishes_checkpoint(
 /// string compares on the 12B) plus an env-var `OnceLock` read. HEAD returned
 /// early on every non-cadence decode step and this restores that, for the
 /// ladder arm and the persistence-OFF arm alike.
+#[cfg(test)]
 fn gemma4_sliding_prefix_len_is_on_the_anchor_grid(prefix_len: u32, block_size: u32) -> bool {
     if block_size == 0 || prefix_len == 0 {
         return false;
@@ -9130,15 +8559,8 @@ fn gemma4_sliding_prefix_len_is_on_the_anchor_grid(prefix_len: u32, block_size: 
 /// What a decode step at `prefix_len` publishes, or `None` for the overwhelming
 /// majority of steps that publish nothing.
 ///
-/// This is the whole DECISION half of
-/// [`Gemma4Inner::maybe_remember_gemma4_sliding_decode_boundary_checkpoint`],
-/// pulled out as a free function of `(config, cold tier, block size, cursor)`.
-/// Its call site contributes nothing but three adapter reads, which is the
-/// point: hard-coding `want_ladder` to `false` at that call site used to revert
-/// decode to cadence-only — the exact defect the rung union fixed — while both
-/// decode tests passed, because they called
-/// [`gemma4_sliding_decode_publishes_checkpoint`] directly and never reached
-/// production's caps derivation.
+/// Retired private-checkpoint decision retained only as a pure policy test. The
+/// active grouped scheduler snapshots its configured anchor rungs directly.
 ///
 /// Ordering is deliberate, and it is what keeps this off the decode hot path:
 ///
@@ -9162,6 +8584,7 @@ fn gemma4_sliding_prefix_len_is_on_the_anchor_grid(prefix_len: u32, block_size: 
 /// existed: the cold-tier probe fails and it returns on the same non-boundary
 /// steps HEAD returned on, having derived no caps at all. A persist turn pays
 /// the derivation on the cadence boundaries plus at most four cursors a turn.
+#[cfg(test)]
 fn gemma4_sliding_decode_boundary_plan(
     config: &Gemma4Config,
     cold: Option<&ColdTierContext>,
@@ -9198,6 +8621,7 @@ fn gemma4_sliding_decode_boundary_plan(
 
 /// What the cold tier already holds at one capture candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum Gemma4ColdCaptureProbe<K> {
     /// The chain derives and nothing is on disk under it: capture here.
     Missing(K),
@@ -9215,6 +8639,7 @@ enum Gemma4ColdCaptureProbe<K> {
 /// that found everything already written is a healthy saturated ladder, while a
 /// descent that could not derive a single chain has nothing on disk at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg(test)]
 enum Gemma4ColdCaptureSelection<C, K> {
     /// Capture here. `skipped_persisted` deeper candidates were stepped past
     /// because the tier already holds them.
@@ -9232,10 +8657,7 @@ enum Gemma4ColdCaptureSelection<C, K> {
 
 /// The deepest capture candidate the cold tier does not already hold.
 ///
-/// The DECISION half of `Gemma4Inner::capture_gemma4_sliding_cold_sidecar`'s
-/// descent, split out for the reason the file splits every such decision: the
-/// body around it needs a loaded checkpoint, a paged adapter and an open cold
-/// root, and this rule needs none of those.
+/// Retired private-checkpoint descent retained only as a pure policy test.
 ///
 /// Stopping at the first `Persisted` — what this used to do inline — makes the
 /// on-disk state ABSORBING. The next turn on the same prompt recomputes the
@@ -9251,6 +8673,7 @@ enum Gemma4ColdCaptureSelection<C, K> {
 /// the caller wearing an already-persisted count of zero: that pair shape is
 /// what let the capture record `already_persisted` for a tier that holds
 /// nothing.
+#[cfg(test)]
 fn gemma4_select_cold_capture_candidate<C, K>(
     candidates: impl IntoIterator<Item = C>,
     mut probe: impl FnMut(&C) -> Gemma4ColdCaptureProbe<K>,
@@ -9288,6 +8711,7 @@ fn gemma4_sliding_cold_sidecar_chain_key(
     extra_keys_per_block: &[Vec<u64>],
     block_size: u32,
     boundary: u32,
+    cache_salt: u64,
 ) -> Option<mlx_paged_attn::ColdCacheKey> {
     if block_size == 0 {
         return None;
@@ -9304,7 +8728,7 @@ fn gemma4_sliding_cold_sidecar_chain_key(
             parent,
             tokens,
             extra_keys,
-            0,
+            cache_salt,
             index,
         ));
     }
@@ -9340,6 +8764,7 @@ fn gemma4_sliding_cold_sidecar_chain_key(
 /// Same rule, same reason as `qwen3_5::paged_forward::gdn_checkpoint_target`,
 /// which the GDN ladder has always used; gemma4's sliding prompt boundary is
 /// the one publisher that rounded the other way.
+#[cfg(test)]
 fn gemma4_cold_restore_reachable_boundary(prompt_len: u32, block_size: u32) -> u32 {
     if block_size == 0 {
         return 0;
@@ -9379,6 +8804,7 @@ fn gemma4_cold_restore_reachable_boundary(prompt_len: u32, block_size: u32) -> u
 /// caller contributes three adapter reads, and as a method on `Gemma4Inner` it
 /// would be reachable only from a loaded checkpoint on a GPU, i.e. from no test
 /// at all.
+#[cfg(test)]
 fn gemma4_sliding_cold_capture_ceiling_blocks(
     cold_captured_blocks: u32,
     request_tokens_len: usize,
@@ -9435,6 +8861,7 @@ fn gemma4_sliding_cold_capture_ceiling_blocks(
 ///    change every downstream GEMM's `M` and with it the tokens the turn emits
 ///    — on the persist side of a parity gate that compares persist against
 ///    no-persist, that is a failure either way.
+#[cfg(test)]
 fn gemma4_cold_restore_tail_publish(
     prompt_len: u32,
     block_size: u32,
@@ -9460,6 +8887,7 @@ fn gemma4_cold_restore_tail_publish(
 ///
 /// `(start, end]` matches `gemma4_sliding_chunk_checkpoint_boundaries`'s rung
 /// filter: a boundary at or below where this chunk began was already passed.
+#[cfg(test)]
 fn gemma4_chunk_cold_restore_tail(
     tail: Option<u32>,
     chunk_start: u32,
@@ -9471,6 +8899,7 @@ fn gemma4_chunk_cold_restore_tail(
     })
 }
 
+#[cfg(test)]
 fn gemma4_sliding_checkpoint_boundaries_crossed(
     start_offset: u32,
     end_offset: u32,
@@ -9513,6 +8942,7 @@ fn gemma4_sliding_checkpoint_boundaries_crossed(
 /// which checkpoint a later warm turn resumes from, and that is observable in
 /// the emitted tokens. A persistence-OFF request must publish exactly what it
 /// published before anchor rungs existed.
+#[cfg(test)]
 fn gemma4_sliding_chunk_checkpoint_boundaries(
     start_offset: u32,
     end_offset: u32,
@@ -9755,7 +9185,10 @@ fn upsert_gemma4_sliding_prefix_checkpoint(
 }
 
 fn gemma4_paged_prefill_group_max_chunk() -> u32 {
-    let configured_chunk_size = crate::array::paged_prefill_chunk_size();
+    gemma4_paged_prefill_group_chunk_size(crate::array::paged_prefill_chunk_size())
+}
+
+fn gemma4_paged_prefill_group_chunk_size(configured_chunk_size: i32) -> u32 {
     if configured_chunk_size > 0 {
         configured_chunk_size as u32
     } else {
@@ -9809,6 +9242,7 @@ fn gemma4_coalesce_single_token_restore_chunks(chunks: &mut Vec<Gemma4PagedPrefi
     *chunks = merged;
 }
 
+#[cfg(test)]
 fn gemma4_split_body_chunk_plan_at_position(
     chunks: &mut Vec<Gemma4PagedPrefillBodyChunk>,
     boundary_position: u32,
@@ -10022,6 +9456,7 @@ pub(crate) fn eval_gemma4_caches(caches: &[Gemma4LayerCache]) -> Result<()> {
 /// 1. Embed ALL tokens once upfront (including PLE if enabled)
 /// 2. Run only the transformer body for each chunk (no lm_head)
 /// 3. Stop BEFORE the last token — the caller handles it via forward_inner
+#[allow(clippy::too_many_arguments)]
 fn prefill_body_gemma4(
     prompt: &MxArray,
     embedding: &Embedding,
@@ -10031,6 +9466,7 @@ fn prefill_body_gemma4(
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
     mut tap: Option<&mut DsparkTap<'_>>,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     let total_len = prompt.shape_at(1)?;
 
@@ -10060,6 +9496,14 @@ fn prefill_body_gemma4(
 
     // Process in chunks
     while prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk
+        // boundary. The Err rides the flat engine's
+        // `fail_closed_flat_turn` arm — no `save_cache_state`, the
+        // session is invalidated, so the partially-advanced caches never
+        // become a live prefix.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let chunk_embeds = all_embeds.slice_axis(1, offset, offset + GEMMA4_PREFILL_STEP_SIZE)?;
         let chunk_ple = all_ple
             .as_ref()
@@ -10085,6 +9529,14 @@ fn prefill_body_gemma4(
 
     // Final chunk (still body only — no lm_head needed)
     if offset < prefill_len {
+        // The final remainder is a chunk boundary too once at least one
+        // looped chunk ran: poll before forwarding it so a cancel landing
+        // during the last looped chunk aborts instead of riding through the
+        // remainder. `offset == 0` (single-shot) stays uncancellable by
+        // design.
+        if offset > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let remaining_embeds = all_embeds.slice_axis(1, offset, prefill_len)?;
         let remaining_ple = all_ple
             .as_ref()
@@ -10221,6 +9673,7 @@ fn masked_scatter(input: &MxArray, mask: &MxArray, source: &MxArray) -> Result<M
 /// lookup: otherwise a continue-turn-failure fallback could match the
 /// token-only hash of media blocks registered by another session and reuse
 /// that session's stale media K/V.
+#[cfg(test)]
 fn prompt_holds_media_placeholders(
     tokens: &[u32],
     image_token_id: u32,
@@ -10234,6 +9687,61 @@ mod tests {
     use super::*;
     use crate::engine::plan::{TurnPath, TurnPlan, TurnRequest};
     use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
+
+    #[test]
+    fn grouped_cold_finalize_recovers_a_missing_scheduler_snapshot_from_live_state() {
+        let request_tokens = (0..160).collect::<Vec<u32>>();
+        let mut reads = Vec::new();
+        let checkpoint = resolve_grouped_sliding_cold_checkpoint(
+            None,
+            &[64, 256, 1024],
+            96,
+            &request_tokens,
+            |boundary| {
+                reads.push(boundary);
+                Ok(Some(Vec::new()))
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(reads, vec![64]);
+        assert_eq!(checkpoint.boundary, 64);
+        assert_eq!(checkpoint.tokens, request_tokens[..64]);
+        assert!(checkpoint.layer_kv.is_empty());
+    }
+
+    #[test]
+    fn grouped_cold_finalize_does_not_fabricate_a_rotated_out_anchor() {
+        let request_tokens = (0..640).collect::<Vec<u32>>();
+        let checkpoint = resolve_grouped_sliding_cold_checkpoint(
+            None,
+            &[64, 256, 1024],
+            512,
+            &request_tokens,
+            |_boundary| Ok(None),
+        )
+        .unwrap();
+
+        assert!(checkpoint.is_none());
+    }
+
+    #[test]
+    fn sliding_sidecar_chain_isolated_by_cache_salt() {
+        let fingerprint = mlx_paged_attn::ColdCacheFingerprint::from_components([
+            b"gemma4-sidecar-salt-test".as_slice(),
+        ]);
+        let tokens: Vec<u32> = (1..=8).collect();
+        let extra_keys = vec![Vec::new(), Vec::new()];
+        let key = |salt| {
+            gemma4_sliding_cold_sidecar_chain_key(fingerprint, &tokens, &extra_keys, 4, 8, salt)
+                .expect("two-block sidecar chain")
+        };
+
+        assert_ne!(key(0), key(11));
+        assert_ne!(key(11), key(22));
+        assert_eq!(key(11), key(11));
+    }
 
     #[test]
     fn test_gemma4_session_media_payload_identity() {
@@ -10356,15 +9864,6 @@ mod tests {
     }
 
     #[test]
-    fn gemma4_vlm_checkpoint_publication_is_image_only_and_opt_in() {
-        assert!(gemma4_vlm_prefix_checkpoint_eligible(true, false, true));
-        assert!(!gemma4_vlm_prefix_checkpoint_eligible(true, false, false));
-        assert!(!gemma4_vlm_prefix_checkpoint_eligible(false, true, true));
-        assert!(!gemma4_vlm_prefix_checkpoint_eligible(true, true, true));
-        assert!(!gemma4_vlm_prefix_checkpoint_eligible(false, false, true));
-    }
-
-    #[test]
     fn gemma4_image_lineage_requires_declared_media_context() {
         let history = [1, 2, 3, 4];
         let extended = [1, 2, 3, 4, 5];
@@ -10450,14 +9949,6 @@ mod tests {
             None,
             "an unrepresentable exclusive image endpoint must fail closed"
         );
-    }
-
-    #[test]
-    fn gemma4_restored_sliding_sidecar_must_match_the_effective_prefix_exactly() {
-        assert!(!gemma4_sliding_cold_sidecar_matches_prefix(0, 0));
-        assert!(!gemma4_sliding_cold_sidecar_matches_prefix(16, 32));
-        assert!(gemma4_sliding_cold_sidecar_matches_prefix(32, 32));
-        assert!(!gemma4_sliding_cold_sidecar_matches_prefix(48, 32));
     }
 
     #[test]
@@ -12175,11 +11666,12 @@ mod tests {
         for (needle, expected, why) in [
             (
                 "gemma4_sliding_cold_ladder_wanted(",
-                3usize,
+                4usize,
                 "defined once; called from `gemma4_sliding_retention_caps_for_cold_tier` (the \
-                 derivation) and from `gemma4_sliding_decode_boundary_plan`'s hot-path screen. \
-                 The screen is covered behaviourally by \
-                 `gemma4_sliding_decode_boundary_plan_reads_the_turns_real_cold_tier`",
+                 derivation), `gemma4_sliding_decode_boundary_plan`'s hot-path screen, and the \
+                 grouped sliding checkpoint publisher. The screen is covered behaviourally by \
+                 `gemma4_sliding_decode_boundary_plan_reads_the_turns_real_cold_tier`; the \
+                 publisher is covered by the grouped cold-tier restart parity test",
             ),
             (
                 "gemma4_sliding_retention_caps(",
@@ -12195,8 +11687,10 @@ mod tests {
             ),
             (
                 "gemma4_sliding_retention_caps_for_cold_tier(",
-                3,
-                "defined once, called from `gemma4_sliding_retention_caps_for_turn` and from \
+                6,
+                "defined once, called from the grouped checkpoint publisher, grouped finalize's \
+                 live-anchor fallback, the scheduler's anchor query, \
+                 `gemma4_sliding_retention_caps_for_turn`, and \
                  `gemma4_sliding_decode_boundary_plan`",
             ),
             (
@@ -12214,13 +11708,12 @@ mod tests {
             ),
             (
                 "cold_tier()",
-                3,
-                "the borrow is the ONLY thing the two GPU-only call sites contribute — \
-                 `gemma4_sliding_retention_caps_for_turn` and the decode publisher — plus \
-                 `capture_gemma4_sliding_cold_sidecar`, the rungs' one consumer. Passing a \
-                 literal `None` in place of one of them disconnects the feature just as \
-                 completely as hard-coding `want_ladder`, and leaves the derivation itself \
-                 untouched, so no behavioural test can see it",
+                5,
+                "the grouped publisher, scheduler anchor query, grouped sidecar capture \
+                 metadata, grouped sidecar enqueue, and \
+                 `gemma4_sliding_retention_caps_for_turn` each borrow the live cold-tier \
+                 context. Passing a literal `None` at any decision/capture seam disconnects \
+                 persistence while leaving the pure derivation untouched",
             ),
         ] {
             assert_eq!(
@@ -12244,8 +11737,8 @@ mod tests {
     ///                               ->  capture_gemma4_sliding_cold_sidecar returns at line 1
     /// ```
     ///
-    /// The load-path half is pinned by
-    /// `persistence::tests::{dspark,embedded}_draft_conflicts_with_explicit_paged_cache`.
+    /// Load-time coexistence is pinned by the corresponding persistence tests;
+    /// this test keeps the draft core itself isolated from paged KV mutation.
     /// This is the other half, and the tripwire: the day a draft turn gains a
     /// paged adapter, the sliding decode publisher has to be wired into the
     /// accept loop — and that is NOT a copy of the AR call, because speculative
@@ -12283,12 +11776,8 @@ mod tests {
     /// A draft turn's real, production-derived plan: no paged adapter, so the
     /// turn reaches the speculative handler.
     ///
-    /// `tiny_inner_with_draft` is the in-crate stand-in for a real draft load —
-    /// its config sets `use_block_paged_cache: false`, which is exactly what
-    /// `persistence::resolve_gemma4_draft_paged_cache` forces on every draft
-    /// checkpoint. This half of the pair asserts the arrangement that works;
-    /// [`gemma4_paged_plus_draft_silently_drops_the_draft`] asserts what the
-    /// other arrangement does.
+    /// `tiny_inner_with_draft` is the in-crate stand-in for the flat lane a
+    /// loaded target scheduler installs for one speculative command.
     #[test]
     fn gemma4_flat_draft_plan_routes_to_the_speculative_handler() {
         let inner = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
@@ -12296,9 +11785,7 @@ mod tests {
 
         assert!(
             execution.paged_attention.is_none(),
-            "a draft-carrying Gemma4Inner must build no paged adapter — \
-             `use_block_paged_cache: false` in the config is the load-path forcing that \
-             keeps it that way, and it is the ONLY reason the draft actually runs"
+            "the flat draft lane must hide paged attention from the turn planner"
         );
         let speculative = match execution.speculative {
             Some(s) => s,
@@ -12331,10 +11818,10 @@ mod tests {
         );
     }
 
-    /// Paged and draft cannot coexist on a gemma4 turn, and the failure is
-    /// SILENT — no error, no log, just an autoregressive decode with a fully
-    /// loaded draft that is never stepped. This test states that in executable
-    /// form so the invariant is not carried by prose alone.
+    /// The model-neutral planner cannot execute the flat draft while paged
+    /// attention is exposed for the same command. This negative control makes
+    /// the scheduler's dynamic lane selection mutation-sensitive: speculative
+    /// commands must hide the resident paged pools before planning.
     ///
     /// ```text
     ///   paged ON + supports_paged_attention:false  -> decoder downgraded to AR
@@ -12353,7 +11840,7 @@ mod tests {
     /// speculative decode needs a branch inside `engine::paged_turn`, not a
     /// flag flip.
     #[test]
-    fn gemma4_paged_plus_draft_silently_drops_the_draft() {
+    fn gemma4_paged_planner_requires_the_scheduler_selected_flat_lane() {
         let inner = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
         let flat = inner.execution_plan();
         let speculative = match flat.speculative {
@@ -12417,6 +11904,75 @@ mod tests {
              `supports_paged_attention: true` is not the missing piece; a speculative \
              branch inside `engine::paged_turn` (plus a CROSSED-boundary sliding \
              checkpoint predicate, since a variable accept count jumps rungs) is"
+        );
+    }
+
+    #[test]
+    fn gemma4_resident_paged_pools_are_hidden_only_for_the_flat_draft_lane() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let mut draft_fixture =
+            crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
+        let mut inner = Gemma4Inner::new(paged_tiny_config(Some(true)))
+            .expect("construct tiny paged Gemma4 target");
+        inner.draft = draft_fixture.draft.take();
+        assert!(inner.kv_cache_coordinator.is_some());
+
+        inner.install_flat_owner_caches(None);
+        let draft_plan = TurnPlan::resolve(
+            inner.execution_plan(),
+            TurnRequest {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                speculative_requested: true,
+            },
+        );
+        assert_eq!(
+            draft_plan.path(),
+            TurnPath::Speculative,
+            "the flat request lane must hide, not destroy, resident paged pools"
+        );
+        assert!(inner.kv_cache_coordinator.is_some());
+
+        inner.set_active_paged_owner(17);
+        let ar_plan = TurnPlan::resolve(
+            inner.execution_plan(),
+            TurnRequest {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                speculative_requested: false,
+            },
+        );
+        assert_eq!(ar_plan.path(), TurnPath::Paged);
+    }
+
+    #[test]
+    fn gemma4_grouped_pool_accounting_covers_every_private_adapter() {
+        let inner = Gemma4Inner::new(paged_tiny_config(Some(true)))
+            .expect("construct tiny paged Gemma4 target");
+        let coordinator = inner
+            .kv_cache_coordinator
+            .as_ref()
+            .expect("paged target must own a grouped coordinator");
+        let expected = (0..coordinator.inner.groups().len())
+            .map(|group_id| {
+                coordinator
+                    .adapter(group_id)
+                    .and_then(PagedKVCacheAdapter::pool_allocated_bytes)
+            })
+            .try_fold(0u64, |total, bytes| {
+                bytes.map(|bytes| total.saturating_add(bytes))
+            })
+            .expect("read every grouped pool footprint");
+        assert!(expected > 0, "paged Gemma4 must allocate private KV pools");
+        assert_eq!(
+            coordinator
+                .pool_allocated_bytes()
+                .expect("report grouped pool footprint"),
+            expected
         );
     }
 
@@ -12590,7 +12146,7 @@ mod tests {
 
     #[test]
     fn stream_dispatch_promotes_channel_only_output_to_visible_text() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::model_thread::stream_channel(8);
         let sender = StreamSender(&tx);
         let mut state = Gemma4StreamDispatchState::default();
 
@@ -12609,7 +12165,7 @@ mod tests {
 
     #[test]
     fn stream_dispatch_keeps_truncated_prompted_channel_as_reasoning() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::model_thread::stream_channel(8);
         let sender = StreamSender(&tx);
         let mut state = Gemma4StreamDispatchState::new(true);
 
@@ -12628,7 +12184,7 @@ mod tests {
 
     #[test]
     fn stream_dispatch_keeps_reasoning_when_visible_text_follows() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::model_thread::stream_channel(8);
         let sender = StreamSender(&tx);
         let mut state = Gemma4StreamDispatchState::default();
 
@@ -12653,18 +12209,14 @@ mod tests {
 
     #[test]
     fn stream_dispatch_keeps_reasoning_when_tool_call_follows() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = crate::model_thread::stream_channel(8);
         let sender = StreamSender(&tx);
         let mut state = Gemma4StreamDispatchState::default();
 
         state.dispatch_segments(
             vec![
                 StreamSegment::Reasoning("scratch".into()),
-                StreamSegment::ToolCall(crate::tools::ToolCallResult::ok(
-                    "tool".into(),
-                    serde_json::json!({}),
-                    String::new(),
-                )),
+                StreamSegment::ToolCall,
             ],
             &sender,
         );
@@ -12746,6 +12298,16 @@ mod tests {
             127,
             "the default bound must not pad a short final chunk"
         );
+    }
+
+    #[test]
+    fn gemma4_grouped_prefill_uses_bounded_default_chunks() {
+        assert_eq!(
+            super::gemma4_paged_prefill_group_chunk_size(0),
+            super::GEMMA4_PREFILL_STEP_SIZE as u32
+        );
+        assert_eq!(super::gemma4_paged_prefill_group_chunk_size(-1), 512);
+        assert_eq!(super::gemma4_paged_prefill_group_chunk_size(2048), 2048);
     }
 
     #[test]
@@ -13211,6 +12773,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gemma4_shared_pool_does_not_partition_a_full_sliding_window_per_slot() {
+        assert_eq!(
+            super::gemma4_group_reserved_blocks(super::AttentionKind::Full, 8192, 8),
+            8192
+        );
+        assert_eq!(
+            super::gemma4_group_reserved_blocks(
+                super::AttentionKind::SlidingWindow {
+                    sliding_window: 1024,
+                },
+                97,
+                8,
+            ),
+            98,
+            "one maximum sliding working set plus its null block serves a shared pool"
+        );
+        assert_eq!(
+            super::gemma4_group_reserved_blocks(
+                super::AttentionKind::SlidingWindow { sliding_window: 8 },
+                2,
+                8,
+            ),
+            9,
+            "a tiny window still reserves one starter block per live row plus null"
+        );
+    }
+
     /// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged
     /// adapter. The previous "None means no adapter" assertion was removed
     /// when the default flipped from `unwrap_or(false)` to `unwrap_or(true)`
@@ -13230,7 +12820,7 @@ mod tests {
             }
         };
         assert!(
-            inner.paged_adapter.is_none(),
+            inner.kv_cache_coordinator.is_none(),
             "paged_adapter must be None when use_block_paged_cache is Some(false)"
         );
     }
@@ -13251,7 +12841,7 @@ mod tests {
         match super::Gemma4Inner::new(cfg) {
             Ok(inner) => {
                 assert!(
-                    inner.paged_adapter.is_some(),
+                    inner.kv_cache_coordinator.is_some(),
                     "paged_adapter must be Some when use_block_paged_cache is None \
                      (new default-on policy: unwrap_or(true))"
                 );
@@ -13282,7 +12872,7 @@ mod tests {
         match super::Gemma4Inner::new(cfg) {
             Ok(inner) => {
                 assert!(
-                    inner.paged_adapter.is_some(),
+                    inner.kv_cache_coordinator.is_some(),
                     "paged_adapter must be Some when use_block_paged_cache = Some(true)"
                 );
             }
@@ -13654,7 +13244,11 @@ mod tests {
         assert_eq!(kinds.len(), 4);
         for (i, k) in kinds.iter().enumerate() {
             match k {
-                super::Gemma4LayerKind::GlobalPaged { paged_idx } => {
+                super::Gemma4LayerKind::GlobalPaged {
+                    group_id,
+                    paged_idx,
+                } => {
+                    assert_eq!(*group_id, 0, "all-global layers share group 0");
                     assert_eq!(*paged_idx as usize, i, "layer {i} paged_idx mismatch");
                 }
                 other => panic!("layer {i}: expected GlobalPaged, got {other:?}"),
@@ -13662,8 +13256,8 @@ mod tests {
         }
     }
 
-    /// Hybrid sliding+global with no sharing: paged_idx counts only
-    /// global layers in original order; sliding layers map to `Sliding`.
+    /// Hybrid sliding+global with no sharing: each attention kind gets its
+    /// own group and physical ordinals are local to that group.
     #[test]
     fn test_compute_layer_kinds_hybrid_no_sharing() {
         // 5-layer cycle: 4 sliding + 1 global, repeated for 10 layers.
@@ -13683,19 +13277,98 @@ mod tests {
         for (i, k) in kinds.iter().enumerate() {
             if i == 4 {
                 assert!(
-                    matches!(k, super::Gemma4LayerKind::GlobalPaged { paged_idx: 0 }),
+                    matches!(
+                        k,
+                        super::Gemma4LayerKind::GlobalPaged {
+                            group_id: 0,
+                            paged_idx: 0
+                        }
+                    ),
                     "layer 4 must be GlobalPaged{{0}}, got {k:?}"
                 );
             } else if i == 9 {
                 assert!(
-                    matches!(k, super::Gemma4LayerKind::GlobalPaged { paged_idx: 1 }),
+                    matches!(
+                        k,
+                        super::Gemma4LayerKind::GlobalPaged {
+                            group_id: 0,
+                            paged_idx: 1
+                        }
+                    ),
                     "layer 9 must be GlobalPaged{{1}}, got {k:?}"
                 );
             } else {
                 assert!(
-                    matches!(k, super::Gemma4LayerKind::Sliding),
-                    "layer {i} must be Sliding, got {k:?}"
+                    matches!(k, super::Gemma4LayerKind::SlidingPaged { group_id: 1, .. }),
+                    "layer {i} must be SlidingPaged in group 1, got {k:?}"
                 );
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn cast_paged_tiny_weights_to_bf16(inner: &mut super::Gemma4Inner) {
+        use crate::array::{DType, MxArray};
+        let cast = |array: &MxArray| -> MxArray {
+            array.astype(DType::BFloat16).expect("astype BFloat16")
+        };
+        let weight = inner.embed_tokens.get_weight();
+        inner
+            .embed_tokens
+            .set_weight(&cast(&weight))
+            .expect("embed");
+        let weight = inner.final_norm.get_weight();
+        inner
+            .final_norm
+            .set_weight(&cast(&weight))
+            .expect("final_norm");
+        if let Some(ref mut head) = inner.lm_head {
+            let weight = head.get_weight();
+            head.set_weight(&cast(&weight), "lm_head").expect("lm_head");
+        }
+        for layer in &mut inner.layers {
+            layer
+                .set_input_layernorm_weight(&cast(&layer.input_layernorm_weight()))
+                .expect("input norm");
+            layer
+                .set_post_attention_layernorm_weight(&cast(
+                    &layer.post_attention_layernorm_weight(),
+                ))
+                .expect("post attention norm");
+            layer
+                .set_pre_feedforward_layernorm_weight(&cast(
+                    &layer.pre_feedforward_layernorm_weight(),
+                ))
+                .expect("pre ffn norm");
+            layer
+                .set_post_feedforward_layernorm_weight(&cast(
+                    &layer.post_feedforward_layernorm_weight(),
+                ))
+                .expect("post ffn norm");
+            let attention = &mut layer.self_attn;
+            let weight = attention.q_proj_weight();
+            attention.set_q_proj_weight(&cast(&weight)).expect("q");
+            let weight = attention.k_proj_weight();
+            attention.set_k_proj_weight(&cast(&weight)).expect("k");
+            if let Some(weight) = attention.v_proj_weight_opt() {
+                attention.set_v_proj_weight(&cast(&weight)).expect("v");
+            }
+            let weight = attention.o_proj_weight();
+            attention.set_o_proj_weight(&cast(&weight)).expect("o");
+            let weight = attention.q_norm_weight();
+            attention.set_q_norm_weight(&cast(&weight)).expect("qn");
+            let weight = attention.k_norm_weight();
+            attention.set_k_norm_weight(&cast(&weight)).expect("kn");
+            if let crate::models::gemma4::quantized_linear::Gemma4MLPVariant::Standard(
+                ref mut mlp,
+            ) = layer.mlp
+            {
+                let weight = mlp.gate_proj_weight();
+                mlp.set_gate_proj_weight(&cast(&weight)).expect("gate");
+                let weight = mlp.up_proj_weight();
+                mlp.set_up_proj_weight(&cast(&weight)).expect("up");
+                let weight = mlp.down_proj_weight();
+                mlp.set_down_proj_weight(&cast(&weight)).expect("down");
             }
         }
     }
@@ -13716,8 +13389,6 @@ mod tests {
             eprintln!("skipping (paged backend unavailable without Metal)");
             return;
         }
-        use crate::array::{DType, MxArray};
-
         let cfg = paged_tiny_config(Some(true));
         let mut inner = match super::Gemma4Inner::new(cfg) {
             Ok(i) => i,
@@ -13730,90 +13401,24 @@ mod tests {
                 panic!("unexpected Gemma4Inner::new failure: {msg}");
             }
         };
-        assert!(inner.paged_adapter.is_some());
+        assert!(inner.kv_cache_coordinator.is_some());
         if let Err(e) = inner.init_caches_sync() {
             eprintln!("init_caches_sync skipped: {}", e.reason);
             return;
         }
 
-        // Cast all weights to BF16 to match the pool dtype. Mirrors
-        // LFM2's smoke-test cast pattern.
-        let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype BFloat16") };
-        let w = inner.embed_tokens.get_weight();
-        inner.embed_tokens.set_weight(&cast(&w)).expect("embed");
-        let w = inner.final_norm.get_weight();
-        inner.final_norm.set_weight(&cast(&w)).expect("final_norm");
-        if let Some(ref mut head) = inner.lm_head {
-            let w = head.get_weight();
-            head.set_weight(&cast(&w), "lm_head").expect("lm_head");
-        }
-        for layer in inner.layers.iter_mut() {
-            // Norms.
-            layer
-                .set_input_layernorm_weight(&cast(&layer.input_layernorm_weight().clone()))
-                .ok();
-            layer
-                .set_post_attention_layernorm_weight(&cast(
-                    &layer.post_attention_layernorm_weight().clone(),
-                ))
-                .ok();
-            layer
-                .set_pre_feedforward_layernorm_weight(&cast(
-                    &layer.pre_feedforward_layernorm_weight().clone(),
-                ))
-                .ok();
-            layer
-                .set_post_feedforward_layernorm_weight(&cast(
-                    &layer.post_feedforward_layernorm_weight().clone(),
-                ))
-                .ok();
-            // Attention projections + norms.
-            let attn = &mut layer.self_attn;
-            let w = attn.q_proj_weight();
-            attn.set_q_proj_weight(&cast(&w)).expect("q");
-            let w = attn.k_proj_weight();
-            attn.set_k_proj_weight(&cast(&w)).expect("k");
-            if let Some(w) = attn.v_proj_weight_opt() {
-                attn.set_v_proj_weight(&cast(&w)).expect("v");
-            }
-            let w = attn.o_proj_weight();
-            attn.set_o_proj_weight(&cast(&w)).expect("o");
-            let w = attn.q_norm_weight();
-            attn.set_q_norm_weight(&cast(&w)).expect("qn");
-            let w = attn.k_norm_weight();
-            attn.set_k_norm_weight(&cast(&w)).expect("kn");
-            // MLP.
-            if let crate::models::gemma4::quantized_linear::Gemma4MLPVariant::Standard(
-                ref mut mlp,
-            ) = layer.mlp
-            {
-                let w = mlp.gate_proj_weight();
-                mlp.set_gate_proj_weight(&cast(&w)).expect("gate");
-                let w = mlp.up_proj_weight();
-                mlp.set_up_proj_weight(&cast(&w)).expect("up");
-                let w = mlp.down_proj_weight();
-                mlp.set_down_proj_weight(&cast(&w)).expect("down");
-            }
-        }
+        cast_paged_tiny_weights_to_bf16(&mut inner);
 
-        // Adapter lifecycle.
+        // Coordinated full+sliding lifecycle.
         let prompt: Vec<u32> = vec![1, 2, 3, 4];
-        if let Some(adapter) = inner.paged_adapter.as_mut() {
-            if let Err(e) = adapter.reset_for_new_request(0) {
-                eprintln!("skipping (adapter reset failed): {e}");
-                return;
-            }
-            if let Err(e) = adapter.find_cached_prefix(&prompt, &[], 0, false) {
-                eprintln!("skipping (find_cached_prefix failed): {e}");
-                return;
-            }
-            if let Err(e) = adapter.allocate_suffix_blocks(16) {
-                eprintln!("skipping (allocate_suffix_blocks failed): {e}");
-                return;
-            }
+        if let Some(coordinator) = inner.kv_cache_coordinator.as_mut()
+            && let Err(error) = coordinator.reset_scheduled_request(0)
+        {
+            eprintln!("skipping (coordinator reset failed): {error}");
+            return;
         }
 
-        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, 0) {
+        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, 0, 0) {
             Ok(l) => l,
             Err(e) => {
                 let msg = e.reason.to_string();
@@ -13847,16 +13452,58 @@ mod tests {
             next_token = next_token.wrapping_add(1);
         }
 
-        if let Some(adapter) = inner.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+        if let Some(coordinator) = inner.kv_cache_coordinator.as_mut() {
+            let _ = coordinator.release_request_all(0);
         }
     }
 
-    /// Hybrid sliding/global config whose sidecar geometry is well defined:
-    /// two PHYSICAL sliding layers, two global layers to carry the paged pool.
-    #[cfg(test)]
-    fn sliding_capture_config() -> super::Gemma4Config {
-        super::Gemma4Config {
+    fn prepare_tiny_paged_request(
+        inner: &mut super::Gemma4Inner,
+        seq_id: u32,
+        prompt: &[u32],
+    ) -> Result<()> {
+        let coordinator = inner
+            .kv_cache_coordinator
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("tiny Gemma4 paged adapter missing"))?;
+        coordinator
+            .reset_scheduled_request(seq_id)
+            .map_err(Error::from_reason)?;
+        inner.run_scheduled_paged_prefill_slice(seq_id, prompt, 0, true)?;
+        Ok(())
+    }
+
+    fn tiny_exclusive_next_token(
+        inner: &mut super::Gemma4Inner,
+        seq_id: u32,
+        prompt: &[u32],
+        decode_token: u32,
+    ) -> Result<(u32, std::time::Duration)> {
+        prepare_tiny_paged_request(inner, seq_id, prompt)?;
+        let decode_started = std::time::Instant::now();
+        let logits = inner.run_paged_decode_step_for(seq_id, decode_token)?;
+        let next = logits.argmax(-1, Some(false))?.item_at_int32(0)? as u32;
+        let decode_elapsed = decode_started.elapsed();
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("adapter prepared")
+            .release_request_all(seq_id)
+            .map_err(Error::from_reason)?;
+        Ok((next, decode_elapsed))
+    }
+
+    /// A real hybrid Gemma wave must execute both rows in one model forward
+    /// while preserving the greedy result of two isolated serial replays.
+    /// This is the regression oracle that the former rotating-cache design
+    /// could not satisfy.
+    #[test]
+    fn gemma4_hybrid_n2_batched_decode_matches_serial_rows() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping (paged backend unavailable without Metal)");
+            return;
+        }
+        let config = super::Gemma4Config {
             num_hidden_layers: 4,
             layer_types: vec![
                 "sliding_attention".to_string(),
@@ -13864,432 +13511,57 @@ mod tests {
                 "sliding_attention".to_string(),
                 "full_attention".to_string(),
             ],
+            num_kv_shared_layers: Some(2),
             ..paged_tiny_config(Some(true))
-        }
-    }
-
-    /// Snapshots a live rotating cache would hold at `boundary`: one per
-    /// PHYSICAL sliding layer, `None` everywhere else, with
-    /// `cached_tokens = min(boundary, window)` rows — a genuine PRE-WRAP state
-    /// when `boundary < window`, not a padded full-window one.
-    #[cfg(test)]
-    fn sliding_capture_snapshots(
-        config: &super::Gemma4Config,
-        boundary: u32,
-    ) -> Vec<Option<RotatingKVCacheSnapshot>> {
-        let geometry = sliding_sidecar::geometry(config).expect("geometry");
-        let cached = boundary.min(geometry.window);
-        let shape = [
-            1i64,
-            geometry.kv_heads as i64,
-            cached as i64,
-            geometry.head_dim as i64,
-        ];
-        let elements =
-            (geometry.kv_heads as usize) * (cached as usize) * (geometry.head_dim as usize);
-        let mut snapshots: Vec<Option<RotatingKVCacheSnapshot>> = (0..config.num_hidden_layers
-            as usize)
-            .map(|_| None)
-            .collect();
-        for (ordinal, &layer) in sliding_sidecar::physical_sliding_layers(config)
-            .iter()
-            .enumerate()
-        {
-            let make = |tag: u16| -> MxArray {
-                let raw: Vec<u16> = (0..elements)
-                    .map(|i| (i as u16).wrapping_mul(31).wrapping_add(tag))
-                    .collect();
-                MxArray::from_bfloat16(&raw, &shape).expect("bf16 snapshot array")
-            };
-            snapshots[layer] = Some(RotatingKVCacheSnapshot {
-                keys: make(ordinal as u16 * 2),
-                values: make(ordinal as u16 * 2 + 1),
-                offset: boundary as i32,
-                max_size: config.sliding_window,
-                keep: 0,
-                cached_tokens: cached as i32,
-            });
-        }
-        snapshots
-    }
-
-    /// A checkpoint BELOW one sliding window is a legal capture anchor.
-    ///
-    /// This is the capture half of Track A. The payload carries
-    /// `min(boundary, window)` rows, so a 32-token boundary under a 128-token
-    /// window describes exactly what a live `RotatingKVCache` holds there. The
-    /// old `boundary >= window` rule made `boundary_is_representable` refuse
-    /// it, `find_gemma4_sliding_capture_checkpoints` come back empty, and gemma4's
-    /// sidecar inert for every typical chat prompt.
-    ///
-    /// Drives the REAL selector rather than `boundary_is_representable` alone,
-    /// so the token-prefix, block-hash and snapshot-readiness gates in front of
-    /// it are all exercised at a sub-window boundary too.
-    #[test]
-    fn test_gemma4_capture_checkpoint_selects_sub_window_boundary() {
-        let cfg = sliding_capture_config();
-        let mut inner = match super::Gemma4Inner::new(cfg) {
+        };
+        let mut inner = match super::Gemma4Inner::new(config) {
             Ok(inner) => inner,
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("No Metal device found") {
-                    eprintln!("skipping (no Metal device): {msg}");
-                    return;
-                }
-                panic!("unexpected Gemma4Inner::new failure: {msg}");
+            Err(error) if error.reason.contains("No Metal device found") => {
+                eprintln!("skipping (no Metal device): {}", error.reason);
+                return;
             }
+            Err(error) => panic!("unexpected Gemma4Inner::new failure: {}", error.reason),
         };
-
-        let geometry = sliding_sidecar::geometry(&inner.config).expect("hybrid config geometry");
-        let block_size = 16u32;
-        let boundary = 32u32;
-        assert!(
-            boundary < geometry.window,
-            "fixture must be SUB-window: boundary={boundary} window={}",
-            geometry.window
+        cast_paged_tiny_weights_to_bf16(&mut inner);
+        let prompt_a = [3, 5, 7, 9];
+        let prompt_b = [4, 6, 8, 10, 12, 14];
+        let (baseline_a, exclusive_a) =
+            tiny_exclusive_next_token(&mut inner, 1, &prompt_a, 21).expect("exclusive A");
+        let (baseline_b, exclusive_b) =
+            tiny_exclusive_next_token(&mut inner, 2, &prompt_b, 22).expect("exclusive B");
+        prepare_tiny_paged_request(&mut inner, 101, &prompt_a).expect("prefill A");
+        prepare_tiny_paged_request(&mut inner, 202, &prompt_b).expect("prefill B");
+        let batched_started = std::time::Instant::now();
+        let logits = inner
+            .run_paged_decode_step_batched(&[(101, 21), (202, 22)])
+            .expect("fused N=2 decode");
+        logits.eval();
+        let batched_elapsed = batched_started.elapsed();
+        let batched = logits
+            .argmax(-1, Some(false))
+            .expect("argmax")
+            .to_int32()
+            .expect("batched tokens")
+            .as_ref()
+            .to_vec();
+        assert_eq!(batched, vec![baseline_a as i32, baseline_b as i32]);
+        eprintln!(
+            "gemma4 N=2 hybrid decode: fused={:.3}ms serial={:.3}ms",
+            batched_elapsed.as_secs_f64() * 1_000.0,
+            (exclusive_a + exclusive_b).as_secs_f64() * 1_000.0,
         );
-
-        // 4 full blocks of prompt; the persisted K/V chain reaches all of them.
-        let request_tokens: Vec<u32> = (7000..7064).collect();
-        let extra_keys_per_block =
-            engine::build_paged_extra_keys(request_tokens.len(), block_size, &[]);
-        let final_block_hash = super::compute_gemma4_paged_prefix_block_hash_with_keys(
-            &request_tokens,
-            boundary,
-            block_size,
-            &extra_keys_per_block,
-            0,
-        )
-        .expect("sub-window prefix hash");
-
-        inner.sliding_prompt_boundary_checkpoint = Some(super::Gemma4SlidingPrefixCheckpoint {
-            prefix_len: boundary,
-            block_size,
-            final_block_hash,
-            protected_image_prompt_boundary: false,
-            cold_anchor_rung: false,
-            tokens: request_tokens[..boundary as usize].to_vec(),
-            snapshots: sliding_capture_snapshots(&inner.config, boundary),
-        });
-
-        let selected = inner.find_gemma4_sliding_capture_checkpoints(
-            &geometry,
-            &request_tokens,
-            block_size,
-            4,
-            &extra_keys_per_block,
-            0,
-        );
-        let &(selected_boundary, snapshots) = selected
-            .first()
-            .expect("a sub-window checkpoint must now anchor a capture");
-        assert_eq!(selected_boundary, boundary);
-        assert_eq!(snapshots.len(), inner.config.num_hidden_layers as usize);
-        for (layer, snapshot) in snapshots.iter().enumerate() {
-            if inner.config.is_sliding_layer(layer) && !inner.config.is_kv_shared_layer(layer) {
-                let snapshot = snapshot.as_ref().expect("physical sliding layer snapshot");
-                assert_eq!(snapshot.offset, boundary as i32);
-                assert_eq!(snapshot.cached_tokens, boundary as i32);
-                assert_eq!(snapshot.max_size, inner.config.sliding_window);
-            } else {
-                assert!(snapshot.is_none(), "layer {layer} must carry no snapshot");
-            }
+        let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+        coordinator
+            .eval_pending_pool_writes_all()
+            .expect("materialize batched K/V");
+        for seq_id in [101, 202] {
+            coordinator
+                .prune_sliding_all(seq_id)
+                .expect("prune sliding group");
+            coordinator
+                .release_request_all(seq_id)
+                .expect("release hybrid request");
         }
-
-        // And the payload the capture would write is well formed at this
-        // sub-window boundary — the format follows the boundary, it does not
-        // dictate it.
-        let layout = sliding_sidecar::layout_at(&geometry, boundary);
-        assert_eq!(layout.boundary_tokens, boundary);
-        assert_eq!(
-            layout.dims,
-            vec![1u32, geometry.kv_heads, boundary, geometry.head_dim]
-        );
-        let tensors =
-            sliding_sidecar::encode_tensors(&inner.config, &geometry, snapshots, boundary)
-                .expect("encode must not error")
-                .expect("sub-window snapshots must encode");
-        assert_eq!(tensors.len(), layout.tensor_count().expect("tensor count"));
-        assert!(tensors.iter().all(|t| t.len() == layout.bytes_per_tensor));
-
-        // Fail-closed the other way: a checkpoint DEEPER than the persisted
-        // K/V chain is still refused. A sidecar past the chain's break could
-        // never be selected on restore, so writing one would only burn quota.
-        assert!(
-            inner
-                .find_gemma4_sliding_capture_checkpoints(
-                    &geometry,
-                    &request_tokens,
-                    block_size,
-                    1,
-                    &extra_keys_per_block,
-                    0,
-                )
-                .is_empty(),
-            "boundary 32 must not be selected when the chain reaches only 16 tokens"
-        );
-    }
-
-    /// The durable image path is deliberately stricter than same-process E2B
-    /// reuse: the selected checkpoint must be after the complete expanded image
-    /// run and carry the exact image-aware block hash.
-    #[test]
-    fn test_gemma4_image_capture_requires_after_image_exact_checkpoint() {
-        let cfg = sliding_capture_config();
-        let mut inner = match super::Gemma4Inner::new(cfg) {
-            Ok(inner) => inner,
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("No Metal device found") {
-                    eprintln!("skipping (no Metal device): {msg}");
-                    return;
-                }
-                panic!("unexpected Gemma4Inner::new failure: {msg}");
-            }
-        };
-
-        let geometry = sliding_sidecar::geometry(&inner.config).expect("hybrid config geometry");
-        let block_size = 16u32;
-        let boundary = 48u32;
-        let request_tokens: Vec<u32> = (8000..8064).collect();
-        let image_positions: Vec<(u32, u64)> =
-            (20..40).map(|position| (position, 0xAAAA)).collect();
-        let last_image_exclusive = 40u32;
-        let extra_keys_per_block =
-            engine::build_paged_extra_keys(request_tokens.len(), block_size, &image_positions);
-        let final_block_hash = super::compute_gemma4_paged_prefix_block_hash_with_keys(
-            &request_tokens,
-            boundary,
-            block_size,
-            &extra_keys_per_block,
-            0,
-        )
-        .expect("image-aware prefix hash");
-
-        inner.sliding_prompt_boundary_checkpoint = Some(super::Gemma4SlidingPrefixCheckpoint {
-            prefix_len: boundary,
-            block_size,
-            final_block_hash,
-            protected_image_prompt_boundary: true,
-            cold_anchor_rung: false,
-            tokens: request_tokens[..boundary as usize].to_vec(),
-            snapshots: sliding_capture_snapshots(&inner.config, boundary),
-        });
-
-        let selected = inner.find_gemma4_sliding_capture_checkpoints(
-            &geometry,
-            &request_tokens,
-            block_size,
-            4,
-            &extra_keys_per_block,
-            last_image_exclusive,
-        );
-        assert_eq!(
-            selected
-                .iter()
-                .map(|(selected_boundary, _)| *selected_boundary)
-                .collect::<Vec<_>>(),
-            vec![boundary],
-            "an exact checkpoint after the complete image run must be selectable"
-        );
-
-        assert!(
-            inner
-                .find_gemma4_sliding_capture_checkpoints(
-                    &geometry,
-                    &request_tokens,
-                    block_size,
-                    4,
-                    &extra_keys_per_block,
-                    boundary + 1,
-                )
-                .is_empty(),
-            "a checkpoint before the conservative image floor must be refused"
-        );
-
-        let changed_image_positions: Vec<(u32, u64)> =
-            (20..40).map(|position| (position, 0xBBBB)).collect();
-        let changed_extra_keys = engine::build_paged_extra_keys(
-            request_tokens.len(),
-            block_size,
-            &changed_image_positions,
-        );
-        assert!(
-            inner
-                .find_gemma4_sliding_capture_checkpoints(
-                    &geometry,
-                    &request_tokens,
-                    block_size,
-                    4,
-                    &changed_extra_keys,
-                    last_image_exclusive,
-                )
-                .is_empty(),
-            "the same tokens with a different image hash must not select the checkpoint"
-        );
-    }
-
-    /// The aligned-prompt case end to end through the SELECTOR: with the prompt
-    /// boundary out of reach, the cold-restore tail is what the capture anchors
-    /// on — and it only gets that chance because it is a candidate at all.
-    ///
-    /// A 64-token prompt (4 whole blocks of 16) plus an 8-token completion. The
-    /// prompt boundary lands at 64; a restore of this prompt looks up
-    /// `prompt[..63]`, whose deepest block boundary is 48. Under the old
-    /// ceiling the selector took 64 — 209.7 MB of structurally valid sidecar at
-    /// an address no restore can name, rewritten every session.
-    #[test]
-    fn test_gemma4_capture_prefers_the_cold_tail_over_an_unreachable_prompt_boundary() {
-        let cfg = sliding_capture_config();
-        let mut inner = match super::Gemma4Inner::new(cfg) {
-            Ok(inner) => inner,
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("No Metal device found") {
-                    eprintln!("skipping (no Metal device): {msg}");
-                    return;
-                }
-                panic!("unexpected Gemma4Inner::new failure: {msg}");
-            }
-        };
-
-        let geometry = sliding_sidecar::geometry(&inner.config).expect("hybrid config geometry");
-        let block_size = 16u32;
-        let prompt_len = 64u32;
-        assert!(
-            prompt_len.is_multiple_of(block_size),
-            "the fixture's whole point is a block-ALIGNED prompt"
-        );
-        let prompt_boundary = prompt_len / block_size * block_size;
-        let tail_boundary = super::gemma4_cold_restore_reachable_boundary(prompt_len, block_size);
-        assert_eq!((prompt_boundary, tail_boundary), (64, 48));
-
-        // The capture sees the completion too, which is what used to widen its
-        // ceiling past the prompt.
-        let request_tokens: Vec<u32> = (7000..7072).collect();
-        let extra_keys_per_block =
-            engine::build_paged_extra_keys(request_tokens.len(), block_size, &[]);
-        let checkpoint_at = |boundary: u32| super::Gemma4SlidingPrefixCheckpoint {
-            prefix_len: boundary,
-            block_size,
-            final_block_hash: super::compute_gemma4_paged_prefix_block_hash_with_keys(
-                &request_tokens,
-                boundary,
-                block_size,
-                &extra_keys_per_block,
-                0,
-            )
-            .expect("prefix hash"),
-            protected_image_prompt_boundary: false,
-            cold_anchor_rung: false,
-            tokens: request_tokens[..boundary as usize].to_vec(),
-            snapshots: sliding_capture_snapshots(&inner.config, boundary),
-        };
-        inner.sliding_prompt_boundary_checkpoint = Some(checkpoint_at(prompt_boundary));
-        inner.sliding_cold_restore_tail_checkpoint = Some(checkpoint_at(tail_boundary));
-
-        // The chain covered every block of the request; only reachability binds.
-        let chain_blocks = super::gemma4_sliding_cold_capture_ceiling_blocks(
-            u32::MAX,
-            request_tokens.len(),
-            prompt_len,
-            block_size,
-        );
-        assert_eq!(chain_blocks, 3, "48 tokens, not the request's 72");
-
-        let candidates = inner.find_gemma4_sliding_capture_checkpoints(
-            &geometry,
-            &request_tokens,
-            block_size,
-            chain_blocks,
-            &extra_keys_per_block,
-            0,
-        );
-        let boundaries: Vec<u32> = candidates.iter().map(|(boundary, _)| *boundary).collect();
-        assert_eq!(
-            boundaries,
-            vec![tail_boundary],
-            "the tail must be offered and the unreachable prompt boundary must not be"
-        );
-
-        // And it really is a usable anchor, not just a boundary number: the
-        // payload the capture would write encodes at it.
-        let (_, snapshots) = candidates[0];
-        let layout = sliding_sidecar::layout_at(&geometry, tail_boundary);
-        assert_eq!(layout.boundary_tokens, tail_boundary);
-        let tensors =
-            sliding_sidecar::encode_tensors(&inner.config, &geometry, snapshots, tail_boundary)
-                .expect("encode must not error")
-                .expect("the cold tail must encode");
-        assert_eq!(tensors.len(), layout.tensor_count().expect("tensor count"));
-        assert!(tensors.iter().all(|t| t.len() == layout.bytes_per_tensor));
-    }
-
-    #[test]
-    fn test_gemma4_prompt_boundary_checkpoint_survives_decode_checkpoint_eviction() {
-        let cfg = paged_tiny_config(Some(true));
-        let mut inner = match super::Gemma4Inner::new(cfg) {
-            Ok(i) => i,
-            Err(err) => {
-                let msg = err.reason.to_string();
-                if msg.contains("No Metal device found") {
-                    eprintln!("skipping (no Metal device): {msg}");
-                    return;
-                }
-                panic!("unexpected Gemma4Inner::new failure: {msg}");
-            }
-        };
-
-        let block_size = 16;
-        let prompt: Vec<u32> = (10..26).collect();
-        let prompt_hash = super::compute_gemma4_paged_prefix_block_hash(
-            &prompt,
-            prompt.len() as u32,
-            block_size,
-            0,
-        )
-        .expect("prompt hash");
-        inner.sliding_prompt_boundary_checkpoint = Some(super::Gemma4SlidingPrefixCheckpoint {
-            prefix_len: prompt.len() as u32,
-            block_size,
-            final_block_hash: prompt_hash,
-            protected_image_prompt_boundary: false,
-            cold_anchor_rung: false,
-            tokens: prompt.clone(),
-            snapshots: vec![None; inner.config.num_hidden_layers as usize],
-        });
-
-        let checkpoint_limit = super::gemma4_sliding_prefix_checkpoint_limit_for_override(
-            &inner.config,
-            block_size,
-            None,
-        );
-        for i in 0..(checkpoint_limit + 3) {
-            let tokens: Vec<u32> = (0..16).map(|token| 100 + i as u32 + token).collect();
-            inner
-                .sliding_prefix_checkpoints
-                .push_back(super::Gemma4SlidingPrefixCheckpoint {
-                    prefix_len: tokens.len() as u32,
-                    block_size,
-                    final_block_hash: i as u64 + 1,
-                    protected_image_prompt_boundary: false,
-                    cold_anchor_rung: false,
-                    tokens,
-                    snapshots: vec![None; inner.config.num_hidden_layers as usize],
-                });
-            while inner.sliding_prefix_checkpoints.len() > checkpoint_limit {
-                inner.sliding_prefix_checkpoints.pop_front();
-            }
-        }
-        assert_eq!(inner.sliding_prefix_checkpoints.len(), checkpoint_limit);
-
-        let restored = inner
-            .find_gemma4_sliding_prefix_checkpoint(&prompt, prompt.len() as u32, block_size, 0)
-            .expect("prefix lookup");
-        assert!(
-            restored.is_some(),
-            "prompt-boundary checkpoint must not be evicted by decode-boundary checkpoints"
-        );
     }
 
     #[test]
@@ -14756,15 +14028,16 @@ mod tests {
         assert_eq!(hit.prefix_len, target_len);
     }
 
-    /// KV-shared layers must resolve their anchor's pool slot
-    /// (SharedOnGlobal) or absolute index (SharedOnSliding).
+    /// KV-shared layers must resolve their anchor's physical ordinal within
+    /// the correct full/sliding group.
     #[test]
     fn test_compute_layer_kinds_kv_sharing_resolves_anchors() {
         // 8 layers: pattern S G S G S G S G (4 global @ 1, 3, 5, 7).
         // num_kv_shared_layers = 4 → last 4 (indices 4, 5, 6, 7) reuse anchors.
         // Anchor for shared global at i=5 should be the last non-shared
         // global before first_kv_shared_layer (=4): that's i=3 → paged_idx=1.
-        // Anchor for shared sliding at i=4 should be sliding at i=2.
+        // Anchor for shared sliding at i=4 should be sliding layer i=2,
+        // whose physical ordinal within the sliding group is 1.
         let layer_types: Vec<String> = (0..8)
             .map(|i| {
                 if i % 2 == 1 {
@@ -14781,74 +14054,86 @@ mod tests {
             ..paged_tiny_config(None)
         };
         let kinds = super::compute_layer_kinds(&cfg);
-        // Non-shared layers: 0=Sliding, 1=GlobalPaged{0}, 2=Sliding, 3=GlobalPaged{1}.
-        assert!(matches!(kinds[0], super::Gemma4LayerKind::Sliding));
+        // Non-shared layers: sliding group 1 has ordinals 0,1; full group 0
+        // has ordinals 0,1.
+        assert!(matches!(
+            kinds[0],
+            super::Gemma4LayerKind::SlidingPaged {
+                group_id: 1,
+                paged_idx: 0
+            }
+        ));
         assert!(matches!(
             kinds[1],
-            super::Gemma4LayerKind::GlobalPaged { paged_idx: 0 }
+            super::Gemma4LayerKind::GlobalPaged {
+                group_id: 0,
+                paged_idx: 0
+            }
         ));
-        assert!(matches!(kinds[2], super::Gemma4LayerKind::Sliding));
+        assert!(matches!(
+            kinds[2],
+            super::Gemma4LayerKind::SlidingPaged {
+                group_id: 1,
+                paged_idx: 1
+            }
+        ));
         assert!(matches!(
             kinds[3],
-            super::Gemma4LayerKind::GlobalPaged { paged_idx: 1 }
+            super::Gemma4LayerKind::GlobalPaged {
+                group_id: 0,
+                paged_idx: 1
+            }
         ));
         // Shared layers 4..8 are aliases. They do not consume paged slots;
         // SharedOnGlobal carries the ANCHOR's pool slot, and
-        // SharedOnSliding carries the anchor's absolute layer index.
+        // SharedOnSliding carries the anchor's group-local physical ordinal.
         match kinds[4] {
-            super::Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
-                assert_eq!(anchor_layer_idx, 2, "anchor for sliding-shared layer 4");
+            super::Gemma4LayerKind::SharedOnSliding {
+                group_id,
+                anchor_paged_idx,
+            } => {
+                assert_eq!(group_id, 1);
+                assert_eq!(anchor_paged_idx, 1, "anchor for sliding-shared layer 4");
             }
             ref other => panic!("layer 4: expected SharedOnSliding, got {other:?}"),
         }
         match kinds[5] {
-            super::Gemma4LayerKind::SharedOnGlobal { anchor_paged_idx } => {
+            super::Gemma4LayerKind::SharedOnGlobal {
+                group_id,
+                anchor_paged_idx,
+            } => {
+                assert_eq!(group_id, 0);
                 // Anchor at layer 3 → paged_idx 1.
                 assert_eq!(anchor_paged_idx, 1, "anchor paged_idx for global-shared 5");
             }
             ref other => panic!("layer 5: expected SharedOnGlobal, got {other:?}"),
         }
         match kinds[6] {
-            super::Gemma4LayerKind::SharedOnSliding { anchor_layer_idx } => {
-                assert_eq!(anchor_layer_idx, 2, "anchor for sliding-shared layer 6");
+            super::Gemma4LayerKind::SharedOnSliding {
+                group_id,
+                anchor_paged_idx,
+            } => {
+                assert_eq!(group_id, 1);
+                assert_eq!(anchor_paged_idx, 1, "anchor for sliding-shared layer 6");
             }
             ref other => panic!("layer 6: expected SharedOnSliding, got {other:?}"),
         }
         match kinds[7] {
-            super::Gemma4LayerKind::SharedOnGlobal { anchor_paged_idx } => {
+            super::Gemma4LayerKind::SharedOnGlobal {
+                group_id,
+                anchor_paged_idx,
+            } => {
+                assert_eq!(group_id, 0);
                 assert_eq!(anchor_paged_idx, 1, "anchor paged_idx for global-shared 7");
             }
             ref other => panic!("layer 7: expected SharedOnGlobal, got {other:?}"),
         }
     }
 
-    /// Element-wise comparison for `Gemma4LayerKind`, which intentionally
-    /// does not derive `PartialEq` (mirrors `Lfm2LayerKind`, which doesn't
-    /// either — this codebase's existing tests compare these routing enums
-    /// via `matches!`/`match`, not `assert_eq!`).
+    /// Keep cached and freshly-derived routes identical, including group IDs
+    /// and group-local physical ordinals.
     fn layer_kind_matches(a: &super::Gemma4LayerKind, b: &super::Gemma4LayerKind) -> bool {
-        use super::Gemma4LayerKind::*;
-        match (a, b) {
-            (Sliding, Sliding) => true,
-            (GlobalPaged { paged_idx: x }, GlobalPaged { paged_idx: y }) => x == y,
-            (
-                SharedOnGlobal {
-                    anchor_paged_idx: x,
-                },
-                SharedOnGlobal {
-                    anchor_paged_idx: y,
-                },
-            ) => x == y,
-            (
-                SharedOnSliding {
-                    anchor_layer_idx: x,
-                },
-                SharedOnSliding {
-                    anchor_layer_idx: y,
-                },
-            ) => x == y,
-            _ => false,
-        }
+        a == b
     }
 
     /// `Gemma4Inner::new` must cache `layer_kinds` once instead of
@@ -14913,7 +14198,7 @@ mod tests {
                 }
             };
             assert!(
-                inner.paged_adapter.is_some(),
+                inner.kv_cache_coordinator.is_some(),
                 "test configs force use_block_paged_cache=true"
             );
             assert_eq!(
@@ -15026,89 +14311,6 @@ mod tests {
             sliding_group.max_admission_blocks, 7,
             "ceil((17 - 1 + 32) / 8) + one partial block"
         );
-    }
-}
-
-#[cfg(test)]
-mod prefix_cache_reuse_integration_tests {
-    //! End-to-end tests for the prefix KV cache reuse refactor on Gemma4.
-    //! These verify that `chat_session_start_sync` no longer
-    //! unconditionally wipes the cache — stateless agent clients that
-    //! resend the full transcript on every turn should hit the
-    //! `verify_cache_prefix` exact-append path and skip redundant
-    //! prefill work.
-    //!
-    //! The Gemma4 variant additionally locks in the exact-match policy:
-    //! when the new prompt equals the cached one
-    //! (`cached_prefix_len == tokens.len()`), we fall through to the
-    //! miss branch and do a full reset + re-prefill. Gemma4 has no
-    //! snapshot of final-step logits and no safe rewind-by-1 primitive
-    //! over its sliding-window cache; reprefilling the last cached token
-    //! on top of the live caches would advance cache state to
-    //! `prompt + last_token` (duplicated) while the history write-back
-    //! block only persists `tokens + generated`, corrupting the next
-    //! warm-hit turn.
-    //!
-    //! These tests are `#[ignore]`-marked because they require loading a
-    //! real Gemma4 model file and a tokenizer. Run them with:
-    //!
-    //!     cargo test -p mlx-core --test '*' -- --ignored prefix_cache_reuse_integration
-    //!
-    //! with `MLX_NODE_GEMMA4_MODEL_DIR` set to a local Gemma4 model dir.
-
-    /// Append hit: two back-to-back session-start calls where the second
-    /// extends the first by exactly one user turn. Must report
-    /// `cached_tokens > 0` and only prefill the delta.
-    #[ignore = "requires a real Gemma4 model directory; run with --ignored"]
-    #[test]
-    fn append_hit_reuses_cached_prefix() {
-        // Pseudocode (same shape as the Qwen3.5 Dense stubs):
-        //
-        //   let p = vec![ChatMessage::user("Hi")];
-        //   let r1 = model.chat_session_start_sync(p.clone(), cfg())?;
-        //   let mut p2 = p.clone();
-        //   p2.push(ChatMessage::assistant(&r1.text));
-        //   p2.push(ChatMessage::user("Follow-up"));
-        //   let r2 = model.chat_session_start_sync(p2, cfg())?;
-        //   assert!(r2.cached_tokens > 0);
-    }
-
-    /// Divergence miss: second call's history is unrelated. Must report
-    /// `cached_tokens == 0` and do a full-history prefill.
-    #[ignore = "requires a real Gemma4 model directory; run with --ignored"]
-    #[test]
-    fn divergence_miss_resets_and_full_prefills() {
-        // Pseudocode:
-        //
-        //   let p1 = vec![ChatMessage::user("Ping")];
-        //   let p2 = vec![ChatMessage::user("Totally unrelated")];
-        //   let _ = model.chat_session_start_sync(p1, cfg())?;
-        //   let r2 = model.chat_session_start_sync(p2, cfg())?;
-        //   assert_eq!(r2.cached_tokens, 0);
-    }
-
-    /// Exact-match: the new prompt is byte-equal to the cached one.
-    /// With the exact-match-as-miss fix, the second call must report
-    /// `cached_tokens == 0` (full reset + full re-prefill). A subsequent
-    /// strict-extension must then hit the warm path.
-    #[ignore = "requires a real Gemma4 model directory; run with --ignored"]
-    #[test]
-    fn exact_match_falls_through_to_cache_miss() {
-        // Pseudocode:
-        //
-        //   let p = vec![ChatMessage::user("Ping")];
-        //   let _ = model.chat_session_start_sync(p.clone(), cfg())?;
-        //   let r2 = model.chat_session_start_sync(p.clone(), cfg())?;
-        //   assert_eq!(r2.cached_tokens, 0); // miss, not exact-match reuse
-        //
-        //   // After the miss, the caches represent `p` cleanly. A strict
-        //   // extension should warm-hit against that fresh state.
-        //   let prompt_token_count_p = r2.prompt_token_count;
-        //   let mut p3 = p.clone();
-        //   p3.push(ChatMessage::assistant(&r2.text));
-        //   p3.push(ChatMessage::user("Follow-up"));
-        //   let r3 = model.chat_session_start_sync(p3, cfg())?;
-        //   assert!(r3.cached_tokens >= prompt_token_count_p);
     }
 }
 

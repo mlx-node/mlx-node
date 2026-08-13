@@ -57,7 +57,7 @@
 //! - For deterministic reproducibility across processes, switch to
 //!   xxhash with a fixed seed (vLLM's default).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -195,6 +195,21 @@ impl PrefixCacheBlockIdentity {
             && self.cache_salt == cache_salt
             && self.block_index == block_index
     }
+}
+
+/// One block in an all-or-nothing cold-restore publication.
+///
+/// The physical block must already be reserved and fully uploaded. Keeping
+/// the borrowed identity beside it lets [`BlockAllocator`] validate the whole
+/// chain before mutating the hot prefix cache.
+pub struct RestoredPrefixRegistration<'a> {
+    pub block: Arc<PhysicalBlock>,
+    pub hash: u64,
+    pub token_ids: &'a [u32],
+    pub parent_hash: u64,
+    pub extra_keys: &'a [u64],
+    pub cache_salt: u64,
+    pub block_index: usize,
 }
 
 impl BlockAllocator {
@@ -1009,12 +1024,18 @@ impl BlockAllocator {
         if free >= num_blocks {
             return true;
         }
-        let evictable = self
-            .prefix_cache
-            .values()
-            .filter(|b| b.get_ref_count() == 1)
-            .count() as u32;
+        let evictable = self.num_evictable_blocks();
         free + evictable >= num_blocks
+    }
+
+    /// Cache-only blocks that admission may reclaim without touching a live
+    /// request. Active request blocks have refcount greater than one and are
+    /// deliberately excluded.
+    pub fn num_evictable_blocks(&self) -> u32 {
+        self.prefix_cache
+            .values()
+            .filter(|block| block.get_ref_count() == 1)
+            .count() as u32
     }
 
     /// Set the maximum number of entries the prefix cache will hold before
@@ -1063,6 +1084,72 @@ impl BlockAllocator {
             cache_salt,
             block_index,
         );
+        Ok(true)
+    }
+
+    /// Atomically publish a chain of restored blocks.
+    ///
+    /// Every fallible condition is checked before the first cache mutation.
+    /// Once preflight succeeds, the individual registrations cannot fail
+    /// while this exclusive allocator borrow is held. This is the commit
+    /// boundary used by asynchronous SSD restore: a missing/corrupt block or
+    /// failed upload leaves no partial hot prefix discoverable.
+    pub fn publish_restored_prefix_batch(
+        &mut self,
+        registrations: &[RestoredPrefixRegistration<'_>],
+    ) -> Result<bool, &'static str> {
+        if registrations.is_empty() {
+            return Ok(true);
+        }
+        if self.max_prefix_cache_entries == 0 {
+            return Ok(false);
+        }
+        if registrations.len() > self.max_prefix_cache_entries {
+            return Err("restored prefix batch exceeds prefix-cache capacity");
+        }
+
+        let mut hashes = HashSet::with_capacity(registrations.len());
+        let mut block_ids = HashSet::with_capacity(registrations.len());
+        for registration in registrations {
+            if registration.token_ids.len() != self.block_size as usize {
+                return Err("restored prefix must contain exactly one full block");
+            }
+            if !self.allocated.contains_key(&registration.block.block_id) {
+                return Err("restored prefix block was not reserved by this allocator");
+            }
+            if !hashes.insert(registration.hash) || !block_ids.insert(registration.block.block_id) {
+                return Err("restored prefix batch contains duplicate hashes or blocks");
+            }
+            if let Some(existing) = self.prefix_cache.get(&registration.hash)
+                && existing.block_id != registration.block.block_id
+            {
+                return Ok(false);
+            }
+            if let Some(identity) = self.prefix_cache_identities.get(&registration.hash)
+                && !identity.matches(
+                    registration.token_ids,
+                    registration.parent_hash,
+                    registration.extra_keys,
+                    registration.cache_salt,
+                    registration.block_index,
+                )
+            {
+                return Ok(false);
+            }
+        }
+
+        for registration in registrations {
+            let inserted = self.register_prefix(Arc::clone(&registration.block), registration.hash);
+            debug_assert!(inserted, "batch publication was fully preflighted");
+            self.remember_prefix_identity(
+                registration.hash,
+                registration.token_ids,
+                registration.parent_hash,
+                registration.extra_keys,
+                registration.cache_salt,
+                registration.block_index,
+            );
+        }
         Ok(true)
     }
 }
@@ -3076,5 +3163,48 @@ mod tests {
         let (hits, cached) = a.find_longest_cache_hit(&token_ids, 16, &[], 0);
         assert_eq!(hits.len(), 1100, "head blocks must survive registration");
         assert_eq!(cached, 1100 * 16);
+    }
+
+    #[test]
+    fn restored_batch_preflights_every_block_before_publishing_any() {
+        let mut allocator = BlockAllocator::new(4, 4);
+        let existing = allocator.allocate().expect("existing block");
+        allocator
+            .publish_restored_prefix(Arc::clone(&existing), 22, &[8, 9, 10, 11], 0, &[], 0, 0)
+            .expect("existing publish");
+
+        let first = allocator.allocate().expect("first destination");
+        let second = allocator.allocate().expect("second destination");
+        let registrations = [
+            RestoredPrefixRegistration {
+                block: Arc::clone(&first),
+                hash: 11,
+                token_ids: &[0, 1, 2, 3],
+                parent_hash: 0,
+                extra_keys: &[],
+                cache_salt: 0,
+                block_index: 0,
+            },
+            RestoredPrefixRegistration {
+                block: Arc::clone(&second),
+                hash: 22,
+                token_ids: &[4, 5, 6, 7],
+                parent_hash: 11,
+                extra_keys: &[],
+                cache_salt: 0,
+                block_index: 1,
+            },
+        ];
+        assert_eq!(
+            allocator.publish_restored_prefix_batch(&registrations),
+            Ok(false),
+            "the second registration collides with the existing block"
+        );
+        assert!(
+            !allocator.prefix_cache.contains_key(&11),
+            "preflight failure must not publish the valid first block"
+        );
+        assert_eq!(first.get_ref_count(), 1);
+        assert_eq!(second.get_ref_count(), 1);
     }
 }

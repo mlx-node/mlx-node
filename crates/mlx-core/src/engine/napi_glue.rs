@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! let cancelled = Arc::new(AtomicBool::new(false));
-//! let (stream_tx, stream_rx) = unbounded_channel();
+//! let (stream_tx, stream_rx) = stream_channel(CHAT_STREAM_NATIVE_QUEUE_LIMIT);
 //! self.thread.send(Cmd::Stream… { …, stream_tx, cancelled: cancelled.clone() })?;
 //! let callback = Arc::new(callback);
 //! tokio::spawn(async move {
@@ -20,10 +20,28 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
+use napi::Status;
 use napi::threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode};
 
 use crate::engine::types::{ChatStreamChunk, ChatStreamHandle};
-use crate::model_thread::StreamTx;
+use crate::model_thread::{StreamTx, stream_channel};
+
+/// Bound both the N-API callback queue and the mirrored JS adapter queue.
+/// A full callback queue cancels the turn instead of relocating HTTP
+/// backpressure into an unbounded native-to-JS backlog.
+pub(crate) const CHAT_STREAM_CALLBACK_QUEUE_LIMIT: usize = 64;
+/// Bound the model-thread-to-Tokio handoff independently from the N-API
+/// callback queue. Both limits are per request.
+pub(crate) const CHAT_STREAM_NATIVE_QUEUE_LIMIT: usize = 64;
+pub(crate) type ChatStreamCallback = ThreadsafeFunction<
+    ChatStreamChunk,
+    (),
+    ChatStreamChunk,
+    Status,
+    true,
+    false,
+    CHAT_STREAM_CALLBACK_QUEUE_LIMIT,
+>;
 
 /// Everything a streaming NAPI entry point needs to dispatch one
 /// streaming chat command: the cancel flag to embed in the command,
@@ -45,13 +63,10 @@ pub(crate) struct ChatStreamPlumbing {
 /// method qualifies). If the subsequent `thread.send(..)` fails, dropping
 /// the returned plumbing closes the channel and the pump task exits on
 /// its own.
-pub(crate) fn start_chat_stream(
-    callback: ThreadsafeFunction<ChatStreamChunk, ()>,
-) -> ChatStreamPlumbing {
+pub(crate) fn start_chat_stream(callback: ChatStreamCallback) -> ChatStreamPlumbing {
     let cancelled = Arc::new(AtomicBool::new(false));
-    let (stream_tx, stream_rx) =
-        tokio::sync::mpsc::unbounded_channel::<napi::Result<ChatStreamChunk>>();
-    spawn_stream_pump(stream_rx, callback);
+    let (stream_tx, stream_rx) = stream_channel(CHAT_STREAM_NATIVE_QUEUE_LIMIT);
+    spawn_stream_pump(stream_rx, callback, Arc::clone(&cancelled));
     ChatStreamPlumbing {
         cancelled: cancelled.clone(),
         stream_tx,
@@ -61,16 +76,41 @@ pub(crate) fn start_chat_stream(
 
 /// The forwarding pump: drain the model thread's stream channel into
 /// the JS callback until the producer drops (turn finished or the
-/// model thread exited). Always `NonBlocking` — a torn-down JS
-/// callback just drops the chunk.
+/// model thread exited). Ordinary delivery is non-blocking. If the bounded
+/// callback queue fills, cancel native work and use one blocking-pool task to
+/// enqueue a terminal backlog error once JavaScript resumes; this preserves a
+/// fixed memory bound without parking a Tokio runtime worker.
 pub(crate) fn spawn_stream_pump(
-    mut stream_rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
-    callback: ThreadsafeFunction<ChatStreamChunk, ()>,
+    mut stream_rx: tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
+    callback: ChatStreamCallback,
+    cancelled: Arc<AtomicBool>,
 ) {
     let callback = Arc::new(callback);
     tokio::spawn(async move {
         while let Some(result) = stream_rx.recv().await {
-            callback.call(result, ThreadsafeFunctionCallMode::NonBlocking);
+            match callback.call(result, ThreadsafeFunctionCallMode::NonBlocking) {
+                Status::Ok => {}
+                Status::QueueFull => {
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    let callback = Arc::clone(&callback);
+                    tokio::task::spawn_blocking(move || {
+                        let _ = callback.call(
+                            Err(napi::Error::from_reason(format!(
+                                "Native chat stream callback backlog exceeded {} buffered events",
+                                CHAT_STREAM_CALLBACK_QUEUE_LIMIT
+                            ))),
+                            ThreadsafeFunctionCallMode::Blocking,
+                        );
+                    });
+                    break;
+                }
+                _ => {
+                    // The JS callback is closing or otherwise unavailable.
+                    // There is no consumer left, so stop the native turn.
+                    cancelled.store(true, std::sync::atomic::Ordering::Relaxed);
+                    break;
+                }
+            }
         }
     });
 }

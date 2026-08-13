@@ -12,7 +12,7 @@ import type {
   SystemBlock,
 } from '../types-anthropic.js';
 import { anthropicToolUseIdToInternal } from './anthropic-response.js';
-import { applyExtraBodyMtpOverrides } from './request.js';
+import { applyExtraBodyMtpOverrides, validateCacheSalt } from './request.js';
 
 export interface MappedAnthropicRequest {
   messages: ChatMessage[];
@@ -427,6 +427,10 @@ export function mapAnthropicRequest(
     reportPerformance: true,
   };
 
+  if (req.cache_salt != null) {
+    validateCacheSalt(req.cache_salt);
+    config.cacheSalt = req.cache_salt;
+  }
   if (req.max_tokens != null) {
     config.maxNewTokens = req.max_tokens;
   }

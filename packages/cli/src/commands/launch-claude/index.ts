@@ -66,10 +66,6 @@ Options:
                                   paged-aware Qwen3.5 launch.
     MLX_GEMMA4_NATIVE_KV_WRITE    Set to 0/false/off to disable graph-native
                                   Gemma4 global KV writes.
-    MLX_GEMMA4_MAX_SLIDING_RESTORE_TOKENS
-                                  Optional emergency cap on cached Gemma4
-                                  prefix tokens replayed for sliding-cache
-                                  restore. Unset by default.
     MLX_GEMMA4_SLIDING_CHECKPOINT_LIMIT
                                   Override retained Gemma4 sliding-cache
                                   checkpoints. Defaults dynamically from the

@@ -144,6 +144,14 @@ pub(crate) struct DecodeLoopArgs<'a> {
     pub first_token_instant: &'a mut Option<Instant>,
     pub report_perf: bool,
     pub generation_stream: Stream,
+    /// Whole-turn cooperative cancel flag, populated for BOTH sync and
+    /// streaming turns (H2). Streaming callers pass the SAME atomic that
+    /// backs [`StreamingCtx::cancelled`], so the per-step snapshot below
+    /// is byte-identical to the previous streaming-only read. Sync
+    /// callers pass the flag threaded down from the `Session*` command;
+    /// `None` (non-chat / training / test drivers) keeps the loop
+    /// uncancellable exactly as before.
+    pub cancel_flag: Option<&'a AtomicBool>,
 }
 
 /// Streaming sub-block arguments of [`run_decode_loop`]. `'t` is the
@@ -222,6 +230,7 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         first_token_instant,
         report_perf,
         generation_stream,
+        cancel_flag,
     } = args;
 
     for step_idx in 0..max_new_tokens {
@@ -282,9 +291,13 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         // fresh after this loop's forward) keeps the break on the SAME
         // iteration as origin/main; see the emit block for the
         // one-token-divergence proof.
-        let cancelled = streaming
-            .as_ref()
-            .map(|s| s.cancelled.load(Ordering::Relaxed))
+        //
+        // The flag comes from `cancel_flag` — populated for BOTH sync
+        // and streaming turns (H2). Streaming callers pass the same
+        // atomic that backs `StreamingCtx::cancelled`, so the streaming
+        // read is byte-identical to the old `streaming.map(..)` chain.
+        let cancelled = cancel_flag
+            .map(|flag| flag.load(Ordering::Relaxed))
             .unwrap_or(false);
         // Repetition-cutoff result computed once; the returned reason is
         // reused by the break below.
@@ -483,6 +496,17 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             // DecodeStream sees every token.
             s.emitter
                 .on_token_text(&token_text, is_reasoning, p.include_reasoning, s.callback);
+        } else if cancelled {
+            // NON-streaming cancel break (H2): same snapshot, same
+            // position in the iteration as the ChatML streaming
+            // cancel-break above (before the outer stop checks, so a
+            // cancel racing an EOS resolves "cancelled" like the default
+            // streaming order — `eos_before_emit` is a streaming-only
+            // emission-ordering knob and is deliberately not consulted
+            // here). The sync session wrapper maps this finish_reason to
+            // the distinguished `"chat session cancelled"` rejection.
+            *finish_reason = String::from("cancelled");
+            break;
         }
 
         if stops_at_eos {
@@ -608,6 +632,7 @@ mod run_decode_loop_tests {
     /// Greedy (T=0) params from a default `ChatConfig` plus overrides.
     fn greedy_params(mutate: impl FnOnce(&mut ChatConfig)) -> ChatParams {
         let mut cfg = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.0),
@@ -658,6 +683,7 @@ mod run_decode_loop_tests {
                 first_token_instant: &mut first_token_instant,
                 report_perf: false,
                 generation_stream,
+                cancel_flag: None,
             },
             None,
         )?;
@@ -883,6 +909,7 @@ mod run_decode_loop_tests {
                 first_token_instant: &mut first_token_instant,
                 report_perf: false,
                 generation_stream,
+                cancel_flag: Some(&cancelled),
             },
             Some(StreamingCtx {
                 callback: &sink,
@@ -970,6 +997,7 @@ mod run_decode_loop_tests {
                 first_token_instant: &mut first_token_instant,
                 report_perf: false,
                 generation_stream,
+                cancel_flag: Some(&cancelled),
             },
             Some(StreamingCtx {
                 callback: &sink,
@@ -1128,6 +1156,7 @@ mod run_decode_loop_tests {
                 first_token_instant: &mut first_token_instant,
                 report_perf: false,
                 generation_stream,
+                cancel_flag: Some(&cancelled),
             },
             Some(StreamingCtx {
                 callback: &sink,
@@ -1172,6 +1201,78 @@ mod run_decode_loop_tests {
             "the post-forward token (4) must be committed (origin/main count); the \
              fresh re-read would have produced [1, 3]"
         );
+    }
+
+    /// H2 — NON-streaming turns poll the SAME per-step snapshot via
+    /// `DecodeLoopArgs::cancel_flag` and break with finish_reason
+    /// "cancelled". Same cancel-during-forward timeline as the streaming
+    /// parity test above, minus the StreamingCtx: the flag flips during
+    /// step_idx 1's forward, so step_idx 2's snapshot observes it and
+    /// the sync `else if cancelled` break fires (token 4 committed, no
+    /// further forward). A control drive with `cancel_flag: None` proves
+    /// the loop stays uncancellable without the threaded flag (named
+    /// mutation: dropping the non-streaming break leaves the cancelled
+    /// drive exiting "length" via the pipelined-`None` fall-out).
+    #[test]
+    fn nonstreaming_cancel_flag_breaks_with_finish_reason_cancelled() {
+        const EOS: u32 = 5; // never sampled
+        let params = greedy_params(|_| {});
+
+        let run = |wire_flag: bool| -> (Vec<u32>, String) {
+            let mut tracker = ReasoningTracker::new(false, None, None);
+            let cancelled = AtomicBool::new(false);
+            let mut step = CancelDuringForwardStep {
+                script: vec![3, 4],
+                vocab: 7,
+                forward_calls: 0,
+                cancel: &cancelled,
+                flip_on_forward: 2,
+            };
+
+            let y = MxArray::from_int32(&[1], &[1]).unwrap_or_else(|e| panic!("{}", e.reason));
+            let mut profiler = DecodeProfiler::new("test", "mock");
+            let mut generated_tokens: Vec<u32> = Vec::new();
+            let mut token_history: Vec<u32> = Vec::new();
+            let mut finish_reason = String::from("length");
+            let mut first_token_instant: Option<std::time::Instant> = None;
+            let generation_stream = Stream::new(DeviceType::Gpu);
+
+            run_decode_loop(
+                &mut step,
+                DecodeLoopArgs {
+                    y,
+                    params: &params,
+                    reasoning_tracker: &mut tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens: 6,
+                    eos_id: EOS,
+                    extra_eos_ids: &[],
+                    eos_before_emit: false,
+                    generated_tokens: &mut generated_tokens,
+                    token_history: &mut token_history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_token_instant,
+                    report_perf: false,
+                    generation_stream,
+                    cancel_flag: wire_flag.then_some(&cancelled),
+                },
+                None,
+            )
+            .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+            (generated_tokens, finish_reason)
+        };
+
+        // Wired flag: cancel observed at step_idx 2's snapshot → break
+        // "cancelled" with the post-forward token (4) committed.
+        let (generated, finish) = run(true);
+        assert_eq!(finish, "cancelled");
+        assert_eq!(generated, vec![1, 3, 4]);
+
+        // Control (no flag threaded — non-chat drivers): the flip is
+        // invisible, the drive runs its full budget and exits "length".
+        let (generated, finish) = run(false);
+        assert_eq!(finish, "length");
+        assert_eq!(generated.len(), 6);
     }
 
     // ---- optional hook seams ----
@@ -1226,6 +1327,7 @@ mod run_decode_loop_tests {
                 first_token_instant: &mut first_token_instant,
                 report_perf: false,
                 generation_stream,
+                cancel_flag: Some(&cancelled),
             },
             Some(StreamingCtx {
                 callback: &sink,
@@ -1500,6 +1602,7 @@ mod run_decode_loop_tests {
                 first_token_instant: &mut first_token_instant,
                 report_perf: false,
                 generation_stream,
+                cancel_flag: None,
             },
             None,
         )

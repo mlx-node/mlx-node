@@ -32,6 +32,7 @@ use napi::bindgen_prelude::Uint8Array;
 
 fn cfg(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
@@ -180,12 +181,12 @@ async fn gemma4_vl_image_chat_t0_capture() {
         .await
         .expect("failed to load Gemma-4-VL model");
 
-    let reset = |m: &Gemma4Model| {
-        tokio::task::block_in_place(|| m.reset_caches()).expect("reset_caches failed");
-    };
+    async fn reset(m: &Gemma4Model) {
+        m.reset_caches().await.expect("reset_caches failed");
+    }
 
     // --- Pass 1: capture the image-turn digest. ---
-    reset(&model);
+    reset(&model).await;
     let (d1, t1) = run_image_turn(&model, &image).await;
 
     println!(
@@ -224,7 +225,7 @@ async fn gemma4_vl_image_chat_t0_capture() {
     );
 
     // Image-dependence control: same prompt, NO image, must differ.
-    reset(&model);
+    reset(&model).await;
     let d_noimg = describe_without_image(&model).await;
     assert_ne!(
         d1.raw_hash, d_noimg.raw_hash,
@@ -233,7 +234,7 @@ async fn gemma4_vl_image_chat_t0_capture() {
     );
 
     // Determinism replay.
-    reset(&model);
+    reset(&model).await;
     let (d1b, _) = run_image_turn(&model, &image).await;
     assert_eq!(d1, d1b, "image turn digest is not deterministic at T=0");
 }

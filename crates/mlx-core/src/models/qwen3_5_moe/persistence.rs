@@ -29,10 +29,11 @@ use crate::models::qwen3_5::persistence::{
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
 use crate::tokenizer::Qwen3Tokenizer;
+use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
 use super::config::Qwen3_5MoeConfig;
 use super::decoder_layer::{AttentionType, MLPType};
-use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, handle_qwen35_moe_cmd};
+use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, Qwen35MoeSchedulerState};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
     MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
@@ -1455,7 +1456,7 @@ fn pin_sym8_to_flat_kv_cache(
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
     let model_path = model_path.to_string();
 
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
             let path = Path::new(&model_path);
 
@@ -1472,12 +1473,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             // the sum of `params.values().nbytes()` is race-free and
             // deterministic. Caveat: post-load lazy growth (the warmup
             // forward pass and any lazy scratch) lands after this
-            // measurement — the coordinator's
-            // 1.75x multiplier adds ~75% slack to cover that post-load
-            // growth without needing runtime measurements. See
-            // `cache_limit.rs` module docs.
-            let load_result: Result<(Qwen35MoeInner, u64)> =
-                (|| -> Result<(Qwen35MoeInner, u64)> {
+            // measurement. The private paged pool is measured separately
+            // after construction because its Metal buffers are invisible to
+            // MLX allocator counters. See `cache_limit.rs` module docs.
+            let load_result: Result<(Qwen35MoeInner, u64, u64)> =
+                (|| -> Result<(Qwen35MoeInner, u64, u64)> {
                     // Load config
                     let config_path = path.join("config.json");
                     let config_data = fs::read_to_string(&config_path)
@@ -1687,6 +1687,12 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
 
                     // Create inner model
                     let mut inner = Qwen35MoeInner::new(config.clone())?;
+                    inner.row_exact_decode_projections =
+                        has_kquant_mode(top_level_mode, &per_layer_quant)
+                            || top_level_mode == Some(PerLayerMode::Affine)
+                            || per_layer_quant
+                                .values()
+                                .any(|quant| quant.mode == PerLayerMode::Affine);
                     inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(
                         path,
                     ));
@@ -1801,10 +1807,19 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     // retained BF16 correctness reconstructions are extra.
                     weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
 
-                    Ok((inner, weight_bytes))
+                    let pool_bytes = inner
+                        .paged_adapter
+                        .as_ref()
+                        .map(PagedKVCacheAdapter::pool_allocated_bytes)
+                        .transpose()
+                        .map_err(Error::from_reason)?
+                        .unwrap_or(0);
+                    Ok((inner, weight_bytes, pool_bytes))
                 })();
-            let (inner, weight_bytes) = load_result?;
+            let (inner, weight_bytes, pool_bytes) = load_result?;
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+            let pool_cache_limit_guard = (pool_bytes != 0)
+                .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
 
             let model_id = inner.model_id;
             let config_out = inner.config.clone();
@@ -1823,7 +1838,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
             );
 
             Ok((
-                inner,
+                Qwen35MoeSchedulerState::new(inner)?,
                 (
                     config_out,
                     model_id,
@@ -1831,6 +1846,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     spatial_merge_size,
                     tokenizer_out,
                     cache_limit_guard,
+                    pool_cache_limit_guard,
                     paged_active,
                     mtp_active,
                     vision_active,
@@ -1838,7 +1854,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                 ),
             ))
         },
-        handle_qwen35_moe_cmd,
+        |state, receiver| state.drive(receiver),
     );
 
     let (
@@ -1848,6 +1864,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         spatial_merge_size,
         _tokenizer,
         cache_limit_guard,
+        pool_cache_limit_guard,
         paged_active,
         mtp_active,
         vision_active,
@@ -1866,6 +1883,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         spatial_merge_size,
         context_limits,
         _cache_limit_guard: cache_limit_guard,
+        _pool_cache_limit_guard: pool_cache_limit_guard,
     })
 }
 
@@ -1991,17 +2009,15 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
             .map(|v| v as u32),
         use_block_paged_cache: {
             let explicit = raw.get("use_block_paged_cache").and_then(|v| v.as_bool());
-            // Vision (VLM) checkpoints default to the block-paged KV backend:
-            // MoE image turns only run on the paged-vision core. When the config
-            // leaves `use_block_paged_cache` unset and a `vision_config` is
-            // present, force paged on. An explicit value is honored as-is; an
-            // explicit `false` leaves the model flat so its image turns are
-            // rejected at dispatch.
-            match explicit {
-                Some(_) => explicit,
-                None if raw.get("vision_config").is_some() => Some(true),
-                None => None,
-            }
+            let env_override = std::env::var("MLX_QWEN35_PAGED_OVERRIDE").ok();
+            let resolved = crate::models::qwen3_5::config::resolve_qwen35_paged_default(
+                explicit,
+                env_override.as_deref(),
+            );
+            // Match dense Qwen3.5: paged is the default for compatible text
+            // and vision checkpoints. Explicit false remains a diagnostic
+            // escape hatch; sym8 is forced flat after quant metadata is known.
+            resolved
         },
         // Persist the out-of-pool GDN recurrent state to the SSD cold tier. Off
         // unless explicitly present as a bool (the agent overlay / a config
@@ -3124,6 +3140,16 @@ mod tests {
             assert!(
                 inner.paged_adapter.is_some(),
                 "affine paged config must build the paged adapter"
+            );
+            let pool_bytes = inner
+                .paged_adapter
+                .as_ref()
+                .expect("paged adapter")
+                .pool_allocated_bytes()
+                .expect("paged pool byte accounting");
+            assert!(
+                pool_bytes > 0,
+                "paged pool must report its private Metal bytes"
             );
         }
     }

@@ -25,8 +25,8 @@ use napi::bindgen_prelude::*;
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkTurnSetup, DsparkVerifyOutput,
-    FinalizeArgs, ResetScope, StreamEmitter, TurnOutput, WholeTurnArgs,
+    ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
+    ResetScope, StreamEmitter, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::StreamingCtx;
 use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
@@ -48,8 +48,7 @@ use super::model::{
 /// [`DsparkBackend::begin_dspark_decode`], one variant per
 /// [`super::model::Gemma4Draft`] variant.
 ///
-/// The engine's [`DsparkTurnSetup`] carries only turn constants, so the
-/// prefill-derived state travels through `Gemma4Inner::draft_turn_state`:
+/// The prefill-derived state travels through `Gemma4Inner::draft_turn_state`:
 /// the whole-turn core stashes it right before calling `run_dspark_turn`,
 /// and `begin_dspark_decode` TAKES it into the stepper (so it can never
 /// leak across turns — fresh state is built every turn).
@@ -527,10 +526,7 @@ impl DsparkBackend for Gemma4Inner {
     where
         Self: 'a;
 
-    fn begin_dspark_decode(
-        &mut self,
-        _setup: &DsparkTurnSetup<'_>,
-    ) -> Result<Self::DsparkDecode<'_>> {
+    fn begin_dspark_decode(&mut self, _block_size: usize) -> Result<Self::DsparkDecode<'_>> {
         let state = self.draft_turn_state.take().ok_or_else(|| {
             Error::from_reason(
                 "gemma4 draft decode: begin_dspark_decode requires a prepared draft context \
@@ -780,6 +776,12 @@ impl Gemma4Inner {
                     first_token_instant: &mut first_token_instant,
                     report_perf,
                     generation_stream,
+                    // H2: on SYNC turns `args.cancelled` is the whole-turn
+                    // cancel flag (streaming_ctx is None, so the loop's
+                    // sync polls are the only cancellation path); on
+                    // streaming turns it is the SAME flag StreamingCtx
+                    // carries — the polls are idempotent.
+                    cancel_flag: args.cancelled,
                 },
                 streaming_ctx,
             );
@@ -1004,6 +1006,18 @@ impl Gemma4Inner {
                 };
                 let mut offset: i64 = 0;
                 while offset < prefill_len {
+                    // Cooperative-cancel checkpoint (H1b) at every chunk
+                    // boundary after the first chunk (a one-chunk prefill is
+                    // the single-shot case and stays uncancellable). The Err
+                    // rides `draft_chat_turn`'s `draft_fail_closed` arm.
+                    if offset > 0
+                        && inner
+                            .turn_cancel
+                            .as_ref()
+                            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return Err(Error::from_reason("prefill cancelled"));
+                    }
                     let end = if prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
                         offset + GEMMA4_PREFILL_STEP_SIZE
                     } else {
@@ -1322,6 +1336,7 @@ pub(crate) mod tests {
 
     pub(crate) fn chat_config(mtp_depth: Option<i32>) -> ChatConfig {
         ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             mtp_depth,
@@ -1444,15 +1459,9 @@ pub(crate) mod tests {
             .map(|d| d.num_layers())
             .expect("draft loaded");
 
-        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
-        let setup = DsparkTurnSetup {
-            params: &p,
-            block_size: 3,
-        };
-
         // No stash → hard error naming the missing prefill.
         let err = inner
-            .begin_dspark_decode(&setup)
+            .begin_dspark_decode(3)
             .err()
             .expect("begin without a stash must fail");
         assert!(
@@ -1469,7 +1478,7 @@ pub(crate) mod tests {
         }));
         {
             let stepper = match inner
-                .begin_dspark_decode(&setup)
+                .begin_dspark_decode(3)
                 .expect("begin with a stash must succeed")
             {
                 Gemma4DraftStepper::Dspark(stepper) => stepper,
@@ -1506,14 +1515,9 @@ pub(crate) mod tests {
             ctx: DsparkContextCache::new(num_draft_layers),
             next_pos: 0,
         }));
-        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
-        let setup = DsparkTurnSetup {
-            params: &p,
-            block_size: 3,
-        };
 
         let mut stepper = match inner
-            .begin_dspark_decode(&setup)
+            .begin_dspark_decode(3)
             .expect("prepared DSpark stepper")
         {
             Gemma4DraftStepper::Dspark(stepper) => stepper,
@@ -1619,13 +1623,8 @@ pub(crate) mod tests {
             ctx: DsparkContextCache::new(num_draft_layers),
             next_pos: 0,
         }));
-        let p = ChatBackend::resolve_params(&inner, &chat_config(None));
-        let setup = DsparkTurnSetup {
-            params: &p,
-            block_size: 3,
-        };
         let mut stepper = match inner
-            .begin_dspark_decode(&setup)
+            .begin_dspark_decode(3)
             .expect("prepared DSpark stepper")
         {
             Gemma4DraftStepper::Dspark(stepper) => stepper,
@@ -1724,6 +1723,7 @@ pub(crate) mod tests {
 
     pub(crate) fn tiny_turn_config(mtp_depth: Option<i32>, max_new_tokens: i32) -> ChatConfig {
         ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             mtp_depth,
@@ -2049,6 +2049,7 @@ pub(crate) mod tests {
 
         fn cfg(enable_mtp: bool) -> ChatConfig {
             ChatConfig {
+                cache_salt: None,
                 cache_owner_id: None,
                 cache_root_owner_id: None,
                 max_new_tokens: Some(64),
@@ -2107,9 +2108,18 @@ pub(crate) mod tests {
         let (mut inner, _weight_bytes) = Gemma4Inner::load_from_dir(&model_path, Some(&draft_path))
             .expect("12B + draft load failed");
 
+        // Never-flipped whole-turn cancel flag — the sync session cores
+        // now take one (H2); these turns are never cancelled.
+        let no_cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         // --- AR baseline: 2 turns, capturing history + offsets ---
-        let ar1 = crate::engine::session::session_start(&mut inner, vec![user(PROMPT)], cfg(false))
-            .expect("AR turn 1 failed");
+        let ar1 = crate::engine::session::session_start(
+            &mut inner,
+            vec![user(PROMPT)],
+            cfg(false),
+            &no_cancel,
+        )
+        .expect("AR turn 1 failed");
         assert_eq!(ar1.finish_reason, "stop", "fixture must stop early on EOS");
         let ar_h1 = inner.cached_token_history.clone();
         assert_offsets_match_history(&inner, "ar_turn1");
@@ -2117,14 +2127,20 @@ pub(crate) mod tests {
             &mut inner,
             vec![user(PROMPT), assistant(&ar1), user(FOLLOW_UP)],
             cfg(false),
+            &no_cancel,
         )
         .expect("AR turn 2 failed");
         let ar_h2 = inner.cached_token_history.clone();
         assert_offsets_match_history(&inner, "ar_turn2");
 
         // --- DSpark pass: same 2 turns ---
-        let sp1 = crate::engine::session::session_start(&mut inner, vec![user(PROMPT)], cfg(true))
-            .expect("DSpark turn 1 failed");
+        let sp1 = crate::engine::session::session_start(
+            &mut inner,
+            vec![user(PROMPT)],
+            cfg(true),
+            &no_cancel,
+        )
+        .expect("DSpark turn 1 failed");
         assert_eq!(sp1.finish_reason, "stop");
         // SHAPE fingerprint: the EOS must have been accepted as a DRAFT.
         let perf = sp1.performance.as_ref().expect("DSpark perf missing");
@@ -2149,6 +2165,7 @@ pub(crate) mod tests {
             &mut inner,
             vec![user(PROMPT), assistant(&sp1), user(FOLLOW_UP)],
             cfg(true),
+            &no_cancel,
         )
         .expect("DSpark turn 2 failed");
         assert!(

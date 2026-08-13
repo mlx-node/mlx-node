@@ -92,6 +92,13 @@ pub struct Lfm2Config {
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,
 
+    /// Persist block-paged attention state and the co-keyed short-convolution
+    /// sidecar to the SSD cold tier. Explicit config overrides the process-wide
+    /// `MLX_PERSIST_PAGED_CACHE` default.
+    #[serde(default)]
+    #[napi(ts_type = "boolean | undefined")]
+    pub persist_paged_cache: Option<bool>,
+
     // ===== LFM2.5 MoE options (`model_type: "lfm2_moe"`, e.g. lfm2.5-8b-a1b) =====
     // All optional/defaulted so existing DENSE LFM2 checkpoints parse unchanged.
     // Mirrors `mlx-lm/mlx_lm/models/lfm2_moe.py` ModelArgs.
@@ -197,23 +204,16 @@ impl Lfm2Config {
     /// Policy (pure, no I/O — isolated here for unit testing):
     /// * An explicit `Some(_)` from config.json always wins (user/converter
     ///   pinned the storage backend — never override it).
-    /// * When the field is absent (`None`) AND the checkpoint is quantized,
-    ///   default to `Some(false)` (flat eager decode). The eager-PAGED loop is
-    ///   slow (~12 `synchronize_mlx()`/token, blocking `y.eval()`, no async
-    ///   double-buffering), whereas the flat path uses an in-graph `KVCache` +
-    ///   `async_eval_arrays` (zero per-layer sync) and is ~1.84× faster on the
-    ///   measured mxfp8 LFM2.5-8B-A1B workload.
-    /// * Otherwise (absent + not quantized, e.g. bf16) leave it `None` so
-    ///   `Lfm2Inner::new`'s `unwrap_or(true)` continues to yield PAGED.
+    /// * When the field is absent (`None`), default to `Some(true)` for both
+    ///   dense and MoE, quantized and unquantized checkpoints. The hybrid
+    ///   paged/full-attention plus ShortConv sidecar path is the production
+    ///   architecture; sym8 is forced flat separately because that storage
+    ///   format cannot enter the compiled paged core.
     pub fn resolve_use_block_paged_default(
         explicit: Option<bool>,
-        is_quantized: bool,
+        _is_quantized: bool,
     ) -> Option<bool> {
-        match explicit {
-            Some(_) => explicit,
-            None if is_quantized => Some(false),
-            None => None,
-        }
+        Some(explicit.unwrap_or(true))
     }
 
     /// Whether the layer at `idx` uses a sparse MoE feed-forward block.
@@ -272,6 +272,7 @@ mod tests {
             paged_cache_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
+            persist_paged_cache: None,
             intermediate_size: None,
             moe_intermediate_size: None,
             num_experts: None,
@@ -455,22 +456,19 @@ mod tests {
         assert!(cfg.is_moe_layer(3));
     }
 
-    /// `resolve_use_block_paged_default` policy: quantized + unset -> flat;
-    /// bf16 + unset -> left None (so `Lfm2Inner::new`'s unwrap_or(true) yields
-    /// paged); explicit Some(_) always honored regardless of quant-ness.
+    /// `resolve_use_block_paged_default` policy: unset -> paged for every
+    /// supported storage format; explicit Some(_) always wins.
     #[test]
-    fn test_resolve_use_block_paged_default_quantized_none_goes_flat() {
-        // quantized + unset -> flat eager decode.
+    fn test_resolve_use_block_paged_default_unset_goes_paged() {
         assert_eq!(
             Lfm2Config::resolve_use_block_paged_default(None, true),
-            Some(false),
-            "quantized checkpoint with use_block_paged_cache unset must default to flat"
+            Some(true),
+            "quantized checkpoint with use_block_paged_cache unset must default to paged"
         );
-        // bf16 + unset -> left None so the downstream unwrap_or(true) keeps paged.
         assert_eq!(
             Lfm2Config::resolve_use_block_paged_default(None, false),
-            None,
-            "bf16 checkpoint with use_block_paged_cache unset must stay None (paged via unwrap_or)"
+            Some(true),
+            "bf16 checkpoint with use_block_paged_cache unset must default to paged"
         );
         // Explicit paged honored even on a quantized checkpoint.
         assert_eq!(
@@ -495,15 +493,13 @@ mod tests {
             "explicit use_block_paged_cache:false must win on bf16"
         );
 
-        // The resolved values feed Lfm2Inner::new's `unwrap_or(true)`:
-        // bf16/None -> true (paged); quantized/None -> Some(false) -> false (flat).
         assert!(
             Lfm2Config::resolve_use_block_paged_default(None, false).unwrap_or(true),
-            "bf16 None must resolve to paged (true) at the unwrap_or(true) site"
+            "bf16 unset must resolve to paged"
         );
         assert!(
-            !Lfm2Config::resolve_use_block_paged_default(None, true).unwrap_or(true),
-            "quantized None must resolve to flat (false) at the unwrap_or(true) site"
+            Lfm2Config::resolve_use_block_paged_default(None, true).unwrap_or(true),
+            "quantized unset must resolve to paged"
         );
     }
 

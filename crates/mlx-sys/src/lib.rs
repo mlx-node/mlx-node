@@ -173,6 +173,27 @@ unsafe extern "C-unwind" {
         v_out: *mut *mut mlx_array,
     );
 
+    /// Fused Q/K/V projection with one RoPE offset per batch row.
+    /// `rope_offsets` must be an int32 array with shape `[batch]`.
+    pub fn mlx_fused_attention_qkv_with_offsets(
+        x: *mut mlx_array,
+        w_q: *mut mlx_array,
+        w_k: *mut mlx_array,
+        w_v: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        k_norm_w: *mut mlx_array,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        rope_base: f32,
+        rope_dims: i32,
+        qk_norm_eps: f32,
+        rope_offsets: *mut mlx_array,
+        q_out: *mut *mut mlx_array,
+        k_out: *mut *mut mlx_array,
+        v_out: *mut *mut mlx_array,
+    );
+
     // Fused SDPA + output projection for cached attention
     pub fn mlx_fused_attention_output(
         q: *mut mlx_array,

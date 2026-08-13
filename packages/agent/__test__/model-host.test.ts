@@ -330,10 +330,9 @@ describe('MlxModelHost', () => {
 
   describe('persistPagedCache cold-tier policy', () => {
     const QWEN3: DiscoveredModelLike = { name: 'qwen3-dense', path: '/models/qwen3-dense', modelType: 'qwen3' };
-    const HOST_MODELS: DiscoveredModelLike[] = [
-      QWEN3,
-      { name: 'gemma-mid', path: '/models/gemma-mid', modelType: 'gemma4' },
-    ];
+    const GEMMA4: DiscoveredModelLike = { name: 'gemma-mid', path: '/models/gemma-mid', modelType: 'gemma4' };
+    const LFM2: DiscoveredModelLike = { name: 'lfm2-small', path: '/models/lfm2-small', modelType: 'lfm2' };
+    const HOST_MODELS: DiscoveredModelLike[] = [QWEN3, GEMMA4, LFM2];
 
     /** Records the exact argument list the host hands the config-override seam. */
     function trackingResolver() {
@@ -365,35 +364,33 @@ describe('MlxModelHost', () => {
       expect(resolveModelPathFn.mock.calls[0]).toEqual([QWEN3, { persistPagedCache: false }]);
     });
 
-    it('requests cold-tier persistence by default for a hybrid family too', async () => {
+    it.each([
+      ['Gemma4 grouped full/sliding state', GEMMA4],
+      ['LFM2 full-attention/ShortConv state', LFM2],
+    ])('requests persistence for %s after restart parity', async (_label, model) => {
       const resolveModelPathFn = trackingResolver();
       const host = new MlxModelHost(HOST_MODELS, { loadModelFn: makeLoader(), resolveModelPathFn });
 
-      await getSession(host, 'gemma-mid');
+      await getSession(host, model.name);
 
-      // gemma4 keeps sliding-window state outside the paged pool, but persists
-      // it as a cold-tier sidecar and passed its restart-parity gate, so it is
-      // on the allowlist and gets the same default-on policy as dense qwen3.
-      // Asserted literally rather than through `expectedResolveArgs`, so this
-      // still fails if the allowlist and the default ever drift apart.
-      expect(resolveModelPathFn.mock.calls[0]).toEqual([HOST_MODELS[1], { persistPagedCache: true }]);
+      expect(resolveModelPathFn.mock.calls[0]).toEqual([model, { persistPagedCache: true }]);
     });
 
     it('hands no policy at all to a family off the allowlist', async () => {
       const resolveModelPathFn = trackingResolver();
-      const lfm2: DiscoveredModelLike = { name: 'lfm2-small', path: '/models/lfm2-small', modelType: 'lfm2' };
-      const host = new MlxModelHost([...HOST_MODELS, lfm2], {
+      const harrier: DiscoveredModelLike = {
+        name: 'harrier-small',
+        path: '/models/harrier-small',
+        modelType: 'harrier',
+      };
+      const host = new MlxModelHost([...HOST_MODELS, harrier], {
         loadModelFn: makeLoader(),
         resolveModelPathFn,
       });
 
-      await getSession(host, 'lfm2-small');
+      await getSession(host, 'harrier-small');
 
-      // lfm2 keeps short-conv state outside the pool with no serialization
-      // path, so it is off the allowlist. It must receive NO policy — not
-      // `{ persistPagedCache: false }` — so the overlay never touches the
-      // field and a checkpoint's own config.json keeps whatever it set.
-      expect(resolveModelPathFn.mock.calls[0]).toEqual([lfm2]);
+      expect(resolveModelPathFn.mock.calls[0]).toEqual([harrier]);
     });
   });
 

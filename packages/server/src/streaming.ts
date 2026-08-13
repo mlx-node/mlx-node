@@ -1,6 +1,9 @@
 /** SSE writer utilities. */
 
-import type { ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
+
+/** Default time a connected SSE peer may remain continuously backpressured. */
+export const DEFAULT_SSE_DRAIN_TIMEOUT_MS = 30_000;
 
 /**
  * Responses that have committed to SSE (`beginSSE`) but have not yet been
@@ -15,6 +18,80 @@ import type { ServerResponse } from 'node:http';
  * `beginSSE`/`endSSE` are free functions called from both endpoints.
  */
 const activeSSEResponses = new Set<ServerResponse>();
+
+/** Disconnect state whose listeners stay armed for one complete SSE handler. */
+export interface SSEClientAbortTracker {
+  readonly aborted: boolean;
+  markAborted(): void;
+  dispose(): void;
+}
+
+/**
+ * Track request/response/socket disconnects until the caller's outermost
+ * `finally`. Keeping this lifetime outside the decode loop matters: a final
+ * native item can expand into backpressured residual protocol frames after the
+ * iterator has already closed, and a disconnect during that drain must still
+ * prevent a success terminal and session adoption.
+ */
+export function trackSSEClientAbort(res: ServerResponse, httpReq: IncomingMessage | undefined): SSEClientAbortTracker {
+  let aborted = false;
+  let disposed = false;
+  const onClose = (): void => {
+    aborted = true;
+  };
+  const onError = (_err: unknown): void => {
+    aborted = true;
+  };
+  const socket = res.socket;
+
+  if (httpReq != null) {
+    httpReq.once('close', onClose);
+    httpReq.on('error', onError);
+  }
+  res.once('close', onClose);
+  res.on('error', onError);
+  if (socket != null) {
+    socket.once('close', onClose);
+    socket.on('error', onError);
+  }
+
+  return {
+    get aborted(): boolean {
+      return aborted;
+    },
+    markAborted(): void {
+      aborted = true;
+    },
+    dispose(): void {
+      if (disposed) return;
+      disposed = true;
+      if (httpReq != null) {
+        httpReq.removeListener('close', onClose);
+        httpReq.removeListener('error', onError);
+      }
+      res.removeListener('close', onClose);
+      res.removeListener('error', onError);
+      if (socket != null) {
+        socket.removeListener('close', onClose);
+        socket.removeListener('error', onError);
+      }
+    },
+  };
+}
+
+interface SSEDrainWaitOptions {
+  /** Override used by focused tests; production reads the env/default. */
+  timeoutMs?: number;
+  /** Mark the owning handler's sticky abort state before the transport closes. */
+  onTimeout?: () => void;
+}
+
+function resolveSSEDrainTimeoutMs(): number {
+  const raw = process.env.MLX_SSE_DRAIN_TIMEOUT_MS;
+  if (raw == null || raw.trim() === '') return DEFAULT_SSE_DRAIN_TIMEOUT_MS;
+  const parsed = Number(raw);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_SSE_DRAIN_TIMEOUT_MS;
+}
 
 export function beginSSE(res: ServerResponse): void {
   activeSSEResponses.add(res);
@@ -33,9 +110,69 @@ export function beginSSE(res: ServerResponse): void {
 }
 
 /** Write one SSE event. Injects `type: eventType` into the payload (data's own `type` wins) for OpenAI SDK compatibility. */
-export function writeSSEEvent(res: ServerResponse, eventType: string, data: object): void {
+export function writeSSEEvent(res: ServerResponse, eventType: string, data: object): boolean {
   const payload = { type: eventType, ...data };
-  res.write(`event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`);
+  return res.write(`event: ${eventType}\ndata: ${JSON.stringify(payload)}\n\n`);
+}
+
+/**
+ * Wait until a backpressured response can accept more data, or until its
+ * transport closes. Close and error resolve rather than reject: the endpoint's
+ * outer abort tracker owns the sticky state, and the next loop check exits
+ * before another native item is written.
+ *
+ * Call this synchronously after `writeSSEEvent` returns false. In particular,
+ * do not defer listener installation until the next iterator turn: `drain`
+ * could fire while that turn is being fetched and leave the handler parked on
+ * an event that already happened.
+ */
+export function awaitDrainOrClose(res: ServerResponse, options: SSEDrainWaitOptions = {}): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const socket = res.socket;
+    const timeoutMs = options.timeoutMs ?? resolveSSEDrainTimeoutMs();
+    const timer = setTimeout(() => {
+      // Set the handler-visible state synchronously. `destroy()` emits close on
+      // a later turn, which is too late for the success gate immediately after
+      // this promise resolves.
+      options.onTimeout?.();
+      if (!res.destroyed) res.destroy();
+      settle();
+    }, timeoutMs);
+    timer.unref();
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      res.removeListener('drain', onDrain);
+      res.removeListener('close', onClose);
+      res.removeListener('error', onError);
+      if (socket != null) socket.removeListener('close', onClose);
+      resolve();
+    };
+    const onDrain = (): void => {
+      settle();
+    };
+    const onClose = (): void => {
+      settle();
+    };
+    const onError = (_err: unknown): void => {
+      settle();
+    };
+
+    // A destroyed peer cannot emit a future useful drain. Do not include
+    // `writableEnded` here: write-after-end returns false and reports
+    // ERR_STREAM_WRITE_AFTER_END asynchronously through the error listener.
+    if (res.destroyed || (socket != null && socket.destroyed)) {
+      settle();
+      return;
+    }
+
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+    res.once('error', onError);
+    if (socket != null) socket.once('close', onClose);
+  });
 }
 
 export function endSSE(res: ServerResponse): void {

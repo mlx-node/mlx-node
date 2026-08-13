@@ -1,5 +1,6 @@
 pub mod attention;
 pub mod config;
+pub(crate) mod conv_sidecar;
 pub mod decoder_layer;
 pub mod layer_cache;
 pub mod model;

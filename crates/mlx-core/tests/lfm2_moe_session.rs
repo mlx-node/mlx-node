@@ -26,6 +26,7 @@ use mlx_core::tokenizer::ChatMessage;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
@@ -236,8 +237,8 @@ async fn lfm2_moe_reset_determinism() {
         .await
         .expect("first start failed");
 
-    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+    // Await the async reset so it is enqueued and settled before the rerun.
+    model.reset_caches().await.expect("reset_caches failed");
 
     let r2 = model
         .chat_session_start(vec![user_message(prompt)], Some(chat_config_default(8)))

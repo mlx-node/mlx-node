@@ -27,6 +27,7 @@ use mlx_core::tokenizer::ChatMessage;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
@@ -317,7 +318,7 @@ async fn lfm2_session_path_keeps_ttft_flat_across_turns() {
 /// or final). The final `done: true` chunk must be observed or the
 /// helper panics.
 async fn drain_stream_turn(
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<napi::Result<ChatStreamChunk>>,
+    mut rx: tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
 ) -> (Vec<ChatStreamChunk>, f64, bool) {
     let start = Instant::now();
     let mut chunks = Vec::new();
@@ -475,13 +476,13 @@ async fn lfm2_stream_session_path_keeps_ttft_flat_across_turns() {
     // which this streaming twin was left out of.
     //
     // The TTFT ratio it replaces did not merely flake, it contradicted the
-    // architecture. lfm2 reprefills the FULL prompt through its conv layers
-    // every turn (`paged_perf_prefill_tokens`, lfm2/model.rs — the
-    // conv-state-reuse fast path is gated OFF by default), so TTFT is
-    // full-prompt scale BY DESIGN and grows with context. The CI failure that
-    // prompted this read turn2=329.1ms turn4=748.5ms, a 2.27x ratio that
-    // tracks the prompt growth between those turns: correct code failing a
-    // bound it can never satisfy. Raising the constant only postpones it.
+    // architecture. On a foreign or partial attention-prefix hit, lfm2 must
+    // reprefill the FULL prompt through its conv layers
+    // (`paged_perf_prefill_tokens`, lfm2/model.rs), so TTFT can remain
+    // full-prompt scale and grow with context. The CI failure that prompted
+    // this read turn2=329.1ms turn4=748.5ms, a 2.27x ratio that tracks the
+    // prompt growth between those turns: correct code failing a bound it can
+    // never satisfy. Raising the constant only postpones it.
     //
     // TTFT is still measured and printed above, so the perf trail stays in the
     // CI log; it just no longer gates.
@@ -557,6 +558,7 @@ async fn lfm2_stream_session_cancellation_preserves_cache_for_next_turn() {
 
     // Turn 1: run a normal session-start stream to prime the cache.
     let turn1_cfg = ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(128),
@@ -868,10 +870,9 @@ async fn lfm2_session_reset_reproduces_turn_output_deterministically() {
         .expect("first chat_session_start failed");
 
     // Reset the entire session/cache state, then run the SAME prompt
-    // again with the SAME config. `reset_caches` is a sync NAPI method
-    // on `&Lfm2Model`.
-    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+    // again with the SAME config. Await the async reset so it settles before
+    // the rerun is dispatched.
+    model.reset_caches().await.expect("reset_caches failed");
 
     let cfg2 = chat_config_default(32);
     let r2 = model
@@ -940,8 +941,8 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
 
     // Hard reset so the streaming run starts from the same fully cold
     // state as the non-streaming run above (prefix-cache purged).
-    // block_in_place: reset_caches blocks on blocking_recv, which panics on a tokio worker.
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+    // Await the async reset before dispatching the streaming run.
+    model.reset_caches().await.expect("reset_caches failed");
 
     // Streaming: drain every non-done chunk and concatenate `chunk.text`.
     let cfg_s = chat_config_default(32);
@@ -968,8 +969,7 @@ async fn lfm2_session_stream_matches_non_stream_byte_for_byte() {
     // `raw_text`, NOT the reasoning-stripped `text`. The original
     // `streamed == text` assert could never pass on a thinking trajectory
     // (lfm2 spends the whole 32-token budget inside `<think>`, so `text` is
-    // empty) — a defect previously masked by the blocking_recv panic in
-    // `reset_caches` (fixed above).
+    // empty) — a defect previously masked by the old synchronous reset path.
     assert_eq!(
         streamed, non_stream_result.raw_text,
         "streamed deltas do not match non-stream raw_text byte-for-byte: \

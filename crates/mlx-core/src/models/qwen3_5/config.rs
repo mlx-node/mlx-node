@@ -47,6 +47,22 @@ pub(crate) fn qwen35_resolve_paged_cache_memory_mb(
     }
 }
 
+/// Resolve the shared dense/MoE Qwen3.5 paged-cache policy.
+///
+/// The environment override is intentionally an input rather than read here:
+/// both loaders use this pure function, and unit tests can pin precedence
+/// without mutating process-global environment state.
+pub(crate) fn resolve_qwen35_paged_default(
+    explicit: Option<bool>,
+    env_override: Option<&str>,
+) -> Option<bool> {
+    match env_override {
+        Some("1") | Some("true") | Some("TRUE") => Some(true),
+        Some("0") | Some("false") | Some("FALSE") => Some(false),
+        _ => Some(explicit.unwrap_or(true)),
+    }
+}
+
 /// Qwen3.5 model configuration (dense variant).
 ///
 /// For MoE models, use `Qwen3_5MoeConfig` from `qwen3_5_moe`.
@@ -88,7 +104,7 @@ pub struct Qwen3_5Config {
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f64,
 
-    // Paged attention options (opt-in, mirror Qwen3/Gemma4/LFM2 knobs).
+    // Paged attention options (default-on, mirror Qwen3/Gemma4/LFM2 knobs).
     /// GPU memory budget for paged KV cache in megabytes.
     /// Only used when `use_block_paged_cache` is true.
     /// Default: automatically sized for one full-context sequence.
@@ -106,7 +122,7 @@ pub struct Qwen3_5Config {
     /// Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
     /// full-attention layers.
     ///
-    /// **OPT-IN — experimental.** When `Some(true)`, `Qwen35Inner`
+    /// When enabled (the default), `Qwen35Inner`
     /// allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
     /// model's full-attention layer count and constructs a
     /// `PagedKVCacheAdapter`. The chat-session forward dispatch routes
@@ -117,12 +133,12 @@ pub struct Qwen3_5Config {
     /// prefix reuse for recurrent layers" stance.
     ///
     /// **Paged vs flat eager**: this flag selects the eager paged decode
-    /// over the eager flat decode. When `Some(true)`, full-attention
+    /// over the eager flat decode. When enabled, full-attention
     /// layers run through the paged adapter (cross-request prefix reuse);
-    /// when unset, they run the eager flat decode. Either way the forward
-    /// is pure-Rust eager.
+    /// an explicit false runs eager flat decode. Either way the forward is
+    /// pure-Rust eager.
     ///
-    /// **VLM under paged**: a VLM checkpoint defaults this flag ON at load, so
+    /// **VLM under paged**: VLM checkpoints also default this flag ON, so
     /// dense image turns ONLY run on the paged-vision core. A fresh single-turn
     /// image-bearing prompt prefills through the paged adapter (M-RoPE positions
     /// feed the rotary; the merged vision embeddings feed the forward) and
@@ -132,8 +148,9 @@ pub struct Qwen3_5Config {
     /// that reaches a None adapter (explicit `Some(false)`, non-Metal build, or
     /// a sym8 checkpoint) errors at dispatch.
     ///
-    /// Default: `None` for text-only checkpoints (eager flat decode);
-    /// `Some(true)` for VLM checkpoints (block-paged, set in `parse_config`).
+    /// Load default: `Some(true)` for compatible text and VLM checkpoints.
+    /// Explicit false remains available for flat-path diagnostics; sym8 is
+    /// forced flat by persistence after its storage mode is known.
     #[serde(default)]
     #[napi(ts_type = "boolean | undefined")]
     pub use_block_paged_cache: Option<bool>,
@@ -181,6 +198,24 @@ fn default_rope_theta() -> f64 {
 }
 
 impl Qwen3_5Config {
+    /// BF16 bytes for one request's complete GDN conv + recurrent state.
+    /// Full-attention K/V is accounted separately by the paged allocator.
+    pub(crate) fn recurrent_state_bytes(&self) -> u64 {
+        let linear_layers = (0..self.num_layers.max(0) as usize)
+            .filter(|&layer| self.is_linear_layer(layer))
+            .count() as u64;
+        let conv_elements = u64::try_from((self.linear_conv_kernel_dim - 1).max(0))
+            .unwrap_or(0)
+            .saturating_mul(u64::try_from(self.linear_conv_dim().max(0)).unwrap_or(0));
+        let recurrent_elements = u64::try_from(self.linear_num_value_heads.max(0))
+            .unwrap_or(0)
+            .saturating_mul(u64::try_from(self.linear_value_head_dim.max(0)).unwrap_or(0))
+            .saturating_mul(u64::try_from(self.linear_key_head_dim.max(0)).unwrap_or(0));
+        linear_layers
+            .saturating_mul(conv_elements.saturating_add(recurrent_elements))
+            .saturating_mul(2)
+    }
+
     /// Returns whether a given layer index uses linear attention (GatedDeltaNet)
     /// vs full attention (Qwen3NextAttention).
     ///
@@ -244,7 +279,10 @@ impl Qwen3_5Config {
 
 #[cfg(test)]
 mod tests {
-    use super::{qwen35_default_paged_cache_memory_mb, qwen35_resolve_paged_cache_memory_mb};
+    use super::{
+        Qwen3_5Config, qwen35_default_paged_cache_memory_mb, qwen35_resolve_paged_cache_memory_mb,
+        resolve_qwen35_paged_default,
+    };
     use mlx_paged_attn::PagedAttentionConfig;
 
     fn paged_config(
@@ -263,6 +301,59 @@ mod tests {
             max_seq_len: Some(262_144),
             max_batch_size: Some(32),
         }
+    }
+
+    #[test]
+    fn gdn_state_bytes_follow_the_real_conv_and_recurrent_shapes() {
+        let config = Qwen3_5Config {
+            vocab_size: 32,
+            hidden_size: 16,
+            num_layers: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            intermediate_size: 32,
+            rms_norm_eps: 1e-6,
+            head_dim: 8,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 2,
+            linear_num_value_heads: 2,
+            linear_num_key_heads: 1,
+            linear_key_head_dim: 4,
+            linear_value_head_dim: 3,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: Some(true),
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        };
+        // Two linear layers. conv=[3, (1*4)*2 + (2*3)=14], recurrent=[2,3,4].
+        assert_eq!(config.recurrent_state_bytes(), 2 * (3 * 14 + 2 * 3 * 4) * 2);
+    }
+
+    #[test]
+    fn paged_default_and_override_precedence_match_dense_and_moe() {
+        assert_eq!(resolve_qwen35_paged_default(None, None), Some(true));
+        assert_eq!(resolve_qwen35_paged_default(Some(false), None), Some(false));
+        assert_eq!(
+            resolve_qwen35_paged_default(Some(false), Some("1")),
+            Some(true)
+        );
+        assert_eq!(
+            resolve_qwen35_paged_default(Some(true), Some("0")),
+            Some(false)
+        );
+        assert_eq!(
+            resolve_qwen35_paged_default(None, Some("unexpected")),
+            Some(true)
+        );
     }
 
     #[test]

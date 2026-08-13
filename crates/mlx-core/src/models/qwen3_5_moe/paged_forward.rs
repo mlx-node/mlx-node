@@ -4,6 +4,7 @@
 //! the MoE `DecoderLayer` (which holds an MoE/dense MLP variant) and
 //! its own `forward_paged_or_flat` method.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use napi::bindgen_prelude::*;
@@ -88,6 +89,7 @@ pub(crate) fn run_gdn_only_prefill_materialized(
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     let configured_chunk_size = crate::array::paged_prefill_chunk_size();
     let chunk_size = if configured_chunk_size > 0 {
@@ -101,6 +103,7 @@ pub(crate) fn run_gdn_only_prefill_materialized(
         layers,
         caches,
         chunk_size,
+        turn_cancel,
     )
 }
 
@@ -110,13 +113,23 @@ fn run_gdn_only_prefill_materialized_with_chunk_size(
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
     chunk_size: usize,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     if chunk_size == 0 {
         return Err(Error::from_reason(
             "MoE GDN materialized replay chunk size must be positive",
         ));
     }
-    for chunk in prefix_tokens.chunks(chunk_size) {
+    for (chunk_idx, chunk) in prefix_tokens.chunks(chunk_size).enumerate() {
+        // Cooperative-cancel checkpoint (H1b) between replay chunks — an
+        // O(prefix) cached-prefix replay must not hold the model thread
+        // hostage after a cancel. A one-chunk replay stays single-shot by
+        // design. The Err rides the callers' invalidate/abort arms, and
+        // `replay_gdn_cache_and_commit` drops the staged cache, so the
+        // partial replay is never published.
+        if chunk_idx > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         run_gdn_only_prefill(chunk, embed, layers, caches)?;
         materialize_linear_layer_caches(caches)?;
         crate::array::synchronize_and_clear_cache();
@@ -182,6 +195,7 @@ pub(crate) fn run_paged_prefill_chunk(
         paged_adapter,
         chunk_size,
         cached_rope_deltas,
+        None,
     )
     .map(|(logits, _)| logits)
 }
@@ -240,6 +254,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     cached_rope_deltas: i32,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<MxArray> {
     run_paged_prefill_chunk_with_size_and_checkpoint(
         full_tokens,
@@ -255,6 +270,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         paged_adapter,
         chunk_size,
         cached_rope_deltas,
+        turn_cancel,
     )
     .map(|(logits, _)| logits)
 }
@@ -274,6 +290,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     cached_rope_deltas: i32,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -362,6 +379,13 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
     let mut chunk_start_position: u32 = cached_prefix_len;
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary
+        // instead of running the rest of the prefill. The Err rides the
+        // generic paged engine's `abort_paged_turn` arm, which releases
+        // the live request without registering its blocks (fail closed).
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let chunk = &suffix_tokens[range];
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);
@@ -582,6 +606,7 @@ pub(crate) fn run_paged_vlm_prefill_moe(
     lm_head: &Option<LinearProj>,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if expanded_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -650,6 +675,12 @@ pub(crate) fn run_paged_vlm_prefill_moe(
     let mut checkpoints = Vec::new();
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary.
+        // The Err rides the VLM cores' `invalidate_moe_paged_session` arm —
+        // the request is released, never finalized.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let absolute_start = cached_prefix_len_us + range.start;
         let absolute_end = cached_prefix_len_us + range.end;
         let chunk_tokens = &expanded_tokens[absolute_start..absolute_end];
@@ -1243,6 +1274,7 @@ mod tests {
                 adapter,
                 chunk_size,
                 /* cached_rope_deltas */ 0,
+                None,
             ) {
                 Ok(l) => l,
                 Err(e) => {
@@ -1423,6 +1455,7 @@ mod tests {
                 adapter,
                 2048,
                 0,
+                None,
             )
             .expect("MoE checkpoint prefill")
         };
@@ -1570,6 +1603,7 @@ mod tests {
                 &mut inner.layers,
                 caches,
                 7,
+                None,
             )
             .expect("bounded GDN replay");
         }
@@ -1588,6 +1622,108 @@ mod tests {
             max_abs_diff <= 0.25,
             "bounded GDN replay diverged from one-shot state: max_abs_diff={max_abs_diff}"
         );
+    }
+
+    /// Fresh per-layer caches matching `model.rs`'s private
+    /// `fresh_moe_layer_caches`, for staged-replay tests.
+    fn fresh_tiny_moe_caches(inner: &Qwen35MoeInner) -> Vec<Qwen3_5LayerCache> {
+        (0..inner.config.num_layers as usize)
+            .map(|i| {
+                if inner.config.is_linear_layer(i) {
+                    Qwen3_5LayerCache::new_linear()
+                } else {
+                    Qwen3_5LayerCache::new_full_attention()
+                }
+            })
+            .collect()
+    }
+
+    /// H1b regression: a cancel flag observed between materialized replay
+    /// chunks must abort the replay with the distinguished error, and the
+    /// staged-commit wrapper must drop the partial state (no warm publish).
+    /// A one-chunk replay stays single-shot and ignores the flag.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn test_moe_materialized_gdn_replay_cancels_between_chunks() {
+        use std::sync::Arc;
+
+        use crate::models::qwen3_5::gdn_checkpoint_store::replay_gdn_cache_and_commit;
+
+        let cfg = moe_paged_tiny_config();
+        let mut inner = Qwen35MoeInner::new(cfg).expect("construct tiny MoE model");
+        cast_moe_inner_weights_bf16(&mut inner);
+        inner.init_caches_sync().expect("initialize MoE caches");
+        let prompt: Vec<u32> = (0u32..37).map(|i| (i * 19 + 11) % 128).collect();
+        let embed = inner.embedding.clone();
+        let cancelled = Arc::new(AtomicBool::new(true));
+
+        // Multi-chunk replay with the flag pre-set: chunk 1 runs, the
+        // between-chunk poll aborts before chunk 2, and the staged cache is
+        // dropped — the active cache is never published.
+        {
+            let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+            let staged = fresh_tiny_moe_caches(&inner);
+            let layers = &mut inner.layers;
+            let err = replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+                super::run_gdn_only_prefill_materialized_with_chunk_size(
+                    &prompt,
+                    &embed,
+                    layers,
+                    staged,
+                    7,
+                    Some(cancelled.as_ref()),
+                )
+            })
+            .expect_err("cancelled multi-chunk replay must abort");
+            assert!(
+                err.to_string().contains("prefill cancelled"),
+                "replay abort must carry the distinguished error, got: {err}",
+            );
+            assert!(
+                active.is_none(),
+                "a cancelled replay must never publish the staged cache"
+            );
+        }
+
+        // One-chunk exception: the same pre-set flag is ignored when the
+        // whole prefix fits in a single replay chunk (single-shot contract).
+        {
+            let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+            let staged = fresh_tiny_moe_caches(&inner);
+            let layers = &mut inner.layers;
+            replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+                super::run_gdn_only_prefill_materialized_with_chunk_size(
+                    &prompt,
+                    &embed,
+                    layers,
+                    staged,
+                    prompt.len(),
+                    Some(cancelled.as_ref()),
+                )
+            })
+            .expect("single-chunk replay stays uncancellable");
+            assert!(active.is_some(), "a completed replay must publish");
+        }
+
+        // Un-set flag: the multi-chunk replay completes and publishes.
+        cancelled.store(false, Ordering::Relaxed);
+        {
+            let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+            let staged = fresh_tiny_moe_caches(&inner);
+            let layers = &mut inner.layers;
+            replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+                super::run_gdn_only_prefill_materialized_with_chunk_size(
+                    &prompt,
+                    &embed,
+                    layers,
+                    staged,
+                    7,
+                    Some(cancelled.as_ref()),
+                )
+            })
+            .expect("uncancelled multi-chunk replay must complete");
+            assert!(active.is_some(), "a completed replay must publish");
+        }
     }
 
     /// **Uneven-tail parity test**: 97-token prompt with chunk_size=16
@@ -1938,6 +2074,7 @@ mod tests {
                 adapter,
                 0,
                 /* cached_rope_deltas */ 0,
+                None,
             )
             .expect("explicit chunk_size=0 prefill")
         };

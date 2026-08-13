@@ -1,6 +1,6 @@
 //! Shared model-thread command enum + dispatcher.
 //!
-//! [`ChatCmd`] is the model-neutral chat command: a 7-variant shape with
+//! [`ChatCmd`] is the model-neutral chat command: an 8-variant shape with
 //! the per-turn payload fields. [`handle_chat_cmd`] dispatches each arm
 //! to the corresponding generic session core from
 //! [`crate::engine::session`].
@@ -41,6 +41,13 @@ pub(crate) enum ChatCmd {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
+        /// Cooperative cancel flag for the whole sync turn (H2). The
+        /// plain NAPI methods pass a fresh never-flipped flag; the
+        /// `begin_chat_session_*` operations share it with the returned
+        /// [`crate::engine::types::ChatSessionCall`] handle. A
+        /// cancelled sync turn REJECTS with the distinguished
+        /// `"chat session cancelled"` (see [`session::session_start`]).
+        cancelled: Arc<AtomicBool>,
     },
     /// Continue an existing session from the complete structured
     /// conversation. The loaded chat template renders the history and the
@@ -49,6 +56,8 @@ pub(crate) enum ChatCmd {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
+        /// See [`Self::SessionStart`]'s `cancelled` field.
+        cancelled: Arc<AtomicBool>,
     },
     /// Continue an existing session from a complete structured
     /// conversation ending in a tool-role message.
@@ -56,6 +65,8 @@ pub(crate) enum ChatCmd {
         messages: Vec<ChatMessage>,
         config: ChatConfig,
         reply: ResponseTx<ChatResult>,
+        /// See [`Self::SessionStart`]'s `cancelled` field.
+        cancelled: Arc<AtomicBool>,
     },
     /// Streaming session-start: same semantics as
     /// [`SessionStart`](Self::SessionStart) but streams token deltas
@@ -88,6 +99,13 @@ pub(crate) enum ChatCmd {
     /// tests and session-management code can start from a known clean
     /// state between turns.
     ResetCaches { reply: ResponseTx<()> },
+    /// Release scheduler-owned state for one logical chat-session owner.
+    /// Stateless HTTP sessions call this after their terminal response so
+    /// completed owners cannot pin paged block tables or history forever.
+    ReleaseCacheOwner {
+        owner_id: String,
+        reply: ResponseTx<()>,
+    },
 }
 
 /// Lifts a [`ChatCmd`] into a family's thread-command type.
@@ -193,22 +211,31 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
             messages,
             config,
             reply,
+            cancelled,
         } => {
-            let _ = reply.send(session::session_start(backend, messages, config));
+            let _ = reply.send(session::session_start(
+                backend, messages, config, &cancelled,
+            ));
         }
         ChatCmd::SessionContinue {
             messages,
             config,
             reply,
+            cancelled,
         } => {
-            let _ = reply.send(session::session_continue(backend, messages, config));
+            let _ = reply.send(session::session_continue(
+                backend, messages, config, &cancelled,
+            ));
         }
         ChatCmd::SessionContinueTool {
             messages,
             config,
             reply,
+            cancelled,
         } => {
-            let _ = reply.send(session::session_continue_tool(backend, messages, config));
+            let _ = reply.send(session::session_continue_tool(
+                backend, messages, config, &cancelled,
+            ));
         }
         ChatCmd::StreamSessionStart {
             messages,
@@ -238,6 +265,9 @@ pub(crate) fn handle_chat_cmd<B: ChatBackend>(backend: &mut B, cmd: ChatCmd) {
         }
         ChatCmd::ResetCaches { reply } => {
             let _ = reply.send(backend.reset_caches(ResetScope::Command));
+        }
+        ChatCmd::ReleaseCacheOwner { owner_id, reply } => {
+            let _ = reply.send(backend.release_cache_owner(&owner_id));
         }
     }
 }
@@ -589,6 +619,16 @@ mod mock_backend_tests {
         /// hook takes `&self`). The pre-render image guard must reject
         /// text-only image turns with this still 0.
         render_prompt_calls: AtomicUsize,
+        /// Recorded `set_turn_cancel_flag` calls: `true` = a flag was
+        /// installed (`Some`), `false` = cleared (`None`). Pins the
+        /// streaming cores' install-then-clear lifecycle — a stale flag
+        /// on the backend would spuriously cancel the NEXT turn's
+        /// prefill.
+        turn_cancel_events: Vec<bool>,
+        /// Knob: flip this shared cancel flag from inside `prefill` —
+        /// models a cancel that lands mid-prefill-forward on a SYNC turn
+        /// (H2), observed by the decode loop's first per-step snapshot.
+        flip_cancel_in_prefill_knob: Option<Arc<AtomicBool>>,
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -630,6 +670,8 @@ mod mock_backend_tests {
                 comparison_media_positions_knob: Vec::new(),
                 flat_caches_desynced_knob: false,
                 render_prompt_calls: AtomicUsize::new(0),
+                turn_cancel_events: Vec::new(),
+                flip_cancel_in_prefill_knob: None,
             }
         }
     }
@@ -796,6 +838,10 @@ mod mock_backend_tests {
             self.flat_caches_desynced_knob = false;
         }
 
+        fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+            self.turn_cancel_events.push(flag.is_some());
+        }
+
         fn run_paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
             // Deliberate streaming-contract violation under streaming: an
             // executor that completes a sink-bearing turn must return
@@ -912,6 +958,12 @@ mod mock_backend_tests {
         fn prefill(&mut self, prompt_tokens: &[u32], _stream: Stream) -> Result<MxArray> {
             self.eval_caches_calls += 1; // prefill+eval cadence proxy
             self.prefill_calls.push(prompt_tokens.to_vec());
+            // Knob: model a cancel landing DURING the prefill forward
+            // (after the pre-start guard, before the decode loop's first
+            // per-step snapshot).
+            if let Some(flag) = self.flip_cancel_in_prefill_knob.as_ref() {
+                flag.store(true, Ordering::Relaxed);
+            }
             // Prefill writes the whole prompt's K/V into the flat cache.
             self.cache_cursor
                 .fetch_add(prompt_tokens.len(), Ordering::Relaxed);
@@ -954,6 +1006,7 @@ mod mock_backend_tests {
 
     fn greedy_config() -> ChatConfig {
         ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.0),
@@ -1013,6 +1066,13 @@ mod mock_backend_tests {
         }
     }
 
+    /// Fresh, never-flipped whole-turn cancel flag for sync command
+    /// literals — the same thing the plain NAPI
+    /// methods pass.
+    fn test_cancel_flag() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     /// Send a sync command through `handle_chat_cmd` and read the
     /// oneshot reply (plain test thread — no Tokio runtime needed for
     /// `blocking_recv`).
@@ -1042,6 +1102,7 @@ mod mock_backend_tests {
 
         // --- turn 1: SessionStart ---
         let r1 = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello world"),
             config: greedy_config(),
             reply,
@@ -1104,6 +1165,7 @@ mod mock_backend_tests {
         messages.push(assistant_message(&r1));
         messages.extend(user_messages("again"));
         let r2 = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            cancelled: test_cancel_flag(),
             messages,
             config: greedy_config(),
             reply,
@@ -1161,6 +1223,7 @@ mod mock_backend_tests {
         messages.push(assistant_message(&r2));
         messages.push(tool_message("call_1", "ok", None));
         let r3 = run_sync(&mut backend, |reply| ChatCmd::SessionContinueTool {
+            cancelled: test_cancel_flag(),
             messages,
             config: greedy_config(),
             reply,
@@ -1203,8 +1266,10 @@ mod mock_backend_tests {
         let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_WORLD, TOK_OK]]);
 
         let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: ChatConfig {
+                cache_salt: None,
                 cache_owner_id: None,
                 cache_root_owner_id: None,
                 temperature: Some(0.0),
@@ -1253,6 +1318,7 @@ mod mock_backend_tests {
         let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_WORLD, TOK_IM_END]]);
 
         let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1289,14 +1355,16 @@ mod mock_backend_tests {
             MockBackend::new(vec![vec![TOK_HELLO, TOK_THINK_END, TOK_WORLD, TOK_IM_END]]);
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
 
         handle_chat_cmd(
             &mut backend,
             ChatCmd::StreamSessionStart {
                 messages: user_messages("hello"),
                 config: ChatConfig {
+                    cache_salt: None,
                     cache_owner_id: None,
                     cache_root_owner_id: None,
                     temperature: Some(0.0),
@@ -1357,11 +1425,205 @@ mod mock_backend_tests {
         assert!(last.text.contains("world"));
     }
 
+    /// H1b flag lifecycle: the streaming cores install the turn's cancel
+    /// flag (`Some`) after the cancelled-before-start guard and clear it
+    /// (`None`) in the epilogue on EVERY exit path — success AND error.
+    /// A stale flag left installed would spuriously cancel the next
+    /// turn's prefill (the per-turn `Arc<AtomicBool>` stays flipped
+    /// forever once cancelled). Named mutation this pins: removing the
+    /// epilogue `set_turn_cancel_flag(None)` leaves the event tape
+    /// ending on `true`.
+    #[test]
+    fn stream_turn_installs_then_clears_cancel_flag_on_success_and_error() {
+        // ONE script — the second streaming turn errors in prefill
+        // ("no script left"), exercising the error-path clear.
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
+
+        let stream_turn = |backend: &mut MockBackend, pre_cancelled: bool| {
+            let cancelled = Arc::new(AtomicBool::new(pre_cancelled));
+            let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+                crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+            );
+            handle_chat_cmd(
+                backend,
+                ChatCmd::StreamSessionStart {
+                    messages: user_messages("hello"),
+                    config: greedy_config(),
+                    stream_tx,
+                    cancelled,
+                },
+            );
+            let mut last_err: Option<String> = None;
+            let mut saw_done = false;
+            while let Some(item) = stream_rx.blocking_recv() {
+                match item {
+                    Ok(chunk) => saw_done |= chunk.done,
+                    Err(e) => last_err = Some(e.reason.clone()),
+                }
+            }
+            (saw_done, last_err)
+        };
+
+        // Success path: install (true) then clear (false).
+        let (saw_done, err) = stream_turn(&mut backend, false);
+        assert!(saw_done, "first streaming turn must complete: {err:?}");
+        assert_eq!(
+            backend.turn_cancel_events,
+            vec![true, false],
+            "success path must install then clear the cancel flag",
+        );
+
+        // Error path (prefill Err: script exhausted): still install+clear.
+        let (saw_done, err) = stream_turn(&mut backend, false);
+        assert!(!saw_done, "second turn must fail in prefill");
+        assert!(
+            err.as_deref().is_some_and(|e| e.contains("no script left")),
+            "expected the scripted prefill error, got: {err:?}",
+        );
+        assert_eq!(
+            backend.turn_cancel_events,
+            vec![true, false, true, false],
+            "the error path must ALSO clear the flag in the epilogue",
+        );
+
+        // Cancelled-before-start: the guard exits BEFORE the install, so
+        // no event is recorded at all (nothing to clear).
+        let (saw_done, err) = stream_turn(&mut backend, true);
+        assert!(!saw_done);
+        assert!(
+            err.as_deref()
+                .is_some_and(|e| e.contains("cancelled before start")),
+            "expected the pre-start cancel guard, got: {err:?}",
+        );
+        assert_eq!(
+            backend.turn_cancel_events,
+            vec![true, false, true, false],
+            "a pre-start cancel must not install the flag",
+        );
+    }
+
+    /// H2 flag lifecycle, SYNC twin of the streaming test above: the
+    /// sync session wrappers install the turn's cancel flag (`Some`)
+    /// after the guards and clear it (`None`) on EVERY exit — success
+    /// AND error — and a pre-flipped flag rejects with the exact
+    /// `"chat session cancelled"` reply BEFORE the install. Named
+    /// mutation this pins: removing a sync wrapper's epilogue
+    /// `set_turn_cancel_flag(None)` leaves the event tape ending on
+    /// `true`.
+    #[test]
+    fn sync_turn_installs_then_clears_cancel_flag_on_success_and_error() {
+        // ONE script — the second sync turn errors in prefill
+        // ("no script left"), exercising the error-path clear.
+        let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
+
+        let sync_turn = |backend: &mut MockBackend, pre_cancelled: bool| {
+            let cancelled = Arc::new(AtomicBool::new(pre_cancelled));
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            handle_chat_cmd(
+                backend,
+                ChatCmd::SessionStart {
+                    messages: user_messages("hello"),
+                    config: greedy_config(),
+                    reply: tx,
+                    cancelled,
+                },
+            );
+            rx.blocking_recv()
+                .unwrap_or_else(|e| panic!("reply channel dropped: {e}"))
+        };
+
+        // Success path: install (true) then clear (false).
+        let r = sync_turn(&mut backend, false);
+        assert!(r.is_ok(), "first sync turn must complete: {r:?}");
+        assert_eq!(
+            backend.turn_cancel_events,
+            vec![true, false],
+            "success path must install then clear the cancel flag",
+        );
+
+        // Error path (prefill Err: script exhausted): still install +
+        // clear, and the RAW error surfaces (the flag was never flipped,
+        // so no cancellation normalization applies).
+        let err = sync_turn(&mut backend, false).expect_err("second turn must fail in prefill");
+        assert!(
+            err.reason.contains("no script left"),
+            "expected the scripted prefill error, got: {}",
+            err.reason,
+        );
+        assert_eq!(
+            backend.turn_cancel_events,
+            vec![true, false, true, false],
+            "the error path must ALSO clear the flag in the epilogue",
+        );
+
+        // Cancelled-before-start: the guard rejects with the exact
+        // distinguished reply BEFORE the install — no event recorded.
+        let err = sync_turn(&mut backend, true).expect_err("pre-cancelled turn must reject");
+        assert_eq!(
+            err.reason, "chat session cancelled",
+            "the pre-start cancel reply is the exact distinguished string",
+        );
+        assert_eq!(
+            backend.turn_cancel_events,
+            vec![true, false, true, false],
+            "a pre-start cancel must not install the flag",
+        );
+    }
+
+    /// H2 mid-turn cancellation on the SYNC path: a flag flipped during
+    /// the prefill forward is observed by the decode loop's FIRST
+    /// per-step snapshot, the loop breaks with `finish_reason ==
+    /// "cancelled"` (only the prefill-sampled token committed), the
+    /// ordinary save epilogue runs (same state outcome as a cancelled
+    /// STREAMING turn), and the reply REJECTS with the exact
+    /// `"chat session cancelled"` string. Named mutation this pins:
+    /// removing the decode loop's non-streaming `else if cancelled`
+    /// break leaves the flag gating only `is_terminal`, so the loop
+    /// falls out through the pipelined-`None` exit with finish_reason
+    /// "length" — the save-call assertion below catches it even though
+    /// the reply still rejects via the flag check.
+    #[test]
+    fn sync_turn_cancel_mid_turn_rejects_with_distinguished_reply() {
+        let mut backend =
+            MockBackend::new(vec![vec![TOK_HELLO, TOK_THINK_END, TOK_WORLD, TOK_IM_END]]);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        backend.flip_cancel_in_prefill_knob = Some(Arc::clone(&cancelled));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        handle_chat_cmd(
+            &mut backend,
+            ChatCmd::SessionStart {
+                messages: user_messages("hello"),
+                config: greedy_config(),
+                reply: tx,
+                cancelled: Arc::clone(&cancelled),
+            },
+        );
+        let err = rx
+            .blocking_recv()
+            .unwrap_or_else(|e| panic!("reply channel dropped: {e}"))
+            .expect_err("mid-turn cancelled sync turn must reject");
+        assert_eq!(
+            err.reason, "chat session cancelled",
+            "the cancellation reply is the exact distinguished string",
+        );
+
+        // The decode loop broke "cancelled" at its first snapshot: only
+        // the prefill-sampled token was committed, and the ordinary save
+        // epilogue ran with that finish_reason (streaming-cancel parity —
+        // deliberately NOT fail-closed).
+        assert_eq!(backend.save_calls.len(), 1, "save epilogue must run");
+        assert_eq!(backend.save_calls[0].finish_reason, "cancelled");
+        // Flag lifecycle held on the cancelled exit too.
+        assert_eq!(backend.turn_cancel_events, vec![true, false]);
+    }
+
     #[test]
     fn session_guards_reject_bad_sessions() {
         // Uninitialized session → typed error.
         let mut backend = MockBackend::new(vec![vec![TOK_HELLO, TOK_IM_END]]);
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hi"),
             config: greedy_config(),
             reply,
@@ -1375,8 +1637,10 @@ mod mock_backend_tests {
 
         // reuse_cache=false on start → typed error, no state mutated.
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: ChatConfig {
+                cache_salt: None,
                 cache_owner_id: None,
                 cache_root_owner_id: None,
                 reuse_cache: Some(false),
@@ -1390,6 +1654,7 @@ mod mock_backend_tests {
         assert!(backend.prefill_calls.is_empty());
 
         run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1400,6 +1665,7 @@ mod mock_backend_tests {
         let mut messages = user_messages("hi");
         messages[0].images = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            cancelled: test_cancel_flag(),
             messages,
             config: greedy_config(),
             reply,
@@ -1416,6 +1682,7 @@ mod mock_backend_tests {
         let mut messages = user_messages("hi");
         messages[0].audio = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            cancelled: test_cancel_flag(),
             messages,
             config: greedy_config(),
             reply,
@@ -1438,6 +1705,7 @@ mod mock_backend_tests {
             MockBackend::new(vec![vec![TOK_WORLD, TOK_IM_END], vec![TOK_OK, TOK_IM_END]]);
 
         let r1 = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1462,6 +1730,7 @@ mod mock_backend_tests {
         let seeded_prefix = backend.history.len();
 
         let r2 = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello world again"),
             config: greedy_config(),
             reply,
@@ -1523,6 +1792,7 @@ mod mock_backend_tests {
         // clears the physical cursor but deliberately preserves history; the
         // scripted prefill then fails after advancing the cursor.
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("different conversation"),
             config: greedy_config(),
             reply,
@@ -1553,6 +1823,7 @@ mod mock_backend_tests {
         // reaches prefill instead of only its three-token suffix.
         backend.scripts.push_back(vec![TOK_OK, TOK_IM_END]);
         let recovered = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: retry_messages,
             config: greedy_config(),
             reply,
@@ -1577,6 +1848,7 @@ mod mock_backend_tests {
             vec![TOK_WORLD, TOK_IM_END],
         ]);
         let first = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1589,6 +1861,7 @@ mod mock_backend_tests {
         backend.flat_caches_desynced_knob = true;
 
         let result = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            cancelled: test_cancel_flag(),
             messages,
             config: greedy_config(),
             reply,
@@ -1624,6 +1897,7 @@ mod mock_backend_tests {
         backend.fail_end_decode_knob = true;
 
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1666,6 +1940,7 @@ mod mock_backend_tests {
         backend.fail_finalize_knob = true;
 
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1699,6 +1974,7 @@ mod mock_backend_tests {
         backend.finalize_marker_knob = true;
 
         let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1723,6 +1999,7 @@ mod mock_backend_tests {
         backend.extra_eos_knob = vec![TOK_WORLD];
 
         let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1745,6 +2022,7 @@ mod mock_backend_tests {
         ]);
 
         let r_default = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(), // report_performance unset → false
             reply,
@@ -1754,6 +2032,7 @@ mod mock_backend_tests {
 
         backend.force_report_perf_knob = true;
         let r_forced = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1796,6 +2075,7 @@ mod mock_backend_tests {
 
         // Explicit request value wins over the model default.
         let explicit = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.0),
@@ -1843,6 +2123,7 @@ mod mock_backend_tests {
         };
 
         let mut cfg = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.9), // explicit → must survive
@@ -1892,6 +2173,7 @@ mod mock_backend_tests {
 
         // (b) do_sample:false + explicit request temperature → request wins.
         let mut cfg = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             temperature: Some(0.8),
@@ -1962,6 +2244,7 @@ mod mock_backend_tests {
         backend.wired_none_knob = true;
 
         let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1982,6 +2265,7 @@ mod mock_backend_tests {
 
         // Turn 1: sync start to establish the session.
         let r1 = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -1992,8 +2276,9 @@ mod mock_backend_tests {
 
         // Turn 2: streaming continue.
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         let mut messages = user_messages("hello");
         messages.push(assistant_message(&r1));
         messages.extend(user_messages("again"));
@@ -2031,8 +2316,9 @@ mod mock_backend_tests {
         let mut backend = MockBackend::new(vec![]);
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         handle_chat_cmd(
             &mut backend,
             ChatCmd::StreamSessionContinue {
@@ -2068,8 +2354,9 @@ mod mock_backend_tests {
         backend.paged_complete_knob = true;
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         handle_chat_cmd(
             &mut backend,
             ChatCmd::StreamSessionStart {
@@ -2114,6 +2401,7 @@ mod mock_backend_tests {
         backend.paged_complete_knob = true;
 
         let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -2138,6 +2426,7 @@ mod mock_backend_tests {
         messages[0].images = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
 
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages,
             config: greedy_config(),
             reply,
@@ -2159,6 +2448,7 @@ mod mock_backend_tests {
         // Counting-renderer sanity: a normal text-only start DOES
         // render (guards the 0-assert above against being vacuous).
         let r = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -2182,6 +2472,7 @@ mod mock_backend_tests {
         messages[0].images = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
 
         let err = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages,
             config: greedy_config(),
             reply,
@@ -2208,6 +2499,7 @@ mod mock_backend_tests {
         config.enable_mtp = Some(true);
 
         let result = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config,
             reply,
@@ -2250,6 +2542,7 @@ mod mock_backend_tests {
             vec![TOK_WORLD, TOK_IM_END],
         ]);
         let first = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -2278,6 +2571,7 @@ mod mock_backend_tests {
         messages.push(assistant_message(&first));
         messages.extend(user_messages("world"));
         let result = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            cancelled: test_cancel_flag(),
             messages,
             config: greedy_config(),
             reply,
@@ -2303,6 +2597,7 @@ mod mock_backend_tests {
             vec![TOK_WORLD, TOK_IM_END],
         ]);
         let first = run_sync(&mut backend, |reply| ChatCmd::SessionStart {
+            cancelled: test_cancel_flag(),
             messages: user_messages("hello"),
             config: greedy_config(),
             reply,
@@ -2320,6 +2615,7 @@ mod mock_backend_tests {
         messages.push(assistant_message(&first));
         messages.extend(user_messages("world"));
         let result = run_sync(&mut backend, |reply| ChatCmd::SessionContinue {
+            cancelled: test_cancel_flag(),
             messages,
             config,
             reply,
@@ -2344,8 +2640,9 @@ mod mock_backend_tests {
         messages[0].images = Some(vec![Uint8Array::new(vec![1, 2, 3])]);
 
         let cancelled = Arc::new(AtomicBool::new(false));
-        let (stream_tx, mut stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, mut stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         handle_chat_cmd(
             &mut backend,
             ChatCmd::StreamSessionStart {

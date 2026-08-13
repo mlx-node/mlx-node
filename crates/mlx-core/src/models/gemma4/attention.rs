@@ -9,7 +9,7 @@ use crate::inference_trace::{
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::paged_kv_cache_adapter::{
     PagedAttentionV2Layout, PagedDecodeRouteHint, PagedKVCacheAdapter, PagedPrefillMemorySnapshot,
-    paged_attention_v2_aux_fits, paged_attention_v2_partition_upper_bound,
+    SeqId, paged_attention_v2_aux_fits, paged_attention_v2_partition_upper_bound,
 };
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -933,6 +933,21 @@ impl Gemma4ProportionalRoPE {
         };
         MxArray::from_handle(handle, "proportional_rope")
     }
+
+    fn forward_with_offsets(&self, x: &MxArray, offsets: &MxArray) -> Result<MxArray> {
+        let handle = unsafe {
+            sys::mlx_fast_rope_with_freqs(
+                x.handle.0,
+                self.dims,
+                false,
+                0.0,
+                1.0,
+                offsets.handle.0,
+                self.freqs.handle.0,
+            )
+        };
+        MxArray::from_handle(handle, "proportional_rope_batched")
+    }
 }
 
 // ============================================
@@ -954,6 +969,13 @@ impl Gemma4RoPE {
         match self {
             Self::Standard(rope) => rope.forward(x, Some(offset)),
             Self::Proportional(rope) => rope.forward(x, offset),
+        }
+    }
+
+    fn forward_with_offsets(&self, x: &MxArray, offsets: &MxArray) -> Result<MxArray> {
+        match self {
+            Self::Standard(rope) => rope.forward_with_offsets(x, offsets),
+            Self::Proportional(rope) => rope.forward_with_offsets(x, offsets),
         }
     }
 }
@@ -2069,6 +2091,100 @@ impl Gemma4Attention {
         self.o_proj.forward(&output)
     }
 
+    /// One graph-native decode forward for a uniform scheduler wave.
+    ///
+    /// Every row owns an independent absolute position and block table, but
+    /// projections, normalization, RoPE, paged K/V write, attention, and the
+    /// output projection each execute once over `[N,1,H]`.
+    pub(crate) fn forward_paged_batched(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        paged_idx: u32,
+        rows: &[(SeqId, u32)],
+    ) -> Result<MxArray> {
+        let shape = x.shape()?;
+        if rows.is_empty()
+            || shape.as_ref().len() != 3
+            || shape[0] != rows.len() as i64
+            || shape[1] != 1
+        {
+            return Err(Error::from_reason(format!(
+                "Gemma4Attention::forward_paged_batched expects [N,1,H] for {} rows, got {:?}",
+                rows.len(),
+                shape.as_ref()
+            )));
+        }
+        if !native_kv_write_enabled() {
+            return Err(Error::from_reason(
+                "Gemma4 batched decode requires native paged K/V writes",
+            ));
+        }
+
+        let batch = rows.len() as i64;
+        let offsets = rows
+            .iter()
+            .map(|&(seq_id, position)| {
+                i32::try_from(position).map_err(|_| {
+                    Error::from_reason(format!(
+                        "Gemma4 batched decode sequence {seq_id} position {position} exceeds i32::MAX"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let offsets = MxArray::from_int32(&offsets, &[batch])?;
+        let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
+
+        let queries = self.q_proj.forward(x)?.reshape(&[
+            batch,
+            1,
+            self.num_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let queries = self
+            .q_norm
+            .forward(&queries)?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let queries = self.rope.forward_with_offsets(&queries, &offsets)?;
+
+        let keys = self.k_proj.forward(x)?.reshape(&[
+            batch,
+            1,
+            self.num_kv_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let values = if self.k_is_v {
+            keys.clone()
+        } else {
+            self.v_proj
+                .as_ref()
+                .expect("Gemma4 non-shared V projection")
+                .forward(x)?
+                .reshape(&[batch, 1, self.num_kv_heads as i64, self.head_dim as i64])?
+        };
+        let keys = self.k_norm.forward(&keys)?.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = self.rope.forward_with_offsets(&keys, &offsets)?;
+        let values = {
+            let handle = unsafe {
+                sys::mlx_fast_rms_norm(values.handle.0, std::ptr::null_mut(), self.v_norm_eps)
+            };
+            MxArray::from_handle(handle, "v_norm_batched")?.transpose(Some(&[0, 2, 1, 3]))?
+        };
+
+        let queries = queries.squeeze(Some(&[2]))?;
+        let keys = keys.squeeze(Some(&[2]))?;
+        let values = values.squeeze(Some(&[2]))?;
+        adapter
+            .update_keys_values_native_batched(paged_idx, &keys, &values, rows)
+            .map_err(Error::from_reason)?;
+        let attended = adapter
+            .gather_kv_for_decode_graph_batched(paged_idx, &queries, &seq_ids, 1.0, 1.0)
+            .map_err(Error::from_reason)?
+            .astype(x.dtype()?)?
+            .reshape(&[batch, 1, (self.num_heads * self.head_dim) as i64])?;
+        self.o_proj.forward(&attended)
+    }
+
     // ========== Weight setters ==========
 
     /// Forward pass for KV-shared layers whose anchor is a global layer
@@ -2140,6 +2256,64 @@ impl Gemma4Attention {
         let output = attn_bhtd.transpose(Some(&[0, 2, 1, 3]))?;
         let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
         self.o_proj.forward(&output)
+    }
+
+    /// Batched query-only decode for a KV-shared layer. The anchor layer has
+    /// already written every row into this group's pool earlier in the model
+    /// traversal, so this dispatch only computes Q and reuses the same
+    /// request-local block tables.
+    pub(crate) fn forward_paged_shared_batched(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        anchor_paged_idx: u32,
+        rows: &[(SeqId, u32)],
+    ) -> Result<MxArray> {
+        let shape = x.shape()?;
+        if rows.is_empty()
+            || shape.as_ref().len() != 3
+            || shape[0] != rows.len() as i64
+            || shape[1] != 1
+        {
+            return Err(Error::from_reason(format!(
+                "Gemma4Attention::forward_paged_shared_batched expects [N,1,H] for {} rows, got {:?}",
+                rows.len(),
+                shape.as_ref()
+            )));
+        }
+        let batch = rows.len() as i64;
+        let offsets = rows
+            .iter()
+            .map(|&(seq_id, position)| {
+                i32::try_from(position).map_err(|_| {
+                    Error::from_reason(format!(
+                        "Gemma4 shared batched decode sequence {seq_id} position {position} exceeds i32::MAX"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let offsets = MxArray::from_int32(&offsets, &[batch])?;
+        let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
+        let queries = self.q_proj.forward(x)?.reshape(&[
+            batch,
+            1,
+            self.num_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let queries = self
+            .q_norm
+            .forward(&queries)?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let queries = self
+            .rope
+            .forward_with_offsets(&queries, &offsets)?
+            .squeeze(Some(&[2]))?;
+        let attended = adapter
+            .gather_kv_for_decode_graph_batched(anchor_paged_idx, &queries, &seq_ids, 1.0, 1.0)
+            .map_err(Error::from_reason)?
+            .astype(x.dtype()?)?
+            .reshape(&[batch, 1, (self.num_heads * self.head_dim) as i64])?;
+        self.o_proj.forward(&attended)
     }
 
     // ========== Test-only weight getters ==========

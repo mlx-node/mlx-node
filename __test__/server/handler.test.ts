@@ -241,7 +241,7 @@ function createMockModel(result: ChatResult = makeChatResult()): SessionCapableM
     chatStreamSessionStart: vi.fn(() => emptyStream()),
     chatStreamSessionContinue: vi.fn(() => emptyStream()),
     chatStreamSessionContinueTool: vi.fn(() => emptyStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 
@@ -263,7 +263,7 @@ function createMockStreamModel(streamEvents: Array<Record<string, unknown>>): Se
     chatStreamSessionStart: vi.fn(() => makeStream()),
     chatStreamSessionContinue: vi.fn(() => makeStream()),
     chatStreamSessionContinueTool: vi.fn(() => makeStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 
@@ -305,7 +305,7 @@ function setupMultiCallChain(followUpText = 'ok'): {
     chatStreamSessionStart: vi.fn(),
     chatStreamSessionContinue: vi.fn(),
     chatStreamSessionContinueTool: vi.fn(),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
   registry.register('test-model', mockModel);
 
@@ -366,7 +366,7 @@ function setupSingleCallChain(followUpText = 'single-ok'): {
     chatStreamSessionStart: vi.fn(),
     chatStreamSessionContinue: vi.fn(),
     chatStreamSessionContinueTool: vi.fn(),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
   registry.register('test-model', mockModel);
 
@@ -2395,6 +2395,89 @@ describe('createHandler', () => {
       expect(resp2.output_text).toBe('second reply');
     });
 
+    it('streams two scheduler-capable paged responses concurrently', async () => {
+      const registry = new ModelRegistry();
+      let active = 0;
+      let peak = 0;
+      let starts = 0;
+      let resolveBoth!: () => void;
+      const bothStarted = new Promise<void>((resolve) => {
+        resolveBoth = resolve;
+      });
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const stream = vi.fn(async function* () {
+        starts += 1;
+        active += 1;
+        peak = Math.max(peak, active);
+        if (starts === 2) resolveBoth();
+        try {
+          yield { done: false as const, text: 'token', isReasoning: false };
+          await held;
+          yield {
+            done: true as const,
+            text: 'done',
+            finishReason: 'stop' as const,
+            toolCalls: [] as ToolCallResult[],
+            thinking: null,
+            numTokens: 1,
+            promptTokens: 1,
+            reasoningTokens: 0,
+            rawText: 'done',
+            cachedTokens: 0,
+          };
+        } finally {
+          active -= 1;
+        }
+      });
+      const model = Object.assign(createMockModel(), {
+        hasBlockPagedCache: () => true,
+        maxConcurrentSequences: () => 2,
+        chatStreamSessionStart: stream,
+      });
+      registry.register('test-model', model);
+      const handler = createHandler(registry);
+      const firstReq = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'first',
+        stream: true,
+      });
+      const secondReq = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'second',
+        stream: true,
+      });
+      const first = createMockRes();
+      const second = createMockRes();
+      const firstRequest = handler(firstReq, first.res);
+      const secondRequest = handler(secondReq, second.res);
+      let timer: ReturnType<typeof setTimeout> | undefined;
+
+      try {
+        await Promise.race([
+          bothStarted,
+          new Promise<never>((_resolve, reject) => {
+            timer = setTimeout(() => reject(new Error('paged response streams did not overlap')), 1_000);
+          }),
+        ]);
+        expect(peak).toBe(2);
+      } finally {
+        if (timer !== undefined) clearTimeout(timer);
+        release();
+      }
+
+      await Promise.all([firstRequest, secondRequest, first.waitForEnd(), second.waitForEnd()]);
+      expect(first.getStatus()).toBe(200);
+      expect(second.getStatus()).toBe(200);
+      expect(first.getBody()).toContain('response.created');
+      expect(second.getBody()).toContain('response.created');
+      expect(registry.getSessionRegistry('test-model')?.queueDepth).toBe(0);
+      // oxlint-disable-next-line typescript/unbound-method
+      expect(model.resetCaches).not.toHaveBeenCalled();
+    });
+
     it('adopts the session into the registry after a successful non-streaming turn', async () => {
       // Baseline for the non-commit regression tests below: a turn
       // that returns cleanly must re-key the live session under the
@@ -2428,6 +2511,34 @@ describe('createHandler', () => {
       expect(resumed.session.turns).toBeGreaterThan(0);
       expect(resumed.hit).toBe(true);
       expect(sessionReg!.size).toBe(0);
+    });
+
+    it('releases the prior Responses owner when a stateless turn replaces the warm slot', async () => {
+      const registry = new ModelRegistry();
+      const releaseCacheOwner = vi.fn((_ownerId: string) => Promise.resolve(undefined));
+      const mockModel = Object.assign(createMockModel(), { releaseCacheOwner });
+      registry.register('test-model', mockModel);
+      const handler = createHandler(registry);
+
+      const first = createMockRes();
+      await handler(createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'first chain' }), first.res);
+      await first.waitForEnd();
+      const firstOwner = (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0][1].cacheOwnerId;
+
+      const second = createMockRes();
+      await handler(
+        createMockReq('POST', '/v1/responses', { model: 'test-model', input: 'replacement chain' }),
+        second.res,
+      );
+      await second.waitForEnd();
+      const secondOwner = (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[1][1].cacheOwnerId;
+
+      expect(first.getStatus()).toBe(200);
+      expect(second.getStatus()).toBe(200);
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledWith(firstOwner);
+      expect(secondOwner).not.toBe(firstOwner);
+      expect(registry.getSessionRegistry('test-model')?.size).toBe(1);
     });
 
     it('does not adopt the session when a streaming turn exhausts without a done event', async () => {
@@ -3004,12 +3115,15 @@ describe('createHandler', () => {
     });
 
     it('iter-35 finding 2: non-streaming skips endJson and persistResponse on a dead peer', async () => {
-      // The non-streaming native path has no AbortSignal surface, so a mid-generation
-      // client disconnect still burns every remaining token under the per-model
-      // mutex. Once decode returns, the handler must NOT write JSON to a dead socket
-      // and must NOT persist a record the client never saw — persistence would leave
-      // a dangling entry that a later `previous_response_id` could resurrect.
-      // `handleNonStreaming` checks `res.destroyed || res.socket?.destroyed` first.
+      // A peer that is already dead when the request reaches the mutex
+      // now takes the H2 pre-dispatch skip: the native turn is never
+      // dispatched at all (previously it ran to completion and only the
+      // flush inside `handleNonStreaming` was skipped). Either way the
+      // handler must NOT write JSON to a dead socket and must NOT
+      // persist a record the client never saw — persistence would leave
+      // a dangling entry that a later `previous_response_id` could
+      // resurrect. Note: no `waitForEnd()` here — the pre-dispatch skip
+      // returns without ever calling `end()`/`destroy()`.
       const model = createMockModel(makeChatResult({ text: 'late reply' }));
       const registry = new ModelRegistry();
       registry.register('nonstream-model', model);
@@ -3029,20 +3143,253 @@ describe('createHandler', () => {
         input: 'hi',
         stream: false,
       });
-      const { res, waitForEnd, getBody } = createMockRes();
-      // Mark the response destroyed BEFORE invoking the handler
-      // so the disconnect-aware skip fires the moment the handler
-      // tries to flush.
+      const { res, getBody } = createMockRes();
+      // Mark the response destroyed BEFORE invoking the handler so the
+      // catch-up abort at listener-attach flips the signal and the
+      // pre-dispatch skip fires inside the mutex callback.
       (res as unknown as { destroyed: boolean }).destroyed = true;
 
       await handler(req, res);
-      await waitForEnd();
 
-      // No body written (the skip branch returns early) and no
-      // persisted record (the outer persist gate reads
-      // `clientObservedOrDisconnected === false`).
+      // No native dispatch, no body, no persisted record.
+      // eslint-disable-next-line @typescript-eslint/unbound-method
+      expect(model.chatSessionStart).not.toHaveBeenCalled();
       expect(getBody()).toBe('');
       expect(mockStore.store).not.toHaveBeenCalled();
+    });
+
+    /** Build a model whose ordinary chatSessionStart honors AbortSignal. */
+    function createAbortableMockModel(): {
+      model: SessionCapableModel;
+      handle: { cancel: ReturnType<typeof vi.fn> };
+      chatSessionStart: ReturnType<typeof vi.fn>;
+      dispatchObserved: Promise<void>;
+    } {
+      let dispatched!: () => void;
+      const dispatchObserved = new Promise<void>((r) => {
+        dispatched = r;
+      });
+      let cancelSeen!: () => void;
+      const cancelObserved = new Promise<void>((r) => {
+        cancelSeen = r;
+      });
+      const handle = {
+        cancel: vi.fn(() => {
+          cancelSeen();
+        }),
+      };
+      const chatSessionStart = vi.fn(async (_messages: unknown, _config: unknown, signal?: AbortSignal) => {
+        dispatched();
+        if (signal == null) return makeChatResult({ text: 'plain reply' });
+        const onAbort = (): void => handle.cancel();
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+        try {
+          await cancelObserved;
+          return makeChatResult({ text: 'resolved after cancel' });
+        } finally {
+          signal.removeEventListener('abort', onAbort);
+        }
+      });
+      const model = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionCapableModel;
+      return { model, handle, chatSessionStart, dispatchObserved };
+    }
+
+    it('H2: non-streaming skips native dispatch entirely when the socket is already destroyed pre-dispatch', async () => {
+      // A client that vanished before the request cleared the per-model
+      // mutex must not burn a whole decode budget. The handler's
+      // pre-dispatch disconnect check fires INSIDE the mutex callback,
+      // before any session lease / reset / prime, so the model is untouched.
+      const { model, chatSessionStart } = createAbortableMockModel();
+      const registry = new ModelRegistry();
+      registry.register('h2-predispatch-model', model);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'h2-predispatch-model',
+        input: 'hi',
+        stream: false,
+      });
+      const { res, getBody } = createMockRes();
+      // Destroy the response BEFORE the handler runs — the 'close' event
+      // (if any) predates the abort-listener attach, so the handler must
+      // consult socket state, not just its AbortController.
+      (res as unknown as { destroyed: boolean }).destroyed = true;
+
+      await handler(req, res);
+
+      expect(chatSessionStart).not.toHaveBeenCalled();
+      expect(getBody()).toBe('');
+    });
+
+    it('H2: mid-flight client disconnect cancels the non-streaming native turn via handle.cancel()', async () => {
+      // Once the non-streaming dispatch is in flight, a client 'close'
+      // must flip the handler's AbortController, whose signal the
+      // model wrapper maps to the native turn flag. The mock resolves only
+      // after cancel() is observed, so a
+      // missing wire-up either leaves cancel() un-invoked (pre-fix plain
+      // path — clean RED) or hangs (broken listener wiring).
+      const { model, handle, chatSessionStart, dispatchObserved } = createAbortableMockModel();
+      const registry = new ModelRegistry();
+      registry.register('h2-midflight-model', model);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'h2-midflight-model',
+        input: 'hi',
+        stream: false,
+      });
+      const { res } = createMockRes();
+      const inflight = handler(req, res);
+
+      await dispatchObserved;
+      // Let the ChatSession attach its abort listener to the signal
+      // before the disconnect fires.
+      await new Promise((r) => setImmediate(r));
+      (res as unknown as NodeJS.EventEmitter).emit('close');
+
+      await inflight;
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart.mock.calls[0][2]).toBeInstanceOf(AbortSignal);
+      expect(handle.cancel).toHaveBeenCalled();
+    });
+
+    it('H2: /v1/messages non-streaming skips native dispatch for a pre-destroyed socket', async () => {
+      const { model, chatSessionStart } = createAbortableMockModel();
+      const registry = new ModelRegistry();
+      registry.register('h2-msg-predispatch-model', model);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/messages', {
+        model: 'h2-msg-predispatch-model',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      });
+      const { res, getBody } = createMockRes();
+      (res as unknown as { destroyed: boolean }).destroyed = true;
+
+      await handler(req, res);
+
+      expect(chatSessionStart).not.toHaveBeenCalled();
+      expect(getBody()).toBe('');
+    });
+
+    it('H2: /v1/messages mid-flight disconnect cancels the non-streaming native turn via handle.cancel()', async () => {
+      const { model, handle, chatSessionStart, dispatchObserved } = createAbortableMockModel();
+      const registry = new ModelRegistry();
+      registry.register('h2-msg-midflight-model', model);
+      const handler = createHandler(registry);
+
+      const req = createMockReq('POST', '/v1/messages', {
+        model: 'h2-msg-midflight-model',
+        max_tokens: 16,
+        messages: [{ role: 'user', content: 'hi' }],
+        stream: false,
+      });
+      const { res } = createMockRes();
+      const inflight = handler(req, res);
+
+      await dispatchObserved;
+      await new Promise((r) => setImmediate(r));
+      (res as unknown as NodeJS.EventEmitter).emit('close');
+
+      await inflight;
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionStart.mock.calls[0][2]).toBeInstanceOf(AbortSignal);
+      expect(handle.cancel).toHaveBeenCalled();
+    });
+
+    it('H2: a cancelled turn — result() rejecting exactly "chat session cancelled" — persists nothing and adopts no session', async () => {
+      // The native reply contract: a cancelled non-streaming turn REJECTS
+      // with the distinguished string. The endpoint must treat that as a
+      // dead-client outcome — no response record persisted, no warm
+      // session adopted into the per-model SessionRegistry — instead of
+      // storing/adopting a half-finished turn.
+      let dispatched!: () => void;
+      const dispatchObserved = new Promise<void>((r) => {
+        dispatched = r;
+      });
+      let cancelSeen!: () => void;
+      const cancelObserved = new Promise<void>((r) => {
+        cancelSeen = r;
+      });
+      const handle = {
+        cancel: vi.fn(() => {
+          cancelSeen();
+        }),
+      };
+      const observedRejections: Error[] = [];
+      const chatSessionStart = vi.fn(async (_messages: unknown, _config: unknown, signal?: AbortSignal) => {
+        dispatched();
+        if (signal == null) throw new Error('AbortSignal missing');
+        const onAbort = (): void => handle.cancel();
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) onAbort();
+        // Reject with the exact native reply string once cancellation lands.
+        const result = cancelObserved.then((): Promise<ChatResult> => {
+          throw new Error('chat session cancelled');
+        });
+        // Second observer: records the exact rejection the session saw
+        // (and keeps the shared promise handled in every interleaving).
+        result.catch((e: Error) => {
+          observedRejections.push(e);
+        });
+        try {
+          return await result;
+        } finally {
+          signal.removeEventListener('abort', onAbort);
+        }
+      });
+      const model = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('continue should not be reached')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('continueTool should not be reached')),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionCapableModel;
+      const mockStore = {
+        store: vi.fn().mockResolvedValue(undefined),
+        getChain: vi.fn().mockResolvedValue([]),
+        cleanupExpired: vi.fn(),
+      };
+      const registry = new ModelRegistry();
+      registry.register('h2-cancelled-reply-model', model);
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const req = createMockReq('POST', '/v1/responses', {
+        model: 'h2-cancelled-reply-model',
+        input: 'hi',
+        stream: false,
+      });
+      const { res } = createMockRes();
+      const inflight = handler(req, res);
+
+      await dispatchObserved;
+      await new Promise((r) => setImmediate(r));
+      (res as unknown as NodeJS.EventEmitter).emit('close');
+      await inflight;
+
+      // The native handle was cancelled exactly once and the session
+      // observed the distinguished rejection verbatim.
+      expect(handle.cancel).toHaveBeenCalledTimes(1);
+      expect(observedRejections).toHaveLength(1);
+      expect(observedRejections[0].message).toBe('chat session cancelled');
+      // No persistence: the cancelled turn produced no response record.
+      expect(mockStore.store).not.toHaveBeenCalled();
+      // No adoption: the per-model warm SessionRegistry stays empty, so
+      // no later request can warm-hit the half-cancelled session.
+      expect(registry.getSessionRegistry('h2-cancelled-reply-model')!.size).toBe(0);
     });
 
     it('iter-35 finding 2: persistResponse runs OUTSIDE the per-model mutex', async () => {
@@ -7695,6 +8042,90 @@ describe('createHandler', () => {
       expect(systemMsg?.content).toBe('B');
     });
 
+    it('cold-replays a warm continuation when cache_salt changes', async () => {
+      const registry = new ModelRegistry();
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'salt-a' }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'salt-b' }));
+      const chatSessionContinue = vi.fn().mockResolvedValueOnce(makeChatResult({ text: 'salt-a-warm' }));
+      const releaseCacheOwner = vi.fn().mockResolvedValue(undefined);
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue,
+        chatSessionContinueTool: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+        releaseCacheOwner,
+      } as unknown as SessionCapableModel;
+      registry.register('test-model', mockModel);
+
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn().mockImplementation((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn().mockImplementation((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const record = storedRecords.get(cursor);
+            if (!record) break;
+            out.unshift(record);
+            cursor = record.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(registry, { store: mockStore as any });
+
+      const first = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'first turn',
+        cache_salt: 'tenant-a/high-entropy-secret',
+      });
+      const firstResponse = createMockRes();
+      await handler(first, firstResponse.res);
+      await firstResponse.waitForEnd();
+      const firstBody = JSON.parse(firstResponse.getBody());
+      expect(firstBody.status).toBe('completed');
+
+      const second = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'second turn',
+        previous_response_id: firstBody.id,
+        cache_salt: 'tenant-a/high-entropy-secret',
+      });
+      const secondResponse = createMockRes();
+      await handler(second, secondResponse.res);
+      await secondResponse.waitForEnd();
+      const secondBody = JSON.parse(secondResponse.getBody());
+      expect(secondBody.status).toBe('completed');
+      expect(chatSessionStart).toHaveBeenCalledTimes(1);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+
+      const third = createMockReq('POST', '/v1/responses', {
+        model: 'test-model',
+        input: 'third turn',
+        previous_response_id: secondBody.id,
+        cache_salt: 'tenant-b/high-entropy-secret',
+      });
+      const thirdResponse = createMockRes();
+      await handler(third, thirdResponse.res);
+      await thirdResponse.waitForEnd();
+
+      expect(JSON.parse(thirdResponse.getBody()).status).toBe('completed');
+      expect(chatSessionStart).toHaveBeenCalledTimes(2);
+      expect(chatSessionContinue).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      const secondConfig = chatSessionStart.mock.calls[1]?.[1] as { cacheSalt?: string };
+      expect(secondConfig.cacheSalt).toBe('tenant-b/high-entropy-secret');
+    });
+
     it('inherits stored instructions on cold replay when the continuation omits them (Finding 4)', async () => {
       // Invariant: the cold-replay path reads the trailing
       // stored record's `instructions` field and inherits it
@@ -10767,7 +11198,10 @@ describe('createHandler', () => {
       // session must NOT be adopted under the responseId the client
       // never saw. The client should receive a 500 error.
       const registry = new ModelRegistry();
-      const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
+      const releaseCacheOwner = vi.fn((_ownerId: string) => Promise.resolve(undefined));
+      const mockModel = Object.assign(createMockModel(makeChatResult({ text: 'committed reply' })), {
+        releaseCacheOwner,
+      });
       registry.register('test-model', mockModel);
 
       const handler = createHandler(registry);
@@ -10810,6 +11244,9 @@ describe('createHandler', () => {
       const sessionReg = registry.getSessionRegistry('test-model');
       expect(sessionReg).toBeDefined();
       expect(sessionReg!.size).toBe(0);
+      const failedOwner = (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0][1].cacheOwnerId;
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      expect(releaseCacheOwner).toHaveBeenCalledWith(failedOwner);
     });
 
     it('committed non-streaming handler crash AFTER writeHead but before end does not adopt under unseen id', async () => {
@@ -11216,9 +11653,12 @@ describe('createHandler', () => {
       // returns without queuing the write) — pinning the per-
       // model `withExclusive` mutex on a dead client forever.
       //
-      // This test marks the underlying socket destroyed before
-      // the handler runs, then verifies the handler completes
-      // within a timeout bound (no hang), no session is
+      // This test destroys the underlying socket MID-FLIGHT (from
+      // inside the mock's `chatSessionStart`, i.e. after the H2
+      // pre-dispatch disconnect check has already passed — a socket
+      // destroyed BEFORE dispatch now takes the pre-dispatch skip and
+      // never reaches `endJson` at all), then verifies the handler
+      // completes within a timeout bound (no hang), no session is
       // adopted, and no SSE frame leaks into the JSON body.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'committed reply' }));
@@ -11231,16 +11671,21 @@ describe('createHandler', () => {
       });
       const { res, getBody, wasDestroyed } = createMockRes();
 
-      // Install a fake destroyed socket. The `endJson` helper's
-      // pre-check reads `res.socket?.destroyed`; mirror that shape.
-      Object.defineProperty(res, 'socket', {
-        configurable: true,
-        get: () => ({
-          destroyed: true,
-          once: () => {},
-          removeListener: () => {},
-          off: () => {},
-        }),
+      // Install the fake destroyed socket only once the native dispatch
+      // is in flight, so the turn completes and `endJson`'s pre-check
+      // (`res.destroyed || res.socket?.destroyed`) is what must catch
+      // the dead peer.
+      (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        Object.defineProperty(res, 'socket', {
+          configurable: true,
+          get: () => ({
+            destroyed: true,
+            once: () => {},
+            removeListener: () => {},
+            off: () => {},
+          }),
+        });
+        return makeChatResult({ text: 'committed reply' });
       });
 
       // If the helper regressed to parking on a callback that
@@ -13082,6 +13527,94 @@ describe('createHandler', () => {
       }
       // And at least the 10 we queued all landed.
       expect(results).toHaveLength(10);
+    });
+  });
+
+  describe('implicit cold-load queue cap', () => {
+    it.each([
+      {
+        endpoint: '/v1/responses',
+        body: (input: string) => ({ model: 'cold-model', input }),
+        assertEnvelope: (body: string) => {
+          const parsed = JSON.parse(body);
+          expect(parsed.error.type).toBe('rate_limit_error');
+          expect(parsed.error.code).toBe('queue_full');
+        },
+      },
+      {
+        endpoint: '/v1/messages',
+        body: (input: string) => ({
+          model: 'cold-model',
+          messages: [{ role: 'user', content: input }],
+          max_tokens: 16,
+        }),
+        assertEnvelope: (body: string) => {
+          const parsed = JSON.parse(body);
+          expect(parsed.type).toBe('error');
+          expect(parsed.error.type).toBe('rate_limit_error');
+        },
+      },
+    ])('bounds unresolved $endpoint requests with the registry limit', async ({ endpoint, body, assertEnvelope }) => {
+      let releaseLoad!: () => void;
+      const loadHold = new Promise<void>((resolve) => {
+        releaseLoad = resolve;
+      });
+      let markLoadStarted!: () => void;
+      const loadStarted = new Promise<void>((resolve) => {
+        markLoadStarted = resolve;
+      });
+      const model = {
+        chatSessionStart: vi.fn(async () => makeChatResult({ text: 'ok' })),
+        chatSessionContinue: vi.fn(async () => makeChatResult({ text: 'ok' })),
+        chatSessionContinueTool: vi.fn(async () => makeChatResult({ text: 'ok' })),
+        chatStreamSessionStart: vi.fn(),
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry({ maxQueueDepth: 1 });
+      let firstLoad = true;
+      const resolveModel = vi.fn(async (name: string) => {
+        if (firstLoad) {
+          firstLoad = false;
+          markLoadStarted();
+          await loadHold;
+        }
+        registry.register(name, model);
+      });
+      const handler = createHandler(registry, { resolveModel });
+
+      const requestA = createMockRes();
+      const pendingA = handler(createMockReq('POST', endpoint, body('A')), requestA.res);
+      await loadStarted;
+
+      const requestB = createMockRes();
+      const pendingB = handler(createMockReq('POST', endpoint, body('B')), requestB.res);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      const requestC = createMockRes();
+      const pendingC = handler(createMockReq('POST', endpoint, body('C')), requestC.res);
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
+      try {
+        const outcome = await Promise.race([
+          pendingC.then(() => 'done' as const),
+          new Promise<'timeout'>((resolve) => {
+            timeoutId = setTimeout(() => resolve('timeout'), 200);
+          }),
+        ]);
+        expect(outcome).toBe('done');
+        await requestC.waitForEnd();
+        expect(requestC.getStatus()).toBe(429);
+        expect(requestC.getHeaders()['retry-after']).toBe('1');
+        assertEnvelope(requestC.getBody());
+      } finally {
+        if (timeoutId !== undefined) clearTimeout(timeoutId);
+        releaseLoad();
+        await Promise.allSettled([pendingA, pendingB, pendingC]);
+      }
+      await Promise.all([requestA.waitForEnd(), requestB.waitForEnd()]);
+      expect(requestA.getStatus()).toBe(200);
+      expect(requestB.getStatus()).toBe(200);
     });
   });
 });

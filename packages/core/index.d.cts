@@ -27,6 +27,34 @@ export declare class BatchGenerationResult {
 }
 
 /**
+ * In-flight non-streaming chat turn returned by the internal
+ * `begin_chat_session_*` operation entry points (H2).
+ *
+ * The dispatching NAPI method resolves with this object IMMEDIATELY
+ * after the command is queued (mirroring how the streaming methods
+ * return their [`ChatStreamHandle`] before the turn runs); the turn's
+ * reply arrives later through [`Self::result`]. `cancel()` flips the
+ * same `Arc<AtomicBool>` the command carries, so it
+ * reaches the model thread's chunk-boundary / per-step polls exactly
+ * like a streaming cancel.
+ *
+ * Reply contract: a cancelled turn REJECTS the `result()` promise with
+ * the exact string `"chat session cancelled"`
+ * ([`crate::engine::session::CHAT_SESSION_CANCELLED`]).
+ */
+export declare class ChatSessionCall {
+  /** Cooperatively cancel this queued or running turn. */
+  cancel(): void;
+  /**
+   * Await the turn's reply. Resolves with the [`ChatResult`] on a
+   * completed turn; rejects with `"chat session cancelled"` when the
+   * turn was cancelled, or with the turn's native error otherwise.
+   * Single-shot: a second call rejects.
+   */
+  result(): Promise<ChatResult>;
+}
+
+/**
  * Handle returned by the streaming chat-session entry points
  * (`chat_stream_session_start`, `chat_stream_session_continue`,
  * `chat_stream_session_continue_tool`) to control an in-progress
@@ -139,9 +167,9 @@ export declare class Gemma4Model {
    * with a `napi::Error` whose message is exactly
    * `"Model not initialized. Call Gemma4Model.load() first."` until
    * `load()` runs and installs the underlying model thread. The
-   * synchronous `resetCaches()` call is a silent no-op on the stub
-   * to keep `ChatSession.reset()` idempotent across both runnable
-   * and stub instances.
+   * async `resetCaches()` call resolves as a silent no-op on the
+   * stub to keep `ChatSession.reset()` idempotent across both
+   * runnable and stub instances.
    *
    * A runnable model requires `await Gemma4Model.load(path)`. The
    * constructor signature is fixed by NAPI-RS; the stub-only behavior is
@@ -165,6 +193,8 @@ export declare class Gemma4Model {
    * without a model-thread roundtrip.
    */
   hasBlockPagedCache(): boolean;
+  maxConcurrentSequences(): number;
+  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Whether this loaded instance can execute image-bearing chat turns.
    * Config-only stubs and incomplete/non-paged physical paths return false.
@@ -187,11 +217,16 @@ export declare class Gemma4Model {
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string, options?: Gemma4LoadOptions | undefined | null): Promise<Gemma4Model>;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
-  resetCaches(): void;
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -201,6 +236,16 @@ export declare class Gemma4Model {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
    * sole authority for the rendered suffix; native cache reuse
@@ -209,10 +254,26 @@ export declare class Gemma4Model {
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
    * Continue an existing chat session from a complete
    * structured conversation ending in a tool-role message.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -505,14 +566,23 @@ export declare class Lfm2Model {
   hasBlockPagedCache(): boolean;
   /** Get the model configuration. */
   getConfig(): Lfm2Config;
+  /** Native admission capacity for the server's per-model semaphore. */
+  maxConcurrentSequences(): number;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
   /** Estimated number of model parameters. */
   numParameters(): number;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
-  resetCaches(): void;
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -522,6 +592,16 @@ export declare class Lfm2Model {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
    * sole authority for the rendered suffix; native cache reuse
@@ -530,10 +610,26 @@ export declare class Lfm2Model {
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
    * Continue an existing chat session from a complete
    * structured conversation ending in a tool-role message.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1029,8 +1125,13 @@ export declare class QianfanOCRModel {
     maxNewTokens?: number | undefined | null,
     temperature?: number | undefined | null,
   ): Promise<Array<number>>;
-  /** Reset KV caches and token history. */
-  resetCaches(): void;
+  /**
+   * Reset KV caches and token history. Async so a reset queued behind
+   * an in-flight turn parks a tokio future, never the Node event loop
+   * (H1a — same contract as the `chat_napi_surface!` families). Callers
+   * requiring reset-before-next-turn ordering must await this Promise.
+   */
+  resetCaches(): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -1044,16 +1145,32 @@ export declare class QianfanOCRModel {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation for `chatSessionStart`. The returned call exposes an
+   * idempotent `cancel()` immediately; `result()` resolves or rejects with the
+   * exact `chat session cancelled` sentinel.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
    * Continue from the caller's complete conversation history. The
    * checkpoint's chat template is rendered again and exact prefix matching
    * decides whether the live cache can be reused.
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /** Internal operation for `chatSessionContinue`. */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
   /**
    * Tool-result continuation over a full history. Tool representation is
    * owned entirely by the model-provided template.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /** Internal operation for `chatSessionContinueTool`. */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1088,15 +1205,23 @@ export declare class Qwen35Model {
    *
    * `true` iff `Qwen35Inner::paged_adapter` was successfully
    * constructed at load time (driven by
-   * `Qwen3_5Config::use_block_paged_cache`, default-OFF for text-only
-   * checkpoints because parity is pending real-weights validation, and
-   * default-ON for VLM checkpoints). On VLM checkpoints dense image turns
-   * ONLY run on the paged-vision core; a vision turn that reaches a None
-   * adapter errors at dispatch. Surfaced through this NAPI method so
+   * `Qwen3_5Config::use_block_paged_cache`, default-ON for every compatible
+   * checkpoint). On VLM checkpoints dense image turns ONLY run on the
+   * paged-vision core; a vision turn that reaches a None adapter errors at
+   * dispatch. Surfaced through this NAPI method so
    * server endpoints can branch on it without round-tripping through
    * the model thread.
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * Native admission width for plain text AR turns. Installed vision and
+   * MTP modules do not disable text batching: requests that actually carry
+   * media or set `enable_mtp=true` are routed through the ordered exclusive
+   * lane by the scheduler.
+   */
+  maxConcurrentSequences(): number;
+  /** Snapshot scheduler occupancy plus unified block/recurrent admission. */
+  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Whether this checkpoint shipped an MTP head (module loaded by
    * `persistence::apply_weights_inner`). Snapshotted at load time from
@@ -1155,11 +1280,16 @@ export declare class Qwen35Model {
    */
   saveModel(savePath: string): Promise<undefined>;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
-  resetCaches(): void;
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -1169,6 +1299,16 @@ export declare class Qwen35Model {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
    * sole authority for the rendered suffix; native cache reuse
@@ -1177,10 +1317,26 @@ export declare class Qwen35Model {
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
    * Continue an existing chat session from a complete
    * structured conversation ending in a tool-role message.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1216,15 +1372,22 @@ export declare class Qwen35MoeModel {
    *
    * `true` iff `Qwen35MoeInner::paged_adapter` was successfully
    * constructed at load time (driven by
-   * `Qwen3_5MoeConfig::use_block_paged_cache`, currently default-OFF
-   * because parity is pending real-weights validation). On VLM
-   * checkpoints the adapter can still be active for text-only
+   * `Qwen3_5MoeConfig::use_block_paged_cache`, default-ON for compatible
+   * checkpoints). On VLM checkpoints the adapter can still be active for text-only
    * inference; image-bearing chat turns are rejected at runtime by
    * the chat-entry sites. Surfaced through this NAPI method so
    * server endpoints can branch on it without round-tripping through
    * the model thread.
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * Native admission width for plain text autoregressive turns. MTP and
+   * multimodal turns remain ordered barriers and do not enter the batched
+   * decode lane.
+   */
+  maxConcurrentSequences(): number;
+  /** Snapshot scheduler occupancy plus unified block/recurrent admission. */
+  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Whether this checkpoint shipped an MTP head (module loaded by
    * `persistence::apply_weights_moe_inner`). Snapshotted at load time from
@@ -1270,11 +1433,16 @@ export declare class Qwen35MoeModel {
    */
   saveModel(savePath: string): Promise<undefined>;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
-  resetCaches(): void;
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -1284,6 +1452,16 @@ export declare class Qwen35MoeModel {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
    * sole authority for the rendered suffix; native cache reuse
@@ -1292,10 +1470,26 @@ export declare class Qwen35MoeModel {
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
    * Continue an existing chat session from a complete
    * structured conversation ending in a tool-role message.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1370,6 +1564,17 @@ export declare class Qwen3Model {
    * runtime-routing decision.
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * Maximum number of independent sequences admitted to the continuous
+   * batching scheduler. Flat-cache and forced-serial instances deliberately
+   * report one so the server retains its exclusive dispatch lane.
+   */
+  maxConcurrentSequences(): number;
+  /**
+   * Snapshot continuous-batching scheduler counters after all commands
+   * already ahead of this query have drained.
+   */
+  schedulerStats(): Promise<SchedulerStats>;
   /** Get model configuration */
   getConfig(): Qwen3Config;
   /**
@@ -1464,11 +1669,16 @@ export declare class Qwen3Model {
     enableThinking?: boolean | undefined | null,
   ): Promise<Uint32Array>;
   /**
-   * Reset all caches and clear cached token history. Exposed
-   * so tests and session-management code can start from a
-   * known clean state between turns.
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
    */
-  resetCaches(): void;
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
   /**
    * Start a new chat session.
    *
@@ -1478,6 +1688,16 @@ export declare class Qwen3Model {
    */
   chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
    * Continue an existing chat session from the complete
    * structured conversation. The loaded model template is the
    * sole authority for the rendered suffix; native cache reuse
@@ -1486,10 +1706,26 @@ export declare class Qwen3Model {
    */
   chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
   /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
    * Continue an existing chat session from a complete
    * structured conversation ending in a tool-role message.
    */
   chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
   /** Streaming variant of `chatSessionStart`. */
   chatStreamSessionStart(
     messages: ChatMessage[],
@@ -1513,8 +1749,8 @@ export declare class Qwen3Model {
    *
    * This loads a model from a directory containing:
    * - config.json: Model configuration
-   * - weights.mlx (optional): MLX format weights with data arrays
-   * - weights.safetensors (optional): SafeTensors format (not yet supported)
+   * - weights.safetensors or model.safetensors (single-file SafeTensors)
+   * - model-*-of-*.safetensors (sharded SafeTensors)
    *
    * # Arguments
    * * `model_path` - Path to the model directory
@@ -2156,6 +2392,14 @@ export declare function calibrateActivationAmaxRaw(
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
   /**
+   * Security domain for content-addressed paged-KV prefix reuse.
+   * Requests with different values cannot reuse each other's cached
+   * prefixes even when their token sequences are identical. This is
+   * deliberately separate from `cache_owner_id`, which controls logical
+   * session/recurrent-state ownership rather than physical KV sharing.
+   */
+  cacheSalt?: string | undefined;
+  /**
    * Internal logical cache owner. The agent provider forwards Pi's stable
    * session id so model-global GDN sidecars can retain parent and child
    * branches independently. This does not namespace the physical paged KV
@@ -2236,12 +2480,18 @@ export interface ChatConfig {
    * `false`.
    *
    * The MTP acceptance gate (`MLX_MTP_ACCEPT_GATE`, default ON) also
-   * applies to explicit requests at depth 1: once the aggregated
-   * first-draft acceptance sample is large enough for a 95% confidence
-   * bound to sit below the break-even, the model runs plain AR for
-   * subsequent depth-1 turns. The gate is depth-1-scoped and exempts
-   * adaptive-depth turns (depth > 1 turns are never gated). Set the env
-   * var to `0` to bypass the gate and always run MTP when requested.
+   * applies to explicit requests at fixed depth 1: the model aggregates
+   * first-draft acceptance counts across completed depth-1 turns (history
+   * bounded to roughly the most recent ~512 attempts) and silently runs
+   * plain autoregressive decoding for the next depth-1 turn when an
+   * exact-binomial test at the 5% level shows the aggregate is
+   * inconsistent with the ~0.6 break-even acceptance rate. After 3
+   * consecutive gated turns the gate re-probes with speculation on, and
+   * `resetCaches()` clears the per-model (not per-session) history. The
+   * gate is depth-1-scoped and exempts adaptive-depth turns
+   * (`mtpAdaptiveDepth` and explicit depth > 1 turns are never gated).
+   * Set the env var to `0` / `false` / `off` to bypass the gate and
+   * always run MTP when requested.
    */
   enableMtp?: boolean | undefined;
   /**
@@ -2785,6 +3035,11 @@ export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig,
  */
 export declare function createRandomQwen3Checkpoint(config: Qwen3Config, savePath: string): Promise<undefined>;
 
+export interface DecodeBatchOccupancyBucket {
+  occupancy: number;
+  steps: number;
+}
+
 /** Document element - either a table or paragraph */
 export interface DocumentElement {
   elementType: ElementType;
@@ -3084,10 +3339,9 @@ export interface Gemma4LoadOptions {
    * alongside the target model for speculative decoding — either a
    * DSpark draft or a Google assistant draft; the kind is probed from
    * the draft config.json. When omitted, `<model_path>/draft/` is loaded
-   * automatically when present. Draft decoding runs only on the flat
-   * KV-cache path: setting this while the model config explicitly enables
-   * `use_block_paged_cache` is a hard load error, and an unset
-   * `use_block_paged_cache` is forced to `false`.
+   * automatically when present. Draft decoding uses a request-local flat
+   * target-cache lane. The resident target retains its grouped paged pools,
+   * so loading an optional proposer does not disable ordinary batching.
    */
   draftModelPath?: string;
 }
@@ -3663,6 +3917,12 @@ export interface Lfm2Config {
    */
   useBlockPagedCache?: boolean | undefined;
   /**
+   * Persist block-paged attention state and the co-keyed short-convolution
+   * sidecar to the SSD cold tier. Explicit config overrides the process-wide
+   * `MLX_PERSIST_PAGED_CACHE` default.
+   */
+  persistPagedCache?: boolean | undefined;
+  /**
    * MLP intermediate size for the DENSE-in-MoE layers (`layer_idx <
    * num_dense_layers`). Used DIRECTLY (no 2/3 `computed_ff_dim()` shrink).
    * Only present on MoE checkpoints.
@@ -4110,7 +4370,7 @@ export interface Qwen35Config {
    * Use the block-paged KV cache adapter (`PagedKVCacheAdapter`) for
    * full-attention layers.
    *
-   * **OPT-IN — experimental.** When `Some(true)`, `Qwen35Inner`
+   * When enabled (the default), `Qwen35Inner`
    * allocates a `BlockAllocator` + `LayerKVPool` pair sized for the
    * model's full-attention layer count and constructs a
    * `PagedKVCacheAdapter`. The chat-session forward dispatch routes
@@ -4121,12 +4381,12 @@ export interface Qwen35Config {
    * prefix reuse for recurrent layers" stance.
    *
    * **Paged vs flat eager**: this flag selects the eager paged decode
-   * over the eager flat decode. When `Some(true)`, full-attention
+   * over the eager flat decode. When enabled, full-attention
    * layers run through the paged adapter (cross-request prefix reuse);
-   * when unset, they run the eager flat decode. Either way the forward
-   * is pure-Rust eager.
+   * an explicit false runs eager flat decode. Either way the forward is
+   * pure-Rust eager.
    *
-   * **VLM under paged**: a VLM checkpoint defaults this flag ON at load, so
+   * **VLM under paged**: VLM checkpoints also default this flag ON, so
    * dense image turns ONLY run on the paged-vision core. A fresh single-turn
    * image-bearing prompt prefills through the paged adapter (M-RoPE positions
    * feed the rotary; the merged vision embeddings feed the forward) and
@@ -4136,8 +4396,9 @@ export interface Qwen35Config {
    * that reaches a None adapter (explicit `Some(false)`, non-Metal build, or
    * a sym8 checkpoint) errors at dispatch.
    *
-   * Default: `None` for text-only checkpoints (eager flat decode);
-   * `Some(true)` for VLM checkpoints (block-paged, set in `parse_config`).
+   * Load default: `Some(true)` for compatible text and VLM checkpoints.
+   * Explicit false remains available for flat-path diagnostics; sym8 is
+   * forced flat by persistence after its storage mode is known.
    */
   useBlockPagedCache?: boolean | undefined;
   /**
@@ -4236,8 +4497,8 @@ export interface Qwen35MoeConfig {
   /**
    * Use the block-paged KV cache adapter for full-attention layers.
    *
-   * **OPT-IN — experimental.** Same semantics as the dense
-   * `Qwen3_5Config::use_block_paged_cache` field. Selects the eager
+   * Same semantics as the dense `Qwen3_5Config::use_block_paged_cache`
+   * field. Selects the eager
    * paged decode over the eager flat decode: routes full-attention
    * layers through `PagedKVCacheAdapter` (cross-request prefix reuse);
    * GDN linear-attention layers stay on `Qwen3_5LayerCache::Linear`
@@ -4251,7 +4512,8 @@ export interface Qwen35MoeConfig {
    * runtime; warm image-bearing session continues / cache-hit reuse are
    * cold-started (no warm GDN two-pass prefix).
    *
-   * Default: `None` / `false`.
+   * Default: enabled for compatible Metal checkpoints. Explicit `false`
+   * and `MLX_QWEN35_PAGED_OVERRIDE=0` retain the flat rollback path.
    */
   useBlockPagedCache?: boolean | undefined;
   /**
@@ -4595,6 +4857,38 @@ export interface SamplingConfig {
  * ```
  */
 export declare function saveToXlsx(text: string, filePath: string): void;
+
+/**
+ * Read-only NAPI/dashboard mirror. Counters use `f64`, matching the other
+ * native metrics snapshots and avoiding BigInt round-trips in JavaScript.
+ */
+export interface SchedulerStats {
+  globalSteps: number;
+  maxBatchOccupancy: number;
+  decodeBatchOccupancyHist: Array<DecodeBatchOccupancyBucket>;
+  fusedGreedyEpilogueSteps: number;
+  admitted: number;
+  completed: number;
+  admissionDeferredBlocks: number;
+  rowsAllocEvicted: number;
+  blockCapacity: number;
+  freeBlocks: number;
+  reclaimableBlocks: number;
+  allocatedBlocks: number;
+  watermarkBlocks: number;
+  reservedBlocks: number;
+  memoryCapacityBytes: number;
+  memoryWatermarkBytes: number;
+  reservedBlockBytes: number;
+  reservedStateBytes: number;
+  admissionDeferredState: number;
+  ssdRestoreWaiting: number;
+  ssdRestoreBytes: number;
+  ssdRestoreWaitMs: number;
+  preemptions: number;
+  preemptionsRecompute: number;
+  preemptionsSsd: number;
+}
 
 /** Enable or disable profiling globally. */
 export declare function setProfilingEnabled(enabled: boolean): void;

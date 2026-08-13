@@ -2,6 +2,8 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::time::Instant;
 
 use napi::bindgen_prelude::*;
 use napi::threadsafe_function::ThreadsafeFunctionCallMode;
@@ -12,25 +14,27 @@ use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
-    PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs, ThinkingSetup, TrainBackend,
-    TurnOutput, TurnSetup, WholeTurnArgs,
+    PagedPrefix, ResetScope, SaveStateArgs, ThinkingSetup, TrainBackend, TurnOutput, TurnSetup,
+    WholeTurnArgs,
 };
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
 };
+use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, HybridSchedulerCommand};
 use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
 };
+use crate::engine::recurrent_state::{HYBRID_LIVE_STATE_UNITS, RecurrentStateTable};
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::model_thread::ResponseTx;
+use crate::model_thread::{ResponseTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
 use super::config::Qwen3_5Config;
 use super::decoder_layer::DecoderLayer;
@@ -57,6 +61,9 @@ use crate::engine::{
     save_cache_state_direct, verify_cache_prefix_direct,
 };
 use crate::models::paddleocr_vl::processing::ProcessedImages;
+
+pub(crate) type Qwen35SchedulerState =
+    crate::engine::hybrid_scheduler::HybridSchedulerState<Qwen35Inner>;
 
 /// Hard cap on inactive per-image feature entries retained by the vision LRU.
 /// The active request is protected from eviction even when it is larger than
@@ -542,6 +549,7 @@ mod paged_context_capacity_tests {
 
     fn make_params(max_new_tokens: i32) -> engine::ChatParams {
         extract_chat_params(&ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             max_new_tokens: Some(max_new_tokens),
@@ -732,6 +740,19 @@ fn clone_dense_linear_layer_caches(
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35Inner {
     pub(crate) config: Qwen3_5Config,
+    /// The in-flight turn's cooperative-cancel flag, installed by the
+    /// sync and streaming session wrappers via
+    /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
+    /// turn epilogue on every exit path.
+    /// Threaded into the engine AR prefill chunk loops (flat
+    /// `chunked_prefill` from `ChatBackend::prefill`, paged
+    /// `run_paged_prefill_chunk_with_size` from
+    /// `PagedBackend::paged_prefill`); a set flag aborts at the next
+    /// chunk boundary with the distinguished `"prefill cancelled"` error,
+    /// riding the engine's fail-closed prefill-`Err` arms. The family's MTP,
+    /// vision, hidden-state replay, and GDN replay cores thread the same flag;
+    /// single-shot prefills remain the documented residual window.
+    pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     /// Turn-constant layer classification (`Linear` vs `FullAttentionPaged`),
     /// computed once in [`Self::new`] instead of re-derived on every paged
     /// decode step. Pure function of the immutable `config`. Mirrors the
@@ -778,6 +799,16 @@ pub(crate) struct Qwen35Inner {
     /// Paged turns run the pure-Rust eager paged forward
     /// (`paged_forward::run_paged_prefill_chunk` / `run_paged_decode_step`).
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Request-keyed GDN state for the hybrid scheduler lane. Full-attention
+    /// K/V remains in `paged_adapter`; each table value contains only the
+    /// corresponding request's two GDN arrays at every linear layer.
+    ///
+    /// The table has the Stage-2 two-unit cap. One state may be temporarily
+    /// activated in `caches` for serial prefill/finalization, so activation
+    /// first parks the previous owner and then removes the next owner from the
+    /// table. Batched decode parks the active owner and stacks table rows.
+    scheduled_recurrent: RecurrentStateTable<Vec<Qwen3_5LayerCache>>,
+    active_scheduled_seq: Option<SeqId>,
     /// True when a paged-core turn has populated
     /// the paged adapter's `LayerKVPool` since the last flat full-attention
     /// prefill, so the flat `self.caches` full-attention slots do NOT
@@ -982,6 +1013,9 @@ pub(crate) enum Qwen35Cmd {
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
     /// [`TrainBackend`] impl on [`Qwen35Inner`].
     Train(TrainCmd),
+    SchedulerStats {
+        reply: ResponseTx<engine::SchedulerStatsJs>,
+    },
 }
 
 impl FromChatCmd for Qwen35Cmd {
@@ -995,6 +1029,31 @@ impl FromTrainCmd for Qwen35Cmd {
     #[inline]
     fn from_train(cmd: TrainCmd) -> Self {
         Qwen35Cmd::Train(cmd)
+    }
+}
+
+impl HybridSchedulerCommand for Qwen35Cmd {
+    fn as_chat(&self) -> Option<&ChatCmd> {
+        match self {
+            Self::Chat(chat) => Some(chat),
+            _ => None,
+        }
+    }
+
+    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
+        match self {
+            Self::Chat(chat) => Ok(chat),
+            other => Err(other),
+        }
+    }
+
+    fn into_scheduler_stats(
+        self,
+    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
+        match self {
+            Self::SchedulerStats { reply } => Ok(reply),
+            other => Err(other),
+        }
     }
 }
 
@@ -1106,6 +1165,108 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         Qwen35Cmd::Train(train_cmd) => {
             handle_train_cmd(inner, train_cmd);
         }
+        Qwen35Cmd::SchedulerStats { reply } => {
+            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
+        }
+    }
+}
+
+impl HybridSchedulerBackend for Qwen35Inner {
+    type Command = Qwen35Cmd;
+    type RestoreTicket = crate::engine::hybrid_scheduler::NoRestoreTicket;
+    type OwnerState = Vec<u32>;
+    type StepExecutor<'a> = crate::engine::hybrid_scheduler::HybridStepExecutor<'a, Self>;
+
+    const SCHEDULER_NAME: &'static str = "Qwen3.5 dense";
+    const ENABLED_BY_DEFAULT: bool = false;
+
+    fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter> {
+        self.paged_adapter.as_ref()
+    }
+
+    fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter> {
+        self.paged_adapter.as_mut()
+    }
+
+    fn max_position_embeddings(&self) -> i32 {
+        self.config.max_position_embeddings
+    }
+
+    fn recurrent_state_bytes(&self) -> u64 {
+        self.config.recurrent_state_bytes()
+    }
+
+    fn scheduled_recurrent_bytes(&self) -> u64 {
+        self.scheduled_recurrent_bytes()
+    }
+
+    fn has_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.has_scheduled_recurrent(seq_id)
+    }
+
+    fn can_activate_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.can_activate_scheduled_recurrent(seq_id)
+    }
+
+    fn activate_scheduled_recurrent(&mut self, seq_id: SeqId) -> Result<()> {
+        self.activate_scheduled_recurrent(seq_id)
+    }
+
+    fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        self.activate_paged_seq(seq_id)
+    }
+
+    fn park_active_scheduled_recurrent(&mut self) -> Result<()> {
+        self.park_active_scheduled_recurrent()
+    }
+
+    fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
+        self.release_scheduled_recurrent_for(seq_id);
+    }
+
+    fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        self.run_paged_decode_step_batched(rows)
+    }
+
+    fn replace_cached_token_history(&mut self, history: Vec<u32>) {
+        self.cached_token_history = history;
+    }
+
+    fn owner_tokens(state: &Self::OwnerState) -> &[u32] {
+        state
+    }
+
+    fn capture_owner_state(&mut self, _seq_id: SeqId) -> Self::OwnerState {
+        self.cached_token_history.clone()
+    }
+
+    fn build_scheduled_prefix(
+        &self,
+        base: &Self::PrefixState,
+        effective_cached_prefix_len: usize,
+        suffix_len: usize,
+        full_tokens: Vec<u32>,
+        first_chunk: bool,
+    ) -> Self::PrefixState {
+        Qwen35PrefixState {
+            effective_cached_prefix_len,
+            suffix_len,
+            full_tokens,
+            cache_salt: base.cache_salt,
+            gdn_prefix_already_primed: !first_chunk || base.gdn_prefix_already_primed,
+        }
+    }
+
+    fn step_executor(&mut self) -> Self::StepExecutor<'_> {
+        crate::engine::hybrid_scheduler::HybridStepExecutor::new(self)
+    }
+
+    fn execute_barrier(
+        &mut self,
+        command: Self::Command,
+        _owners: crate::engine::hybrid_scheduler::SchedulerOwnerContext<'_, Self::OwnerState>,
+    ) {
+        handle_qwen35_cmd(self, command);
     }
 }
 
@@ -1261,6 +1422,7 @@ impl Qwen35Inner {
 
         Ok(Self {
             config,
+            turn_cancel: None,
             layer_kinds,
             embedding,
             layers,
@@ -1284,6 +1446,8 @@ impl Qwen35Inner {
             gdn_last_history_checkpoint: None,
             paged_finalize_failed: false,
             paged_adapter,
+            scheduled_recurrent: RecurrentStateTable::stage2(),
+            active_scheduled_seq: None,
             paged_full_attn_caches_dirty: false,
             flat_mtp_caches_desynced: false,
             flat_full_reprefill_count: 0,
@@ -1303,7 +1467,7 @@ impl Qwen35Inner {
     /// been installed and materialized. The configured memory value is a
     /// requested maximum; live unified-memory/Metal probes may only reduce it.
     pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
-        if !self.config.use_block_paged_cache.unwrap_or(false)
+        if !self.config.use_block_paged_cache.unwrap_or(true)
             || !crate::engine::persistence::compiled_forward_backend_available()
         {
             return Ok(());
@@ -1353,15 +1517,24 @@ impl Qwen35Inner {
             )));
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-        let (num_blocks, sizing_source) = match mlx_paged_attn::profile::load_time_pool_sizing(
-            requested_blocks,
-            attn_layer_count,
-            num_kv_heads,
-            head_size,
-            block_size,
-            cache_dtype,
-        ) {
-            Ok(sizing) => (
+        let (num_blocks, sizing_source) = if self.config.paged_cache_memory_mb.is_some() {
+            (requested_blocks, "explicit".to_string())
+        } else {
+            let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
+                requested_blocks,
+                attn_layer_count,
+                num_kv_heads,
+                head_size,
+                block_size,
+                cache_dtype,
+            )
+            .map_err(|e| {
+                Error::from_reason(format!(
+                    "Qwen3.5 adaptive paged cache sizing failed safely; refusing an uncapped \
+                     pool request: {e}"
+                ))
+            })?;
+            (
                 sizing.selected_blocks,
                 format!(
                     "adaptive(requested_blocks={}, active_mib={}, working_set_mib={})",
@@ -1372,13 +1545,7 @@ impl Qwen35Inner {
                         .map(|v| (v / (1024 * 1024)).to_string())
                         .unwrap_or_else(|| "n/a".to_string())
                 ),
-            ),
-            Err(e) => {
-                return Err(Error::from_reason(format!(
-                    "Qwen3.5 adaptive paged cache sizing failed safely; refusing an uncapped \
-                     pool request: {e}"
-                )));
-            }
+            )
         };
 
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
@@ -1535,6 +1702,8 @@ impl Qwen35Inner {
     /// Initialize KV caches.
     pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
         self.caches = Some(fresh_dense_layer_caches(&self.config));
+        self.scheduled_recurrent = RecurrentStateTable::stage2();
+        self.active_scheduled_seq = None;
         self.clear_reuse_state();
         Ok(())
     }
@@ -1547,6 +1716,8 @@ impl Qwen35Inner {
             }
         }
         self.caches = None;
+        self.scheduled_recurrent = RecurrentStateTable::stage2();
+        self.active_scheduled_seq = None;
         self.clear_reuse_state();
         // A full session reset must also clear the MTP acceptance gate
         // state: a new independent chat on this model starts fresh (probes)
@@ -1555,6 +1726,329 @@ impl Qwen35Inner {
         self.mtp_draft_attempted = 0;
         self.mtp_gated_turns = 0;
         Ok(())
+    }
+
+    /// Move the serially active request's GDN state back to the request table.
+    /// Full-attention slots are empty placeholders; their K/V remains in the
+    /// paged adapter and is never copied here.
+    fn park_active_scheduled_recurrent(&mut self) -> Result<()> {
+        let Some(seq_id) = self.active_scheduled_seq else {
+            return Ok(());
+        };
+        let bytes = self.config.recurrent_state_bytes();
+        if bytes == 0 {
+            self.active_scheduled_seq = None;
+            self.caches = None;
+            return Ok(());
+        }
+        if !self.scheduled_recurrent.can_insert_live(seq_id) {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 sequence {seq_id}: recurrent-state live-unit cap reached"
+            )));
+        }
+        self.active_scheduled_seq = None;
+        let state = self
+            .caches
+            .take()
+            .unwrap_or_else(|| fresh_dense_layer_caches(&self.config));
+        self.scheduled_recurrent
+            .insert_live(seq_id, bytes, state)
+            .map_err(Error::from_reason)?;
+        Ok(())
+    }
+
+    fn scheduled_recurrent_units(&self) -> usize {
+        self.scheduled_recurrent.live_len() + usize::from(self.active_scheduled_seq.is_some())
+    }
+
+    fn scheduled_recurrent_bytes(&self) -> u64 {
+        let active_bytes = if self.active_scheduled_seq.is_some() {
+            self.config.recurrent_state_bytes()
+        } else {
+            0
+        };
+        self.scheduled_recurrent
+            .live_bytes()
+            .saturating_add(active_bytes)
+    }
+
+    fn has_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.active_scheduled_seq == Some(seq_id) || self.scheduled_recurrent.contains_live(seq_id)
+    }
+
+    fn can_activate_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.has_scheduled_recurrent(seq_id)
+            || self.scheduled_recurrent_units() < HYBRID_LIVE_STATE_UNITS
+    }
+
+    fn activate_scheduled_recurrent(&mut self, seq_id: SeqId) -> Result<()> {
+        if self.active_scheduled_seq == Some(seq_id) {
+            return Ok(());
+        }
+        if !self.can_activate_scheduled_recurrent(seq_id) {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 sequence {seq_id}: recurrent-state live-unit cap reached"
+            )));
+        }
+        self.park_active_scheduled_recurrent()?;
+        self.caches = Some(
+            self.scheduled_recurrent
+                .take_live(seq_id)
+                .unwrap_or_else(|| fresh_dense_layer_caches(&self.config)),
+        );
+        self.active_scheduled_seq = Some(seq_id);
+        Ok(())
+    }
+
+    /// Activate one already-prepared request for the existing scalar
+    /// prefill/finalize cores.
+    fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        self.paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen3.5 paged adapter is unavailable"))?
+            .activate_request(seq_id)
+            .map_err(Error::from_reason)?;
+        self.activate_scheduled_recurrent(seq_id)
+    }
+
+    fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
+        if self.active_scheduled_seq == Some(seq_id) {
+            self.active_scheduled_seq = None;
+            self.caches = Some(fresh_dense_layer_caches(&self.config));
+        }
+        self.scheduled_recurrent.remove_live(seq_id);
+    }
+
+    fn stacked_gdn_cache(
+        &mut self,
+        seq_ids: &[SeqId],
+        layer_idx: usize,
+    ) -> Result<Qwen3_5LayerCache> {
+        self.park_active_scheduled_recurrent()?;
+        let rows = seq_ids
+            .iter()
+            .map(|&seq_id| {
+                self.scheduled_recurrent
+                    .live(seq_id)
+                    .ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "Qwen3.5 sequence {seq_id} has no recurrent state"
+                        ))
+                    })?
+                    .get(layer_idx)
+                    .and_then(|cache| match cache {
+                        Qwen3_5LayerCache::Linear(arrays) => Some(arrays),
+                        Qwen3_5LayerCache::FullAttention(_) => None,
+                    })
+                    .ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "Qwen3.5 linear layer {layer_idx} has no GDN cache"
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Qwen3_5LayerCache::Linear(
+            super::arrays_cache::ArraysCache::stack_rows(&rows)?,
+        ))
+    }
+
+    fn scatter_gdn_cache(
+        &mut self,
+        seq_ids: &[SeqId],
+        layer_idx: usize,
+        combined: &Qwen3_5LayerCache,
+    ) -> Result<()> {
+        let Qwen3_5LayerCache::Linear(combined) = combined else {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 linear layer {layer_idx} returned a non-GDN cache"
+            )));
+        };
+        for (row, &seq_id) in seq_ids.iter().enumerate() {
+            let state = self.scheduled_recurrent.live_mut(seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Qwen3.5 sequence {seq_id} disappeared during GDN scatter"
+                ))
+            })?;
+            state[layer_idx] = Qwen3_5LayerCache::Linear(combined.row(row, seq_ids.len())?);
+        }
+        Ok(())
+    }
+
+    /// Execute one uniform text decode step for multiple hybrid requests.
+    /// Full-attention layers issue one paged gather over all rows; GDN layers
+    /// stack the two request-local arrays, execute once over `[N,1,H]`, then
+    /// scatter the replacement arrays back to their sequence entries.
+    fn validate_scheduled_decode_residency(&self, rows: &[(SeqId, u32)]) -> Result<()> {
+        if self.config.recurrent_state_bytes() == 0 {
+            return Ok(());
+        }
+        for &(seq_id, _) in rows {
+            if self.scheduled_recurrent.live(seq_id).is_none() {
+                return Err(Error::from_reason(format!(
+                    "Qwen3.5 sequence {seq_id} has no recurrent state before batched decode"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn scheduled_decode_recurrent_snapshots(
+        &self,
+        rows: &[(SeqId, u32)],
+    ) -> Result<Vec<(SeqId, Vec<Qwen3_5LayerCache>)>> {
+        if self.config.recurrent_state_bytes() == 0 {
+            return Ok(Vec::new());
+        }
+        rows.iter()
+            .map(|&(seq_id, _)| {
+                let state = self.scheduled_recurrent.live(seq_id).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Qwen3.5 sequence {seq_id} disappeared before recurrent snapshot"
+                    ))
+                })?;
+                crate::models::qwen3_5::paged_forward::snapshot_materialized_linear_layer_caches(
+                    state,
+                )
+                .map(|snapshot| (seq_id, snapshot))
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Qwen3.5 sequence {seq_id} has an unmaterialized recurrent state"
+                    ))
+                })
+            })
+            .collect()
+    }
+
+    fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "Qwen3.5 batched decode requires at least one row",
+            ));
+        }
+        if self.cached_rope_deltas.unwrap_or(0) != 0 {
+            return Err(Error::from_reason(
+                "Qwen3.5 batched decode does not admit image-derived M-RoPE state",
+            ));
+        }
+        self.park_active_scheduled_recurrent()?;
+        self.validate_scheduled_decode_residency(rows)?;
+
+        let adapter = self
+            .paged_adapter
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Qwen3.5 batched decode requires a paged adapter"))?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut planned_rows = Vec::with_capacity(rows.len());
+        for &(seq_id, _) in rows {
+            if !seen.insert(seq_id) {
+                return Err(Error::from_reason(format!(
+                    "Qwen3.5 batched decode received duplicate sequence {seq_id}"
+                )));
+            }
+            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Qwen3.5 batched decode received unknown sequence {seq_id}"
+                ))
+            })?;
+            planned_rows.push((seq_id, position));
+        }
+        // The table is a residency cache, not the current batch. It may also
+        // contain warm completed rows or a newly admitted prefill row. Only
+        // the rows selected for this decode must be present and materialized;
+        // stack_rows below reads exactly this filtered set.
+        let recurrent_snapshots = self.scheduled_decode_recurrent_snapshots(rows)?;
+
+        let mut recorded = Vec::with_capacity(rows.len());
+        for &(seq_id, token_id) in rows {
+            let record_result = self
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason("Qwen3.5 paged adapter disappeared before token recording")
+                })?
+                .record_token_for(seq_id, token_id);
+            if let Err(error) = record_result {
+                for &recorded_seq in recorded.iter().rev() {
+                    let Some(adapter) = self.paged_adapter.as_mut() else {
+                        return Err(Error::from_reason(format!(
+                            "Qwen3.5 paged adapter disappeared while rolling back a failed token record for sequence {seq_id}: {error}"
+                        )));
+                    };
+                    adapter
+                        .activate_request(recorded_seq)
+                        .map_err(Error::from_reason)?;
+                    adapter
+                        .rollback_last_tokens(1)
+                        .map_err(Error::from_reason)?;
+                }
+                return Err(Error::from_reason(format!(
+                    "Qwen3.5 batched decode failed to record sequence {seq_id}: {error}"
+                )));
+            }
+            recorded.push(seq_id);
+        }
+
+        let result = (|| {
+            let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
+            let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
+            let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
+            let mut hidden_states = self.embedding.forward(&input_ids)?;
+
+            for layer_idx in 0..self.layers.len() {
+                let kind = self.layer_kinds[layer_idx];
+                let mut gdn_cache =
+                    if matches!(kind, super::decoder_layer::Qwen3_5LayerKind::Linear) {
+                        Some(self.stacked_gdn_cache(&seq_ids, layer_idx)?)
+                    } else {
+                        None
+                    };
+                hidden_states = {
+                    let layer = unsafe { &mut *self.layers.as_mut_ptr().add(layer_idx) };
+                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason("Qwen3.5 paged adapter dropped during batched decode")
+                    })?;
+                    layer.forward_paged_batched(
+                        &hidden_states,
+                        kind,
+                        adapter,
+                        &planned_rows,
+                        gdn_cache.as_mut(),
+                    )?
+                };
+                if let Some(cache) = gdn_cache.as_ref() {
+                    self.scatter_gdn_cache(&seq_ids, layer_idx, cache)?;
+                }
+            }
+
+            let hidden_states = self.final_norm.forward(&hidden_states)?;
+            if let Some(head) = &self.lm_head {
+                head.forward(&hidden_states)
+            } else {
+                self.embedding.as_linear(&hidden_states)
+            }
+        })();
+        if result.is_err() {
+            for &recorded_seq in recorded.iter().rev() {
+                let Some(adapter) = self.paged_adapter.as_mut() else {
+                    return Err(Error::from_reason(
+                        "Qwen3.5 paged adapter disappeared while rolling back a failed batched decode",
+                    ));
+                };
+                if adapter.activate_request(recorded_seq).is_ok() {
+                    let _ = adapter.rollback_last_tokens(1);
+                }
+            }
+            for (seq_id, snapshot) in recurrent_snapshots {
+                self.scheduled_recurrent
+                    .insert_live(seq_id, self.config.recurrent_state_bytes(), snapshot)
+                    .map_err(|error| {
+                        Error::from_reason(format!(
+                            "Qwen3.5 failed to restore recurrent state for sequence {seq_id} after a batched decode error: {error}"
+                        ))
+                    })?;
+            }
+        }
+        result
     }
 
     /// Clear cached token history, image key, and rope deltas.
@@ -1622,6 +2116,7 @@ impl Qwen35Inner {
     fn finalize_dense_manual_paged_turn(
         &mut self,
         image_token_positions: &[(u32, u64)],
+        cache_salt: u64,
     ) -> Result<()> {
         let finalize_result = self
             .paged_adapter
@@ -1633,11 +2128,11 @@ impl Qwen35Inner {
                     adapter.block_size(),
                     image_token_positions,
                 );
-                adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
+                adapter.finalize_turn_keep_live_per_block(&finalize_extra_keys, cache_salt)
             });
         match finalize_result {
             Ok(_) => {
-                self.capture_dense_gdn_cold_sidecar(image_token_positions);
+                self.capture_dense_gdn_cold_sidecar(image_token_positions, cache_salt);
                 Ok(())
             }
             Err(error) => {
@@ -1761,11 +2256,10 @@ impl Qwen35Inner {
     /// those are already materialized and cost no decode.
     ///
     /// `ColdTierWalk::restore_extend` guarantees the sidecar backs EXACTLY the
-    /// prefix the adapter reported, so no boundary re-derivation is needed — but
-    /// every structural precondition is re-checked here (group, layout equality
-    /// against this config's geometry, boundary == the reported prefix). A
-    /// contract slip degrades to a MISS (`Ok(false)`) that falls through to the
-    /// caller's replay, never state installed at the wrong offset.
+    /// prefix the adapter reported. The shared cold-tier preparation re-checks
+    /// group, boundary, and loaded-config geometry before this family decodes
+    /// it. A contract slip degrades to a MISS (`Ok(false)`) that falls through
+    /// to the caller's replay, never state installed at the wrong offset.
     ///
     /// Taking the sidecar is unconditional so a rejected one cannot be
     /// reconsidered later in the same turn. On success the decoded state is also
@@ -1778,51 +2272,39 @@ impl Qwen35Inner {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<bool> {
-        let sidecar = {
+        let (restored, cache_dtype) = {
             let Some(adapter) = self.paged_adapter.as_mut() else {
                 return Ok(false);
             };
-            match adapter.take_restored_sidecar() {
-                Some(sidecar) => sidecar,
-                None => return Ok(false),
-            }
-        };
-        if sidecar.layout.group != mlx_paged_attn::ColdGroup::GdnState {
-            return Ok(false);
-        }
-        let boundary = sidecar.layout.boundary_tokens;
-        // The walk reconciles the prefix and the state together, so a sidecar
-        // that does not describe EXACTLY the reported prefix is a broken
-        // contract, not a deeper opportunity: refuse it.
-        if boundary == 0 || boundary != cached_prefix_len {
-            return Ok(false);
-        }
-        let cache_dtype = {
-            let Some(adapter) = self.paged_adapter.as_ref() else {
-                return Ok(false);
-            };
-            format!("{:?}", adapter.layer_kv_pool().cache_dtype())
+            (
+                adapter.take_restored_sidecar(),
+                format!("{:?}", adapter.layer_kv_pool().cache_dtype()),
+            )
         };
         let Some(geometry) = super::gdn_sidecar::geometry(&self.config, &cache_dtype) else {
             return Ok(false);
         };
-        // `load_sidecar` already compared the layout to the policy's template;
-        // comparing again against the geometry derived from the LOADED config
-        // makes the install independent of that earlier check.
-        if super::gdn_sidecar::layout_at(&geometry, boundary) != sidecar.layout {
-            return Ok(false);
-        }
-        let Some(caches) =
-            super::gdn_sidecar::decode_caches(&self.config, &geometry, &sidecar.tensors, boundary)?
-        else {
+        let expected_layout = super::gdn_sidecar::layout_at(&geometry, cached_prefix_len);
+        let installed_boundary = crate::cold_tier::try_install_cold_sidecar(
+            restored,
+            &expected_layout,
+            |tensors, boundary| {
+                let Some(caches) =
+                    super::gdn_sidecar::decode_caches(&self.config, &geometry, tensors, boundary)?
+                else {
+                    return Ok(None);
+                };
+                self.caches = Some(caches);
+                Ok(Some(boundary))
+            },
+        )?;
+        let Some(boundary) = installed_boundary else {
             return Ok(false);
         };
-        self.caches = Some(caches);
         // The one observable that separates "the tier restored the recurrent
         // half" from "the tier read it and every arm above declined". Both
         // produce identical text, identical `num_tokens` and identical
         // `cached_tokens`; only the second re-forwards the whole prefix.
-        crate::cold_tier::cold_sidecar_counters().record_install();
         // Feed the in-memory store so later turns in this process hit RAM
         // instead of decoding the sidecar again. Best-effort: a failure to
         // clone/store never invalidates the freshly installed live caches.
@@ -1920,6 +2402,7 @@ impl Qwen35Inner {
     fn publish_dense_gdn_materialized_prefix_checkpoint(
         &mut self,
         tokens: &[u32],
+        cache_salt: u64,
         checkpoints: Vec<super::paged_forward::MaterializedGdnPrefixCheckpoint>,
     ) {
         let Some(block_size) = self
@@ -1937,7 +2420,7 @@ impl Qwen35Inner {
         self.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
             tokens,
             &extra_keys,
-            0,
+            cache_salt,
             checkpoints,
         );
     }
@@ -2086,6 +2569,11 @@ impl Qwen35Inner {
         // image prefill); feeds the scalar-offset RoPE for the suffix.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
         let chunk_size = self.cold_gdn_prefill_chunk_size();
+        // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
+        // can borrow `self.layers`/`self.caches` mutably at the same time.
+        // Threaded into BOTH arms: the AR chunk loop and the planned-MTP
+        // `_with_hidden` chunk loop poll it at every chunk boundary.
+        let turn_cancel = self.turn_cancel.clone();
         let caches_ref = self
             .caches
             .as_mut()
@@ -2111,6 +2599,7 @@ impl Qwen35Inner {
                     chunk_size,
                     Some(keep_tokens),
                     rope_deltas,
+                    turn_cancel.as_deref(),
                 )?;
             Ok((logits, Some(hidden), checkpoints))
         } else {
@@ -2128,6 +2617,7 @@ impl Qwen35Inner {
                 adapter,
                 chunk_size,
                 rope_deltas,
+                turn_cancel.as_deref(),
             )?;
             Ok((logits, None, checkpoints))
         }
@@ -2160,7 +2650,11 @@ impl Qwen35Inner {
     /// `cached_paged_image_token_positions` before their prefill and reassign it
     /// only after finalization returns, so a `self`-read guard would see an
     /// empty vec on exactly the media turns it exists to refuse.
-    fn capture_dense_gdn_cold_sidecar(&self, image_token_positions: &[(u32, u64)]) {
+    fn capture_dense_gdn_cold_sidecar(
+        &self,
+        image_token_positions: &[(u32, u64)],
+        cache_salt: u64,
+    ) {
         crate::cold_tier::cold_sidecar_counters().record_capture_reached();
         let Some(adapter) = self.paged_adapter.as_ref() else {
             return;
@@ -2222,11 +2716,9 @@ impl Qwen35Inner {
             engine::build_paged_extra_keys(request_tokens.len(), block_size, image_token_positions);
 
         // Deepest same-owner in-memory GDN checkpoint whose block-hash chain
-        // matches this request and whose prefix the KV chain reaches. `cache_salt`
-        // is 0 here to match the KV-chain finalize
-        // (`finalize_turn_keep_live_per_block(.., 0)`) and the in-memory publish,
-        // so the restore walk — which chains the sidecar under the SAME salt as
-        // the KV blocks — can select it.
+        // matches this request and whose prefix the K/V chain reaches. The
+        // sidecar uses the turn's exact cache security domain so capture and
+        // restore derive the same parent-linked chain.
         let (idx, boundary) = match select_gdn_sidecar_boundary(
             &self.gdn_prefix_checkpoints,
             &self.active_cache_owner_id,
@@ -2234,7 +2726,7 @@ impl Qwen35Inner {
             ceiling_tokens,
             block_size,
             &extra_keys_per_block,
-            0,
+            cache_salt,
             |checkpoint| dense_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
         ) {
             GdnSidecarBoundary::Selected { index, boundary } => (index, boundary),
@@ -2290,7 +2782,7 @@ impl Qwen35Inner {
                 parent,
                 tokens,
                 extra_keys,
-                0,
+                cache_salt,
                 index,
             ));
         }
@@ -2474,6 +2966,7 @@ impl Qwen35Inner {
                     )
                 })?;
             let embed = self.embedding.clone();
+            let turn_cancel = self.turn_cancel.clone();
             let layers = &mut self.layers;
             replay_gdn_cache_and_commit(&mut self.caches, checkpoint, |staged| {
                 super::paged_forward::run_gdn_only_prefill_materialized(
@@ -2481,6 +2974,7 @@ impl Qwen35Inner {
                     &embed,
                     layers,
                     staged,
+                    turn_cancel.as_deref(),
                 )
             })?;
             return Ok(finish(
@@ -2527,9 +3021,16 @@ impl Qwen35Inner {
             Error::from_reason("dense paged GDN prefix replay length exceeds prompt length")
         })?;
         let embed = self.embedding.clone();
+        let turn_cancel = self.turn_cancel.clone();
         let layers = &mut self.layers;
         replay_gdn_cache_and_commit(&mut self.caches, fresh_caches, |staged| {
-            super::paged_forward::run_gdn_only_prefill_materialized(prefix, &embed, layers, staged)
+            super::paged_forward::run_gdn_only_prefill_materialized(
+                prefix,
+                &embed,
+                layers,
+                staged,
+                turn_cancel.as_deref(),
+            )
         })?;
         Ok(finish("replay_materialized", 0, cached_prefix_len))
     }
@@ -2596,6 +3097,7 @@ impl Qwen35Inner {
         reuse_cache: bool,
         allow_live_continue: bool,
         image_key: u64,
+        cache_salt: u64,
     ) -> Result<engine::VlmPagedPrefixResolution> {
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let candidate_plan_result = match self.paged_adapter.as_mut() {
@@ -2606,7 +3108,7 @@ impl Qwen35Inner {
                     total_budget,
                     allow_live_continue,
                     extra_keys_per_block,
-                    0,
+                    cache_salt,
                     !reuse_cache,
                     max_cache_hit_tokens,
                 )
@@ -2628,7 +3130,7 @@ impl Qwen35Inner {
             candidate_plan.cached_prefix_len,
             block_size,
             extra_keys_per_block,
-            0,
+            cache_salt,
             candidate_plan.continued_live_prefix,
             image_key,
         ) {
@@ -2652,7 +3154,7 @@ impl Qwen35Inner {
                         tokens,
                         total_budget,
                         extra_keys_per_block,
-                        0,
+                        cache_salt,
                     )
             });
         match resolution {
@@ -3202,8 +3704,9 @@ impl Qwen35Inner {
         let mut prompt_hidden: Option<MxArray> = None;
         let (last_logits, seq_len) = {
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let last_logits = if want_prompt_hidden {
-                let (logits, ph) = chunked_prefill_with_hidden(
+            let turn_cancel = self.turn_cancel.clone();
+            let prefill_result = if want_prompt_hidden {
+                chunked_prefill_with_hidden(
                     &prompt,
                     &embedding,
                     &mut self.layers,
@@ -3212,9 +3715,12 @@ impl Qwen35Inner {
                     &self.lm_head,
                     generation_stream,
                     Some(mtp_prompt_history.keep_tokens),
-                )?;
-                prompt_hidden = Some(ph);
-                logits
+                    turn_cancel.as_deref(),
+                )
+                .map(|(logits, ph)| {
+                    prompt_hidden = Some(ph);
+                    logits
+                })
             } else {
                 chunked_prefill(
                     &prompt,
@@ -3224,7 +3730,18 @@ impl Qwen35Inner {
                     &self.final_norm,
                     &self.lm_head,
                     generation_stream,
-                )?
+                    turn_cancel.as_deref(),
+                )
+            };
+            // A partially advanced prefill (cancel or failure) must never be
+            // continued: `self.caches` would hold the partial delta while
+            // `cached_token_history` still describes the previous turn.
+            let last_logits = match prefill_result {
+                Ok(logits) => logits,
+                Err(e) => {
+                    self.invalidate_dense_paged_session("MTP whole-turn flat prefill failure");
+                    return Err(e);
+                }
             };
 
             (last_logits, tokens.len() as i64)
@@ -3399,7 +3916,8 @@ impl Qwen35Inner {
 
         // Text-only prefill of the delta on top of the existing caches.
         profiler.begin_prefill();
-        let last_logits = if self.flat_mtp_caches_desynced {
+        let turn_cancel = self.turn_cancel.clone();
+        let prefill_result = if self.flat_mtp_caches_desynced {
             // A prior eager-MTP turn stopped mid-cycle, leaving self.caches
             // advanced past the emitted history; GDN state cannot be rewound,
             // so discard and re-prefill the full conversation into fresh caches.
@@ -3415,8 +3933,11 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
-            )?;
-            self.flat_mtp_caches_desynced = false;
+                turn_cancel.as_deref(),
+            );
+            if logits.is_ok() {
+                self.flat_mtp_caches_desynced = false;
+            }
             logits
         } else {
             let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
@@ -3428,7 +3949,18 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
-            )?
+                turn_cancel.as_deref(),
+            )
+        };
+        // A partial delta prefill (cancel or failure) leaves `self.caches`
+        // ahead of `cached_token_history` — invalidate rather than let the
+        // next delta extend poisoned caches.
+        let last_logits = match prefill_result {
+            Ok(logits) => logits,
+            Err(e) => {
+                self.invalidate_dense_paged_session("delta flat prefill failure");
+                return Err(e);
+            }
         };
         // Total context length post-prefill = full history length.
         let total_seq_len = full_token_history.len() as i64;
@@ -3576,6 +4108,11 @@ impl Qwen35Inner {
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
+        // H2: clone the backend-installed per-turn cancel flag up front —
+        // the decode closures below borrow `self` mutably, so the flat AR
+        // macro / eager-MTP loop read the clone, not `self.turn_cancel`.
+        let turn_cancel = self.turn_cancel.clone();
+
         let mut token_history: Vec<u32> = token_history_init;
 
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
@@ -3625,6 +4162,9 @@ impl Qwen35Inner {
                     prompt_hidden,
                     prompt_hidden_ids,
                     prompt_hidden_position_base,
+                    // H2: sync turns cancel through the engine loop's
+                    // ungated polls (this site has no StreamingCtx).
+                    cancel_flag: turn_cancel.as_deref(),
                 },
                 // SYNC site: no streaming sink (the streaming flat site wires
                 // its own `StreamingCtx` and shares this one loop).
@@ -3674,7 +4214,8 @@ impl Qwen35Inner {
                 last_in_cache: last_in_cache,
                 first_token_instant: first_token_instant,
                 report_perf: p.report_performance,
-                generation_stream: generation_stream
+                generation_stream: generation_stream,
+                cancel: turn_cancel.as_deref()
             );
         }
 
@@ -3850,6 +4391,9 @@ impl Qwen35Inner {
                 prompt_hidden,
                 prompt_hidden_ids,
                 prompt_hidden_position_base,
+                // H2: the same flag StreamingCtx carries — the engine's
+                // ungated polls and the streaming reads are idempotent.
+                cancel_flag: Some(cancelled),
             },
             Some(streaming),
         )?;
@@ -3963,7 +4507,7 @@ impl Qwen35Inner {
         };
         let lookup_extra_keys =
             engine::build_paged_extra_keys(tokens.len(), block_size, image_positions);
-        let cache_salt = 0;
+        let cache_salt = p.cache_salt;
         // vLLM exact-prefix cap — see qwen3/model.rs:paged_turn_sync_core.
         // Ensures every paged turn has at least one suffix token to prefill,
         // even when the live cache (or a prior request's residue) already
@@ -4112,7 +4656,7 @@ impl Qwen35Inner {
         let (generated_tokens, finish_reason, mtp_profiler) = match forward_result {
             Ok(t) => {
                 let image_token_positions = self.cached_paged_image_token_positions.clone();
-                self.finalize_dense_manual_paged_turn(&image_token_positions)?;
+                self.finalize_dense_manual_paged_turn(&image_token_positions, cache_salt)?;
                 t
             }
             Err(e) => {
@@ -4225,6 +4769,10 @@ impl Qwen35Inner {
             "paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
+        // H2: clone the backend-installed per-turn cancel flag up front —
+        // the decode loop below borrows `self` mutably.
+        let turn_cancel = self.turn_cancel.clone();
+
         let suffix = &tokens[(cached_prefix_len as usize)..];
         let layer_kinds =
             super::decoder_layer::compute_layer_kinds(self.config.num_layers as usize, |i| {
@@ -4259,7 +4807,7 @@ impl Qwen35Inner {
         if let Some(profiler) = mtp_profiler.as_mut() {
             profiler.end_prefill();
         }
-        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, gdn_checkpoint);
+        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, p.cache_salt, gdn_checkpoint);
 
         // First-token sample.
         let mut token_history: Vec<u32> = tokens.to_vec();
@@ -4307,9 +4855,9 @@ impl Qwen35Inner {
             // NOT a `self.caches` KV trim.
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut profiler = mtp_profiler
-                .take()
-                .expect("paged MTP profiler must be created before prefill");
+            let mut profiler = mtp_profiler.take().ok_or_else(|| {
+                Error::from_reason("Qwen3.5 paged MTP profiler was not initialized before decode")
+            })?;
 
             let eos_id = eos_token_id;
             let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
@@ -4360,6 +4908,9 @@ impl Qwen35Inner {
                     prompt_hidden,
                     prompt_hidden_ids: Some(prompt_hidden_ids),
                     prompt_hidden_position_base,
+                    // H2: sync paged MTP cancels through the engine loop's
+                    // ungated polls (no StreamingCtx on this site).
+                    cancel_flag: turn_cancel.as_deref(),
                 },
                 None,
             )?;
@@ -4378,6 +4929,16 @@ impl Qwen35Inner {
 
             if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                 finish_reason = String::from("stop");
+                break;
+            }
+            // H2 sync cancel poll — the SAME snapshot point as the paged
+            // streaming twin (`paged_turn_stream_core_inner`): after the
+            // EOS check, before the repetition cutoff.
+            if turn_cancel
+                .as_deref()
+                .is_some_and(|flag| flag.load(Ordering::Relaxed))
+            {
+                finish_reason = String::from("cancelled");
                 break;
             }
             if let Some(reason) = crate::sampling::check_repetition_cutoff(
@@ -4560,6 +5121,7 @@ impl Qwen35Inner {
             p.reuse_cache,
             p.reuse_cache && same_live_image,
             image_cache_key,
+            p.cache_salt,
         )?;
         let plan = prefix_resolution.effective_plan;
         let cached_prefix_len = plan.cached_prefix_len;
@@ -4594,6 +5156,7 @@ impl Qwen35Inner {
                 self.config.is_linear_layer(i)
             });
 
+        let turn_cancel = self.turn_cancel.clone();
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             // === PREFILL ===
             let last_logits = {
@@ -4616,13 +5179,14 @@ impl Qwen35Inner {
                     &self.lm_head,
                     &layer_kinds,
                     adapter,
+                    turn_cancel.as_deref(),
                 )?
             };
             let (last_logits, gdn_checkpoint) = last_logits;
             self.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
                 &expanded_tokens,
                 &lookup_extra_keys,
-                0,
+                p.cache_salt,
                 gdn_checkpoint,
             );
 
@@ -4650,6 +5214,16 @@ impl Qwen35Inner {
 
                 if token_id == eos_token_id || p.extra_eos_ids.contains(&token_id) {
                     finish_reason = String::from("stop");
+                    break;
+                }
+                // H2 sync cancel poll — the SAME snapshot point as the
+                // vision paged streaming twin: after the EOS check, before
+                // the repetition cutoff.
+                if turn_cancel
+                    .as_deref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    finish_reason = String::from("cancelled");
                     break;
                 }
                 if let Some(reason) = crate::sampling::check_repetition_cutoff(
@@ -4741,7 +5315,7 @@ impl Qwen35Inner {
         // already-successful generation output.
         let keep_live_ok = p.reuse_cache
             && self
-                .finalize_dense_manual_paged_turn(&image_token_positions)
+                .finalize_dense_manual_paged_turn(&image_token_positions, p.cache_salt)
                 .is_ok();
         let continuable = if keep_live_ok {
             self.cached_token_history = full_history;
@@ -4921,6 +5495,7 @@ impl Qwen35Inner {
             p.reuse_cache,
             p.reuse_cache && same_live_image,
             image_cache_key,
+            p.cache_salt,
         )?;
         let plan = prefix_resolution.effective_plan;
         let cached_prefix_len = plan.cached_prefix_len;
@@ -4955,6 +5530,7 @@ impl Qwen35Inner {
                 self.config.is_linear_layer(i)
             });
 
+        let turn_cancel = self.turn_cancel.clone();
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
             // === PREFILL ===
             let last_logits = {
@@ -4977,13 +5553,14 @@ impl Qwen35Inner {
                     &self.lm_head,
                     &layer_kinds,
                     adapter,
+                    turn_cancel.as_deref(),
                 )?
             };
             let (last_logits, gdn_checkpoint) = last_logits;
             self.publish_dense_gdn_materialized_prefix_checkpoint_with_keys(
                 &expanded_tokens,
                 &lookup_extra_keys,
-                0,
+                p.cache_salt,
                 gdn_checkpoint,
             );
 
@@ -5131,7 +5708,7 @@ impl Qwen35Inner {
         // failure downgrades to NON-continuable rather than discarding output.
         let keep_live_ok = p.reuse_cache
             && self
-                .finalize_dense_manual_paged_turn(&image_token_positions)
+                .finalize_dense_manual_paged_turn(&image_token_positions, p.cache_salt)
                 .is_ok();
         let continuable = if keep_live_ok {
             self.cached_token_history = full_history;
@@ -5348,7 +5925,7 @@ impl Qwen35Inner {
         };
         let lookup_extra_keys =
             engine::build_paged_extra_keys(tokens.len(), block_size, image_positions);
-        let cache_salt = 0;
+        let cache_salt = p.cache_salt;
         // See `paged_turn_sync_core` for the vLLM exact-prefix cap rationale.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let live_ready;
@@ -5549,7 +6126,7 @@ impl Qwen35Inner {
         let (generated_tokens, finish_reason, decode_profiler) = match result {
             Ok(t) => {
                 let image_token_positions = self.cached_paged_image_token_positions.clone();
-                self.finalize_dense_manual_paged_turn(&image_token_positions)?;
+                self.finalize_dense_manual_paged_turn(&image_token_positions, cache_salt)?;
                 t
             }
             Err(e) => {
@@ -5839,7 +6416,7 @@ impl Qwen35Inner {
         if let Some(profiler) = mtp_profiler.as_mut() {
             profiler.end_prefill();
         }
-        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, gdn_checkpoint);
+        self.publish_dense_gdn_materialized_prefix_checkpoint(tokens, p.cache_salt, gdn_checkpoint);
 
         let mut token_history: Vec<u32> = tokens.to_vec();
         let last_logits = apply_all_penalties(last_logits, &token_history, p)?;
@@ -5889,9 +6466,11 @@ impl Qwen35Inner {
             // `run_mtp_turn` streaming path emits decoded text per token via `cb`.
             MxArray::async_eval_arrays(&[&y]);
 
-            let mut profiler = mtp_profiler
-                .take()
-                .expect("paged MTP profiler must be created before prefill");
+            let mut profiler = mtp_profiler.take().ok_or_else(|| {
+                Error::from_reason(
+                    "Qwen3.5 streaming paged MTP profiler was not initialized before decode",
+                )
+            })?;
 
             let eos_id = eos_token_id;
             let generation_stream = crate::stream::Stream::new(crate::stream::DeviceType::Gpu);
@@ -5961,6 +6540,9 @@ impl Qwen35Inner {
                     prompt_hidden,
                     prompt_hidden_ids: Some(prompt_hidden_ids),
                     prompt_hidden_position_base,
+                    // H2: the same flag StreamingCtx carries — the engine's
+                    // ungated polls and the streaming reads are idempotent.
+                    cancel_flag: Some(cancelled),
                 },
                 Some(streaming),
             )?;
@@ -6249,7 +6831,8 @@ impl Qwen35Inner {
             delta_tokens.len() as u32
         });
         profiler.begin_prefill();
-        let mut last_logits = if rebuild_full_flat_prefill {
+        let turn_cancel = self.turn_cancel.clone();
+        let prefill_result = if rebuild_full_flat_prefill {
             // Discard the paged-session flat caches (full-attn slots are
             // stale, GDN state belongs to the released paged request) and
             // re-prefill the entire conversation into fresh flat caches.
@@ -6265,7 +6848,8 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
-            )?
+                turn_cancel.as_deref(),
+            )
         } else {
             // Text-only prefill of the delta on top of the existing caches.
             let prompt = MxArray::from_uint32(&delta_tokens, &[1, delta_tokens.len() as i64])?;
@@ -6277,7 +6861,19 @@ impl Qwen35Inner {
                 &self.final_norm,
                 &self.lm_head,
                 generation_stream,
-            )?
+                turn_cancel.as_deref(),
+            )
+        };
+        // A partial prefill (cancel or failure) leaves `self.caches` ahead of
+        // `cached_token_history` — invalidate so the session goes cold instead
+        // of extending poisoned caches. Full invalidation supersedes the
+        // dirty-gate mitigation described below for this exit.
+        let mut last_logits = match prefill_result {
+            Ok(logits) => logits,
+            Err(e) => {
+                self.invalidate_dense_paged_session("delta stream flat prefill failure");
+                return Err(e);
+            }
         };
         // caches now reflect the prefilled history
         self.flat_mtp_caches_desynced = false;
@@ -6780,8 +7376,9 @@ impl Qwen35Inner {
         profiler.begin_prefill();
         let (mut last_logits, _seq_len) = {
             let prompt = MxArray::from_uint32(&prefill_tokens, &[1, prefill_tokens.len() as i64])?;
-            let last_logits = if want_prompt_hidden {
-                let (logits, ph) = chunked_prefill_with_hidden(
+            let turn_cancel = self.turn_cancel.clone();
+            let prefill_result = if want_prompt_hidden {
+                chunked_prefill_with_hidden(
                     &prompt,
                     &embedding,
                     &mut self.layers,
@@ -6790,9 +7387,12 @@ impl Qwen35Inner {
                     &self.lm_head,
                     generation_stream,
                     Some(mtp_prompt_history.keep_tokens),
-                )?;
-                prompt_hidden = Some(ph);
-                logits
+                    turn_cancel.as_deref(),
+                )
+                .map(|(logits, ph)| {
+                    prompt_hidden = Some(ph);
+                    logits
+                })
             } else {
                 chunked_prefill(
                     &prompt,
@@ -6802,7 +7402,21 @@ impl Qwen35Inner {
                     &self.final_norm,
                     &self.lm_head,
                     generation_stream,
-                )?
+                    turn_cancel.as_deref(),
+                )
+            };
+            // A partially advanced prefill (cancel or failure) must never be
+            // continued: `self.caches` would hold the partial delta while
+            // `cached_token_history` still describes the previous turn. Full
+            // invalidation supersedes the dirty-gate mitigation described
+            // below — the session goes cold, so the next turn prefills from
+            // scratch rather than rebuilding.
+            let last_logits = match prefill_result {
+                Ok(logits) => logits,
+                Err(e) => {
+                    self.invalidate_dense_paged_session("MTP stream flat prefill failure");
+                    return Err(e);
+                }
             };
 
             (last_logits, tokens.len() as i64)
@@ -7725,7 +8339,9 @@ impl Qwen35Inner {
             // Skipped steps must still advance the authoritative step counter
             // (H1) and drop the cached generation so the next cycle starts
             // clean.
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self.training_state.as_mut().ok_or_else(|| {
+                Error::from_reason("Training state disappeared during GRPO loss handling")
+            })?;
             ts.clear_generation_cache();
             ts.step += 1;
             let new_step = ts.step;
@@ -7762,7 +8378,9 @@ impl Qwen35Inner {
                     warn!("Gradient '{}' contains NaN/Inf - SKIPPING STEP", name);
                 }
 
-                let ts = self.training_state.as_mut().unwrap();
+                let ts = self.training_state.as_mut().ok_or_else(|| {
+                    Error::from_reason("Training state disappeared during GRPO gradient validation")
+                })?;
                 ts.nan_gradient_count += 1;
                 ts.consecutive_nan_count += 1;
 
@@ -7822,7 +8440,9 @@ impl Qwen35Inner {
         };
 
         // Accumulate gradients
-        let ts = self.training_state.as_mut().unwrap();
+        let ts = self.training_state.as_mut().ok_or_else(|| {
+            Error::from_reason("Training state disappeared before GRPO gradient accumulation")
+        })?;
         // Reset consecutive NaN count on successful gradient computation
         ts.consecutive_nan_count = 0;
 
@@ -7893,7 +8513,14 @@ impl Qwen35Inner {
 
                 tracing::debug!(
                     "Applied AdamW update (step={})",
-                    self.training_state.as_ref().unwrap().step
+                    self.training_state
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::from_reason(
+                                "Training state disappeared after the GRPO optimizer update",
+                            )
+                        })?
+                        .step
                 );
             } else {
                 // SGD path
@@ -7904,7 +8531,9 @@ impl Qwen35Inner {
                 tracing::debug!("Applied SGD gradients with lr: {}", lr);
             }
 
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self.training_state.as_mut().ok_or_else(|| {
+                Error::from_reason("Training state disappeared while finalizing the GRPO update")
+            })?;
             ts.accumulated_gradients = None;
             ts.micro_step = 0;
             ts.step += 1;
@@ -7935,7 +8564,9 @@ impl Qwen35Inner {
 
         // Count tokens BEFORE clearing the cache — otherwise total_tokens is
         // always zero on the success path.
-        let ts = self.training_state.as_ref().unwrap();
+        let ts = self.training_state.as_ref().ok_or_else(|| {
+            Error::from_reason("Training state disappeared before GRPO token accounting")
+        })?;
         let total_tokens: i32 = if let Some(ref ct) = ts.cached_completion_tokens {
             ct.iter()
                 .filter_map(|t| t.shape_at(0).ok())
@@ -7953,7 +8584,9 @@ impl Qwen35Inner {
         // CRITICAL: heavy_cleanup after autograd to clear compiled graph cache
         heavy_cleanup();
 
-        let ts = self.training_state.as_ref().unwrap();
+        let ts = self.training_state.as_ref().ok_or_else(|| {
+            Error::from_reason("Training state disappeared before GRPO metrics were returned")
+        })?;
         Ok(crate::training_model::TrainStepPlainMetrics {
             loss: loss_value,
             gradients_applied,
@@ -8026,7 +8659,9 @@ impl Qwen35Inner {
         if loss_value.is_nan() || loss_value.is_infinite() {
             warn!("SFT: Skipping step due to invalid loss: {}", loss_value);
             synchronize_and_clear_cache();
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self.training_state.as_mut().ok_or_else(|| {
+                Error::from_reason("Training state disappeared during SFT loss handling")
+            })?;
             ts.nan_gradient_count += 1;
             ts.consecutive_nan_count += 1;
 
@@ -8076,7 +8711,9 @@ impl Qwen35Inner {
                     warn!("SFT: Gradient '{}' contains NaN/Inf - SKIPPING STEP", name);
                 }
 
-                let ts = self.training_state.as_mut().unwrap();
+                let ts = self.training_state.as_mut().ok_or_else(|| {
+                    Error::from_reason("Training state disappeared during SFT gradient validation")
+                })?;
                 ts.nan_gradient_count += 1;
                 ts.consecutive_nan_count += 1;
 
@@ -8134,7 +8771,9 @@ impl Qwen35Inner {
         };
 
         // Accumulate gradients
-        let ts = self.training_state.as_mut().unwrap();
+        let ts = self.training_state.as_mut().ok_or_else(|| {
+            Error::from_reason("Training state disappeared before SFT gradient accumulation")
+        })?;
         ts.consecutive_nan_count = 0;
 
         Self::accumulate_gradients_inner(ts, final_gradients)?;
@@ -8203,7 +8842,14 @@ impl Qwen35Inner {
 
                 tracing::debug!(
                     "SFT: Applied AdamW update (step={})",
-                    self.training_state.as_ref().unwrap().step
+                    self.training_state
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Error::from_reason(
+                                "Training state disappeared after the SFT optimizer update",
+                            )
+                        })?
+                        .step
                 );
             } else {
                 let lr = learning_rate / grad_acc_steps as f64;
@@ -8236,7 +8882,9 @@ impl Qwen35Inner {
                 tracing::debug!("SFT: Applied SGD gradients with lr: {}", lr);
             }
 
-            let ts = self.training_state.as_mut().unwrap();
+            let ts = self.training_state.as_mut().ok_or_else(|| {
+                Error::from_reason("Training state disappeared while finalizing the SFT update")
+            })?;
             ts.accumulated_gradients = None;
             ts.micro_step = 0;
             ts.step += 1;
@@ -8258,7 +8906,9 @@ impl Qwen35Inner {
         // CRITICAL: heavy_cleanup after autograd to clear compiled graph cache
         heavy_cleanup();
 
-        let ts = self.training_state.as_ref().unwrap();
+        let ts = self.training_state.as_ref().ok_or_else(|| {
+            Error::from_reason("Training state disappeared before SFT metrics were returned")
+        })?;
         Ok(crate::training_model::TrainStepPlainMetrics {
             loss: loss_value,
             gradients_applied,
@@ -8626,6 +9276,7 @@ pub(crate) struct Qwen35PrefixState {
     effective_cached_prefix_len: usize,
     suffix_len: usize,
     full_tokens: Vec<u32>,
+    cache_salt: u64,
     gdn_prefix_already_primed: bool,
 }
 
@@ -8661,7 +9312,10 @@ impl PagedBackend for Qwen35Inner {
         // vLLM exact-prefix cap: leave at least one prompt token to prefill so
         // the decoder always has something to consume.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let seq_id: u32 = 0;
+        // Whole-turn callers retain sequence 0. The continuous scheduler
+        // activates a request-local recurrent row before entering this same
+        // prime core, so K/V and GDN state share one sequence identity.
+        let seq_id = self.active_scheduled_seq.unwrap_or(0);
         let block_size = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason(
@@ -8752,6 +9406,16 @@ impl PagedBackend for Qwen35Inner {
             cache_salt,
             continued_live_prefix,
         )?;
+        let reconciled_prefix = crate::engine::recurrent_state::reconcile_hybrid_prefix(&[
+            cached_prefix_len,
+            gdn_prefix_preparation
+                .restored_prefix_tokens
+                .saturating_add(gdn_prefix_preparation.replayed_prefix_tokens),
+        ]);
+        debug_assert_eq!(
+            reconciled_prefix, cached_prefix_len,
+            "paged K/V and GDN must agree on one hybrid prefix boundary"
+        );
         let gdn_prefix_already_primed = gdn_prefix_preparation.already_primed;
         // GDN recurrent state now covers exactly the cached prefix (installed
         // live, restored from a cold sidecar, or replayed just above). Discharge
@@ -8790,6 +9454,7 @@ impl PagedBackend for Qwen35Inner {
             effective_cached_prefix_len: cached_prefix_len as usize,
             suffix_len,
             full_tokens: plan.to_vec(),
+            cache_salt,
             gdn_prefix_already_primed,
         })
     }
@@ -8818,6 +9483,9 @@ impl PagedBackend for Qwen35Inner {
         // compressed-position image keys.
         let rope_deltas = self.cached_rope_deltas.unwrap_or(0);
         let chunk_size = self.cold_gdn_prefill_chunk_size();
+        // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
+        // can borrow `self.layers`/`self.caches` mutably at the same time.
+        let turn_cancel = self.turn_cancel.clone();
         let (logits, checkpoint) = {
             let caches_ref = self
                 .caches
@@ -8841,20 +9509,25 @@ impl PagedBackend for Qwen35Inner {
                 adapter,
                 chunk_size,
                 rope_deltas,
+                turn_cancel.as_deref(),
             )?
         };
-        self.publish_dense_gdn_materialized_prefix_checkpoint(&prefix.full_tokens, checkpoint);
+        self.publish_dense_gdn_materialized_prefix_checkpoint(
+            &prefix.full_tokens,
+            prefix.cache_salt,
+            checkpoint,
+        );
         Ok(logits)
     }
 
-    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
+    fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
         // Pure-Rust eager paged decode: the stepper drives
         // `run_paged_decode_step` against the live post-prefill adapter pools +
         // GDN caches. No compiled-graph seeding / lifecycle locks needed.
         Ok(Qwen35PagedDecode { inner: self })
     }
 
-    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
+    fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
         // Terminal lifecycle block of a paged turn. Success: keep the request
         // live across turns when reuse is on, using PER-BLOCK extra keys (NOT
         // qwen3's empty `&[]`), so the next turn's continue builds on the
@@ -8874,7 +9547,7 @@ impl PagedBackend for Qwen35Inner {
                     &self.cached_paged_image_token_positions,
                 );
                 adapter
-                    .finalize_turn_keep_live_per_block(&finalize_extra_keys, 0)
+                    .finalize_turn_keep_live_per_block(&finalize_extra_keys, cache_salt)
                     .err()
             }
             Some(adapter) => {
@@ -8890,7 +9563,7 @@ impl PagedBackend for Qwen35Inner {
                 // adapter's cold-chain frontier to 0.
                 release_pending = true;
                 adapter
-                    .register_full_blocks_for_reuse_per_block(&finalize_extra_keys, 0)
+                    .register_full_blocks_for_reuse_per_block(&finalize_extra_keys, cache_salt)
                     .err()
             }
             None => Some("paged_adapter is None during dense finalization".to_owned()),
@@ -8903,7 +9576,10 @@ impl PagedBackend for Qwen35Inner {
         // K/V chain the sidecar would anchor on was not published, so nothing
         // could ever select it.
         if finalize_error.is_none() {
-            self.capture_dense_gdn_cold_sidecar(&self.cached_paged_image_token_positions);
+            self.capture_dense_gdn_cold_sidecar(
+                &self.cached_paged_image_token_positions,
+                cache_salt,
+            );
         }
         // Always attempt the release for the non-reuse path, even when
         // registration failed (mirrors the prior `register_error.or(release)`).
@@ -10022,6 +10698,10 @@ impl ChatBackend for Qwen35Inner {
         "qwen3_5"
     }
 
+    fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.turn_cancel = flag;
+    }
+
     fn set_cache_owner_id(&mut self, owner_id: &str, root_owner_id: Option<&str>) {
         self.active_cache_owner_id.clear();
         self.active_cache_owner_id.push_str(owner_id);
@@ -10195,6 +10875,7 @@ impl ChatBackend for Qwen35Inner {
             &self.final_norm,
             &self.lm_head,
             stream,
+            self.turn_cancel.as_deref(),
         )
     }
 
@@ -10422,11 +11103,9 @@ pub struct Qwen3_5Model {
     /// Cloned from inner for pure-getter NAPI methods (no command dispatch needed).
     pub(crate) config: Qwen3_5Config,
     /// Snapshot of `Qwen35Inner::paged_adapter.is_some()` captured at
-    /// construction time. Text-only checkpoints default-OFF on Qwen3.5
-    /// (parity-pending — see CLAUDE.md and
-    /// `Qwen3_5Config::use_block_paged_cache`). VLM checkpoints default the
-    /// adapter ON: dense image turns ONLY run on the paged-vision core, and a
-    /// vision turn that reaches a None adapter errors at dispatch. Surfaced
+    /// construction time. Qwen3.5 checkpoints default the adapter ON; an
+    /// explicit false or a structurally unsupported sym8 checkpoint keeps the
+    /// flat path. Dense image turns only run on the paged-vision core. Surfaced
     /// through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
     /// Snapshot of `Qwen35Inner::has_mtp_weights()` captured
@@ -10454,6 +11133,8 @@ pub struct Qwen3_5Model {
     /// coordinator on drop, so the global cap can shrink once JS GCs
     /// the wrapper.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    /// RAII debit for the native paged KV pool.
+    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
 }
 
 #[napi]
@@ -10463,16 +11144,37 @@ impl Qwen3_5Model {
     ///
     /// `true` iff `Qwen35Inner::paged_adapter` was successfully
     /// constructed at load time (driven by
-    /// `Qwen3_5Config::use_block_paged_cache`, default-OFF for text-only
-    /// checkpoints because parity is pending real-weights validation, and
-    /// default-ON for VLM checkpoints). On VLM checkpoints dense image turns
-    /// ONLY run on the paged-vision core; a vision turn that reaches a None
-    /// adapter errors at dispatch. Surfaced through this NAPI method so
+    /// `Qwen3_5Config::use_block_paged_cache`, default-ON for every compatible
+    /// checkpoint). On VLM checkpoints dense image turns ONLY run on the
+    /// paged-vision core; a vision turn that reaches a None adapter errors at
+    /// dispatch. Surfaced through this NAPI method so
     /// server endpoints can branch on it without round-tripping through
     /// the model thread.
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
+    }
+
+    /// Native admission width for plain text AR turns. Installed vision and
+    /// MTP modules do not disable text batching: requests that actually carry
+    /// media or set `enable_mtp=true` are routed through the ordered exclusive
+    /// lane by the scheduler.
+    #[napi]
+    pub fn max_concurrent_sequences(&self) -> u32 {
+        if self.paged_active
+            && Qwen35SchedulerState::continuous_batching_enabled()
+            && !Qwen35SchedulerState::force_serial()
+        {
+            crate::engine::hybrid_scheduler::scheduler_max_num_seqs() as u32
+        } else {
+            1
+        }
+    }
+
+    /// Snapshot scheduler occupancy plus unified block/recurrent admission.
+    #[napi]
+    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
+        send_and_await(&self.thread, |reply| Qwen35Cmd::SchedulerStats { reply }).await
     }
 
     /// Whether this checkpoint shipped an MTP head (module loaded by
@@ -10596,13 +11298,14 @@ impl Qwen3_5Model {
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         self.thread
             .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionStart {
                 messages,
@@ -10622,13 +11325,14 @@ impl Qwen3_5Model {
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
         self.thread
             .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionContinue {
                 messages,
@@ -10656,24 +11360,22 @@ impl Qwen3_5Model {
     /// the desync flag on flat MTP. Serialized behind the model thread, so it
     /// observes the fully-finalized preceding turn.
     #[doc(hidden)]
-    pub async fn mtp_flat_state_for_test(&self) -> (usize, bool, u64, usize) {
+    pub async fn mtp_flat_state_for_test(&self) -> Result<(usize, bool, u64, usize)> {
         crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::MtpFlatStateForTest {
             reply,
         })
         .await
-        .expect("mtp_flat_state_for_test: model thread reply failed")
     }
 
     /// Test-only: arm the flat-MTP desync heal so the NEXT delta turn takes the
     /// discard+re-prefill path. Lets a test exercise the heal deterministically
     /// (the mid-cycle cancel that naturally arms it is host-timing-dependent).
     #[doc(hidden)]
-    pub async fn force_flat_mtp_desync_for_test(&self) {
+    pub async fn force_flat_mtp_desync_for_test(&self) -> Result<()> {
         crate::model_thread::send_and_await(&self.thread, |reply| {
             Qwen35Cmd::ForceFlatMtpDesyncForTest { reply }
         })
         .await
-        .expect("force_flat_mtp_desync_for_test: model thread reply failed")
     }
 
     /// Get the number of parameters in the model.
@@ -10838,6 +11540,7 @@ pub(crate) fn async_eval_layer_caches(caches: &Option<Vec<Qwen3_5LayerCache>>) {
 ///
 /// Accepts `&MxArray` shaped `[1, seq_len]`. Slices on GPU — no data roundtrip.
 /// For `&[u32]` inputs (from tokenizer), callers convert with `MxArray::from_uint32` first.
+#[allow(clippy::too_many_arguments)]
 fn chunked_prefill(
     prompt: &MxArray,
     embedding: &Embedding,
@@ -10846,6 +11549,7 @@ fn chunked_prefill(
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
     generation_stream: crate::stream::Stream,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<MxArray> {
     chunked_prefill_with_size(
         prompt,
@@ -10856,9 +11560,11 @@ fn chunked_prefill(
         lm_head,
         generation_stream,
         PREFILL_STEP_SIZE,
+        turn_cancel,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chunked_prefill_with_size(
     prompt: &MxArray,
     embedding: &Embedding,
@@ -10868,6 +11574,7 @@ fn chunked_prefill_with_size(
     lm_head: &Option<LinearProj>,
     generation_stream: crate::stream::Stream,
     chunk_size: i64,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<MxArray> {
     let total_len = prompt.shape_at(1)?;
     if total_len <= 0 {
@@ -10884,6 +11591,14 @@ fn chunked_prefill_with_size(
     // falls back to synchronous eval_layer_caches (the prior behavior).
     let chunk_async = std::env::var("MLX_PREFILL_SYNC_BETWEEN_CHUNKS").is_err();
     while total_len - offset > chunk_size {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk
+        // boundary. The Err rides the flat engine's
+        // `fail_closed_flat_turn` arm — no `save_cache_state`, the
+        // session is invalidated, so the partially-advanced caches never
+        // become a live prefix.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let chunk = prompt.slice_axis(1, offset, offset + chunk_size)?;
         {
             let _stream_ctx = StreamContext::new(generation_stream);
@@ -10898,6 +11613,14 @@ fn chunked_prefill_with_size(
         offset += chunk_size;
     }
 
+    // The final remainder is a chunk boundary too once at least one looped
+    // chunk ran: poll before forwarding it so a cancel landing during the
+    // last looped chunk aborts instead of riding through the remainder.
+    // `offset == 0` means the whole prompt fits in one forward — single-shot
+    // prefills stay uncancellable by design.
+    if offset > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+        return Err(Error::from_reason("prefill cancelled"));
+    }
     let remaining = prompt.slice_axis(1, offset, total_len)?;
     let last_logits = {
         let _stream_ctx = StreamContext::new(generation_stream);
@@ -10919,6 +11642,7 @@ fn chunked_prefill_with_size(
 /// chunks whose hidden is kept; chunks before the requested tail use the
 /// logits-only path and discard hidden to avoid materializing prompt history
 /// MTPLX would not seed.
+#[allow(clippy::too_many_arguments)]
 fn chunked_prefill_with_hidden(
     prompt: &MxArray,
     embedding: &Embedding,
@@ -10928,6 +11652,7 @@ fn chunked_prefill_with_hidden(
     lm_head: &Option<LinearProj>,
     generation_stream: crate::stream::Stream,
     keep_last_hidden: Option<usize>,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, MxArray)> {
     chunked_prefill_with_hidden_with_size(
         prompt,
@@ -10939,9 +11664,11 @@ fn chunked_prefill_with_hidden(
         generation_stream,
         keep_last_hidden,
         PREFILL_STEP_SIZE,
+        turn_cancel,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chunked_prefill_with_hidden_with_size(
     prompt: &MxArray,
     embedding: &Embedding,
@@ -10952,6 +11679,7 @@ fn chunked_prefill_with_hidden_with_size(
     generation_stream: crate::stream::Stream,
     keep_last_hidden: Option<usize>,
     chunk_size: i64,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, MxArray)> {
     let total_len = prompt.shape_at(1)?;
     if total_len <= 0 {
@@ -10971,6 +11699,11 @@ fn chunked_prefill_with_hidden_with_size(
         .unwrap_or(0);
 
     while total_len - offset > chunk_size {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary,
+        // same contract as `chunked_prefill_with_size`.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let end = offset + chunk_size;
         let chunk = prompt.slice_axis(1, offset, end)?;
         let overlaps_kept_tail = end > keep_start;
@@ -11001,6 +11734,11 @@ fn chunked_prefill_with_hidden_with_size(
         offset = end;
     }
 
+    // Final-remainder boundary poll, mirroring `chunked_prefill_with_size`:
+    // single-shot (`offset == 0`) stays uncancellable by design.
+    if offset > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+        return Err(Error::from_reason("prefill cancelled"));
+    }
     let remaining = prompt.slice_axis(1, offset, total_len)?;
     let (last_logits, last_hidden) = {
         let _stream_ctx = StreamContext::new(generation_stream);
@@ -11400,7 +12138,9 @@ pub(crate) fn inject_image_placeholders(
                         new_tokens.extend(std::iter::repeat_n(IMAGE_TOKEN_ID as u32, count));
                     }
                     None => {
-                        unreachable!("placeholder count was validated before expansion");
+                        return Err(Error::from_reason(
+                            "image placeholder expansion exhausted its validated image counts",
+                        ));
                     }
                 }
             } else {
@@ -11458,14 +12198,12 @@ pub(crate) fn get_rope_index(
     let seq_len = shape[1];
 
     // If no images, use simple sequential positions
-    if image_grid_thw.is_none() {
+    let Some(grid_thw) = image_grid_thw else {
         let pos = MxArray::arange(0.0, seq_len as f64, Some(1.0), None)?;
         let pos = pos.reshape(&[1, 1, seq_len])?;
         let position_ids = MxArray::tile(&pos, &[3, batch_size as i32, 1])?;
         return Ok((position_ids, 0));
-    }
-
-    let grid_thw = image_grid_thw.unwrap();
+    };
     let input_ids_data = input_ids.to_int32()?;
     grid_thw.eval();
     let grid_data = grid_thw.to_int32()?;
@@ -11616,8 +12354,11 @@ pub(crate) fn get_rope_index(
         // End of the last image token in the token stream — everything
         // beyond is trailing text. For case (a) this is the last run's
         // end; for case (b) it's the shared run's end. In both cases
-        // it equals `image_runs.last().unwrap().1`.
-        let last_image_end = image_runs.last().expect("at least one run").1;
+        // it equals the end of the validated non-empty `image_runs` list.
+        let last_image_end = image_runs
+            .last()
+            .ok_or_else(|| Error::from_reason("image run validation lost its non-empty run"))?
+            .1;
 
         // Emit positions by walking the sequence: text gap, image,
         // text gap, image, … final text gap. `current_pos` carries the
@@ -13170,75 +13911,6 @@ mod rope_index_tests {
 }
 
 #[cfg(test)]
-mod prefix_cache_reuse_integration_tests {
-    //! End-to-end tests for the prefix KV cache reuse refactor on
-    //! Qwen3.5 Dense. These verify that `chat_session_start_sync` no
-    //! longer unconditionally wipes the cache — stateless agent clients
-    //! (Aider, Codex CLI, pi-mono, etc.) that resend the full transcript
-    //! on every turn should hit the `verify_cache_prefix_direct`
-    //! exact-append path and pay only the delta prefill cost.
-    //!
-    //! These tests are `#[ignore]`-marked because they require loading a
-    //! real Qwen3.5 model file and a tokenizer. Run them with:
-    //!
-    //!     cargo test -p mlx-core --test '*' -- --ignored prefix_cache_reuse_integration
-    //!
-    //! with `MLX_NODE_QWEN35_MODEL_DIR` set to a local Qwen3.5 dir
-    //! (e.g. `~/models/Qwen3.5-0.8B`).
-    //!
-    //! The test bodies are intentionally skeletal — they document what
-    //! needs to hold rather than wiring up the full model-loading
-    //! boilerplate. Flesh them out alongside the end-to-end harness in
-    //! `serve.ts`.
-
-    /// Append hit: two back-to-back session-start calls where the second's
-    /// token sequence is `first_tokens + extra_tokens`. The result of the
-    /// second call must report `cached_tokens > 0` and a prefill that
-    /// counts only the delta tokens.
-    #[ignore = "requires a real Qwen3.5 Dense model directory; run with --ignored"]
-    #[test]
-    fn append_hit_reuses_cached_prefix() {
-        // Pseudocode for the real test body:
-        //
-        //   let mut model = Qwen35Model::load(env!("MLX_NODE_QWEN35_MODEL_DIR"))?;
-        //   let turn1 = vec![ChatMessage::user("What is 2+2?")];
-        //   let r1 = model.chat_session_start_sync(turn1, cfg())?;
-        //   assert_eq!(r1.cached_tokens, 0);
-        //
-        //   let turn2 = vec![
-        //       ChatMessage::user("What is 2+2?"),
-        //       ChatMessage::assistant(&r1.text),
-        //       ChatMessage::user("And 3+3?"),
-        //   ];
-        //   let r2 = model.chat_session_start_sync(turn2, cfg())?;
-        //   assert!(r2.cached_tokens > 0);
-        //   assert!(r2.performance.as_ref().unwrap().prefill_tokens
-        //             < turn2_token_count);  // only the delta was prefilled
-    }
-
-    /// Divergence miss: two calls with totally different histories. The
-    /// result of the second call must report `cached_tokens == 0` and a
-    /// full-history prefill.
-    #[ignore = "requires a real Qwen3.5 Dense model directory; run with --ignored"]
-    #[test]
-    fn divergence_miss_resets_and_full_prefills() {
-        // Pseudocode:
-        //
-        //   let r1 = model.chat_session_start_sync(
-        //       vec![ChatMessage::user("Hello")],
-        //       cfg(),
-        //   )?;
-        //   let r2 = model.chat_session_start_sync(
-        //       vec![ChatMessage::user("Goodbye")],
-        //       cfg(),
-        //   )?;
-        //   assert_eq!(r2.cached_tokens, 0);
-        //   // And the second call must have done a full prefill, not
-        //   // attempted to decode from stale caches.
-    }
-}
-
-#[cfg(test)]
 mod paged_construction_tests {
     //! Smoke tests for the block-paged adapter construction on Qwen3.5
     //! dense. The forward dispatch lives in `paged_turn_sync_core`
@@ -13302,6 +13974,70 @@ mod paged_construction_tests {
         cfg.linear_value_head_dim = 32;
         cfg.paged_cache_memory_mb = Some(256);
         cfg
+    }
+
+    #[test]
+    fn scheduled_recurrent_cap_counts_the_active_row_and_parked_rows() {
+        let mut inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+        let bytes = inner.config.recurrent_state_bytes();
+
+        inner
+            .activate_scheduled_recurrent(1)
+            .expect("activate first row");
+        assert_eq!(inner.scheduled_recurrent_units(), 1);
+        assert_eq!(inner.scheduled_recurrent_bytes(), bytes);
+
+        inner
+            .activate_scheduled_recurrent(2)
+            .expect("park first and activate second row");
+        assert_eq!(inner.scheduled_recurrent_units(), 2);
+        assert_eq!(inner.scheduled_recurrent_bytes(), bytes * 2);
+        assert!(
+            inner.activate_scheduled_recurrent(3).is_err(),
+            "the active row must count toward the two-unit cap"
+        );
+
+        inner.release_scheduled_recurrent_for(1);
+        inner
+            .activate_scheduled_recurrent(3)
+            .expect("an idle row release opens exactly one slot");
+        assert_eq!(inner.scheduled_recurrent_units(), 2);
+        assert_eq!(inner.scheduled_recurrent_bytes(), bytes * 2);
+    }
+
+    #[test]
+    fn all_full_attention_recurrent_lifecycle_is_a_noop() {
+        let mut config = tiny_cfg(false);
+        config.full_attention_interval = 1;
+        let mut inner = Qwen35Inner::new(config).expect("construct all-full dense model");
+        assert_eq!(inner.config.recurrent_state_bytes(), 0);
+
+        inner
+            .activate_scheduled_recurrent(7)
+            .expect("activate empty recurrent shell");
+        assert_eq!(inner.active_scheduled_seq, Some(7));
+        inner
+            .park_active_scheduled_recurrent()
+            .expect("zero-byte recurrent state must park as a no-op");
+
+        assert_eq!(inner.active_scheduled_seq, None);
+        assert!(
+            inner.caches.is_none(),
+            "the empty recurrent shell is dropped"
+        );
+        assert_eq!(inner.scheduled_recurrent_units(), 0);
+        assert_eq!(inner.scheduled_recurrent_bytes(), 0);
+        assert!(!inner.has_scheduled_recurrent(7));
+        assert!(inner.can_activate_scheduled_recurrent(8));
+        inner
+            .validate_scheduled_decode_residency(&[(7, 11), (8, 13)])
+            .expect("attention-only decode must not require recurrent rows");
+        assert!(
+            inner
+                .scheduled_decode_recurrent_snapshots(&[(7, 11), (8, 13)])
+                .expect("attention-only decode must not snapshot recurrent rows")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -13456,6 +14192,123 @@ mod paged_construction_tests {
         }
     }
 
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn dense_hybrid_n2_batched_decode_matches_scalar_replay() {
+        let Some((mut inner, cfg)) =
+            paged_inner_or_skip("dense_hybrid_n2_batched_decode_matches_scalar_replay")
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        let prompt = vec![7, 11, 13, 17];
+        for seq_id in [101, 202] {
+            inner
+                .activate_scheduled_recurrent(seq_id)
+                .expect("activate recurrent row");
+            inner.set_cache_owner_id(&format!("owner-{seq_id}"), None);
+            let prefix = inner
+                .prime_prefix_state(&prompt, true, 16, &[], seq_id as u64)
+                .expect("prime request");
+            inner
+                .paged_prefill(
+                    &prompt[prefix.effective_cached_prefix_len..],
+                    &prefix,
+                    Stream::new(DeviceType::Gpu),
+                )
+                .expect("prefill request")
+                .eval();
+            inner
+                .park_active_scheduled_recurrent()
+                .expect("park recurrent row");
+        }
+
+        let snapshots = [101, 202]
+            .into_iter()
+            .map(|seq_id| {
+                let state = inner
+                    .scheduled_recurrent
+                    .live(seq_id)
+                    .expect("prefilled recurrent row");
+                let snapshot = crate::models::qwen3_5::paged_forward::snapshot_materialized_linear_layer_caches(state)
+                    .expect("materialized GDN state");
+                (seq_id, snapshot)
+            })
+            .collect::<Vec<_>>();
+        let decode_rows = [(101, 19), (202, 23)];
+        let batched_started = Instant::now();
+        let batched = inner
+            .run_paged_decode_step_batched(&decode_rows)
+            .expect("batched hybrid decode");
+        assert_eq!(
+            batched.shape().unwrap().as_ref(),
+            [2, 1, cfg.vocab_size as i64]
+        );
+        let batched_tokens = batched
+            .argmax(-1, Some(false))
+            .unwrap()
+            .to_uint32()
+            .unwrap()
+            .to_vec();
+        let batched_elapsed = batched_started.elapsed();
+
+        for &(seq_id, _) in decode_rows.iter().rev() {
+            let adapter = inner.paged_adapter.as_mut().unwrap();
+            adapter.activate_request(seq_id).unwrap();
+            adapter.rollback_last_tokens(1).unwrap();
+        }
+        for (seq_id, snapshot) in snapshots {
+            inner
+                .scheduled_recurrent
+                .insert_live(seq_id, inner.config.recurrent_state_bytes(), snapshot)
+                .expect("restore GDN snapshot");
+        }
+
+        let serial_started = Instant::now();
+        let mut serial_rows = Vec::new();
+        for (seq_id, token_id) in decode_rows {
+            inner
+                .activate_paged_seq(seq_id)
+                .expect("activate scalar row");
+            let embed = inner.embedding.clone();
+            let logits = {
+                let caches = inner.caches.as_mut().expect("active GDN state");
+                let adapter = inner.paged_adapter.as_mut().expect("paged adapter");
+                crate::models::qwen3_5::paged_forward::run_paged_decode_step(
+                    token_id,
+                    &embed,
+                    &mut inner.layers,
+                    caches,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    &inner.layer_kinds,
+                    adapter,
+                    0,
+                )
+                .expect("scalar hybrid replay")
+            };
+            serial_rows.push(logits);
+            inner
+                .park_active_scheduled_recurrent()
+                .expect("park scalar row");
+        }
+        let serial = MxArray::concatenate_many(serial_rows.iter().collect(), Some(0)).unwrap();
+        let serial_tokens = serial
+            .argmax(-1, Some(false))
+            .unwrap()
+            .to_uint32()
+            .unwrap()
+            .to_vec();
+        let serial_elapsed = serial_started.elapsed();
+        assert_eq!(batched_tokens, serial_tokens);
+        eprintln!(
+            "qwen3.5 N=2 decode microbench: fused={:.3}ms exclusive={:.3}ms speedup={:.2}x",
+            batched_elapsed.as_secs_f64() * 1_000.0,
+            serial_elapsed.as_secs_f64() * 1_000.0,
+            serial_elapsed.as_secs_f64() / batched_elapsed.as_secs_f64().max(f64::EPSILON),
+        );
+    }
+
     fn reset_paged_request(inner: &mut Qwen35Inner, prompt: &[u32]) {
         inner.caches = Some(
             (0..inner.config.num_layers as usize)
@@ -13535,6 +14388,7 @@ mod paged_construction_tests {
             adapter,
             chunk_size,
             /* cached_rope_deltas */ 0,
+            None,
         )
     }
 
@@ -13580,6 +14434,7 @@ mod paged_construction_tests {
             chunk_size,
             Some(keep_tokens),
             /* cached_rope_deltas */ 0,
+            None,
         )
     }
 
@@ -13734,6 +14589,7 @@ mod paged_construction_tests {
             &inner.lm_head,
             Stream::new(DeviceType::Gpu),
             chunk_size,
+            None,
         )
     }
 
@@ -14110,7 +14966,7 @@ mod paged_construction_tests {
         // for registration/evaluation/release failures without allocating a
         // Metal LayerKVPool in this unit test.
         <Qwen35Inner as crate::engine::backend::PagedBackend>::finalize_paged_turn(
-            &mut inner, true,
+            &mut inner, true, 0,
         );
         assert!(inner.paged_finalize_failed);
         assert!(inner.caches.is_none());
@@ -14157,7 +15013,7 @@ mod paged_construction_tests {
         seed_dense_paged_image_session(&mut inner);
 
         let error = inner
-            .finalize_dense_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)])
+            .finalize_dense_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)], 0)
             .expect_err("missing adapter must fail manual finalization");
         assert!(error.to_string().contains("paged finalization failed"));
         assert!(inner.caches.is_none());
@@ -14183,6 +15039,7 @@ mod paged_construction_tests {
                 true,
                 true,
                 0xD35E,
+                0,
             )
             .expect_err("missing adapter must fail VLM prefix preparation");
         assert!(inner.caches.is_none());
@@ -14214,6 +15071,7 @@ mod paged_construction_tests {
     #[test]
     fn test_qwen35_planned_decoder_overrides_raw_mtp_flag() {
         let mut config = ChatConfig {
+            cache_salt: None,
             cache_owner_id: None,
             cache_root_owner_id: None,
             enable_mtp: Some(true),
@@ -14324,6 +15182,7 @@ mod paged_construction_tests {
             Stream::new(DeviceType::Gpu),
             Some(5),
             16,
+            None,
         )?;
         assert_finite_batch_vocab_logits(
             &logits,
@@ -14360,6 +15219,7 @@ mod paged_construction_tests {
             Stream::new(DeviceType::Gpu),
             Some(100),
             16,
+            None,
         )?;
         assert_eq!(
             full_tail_hidden.shape_at(1)?,
@@ -14647,23 +15507,28 @@ mod paged_construction_tests {
             .expect("paged_adapter")
             .block_size();
         let extra_keys = engine::build_paged_extra_keys(prompt.len(), block_size, &[]);
-        assert!(inner.remember_dense_gdn_materialized_prefix_checkpoint(
+        let cache_salt = 59;
+        inner.publish_dense_gdn_materialized_prefix_checkpoint(
             &prompt,
-            block_size,
-            &extra_keys,
-            0,
-            checkpoint,
-        ));
+            cache_salt,
+            vec![checkpoint],
+        );
         inner.active_cache_owner_id = "child-session".to_owned();
         assert!(
             inner
-                .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, 0)
+                .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, cache_salt,)
                 .is_none(),
             "an exact token/hash checkpoint owned by another session must not restore"
         );
         inner.active_cache_owner_id.clear();
+        assert!(
+            inner
+                .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, 0)
+                .is_none(),
+            "the salted publisher must not silently store the checkpoint in domain zero"
+        );
         let restored = inner
-            .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, 0)
+            .find_dense_gdn_prefix_checkpoint(&prompt, 16, block_size, &extra_keys, cache_salt)
             .expect("exact checkpoint restore");
         assert_eq!(restored.0, 16);
         assert!(dense_paged_linear_caches_ready(
@@ -14671,7 +15536,7 @@ mod paged_construction_tests {
             Some(&restored.1)
         ));
         let prepared = inner
-            .prepare_dense_gdn_prefix_state(&prompt, 16, block_size, &extra_keys, 0, false)
+            .prepare_dense_gdn_prefix_state(&prompt, 16, block_size, &extra_keys, cache_salt, false)
             .expect("prepare one-block rollback checkpoint");
         assert_eq!(prepared.state, "checkpoint");
         assert!(prepared.already_primed);
@@ -14679,7 +15544,7 @@ mod paged_construction_tests {
         assert_eq!(prepared.replayed_prefix_tokens, 0);
 
         let prepared = inner
-            .prepare_dense_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, 0, false)
+            .prepare_dense_gdn_prefix_state(&prompt, 32, block_size, &extra_keys, cache_salt, false)
             .expect("prepare full-boundary hit from stable checkpoint");
         assert_eq!(prepared.state, "checkpoint_replay_materialized");
         assert!(prepared.already_primed);
@@ -14687,7 +15552,96 @@ mod paged_construction_tests {
         assert_eq!(prepared.replayed_prefix_tokens, 16);
 
         let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
-        let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+        let _ = adapter.register_full_blocks_for_reuse(&[], cache_salt);
+        adapter.release_request().expect("release_request");
+    }
+
+    /// H1b regression: a cancel flag observed between materialized GDN
+    /// replay chunks must abort the replay with the distinguished error,
+    /// and the staged-commit wrapper must drop the partial state (no warm
+    /// publish). A one-chunk replay stays single-shot and ignores the flag.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn test_dense_materialized_gdn_replay_cancels_between_chunks() {
+        let Some((mut inner, cfg)) =
+            paged_inner_or_skip("test_dense_materialized_gdn_replay_cancels_between_chunks")
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        let prompt: Vec<u32> = (0u32..37).map(|i| (i * 19 + 11) % 128).collect();
+        let embed = inner.embedding.clone();
+        let cancelled = std::sync::Arc::new(AtomicBool::new(true));
+
+        // Multi-chunk replay with the flag pre-set: chunk 1 runs, the
+        // between-chunk poll aborts before chunk 2, and the staged cache is
+        // dropped — the active cache is never published.
+        {
+            let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+            let staged = fresh_dense_layer_caches(&cfg);
+            let layers = &mut inner.layers;
+            let err = replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+                super::super::paged_forward::run_gdn_only_prefill_materialized_with_chunk_size(
+                    &prompt,
+                    &embed,
+                    layers,
+                    staged,
+                    7,
+                    Some(cancelled.as_ref()),
+                )
+            })
+            .expect_err("cancelled multi-chunk replay must abort");
+            assert!(
+                err.to_string().contains("prefill cancelled"),
+                "replay abort must carry the distinguished error, got: {err}",
+            );
+            assert!(
+                active.is_none(),
+                "a cancelled replay must never publish the staged cache"
+            );
+        }
+
+        // One-chunk exception: the same pre-set flag is ignored when the
+        // whole prefix fits in a single replay chunk (single-shot contract).
+        {
+            let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+            let staged = fresh_dense_layer_caches(&cfg);
+            let layers = &mut inner.layers;
+            replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+                super::super::paged_forward::run_gdn_only_prefill_materialized_with_chunk_size(
+                    &prompt,
+                    &embed,
+                    layers,
+                    staged,
+                    prompt.len(),
+                    Some(cancelled.as_ref()),
+                )
+            })
+            .expect("single-chunk replay stays uncancellable");
+            assert!(active.is_some(), "a completed replay must publish");
+        }
+
+        // Un-set flag: the multi-chunk replay completes and publishes.
+        cancelled.store(false, Ordering::Relaxed);
+        {
+            let mut active: Option<Vec<Qwen3_5LayerCache>> = None;
+            let staged = fresh_dense_layer_caches(&cfg);
+            let layers = &mut inner.layers;
+            replay_gdn_cache_and_commit(&mut active, staged, |staged| {
+                super::super::paged_forward::run_gdn_only_prefill_materialized_with_chunk_size(
+                    &prompt,
+                    &embed,
+                    layers,
+                    staged,
+                    7,
+                    Some(cancelled.as_ref()),
+                )
+            })
+            .expect("uncancelled multi-chunk replay must complete");
+            assert!(active.is_some(), "a completed replay must publish");
+        }
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
         adapter.release_request().expect("release_request");
     }
 
@@ -14866,7 +15820,7 @@ mod paged_construction_tests {
         let _serialized = crate::cold_tier::sidecar_counter_test_lock();
         let before = crate::cold_tier::cold_sidecar_telemetry();
         inner
-            .finalize_dense_manual_paged_turn(&[])
+            .finalize_dense_manual_paged_turn(&[], 0)
             .expect("manual paged finalization must succeed");
         let after = crate::cold_tier::cold_sidecar_telemetry();
 
@@ -14931,7 +15885,7 @@ mod paged_construction_tests {
         let _serialized = crate::cold_tier::sidecar_counter_test_lock();
         let before = crate::cold_tier::cold_sidecar_telemetry();
         inner
-            .finalize_dense_manual_paged_turn(&[(4, 99)])
+            .finalize_dense_manual_paged_turn(&[(4, 99)], 0)
             .expect("manual paged finalization must succeed");
         let after = crate::cold_tier::cold_sidecar_telemetry();
 

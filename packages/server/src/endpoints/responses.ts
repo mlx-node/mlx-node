@@ -26,11 +26,27 @@ import {
   genId,
   mapFinishReasonToStatus,
 } from '../mappers/response.js';
-import type { ModelWorkCoordinator } from '../model-work-coordinator.js';
+import {
+  type ModelLoadAdmission,
+  ModelLoadQueueFullError,
+  type ModelWorkCoordinator,
+} from '../model-work-coordinator.js';
 import { getPendingWritesFor } from '../pending-writes.js';
 import type { ModelRegistry } from '../registry.js';
-import { maybeWarnPromptCacheKeyIneligible, QueueFullError, type SessionRegistry } from '../session-registry.js';
-import { beginSSE, endSSE, writeSSEEvent } from '../streaming.js';
+import {
+  maybeWarnPromptCacheKeyIneligible,
+  QueueFullError,
+  type PreDispatchAdmission,
+  type SessionRegistry,
+} from '../session-registry.js';
+import {
+  awaitDrainOrClose,
+  beginSSE,
+  endSSE,
+  type SSEClientAbortTracker,
+  trackSSEClientAbort,
+  writeSSEEvent as writeRawSSEEvent,
+} from '../streaming.js';
 import { longestSuffixPrefixOverlap } from '../text-recovery.js';
 import { mergeTimingUsageExtensions, resolveServerTuningForUsage, type ServerTimingForUsage } from '../timing.js';
 import { ToolCallTagBuffer } from '../tool-call-buffer.js';
@@ -73,9 +89,17 @@ export const MAX_OUTPUT_TOKENS = 2147483647; // i32::MAX — native ChatConfig.m
 function withAdmissionControlledInference<T>(
   sessionReg: SessionRegistry,
   modelWorkCoordinator: ModelWorkCoordinator | undefined,
+  // Pre-dispatch permit handed off ATOMICALLY as this call's admission
+  // (the selected admission lane consumes it instead of charging
+  // `queuedCount` a second time). See `beginPreDispatchAdmission`. Placed BEFORE `fn`
+  // so call sites keep the trailing-closure layout.
+  permit: PreDispatchAdmission | undefined,
   fn: () => Promise<T>,
 ): Promise<T> {
-  return sessionReg.withExclusive(() => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn()));
+  const run = () => (modelWorkCoordinator ? modelWorkCoordinator.withInference(fn) : fn());
+  return sessionReg.concurrentAdmissionLimit > 1
+    ? sessionReg.withAdmission(run, permit)
+    : sessionReg.withExclusive(run, permit);
 }
 
 /**
@@ -236,10 +260,9 @@ async function handleNonStreaming(
     serverTiming,
   );
 
-  // `chatSession*` has no AbortSignal surface yet, so a mid-decode
-  // client disconnect still burns the full decode budget — peer loss
-  // is only observable when native decode resolves. Disconnect
-  // detection is delegated to `endJson`'s `isSocketGone(res)` check:
+  // The request AbortSignal reaches the normal session method, whose wrapper
+  // maps it to native cancellation at the next model safepoint.
+  // `endJson`'s `isSocketGone(res)` remains the final transport race check:
   // on a dead peer it rejects AFTER committing `responseMode = 'json'`
   // so the outer catch routes to the JSON error / socket-destroy
   // shape; `responseBodyWritten` flips only from `res.end`'s write
@@ -341,6 +364,35 @@ async function handleStreamingNative(
   visibility: TransportVisibility,
   serverTiming?: ServerTimingForUsage,
 ): Promise<StreamingHandlerOutcome> {
+  const abort = trackSSEClientAbort(res, httpReq);
+  try {
+    return await handleStreamingNativeWithAbort(
+      res,
+      chatStream,
+      req,
+      responseId,
+      previousResponseId,
+      wasCommitted,
+      abort,
+      visibility,
+      serverTiming,
+    );
+  } finally {
+    abort.dispose();
+  }
+}
+
+async function handleStreamingNativeWithAbort(
+  res: ServerResponse,
+  chatStream: AsyncGenerator<ChatStreamEvent>,
+  req: ResponsesAPIRequest,
+  responseId: string,
+  previousResponseId: string | undefined,
+  wasCommitted: () => boolean,
+  abort: SSEClientAbortTracker,
+  visibility: TransportVisibility,
+  serverTiming?: ServerTimingForUsage,
+): Promise<StreamingHandlerOutcome> {
   // `runSessionStreaming` completed the exact token/capacity preflight before
   // handing us this iterator. Commit SSE immediately instead of entering the
   // generator here: its first `next()` also starts image processing/prefill and
@@ -353,8 +405,23 @@ async function handleStreamingNative(
   markSSEMode(visibility);
 
   const partial = buildPartialResponse(req, responseId, previousResponseId);
-  writeSSEEvent(res, 'response.created', { response: partial });
-  writeSSEEvent(res, 'response.in_progress', { response: partial });
+
+  // Arm the close-safe drain listener synchronously on the FIRST false write.
+  // A native event can expand into several SSE frames, so the promise stays
+  // sticky until the loop awaits it; no later true return may erase the gate.
+  let pendingDrain: Promise<void> | null = null;
+  const writeSSEEvent = (response: ServerResponse, eventType: string, data: object): void => {
+    const ok = writeRawSSEEvent(response, eventType, data);
+    if (!ok && pendingDrain === null) {
+      pendingDrain = awaitDrainOrClose(response, { onTimeout: () => abort.markAborted() });
+    }
+  };
+  const drainPending = async (): Promise<void> => {
+    const drain = pendingDrain;
+    if (drain === null) return;
+    await drain;
+    if (pendingDrain === drain) pendingDrain = null;
+  };
 
   const outputItems: OutputItem[] = [];
   let outputIndex = 0;
@@ -390,43 +457,24 @@ async function handleStreamingNative(
   // future native plumbing change can lift it through.
   let cachedTokens: number | undefined;
 
-  // Fault state. `thrownError` sticks on a generator throw;
-  // `clientAborted` sticks on any `close`/`error` from `httpReq`, `res`,
-  // or `res.socket`. Either flips the post-loop block to the failure
-  // epilogue. Listening on `res` and `res.socket` matters because
-  // non-terminal SSE writes can silently "succeed" on a dead socket.
+  // Fault state. `thrownError` sticks on a generator throw. The outer
+  // `SSEClientAbortTracker` remains armed through every residual write, drain,
+  // classification, and terminal flush — not merely through this loop.
   let thrownError: Error | null = null;
-  let clientAborted = false;
-  const onClientClose = () => {
-    clientAborted = true;
-  };
-  const onClientError = (_err: unknown) => {
-    clientAborted = true;
-  };
-  const onResClose = () => {
-    clientAborted = true;
-  };
-  const onResError = (_err: unknown) => {
-    clientAborted = true;
-  };
-  const resSocketForAbort = res.socket;
-  if (httpReq) {
-    httpReq.once('close', onClientClose);
-    httpReq.once('error', onClientError);
-  }
-  res.once('close', onResClose);
-  res.once('error', onResError);
-  if (resSocketForAbort != null) {
-    resSocketForAbort.once('close', onResClose);
-  }
+
+  // The outer wrapper installed abort listeners before the first body write.
+  // If that write queues an asynchronous transport error, `abort.aborted` must
+  // flip before its drain promise settles and the loop evaluates the gate.
+  writeSSEEvent(res, 'response.created', { response: partial });
+  writeSSEEvent(res, 'response.in_progress', { response: partial });
 
   try {
     for await (const event of chatStream) {
-      // Honor client disconnect at loop-top. Native decode has no
-      // AbortSignal yet; `break` drops the generator reference so
-      // the producer's `finally` releases per-model locks and the
-      // post-loop block routes to the failure epilogue.
-      if (clientAborted) break;
+      await drainPending();
+      // Honor disconnect or a bounded drain timeout at loop-top. Breaking
+      // drops the generator reference; its AbortSignal cancels native work
+      // and its finally releases the per-model lock.
+      if (abort.aborted) break;
       if (event.done) {
         sawDone = true;
         // Final event -- close open items and emit completed
@@ -911,15 +959,9 @@ async function handleStreamingNative(
     // and never the underlying exception text.
     console.error(`[responses] native dispatch failed for ${req.model} (response ${responseId}):`, thrownError.message);
   } finally {
-    if (httpReq) {
-      httpReq.off('close', onClientClose);
-      httpReq.off('error', onClientError);
-    }
-    res.off('close', onResClose);
-    res.off('error', onResError);
-    if (resSocketForAbort != null) {
-      resSocketForAbort.off('close', onResClose);
-    }
+    // Cover done/break/continue/generator-throw paths. Abort listeners belong
+    // to the outer wrapper and intentionally remain installed after this.
+    await drainPending();
   }
 
   // Post-loop terminal emission. The producer's finally has run so
@@ -929,7 +971,7 @@ async function handleStreamingNative(
   // `stream_exhausted`. `response.failed` is emitted even on
   // `client_abort` so a tee/proxy that stays connected sees a terminal.
   const committed = wasCommitted();
-  const successful = sawDone && committed && thrownError == null && !clientAborted;
+  const successful = sawDone && committed && thrownError == null && !abort.aborted;
 
   if (successful) {
     const terminal = completedResponse!;
@@ -956,16 +998,22 @@ async function handleStreamingNative(
       }
     }
 
-    // The terminal SSE flushes inside the per-model mutex (client
-    // expects it ordered against prior deltas); the `ResponseStore`
-    // write is deferred to the outer handler so a slow SQLite write
-    // does not pin the next waiter. `flushTerminalSSE` flips
-    // `terminalEmitted` only once the kernel acks the frame — a
-    // callback-reported error rejects so the outer catch refuses to
-    // adopt under an unseen responseId.
-    await flushTerminalSSE(res, 'response.completed', { response: terminal }, visibility);
-    endSSE(res);
-    return { terminalToPersist: terminal, failureMode: null, cachedTokens };
+    await drainPending();
+
+    // A close/error can be the event that settled the residual drain. Recheck
+    // after the await; the pre-drain success snapshot is no longer sufficient.
+    if (!abort.aborted) {
+      // The terminal SSE flushes inside the per-model mutex (client
+      // expects it ordered against prior deltas); the `ResponseStore`
+      // write is deferred to the outer handler so a slow SQLite write
+      // does not pin the next waiter. `flushTerminalSSE` flips
+      // `terminalEmitted` only once the kernel acks the frame — a
+      // callback-reported error rejects so the outer catch refuses to
+      // adopt under an unseen responseId.
+      await flushTerminalSSE(res, 'response.completed', { response: terminal }, visibility);
+      endSSE(res);
+      return { terminalToPersist: terminal, failureMode: null, cachedTokens };
+    }
   }
 
   // Failure epilogue. Close any dangling message items BEFORE the
@@ -974,7 +1022,7 @@ async function handleStreamingNative(
   // deferred to the success path); reasoning items have no `status`.
   const reason: 'error' | 'client_abort' | 'finish_reason_error' | 'stream_exhausted' = thrownError
     ? 'error'
-    : clientAborted
+    : abort.aborted
       ? 'client_abort'
       : sawDone
         ? 'finish_reason_error'
@@ -1048,6 +1096,8 @@ async function handleStreamingNative(
       writeSSEEvent(res, 'response.output_item.done', { output_index: riIndex, item: reasoningItem });
     }
   }
+
+  await drainPending();
 
   const failedTerminal = buildFailedTerminal(
     partial,
@@ -1345,14 +1395,14 @@ interface StreamingOutcome {
  * is responsible for rejecting partial tool-result submissions
  * against a fan-out (`handleCreateResponse` fan-out gate).
  *
- * `isFreshSession` is the MISS / HIT signal from `SessionRegistry`:
- * `true` when `lookup.hit === false` (a truly new session minted via
- * `newSession()`), `false` when a tier-1 or tier-2 warm lease was
- * handed out. On a MISS we must wipe the shared native model's
+ * `resetNativeCache` is the cache-isolation decision made by the caller.
+ * A non-paged registry miss wipes the shared native model's
  * leftover `cached_token_history` + KV caches before re-priming, or
  * a previous UNRELATED request's cache could silently get reused as
- * a prefix (cross-request cache-affinity side channel). On a HIT we
- * must NOT wipe — the whole point of the warm lease is that
+ * a prefix (cross-request cache-affinity side channel). Registry hits
+ * and block-paged models preserve native state: the former owns the
+ * leased cache, while the latter validates reusable blocks by content
+ * hash and isolates live requests by cache owner. In both cases
  * `verify_cache_prefix_direct` can recover the reused prefix on the
  * next `chat_session_start_sync`. The HIT branch calls the
  * server-private `resetPreservingNativeCacheForWarmReuse(session)`
@@ -1368,7 +1418,8 @@ async function runSessionNonStreaming(
   messages: ChatMessage[],
   newInputMessages: ChatMessage[],
   config: ChatConfig,
-  isFreshSession: boolean,
+  resetNativeCache: boolean,
+  signal?: AbortSignal,
 ): Promise<NonStreamingOutcome> {
   if (session.turns === 0) {
     // Fresh JS session does NOT imply a fresh native cache — the
@@ -1381,21 +1432,18 @@ async function runSessionNonStreaming(
     // `primeHistory() + startFromHistory()` on a fresh session would
     // inherit the PREVIOUS request's native cache and silently reuse
     // whatever prefix happened to overlap — a cross-request
-    // cache-affinity side channel. Only registry HITS (tier-1 /
-    // tier-2) are authorized for cache reuse, and a leased session
-    // almost always has `turns > 0` so this branch is nearly always
-    // a MISS. The `isFreshSession` flag is the authoritative signal
-    // — on `false` we still need to clear JS-side state so
-    // `primeHistory()` accepts the replay, but we keep the native
-    // cache intact so the prefix verifier can recover it.
-    if (isFreshSession) {
+    // cache-affinity side channel. The caller permits native reuse only
+    // for a registry hit or a content-addressed block-paged model. In
+    // both cases we still clear JS-side state so `primeHistory()` accepts
+    // the replay while the native prefix verifier decides what is reusable.
+    if (resetNativeCache) {
       await session.reset();
     } else {
       await resetPreservingNativeCacheForWarmReuse(session);
     }
     session.primeHistory(messages);
     const initialTurns = session.turns;
-    const result = await session.startFromHistory(config);
+    const result = await session.startFromHistory(config, { signal });
     return { result, committed: session.turns > initialTurns };
   }
 
@@ -1415,7 +1463,7 @@ async function runSessionNonStreaming(
     if (last.role === 'user') {
       const initialTurns = session.turns;
       const images = last.images ?? undefined;
-      const result = await session.send(last.content, images ? { images, config } : { config });
+      const result = await session.send(last.content, images ? { images, config, signal } : { config, signal });
       return { result, committed: session.turns > initialTurns };
     }
     if (last.role === 'tool') {
@@ -1428,7 +1476,11 @@ async function runSessionNonStreaming(
       // with the Anthropic `tool_result.is_error === true` source field
       // (the structured channel is the authoritative signal — see
       // `ChatMessage.isError` rustdoc).
-      const result = await session.sendToolResult(last.toolCallId, last.content, { config, isError: last.isError });
+      const result = await session.sendToolResult(last.toolCallId, last.content, {
+        config,
+        isError: last.isError,
+        signal,
+      });
       return { result, committed: session.turns > initialTurns };
     }
     // Non-user / non-tool single-message continuation (assistant /
@@ -1445,16 +1497,17 @@ async function runSessionNonStreaming(
   // warm session falls through to this branch), we MUST keep the
   // native KV cache so the native `verify_cache_prefix_direct` can
   // recover the reused prefix — wiping it would neutralize the
-  // entire warm-lease feature on multi-message hits. On a MISS we
-  // still wipe to prevent cross-request cache-affinity leakage.
-  if (isFreshSession) {
+  // entire warm-lease feature on multi-message hits. Block-paged models
+  // also preserve their content-verified per-owner cache; only a non-paged
+  // miss wipes to prevent cross-request cache-affinity leakage.
+  if (resetNativeCache) {
     await session.reset();
   } else {
     await resetPreservingNativeCacheForWarmReuse(session);
   }
   session.primeHistory(messages);
   const initialTurns = session.turns;
-  const result = await session.startFromHistory(config);
+  const result = await session.startFromHistory(config, { signal });
   return { result, committed: session.turns > initialTurns };
 }
 
@@ -1465,7 +1518,7 @@ async function runSessionStreaming(
   newInputMessages: ChatMessage[],
   config: ChatConfig,
   signal: AbortSignal | undefined,
-  isFreshSession: boolean,
+  resetNativeCache: boolean,
 ): Promise<StreamingOutcome> {
   // Preserve the startFromHistoryStream precondition outside the lazy
   // generator. Without this guard an accepted `input: []` request would commit
@@ -1484,11 +1537,10 @@ async function runSessionStreaming(
     // prior requests; without an explicit `reset()` here the native
     // prefix verifier can silently reuse a previous request's cache
     // on any prompt-prefix overlap (a cross-request cache-affinity
-    // side channel). On MISS (`isFreshSession === true`) we wipe
-    // native cache + JS state. On tier-1 / tier-2 HIT we keep the
-    // native cache so the prefix verifier can recover the reused
-    // prefix, while still clearing JS-side state for `primeHistory`.
-    if (isFreshSession) {
+    // side channel). The caller requests a full native wipe only for a
+    // non-paged registry miss; warm hits and content-addressed paged models
+    // keep verified native state while still clearing JS state for replay.
+    if (resetNativeCache) {
       await session.reset();
     } else {
       await resetPreservingNativeCacheForWarmReuse(session);
@@ -1550,10 +1602,11 @@ async function runSessionStreaming(
   // captured AFTER reset. On tier-1 / tier-2 HIT (warm lease that
   // cannot use the delta API because the input spans multiple
   // messages), keep the native KV cache so the prefix verifier can
-  // reuse it on the replayed `chat_session_start_sync`; on MISS, wipe
+  // reuse it on the replayed `chat_session_start_sync`. Block-paged models
+  // likewise preserve content-verified native state; non-paged misses wipe
   // to block cross-request cache-affinity leakage.
   const constrainedConfig = await session.preflightContextCapacity(messages, config);
-  if (isFreshSession) {
+  if (resetNativeCache) {
     await session.reset();
   } else {
     await resetPreservingNativeCacheForWarmReuse(session);
@@ -1695,6 +1748,9 @@ export async function handleCreateResponse(
   /** Lazy-load hook. See the call site below and `ServerConfig.resolveModel`. */
   resolveModel?: (name: string) => Promise<void>,
 ): Promise<void> {
+  if (modelWorkCoordinator) {
+    registry.setModelLoadAdmissionCoordinator(modelWorkCoordinator);
+  }
   const handlerStartedAt = Date.now();
 
   // Validate required fields
@@ -1769,8 +1825,54 @@ export async function handleCreateResponse(
   }
   const effectiveRetentionSec = requestedRetentionSec ?? responseRetentionSec;
 
-  // Lazy load, exactly as the Anthropic endpoints do. Nothing is resident at
-  // boot — `createInferenceHost` only discovers — so without this the very
+  // Pre-dispatch admission gate (H3, host mode). Resident requests bypass
+  // the model-load writer below and proceed toward the continuous-batching
+  // lane, but can still park in pre-lock store work before reaching it. Admit
+  // or 429 up front against the same per-model budget so that work stays
+  // bounded too. A non-resident model has no `SessionRegistry` yet, so it
+  // takes the coordinator's bounded pre-resolution permit below instead of
+  // entering its writer queue uncounted.
+  //
+  // The applicable permit is RETAINED through every pre-lock await — the
+  // writer bracket for a cold model, or the `store.getChain` continuation
+  // lookups for a resident model — and handed to the selected resident lane
+  // at placement, which consumes it
+  // atomically as this request's admission (one budget, one token,
+  // never double-counted). It is released only on the bail-out exits:
+  // explicitly on the early returns before the outer `try`, and by the
+  // outer `finally` for everything inside it (idempotent + no-op after
+  // handoff, so the unconditional release is always safe).
+  let preDispatchAdmission: PreDispatchAdmission | undefined;
+  let modelLoadAdmission: ModelLoadAdmission | undefined;
+  const preDispatchRegistry = registry.getSessionRegistry(body.model);
+  if (preDispatchRegistry) {
+    try {
+      preDispatchAdmission = preDispatchRegistry.beginPreDispatchAdmission();
+    } catch (err) {
+      if (err instanceof QueueFullError) {
+        sendRateLimit(res, `${err.message}. Retry after 1s.`);
+        return;
+      }
+      throw err;
+    }
+  } else if (resolveModel && modelWorkCoordinator) {
+    try {
+      modelLoadAdmission = modelWorkCoordinator.beginRequestLoadAdmission(body.model);
+    } catch (err) {
+      if (err instanceof ModelLoadQueueFullError) {
+        sendRateLimit(
+          res,
+          `Model queue full: admission footprint ${err.admissionFootprint} (limit ${err.limit}). Retry after 1s.`,
+        );
+        return;
+      }
+      throw err;
+    }
+  }
+
+  // Lazy load, exactly as the Anthropic endpoints do, only when the requested
+  // name has no resident registry. Nothing is resident at boot —
+  // `createInferenceHost` only discovers — so without this the very
   // first `/v1/responses` 404s against a `/v1/models` list that advertises the
   // model, and a client id that exists only as an alias 404s forever.
   //
@@ -1778,7 +1880,7 @@ export async function handleCreateResponse(
   // 400 cannot burn a 30 s load or evict the resident model. BEFORE
   // `registry.get` below, and therefore before the dispatch lease, which needs
   // a registered name.
-  if (resolveModel) {
+  if (resolveModel && !preDispatchRegistry) {
     // Errors serialize through the OpenAI envelope here. Letting them reach
     // the outer `createHandler` catch would be right for this endpoint by
     // accident and wrong for the Anthropic one — `messages.ts` has the mirror
@@ -1795,14 +1897,22 @@ export async function handleCreateResponse(
           : resolveModel(body.model);
       await (idleSweeper ? idleSweeper.withSuspendedDrains(load) : load());
     } catch (err) {
+      preDispatchAdmission?.release();
+      modelLoadAdmission?.release();
       sendInternalError(res, err instanceof Error ? err.message : 'Failed to resolve model');
       return;
     }
   }
+  // NOTE: the permit is NOT released here. Pre-lock work continues below
+  // (`store.getChain` on continuations can block indefinitely on a slow
+  // store) and the request must stay counted until `withExclusive`
+  // consumes the permit at placement. Only bail-out exits release.
 
   // Look up model
   const model = registry.get(body.model);
   if (!model) {
+    preDispatchAdmission?.release();
+    modelLoadAdmission?.release();
     sendNotFound(
       res,
       `Model "${body.model}" not found. Available models: ${registry
@@ -1820,10 +1930,25 @@ export async function handleCreateResponse(
   // chains against one native model. Released in `finally` below.
   const lease = registry.acquireDispatchLease(body.model);
   if (!lease) {
+    preDispatchAdmission?.release();
+    modelLoadAdmission?.release();
     sendInternalError(res, 'session registry missing for registered model');
     return;
   }
   const leaseModel = lease.model;
+  if (modelLoadAdmission) {
+    try {
+      preDispatchAdmission = modelLoadAdmission.transferToResident(lease.registry);
+    } catch (err) {
+      registry.releaseDispatchLease(leaseModel);
+      modelLoadAdmission.release();
+      if (err instanceof QueueFullError) {
+        sendRateLimit(res, `${err.message}. Retry after 1s.`);
+        return;
+      }
+      throw err;
+    }
+  }
   // AbortController wired to disconnect events, declared at handler
   // scope so the outer `finally` can always detach even on early
   // return. Listeners attach only after the pre-lock validation gates
@@ -2370,6 +2495,17 @@ export async function handleCreateResponse(
       httpReq.once('close', onAbortClose);
       httpReq.once('error', onAbortError);
     }
+    // Catch-up abort: a response torn down BEFORE the attach above has
+    // already emitted its terminal event, so the `once('close')`
+    // listeners will never fire. Consult the response-side socket state
+    // directly (the REQUEST side is deliberately excluded — a fully
+    // consumed IncomingMessage auto-destroys after 'end' on every normal
+    // request, so `httpReq.destroyed` is not a disconnect signal). This
+    // makes `streamSignal.aborted` authoritative for the H2 pre-dispatch
+    // disconnect check inside the mutex callback.
+    if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
+      abortController.abort();
+    }
     abortListenersAttached = true;
     const streamSignal: AbortSignal = abortController.signal;
 
@@ -2460,8 +2596,8 @@ export async function handleCreateResponse(
 
     try {
       const mutexQueuedAt = Date.now();
-      const runInference = () =>
-        withAdmissionControlledInference(sessionReg, modelWorkCoordinator, async () => {
+      const runInference = () => {
+        return withAdmissionControlledInference(sessionReg, modelWorkCoordinator, preDispatchAdmission, async () => {
           const serverTiming: ServerTimingForUsage = {
             server_queue_ms: Date.now() - mutexQueuedAt,
             server_pre_inference_ms: Date.now() - handlerStartedAt,
@@ -2582,80 +2718,22 @@ export async function handleCreateResponse(
           if (effectivePromptCacheKey !== null) {
             maybeWarnPromptCacheKeyIneligible(effectivePromptCacheKey);
           }
-          const lookup = sessionReg.getOrCreate(
-            previousResponseId ?? null,
-            requestedInstructions,
-            effectivePromptCacheKey,
-          );
-          const session = lookup.session;
-          // `X-Session-Cache` observability header: classify this turn as
-          // `fresh` (no `previous_response_id` on the request and tier-2
-          // prompt-cache-key did not hit), `hit` (prev-id warm-cache
-          // lease consumed on tier 1), `prefix_hit` (tier-2 warm-cache
-          // lease consumed — only promoted from `fresh` later once the
-          // native `cachedTokens > 0` confirms real prefix reuse), or
-          // `cold_replay` (request carried `previous_response_id` but
-          // the warm entry was missing / expired / instructions-
-          // mismatched / already leased, OR the request shape is
-          // ineligible for the hot path — the endpoint will rebuild the
-          // session from the `ResponseStore` below). Set before any
-          // `writeHead` / SSE `beginSSE` so both JSON and SSE responses
-          // carry it. See `endpoints/messages.ts` for the matching
-          // emission on `/v1/messages`.
-          //
-          // The `prefix_hit` promotion and the companion
-          // `X-Cached-Tokens: N` header both depend on the native
-          // ChatResult's `cachedTokens` field, which is only authoritative
-          // AFTER the native dispatch completes. We therefore emit the
-          // initial `fresh` / `hit` / `cold_replay` value here and let
-          // the post-dispatch branch below promote a `fresh`+tier2-hit
-          // classification to `prefix_hit` once the cached-tokens count
-          // is known.
-          const tier2Hit = previousResponseId == null && lookup.hit;
-          // Optimistic pre-dispatch classification. SSE flushes headers on
-          // `beginSSE` inside `handleStreamingNative`, so the streaming
-          // path has exactly one shot to commit the header value — before
-          // the dispatch runs, i.e. BEFORE the native prefix verifier has
-          // reported whether any tokens were actually reused.
-          //
-          // For non-streaming we still commit optimistically to
-          // `prefix_hit` on tier-2 hit and demote to `fresh` post-dispatch
-          // if `cachedTokens === 0` (template drift, tokenizer change,
-          // image-set change, etc.) — `res.end` has not fired yet so the
-          // header is still settable.
-          //
-          // For streaming we deliberately do NOT promote to `prefix_hit`
-          // on tier-2 hit. Once SSE headers flush they cannot be
-          // corrected, and a false-positive `prefix_hit` would contradict
-          // consumers that read `cachedTokens` from the terminal event.
-          // Approach B (this path): emit `fresh` on streaming even when
-          // tier-2 found a warm session — the cache reuse still happens,
-          // only the observability header is conservative. A future
-          // refactor can thread `cached_tokens` through the native
-          // streaming `start` chunk so the server knows authoritatively
-          // before `beginSSE()` flushes, at which point streaming can
-          // commit `prefix_hit` too (Approach A). Until then,
-          // `prefix_hit` is a non-streaming-only signal.
-          const isStreaming = mappedBody.stream === true;
-          // Prev-id branch classification. A tier-1 HIT is labeled `hit`
-          // regardless of whether the request is hot-path-eligible: the
-          // warm native KV cache is reused in both paths (the cheap
-          // `send` / `sendToolResult` delta on the eligible branch; the
-          // full-history `primeHistory` + `startFromHistory*` replay on
-          // the ineligible branch, where `resetPreservingNativeCacheForWarmReuse`
-          // keeps the cache alive for `verify_cache_prefix_direct` to
-          // recover). Only a registry MISS on the prev-id branch
-          // downgrades to `cold_replay` (no warm cache to reuse, the
-          // request must rebuild from `ResponseStore`).
-          let sessionCacheStatus: SessionCacheStatus =
-            previousResponseId == null
-              ? tier2Hit && !isStreaming
-                ? 'prefix_hit'
-                : 'fresh'
-              : lookup.hit
-                ? 'hit'
-                : 'cold_replay';
-          res.setHeader('X-Session-Cache', sessionCacheStatus);
+
+          // H2 pre-dispatch disconnect check (non-streaming only). A
+          // client that vanished while this request was parked behind the
+          // per-model mutex must not burn a whole prefill+decode budget
+          // producing a JSON body nobody can receive. Checked BEFORE the
+          // session lease so no warm entry is consumed and no native
+          // state is touched — the early return composes with the permit
+          // lifecycle exactly like the binding-changed return above (the
+          // pre-dispatch permit was already consumed atomically by
+          // `withExclusive`, and the handler's outer `finally` release is
+          // an idempotent no-op after that handoff). Streaming keeps its
+          // existing paths: the signal fast-aborts `_runChatStream` and
+          // the SSE drain loop breaks on `clientAborted` at loop-top.
+          if (mappedBody.stream !== true && abortController.signal.aborted) {
+            return;
+          }
 
           // Multi-tool-call fan-out gate.
           //
@@ -2863,6 +2941,30 @@ export async function handleCreateResponse(
           // the now-canonical `messages`.
           newInputMessages = messages.slice(priorOffset);
 
+          // Lease only after every request-shape validation has passed. Once a
+          // session is removed from the warm slot, the try/finally below owns
+          // it until a clean turn adopts it again.
+          const pagedActive = leaseModel.hasBlockPagedCache?.() === true;
+          const lookup = sessionReg.getOrCreate(
+            previousResponseId ?? null,
+            requestedInstructions,
+            effectivePromptCacheKey,
+            config.cacheSalt ?? null,
+          );
+          const session = lookup.session;
+          await sessionReg.flushPendingDisposals();
+          let sessionRetained = false;
+          let sessionCleanupStarted = false;
+          const disposeUnretainedSession = async (): Promise<void> => {
+            if (sessionRetained || sessionCleanupStarted) return;
+            sessionCleanupStarted = true;
+            try {
+              await sessionReg.disposeSession(session);
+            } catch (error) {
+              console.error('[responses] failed to release an unretained chat-session cache owner:', error);
+            }
+          };
+
           // Visibility / wire-format tracker shared between the handler
           // body and the outer catch. Declared outside the `try` so the
           // catch can branch on `responseMode` (JSON vs SSE) and know
@@ -2871,6 +2973,20 @@ export async function handleCreateResponse(
           const visibility = createVisibility();
 
           try {
+            const tier2Hit = previousResponseId == null && lookup.hit;
+            const isStreaming = mappedBody.stream === true;
+            // Streaming headers are conservative because native cached-token
+            // evidence is not available until after SSE headers have flushed.
+            let sessionCacheStatus: SessionCacheStatus =
+              previousResponseId == null
+                ? tier2Hit && !isStreaming
+                  ? 'prefix_hit'
+                  : 'fresh'
+                : lookup.hit
+                  ? 'hit'
+                  : 'cold_replay';
+            res.setHeader('X-Session-Cache', sessionCacheStatus);
+
             // `runSession*` plumbs an honest commit signal out of the helper:
             // `ChatSession` only advances `turns` on a successful non-error
             // final chunk (streaming) or a resolved native promise
@@ -2930,7 +3046,7 @@ export async function handleCreateResponse(
                 newInputMessages,
                 config,
                 streamSignal,
-                !lookup.hit,
+                !lookup.hit && !pagedActive,
               );
               const streamingWasCommitted = () => outcome.wasCommitted();
               try {
@@ -3170,16 +3286,27 @@ export async function handleCreateResponse(
               }
               committed = streamingWasCommitted();
             } else {
-              // The non-streaming native path has NO AbortSignal surface
-              // (plain `chatSession*` returns a Promise, no cancel), so a
-              // client that disconnects mid-generation still burns the
-              // full decode budget under this mutex. TODO: native
-              // cancellation for `chatSession*` — until then the best we
-              // can do is the disconnect-aware skip inside
-              // `handleNonStreaming` (short-circuits `endJson` and
-              // signals the outer persist gate) plus this documented
-              // limitation.
-              const outcome = await runSessionNonStreaming(session, messages, newInputMessages, config, !lookup.hit);
+              // Non-streaming cancellation (H2): `streamSignal` threads
+              // through `ChatSession.send/sendToolResult/startFromHistory`
+              // into the normal public session method; the wrapper maps it to
+              // the internal native operation, so a client that disconnects mid-generation
+              // flips the controller, the native turn unwinds at the
+              // next safepoint, and the dispatch REJECTS with
+              // "chat session cancelled" (routed through the ordinary
+              // uncommitted-error epilogue below — no adopt, no
+              // persist). A disconnect that lands before dispatch takes
+              // the pre-dispatch early return above instead. The
+              // disconnect-aware skip inside `handleNonStreaming` /
+              // `endJson` remains the last line of defense for a
+              // disconnect racing the final flush.
+              const outcome = await runSessionNonStreaming(
+                session,
+                messages,
+                newInputMessages,
+                config,
+                !lookup.hit && !pagedActive,
+                streamSignal,
+              );
               // Prefix-cache observability headers for the non-streaming
               // path. `res.end` has not fired yet (the handler's
               // `endJson` call below is what flushes), so `setHeader`
@@ -3473,7 +3600,14 @@ export async function handleCreateResponse(
               // tier-2 hit and lease rA's chain session — a cross-chain
               // corruption the precedence rule was explicitly designed
               // to prevent. Keep adopt's key aligned with lookup's key.
-              sessionReg.adopt(responseId, session, requestedInstructions, effectivePromptCacheKey);
+              sessionReg.adopt(
+                responseId,
+                session,
+                requestedInstructions,
+                effectivePromptCacheKey,
+                config.cacheSalt ?? null,
+              );
+              sessionRetained = true;
             }
 
             // Rethrow handler errors when the client hasn't seen a
@@ -3543,8 +3677,12 @@ export async function handleCreateResponse(
                 // Already closed / destroyed.
               }
             }
+          } finally {
+            await disposeUnretainedSession();
+            await sessionReg.flushPendingDisposals();
           }
         });
+      };
       await runInference();
     } catch (err) {
       // Admission-control rejection from the per-model queue cap
@@ -3561,7 +3699,7 @@ export async function handleCreateResponse(
       // preserved untouched.
       if (err instanceof QueueFullError) {
         if (!res.headersSent) {
-          sendRateLimit(res, `Model queue full: ${err.queuedCount} waiting (limit ${err.limit}). Retry after 1s.`);
+          sendRateLimit(res, `${err.message}. Retry after 1s.`);
         }
       } else {
         throw err;
@@ -3705,6 +3843,13 @@ export async function handleCreateResponse(
       }
     }
   } finally {
+    // Balance the pre-dispatch admission on EVERY exit that never
+    // handed the permit to `withExclusive`: getChain storage errors,
+    // the binding-changed 400s, disconnects, and any validation
+    // early-return inside the outer `try`. Idempotent and a no-op
+    // after handoff, so the unconditional call is always safe.
+    preDispatchAdmission?.release();
+    modelLoadAdmission?.release();
     // Idempotent fallback: if the post-dispatch cleanup above
     // never ran (early-return validation failure, or an exception
     // raised inside the outer `try` block between lease

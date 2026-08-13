@@ -2,7 +2,7 @@ use crate::array::MxArray;
 use crate::models::qwen3_5_moe::quantized_linear::MLPVariant;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::bindgen_prelude::*;
 
 use super::attention::Lfm2Attention;
@@ -251,6 +251,47 @@ impl Lfm2DecoderLayer {
         let ffn_normed = self.ffn_norm.forward(&h)?;
         let ffn_out = self.feed_forward.forward(&ffn_normed)?;
         h.add(&ffn_out)
+    }
+
+    /// Uniform `[N,1,H]` decode for the continuous-batching lane.
+    ///
+    /// Attention rows share one paged dispatch. Conv rows share one
+    /// `ShortConv` forward while their stacked state is returned to the caller
+    /// for per-request scatter. Exactly one of `conv_state` / paged attention
+    /// is consumed according to `kind`.
+    pub(crate) fn forward_paged_or_flat_batched(
+        &self,
+        x: &MxArray,
+        kind: Lfm2LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        rows: &[(SeqId, u32)],
+        conv_state: Option<&MxArray>,
+    ) -> Result<(MxArray, Option<MxArray>)> {
+        let normed = self.operator_norm.forward(x)?;
+        let (operator_output, next_conv_state) = match (kind, &self.operator) {
+            (Lfm2LayerKind::FullAttention { paged_idx }, OperatorType::Attention(attn)) => (
+                attn.forward_paged_batched(&normed, adapter, paged_idx, rows)?,
+                None,
+            ),
+            (Lfm2LayerKind::Conv, OperatorType::Conv(conv)) => {
+                let (output, state) = conv.forward_with_state(&normed, conv_state)?;
+                (output, Some(state))
+            }
+            (Lfm2LayerKind::FullAttention { .. }, OperatorType::Conv(_)) => {
+                return Err(Error::from_reason(
+                    "LFM2 batched layer classified attention but contains ShortConv",
+                ));
+            }
+            (Lfm2LayerKind::Conv, OperatorType::Attention(_)) => {
+                return Err(Error::from_reason(
+                    "LFM2 batched layer classified ShortConv but contains attention",
+                ));
+            }
+        };
+        let h = x.add(&operator_output)?;
+        let ffn_normed = self.ffn_norm.forward(&h)?;
+        let ffn_output = self.feed_forward.forward(&ffn_normed)?;
+        Ok((h.add(&ffn_output)?, next_conv_state))
     }
 
     // ========== Norm weight setters ==========

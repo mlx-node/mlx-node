@@ -193,6 +193,220 @@ pub struct LayerKVCacheRoute {
     pub shared_kv_anchor: Option<usize>,
 }
 
+/// Runtime owner for the cache manager assigned to each compatible KV group.
+///
+/// Models declare [`LayerKVCacheSpec`]s, build one manager per resulting
+/// [`KVCacheGroup`], and then route every logical layer through this object.
+/// Keeping the group metadata, routes, and managers together prevents model
+/// implementations from silently deriving a second, divergent layer map.
+pub struct KVCacheCoordinator<M> {
+    groups: Vec<KVCacheGroup>,
+    routes: Vec<LayerKVCacheRoute>,
+    managers: Vec<M>,
+}
+
+impl<M> KVCacheCoordinator<M> {
+    pub fn from_groups(
+        specs: &[LayerKVCacheSpec],
+        groups: Vec<KVCacheGroup>,
+        managers: Vec<M>,
+    ) -> Result<Self, KVCacheCoordinatorError> {
+        if groups.len() != managers.len() {
+            return Err(KVCacheCoordinatorError::ManagerCountMismatch {
+                group_count: groups.len(),
+                manager_count: managers.len(),
+            });
+        }
+        for (expected_group_id, group) in groups.iter().enumerate() {
+            if group.group_id != expected_group_id {
+                return Err(KVCacheCoordinatorError::NonContiguousGroupId {
+                    expected_group_id,
+                    actual_group_id: group.group_id,
+                });
+            }
+        }
+        let by_layer: BTreeMap<usize, &LayerKVCacheSpec> =
+            specs.iter().map(|spec| (spec.layer_index, spec)).collect();
+        let mut assigned_layers = BTreeSet::new();
+        for group in &groups {
+            let mut expected_physical_layers = Vec::new();
+            for &layer_index in &group.layer_indices {
+                let spec = by_layer.get(&layer_index).ok_or(
+                    KVCacheCoordinatorError::UnknownGroupLayer {
+                        group_id: group.group_id,
+                        layer_index,
+                    },
+                )?;
+                if !assigned_layers.insert(layer_index) {
+                    return Err(KVCacheCoordinatorError::DuplicateLayerAssignment { layer_index });
+                }
+                if spec.attention_kind != group.attention_kind
+                    || spec.physical_layout != group.physical_layout
+                {
+                    return Err(KVCacheCoordinatorError::IncompatibleGroupLayer {
+                        group_id: group.group_id,
+                        layer_index,
+                    });
+                }
+                if spec.shared_kv_anchor.is_none() {
+                    expected_physical_layers.push(layer_index);
+                }
+            }
+            if group.physical_layer_indices != expected_physical_layers {
+                return Err(KVCacheCoordinatorError::PhysicalLayerMembershipMismatch {
+                    group_id: group.group_id,
+                });
+            }
+        }
+        if let Some(missing) = specs
+            .iter()
+            .find(|spec| !assigned_layers.contains(&spec.layer_index))
+        {
+            return Err(KVCacheCoordinatorError::MissingLayerAssignment {
+                layer_index: missing.layer_index,
+            });
+        }
+        let routes = derive_layer_kv_cache_routes_from_groups(specs, &groups)?;
+        Ok(Self {
+            groups,
+            routes,
+            managers,
+        })
+    }
+
+    pub fn groups(&self) -> &[KVCacheGroup] {
+        &self.groups
+    }
+
+    pub fn routes(&self) -> &[LayerKVCacheRoute] {
+        &self.routes
+    }
+
+    pub fn manager(&self, group_id: usize) -> Option<&M> {
+        self.managers.get(group_id)
+    }
+
+    pub fn manager_mut(&mut self, group_id: usize) -> Option<&mut M> {
+        self.managers.get_mut(group_id)
+    }
+
+    pub fn route_for_layer(&self, layer_index: usize) -> Option<&LayerKVCacheRoute> {
+        self.routes
+            .binary_search_by_key(&layer_index, |route| route.layer_index)
+            .ok()
+            .map(|index| &self.routes[index])
+    }
+
+    pub fn manager_for_layer(&self, layer_index: usize) -> Option<&M> {
+        let route = self.route_for_layer(layer_index)?;
+        self.manager(route.group_id)
+    }
+
+    pub fn manager_for_layer_mut(&mut self, layer_index: usize) -> Option<&mut M> {
+        let group_id = self.route_for_layer(layer_index)?.group_id;
+        self.manager_mut(group_id)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KVCacheCoordinatorError {
+    Spec(KVCacheSpecError),
+    ManagerCountMismatch {
+        group_count: usize,
+        manager_count: usize,
+    },
+    NonContiguousGroupId {
+        expected_group_id: usize,
+        actual_group_id: usize,
+    },
+    UnknownGroupLayer {
+        group_id: usize,
+        layer_index: usize,
+    },
+    DuplicateLayerAssignment {
+        layer_index: usize,
+    },
+    MissingLayerAssignment {
+        layer_index: usize,
+    },
+    IncompatibleGroupLayer {
+        group_id: usize,
+        layer_index: usize,
+    },
+    PhysicalLayerMembershipMismatch {
+        group_id: usize,
+    },
+}
+
+impl fmt::Display for KVCacheCoordinatorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spec(error) => write!(f, "invalid KV cache coordinator specs: {error}"),
+            Self::ManagerCountMismatch {
+                group_count,
+                manager_count,
+            } => write!(
+                f,
+                "KV cache coordinator has {group_count} groups but {manager_count} managers"
+            ),
+            Self::NonContiguousGroupId {
+                expected_group_id,
+                actual_group_id,
+            } => write!(
+                f,
+                "KV cache coordinator expected group id {expected_group_id}, got {actual_group_id}"
+            ),
+            Self::UnknownGroupLayer {
+                group_id,
+                layer_index,
+            } => write!(
+                f,
+                "KV cache group {group_id} references unknown layer {layer_index}"
+            ),
+            Self::DuplicateLayerAssignment { layer_index } => write!(
+                f,
+                "KV cache layer {layer_index} is assigned to more than one group"
+            ),
+            Self::MissingLayerAssignment { layer_index } => write!(
+                f,
+                "KV cache layer {layer_index} is not assigned to a runtime group"
+            ),
+            Self::IncompatibleGroupLayer {
+                group_id,
+                layer_index,
+            } => write!(
+                f,
+                "KV cache layer {layer_index} is incompatible with group {group_id}"
+            ),
+            Self::PhysicalLayerMembershipMismatch { group_id } => write!(
+                f,
+                "KV cache group {group_id} physical-layer membership does not match its specs"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for KVCacheCoordinatorError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Spec(error) => Some(error),
+            Self::ManagerCountMismatch { .. }
+            | Self::NonContiguousGroupId { .. }
+            | Self::UnknownGroupLayer { .. }
+            | Self::DuplicateLayerAssignment { .. }
+            | Self::MissingLayerAssignment { .. }
+            | Self::IncompatibleGroupLayer { .. }
+            | Self::PhysicalLayerMembershipMismatch { .. } => None,
+        }
+    }
+}
+
+impl From<KVCacheSpecError> for KVCacheCoordinatorError {
+    fn from(error: KVCacheSpecError) -> Self {
+        Self::Spec(error)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KVCacheSpecError {
     DuplicateLayerIndex {
@@ -554,6 +768,91 @@ mod tests {
         assert_eq!(routes[5].shared_kv_anchor, Some(3));
         assert_eq!(routes[5].physical_layer_index, 3);
         assert_eq!(routes[5].physical_layer_ordinal, 1);
+    }
+
+    #[test]
+    fn coordinator_keeps_runtime_managers_aligned_with_layer_routes() {
+        let specs = vec![
+            LayerKVCacheSpec::sliding_window(0, 128, layout(16)),
+            LayerKVCacheSpec::full(1, layout(16)),
+            LayerKVCacheSpec::sliding_window(2, 128, layout(16)).shared_with_anchor(0),
+            LayerKVCacheSpec::full(3, layout(16)).shared_with_anchor(1),
+        ];
+        let groups = group_layer_kv_cache_specs(&specs, 4096, 512).unwrap();
+        let managers: Vec<String> = groups
+            .iter()
+            .map(|group| format!("manager-{}", group.group_id))
+            .collect();
+        let mut coordinator = KVCacheCoordinator::from_groups(&specs, groups, managers).unwrap();
+
+        let sliding_alias = coordinator.route_for_layer(2).unwrap();
+        assert_eq!(sliding_alias.physical_layer_index, 0);
+        assert_eq!(sliding_alias.physical_layer_ordinal, 0);
+        assert_eq!(
+            coordinator.manager_for_layer(2).map(String::as_str),
+            Some("manager-1")
+        );
+
+        let full_alias_group = coordinator.route_for_layer(3).unwrap().group_id;
+        *coordinator.manager_for_layer_mut(3).unwrap() = "full-mutated".to_string();
+        assert_eq!(
+            coordinator.manager(full_alias_group).map(String::as_str),
+            Some("full-mutated")
+        );
+    }
+
+    #[test]
+    fn coordinator_rejects_missing_group_managers() {
+        let specs = vec![LayerKVCacheSpec::full(0, layout(16))];
+        let groups = group_layer_kv_cache_specs(&specs, 128, 32).unwrap();
+        let error = KVCacheCoordinator::<()>::from_groups(&specs, groups, Vec::new())
+            .err()
+            .expect("manager count mismatch");
+        assert_eq!(
+            error,
+            KVCacheCoordinatorError::ManagerCountMismatch {
+                group_count: 1,
+                manager_count: 0
+            }
+        );
+    }
+
+    #[test]
+    fn coordinator_rejects_incomplete_or_incompatible_group_topology() {
+        let specs = vec![
+            LayerKVCacheSpec::full(0, layout(16)),
+            LayerKVCacheSpec::sliding_window(1, 128, layout(16)),
+        ];
+        let mut groups = group_layer_kv_cache_specs(&specs, 128, 32).unwrap();
+        let missing_layer = groups
+            .iter_mut()
+            .find(|group| group.layer_indices.contains(&1))
+            .expect("sliding group");
+        missing_layer.layer_indices.clear();
+        missing_layer.physical_layer_indices.clear();
+        let error = KVCacheCoordinator::from_groups(&specs, groups, vec![(), ()])
+            .err()
+            .expect("missing layer assignment");
+        assert_eq!(
+            error,
+            KVCacheCoordinatorError::MissingLayerAssignment { layer_index: 1 }
+        );
+
+        let specs = vec![LayerKVCacheSpec::full(0, layout(16))];
+        let mut groups = group_layer_kv_cache_specs(&specs, 128, 32).unwrap();
+        groups[0].attention_kind = AttentionKind::SlidingWindow {
+            sliding_window: 128,
+        };
+        let error = KVCacheCoordinator::from_groups(&specs, groups, vec![()])
+            .err()
+            .expect("incompatible group layer");
+        assert_eq!(
+            error,
+            KVCacheCoordinatorError::IncompatibleGroupLayer {
+                group_id: 0,
+                layer_index: 0,
+            }
+        );
     }
 
     #[test]

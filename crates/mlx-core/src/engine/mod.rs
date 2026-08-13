@@ -7,12 +7,14 @@
 //! pass.
 
 pub(crate) mod backend;
+pub(crate) mod batch_sampling;
 pub(crate) mod cache;
 pub(crate) mod cmd;
 pub(crate) mod compiled_lock;
 pub(crate) mod decode;
 pub(crate) mod dspark_turn;
 pub(crate) mod finalize;
+pub(crate) mod hybrid_scheduler;
 pub(crate) mod mtp_turn;
 pub(crate) mod napi_glue;
 pub(crate) mod paged_turn;
@@ -20,6 +22,8 @@ pub(crate) mod params;
 pub(crate) mod penalties;
 pub(crate) mod persistence;
 pub(crate) mod plan;
+pub(crate) mod recurrent_state;
+pub(crate) mod scheduler;
 pub(crate) mod session;
 pub mod types;
 pub(crate) mod vision;
@@ -31,3 +35,4 @@ pub(crate) use cache::*;
 pub(crate) use finalize::*;
 pub(crate) use params::*;
 pub(crate) use penalties::*;
+pub use scheduler::{DecodeBatchOccupancyBucketJs, SchedulerStatsJs};

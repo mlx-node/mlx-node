@@ -891,6 +891,14 @@ where
 ///
 /// The optional `streaming:` block adds callback emission, cancellation,
 /// incremental detokenization, and is_reasoning tagging.
+///
+/// The optional `cancel:` fragment (H2, MUTUALLY EXCLUSIVE with
+/// `streaming:` by convention — streaming already polls its own flag)
+/// takes an `Option<&AtomicBool>` and compiles in a per-step cancel poll
+/// at the SAME loop position as the streaming block's poll, breaking
+/// with `finish_reason = "cancelled"`. SYNC whole-turn cores pass their
+/// installed `self.turn_cancel` clone here so a client disconnect stops
+/// the decode instead of burning the whole budget.
 macro_rules! decode_loop {
     (
         ops: $ops:expr,
@@ -908,6 +916,7 @@ macro_rules! decode_loop {
         first_token_instant: $first_tok:expr,
         report_perf: $report:expr,
         generation_stream: $stream:expr
+        $(, cancel: $cancel_flag:expr)?
         $(, streaming: {
             callback: $cb:expr,
             cancelled: $cancelled:expr,
@@ -1027,6 +1036,20 @@ macro_rules! decode_loop {
                     $gen.len(),
                 );
             }
+
+            // Sync-turn cancel poll (H2; conditionally compiled via the
+            // `cancel:` macro repetition). Same snapshot point as the
+            // streaming block's poll below: after the sampled token is
+            // pushed/observed, before EOS/repetition checks.
+            $(
+                if $cancel_flag
+                    .is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed))
+                {
+                    $reason = String::from("cancelled");
+                    $last_in_cache = step + 1 < $max;
+                    break;
+                }
+            )?
 
             // Streaming-only block (conditionally compiled via macro repetition)
             $(
@@ -1259,5 +1282,155 @@ mod mtp_history_policy_tests {
         let (mut a, mut t) = (300u64, 500u64); // under cap
         mtp_bound_gate_history(&mut a, &mut t);
         assert_eq!((a, t), (300, 500));
+    }
+}
+
+#[cfg(test)]
+mod decode_loop_sync_cancel_tests {
+    use std::cell::Cell;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use napi::bindgen_prelude::Result;
+
+    use super::DecodeOps;
+    use crate::array::MxArray;
+    use crate::engine::params::ChatParams;
+    use crate::engine::penalties::ReasoningTracker;
+    use crate::nn::Embedding;
+    use crate::sampling::SamplingConfig;
+    use crate::stream::{DeviceType, Stream};
+
+    /// Greedy T=0 params with every penalty/cutoff neutral, mirroring the
+    /// engine turn tests' `greedy_params`.
+    fn greedy_params(max_new_tokens: i32) -> ChatParams {
+        ChatParams {
+            cache_salt: 0,
+            cache_owner_id: String::new(),
+            cache_root_owner_id: None,
+            max_new_tokens,
+            repetition_penalty: 1.0,
+            repetition_context_size: 0,
+            presence_penalty: 0.0,
+            presence_context_size: 0,
+            frequency_penalty: 0.0,
+            frequency_context_size: 0,
+            max_consecutive_tokens: 0,
+            max_ngram_repeats: 0,
+            ngram_size: 0,
+            sampling_config: Some(SamplingConfig {
+                temperature: Some(0.0),
+                top_k: Some(0),
+                top_p: Some(1.0),
+                min_p: Some(0.0),
+            }),
+            report_performance: false,
+            reuse_cache: true,
+            include_reasoning: true,
+            extra_eos_ids: Vec::new(),
+            enable_mtp: false,
+            mtp_depth: 0,
+            mtp_adaptive_depth: false,
+        }
+    }
+
+    /// `[1, vocab]` logits whose T=0 argmax is `id`.
+    fn logits_row(vocab: i64, id: i32) -> Result<MxArray> {
+        let mut row = vec![0.0f32; vocab as usize];
+        row[id as usize] = 1.0;
+        MxArray::from_float32(&row, &[1, vocab])
+    }
+
+    /// H2: the `cancel:` fragment must stop the flat AR `decode_loop!`
+    /// (the dense/MoE SYNC whole-turn AR arm) at the per-step poll — the
+    /// SAME loop position as the `streaming:` block's poll — with
+    /// `finish_reason == "cancelled"`. The mock forward flips the shared
+    /// flag, emulating a client disconnect landing during the pipelined
+    /// step-0 forward.
+    ///
+    /// Named mutation this catches: reverting the `cancel:` fragment (or
+    /// a family call site dropping `cancel: turn_cancel.as_deref()` — the
+    /// pre-fix behavior): the loop then runs the full 16-token budget and
+    /// finishes "length" with 16 committed tokens.
+    #[test]
+    fn decode_loop_sync_cancel_flag_breaks_with_finish_reason_cancelled() -> Result<()> {
+        let vocab: i64 = 8;
+        let eos_id: u32 = 7;
+        let max_new_tokens: i32 = 16;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let flip = Arc::clone(&cancel);
+        let forward_calls = Cell::new(0usize);
+
+        let mut ops = DecodeOps {
+            forward: |_ids: &MxArray, _emb: &Embedding| -> Result<(MxArray, bool)> {
+                forward_calls.set(forward_calls.get() + 1);
+                // Disconnect lands DURING the step-0 forward — the poll
+                // right after the seed's push/observe must see it.
+                flip.store(true, Ordering::Relaxed);
+                // Never-EOS argmax (6): an uncancelled loop walks the
+                // whole budget.
+                Ok((logits_row(vocab, 6)?, false))
+            },
+            eval_step: |_t: &MxArray, _l: &MxArray, _b: bool| {},
+        };
+
+        let mut y = MxArray::from_int32(&[3], &[1])?;
+        let embedding = Embedding::from_weight(&MxArray::from_float32(
+            &vec![0.0f32; vocab as usize],
+            &[vocab, 1],
+        )?)?;
+        let p = greedy_params(max_new_tokens);
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut profiler = crate::decode_profiler::DecodeProfiler::new("decode_loop_test", "test");
+        let mut generated: Vec<u32> = Vec::new();
+        let mut hist: Vec<u32> = Vec::new();
+        let mut finish_reason = String::from("length");
+        let mut last_in_cache = true;
+        let mut first_tok: Option<std::time::Instant> = None;
+        let generation_stream = Stream::new(DeviceType::Gpu);
+
+        decode_loop!(
+            ops: ops,
+            y: y,
+            embedding_weight: embedding,
+            params: p,
+            reasoning_tracker: tracker,
+            profiler: profiler,
+            max_new_tokens: max_new_tokens,
+            eos_id: eos_id,
+            generated_tokens: generated,
+            token_history: hist,
+            finish_reason: finish_reason,
+            last_in_cache: last_in_cache,
+            first_token_instant: first_tok,
+            report_perf: false,
+            generation_stream: generation_stream,
+            cancel: Some(cancel.as_ref())
+        );
+
+        // Silence the "value assigned is never read" path: the loop
+        // reassigns `y` on non-terminal steps; a cancelled step 0 never
+        // does.
+        let _ = y;
+
+        assert_eq!(finish_reason, "cancelled");
+        assert_eq!(
+            generated,
+            vec![3],
+            "only the seed commits — the poll fires on the seed's own step"
+        );
+        assert_eq!(hist, generated, "history stays in lockstep");
+        assert!(
+            last_in_cache,
+            "the pipelined step-0 forward already ran (step + 1 < max), so the \
+             seed's K/V is in the cache"
+        );
+        assert_eq!(
+            forward_calls.get(),
+            1,
+            "exactly the pipelined step-0 forward ran before the poll broke the loop"
+        );
+        Ok(())
     }
 }

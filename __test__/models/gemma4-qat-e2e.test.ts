@@ -125,6 +125,8 @@ const modelPath = findModelPath();
 const modelExists = modelPath !== null;
 const imagePath = resolve(process.cwd(), 'examples/ocr.png');
 const imageExists = existsSync(imagePath);
+const TURN_TIMEOUT_MS = 240_000;
+const TEST_TIMEOUT_MS = TURN_TIMEOUT_MS + 30_000;
 
 describe.skipIf(!modelExists)('Gemma 4 E2B QAT (wNa8o8) — end-to-end decode', () => {
   let session: ChatSession;
@@ -143,52 +145,77 @@ describe.skipIf(!modelExists)('Gemma 4 E2B QAT (wNa8o8) — end-to-end decode', 
     images: Uint8Array[] | undefined,
     maxNewTokens = 80,
   ): Promise<{ text: string; finishReason: string; numTokens: number }> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TURN_TIMEOUT_MS);
     let text = '';
     let finishReason = 'unknown';
     let numTokens = 0;
-    for await (const event of session.sendStream(prompt, {
-      ...(images !== undefined && { images }),
-      config: { maxNewTokens, temperature: 0, reportPerformance: false },
-    })) {
-      if (event.done) {
-        finishReason = event.finishReason;
-        numTokens = event.numTokens;
-      } else {
-        text += event.text;
+    try {
+      for await (const event of session.sendStream(prompt, {
+        ...(images !== undefined && { images }),
+        signal: controller.signal,
+        config: { maxNewTokens, temperature: 0, reportPerformance: false },
+      })) {
+        if (event.done) {
+          finishReason = event.finishReason;
+          numTokens = event.numTokens;
+        } else {
+          text += event.text;
+        }
       }
+      return { text, finishReason, numTokens };
+    } finally {
+      clearTimeout(timer);
+      // A timed-out/failed stream must not leave this shared session inFlight
+      // and turn every later assertion into a misleading concurrent-send
+      // failure. Native cancellation settles before the owner-scoped reset.
+      await session.reset();
     }
-    // Reset between turns so each greedy decode is independent.
-    await session.reset();
-    return { text, finishReason, numTokens };
   }
 
-  it('answers a factual question (capital of France → Paris)', async () => {
-    const r = await runTurn('What is the capital of France?', undefined, 16);
-    assertCoherent(r.text, r.finishReason, r.numTokens);
-    expect(r.text.toLowerCase()).toContain('paris');
-  });
+  it(
+    'answers a factual question (capital of France → Paris)',
+    async () => {
+      const r = await runTurn('What is the capital of France?', undefined, 16);
+      assertCoherent(r.text, r.finishReason, r.numTokens);
+      expect(r.text.toLowerCase()).toContain('paris');
+    },
+    TEST_TIMEOUT_MS,
+  );
 
-  it('counts deterministically from 1 to 10', async () => {
-    const r = await runTurn('Count from 1 to 10.', undefined, 48);
-    assertCoherent(r.text, r.finishReason, r.numTokens);
-    // The full sequence must appear; a degenerate decode never reaches "10".
-    for (const n of ['1', '2', '5', '9', '10']) {
-      expect(r.text).toContain(n);
-    }
-  });
+  it(
+    'counts deterministically from 1 to 10',
+    async () => {
+      const r = await runTurn('Count from 1 to 10.', undefined, 48);
+      assertCoherent(r.text, r.finishReason, r.numTokens);
+      // The full sequence must appear; a degenerate decode never reaches "10".
+      for (const n of ['1', '2', '5', '9', '10']) {
+        expect(r.text).toContain(n);
+      }
+    },
+    TEST_TIMEOUT_MS,
+  );
 
-  it('produces a coherent open-ended sentence', async () => {
-    const r = await runTurn('Write one sentence about the ocean.', undefined, 80);
-    assertCoherent(r.text, r.finishReason, r.numTokens);
-    expect(r.text.toLowerCase()).toContain('ocean');
-  });
+  it(
+    'produces a coherent open-ended sentence',
+    async () => {
+      const r = await runTurn('Write one sentence about the ocean.', undefined, 80);
+      assertCoherent(r.text, r.finishReason, r.numTokens);
+      expect(r.text.toLowerCase()).toContain('ocean');
+    },
+    TEST_TIMEOUT_MS,
+  );
 
-  it.runIf(imageExists)('produces a coherent caption for a document image', async () => {
-    const buf = readFileSync(imagePath);
-    const bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-    const r = await runTurn('Describe this image.', [bytes], 96);
-    assertCoherent(r.text, r.finishReason, r.numTokens);
-    // A working vision path yields a multi-word description, not one token.
-    expect(r.text.trim().split(/\s+/).filter(Boolean).length).toBeGreaterThan(3);
-  });
+  it.runIf(imageExists)(
+    'produces a coherent caption for a document image',
+    async () => {
+      const buf = readFileSync(imagePath);
+      const bytes = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+      const r = await runTurn('Describe this image.', [bytes], 96);
+      assertCoherent(r.text, r.finishReason, r.numTokens);
+      // A working vision path yields a multi-word description, not one token.
+      expect(r.text.trim().split(/\s+/).filter(Boolean).length).toBeGreaterThan(3);
+    },
+    TEST_TIMEOUT_MS,
+  );
 });

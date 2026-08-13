@@ -1,4 +1,6 @@
-use crate::array::{MxArray, scaled_dot_product_attention, scaled_dot_product_attention_causal};
+use crate::array::{
+    DType, MxArray, scaled_dot_product_attention, scaled_dot_product_attention_causal,
+};
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::kv_cache::KVCache;
 use mlx_sys as sys;
@@ -475,6 +477,107 @@ impl Attention {
         })
     }
 
+    /// Compute one decode token per batch row with row-specific RoPE offsets.
+    ///
+    /// `x` must have shape `[N, 1, hidden_size]` and `rope_offsets` must be an
+    /// int32 array with shape `[N]`. The returned tensors use paged-attention
+    /// layout `[N, heads, head_dim]`.
+    pub fn compute_qkv_with_offsets(
+        &self,
+        x: &MxArray,
+        rope_offsets: &MxArray,
+    ) -> Result<QKVResult> {
+        let x_shape = x.shape()?;
+        if x_shape.len() != 3 || x_shape[1] != 1 {
+            return Err(Error::from_reason(format!(
+                "compute_qkv_with_offsets expects x shape [N, 1, hidden], got {:?}",
+                x_shape.as_ref()
+            )));
+        }
+        if x_shape[0] <= 0 {
+            return Err(Error::from_reason(
+                "compute_qkv_with_offsets requires at least one row",
+            ));
+        }
+        let w_q = self.q_proj.get_weight();
+        let hidden_size = w_q.shape_at(1)?;
+        if x_shape[2] != hidden_size {
+            return Err(Error::from_reason(format!(
+                "compute_qkv_with_offsets hidden size mismatch: expected {}, got {}",
+                hidden_size, x_shape[2]
+            )));
+        }
+        let offsets_shape = rope_offsets.shape()?;
+        if offsets_shape.as_ref() != [x_shape[0]] {
+            return Err(Error::from_reason(format!(
+                "compute_qkv_with_offsets expects rope_offsets shape [{}], got {:?}",
+                x_shape[0],
+                offsets_shape.as_ref()
+            )));
+        }
+        if rope_offsets.dtype()? != DType::Int32 {
+            return Err(Error::from_reason(format!(
+                "compute_qkv_with_offsets expects int32 rope_offsets, got {:?}",
+                rope_offsets.dtype()?
+            )));
+        }
+
+        let w_k = self.k_proj.get_weight();
+        let w_v = self.v_proj.get_weight();
+        let q_norm_w = self.q_norm.as_ref().map(|n| n.get_weight());
+        let k_norm_w = self.k_norm.as_ref().map(|n| n.get_weight());
+        let mut q_out: *mut sys::mlx_array = ptr::null_mut();
+        let mut k_out: *mut sys::mlx_array = ptr::null_mut();
+        let mut v_out: *mut sys::mlx_array = ptr::null_mut();
+
+        unsafe {
+            sys::mlx_fused_attention_qkv_with_offsets(
+                x.handle.0,
+                w_q.handle.0,
+                w_k.handle.0,
+                w_v.handle.0,
+                q_norm_w
+                    .as_ref()
+                    .map(|w| w.handle.0)
+                    .unwrap_or(ptr::null_mut()),
+                k_norm_w
+                    .as_ref()
+                    .map(|w| w.handle.0)
+                    .unwrap_or(ptr::null_mut()),
+                self.n_heads as i32,
+                self.n_kv_heads as i32,
+                self.head_dim as i32,
+                self.rope_base,
+                self.head_dim as i32,
+                self.qk_norm_eps,
+                rope_offsets.handle.0,
+                &mut q_out,
+                &mut k_out,
+                &mut v_out,
+            );
+        }
+        if q_out.is_null() || k_out.is_null() || v_out.is_null() {
+            return Err(Error::from_reason(
+                "mlx_fused_attention_qkv_with_offsets returned null pointer",
+            ));
+        }
+
+        let queries = MxArray::from_handle(q_out, "compute_qkv_with_offsets_q")?
+            .transpose(Some(&[0, 2, 1, 3]))?
+            .reshape(&[x_shape[0], self.n_heads as i64, self.head_dim as i64])?;
+        let keys = MxArray::from_handle(k_out, "compute_qkv_with_offsets_k")?
+            .transpose(Some(&[0, 2, 1, 3]))?
+            .reshape(&[x_shape[0], self.n_kv_heads as i64, self.head_dim as i64])?;
+        let values = MxArray::from_handle(v_out, "compute_qkv_with_offsets_v")?
+            .transpose(Some(&[0, 2, 1, 3]))?
+            .reshape(&[x_shape[0], self.n_kv_heads as i64, self.head_dim as i64])?;
+        Ok(QKVResult {
+            queries,
+            keys,
+            values,
+        })
+    }
+
     /// Run output projection on attention output.
     ///
     /// # Arguments
@@ -522,5 +625,164 @@ impl Clone for Attention {
             rope_base: self.rope_base,
             qk_norm_eps: self.qk_norm_eps,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_bit_equal(label: &str, actual: &MxArray, expected: &MxArray) {
+        assert_eq!(
+            actual.shape().expect("actual shape").as_ref(),
+            expected.shape().expect("expected shape").as_ref(),
+            "{label} shape"
+        );
+        let actual = actual.to_float32().expect("actual values");
+        let expected = expected.to_float32().expect("expected values");
+        assert_eq!(actual.as_ref(), expected.as_ref(), "{label} values");
+    }
+
+    fn assert_close(label: &str, actual: &MxArray, expected: &MxArray, tolerance: f32) {
+        assert_eq!(
+            actual.shape().expect("actual shape").as_ref(),
+            expected.shape().expect("expected shape").as_ref(),
+            "{label} shape"
+        );
+        let actual = actual.to_float32().expect("actual values");
+        let expected = expected.to_float32().expect("expected values");
+        let max_abs = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs <= tolerance,
+            "{label} max abs diff {max_abs} exceeds {tolerance}"
+        );
+    }
+
+    #[test]
+    fn array_offset_rope_is_bit_equal_to_scalar_rows() {
+        let x = MxArray::from_float32(
+            &[
+                0.25, -0.5, 0.75, 1.0, -1.25, 1.5, -1.75, 2.0, 0.125, 0.375, -0.625, 0.875, 1.125,
+                -1.375, 1.625, -1.875, -0.2, 0.4, -0.6, 0.8, -1.0, 1.2, -1.4, 1.6,
+            ],
+            &[3, 2, 1, 4],
+        )
+        .expect("input");
+        let offsets = MxArray::from_int32(&[0, 7, 31], &[3]).expect("offsets");
+        let batched_handle = unsafe {
+            sys::mlx_fast_rope_with_freqs(
+                x.handle.0,
+                4,
+                false,
+                10_000.0,
+                1.0,
+                offsets.handle.0,
+                ptr::null_mut(),
+            )
+        };
+        let batched = MxArray::from_handle(batched_handle, "batched rope").expect("batched rope");
+        let mut serial = Vec::new();
+        for (row, offset) in [0, 7, 31].into_iter().enumerate() {
+            let row = x
+                .slice(&[row as i64, 0, 0, 0], &[row as i64 + 1, 2, 1, 4])
+                .expect("row slice");
+            let handle =
+                unsafe { sys::mlx_fast_rope(row.handle.0, 4, false, 10_000.0, 1.0, offset) };
+            serial.push(MxArray::from_handle(handle, "scalar rope").expect("scalar rope"));
+        }
+        let expected = MxArray::concatenate_many(serial.iter().collect(), Some(0))
+            .expect("concat scalar rope");
+        assert_bit_equal("rope", &batched, &expected);
+    }
+
+    #[test]
+    fn array_offset_qkv_matches_scalar_rows_within_batched_gemm_tolerance() {
+        let mut attention =
+            Attention::new(8, 2, 1, Some(4), Some(10_000.0), Some(true), None).expect("attention");
+        let weights = |len: usize| {
+            (0..len)
+                .map(|i| ((i as i32 % 17) - 8) as f32 * 0.03125)
+                .collect::<Vec<_>>()
+        };
+        attention
+            .q_proj
+            .set_weight(&MxArray::from_float32(&weights(64), &[8, 8]).expect("q weight"))
+            .expect("set q weight");
+        attention
+            .k_proj
+            .set_weight(&MxArray::from_float32(&weights(32), &[4, 8]).expect("k weight"))
+            .expect("set k weight");
+        attention
+            .v_proj
+            .set_weight(&MxArray::from_float32(&weights(32), &[4, 8]).expect("v weight"))
+            .expect("set v weight");
+        let x = MxArray::from_float32(
+            &[
+                0.25, -0.5, 0.75, 1.0, -1.25, 1.5, -1.75, 2.0, 0.125, 0.375, -0.625, 0.875, 1.125,
+                -1.375, 1.625, -1.875, -0.2, 0.4, -0.6, 0.8, -1.0, 1.2, -1.4, 1.6,
+            ],
+            &[3, 1, 8],
+        )
+        .expect("input");
+        let offsets = MxArray::from_int32(&[0, 7, 31], &[3]).expect("offsets");
+
+        let batched = attention
+            .compute_qkv_with_offsets(&x, &offsets)
+            .expect("batched qkv");
+        let mut serial = Vec::new();
+        for (row, offset) in [0, 7, 31].into_iter().enumerate() {
+            let row = x
+                .slice(&[row as i64, 0, 0], &[row as i64 + 1, 1, 8])
+                .expect("row slice");
+            serial.push(attention.compute_qkv(&row, offset).expect("scalar qkv"));
+        }
+        let expected_q =
+            MxArray::concatenate_many(serial.iter().map(|qkv| &qkv.queries).collect(), Some(0))
+                .expect("concat q");
+        let expected_k =
+            MxArray::concatenate_many(serial.iter().map(|qkv| &qkv.keys).collect(), Some(0))
+                .expect("concat k");
+        let expected_v =
+            MxArray::concatenate_many(serial.iter().map(|qkv| &qkv.values).collect(), Some(0))
+                .expect("concat v");
+
+        // MLX chooses a different GEMM reduction for M=N than for N separate
+        // M=1 projections. RoPE itself is bit-exact (the test above); this
+        // bound isolates the expected projection-order difference without
+        // permitting a row/offset mix-up.
+        assert_close("queries", &batched.queries, &expected_q, 1e-3);
+        assert_close("keys", &batched.keys, &expected_k, 1e-3);
+        assert_close("values", &batched.values, &expected_v, 1e-3);
+    }
+
+    #[test]
+    fn array_offset_qkv_rejects_non_decode_shapes_and_offsets() {
+        let attention = Attention::new(8, 2, 1, Some(4), None, None, None).expect("attention");
+        let prefill = MxArray::zeros(&[2, 3, 8], None).expect("prefill");
+        let offsets = MxArray::from_int32(&[0, 1], &[2]).expect("offsets");
+        let err = attention
+            .compute_qkv_with_offsets(&prefill, &offsets)
+            .err()
+            .expect("multi-token rows must be rejected");
+        assert!(err.to_string().contains("[N, 1, hidden]"));
+
+        let decode = MxArray::zeros(&[2, 1, 8], None).expect("decode");
+        let wrong_len = MxArray::from_int32(&[0], &[1]).expect("wrong offsets");
+        let err = attention
+            .compute_qkv_with_offsets(&decode, &wrong_len)
+            .err()
+            .expect("offset row mismatch must be rejected");
+        assert!(err.to_string().contains("shape [2]"));
+
+        let wrong_dtype = MxArray::from_float32(&[0.0, 1.0], &[2]).expect("float offsets");
+        let err = attention
+            .compute_qkv_with_offsets(&decode, &wrong_dtype)
+            .err()
+            .expect("float offsets must be rejected");
+        assert!(err.to_string().contains("int32 rope_offsets"));
     }
 }

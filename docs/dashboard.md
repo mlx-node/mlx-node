@@ -84,22 +84,24 @@ restored on a hot-cache miss before falling back to a normal prefill.
 
 - Library default is **off** (`persistPagedCache` per-model config field, TS
   `persistPagedCache`). `mlx agent` turns it **on by default for every allowlisted
-  family** — `qwen3`, `qwen3_5`, `qwen3_5_moe`, `gemma4` — via a temporary config
+  family** — `qwen3`, `qwen3_5`, `qwen3_5_moe`, `gemma4`, `lfm2`, and
+  `lfm2_moe` — via a temporary config
   overlay, so a warm prefix survives a restart without opting in. Disable with
   `mlx agent --no-persist-cache`. The overlay writes an EXPLICIT value, so the
   flag beats whatever the checkpoint's `config.json` hard-codes; a family off the
   allowlist is handed no policy at all and the overlay never touches its field.
-- **Restore is gated to an allowlist: `qwen3`, `qwen3_5`, `qwen3_5_moe`, `gemma4`.**
+- **Restore is gated to an allowlist: `qwen3`, `qwen3_5`, `qwen3_5_moe`, `gemma4`, `lfm2`, and `lfm2_moe`.**
   Dense qwen3 sizes its pool over every layer, so paged blocks fully determine its
   layer state. The other three are hybrid — their pools cover the full-attention
   layers only — but each now persists its out-of-pool state as a cold-tier
-  **sidecar**: sliding-window `RotatingKVCache` state for gemma4, GDN recurrent
-  state for qwen3.5/3.6 dense and MoE. A `ColdSidecarPolicy` makes the restore
+  **sidecar**: grouped sliding-window K/V for gemma4, GDN recurrent state for
+  qwen3.5/3.6 dense and MoE, and ShortConv recurrent state for LFM2/2.5. A
+  `ColdSidecarPolicy` makes the restore
   reconcile DOWN to a boundary a validated sidecar actually backs (vLLM's per-group
   rule), and the `aux_prefix_unbacked` latch fails closed if an in-process hot hit
-  would resume a K/V prefix whose out-of-pool half is missing. `lfm2` / `lfm2_moe`
-  keep short-conv state outside the pool with no serialization path, so they are
-  **not** restore-eligible. A family joins the allowlist only after its restart-parity
+  would resume a K/V prefix whose out-of-pool half is missing. Gemma4 instead
+  installs every paged group at one validated boundary or resets them all to zero.
+  A family joins the allowlist only after its restart-parity
   gate passes on real weights with `hits > 0` and `corruptions == 0` — see
   `docs/paged-cache.md`. The allowlist is enforced natively in
   `cold_tier::resolve_persist_cold`, so a family that is off it never persists or
@@ -130,13 +132,13 @@ restored on a hot-cache miss before falling back to a normal prefill.
 
 ## Environment variables
 
-| Var                   | Effect                                                                                                                                                              |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `MLX_AGENT_METRICS=0` | Kill switch for the always-on metrics sink (`0` / `false` / `off`). Without it, the agent writes a trace per turn — no metrics page data means no traces to ingest. |
-| `MLX_COLD_CACHE_DIR`  | Parent dir for the cold tier (operates in its `mlx-paged-v1` child). Default `~/.mlx-node/cache/paged/v1`.                                                          |
+| Var                                | Effect                                                                                                                                                                       |
+| ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `MLX_AGENT_METRICS=0`              | Kill switch for the always-on metrics sink (`0` / `false` / `off`). Without it, the agent writes a trace per turn — no metrics page data means no traces to ingest.          |
+| `MLX_COLD_CACHE_DIR`               | Parent dir for the cold tier (operates in its `mlx-paged-v1` child). Default `~/.mlx-node/cache/paged/v1`.                                                                   |
 | `MLX_COLD_CAPTURE_BLOCKS_PER_TURN` | Blocks one turn's cold-tier capture walk may persist. Default `128` (2048 tokens at block size 16). Raising it covers a long prompt in fewer turns at the cost of turn tail. |
-| `MLX_COLD_CAPTURE_BUDGET_MS` | Wall-clock ceiling on one capture walk. Default `250`. A walk that hits it warns and ratchets less than configured. |
-| `MLX_MODELS_DIR`      | Local models directory when `--models-dir` is omitted.                                                                                                              |
+| `MLX_COLD_CAPTURE_BUDGET_MS`       | Wall-clock ceiling on one capture walk. Default `250`. A walk that hits it warns and ratchets less than configured.                                                          |
+| `MLX_MODELS_DIR`                   | Local models directory when `--models-dir` is omitted.                                                                                                                       |
 
 ## Security model
 

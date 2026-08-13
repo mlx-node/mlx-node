@@ -7,7 +7,7 @@ use crate::nn::RMSNorm;
 use crate::transformer::attention::Attention;
 use crate::transformer::kv_cache::KVCache;
 use crate::transformer::mlp::MLP;
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRaggedRow, SeqId};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use std::ptr;
@@ -531,6 +531,152 @@ impl TransformerBlock {
         let out = h.add(&mlp_out)?;
 
         Ok(out)
+    }
+
+    /// Uniform batched paged decode: one token and one request-specific RoPE
+    /// offset per row, one native K/V write, and one paged-attention dispatch.
+    ///
+    /// This path intentionally has no hidden N-times-serial fallback. A failed
+    /// batched primitive is returned to the scheduler so it can fail/park the
+    /// affected step without silently destroying the occupancy guarantee.
+    pub fn forward_paged_adapter_batched(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        layer_idx: u32,
+        rows: &[(SeqId, u32)],
+    ) -> Result<MxArray> {
+        let x_shape = x.shape()?;
+        if x_shape.len() != 3 || x_shape[0] != rows.len() as i64 || x_shape[1] != 1 {
+            return Err(Error::from_reason(format!(
+                "forward_paged_adapter_batched expects x [N,1,H] matching {} rows, got {:?}",
+                rows.len(),
+                x_shape.as_ref()
+            )));
+        }
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "forward_paged_adapter_batched requires at least one row",
+            ));
+        }
+        if !native_kv_write_enabled() {
+            return Err(Error::from_reason(
+                "forward_paged_adapter_batched requires MLX_QWEN3_NATIVE_KV_WRITE=1",
+            ));
+        }
+
+        let mut offsets = Vec::with_capacity(rows.len());
+        let mut seq_ids = Vec::with_capacity(rows.len());
+        for &(seq_id, position) in rows {
+            offsets.push(i32::try_from(position).map_err(|_| {
+                Error::from_reason(format!(
+                    "forward_paged_adapter_batched: sequence {seq_id} position {position} exceeds i32::MAX"
+                ))
+            })?);
+            seq_ids.push(seq_id);
+        }
+        let offsets = MxArray::from_int32(&offsets, &[rows.len() as i64])?;
+
+        let normed = self.input_layernorm.forward(x)?;
+        let qkv = self.self_attn.compute_qkv_with_offsets(&normed, &offsets)?;
+        adapter
+            .update_keys_values_native_batched(layer_idx, &qkv.keys, &qkv.values, rows)
+            .map_err(Error::from_reason)?;
+        let attn = adapter
+            .gather_kv_for_decode_graph_batched(
+                layer_idx,
+                &qkv.queries,
+                &seq_ids,
+                self.self_attn.get_scale() as f32,
+                1.0,
+            )
+            .map_err(Error::from_reason)?
+            .astype(x.dtype()?)?;
+        let attn = self
+            .self_attn
+            .output_projection(&attn, rows.len() as i64, 1)?;
+        let h = x.add(&attn)?;
+        let normed = self.post_attention_layernorm.forward(&h)?;
+        let mlp = self.mlp.forward(&normed)?;
+        h.add(&mlp)
+    }
+
+    /// Ragged scheduler step: packed prefill/decode query slices share one
+    /// QKV projection, one native K/V write, one varlen attention dispatch,
+    /// and one MLP pass. Request boundaries live exclusively in `rows`.
+    pub(crate) fn forward_paged_adapter_ragged(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        layer_idx: u32,
+        rows: &[PagedRaggedRow],
+    ) -> Result<MxArray> {
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "forward_paged_adapter_ragged requires at least one row",
+            ));
+        }
+        let total_queries = rows.iter().try_fold(0u32, |total, row| {
+            total.checked_add(row.query_len).ok_or_else(|| {
+                Error::from_reason("forward_paged_adapter_ragged query count overflow")
+            })
+        })?;
+        let x_shape = x.shape()?;
+        if x_shape.len() != 3 || x_shape[0] != i64::from(total_queries) || x_shape[1] != 1 {
+            return Err(Error::from_reason(format!(
+                "forward_paged_adapter_ragged expects x [{total_queries},1,H], got {:?}",
+                x_shape.as_ref()
+            )));
+        }
+        if !native_kv_write_enabled() {
+            return Err(Error::from_reason(
+                "forward_paged_adapter_ragged requires MLX_QWEN3_NATIVE_KV_WRITE=1",
+            ));
+        }
+
+        let mut offsets = Vec::with_capacity(total_queries as usize);
+        for row in rows {
+            for offset in 0..row.query_len {
+                let position = row
+                    .first_logical_position
+                    .checked_add(offset)
+                    .ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "forward_paged_adapter_ragged: sequence {} position overflow",
+                            row.seq_id
+                        ))
+                    })?;
+                offsets.push(i32::try_from(position).map_err(|_| {
+                    Error::from_reason(format!(
+                        "forward_paged_adapter_ragged: sequence {} position {position} exceeds i32::MAX",
+                        row.seq_id
+                    ))
+                })?);
+            }
+        }
+        let offsets = MxArray::from_int32(&offsets, &[i64::from(total_queries)])?;
+        let normed = self.input_layernorm.forward(x)?;
+        let qkv = self.self_attn.compute_qkv_with_offsets(&normed, &offsets)?;
+        adapter
+            .update_keys_values_native_ragged(layer_idx, &qkv.keys, &qkv.values, rows)
+            .map_err(Error::from_reason)?;
+        let attn = adapter
+            .gather_kv_for_ragged_graph(
+                layer_idx,
+                &qkv.queries,
+                rows,
+                self.self_attn.get_scale() as f32,
+                1.0,
+            )
+            .map_err(Error::from_reason)?
+            .astype(x.dtype()?)?;
+        let attn = self
+            .self_attn
+            .output_projection(&attn, i64::from(total_queries), 1)?;
+        let h = x.add(&attn)?;
+        let normed = self.post_attention_layernorm.forward(&h)?;
+        let mlp = self.mlp.forward(&normed)?;
+        h.add(&mlp)
     }
 
     // Norm weight getters/setters for parameter management

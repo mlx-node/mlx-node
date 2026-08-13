@@ -13,7 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheManager, ColdCacheStats};
+use mlx_paged_attn::{
+    ColdCacheFingerprint, ColdCacheManager, ColdCacheStats, ColdSidecar, ColdSidecarLayout,
+};
 use napi_derive::napi;
 use sha2::{Digest, Sha256};
 
@@ -240,10 +242,10 @@ pub struct ColdSidecarTelemetry {
     ///
     /// The only counter on the read side, and it exists because every other
     /// signal a restore emits is satisfiable with the sidecar thrown away.
-    /// `install_*_gdn_cold_sidecar` has eight `Ok(false)` arms and each one falls
-    /// through to a full O(prefix) recurrent replay that produces CORRECT state
-    /// — so `cached_tokens`, `hits`, `corruptions`, and text/`num_tokens` parity
-    /// all stay exactly as they were. Without this counter a regression from
+    /// A family can reject an otherwise readable sidecar and fall through to a
+    /// full O(prefix) recurrent replay that produces CORRECT state — so
+    /// `cached_tokens`, `hits`, `corruptions`, and text/`num_tokens` parity all
+    /// stay exactly as they were. Without this counter a regression from
     /// "restored and used" to "restored and re-derived from scratch" is
     /// invisible, and that regression is the whole feature.
     pub installed: u64,
@@ -372,6 +374,36 @@ pub fn cold_sidecar_telemetry() -> ColdSidecarTelemetry {
     SIDECAR_COUNTERS.snapshot()
 }
 
+/// Consume, validate, and transactionally install one restored auxiliary payload.
+///
+/// A rejected payload stays consumed so it cannot be reconsidered later in the
+/// turn. Any mismatch degrades to a cache miss; no caller may install state at a
+/// different boundary or under a geometry derived from another checkpoint.
+///
+/// This is the MLX equivalent of vLLM's cache coordinator handing the model
+/// runner one already-matched cache group. The family callback still decodes
+/// and seats its architecture-specific GDN, ShortConv, or sliding tensors, but
+/// the shared transaction owns the validation and success commit. Returning
+/// `Ok(None)` declines the payload without advancing install telemetry;
+/// returning `Err` fails the turn without claiming the state became live.
+pub(crate) fn try_install_cold_sidecar<T>(
+    restored: Option<ColdSidecar>,
+    expected_layout: &ColdSidecarLayout,
+    install: impl FnOnce(&[Vec<u8>], u32) -> napi::Result<Option<T>>,
+) -> napi::Result<Option<T>> {
+    let Some(sidecar) = restored else {
+        return Ok(None);
+    };
+    if expected_layout.boundary_tokens == 0 || &sidecar.layout != expected_layout {
+        return Ok(None);
+    }
+    let installed = install(&sidecar.tensors, sidecar.layout.boundary_tokens)?;
+    if installed.is_some() {
+        cold_sidecar_counters().record_install();
+    }
+    Ok(installed)
+}
+
 /// Serializes tests that assert on a DELTA of the process-wide counters.
 ///
 /// `SIDECAR_COUNTERS` is one static shared by every test thread, and cargo runs
@@ -388,7 +420,7 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 /// Model families whose paged prefix blocks can be restored from the SSD
 /// cold tier soundly. The single source of truth on the native side, and the
 /// exact mirror of `COLD_TIER_RESTORE_FAMILIES` in
-/// `packages/agent/src/provider/model-host.ts`; the two gate the same
+/// `packages/agent/src/cold-tier.ts`; the two gate the same
 /// decision from opposite ends, so a test asserts they never drift.
 ///
 /// A family belongs here only when EVERY piece of per-token state its forward
@@ -400,11 +432,10 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 ///  * `qwen3` (dense) sizes its pool over all layers, so the pool holds the
 ///    complete KV for the prefix and needs no sidecar
 ///    (`ColdTierContext::sidecar_policy` is `None`).
-///  * `gemma4` sizes its pool over the full-attention layers only, but persists
-///    its out-of-pool sliding-window `RotatingKVCache` state as a
-///    `ColdGroup::SlidingWindow` sidecar
-///    (`crate::models::gemma4::sliding_sidecar`). Its `ColdSidecarPolicy` makes
-///    the restore walk refuse any boundary a validated sidecar does not back.
+///  * `gemma4` owns full- and sliding-attention state in separate paged groups.
+///    The full-attention chain is the authority; a `ColdGroup::SlidingWindow`
+///    sidecar stores every sliding group at the same exact block boundary. A
+///    restore installs every group atomically or discards the candidate.
 ///  * `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
 ///    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
 ///    `ColdGroup::GdnState` sidecar (`crate::models::qwen3_5::gdn_sidecar`). A
@@ -416,20 +447,27 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 ///    shapes, same dtype, same layer mapping, projected by
 ///    `Qwen3_5MoeConfig::to_dense_config` — so it shares the dense family's
 ///    sidecar codec and `ColdSidecarPolicy` verbatim. Witnessed on
-///    `Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx`: the restore reconciled onto rung 304 of
+///    `Qwen3.6-35B-A3B-mxfp4-mlx`: the restore reconciled onto rung 304 of
 ///    the ladder `[16, 64, 304, 1248]` with `hits=42`, `corruptions=0`, and text
 ///    matching a no-persist baseline
 ///    (`crates/mlx-core/tests/qwen3_5_moe_cold_tier_parity.rs`).
-///  * `lfm2` / `lfm2_moe` keep short-conv state outside the pool with no
-///    serialization path for it at all, AND drive the uniform adapter API
-///    whose restore branch is already wired to the tier — attaching a context
-///    to them would restore an incomplete prefix silently.
+///  * `lfm2` / `lfm2_moe` keep ShortConv recurrent state outside the full-
+///    attention pool. `ColdGroup::ConvState` serializes that state at the same
+///    exact boundary as the K/V chain, so missing or malformed auxiliary state
+///    reconciles to a smaller backed boundary or zero.
 ///
 /// Widening this list is a correctness decision, never a perf one, and it is
 /// authorized by exactly one thing: the family's restart-parity gate
 /// (`crates/mlx-core/tests/cold_tier_parity_harness.rs`) passing on real
 /// weights with `hits > 0` and `corruptions == 0`.
-const COLD_RESTORE_FAMILIES: &[&str] = &["gemma4", "qwen3", "qwen3_5", "qwen3_5_moe"];
+const COLD_RESTORE_FAMILIES: &[&str] = &[
+    "qwen3",
+    "qwen3_5",
+    "qwen3_5_moe",
+    "gemma4",
+    "lfm2",
+    "lfm2_moe",
+];
 
 /// Whether the cold tier may restore persisted paged blocks for `model_type`
 /// (see [`COLD_RESTORE_FAMILIES`]). Fails closed: an unknown or misspelled
@@ -1113,6 +1151,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    use mlx_paged_attn::ColdGroup;
+
     use super::*;
 
     fn unique_tmp(tag: &str) -> PathBuf {
@@ -1159,6 +1199,123 @@ mod tests {
         WeightsResident::for_test(1, 4096)
     }
 
+    fn restored_sidecar(layout: ColdSidecarLayout) -> ColdSidecar {
+        let fingerprint = ColdCacheFingerprint::from_components([b"aux-install".as_slice()]);
+        let key = mlx_paged_attn::ColdCacheKey::chain(
+            layout.group,
+            fingerprint,
+            None,
+            &[1, 2, 3, 4],
+            &[],
+            0,
+            0,
+        );
+        let tensor_count = layout.tensor_count().unwrap_or(0);
+        let bytes_per_tensor = layout.bytes_per_tensor;
+        ColdSidecar {
+            key,
+            fingerprint,
+            layout,
+            tensors: vec![vec![0xA5; bytes_per_tensor]; tensor_count],
+        }
+    }
+
+    #[test]
+    fn cold_sidecar_transaction_validates_once_and_commits_only_after_seating() {
+        let _guard = sidecar_counter_test_lock();
+        let layout = ColdSidecarLayout {
+            group: ColdGroup::GdnState,
+            boundary_tokens: 32,
+            num_layers: 2,
+            tensors_per_layer: 2,
+            dtype: "BFloat16".to_string(),
+            dims: vec![2, 4],
+            bytes_per_tensor: 16,
+        };
+        let before = cold_sidecar_telemetry();
+        let mut seated = false;
+        let installed = try_install_cold_sidecar(
+            Some(restored_sidecar(layout.clone())),
+            &layout,
+            |tensors, boundary| {
+                assert_eq!(boundary, 32);
+                assert_eq!(tensors.len(), 4);
+                assert_eq!(
+                    cold_sidecar_telemetry().installed,
+                    before.installed,
+                    "the transaction must not commit before the family seats state"
+                );
+                seated = true;
+                Ok::<_, napi::Error>(Some(boundary))
+            },
+        )
+        .expect("matching restored sidecar");
+        assert!(seated);
+        assert_eq!(installed, Some(32));
+        assert_eq!(cold_sidecar_telemetry().installed, before.installed + 1);
+
+        let mut wrong_layout = layout.clone();
+        wrong_layout.dims = vec![4, 2];
+        let mut rejected_callback_ran = false;
+        assert!(
+            try_install_cold_sidecar(
+                Some(restored_sidecar(layout.clone())),
+                &wrong_layout,
+                |_tensors, _boundary| {
+                    rejected_callback_ran = true;
+                    Ok::<_, napi::Error>(Some(()))
+                },
+            )
+            .expect("layout mismatch is a cache miss")
+            .is_none(),
+            "loaded-model geometry mismatch must fail closed"
+        );
+        assert!(!rejected_callback_ran);
+        let mut wrong_group = layout.clone();
+        wrong_group.group = ColdGroup::ConvState;
+        assert!(
+            try_install_cold_sidecar(
+                Some(restored_sidecar(layout.clone())),
+                &wrong_group,
+                |_tensors, _boundary| Ok::<_, napi::Error>(Some(())),
+            )
+            .expect("group mismatch is a cache miss")
+            .is_none(),
+            "a payload from another auxiliary group must fail closed"
+        );
+        let mut wrong_boundary = layout.clone();
+        wrong_boundary.boundary_tokens = 16;
+        assert!(
+            try_install_cold_sidecar(
+                Some(restored_sidecar(layout.clone())),
+                &wrong_boundary,
+                |_tensors, _boundary| Ok::<_, napi::Error>(Some(())),
+            )
+            .expect("boundary mismatch is a cache miss")
+            .is_none(),
+            "a payload at another token boundary must fail closed"
+        );
+        let decode_error = try_install_cold_sidecar(
+            Some(restored_sidecar(layout.clone())),
+            &layout,
+            |_tensors, _boundary| Err::<Option<()>, _>(napi::Error::from_reason("decode failed")),
+        )
+        .expect_err("family decode error must escape the transaction");
+        assert_eq!(decode_error.reason, "decode failed");
+        let declined = try_install_cold_sidecar(
+            Some(restored_sidecar(layout.clone())),
+            &layout,
+            |_tensors, _boundary| Ok::<_, napi::Error>(None::<()>),
+        )
+        .expect("family decline is a cache miss");
+        assert!(declined.is_none());
+        assert_eq!(
+            cold_sidecar_telemetry().installed,
+            before.installed + 1,
+            "rejected, failed, and declined payloads must not advance telemetry"
+        );
+    }
+
     fn build(dir: &Path) -> Option<ColdCacheFingerprint> {
         build_with_witness(dir, &materialized())
     }
@@ -1190,11 +1347,9 @@ mod tests {
     fn cold_restore_allowlist_covers_gated_families_only() {
         // Dense: the pool holds the whole prefix.
         assert!(cold_restore_supported("qwen3"));
-        // Hybrid, admitted only because its out-of-pool sliding-window state is
-        // persisted as a `ColdGroup::SlidingWindow` sidecar AND its
-        // restart-parity gate passes on real weights
-        // (`crates/mlx-core/tests/gemma4_cold_tier_parity.rs`).
+        // Gemma4 restores full and sliding groups at one exact boundary.
         assert!(cold_restore_supported("gemma4"));
+        assert!(resolve_persist_cold("gemma4", Some("1"), Some(true)));
         // Hybrid, admitted only because its out-of-pool GDN recurrent state is
         // persisted as a `ColdGroup::GdnState` sidecar AND its restart-parity
         // gate passes on real weights
@@ -1206,14 +1361,11 @@ mod tests {
         // (`crates/mlx-core/tests/qwen3_5_moe_cold_tier_parity.rs`) — sharing a
         // codec with a passing family is not evidence, so the MoE ran its own.
         assert!(cold_restore_supported("qwen3_5_moe"));
-        // Every remaining family still keeps per-token state outside the paged
-        // pool with no cold-tier attach wired. lfm2 / lfm2_moe matter most:
-        // they drive the uniform adapter API whose restore branch is already
-        // wired to the tier, so admitting them would corrupt output rather
-        // than merely slow it down.
+        // LFM2 dense and MoE share the same exact-boundary ShortConv codec.
+        assert!(cold_restore_supported("lfm2"));
+        assert!(cold_restore_supported("lfm2_moe"));
+        // Unknown spellings still fail closed.
         for family in [
-            "lfm2",
-            "lfm2_moe",
             // Fails closed on anything unrecognized, including near-misses.
             "Qwen3",
             "qwen3 ",
@@ -1234,10 +1386,12 @@ mod tests {
         assert_eq!(
             cold_restore_families(),
             vec![
-                "gemma4".to_string(),
                 "qwen3".to_string(),
                 "qwen3_5".to_string(),
-                "qwen3_5_moe".to_string()
+                "qwen3_5_moe".to_string(),
+                "gemma4".to_string(),
+                "lfm2".to_string(),
+                "lfm2_moe".to_string()
             ]
         );
     }

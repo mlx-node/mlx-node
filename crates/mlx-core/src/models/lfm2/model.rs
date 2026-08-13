@@ -1,5 +1,6 @@
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
@@ -9,19 +10,29 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
-    ChatBackend, DecodeStep, PagedBackend, PagedPrefix, PagedTurnSetup, ResetScope, SaveStateArgs,
-    TurnOutput, TurnSetup, WholeTurnArgs,
+    ChatBackend, DecodeStep, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs, TurnOutput,
+    TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::ChatCmd;
+use crate::engine::cmd::{ChatCmd, FromChatCmd, handle_chat_cmd};
+use crate::engine::hybrid_scheduler::{
+    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
+    ScheduledPrefixAdmission, ScheduledRestoreResult, SchedulerOwnerContext,
+    scheduler_max_num_seqs_for, scheduler_per_seq_context,
+};
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
+use crate::engine::{self};
+use crate::model_thread::{ResponseTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
 use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
-use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::{
+    PagedKVCacheAdapter, PagedRestorePoll, PagedRestoreTicket, PagedTurnAdmission, SeqId,
+};
 
 use super::config::Lfm2Config;
+use super::conv_sidecar;
 use super::decoder_layer::{Lfm2DecoderLayer, Lfm2LayerKind};
 use super::layer_cache::Lfm2LayerCache;
 
@@ -40,24 +51,67 @@ fn last_token_slice_enabled() -> bool {
     *CACHED.get_or_init(|| std::env::var_os("MLX_LFM2_DISABLE_LAST_TOKEN_SLICE").is_none())
 }
 
-/// Whether the warm paged-turn conv-state reuse fast path is enabled.
-///
-/// OPT-IN, DEFAULT OFF. When ON, a qualifying warm continuation (see
-/// [`conv_state_reusable`]) reuses `self.caches`'s live incremental conv
-/// state instead of reconstructing it via a full re-embed + causal-SDPA pass
-/// over the whole cached prefix, skipping the redundant Pass 1. It ships
-/// opt-in because the reused incremental conv state differs MATERIALLY from
-/// the single-pass reconstruction it replaces (~40 ULP, enough to flip a
-/// near-tie argmax) — LFM2 ShortConv `in_proj` produces different bf16 for a
-/// T=1 incremental step vs the batched reconstruction input — so it is a real
-/// behavior change (arguably closer to flat continuous generation) that stays
-/// disabled until a conv oracle validates enabling it by default. Read once on
-/// first call and cached; subsequent reads hit the `OnceLock` fast path.
-fn conv_state_reuse_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled_or_default("MLX_LFM2_CONV_STATE_REUSE", false)
-    })
+/// Deepest full block a future identical prompt can restore while still
+/// recomputing its final prompt token to produce logits.
+fn lfm2_cold_restore_boundary(prompt_tokens: u32, block_size: u32) -> u32 {
+    if prompt_tokens == 0 || block_size == 0 {
+        return 0;
+    }
+    prompt_tokens
+        .saturating_sub(1)
+        .checked_div(block_size)
+        .unwrap_or(0)
+        .saturating_mul(block_size)
+}
+
+/// Commands owned by the LFM2 scheduler thread. Chat variants are lifted from
+/// the model-neutral API; scheduler telemetry is a barrier so it observes a
+/// coherent step boundary.
+pub(crate) enum Lfm2Cmd {
+    Chat(Box<ChatCmd>),
+    SchedulerStats {
+        reply: ResponseTx<engine::SchedulerStatsJs>,
+    },
+}
+
+impl FromChatCmd for Lfm2Cmd {
+    fn from_chat(cmd: ChatCmd) -> Self {
+        Self::Chat(Box::new(cmd))
+    }
+}
+
+impl HybridSchedulerCommand for Lfm2Cmd {
+    fn as_chat(&self) -> Option<&ChatCmd> {
+        match self {
+            Self::Chat(chat) => Some(chat),
+            Self::SchedulerStats { .. } => None,
+        }
+    }
+
+    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
+        match self {
+            Self::Chat(chat) => Ok(*chat),
+            other => Err(other),
+        }
+    }
+
+    fn into_scheduler_stats(
+        self,
+    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
+        match self {
+            Self::SchedulerStats { reply } => Ok(reply),
+            other => Err(other),
+        }
+    }
+}
+
+fn handle_lfm2_cmd(inner: &mut Lfm2Inner, command: Lfm2Cmd) {
+    match command {
+        Lfm2Cmd::Chat(command) => handle_chat_cmd(inner, *command),
+        Lfm2Cmd::SchedulerStats { reply } => {
+            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
+        }
+    }
 }
 
 /// Internal model state owned exclusively by the dedicated model thread.
@@ -65,6 +119,17 @@ fn conv_state_reuse_enabled() -> bool {
 /// No `Arc<RwLock<>>` — the model thread has sole ownership.
 pub(crate) struct Lfm2Inner {
     pub(crate) config: Lfm2Config,
+    /// The in-flight turn's cooperative-cancel flag, installed by the
+    /// sync and streaming session wrappers via
+    /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
+    /// turn epilogue on every exit path.
+    /// Polled at the top of each flat `chunked_prefill` chunk; `true`
+    /// aborts with the distinguished `"prefill cancelled"` error, riding
+    /// the engine's fail-closed prefill-`Err` arm. An LFM2 paged miss may
+    /// perform a full cached-prefix convolution replay in Pass 1 before the
+    /// single-shot suffix forward in Pass 2; neither has an internal chunk
+    /// boundary, so each dispatched slice remains an uncancellable window.
+    pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     /// Turn-constant layer classification (`FullAttention` vs `Conv`),
     /// computed once in [`Self::new`] instead of re-derived on every paged
     /// decode step. Pure function of the immutable `config` + layer count.
@@ -97,6 +162,12 @@ pub(crate) struct Lfm2Inner {
     /// not by absolute layer index. `Lfm2DecoderLayer::forward_paged_or_flat`
     /// performs the per-layer dispatch.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Per-request recurrent state for the scheduler lane. The legacy
+    /// whole-turn path continues to use `caches`; scheduled execution swaps one
+    /// request into that field for serial prefill/finalize and stacks rows
+    /// directly from this table for batched decode.
+    scheduled_caches: HashMap<SeqId, Vec<Lfm2LayerCache>>,
+    active_scheduled_seq: Option<SeqId>,
     /// Sampling + stop-token defaults parsed from the checkpoint's
     /// `generation_config.json` at load time. Empty for checkpoints that
     /// ship no such file. Consumed by the [`ChatBackend`] sampling/EOS
@@ -116,6 +187,22 @@ pub(crate) struct Lfm2Inner {
     /// actually did) instead of the full-prompt-scale numerator that is
     /// only honest when the reconstruction pass actually ran.
     last_paged_prefill_reused_conv_state: bool,
+    /// Materialized short-conv snapshots at exact block boundaries, keyed by
+    /// scheduler sequence (`0` for the whole-turn path). The SSD writer picks
+    /// the deepest checkpoint its K/V chain has actually reached.
+    conv_cold_checkpoints: HashMap<SeqId, VecDeque<Lfm2ConvColdCheckpoint>>,
+    /// Deepest boundary from the current PROMPT that a future request can
+    /// actually name. Decode extends the K/V chain past the prompt; allowing
+    /// those generated-token checkpoints to win would persist a sidecar no
+    /// identical fresh request can reach because lookup is capped at
+    /// `prompt_len - 1`.
+    conv_cold_capture_boundaries: HashMap<SeqId, u32>,
+}
+
+struct Lfm2ConvColdCheckpoint {
+    boundary: u32,
+    tokens: Vec<u32>,
+    states: Vec<MxArray>,
 }
 
 /// Classification of the prefix-cache decision made from a
@@ -198,11 +285,9 @@ pub(crate) fn classify_prefix_cache_decision(
 /// mirrors [`classify_prefix_cache_decision`]'s exact-match-is-miss
 /// invariant: LFM2 has no safe "rewind by one" primitive.
 ///
-/// This predicate only gates the fast path when [`conv_state_reuse_enabled`]
-/// is also true (opt-in via `MLX_LFM2_CONV_STATE_REUSE`, DEFAULT OFF): the
-/// reused live conv state differs materially (~40 ULP, near-tie argmax may
-/// flip) from the single-pass reconstruction it replaces, so it stays off
-/// until an oracle validates it.
+/// Both the legacy whole-turn path and the scheduler consume this predicate
+/// directly. The sole oracle is the carried incremental state produced by that
+/// sequence's preceding tokens, never a numerically different reconstruction.
 #[inline]
 fn conv_state_reusable(
     plan: &[u32],
@@ -347,6 +432,7 @@ impl Lfm2Inner {
 
         Ok(Self {
             config,
+            turn_cancel: None,
             layer_kinds,
             embed_tokens,
             layers,
@@ -357,11 +443,346 @@ impl Lfm2Inner {
             cached_token_history: Vec::new(),
             cached_image_key: None,
             paged_adapter,
+            scheduled_caches: HashMap::new(),
+            active_scheduled_seq: None,
             // Empty until the load path parses `generation_config.json`
             // (set via `set_gen_defaults` in `persistence.rs`).
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
             last_paged_prefill_reused_conv_state: false,
+            conv_cold_checkpoints: HashMap::new(),
+            conv_cold_capture_boundaries: HashMap::new(),
         })
+    }
+
+    /// Rebuild the construction-time pool after weight materialization so the
+    /// Metal working-set probe caps cache residency against the already-live
+    /// model instead of independently spending the same device budget twice.
+    pub(crate) fn size_paged_pool_after_weight_load(&mut self) -> Result<()> {
+        if self.paged_adapter.is_none() {
+            return Ok(());
+        }
+        // Preserve an explicit operator/test cap. Adaptive sizing is only for
+        // uncapped configurations; replacing a successfully co-resident fixed
+        // pool here can fail spuriously as prior model instances tear down.
+        if self.config.paged_cache_memory_mb.is_some() {
+            return Ok(());
+        }
+        self.paged_adapter = None;
+
+        let attn_layer_count = self.config.full_attn_idxs().len() as u32;
+        let block_size = self.config.paged_block_size.unwrap_or(16);
+        let trained_context = u32::try_from(self.config.max_position_embeddings)
+            .unwrap_or(1)
+            .max(1);
+        let per_seq_context = trained_context.min(scheduler_per_seq_context());
+        let requested_tokens =
+            per_seq_context.saturating_mul(scheduler_max_num_seqs_for(32) as u32);
+        let requested_blocks = requested_tokens.div_ceil(block_size).max(1);
+        let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+        let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
+            requested_blocks,
+            attn_layer_count,
+            self.config.num_key_value_heads as u32,
+            self.config.head_dim() as u32,
+            block_size,
+            cache_dtype,
+        )
+        .map_err(|error| {
+            Error::from_reason(format!(
+                "LFM2 adaptive paged cache sizing failed safely; refusing an uncapped pool request: {error}"
+            ))
+        })?;
+        let selected_mb = sizing.selected_bytes.div_ceil(1024 * 1024).max(1) as u32;
+        let pa_config = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            gpu_memory_mb: selected_mb,
+            head_size: self.config.head_dim() as u32,
+            num_kv_heads: self.config.num_key_value_heads as u32,
+            num_layers: attn_layer_count,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(per_seq_context),
+            max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
+        };
+        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            sizing.selected_blocks,
+            block_size,
+        )));
+        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, sizing.selected_blocks, cache_dtype)
+            .map_err(|error| {
+                Error::from_reason(format!("Failed to construct LFM2 KV pool: {error}"))
+            })?;
+        self.paged_adapter = Some(
+            PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
+                .map_err(Error::from_reason)?,
+        );
+        info!(
+            "LFM2 scheduler pool enabled: requested_blocks={}, selected_blocks={}, bytes={:.2} GiB, per_seq_context={}, max_num_seqs={}",
+            requested_blocks,
+            sizing.selected_blocks,
+            sizing.selected_bytes as f64 / (1u64 << 30) as f64,
+            per_seq_context,
+            scheduler_max_num_seqs_for(32),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn build_cold_tier_context(
+        &self,
+        model_path: &str,
+        weights: &crate::array::memory::WeightsResident,
+    ) -> Option<crate::transformer::paged_kv_cache_adapter::ColdTierContext> {
+        let adapter = self.paged_adapter.as_ref()?;
+        let manager = crate::cold_tier::global_cold_cache()?;
+        let cache_dtype = format!("{:?}", adapter.layer_kv_pool().cache_dtype());
+        let geometry = conv_sidecar::geometry(&self.config, &cache_dtype)?;
+        let sidecar_policy = conv_sidecar::policy(&self.config, &cache_dtype)?;
+        let mut config_json = serde_json::to_vec(&self.config).ok()?;
+        config_json.extend_from_slice(&geometry.fingerprint_component());
+        let pool = adapter.layer_kv_pool();
+        let pool_geometry = crate::cold_tier::ColdTierGeometry {
+            block_size: pool.block_size() as u64,
+            num_layers: pool.num_layers() as u64,
+            num_kv_heads: pool.config().num_kv_heads as u64,
+            head_size: pool.config().head_size as u64,
+            cache_dtype,
+        };
+        let family = if self.config.is_moe() {
+            "lfm2_moe"
+        } else {
+            "lfm2"
+        };
+        crate::cold_tier::build_model_fingerprint(
+            family,
+            model_path,
+            Some(&config_json),
+            &pool_geometry,
+            weights,
+        )
+        .map(
+            |fingerprint| crate::transformer::paged_kv_cache_adapter::ColdTierContext {
+                manager,
+                fingerprint,
+                sidecar_policy: Some(sidecar_policy),
+            },
+        )
+    }
+
+    pub(crate) fn attach_cold_tier(
+        &mut self,
+        context: crate::transformer::paged_kv_cache_adapter::ColdTierContext,
+        _weights: &crate::array::memory::WeightsResident,
+    ) {
+        if let Some(adapter) = self.paged_adapter.as_mut() {
+            adapter.set_cold_tier(context);
+        }
+    }
+
+    fn cold_restore_boundary(&self, prompt_tokens: u32) -> u32 {
+        self.paged_adapter
+            .as_ref()
+            .filter(|adapter| {
+                adapter.cold_tier().is_some_and(|cold| {
+                    cold.sidecar_policy.as_ref().is_some_and(|policy| {
+                        policy.group() == mlx_paged_attn::ColdGroup::ConvState
+                    })
+                })
+            })
+            .map_or(0, |adapter| {
+                lfm2_cold_restore_boundary(prompt_tokens, adapter.block_size())
+            })
+    }
+
+    fn remember_conv_cold_checkpoint_for(&mut self, seq_id: SeqId) {
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return;
+        };
+        let Some(boundary) = adapter.current_token_count_for(seq_id) else {
+            return;
+        };
+        let block_size = adapter.block_size();
+        if boundary == 0 || block_size == 0 || !boundary.is_multiple_of(block_size) {
+            return;
+        }
+        let Some(tokens) = adapter
+            .request_tokens_for(seq_id)
+            .and_then(|tokens| tokens.get(..boundary as usize))
+        else {
+            return;
+        };
+        let caches = if self.active_scheduled_seq == Some(seq_id)
+            || (seq_id == 0 && self.active_scheduled_seq.is_none())
+        {
+            &self.caches
+        } else {
+            let Some(caches) = self.scheduled_caches.get(&seq_id) else {
+                return;
+            };
+            caches
+        };
+        let Some(states) = conv_sidecar::snapshot_states(&self.config, caches) else {
+            return;
+        };
+        let checkpoints = self.conv_cold_checkpoints.entry(seq_id).or_default();
+        if checkpoints
+            .back()
+            .is_some_and(|entry| entry.boundary == boundary && entry.tokens.as_slice() == tokens)
+        {
+            return;
+        }
+        checkpoints.push_back(Lfm2ConvColdCheckpoint {
+            boundary,
+            tokens: tokens.to_vec(),
+            states,
+        });
+        while checkpoints.len() > 16 {
+            checkpoints.pop_front();
+        }
+    }
+
+    fn remember_conv_cold_checkpoint(&mut self) {
+        self.remember_conv_cold_checkpoint_for(self.active_scheduled_seq.unwrap_or(0));
+    }
+
+    fn install_lfm2_conv_cold_sidecar(
+        &mut self,
+        seq_id: SeqId,
+        cached_prefix_len: u32,
+    ) -> Result<bool> {
+        let (restored, cache_dtype) = {
+            let Some(adapter) = self.paged_adapter.as_mut() else {
+                return Ok(false);
+            };
+            let cache_dtype = format!("{:?}", adapter.layer_kv_pool().cache_dtype());
+            (adapter.take_restored_sidecar(), cache_dtype)
+        };
+        let Some(geometry) = conv_sidecar::geometry(&self.config, &cache_dtype) else {
+            return Ok(false);
+        };
+        let expected_layout = conv_sidecar::layout_at(&geometry, cached_prefix_len);
+        crate::cold_tier::try_install_cold_sidecar(
+            restored,
+            &expected_layout,
+            |tensors, _boundary| {
+                let Some(caches) = conv_sidecar::decode_caches(&self.config, &geometry, tensors)?
+                else {
+                    return Ok(None);
+                };
+                if seq_id == 0 || self.active_scheduled_seq == Some(seq_id) {
+                    self.caches = caches;
+                } else {
+                    self.scheduled_caches.insert(seq_id, caches);
+                }
+                Ok(Some(()))
+            },
+        )
+        .map(|installed| installed.is_some())
+    }
+
+    fn capture_lfm2_conv_cold_sidecar(&self, cache_salt: u64) {
+        crate::cold_tier::cold_sidecar_counters().record_capture_reached();
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return;
+        };
+        let Some(cold) = adapter.cold_tier() else {
+            return;
+        };
+        let Some(policy) = cold.sidecar_policy.as_ref() else {
+            return;
+        };
+        if policy.group() != mlx_paged_attn::ColdGroup::ConvState {
+            return;
+        }
+        let block_size = adapter.block_size();
+        if block_size == 0 {
+            return;
+        }
+        let request_tokens = adapter.request_tokens();
+        let seq_id = self.active_scheduled_seq.unwrap_or(0);
+        let Some(prompt_boundary) = self.conv_cold_capture_boundaries.get(&seq_id).copied() else {
+            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
+            return;
+        };
+        let ceiling = adapter
+            .cold_captured_blocks()
+            .saturating_mul(block_size)
+            .min(prompt_boundary);
+        let Some(checkpoints) = self.conv_cold_checkpoints.get(&seq_id) else {
+            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
+            return;
+        };
+        let Some(checkpoint) = checkpoints.iter().rev().find(|checkpoint| {
+            checkpoint.boundary <= ceiling
+                && request_tokens
+                    .get(..checkpoint.boundary as usize)
+                    .is_some_and(|tokens| tokens == checkpoint.tokens)
+        }) else {
+            crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
+            return;
+        };
+        let cache_dtype = format!("{:?}", adapter.layer_kv_pool().cache_dtype());
+        let Some(geometry) = conv_sidecar::geometry(&self.config, &cache_dtype) else {
+            return;
+        };
+        let blocks = checkpoint.boundary as usize / block_size as usize;
+        let mut parent = None;
+        for index in 0..blocks {
+            let Some(tokens) = checkpoint
+                .tokens
+                .get(index * block_size as usize..(index + 1) * block_size as usize)
+            else {
+                return;
+            };
+            parent = Some(mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::ConvState,
+                cold.fingerprint,
+                parent,
+                tokens,
+                &[],
+                cache_salt,
+                index,
+            ));
+        }
+        let Some(key) = parent else {
+            return;
+        };
+        if cold
+            .manager
+            .contains_in(&key, mlx_paged_attn::ColdGroup::ConvState)
+        {
+            crate::cold_tier::cold_sidecar_counters().record_already_persisted();
+            return;
+        }
+        let refs = checkpoint.states.iter().collect::<Vec<_>>();
+        if MxArray::eval_arrays(&refs).is_err() {
+            return;
+        }
+        let Ok(Some(tensors)) = conv_sidecar::encode_states(&geometry, &checkpoint.states) else {
+            return;
+        };
+        let sidecar = mlx_paged_attn::ColdSidecar {
+            key,
+            fingerprint: cold.fingerprint,
+            layout: conv_sidecar::layout_at(&geometry, checkpoint.boundary),
+            tensors,
+        };
+        let deadline = std::time::Instant::now() + adapter.cold_capture_budget().max_walk;
+        match cold.manager.enqueue_sidecar_before(sidecar, deadline) {
+            Ok(true) => crate::cold_tier::cold_sidecar_counters().record_enqueued(),
+            Ok(false) => crate::cold_tier::cold_sidecar_counters().record_queue_drop(),
+            Err(error) => tracing::debug!(
+                target: "mlx_core::lfm2::paged",
+                "LFM2 conv sidecar enqueue failed: {error}"
+            ),
+        }
+    }
+
+    pub(crate) fn paged_pool_allocated_bytes(&self) -> Result<u64> {
+        self.paged_adapter
+            .as_ref()
+            .map(PagedKVCacheAdapter::pool_allocated_bytes)
+            .transpose()
+            .map(|bytes| bytes.unwrap_or(0))
+            .map_err(Error::from_reason)
     }
 
     pub(crate) fn set_tokenizer(&mut self, tokenizer: Arc<Qwen3Tokenizer>) {
@@ -417,6 +838,18 @@ impl Lfm2Inner {
         let total_len = prompt.shape_at(1)?;
         let mut offset: i64 = 0;
         while total_len - offset > PREFILL_STEP_SIZE {
+            // Cooperative-cancel checkpoint (H1b): abort at the chunk
+            // boundary. The Err rides the flat engine's
+            // `fail_closed_flat_turn` arm — no `save_cache_state`, the
+            // session is invalidated, so the partially-advanced
+            // conv/attention caches never become a live prefix.
+            if self
+                .turn_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                return Err(Error::from_reason("prefill cancelled"));
+            }
             let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
             {
                 let _stream_ctx = StreamContext::new(generation_stream);
@@ -425,6 +858,19 @@ impl Lfm2Inner {
             eval_lfm2_caches(&self.caches)?;
             crate::array::clear_cache();
             offset += PREFILL_STEP_SIZE;
+        }
+        // The final remainder is a chunk boundary too once at least one
+        // looped chunk ran: poll before forwarding it so a cancel landing
+        // during the last looped chunk aborts instead of riding through the
+        // remainder. `offset == 0` (single-shot) stays uncancellable by
+        // design.
+        if offset > 0
+            && self
+                .turn_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+        {
+            return Err(Error::from_reason("prefill cancelled"));
         }
         let remaining = prompt.slice_axis(1, offset, total_len)?;
         let logits = {
@@ -444,6 +890,10 @@ impl Lfm2Inner {
     /// (see [`ChatBackend::reset_caches`]).
     fn reset_caches_internal(&mut self) {
         self.caches = init_caches(&self.config);
+        self.scheduled_caches.clear();
+        self.active_scheduled_seq = None;
+        self.conv_cold_checkpoints.clear();
+        self.conv_cold_capture_boundaries.clear();
         self.cached_token_history.clear();
         self.cached_image_key = None;
         // Drop any live paged-adapter request. Without this, a
@@ -456,7 +906,7 @@ impl Lfm2Inner {
         // cache; the EXPLICIT command reset purges them on top of this
         // (`ResetScope::Command` branch of the trait impl).
         if let Some(adapter) = self.paged_adapter.as_mut() {
-            let _ = adapter.release_request();
+            let _ = adapter.release_all_requests();
         }
     }
 
@@ -508,12 +958,11 @@ impl Lfm2Inner {
     /// hit length. `skip_conv_reconstruction` is
     /// [`conv_state_reusable`]'s verdict from `prime_prefix_state`
     /// (threaded through [`Lfm2PrefixState::conv_state_reusable`]),
-    /// and is only ever `true` when the opt-in `MLX_LFM2_CONV_STATE_REUSE`
-    /// flag is set ([`conv_state_reuse_enabled`], DEFAULT OFF): when `true`,
-    /// `self.caches`'s conv-layer state is already known to be at the
-    /// `cached_prefix_len` boundary, so Pass 1 is skipped entirely and Pass 2
-    /// runs directly on the live caches. Default-off ⇒ always `false` ⇒ Pass 1
-    /// reconstruction always runs (byte-identical to prior behavior).
+    /// is true when `self.caches`'s conv-layer state is already known to be at
+    /// the `cached_prefix_len` boundary. The legacy path proves this against
+    /// its one live history; the scheduler proves it against exact owner
+    /// history plus the sequence-keyed recurrent-state table. In either case
+    /// Pass 1 is skipped and Pass 2 runs on the carried state.
     ///
     /// Returns the last position's logits squeezed to `[vocab]`.
     fn run_paged_prefill_chunk(
@@ -529,19 +978,7 @@ impl Lfm2Inner {
             ));
         }
 
-        // Record the SUFFIX tokens in the paged adapter (cached_prefix
-        // already lives in the pool). The conv layers see the FULL
-        // prompt below.
         let suffix_len = suffix_tokens.len() as u32;
-        {
-            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
-                Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
-            })?;
-            adapter
-                .record_tokens(suffix_tokens)
-                .map_err(Error::from_reason)?;
-        }
-
         // Build per-layer kind list once. paged_idx counts only
         // full_attention layers in their original layer order.
         let layer_kinds = self.compute_layer_kinds();
@@ -576,6 +1013,24 @@ impl Lfm2Inner {
             // pass 2 can continue from there.
             let prefix = &full_tokens[..(cached_prefix_len as usize)];
             self.run_conv_only_prefill(prefix)?;
+        }
+
+        // A hybrid cold/hot prefix is not writable until its out-of-pool
+        // ShortConv half is established. A restored sidecar reaches this point
+        // with no obligation; a warm foreign hit takes Pass 1 above, then this
+        // exact-boundary acknowledgement makes it safe to append the suffix.
+        // Arming this before replay would permit KV/conv skew, while recording
+        // before acknowledgement fails closed in the adapter.
+        {
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_prefill_chunk: paged_adapter is None")
+            })?;
+            adapter
+                .confirm_aux_prefix_primed(cached_prefix_len)
+                .map_err(Error::from_reason)?;
+            adapter
+                .record_tokens(suffix_tokens)
+                .map_err(Error::from_reason)?;
         }
 
         // Pass 2: full forward on the suffix.
@@ -684,7 +1139,132 @@ impl Lfm2Inner {
         let last = logits
             .slice_axis(1, seq_len - 1, seq_len)?
             .squeeze(Some(&[0, 1]))?;
+        self.remember_conv_cold_checkpoint();
         Ok(last)
+    }
+
+    fn park_active_scheduled_caches(&mut self) {
+        let Some(seq_id) = self.active_scheduled_seq.take() else {
+            return;
+        };
+        let replacement = init_caches(&self.config);
+        let caches = std::mem::replace(&mut self.caches, replacement);
+        self.scheduled_caches.insert(seq_id, caches);
+    }
+
+    fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        self.paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("lfm2 paged adapter is unavailable"))?
+            .activate_request(seq_id)
+            .map_err(Error::from_reason)?;
+        if self.active_scheduled_seq == Some(seq_id) {
+            return Ok(());
+        }
+        self.park_active_scheduled_caches();
+        self.caches = self
+            .scheduled_caches
+            .remove(&seq_id)
+            .unwrap_or_else(|| init_caches(&self.config));
+        self.active_scheduled_seq = Some(seq_id);
+        Ok(())
+    }
+
+    fn reset_scheduled_caches_for(&mut self, seq_id: SeqId) {
+        if self.active_scheduled_seq == Some(seq_id) {
+            self.caches = init_caches(&self.config);
+        } else {
+            self.scheduled_caches
+                .insert(seq_id, init_caches(&self.config));
+        }
+    }
+
+    fn release_scheduled_caches_for(&mut self, seq_id: SeqId) {
+        if self.active_scheduled_seq == Some(seq_id) {
+            self.active_scheduled_seq = None;
+            self.caches = init_caches(&self.config);
+        }
+        self.scheduled_caches.remove(&seq_id);
+        self.conv_cold_checkpoints.remove(&seq_id);
+        self.conv_cold_capture_boundaries.remove(&seq_id);
+    }
+
+    fn recurrent_state_bytes_per_seq(&self) -> u64 {
+        let conv_layers = self
+            .layer_kinds
+            .iter()
+            .filter(|kind| matches!(kind, Lfm2LayerKind::Conv))
+            .count() as u64;
+        conv_layers
+            .saturating_mul(self.config.conv_l_cache.saturating_sub(1).max(0) as u64)
+            .saturating_mul(self.config.hidden_size.max(0) as u64)
+            .saturating_mul(2) // production recurrent state is BF16
+    }
+
+    fn has_scheduled_caches_for(&self, seq_id: SeqId) -> bool {
+        self.active_scheduled_seq == Some(seq_id) || self.scheduled_caches.contains_key(&seq_id)
+    }
+
+    fn scheduled_recurrent_bytes(&self) -> u64 {
+        let rows =
+            self.scheduled_caches.len() as u64 + u64::from(self.active_scheduled_seq.is_some());
+        rows.saturating_mul(self.recurrent_state_bytes_per_seq())
+    }
+
+    fn stacked_conv_state(
+        &mut self,
+        seq_ids: &[SeqId],
+        layer_idx: usize,
+        _dtype: crate::array::DType,
+    ) -> Result<MxArray> {
+        self.park_active_scheduled_caches();
+        let mut states = Vec::with_capacity(seq_ids.len());
+        for &seq_id in seq_ids {
+            let caches = self.scheduled_caches.get(&seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "LFM2 sequence {seq_id} has no scheduled convolution state"
+                ))
+            })?;
+            let state = caches
+                .get(layer_idx)
+                .and_then(|cache| match cache {
+                    Lfm2LayerCache::Conv(cache) => cache.get(0).cloned(),
+                    Lfm2LayerCache::Attention(_) => None,
+                })
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "LFM2 sequence {seq_id} has no materialized convolution state for layer {layer_idx}"
+                    ))
+                })?;
+            states.push(state);
+        }
+        MxArray::concatenate_many(states.iter().collect(), Some(0))
+    }
+
+    fn scatter_conv_state(
+        &mut self,
+        seq_ids: &[SeqId],
+        layer_idx: usize,
+        state: &MxArray,
+    ) -> Result<()> {
+        for (row, &seq_id) in seq_ids.iter().enumerate() {
+            let row_state = state.slice_axis(0, row as i64, row as i64 + 1)?;
+            let caches = self.scheduled_caches.get_mut(&seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "LFM2 sequence {seq_id} disappeared during convolution-state scatter"
+                ))
+            })?;
+            let cache = caches
+                .get_mut(layer_idx)
+                .and_then(Lfm2LayerCache::as_conv_cache_mut)
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "LFM2 layer {layer_idx} has no convolution-state slot"
+                    ))
+                })?;
+            cache.set(0, row_state)?;
+        }
+        Ok(())
     }
 
     /// Run one paged decode step: feed `[token_id]` through the model.
@@ -765,6 +1345,8 @@ impl Lfm2Inner {
             }
         }
 
+        self.remember_conv_cold_checkpoint();
+
         // Tied path → `Embedding::as_linear` (packed quantized matmul or dense
         // `h @ weight^T`).
         hidden_states = self.embedding_norm.forward(&hidden_states)?;
@@ -774,6 +1356,103 @@ impl Lfm2Inner {
             self.embed_tokens.as_linear(&hidden_states)?
         };
         Ok(logits)
+    }
+
+    /// Run one uniform paged decode step for multiple LFM2 requests.
+    /// Attention and ShortConv layers both execute once over `[N,1,H]`; the
+    /// convolution state is stacked/scattered around each conv layer.
+    fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        if rows.is_empty() {
+            return Err(Error::from_reason(
+                "run_paged_decode_step_batched requires at least one row",
+            ));
+        }
+        self.park_active_scheduled_caches();
+        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
+            Error::from_reason("run_paged_decode_step_batched: paged adapter is unavailable")
+        })?;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut planned_rows = Vec::with_capacity(rows.len());
+        for &(seq_id, _) in rows {
+            if !seen.insert(seq_id) {
+                return Err(Error::from_reason(format!(
+                    "run_paged_decode_step_batched received duplicate sequence {seq_id}"
+                )));
+            }
+            let position = adapter.current_token_count_for(seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "run_paged_decode_step_batched: unknown sequence {seq_id}"
+                ))
+            })?;
+            planned_rows.push((seq_id, position));
+        }
+
+        let mut recorded = Vec::with_capacity(rows.len());
+        for &(seq_id, token_id) in rows {
+            let result = self
+                .paged_adapter
+                .as_mut()
+                .ok_or_else(|| {
+                    Error::from_reason("run_paged_decode_step_batched: paged adapter disappeared")
+                })?
+                .record_token_for(seq_id, token_id);
+            if let Err(error) = result {
+                for &recorded_seq in recorded.iter().rev() {
+                    let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                        Error::from_reason(
+                            "run_paged_decode_step_batched: paged adapter disappeared during rollback",
+                        )
+                    })?;
+                    adapter
+                        .activate_request(recorded_seq)
+                        .map_err(Error::from_reason)?;
+                    adapter
+                        .rollback_last_tokens(1)
+                        .map_err(Error::from_reason)?;
+                }
+                return Err(Error::from_reason(format!(
+                    "run_paged_decode_step_batched failed to record sequence {seq_id}: {error}"
+                )));
+            }
+            recorded.push(seq_id);
+        }
+
+        let token_ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
+        let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
+        let input_ids = MxArray::from_uint32(&token_ids, &[rows.len() as i64, 1])?;
+        let mut hidden_states = self.embed_tokens.forward(&input_ids)?;
+        for layer_idx in 0..self.layers.len() {
+            let kind = self.layer_kinds[layer_idx];
+            let layer: &Lfm2DecoderLayer = unsafe { &*self.layers.as_ptr().add(layer_idx) };
+            let conv_state = if kind == Lfm2LayerKind::Conv {
+                Some(self.stacked_conv_state(&seq_ids, layer_idx, hidden_states.dtype()?)?)
+            } else {
+                None
+            };
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("run_paged_decode_step_batched: paged adapter dropped")
+            })?;
+            let (next_hidden, next_conv_state) = layer.forward_paged_or_flat_batched(
+                &hidden_states,
+                kind,
+                adapter,
+                &planned_rows,
+                conv_state.as_ref(),
+            )?;
+            hidden_states = next_hidden;
+            if let Some(state) = next_conv_state {
+                self.scatter_conv_state(&seq_ids, layer_idx, &state)?;
+            }
+        }
+        for &seq_id in &seq_ids {
+            self.remember_conv_cold_checkpoint_for(seq_id);
+        }
+        hidden_states = self.embedding_norm.forward(&hidden_states)?;
+        if let Some(ref head) = self.lm_head {
+            head.forward(&hidden_states)
+        } else {
+            self.embed_tokens.as_linear(&hidden_states)
+        }
     }
 
     /// Forward the cached prefix tokens through ALL layers (conv state
@@ -859,9 +1538,233 @@ impl Lfm2Inner {
     }
 }
 
-/// Eager flat decode stepper for one lfm2 turn (built by
-/// [`ChatBackend::begin_decode`]). Each `forward` runs the native
-/// [`Lfm2Inner::forward`].
+pub(crate) type Lfm2SchedulerState = HybridSchedulerState<Lfm2Inner>;
+
+impl HybridSchedulerBackend for Lfm2Inner {
+    type Command = Lfm2Cmd;
+    type RestoreTicket = PagedRestoreTicket;
+    type OwnerState = Vec<u32>;
+    type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
+
+    const SCHEDULER_NAME: &'static str = "LFM2";
+
+    fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter> {
+        self.paged_adapter.as_ref()
+    }
+
+    fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter> {
+        self.paged_adapter.as_mut()
+    }
+
+    fn max_position_embeddings(&self) -> i32 {
+        self.config.max_position_embeddings
+    }
+
+    fn recurrent_state_bytes(&self) -> u64 {
+        self.recurrent_state_bytes_per_seq()
+    }
+
+    fn scheduled_recurrent_bytes(&self) -> u64 {
+        self.scheduled_recurrent_bytes()
+    }
+
+    fn has_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.has_scheduled_caches_for(seq_id)
+    }
+
+    fn activate_scheduled_recurrent(&mut self, seq_id: SeqId) -> Result<()> {
+        self.activate_paged_seq(seq_id)
+    }
+
+    fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+        self.activate_paged_seq(seq_id)
+    }
+
+    fn park_active_scheduled_recurrent(&mut self) -> Result<()> {
+        self.park_active_scheduled_caches();
+        Ok(())
+    }
+
+    fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
+        self.release_scheduled_caches_for(seq_id);
+    }
+
+    fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+        self.run_paged_decode_step_batched(rows)
+    }
+
+    fn replace_cached_token_history(&mut self, history: Vec<u32>) {
+        self.cached_token_history = history;
+    }
+
+    fn owner_tokens(state: &Self::OwnerState) -> &[u32] {
+        state
+    }
+
+    fn capture_owner_state(&mut self, _seq_id: SeqId) -> Self::OwnerState {
+        self.cached_token_history.clone()
+    }
+
+    fn build_scheduled_prefix(
+        &self,
+        base: &Self::PrefixState,
+        effective_cached_prefix_len: usize,
+        suffix_len: usize,
+        full_tokens: Vec<u32>,
+        first_chunk: bool,
+    ) -> Self::PrefixState {
+        Lfm2PrefixState {
+            effective_cached_prefix_len,
+            suffix_len,
+            full_tokens,
+            conv_state_reusable: !first_chunk || base.conv_state_reusable,
+        }
+    }
+
+    fn prepare_scheduled_prefix(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+        owner_history: &[u32],
+        reuse_cache: bool,
+        cache_salt: u64,
+        _block_size: u32,
+    ) -> Result<ScheduledPrefixAdmission<Self::PrefixState, Self::RestoreTicket>> {
+        self.activate_paged_seq(seq_id)?;
+        let total_budget = tokens.len() as u32;
+        let admission = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("LFM2 paged adapter is unavailable"))?
+            .prepare_turn_with_async_restore(
+                seq_id,
+                tokens,
+                total_budget,
+                reuse_cache,
+                &[],
+                cache_salt,
+                false,
+                total_budget.saturating_sub(1),
+            )
+            .map_err(Error::from_reason)?;
+        let (plan, restore) = match admission {
+            PagedTurnAdmission::Ready(plan) => (plan, None),
+            PagedTurnAdmission::Waiting {
+                provisional,
+                restore,
+            } => (provisional, Some(restore)),
+        };
+        let installed = if restore.is_none() {
+            self.install_lfm2_conv_cold_sidecar(seq_id, plan.cached_prefix_len)?
+        } else {
+            false
+        };
+        let conv_state_reusable = installed
+            || conv_state_reusable(tokens, owner_history, plan.cached_prefix_len as usize);
+        if restore.is_none() && !conv_state_reusable {
+            self.reset_scheduled_caches_for(seq_id);
+        }
+        let prefix = Lfm2PrefixState {
+            effective_cached_prefix_len: plan.cached_prefix_len as usize,
+            suffix_len: plan.suffix_len as usize,
+            full_tokens: tokens.to_vec(),
+            conv_state_reusable,
+        };
+        Ok(match restore {
+            Some(restore) => ScheduledPrefixAdmission::Waiting {
+                provisional: prefix,
+                restore,
+            },
+            None => ScheduledPrefixAdmission::Ready(prefix),
+        })
+    }
+
+    fn poll_scheduled_restore(
+        &mut self,
+        seq_id: SeqId,
+        restore: &mut Self::RestoreTicket,
+        prompt_tokens: &[u32],
+        owner_history: &[u32],
+        _is_preemption_replay: bool,
+    ) -> Result<Option<ScheduledRestoreResult<Self::PrefixState>>> {
+        let outcome = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("LFM2 paged adapter is unavailable"))?
+            .poll_restore(restore)
+            .map_err(Error::from_reason)?;
+        let PagedRestorePoll::Ready {
+            plan,
+            bytes_restored,
+            wait,
+        } = outcome
+        else {
+            return Ok(None);
+        };
+        let installed = self.install_lfm2_conv_cold_sidecar(seq_id, plan.cached_prefix_len)?;
+        let conv_state_reusable = installed
+            || conv_state_reusable(
+                prompt_tokens,
+                owner_history,
+                plan.cached_prefix_len as usize,
+            );
+        if !conv_state_reusable {
+            self.reset_scheduled_caches_for(seq_id);
+        }
+        let cold_boundary = self.cold_restore_boundary(prompt_tokens.len() as u32);
+        Ok(Some(ScheduledRestoreResult {
+            prefix: Lfm2PrefixState {
+                effective_cached_prefix_len: plan.cached_prefix_len as usize,
+                suffix_len: plan.suffix_len as usize,
+                full_tokens: prompt_tokens.to_vec(),
+                conv_state_reusable,
+            },
+            bytes_restored,
+            wait,
+            materialized_blocks: self
+                .paged_adapter
+                .as_ref()
+                .and_then(|adapter| adapter.block_table_for(seq_id))
+                .map(|table| table.num_blocks() as u32)
+                .unwrap_or(0),
+            profiler_prefill_tokens: if conv_state_reusable {
+                plan.suffix_len
+            } else {
+                prompt_tokens.len() as u32
+            },
+            extra_prefill_breaks: vec![cold_boundary],
+        }))
+    }
+
+    fn restore_reserved_blocks(restore: &Self::RestoreTicket) -> u32 {
+        restore.reserved_blocks()
+    }
+
+    fn extra_prefill_breaks(&self, prompt_tokens: u32, _cached_prefix: u32) -> Vec<u32> {
+        vec![self.cold_restore_boundary(prompt_tokens)]
+    }
+
+    fn profiler_prefill_tokens(&self, prefix: &Self::PrefixState, prompt_tokens: u32) -> u32 {
+        if prefix.conv_state_reusable {
+            prefix.suffix_len as u32
+        } else {
+            prompt_tokens
+        }
+    }
+
+    fn step_executor(&mut self) -> Self::StepExecutor<'_> {
+        HybridStepExecutor::new(self)
+    }
+
+    fn execute_barrier(
+        &mut self,
+        command: Self::Command,
+        _owners: SchedulerOwnerContext<'_, Self::OwnerState>,
+    ) {
+        handle_lfm2_cmd(self, command);
+    }
+}
+
 pub(crate) struct Lfm2Decode<'a> {
     inner: &'a mut Lfm2Inner,
 }
@@ -889,6 +1792,10 @@ impl ChatBackend for Lfm2Inner {
 
     fn family_name(&self) -> &'static str {
         "lfm2"
+    }
+
+    fn set_turn_cancel_flag(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.turn_cancel = flag;
     }
 
     fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
@@ -1046,10 +1953,10 @@ impl ChatBackend for Lfm2Inner {
                 // plan resolves, so a delta reaches `run_paged_turn` as the
                 // same strict extension a resent growing conversation
                 // produces: the adapter warm-continues the live request and
-                // conv Pass-1 (`run_conv_only_prefill`) rebuilds short-conv
-                // state over the cached prefix. The short-conv state itself
-                // is still never represented by the adapter — it is
-                // reconstructed from tokens every paged turn. Declaring
+                // exact-owner turns carry their incremental ShortConv state.
+                // Foreign/partial prefix hits rebuild that state once via
+                // Pass 1 (`run_conv_only_prefill`). The ShortConv state itself
+                // is never represented by the paged adapter. Declaring
                 // `supports_delta: false` would route deltas to the flat
                 // tail, which tail-prefills onto EMPTY flat attention KV
                 // (paged turns never fill it) while conv state sits at the
@@ -1100,8 +2007,9 @@ impl ChatBackend for Lfm2Inner {
         // before plan resolution) and the engine forces `reuse_cache = true`,
         // so `prime_prefix_state` sees the exact strict-extension shape a
         // resent growing conversation produces — the adapter warm-continues
-        // the live request and `run_paged_prefill_chunk` Pass-1 rebuilds
-        // conv state over the cached prefix.
+        // the live request and `run_paged_prefill_chunk` carries the exact
+        // incremental conv state (or performs one fail-closed Pass-1 rebuild
+        // for a foreign/partial prefix hit).
         //
         // The model-neutral `run_paged_turn` drives the whole turn
         // through `<Lfm2Inner as PagedBackend>` (prime → prefill →
@@ -1186,9 +2094,10 @@ impl DecodeStep for Lfm2PagedDecode<'_> {
     // `<Lfm2Inner as PagedBackend>::save_paged_history`), so no extra forward
     // is needed.
     //
-    // `end_decode` — DO NOT override (default Ok(())). lfm2 PAGED reprefills
-    // conv from token 0 every turn, so there is nothing to export back into
-    // `self.caches`.
+    // `end_decode` — DO NOT override (default Ok(())). The decode loop updates
+    // the active request's convolution state in place. The scheduler parks that
+    // state in its sequence-keyed table after finalization; the legacy lane
+    // leaves it in `self.caches` for the next exact-owner continuation.
 }
 
 /// lfm2 paged prefix state — the effective prefix/suffix split from
@@ -1272,6 +2181,9 @@ impl PagedBackend for Lfm2Inner {
 
         let cached_prefix_len = turn_plan.cached_prefix_len as usize;
 
+        let installed_conv_sidecar =
+            self.install_lfm2_conv_cold_sidecar(seq_id, turn_plan.cached_prefix_len)?;
+
         // Conv-state reuse fast path (see `conv_state_reusable`): when this
         // turn strictly extends the immediately preceding successful turn's
         // saved history byte-for-byte, `self.caches`'s conv-layer state is
@@ -1282,13 +2194,9 @@ impl PagedBackend for Lfm2Inner {
         // foreign/partial prefix hit) falls through to the existing
         // unconditional reset — `run_paged_turn` is family-neutral and will
         // NOT do this for us; skip it and conv state goes stale across
-        // turns. Gated OFF by default (`conv_state_reuse_enabled`): reusing the
-        // live incremental conv state differs materially (~40 ULP, near-tie
-        // argmax may flip) from the reconstruction it replaces, so the flag
-        // stays off until an oracle validates it — flag off ⇒ `reused_conv_state
-        // == false` ⇒ the unconditional reset below always runs (pre-fix path).
-        let reused_conv_state = conv_state_reuse_enabled()
-            && conv_state_reusable(plan, &self.cached_token_history, cached_prefix_len);
+        // turns. Carried incremental state is the sole oracle.
+        let reused_conv_state = installed_conv_sidecar
+            || conv_state_reusable(plan, &self.cached_token_history, cached_prefix_len);
         if !reused_conv_state {
             self.caches = init_caches(&self.config);
             self.cached_token_history.clear();
@@ -1318,19 +2226,40 @@ impl PagedBackend for Lfm2Inner {
         // last-token slice (returns `[vocab]`). The engine fires the
         // post-prefill `synchronize_and_clear_cache` AFTER this returns
         // (NOT here).
+        let cached_prefix = prefix.effective_cached_prefix_len as u32;
+        let split_boundary = self.cold_restore_boundary(prefix.full_tokens.len() as u32);
+        self.conv_cold_capture_boundaries
+            .insert(self.active_scheduled_seq.unwrap_or(0), split_boundary);
+        if split_boundary > cached_prefix {
+            let split = (split_boundary - cached_prefix) as usize;
+            if split < suffix_tokens.len() {
+                self.run_paged_prefill_chunk(
+                    &prefix.full_tokens,
+                    &suffix_tokens[..split],
+                    cached_prefix,
+                    prefix.conv_state_reusable,
+                )?;
+                return self.run_paged_prefill_chunk(
+                    &prefix.full_tokens,
+                    &suffix_tokens[split..],
+                    split_boundary,
+                    true,
+                );
+            }
+        }
         self.run_paged_prefill_chunk(
             &prefix.full_tokens,
             suffix_tokens,
-            prefix.effective_cached_prefix_len as u32,
+            cached_prefix,
             prefix.conv_state_reusable,
         )
     }
 
-    fn begin_paged_decode(&mut self, _setup: &PagedTurnSetup<'_>) -> Result<Self::PagedDecode<'_>> {
+    fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
         Ok(Lfm2PagedDecode { inner: self })
     }
 
-    fn finalize_paged_turn(&mut self, reuse_cache: bool) {
+    fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
         // Terminal lifecycle. Success: keep the request live across turns
         // when reuse is on so the next turn's `continue_turn` builds on the
         // partial trailing block's live K/V; otherwise register full blocks
@@ -1338,11 +2267,22 @@ impl PagedBackend for Lfm2Inner {
         // failure must not mask the turn result).
         if let Some(adapter) = self.paged_adapter.as_mut() {
             if reuse_cache {
-                let _ = adapter.finalize_turn_keep_live(&[], 0);
+                let _ = adapter.finalize_turn_keep_live(&[], cache_salt);
             } else {
-                let _ = adapter.register_full_blocks_for_reuse(&[], 0);
+                let _ = adapter.register_full_blocks_for_reuse(&[], cache_salt);
+            }
+        }
+        // The K/V capture above establishes the authoritative cold frontier;
+        // publish exactly the deepest matching ShortConv checkpoint beneath
+        // it, then release the request. This is the same joint-boundary
+        // contract as vLLM's KV+Mamba hybrid coordinator.
+        self.capture_lfm2_conv_cold_sidecar(cache_salt);
+        if !reuse_cache {
+            if let Some(adapter) = self.paged_adapter.as_mut() {
                 let _ = adapter.release_request();
             }
+            self.conv_cold_checkpoints.remove(&0);
+            self.conv_cold_capture_boundaries.remove(&0);
         }
     }
 
@@ -1353,29 +2293,32 @@ impl PagedBackend for Lfm2Inner {
         if let Some(adapter) = self.paged_adapter.as_mut() {
             let _ = adapter.release_request();
         }
+        self.conv_cold_checkpoints
+            .remove(&self.active_scheduled_seq.unwrap_or(0));
+        self.conv_cold_capture_boundaries
+            .remove(&self.active_scheduled_seq.unwrap_or(0));
         // Invalidate the conv-state-reuse invariant `conv_state_reusable`
         // depends on: `self.caches`'s conv-layer state may now reflect a
         // partially-executed (aborted) turn rather than the exact position
         // `cached_token_history.len()` records (e.g. Pass 2 or a decode step
         // ran partway before the error). Clearing `cached_token_history`
         // forces the NEXT `prime_prefix_state` call's length/content check
-        // to fail closed (`> 0` guard), taking the unconditional
-        // `init_caches` reset — the same safe rebuild every paged turn got
-        // before this fast path existed.
+        // to fail closed (`> 0` guard), taking the `init_caches` reset and
+        // one safe Pass-1 rebuild.
         self.cached_token_history.clear();
     }
 
     fn paged_perf_prefill_tokens(&self, prompt_token_count: usize, suffix_len: usize) -> usize {
-        // lfm2 reprefills the FULL prompt through conv layers on a normal
-        // warm attention-prefix hit (`run_paged_prefill_chunk` Pass-1), so
+        // LFM2 reprefills the FULL prompt through conv layers on a foreign or
+        // partial attention-prefix hit (`run_paged_prefill_chunk` Pass-1), so
         // ttft measures full-prompt work and the throughput numerator must
         // be the FULL prompt — NOT the attention suffix (pinned by the
         // `lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse` guard).
         // The default (`suffix_len`) is the standard-KV qwen behavior, which
         // would under-report lfm2's prefill tok/s by the cache-hit ratio.
         //
-        // EXCEPTION: when `prime_prefix_state` took the conv-state-reuse
-        // fast path this turn (`last_paged_prefill_reused_conv_state`),
+        // When `prime_prefix_state` took the exact-owner carried-state path
+        // this turn (`last_paged_prefill_reused_conv_state`),
         // Pass 1 never ran — the ACTUAL prefill work this turn was
         // suffix-scale, so reporting the full-prompt count here would
         // inflate `prefill_tokens_per_second` by the cache-hit ratio
@@ -1499,7 +2442,7 @@ fn compute_layer_kinds_for(config: &Lfm2Config, num_layers: usize) -> Vec<Lfm2La
     kinds
 }
 
-fn init_caches(config: &Lfm2Config) -> Vec<Lfm2LayerCache> {
+pub(crate) fn init_caches(config: &Lfm2Config) -> Vec<Lfm2LayerCache> {
     let num_layers = config.num_hidden_layers as usize;
     let mut caches = Vec::with_capacity(num_layers);
     for i in 0..num_layers {
@@ -1536,12 +2479,11 @@ fn eval_lfm2_caches(caches: &[Lfm2LayerCache]) -> Result<()> {
 /// commands via channels and await responses.
 #[napi]
 pub struct Lfm2Model {
-    /// Dedicated model thread owning `Lfm2Inner`. lfm2 is chat-only (no
-    /// training/generate variants), so the thread dispatches the
-    /// model-neutral [`ChatCmd`] directly via
-    /// `engine::cmd::handle_chat_cmd::<Lfm2Inner>` — no per-family
-    /// command enum.
-    pub(crate) thread: crate::model_thread::ModelThread<ChatCmd>,
+    /// Dedicated model thread owning `Lfm2SchedulerState`. LFM2 is chat-only
+    /// (no training/generate variants); `Lfm2Cmd` wraps the model-neutral chat
+    /// protocol and adds scheduler telemetry without exposing model state
+    /// outside the thread.
+    pub(crate) thread: crate::model_thread::ModelThread<Lfm2Cmd>,
     pub(crate) config: Lfm2Config,
     /// Snapshot of `Lfm2Inner::paged_adapter.is_some()` captured at
     /// construction time. The block-paged KV adapter is wired up once at
@@ -1554,6 +2496,9 @@ pub struct Lfm2Model {
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    /// RAII debit for the native paged KV pool, kept separate from weights so
+    /// the global coordinator can account both deterministic residents.
+    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
 }
 
 #[napi]
@@ -1601,19 +2546,21 @@ impl Lfm2Model {
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(ChatCmd::StreamSessionStart {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
+        self.thread
+            .send(Lfm2Cmd::Chat(Box::new(ChatCmd::StreamSessionStart {
+                messages,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            })))?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
@@ -1627,19 +2574,21 @@ impl Lfm2Model {
         config: Option<ChatConfig>,
     ) -> Result<(
         ChatStreamHandle,
-        tokio::sync::mpsc::UnboundedReceiver<Result<ChatStreamChunk>>,
+        tokio::sync::mpsc::Receiver<Result<ChatStreamChunk>>,
     )> {
         let config = config.unwrap_or_default();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancelled_inner = cancelled.clone();
-        let (stream_tx, stream_rx) =
-            tokio::sync::mpsc::unbounded_channel::<Result<ChatStreamChunk>>();
-        self.thread.send(ChatCmd::StreamSessionContinue {
-            messages,
-            config,
-            stream_tx,
-            cancelled: cancelled_inner,
-        })?;
+        let (stream_tx, stream_rx) = crate::model_thread::stream_channel(
+            crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
+        );
+        self.thread
+            .send(Lfm2Cmd::Chat(Box::new(ChatCmd::StreamSessionContinue {
+                messages,
+                config,
+                stream_tx,
+                cancelled: cancelled_inner,
+            })))?;
         Ok((ChatStreamHandle { cancelled }, stream_rx))
     }
 
@@ -1647,6 +2596,22 @@ impl Lfm2Model {
     #[napi]
     pub fn get_config(&self) -> Lfm2Config {
         self.config.clone()
+    }
+
+    /// Native admission capacity for the server's per-model semaphore.
+    #[napi]
+    pub fn max_concurrent_sequences(&self) -> u32 {
+        if self.paged_active && !Lfm2SchedulerState::force_serial() {
+            scheduler_max_num_seqs_for(32) as u32
+        } else {
+            1
+        }
+    }
+
+    /// Snapshot scheduler occupancy and paged-pool admission telemetry.
+    #[napi]
+    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
+        send_and_await(&self.thread, |reply| Lfm2Cmd::SchedulerStats { reply }).await
     }
 
     /// Estimated number of model parameters.
@@ -1698,7 +2663,7 @@ impl Lfm2Model {
 
 crate::models::chat_napi::chat_napi_surface! {
     class: Lfm2Model,
-    thread_cmd: crate::engine::cmd::ChatCmd,
+    thread_cmd: crate::models::lfm2::model::Lfm2Cmd,
     thread: direct,
     image_guard: text_only,
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
@@ -1922,8 +2887,20 @@ mod paged_adapter_construction_tests {
     //! "default = no allocation" invariant and verify that flipping the
     //! flag wires up a real adapter without churning forward-path code.
 
-    use super::{Lfm2Inner, compute_layer_kinds_for};
+    use super::{Lfm2Inner, Lfm2SchedulerState, compute_layer_kinds_for};
+    use crate::array::DType;
     use crate::models::lfm2::Lfm2Config;
+
+    #[test]
+    fn cold_restore_boundary_keeps_one_prompt_token_uncached() {
+        assert_eq!(super::lfm2_cold_restore_boundary(0, 16), 0);
+        assert_eq!(super::lfm2_cold_restore_boundary(15, 16), 0);
+        assert_eq!(super::lfm2_cold_restore_boundary(16, 16), 0);
+        assert_eq!(super::lfm2_cold_restore_boundary(17, 16), 16);
+        assert_eq!(super::lfm2_cold_restore_boundary(32, 16), 16);
+        assert_eq!(super::lfm2_cold_restore_boundary(33, 16), 32);
+        assert_eq!(super::lfm2_cold_restore_boundary(33, 0), 0);
+    }
 
     /// Tiny LFM2-shaped config compatible with `LayerKVPool`'s validate
     /// constraints (head_size in {32, 64, 96, 128, 256}, FP8 off).
@@ -1964,6 +2941,7 @@ mod paged_adapter_construction_tests {
             paged_cache_memory_mb: Some(256),
             paged_block_size: Some(16),
             use_block_paged_cache: use_block_paged,
+            persist_paged_cache: None,
             intermediate_size: None,
             moe_intermediate_size: None,
             num_experts: None,
@@ -2318,5 +3296,35 @@ mod paged_adapter_construction_tests {
             inner.layer_kinds, fresh,
             "cached layer classification must equal a fresh compute over the same config"
         );
+    }
+
+    #[test]
+    fn cache_owner_release_drops_history_sequence_and_recurrent_state() {
+        let inner = Lfm2Inner::new(paged_tiny_config(Some(false))).expect("construct");
+        let mut state = Lfm2SchedulerState::new(inner).expect("construct scheduler state");
+        state.owner_sequences.insert("stateless-owner".into(), 9);
+        state
+            .owner_states
+            .insert("stateless-owner".into(), vec![7, 8]);
+        state.inner.reset_scheduled_caches_for(9);
+
+        state
+            .release_cache_owner_now("stateless-owner")
+            .expect("release owner");
+
+        assert!(!state.owner_sequences.contains_key("stateless-owner"));
+        assert!(!state.owner_states.contains_key("stateless-owner"));
+        assert!(!state.inner.has_scheduled_caches_for(9));
+    }
+
+    #[test]
+    fn stacked_conv_state_fails_closed_for_unknown_sequence() {
+        let cfg = paged_tiny_config(Some(false));
+        let mut inner = Lfm2Inner::new(cfg).expect("construct");
+        let error = match inner.stacked_conv_state(&[99], 0, DType::BFloat16) {
+            Ok(_) => panic!("missing scheduler state must not be fabricated as zeros"),
+            Err(error) => error,
+        };
+        assert!(error.reason.contains("99"));
     }
 }

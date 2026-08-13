@@ -68,7 +68,7 @@ function makeMockModel(): SessionCapableModel {
     chatStreamSessionContinueTool: async function* () {
       yield finalEvent;
     },
-    resetCaches: () => {},
+    resetCaches: () => Promise.resolve(),
   } as unknown as SessionCapableModel;
 }
 
@@ -160,6 +160,19 @@ describe('SessionRegistry tier-2 prompt_cache_key lookup', () => {
 
     expect(got.session).not.toBe(s1);
     expect(got.session).toBeInstanceOf(ChatSession);
+    expect(got.hit).toBe(false);
+    expect(reg.size).toBe(0);
+  });
+
+  it('cache-salt mismatch blocks tier-2 hit even when promptCacheKey matches', () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const warm = new ChatSession(model);
+
+    reg.adopt('resp_1', warm, 'ins', 'chain-abc', 'tenant-a/high-entropy-secret');
+    const got = reg.getOrCreate(null, 'ins', 'chain-abc', 'tenant-b/high-entropy-secret');
+
+    expect(got.session).not.toBe(warm);
     expect(got.hit).toBe(false);
     expect(reg.size).toBe(0);
   });

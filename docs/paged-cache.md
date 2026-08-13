@@ -2,7 +2,10 @@
 
 A vLLM-style block-paged KV cache lives alongside the legacy flat `Vec<KVCache>` path. Multiple in-flight requests share refcounted KV blocks for any prompt prefix they have in common (system prompt, shared few-shot preamble, repeated tool-result frames, etc.).
 
-Routing is per-model via the `use_block_paged_cache: Option<bool>` config field. Only the full-attention layers of supported models go through the paged adapter — sliding-window, convolutional, and recurrent (GDN) layers stay on their dedicated cache types regardless of the flag.
+Routing is per-model via the `use_block_paged_cache: Option<bool>` config field.
+Dense models use one paged group. Hybrid models may retain dedicated recurrent
+state (LFM2 ShortConv and Qwen3.5 GDN), while Gemma4 maps both full and sliding
+attention to separate paged groups and aliases KV-shared layers to their anchor.
 
 ## Foundation types
 
@@ -11,18 +14,68 @@ Routing is per-model via the `use_block_paged_cache: Option<bool>` config field.
 | `BlockAllocator`      | `crates/mlx-paged-attn/src/block_allocator.rs`              | Logical lifecycle — per-block refcounts, LRU eviction, prefix-hash table for cross-request reuse                                                                                                    |
 | `LayerKVPool`         | `crates/mlx-paged-attn/src/layer_kv_pool.rs`                | Physical storage — per-layer Metal K and V `Buffer` pairs sized to `paged_cache_memory_mb`                                                                                                          |
 | `PagedKVCacheAdapter` | `crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs` | Session-friendly wrapper. Per-request lifecycle: `reset_for_new_request` → `find_cached_prefix` → `allocate_suffix_blocks` → `record_tokens` → `register_full_blocks_for_reuse` → `release_request` |
+| `KVCacheCoordinator`  | `crates/mlx-core/src/transformer/kv_cache_spec.rs`          | Keeps declared cache groups, per-layer physical routes, and one runtime manager per group aligned. Gemma4 owns independent full/sliding paged managers through it.                                  |
 
 `BlockAllocator` and `LayerKVPool` are intentionally split so the legacy `CacheEngineManager` path (used by `use_paged_attention`, a different flag — see below) is unaffected. `paged_cache_memory_mb` defaults to 2048 when `None`.
 
+## Prefix-cache security domains
+
+The native `ChatConfig.cacheSalt` field (Responses and Anthropic APIs:
+`cache_salt`) separates content-addressed KV reuse between security domains.
+The runtime hashes the caller-provided string with SHA-256 into the allocator's
+compact domain id and uses the same id for both prefix lookup and block
+publication. The server limits the source value to 256 UTF-8 bytes. Omitting it retains the shared default domain for trusted
+single-tenant use.
+
+This is intentionally different from `prompt_cache_key` and `cacheOwnerId`:
+those select a warm conversation/session, while `cacheSalt` controls whether
+identical token blocks may be physically shared at all. Multi-tenant servers
+should derive a stable, high-entropy value from authenticated tenant identity
+rather than accepting an arbitrary client-selected namespace.
+
 ## Per-model support matrix
 
-| Model             | Default | Status                                                                                                                                                                                                                                          |
-| ----------------- | :-----: | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Qwen3**         | **on**  | Greedy + prefix-reuse byte-equal vs. flat path on Qwen3-0.6B BF16. Opt out via `use_block_paged_cache: Some(false)`.                                                                                                                            |
-| **LFM2.5**        | **on**  | Same parity result on LFM2.5-1.2B. Hybrid arch — only `full_attention` layers go through the adapter; conv layers stay on `Lfm2LayerCache::Conv`.                                                                                               |
-| **Gemma4**        | **on**  | Same parity result on Gemma-4-E2B-IT. Sliding layers stay on `RotatingKVCache`; global layers go through the adapter; KV-shared layers consume the anchor via `SharedOnGlobal` / `SharedOnSliding`.                                             |
-| **Qwen3.5 Dense** | **off** | Single-turn greedy parity verified on Qwen3.5-0.8B BF16. Default-flip pending a perf decision against the eager Rust flat path. GDN linear-attention layers stay on flat `ArraysCache` (no cross-request reuse — vLLM `MambaManager` stance). |
-| **Qwen3.5 MoE**   | **off** | Forward dispatch wired and parity-test scaffold present, but no local MoE checkpoint to verify against yet.                                                                                                                                     |
+| Model             | Default | Status                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| ----------------- | :-----: | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Qwen3**         | **on**  | Greedy + prefix-reuse byte-equal vs. flat path on Qwen3-0.6B BF16. Opt out via `use_block_paged_cache: Some(false)`.                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| **LFM2.5**        | **on**  | Same parity result on LFM2.5-1.2B. Hybrid arch — only `full_attention` layers go through the adapter; conv layers stay on `Lfm2LayerCache::Conv`.                                                                                                                                                                                                                                                                                                                                                                                                 |
+| **Gemma4**        | **on**  | Serial/concurrent start and continuation parity on Gemma-4-E2B-IT with a real occupancy-2 wave. Full and sliding layers use distinct paged groups; expired sliding blocks are replaced by a null sentinel; KV-shared layers alias their global/sliding anchor. Same-owner continuation is live; cross-owner prefix hits currently fail closed.                                                                                                                                                                                                    |
+| **Qwen3.5 Dense** | **on**  | Single-turn greedy parity and paged construction are verified on Qwen3.5-0.8B BF16. Full-attention K/V is paged; GDN recurrent state remains request-local and is checkpointed beside K/V for SSD restore. Explicit false and the environment override retain a rollback path.                                                                                                                                                                                                                                                                    |
+| **Qwen3.5 MoE**   | **on**  | Uses the same paged full-attention, exact-boundary GDN sidecar, and two-row text scheduler contract as dense. Sparse expert routing stays batched over `[N,1,H]`; checkpoint-specific projections preserve exact greedy parity while K/V gather/attention remains batched. MTP/media turns remain exclusive. Real `Qwen3.6-35B-A3B-mxfp4-mlx` decode and SSD-restart parity gates remain local-only because no small published checkpoint fits the standard CI runner; synthetic Metal gates cover paged construction and N=2 token parity in CI. |
+
+### Gemma4 hybrid groups and draft coexistence
+
+Gemma4 follows vLLM's `HybridKVCacheCoordinator` shape rather than allocating
+one maximum-context cache per request:
+
+```text
+layer specs ──group──▶ full pool ───────▶ GlobalPaged
+                  └─▶ sliding pool ────▶ SlidingPaged(window)
+KV-shared layer ───────────────────────▶ alias(anchor group, physical slot)
+```
+
+Each live owner has one sequence id across every group. The scheduler only
+advances a row after every group accepts the same cursor, rolls all groups back
+on a partial failure, and preempts the newest victim by releasing all of its
+tables before recomputing. Sliding adapters retain absolute logical block-table
+width: once a block is wholly outside the attention window its physical block
+is freed and that logical entry becomes a shared null sentinel. This bounds
+sliding residency without renumbering RoPE positions.
+
+The Gemma4 KV budget is a shared pool budget, not
+`max_context × max_num_seqs`. The automatic minimum holds one maximum-context
+request in every group plus a null block and at least one starter block per live
+row. Short rows can therefore batch up to the scheduler width; as aggregate
+contexts grow, recompute preemption—not a static per-request partition—arbitrates
+the shared blocks. The server exposes this admission width through
+`maxConcurrentSequences()`.
+
+MTP/DSpark and assistant drafts remain flat-cache algorithms, but loading one
+does not turn the paged coordinator off. The model scheduler installs a
+request-local flat owner lane only while that speculative command executes;
+ordinary owners continue to use the resident grouped pools. A live owner may
+not switch cache layouts mid-history, and releasing the owner drops both lane
+registries plus metadata.
 
 For Qwen3.5 (dense + MoE) both the flat and paged decode paths are pure-Rust
 eager — the compiled C++ forward and its process-wide locks
@@ -40,24 +93,23 @@ blocks so a warm prefix survives a process restart. Whether a family may _restor
 from it is a correctness decision, gated by an allowlist that exists in two places
 and is drift-guarded by a test:
 
-| Side  | Symbol                                                                      |
-| ----- | --------------------------------------------------------------------------- |
-| Rust  | `COLD_RESTORE_FAMILIES` in `crates/mlx-core/src/cold_tier.rs`               |
-| TS    | `COLD_TIER_RESTORE_FAMILIES` in `packages/agent/src/provider/model-host.ts` |
-| Guard | `packages/agent/__test__/cold-tier-families.test.ts`                        |
+| Side  | Symbol                                                            |
+| ----- | ----------------------------------------------------------------- |
+| Rust  | `COLD_RESTORE_FAMILIES` in `crates/mlx-core/src/cold_tier.rs`     |
+| TS    | `COLD_TIER_RESTORE_FAMILIES` in `packages/agent/src/cold-tier.ts` |
+| Guard | `packages/agent/__test__/cold-tier-families.test.ts`              |
 
 Dense `qwen3` is sound because its pool covers **all** layers, so a restored block
-reconstructs the whole prefix. Every other supported family is **hybrid** — it sizes
-the pool to attention layers only and keeps the rest of its cross-token state
-outside:
+reconstructs the whole prefix. Every supported hybrid family now pairs K/V with an
+exact-boundary sidecar or a second paged group:
 
-| Family              | Out-of-pool state                        | Sidecar | Restore-eligible |
-| ------------------- | ---------------------------------------- | ------- | ---------------- |
-| `qwen3` (dense)     | none — pool covers every layer           | n/a     | **yes**          |
-| `gemma4`            | sliding-window `RotatingKVCache`         | yes     | **yes**          |
-| `qwen3_5` (dense)   | GDN (gated delta-net) recurrent state    | yes     | **yes**          |
-| `qwen3_5_moe`       | GDN recurrent state (same as dense)      | yes     | **yes**          |
-| `lfm2` / `lfm2_moe` | short-conv state (no serialization path) | no      | no               |
+| Family              | State outside the primary full-attention pool | Restore companion                                                   | Restore-eligible |
+| ------------------- | --------------------------------------------- | ------------------------------------------------------------------- | :--------------: |
+| `qwen3` (dense)     | none — pool covers every layer                | n/a                                                                 |     **yes**      |
+| `gemma4`            | sliding-attention paged groups                | grouped live-window K/V sidecar; all groups install at one boundary |     **yes**      |
+| `qwen3_5` (dense)   | GDN recurrent state                           | exact-boundary GDN sidecar                                          |     **yes**      |
+| `qwen3_5_moe`       | GDN recurrent state (same as dense)           | exact-boundary GDN sidecar                                          |     **yes**      |
+| `lfm2` / `lfm2_moe` | ShortConv recurrent state                     | exact-boundary `ConvState` sidecar                                  |     **yes**      |
 
 The allowlist is enforced **natively**, not only in the agent:
 `cold_tier::resolve_persist_cold` consults `cold_restore_supported(model_type)`
@@ -68,7 +120,15 @@ A loader may therefore carry a fully wired cold bracket ahead of proving it; the
 keeps that bracket dormant until the family is admitted.
 
 A K/V-only restore for a hybrid would resume from state the pool never held. Two
-mechanisms make that impossible rather than merely unlikely.
+mechanisms make that impossible rather than merely unlikely. Gemma4 applies the
+same rule to its physical groups: the full group proposes a boundary, a validated
+sliding sidecar reconstructs every sliding group there, and any decode/install
+failure resets all groups to zero.
+
+Hybrid sidecar capture uses the same `cache_salt` as the K/V chain. The salt is
+part of the first-block domain for both the hot prefix checkpoint and the
+persisted GDN/ShortConv/sliding sidecar key, so a salted request can use the cold tier
+without either crossing domains or failing at finalization.
 
 **Reconcile-down (`ColdSidecarPolicy`).** A family whose out-of-pool state _is_
 serializable attaches a `ColdTierContext` carrying a policy. The restore walk
@@ -126,10 +186,10 @@ producer interval and counts the accepted prefix directly rather than deriving i
 Blocks accepted per turn at queue depth 8, two runs:
 
 | dialled producer `Tc` | dense, `sync_all` | dense, `fsync(2)` | MoE, `sync_all` | MoE, `fsync(2)` |
-| ------------------ | ----------------- | ----------------- | --------------- | --------------- |
-| 0.10 ms            | 9                 | 11, 13            | 9               | 11, 10          |
-| **0.20 ms (real)** | 9                 | **28, 25**        | 9               | **17, 18**      |
-| 0.32 ms            | 9                 | 600+, 403         | 9               | 72, 45          |
+| --------------------- | ----------------- | ----------------- | --------------- | --------------- |
+| 0.10 ms               | 9                 | 11, 13            | 9               | 11, 10          |
+| **0.20 ms (real)**    | 9                 | **28, 25**        | 9               | **17, 18**      |
+| 0.32 ms               | 9                 | 600+, 403         | 9               | 72, 45          |
 
 Under `sync_all` the answer is 9 at every producer rate — the writer was so much slower
 than the producer that `N` collapsed onto `Q + 1` and nothing else mattered. That is
@@ -153,8 +213,8 @@ one.
 flush its volatile write cache, and drops the implicit device ordering barrier between
 the payload extents and the journalled rename.
 
-|                    | process kill | kernel panic | sudden power loss / hard reset |
-| ------------------ | ------------ | ------------ | ------------------------------ |
+|                     | process kill | kernel panic | sudden power loss / hard reset |
+| ------------------- | ------------ | ------------ | ------------------------------ |
 | `F_FULLFSYNC` (was) | safe         | safe         | safe                           |
 | `fsync(2)` (now)    | safe         | safe         | **at risk**                    |
 
@@ -168,7 +228,7 @@ and `a_block_without_a_payload_checksum_is_refused` pin both halves of that.
 
 The checksum stays SHA-256. Swapping it for a non-cryptographic hash would break the
 on-disk format, and the bench says it is not worth it at the sizes that ship: on the
-dense block `payload_checksum` is 0.061 ms of a 0.432 ms `Tw`, so making it *free*
+dense block `payload_checksum` is 0.061 ms of a 0.432 ms `Tw`, so making it _free_
 (the harness prints that projection) would reach only 0.366 ms — worth ~3 more blocks
 per turn, against invalidating every cache on disk.
 
@@ -179,11 +239,11 @@ That was the bug, not the analysis. `N` was **emergent**: it moved with the
 filesystem, it was never chosen, and end to end it left the restored prefix at
 **1.4-6.2% of the prompt** after a full session.
 
-| prompt | restored | share |
-| ------ | -------- | ----- |
-| 7781 (qwen3)      | 208 | 2.7% |
-| 8025 (qwen3_5_moe)| 496 | 6.2% |
-| 8025 (qwen3_5 27B)| 112 | 1.4% |
+| prompt             | restored | share |
+| ------------------ | -------- | ----- |
+| 7781 (qwen3)       | 208      | 2.7%  |
+| 8025 (qwen3_5_moe) | 496      | 6.2%  |
+| 8025 (qwen3_5 27B) | 112      | 1.4%  |
 
 Every turn showed `enqueued=12 queueDrops=1`: the walk stopped because the queue
 refused, and it refused at the same place regardless of prompt length.
@@ -191,16 +251,16 @@ refused, and it refused at the same place regardless of prompt length.
 `capture_chain` now spends an explicit budget instead, and waits for a queue slot
 rather than treating a full queue as a stop:
 
-| | memory pinned | ratchet | disk-independent | bounded tail |
-| --- | --- | --- | --- | --- |
-| break-at-refusal, `Q`=8  | 8 blk  | 9-14, emergent  | no  | no (unbounded on a RAM disk) |
-| break-at-refusal, `Q`=64 | 64 blk | 92-126, emergent| no  | no |
-| **budget, `Q`=8**        | 8 blk  | **= budget, exact** | **yes** | **yes** |
+|                          | memory pinned | ratchet             | disk-independent | bounded tail                 |
+| ------------------------ | ------------- | ------------------- | ---------------- | ---------------------------- |
+| break-at-refusal, `Q`=8  | 8 blk         | 9-14, emergent      | no               | no (unbounded on a RAM disk) |
+| break-at-refusal, `Q`=64 | 64 blk        | 92-126, emergent    | no               | no                           |
+| **budget, `Q`=8**        | 8 blk         | **= budget, exact** | **yes**          | **yes**                      |
 
-* `MLX_COLD_CAPTURE_BLOCKS_PER_TURN` (default **128** = 2048 tokens at block 16)
+- `MLX_COLD_CAPTURE_BLOCKS_PER_TURN` (default **128** = 2048 tokens at block 16)
   bounds the steady-state ratchet.
-* `MLX_COLD_CAPTURE_BUDGET_MS` (default **250**) bounds the turn tail.
-* `DEFAULT_QUEUE_DEPTH` stays **8** and is now purely a host-memory bound
+- `MLX_COLD_CAPTURE_BUDGET_MS` (default **250**) bounds the turn tail.
+- `DEFAULT_QUEUE_DEPTH` stays **8** and is now purely a host-memory bound
   (`Q x block_bytes` in flight). Raising it no longer buys reach.
 
 The budget counts blocks this turn WROTE, not blocks it walked: a `contains` hit on
@@ -224,13 +284,27 @@ absorb the configured budget).
 
 **One hazard the deeper walk creates, fixed in the same change.** Every hybrid family
 offers its state sidecar microseconds after the K/V walk returns, onto the same queue.
-While the walk stopped *because* the queue was full, a non-blocking sidecar offer was
+While the walk stopped _because_ the queue was full, a non-blocking sidecar offer was
 guaranteed to lose — and a dropped sidecar is worse than a dropped block, because the
 restore reconciles down to the deepest boundary a validated sidecar backs, so losing it
 makes the turn's whole chain unusable. The families now use
 `enqueue_sidecar_before(…, now + budget.max_walk)`.
 
-### gemma4's sliding-window sidecar
+### Gemma4 sliding-window sidecars
+
+Gemma4 continuous batching stores full- and sliding-attention K/V in separate
+paged groups. The scheduled text route snapshots the live K/V suffix from every
+sliding group, persists it under `ColdGroup::SlidingWindow`, and reinstalls every
+group at the full group's reconciled boundary. Retired logical positions become
+null sentinels, so the restored block table preserves absolute positions without
+allocating the expired prefix. Missing, malformed, or partially installable state
+resets all groups to zero; reusing only the full group is forbidden.
+
+The older rotating-cache representation remains active for the flat/exclusive
+route used by media and MTP/DSpark commands. It shares the same sidecar layout
+rules below, while the grouped route encodes/decodes layer-major paged K/V arrays
+directly. It is therefore not an obsolete compatibility path: the two codecs cover
+the two cache layouts that intentionally coexist on one loaded Gemma4 model.
 
 `crates/mlx-core/src/models/gemma4/sliding_sidecar.rs` persists one
 `RotatingKVCacheSnapshot` per **physical** sliding layer (`is_sliding_layer &&
@@ -321,10 +395,10 @@ Capturing a rung is numerically transparent — `snapshot_from_attention_view` s
 the attention view the chunk already produced, and the chunk plan is **not** split at
 a rung — so the whole cost is memory, which is why the grid is bounded two ways:
 
-| bound | value |
-| ----- | ----- |
-| `GEMMA4_SLIDING_ANCHOR_MAX_RUNGS` | 4 — how many rungs the grid may hold |
-| `GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES` | 3 GiB, at 4 bytes/element — the ceiling the rung grid is *admitted* against, and the ceiling `trim_gemma4_sliding_prefix_checkpoints` *enforces* over the entries actually retained |
+| bound                                       | value                                                                                                                                                                               |
+| ------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `GEMMA4_SLIDING_ANCHOR_MAX_RUNGS`           | 4 — how many rungs the grid may hold                                                                                                                                                |
+| `GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES` | 3 GiB, at 4 bytes/element — the ceiling the rung grid is _admitted_ against, and the ceiling `trim_gemma4_sliding_prefix_checkpoints` _enforces_ over the entries actually retained |
 
 Sizing is per boundary (`min(b, window)` rows), not per window; that is what makes the
 two sub-window rungs nearly free and lets the fourth rung fit at all. On the 12B
@@ -343,15 +417,15 @@ paged pool (see `docs/architecture.md`).
 
 Retention answers to the same gate (`Gemma4SlidingRetentionPolicy`):
 
-| turn | limit (12B) | victim |
-| ---- | ----------- | ------ |
-| no cold tier — `PreLadder` | 2 | oldest non-image-protected entry (unchanged); count only, never bytes |
-| cold sidecar — `Ladder` | 2 + 4 = 6, then the byte ceiling | oldest non-anchor; then the oldest anchor that is **not** an ancestor of the newest entry; then the **deepest** anchor |
+| turn                       | limit (12B)                      | victim                                                                                                                 |
+| -------------------------- | -------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| no cold tier — `PreLadder` | 2                                | oldest non-image-protected entry (unchanged); count only, never bytes                                                  |
+| cold sidecar — `Ladder`    | 2 + 4 = 6, then the byte ceiling | oldest non-anchor; then the oldest anchor that is **not** an ancestor of the newest entry; then the **deepest** anchor |
 
 The deepest-anchor step matters because the two image-protected prompt-boundary slots
 are never eviction candidates, so a `{image, image, rung, rung, rung, deep}` store —
 a VLM turn followed by a fresh text turn — leaves the first two steps with nothing to
-take. Falling through to the pre-ladder floor there would evict the *shallowest*
+take. Falling through to the pre-ladder floor there would evict the _shallowest_
 entry, which is exactly the rung a chain advancing ~544 tokens per turn can reach.
 Giving up the deepest anchor instead costs the least: the deep end is what the chain
 reaches last.
@@ -486,11 +560,11 @@ observable quantity — the depth a later turn restores from — so neither may 
 from a different column:
 
 | `want_ladder` | explicit root | global cap | per-owner cap | victim order |
-| --- | --- | --- | --- | --- |
-| false | false | 2 | 2 | `PreLadder` |
-| false | true  | 5 | 2 | `PreLadder` |
-| true  | false | 4 | 4 | `Ladder` |
-| true  | true  | 5 | 4 | `Ladder` |
+| ------------- | ------------- | ---------- | ------------- | ------------ |
+| false         | false         | 2          | 2             | `PreLadder`  |
+| false         | true          | 5          | 2             | `PreLadder`  |
+| true          | false         | 4          | 4             | `Ladder`     |
+| true          | true          | 5          | 4             | `Ladder`     |
 
 The caps decide how many entries survive; the victim order decides **which**.
 `Ladder` defers the publishing owner and then drops the rung with the smallest
@@ -535,18 +609,18 @@ turns have run, which is safe in both directions: 4 → 2 only prunes down at th
 publish, and 2 → 4 cannot resurrect an entry that is already gone.
 
 Be exact about who survives that, because the guarantee is narrower than "the
-publisher is protected". Preferring a foreign victim is a *preference*, not a floor:
+publisher is protected". Preferring a foreign victim is a _preference_, not a floor:
 the search only ever considers entries whose owner keeps something afterwards, so when
 no other owner holds a spare rung — four siblings with one checkpoint each, exactly the
 shape five slots was sized for — it finds nothing and the publisher's own ladder
 collapses to its endpoint rung anyway, and that turn's cold capture misses.
 `four_single_entry_siblings_outlive_the_publishers_ladder` pins that. The root, in
 turn, keeps only its **last** checkpoint: the redundancy search carries no root guard,
-so while the root holds more than one rung its ladder is the *preferred* victim
+so while the root holds more than one rung its ladder is the _preferred_ victim
 (`one_subagent_turn_strips_the_root_to_its_deepest_rung`).
 
 What the ordering cannot do is take an owner's warm reuse away. The only arm that
-empties an owner runs after the redundancy search over *every* owner comes back empty,
+empties an owner runs after the redundancy search over _every_ owner comes back empty,
 which means one entry per owner and still over cap — strictly more live owners than
 slots. Below that point nobody goes blind under either order
 (`one_subagent_turn_leaves_every_sibling_a_checkpoint`), and the measured hot-path cost
@@ -588,9 +662,9 @@ it reports on a run where the tier failed to open — which is exactly the run t
 it. It is also why both prefixes exist.
 
 The two `enqueued` / `queueDrops` pairs are **nested, not disjoint** — the one place the
-scopes differ. `ColdCacheStats` answers *is the writer keeping up?*, so it counts every
+scopes differ. `ColdCacheStats` answers _is the writer keeping up?_, so it counts every
 object that took a slot in the shared queue, sidecars included; `ColdSidecarStats`
-answers *did the family state persist?*, so it isolates the sidecars. **Summing them
+answers _did the family state persist?_, so it isolates the sidecars. **Summing them
 double-counts every sidecar.** Read the block pair for queue health and the sidecar pair
 for chain health. Scoping the queue counters to blocks would look tidier and would hide
 the failure that matters most: a capture walk that fills the queue and starves the
@@ -607,12 +681,12 @@ natively; `coldSidecarStats()` is the same fact for the dashboard and for `mlx a
 
 The capture counters split a zero-reuse run into its causes without `MLX_INFERENCE_TRACE`:
 
-| line | reading |
-| --- | --- |
-| `coldSidecarCaptureReached == 0` | the turn's finalize never calls the capture |
-| `captureReached > 0`, `chainEmpty > 0` | no whole block of the request was persisted |
-| `captureReached > 0`, `boundarySkips > 0` | no retained checkpoint sat under the chain's reach |
-| `captureReached > 0`, `alreadyPersisted > 0` | steady state — the chain is already on disk |
+| line                                         | reading                                            |
+| -------------------------------------------- | -------------------------------------------------- |
+| `coldSidecarCaptureReached == 0`             | the turn's finalize never calls the capture        |
+| `captureReached > 0`, `chainEmpty > 0`       | no whole block of the request was persisted        |
+| `captureReached > 0`, `boundarySkips > 0`    | no retained checkpoint sat under the chain's reach |
+| `captureReached > 0`, `alreadyPersisted > 0` | steady state — the chain is already on disk        |
 
 That last row is why `alreadyPersisted` is a counter rather than silence: after the
 first turn writes a rung, every later turn re-selects it and dedups, so `enqueued == 0`
@@ -660,11 +734,11 @@ and runs in milliseconds. Arithmetic is pinned by arithmetic; the three-model-lo
 is reserved for the part only real weights can show — that a shallow rung is genuinely
 written, found, decoded, and restored across a process boundary.
 
-Note what the failure looks like when the ladder *does* collapse: nothing is written at
+Note what the failure looks like when the ladder _does_ collapse: nothing is written at
 all (the single endpoint rung is tens of blocks past what the writer queue drains), so
 instance 2 restores zero and the harness's **assertion 1** fires with a message about
 the restore path — not assertion 1b. The harness therefore prints the computed ladder
-and the sidecar telemetry *before* any assertion, and assertion 1's own message names
+and the sidecar telemetry _before_ any assertion, and assertion 1's own message names
 the prefill as the place to look.
 
 ```bash
@@ -673,74 +747,65 @@ MLX_COLD_CACHE_DIR=$(mktemp -d) \
   cargo test -p mlx-core --test qwen3_cold_tier_parity -- --ignored --test-threads=1 --nocapture
 
 MLX_COLD_CACHE_DIR=$(mktemp -d) \
-  MLX_TEST_MODEL_PATH=~/.mlx-node/models/Gemma-4-26B-A4B-IT-UD-Q3_K_XL-mlx \
-  cargo test -p mlx-core --test gemma4_cold_tier_parity -- --ignored --test-threads=1 --nocapture
-
-MLX_COLD_CACHE_DIR=$(mktemp -d) \
   MLX_TEST_MODEL_PATH=~/.mlx-node/models/qwen3.5-0.8b-mlx-bf16 \
   cargo test -p mlx-core --test qwen3_5_cold_tier_parity -- --ignored --test-threads=1 --nocapture
 
 MLX_COLD_CACHE_DIR=$(mktemp -d) \
-  MLX_TEST_MODEL_PATH=~/.mlx-node/models/Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx \
+  MLX_TEST_MODEL_PATH=~/.mlx-node/models/Qwen3.6-35B-A3B-mxfp4-mlx \
   cargo test -p mlx-core --test qwen3_5_moe_cold_tier_parity -- --ignored --test-threads=1 --nocapture
+
+MLX_COLD_CACHE_DIR=$(mktemp -d) \
+  MLX_TEST_MODEL_PATH=~/.mlx-node/models/lfm2.5-1.2b-thinking-mlx \
+  cargo test -p mlx-core --test lfm2_cold_tier_parity -- --ignored --exact \
+    --test-threads=1 --nocapture lfm2_cold_tier_restart_parity
+
+MLX_PAGED_PREFILL_CHUNK_SIZE=64 MLX_COLD_CACHE_DIR=$(mktemp -d) \
+  MLX_TEST_MODEL_PATH=~/.mlx-node/models/gemma-4-12b-it-qat-q4_0-mlx \
+  cargo test -p mlx-core --test gemma4_grouped_cold_tier_parity -- --ignored --exact \
+    --test-threads=1 --nocapture gemma4_grouped_cold_tier_restart_parity
 ```
 
-The large-checkpoint gates are minutes, not hours. Measured on an M5 Max, `--release`,
-with the checkpoint already resident in the page cache:
+The large-checkpoint gates are minutes, not hours. The latest local MoE run on
+an M5 Max used the debug test profile with the checkpoint already resident in
+the page cache:
 
-| gate                                          | wall     | fresh model loads |
-| --------------------------------------------- | -------- | ----------------- |
-| `qwen3_5_moe_cold_tier_restart_parity`         | 105 s    | 5                 |
-| `gemma4_cold_tier_restart_parity`              | 175 s    | 15                |
-| `gemma4_cold_tier_restart_parity_sub_window`   | 84 s     | 9                 |
+| gate                                   | wall  | fresh model loads |
+| -------------------------------------- | ----- | ----------------- |
+| `qwen3_5_moe_cold_tier_restart_parity` | 721 s | 5                 |
 
-Earlier notes here said ~66 min and ~26 min. **Do not read the drop as something the
-cold-tier commits bought** — the arithmetic does not support it. The long gemma4 gate
-restores 739 blocks; at the batched command buffer's own measured saving that is
-`739 x (5.271 - 1.158) ms` = **3.0 s**, and the capture side is smaller again. A few
-seconds, against a 62-minute difference.
+This is a correctness gate, not a performance benchmark. Its wall time is dominated
+by five loads of the 24.13 GiB MXFP4 weights and is sensitive to page-cache state and
+build profile; do not use it to attribute a speedup to the cold-tier implementation.
 
-What the two numbers really differ in is model-load I/O. Neither checkpoint carries a
-`.mlx-download-complete.json` marker, so every persist-enabled load full-shard-hashes
-~14 GB of weights, and the long gate makes 15 such loads. 175 s over 15 loads is
-11.7 s per load, with the weights already in the page cache. 66 min over the same 15
-loads is 264 s per load — about what ~14 GB reads like when it has to come off the
-disk each time. Both runs keep their checkpoints on the same volume, so page-cache
-state is the variable, not the storage. So: **budget the table above only for a warm
-page cache, and expect minutes per load otherwise.** The 264 s/load figure is what the
-arithmetic implies, not a re-measured number — the cold case was not re-run. What is
-certain is the direction: the cold-tier commits moved seconds, not the headline.
-
-The two small-checkpoint gates run in CI, on the existing `model-test` matrix legs
+The small-checkpoint gates run in CI, on the existing `model-test` matrix legs
 that already download and convert the checkpoint they need (`.github/workflows/ci.yml`):
 `qwen3_cold_tier_parity` on the `qwen3` leg, `qwen3_5_cold_tier_parity` plus the
 Metal-gated unit tests `dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy`
 and `moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy` on the
-`qwen3_5-dense` leg. The MoE unit test rides that leg because it needs no checkpoint
-at all — it builds a tiny synthetic MoE and a real paged pool — and there is no MoE
-leg for it to ride instead.
+`qwen3_5-dense` leg, `lfm2_cold_tier_parity` on the LFM2.5 leg, and
+`gemma4_grouped_cold_tier_parity` on the Gemma4 QAT PR leg. The MoE unit test rides
+the dense Qwen leg because it needs no checkpoint at all — it builds a tiny synthetic
+MoE and a real paged pool — and there is no MoE model leg for it to ride instead.
 
 The two real-weights gates that stay local-only stay that way because of their
 CHECKPOINTS, not their runtime:
 
-- **MoE** — the smallest published `qwen3_5_moe` is 35B-A3B. Even the UD-Q2_K_XL quant
-  peaks at 14.2 GB resident, past a standard macOS runner.
-- **gemma4** — the only CI-reachable gemma4 is the gated
-  `google/gemma-4-E2B-it-qat-mobile-transformers`, whose `sliding_window` is **512**.
-  `gemma4_cold_tier_parity.rs` pins `SLIDING_WINDOW_TOKENS = 1024` and uses it as both
-  the long gate's `min_restored_tokens` floor and the sub-window gate's ceiling
-  assertion, so on a 512-window checkpoint those two assertions stop meaning what
-  their messages say. Wiring it needs the window read from the loaded config first.
+- **MoE** — the smallest published `qwen3_5_moe` is 35B-A3B. The locally gated
+  MXFP4 checkpoint contains 24.13 GiB of weight shards, past a standard macOS runner.
+- **gemma4 MoE** — the standard CI runner covers dense E2B grouped restore. The
+  local-only MoE gate uses a real 26B-A4B checkpoint; its grouped cache layout and
+  codec are shared with dense, but the separate real gate protects the loader and
+  KV-shared/MoE composition.
 
 The structural fact both gemma4 gates rest on: with a `ColdSidecarPolicy` installed, a
 non-zero `cached_tokens` in a _freshly loaded_ instance (empty hot cache) can only
 have come from a validated sidecar. `gemma4_cold_tier_parity.rs` therefore runs **two**
 gates, one per side of `min(boundary, window)`:
 
-| gate                                            | prompt        | restored rotating state                        |
-| ----------------------------------------------- | ------------- | ---------------------------------------------- |
-| `gemma4_cold_tier_restart_parity`               | ~1.2k tokens  | post-wrap: a full window, `idx` inside the ring |
-| `gemma4_cold_tier_restart_parity_sub_window`    | ~350 tokens   | pre-wrap: `boundary` rows                       |
+| gate                                         | prompt       | restored rotating state                         |
+| -------------------------------------------- | ------------ | ----------------------------------------------- |
+| `gemma4_cold_tier_restart_parity`            | ~1.2k tokens | post-wrap: a full window, `idx` inside the ring |
+| `gemma4_cold_tier_restart_parity_sub_window` | ~350 tokens  | pre-wrap: `boundary` rows                       |
 
 The long-prompt one keeps a `min_restored_tokens` floor of one whole window so it
 stays in the `>= window` regime rather than quietly duplicating its sibling; that

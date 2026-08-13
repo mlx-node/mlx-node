@@ -149,6 +149,11 @@ export interface InferenceHostOptions {
   /** Disable response persistence entirely. See `ServerConfig.disableStore`. */
   disableStore?: boolean;
   /**
+   * Per-model waiter cap forwarded to `createServer`. Default 16; pass
+   * `'unbounded'` for an explicitly uncapped embedded host.
+   */
+  maxQueueDepthPerModel?: number | 'unbounded';
+  /**
    * Remove temp roots left behind by hosts that were killed without running
    * `close()`. Default `true`; a supervisor that runs several hosts under one
    * pid namespace and wants to control the timing can turn it off and call
@@ -294,6 +299,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     ...(opts.authToken !== undefined ? { authToken: opts.authToken } : {}),
     ...(opts.storePath !== undefined ? { storePath: opts.storePath } : {}),
     ...(opts.disableStore !== undefined ? { disableStore: opts.disableStore } : {}),
+    ...(opts.maxQueueDepthPerModel !== undefined ? { maxQueueDepthPerModel: opts.maxQueueDepthPerModel } : {}),
   };
   const server = await createServer(serverConfig);
 

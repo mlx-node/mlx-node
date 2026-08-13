@@ -146,9 +146,63 @@ function createMockModel(paged: boolean, result: ChatResult = makeChatResult()):
     chatStreamSessionStart: vi.fn(() => fallbackStream()),
     chatStreamSessionContinue: vi.fn(() => fallbackStream()),
     chatStreamSessionContinueTool: vi.fn(() => fallbackStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
+    releaseCacheOwner: vi.fn().mockResolvedValue(undefined),
     hasBlockPagedCache: vi.fn(() => paged),
   } as unknown as SessionCapableModel;
+}
+
+function createConcurrentStreamModel(): {
+  model: SessionCapableModel;
+  bothStarted: Promise<void>;
+  release: () => void;
+  maxActive: () => number;
+} {
+  let active = 0;
+  let peak = 0;
+  let starts = 0;
+  let resolveBoth!: () => void;
+  const bothStarted = new Promise<void>((resolve) => {
+    resolveBoth = resolve;
+  });
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const base = createMockModel(true);
+  const stream = vi.fn(async function* () {
+    starts += 1;
+    active += 1;
+    peak = Math.max(peak, active);
+    if (starts === 2) resolveBoth();
+    try {
+      yield { done: false as const, text: 'token', isReasoning: false };
+      await held;
+      yield {
+        done: true as const,
+        text: 'done',
+        finishReason: 'stop',
+        toolCalls: [],
+        thinking: null,
+        numTokens: 1,
+        promptTokens: 1,
+        reasoningTokens: 0,
+        rawText: 'done',
+        cachedTokens: 0,
+      };
+    } finally {
+      active -= 1;
+    }
+  });
+  return {
+    model: Object.assign(base, {
+      maxConcurrentSequences: () => 2,
+      chatStreamSessionStart: stream,
+    }),
+    bothStarted,
+    release,
+    maxActive: () => peak,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +242,11 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     // native reset because that clears MoE GDN prefix checkpoints between
     // otherwise cacheable stateless turns.
     expect(mockModel.resetCaches).not.toHaveBeenCalled();
+    const releaseCacheOwner = Reflect.get(mockModel, 'releaseCacheOwner') as ReturnType<typeof vi.fn>;
+    expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+    expect(releaseCacheOwner).toHaveBeenCalledWith(
+      (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0][1].cacheOwnerId,
+    );
     // Pre-dispatch header is `fresh` because `lookup.hit` is always
     // false on the paged path; no `cachedTokens > 0` promotion fired
     // because the mock returned `cachedTokens: 0`.
@@ -222,6 +281,39 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     expect(sessionReg.size).toBe(0);
     expect(getHeaders()['x-session-cache']).toBe('prefix_hit');
     expect(getHeaders()['x-cached-tokens']).toBe('42');
+  });
+
+  it('keeps a delivered Messages response successful when owner cleanup rejects', async () => {
+    const registry = new ModelRegistry();
+    const mockModel = createMockModel(/* paged */ true);
+    const releaseCacheOwner = Reflect.get(mockModel, 'releaseCacheOwner') as ReturnType<typeof vi.fn>;
+    releaseCacheOwner.mockRejectedValueOnce(new Error('simulated owner cleanup failure'));
+    registry.register('paged-model', mockModel);
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      const { res, getStatus, getBody } = createMockRes();
+      await expect(
+        handleCreateMessage(
+          res,
+          {
+            model: 'paged-model',
+            messages: [{ role: 'user', content: 'hi' }],
+            max_tokens: 16,
+          },
+          registry,
+        ),
+      ).resolves.toBeUndefined();
+
+      expect(getStatus()).toBe(200);
+      expect(JSON.parse(getBody())).toMatchObject({ type: 'message' });
+      expect(errorSpy).toHaveBeenCalledWith(
+        '[messages] failed to release an unretained chat-session cache owner:',
+        expect.objectContaining({ message: 'simulated owner cleanup failure' }),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 
   it('paged-active path does NOT consult the warm slot even when one is pre-seeded with byte-equal instructions', async () => {
@@ -351,5 +443,51 @@ describe('handleCreateMessage — paged-active warm-slot bypass', () => {
     expect(getStatus2()).toBe(200);
     // Both turns committed AND neither adopted: the size is still 0.
     expect(sessionReg.size).toBe(0);
+  });
+
+  it('streams two paged scheduler-capable requests at the same time', async () => {
+    const registry = new ModelRegistry();
+    const concurrent = createConcurrentStreamModel();
+    registry.register('paged-model', concurrent.model);
+    expect(registry.getSessionRegistry('paged-model')?.concurrentAdmissionLimit).toBe(2);
+
+    const first = createMockRes();
+    const second = createMockRes();
+    const request = (res: ServerResponse, content: string) =>
+      handleCreateMessage(
+        res,
+        {
+          model: 'paged-model',
+          messages: [{ role: 'user', content }],
+          max_tokens: 8,
+          stream: true,
+        },
+        registry,
+      );
+    const firstRequest = request(first.res, 'first');
+    const secondRequest = request(second.res, 'second');
+    let timer: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      await Promise.race([
+        concurrent.bothStarted,
+        new Promise<never>((_resolve, reject) => {
+          timer = setTimeout(() => reject(new Error('paged streams did not overlap')), 1_000);
+        }),
+      ]);
+      expect(concurrent.maxActive()).toBe(2);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      concurrent.release();
+    }
+
+    await Promise.all([firstRequest, secondRequest]);
+    expect(first.getStatus()).toBe(200);
+    expect(second.getStatus()).toBe(200);
+    expect(first.getBody()).toContain('message_start');
+    expect(second.getBody()).toContain('message_start');
+    expect(registry.getSessionRegistry('paged-model')?.queueDepth).toBe(0);
+    const releaseCacheOwner = Reflect.get(concurrent.model, 'releaseCacheOwner') as ReturnType<typeof vi.fn>;
+    expect(releaseCacheOwner).toHaveBeenCalledTimes(2);
   });
 });

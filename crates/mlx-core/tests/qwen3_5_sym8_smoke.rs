@@ -44,6 +44,7 @@ async fn sym8_checkpoint_loads_and_generates_coherent_text() {
         .expect("failed to load sym8 Qwen3.5 model");
 
     let cfg = ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(160),

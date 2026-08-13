@@ -20,6 +20,28 @@ import {
 } from './metallib-select';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
+const packageDeclarationsPath = join(__dirname, 'index.d.cts');
+const crateDeclarationsPath = join(__dirname, '../../crates/mlx-core/index.d.cts');
+
+async function assertDeclarationCopiesMatch(phase: string): Promise<void> {
+  const [packageDeclarations, crateDeclarations] = await Promise.all([
+    readFile(packageDeclarationsPath, 'utf-8'),
+    readFile(crateDeclarationsPath, 'utf-8'),
+  ]);
+  if (packageDeclarations !== crateDeclarations) {
+    throw new Error(
+      `[build.ts declaration drift] packages/core/index.d.cts and crates/mlx-core/index.d.cts differ ${phase}. ` +
+        'Regenerate the native declarations, synchronize both committed copies, and retry.',
+    );
+  }
+}
+
+// Both paths are published/reviewed surfaces. Check the committed inputs
+// before generation so an already-stale package copy cannot be hidden when
+// napi overwrites it, then check again below against the freshly generated
+// output so a native API change cannot silently leave the crate copy stale.
+await assertDeclarationCopiesMatch('before native generation');
+
 const buildCommand = createBuildCommand(process.argv.slice(2));
 const cli = new NapiCli();
 const buildOptions = buildCommand.getOptions();
@@ -46,6 +68,8 @@ for (const output of outputs) {
     await writeFile(output.path, replaced);
   }
 }
+
+await assertDeclarationCopiesMatch('after native generation');
 
 await copyNativeAddon(outputs);
 // Copy mlx.metallib for colocated Metal shader loading

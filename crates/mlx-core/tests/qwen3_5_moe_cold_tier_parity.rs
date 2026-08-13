@@ -59,8 +59,8 @@
 //! `qwen3_5::paged_forward::gdn_checkpoint_tests::ladder_rungs_are_quarters_of_the_one_above`,
 //! model-free and in milliseconds. See the dense gate's module doc.
 //!
-//! Observed on `Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx` (40 layers, `full_attention_interval`
-//! 4, `head_dim` 256, no MTP head), 105 s wall over 5 fresh loads:
+//! Observed on `Qwen3.6-35B-A3B-mxfp4-mlx` (40 layers, `full_attention_interval`
+//! 4, `head_dim` 256), 721 s wall in the debug test profile over 5 fresh loads:
 //!
 //! ```text
 //! capture prompt 1259 tok -> ladder [16, 64, 304, 1248]   (deepest = 78 blocks)
@@ -89,7 +89,7 @@
 //!
 //! ```shell
 //! MLX_COLD_CACHE_DIR=$(mktemp -d) \
-//!     MLX_TEST_MODEL_PATH=~/.mlx-node/models/Qwen3.6-35b-a3b-UD-Q2_K_XL-mlx \
+//!     MLX_TEST_MODEL_PATH=~/.mlx-node/models/Qwen3.6-35B-A3B-mxfp4-mlx \
 //!     cargo test -p mlx-core --test qwen3_5_moe_cold_tier_parity \
 //!     -- --ignored --test-threads=1 --nocapture
 //! ```

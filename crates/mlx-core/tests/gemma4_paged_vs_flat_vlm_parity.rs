@@ -105,6 +105,7 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
 
 fn correctness_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
@@ -330,7 +331,10 @@ async fn gemma4_paged_vlm_correctness() {
 
     // --- 4. EXPLICIT RESET: clears both paged entries owned by the session and
     // Gemma's sliding sidecars, so the next identical image turn is cold. ---
-    tokio::task::block_in_place(|| paged_model.reset_caches()).expect("reset_caches failed");
+    paged_model
+        .reset_caches()
+        .await
+        .expect("reset_caches failed");
     let paged_after_reset = paged_model
         .chat_session_start(
             vec![user_message_with_image(PROMPT, &image)],
@@ -345,7 +349,10 @@ async fn gemma4_paged_vlm_correctness() {
     assert_eq!(paged_a.text, paged_after_reset.text);
 
     // --- 5. IMAGE-DEPENDENCE: paged(image) differs from paged(no-image). ---
-    tokio::task::block_in_place(|| paged_model.reset_caches()).expect("reset_caches failed");
+    paged_model
+        .reset_caches()
+        .await
+        .expect("reset_caches failed");
     let paged_no_image = paged_model
         .chat_session_start(
             vec![user_message(PROMPT)],

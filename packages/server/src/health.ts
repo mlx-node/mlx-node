@@ -42,12 +42,10 @@ export type ServerHealthStatus = 'ok' | 'loading' | 'degraded' | 'error';
  * dropped — a supervisor polling after the fact had no way to learn WHY the
  * server had no resident model.
  *
- * Caveat worth knowing when reading this field: the coordinator brackets
- * EVERY resolve attempt, including the no-op fast path taken when the
- * requested model is already resident. A successful no-op therefore
- * overwrites an earlier failure record. That is why the `'error'` rung is
- * additionally gated on "no resident models" — a server that is answering
- * requests is not in an error state regardless of what the last bracket did.
+ * Resident HTTP requests bypass the load writer and do not overwrite this
+ * record with a no-op. The `'error'` rung is nevertheless gated on "no
+ * resident models": a server that is answering requests is not in an error
+ * state regardless of what the last load bracket did.
  */
 export interface ModelLoadRecord {
   /** Caller-supplied label, normally the model name. `null` when unlabelled. */

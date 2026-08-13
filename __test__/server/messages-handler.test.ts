@@ -5,6 +5,7 @@ import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { handleCreateMessage } from '../../packages/server/src/endpoints/messages.js';
+import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 
 // ---------------------------------------------------------------------------
@@ -156,7 +157,7 @@ function createMockModel(result: ChatResult = makeChatResult()): SessionCapableM
     chatStreamSessionStart: vi.fn(() => fallbackStream()),
     chatStreamSessionContinue: vi.fn(() => fallbackStream()),
     chatStreamSessionContinueTool: vi.fn(() => fallbackStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 
@@ -178,7 +179,7 @@ function createMockStreamModel(streamEvents: Array<Record<string, unknown>>): Se
     chatStreamSessionStart: vi.fn(() => makeStream()),
     chatStreamSessionContinue: vi.fn(() => makeStream()),
     chatStreamSessionContinueTool: vi.fn(() => makeStream()),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 
@@ -3420,7 +3421,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(() => crashingStream()),
         chatStreamSessionContinue: vi.fn(() => crashingStream()),
         chatStreamSessionContinueTool: vi.fn(() => crashingStream()),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       registry.register('test-model', mockModel);
       const { res, getBody } = createMockRes();
@@ -3462,7 +3463,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(() => throwingStream()),
         chatStreamSessionContinue: vi.fn(() => throwingStream()),
         chatStreamSessionContinueTool: vi.fn(() => throwingStream()),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
       registry.register('test-model', mockModel);
@@ -3546,7 +3547,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(() => abortingStream()),
         chatStreamSessionContinue: vi.fn(() => abortingStream()),
         chatStreamSessionContinueTool: vi.fn(() => abortingStream()),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
       registry.register('test-model', mockModel);
@@ -3652,7 +3653,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(signalAwareStream),
         chatStreamSessionContinue: vi.fn(signalAwareStream),
         chatStreamSessionContinueTool: vi.fn(signalAwareStream),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
       registry.register('stall-model', mockModel);
@@ -4539,6 +4540,8 @@ describe('handleCreateMessage', () => {
       // Unlike `/v1/responses`, the Anthropic path has no later stored-identity check,
       // so the in-mutex re-read is the only line of defence — it rejects 400 on drift.
       const registry = new ModelRegistry();
+      const coordinator = new ModelWorkCoordinator();
+      const resolveModel = vi.fn(async () => {});
       const originalModel = createMockModel(makeChatResult({ text: 'original' }));
       const swappedModel = createMockModel(makeChatResult({ text: 'swapped' }));
 
@@ -4567,6 +4570,10 @@ describe('handleCreateMessage', () => {
           max_tokens: 100,
         },
         registry,
+        undefined,
+        null,
+        resolveModel,
+        coordinator,
       );
 
       // Yield so the blocker enters `withExclusive` and awaits
@@ -4587,12 +4594,18 @@ describe('handleCreateMessage', () => {
           max_tokens: 100,
         },
         registry,
+        undefined,
+        null,
+        resolveModel,
+        coordinator,
       );
 
       // Yield so the queued request reaches the mutex await.
       await Promise.resolve();
       await Promise.resolve();
       await Promise.resolve();
+      expect(resolveModel).not.toHaveBeenCalled();
+      expect(coordinator.waitingWriters).toBe(0);
 
       // Hot-swap the binding STRICTLY between the queued
       // request's pre-lock snapshot and the moment it wins the
@@ -4703,7 +4716,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(() => stream()),
         chatStreamSessionContinue: vi.fn(() => stream()),
         chatStreamSessionContinueTool: vi.fn(() => stream()),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       registry.register('test-model', mockModel);
 
@@ -4747,19 +4760,26 @@ describe('handleCreateMessage', () => {
       // socket — awaiting it would pin the per-model `withExclusive` mutex on a
       // dead client. `endJson` pre-checks `res.destroyed || res.socket?.destroyed`
       // and rejects synchronously.
+      //
+      // The socket is destroyed MID-FLIGHT (from inside the mock's
+      // `chatSessionStart`): a socket already destroyed BEFORE dispatch
+      // now takes the H2 pre-dispatch skip and never reaches `endJson`.
       const registry = new ModelRegistry();
       const mockModel = createMockModel(makeChatResult({ text: 'hi' }));
       registry.register('test-model', mockModel);
       const { res, getBody, wasDestroyed } = createMockRes();
 
-      Object.defineProperty(res, 'socket', {
-        configurable: true,
-        get: () => ({
-          destroyed: true,
-          once: () => {},
-          removeListener: () => {},
-          off: () => {},
-        }),
+      (mockModel.chatSessionStart as ReturnType<typeof vi.fn>).mockImplementation(async () => {
+        Object.defineProperty(res, 'socket', {
+          configurable: true,
+          get: () => ({
+            destroyed: true,
+            once: () => {},
+            removeListener: () => {},
+            off: () => {},
+          }),
+        });
+        return makeChatResult({ text: 'hi' });
       });
 
       const handlerPromise = handleCreateMessage(
@@ -4999,7 +5019,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn(),
         chatStreamSessionContinue: vi.fn(),
         chatStreamSessionContinueTool: vi.fn(),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
 
       const registry = new ModelRegistry({ maxQueueDepth: 1 });
@@ -5130,6 +5150,7 @@ describe('handleCreateMessage', () => {
             model: 'test-model',
             messages: [{ role: 'user', content: 'A' }],
             max_tokens: 100,
+            cache_salt: 'tenant-a/high-entropy-secret',
           },
           registry,
         );
@@ -5153,6 +5174,7 @@ describe('handleCreateMessage', () => {
               { role: 'user', content: 'B' },
             ],
             max_tokens: 100,
+            cache_salt: 'tenant-a/high-entropy-secret',
           },
           registry,
         );
@@ -5179,6 +5201,7 @@ describe('handleCreateMessage', () => {
               { role: 'user', content: 'C' },
             ],
             max_tokens: 100,
+            cache_salt: 'tenant-a/high-entropy-secret',
           },
           registry,
         );
@@ -5238,6 +5261,65 @@ describe('handleCreateMessage', () => {
       } finally {
         primeHistorySpy.mockRestore();
       }
+    });
+
+    it('cold-replays the non-paged warm slot when cache_salt changes', async () => {
+      const chatSessionStart = vi
+        .fn()
+        .mockResolvedValueOnce(makeChatResult({ text: 'A1', cachedTokens: 0 }))
+        .mockResolvedValueOnce(makeChatResult({ text: 'A2', cachedTokens: 0 }));
+      const resetCaches = vi.fn().mockResolvedValue(undefined);
+      const releaseCacheOwner = vi.fn().mockResolvedValue(undefined);
+      const mockModel = {
+        chatSessionStart,
+        chatSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
+        chatStreamSessionStart: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('non-streaming test')),
+        resetCaches,
+        releaseCacheOwner,
+      } as unknown as SessionCapableModel;
+      const registry = new ModelRegistry();
+      registry.register('test-model', mockModel);
+
+      const first = createMockRes();
+      await handleCreateMessage(
+        first.res,
+        {
+          model: 'test-model',
+          messages: [{ role: 'user', content: 'A' }],
+          max_tokens: 100,
+          cache_salt: 'tenant-a/high-entropy-secret',
+        },
+        registry,
+      );
+      expect(first.getStatus()).toBe(200);
+      const resetsAfterFirst = resetCaches.mock.calls.length;
+      expect(resetsAfterFirst).toBeGreaterThanOrEqual(1);
+
+      const second = createMockRes();
+      await handleCreateMessage(
+        second.res,
+        {
+          model: 'test-model',
+          messages: [
+            { role: 'user', content: 'A' },
+            { role: 'assistant', content: 'A1' },
+            { role: 'user', content: 'B' },
+          ],
+          max_tokens: 100,
+          cache_salt: 'tenant-b/high-entropy-secret',
+        },
+        registry,
+      );
+
+      expect(second.getStatus()).toBe(200);
+      expect(second.getHeaders()['x-session-cache']).toBe('fresh');
+      expect(resetCaches.mock.calls.length).toBeGreaterThan(resetsAfterFirst);
+      expect(releaseCacheOwner).toHaveBeenCalledTimes(1);
+      const secondConfig = chatSessionStart.mock.calls[1]?.[1] as { cacheSalt?: string };
+      expect(secondConfig.cacheSalt).toBe('tenant-b/high-entropy-secret');
     });
 
     it('rotating x-anthropic-billing-header does not bust the warm slot', async () => {
@@ -5724,9 +5806,10 @@ describe('handleCreateMessage', () => {
       //   * Identity witness: `primeHistory` runs on the SAME
       //     pre-seeded session instance on turn 1 — proves the warm
       //     hit actually leased it.
-      //   * Committed-producer witness: `warmSession.turns === 1` after
-      //     the failure — names the exact path under test (commit
-      //     fired despite the writer-side failure).
+      //   * Committed-producer witness: disposal observes
+      //     `warmSession.turns === 1` before it clears the dead wrapper —
+      //     names the exact path under test (commit fired despite the
+      //     writer-side failure).
       //   * Failed wire: `error` event without a `message_stop`.
       //   * Slot drop: `sessionReg.size === 0` after the failure —
       //     the leased session was NOT re-adopted under the sentinel.
@@ -5798,6 +5881,12 @@ describe('handleCreateMessage', () => {
       const warmSession = new ChatSession(mockModel);
       sessionReg.adopt('warm-prefix', warmSession, 'sysA', null);
       expect(sessionReg.size).toBe(1);
+      let turnsAtDispose = -1;
+      const originalDispose = warmSession.dispose.bind(warmSession);
+      const disposeSpy = vi.spyOn(warmSession, 'dispose').mockImplementation(async () => {
+        turnsAtDispose = warmSession.turns;
+        await originalDispose();
+      });
 
       // Identity witness: spy on the prototype (matches the
       // 3-turn streaming test pattern). The streaming dispatcher
@@ -5838,12 +5927,14 @@ describe('handleCreateMessage', () => {
         // where the warm hit is silently bypassed.
         expect(primeHistorySpy).toHaveBeenCalledTimes(1);
         expect(primeHistorySpy.mock.contexts[0]).toBe(warmSession);
-        // Committed-producer witness: turnCount advanced on the warm
-        // session even though the wire emitted `error`. This is the
+        // Committed-producer witness: disposal saw turnCount advance on
+        // the warm session even though the wire emitted `error`. This is the
         // exact `wasCommitted() === true && streamResult.ok === false`
         // scenario the dual-gate exists to drop. A regression that
         // adopts on `wasCommitted()` alone would slip past this turn.
-        expect(warmSession.turns).toBe(1);
+        expect(disposeSpy).toHaveBeenCalledTimes(1);
+        expect(turnsAtDispose).toBe(1);
+        await expect(warmSession.send('disposed session')).rejects.toThrow('session has been disposed');
         // Slot dropped — the committed-but-failed warm session was
         // NOT re-adopted under the sentinel.
         expect(sessionReg.size).toBe(0);
@@ -5883,6 +5974,7 @@ describe('handleCreateMessage', () => {
         expect(primeHistorySpy).toHaveBeenCalledTimes(2);
         expect(primeHistorySpy.mock.contexts[1]).not.toBe(warmSession);
       } finally {
+        disposeSpy.mockRestore();
         primeHistorySpy.mockRestore();
       }
     });
@@ -6088,7 +6180,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: vi.fn().mockRejectedValue(new Error('non-streaming test')),
         chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('non-streaming test')),
         chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('non-streaming test')),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
       registry.register('test-model', mockModel);
@@ -6185,7 +6277,7 @@ describe('handleCreateMessage', () => {
         chatStreamSessionStart: stream,
         chatStreamSessionContinue: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
         chatStreamSessionContinueTool: vi.fn().mockRejectedValue(new Error('hot path: not expected')),
-        resetCaches: vi.fn(),
+        resetCaches: vi.fn().mockResolvedValue(undefined),
       } as unknown as SessionCapableModel;
       const registry = new ModelRegistry();
       registry.register('stream-model', mockModel);

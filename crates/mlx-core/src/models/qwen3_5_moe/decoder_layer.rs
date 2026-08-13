@@ -2,6 +2,7 @@ use crate::array::MxArray;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi::bindgen_prelude::*;
 
 use super::attention::Qwen3_5Attention;
@@ -44,6 +45,26 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    fn forward_mlp_decode_rows(&self, x: &MxArray) -> Result<MxArray> {
+        let batch = usize::try_from(x.shape_at(0)?)
+            .map_err(|_| Error::from_reason("Qwen3.5 MoE decode MLP received a negative batch"))?;
+        if batch == 0 {
+            return Err(Error::from_reason(
+                "Qwen3.5 MoE decode MLP requires at least one row",
+            ));
+        }
+        let rows = (0..batch)
+            .map(|row| {
+                let row = x.slice_axis(0, row as i64, row as i64 + 1)?;
+                match &self.mlp {
+                    MLPType::Dense(mlp) => mlp.forward(&row),
+                    MLPType::MoE(moe) => moe.forward(&row),
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        MxArray::concatenate_many(rows.iter().collect(), Some(0))
+    }
+
     pub fn is_linear(&self) -> bool {
         matches!(self.attn, AttentionType::Linear(_))
     }
@@ -222,6 +243,98 @@ impl DecoderLayer {
                 let mlp_out = match &self.mlp {
                     MLPType::Dense(mlp) => mlp.forward(&normed)?,
                     MLPType::MoE(moe) => moe.forward(&normed)?,
+                };
+                h.add(&mlp_out)
+            }
+        }
+    }
+
+    /// One text decode forward over independent paged/GDN request rows.
+    /// Sparse expert routing already flattens `[B,T,H]`, so the MoE tail uses
+    /// the same batched tensor as attention without a serial fallback.
+    pub(crate) fn forward_paged_batched(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        rows: &[(SeqId, u32)],
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+        preserve_singleton_projection_graphs: bool,
+    ) -> Result<MxArray> {
+        match kind {
+            Qwen3_5LayerKind::Linear => {
+                if !matches!(self.attn, AttentionType::Linear(_)) {
+                    return Err(Error::from_reason(
+                        "Qwen3_5MoeDecoderLayer::forward_paged_batched: Linear kind/operator mismatch",
+                    ));
+                }
+                let normed = self.input_layernorm.forward(x)?;
+                let attn_out = match &mut self.attn {
+                    AttentionType::Linear(gdn) => {
+                        let cache = flat_cache
+                            .and_then(|cache| cache.as_arrays_cache_mut())
+                            .ok_or_else(|| {
+                                Error::from_reason(
+                                    "Qwen3.5 MoE batched GDN layer has no recurrent cache",
+                                )
+                            })?;
+                        if preserve_singleton_projection_graphs {
+                            let (output, next_cache) =
+                                crate::models::qwen3_5::arrays_cache::forward_rows_independently(
+                                    &normed,
+                                    cache,
+                                    |row, row_cache| gdn.forward(row, None, Some(row_cache), true),
+                                )?;
+                            *cache = next_cache;
+                            output
+                        } else {
+                            gdn.forward(&normed, None, Some(cache), true)?
+                        }
+                    }
+                    AttentionType::Full(_) => {
+                        return Err(Error::from_reason(
+                            "Qwen3_5MoeDecoderLayer::forward_paged_batched: Linear operator disappeared",
+                        ));
+                    }
+                };
+                let h = x.add(&attn_out)?;
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                let mlp_out = if preserve_singleton_projection_graphs {
+                    self.forward_mlp_decode_rows(&normed)?
+                } else {
+                    match &self.mlp {
+                        MLPType::Dense(mlp) => mlp.forward(&normed)?,
+                        MLPType::MoE(moe) => moe.forward(&normed)?,
+                    }
+                };
+                h.add(&mlp_out)
+            }
+            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                let attn = match &self.attn {
+                    AttentionType::Full(attn) => attn,
+                    AttentionType::Linear(_) => {
+                        return Err(Error::from_reason(
+                            "Qwen3_5MoeDecoderLayer::forward_paged_batched: FullAttention kind/operator mismatch",
+                        ));
+                    }
+                };
+                let normed = self.input_layernorm.forward(x)?;
+                let attn_out = attn.forward_paged_batched(
+                    &normed,
+                    adapter,
+                    paged_idx,
+                    rows,
+                    preserve_singleton_projection_graphs,
+                )?;
+                let h = x.add(&attn_out)?;
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                let mlp_out = if preserve_singleton_projection_graphs {
+                    self.forward_mlp_decode_rows(&normed)?
+                } else {
+                    match &self.mlp {
+                        MLPType::Dense(mlp) => mlp.forward(&normed)?,
+                        MLPType::MoE(moe) => moe.forward(&normed)?,
+                    }
                 };
                 h.add(&mlp_out)
             }

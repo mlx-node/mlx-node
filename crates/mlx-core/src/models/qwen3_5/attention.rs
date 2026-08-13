@@ -14,7 +14,7 @@ use crate::models::paddleocr_vl::language::{
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::{
-    PagedAttentionV2Layout, PagedKVCacheAdapter, PagedPrefillMemorySnapshot,
+    PagedAttentionV2Layout, PagedKVCacheAdapter, PagedPrefillMemorySnapshot, SeqId,
     paged_attention_v2_aux_fits, paged_attention_v2_partition_upper_bound,
 };
 use napi::bindgen_prelude::*;
@@ -1465,6 +1465,131 @@ impl Qwen3_5Attention {
         self.o_proj.forward(&gated_output)
     }
 
+    /// Uniform hybrid decode: one text token per request, with one GDN-safe
+    /// batch row and one paged K/V row per scheduler sequence.
+    pub(crate) fn forward_paged_batched(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        rows: &[(SeqId, u32)],
+        preserve_singleton_projection_graphs: bool,
+    ) -> Result<MxArray> {
+        let shape = x.shape()?;
+        if rows.is_empty()
+            || shape.as_ref().len() != 3
+            || shape[0] != rows.len() as i64
+            || shape[1] != 1
+        {
+            return Err(Error::from_reason(format!(
+                "Qwen3_5Attention::forward_paged_batched expects [N,1,H] for {} rows, got {:?}",
+                rows.len(),
+                shape.as_ref()
+            )));
+        }
+        if !native_kv_write_enabled() {
+            return Err(Error::from_reason(
+                "Qwen3.5 batched decode requires native K/V writes",
+            ));
+        }
+
+        let batch = rows.len() as i64;
+        let offsets = rows
+            .iter()
+            .map(|&(seq_id, position)| {
+                i32::try_from(position).map_err(|_| {
+                    Error::from_reason(format!(
+                        "Qwen3.5 batched decode sequence {seq_id} position {position} exceeds i32::MAX"
+                    ))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let offsets = MxArray::from_int32(&offsets, &[batch])?;
+        let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
+
+        // K-quant projections stay on their established one-token graph.
+        // Packed kernels may select a different reduction path for `B > 1`,
+        // which can change greedy tokens even though the paged attention
+        // operation itself is row-independent. Projection rows are cheap to
+        // concatenate and K/V attention below remains one genuine batch.
+        let (queries, gate, keys, values) = if preserve_singleton_projection_graphs {
+            let mut query_rows = Vec::with_capacity(rows.len());
+            let mut gate_rows = Vec::with_capacity(rows.len());
+            let mut key_rows = Vec::with_capacity(rows.len());
+            let mut value_rows = Vec::with_capacity(rows.len());
+            for row in 0..rows.len() {
+                let x_row = x.slice_axis(0, row as i64, row as i64 + 1)?;
+                let (query, gate) = self.project_q_gate(&x_row, 1, 1)?;
+                query_rows.push(self.q_norm.forward(&query)?);
+                gate_rows.push(gate);
+                let key = self.k_proj.forward(&x_row)?.reshape(&[
+                    1,
+                    1,
+                    self.num_kv_heads as i64,
+                    self.head_dim as i64,
+                ])?;
+                key_rows.push(self.k_norm.forward(&key)?);
+                value_rows.push(self.v_proj.forward(&x_row)?.reshape(&[
+                    1,
+                    1,
+                    self.num_kv_heads as i64,
+                    self.head_dim as i64,
+                ])?);
+            }
+            (
+                MxArray::concatenate_many(query_rows.iter().collect(), Some(0))?,
+                MxArray::concatenate_many(gate_rows.iter().collect(), Some(0))?,
+                MxArray::concatenate_many(key_rows.iter().collect(), Some(0))?,
+                MxArray::concatenate_many(value_rows.iter().collect(), Some(0))?,
+            )
+        } else {
+            let (queries, gate) = self.project_q_gate(x, batch, 1)?;
+            let queries = self.q_norm.forward(&queries)?;
+            let keys = self.k_norm.forward(&self.k_proj.forward(x)?.reshape(&[
+                batch,
+                1,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])?)?;
+            let values = self.v_proj.forward(x)?.reshape(&[
+                batch,
+                1,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])?;
+            (queries, gate, keys, values)
+        };
+        let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
+        let queries = self.rope.forward_with_offsets(&queries, &offsets)?;
+        let keys = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = self.rope.forward_with_offsets(&keys, &offsets)?;
+        let values = values.transpose(Some(&[0, 2, 1, 3]))?;
+
+        let queries = queries.squeeze(Some(&[2]))?;
+        let keys = keys.squeeze(Some(&[2]))?;
+        let values = values.squeeze(Some(&[2]))?;
+        adapter
+            .update_keys_values_native_batched(attn_layer_idx, &keys, &values, rows)
+            .map_err(Error::from_reason)?;
+        let output = adapter
+            .gather_kv_for_decode_graph_batched(attn_layer_idx, &queries, &seq_ids, self.scale, 1.0)
+            .map_err(Error::from_reason)?
+            .astype(x.dtype()?)?
+            .reshape(&[batch, 1, (self.num_heads * self.head_dim) as i64])?;
+        let output = output.mul(&Activations::sigmoid(&gate)?)?;
+        if preserve_singleton_projection_graphs {
+            let projected = (0..rows.len())
+                .map(|row| {
+                    let row = output.slice_axis(0, row as i64, row as i64 + 1)?;
+                    self.o_proj.forward(&row)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            MxArray::concatenate_many(projected.iter().collect(), Some(0))
+        } else {
+            self.o_proj.forward(&output)
+        }
+    }
+
     /// Initialize M-RoPE for VLM mode.
     pub fn init_mrope(
         &mut self,
@@ -1547,7 +1672,9 @@ impl Qwen3_5Attention {
         }
 
         let LinearProj::Standard(q_lin) = &self.q_proj else {
-            unreachable!("q_proj variant checked above")
+            return Err(Error::from_reason(
+                "Qwen3.5 q_proj changed variants while finalizing the block layout",
+            ));
         };
 
         let weight = q_lin.get_weight(); // [2*H*D, hidden], per-head-interleaved

@@ -25,9 +25,9 @@ pub use attention::{Attention, QKVResult};
 pub use block::TransformerBlock;
 pub use kv_cache::KVCache;
 pub use kv_cache_spec::{
-    AttentionKind, KVCacheDType, KVCacheGroup, KVCachePhysicalLayout, KVCacheSpecError,
-    LayerKVCacheRoute, LayerKVCacheSpec, derive_layer_kv_cache_routes, group_layer_kv_cache_specs,
-    validate_layer_kv_cache_specs,
+    AttentionKind, KVCacheCoordinator, KVCacheCoordinatorError, KVCacheDType, KVCacheGroup,
+    KVCachePhysicalLayout, KVCacheSpecError, LayerKVCacheRoute, LayerKVCacheSpec,
+    derive_layer_kv_cache_routes, group_layer_kv_cache_specs, validate_layer_kv_cache_specs,
 };
 pub use mlp::MLP;
 pub use rotating_kv_cache::RotatingKVCache;

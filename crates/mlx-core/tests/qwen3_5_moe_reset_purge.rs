@@ -92,6 +92,7 @@ fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
@@ -195,10 +196,9 @@ async fn qwen3_5_moe_session_reset_purges_prefix_cache_cold_prefill() {
         r1.cached_tokens
     );
 
-    // Explicit Command reset via the sync NAPI method. block_in_place:
-    // reset_caches blocks on blocking_recv, which panics on a tokio
-    // worker thread (see qwen3_5_moe_session.rs + 8d5283a7 precedent).
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+    // Explicit async Command reset; awaiting preserves reset-before-rerun
+    // ordering without blocking a Tokio/Node worker.
+    model.reset_caches().await.expect("reset_caches failed");
 
     // Turn 2: rerun the IDENTICAL prompt as a fresh session start.
     let r2 = model

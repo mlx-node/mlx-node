@@ -97,6 +97,7 @@ fn clone_model_dir_paged(src: &Path, suffix: &str) -> Result<PathBuf, String> {
 /// thinking (when ON) is not artificially truncated to zero.
 fn chat_config(reasoning_effort: Option<&str>) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(96),
@@ -193,7 +194,7 @@ async fn qwen3_5_paged_honors_enable_thinking() {
     );
 
     // Independent cold session for the second effort.
-    tokio::task::block_in_place(|| model.reset_caches()).expect("reset_caches failed");
+    model.reset_caches().await.expect("reset_caches failed");
 
     // --- thinking OFF (reasoning_effort=none → enable_thinking=false) ---
     // THE P2 GATE: pre-P2 the paged cores hardcoded thinking_enabled=true so

@@ -1,5 +1,29 @@
-import { __parseEnvPositiveInt, __parseEnvSeconds, createServer } from '@mlx-node/server';
+import {
+  __parseEnvPositiveInt,
+  __parseEnvSeconds,
+  createServer,
+  DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL,
+  type ServableModel,
+} from '@mlx-node/server';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
+
+/**
+ * Minimal session-capable stub for observing per-model registry state
+ * (`queueDepthLimit`). `ModelRegistry.register()` never invokes the
+ * model — it only binds a `SessionRegistry` to it (the constructor is
+ * pure field assignment) — so no-op methods are sufficient.
+ */
+function createStubModel(): ServableModel {
+  return {
+    chatSessionStart: async () => ({}),
+    chatSessionContinue: async () => ({}),
+    chatSessionContinueTool: async () => ({}),
+    chatStreamSessionStart: () => {},
+    chatStreamSessionContinue: () => {},
+    chatStreamSessionContinueTool: () => {},
+    resetCaches: () => Promise.resolve(),
+  } as unknown as ServableModel;
+}
 
 /**
  * `createServer` config validation.
@@ -72,13 +96,53 @@ describe('createServer config validation', () => {
     it('accepts the minimum valid value of 1', async () => {
       const srv = await createServer({ maxQueueDepthPerModel: 1, disableStore: true, port: 0 });
       openedServers.push(srv);
-      expect(srv.registry).toBeDefined();
+      srv.registry.register('m', createStubModel());
+      expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(1);
     });
 
-    it('accepts undefined (no opt-in)', async () => {
+    // Deliberate behavior-change pins: before the default cap landed,
+    // omitting the knob meant an UNBOUNDED per-model FIFO
+    // (`queueDepthLimit === undefined`). The default is now 16 so an
+    // agent fan-out cannot pile unbounded waiters behind one model;
+    // `'unbounded'` restores the old behaviour explicitly.
+    it('applies the default cap of 16 when config is undefined and env is absent', async () => {
+      // `beforeEach` deleted MLX_MAX_QUEUE_DEPTH_PER_MODEL. The literal
+      // pin keeps the exported constant honest; the registry assertion
+      // proves the constant actually flows into per-model admission.
+      expect(DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL).toBe(16);
       const srv = await createServer({ maxQueueDepthPerModel: undefined, disableStore: true, port: 0 });
       openedServers.push(srv);
-      expect(srv.registry).toBeDefined();
+      srv.registry.register('m', createStubModel());
+      expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL);
+    });
+
+    it('applies the default cap when the knob is entirely absent from config', async () => {
+      // Same `??` path as explicit-undefined today, but pinned separately
+      // so a future "explicit undefined differs from absent" refactor
+      // cannot silently drop either case.
+      const srv = await createServer({ disableStore: true, port: 0 });
+      openedServers.push(srv);
+      srv.registry.register('m', createStubModel());
+      expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL);
+    });
+
+    it("'unbounded' opts out of the default cap", async () => {
+      const srv = await createServer({ maxQueueDepthPerModel: 'unbounded', disableStore: true, port: 0 });
+      openedServers.push(srv);
+      srv.registry.register('m', createStubModel());
+      expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBeUndefined();
+    });
+
+    it("'unbounded' also bypasses an env override (explicit config wins over env)", async () => {
+      process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL = '4';
+      try {
+        const srv = await createServer({ maxQueueDepthPerModel: 'unbounded', disableStore: true, port: 0 });
+        openedServers.push(srv);
+        srv.registry.register('m', createStubModel());
+        expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBeUndefined();
+      } finally {
+        delete process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL;
+      }
     });
 
     it('falls through to env when config value is absent', async () => {
@@ -86,7 +150,36 @@ describe('createServer config validation', () => {
       try {
         const srv = await createServer({ disableStore: true, port: 0 });
         openedServers.push(srv);
-        expect(srv.registry).toBeDefined();
+        srv.registry.register('m', createStubModel());
+        expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(4);
+      } finally {
+        delete process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL;
+      }
+    });
+
+    it('numeric config wins over env and default', async () => {
+      process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL = '4';
+      try {
+        const srv = await createServer({ maxQueueDepthPerModel: 3, disableStore: true, port: 0 });
+        openedServers.push(srv);
+        srv.registry.register('m', createStubModel());
+        expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(3);
+      } finally {
+        delete process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL;
+      }
+    });
+
+    it('invalid env value falls back to the default cap of 16, not to unbounded', async () => {
+      // The parser rejecting `"1.5"` used to leave the queue UNBOUNDED;
+      // since the default cap landed, the fall-through target is 16.
+      // This is the effective end-to-end pin the parser unit tests
+      // below cannot provide on their own.
+      process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL = '1.5';
+      try {
+        const srv = await createServer({ disableStore: true, port: 0 });
+        openedServers.push(srv);
+        srv.registry.register('m', createStubModel());
+        expect(srv.registry.getSessionRegistry('m')!.queueDepthLimit).toBe(DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL);
       } finally {
         delete process.env.MLX_MAX_QUEUE_DEPTH_PER_MODEL;
       }
@@ -158,10 +251,10 @@ describe('createServer config validation', () => {
  *
  * Fix: reject non-integer positive values by returning `undefined` so the
  * caller falls through to its documented default (7 days retention /
- * unbounded queue). We deliberately do NOT throw on bad env — env vars
- * are routinely set by orchestrators and CI templates, and a
- * startup-crash-on-typo is harsher than falling through to a safe
- * default.
+ * the 16-waiter queue cap `DEFAULT_MAX_QUEUE_DEPTH_PER_MODEL`). We
+ * deliberately do NOT throw on bad env — env vars are routinely set by
+ * orchestrators and CI templates, and a startup-crash-on-typo is
+ * harsher than falling through to a safe default.
  */
 describe('env var parsing', () => {
   const RETENTION_VAR = 'MLX_RESPONSE_RETENTION_SECONDS';
@@ -244,9 +337,12 @@ describe('env var parsing', () => {
   });
 
   describe('parseEnvPositiveInt (MLX_MAX_QUEUE_DEPTH_PER_MODEL)', () => {
-    it('rejects fractional MLX_MAX_QUEUE_DEPTH_PER_MODEL and leaves queue unbounded', () => {
+    it('rejects fractional MLX_MAX_QUEUE_DEPTH_PER_MODEL so createServer falls back to the default cap', () => {
       // `"1.5"` must NOT silently coerce to 1 — that would clamp the
       // queue to depth=1 and return 429 for every second request.
+      // The parser returns undefined; `createServer` then applies the
+      // 16-waiter default (pinned end-to-end by 'invalid env value
+      // falls back to the default cap of 16' above).
       process.env[QUEUE_VAR] = '1.5';
       expect(__parseEnvPositiveInt(QUEUE_VAR)).toBeUndefined();
     });

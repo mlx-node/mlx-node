@@ -4,6 +4,20 @@ import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
 import type { ContentPart, ResponsesAPIRequest, ResponsesToolDefinition } from '../types.js';
 
+export const MAX_CACHE_SALT_BYTES = 256;
+
+export function validateCacheSalt(cacheSalt: unknown): asserts cacheSalt is string {
+  if (typeof cacheSalt !== 'string') {
+    throw new Error('cache_salt must be a string');
+  }
+  if (cacheSalt.length === 0) {
+    throw new Error('cache_salt must not be empty');
+  }
+  if (Buffer.byteLength(cacheSalt, 'utf8') > MAX_CACHE_SALT_BYTES) {
+    throw new Error(`cache_salt must be at most ${MAX_CACHE_SALT_BYTES} UTF-8 bytes`);
+  }
+}
+
 /**
  * Resolve a message's `content` array into text + optional image bytes.
  *
@@ -256,6 +270,10 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
     reportPerformance: true,
   };
 
+  if (req.cache_salt != null) {
+    validateCacheSalt(req.cache_salt);
+    config.cacheSalt = req.cache_salt;
+  }
   if (req.max_output_tokens != null) {
     config.maxNewTokens = req.max_output_tokens;
   }

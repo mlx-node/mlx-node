@@ -49,6 +49,7 @@ const PREFILL_STEP_SIZE: usize = 2048;
 
 fn chat_config_default(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         // Deterministic greedy decoding: temperature=0 collapses sampling

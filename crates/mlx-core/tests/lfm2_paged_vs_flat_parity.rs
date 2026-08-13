@@ -111,6 +111,7 @@ fn clone_model_dir(src: &Path, suffix: &str, use_block_paged: bool) -> Result<Pa
 
 fn parity_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         max_new_tokens: Some(max_new_tokens),
@@ -182,6 +183,7 @@ fn assistant_message(result: &ChatResult) -> ChatMessage {
 /// token-exact (turn-2's prompt strict-extends the persisted history).
 fn budget_force_chat_config(max_new_tokens: i32) -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         thinking_token_budget: Some(0),
@@ -440,9 +442,13 @@ async fn lfm2_paged_vs_flat_length_exit_parity() {
 // rebuilds conv over the 23-token prefix via run_conv_only_prefill (the fixed
 // path).
 //
-// TWO independent hole-free ORACLES, cross-checked (assert flat==cold):
-//   * FLAT two-turn — carries conv across turns.
-//   * COLD paged self-reference — cached_prefix_len==0, never runs Pass-1.
+// AUTHORITATIVE ORACLE:
+//   * FLAT two-turn — carries the incremental conv state across turns.
+//
+// A cold paged Pass-1 reconstruction is deliberately NOT an oracle: batched
+// reconstruction and incremental T=1 state differ by roughly 40 ULP on bf16,
+// enough to flip a near-tied greedy token. Carried state is now the sole model
+// behavior; the old reconstruction-compatibility switch has been removed.
 // Compare `raw_text` NOT `text`: the divergent tokens live inside the reasoning
 // span, which `text` strips (comparing `text` could match two empties + MASK).
 // Reachability gate: `cached_tokens>0` proves turn 2 took the live-continue
@@ -543,7 +549,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
 
     drop(warm_model);
 
-    // ---- DIAGNOSTIC ORACLE A: FLAT two-turn (the real P4-2 bar) ----
+    // ---- AUTHORITATIVE ORACLE: FLAT carried-state two-turn ----
     let flat_dir = match clone_model_dir(&src, "lfm2-flat-warmcont", false) {
         Ok(p) => p,
         Err(e) => panic!("failed to clone flat-oracle dir: {e}"),
@@ -579,46 +585,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
     );
     drop(flat_model);
 
-    // ---- DIAGNOSTIC ORACLE B: COLD paged self-reference (re-prefill) ----
-    let cold_dir = match clone_model_dir(&src, "lfm2-paged-warmcont-cold", true) {
-        Ok(p) => p,
-        Err(e) => panic!("failed to clone paged cold-oracle dir: {e}"),
-    };
-    let cold_model = Lfm2Model::load_from_dir(&cold_dir.to_string_lossy())
-        .await
-        .expect("failed to load paged cold-oracle LFM2 model");
-    let r2_cold = cold_model
-        .chat_session_start(
-            vec![
-                user_message(user1),
-                assistant_message(&r1),
-                user_message(user2),
-            ],
-            Some(parity_chat_config(MAX_NEW_TURN2)),
-        )
-        .await
-        .expect("cold-oracle turn 2 paged chat_session_start failed");
-    eprintln!(
-        "[warm-cont] turn2 COLD oracle: num_tokens={} cached_tokens={} finish={} raw_text={:?}",
-        r2_cold.num_tokens, r2_cold.cached_tokens, r2_cold.finish_reason, r2_cold.raw_text,
-    );
-    drop(cold_model);
-
-    // Oracle sanity: the two INDEPENDENT hole-free oracles must agree
-    // (flat carries conv across turns; cold paged re-prefills from scratch).
-    // If they disagree the test scaffold itself is broken, not the fix.
-    assert_eq!(
-        r2_flat.raw_text, r2_cold.raw_text,
-        "oracle disagreement: FLAT two-turn != COLD paged full-prefill — the test's \
-         reference is unsound, fix the harness before trusting the bite below",
-    );
-
-    // THE BITE: warm paged-CONTINUE must equal the hole-free oracle.
-    //   - PRE-fix (conv Pass-1 identity-passthrough of attention layers):
-    //     downstream conv state drifts → warm diverges from flat/cold (~14 tokens
-    //     into turn 2) → this assertion FAILS.
-    //   - POST-fix (run_conv_only_prefill runs attention as a flat causal
-    //     self-prefill): warm == flat == cold byte-for-byte → PASSES.
+    // THE BITE: warm paged continuation must equal the carried-state oracle.
     if r2_warm.raw_text != r2_flat.raw_text {
         let first_diff = r2_warm
             .raw_text
@@ -628,7 +595,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
             .position(|(a, b)| a != b);
         panic!(
             "PAGED-CONTINUE BOUNDARY DIVERGENCE: warm paged-continue turn-2 != flat oracle \
-             (conv Pass-1 attention-skip drifted downstream conv state). \
+             (sequence-private carried conv state drifted). \
              first_diff_byte={first_diff:?}\n\
              WARM (cached={}) raw_text={:?}\n\
              FLAT (cached={}) raw_text={:?}",
@@ -637,7 +604,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
     }
 
     eprintln!(
-        "[PASS] paged-continue == flat == cold on the budget-forced length-exit boundary \
+        "[PASS] paged carried-state continue == flat carried-state oracle on the budget-forced boundary \
          (warm cached={})",
         r2_warm.cached_tokens,
     );
@@ -1045,6 +1012,7 @@ fn states_number_rejects_digits_inside_a_longer_number() {
 /// [`answer_surface`]. The budget bounds reasoning length, nothing more.
 fn memory_probe_chat_config() -> ChatConfig {
     ChatConfig {
+        cache_salt: None,
         cache_owner_id: None,
         cache_root_owner_id: None,
         thinking_token_budget: Some(128),
@@ -1378,8 +1346,9 @@ async fn lfm2_flat_delta_memory_probe_content() {
 // Telemetry regression: LFM2 paged prefillTokensPerSecond must be full-prompt
 // scale, not attention-suffix scale, on a warm cross-request prefix-cache hit.
 //
-// The paged prefill reprocesses the FULL prompt through the conv layers every
-// turn (run_paged_prefill_chunk Pass 1), so ttft measures full-prompt work.
+// An identical resend cannot reuse carried state because the exact-match
+// prefix lookup is capped at len-1; it therefore reprocesses the FULL prompt
+// through Pass 1, so ttft measures full-prompt work.
 // The pre-fix code divided that ttft into the attention SUFFIX
 // (tokens.len()-cached_prefix_len), under-reporting prefill tok/s by the
 // cache-hit ratio (~37 vs ~thousands). This guards the fix that uses the
@@ -1423,8 +1392,9 @@ async fn lfm2_paged_prefill_tps_is_full_prompt_scale_on_warm_reuse() {
     // Turn 2: a FRESH paged session re-submitting the IDENTICAL prompt. On a
     // paged model the BlockAllocator reuses the content-addressed prefix, so
     // `cached_tokens` covers ~the whole prompt while the new attention suffix is
-    // tiny — yet paged prefill still reprocesses the FULL prompt through the conv
-    // layers (run_paged_prefill_chunk Pass 1), so ttft stays full-prompt scale.
+    // tiny. The len-1 exact-resend cap prevents the carried-state proof, so
+    // paged prefill reprocesses the FULL prompt through Pass 1 and ttft stays
+    // full-prompt scale.
     // This exercises the fresh-turn paged START path (`run_paged_turn` →
     // `paged_prefill`) that the telemetry fix touches. (The
     // `chat_session_continue` delta path now ALSO runs paged — see the
@@ -1554,23 +1524,24 @@ async fn lfm2_paged_prefill_bridge_cache_hit_ab_probe() {
 
 // ---------------------------------------------------------------------------
 // Regression: a quantized LFM2 checkpoint loaded with NO config override must
-// default to the FLAT decode path.
+// default to the block-paged decode path.
 //
-// The default is resolved in `Lfm2Inner::load_from_dir` from the authoritative
-// `.scales` tensor signal (NOT config metadata), the same signal that gates
-// compiled registration. This proves the wiring end-to-end on real weights and
-// guards against a quantized checkpoint silently landing on the slow eager-PAGED
-// path (the bug this branch removes). Because detection keys on tensors, a
+// The default is resolved in `Lfm2Inner::load_from_dir` after authoritative
+// tensor-based storage classification (NOT config metadata), the same point
+// that can force structurally incompatible sym8 checkpoints flat. This proves
+// the compatible-quantized wiring end-to-end on real weights and
+// guards against the default drifting back to the former flat-only policy.
+// Because detection keys on tensors, a
 // checkpoint whose `quantization` block lacks top-level `bits`/`mode` (per-layer
 // only) is handled identically — the metadata shape is never consulted.
 //
 // Gated on its OWN env var so it only runs when the operator explicitly points
-// at a QUANTIZED checkpoint (a bf16 checkpoint would correctly stay paged and
-// fail this assertion).
+// at a QUANTIZED checkpoint; bf16 and quantized checkpoints now share the same
+// default.
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs MLX_TEST_QUANTIZED_MODEL_PATH pointing to a real QUANTIZED LFM2 checkpoint"]
-async fn lfm2_quantized_default_load_takes_flat_path() {
+async fn lfm2_quantized_default_load_takes_paged_path() {
     let Ok(model_path) = std::env::var("MLX_TEST_QUANTIZED_MODEL_PATH") else {
         eprintln!(
             "skipping: MLX_TEST_QUANTIZED_MODEL_PATH unset (point it at a quantized LFM2 \
@@ -1584,15 +1555,15 @@ async fn lfm2_quantized_default_load_takes_flat_path() {
     }
 
     // DEFAULT load — no config override, no clone. The on-disk config.json has
-    // `use_block_paged_cache` unset; the loader must flip it to flat because the
-    // weights carry `.scales`.
+    // `use_block_paged_cache` unset; the loader must select paged even though
+    // the weights carry `.scales` (sym8 remains the one forced-flat format).
     let model = Lfm2Model::load_from_dir(&model_path)
         .await
         .expect("failed to load quantized LFM2 model");
 
     assert!(
-        !model.has_block_paged_cache(),
-        "a quantized LFM2 checkpoint with use_block_paged_cache unset must default to FLAT \
-         (has_block_paged_cache()==false); got paged — the .scales-keyed default did not fire"
+        model.has_block_paged_cache(),
+        "a compatible quantized LFM2 checkpoint with use_block_paged_cache unset must default \
+         to paged (has_block_paged_cache()==true)"
     );
 }

@@ -19,11 +19,10 @@ use crate::array::MxArray;
 #[cfg(test)]
 use crate::cold_tier::parse_bool_env;
 use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
-use crate::engine::persistence::prewarm_checkpoint_pages;
+use crate::engine::persistence::{load_all_safetensors, prewarm_checkpoint_pages};
 use crate::tokenizer::Qwen3Tokenizer;
-use crate::utils::safetensors::load_safetensors_lazy;
 
-use super::model::{Qwen3Cmd, Qwen3Inner, handle_qwen3_cmd};
+use super::model::{Qwen3Cmd, Qwen3Inner, QwenSchedulerState, handle_qwen3_cmd};
 use super::{Qwen3Config, Qwen3Model};
 
 /// Validate that all required parameters were loaded with correct shapes
@@ -202,8 +201,8 @@ impl Qwen3Model {
     ///
     /// This loads a model from a directory containing:
     /// - config.json: Model configuration
-    /// - weights.mlx (optional): MLX format weights with data arrays
-    /// - weights.safetensors (optional): SafeTensors format (not yet supported)
+    /// - weights.safetensors or model.safetensors (single-file SafeTensors)
+    /// - model-*-of-*.safetensors (sharded SafeTensors)
     ///
     /// # Arguments
     /// * `model_path` - Path to the model directory
@@ -437,28 +436,10 @@ fn parse_config(raw_config: &Value) -> Result<Qwen3Config> {
 
 /// Load weights from SafeTensors, mapping HuggingFace names to our naming convention.
 fn load_safetensors_mapped(path: &Path) -> Result<HashMap<String, MxArray>> {
-    let safetensors_path = if path.join("weights.safetensors").exists() {
-        path.join("weights.safetensors")
-    } else {
-        path.join("model.safetensors")
-    };
-
-    if !safetensors_path.exists() {
-        return Err(Error::new(
-            Status::InvalidArg,
-            format!(
-                "No supported weight file found in {}. Expected weights.safetensors or model.safetensors",
-                path.display()
-            ),
-        ));
-    }
-
-    info!(
-        "Loading model from SafeTensors format: {} (mmap)",
-        safetensors_path.display()
-    );
-
-    let mut param_map = load_safetensors_lazy(&safetensors_path)?;
+    // Qwen3-8B checkpoints are normally published as multiple safetensors
+    // shards. Use the shared mmap loader so the dense family accepts the same
+    // single-file and sharded layouts as LFM2/Qwen3.5/Gemma4.
+    let mut param_map = load_all_safetensors(path, false)?;
     info!("  Loaded {} tensors", param_map.len());
 
     let mut mapped_params: HashMap<String, MxArray> = HashMap::new();
@@ -487,13 +468,94 @@ fn load_safetensors_mapped(path: &Path) -> Result<HashMap<String, MxArray>> {
     Ok(mapped_params)
 }
 
+fn apply_loaded_parameters(
+    inner: &mut Qwen3Inner,
+    mapped_params: &HashMap<String, MxArray>,
+    config: &Qwen3Config,
+) -> Result<()> {
+    if let Some(array) = mapped_params.get("embedding.weight") {
+        inner.embedding.set_weight(array)?;
+    }
+    if let Some(array) = mapped_params.get("final_norm.weight") {
+        inner.final_norm.set_weight(array)?;
+    }
+    if !config.tie_word_embeddings
+        && let Some(array) = mapped_params.get("lm_head.weight")
+    {
+        inner.lm_head.set_weight(array)?;
+    }
+
+    for layer_idx in 0..config.num_layers as usize {
+        let prefix = format!("layers.{layer_idx}");
+        let layer = &mut inner.layers[layer_idx];
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.q_proj.weight")) {
+            layer.self_attn.set_q_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.k_proj.weight")) {
+            layer.self_attn.set_k_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.v_proj.weight")) {
+            layer.self_attn.set_v_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.o_proj.weight")) {
+            layer.self_attn.set_o_proj_weight(weight)?;
+        }
+        if config.use_qk_norm {
+            if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.q_norm.weight")) {
+                layer.self_attn.set_q_norm_weight(weight)?;
+            }
+            if let Some(weight) = mapped_params.get(&format!("{prefix}.self_attn.k_norm.weight")) {
+                layer.self_attn.set_k_norm_weight(weight)?;
+            }
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.mlp.gate_proj.weight")) {
+            layer.mlp.set_gate_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.mlp.up_proj.weight")) {
+            layer.mlp.set_up_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.mlp.down_proj.weight")) {
+            layer.mlp.set_down_proj_weight(weight)?;
+        }
+        if let Some(weight) = mapped_params.get(&format!("{prefix}.input_layernorm.weight")) {
+            layer.set_input_layernorm_weight(weight)?;
+        }
+        if let Some(weight) =
+            mapped_params.get(&format!("{prefix}.post_attention_layernorm.weight"))
+        {
+            layer.set_post_attention_layernorm_weight(weight)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn load_inner_for_test(model_path: &Path) -> Result<Qwen3Inner> {
+    let config_path = model_path.join("config.json");
+    let config_data = fs::read_to_string(&config_path)
+        .map_err(|error| Error::from_reason(format!("Failed to read config: {error}")))?;
+    let raw_config: Value = serde_json::from_str(&config_data)
+        .map_err(|error| Error::from_reason(format!("Failed to parse config: {error}")))?;
+    let mut config = parse_config(&raw_config)?;
+    reject_quantized_checkpoint(&raw_config, &model_path.display().to_string())?;
+    let mapped_params = load_safetensors_mapped(model_path)?;
+    validate_loaded_parameters(&mapped_params, &config)?;
+    config.use_block_paged_cache = Some(true);
+    config.paged_cache_memory_mb = Some(256);
+    let mut inner = Qwen3Inner::new(config.clone())?;
+    apply_loaded_parameters(&mut inner, &mapped_params, &config)?;
+    let arrays: Vec<&MxArray> = mapped_params.values().collect();
+    crate::array::memory::materialize_weights(&arrays)?;
+    Ok(inner)
+}
+
 /// Spawn a dedicated model thread, load all weights inside init_fn.
 ///
 /// Returns a thin `Qwen3Model` NAPI shell with the thread handle.
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
     let model_path = model_path.to_string();
 
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
             let path = Path::new(&model_path);
 
@@ -510,7 +572,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
             // load completes — no active-memory sampling, so no race
             // with concurrent inference on the process-wide counter.
             // See `cache_limit.rs` module docs.
-            let load_result: Result<(Qwen3Inner, Qwen3Config, Qwen3Tokenizer, u64, bool)> =
+            let load_result: Result<(Qwen3Inner, Qwen3Config, Qwen3Tokenizer, u64, u64, bool)> =
                 (|| {
                     // Load config
                     let config_path = path.join("config.json");
@@ -614,95 +676,15 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                     ));
                     inner.set_tokenizer(Arc::new(tokenizer.clone()));
 
-                    // Load parameters into inner
-                    let num_layers = config.num_layers as usize;
-
-                    // Embedding
-                    if let Some(arr) = mapped_params.get("embedding.weight") {
-                        inner.embedding.set_weight(arr)?;
-                    }
-
-                    // Final norm
-                    if let Some(arr) = mapped_params.get("final_norm.weight") {
-                        inner.final_norm.set_weight(arr)?;
-                    }
-
-                    // LM head (only if not tied)
-                    if !config.tie_word_embeddings
-                        && let Some(arr) = mapped_params.get("lm_head.weight")
-                    {
-                        inner.lm_head.set_weight(arr)?;
-                    }
-
-                    // Per-layer weights
-                    for i in 0..num_layers {
-                        let prefix = format!("layers.{}", i);
-                        let layer = &mut inner.layers[i];
-
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.self_attn.q_proj.weight", prefix))
-                        {
-                            layer.self_attn.set_q_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.self_attn.k_proj.weight", prefix))
-                        {
-                            layer.self_attn.set_k_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.self_attn.v_proj.weight", prefix))
-                        {
-                            layer.self_attn.set_v_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.self_attn.o_proj.weight", prefix))
-                        {
-                            layer.self_attn.set_o_proj_weight(w)?;
-                        }
-                        if config.use_qk_norm {
-                            if let Some(w) =
-                                mapped_params.get(&format!("{}.self_attn.q_norm.weight", prefix))
-                            {
-                                layer.self_attn.set_q_norm_weight(w)?;
-                            }
-                            if let Some(w) =
-                                mapped_params.get(&format!("{}.self_attn.k_norm.weight", prefix))
-                            {
-                                layer.self_attn.set_k_norm_weight(w)?;
-                            }
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.mlp.gate_proj.weight", prefix))
-                        {
-                            layer.mlp.set_gate_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.mlp.up_proj.weight", prefix))
-                        {
-                            layer.mlp.set_up_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.mlp.down_proj.weight", prefix))
-                        {
-                            layer.mlp.set_down_proj_weight(w)?;
-                        }
-                        if let Some(w) =
-                            mapped_params.get(&format!("{}.input_layernorm.weight", prefix))
-                        {
-                            layer.set_input_layernorm_weight(w)?;
-                        }
-                        if let Some(w) = mapped_params
-                            .get(&format!("{}.post_attention_layernorm.weight", prefix))
-                        {
-                            layer.set_post_attention_layernorm_weight(w)?;
-                        }
-                    }
+                    apply_loaded_parameters(&mut inner, &mapped_params, &config)?;
 
                     // Materialize all mmap-backed weight arrays
                     let weights_resident = {
                         let arrays: Vec<&MxArray> = mapped_params.values().collect();
                         crate::array::memory::materialize_weights(&arrays)?
                     };
+
+                    inner.size_paged_pool_after_weight_load()?;
 
                     if persist_cold {
                         // Fail-closed revalidation bracketing the WHOLE
@@ -751,24 +733,40 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
                         .values()
                         .map(|a| a.nbytes() as u64)
                         .fold(0u64, |acc, v| acc.saturating_add(v));
+                    let pool_bytes = inner.paged_pool_allocated_bytes()?;
 
                     let paged_active = inner.paged_adapter.is_some();
-                    Ok((inner, config, tokenizer, weight_bytes, paged_active))
+                    Ok((
+                        inner,
+                        config,
+                        tokenizer,
+                        weight_bytes,
+                        pool_bytes,
+                        paged_active,
+                    ))
                 })();
-            let (inner, config, tokenizer, weight_bytes, paged_active) = load_result?;
+            let (inner, config, tokenizer, weight_bytes, pool_bytes, paged_active) = load_result?;
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+            let pool_cache_limit_guard = (pool_bytes != 0)
+                .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
             let config_out = config.clone();
             let tokenizer_out = Some(Arc::new(tokenizer));
 
             Ok((
-                inner,
-                (config_out, tokenizer_out, cache_limit_guard, paged_active),
+                QwenSchedulerState::new(inner)?,
+                (
+                    config_out,
+                    tokenizer_out,
+                    cache_limit_guard,
+                    pool_cache_limit_guard,
+                    paged_active,
+                ),
             ))
         },
-        handle_qwen3_cmd,
+        |state, receiver| state.drive(receiver),
     );
 
-    let (config, tokenizer, cache_limit_guard, paged_active) = init_rx
+    let (config, tokenizer, cache_limit_guard, pool_cache_limit_guard, paged_active) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
@@ -778,6 +776,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3Model> {
         tokenizer,
         paged_active,
         _cache_limit_guard: cache_limit_guard,
+        _pool_cache_limit_guard: pool_cache_limit_guard,
     })
 }
 
@@ -1100,9 +1099,9 @@ mod persist_cold_resolution_tests {
         // loudly persistence is requested — not via an explicit config `true`,
         // not via `MLX_PERSIST_PAGED_CACHE=1`. This is what keeps a loader's
         // cold bracket dormant until its family is admitted, so an unproven
-        // path (e.g. qwen3_5_moe before its parity gate passes) cannot be
+        // path cannot be
         // exercised by a direct library caller that bypasses the agent.
-        for family in ["lfm2", "lfm2_moe", "harrier", "not-a-family"] {
+        for family in ["harrier", "not-a-family"] {
             assert!(
                 !resolve_persist_cold(family, Some("1"), Some(true)),
                 "{family} is off the allowlist and must never persist a cold tier"
@@ -1110,9 +1109,11 @@ mod persist_cold_resolution_tests {
         }
         // A family on the list still honours the config/env precedence above.
         assert!(resolve_persist_cold("qwen3", Some("0"), Some(true)));
-        assert!(resolve_persist_cold("gemma4", Some("1"), None));
         assert!(resolve_persist_cold("qwen3_5", None, Some(true)));
         assert!(resolve_persist_cold("qwen3_5_moe", Some("1"), None));
+        assert!(resolve_persist_cold("gemma4", Some("1"), None));
+        assert!(resolve_persist_cold("lfm2", Some("1"), None));
+        assert!(resolve_persist_cold("lfm2_moe", Some("1"), None));
     }
 
     #[test]

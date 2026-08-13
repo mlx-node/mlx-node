@@ -77,8 +77,8 @@
 //! gives the remainder to MLX:
 //!
 //! ```text
-//! cap = wired - weights - overhead - headroom      (if positive)
-//!     = MIN_FREELIST_BYTES (1 GiB)                 (otherwise)
+//! cap = wired - weights - paged pools - overhead - headroom (if positive)
+//!     = MIN_FREELIST_BYTES (1 GiB)                      (otherwise)
 //! ```
 //!
 //! where
@@ -90,14 +90,17 @@
 //!     other apps so the system stays responsive. Overridable via
 //!     `MLX_GPU_HEADROOM_GB`.
 //!
-//! If weights + overhead + headroom already exceed wired (tight-fit
+//! Private paged-KV pools are registered separately because their Metal
+//! buffers are invisible to MLX's allocator counters. If weights + pools +
+//! overhead + headroom already exceed wired (tight-fit
 //! territory) we floor the freelist at 1 GiB so the allocator still
 //! has something to reuse — MLX will churn but the model at least
 //! runs.
 //!
 //! When wired is 0 (non-Metal machine or query failed) we fall back to
-//! `weights * 3/2`, the same flavour of fixed multiplier as the old
-//! formula's baseline term.
+//! `max(weights * 3/2 - paged pools, 1 GiB)`, the same flavour of fixed
+//! multiplier as the old formula's baseline term without double-budgeting
+//! a known private pool.
 //!
 //! ## Env overrides (precedence)
 //!
@@ -162,6 +165,9 @@ struct CoordState {
     /// so the cap tracks the true total working set across loaded
     /// models: unload subtracts cleanly and load adds cleanly.
     profiles: HashMap<u64, u64>,
+    /// Private paged-KV pools allocate outside MLX's freelist counters but
+    /// consume the same unified-memory working-set budget.
+    pools: HashMap<u64, u64>,
     /// Most recent cap we actually pushed through `set_cache_limit`. Used
     /// so `recompute_locked` can short-circuit when the cap did not
     /// change — avoids log spam on every register/unregister.
@@ -184,6 +190,7 @@ impl CacheLimitCoordinator {
             state: Mutex::new(CoordState {
                 next_id: 1,
                 profiles: HashMap::new(),
+                pools: HashMap::new(),
                 last_applied: None,
             }),
         }
@@ -221,12 +228,39 @@ impl CacheLimitCoordinator {
         CacheLimitGuard { id }
     }
 
+    /// Register a private paged-KV pool so the MLX freelist ceiling is
+    /// debited by memory that MLX's own allocator counters cannot see.
+    pub fn register_pool(&self, pool_bytes: u64) -> PoolCacheLimitGuard {
+        let id = {
+            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let id = state.next_id;
+            state.next_id = state.next_id.saturating_add(1);
+            state.pools.insert(id, pool_bytes);
+            info!(
+                "[cache_limit] register paged pool guard={} bytes={:.2} GB (live_pools={})",
+                id,
+                pool_bytes as f64 / ONE_GIB,
+                state.pools.len(),
+            );
+            recompute_locked(&mut state);
+            id
+        };
+        PoolCacheLimitGuard { id }
+    }
+
     fn unregister(&self, id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.profiles.remove(&id).is_some() {
             // Recompute after unregister. If the last model unloaded,
             // `recompute_locked` leaves the existing cap in place — a
             // cold process has nothing to allocate anyway.
+            recompute_locked(&mut state);
+        }
+    }
+
+    fn unregister_pool(&self, id: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.pools.remove(&id).is_some() {
             recompute_locked(&mut state);
         }
     }
@@ -243,6 +277,16 @@ impl CacheLimitCoordinator {
 /// unregisters the model.
 pub struct CacheLimitGuard {
     id: u64,
+}
+
+pub struct PoolCacheLimitGuard {
+    id: u64,
+}
+
+impl Drop for PoolCacheLimitGuard {
+    fn drop(&mut self) {
+        coordinator().unregister_pool(self.id);
+    }
 }
 
 impl Drop for CacheLimitGuard {
@@ -307,7 +351,7 @@ fn recompute_locked(state: &mut CoordState) {
     // Empty coordinator → nothing to cap. Do NOT reset the last-applied
     // cap: the allocator state the prior cap was protecting is gone, so
     // the cap costs nothing; resetting just churns logs.
-    if state.profiles.is_empty() {
+    if state.profiles.is_empty() && state.pools.is_empty() {
         return;
     }
     // Sum (not max) across live weight-byte totals: each caller
@@ -320,7 +364,12 @@ fn recompute_locked(state: &mut CoordState) {
         .values()
         .copied()
         .fold(0u64, |acc, v| acc.saturating_add(v));
-    if summed_weights == 0 {
+    let summed_pools: u64 = state
+        .pools
+        .values()
+        .copied()
+        .fold(0u64, |acc, v| acc.saturating_add(v));
+    if summed_weights == 0 && summed_pools == 0 {
         // All weight-byte totals were zero (unlikely — should only
         // happen in a synthetic test that registers a zero). Skip
         // rather than set a zero ceiling that would deadlock the
@@ -329,7 +378,7 @@ fn recompute_locked(state: &mut CoordState) {
     }
 
     let wired = WiredLimitContext::get_max_working_set_size() as u64;
-    let limit = compute_cache_limit(summed_weights, wired);
+    let limit = compute_cache_limit(summed_weights, summed_pools, wired);
 
     if limit == 0 {
         return;
@@ -345,8 +394,9 @@ fn recompute_locked(state: &mut CoordState) {
     // own string at the top of `recompute_locked`.
     let source = if wired == 0 {
         format!(
-            "auto (weights={:.1}GB, wired=0 → fallback cap={:.1}GB (weights × 1.5), live_guards={})",
+            "auto (weights={:.1}GB, pools={:.1}GB, wired=0 → fallback cap={:.1}GB, live_guards={})",
             summed_weights as f64 / ONE_GIB,
+            summed_pools as f64 / ONE_GIB,
             limit as f64 / ONE_GIB,
             state.profiles.len(),
         )
@@ -354,8 +404,9 @@ fn recompute_locked(state: &mut CoordState) {
         let overhead = estimate_metal_overhead(wired);
         let headroom = estimate_user_headroom(wired);
         format!(
-            "auto (weights={:.1}GB, overhead={:.1}GB, headroom={:.1}GB, wired={:.1}GB → cap={:.1}GB, live_guards={})",
+            "auto (weights={:.1}GB, pools={:.1}GB, overhead={:.1}GB, headroom={:.1}GB, wired={:.1}GB → cap={:.1}GB, live_guards={})",
             summed_weights as f64 / ONE_GIB,
+            summed_pools as f64 / ONE_GIB,
             overhead as f64 / ONE_GIB,
             headroom as f64 / ONE_GIB,
             wired as f64 / ONE_GIB,
@@ -406,18 +457,25 @@ fn estimate_user_headroom(wired: u64) -> u64 {
 ///
 /// Contract:
 ///   - `wired == 0` → assume non-Metal or failed query, fall back to
-///     `weights * 3/2`.
-///   - `weights + overhead + headroom >= wired` → return
+///     `max(weights * 3/2 - pool_bytes, 1 GiB)`.
+///   - `weights + pool_bytes + overhead + headroom >= wired` → return
 ///     [`MIN_FREELIST_BYTES`] (tight-fit floor).
-///   - otherwise → `wired - weights - overhead - headroom`, clamped to
+///   - otherwise → `wired - weights - pool_bytes - overhead - headroom`, clamped to
 ///     at least [`MIN_FREELIST_BYTES`].
-fn compute_cache_limit(weights: u64, wired: u64) -> u64 {
+fn compute_cache_limit(weights: u64, pool_bytes: u64, wired: u64) -> u64 {
     if wired == 0 {
-        return weights.saturating_mul(3) / 2;
+        return weights
+            .saturating_mul(3)
+            .saturating_div(2)
+            .saturating_sub(pool_bytes)
+            .max(MIN_FREELIST_BYTES);
     }
     let overhead = estimate_metal_overhead(wired);
     let headroom = estimate_user_headroom(wired);
-    let reserved = weights.saturating_add(overhead).saturating_add(headroom);
+    let reserved = weights
+        .saturating_add(pool_bytes)
+        .saturating_add(overhead)
+        .saturating_add(headroom);
     if wired <= reserved {
         return MIN_FREELIST_BYTES;
     }
@@ -608,7 +666,7 @@ mod tests {
         // overhead = max(4, 96/20=4.8) = 4.8 GB
         // headroom = max(4, 96/10=9.6) = 9.6 GB
         // cap = 96 - 36 - 4.8 - 9.6 = 45.6 GB
-        let cap = compute_cache_limit(36 * GB, 96 * GB);
+        let cap = compute_cache_limit(36 * GB, 0, 96 * GB);
         approx_eq_gb(cap, 45.6);
     }
 
@@ -619,7 +677,7 @@ mod tests {
         // overhead = max(4, 48/20=2.4) = 4 GB (floor)
         // headroom = max(4, 48/10=4.8) = 4.8 GB
         // cap = 48 - 36 - 4 - 4.8 = 3.2 GB
-        let cap = compute_cache_limit(36 * GB, 48 * GB);
+        let cap = compute_cache_limit(36 * GB, 0, 48 * GB);
         approx_eq_gb(cap, 3.2);
     }
 
@@ -629,7 +687,7 @@ mod tests {
         clear_headroom_env();
         // overhead = 4 GB, headroom = 4.8 GB
         // reserved = 42 + 4 + 4.8 = 50.8 GB > 48 GB wired → floor
-        let cap = compute_cache_limit(42 * GB, 48 * GB);
+        let cap = compute_cache_limit(42 * GB, 0, 48 * GB);
         assert_eq!(cap, MIN_FREELIST_BYTES);
         approx_eq_gb(cap, 1.0);
     }
@@ -641,7 +699,7 @@ mod tests {
         // overhead = max(4, 192/20=9.6) = 9.6 GB
         // headroom = max(4, 192/10=19.2) = 19.2 GB
         // cap = 192 - 36 - 9.6 - 19.2 = 127.2 GB
-        let cap = compute_cache_limit(36 * GB, 192 * GB);
+        let cap = compute_cache_limit(36 * GB, 0, 192 * GB);
         approx_eq_gb(cap, 127.2);
     }
 
@@ -651,7 +709,7 @@ mod tests {
         clear_headroom_env();
         // overhead = 9.6 GB, headroom = 19.2 GB
         // cap = 192 - 10 - 9.6 - 19.2 = 153.2 GB
-        let cap = compute_cache_limit(10 * GB, 192 * GB);
+        let cap = compute_cache_limit(10 * GB, 0, 192 * GB);
         approx_eq_gb(cap, 153.2);
     }
 
@@ -659,9 +717,19 @@ mod tests {
     fn wired_zero_falls_back_to_weights_times_one_and_a_half() {
         let _lock = ENV_LOCK.lock().unwrap();
         clear_headroom_env();
-        let cap = compute_cache_limit(10 * GB, 0);
+        let cap = compute_cache_limit(10 * GB, 0, 0);
         // 10 * 3 / 2 = 15 GB
         approx_eq_gb(cap, 15.0);
+    }
+
+    #[test]
+    fn paged_pool_bytes_debit_the_same_wired_budget() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        clear_headroom_env();
+        let without_pool = compute_cache_limit(36 * GB, 0, 96 * GB);
+        let with_pool = compute_cache_limit(36 * GB, 8 * GB, 96 * GB);
+        assert_eq!(without_pool.saturating_sub(with_pool), 8 * GB);
+        approx_eq_gb(with_pool, 37.6);
     }
 
     // ── env override: MLX_GPU_HEADROOM_GB ─────────────────────────
@@ -672,7 +740,7 @@ mod tests {
         let _env = EnvGuard::set(GPU_HEADROOM_ENV, "20");
         // overhead (96/20=4.8) = 4.8 GB, headroom forced to 20 GB
         // cap = 96 - 36 - 4.8 - 20 = 35.2 GB
-        let cap = compute_cache_limit(36 * GB, 96 * GB);
+        let cap = compute_cache_limit(36 * GB, 0, 96 * GB);
         approx_eq_gb(cap, 35.2);
     }
 
@@ -682,7 +750,7 @@ mod tests {
         let _env = EnvGuard::set(GPU_HEADROOM_ENV, "0");
         // overhead = 4.8, headroom forced to 0
         // cap = 96 - 36 - 4.8 - 0 = 55.2 GB
-        let cap = compute_cache_limit(36 * GB, 96 * GB);
+        let cap = compute_cache_limit(36 * GB, 0, 96 * GB);
         approx_eq_gb(cap, 55.2);
     }
 
@@ -691,7 +759,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(GPU_HEADROOM_ENV, "not-a-number");
         // Invalid → default 10% applies → same as case 1.
-        let cap = compute_cache_limit(36 * GB, 96 * GB);
+        let cap = compute_cache_limit(36 * GB, 0, 96 * GB);
         approx_eq_gb(cap, 45.6);
     }
 
@@ -700,7 +768,7 @@ mod tests {
         let _lock = ENV_LOCK.lock().unwrap();
         let _env = EnvGuard::set(GPU_HEADROOM_ENV, "-5");
         // Negative → rejected → default 10% applies.
-        let cap = compute_cache_limit(36 * GB, 96 * GB);
+        let cap = compute_cache_limit(36 * GB, 0, 96 * GB);
         approx_eq_gb(cap, 45.6);
     }
 

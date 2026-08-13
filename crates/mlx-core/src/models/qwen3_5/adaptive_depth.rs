@@ -536,15 +536,6 @@ impl AdaptiveDepthPolicy {
         }
     }
 
-    /// Diagnostic snapshot of per-depth EMA. Used by tests; the engine's
-    /// `run_mtp_cycle` logs the chosen depth + state
-    /// label per cycle via `tracing::debug!`.
-    #[cfg(test)]
-    #[allow(dead_code)]
-    pub fn rate_ema_snapshot(&self) -> [f64; MAX_DEPTH as usize] {
-        self.rate_ema
-    }
-
     /// Record a cycle's observation and update the state machine + EMA.
     pub fn record_cycle(&mut self, c: CycleStats) {
         self.total_cycles += 1;

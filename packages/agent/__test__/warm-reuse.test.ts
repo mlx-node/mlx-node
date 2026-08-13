@@ -90,7 +90,7 @@ function makeMockModel(): SessionCapableModel & {
     chatStreamSessionContinueTool: async function* () {
       yield finalEvent;
     },
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
     startConfigs,
   } as unknown as SessionCapableModel & {
     resetCaches: ReturnType<typeof vi.fn>;

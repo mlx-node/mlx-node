@@ -458,12 +458,7 @@ pub(crate) fn parse_gemma4_output_with_open_channel(
 pub(crate) enum StreamSegment {
     Text(String),
     Reasoning(String),
-    /// Payload is read by tests and by `parser.tool_calls()`; the wire
-    /// dispatcher ignores it because tool calls only land on the terminal
-    /// chunk. Marked `allow(dead_code)` so we can keep the payload for
-    /// test ergonomics without tripping `-D warnings`.
-    #[allow(dead_code)]
-    ToolCall(ToolCallResult),
+    ToolCall,
 }
 
 /// Current position of the stream parser inside Gemma4's output grammar.
@@ -930,9 +925,8 @@ impl Gemma4StreamParser {
             self.pending.drain(..close_marker.len());
             self.tool_call_buf.push_str(&body);
             let raw = std::mem::take(&mut self.tool_call_buf);
-            let tc = parse_tool_call_body(&raw);
-            self.tool_calls.push(tc.clone());
-            out.push(StreamSegment::ToolCall(tc));
+            self.tool_calls.push(parse_tool_call_body(&raw));
+            out.push(StreamSegment::ToolCall);
             self.state = StreamState::Message;
             return true;
         }
@@ -1478,19 +1472,15 @@ mod tests {
             .collect();
         assert_eq!(text, "beforeafter");
 
-        let tool_calls: Vec<_> = all
-            .iter()
-            .filter_map(|s| {
-                if let StreamSegment::ToolCall(tc) = s {
-                    Some(tc.clone())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(tool_calls.len(), 1);
-        assert_eq!(tool_calls[0].name, "bash");
-        let args = tool_calls[0].arguments.as_object().unwrap();
+        assert_eq!(
+            all.iter()
+                .filter(|segment| matches!(segment, StreamSegment::ToolCall))
+                .count(),
+            1
+        );
+        let tool_call = &parser.tool_calls()[0];
+        assert_eq!(tool_call.name, "bash");
+        let args = tool_call.arguments.as_object().unwrap();
         assert_eq!(args.get("command").and_then(|v| v.as_str()), Some("ls -R"));
 
         // The aggregated accessor reports the same list.
@@ -1510,17 +1500,12 @@ mod tests {
         all.extend(parser.feed("call|><turn|>"));
         all.extend(parser.flush());
 
-        let emitted_calls: Vec<_> = all
-            .iter()
-            .filter_map(|segment| {
-                if let StreamSegment::ToolCall(call) = segment {
-                    Some(call)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert_eq!(emitted_calls.len(), 1);
+        assert_eq!(
+            all.iter()
+                .filter(|segment| matches!(segment, StreamSegment::ToolCall))
+                .count(),
+            1
+        );
         assert_eq!(parser.tool_calls().len(), 1);
         let tc = &parser.tool_calls()[0];
         assert_eq!(tc.name, "bash");

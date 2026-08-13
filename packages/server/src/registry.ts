@@ -42,6 +42,18 @@ import type { SessionCapableModel } from '@mlx-node/lm';
 
 import { SessionRegistry } from './session-registry.js';
 
+interface ModelLoadAdmissionCoordinator {
+  bindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void;
+  unbindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void;
+}
+
+function concurrentDispatchCapacity(model: ServableModel): number {
+  if (model.hasBlockPagedCache?.() !== true) return 1;
+  const reported = model.maxConcurrentSequences?.();
+  if (reported === undefined || !Number.isSafeInteger(reported) || reported < 2) return 1;
+  return reported;
+}
+
 /** Minimal contract for a model that can be served via chat sessions. */
 export type ServableModel = SessionCapableModel;
 
@@ -188,9 +200,36 @@ export class ModelRegistry {
    * hard-timeouts have fired.
    */
   private readonly retiredInstanceIds = new WeakMap<ServableModel, { instanceId: number; outstandingCount: number }>();
+  private modelLoadAdmissionCoordinator: ModelLoadAdmissionCoordinator | undefined;
 
   constructor(opts?: ModelRegistryOptions) {
     this.maxQueueDepth = opts?.maxQueueDepth;
+  }
+
+  /** Configured per-model waiter cap, or `undefined` when unbounded. */
+  get queueDepthLimit(): number | undefined {
+    return this.maxQueueDepth;
+  }
+
+  /**
+   * Connect cold-load admission to name registration. The coordinator is
+   * attached by the HTTP handler before dispatch; existing names are
+   * published immediately and future `register`/`unregister` calls keep the
+   * mapping current.
+   */
+  setModelLoadAdmissionCoordinator(coordinator: ModelLoadAdmissionCoordinator | undefined): void {
+    if (this.modelLoadAdmissionCoordinator === coordinator) return;
+    if (this.modelLoadAdmissionCoordinator) {
+      for (const [name, entry] of this.models) {
+        this.modelLoadAdmissionCoordinator.unbindRequestLoadAdmissions(name, entry.sessionRegistry);
+      }
+    }
+    this.modelLoadAdmissionCoordinator = coordinator;
+    if (coordinator) {
+      for (const [name, entry] of this.models) {
+        coordinator.bindRequestLoadAdmissions(name, entry.sessionRegistry);
+      }
+    }
   }
 
   /**
@@ -234,11 +273,13 @@ export class ModelRegistry {
       if (opts && 'maxOutputTokens' in opts) {
         existing.sessionRegistry.setMaxOutputTokens(maxOutputTokens);
       }
+      this.modelLoadAdmissionCoordinator?.bindRequestLoadAdmissions(name, existing.sessionRegistry);
       return;
     }
     if (existing) {
       // Same name, different model: release the old model's refcount
       // before installing the new binding.
+      this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, existing.sessionRegistry);
       this.dropNameReference(existing.model);
     }
 
@@ -254,6 +295,7 @@ export class ModelRegistry {
         registry: new SessionRegistry({
           model,
           maxQueueDepth: this.maxQueueDepth,
+          maxConcurrentDispatches: concurrentDispatchCapacity(model),
           samplingDefaults,
           maxOutputTokens,
         }),
@@ -305,6 +347,7 @@ export class ModelRegistry {
       createdAt: Math.floor(Date.now() / 1000),
       sessionRegistry: binding.registry,
     });
+    this.modelLoadAdmissionCoordinator?.bindRequestLoadAdmissions(name, binding.registry);
   }
 
   /**
@@ -321,6 +364,7 @@ export class ModelRegistry {
   unregister(name: string): boolean {
     const entry = this.models.get(name);
     if (!entry) return false;
+    this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, entry.sessionRegistry);
     this.models.delete(name);
     this.dropNameReference(entry.model);
     return true;
@@ -373,6 +417,17 @@ export class ModelRegistry {
    * persists that crossed the safety breaker.
    */
   private finalizeBindingTeardown(model: ServableModel): void {
+    const binding = this.sessionRegistriesByModel.get(model);
+    if (!binding) return;
+    binding.registry.clear();
+    // The binding maps are removed synchronously below, so no later request can
+    // discover this registry and call flushPendingDisposals() for it. Start the
+    // flush while the registry is still in hand: the promise retains it until
+    // every pending disposal has settled and every transient failure observed
+    // during this flush has received its one bounded retry.
+    void binding.registry.flushPendingDisposals().catch((error: unknown) => {
+      console.error('[server] failed to flush final chat-session owner disposals:', error);
+    });
     this.sessionRegistriesByModel.delete(model);
     this.instanceIds.delete(model);
   }

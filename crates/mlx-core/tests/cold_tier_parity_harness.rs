@@ -1344,8 +1344,8 @@ where
         );
     } else {
         assert_text_eq(
-            "instance 1 (capture)",
-            &result_a.text,
+            "instance 3 (no-persist)",
+            &result_c.text,
             "instance 2 (restore)",
             &result_b.text,
         );
@@ -1356,9 +1356,9 @@ where
             &result_c.text,
         );
         assert_eq!(
-            result_a.num_tokens, result_b.num_tokens,
-            "[{}] num_tokens diverged: instance 1 = {}, instance 2 (restore) = {}",
-            spec.family, result_a.num_tokens, result_b.num_tokens
+            result_c.num_tokens, result_b.num_tokens,
+            "[{}] num_tokens diverged: instance 3 (no-persist) = {}, instance 2 (restore) = {}",
+            spec.family, result_c.num_tokens, result_b.num_tokens
         );
         assert_eq!(
             result_a.num_tokens, result_c.num_tokens,
@@ -1427,9 +1427,10 @@ mod harness_tests {
     /// version left a directory at the same pathname; only the identity differs.
     ///
     /// Costs microseconds and needs no checkpoint, so unlike the gates it guards
-    /// it runs on the ordinary `cargo test` leg — where those gates never run at
-    /// all (`ci.yml` names only the qwen3 and qwen3_5 cold-tier binaries, both
-    /// single-gate, so nothing in CI exercises two gates in one process).
+    /// it runs on the ordinary `cargo test` leg — where the ignored real-model
+    /// gates never run at all. Each CI family invokes one gate in its own test
+    /// process, so nothing there exercises two gates sharing one process-global
+    /// manager.
     #[test]
     fn preparing_the_root_twice_keeps_the_same_directory() {
         use std::os::unix::fs::MetadataExt;

@@ -21,8 +21,10 @@
  *   - An image hash (`lastImagesKey`) tracks the images bound to the
  *     current cache. A `send()` call whose image set has changed
  *     (different bytes or different ordering) triggers a full
- *     restart: `resetCaches()` → push the new user message (with
- *     images) to history → `chatSessionStart(history)`.
+ *     restart: release this session's native cache owner → push the new user
+ *     message (with images) to history → `chatSessionStart(history)`. Native
+ *     models without owner-scoped release retain the exclusive-model
+ *     `resetCaches()` fallback.
  *
  *   - Text-only `send()` on turn >= 1 still gets incremental prefill
  *     on a token-prefix hit. Prompt structure is never reconstructed
@@ -83,7 +85,7 @@
  * await session.reset();
  * ```
  */
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, ToolDefinition } from '@mlx-node/core';
 
@@ -391,9 +393,18 @@ export interface SessionCapableModel {
    * `reasoningContent` field.
    */
   replaysAssistantRawText?(): boolean;
-  chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
-  chatSessionContinue(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
-  chatSessionContinueTool(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
+  /**
+   * Non-streaming entry points accept the platform-native AbortSignal.
+   * The bundled wrappers translate it to the Rust atomic cancellation
+   * flag without exposing the native two-phase handle API.
+   */
+  chatSessionStart(messages: ChatMessage[], config?: ChatConfig | null, signal?: AbortSignal): Promise<ChatResult>;
+  chatSessionContinue(messages: ChatMessage[], config?: ChatConfig | null, signal?: AbortSignal): Promise<ChatResult>;
+  chatSessionContinueTool(
+    messages: ChatMessage[],
+    config?: ChatConfig | null,
+    signal?: AbortSignal,
+  ): Promise<ChatResult>;
   /**
    * The optional `signal` parameter on every streaming entry point is
    * plumbed into the `_runChatStream` fast-abort path in the wrapper
@@ -418,7 +429,20 @@ export interface SessionCapableModel {
     config?: ChatConfig | null,
     signal?: AbortSignal,
   ): AsyncGenerator<ChatStreamEvent>;
-  resetCaches(): void;
+  /**
+   * Wipe the native KV caches and cached token history.
+   *
+   * Native models return a `Promise<void>` (the reset is dispatched
+   * onto the model thread's command queue and resolves once
+   * processed — H1a: a reset queued behind an in-flight turn must
+   * park a promise, never the Node event loop). The union keeps
+   * synchronous test doubles valid; every consumer in this file
+   * `await`s the result so command-queue ordering is preserved
+   * relative to subsequent session calls.
+   */
+  resetCaches(): void | Promise<void>;
+  /** Release scheduler-owned state for one logical session owner. */
+  releaseCacheOwner?(ownerId: string): void | Promise<void>;
   /**
    * Whether the underlying native model has the block-paged KV cache
    * adapter (`PagedKVCacheAdapter` + `BlockAllocator` + `LayerKVPool`)
@@ -426,15 +450,15 @@ export interface SessionCapableModel {
    *
    * `true` iff the adapter was successfully constructed at load time
    * (driven by the per-model `use_block_paged_cache` config flag, which
-   * defaults to ON for Qwen3 + LFM2 after parity verification and OFF
-   * for Gemma4 + Qwen3.5 + Qwen3.5 MoE pending parity validation; also
-   * always `false` on Qwen3.5 VLM checkpoints where
-   * `set_vision_encoder` rejects when the adapter is populated).
+   * defaults to ON for Qwen3, LFM2, Gemma4, and Qwen3.5 dense/MoE after
+   * parity validation). Qwen3.5 VLM instances expose the loaded paged
+   * text lane while media/MTP requests retain their model-specific ordered
+   * execution path.
    *
    * When `true`, the native cache reuses SYS blocks across requests via
    * content-addressing in the `BlockAllocator`'s prefix-hash table —
    * the JS-side warm slot in
-   * `SessionRegistry.getOrCreateWarmAny(requestedSystem)` becomes
+   * `SessionRegistry.getOrCreateWarmAny(requestedSystem, cacheSalt)` becomes
    * redundant for stateless `/v1/messages` traffic. The server
    * endpoint reads this getter to decide whether to allocate a fresh
    * `ChatSession` per request (paged-active) or to lease the warm slot
@@ -450,6 +474,16 @@ export interface SessionCapableModel {
    * time and never changes for a given model instance.
    */
   hasBlockPagedCache?(): boolean;
+  /**
+   * Maximum number of independent chat sequences this model can advance in
+   * one scheduler lane. Models without a continuous-batching scheduler omit
+   * the method and remain on the server's single-dispatch lane.
+   *
+   * The value is synchronous and fixed for normal server operation so the
+   * per-model admission semaphore can be constructed without a model-thread
+   * round trip. A value below two is treated as exclusive execution.
+   */
+  maxConcurrentSequences?(): number;
   /**
    * MTP: whether the underlying native model can run speculative
    * decoding. Surfaced by `Qwen3_5Model` / `Qwen3_5MoeModel` (an MTP
@@ -567,20 +601,24 @@ export interface SendOptions {
    */
   config?: ChatConfig;
   /**
-   * Optional AbortSignal plumbed into the streaming fast-abort path.
+   * Optional AbortSignal for client-disconnect-aware cancellation.
    *
-   * Only honored by the streaming entry points (`sendStream`,
-   * `sendToolResultStream`, `startFromHistoryStream`) — the
-   * non-streaming `send` / `sendToolResult` / `startFromHistory`
-   * calls have NO native cancel surface, so a signal passed to them
-   * is ignored. Pass one here and the inner `_runChatStream`
-   * adapter wakes from `waitForItem()` on abort, calls
-   * `handle.cancel()` on the native handle, and unwinds the stream
-   * without throwing an AbortError — the outer consumer's `for await`
-   * just ends early. Intended for HTTP endpoints that flip a
-   * controller on `res.once('close', …)` so client disconnect stops
-   * the native decode at the next safepoint rather than running it
-   * to completion under the per-model mutex.
+   * Streaming entry points (`sendStream`, `sendToolResultStream`,
+   * `startFromHistoryStream`): the inner `_runChatStream` adapter wakes
+   * from `waitForItem()` on abort, calls `handle.cancel()` on the
+   * native handle, and unwinds the stream without throwing an
+   * AbortError — the outer consumer's `for await` just ends early.
+   *
+   * Non-streaming entry points (`send` / `sendToolResult` /
+   * `startFromHistory`) honor it too (H2): an already-aborted signal
+   * rejects before dispatch, and the bundled model wrappers translate a
+   * mid-turn abort to the native turn flag. The public method remains one
+   * ordinary Promise and rejects with `"chat session cancelled"`.
+   *
+   * Intended for HTTP endpoints that flip a controller on
+   * `res.once('close', …)` so client disconnect stops the native
+   * decode at the next safepoint rather than running it to completion
+   * under the per-model mutex.
    */
   signal?: AbortSignal;
 }
@@ -684,6 +722,19 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private readonly model: M;
   private readonly system: string | undefined;
   private readonly defaultConfig: ChatConfig;
+  /**
+   * Stable native cache/scheduler identity for this JS session.
+   *
+   * Direct HTTP callers do not carry the agent provider's cacheOwnerId. If
+   * they reach a paged model without an owner, native must conservatively use
+   * the legacy exclusive lane because sequence zero cannot represent two live
+   * requests. Give every ChatSession its own identity while still allowing an
+   * explicit provider identity to override it.
+   */
+  private cacheOwnerId: string | null = null;
+  /** The native owner used by this session, retained as a set for retryable release. */
+  private readonly nativeCacheOwnerIds = new Set<string>();
+  private disposed = false;
   /** Tool definitions are conversation state for deterministic template replay. */
   private activeTools: ToolDefinition[] | undefined;
 
@@ -783,7 +834,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     if (this.inFlight) {
       throw new Error('ChatSession: cannot preflight context capacity while a send() is in flight');
     }
-    return await this.constrainToContextCapacity(messages.slice(), this.mergeConfig(config));
+    return await this.constrainToContextCapacity(messages.slice(), this.mergeConfig(config, false));
   }
 
   /**
@@ -805,7 +856,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     } else {
       throw new Error('ChatSession: pending context capacity preflight requires a user or tool message');
     }
-    return await this.constrainToContextCapacity(this.historyWithPending(pending), this.mergeConfig(config));
+    return await this.constrainToContextCapacity(this.historyWithPending(pending), this.mergeConfig(config, false));
   }
 
   /**
@@ -865,6 +916,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
           imageChanged || audioChanged || replayRequired,
           isFirstTurn,
           mergedConfig,
+          opts.signal,
         );
       }
 
@@ -876,9 +928,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const constrainedConfig = await this.constrainToContextCapacity(pendingHistory, mergedConfig);
       let result: ChatResult;
       try {
-        result = await this.model.chatSessionContinue(
+        result = await this.runNonStreamingNative(
+          'continue',
           pendingHistory,
           withReplayReasoning(constrainedConfig, this.model),
+          opts.signal,
         );
       } catch (err) {
         if (!isMediaHeldRestartError(err)) {
@@ -892,7 +946,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // the trailing-media keys keep `lastImagesKey`/`lastAudioKey`
         // consistent across the replay. The continuation path has NOT pushed
         // `userMessage` yet, so `runStartPath` pushing it adds no duplicate.
-        return await this.runStartPath(userMessage, undefined, undefined, true, false, constrainedConfig);
+        return await this.runStartPath(userMessage, undefined, undefined, true, false, constrainedConfig, opts.signal);
       }
       this.history.push(pendingUser);
       this.history.push(
@@ -1094,7 +1148,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   async sendToolResult(
     toolCallId: string,
     content: string,
-    opts: { isError?: boolean; config?: ChatConfig } = {},
+    opts: { isError?: boolean; config?: ChatConfig; signal?: AbortSignal } = {},
   ): Promise<ChatResult> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
@@ -1102,7 +1156,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.assertCanSendToolResult('sendToolResult');
     this.inFlight = true;
     try {
-      const { isError, config } = opts;
+      const { isError, config, signal } = opts;
       const mergedConfig = this.mergeConfig(config);
       const toolMsg: ChatMessage = {
         role: 'tool',
@@ -1123,12 +1177,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // tool-call turn (turnCount>=1), so this never fires on the happy
       // path.
       if (this.turnCount === 0 || this.needsFullReplay) {
-        return await this.replayToolResultThroughStartPath(toolMsg, constrainedConfig);
+        return await this.replayToolResultThroughStartPath(toolMsg, constrainedConfig, signal);
       }
       try {
-        const result = await this.model.chatSessionContinueTool(
+        const result = await this.runNonStreamingNative(
+          'continueTool',
           pendingHistory,
           withReplayReasoning(constrainedConfig, this.model),
+          signal,
         );
         this.history.push({ role: 'tool', content, toolCallId, isError });
         this.history.push(
@@ -1160,7 +1216,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // restart core pushes it — `isError` rides on that message so the
         // wire-format error marker is re-rendered, and a tool result
         // always follows >=1 prior turn so `isFirstTurn` is false.
-        return await this.replayToolResultThroughStartPath(toolMsg, constrainedConfig);
+        return await this.replayToolResultThroughStartPath(toolMsg, constrainedConfig, signal);
       }
     } finally {
       this.inFlight = false;
@@ -1174,12 +1230,16 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * when the native session is cold (turnCount===0 — e.g. after an
    * interrupted media-held replay rolled the cache back) and by the
    * media-held rejection catch. `mediaChanged=true` forces a
-   * resetCaches so the prefill always starts from a guaranteed-clean
-   * cache; `isFirstTurn=false` because a tool result always follows a
-   * prior tool-call turn.
+   * native cache invalidation so the prefill starts from a guaranteed-clean
+   * owner; `isFirstTurn=false` because a tool result always follows a prior
+   * tool-call turn.
    */
-  private async replayToolResultThroughStartPath(toolMsg: ChatMessage, config: ChatConfig): Promise<ChatResult> {
-    return await this.runStartPathWithMessage(toolMsg, true, false, config);
+  private async replayToolResultThroughStartPath(
+    toolMsg: ChatMessage,
+    config: ChatConfig,
+    signal?: AbortSignal,
+  ): Promise<ChatResult> {
+    return await this.runStartPathWithMessage(toolMsg, true, false, config, signal);
   }
 
   /**
@@ -1337,42 +1397,99 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   /**
    * Reset the session state.
    *
-   * Clears the underlying model's KV caches and wipes local history,
-   * image key, and turn counter so the next `send()` goes through
-   * `chatSessionStart` again.
+   * Invalidates this session's native KV state and wipes local history,
+   * media keys, and turn counter so the next `send()` goes through
+   * `chatSessionStart` again. Block-paged models release only this stable
+   * session owner; clearing the model-wide scheduler would invalidate every
+   * other live `ChatSession`. Exclusive/flat models retain the model-wide
+   * `resetCaches()` barrier because they have no independently releasable
+   * owner state.
    *
-   * This is a full wipe — safe default for public callers. It always
-   * calls `model.resetCaches()`, which is the ONLY behavior exposed
-   * on the public API because the underlying `SessionCapableModel`
-   * is shared across every `ChatSession` lifetime via the native
-   * `ModelRegistry`: a partial wipe that leaves the shared native
-   * KV cache intact would leak a previous (unrelated) request's
-   * cached prefix into the next `chat_session_start_sync` call. The
-   * server-side warm-lease replay path (where preserving the native
-   * cache is correct) uses its own server-private helper gated by
-   * the `SessionRegistry` HIT signal — the only authoritative proof
-   * that the native cache genuinely belongs to this chain. That
-   * helper lives inside `@mlx-node/server`, never touches the
-   * `@mlx-node/lm` export map, and is not reachable from downstream
-   * consumers. Public consumers of `@mlx-node/lm` have no such HIT
-   * signal, so the public API intentionally offers only the full-wipe
-   * option.
-   *
-   * Returns `Promise<void>` for an async-friendly signature even
-   * though `resetCaches()` is currently synchronous.
+   * Native invalidation is async: the release/reset command is awaited so it
+   * has fully drained through the model thread before this promise resolves —
+   * callers that `await reset()` and
+   * then start a turn keep strict command-queue ordering. Because the
+   * await genuinely suspends, `reset()` RESERVES the same in-flight
+   * guard as the send entry points for its whole duration: any
+   * concurrent `send*()`, `reset()`, `primeHistory()`, or
+   * `startFromHistory*()` on this session rejects until the reset
+   * settles, so a racing turn can never commit against the pre-wipe
+   * history (or have its state erased mid-commit). If native invalidation
+   * rejects, no JS state is wiped and the guard is released.
    */
   async reset(): Promise<void> {
+    if (this.disposed) {
+      throw new Error('ChatSession: session has been disposed');
+    }
     if (this.inFlight) {
       throw new Error('ChatSession: cannot reset() while a send() is in flight; await the previous call first');
     }
-    this.model.resetCaches();
-    this.history = [];
-    this.lastImagesKey = null;
-    this.lastAudioKey = null;
-    this.turnCount = 0;
-    this.unresolvedOkToolCallCount = null;
-    this.needsFullReplay = false;
-    this.activeTools = this.defaultConfig.tools;
+    this.inFlight = true;
+    try {
+      if (this.model.hasBlockPagedCache?.() === true && this.model.releaseCacheOwner) {
+        for (const ownerId of Array.from(this.nativeCacheOwnerIds)) {
+          await this.model.releaseCacheOwner(ownerId);
+          this.nativeCacheOwnerIds.delete(ownerId);
+        }
+      } else {
+        await this.model.resetCaches();
+        this.nativeCacheOwnerIds.clear();
+      }
+      this.history = [];
+      this.lastImagesKey = null;
+      this.lastAudioKey = null;
+      this.turnCount = 0;
+      this.unresolvedOkToolCallCount = null;
+      this.needsFullReplay = false;
+      this.activeTools = this.defaultConfig.tools;
+    } finally {
+      this.inFlight = false;
+    }
+  }
+
+  /**
+   * Permanently dispose this JS session and release its native scheduler
+   * owner. The operation is awaited and idempotent; it rejects while
+   * a turn is in flight so native state cannot be torn down mid-decode.
+   *
+   * A caller-supplied first `cacheOwnerId` becomes this session's stable owner
+   * just like the generated default. Do not share an explicit owner id between
+   * independently disposed sessions: disposing either session releases that
+   * owner's native scheduler state for both.
+   */
+  async dispose(): Promise<void> {
+    if (this.disposed) return;
+    if (this.inFlight) {
+      throw new Error('ChatSession: cannot dispose() while a send() is in flight; await the previous call first');
+    }
+    this.inFlight = true;
+    try {
+      let firstReleaseError: unknown;
+      let hadReleaseError = false;
+      if (this.model.releaseCacheOwner) {
+        for (const ownerId of Array.from(this.nativeCacheOwnerIds)) {
+          try {
+            await this.model.releaseCacheOwner(ownerId);
+            this.nativeCacheOwnerIds.delete(ownerId);
+          } catch (error) {
+            if (!hadReleaseError) firstReleaseError = error;
+            hadReleaseError = true;
+          }
+        }
+      } else {
+        this.nativeCacheOwnerIds.clear();
+      }
+      if (hadReleaseError) throw firstReleaseError;
+      this.disposed = true;
+      this.history = [];
+      this.lastImagesKey = null;
+      this.lastAudioKey = null;
+      this.turnCount = 0;
+      this.unresolvedOkToolCallCount = null;
+      this.needsFullReplay = false;
+    } finally {
+      this.inFlight = false;
+    }
   }
 
   /**
@@ -1427,7 +1544,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * stay on the delta path, and subsequent image turns correctly
    * trigger restart).
    */
-  async startFromHistory(config?: ChatConfig): Promise<ChatResult> {
+  async startFromHistory(config?: ChatConfig, opts: { signal?: AbortSignal } = {}): Promise<ChatResult> {
     if (this.inFlight) {
       throw new Error('ChatSession: cannot startFromHistory() while a send() is in flight');
     }
@@ -1442,9 +1559,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       const mergedConfig = this.mergeConfig(config);
       const historySnapshot = this.history.slice();
       const constrainedConfig = await this.constrainToContextCapacity(historySnapshot, mergedConfig);
-      const result = await this.model.chatSessionStart(
+      const result = await this.runNonStreamingNative(
+        'start',
         historySnapshot,
         withReplayReasoning(constrainedConfig, this.model),
+        opts.signal,
       );
       this.history.push(
         buildAssistantMessage(
@@ -1562,6 +1681,39 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   // -------------------------------------------------------------------
 
   /**
+   * Dispatch one non-streaming native turn through the public AbortSignal
+   * surface (H2). The model wrapper owns the attach-race-safe translation
+   * from AbortSignal to the lower-level native operation handle; ChatSession
+   * never exposes that two-phase primitive to callers.
+   *
+   * Callers sit inside the entry points' existing try/finally blocks,
+   * so a rejection here releases `inFlight` and (on the delta paths)
+   * sets `needsFullReplay` exactly like any other native failure.
+   */
+  private async runNonStreamingNative(
+    kind: 'start' | 'continue' | 'continueTool',
+    messages: ChatMessage[],
+    config: ChatConfig,
+    signal: AbortSignal | undefined,
+  ): Promise<ChatResult> {
+    const model = this.model;
+    if (signal?.aborted === true) throw new Error('chat session cancelled');
+    if (kind === 'start') {
+      return signal == null
+        ? await model.chatSessionStart(messages, config)
+        : await model.chatSessionStart(messages, config, signal);
+    }
+    if (kind === 'continue') {
+      return signal == null
+        ? await model.chatSessionContinue(messages, config)
+        : await model.chatSessionContinue(messages, config, signal);
+    }
+    return signal == null
+      ? await model.chatSessionContinueTool(messages, config)
+      : await model.chatSessionContinueTool(messages, config, signal);
+  }
+
+  /**
    * Gate plain-text continuation entry points (`send`, `sendStream`)
    * on the tool-call resolution invariant. Any outstanding `ok` tool
    * call from the prior assistant turn — single or multi — makes a
@@ -1677,8 +1829,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * cache the delta depends on.
    *
    * Tool resolution here is side-effect free because public capacity
-   * preflights use this same merge path. Successful turn commit sites call
-   * {@link commitActiveTools} after native inference finishes.
+   * preflights use this same merge path with owner establishment disabled.
+   * Successful turn commit sites call {@link commitActiveTools} after native
+   * inference finishes.
    *
    * MTP auto-default: if neither `defaultConfig` nor `overlay`
    * sets `enableMtp` AND the underlying model exposes
@@ -1690,12 +1843,30 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * assistant (`hasMtpWeights()` reports the external draft there,
    * not in-checkpoint MTP heads).
    */
-  private mergeConfig(overlay: ChatConfig | undefined): ChatConfig {
+  private mergeConfig(overlay: ChatConfig | undefined, establishCacheOwner = true): ChatConfig {
+    if (this.disposed) {
+      throw new Error('ChatSession: session has been disposed');
+    }
     const merged: ChatConfig = {
       ...this.defaultConfig,
       ...overlay,
       reuseCache: true,
     };
+    const requestedOwnerId = merged.cacheOwnerId;
+    if (this.cacheOwnerId === null) {
+      if (establishCacheOwner) {
+        this.cacheOwnerId = requestedOwnerId === undefined || requestedOwnerId === '' ? randomUUID() : requestedOwnerId;
+        merged.cacheOwnerId = this.cacheOwnerId;
+        this.nativeCacheOwnerIds.add(this.cacheOwnerId);
+      }
+    } else if (requestedOwnerId !== undefined && requestedOwnerId !== '' && requestedOwnerId !== this.cacheOwnerId) {
+      throw new Error(
+        `ChatSession: cacheOwnerId cannot change after the session owner is established; create a new ChatSession for owner ${requestedOwnerId}`,
+      );
+    } else {
+      merged.cacheOwnerId = this.cacheOwnerId;
+      if (establishCacheOwner) this.nativeCacheOwnerIds.add(this.cacheOwnerId);
+    }
     // Tools are part of the committed conversation state. Constructor
     // defaults seed that state, but must not overwrite a tool set committed by
     // a later successful turn. A current-call overlay is the only higher
@@ -1789,9 +1960,10 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
+    signal?: AbortSignal,
   ): Promise<ChatResult> {
     const userMsg = this.buildUserMessage(userMessage, images, audio);
-    return await this.runStartPathWithMessage(userMsg, mediaChanged, isFirstTurn, config);
+    return await this.runStartPathWithMessage(userMsg, mediaChanged, isFirstTurn, config, signal);
   }
 
   /**
@@ -1807,31 +1979,35 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     mediaChanged: boolean,
     isFirstTurn: boolean,
     config: ChatConfig,
+    signal?: AbortSignal,
   ): Promise<ChatResult> {
     // Capture pre-state so the restart can be rolled back if the
-    // native call fails. The media-change branch resets caches BEFORE
-    // we know whether the new prefill will succeed, so on failure we
-    // also have to drop turnCount + lastImagesKey/lastAudioKey to force
-    // the next call to re-route through the start path (rather than a
-    // delta continue against wiped caches).
+    // native call fails. The media-change branch releases this owner's caches
+    // BEFORE we know whether the new prefill will succeed, so on failure we
+    // also have to drop turnCount + lastImagesKey/lastAudioKey to force the
+    // next call to re-route through the start path (rather than a delta
+    // continue against released caches).
     const wasMediaChangeRestart = mediaChanged && !isFirstTurn;
     const historyLenBefore = this.history.length;
 
     // Capacity validation must happen before `prepareStartPath()` because a
-    // media-change restart clears native caches. A rejected oversized prompt
-    // is a request error and must leave both JS history and native state intact.
+    // media-change restart releases native owner state. A rejected oversized
+    // prompt is a request error and must leave both JS history and native state
+    // intact.
     const constrainedConfig = await this.constrainToContextCapacity(this.historyWithPending(pendingMessage), config);
 
-    this.prepareStartPath(mediaChanged, isFirstTurn);
+    await this.prepareStartPath(mediaChanged, isFirstTurn, constrainedConfig.cacheOwnerId);
     this.history.push(pendingMessage);
     try {
       // Pass a shallow snapshot so later pushes to `this.history`
       // (e.g. the assistant reply below) don't retroactively mutate
       // what the native side / any mock observed as its `messages`
       // argument.
-      const result = await this.model.chatSessionStart(
+      const result = await this.runNonStreamingNative(
+        'start',
         this.history.slice(),
         withReplayReasoning(constrainedConfig, this.model),
+        signal,
       );
       this.history.push(
         buildAssistantMessage(
@@ -1862,7 +2038,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       // consistent with turnCount.
       this.history.length = historyLenBefore;
       if (wasMediaChangeRestart) {
-        // Caches were wiped by prepareStartPath() but the new prefill
+        // This owner's caches were released by prepareStartPath() but the new prefill
         // failed. Force the next call to re-route through the start
         // path with the (preserved) prior history.
         this.turnCount = 0;
@@ -1905,11 +2081,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     const wasMediaChangeRestart = mediaChanged && !isFirstTurn;
     const historyLenBefore = this.history.length;
 
-    // See the sync start path: reject before a media restart can clear native
-    // state, and make the output budget explicit before allocating KV blocks.
+    // See the sync start path: reject before a media restart can release native
+    // owner state, and make the output budget explicit before allocating KV blocks.
     const constrainedConfig = await this.constrainToContextCapacity(this.historyWithPending(pendingMessage), config);
 
-    this.prepareStartPath(mediaChanged, isFirstTurn);
+    await this.prepareStartPath(mediaChanged, isFirstTurn, constrainedConfig.cacheOwnerId);
     // Stage the pending message on the pending history BEFORE the
     // stream starts — the native call reads it synchronously via
     // `model.chatStreamSessionStart(history, config)`.
@@ -1990,7 +2166,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
         // consistent with turnCount.
         this.history.length = historyLenBefore;
         if (wasMediaChangeRestart) {
-          // Caches were wiped by prepareStartPath() but the new
+          // This owner's caches were released by prepareStartPath() but the new
           // prefill never reached a successful done:true. Force the
           // next call to re-route through the start path with the
           // preserved prior history.
@@ -2005,8 +2181,9 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   /**
    * Shared pre-start bookkeeping for both `send()` and `sendStream()`:
    *
-   *   - On an image-change restart (turn >= 1), reset the native KV
-   *     caches so the new image set gets a fresh prefill. History is
+   *   - On an image-change restart (turn >= 1), release this session's native
+   *     cache owner so the new image set gets a fresh prefill without wiping
+   *     concurrently live owners. History is
    *     intentionally preserved — `chatSessionStart` receives the full
    *     accumulated conversation plus the new user turn so the jinja
    *     render walks every prior turn and every prior image again
@@ -2017,9 +2194,22 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    *     turn.
    *   - On a fresh / reset history, re-inject the system prompt.
    */
-  private prepareStartPath(mediaChanged: boolean, isFirstTurn: boolean): void {
+  private async prepareStartPath(
+    mediaChanged: boolean,
+    isFirstTurn: boolean,
+    cacheOwnerId: string | undefined,
+  ): Promise<void> {
     if (mediaChanged && !isFirstTurn) {
-      this.model.resetCaches();
+      // Await owner release so it has drained through the model thread before
+      // the replacement start is enqueued. This is deliberately owner-scoped
+      // on continuously batched models: a model-wide reset would invalidate
+      // unrelated live ChatSessions. Third-party/exclusive models predating
+      // the owner lifecycle retain the full-reset fallback.
+      if (this.model.hasBlockPagedCache?.() === true && this.model.releaseCacheOwner && cacheOwnerId) {
+        await this.model.releaseCacheOwner(cacheOwnerId);
+      } else {
+        await this.model.resetCaches();
+      }
     }
     if (this.history.length === 0 && this.system != null) {
       this.history.push({ role: 'system', content: this.system });

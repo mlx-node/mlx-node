@@ -34,6 +34,7 @@
 //!   skipped entirely and the result is exact.
 
 use std::ops::Range;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use napi::bindgen_prelude::*;
@@ -401,6 +402,7 @@ pub(crate) fn run_gdn_only_prefill_materialized(
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     let configured_chunk_size = crate::array::paged_prefill_chunk_size();
     let chunk_size = if configured_chunk_size > 0 {
@@ -408,7 +410,42 @@ pub(crate) fn run_gdn_only_prefill_materialized(
     } else {
         2048
     };
-    for chunk in prefix_tokens.chunks(chunk_size) {
+    run_gdn_only_prefill_materialized_with_chunk_size(
+        prefix_tokens,
+        embed,
+        layers,
+        caches,
+        chunk_size,
+        turn_cancel,
+    )
+}
+
+/// Chunk-size-parameterized worker for [`run_gdn_only_prefill_materialized`]
+/// (mirrors the MoE split so tests can pin the replay behavior without
+/// touching the process environment).
+pub(crate) fn run_gdn_only_prefill_materialized_with_chunk_size(
+    prefix_tokens: &[u32],
+    embed: &Embedding,
+    layers: &mut [DecoderLayer],
+    caches: &mut [Qwen3_5LayerCache],
+    chunk_size: usize,
+    turn_cancel: Option<&AtomicBool>,
+) -> Result<()> {
+    if chunk_size == 0 {
+        return Err(Error::from_reason(
+            "dense GDN materialized replay chunk size must be positive",
+        ));
+    }
+    for (chunk_idx, chunk) in prefix_tokens.chunks(chunk_size).enumerate() {
+        // Cooperative-cancel checkpoint (H1b) between replay chunks — an
+        // O(prefix) cached-prefix replay must not hold the model thread
+        // hostage after a cancel. A one-chunk replay stays single-shot by
+        // design. The Err rides the callers' invalidate/abort arms, and
+        // `replay_gdn_cache_and_commit` drops the staged cache, so the
+        // partial replay is never published.
+        if chunk_idx > 0 && turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         run_gdn_only_prefill(chunk, embed, layers, caches)?;
         materialize_linear_layer_caches(caches)?;
         crate::array::synchronize_and_clear_cache();
@@ -452,6 +489,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     paged_adapter: &mut PagedKVCacheAdapter,
     chunk_size: i32,
     cached_rope_deltas: i32,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -560,6 +598,15 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
     let mut chunk_start_position = cached_prefix_len;
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary
+        // instead of running the rest of the prefill. The Err rides the
+        // caller's release arm (the generic engine's `abort_paged_turn` /
+        // the dense core's `invalidate_dense_paged_session`), which
+        // releases the live request without registering its blocks (fail
+        // closed).
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let chunk = &suffix_tokens[range];
         let is_last_chunk = chunk_idx + 1 == total_chunks;
         let chunk_trace_start = trace_enabled.then(Instant::now);
@@ -832,6 +879,7 @@ pub(crate) fn run_paged_vlm_prefill(
     lm_head: &Option<LinearProj>,
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if expanded_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -900,6 +948,12 @@ pub(crate) fn run_paged_vlm_prefill(
     let mut checkpoints = Vec::new();
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary.
+        // The Err rides the VLM cores' `invalidate_dense_paged_session` arm —
+        // the request is released, never finalized.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let absolute_start = cached_prefix_len_us + range.start;
         let absolute_end = cached_prefix_len_us + range.end;
         let chunk_tokens = &expanded_tokens[absolute_start..absolute_end];
@@ -998,6 +1052,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
     chunk_size: i32,
     keep_last_hidden: Option<usize>,
     cached_rope_deltas: i32,
+    turn_cancel: Option<&AtomicBool>,
 ) -> Result<(MxArray, MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -1096,6 +1151,13 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
     let mut suffix_offset = 0usize;
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
+        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary.
+        // The Err rides the caller's `invalidate_dense_paged_session` /
+        // `abort_paged_turn` arm — the request is released, never finalized,
+        // so partial K/V is never registered as a live prefix.
+        if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
+            return Err(Error::from_reason("prefill cancelled"));
+        }
         let chunk = &suffix_tokens[range];
         let chunk_trace_start = inference_info_enabled.then(Instant::now);
         let is_last_chunk = chunk_idx + 1 == total_chunks;

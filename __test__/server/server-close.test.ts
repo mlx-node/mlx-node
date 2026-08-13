@@ -96,7 +96,7 @@ function createStallModel(): { model: SessionCapableModel; entered: Promise<void
     chatStreamSessionStart: vi.fn(stall),
     chatStreamSessionContinue: vi.fn(stall),
     chatStreamSessionContinueTool: vi.fn(stall),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 
   return { model, entered, sawAbort };
@@ -138,7 +138,7 @@ function createQuickModel(): SessionCapableModel {
     chatStreamSessionStart: vi.fn(quick),
     chatStreamSessionContinue: vi.fn(quick),
     chatStreamSessionContinueTool: vi.fn(quick),
-    resetCaches: vi.fn(),
+    resetCaches: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
 }
 

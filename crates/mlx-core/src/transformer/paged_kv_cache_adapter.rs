@@ -29,10 +29,14 @@
 //!
 //! ## Lifecycle contract
 //!
-//! Each adapter instance scopes per-session state across multiple turns.
-//! Within a session the caller flow is:
+//! One adapter owns all paged requests for a model. `begin_request` creates a
+//! row and `activate_request` selects it for the established single-row
+//! helpers; selecting another row parks the complete current state without
+//! releasing blocks. Within one selected request the caller flow is:
 //!
-//! 1. `reset_for_new_request(seq_id)` — releases any prior request.
+//! 1. `begin_request(seq_id)` (or a scheduler-aware `prepare_turn`) — creates
+//!    the request without disturbing peer rows. `reset_for_new_request` is the
+//!    destructive N=1 migration entry point.
 //! 2. `find_cached_prefix(prompt_tokens, extra_keys, cache_salt)` —
 //!    populates block_table with reused prefix blocks (refcounts already
 //!    incremented). `cache_salt` is mixed into the FIRST block's hash
@@ -60,7 +64,7 @@
 //!    - **Single-turn or session end**: optionally call
 //!      `register_full_blocks_for_reuse(extra_keys, cache_salt)` to
 //!      publish full blocks for cross-request prefix reuse.
-//! 6. `release_request()` — decrefs every block in the table. Blocks
+//! 6. `release_request_for(seq_id)` — decrefs every block in that row. Blocks
 //!    still referenced by the prefix cache (registered above) survive at
 //!    refcount greater than zero; otherwise return to the free pool.
 //!    Always call exactly once when the session ends or on any error or
@@ -74,6 +78,9 @@
 //! sequential decode flip the argmax → token streams diverge from the
 //! flat path. See `finalize_turn_keep_live` for full discussion.
 
+use std::collections::HashMap;
+#[cfg(target_os = "macos")]
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -622,6 +629,64 @@ pub struct PagedTurnPlan {
     pub reason: PagedTurnPlanReason,
 }
 
+/// Two-phase result of scheduler-aware turn preparation.
+///
+/// Dense Qwen cold restores return `Waiting` after hot-prefix lookup and
+/// destination reservation. The scheduler can then run peer rows until
+/// [`PagedKVCacheAdapter::poll_restore`] completes the model-thread commit.
+pub(crate) enum PagedTurnAdmission {
+    Ready(PagedTurnPlan),
+    Waiting {
+        provisional: PagedTurnPlan,
+        restore: PagedRestoreTicket,
+    },
+}
+
+pub(crate) enum PagedRestorePoll {
+    Pending,
+    Ready {
+        plan: PagedTurnPlan,
+        bytes_restored: u64,
+        wait: Duration,
+    },
+}
+
+pub(crate) struct PagedRestoreTicket {
+    seq_id: SeqId,
+    total_budget: u32,
+    prompt_tokens: Vec<u32>,
+    hot_cached_prefix_len: u32,
+    hot_cached_blocks: usize,
+    reason: PagedTurnPlanReason,
+    job: mlx_paged_attn::ColdRestoreBatchJob,
+    reserved: Option<Vec<Arc<PhysicalBlock>>>,
+    identities: Vec<mlx_paged_attn::RestorePrefixIdentity>,
+    allocator: Arc<Mutex<BlockAllocator>>,
+}
+
+impl PagedRestoreTicket {
+    pub(crate) fn reserved_blocks(&self) -> u32 {
+        self.reserved
+            .as_ref()
+            .map_or(0, |blocks| blocks.len().try_into().unwrap_or(u32::MAX))
+    }
+}
+
+impl Drop for PagedRestoreTicket {
+    fn drop(&mut self) {
+        let Some(blocks) = self.reserved.take() else {
+            return;
+        };
+        let mut allocator = self
+            .allocator
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        for block in blocks {
+            allocator.free(block);
+        }
+    }
+}
+
 /// Prefix-cache identity supplied to the shared turn-preparation lifecycle.
 ///
 /// The turn lifecycle itself (live continuation, reset, suffix allocation,
@@ -649,6 +714,14 @@ pub struct PagedPrefillMemorySnapshot {
     pub metal_recommended_working_set_bytes: Option<u64>,
     pub metal_current_allocated_bytes: Option<u64>,
     pub paged_pool_allocated_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct PagedBlockTelemetry {
+    pub total_blocks: u32,
+    pub free_blocks: u32,
+    pub reclaimable_blocks: u32,
+    pub allocated_blocks: u32,
 }
 
 /// SSD cold-tier handle for persisting full paged KV blocks across process
@@ -707,6 +780,12 @@ struct ColdRestore {
     sidecar: Option<mlx_paged_attn::ColdSidecar>,
 }
 
+struct PendingColdRestore {
+    job: mlx_paged_attn::ColdRestoreBatchJob,
+    reserved: Vec<Arc<PhysicalBlock>>,
+    identities: Vec<mlx_paged_attn::RestorePrefixIdentity>,
+}
+
 impl ColdRestore {
     /// Restore nothing: the hot hit stands unextended and no state is handed
     /// back. Every fail-closed exit returns this.
@@ -719,6 +798,129 @@ impl ColdRestore {
 }
 
 impl ColdTierWalk<'_> {
+    /// Prepare a dense-family cold restore without performing filesystem I/O
+    /// or Metal work on the model thread. The consecutive on-disk chain is
+    /// index-probed first, every destination is reserved next, and only then
+    /// is the background read launched.
+    fn begin_restore_extend<'k>(
+        &self,
+        lookup_tokens: &[u32],
+        hot_cached_tokens: usize,
+        cache_salt: u64,
+        extra_keys_for: impl Fn(usize) -> Option<&'k [u64]>,
+        hot_hashes: impl FnOnce(usize) -> Vec<u64>,
+    ) -> Option<PendingColdRestore> {
+        if self.cold.sidecar_policy.is_some() {
+            return None;
+        }
+        let bs = self.block_size as usize;
+        if bs == 0 {
+            return None;
+        }
+        let mut full_blocks = lookup_tokens.len() / bs;
+        let base = hot_cached_tokens.min(lookup_tokens.len()) / bs;
+        if base >= full_blocks {
+            return None;
+        }
+        let hot = hot_hashes(full_blocks);
+        full_blocks = full_blocks.min(hot.len());
+        if base >= full_blocks {
+            return None;
+        }
+
+        let mut parent_key = None;
+        for index in 0..base {
+            let extra_keys = extra_keys_for(index)?;
+            let tokens = lookup_tokens.get(index * bs..(index + 1) * bs)?;
+            parent_key = Some(mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::Kv,
+                self.cold.fingerprint,
+                parent_key,
+                tokens,
+                extra_keys,
+                cache_salt,
+                index,
+            ));
+        }
+        let limit = self.kv_chain_upper_bound(
+            lookup_tokens,
+            cache_salt,
+            &extra_keys_for,
+            base,
+            full_blocks,
+            parent_key,
+        );
+        if limit <= base {
+            return None;
+        }
+
+        let mut keys = Vec::with_capacity(limit - base);
+        let mut identities = Vec::with_capacity(limit - base);
+        for index in base..limit {
+            let extra_keys = extra_keys_for(index)?;
+            let tokens = lookup_tokens.get(index * bs..(index + 1) * bs)?;
+            let key = mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::Kv,
+                self.cold.fingerprint,
+                parent_key,
+                tokens,
+                extra_keys,
+                cache_salt,
+                index,
+            );
+            keys.push(key);
+            identities.push(mlx_paged_attn::RestorePrefixIdentity {
+                hot_hash: hot[index],
+                tokens: tokens.to_vec(),
+                parent_hot_hash: if index == 0 { 0 } else { hot[index - 1] },
+                extra_keys: extra_keys.to_vec(),
+                cache_salt,
+                block_index: index,
+            });
+            parent_key = Some(key);
+        }
+
+        let mut reserved = Vec::with_capacity(keys.len());
+        {
+            let mut allocator = self
+                .allocator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for _ in 0..keys.len() {
+                let Some(block) = allocator.allocate() else {
+                    for block in reserved.drain(..) {
+                        allocator.free(block);
+                    }
+                    return None;
+                };
+                reserved.push(block);
+            }
+        }
+        let job =
+            match self
+                .cold
+                .manager
+                .begin_restore_batch(self.pool, keys, self.cold.fingerprint)
+            {
+                Ok(job) => job,
+                Err(_) => {
+                    let mut allocator = self
+                        .allocator
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    for block in reserved {
+                        allocator.free(block);
+                    }
+                    return None;
+                }
+            };
+        Some(PendingColdRestore {
+            job,
+            reserved,
+            identities,
+        })
+    }
+
     /// SSD cold-tier restore on a hot-cache prefix miss: for each full block
     /// the in-memory lookup did NOT cover, recompute the persisted chain (the
     /// capture contract below — parent-linked per block, `cache_salt` mixed
@@ -1374,16 +1576,112 @@ pub struct ColdCaptureOutcome {
     pub stop: ColdCaptureStop,
 }
 
+pub type SeqId = u32;
+
+/// One request-local slice inside a packed ragged scheduler step.
+///
+/// Query rows for each entry are contiguous in scheduler order. The adapter
+/// uses `first_logical_position` both for K/V slot writes and to verify that
+/// the request cursor was advanced by exactly `query_len` before execution.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PagedRaggedRow {
+    pub seq_id: SeqId,
+    pub first_logical_position: u32,
+    pub query_len: u32,
+}
+
+/// All state whose meaning is scoped to one logical sequence.
+///
+/// `PagedKVCacheAdapter` keeps the selected sequence in a hot workspace so
+/// the established single-row code does not pay a hash lookup at every layer.
+/// Switching sequences moves that whole workspace into/out of `requests`.
+/// Nothing in this struct is model-global: the allocator, physical K/V pool,
+/// cold-tier manager, scale manager, and native pool dependency chain remain
+/// on the adapter itself.
+pub struct PagedRequestState {
+    block_table: SequenceBlockTable,
+    cached_token_count: u32,
+    request_tokens: Vec<u32>,
+    already_registered: bool,
+    prefix_lookup_done: bool,
+    cache_salt: Option<u64>,
+    restored_sidecar: Option<mlx_paged_attn::ColdSidecar>,
+    aux_prefix_unbacked: bool,
+    cold_capture: ColdCaptureOutcome,
+    #[cfg(target_os = "macos")]
+    prefill_attention_inputs_cache: Option<PrefillPagedAttentionInputsCache>,
+    #[cfg(target_os = "macos")]
+    compact_prefill_inputs_cache: Option<CompactPrefillInputsCache>,
+    #[cfg(target_os = "macos")]
+    varlen_prefill_inputs_cache: Option<VarlenPrefillInputsCache>,
+    #[cfg(target_os = "macos")]
+    decode_attention_inputs_cache: Option<DecodePagedAttentionInputsCache>,
+    #[cfg(target_os = "macos")]
+    write_slot_mapping_cache: Option<WriteSlotMappingCache>,
+    #[cfg(target_os = "macos")]
+    prefill_memory_snapshot_cache: Option<PrefillMemorySnapshotCache>,
+    #[cfg(target_os = "macos")]
+    decode_planning_cache: Option<DecodePlanningCache>,
+}
+
+impl PagedRequestState {
+    fn new(seq_id: SeqId, block_size: u32) -> Self {
+        Self {
+            block_table: SequenceBlockTable::new(seq_id, block_size),
+            cached_token_count: 0,
+            request_tokens: Vec::new(),
+            already_registered: false,
+            prefix_lookup_done: false,
+            cache_salt: None,
+            restored_sidecar: None,
+            aux_prefix_unbacked: false,
+            cold_capture: ColdCaptureOutcome::default(),
+            #[cfg(target_os = "macos")]
+            prefill_attention_inputs_cache: None,
+            #[cfg(target_os = "macos")]
+            compact_prefill_inputs_cache: None,
+            #[cfg(target_os = "macos")]
+            varlen_prefill_inputs_cache: None,
+            #[cfg(target_os = "macos")]
+            decode_attention_inputs_cache: None,
+            #[cfg(target_os = "macos")]
+            write_slot_mapping_cache: None,
+            #[cfg(target_os = "macos")]
+            prefill_memory_snapshot_cache: None,
+            #[cfg(target_os = "macos")]
+            decode_planning_cache: None,
+        }
+    }
+}
+
 /// Per-model session-friendly KV cache adapter.
 ///
-/// Holds shared `BlockAllocator` (`Arc<Mutex<...>>`) so multiple in-flight
-/// requests on the same model can share blocks. Each adapter instance is
-/// scoped to ONE request at a time — call `reset_for_new_request` between
-/// requests.
+/// Holds one model-global `BlockAllocator` / `LayerKVPool` and a request-keyed
+/// logical state table. The selected row occupies a hot workspace for the
+/// single-row helpers; all other live rows remain parked in `requests`.
 pub struct PagedKVCacheAdapter {
     allocator: Arc<Mutex<BlockAllocator>>,
     layer_kv_pool: Arc<LayerKVPool>,
     block_size: u32,
+    /// Positive for a scheduler-owned sliding-window group. Such a group
+    /// keeps the logical block table dense (old positions map to one reserved
+    /// null block) while releasing physical blocks that are wholly left of
+    /// the live window. `0` retains the ordinary full-attention semantics.
+    sliding_window: u32,
+    /// Logical context limit. Full-attention adapters derive this from their
+    /// physical pool; sliding adapters decouple it from the bounded live pool.
+    logical_max_tokens: u32,
+    /// Permanently reserved placeholder used by sparse sliding block tables.
+    /// It is never written or freed through a request lifecycle; the paged
+    /// attention mask guarantees placeholder positions are outside the live
+    /// window before their original physical block is reclaimed.
+    null_block: Option<Arc<PhysicalBlock>>,
+
+    /// Parked logical requests keyed exactly like vLLM's `req_to_blocks`.
+    /// The selected request lives in the hot fields below and is identified by
+    /// `active_seq`; `request_count` accounts for both locations.
+    requests: HashMap<SeqId, PagedRequestState>,
+    active_seq: Option<SeqId>,
 
     /// Block table for the active request. None between requests.
     block_table: Option<SequenceBlockTable>,
@@ -1411,6 +1709,11 @@ pub struct PagedKVCacheAdapter {
     /// the shared allocator). Both violate the documented at-most-once
     /// lifecycle.
     prefix_lookup_done: bool,
+
+    /// Prefix-cache security domain bound to the active logical request.
+    /// A live continuation is valid only in the same domain; changing the salt
+    /// forces the normal release + fresh lookup path even when tokens match.
+    request_cache_salt: Option<u64>,
 
     /// Optional SSD cold tier for persisting full blocks across process
     /// restarts. `None` (the default) keeps persistence fully off. Lives
@@ -1681,6 +1984,11 @@ impl PagedKVCacheAdapter {
         self.native_pool_arrays
             .iter_mut()
             .for_each(|slot| *slot = None);
+        self.clear_active_request_graph_state();
+    }
+
+    #[cfg(target_os = "macos")]
+    fn clear_active_request_graph_state(&mut self) {
         self.clear_attention_inputs_caches();
         self.clear_decode_planning_cache();
         self.write_slot_mapping_cache = None;
@@ -1701,6 +2009,43 @@ impl PagedKVCacheAdapter {
         allocator: Arc<Mutex<BlockAllocator>>,
         layer_kv_pool: Arc<LayerKVPool>,
         block_size: u32,
+    ) -> Result<Self, String> {
+        Self::new_with_attention_kind(allocator, layer_kv_pool, block_size, 0, None)
+    }
+
+    /// Construct a bounded physical manager for one sliding-window KV group.
+    ///
+    /// Logical positions remain absolute up to `logical_max_tokens`; old
+    /// physical blocks are replaced by a reserved null block after evaluation
+    /// once every token in that block is older than `sliding_window`.
+    pub fn new_sliding(
+        allocator: Arc<Mutex<BlockAllocator>>,
+        layer_kv_pool: Arc<LayerKVPool>,
+        block_size: u32,
+        sliding_window: u32,
+        logical_max_tokens: u32,
+    ) -> Result<Self, String> {
+        if sliding_window == 0 {
+            return Err("sliding_window must be positive".to_string());
+        }
+        if logical_max_tokens == 0 {
+            return Err("logical_max_tokens must be positive".to_string());
+        }
+        Self::new_with_attention_kind(
+            allocator,
+            layer_kv_pool,
+            block_size,
+            sliding_window,
+            Some(logical_max_tokens),
+        )
+    }
+
+    fn new_with_attention_kind(
+        allocator: Arc<Mutex<BlockAllocator>>,
+        layer_kv_pool: Arc<LayerKVPool>,
+        block_size: u32,
+        sliding_window: u32,
+        logical_max_tokens: Option<u32>,
     ) -> Result<Self, String> {
         let (allocator_block_size, allocator_num_blocks) = {
             let guard = allocator
@@ -1728,17 +2073,35 @@ impl PagedKVCacheAdapter {
                 layer_kv_pool.num_blocks()
             ));
         }
+        let physical_capacity_tokens = layer_kv_pool.num_blocks().saturating_mul(block_size);
+        let logical_max_tokens = logical_max_tokens.unwrap_or(physical_capacity_tokens);
+        let null_block = if sliding_window == 0 {
+            None
+        } else {
+            let mut guard = allocator
+                .lock()
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+            Some(guard.allocate().ok_or_else(|| {
+                "sliding-window adapter requires one reserved null block".to_string()
+            })?)
+        };
         #[cfg(target_os = "macos")]
         let num_layers = layer_kv_pool.num_layers();
         Ok(Self {
             allocator,
             layer_kv_pool,
             block_size,
+            sliding_window,
+            logical_max_tokens,
+            null_block,
+            requests: HashMap::new(),
+            active_seq: None,
             block_table: None,
             cached_token_count: 0,
             request_tokens: Vec::new(),
             already_registered: false,
             prefix_lookup_done: false,
+            request_cache_salt: None,
             cold_tier: None,
             suppress_cold_restore_once: false,
             restored_sidecar: None,
@@ -1941,6 +2304,19 @@ impl PagedKVCacheAdapter {
         ))
     }
 
+    fn bind_request_cache_salt(&mut self, cache_salt: u64, op: &str) -> Result<(), String> {
+        match self.request_cache_salt {
+            Some(bound) if bound != cache_salt => Err(format!(
+                "{op}: cache_salt changed within one live request (bound={bound}, requested={cache_salt}); release the request and start a fresh cache-domain lookup"
+            )),
+            Some(_) => Ok(()),
+            None => {
+                self.request_cache_salt = Some(cache_salt);
+                Ok(())
+            }
+        }
+    }
+
     /// Shared per-layer K/V pool. Exposed so callers can fold the pool's
     /// cache layout (block size, layers, heads, head size, dtype) into the
     /// cold-tier fingerprint.
@@ -1948,36 +2324,171 @@ impl PagedKVCacheAdapter {
         &self.layer_kv_pool
     }
 
+    fn take_active_request_state(&mut self) -> Result<PagedRequestState, String> {
+        let seq_id = self
+            .active_seq
+            .ok_or_else(|| "no active paged request to park".to_string())?;
+        let block_table = self.block_table.take().ok_or_else(|| {
+            format!(
+                "active paged request {seq_id} has no block table; request table is inconsistent"
+            )
+        })?;
+        if block_table.seq_id != seq_id {
+            let table_seq_id = block_table.seq_id;
+            self.block_table = Some(block_table);
+            return Err(format!(
+                "active paged request id {seq_id} does not match block table id {table_seq_id}"
+            ));
+        }
+        Ok(PagedRequestState {
+            block_table,
+            cached_token_count: std::mem::take(&mut self.cached_token_count),
+            request_tokens: std::mem::take(&mut self.request_tokens),
+            already_registered: std::mem::take(&mut self.already_registered),
+            prefix_lookup_done: std::mem::take(&mut self.prefix_lookup_done),
+            cache_salt: self.request_cache_salt.take(),
+            restored_sidecar: self.restored_sidecar.take(),
+            aux_prefix_unbacked: std::mem::take(&mut self.aux_prefix_unbacked),
+            cold_capture: std::mem::take(&mut self.cold_capture),
+            #[cfg(target_os = "macos")]
+            prefill_attention_inputs_cache: self.prefill_attention_inputs_cache.take(),
+            #[cfg(target_os = "macos")]
+            compact_prefill_inputs_cache: self.compact_prefill_inputs_cache.take(),
+            #[cfg(target_os = "macos")]
+            varlen_prefill_inputs_cache: self.varlen_prefill_inputs_cache.take(),
+            #[cfg(target_os = "macos")]
+            decode_attention_inputs_cache: self.decode_attention_inputs_cache.take(),
+            #[cfg(target_os = "macos")]
+            write_slot_mapping_cache: self.write_slot_mapping_cache.take(),
+            #[cfg(target_os = "macos")]
+            prefill_memory_snapshot_cache: self.prefill_memory_snapshot_cache.take(),
+            #[cfg(target_os = "macos")]
+            decode_planning_cache: self.decode_planning_cache.take(),
+        })
+    }
+
+    fn install_active_request_state(&mut self, state: PagedRequestState) {
+        let seq_id = state.block_table.seq_id;
+        self.block_table = Some(state.block_table);
+        self.cached_token_count = state.cached_token_count;
+        self.request_tokens = state.request_tokens;
+        self.already_registered = state.already_registered;
+        self.prefix_lookup_done = state.prefix_lookup_done;
+        self.request_cache_salt = state.cache_salt;
+        self.restored_sidecar = state.restored_sidecar;
+        self.aux_prefix_unbacked = state.aux_prefix_unbacked;
+        self.cold_capture = state.cold_capture;
+        #[cfg(target_os = "macos")]
+        {
+            self.prefill_attention_inputs_cache = state.prefill_attention_inputs_cache;
+            self.compact_prefill_inputs_cache = state.compact_prefill_inputs_cache;
+            self.varlen_prefill_inputs_cache = state.varlen_prefill_inputs_cache;
+            self.decode_attention_inputs_cache = state.decode_attention_inputs_cache;
+            self.write_slot_mapping_cache = state.write_slot_mapping_cache;
+            self.prefill_memory_snapshot_cache = state.prefill_memory_snapshot_cache;
+            self.decode_planning_cache = state.decode_planning_cache;
+        }
+        self.active_seq = Some(seq_id);
+    }
+
+    fn park_active_request(&mut self) -> Result<(), String> {
+        let Some(seq_id) = self.active_seq else {
+            return Ok(());
+        };
+        if self.requests.contains_key(&seq_id) {
+            return Err(format!(
+                "paged request table already contains active sequence {seq_id}"
+            ));
+        }
+        let state = self.take_active_request_state()?;
+        let replaced = self.requests.insert(seq_id, state);
+        debug_assert!(replaced.is_none(), "duplicate checked before state move");
+        self.active_seq = None;
+        Ok(())
+    }
+
+    /// Select an existing request without releasing the previously selected
+    /// one. A missing id creates a fresh request slot.
+    pub(crate) fn activate_request(&mut self, seq_id: SeqId) -> Result<(), String> {
+        if self.active_seq == Some(seq_id) {
+            return Ok(());
+        }
+        self.park_active_request()?;
+        let state = self
+            .requests
+            .remove(&seq_id)
+            .unwrap_or_else(|| PagedRequestState::new(seq_id, self.block_size));
+        self.install_active_request_state(state);
+        Ok(())
+    }
+
+    /// Begin a brand-new request while preserving every other live request.
+    pub fn begin_request(&mut self, seq_id: SeqId) -> Result<(), String> {
+        if self.active_seq == Some(seq_id) || self.requests.contains_key(&seq_id) {
+            return Err(format!("paged request {seq_id} already exists"));
+        }
+        self.park_active_request()?;
+        self.install_active_request_state(PagedRequestState::new(seq_id, self.block_size));
+        Ok(())
+    }
+
+    pub fn active_seq_id(&self) -> Option<SeqId> {
+        self.active_seq
+    }
+
+    pub fn request_count(&self) -> usize {
+        self.requests.len() + usize::from(self.active_seq.is_some())
+    }
+
+    pub fn current_token_count_for(&self, seq_id: SeqId) -> Option<u32> {
+        if self.active_seq == Some(seq_id) {
+            return Some(self.request_tokens.len() as u32);
+        }
+        self.requests
+            .get(&seq_id)
+            .map(|state| state.request_tokens.len() as u32)
+    }
+
+    pub fn request_tokens_for(&self, seq_id: SeqId) -> Option<&[u32]> {
+        if self.active_seq == Some(seq_id) {
+            return Some(&self.request_tokens);
+        }
+        self.requests
+            .get(&seq_id)
+            .map(|state| state.request_tokens.as_slice())
+    }
+
+    pub fn is_live_for_continue_for(&self, seq_id: SeqId) -> bool {
+        if self.active_seq == Some(seq_id) {
+            return self.is_live_for_continue();
+        }
+        self.requests
+            .get(&seq_id)
+            .is_some_and(|state| state.block_table.num_tokens() > 0 && state.already_registered)
+    }
+
+    pub fn block_table_for(&self, seq_id: SeqId) -> Option<&SequenceBlockTable> {
+        if self.active_seq == Some(seq_id) {
+            return self.block_table.as_ref();
+        }
+        self.requests.get(&seq_id).map(|state| &state.block_table)
+    }
+
     /// Begin a new request. Releases any prior request's blocks first.
     /// `seq_id` is a logical request identifier (caller's choice; not
     /// interpreted by the adapter beyond passing it to `SequenceBlockTable`).
     pub fn reset_for_new_request(&mut self, seq_id: u32) -> Result<(), String> {
-        // If there's a prior request, release its blocks first. We must NOT
-        // silently leak; the prior caller forgot to call release_request.
-        if self.block_table.is_some() {
+        // This is the single-request migration shim. It deliberately retains
+        // its historical destructive semantics; the scheduler uses
+        // `begin_request` / `activate_request` to preserve other rows.
+        if self.active_seq.is_some() {
             self.release_request()?;
         }
-        self.block_table = Some(SequenceBlockTable::new(seq_id, self.block_size));
-        self.cached_token_count = 0;
-        self.request_tokens.clear();
-        // Auxiliary state belongs to the prefix the previous lookup restored,
-        // never to the next request.
-        self.restored_sidecar = None;
-        // No prefix is being resumed yet, so there is no auxiliary obligation.
-        self.aux_prefix_unbacked = false;
-        // The previous turn's capture depth describes the previous turn's
-        // tokens; a family must never anchor this turn's sidecar on it.
-        self.cold_capture = ColdCaptureOutcome::default();
-        #[cfg(target_os = "macos")]
-        {
-            self.prefill_attention_inputs_cache = None;
-            self.clear_native_graph_state();
+        if self.requests.contains_key(&seq_id) {
+            self.activate_request(seq_id)?;
+            self.release_request()?;
         }
-        // Reset registration flag AFTER release so a subsequent
-        // register_full_blocks_for_reuse on the new request runs.
-        self.already_registered = false;
-        self.prefix_lookup_done = false;
-        Ok(())
+        self.begin_request(seq_id)
     }
 
     /// Prepare an active turn using the adapter lifecycle shared by paged
@@ -2039,6 +2550,253 @@ impl PagedKVCacheAdapter {
             skip_lookup,
             Some(max_cache_hit_tokens),
         )
+    }
+
+    /// Scheduler-aware dense-family preparation with asynchronous SSD restore.
+    ///
+    /// Live continuations and families with auxiliary sidecars retain the
+    /// established synchronous path. A fresh dense request performs only the
+    /// hot lookup on the model thread, reserves every destination for the
+    /// consecutive cold chain, and returns a ticket while filesystem work runs
+    /// in the background.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn prepare_turn_with_async_restore(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: &[u32],
+        total_budget: u32,
+        reuse_cache: bool,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        skip_lookup: bool,
+        max_cache_hit_tokens: u32,
+    ) -> Result<PagedTurnAdmission, String> {
+        let async_dense = self
+            .cold_tier
+            .as_ref()
+            .is_some_and(|cold| cold.sidecar_policy.is_none());
+        if !async_dense {
+            return self
+                .prepare_turn_with_max_cache_hit_tokens(
+                    seq_id,
+                    prompt_tokens,
+                    total_budget,
+                    reuse_cache,
+                    extra_keys,
+                    cache_salt,
+                    skip_lookup,
+                    max_cache_hit_tokens,
+                )
+                .map(PagedTurnAdmission::Ready);
+        }
+
+        self.activate_request(seq_id)?;
+        let max_live_continue_tokens = usize::try_from(max_cache_hit_tokens).unwrap_or(usize::MAX);
+        let can_continue = reuse_cache
+            && self.is_live_for_continue()
+            && self.request_cache_salt == Some(cache_salt)
+            && prompt_tokens.starts_with(self.request_tokens())
+            && self.request_tokens().len() <= max_live_continue_tokens;
+        if can_continue {
+            let result = self.prepare_turn_inner_mutating(
+                seq_id,
+                prompt_tokens,
+                total_budget,
+                reuse_cache,
+                PreparePrefixKeys::Uniform(extra_keys),
+                cache_salt,
+                skip_lookup,
+                Some(max_cache_hit_tokens),
+            );
+            if result.is_err() {
+                let _ = self.release_request();
+            }
+            return result.map(PagedTurnAdmission::Ready);
+        }
+
+        let result = (|| {
+            if self.block_table().is_some() {
+                let _ = self.release_request();
+            }
+            self.reset_for_new_request(seq_id)?;
+            let cold_suppressed = self.suppress_cold_restore_once;
+            let prefix = self.find_cached_prefix_inner(
+                prompt_tokens,
+                extra_keys,
+                cache_salt,
+                skip_lookup,
+                Some(max_cache_hit_tokens),
+                false,
+            )?;
+            let cached_prefix_len = prefix.cached_token_count;
+            let cached_blocks = prefix.blocks.len();
+            let lookup_len = usize::try_from(max_cache_hit_tokens)
+                .unwrap_or(usize::MAX)
+                .min(prompt_tokens.len());
+            let lookup_tokens = &prompt_tokens[..lookup_len];
+            let pending = if cold_suppressed || skip_lookup {
+                None
+            } else {
+                self.cold_tier.as_ref().and_then(|cold| {
+                    let walk = ColdTierWalk {
+                        cold,
+                        pool: &self.layer_kv_pool,
+                        allocator: &self.allocator,
+                        block_size: self.block_size,
+                    };
+                    walk.begin_restore_extend(
+                        lookup_tokens,
+                        cached_prefix_len as usize,
+                        cache_salt,
+                        |_| Some(extra_keys),
+                        |full_blocks| {
+                            mlx_paged_attn::chain_hashes(
+                                &lookup_tokens[..full_blocks * self.block_size as usize],
+                                self.block_size,
+                                extra_keys,
+                                cache_salt,
+                            )
+                        },
+                    )
+                })
+            };
+            let suffix_len = total_budget.checked_sub(cached_prefix_len).ok_or_else(|| {
+                format!(
+                    "prepare_turn: cached_prefix_len {cached_prefix_len} exceeds total_budget {total_budget}"
+                )
+            })?;
+            let reason = PagedTurnPlanReason::FreshReset;
+            let Some(pending) = pending else {
+                let allocated_blocks = self.allocate_suffix_blocks(total_budget)?;
+                return Ok(PagedTurnAdmission::Ready(PagedTurnPlan {
+                    cached_prefix_len,
+                    continued_live_prefix: false,
+                    allocated_blocks,
+                    cached_blocks,
+                    total_budget,
+                    suffix_len,
+                    reason,
+                }));
+            };
+            let provisional = PagedTurnPlan {
+                cached_prefix_len,
+                continued_live_prefix: false,
+                allocated_blocks: pending.reserved.len() as u32,
+                cached_blocks,
+                total_budget,
+                suffix_len,
+                reason,
+            };
+            Ok(PagedTurnAdmission::Waiting {
+                provisional,
+                restore: PagedRestoreTicket {
+                    seq_id,
+                    total_budget,
+                    prompt_tokens: prompt_tokens.to_vec(),
+                    hot_cached_prefix_len: cached_prefix_len,
+                    hot_cached_blocks: cached_blocks,
+                    reason,
+                    job: pending.job,
+                    reserved: Some(pending.reserved),
+                    identities: pending.identities,
+                    allocator: Arc::clone(&self.allocator),
+                },
+            })
+        })();
+        if result.is_err() {
+            let _ = self.release_request();
+        }
+        result
+    }
+
+    /// Poll and, once ready, commit one scheduler-owned restore ticket.
+    pub(crate) fn poll_restore(
+        &mut self,
+        restore: &mut PagedRestoreTicket,
+    ) -> Result<PagedRestorePoll, String> {
+        let Some(batch) = restore.job.poll() else {
+            return Ok(PagedRestorePoll::Pending);
+        };
+        let wait = restore.job.elapsed();
+        self.activate_request(restore.seq_id)?;
+        let manager = Arc::clone(
+            &self
+                .cold_tier
+                .as_ref()
+                .ok_or_else(|| "cold tier disappeared during restore".to_string())?
+                .manager,
+        );
+        let reserved = restore.reserved.take().unwrap_or_default();
+        let committed = manager.commit_restore_batch(
+            &self.layer_kv_pool,
+            &self.allocator,
+            batch,
+            reserved,
+            &restore.identities,
+            wait,
+        );
+        let (blocks, bytes_restored) = committed
+            .map(|commit| (commit.blocks, commit.bytes_restored))
+            .unwrap_or_default();
+        let restored_block_count = blocks.len();
+        let restored_tokens = (blocks.len() as u32).saturating_mul(self.block_size);
+        let cached_prefix_len = restore
+            .hot_cached_prefix_len
+            .saturating_add(restored_tokens);
+        if cached_prefix_len > restore.total_budget
+            || cached_prefix_len as usize > restore.prompt_tokens.len()
+        {
+            let mut allocator = self
+                .allocator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for block in blocks {
+                allocator.free(block);
+            }
+            return Err("asynchronous cold restore exceeded the prepared prompt".to_string());
+        }
+        if !blocks.is_empty() {
+            if self.block_table.is_none() {
+                let mut allocator = self
+                    .allocator
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                for block in blocks {
+                    allocator.free(block);
+                }
+                return Err("restore commit has no active block table".to_string());
+            }
+            {
+                let block_table = self
+                    .block_table
+                    .as_mut()
+                    .expect("presence checked before consuming restored blocks");
+                for block in blocks {
+                    block_table.add_block(block);
+                }
+                block_table.set_num_tokens(cached_prefix_len);
+            }
+            self.cached_token_count = cached_prefix_len;
+            self.request_tokens.extend_from_slice(
+                &restore.prompt_tokens
+                    [restore.hot_cached_prefix_len as usize..cached_prefix_len as usize],
+            );
+        }
+        let allocated_blocks = self.allocate_suffix_blocks(restore.total_budget)?;
+        let suffix_len = restore.total_budget.saturating_sub(cached_prefix_len);
+        Ok(PagedRestorePoll::Ready {
+            plan: PagedTurnPlan {
+                cached_prefix_len,
+                continued_live_prefix: false,
+                allocated_blocks,
+                cached_blocks: restore.hot_cached_blocks + restored_block_count,
+                total_budget: restore.total_budget,
+                suffix_len,
+                reason: restore.reason,
+            },
+            bytes_restored,
+            wait,
+        })
     }
 
     /// Per-block-extra-keys variant of
@@ -2129,6 +2887,10 @@ impl PagedKVCacheAdapter {
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
     ) -> Result<PagedTurnPlan, String> {
+        // Select only this request. Other live rows are parked in the request
+        // table and must survive a prefix miss, failed continuation, or suffix
+        // allocation failure on this row.
+        self.activate_request(seq_id)?;
         let result = self.prepare_turn_inner_mutating(
             seq_id,
             prompt_tokens,
@@ -2166,6 +2928,7 @@ impl PagedKVCacheAdapter {
             .unwrap_or(usize::MAX);
         let can_continue = reuse_cache
             && self.is_live_for_continue()
+            && self.request_cache_salt == Some(cache_salt)
             && prompt_tokens.starts_with(self.request_tokens())
             && self.request_tokens().len() <= max_live_continue_tokens;
 
@@ -2254,6 +3017,7 @@ impl PagedKVCacheAdapter {
                 cache_salt,
                 skip_lookup,
                 max_cache_hit_tokens,
+                true,
             ),
             PreparePrefixKeys::PerBlock(extra_keys_per_block) => self
                 .find_cached_prefix_per_block_inner(
@@ -2340,7 +3104,14 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
         skip_lookup: bool,
     ) -> Result<CachedPrefix, String> {
-        self.find_cached_prefix_inner(prompt_tokens, extra_keys, cache_salt, skip_lookup, None)
+        self.find_cached_prefix_inner(
+            prompt_tokens,
+            extra_keys,
+            cache_salt,
+            skip_lookup,
+            None,
+            true,
+        )
     }
 
     /// Variant of [`Self::find_cached_prefix`] that caps the lookup length
@@ -2367,6 +3138,7 @@ impl PagedKVCacheAdapter {
             cache_salt,
             skip_lookup,
             Some(max_cache_hit_tokens),
+            true,
         )
     }
 
@@ -2377,6 +3149,7 @@ impl PagedKVCacheAdapter {
         cache_salt: u64,
         skip_lookup: bool,
         max_cache_hit_tokens: Option<u32>,
+        restore_cold: bool,
     ) -> Result<CachedPrefix, String> {
         // Reject re-entrant calls BEFORE touching the allocator. The flag
         // tracks lookup-already-ran regardless of hit/miss outcome, so a
@@ -2390,6 +3163,7 @@ impl PagedKVCacheAdapter {
                  Call reset_for_new_request() to start a new request."
                 .to_string());
         }
+        self.bind_request_cache_salt(cache_salt, "find_cached_prefix")?;
         // Consume the command-reset one-shot on every processed lookup
         // (including the forced-miss `skip_lookup` path below), so exactly the
         // immediately-following request is suppressed.
@@ -2439,7 +3213,10 @@ impl PagedKVCacheAdapter {
         //
         // Skipped for one lookup after a command reset (`suppress_cold_restore`)
         // so the just-purged prefix is re-prefilled cold rather than restored.
-        if !suppress_cold_restore && let Some(cold) = self.cold_tier.as_ref() {
+        if restore_cold
+            && !suppress_cold_restore
+            && let Some(cold) = self.cold_tier.as_ref()
+        {
             let block_size = self.block_size;
             let walk = ColdTierWalk {
                 cold,
@@ -2596,6 +3373,7 @@ impl PagedKVCacheAdapter {
                     .to_string(),
             );
         }
+        self.bind_request_cache_salt(cache_salt, "find_cached_prefix_per_block")?;
         // Consume the command-reset one-shot on every processed lookup
         // (including the forced-miss `skip_lookup` path below), exactly as the
         // uniform entry point does. Leaving it armed here would let a
@@ -2777,6 +3555,15 @@ impl PagedKVCacheAdapter {
         Ok(needed_blocks)
     }
 
+    pub fn allocate_suffix_blocks_for(
+        &mut self,
+        seq_id: SeqId,
+        total_tokens: u32,
+    ) -> Result<u32, String> {
+        self.activate_request(seq_id)?;
+        self.allocate_suffix_blocks(total_tokens)
+    }
+
     /// Lazily extend `block_table` to cover `new_total_tokens` logical
     /// positions. Called from `record_tokens` so decode steps don't have
     /// to pre-reserve blocks for the full speculative `max_new_tokens`
@@ -2840,6 +3627,198 @@ impl PagedKVCacheAdapter {
         Ok(to_allocate)
     }
 
+    /// Release physical blocks that are wholly older than this adapter's
+    /// sliding window while preserving an absolute-position block table.
+    ///
+    /// Old entries are replaced with the one reserved null block. The Metal
+    /// kernel receives the original context length and absolute logical block
+    /// indices, but masks every placeholder position before dereferencing its
+    /// K/V. Pending native writes are evaluated before any block id can be
+    /// returned to the allocator and reused by another sequence.
+    pub fn prune_sliding_window_for(&mut self, seq_id: SeqId) -> Result<u32, String> {
+        if self.sliding_window == 0 {
+            return Ok(0);
+        }
+        self.activate_request(seq_id)?;
+        #[cfg(target_os = "macos")]
+        self.eval_pending_pool_writes()?;
+
+        let null_block = self
+            .null_block
+            .as_ref()
+            .ok_or_else(|| "sliding adapter is missing its reserved null block".to_string())?
+            .clone();
+        let null_id = null_block.block_id;
+        let table = self
+            .block_table
+            .as_mut()
+            .ok_or_else(|| "prune_sliding_window_for called before begin_request".to_string())?;
+        let cutoff = table.num_tokens().saturating_sub(self.sliding_window);
+        let first_live_block = cutoff / self.block_size;
+        let replace_count = usize::try_from(first_live_block)
+            .unwrap_or(usize::MAX)
+            .min(table.num_blocks());
+        let mut released = Vec::new();
+        for index in 0..replace_count {
+            let Some(block) = table.blocks().get(index) else {
+                break;
+            };
+            if block.block_id == null_id {
+                continue;
+            }
+            released.push(Arc::clone(block));
+            let replaced = table.replace_block(index, Arc::clone(&null_block));
+            debug_assert!(replaced);
+        }
+        if released.is_empty() {
+            return Ok(0);
+        }
+        let released_count = released.len() as u32;
+        let mut guard = self
+            .allocator
+            .lock()
+            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        for block in released {
+            guard.free(block);
+        }
+        drop(guard);
+        #[cfg(target_os = "macos")]
+        self.clear_attention_inputs_caches();
+        Ok(released_count)
+    }
+
+    /// Restore one sliding-window cache group at an exact hybrid-prefix
+    /// boundary without materializing the retired logical prefix.
+    ///
+    /// `layer_kv` is layer-major and uses the read-side shape
+    /// `[1, kv_heads, live_tokens, head_size]`. The logical block table keeps
+    /// absolute positions: blocks wholly before the live window point at the
+    /// reserved null sentinel, while only blocks intersecting the live suffix
+    /// consume physical capacity. This is the local equivalent of vLLM's
+    /// hybrid KV-group restore: the caller must install every group at the same
+    /// boundary or discard all of them.
+    pub fn restore_sliding_prefix_for(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: &[u32],
+        boundary: u32,
+        layer_kv: &[(MxArray, MxArray)],
+    ) -> Result<(), String> {
+        if self.sliding_window == 0 {
+            return Err("restore_sliding_prefix_for requires a sliding adapter".to_string());
+        }
+        if boundary == 0 || boundary as usize > prompt_tokens.len() {
+            return Err(format!(
+                "restore_sliding_prefix_for boundary {boundary} is outside prompt length {}",
+                prompt_tokens.len()
+            ));
+        }
+        if layer_kv.len() != self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "restore_sliding_prefix_for received {} layers, expected {}",
+                layer_kv.len(),
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+
+        let live_tokens = boundary.min(self.sliding_window);
+        let first_live_position = boundary - live_tokens;
+        let first_live_block = first_live_position / self.block_size;
+        let total_blocks = boundary.div_ceil(self.block_size);
+        let live_blocks = total_blocks.saturating_sub(first_live_block);
+        let null_block = self
+            .null_block
+            .as_ref()
+            .ok_or_else(|| "sliding adapter is missing its reserved null block".to_string())?
+            .clone();
+
+        self.release_request_for(seq_id)?;
+        self.begin_request(seq_id)?;
+        let allocated = {
+            let mut guard = self
+                .allocator
+                .lock()
+                .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?;
+            let mut blocks = Vec::with_capacity(live_blocks as usize);
+            for allocated_count in 0..live_blocks {
+                let Some(block) = guard.allocate() else {
+                    for block in blocks.drain(..) {
+                        guard.free(block);
+                    }
+                    drop(guard);
+                    let _ = self.release_request_for(seq_id);
+                    return Err(format!(
+                        "restore_sliding_prefix_for could allocate only {allocated_count} of \
+                         {live_blocks} live blocks"
+                    ));
+                };
+                blocks.push(block);
+            }
+            blocks
+        };
+
+        let Some(table) = self.block_table.as_mut() else {
+            let mut guard = self
+                .allocator
+                .lock()
+                .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?;
+            for block in allocated {
+                guard.free(block);
+            }
+            drop(guard);
+            let _ = self.release_request_for(seq_id);
+            return Err(
+                "restore_sliding_prefix_for: begin_request did not install a block table"
+                    .to_string(),
+            );
+        };
+        for _ in 0..first_live_block {
+            table.add_block(Arc::clone(&null_block));
+        }
+        for block in allocated {
+            table.add_block(block);
+        }
+        table.set_num_tokens(boundary);
+        self.request_tokens
+            .extend_from_slice(&prompt_tokens[..boundary as usize]);
+        self.cached_token_count = boundary;
+        self.prefix_lookup_done = true;
+        self.already_registered = false;
+        self.restored_sidecar = None;
+        self.aux_prefix_unbacked = false;
+
+        let num_kv_heads = self.layer_kv_pool.config().num_kv_heads as i64;
+        let head_size = self.layer_kv_pool.config().head_size as i64;
+        for (layer, (keys, values)) in layer_kv.iter().enumerate() {
+            // Match the normal attention write path exactly:
+            // [B, H, T, D] -> [B, T, H, D] -> [B*T, H, D]. The final
+            // reshape is load-bearing, not cosmetic. A bare transpose/squeeze
+            // leaves a strided view whose backing Metal buffer is still laid
+            // out as [H, T, D], while `reshape_and_cache` consumes a contiguous
+            // [T, H, D] buffer and has no stride metadata. That silently
+            // transposes tokens and heads for multi-head sliding groups.
+            let keys = keys
+                .transpose(Some(&[0, 2, 1, 3]))
+                .map_err(|error| format!("restore sliding keys transpose: {error}"))?
+                .reshape(&[live_tokens as i64, num_kv_heads, head_size])
+                .map_err(|error| format!("restore sliding keys reshape: {error}"))?;
+            let values = values
+                .transpose(Some(&[0, 2, 1, 3]))
+                .map_err(|error| format!("restore sliding values transpose: {error}"))?
+                .reshape(&[live_tokens as i64, num_kv_heads, head_size])
+                .map_err(|error| format!("restore sliding values reshape: {error}"))?;
+            if let Err(error) =
+                self.update_keys_values(layer as u32, &keys, &values, first_live_position)
+            {
+                let _ = self.release_request_for(seq_id);
+                return Err(format!(
+                    "restore_sliding_prefix_for failed to upload layer {layer}: {error}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Record tokens emitted/consumed in this request. Updates
     /// `request_tokens` and `block_table.num_tokens`. Caller passes
     /// EVERY token (prompt prefill + decoded output) in order.
@@ -2889,6 +3868,27 @@ impl PagedKVCacheAdapter {
         #[cfg(target_os = "macos")]
         self.clear_prefill_attention_inputs_cache();
         Ok(())
+    }
+
+    /// Record one scheduler-produced token against exactly one sequence.
+    /// Allocation exhaustion is returned for this row only; callers can park
+    /// it without rolling back or releasing any peer in the batch.
+    pub fn record_token_for(&mut self, seq_id: SeqId, token: u32) -> Result<(), String> {
+        self.activate_request(seq_id)?;
+        self.record_tokens(&[token])
+    }
+
+    /// Record one scheduler-owned slice against exactly one sequence.
+    /// Allocation is atomic for the slice: exhaustion leaves the request
+    /// cursor unchanged, allowing the executor to roll back earlier peers and
+    /// hand the squeeze to scheduler preemption policy.
+    pub(crate) fn record_tokens_for(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+    ) -> Result<(), String> {
+        self.activate_request(seq_id)?;
+        self.record_tokens(tokens)
     }
 
     /// Roll back the most recent `n` tokens from `request_tokens` and
@@ -3506,6 +4506,255 @@ impl PagedKVCacheAdapter {
         Ok(())
     }
 
+    /// One graph-native K/V write for a uniform one-token decode batch.
+    /// `rows[i]` owns `keys[i]` / `values[i]` and supplies that request's
+    /// logical write position.
+    #[cfg(target_os = "macos")]
+    pub fn update_keys_values_native_batched(
+        &mut self,
+        layer_idx: u32,
+        keys: &MxArray,
+        values: &MxArray,
+        rows: &[(SeqId, u32)],
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Err("update_keys_values_native_batched requires at least one row".to_string());
+        }
+        if layer_idx as usize >= self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "update_keys_values_native_batched: layer_idx {layer_idx} out of range (num_layers = {})",
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+        let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
+        let values_meta = KvTensorMeta::from_array(values, "values")?;
+        let info = validate_kv_input(&keys_meta, &values_meta, self.layer_kv_pool.config())?;
+        if info.num_tokens as usize != rows.len() {
+            return Err(format!(
+                "update_keys_values_native_batched: keys/values contain {} rows but metadata names {} sequences",
+                info.num_tokens,
+                rows.len()
+            ));
+        }
+
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut seen_slots = HashSet::with_capacity(rows.len());
+        let mut slots = Vec::with_capacity(rows.len());
+        for &(seq_id, first_logical_position) in rows {
+            if !seen.insert(seq_id) {
+                return Err(format!(
+                    "update_keys_values_native_batched received duplicate sequence {seq_id}"
+                ));
+            }
+            if self.active_seq != Some(seq_id) && !self.requests.contains_key(&seq_id) {
+                return Err(format!(
+                    "update_keys_values_native_batched: unknown sequence {seq_id}"
+                ));
+            }
+            self.activate_request(seq_id)?;
+            let current = self.request_tokens.len() as u32;
+            let expected_first = current.checked_sub(1).ok_or_else(|| {
+                format!(
+                    "update_keys_values_native_batched: sequence {seq_id} has no recorded token"
+                )
+            })?;
+            if first_logical_position != expected_first {
+                return Err(format!(
+                    "update_keys_values_native_batched: sequence {seq_id} position {first_logical_position} does not align with its recorded suffix (expected {expected_first}, current_token_count {current})"
+                ));
+            }
+            let slot = self
+                .block_table
+                .as_ref()
+                .and_then(|table| table.absolute_slot_index(first_logical_position))
+                .ok_or_else(|| {
+                    format!(
+                        "update_keys_values_native_batched: sequence {seq_id} position {first_logical_position} has no allocated slot"
+                    )
+                })?;
+            if !seen_slots.insert(slot) {
+                return Err(format!(
+                    "update_keys_values_native_batched: sequence {seq_id} aliases physical slot {slot} with another row"
+                ));
+            }
+            slots.push(slot);
+        }
+        let slot_mapping = MxArray::from_int64(&slots, &[rows.len() as i64])
+            .map_err(|e| format!("update_keys_values_native_batched slot_mapping: {e}"))?;
+        MxArray::eval_arrays(&[&slot_mapping])
+            .map_err(|e| format!("update_keys_values_native_batched slot_mapping eval: {e}"))?;
+
+        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
+        let k_scale = self.k_scale_array(layer_idx)?;
+        let v_scale = self.v_scale_array(layer_idx)?;
+        let kv_dtype_raw = self.kv_dtype_raw()?;
+        let mut out_k_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_paged_kv_write_forward(
+                k_pool.as_raw_ptr(),
+                v_pool.as_raw_ptr(),
+                keys.as_raw_ptr(),
+                values.as_raw_ptr(),
+                slot_mapping.as_raw_ptr(),
+                k_scale.as_raw_ptr(),
+                v_scale.as_raw_ptr(),
+                self.block_size as i32,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+                self.layer_kv_pool.config().head_size as i32,
+                kv_dtype_raw,
+                &mut out_k_pool,
+                &mut out_v_pool,
+            )
+        };
+        if !ok || out_k_pool.is_null() || out_v_pool.is_null() {
+            unsafe {
+                if !out_k_pool.is_null() {
+                    mlx_sys::mlx_array_delete(out_k_pool);
+                }
+                if !out_v_pool.is_null() {
+                    mlx_sys::mlx_array_delete(out_v_pool);
+                }
+            }
+            return Err(format!(
+                "update_keys_values_native_batched: mlx_paged_kv_write_forward returned null (layer={layer_idx}, rows={})",
+                rows.len()
+            ));
+        }
+        let k_out = MxArray::from_handle(out_k_pool, "paged_kv_write_forward batched k_pool")
+            .map_err(|e| {
+                format!("update_keys_values_native_batched: failed to wrap k_pool output: {e}")
+            })?;
+        let v_out = MxArray::from_handle(out_v_pool, "paged_kv_write_forward batched v_pool")
+            .map_err(|e| {
+                format!("update_keys_values_native_batched: failed to wrap v_pool output: {e}")
+            })?;
+        self.replace_native_pool_arrays(layer_idx, k_out, v_out)
+    }
+
+    /// One graph-native K/V write for packed ragged prefill/decode slices.
+    /// Query tokens are laid out as the concatenation of `rows`, in order.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn update_keys_values_native_ragged(
+        &mut self,
+        layer_idx: u32,
+        keys: &MxArray,
+        values: &MxArray,
+        rows: &[PagedRaggedRow],
+    ) -> Result<(), String> {
+        if rows.is_empty() {
+            return Err("update_keys_values_native_ragged requires at least one row".to_string());
+        }
+        if layer_idx as usize >= self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "update_keys_values_native_ragged: layer_idx {layer_idx} out of range (num_layers = {})",
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+        let total_queries = rows.iter().try_fold(0u32, |total, row| {
+            if row.query_len == 0 {
+                return Err(format!(
+                    "update_keys_values_native_ragged: sequence {} has an empty query slice",
+                    row.seq_id
+                ));
+            }
+            total
+                .checked_add(row.query_len)
+                .ok_or_else(|| "update_keys_values_native_ragged query count overflow".to_string())
+        })?;
+        let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
+        let values_meta = KvTensorMeta::from_array(values, "values")?;
+        let info = validate_kv_input(&keys_meta, &values_meta, self.layer_kv_pool.config())?;
+        if info.num_tokens != total_queries {
+            return Err(format!(
+                "update_keys_values_native_ragged: keys/values contain {} query rows but metadata names {total_queries}",
+                info.num_tokens
+            ));
+        }
+
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut slots = Vec::with_capacity(total_queries as usize);
+        for row in rows {
+            if !seen.insert(row.seq_id) {
+                return Err(format!(
+                    "update_keys_values_native_ragged received duplicate sequence {}",
+                    row.seq_id
+                ));
+            }
+            if self.active_seq != Some(row.seq_id) && !self.requests.contains_key(&row.seq_id) {
+                return Err(format!(
+                    "update_keys_values_native_ragged: unknown sequence {}",
+                    row.seq_id
+                ));
+            }
+            self.activate_request(row.seq_id)?;
+            let current = self.request_tokens.len() as u32;
+            let expected_first = current.checked_sub(row.query_len).ok_or_else(|| {
+                format!(
+                    "update_keys_values_native_ragged: sequence {} recorded {current} tokens for query length {}",
+                    row.seq_id, row.query_len
+                )
+            })?;
+            if row.first_logical_position != expected_first {
+                return Err(format!(
+                    "update_keys_values_native_ragged: sequence {} position {} does not align with its recorded suffix (expected {expected_first}, current_token_count {current}, query_len {})",
+                    row.seq_id, row.first_logical_position, row.query_len
+                ));
+            }
+            slots.extend(self.build_slot_mapping(row.first_logical_position, row.query_len)?);
+        }
+        let slot_mapping = MxArray::from_int64(&slots, &[i64::from(total_queries)])
+            .map_err(|error| format!("update_keys_values_native_ragged slot_mapping: {error}"))?;
+        MxArray::eval_arrays(&[&slot_mapping]).map_err(|error| {
+            format!("update_keys_values_native_ragged slot_mapping eval: {error}")
+        })?;
+
+        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
+        let k_scale = self.k_scale_array(layer_idx)?;
+        let v_scale = self.v_scale_array(layer_idx)?;
+        let mut out_k_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+        let ok = unsafe {
+            mlx_sys::mlx_paged_kv_write_forward(
+                k_pool.as_raw_ptr(),
+                v_pool.as_raw_ptr(),
+                keys.as_raw_ptr(),
+                values.as_raw_ptr(),
+                slot_mapping.as_raw_ptr(),
+                k_scale.as_raw_ptr(),
+                v_scale.as_raw_ptr(),
+                self.block_size as i32,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+                self.layer_kv_pool.config().head_size as i32,
+                self.kv_dtype_raw()?,
+                &mut out_k_pool,
+                &mut out_v_pool,
+            )
+        };
+        if !ok || out_k_pool.is_null() || out_v_pool.is_null() {
+            unsafe {
+                if !out_k_pool.is_null() {
+                    mlx_sys::mlx_array_delete(out_k_pool);
+                }
+                if !out_v_pool.is_null() {
+                    mlx_sys::mlx_array_delete(out_v_pool);
+                }
+            }
+            return Err(format!(
+                "update_keys_values_native_ragged: mlx_paged_kv_write_forward returned null (layer={layer_idx}, queries={total_queries})"
+            ));
+        }
+        let k_out = MxArray::from_handle(out_k_pool, "paged_kv_write_forward ragged k_pool")
+            .map_err(|error| {
+                format!("update_keys_values_native_ragged: failed to wrap k_pool output: {error}")
+            })?;
+        let v_out = MxArray::from_handle(out_v_pool, "paged_kv_write_forward ragged v_pool")
+            .map_err(|error| {
+                format!("update_keys_values_native_ragged: failed to wrap v_pool output: {error}")
+            })?;
+        self.replace_native_pool_arrays(layer_idx, k_out, v_out)
+    }
+
     /// Non-macOS stub: the underlying Metal kernel is macOS-only. Calling
     /// this on another platform is a programming error rather than a
     /// runtime fallback.
@@ -3531,11 +4780,50 @@ impl PagedKVCacheAdapter {
         Err("update_keys_values_native is only supported on macOS (Metal backend)".to_string())
     }
 
+    #[cfg(not(target_os = "macos"))]
+    pub fn update_keys_values_native_batched(
+        &mut self,
+        _layer_idx: u32,
+        _keys: &MxArray,
+        _values: &MxArray,
+        _rows: &[(SeqId, u32)],
+    ) -> Result<(), String> {
+        Err(
+            "update_keys_values_native_batched is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn update_keys_values_native_ragged(
+        &mut self,
+        _layer_idx: u32,
+        _keys: &MxArray,
+        _values: &MxArray,
+        _rows: &[PagedRaggedRow],
+    ) -> Result<(), String> {
+        Err(
+            "update_keys_values_native_ragged is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn decode_attention_inputs_batched(
+        &mut self,
+        _seq_ids: &[SeqId],
+    ) -> Result<(MxArray, MxArray, u32), String> {
+        Err(
+            "decode_attention_inputs_batched is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
+    }
+
     /// Build and cache the small metadata arrays used by graph-native decode
     /// paged attention for the active request.
-    /// Always emits `num_seqs = 1`: the adapter is per request, so the
-    /// block table contains exactly the active sequence and `seq_lens[0]`
-    /// is the request's recorded token count.
+    /// Always emits `num_seqs = 1`: this helper operates on the selected
+    /// request, so the block table contains exactly that sequence and
+    /// `seq_lens[0]` is its recorded token count.
     #[cfg(target_os = "macos")]
     fn decode_attention_inputs(&mut self) -> Result<(MxArray, MxArray, u32), String> {
         let block_table = self.block_table.as_ref().ok_or_else(|| {
@@ -3647,6 +4935,118 @@ impl PagedKVCacheAdapter {
         ))
     }
 
+    /// Materialize decode metadata for multiple logical requests.
+    ///
+    /// Each row is sourced from that request's own `(physical_revision,
+    /// token_count)` cache. Rows are zero-padded to the longest block table;
+    /// `seq_lens` is authoritative, so kernels never read the padding.
+    #[cfg(target_os = "macos")]
+    pub fn decode_attention_inputs_batched(
+        &mut self,
+        seq_ids: &[SeqId],
+    ) -> Result<(MxArray, MxArray, u32), String> {
+        if seq_ids.is_empty() {
+            return Err(
+                "decode_attention_inputs_batched requires at least one sequence".to_string(),
+            );
+        }
+        let mut seen = HashSet::with_capacity(seq_ids.len());
+        let mut rows = Vec::with_capacity(seq_ids.len());
+        let mut seq_lens = Vec::with_capacity(seq_ids.len());
+        let mut max_blocks = 0usize;
+        let mut max_context_len = 0u32;
+
+        for &seq_id in seq_ids {
+            if !seen.insert(seq_id) {
+                return Err(format!(
+                    "decode_attention_inputs_batched received duplicate sequence {seq_id}"
+                ));
+            }
+            if self.active_seq != Some(seq_id) && !self.requests.contains_key(&seq_id) {
+                return Err(format!(
+                    "decode_attention_inputs_batched: unknown sequence {seq_id}"
+                ));
+            }
+            self.activate_request(seq_id)?;
+            // Populate/validate this entry's own metadata cache before
+            // building the batch-shaped arrays.
+            let _ = self.decode_attention_inputs()?;
+            let table = self
+                .block_table
+                .as_ref()
+                .expect("decode_attention_inputs validated the active table");
+            let ids = build_decode_block_ids(table);
+            max_blocks = max_blocks.max(ids.len());
+            let recorded = table.num_tokens();
+            max_context_len = max_context_len.max(recorded);
+            seq_lens.push(i32::try_from(recorded).map_err(|_| {
+                format!(
+                    "decode_attention_inputs_batched: sequence {seq_id} length {recorded} exceeds i32::MAX"
+                )
+            })?);
+            rows.push(ids);
+        }
+
+        let mut padded = vec![0i32; seq_ids.len() * max_blocks];
+        for (row_idx, ids) in rows.iter().enumerate() {
+            let offset = row_idx * max_blocks;
+            padded[offset..offset + ids.len()].copy_from_slice(ids);
+        }
+        let block_tables = MxArray::from_int32(&padded, &[seq_ids.len() as i64, max_blocks as i64])
+            .map_err(|e| format!("decode_attention_inputs_batched block_tables: {e}"))?;
+        let seq_lens = MxArray::from_int32(&seq_lens, &[seq_ids.len() as i64])
+            .map_err(|e| format!("decode_attention_inputs_batched seq_lens: {e}"))?;
+        MxArray::eval_arrays(&[&block_tables, &seq_lens])
+            .map_err(|e| format!("decode_attention_inputs_batched metadata eval: {e}"))?;
+        Ok((block_tables, seq_lens, max_context_len))
+    }
+
+    /// Materialize the real cumulative-query metadata for one packed ragged
+    /// step. Block tables and context lengths remain request-local rows;
+    /// `cu_seqlens_q` maps the packed query stream back to those rows.
+    #[cfg(target_os = "macos")]
+    fn ragged_attention_inputs(
+        &mut self,
+        rows: &[PagedRaggedRow],
+    ) -> Result<(MxArray, MxArray, MxArray, u32, u32), String> {
+        if rows.is_empty() {
+            return Err("ragged_attention_inputs requires at least one row".to_string());
+        }
+        let seq_ids = rows.iter().map(|row| row.seq_id).collect::<Vec<_>>();
+        let (block_tables, seq_lens, max_context_len) =
+            self.decode_attention_inputs_batched(&seq_ids)?;
+        let mut total_queries = 0u32;
+        let mut cumulative = Vec::with_capacity(rows.len() + 1);
+        cumulative.push(0i32);
+        for row in rows {
+            if row.query_len == 0 {
+                return Err(format!(
+                    "ragged_attention_inputs: sequence {} has an empty query slice",
+                    row.seq_id
+                ));
+            }
+            total_queries = total_queries
+                .checked_add(row.query_len)
+                .ok_or_else(|| "ragged_attention_inputs query count overflow".to_string())?;
+            cumulative.push(
+                i32::try_from(total_queries).map_err(|_| {
+                    "ragged_attention_inputs query count exceeds i32::MAX".to_string()
+                })?,
+            );
+        }
+        let cu_seqlens_q = MxArray::from_int32(&cumulative, &[cumulative.len() as i64])
+            .map_err(|error| format!("ragged_attention_inputs cu_seqlens_q: {error}"))?;
+        MxArray::eval_arrays(&[&cu_seqlens_q])
+            .map_err(|error| format!("ragged_attention_inputs metadata eval: {error}"))?;
+        Ok((
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            max_context_len,
+            total_queries,
+        ))
+    }
+
     /// Graph-native decode attention. Unlike [`Self::gather_kv_for_decode`],
     /// this consumes the MLX K/V pool arrays tracked in `native_pool_arrays`,
     /// so a lazy native `paged_kv_write` can feed the attention read through
@@ -3666,6 +5066,248 @@ impl PagedKVCacheAdapter {
             softcap,
             PagedDecodeRouteHint::Auto,
         )
+    }
+
+    /// Graph-native uniform decode attention for one query token per request.
+    ///
+    /// `queries` is `[N, num_query_heads, head_size]`; `seq_ids` defines the
+    /// exact row order used to build `[N,max_blocks]` block tables and `[N]`
+    /// context lengths. No serial fallback is hidden inside this method.
+    #[cfg(target_os = "macos")]
+    pub fn gather_kv_for_decode_graph_batched(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        seq_ids: &[SeqId],
+        scale: f32,
+        softcap: f32,
+    ) -> Result<MxArray, String> {
+        if seq_ids.is_empty() {
+            return Err(
+                "gather_kv_for_decode_graph_batched requires at least one sequence".to_string(),
+            );
+        }
+        if layer_idx as usize >= self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: layer_idx {layer_idx} out of range (num_layers = {})",
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+        let q_meta = KvTensorMeta::from_array(queries, "queries")?;
+        if q_meta.ndim != 3 || q_meta.shape.len() != 3 {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: queries must be 3-D [N, num_query_heads, head_size], got ndim {} shape {:?}",
+                q_meta.ndim, q_meta.shape
+            ));
+        }
+        if q_meta.shape[0] != seq_ids.len() as i64 {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: query rows {} do not match {} sequence ids",
+                q_meta.shape[0],
+                seq_ids.len()
+            ));
+        }
+        if q_meta.shape[1] <= 0 {
+            return Err(
+                "gather_kv_for_decode_graph_batched requires at least one query head".to_string(),
+            );
+        }
+        if q_meta.shape[2] != self.layer_kv_pool.config().head_size as i64 {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: query head size {} does not match pool head size {}",
+                q_meta.shape[2],
+                self.layer_kv_pool.config().head_size
+            ));
+        }
+        let query_dtype = match q_meta.dtype {
+            DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
+            DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
+            other => {
+                return Err(format!(
+                    "gather_kv_for_decode_graph_batched: unsupported query dtype {other:?} (expected Float16 or BFloat16)"
+                ));
+            }
+        };
+        let cache_dtype = self.layer_kv_pool.cache_dtype();
+        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: query_dtype ({query_dtype:?}) must equal cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+            ));
+        }
+
+        let (block_tables, seq_lens, max_context_len) =
+            self.decode_attention_inputs_batched(seq_ids)?;
+        let k_pool = self.key_pool_array(layer_idx)?;
+        let v_pool = self.value_pool_array(layer_idx)?;
+        let k_scale = self.k_scale_array(layer_idx)?;
+        let v_scale = self.v_scale_array(layer_idx)?;
+        let graph_softcap = if softcap == 1.0 { 0.0 } else { softcap };
+        let raw = unsafe {
+            mlx_sys::mlx_paged_attention_forward(
+                queries.as_raw_ptr(),
+                k_pool.as_raw_ptr(),
+                v_pool.as_raw_ptr(),
+                block_tables.as_raw_ptr(),
+                seq_lens.as_raw_ptr(),
+                k_scale.as_raw_ptr(),
+                v_scale.as_raw_ptr(),
+                scale,
+                graph_softcap,
+                self.sliding_window as i32,
+                self.block_size as i32,
+                q_meta.shape[1] as i32,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+                self.layer_kv_pool.config().head_size as i32,
+                self.kv_dtype_raw()?,
+            )
+        };
+        if raw.is_null() {
+            return Err(format!(
+                "gather_kv_for_decode_graph_batched: mlx_paged_attention_forward returned null (layer={layer_idx}, rows={}, max_context_len={max_context_len})",
+                seq_ids.len()
+            ));
+        }
+        MxArray::from_handle(raw, "gather_kv_for_decode_graph_batched").map_err(|error| {
+            format!("gather_kv_for_decode_graph_batched: failed to wrap output array: {error}")
+        })
+    }
+
+    /// Graph-native varlen attention for mixed prefill/decode slices.
+    ///
+    /// `queries` is `[sum(query_len), num_query_heads, head_size]` and follows
+    /// the exact row order in `rows`. The kernel derives each query's causal
+    /// logical position from the request's final `seq_len` and the real
+    /// `cu_seqlens_q` boundaries.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn gather_kv_for_ragged_graph(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        rows: &[PagedRaggedRow],
+        scale: f32,
+        softcap: f32,
+    ) -> Result<MxArray, String> {
+        if layer_idx as usize >= self.layer_kv_pool.num_layers() {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: layer_idx {layer_idx} out of range (num_layers = {})",
+                self.layer_kv_pool.num_layers()
+            ));
+        }
+        let q_meta = KvTensorMeta::from_array(queries, "ragged_queries")?;
+        if q_meta.ndim != 3 || q_meta.shape.len() != 3 {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: queries must be [total_queries, num_query_heads, head_size], got ndim {} shape {:?}",
+                q_meta.ndim, q_meta.shape
+            ));
+        }
+        if q_meta.shape[1] <= 0 {
+            return Err("gather_kv_for_ragged_graph requires at least one query head".to_string());
+        }
+        if q_meta.shape[2] != self.layer_kv_pool.config().head_size as i64 {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: query head size {} does not match pool head size {}",
+                q_meta.shape[2],
+                self.layer_kv_pool.config().head_size
+            ));
+        }
+        let query_dtype = match q_meta.dtype {
+            DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
+            DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
+            other => {
+                return Err(format!(
+                    "gather_kv_for_ragged_graph: unsupported query dtype {other:?} (expected Float16 or BFloat16)"
+                ));
+            }
+        };
+        let cache_dtype = self.layer_kv_pool.cache_dtype();
+        if !cache_dtype.is_fp8() && query_dtype != cache_dtype {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: query_dtype ({query_dtype:?}) must equal cache_dtype ({cache_dtype:?}) for non-FP8 caches"
+            ));
+        }
+        let (block_tables, seq_lens, cu_seqlens_q, max_context_len, total_queries) =
+            self.ragged_attention_inputs(rows)?;
+        if q_meta.shape[0] != i64::from(total_queries) {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: query rows {} do not match metadata total {total_queries}",
+                q_meta.shape[0]
+            ));
+        }
+        let num_query_heads = u32::try_from(q_meta.shape[1])
+            .map_err(|_| "gather_kv_for_ragged_graph query head count overflow".to_string())?;
+        if !paged_attention_v2_aux_fits(
+            PagedAttentionV2Layout::Varlen,
+            total_queries,
+            num_query_heads,
+            self.layer_kv_pool.config().num_kv_heads,
+            max_context_len,
+            self.layer_kv_pool.config().head_size,
+        ) {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: paged-attention V2 metadata or auxiliary buffer would exceed INT_MAX (total_queries={total_queries}, num_query_heads={num_query_heads}, max_context_len={max_context_len})"
+            ));
+        }
+
+        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
+        let k_scale = self.k_scale_array(layer_idx)?;
+        let v_scale = self.v_scale_array(layer_idx)?;
+        let graph_softcap = if softcap == 1.0 { 0.0 } else { softcap };
+        let raw = unsafe {
+            mlx_sys::mlx_paged_attention_varlen_forward(
+                queries.as_raw_ptr(),
+                k_pool.as_raw_ptr(),
+                v_pool.as_raw_ptr(),
+                block_tables.as_raw_ptr(),
+                seq_lens.as_raw_ptr(),
+                cu_seqlens_q.as_raw_ptr(),
+                k_scale.as_raw_ptr(),
+                v_scale.as_raw_ptr(),
+                scale,
+                graph_softcap,
+                self.sliding_window as i32,
+                self.block_size as i32,
+                num_query_heads as i32,
+                self.layer_kv_pool.config().num_kv_heads as i32,
+                self.layer_kv_pool.config().head_size as i32,
+                self.kv_dtype_raw()?,
+            )
+        };
+        if raw.is_null() {
+            return Err(format!(
+                "gather_kv_for_ragged_graph: mlx_paged_attention_varlen_forward returned null (layer={layer_idx}, sequences={}, total_queries={total_queries}, max_context_len={max_context_len})",
+                rows.len()
+            ));
+        }
+        MxArray::from_handle(raw, "gather_kv_for_ragged_graph").map_err(|error| {
+            format!("gather_kv_for_ragged_graph: failed to wrap output array: {error}")
+        })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn gather_kv_for_decode_graph_batched(
+        &mut self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _seq_ids: &[SeqId],
+        _scale: f32,
+        _softcap: f32,
+    ) -> Result<MxArray, String> {
+        Err(
+            "gather_kv_for_decode_graph_batched is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn gather_kv_for_ragged_graph(
+        &mut self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _rows: &[PagedRaggedRow],
+        _scale: f32,
+        _softcap: f32,
+    ) -> Result<MxArray, String> {
+        Err("gather_kv_for_ragged_graph is only supported on macOS (Metal backend)".to_string())
     }
 
     /// Route-hinted graph-native decode attention. The hint is captured in the
@@ -3731,7 +5373,7 @@ impl PagedKVCacheAdapter {
                 v_scale.as_raw_ptr(),
                 scale,
                 graph_softcap,
-                0,
+                self.sliding_window as i32,
                 self.block_size as i32,
                 num_query_heads as i32,
                 self.layer_kv_pool.config().num_kv_heads as i32,
@@ -3902,7 +5544,7 @@ impl PagedKVCacheAdapter {
                 num_query_heads,
                 scale,
                 softcap,
-                0,
+                self.sliding_window as i32,
                 k_scale,
                 v_scale,
                 raw_route_hint,
@@ -4476,7 +6118,7 @@ impl PagedKVCacheAdapter {
                 v_scale.as_raw_ptr(),
                 scale,
                 0.0, // softcap disabled in the MLX C++ paged_attention factory.
-                0,   // sliding-window disabled for Qwen3.5 full attention.
+                self.sliding_window as i32,
                 self.block_size as i32,
                 num_query_heads as i32,
                 self.layer_kv_pool.config().num_kv_heads as i32,
@@ -5021,6 +6663,16 @@ impl PagedKVCacheAdapter {
         extra_keys: &[u64],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        self.register_full_blocks_for_reuse_inner(extra_keys, cache_salt, true)
+    }
+
+    fn register_full_blocks_for_reuse_inner(
+        &mut self,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        capture_cold: bool,
+    ) -> Result<u32, String> {
+        self.bind_request_cache_salt(cache_salt, "register_full_blocks_for_reuse")?;
         // Never publish blocks computed on top of a prefix whose out-of-pool
         // half nobody established — that would hand the same unsound resume
         // point to every later request.
@@ -5102,7 +6754,7 @@ impl PagedKVCacheAdapter {
 
         // Persist the same chain to the SSD cold tier (see
         // [`ColdTierWalk::capture_chain`]).
-        if let Some(cold) = self.cold_tier.as_ref() {
+        if capture_cold && let Some(cold) = self.cold_tier.as_ref() {
             let outcome = ColdTierWalk {
                 cold,
                 pool: &self.layer_kv_pool,
@@ -5131,6 +6783,19 @@ impl PagedKVCacheAdapter {
         // (≤ num_full_blocks), which is bounded by allocator capacity —
         // far below u32::MAX in any realistic deployment.
         Ok(registered as u32)
+    }
+
+    /// Activate and publish one logical request, selecting whether its full
+    /// hot-prefix chain is also offered to the SSD writer.
+    pub(crate) fn register_full_blocks_for_reuse_for(
+        &mut self,
+        seq_id: SeqId,
+        extra_keys: &[u64],
+        cache_salt: u64,
+        capture_cold: bool,
+    ) -> Result<u32, String> {
+        self.activate_request(seq_id)?;
+        self.register_full_blocks_for_reuse_inner(extra_keys, cache_salt, capture_cold)
     }
 
     /// Per-block-extra_keys variant of
@@ -5166,30 +6831,8 @@ impl PagedKVCacheAdapter {
         extra_keys_per_block: &[Vec<u64>],
         cache_salt: u64,
     ) -> Result<u32, String> {
+        self.bind_request_cache_salt(cache_salt, "register_full_blocks_for_reuse_per_block")?;
         self.ensure_aux_prefix_primed("register_full_blocks_for_reuse_per_block")?;
-        // A family that captures an auxiliary sidecar derives that sidecar's
-        // chain with a salt of ZERO (see `capture_dense_gdn_cold_sidecar` /
-        // `capture_gemma4_sliding_cold_sidecar`), while the restore walk chains
-        // under whatever salt the LOOKUP carried. Both are zero today, so they
-        // agree. Should a salt ever be introduced (tenant isolation is the
-        // obvious reason) the K/V chain would move and the sidecar chain would
-        // not, so `deepest_backed_boundary` would find nothing — every hybrid
-        // restore silently and permanently pinned at zero, indistinguishable
-        // from a cold cache. Fail loudly at the seam instead: the fix is to
-        // thread the salt into sidecar capture, not to quietly lose the tier.
-        if cache_salt != 0
-            && self
-                .cold_tier
-                .as_ref()
-                .is_some_and(|cold| cold.sidecar_policy.is_some())
-        {
-            return Err(format!(
-                "register_full_blocks_for_reuse_per_block: cache_salt={cache_salt} with an \
-                 auxiliary sidecar policy installed, but sidecar capture derives its chain \
-                 with salt 0 — the two chains would disagree and every restore would miss. \
-                 Thread the salt through sidecar capture before using a non-zero salt."
-            ));
-        }
         if self.already_registered {
             return Ok(0);
         }
@@ -5305,11 +6948,17 @@ impl PagedKVCacheAdapter {
             // partially failed lifecycle transition. Never let graph arrays or
             // request-shaped metadata outlive the request table they describe.
             #[cfg(target_os = "macos")]
-            self.clear_native_graph_state();
+            self.clear_active_request_graph_state();
             return Ok(0);
         };
 
-        let blocks = table.blocks().to_vec();
+        let null_id = self.null_block.as_ref().map(|block| block.block_id);
+        let blocks = table
+            .blocks()
+            .iter()
+            .filter(|block| Some(block.block_id) != null_id)
+            .cloned()
+            .collect::<Vec<_>>();
         let count = blocks.len() as u32;
 
         // Acquire the allocator before taking `block_table`. If locking fails,
@@ -5321,7 +6970,7 @@ impl PagedKVCacheAdapter {
             Ok(guard) => guard,
             Err(error) => {
                 #[cfg(target_os = "macos")]
-                self.clear_native_graph_state();
+                self.clear_active_request_graph_state();
                 return Err(format!("BlockAllocator mutex poisoned: {error}"));
             }
         };
@@ -5333,6 +6982,7 @@ impl PagedKVCacheAdapter {
             .block_table
             .take()
             .expect("release_request table remained present while allocator was locked");
+        self.active_seq = None;
 
         self.cached_token_count = 0;
         self.request_tokens.clear();
@@ -5343,7 +6993,7 @@ impl PagedKVCacheAdapter {
         #[cfg(target_os = "macos")]
         {
             self.prefill_attention_inputs_cache = None;
-            self.clear_native_graph_state();
+            self.clear_active_request_graph_state();
         }
         // Defense-in-depth: clear the registration flag so a subsequent
         // reset_for_new_request → register flow on this adapter works
@@ -5351,6 +7001,32 @@ impl PagedKVCacheAdapter {
         self.already_registered = false;
         self.prefix_lookup_done = false;
         Ok(count)
+    }
+
+    /// Release exactly one logical request, leaving every other row live.
+    pub fn release_request_for(&mut self, seq_id: SeqId) -> Result<u32, String> {
+        if self.active_seq != Some(seq_id) && !self.requests.contains_key(&seq_id) {
+            return Ok(0);
+        }
+        self.activate_request(seq_id)?;
+        self.release_request()
+    }
+
+    /// Release every logical request owned by this adapter.
+    pub fn release_all_requests(&mut self) -> Result<u32, String> {
+        let mut released = 0u32;
+        if self.active_seq.is_some() {
+            released = released
+                .checked_add(self.release_request()?)
+                .ok_or_else(|| "release_all_requests block count overflow".to_string())?;
+        }
+        while let Some(&seq_id) = self.requests.keys().next() {
+            self.activate_request(seq_id)?;
+            released = released
+                .checked_add(self.release_request()?)
+                .ok_or_else(|| "release_all_requests block count overflow".to_string())?;
+        }
+        Ok(released)
     }
 
     /// Hard reset for an EXPLICIT session reset
@@ -5366,10 +7042,10 @@ impl PagedKVCacheAdapter {
     /// fully cold state (observed flip: "says," vs "said" at token ~6 on the
     /// lfm2.5-1.2b checkpoint).
     ///
-    /// Releases the live request (idempotent — a prior `release_request`
-    /// makes that half a no-op) AND purges every prefix-cache entry from
-    /// the allocator via [`BlockAllocator::purge_prefix_cache`]. Returns
-    /// the number of blocks the release freed.
+    /// Releases every live request owned by this adapter AND purges every
+    /// prefix-cache entry from the allocator via
+    /// [`BlockAllocator::purge_prefix_cache`]. Returns the total number of
+    /// request block references released.
     ///
     /// NOTE: the allocator may be shared by multiple adapters; purged
     /// entries vanish for every tenant (blocks still referenced by another
@@ -5380,7 +7056,7 @@ impl PagedKVCacheAdapter {
     /// — cross-request block reuse after a history miss is the paged
     /// design's entire point.
     pub fn release_request_and_purge_prefix_cache(&mut self) -> Result<u32, String> {
-        let released = self.release_request()?;
+        let released = self.release_all_requests()?;
         let mut guard = self
             .allocator
             .lock()
@@ -5391,6 +7067,8 @@ impl PagedKVCacheAdapter {
         // arm a one-shot suppressor: the next lookup must NOT restore the
         // just-cleared prefix from disk (see `suppress_cold_restore_once`).
         self.suppress_cold_restore_once = true;
+        #[cfg(target_os = "macos")]
+        self.clear_native_graph_state();
         Ok(released)
     }
 
@@ -5596,6 +7274,23 @@ impl PagedKVCacheAdapter {
         }
         let prior_token_count = self.request_tokens.len() as u32;
 
+        if self.sliding_window != 0 {
+            if total_budget > self.logical_max_tokens {
+                return Err(format!(
+                    "context_length_exceeded: requested {total_budget} tokens, sliding cache \
+                     logical capacity is {}",
+                    self.logical_max_tokens
+                ));
+            }
+            self.already_registered = false;
+            self.prefix_lookup_done = true;
+            self.aux_prefix_unbacked = false;
+            self.restored_sidecar = None;
+            #[cfg(target_os = "macos")]
+            self.clear_active_request_graph_state();
+            return Ok((prior_token_count, 0));
+        }
+
         // Allocate any new blocks needed to cover the budget. The adapter's
         // existing block_table already covers `request_tokens.len()` tokens
         // (with possibly a partial trailing block). `allocate_suffix_blocks`
@@ -5679,6 +7374,26 @@ impl PagedKVCacheAdapter {
         self.block_table.is_some() && self.already_registered
     }
 
+    /// Finalize a sliding group without publishing null-containing logical
+    /// blocks into the content-addressed full-prefix cache.
+    pub fn finalize_turn_keep_live_no_prefix(&mut self) -> Result<(), String> {
+        if self.sliding_window == 0 {
+            return Err("finalize_turn_keep_live_no_prefix requires a sliding adapter".to_string());
+        }
+        if self.block_table.is_none() {
+            return Err(
+                "finalize_turn_keep_live_no_prefix called before begin_request".to_string(),
+            );
+        }
+        #[cfg(target_os = "macos")]
+        self.eval_pending_pool_writes()?;
+        self.already_registered = true;
+        self.prefix_lookup_done = true;
+        #[cfg(target_os = "macos")]
+        self.clear_active_request_graph_state();
+        Ok(())
+    }
+
     // ------------------------ Getters ------------------------
 
     pub fn block_size(&self) -> u32 {
@@ -5687,14 +7402,55 @@ impl PagedKVCacheAdapter {
 
     /// Hard token capacity of this adapter's physical KV pool.
     pub fn max_capacity_tokens(&self) -> u32 {
-        self.layer_kv_pool
-            .num_blocks()
-            .saturating_mul(self.block_size)
+        self.logical_max_tokens
+    }
+
+    /// Positive when this adapter owns a bounded sliding-window group.
+    pub fn sliding_window(&self) -> u32 {
+        self.sliding_window
     }
 
     /// Number of physical blocks shared by the allocator and layer pool.
     pub fn block_capacity(&self) -> u32 {
         self.layer_kv_pool.num_blocks()
+    }
+
+    pub(crate) fn block_telemetry(&self) -> Result<PagedBlockTelemetry, String> {
+        let allocator = self
+            .allocator
+            .lock()
+            .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?;
+        Ok(PagedBlockTelemetry {
+            total_blocks: allocator.num_blocks(),
+            free_blocks: allocator.num_free_blocks(),
+            reclaimable_blocks: allocator.num_evictable_blocks(),
+            allocated_blocks: allocator.num_allocated_blocks(),
+        })
+    }
+
+    pub(crate) fn pool_allocated_bytes(&self) -> Result<u64, String> {
+        let config = self.layer_kv_pool.config();
+        mlx_paged_attn::profile::bytes_per_block(
+            self.layer_kv_pool.num_layers() as u32,
+            config.num_kv_heads,
+            config.head_size,
+            config.block_size,
+            self.layer_kv_pool.cache_dtype(),
+        )
+        .map(|bytes| bytes.saturating_mul(self.layer_kv_pool.num_blocks() as u64))
+        .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn bytes_per_block(&self) -> Result<u64, String> {
+        let config = self.layer_kv_pool.config();
+        mlx_paged_attn::profile::bytes_per_block(
+            self.layer_kv_pool.num_layers() as u32,
+            config.num_kv_heads,
+            config.head_size,
+            config.block_size,
+            self.layer_kv_pool.cache_dtype(),
+        )
+        .map_err(|error| error.to_string())
     }
 
     /// Number of physical full-attention K/V layers in the authoritative pool.
@@ -5955,6 +7711,12 @@ impl PagedKVCacheAdapter {
     /// means the cache requires dequantization and cannot feed plain MLX
     /// SDPA directly.
     pub(crate) fn prefill_sdpa_cache_dtype(&self) -> Option<DType> {
+        if self.sliding_window != 0 {
+            // A dense gather would materialize the null placeholders. Sliding
+            // groups must remain on the paged kernel, which applies the window
+            // before touching those entries.
+            return None;
+        }
         match self.layer_kv_pool.cache_dtype() {
             mlx_paged_attn::metal::MetalDtype::Float16 => Some(DType::Float16),
             mlx_paged_attn::metal::MetalDtype::BFloat16 => Some(DType::BFloat16),
@@ -5981,7 +7743,14 @@ impl PagedKVCacheAdapter {
     pub fn num_allocated_blocks(&self) -> usize {
         self.block_table
             .as_ref()
-            .map(|t| t.num_blocks())
+            .map(|table| {
+                let null_id = self.null_block.as_ref().map(|block| block.block_id);
+                table
+                    .blocks()
+                    .iter()
+                    .filter(|block| Some(block.block_id) != null_id)
+                    .count()
+            })
             .unwrap_or(0)
     }
 
@@ -6834,6 +8603,87 @@ mod tests {
         Some(maybe_make_adapter(allocator, block_size)?.expect("adapter ctor must succeed"))
     }
 
+    fn maybe_sliding_adapter(
+        num_blocks: u32,
+        block_size: u32,
+        sliding_window: u32,
+        logical_max_tokens: u32,
+    ) -> Option<PagedKVCacheAdapter> {
+        let allocator = new_allocator(num_blocks, block_size);
+        let pool = maybe_test_pool(num_blocks, block_size)?;
+        Some(
+            PagedKVCacheAdapter::new_sliding(
+                allocator,
+                pool,
+                block_size,
+                sliding_window,
+                logical_max_tokens,
+            )
+            .expect("sliding adapter ctor must succeed"),
+        )
+    }
+
+    #[test]
+    fn sliding_adapter_reclaims_expired_blocks_but_keeps_absolute_positions() {
+        let Some(mut adapter) = maybe_sliding_adapter(6, 4, 8, 64) else {
+            return;
+        };
+        adapter.reset_for_new_request(7).unwrap();
+        for chunk in 0..6u32 {
+            let tokens = (chunk * 4..chunk * 4 + 4).collect::<Vec<_>>();
+            adapter.record_tokens(&tokens).unwrap();
+            adapter.prune_sliding_window_for(7).unwrap();
+            assert!(
+                adapter.num_allocated_blocks() <= 3,
+                "two live window blocks plus at most one boundary block"
+            );
+        }
+        let table = adapter.block_table_for(7).expect("request table");
+        assert_eq!(table.num_tokens(), 24);
+        assert_eq!(table.num_blocks(), 6, "logical block indices stay absolute");
+        let null_id = adapter.null_block.as_ref().unwrap().block_id;
+        assert!(
+            table.blocks()[..4]
+                .iter()
+                .all(|block| block.block_id == null_id),
+            "every block wholly left of the live window is a null placeholder"
+        );
+        assert!(
+            table.blocks()[4..]
+                .iter()
+                .all(|block| block.block_id != null_id),
+            "the live window must remain physically backed"
+        );
+    }
+
+    #[test]
+    fn sliding_adapter_isolates_rows_and_continues_one_live_owner() {
+        let Some(mut adapter) = maybe_sliding_adapter(8, 4, 8, 64) else {
+            return;
+        };
+        for seq_id in [11, 12] {
+            adapter.reset_for_new_request(seq_id).unwrap();
+            adapter
+                .record_tokens_for(seq_id, &(0..12).collect::<Vec<_>>())
+                .unwrap();
+            adapter.prune_sliding_window_for(seq_id).unwrap();
+            adapter.activate_request(seq_id).unwrap();
+            adapter.finalize_turn_keep_live_no_prefix().unwrap();
+        }
+        adapter.release_request_for(11).unwrap();
+        assert!(adapter.block_table_for(11).is_none());
+        assert!(adapter.is_live_for_continue_for(12));
+        let prompt = (0..14).collect::<Vec<_>>();
+        adapter.activate_request(12).unwrap();
+        let (boundary, allocated) = adapter.continue_turn(&prompt, 14).unwrap();
+        assert_eq!(boundary, 12);
+        assert_eq!(allocated, 0, "sliding continuation allocates lazily");
+        adapter.record_tokens(&prompt[12..]).unwrap();
+        adapter.prune_sliding_window_for(12).unwrap();
+        assert_eq!(adapter.request_tokens(), prompt);
+        assert!(adapter.num_allocated_blocks() <= 3);
+    }
+
     #[test]
     fn cold_tier_defaults_none_and_holds_context_across_resets() {
         let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
@@ -7193,6 +9043,46 @@ mod tests {
             sidecar_policy: None,
         });
         Some((adapter, manager, root))
+    }
+
+    #[test]
+    fn recompute_preemption_publishes_hot_prefix_without_ssd_capture() {
+        let Some((mut adapter, manager, root)) = cold_capture_fixture("preempt-hot-only", 8, 4, 4)
+        else {
+            eprintln!(
+                "skipping recompute_preemption_publishes_hot_prefix_without_ssd_capture: Metal unavailable"
+            );
+            return;
+        };
+        let tokens = [1, 2, 3, 4, 5, 6, 7, 8];
+        adapter.reset_for_new_request(17).unwrap();
+        adapter.allocate_suffix_blocks(tokens.len() as u32).unwrap();
+        adapter.record_tokens(&tokens).unwrap();
+        assert_eq!(
+            adapter
+                .register_full_blocks_for_reuse_for(17, &[], 0, false)
+                .unwrap(),
+            2
+        );
+        let capture = adapter.cold_capture();
+        assert_eq!(capture.blocks, 0);
+        assert_eq!(capture.enqueued, 0);
+        assert_eq!(
+            manager.stats().enqueued,
+            0,
+            "recompute must not enqueue SSD writes"
+        );
+
+        adapter.release_request_for(17).unwrap();
+        adapter.reset_for_new_request(18).unwrap();
+        let hit = adapter.find_cached_prefix(&tokens, &[], 0, false).unwrap();
+        assert_eq!(hit.cached_token_count, tokens.len() as u32);
+        assert_eq!(
+            hit.blocks.len(),
+            2,
+            "released victim leaves a verified hot prefix"
+        );
+        let _ = std::fs::remove_dir_all(root);
     }
 
     /// Fill the writer queue and PROVE it is full, by offering ballast blocks
@@ -8249,15 +10139,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Sidecar capture hardcodes salt 0 while the restore walk chains under the
-    /// lookup's salt. They agree only because every caller passes 0, so a
-    /// non-zero salt would move the K/V chain, leave the sidecar chain behind,
-    /// and pin every hybrid restore at zero for good. That must be an error at
-    /// the seam, not a silently dead tier — while a family with no sidecar
-    /// policy keeps salting freely, since it has no second chain to desync.
+    /// Salt remains legal with a sidecar policy: hybrid families derive their
+    /// auxiliary key from the same turn salt as the K/V capture. The adapter
+    /// must not reject the K/V half after a successful model turn.
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_nonzero_salt_is_refused_while_a_sidecar_policy_is_installed() {
+    fn a_nonzero_salt_is_accepted_while_a_sidecar_policy_is_installed() {
         let tokens: Vec<u32> = (0..32u32).map(|i| 7_100 + i).collect();
         let root = std::env::temp_dir().join(format!(
             "mlx-adapter-salt-guard-{}-{}",
@@ -8305,19 +10192,11 @@ mod tests {
         adapter.reset_for_new_request(1).unwrap();
         adapter.allocate_suffix_blocks(32).unwrap();
         adapter.record_tokens(&tokens).unwrap();
-        let err = adapter
-            .register_full_blocks_for_reuse_per_block(&per_block, 42)
-            .expect_err("a non-zero salt desyncs the sidecar chain and must be refused");
-        assert!(
-            err.contains("cache_salt"),
-            "the error must name the offending knob, got: {err}"
-        );
-        // Salt 0 is the contract capture actually honours, so it still works.
         assert!(
             adapter
-                .register_full_blocks_for_reuse_per_block(&per_block, 0)
+                .register_full_blocks_for_reuse_per_block(&per_block, 42)
                 .is_ok(),
-            "the supported salt must remain usable after the refusal"
+            "hybrid K/V publication must accept the salt its sidecar capture also uses"
         );
         adapter.release_request().unwrap();
         drop(adapter);
@@ -9441,6 +11320,369 @@ mod tests {
             "shared SYS prefix must hit even when USER suffix differs"
         );
         assert_eq!(res.blocks.len(), 2);
+    }
+
+    /// De-risk the request-table port independently of its bookkeeping:
+    /// two simultaneously-live adapters may share the same allocator AND the
+    /// same physical K/V pool, and a prefix published by A is attached to B's
+    /// own block table without copying or renumbering its physical blocks.
+    ///
+    /// This is the Rust-side equivalent of vLLM's global `BlockPool` plus
+    /// request-keyed `req_to_blocks`: physical storage is model-global while
+    /// the logical block-table cursor remains request-owned.
+    #[test]
+    fn two_live_adapters_share_prefix_blocks_in_one_pool() {
+        let allocator = new_allocator(16, 4);
+        let Some(pool) = maybe_test_pool(16, 4) else {
+            eprintln!(
+                "skipping two_live_adapters_share_prefix_blocks_in_one_pool: Metal unavailable"
+            );
+            return;
+        };
+        let mut adapter_a = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 4)
+            .expect("adapter A must share the model pool");
+        let mut adapter_b = PagedKVCacheAdapter::new(allocator, Arc::clone(&pool), 4)
+            .expect("adapter B must share the model pool");
+        assert!(Arc::ptr_eq(
+            adapter_a.layer_kv_pool(),
+            adapter_b.layer_kv_pool()
+        ));
+
+        let tokens: Vec<u32> = (1..=8).collect();
+        adapter_a.reset_for_new_request(10).unwrap();
+        adapter_a
+            .allocate_suffix_blocks(tokens.len() as u32)
+            .unwrap();
+        adapter_a.record_tokens(&tokens).unwrap();
+        adapter_a.register_full_blocks_for_reuse(&[], 0).unwrap();
+        let a_ids = adapter_a.block_table().unwrap().block_ids();
+
+        // A remains live here: B must acquire its own references to exactly
+        // the same physical blocks, not rely on A releasing first.
+        adapter_b.reset_for_new_request(20).unwrap();
+        let hit = adapter_b
+            .find_cached_prefix(&tokens, &[], 0, false)
+            .expect("B must attach A's published prefix");
+        assert_eq!(hit.cached_token_count, tokens.len() as u32);
+        assert_eq!(adapter_b.block_table().unwrap().block_ids(), a_ids);
+        assert_eq!(
+            adapter_b.block_table().unwrap().physical_revision(),
+            a_ids.len() as u64,
+            "B's request-owned table must record each shared block attachment"
+        );
+    }
+
+    #[test]
+    fn request_table_alternates_rows_without_releasing_either() {
+        let allocator = new_allocator(16, 4);
+        let Some(pool) = maybe_test_pool(16, 4) else {
+            eprintln!(
+                "skipping request_table_alternates_rows_without_releasing_either: Metal unavailable"
+            );
+            return;
+        };
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 4).unwrap();
+
+        adapter.begin_request(101).unwrap();
+        adapter.allocate_suffix_blocks_for(101, 4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+
+        adapter.begin_request(202).unwrap();
+        adapter.allocate_suffix_blocks_for(202, 8).unwrap();
+        adapter
+            .record_tokens(&[20, 21, 22, 23, 24, 25, 26, 27])
+            .unwrap();
+        assert_eq!(adapter.request_count(), 2);
+
+        adapter.record_token_for(101, 5).unwrap();
+        adapter.record_token_for(202, 28).unwrap();
+        assert_eq!(adapter.current_token_count_for(101), Some(5));
+        assert_eq!(adapter.current_token_count_for(202), Some(9));
+        assert_eq!(adapter.block_table_for(101).unwrap().num_tokens(), 5);
+        assert_eq!(adapter.block_table_for(202).unwrap().num_tokens(), 9);
+        assert_ne!(
+            adapter.block_table_for(101).unwrap().block_ids(),
+            adapter.block_table_for(202).unwrap().block_ids(),
+            "independent rows must not alias a whole logical block table"
+        );
+
+        assert!(adapter.release_request_for(101).unwrap() > 0);
+        assert_eq!(adapter.request_count(), 1);
+        assert_eq!(adapter.current_token_count_for(202), Some(9));
+    }
+
+    #[test]
+    fn request_table_allocation_failure_rolls_back_only_that_row() {
+        let allocator = new_allocator(3, 4);
+        let Some(pool) = maybe_test_pool(3, 4) else {
+            eprintln!(
+                "skipping request_table_allocation_failure_rolls_back_only_that_row: Metal unavailable"
+            );
+            return;
+        };
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 4).unwrap();
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks_for(1, 4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        let a_ids = adapter.block_table().unwrap().block_ids();
+
+        adapter.begin_request(2).unwrap();
+        adapter.allocate_suffix_blocks_for(2, 4).unwrap();
+        adapter.record_tokens(&[20, 21, 22, 23]).unwrap();
+        let b_ids = adapter.block_table().unwrap().block_ids();
+
+        let error = adapter
+            .activate_request(1)
+            .and_then(|()| adapter.record_tokens(&[5, 6, 7, 8, 9, 10, 11, 12]))
+            .expect_err("A needs two more blocks but only one is free");
+        assert!(
+            error.contains("could not reserve 2 more block"),
+            "got: {error}"
+        );
+        assert_eq!(adapter.current_token_count_for(1), Some(4));
+        assert_eq!(adapter.block_table_for(1).unwrap().block_ids(), a_ids);
+        assert_eq!(adapter.current_token_count_for(2), Some(4));
+        assert_eq!(adapter.block_table_for(2).unwrap().block_ids(), b_ids);
+    }
+
+    #[test]
+    fn prepare_failure_and_divergence_release_only_the_selected_request() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(16, 4), 4) else {
+            eprintln!(
+                "skipping prepare_failure_and_divergence_release_only_the_selected_request: Metal unavailable"
+            );
+            return;
+        };
+        let a = [1, 2, 3, 4, 5];
+        adapter
+            .prepare_turn(1, &a, a.len() as u32, true, &[], 0, false)
+            .unwrap();
+        adapter.record_tokens(&a).unwrap();
+        adapter.finalize_turn_keep_live(&[], 0).unwrap();
+
+        let b = [20, 21, 22, 23];
+        adapter
+            .prepare_turn(2, &b, b.len() as u32, true, &[], 0, false)
+            .unwrap();
+        adapter.record_tokens(&b).unwrap();
+        adapter.finalize_turn_keep_live(&[], 0).unwrap();
+        let b_ids = adapter.block_table().unwrap().block_ids();
+
+        let diverged = [100, 101, 102, 103];
+        adapter
+            .prepare_turn(1, &diverged, diverged.len() as u32, true, &[], 0, false)
+            .unwrap();
+        assert_eq!(adapter.request_count(), 2);
+        assert_eq!(adapter.current_token_count_for(2), Some(b.len() as u32));
+        assert_eq!(adapter.block_table_for(2).unwrap().block_ids(), b_ids);
+        assert_eq!(adapter.current_token_count_for(1), Some(0));
+    }
+
+    #[test]
+    fn release_all_requests_returns_every_uncached_block() {
+        let allocator = new_allocator(8, 4);
+        let initial_free = allocator.lock().unwrap().num_free_blocks();
+        let Some(pool) = maybe_test_pool(8, 4) else {
+            eprintln!(
+                "skipping release_all_requests_returns_every_uncached_block: Metal unavailable"
+            );
+            return;
+        };
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), pool, 4).unwrap();
+        for seq_id in [1, 2] {
+            adapter.begin_request(seq_id).unwrap();
+            adapter.allocate_suffix_blocks_for(seq_id, 4).unwrap();
+            adapter.record_token_for(seq_id, seq_id).unwrap();
+        }
+        assert_eq!(adapter.release_all_requests().unwrap(), 2);
+        assert_eq!(adapter.request_count(), 0);
+        assert_eq!(allocator.lock().unwrap().num_free_blocks(), initial_free);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn batched_native_write_checks_each_request_cursor() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!(
+                "skipping batched_native_write_checks_each_request_cursor: Metal unavailable"
+            );
+            return;
+        };
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks_for(1, 4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        adapter.begin_request(2).unwrap();
+        adapter.allocate_suffix_blocks_for(2, 8).unwrap();
+        adapter
+            .record_tokens(&[10, 11, 12, 13, 14, 15, 16, 17])
+            .unwrap();
+
+        let keys = MxArray::zeros(&[2, 1, 32], Some(DType::Float16)).unwrap();
+        let values = MxArray::zeros(&[2, 1, 32], Some(DType::Float16)).unwrap();
+        let error = adapter
+            .update_keys_values_native_batched(0, &keys, &values, &[(1, 3), (2, 6)])
+            .expect_err("B's expected suffix starts at 7, not 6");
+        assert!(
+            error.contains("sequence 2 position 6") && error.contains("expected 7"),
+            "got: {error}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ragged_metadata_and_native_write_preserve_real_query_boundaries() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(8, 4), 4) else {
+            eprintln!(
+                "skipping ragged_metadata_and_native_write_preserve_real_query_boundaries: Metal unavailable"
+            );
+            return;
+        };
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks_for(1, 4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        adapter.begin_request(2).unwrap();
+        adapter.allocate_suffix_blocks_for(2, 8).unwrap();
+        adapter
+            .record_tokens(&[10, 11, 12, 13, 14, 15, 16, 17])
+            .unwrap();
+        let rows = [
+            PagedRaggedRow {
+                seq_id: 1,
+                first_logical_position: 2,
+                query_len: 2,
+            },
+            PagedRaggedRow {
+                seq_id: 2,
+                first_logical_position: 5,
+                query_len: 3,
+            },
+        ];
+        let (_, lens, cu_seqlens_q, max_context, total_queries) =
+            adapter.ragged_attention_inputs(&rows).unwrap();
+        assert_eq!(lens.to_int32().unwrap().as_ref(), &[4, 8]);
+        assert_eq!(cu_seqlens_q.to_int32().unwrap().as_ref(), &[0, 2, 5]);
+        assert_eq!(max_context, 8);
+        assert_eq!(total_queries, 5);
+
+        let keys = MxArray::zeros(&[5, 1, 32], Some(DType::Float16)).unwrap();
+        let values = MxArray::zeros(&[5, 1, 32], Some(DType::Float16)).unwrap();
+        let mut wrong = rows;
+        wrong[1].first_logical_position = 4;
+        let error = adapter
+            .update_keys_values_native_ragged(0, &keys, &values, &wrong)
+            .expect_err("B's three-token suffix begins at 5");
+        assert!(
+            error.contains("sequence 2 position 4") && error.contains("expected 5"),
+            "got: {error}"
+        );
+        adapter
+            .update_keys_values_native_ragged(0, &keys, &values, &rows)
+            .expect("real ragged slot mapping must write once");
+    }
+
+    #[test]
+    fn prefix_lookup_once_latch_is_scoped_per_request() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(16, 4), 4) else {
+            eprintln!("skipping prefix_lookup_once_latch_is_scoped_per_request: Metal unavailable");
+            return;
+        };
+        let prompt = [1, 2, 3, 4];
+
+        adapter.begin_request(11).unwrap();
+        adapter.find_cached_prefix(&prompt, &[], 0, false).unwrap();
+        adapter.begin_request(22).unwrap();
+        adapter.find_cached_prefix(&prompt, &[], 0, false).unwrap();
+
+        adapter.activate_request(11).unwrap();
+        assert!(
+            adapter
+                .find_cached_prefix(&prompt, &[], 0, false)
+                .unwrap_err()
+                .contains("already called"),
+            "A's at-most-once latch must survive a switch through B"
+        );
+        adapter.activate_request(22).unwrap();
+        assert!(
+            adapter
+                .find_cached_prefix(&prompt, &[], 0, false)
+                .unwrap_err()
+                .contains("already called"),
+            "B must own an independent at-most-once latch"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decode_metadata_cache_is_scoped_by_request_and_physical_revision() {
+        let Some(mut adapter) = maybe_adapter(new_allocator(16, 4), 4) else {
+            eprintln!(
+                "skipping decode_metadata_cache_is_scoped_by_request_and_physical_revision: Metal unavailable"
+            );
+            return;
+        };
+
+        adapter.begin_request(1).unwrap();
+        adapter.allocate_suffix_blocks_for(1, 4).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        adapter.decode_attention_inputs().unwrap();
+        let a_ids = adapter.block_table().unwrap().block_ids();
+        let a_revision = adapter.block_table().unwrap().physical_revision();
+        assert_eq!(
+            adapter
+                .decode_attention_inputs_cache
+                .as_ref()
+                .unwrap()
+                .token_count,
+            4
+        );
+
+        adapter.begin_request(2).unwrap();
+        adapter.allocate_suffix_blocks_for(2, 8).unwrap();
+        adapter
+            .record_tokens(&[10, 11, 12, 13, 14, 15, 16, 17])
+            .unwrap();
+        adapter.decode_attention_inputs().unwrap();
+        let b_ids = adapter.block_table().unwrap().block_ids();
+        assert_ne!(a_ids, b_ids);
+        adapter.record_token_for(2, 18).unwrap();
+        adapter.decode_attention_inputs().unwrap();
+        assert_eq!(
+            adapter
+                .decode_attention_inputs_cache
+                .as_ref()
+                .unwrap()
+                .token_count,
+            9
+        );
+        let b_ids_after_append = adapter.block_table().unwrap().block_ids();
+        let (tables, lens, max_context) = adapter.decode_attention_inputs_batched(&[1, 2]).unwrap();
+        assert_eq!(tables.shape().unwrap().as_ref(), &[2, 3]);
+        assert_eq!(lens.to_int32().unwrap().as_ref(), &[4, 9]);
+        assert_eq!(max_context, 9);
+        let table_values = tables.to_int32().unwrap();
+        assert_eq!(
+            table_values.as_ref(),
+            &[
+                a_ids[0] as i32,
+                0,
+                0,
+                b_ids_after_append[0] as i32,
+                b_ids_after_append[1] as i32,
+                b_ids_after_append[2] as i32,
+            ],
+            "A's shorter table must be padded, never replaced by B's physical ids"
+        );
+
+        // Query A after B appended across another physical block boundary.
+        // A must recover its own row and its own cached metadata, not reuse B's
+        // newer token cursor or materialized block table.
+        adapter.activate_request(1).unwrap();
+        let (_, _, a_block_count) = adapter.decode_attention_inputs().unwrap();
+        let a_cache = adapter.decode_attention_inputs_cache.as_ref().unwrap();
+        assert_eq!(a_cache.token_count, 4);
+        assert_eq!(a_cache.physical_revision, a_revision);
+        assert_eq!(a_cache.block_count, a_block_count);
+        assert_eq!(adapter.block_table().unwrap().block_ids(), a_ids);
     }
 
     /// Calling `register_full_blocks_for_reuse` twice on the same request
@@ -11985,6 +14227,92 @@ mod tests {
         }
     }
 
+    /// A grouped sliding sidecar is decoded as `[B, H, T, D]`, while the
+    /// Metal cache writer consumes contiguous `[T, H, D]`. Exercise more than
+    /// one head with non-uniform BF16 bits so dropping the final materializing
+    /// reshape (and passing a strided transpose view to the raw writer) swaps
+    /// token/head rows and fails byte-for-byte.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn restore_sliding_prefix_materializes_multi_head_layout() {
+        let block_size = 8;
+        let boundary = 16;
+        let num_kv_heads = 8;
+        let head_size = 64;
+        let num_layers = 2;
+        let num_blocks = 8;
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            num_kv_heads,
+            head_size,
+            num_layers,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(64),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new_for_test(
+            cfg,
+            num_blocks,
+            num_layers,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) if error.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping restore_sliding_prefix_materializes_multi_head_layout: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("create multi-head test pool: {error}"),
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let mut adapter = PagedKVCacheAdapter::new_sliding(allocator, pool, block_size, 32, 64)
+            .expect("create sliding adapter");
+        let elements = num_kv_heads as usize * boundary as usize * head_size as usize;
+        let shape = [1, num_kv_heads as i64, boundary as i64, head_size as i64];
+        let mut expected = Vec::with_capacity(num_layers as usize);
+        for layer in 0..num_layers {
+            let keys = (0..elements)
+                .map(|index| 0x3f00u16 + ((index + layer as usize * 17) % 0x7f) as u16)
+                .collect::<Vec<_>>();
+            let values = (0..elements)
+                .map(|index| 0x4000u16 + ((index * 3 + layer as usize * 29) % 0x7f) as u16)
+                .collect::<Vec<_>>();
+            expected.push((keys, values));
+        }
+        let layer_kv = expected
+            .iter()
+            .map(|(keys, values)| {
+                Ok((
+                    MxArray::from_bfloat16(keys, &shape)?,
+                    MxArray::from_bfloat16(values, &shape)?,
+                ))
+            })
+            .collect::<napi::Result<Vec<_>>>()
+            .expect("build sliding sidecar arrays");
+        let prompt_tokens = (0..boundary).collect::<Vec<_>>();
+
+        adapter
+            .restore_sliding_prefix_for(7, &prompt_tokens, boundary, &layer_kv)
+            .expect("restore multi-head sliding prefix");
+        for (layer, (expected_k, expected_v)) in expected.iter().enumerate() {
+            let (actual_k, actual_v) = adapter
+                .read_kv_range(layer as u32, 0, boundary)
+                .expect("read restored sliding layer");
+            assert_eq!(
+                actual_k.to_uint16_native().expect("read K bits"),
+                *expected_k,
+                "restored K differs at layer {layer}"
+            );
+            assert_eq!(
+                actual_v.to_uint16_native().expect("read V bits"),
+                *expected_v,
+                "restored V differs at layer {layer}"
+            );
+        }
+    }
+
     /// `finalize_turn_keep_live` registers full blocks but does NOT
     /// release — the block_table, recorded tokens, and partial trailing
     /// block stay live so the next turn can build directly on top.
@@ -12251,6 +14579,37 @@ mod tests {
         assert!(!plan.continued_live_prefix);
         assert_eq!(plan.cached_prefix_len, 0);
         assert_eq!(plan.suffix_len, diverged.len() as u32);
+
+        adapter.release_request().unwrap();
+    }
+
+    #[test]
+    fn test_prepare_turn_never_continues_live_state_across_cache_salts() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            eprintln!(
+                "skipping test_prepare_turn_never_continues_live_state_across_cache_salts: Metal unavailable"
+            );
+            return;
+        };
+
+        let tokens_t1: [u32; 5] = [10, 20, 30, 40, 50];
+        adapter.reset_for_new_request(0).unwrap();
+        adapter.find_cached_prefix(&[], &[], 11, false).unwrap();
+        adapter
+            .allocate_suffix_blocks(tokens_t1.len() as u32)
+            .unwrap();
+        adapter.record_tokens(&tokens_t1).unwrap();
+        adapter.finalize_turn_keep_live(&[], 11).unwrap();
+
+        let tokens_t2: [u32; 6] = [10, 20, 30, 40, 50, 60];
+        let plan = adapter
+            .prepare_turn(0, &tokens_t2, tokens_t2.len() as u32, true, &[], 22, false)
+            .unwrap();
+        assert_eq!(plan.reason, PagedTurnPlanReason::FreshReset);
+        assert!(!plan.continued_live_prefix);
+        assert_eq!(plan.cached_prefix_len, 0);
+        assert_eq!(plan.suffix_len, tokens_t2.len() as u32);
 
         adapter.release_request().unwrap();
     }

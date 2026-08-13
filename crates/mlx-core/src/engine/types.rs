@@ -17,6 +17,13 @@ use crate::tools::ToolCallResult;
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct ChatConfig {
+    /// Security domain for content-addressed paged-KV prefix reuse.
+    /// Requests with different values cannot reuse each other's cached
+    /// prefixes even when their token sequences are identical. This is
+    /// deliberately separate from `cache_owner_id`, which controls logical
+    /// session/recurrent-state ownership rather than physical KV sharing.
+    #[napi(ts_type = "string | undefined")]
+    pub cache_salt: Option<String>,
     /// Internal logical cache owner. The agent provider forwards Pi's stable
     /// session id so model-global GDN sidecars can retain parent and child
     /// branches independently. This does not namespace the physical paged KV
@@ -101,6 +108,20 @@ pub struct ChatConfig {
     /// loop (pure-Rust eager; qwen3.5 dense and MoE). Requires the model
     /// checkpoint to carry an MTP head (otherwise silently ignored). Default:
     /// `false`.
+    ///
+    /// The MTP acceptance gate (`MLX_MTP_ACCEPT_GATE`, default ON) also
+    /// applies to explicit requests at fixed depth 1: the model aggregates
+    /// first-draft acceptance counts across completed depth-1 turns (history
+    /// bounded to roughly the most recent ~512 attempts) and silently runs
+    /// plain autoregressive decoding for the next depth-1 turn when an
+    /// exact-binomial test at the 5% level shows the aggregate is
+    /// inconsistent with the ~0.6 break-even acceptance rate. After 3
+    /// consecutive gated turns the gate re-probes with speculation on, and
+    /// `resetCaches()` clears the per-model (not per-session) history. The
+    /// gate is depth-1-scoped and exempts adaptive-depth turns
+    /// (`mtpAdaptiveDepth` and explicit depth > 1 turns are never gated).
+    /// Set the env var to `0` / `false` / `off` to bypass the gate and
+    /// always run MTP when requested.
     #[napi(ts_type = "boolean | undefined")]
     pub enable_mtp: Option<bool>,
     /// MTP: number of draft tokens per speculative cycle.
@@ -242,5 +263,56 @@ impl ChatStreamHandle {
     #[napi]
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+/// In-flight non-streaming chat turn returned by the internal
+/// `begin_chat_session_*` operation entry points (H2).
+///
+/// The dispatching NAPI method resolves with this object IMMEDIATELY
+/// after the command is queued (mirroring how the streaming methods
+/// return their [`ChatStreamHandle`] before the turn runs); the turn's
+/// reply arrives later through [`Self::result`]. `cancel()` flips the
+/// same `Arc<AtomicBool>` the command carries, so it
+/// reaches the model thread's chunk-boundary / per-step polls exactly
+/// like a streaming cancel.
+///
+/// Reply contract: a cancelled turn REJECTS the `result()` promise with
+/// the exact string `"chat session cancelled"`
+/// ([`crate::engine::session::CHAT_SESSION_CANCELLED`]).
+#[napi]
+pub struct ChatSessionCall {
+    pub(crate) cancelled: Arc<AtomicBool>,
+    /// Oneshot receiver for the turn's reply. `Mutex<Option<..>>`
+    /// because NAPI methods take `&self` and the receiver is consumed by
+    /// the first `result()` call; a second call rejects.
+    pub(crate) result_rx:
+        std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<napi::Result<ChatResult>>>>,
+}
+
+#[napi]
+impl ChatSessionCall {
+    /// Cooperatively cancel this queued or running turn.
+    #[napi]
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+
+    /// Await the turn's reply. Resolves with the [`ChatResult`] on a
+    /// completed turn; rejects with `"chat session cancelled"` when the
+    /// turn was cancelled, or with the turn's native error otherwise.
+    /// Single-shot: a second call rejects.
+    #[napi]
+    pub async fn result(&self) -> napi::Result<ChatResult> {
+        let rx = self
+            .result_rx
+            .lock()
+            .map_err(|_| napi::Error::from_reason("ChatSessionCall.result mutex poisoned"))?
+            .take()
+            .ok_or_else(|| {
+                napi::Error::from_reason("ChatSessionCall.result was already consumed")
+            })?;
+        rx.await
+            .map_err(|_| napi::Error::from_reason("Model thread exited unexpectedly"))?
     }
 }

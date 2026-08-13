@@ -8,6 +8,7 @@ use serde_json::Value;
 use tracing::info;
 
 use crate::array::{DType, MxArray};
+use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
 use crate::engine::persistence::{
     dequant_fp8_weights, load_all_safetensors, prewarm_checkpoint_pages,
 };
@@ -1428,7 +1429,7 @@ impl Lfm2Inner {
     /// exactly the packed-tensor sum — no dense dequant copies to add. See
     /// `cache_limit.rs` module docs for why this deterministic measurement is
     /// preferred over a process-wide `get_active_memory()` delta.
-    pub fn load_from_dir(model_path: &str) -> Result<(Self, u64)> {
+    pub fn load_from_dir(model_path: &str) -> Result<(Self, u64, u64)> {
         let path = Path::new(model_path);
 
         // Parse config
@@ -1460,6 +1461,21 @@ impl Lfm2Inner {
             );
         }
 
+        // Resolve durable paged-cache intent before opening the weight mmap so
+        // the shard-identity guard brackets the complete load. LFM2 is a
+        // hybrid cache: the paged full-attention blocks are committed only
+        // together with the exact-boundary ShortConv sidecar installed by
+        // `Lfm2Inner::build_cold_tier_context`.
+        let family = if config.is_moe() { "lfm2_moe" } else { "lfm2" };
+        let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
+        let persist_cold =
+            resolve_persist_cold(family, persist_env.as_deref(), config.persist_paged_cache);
+        let shard_snapshot_before_mmap = if persist_cold {
+            snapshot_shard_identities(path)
+        } else {
+            None
+        };
+
         // Quantization settings (read straight from config.json's
         // `quantization` block). For dense bf16 checkpoints these are the
         // affine defaults with empty overrides and `apply_weights`'s dense
@@ -1469,6 +1485,11 @@ impl Lfm2Inner {
 
         // Load safetensors
         let mut params = load_all_safetensors(path, false)?;
+        let shard_snapshot_at_mmap = if persist_cold {
+            snapshot_shard_identities(path)
+        } else {
+            None
+        };
 
         // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval of any
         // mmap-backed weight (FP8 dequant in `dequant_fp8_weights`, the tensor
@@ -1496,21 +1517,12 @@ impl Lfm2Inner {
         // `config` to build the paged adapter), keyed on tensors rather than
         // config metadata so it can never diverge from the registration gate for
         // a checkpoint whose `quantization` block lacks top-level `bits`/`mode`.
-        // Quantized checkpoints default to FLAT decode: flat is ~1.84× faster
-        // than the eager-PAGED loop on the measured mxfp8 LFM2.5-8B-A1B (eager
-        // PAGED pays ~12 `synchronize_mlx()`/token, a blocking `y.eval()`, and no
-        // async double-buffering). Compiled-PAGED for quantized IS now supported
-        // (see the registration gate below — it lifts the paged route well above
-        // eager-PAGED), but FLAT stays the default; pin `use_block_paged_cache:
-        // true` in config.json to opt into compiled-PAGED. bf16 (no `.scales`)
-        // stays `None` so `Lfm2Inner::new`'s `unwrap_or(true)` keeps PAGED
-        // (compiled-PAGED ~1.5×). Explicit `use_block_paged_cache` in config.json
-        // always wins.
+        // Block-paged attention is the default for every compatible LFM2
+        // checkpoint. Explicit false remains available for diagnostics.
         let is_quantized = params.keys().any(|k| k.ends_with(".scales"));
         // sym8 scope: lfm2 consumes sym8 checkpoints FLAT only (compiled-FLAT
         // when registration succeeds, eager-FLAT when it aborts). The
-        // quantized default below already resolves to flat; an explicit
-        // `use_block_paged_cache: true` pin must ALSO be forced flat —
+        // an explicit or defaulted `use_block_paged_cache: true` must be forced flat —
         // eager-PAGED would be numerically fine (LinearProj dispatches sym8)
         // but slow, and compiled-PAGED is structurally barred anyway (the f32
         // [N] sym8 `.scales` fail the paged arm's `non_quant_floats_bf16`
@@ -1528,13 +1540,6 @@ impl Lfm2Inner {
                 config.use_block_paged_cache,
                 is_quantized,
             );
-            if config.use_block_paged_cache.is_none() && resolved == Some(false) {
-                info!(
-                    "LFM2: quantized checkpoint (.scales tensors) detected -> defaulting \
-                     use_block_paged_cache=false (flat decode); pin use_block_paged_cache:true \
-                     in config.json to force paged"
-                );
-            }
             config.use_block_paged_cache = resolved;
         }
 
@@ -1554,9 +1559,29 @@ impl Lfm2Inner {
 
         // Materialize weights in chunked evals to avoid Metal command buffer
         // timeouts. Without this, weights remain as lazy mmap references.
-        {
+        let weights_resident = {
             let weight_refs: Vec<&MxArray> = params.values().collect();
-            crate::array::memory::materialize_weights(&weight_refs)?;
+            crate::array::memory::materialize_weights(&weight_refs)?
+        };
+        inner.size_paged_pool_after_weight_load()?;
+
+        if persist_cold
+            && let Some(context) = inner.build_cold_tier_context(model_path, &weights_resident)
+        {
+            let after_fingerprint = snapshot_shard_identities(path);
+            if shard_identities_stable(
+                &shard_snapshot_before_mmap,
+                &shard_snapshot_at_mmap,
+                &after_fingerprint,
+            ) {
+                inner.attach_cold_tier(context, &weights_resident);
+            } else {
+                tracing::warn!(
+                    "cold-tier persistence disabled for {model_path}: model directory changed \
+                     during load (shard identity mismatch); KV and ShortConv persistence stay \
+                     off for safety"
+                );
+            }
         }
 
         // NOTE: the cache-limit coordinator registration happens in
@@ -1582,8 +1607,9 @@ impl Lfm2Inner {
         // footprint is EXACTLY the packed-tensor sum with NO dense dequant deltas
         // to add. See `compute_weight_bytes`'s doc comment for the rationale.
         let weight_bytes: u64 = compute_weight_bytes(&params, &inner.config);
+        let pool_bytes = inner.paged_pool_allocated_bytes()?;
 
-        Ok((inner, weight_bytes))
+        Ok((inner, weight_bytes, pool_bytes))
     }
 }
 
@@ -1595,7 +1621,7 @@ impl Lfm2Model {
     pub async fn load_from_dir(model_path: &str) -> Result<Self> {
         let model_path = model_path.to_string();
 
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
             move || {
                 // `Lfm2Inner::load_from_dir` returns a deterministic
                 // weight-byte total alongside the inner; register it
@@ -1603,16 +1629,26 @@ impl Lfm2Model {
                 // active-memory sampling — the deterministic path is
                 // race-free against concurrent inference. See
                 // `cache_limit.rs` module docs.
-                let (inner, weight_bytes) = Lfm2Inner::load_from_dir(&model_path)?;
+                let (inner, weight_bytes, pool_bytes) = Lfm2Inner::load_from_dir(&model_path)?;
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+                let pool_cache_limit_guard = (pool_bytes != 0)
+                    .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
                 let config = inner.config.clone();
                 let paged_active = inner.paged_adapter.is_some();
-                Ok((inner, (config, cache_limit_guard, paged_active)))
+                Ok((
+                    super::model::Lfm2SchedulerState::new(inner)?,
+                    (
+                        config,
+                        cache_limit_guard,
+                        pool_cache_limit_guard,
+                        paged_active,
+                    ),
+                ))
             },
-            crate::engine::cmd::handle_chat_cmd::<Lfm2Inner>,
+            |state, receiver| state.drive(receiver),
         );
 
-        let (config, cache_limit_guard, paged_active) = init_rx
+        let (config, cache_limit_guard, pool_cache_limit_guard, paged_active) = init_rx
             .await
             .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
@@ -1621,6 +1657,7 @@ impl Lfm2Model {
             config,
             paged_active,
             _cache_limit_guard: cache_limit_guard,
+            _pool_cache_limit_guard: pool_cache_limit_guard,
         })
     }
 }
@@ -1658,6 +1695,7 @@ mod tests {
             paged_cache_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: Some(false),
+            persist_paged_cache: None,
             intermediate_size: Some(4),
             moe_intermediate_size: Some(4),
             num_experts: Some(4),

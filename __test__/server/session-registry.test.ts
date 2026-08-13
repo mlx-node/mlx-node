@@ -51,8 +51,13 @@ function makeMockModel(): SessionCapableModel {
     chatStreamSessionContinueTool: async function* () {
       yield finalEvent;
     },
-    resetCaches: () => {},
+    resetCaches: () => Promise.resolve(),
+    releaseCacheOwner: vi.fn().mockResolvedValue(undefined),
   } as unknown as SessionCapableModel;
+}
+
+function releaseOwnerSpy(model: SessionCapableModel): ReturnType<typeof vi.fn> {
+  return Reflect.get(model, 'releaseCacheOwner') as ReturnType<typeof vi.fn>;
 }
 
 describe('SessionRegistry', () => {
@@ -199,6 +204,52 @@ describe('SessionRegistry', () => {
     expect(reg.size).toBe(0);
   });
 
+  it.each([
+    ['a changed salt', 'tenant-b/high-entropy-secret'],
+    ['an omitted salt', null],
+  ])('treats %s as a tier-1 warm-session mismatch', async (_label, requestedCacheSalt) => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const warm = new ChatSession(model);
+    await warm.send('seed owner');
+
+    reg.adopt('resp_1', warm, null, null, 'tenant-a/high-entropy-secret');
+    const got = reg.getOrCreate('resp_1', null, null, requestedCacheSalt);
+
+    expect(got.session).not.toBe(warm);
+    expect(got.hit).toBe(false);
+    expect(reg.size).toBe(0);
+    await reg.flushPendingDisposals();
+    expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(1);
+  });
+
+  it('leases a tier-1 warm session when cache salts are equal', () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const warm = new ChatSession(model);
+
+    reg.adopt('resp_1', warm, null, null, 'tenant-a/high-entropy-secret');
+    const got = reg.getOrCreate('resp_1', null, null, 'tenant-a/high-entropy-secret');
+
+    expect(got.session).toBe(warm);
+    expect(got.hit).toBe(true);
+  });
+
+  it('treats cache salt as part of non-paged Messages warm-any compatibility', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const warm = new ChatSession(model);
+    await warm.send('seed owner');
+
+    reg.adopt('__msg_warm__', warm, 'system', null, 'tenant-a/high-entropy-secret');
+    const got = reg.getOrCreateWarmAny('system', 'tenant-b/high-entropy-secret');
+
+    expect(got.session).not.toBe(warm);
+    expect(got.hit).toBe(false);
+    await reg.flushPendingDisposals();
+    expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(1);
+  });
+
   it('evicts entries whose TTL has expired on lookup', () => {
     const model = makeMockModel();
     const reg = new SessionRegistry({ model, ttlSec: 60 });
@@ -281,6 +332,84 @@ describe('SessionRegistry', () => {
     expect(fresh.session).not.toBe(sA);
     expect(fresh.hit).toBe(false);
     expect(reg.size).toBe(0);
+  });
+
+  it('disposes an evicted session but never disposes the session leased on a hit', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const evicted = new ChatSession(model);
+    await evicted.send('evicted');
+    reg.adopt('evicted', evicted, null);
+
+    reg.getOrCreate(null, null);
+    await reg.flushPendingDisposals();
+    expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(1);
+
+    const leased = new ChatSession(model);
+    await leased.send('leased');
+    reg.adopt('leased', leased, null);
+    const hit = reg.getOrCreate('leased', null);
+    await reg.flushPendingDisposals();
+    expect(hit.session).toBe(leased);
+    expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(1);
+    await expect(leased.send('still usable')).resolves.toBeDefined();
+  });
+
+  it('disposes sessions removed by adopt replacement, drop, sweep, and clear', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, ttlSec: 60 });
+    const makeOwnedSession = async (ownerId: string): Promise<ChatSession<SessionCapableModel>> => {
+      const session = new ChatSession(model);
+      await session.send(ownerId, { config: { cacheOwnerId: ownerId } });
+      return session;
+    };
+
+    const replaced = await makeOwnedSession('replaced');
+    const replacement = await makeOwnedSession('replacement');
+    reg.adopt('old', replaced, null);
+    reg.adopt('new', replacement, null);
+    await reg.flushPendingDisposals();
+
+    reg.drop('new');
+    await reg.flushPendingDisposals();
+
+    const expired = await makeOwnedSession('expired');
+    reg.adopt('expired', expired, null);
+    vi.advanceTimersByTime(61_000);
+    reg.sweep();
+    await reg.flushPendingDisposals();
+
+    const cleared = await makeOwnedSession('cleared');
+    reg.adopt('cleared', cleared, null);
+    reg.clear();
+    await reg.flushPendingDisposals();
+
+    expect(releaseOwnerSpy(model).mock.calls.map(([ownerId]) => ownerId)).toEqual([
+      'replaced',
+      'replacement',
+      'expired',
+      'cleared',
+    ]);
+  });
+
+  it('retries a disposal failure discovered while the flush is awaiting it', async () => {
+    const model = makeMockModel();
+    const releaseCacheOwner = releaseOwnerSpy(model);
+    releaseCacheOwner.mockRejectedValueOnce(new Error('transient release failure')).mockResolvedValue(undefined);
+    const reg = new SessionRegistry({ model });
+    const session = new ChatSession(model);
+    await session.send('owned', { config: { cacheOwnerId: 'owner-a' } });
+    reg.adopt('owned', session, null);
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+
+    try {
+      reg.clear();
+      await reg.flushPendingDisposals();
+    } finally {
+      consoleError.mockRestore();
+    }
+
+    expect(releaseCacheOwner.mock.calls.map(([ownerId]) => ownerId)).toEqual(['owner-a', 'owner-a']);
   });
 
   it('adopt overwrites an existing key and refreshes expiry', () => {
@@ -570,9 +699,7 @@ describe('SessionRegistry', () => {
       await dispatchB;
     });
 
-    it('attaches queuedCount and limit to the thrown QueueFullError', async () => {
-      // The error needs to carry both numbers so endpoint handlers
-      // can surface them to the client in the 429 body.
+    it('reports queue depth separately from the combined admission footprint', async () => {
       const model = makeMockModel();
       const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
 
@@ -597,9 +724,11 @@ describe('SessionRegistry', () => {
       }
       expect(caught).toBeInstanceOf(QueueFullError);
       const queueErr = caught as QueueFullError;
-      expect(queueErr.queuedCount).toBe(1);
+      expect(queueErr.queueDepth).toBe(1);
+      expect(queueErr.preDispatchAdmissions).toBe(0);
+      expect(queueErr.admissionFootprint).toBe(1);
       expect(queueErr.limit).toBe(1);
-      expect(queueErr.message).toContain('1 waiting (limit 1)');
+      expect(queueErr.message).toContain('1 queued, 0 pre-dispatch');
 
       releaseA();
       await dispatchA;
@@ -708,7 +837,8 @@ describe('SessionRegistry', () => {
         caught = err;
       }
       expect(caught).toBeInstanceOf(QueueFullError);
-      expect((caught as QueueFullError).queuedCount).toBe(1);
+      expect((caught as QueueFullError).queueDepth).toBe(1);
+      expect((caught as QueueFullError).admissionFootprint).toBe(1);
       expect((caught as QueueFullError).limit).toBe(1);
 
       // A and B still drain cleanly; the rejected 3rd never entered the
@@ -862,5 +992,444 @@ describe('SessionRegistry', () => {
       await Promise.all(extras);
       expect(reg.queueDepth).toBe(0);
     });
+  });
+});
+
+/**
+ * Pre-dispatch admission — the endpoint-side early gate that keeps
+ * host-mode traffic from parking unbounded in the `ModelWorkCoordinator`
+ * writer queue where `queuedCount` cannot see it. The gate shares this
+ * registry's cap: pre-dispatch admits and `withExclusive` waiters draw
+ * from the same budget, plus one runner slot while the exec chain is
+ * idle (mirroring `withExclusive`'s runner-slot admission).
+ */
+describe('SessionRegistry.beginPreDispatchAdmission', () => {
+  it('idle chain: cap 1 admits runner + one waiter, rejects the next', () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+    // Chain idle: one of the admitted callers will take the runner
+    // slot, so cap+1 pre-dispatch admissions are legal.
+    const permitA = reg.beginPreDispatchAdmission();
+    const permitB = reg.beginPreDispatchAdmission();
+    let caught: unknown;
+    try {
+      reg.beginPreDispatchAdmission();
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(QueueFullError);
+    expect(caught).toMatchObject({
+      queueDepth: 0,
+      preDispatchAdmissions: 2,
+      admissionFootprint: 2,
+      limit: 1,
+    });
+    permitA.release();
+    permitB.release();
+  });
+
+  it('busy chain: cap 1 admits exactly one pre-dispatch waiter', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+
+    // Runner slot is taken -> only the single waiter slot remains.
+    const permitB = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    // Releasing the pre-dispatch permit frees the slot again.
+    permitB.release();
+    const permitC = reg.beginPreDispatchAdmission();
+    permitC.release();
+
+    releaseHolder();
+    await holder;
+  });
+
+  it('shares the budget with withExclusive waiters', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 2 });
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+    const queued = reg.withExclusive(async () => {});
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+
+    // 1 queued waiter + 1 pre-dispatch permit == cap 2 -> next rejects.
+    const permit = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    permit.release();
+
+    releaseHolder();
+    await holder;
+    await queued;
+  });
+
+  it('release is idempotent — double release frees one slot only', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+
+    const permitB = reg.beginPreDispatchAdmission();
+    permitB.release();
+    permitB.release();
+    // Were the double release under-counting, TWO admits would now fit
+    // under cap 1 with the runner slot taken.
+    const permitC = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    permitC.release();
+
+    releaseHolder();
+    await holder;
+  });
+
+  it('unbounded registry never rejects pre-dispatch admissions', () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model });
+    const permits = [];
+    for (let i = 0; i < 64; i += 1) {
+      permits.push(reg.beginPreDispatchAdmission());
+    }
+    for (const permit of permits) permit.release();
+    expect(reg.preDispatchAdmitCount).toBe(0);
+  });
+});
+
+describe('SessionRegistry.withAdmission', () => {
+  it('runs up to the configured model capacity and queues the next caller', async () => {
+    const reg = new SessionRegistry({
+      model: makeMockModel(),
+      maxConcurrentDispatches: 2,
+      maxQueueDepth: 1,
+    });
+    const active = new Set<string>();
+    const started: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const run = (name: string) =>
+      reg.withAdmission(async () => {
+        active.add(name);
+        started.push(name);
+        await held;
+        active.delete(name);
+      });
+
+    const a = run('A');
+    const b = run('B');
+    const c = run('C');
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(new Set(started)).toEqual(new Set(['A', 'B']));
+    expect(active.size).toBe(2);
+    expect(reg.queueDepth).toBe(1);
+    expect(() => run('D')).toThrow(QueueFullError);
+    expect(reg.queueDepth).toBe(1);
+
+    release();
+    await Promise.all([a, b, c]);
+    expect(started).toEqual(['A', 'B', 'C']);
+    expect(active.size).toBe(0);
+    expect(reg.queueDepth).toBe(0);
+  });
+
+  it('atomically hands pre-dispatch permits into active and queued slots', async () => {
+    const reg = new SessionRegistry({
+      model: makeMockModel(),
+      maxConcurrentDispatches: 2,
+      maxQueueDepth: 1,
+    });
+    const permitA = reg.beginPreDispatchAdmission();
+    const permitB = reg.beginPreDispatchAdmission();
+    const permitC = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const a = reg.withAdmission(async () => held, permitA);
+    const b = reg.withAdmission(async () => held, permitB);
+    const c = reg.withAdmission(async () => {}, permitC);
+    await Promise.resolve();
+
+    expect(reg.preDispatchAdmitCount).toBe(0);
+    expect(reg.queueDepth).toBe(1);
+    expect(() => reg.withAdmission(async () => {})).toThrow(QueueFullError);
+
+    release();
+    await Promise.all([a, b, c]);
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+  });
+
+  it('releases a slot when a concurrent closure rejects', async () => {
+    const reg = new SessionRegistry({
+      model: makeMockModel(),
+      maxConcurrentDispatches: 2,
+    });
+    const events: string[] = [];
+    const failing = reg.withAdmission(async () => {
+      events.push('fail');
+      throw new Error('boom');
+    });
+    const peer = reg.withAdmission(async () => {
+      events.push('peer');
+    });
+    const successor = reg.withAdmission(async () => {
+      events.push('successor');
+    });
+
+    await expect(failing).rejects.toThrow('boom');
+    await Promise.all([peer, successor]);
+    expect(events).toEqual(['fail', 'peer', 'successor']);
+    expect(reg.queueDepth).toBe(0);
+  });
+});
+
+/**
+ * Permit handoff: `withExclusive(fn, permit)` must consume an
+ * outstanding permit ATOMICALLY as this call's admission instead of
+ * charging `queuedCount` a second time — one budget, one token per
+ * request. Without the handoff, a permit-holding request that reaches
+ * `withExclusive` would double-spend (its permit still outstanding
+ * while it also occupies a waiter slot), and a request whose permit was
+ * released early would be counted by neither side while parked in
+ * pre-lock async work.
+ */
+describe('SessionRegistry pre-dispatch permit handoff', () => {
+  it('withExclusive consumes a handed-off permit as the waiter charge (no double-spend)', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+
+    // The permit occupies the single waiter slot...
+    const permit = reg.beginPreDispatchAdmission();
+    expect(reg.preDispatchAdmitCount).toBe(1);
+
+    // ...and placement converts it: the SAME budget unit moves from
+    // `preDispatchAdmits` to `queuedCount`, with no second cap check
+    // (a re-check would double-charge an already-admitted request).
+    const queued = reg.withExclusive(async () => {}, permit);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+
+    // Budget is still exactly full: both gates reject the next caller.
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    expect(() => reg.withExclusive(async () => {})).toThrow(QueueFullError);
+
+    // Post-handoff release must be a no-op — the token was consumed.
+    permit.release();
+    expect(reg.queueDepth).toBe(1);
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+
+    releaseHolder();
+    await holder;
+    await queued;
+  });
+
+  it('runner-slot handoff retires the permit without charging the queue', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+    // Idle chain: the permit holder becomes the runner; its budget unit
+    // is retired, leaving the full waiter budget available.
+    const permit = reg.beginPreDispatchAdmission();
+    let releaseRunner!: () => void;
+    const runnerDone = new Promise<void>((r) => {
+      releaseRunner = r;
+    });
+    const runner = reg.withExclusive(async () => {
+      await runnerDone;
+    }, permit);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+
+    // Exactly one waiter slot remains under cap 1.
+    const next = reg.beginPreDispatchAdmission();
+    expect(() => reg.beginPreDispatchAdmission()).toThrow(QueueFullError);
+    next.release();
+
+    releaseRunner();
+    await runner;
+  });
+
+  it('permitless callers cannot double-spend outstanding permits (mixed admission)', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+    // Active holder occupies the runner slot (outside the budget).
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+
+    // The single waiter slot is held as an OUTSTANDING permit — a
+    // continuation parked in pre-lock store work, for example.
+    const permit = reg.beginPreDispatchAdmission();
+    expect(reg.preDispatchAdmitCount).toBe(1);
+
+    // A permitless waiter (the cold-load path calls withExclusive with
+    // no permit; a foreign registry's permit degrades to the same) must
+    // see the COMBINED footprint and reject — admitting it would put
+    // queueDepth + outstanding permits at 2 under cap 1.
+    expect(() => reg.withExclusive(async () => {})).toThrow(QueueFullError);
+    expect(reg.queueDepth + reg.preDispatchAdmitCount).toBeLessThanOrEqual(1);
+
+    // The permit handoff still lands: its unit converts, total constant.
+    const queued = reg.withExclusive(async () => {}, permit);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+    expect(reg.queueDepth + reg.preDispatchAdmitCount).toBeLessThanOrEqual(1);
+
+    releaseHolder();
+    await holder;
+    await queued;
+  });
+
+  it('a released (stale) permit falls back to normal waiter charging', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+    let releaseHolder!: () => void;
+    const holderDone = new Promise<void>((r) => {
+      releaseHolder = r;
+    });
+    const holder = reg.withExclusive(async () => {
+      await holderDone;
+    });
+    await Promise.resolve();
+
+    const permit = reg.beginPreDispatchAdmission();
+    permit.release();
+    expect(reg.preDispatchAdmitCount).toBe(0);
+
+    // The stale permit must NOT skip the cap check or double-free: the
+    // call charges `queuedCount` exactly like a permitless caller.
+    const queued = reg.withExclusive(async () => {}, permit);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+    expect(() => reg.withExclusive(async () => {})).toThrow(QueueFullError);
+
+    releaseHolder();
+    await holder;
+    await queued;
+  });
+
+  it('idle chain: a permitless runner cannot double-spend the reserved runner entitlement', async () => {
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+    // Idle chain: the gate legitimately lends the full runner-plus-
+    // waiter capacity (cap + 1 = 2) as outstanding permits — exactly
+    // ONE of them is entitled to become the runner.
+    const permitA = reg.beginPreDispatchAdmission();
+    const permitB = reg.beginPreDispatchAdmission();
+    expect(reg.preDispatchAdmitCount).toBe(2);
+    expect(reg.queueDepth).toBe(0);
+
+    // A permitless call at the still-idle chain would seat itself on
+    // the runner entitlement a permit already owns: the footprint (2)
+    // fills the whole runner-plus-waiter capacity, so admission must
+    // reject — NOT bypass the check because `asWaiter === false`.
+    expect(() => reg.withExclusive(async () => {})).toThrow(QueueFullError);
+    // The reject path mutated nothing.
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(2);
+
+    // Both permits still hand off cleanly. First one becomes the
+    // runner: its unit retires and the chain is now occupied.
+    let releaseRunner!: () => void;
+    const runnerDone = new Promise<void>((r) => {
+      releaseRunner = r;
+    });
+    const runner = reg.withExclusive(async () => {
+      await runnerDone;
+    }, permitA);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(1);
+    expect(reg.queueDepth + reg.preDispatchAdmitCount).toBeLessThanOrEqual(1);
+
+    // Second one converts into the single legal waiter slot; the
+    // queue depth never exceeds the waiter capacity (cap 1) at any
+    // observation point.
+    const waiter = reg.withExclusive(async () => {}, permitB);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+    expect(reg.queueDepth).toBeLessThanOrEqual(1);
+
+    releaseRunner();
+    await runner;
+    await waiter;
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+  });
+
+  it('idle chain: a permitless runner IS admitted while the entitlement is free (no over-reject)', async () => {
+    // Over-rejection guard for the unified admission check: with only
+    // ONE outstanding permit under cap 1, the runner entitlement is
+    // still free (footprint 1 < cap 1 + entitlement 1) — a permitless
+    // arrival at the idle chain must run immediately, and the parked
+    // permit must still convert into the waiter slot behind it.
+    const model = makeMockModel();
+    const reg = new SessionRegistry({ model, maxQueueDepth: 1 });
+
+    const permit = reg.beginPreDispatchAdmission();
+    let releaseRunner!: () => void;
+    const runnerDone = new Promise<void>((r) => {
+      releaseRunner = r;
+    });
+    const runner = reg.withExclusive(async () => {
+      await runnerDone;
+    });
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(0);
+    expect(reg.preDispatchAdmitCount).toBe(1);
+
+    const waiter = reg.withExclusive(async () => {}, permit);
+    await Promise.resolve();
+    expect(reg.queueDepth).toBe(1);
+    expect(reg.preDispatchAdmitCount).toBe(0);
+
+    releaseRunner();
+    await runner;
+    await waiter;
+    expect(reg.queueDepth).toBe(0);
   });
 });

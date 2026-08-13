@@ -56,7 +56,7 @@ oxnode <file.ts>                                 # run a TS file (NOT tsx)
 
 - Primary platform: macOS / Apple Silicon (Metal) — full inference + training + VLM
 - Experimental: Linux aarch64 (glibc) + NVIDIA CUDA — **inference-only preview**. Qwen3.6 dense/MoE validated on GB10 / DGX Spark (`sm_121`, CUDA 13.0) via device-agnostic eager fallbacks (no custom CUDA kernels; paged-attn forced off; perf below Apple Silicon). Training, other model families, and x86_64 Linux are untested. See README "Platform Support" + `docs/cuda-poc-benchmark.md`.
-- Compiled C++ forward paths use process-wide globals (serialized via `std::sync::Mutex` + `RwLock` in `crates/mlx-core/src/models/qwen3_5/model.rs`)
+- Chat inference is serialized per model: one `"mlx-model"` OS thread per loaded model runs one whole turn at a time, and the server adds a per-model FIFO mutex. Different loaded models run in parallel (MLX state is thread-local; residual coupling is the process-wide Metal allocator pool and wired limit). See `docs/concurrent-inference.md`.
 
 ---
 

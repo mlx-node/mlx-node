@@ -2,6 +2,7 @@ use crate::array::MxArray;
 use crate::nn::RMSNorm;
 use crate::transformer::MLP;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi::bindgen_prelude::*;
 
 use super::attention::Qwen3_5Attention;
@@ -325,6 +326,44 @@ impl DecoderLayer {
                 // Residual.
                 let h = x.add(&attn_out)?;
                 // Pre-norm + MLP.
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                let mlp_out = self.mlp.forward(&normed)?;
+                h.add(&mlp_out)
+            }
+        }
+    }
+
+    /// One uniform decode forward over independent recurrent-state rows.
+    pub(crate) fn forward_paged_batched(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        rows: &[(SeqId, u32)],
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+    ) -> Result<MxArray> {
+        match kind {
+            Qwen3_5LayerKind::Linear => {
+                if !matches!(self.attn, AttentionType::Linear(_)) {
+                    return Err(Error::from_reason(
+                        "Qwen3_5DecoderLayer::forward_paged_batched: Linear kind/operator mismatch",
+                    ));
+                }
+                self.forward(x, None, flat_cache, None, true)
+            }
+            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                let attn = match &self.attn {
+                    AttentionType::Full(attn) => attn,
+                    AttentionType::Linear(_) => {
+                        return Err(Error::from_reason(
+                            "Qwen3_5DecoderLayer::forward_paged_batched: FullAttention kind/operator mismatch",
+                        ));
+                    }
+                };
+                let normed = self.input_layernorm.forward(x)?;
+                let attn_out =
+                    attn.forward_paged_batched(&normed, adapter, paged_idx, rows, false)?;
+                let h = x.add(&attn_out)?;
                 let normed = self.post_attention_layernorm.forward(&h)?;
                 let mlp_out = self.mlp.forward(&normed)?;
                 h.add(&mlp_out)

@@ -55,6 +55,41 @@ layers represented by the adapter. Convolutional, recurrent, sliding-window,
 cross-attention, and other state remains model-owned. Do not add a global
 `CacheMode` enum that implies all layer caches have the same topology.
 
+Scheduling policy is nevertheless engine-owned. `HybridSchedulerState<B>`
+owns admission, owner/sequence mapping, block and recurrent-state reservation,
+prefill/decode planning, SSD waits, preemption, completion, and barriers for
+Qwen3, LFM2/2.5, Qwen3.5 Dense/MoE, and Gemma4. `HybridSchedulerBackend` is the
+model-runner boundary: a family exposes its paged cache manager, auxiliary-state
+lifecycle, prefix construction/restore, and batched decode implementation.
+Environment-derived limits remain shared engine policy, not pass-through
+methods on each model backend. This follows vLLM's separation between its
+scheduler/KV-cache manager and per-layer cache specifications/model runner
+without importing its CUDA or multiprocessing topology.
+
+The cache-manager boundary follows the same unitary-versus-hybrid distinction
+as vLLM's `UnitaryKVCacheCoordinator` and `HybridKVCacheCoordinator`. A family
+with one homogeneous attention group exposes its `PagedKVCacheAdapter`
+directly; wrapping that adapter in a one-element coordinator would add another
+owner without changing allocation, prefix matching, or restore semantics.
+Gemma4 uses `KVCacheCoordinator` because its full- and sliding-attention groups
+really do need independent managers and reconcile-down routing. New families
+should select between those two representations from their declared layer
+specs, rather than forcing every cache through the grouped representation.
+Whichever representation is selected, every active private adapter contributes
+its allocated pool bytes to the process cache-limit coordinator for the model's
+entire lifetime; grouped models sum all managers before registering the guard.
+
+Cold auxiliary restore has the same coordinator/runner boundary. The cold-tier
+coordinator consumes a candidate and validates its cache group, exact token
+boundary, and loaded-checkpoint geometry once. Through
+`try_install_cold_sidecar`, only the family callback can decode and seat its
+GDN, ShortConv, or sliding-attention tensors; the shared transaction records
+success only after that callback returns the installed state. A mismatch is
+consumed as a cache miss, while a decode/seat error fails the turn without
+claiming a successful install. This keeps the reusable restore transaction
+outside model files without flattening different hybrid states into a
+misleading uniform cache type.
+
 `MediaPlan` distinguishes media that this loaded instance can execute from
 `backend_validated` input. The latter is admitted only so an existing family
 handler can produce a precise compatibility error; it is never reported as a
@@ -68,15 +103,24 @@ empty current input is not a text-only context. An unsupported combination
 keeps the exact target-model path and disables speculation for that turn; it
 never discards media or the request.
 
+Native MTP and external-draft speculation are intentionally unified at
+`SpeculativeKind`/turn planning, not at their tensor-state stepper. Native MTP
+commits hidden-state and GDN snapshots from the target checkpoint; an external
+draft owns proposal distributions, target taps, and an autoregressive fallback.
+A shared lowest-common-denominator stepper would hide those different commit
+and rollback invariants. Introduce a deeper common trait only when another
+implementation demonstrates a reusable state transaction, not merely because
+both routes propose and verify tokens.
+
 ## Current routing contracts
 
-| Family        | Media                                                        | Paged attention | Chat speculation                                                                  | Important constraint                                                    |
-| ------------- | ------------------------------------------------------------ | --------------- | --------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
-| Qwen3         | none                                                         | fresh and delta | none                                                                              | all paged turns use the shared paged executor                           |
+| Family        | Media                                                        | Paged attention | Chat speculation                                                                  | Important constraint                                                                                                      |
+| ------------- | ------------------------------------------------------------ | --------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
+| Qwen3         | none                                                         | fresh and delta | none                                                                              | all paged turns use the shared paged executor                                                                             |
 | LFM2          | none                                                         | fresh and delta | none                                                                              | short-conv state is never paged: every paged turn (fresh or delta) rebuilds it from the full token stream via conv Pass-1 |
-| Qwen3.5 dense | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP, including paged target state and supported image-context continuation | multimedia turns keep the model's VLM preparation path                  |
-| Qwen3.5 MoE   | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP on flat target state                                                   | paged target execution takes precedence and falls back to target AR     |
-| Gemma4        | image/audio components that have a paged adapter             | fresh and delta | external draft on flat text-only state                                            | missing components retain family-specific validation errors             |
+| Qwen3.5 dense | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP, including paged target state and supported image-context continuation | plain paged AR may use the two-row GDN scheduler; multimedia/MTP retain the ordered path                                  |
+| Qwen3.5 MoE   | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP on flat target state                                                   | plain paged AR may use the two-row GDN/MoE scheduler; multimedia/MTP retain the ordered path                              |
+| Gemma4        | image/audio components that have a paged adapter             | fresh and delta | external draft on flat text-only state                                            | ordinary paged text AR uses grouped full/sliding batching; media and MTP/DSpark remain ordered barriers                   |
 
 The table is a conformance description, not dispatch code. The source of truth
 is each model's `execution_plan()` plus its executor implementations.
@@ -122,6 +166,14 @@ otherwise expose the optimization behind the relevant narrow backend.
 One-shot OCR pipelines and embedding-only models are intentionally not forced
 through `ChatBackend`. They use the same registry for loading but retain APIs
 that match their lifecycle.
+
+The TypeScript model registry is the load-time source of truth. Native N-API
+classes remain statically typed exports, so a runtime native descriptor cannot
+construct or register them dynamically. The cold-restore family set is also
+mirrored deliberately in a native-free agent leaf used by CLI/catalog code;
+its parity test makes that duplication fail closed without loading the native
+addon. These boundaries should only be replaced by code generation that keeps
+the native-free import contract, not by a second runtime registry.
 
 ## Cache and speculative safety
 

@@ -2286,42 +2286,17 @@ fn apply_unified_vision_embedder_weights(
 /// been resolved, where `label` names how it was requested, and `None` when
 /// there is no draft at all.
 ///
-/// Draft speculative decoding runs only on the flat KV-cache path, so a draft
-/// forces flat. The forcing is what keeps a draft turn off the paged handler,
-/// and it is load-bearing rather than cosmetic:
-///
-/// ```text
-///   Some(false) here  ->  Gemma4Inner::new builds NO paged adapter
-///                     ->  ExecutionPlan.paged_attention = None
-///                     ->  TurnPlan::resolve keeps DecoderPlan::Speculative
-///                     ->  TurnPlan::path() = TurnPath::Speculative
-///
-///   drop it, and `use_block_paged_cache.unwrap_or(true)` builds the adapter
-///                     ->  paged ON + SpeculativePlan.supports_paged_attention:false
-///                     ->  TurnPlan::resolve downgrades to Autoregressive
-///                     ->  path() tests paged BEFORE speculative => TurnPath::Paged
-///                     ->  engine::paged_turn never reads `plan.decoder`
-/// ```
-///
-/// The draft would then load, hold its weights resident and answer
-/// `hasMtpWeights()`, while not one draft forward ever runs — a silent
-/// autoregressive decode. That is exactly the outcome the explicit-`true` arm
-/// below refuses to allow, so the two arms must stay in step.
+/// Draft turns still execute with their flat target caches, but the resident
+/// target may keep its grouped paged pools for ordinary autoregressive turns.
+/// The scheduler drains before a draft command, so the two storage modes never
+/// mutate concurrently. This mirrors vLLM's request-level feature routing:
+/// an optional proposer does not globally disable the target's batch-capable
+/// KV manager.
 fn resolve_gemma4_draft_paged_cache(
     explicit: Option<bool>,
-    draft_source: Option<&str>,
-) -> Result<Option<bool>> {
-    let Some(draft_source) = draft_source else {
-        return Ok(explicit);
-    };
-    if explicit == Some(true) {
-        return Err(Error::from_reason(format!(
-            "Gemma4 {draft_source} conflicts with use_block_paged_cache=true: draft \
-                 speculative decoding runs only on the flat KV-cache path. Remove the \
-                 draft request or set use_block_paged_cache to false in config.json."
-        )));
-    }
-    Ok(Some(false))
+    _draft_source: Option<&str>,
+) -> Option<bool> {
+    explicit
 }
 
 impl Gemma4Inner {
@@ -2339,11 +2314,9 @@ impl Gemma4Inner {
     /// `draft_model_path` optionally points at a draft checkpoint directory
     /// (DSpark or assistant — probed from its config.json) loaded alongside
     /// the target for speculative decoding. When it is omitted, a draft in
-    /// `<model_path>/draft/` is discovered automatically. Draft decoding runs
-    /// only on the flat KV-cache path, so an explicit
-    /// `use_block_paged_cache: true` in the target config is a hard error
-    /// (silently ignoring the draft would be worse), and the unset default
-    /// (paged ON) is forced to flat.
+    /// `<model_path>/draft/` is discovered automatically. Draft decoding uses
+    /// a scheduler-owned flat target-cache lane while the same loaded target
+    /// retains grouped paged pools for ordinary AR/media owners.
     pub fn load_from_dir(model_path: &str, draft_model_path: Option<&str>) -> Result<(Self, u64)> {
         let path = Path::new(model_path);
 
@@ -2369,15 +2342,13 @@ impl Gemma4Inner {
         let text_config_explicitly_bfloat16 = parsed_config.text_config_explicitly_bfloat16;
         let mut config = parsed_config.config;
 
-        // DSpark/paged conflict guard — BEFORE any weight I/O so a
-        // misconfigured request fails fast. `use_block_paged_cache`
-        // defaults ON (`unwrap_or(true)` in `Gemma4Inner::new`); a draft
-        // request flips that default to flat, but an EXPLICIT `true` is a
-        // config-level conflict the caller must resolve.
+        // Preserve the target cache policy even when a draft resolves. The
+        // scheduler selects the flat speculative lane per request instead of
+        // suppressing the target's paged capability at load time.
         config.use_block_paged_cache = resolve_gemma4_draft_paged_cache(
             config.use_block_paged_cache,
             resolved_draft_model_path.is_some().then_some(draft_source),
-        )?;
+        );
 
         // Merge stop tokens and sampling defaults from generation_config.json
         let gen_config_path = path.join("generation_config.json");
@@ -2458,6 +2429,9 @@ impl Gemma4Inner {
         // shard-identity bracket can open on the pre-mmap snapshot.
         // Precedence: explicit config > `MLX_PERSIST_PAGED_CACHE` > off.
         let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
+        // Gemma4's full-attention chain and grouped sliding sidecar restore one
+        // exact boundary atomically. The native allowlist remains the final
+        // fail-closed gate before this loader attaches persistence.
         let persist_cold =
             resolve_persist_cold("gemma4", persist_env.as_deref(), config.persist_paged_cache);
         let shard_snapshot_before_mmap = if persist_cold {
@@ -2886,7 +2860,7 @@ impl Gemma4Model {
         let model_path = model_path.to_string();
         let draft_model_path = options.and_then(|o| o.draft_model_path);
 
-        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+        let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
             move || {
                 // `Gemma4Inner::load_from_dir` returns a deterministic
                 // weight-byte total alongside the inner; register it
@@ -2897,31 +2871,59 @@ impl Gemma4Model {
                 // module docs.
                 let (inner, weight_bytes) =
                     Gemma4Inner::load_from_dir(&model_path, draft_model_path.as_deref())?;
+                let pool_bytes = inner
+                    .kv_cache_coordinator
+                    .as_ref()
+                    .map(super::model::Gemma4KVCacheCoordinator::pool_allocated_bytes)
+                    .transpose()
+                    .map_err(Error::from_reason)?
+                    .unwrap_or(0);
                 let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+                let pool_cache_limit_guard = (pool_bytes != 0)
+                    .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
                 let model_id = inner.model_id;
                 let has_vision = inner.image_path_loaded();
                 let has_audio = inner.embed_audio.is_some();
-                let paged_active = inner.paged_adapter.is_some();
+                let paged_active = inner.kv_cache_coordinator.is_some();
+                let max_concurrent_sequences =
+                    crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(
+                        inner
+                            .kv_cache_coordinator
+                            .as_ref()
+                            .map_or(1, |coordinator| {
+                                coordinator.max_concurrent_sequences() as usize
+                            }),
+                    ) as u32;
                 let draft_active = inner.draft.is_some();
                 Ok((
-                    inner,
+                    super::model::Gemma4SchedulerState::new(inner)?,
                     (
                         model_id,
                         has_vision,
                         has_audio,
                         cache_limit_guard,
+                        pool_cache_limit_guard,
                         paged_active,
+                        max_concurrent_sequences,
                         draft_active,
                     ),
                 ))
             },
-            crate::engine::cmd::handle_chat_cmd::<super::model::Gemma4Inner>,
+            |state, receiver| state.drive(receiver),
         );
 
-        let (model_id, has_vision, has_audio, cache_limit_guard, paged_active, draft_active) =
-            init_rx
-                .await
-                .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
+        let (
+            model_id,
+            has_vision,
+            has_audio,
+            cache_limit_guard,
+            pool_cache_limit_guard,
+            paged_active,
+            max_concurrent_sequences,
+            draft_active,
+        ) = init_rx
+            .await
+            .map_err(|_| napi::Error::from_reason("Model thread exited during load"))??;
 
         Ok(Gemma4Model {
             thread: Some(thread),
@@ -2930,7 +2932,9 @@ impl Gemma4Model {
             has_audio,
             initialized: true,
             paged_active,
+            max_concurrent_sequences,
             _cache_limit_guard: Some(cache_limit_guard),
+            _pool_cache_limit_guard: pool_cache_limit_guard,
             draft_active,
         })
     }
@@ -3167,7 +3171,7 @@ mod tests {
     }
 
     #[test]
-    fn embedded_draft_conflicts_with_explicit_paged_cache() {
+    fn embedded_draft_coexists_with_explicit_paged_cache() {
         let dir = write_config_dir(serde_json::json!({
             "model_type": "gemma4_text",
             "text_config": { "hidden_size": 64 },
@@ -3176,23 +3180,22 @@ mod tests {
         fs::create_dir_all(dir.join(EMBEDDED_DRAFT_DIR)).expect("create embedded draft dir");
 
         let err = match Gemma4Inner::load_from_dir(dir.to_str().expect("utf8 temp dir"), None) {
-            Ok(_) => panic!("explicit paged + embedded draft must be rejected"),
+            Ok(_) => panic!("temp dir has no weights; the load must fail downstream"),
             Err(e) => e,
         };
         assert!(
-            err.reason.contains("embedded draft/ checkpoint")
-                && err.reason.contains("use_block_paged_cache=true"),
-            "unexpected error: {}",
+            err.reason.contains("No safetensors files found")
+                && !err.reason.contains("use_block_paged_cache=true"),
+            "paged target pools and an embedded draft must pass the feature guard: {}",
             err.reason
         );
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// draft_model_path + an EXPLICIT `use_block_paged_cache: true` is a
-    /// hard load error, surfaced from the config guard BEFORE any weight
-    /// I/O (the temp dir deliberately carries no safetensors).
+    /// A separately supplied draft coexists with explicitly enabled paged
+    /// target pools; this fixture then fails later because it has no weights.
     #[test]
-    fn dspark_draft_conflicts_with_explicit_paged_cache() {
+    fn dspark_draft_coexists_with_explicit_paged_cache() {
         let dir = write_config_dir(serde_json::json!({
             "model_type": "gemma4_text",
             "text_config": { "hidden_size": 64 },
@@ -3202,25 +3205,20 @@ mod tests {
             dir.to_str().expect("utf8 temp dir"),
             Some("/nonexistent/dspark-draft"),
         ) {
-            Ok(_) => panic!("explicit paged + draft must be rejected"),
+            Ok(_) => panic!("temp dir has no weights; the load must fail downstream"),
             Err(e) => e,
         };
         assert!(
-            err.reason.contains("use_block_paged_cache=true"),
-            "error must name the conflicting flag, got: {}",
-            err.reason
-        );
-        assert!(
-            err.reason.contains("draft_model_path"),
-            "error must name the draft option, got: {}",
+            err.reason.contains("No safetensors files found")
+                && !err.reason.contains("use_block_paged_cache=true"),
+            "paged target pools and draft_model_path must pass the feature guard: {}",
             err.reason
         );
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// With `use_block_paged_cache` UNSET, a draft request passes the guard
-    /// (the default is forced to flat) — the load then fails later on the
-    /// missing weights, NOT on the conflict guard.
+    /// With `use_block_paged_cache` unset, a draft request keeps the paged
+    /// default and fails later on the deliberately missing weights.
     #[test]
     fn dspark_draft_with_unset_paged_flag_passes_the_guard() {
         let dir = write_config_dir(serde_json::json!({
@@ -3242,32 +3240,21 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// The whole truth table of [`resolve_gemma4_draft_paged_cache`], because
-    /// `load_from_dir` cannot reach the interesting rows: it runs
-    /// `validate_required_weights` before `Gemma4Inner::new`, so a config-only
-    /// fixture always dies on the missing safetensors long before the adapter
-    /// decision, and the two guard tests above can therefore only observe the
-    /// ABSENCE of the conflict error — which holds whether or not the flat
-    /// forcing survives.
+    /// Draft loading preserves the target's paged-cache choice. The scheduler
+    /// selects a request-local flat lane only while speculative decode runs;
+    /// load-time feature suppression would unnecessarily disable batching for
+    /// every ordinary AR owner.
     ///
     /// ```text
     ///   explicit      draft   ->  resolved       what it pins
     ///   None          no      ->  None           forcing is DRAFT-scoped
     ///   Some(true)    no      ->  Some(true)     ...not a blanket override
     ///   Some(false)   no      ->  Some(false)    passthrough
-    ///   None          yes     ->  Some(false)    THE SHIPPING ROW
-    ///   Some(false)   yes     ->  Some(false)    agreement, not conflict
-    ///   Some(true)    yes     ->  Err            the sibling arm
+    ///   None          yes     ->  None           keep the paged default
+    ///   Some(false)   yes     ->  Some(false)    explicit flat target
+    ///   Some(true)    yes     ->  Some(true)     explicit paged target
     /// ```
     ///
-    /// The `None + draft` row is the one that carries the feature: no gemma4
-    /// checkpoint writes `use_block_paged_cache`, so every real draft load
-    /// arrives with `explicit = None`. Delete the forcing and that row returns
-    /// `None`, `Gemma4Inner::new`'s `unwrap_or(true)` builds a paged adapter,
-    /// and the turn silently resolves to `TurnPath::Paged` with the draft
-    /// loaded but never stepped. It is also the only row that survives that
-    /// mutation as a distinguishable value — `Some(false) + draft` returns
-    /// `Some(false)` either way.
     #[test]
     fn draft_paged_cache_resolution_covers_the_whole_truth_table() {
         for (explicit, draft_source, expected, why) in [
@@ -3294,46 +3281,28 @@ mod tests {
             (
                 None,
                 Some("draft_model_path"),
-                Some(false),
-                "draft with the key absent — the shipping configuration. This MUST be \
-                 forced flat: `Gemma4Inner::new` reads `unwrap_or(true)`, so leaving it \
-                 `None` builds a paged adapter, `TurnPlan::path` prefers Paged over \
-                 Speculative, and the draft loads without ever running a forward",
+                None,
+                "draft with the key absent keeps the paged target default; the scheduler \
+                 hides those pools only while the request-local flat draft lane runs",
             ),
             (
                 Some(false),
                 Some("embedded draft/ checkpoint"),
                 Some(false),
-                "draft plus an explicit opt-out agree; that is not a conflict",
+                "draft plus an explicit target opt-out stays flat",
+            ),
+            (
+                Some(true),
+                Some("draft_model_path"),
+                Some(true),
+                "draft plus an explicit paged target keeps both resident features",
             ),
         ] {
-            let resolved = match resolve_gemma4_draft_paged_cache(explicit, draft_source) {
-                Ok(v) => v,
-                Err(e) => panic!("({explicit:?}, {draft_source:?}) must resolve, got: {e}"),
-            };
+            let resolved = resolve_gemma4_draft_paged_cache(explicit, draft_source);
             assert_eq!(
                 resolved, expected,
                 "resolve_gemma4_draft_paged_cache({explicit:?}, {draft_source:?}) = \
                  {resolved:?}, expected {expected:?} — {why}"
-            );
-        }
-
-        // The sibling arm: an EXPLICIT paged opt-in plus a draft is a config
-        // conflict the caller has to resolve, because silently dropping either
-        // one is worse than failing the load.
-        for draft_source in ["draft_model_path", "embedded draft/ checkpoint"] {
-            let err = match resolve_gemma4_draft_paged_cache(Some(true), Some(draft_source)) {
-                Ok(v) => panic!("explicit paged + {draft_source} must be rejected, got {v:?}"),
-                Err(e) => e,
-            };
-            assert_eq!(
-                err.reason,
-                format!(
-                    "Gemma4 {draft_source} conflicts with use_block_paged_cache=true: draft \
-                     speculative decoding runs only on the flat KV-cache path. Remove the \
-                     draft request or set use_block_paged_cache to false in config.json."
-                ),
-                "the conflict message is user-facing config advice; keep it verbatim"
             );
         }
     }
