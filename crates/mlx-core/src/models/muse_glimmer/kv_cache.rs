@@ -2071,9 +2071,17 @@ mod tests {
     ///    * `gather_kv_for_prefill_sdpa` refuses a sliding group
     ///      unconditionally — one `if self.sliding_window != 0 { Err }`, no
     ///      argument inspected.
-    ///    * `read_kv_range` refuses by WIDTH: a read of more tokens than the
-    ///      window. It does NOT refuse a sliding group outright, and an earlier
-    ///      revision of this comment said it did.
+    ///    * `read_kv_range` refuses on TWO grounds, neither of which is "is a
+    ///      sliding group": by WIDTH, a read of more tokens than the window; and
+    ///      by AGE, a read starting below the live floor
+    ///      `num_tokens - sliding_window`, which is where
+    ///      `prune_sliding_window_for` puts its cutoff. The age arm exists
+    ///      because width alone does not imply liveness: a read whose length
+    ///      equals the window slips the width check no matter how old it is, and
+    ///      after a prune those positions sit on the never-written null block.
+    ///      An earlier revision of this comment claimed the reader refuses a
+    ///      sliding group outright, which it does not; a later one described
+    ///      only the width arm, which understated it.
     ///
     ///    The narrower guarantee is still enough for the claim being made here,
     ///    and that is why the wording is worth getting exact rather than

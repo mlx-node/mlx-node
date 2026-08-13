@@ -25,14 +25,32 @@
 //! THIS module, and its only exit to numbers is [`DenseCacheHitKv::attention`].
 //! Rust privacy is module-scoped, which is the whole point of the separate
 //! file: a struct declared inside `attention.rs` would still be destructurable
-//! by the very call sites being protected. Deleting or bypassing the
-//! `.attention(..)` call is now a compile error (`cannot find value keys`, or
-//! E0616 on the private field) rather than a silent wrong answer.
+//! by the very call sites being protected.
+//!
+//! ## What this seals, and what it does NOT — measured, not assumed
+//!
+//! An adversarial recheck ran the bypasses. Be precise about the result,
+//! because the load-bearing gate is not the one you would guess:
+//!
+//! * Bypassing while still holding a [`DenseCacheHitKv`] — reaching for
+//!   `kv.keys` / `kv.values` — is a compile error (E0616, private field).
+//! * Reverting an arm ALL THE WAY BACK to the adapter reader, which is the
+//!   actual historical spelling, still **compiles**. Both readers remain `pub`
+//!   and still return `(MxArray, MxArray, DenseAttentionWindow)`, so an arm can
+//!   destructure that tuple and call a window-blind kernel without ever
+//!   mentioning this module. Sealing the readers' own return type would close
+//!   it; that was not done.
+//!
+//! So the seal removes the cheapest bypass, and the REAL gate is the
+//! behavioural test `both_dense_cache_hit_arms_apply_the_window_through_the_dispatcher`,
+//! which drives the production dispatcher once per dense route and fails red on
+//! either reversion. Do not treat this module as the gate, and do not delete
+//! that test believing the type system has it covered.
 //!
 //! The two constructors are the two adapter readers that hand back a window
 //! with the data. The window-blind spellings (`gather_kv_for_prefill_sdpa`,
-//! `read_kv_range`) are not reachable from here at all, and they fail closed on
-//! a sliding group in the adapter itself.
+//! `read_kv_range`) are not called from this module, and they fail closed on a
+//! sliding group in the adapter itself — by width and by age.
 
 use napi::bindgen_prelude::*;
 

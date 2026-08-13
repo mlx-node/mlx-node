@@ -3313,10 +3313,20 @@ mod tests {
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
-            Err(e) => {
+            // Only an absent GPU is a skip, matched on the same specific string
+            // as the `write` arm below. A blanket `Err(_) => Ok(None)` would
+            // turn every gate built on this fixture into a silent no-op the
+            // first time the pool refused for any other reason -- a bad
+            // geometry, or the cold-tier reserve declining on a full disk,
+            // which already fails five tests in this crate on a full volume.
+            // The gate this fixture feeds is the only thing standing between
+            // the dense arms and a silent return of the window-dropping
+            // defect, so it must fail loudly rather than pass vacuously.
+            Err(e) if e.to_string().contains("Metal GPU not available") => {
                 eprintln!("skipping dense cache-hit numerics: {e}");
                 return Ok(None);
             }
+            Err(e) => return Err(Error::from_reason(e.to_string())),
         };
         let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
             16,

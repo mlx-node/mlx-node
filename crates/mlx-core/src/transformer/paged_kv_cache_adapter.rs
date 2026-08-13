@@ -14701,10 +14701,16 @@ mod tests {
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
-            Err(e) => {
+            // Skip only for an absent GPU, the same specific string the rest of
+            // this module matches on. The comment above says a pool failure
+            // would make this test "pass for the wrong reason" -- a blanket skip
+            // is exactly how that happens, so match the reason rather than
+            // trusting the geometry.
+            Err(e) if e.to_string().contains("Metal GPU not available") => {
                 eprintln!("skipping new_sliding i32-window test: {e}");
                 return;
             }
+            Err(e) => panic!("pool construction failed for a non-GPU reason: {e}"),
         };
         let new_sliding = |window: u32| {
             let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK)));
