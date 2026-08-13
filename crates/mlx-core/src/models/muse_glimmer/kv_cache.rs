@@ -1836,9 +1836,33 @@ mod tests {
     /// It is vacuously true today (no forward pass exists) and that is the
     /// point: it is armed, not satisfied.
     ///
-    /// Mutation caught: adding `let w = 0i32;` next to a
+    /// ## What it does NOT cover, named rather than implied
+    ///
+    /// 1. **Textual, not semantic.** It checks that the string
+    ///    `PagedWindowSlot` appears in the same file as the wiring. A `use
+    ///    super::kv_cache::PagedWindowSlot;` next to a hand-written FFI call
+    ///    satisfies it. Naming the seam is the floor, not the contract.
+    /// 2. **Per-file, not per-call.** A file that admits one dispatch through
+    ///    the seam and launches a second one with a literal passes.
+    /// 3. **This family's directory only.** Wiring placed in a shared file —
+    ///    `transformer/block.rs`, a new generic paged forward — trips nothing
+    ///    here. That gap is covered from the other side, in the adapter: its
+    ///    window-blind dense readers (`gather_kv_for_prefill_sdpa`,
+    ///    `read_kv_range`) refuse a sliding group outright, so a shared route
+    ///    cannot serve one window-blind regardless of which family calls it.
+    ///
+    /// The scan itself IS recursive, so a `muse_glimmer/attention/paged.rs`
+    /// subdirectory is opened — this repo already ships that layout elsewhere
+    /// (`models/qwen3_5/gdn_checkpoint_store/` beside
+    /// `models/qwen3_5/paged_forward.rs`), and a non-recursive `read_dir` would
+    /// have gone silently vacuous the moment the family grew one.
+    ///
+    /// Mutations caught: adding `let w = 0i32;` next to a
     /// `mlx_paged_attention_varlen_forward` call in a new
-    /// `muse_glimmer/attention.rs` that never mentions the seam.
+    /// `muse_glimmer/attention.rs`, or in a new
+    /// `muse_glimmer/attention/paged.rs`, that never mentions the seam;
+    /// dropping the recursive descent (the file-count floor below then fails
+    /// once a subdirectory exists).
     #[test]
     fn wiring_a_sliding_adapter_without_this_seam_trips_the_tripwire() {
         // Names that only real paged wiring uses. Deliberately NOT
@@ -1854,21 +1878,37 @@ mod tests {
         ];
         const SEAM: &str = "PagedWindowSlot";
 
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("src")
             .join("models")
             .join("muse_glimmer");
-        let entries = std::fs::read_dir(&dir)
-            .unwrap_or_else(|e| panic!("the family's own source directory must be readable: {e}"));
+
+        // Recursive: a `muse_glimmer/attention/paged.rs` must be opened, not
+        // skipped. A non-recursive scan is how this check goes silently
+        // vacuous.
+        let mut pending = vec![root.clone()];
+        let mut sources: Vec<(std::path::PathBuf, String)> = Vec::new();
+        while let Some(dir) = pending.pop() {
+            let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| {
+                panic!("{} must be readable: {e}", dir.display());
+            });
+            for entry in entries {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+                sources.push((path, source));
+            }
+        }
 
         let mut checked = 0usize;
-        for entry in entries {
-            let path = entry.expect("a readable directory entry").path();
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let source = std::fs::read_to_string(&path)
-                .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+        for (path, source) in &sources {
             checked += 1;
 
             // Strip whole-line comments so this file's own prose about the
@@ -1902,10 +1942,35 @@ mod tests {
                 path.display()
             );
         }
+        // Floor equal to the family's CURRENT file count, not a loose 3. Every
+        // file added to the family must raise it, which is the one moment a
+        // reader is forced to look at this test — and it is the only way "the
+        // scan still reaches everything" can be checked at all, since a scan
+        // that silently stopped descending would otherwise just report fewer
+        // files and still pass a loose floor.
+        const FAMILY_FILES: usize = 5; // config, kv_cache, mod, output_parser, stream_guard
         assert!(
-            checked >= 3,
-            "the tripwire scanned only {checked} file(s); if the family moved, this test \
-             is silently vacuous and must be repointed"
+            checked >= FAMILY_FILES,
+            "the tripwire scanned only {checked} file(s), fewer than the {FAMILY_FILES} this \
+             family is known to have. Either the family moved and this test must be \
+             repointed, or the recursive descent stopped working — in both cases the check \
+             is silently vacuous. Scanned: {:?}",
+            sources
+                .iter()
+                .map(|(p, _)| p.file_name())
+                .collect::<Vec<_>>()
+        );
+        // And every added file must be scanned, so growing the family without
+        // raising `FAMILY_FILES` is caught from the other side too.
+        assert!(
+            checked <= FAMILY_FILES,
+            "the tripwire scanned {checked} file(s) but FAMILY_FILES says {FAMILY_FILES}. \
+             The family grew: raise FAMILY_FILES, and while you are here confirm the new \
+             file either names {SEAM} or wires no paged attention. Scanned: {:?}",
+            sources
+                .iter()
+                .map(|(p, _)| p.file_name())
+                .collect::<Vec<_>>()
         );
     }
 }
