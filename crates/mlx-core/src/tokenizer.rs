@@ -4241,6 +4241,294 @@ mod tests {
         eprintln!("scanned {seen} templates, {atem} ATEM, rewrote {changed:?}");
     }
 
+    /// A tool declaration shaped so that all THREE of
+    /// [`PythonDefaultFormatter`]'s overrides are load-bearing at once:
+    ///
+    /// - two properties, so `begin_object_key` writes a real `, `;
+    /// - each property a nested object, so `begin_object_value` writes `: ` at two
+    ///   depths;
+    /// - two `required` entries, so `begin_array_value` writes a real `, `.
+    ///
+    /// The single-property/single-`required` shape an earlier revision used made
+    /// the array separator untestable — dropping `begin_array_value` entirely left
+    /// the gate green, because `["city"]` has no separator in it. Verified by
+    /// mutation, see the gate's own doc comment.
+    fn separator_probe_tool() -> ToolDefinition {
+        ToolDefinition {
+            r#type: "function".to_string(),
+            function: FunctionDefinition {
+                name: "wx.forecast".to_string(),
+                description: Some("Get a forecast.".to_string()),
+                parameters: Some(FunctionParameters {
+                    r#type: "object".to_string(),
+                    properties: Some(
+                        r#"{"city": {"type": "string"}, "days": {"type": "integer"}}"#.to_string(),
+                    ),
+                    required: Some(vec!["city".to_string(), "days".to_string()]),
+                }),
+            },
+        }
+    }
+
+    /// The conversation both separator gates render: declare a tool, call it with
+    /// a NESTED object argument, answer with the result. The nesting matters —
+    /// a flat `{"city": "Paris"}` puts a separator only between key and value, so
+    /// a formatter that got `begin_array_value` wrong would still pass.
+    fn separator_probe_messages() -> Vec<ChatMessage> {
+        let blank = |role: &str, content: &str| ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+        let mut call = blank("assistant", "");
+        call.tool_calls = Some(vec![ToolCall {
+            id: Some("call_1".to_string()),
+            name: "wx.forecast".to_string(),
+            arguments: r#"{"city": "Paris", "opts": {"deep": [1, 2]}}"#.to_string(),
+        }]);
+        let mut result = blank("tool", "18C, clear");
+        result.tool_call_id = Some("call_1".to_string());
+        vec![
+            blank("user", "weather in Paris?"),
+            call,
+            result,
+            blank("assistant", "18C and clear."),
+        ]
+    }
+
+    /// Render `template` through the production Jinja entry point with the probe
+    /// conversation. Deliberately the same function
+    /// [`Qwen3Tokenizer::render_chat_template_sync_with_content_order`] calls, so
+    /// the filter under test is the registered one and not a local copy — a
+    /// hand-built `Environment` would keep passing while production drifted.
+    fn render_separator_probe(template: &str) -> std::result::Result<String, String> {
+        let tools = [separator_probe_tool()];
+        Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+            template,
+            &separator_probe_messages(),
+            Some(&tools),
+            true,
+            Some(true),
+            BOS_PROBE,
+            EOS_PROBE,
+            MultimodalContentOrder::TextThenMedia,
+            None,
+            RenderContextOptions {
+                current_date: Some(PROBE_DATE.to_string()),
+                reasoning_strength: None,
+            },
+        )
+    }
+
+    /// Pinned so a template that prints today's date does not make the HF
+    /// fixtures rot overnight.
+    const PROBE_DATE: &str = "2026-08-10";
+    const BOS_PROBE: &str = "<|begin_of_text|>";
+    const EOS_PROBE: &str = "<|endoftext|>";
+
+    /// `(detector, expected)` pairs: where the probe's JSON can surface, and the
+    /// exact bytes `tojson` must produce there.
+    ///
+    /// **The detector carries no separators.** That is the whole trick, and an
+    /// earlier revision got it wrong by pairing each spaced string with *the*
+    /// compact string and asking "is either present?". A mutation that fixes some
+    /// separators and not others produces a THIRD spelling that matches neither,
+    /// so the template silently fell into the "never reached the filter" bucket and
+    /// the gate stayed green while `begin_array_value` was deleted. A
+    /// separator-free detector cannot be fooled that way: it fires whenever
+    /// `tojson` ran at all, and the `expected` assertion then has to hold.
+    ///
+    /// Two rather than one because the installed families route the probe through
+    /// the filter in two different shapes: qwen3.5/qwen3.6/ornith/agentworld/
+    /// agents-a1/lfm2.5/muse-glimmer dump the whole `parameters` schema, while
+    /// Nemotron dumps each argument VALUE separately and never dumps the schema —
+    /// so its only `tojson` output is the innermost object. Missing that second
+    /// shape is what made an earlier revision report Nemotron as
+    /// "mentions `tojson` but never reaches it".
+    const SEPARATOR_PROBES: &[(&str, &str)] = &[
+        // The tool's `parameters` schema, wherever a template embeds it: whole
+        // `tools` list, single `function`, or bare `parameters` — the sub-object is
+        // byte-identical in all three.
+        (
+            r#""properties""#,
+            r#"{"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city", "days"]}"#,
+        ),
+        // A single container-valued ARGUMENT, which is all Nemotron and
+        // Muse-Glimmer's ATEM renderer put through the filter.
+        (r#""deep""#, r#"{"deep": [1, 2]}"#),
+    ];
+
+    /// Render failures the separator gate has SEEN and accepts, matched on the
+    /// error text so the record survives checkpoint renames. Both are pre-existing
+    /// and neither is a separator defect — but both are recorded here rather than
+    /// skipped, because a silent skip is how a cross-family gate rots into a
+    /// single-family gate.
+    ///
+    /// 1. `strftime_now` — HF registers it in `_compile_jinja_template`
+    ///    (`chat_template_utils.py:483`) and `install_template_helpers` does not.
+    ///    LFM2.5-8B-A1B calls it ONLY inside its `{%- if tools -%}` branch, so
+    ///    that family renders plain chat fine and hard-errors on every
+    ///    tool-calling turn. Not fixed here: the deliberate design ruling on
+    ///    [`RenderContextOptions::current_date`] is that this renderer never reads
+    ///    the system clock, because the date lands in the prompt PREFIX and a
+    ///    mid-session rollover invalidates every prefix-reuse and cold-tier entry
+    ///    behind it. Registering `strftime_now` therefore needs a decision about
+    ///    where its date comes from, which is a plumbing change, not a filter fix.
+    /// 2. `too many arguments` — HF's `tojson` takes `ensure_ascii` / `indent` /
+    ///    `separators` / `sort_keys` kwargs and ours takes one positional value.
+    ///    Only `step-3.7-flash` uses the kwarg form and it is not a supported
+    ///    family; the pre-formatter `serde_json::to_string` filter had the same
+    ///    arity, so this is not a regression. See [`PythonDefaultFormatter`].
+    const KNOWN_UNRENDERABLE_CAUSES: &[&str] =
+        &["unknown function: strftime_now", "too many arguments"];
+
+    /// THE CROSS-FAMILY SEPARATOR GATE — the `tojson` analogue of
+    /// `ternary_kwarg_transform_is_byte_identity_on_every_other_installed_template`.
+    ///
+    /// `tojson` is registered for EVERY family in `install_template_helpers`, so
+    /// the `json.dumps` separators are not a Muse-Glimmer change: they move the
+    /// tool-calling prompt of every installed family that uses the filter. This
+    /// gate renders each installed template through the PRODUCTION entry point
+    /// with a real tool round trip and asserts the spaced form reached the prompt
+    /// and the compact form did not.
+    ///
+    /// ## What it pins, and what it does not
+    ///
+    /// It pins the SEPARATORS, family by family — not the whole prompt. It is not
+    /// a byte-identity pin against our own previous output, and deliberately so:
+    /// this filter is *supposed* to change bytes relative to the compact form, and
+    /// pinning our prior output would pin the bug it fixed. Byte-identity against
+    /// HuggingFace's own renderer is pinned separately, and checkpoint-free, by
+    /// `our_render_matches_hf_transformers_byte_for_byte`.
+    ///
+    /// ## Measured on the cache this was written against
+    ///
+    /// 62 `chat_template.jinja` files; 40 contain `tojson`; 37 of those 40 render
+    /// the probe AND route it through the filter, spanning 8 distinct supported
+    /// families — qwen3.5, qwen3.6, ornith-1.0, agentworld, agents-a1,
+    /// lfm2.5 (1.2b-thinking + 2.6b), nemotron-3.5-lightning, muse-glimmer (the
+    /// count is 37 because the cache holds several quant variants per family).
+    /// The remaining 3 do not render at all, for the two causes recorded in
+    /// `KNOWN_UNRENDERABLE_CAUSES`. gemma4 contains no `tojson` and is correctly
+    /// not counted. Zero templates fall in the "mentions it but never reaches it"
+    /// bucket, which is the state this probe conversation was tuned to reach.
+    ///
+    /// ## Non-vacuity, verified by mutation
+    ///
+    /// Five mutations were each compiled and run against this gate. Every one is
+    /// red, and each names a different assertion, so no assertion here is carried
+    /// by another:
+    ///
+    /// | mutation | fails on |
+    /// |---|---|
+    /// | `install_template_helpers`' filter back to `serde_json::to_string` | the `expected` assertion, naming `ornith-1.0-9b` and the bytes it wanted |
+    /// | `PythonDefaultFormatter::begin_array_value` deleted (inherit serde's) | the same, via `"required": ["city", "days"]` |
+    /// | both `SEPARATOR_PROBES` detectors renamed to strings no prompt contains | the `exercised` floor: `only 0 template(s) actually hit tojson out of 40` |
+    /// | `MLX_TEST_MODEL_CACHE_DIR` pointed at an empty directory | the `seen` floor: `only 0 chat template(s) found` |
+    /// | probe conversation's `tools` set to `None` | `KNOWN_UNRENDERABLE_CAUSES`, because Nemotron's template cannot render a toolless turn |
+    ///
+    /// Note the second row in particular: with the single-property, single-required
+    /// tool an earlier revision used, deleting `begin_array_value` left this gate
+    /// GREEN — `["city"]` contains no separator to get wrong. See
+    /// `separator_probe_tool`.
+    ///
+    /// ```text
+    /// MLX_TEST_MODEL_CACHE_DIR=/path/to/.cache/models \
+    ///   cargo test -p mlx-core --lib -- tojson_emits_hf_separators --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires a local model cache; set MLX_TEST_MODEL_CACHE_DIR and run with --ignored"]
+    fn tojson_emits_hf_separators_in_every_installed_family_that_uses_it() {
+        let Ok(root) = std::env::var("MLX_TEST_MODEL_CACHE_DIR") else {
+            panic!("set MLX_TEST_MODEL_CACHE_DIR to the directory holding checkpoint directories");
+        };
+        let entries = std::fs::read_dir(&root).unwrap_or_else(|e| panic!("read_dir {root}: {e}"));
+
+        let mut seen = 0usize;
+        let mut uses_filter = 0usize;
+        let mut exercised: Vec<String> = Vec::new();
+        let mut unexercised: Vec<String> = Vec::new();
+        let mut unrenderable: Vec<String> = Vec::new();
+        for entry in entries.flatten() {
+            let template_path = entry.path().join("chat_template.jinja");
+            let Ok(template) = std::fs::read_to_string(&template_path) else {
+                continue;
+            };
+            seen += 1;
+            if !template.contains("tojson") {
+                continue;
+            }
+            uses_filter += 1;
+            // Classified by CONTENT, never by directory name: the cache holds
+            // several quant variants per family and they get renamed.
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let out = match render_separator_probe(&template) {
+                Ok(out) => out,
+                Err(e) => {
+                    // A template that cannot render a tool turn at all is a
+                    // separate defect, and it must not be a silent skip here —
+                    // otherwise this gate quietly shrinks as families break. The
+                    // known causes are enumerated by their ERROR TEXT rather than
+                    // by directory name, so a NEW breakage fails loudly while the
+                    // two recorded ones stay recorded.
+                    assert!(
+                        KNOWN_UNRENDERABLE_CAUSES
+                            .iter()
+                            .any(|cause| e.contains(cause)),
+                        "{name} cannot render a tool-calling turn, and the cause is not one of the \
+                         recorded gaps {KNOWN_UNRENDERABLE_CAUSES:?}: {e}",
+                    );
+                    unrenderable.push(format!("{name}: {e}"));
+                    continue;
+                }
+            };
+            let reached: Vec<&(&str, &str)> = SEPARATOR_PROBES
+                .iter()
+                .filter(|(detector, _)| out.contains(detector))
+                .collect();
+            if reached.is_empty() {
+                // Mentions `tojson` but the probe conversation never routed the
+                // schema or the arguments through it. Not a failure, but it does
+                // not count toward the floor either.
+                unexercised.push(name);
+                continue;
+            }
+            for (detector, expected) in reached {
+                assert!(
+                    out.contains(expected),
+                    "{name} put {detector} through `tojson` but not with Python `json.dumps` \
+                     separators. Expected to find:\n  {expected}\nin:\n{out}",
+                );
+            }
+            exercised.push(name);
+        }
+
+        // Two floors, for the two ways this gate can pass while proving nothing:
+        // an empty cache, and a probe that stopped reaching the filter.
+        assert!(
+            seen >= 2,
+            "only {seen} chat template(s) found under {root} — this gate needs the real cache",
+        );
+        assert!(
+            exercised.len() >= 8,
+            "only {} template(s) actually hit `tojson` ({exercised:?}) out of {uses_filter} that \
+             mention it — the probe conversation stopped exercising the filter",
+            exercised.len(),
+        );
+        eprintln!(
+            "scanned {seen} templates, {uses_filter} mention `tojson`, {} exercised it: \
+             {exercised:?}\n  mentioned but not exercised by this conversation: {unexercised:?}\
+             \n  did not render: {unrenderable:?}",
+            exercised.len(),
+        );
+    }
+
     /// Finding B end-to-end: a template that emits literal `{% generation %}`
     /// text via a `{{ ... }}` expression and a `{% raw %}` block must RENDER
     /// with that literal text intact (byte-identical), while a real top-level
