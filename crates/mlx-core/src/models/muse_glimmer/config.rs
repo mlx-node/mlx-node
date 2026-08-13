@@ -357,12 +357,17 @@ impl MuseGlimmerConfig {
     }
 }
 
+/// `config.json` bodies for tests.
+///
+/// Shared rather than private to `mod tests` so the sibling modules that
+/// consume a validated config — [`super::kv_cache`] — derive their fixtures from
+/// the SAME JSON this module's tests validate. Two hand-written copies of the
+/// checkpoint shape would let one drift into describing a model the parser would
+/// reject.
 #[cfg(test)]
-mod tests {
-    use super::*;
-
+pub(crate) mod fixtures {
     /// The two parallel per-layer tables at full length, as JSON array bodies.
-    fn layer_tables(layers: usize) -> (String, String) {
+    pub(crate) fn layer_tables(layers: usize) -> (String, String) {
         let kinds: Vec<String> = (0..layers)
             .map(|i| {
                 if (layers - 1 - i).is_multiple_of(4) {
@@ -386,7 +391,7 @@ mod tests {
 
     /// The real checkpoint's text_config, trimmed to the fields under test.
     /// layer_types / layer_rope_theta are given at full length by the helper.
-    fn text_config_json(layers: usize) -> String {
+    pub(crate) fn text_config_json(layers: usize) -> String {
         let (kinds, thetas) = layer_tables(layers);
         format!(
             r#"{{
@@ -408,7 +413,7 @@ mod tests {
 
     /// Only the fields the parser requires: every `#[serde(default)]` field is
     /// omitted so the documented defaults are what gets exercised.
-    fn minimal_text_config_json(layers: usize) -> String {
+    pub(crate) fn minimal_text_config_json(layers: usize) -> String {
         let (kinds, thetas) = layer_tables(layers);
         format!(
             r#"{{
@@ -428,7 +433,7 @@ mod tests {
     /// written to a temp dir: `tempfile` is not a dependency of this workspace,
     /// so the validating core takes `&str` and `from_path` is a thin I/O shim
     /// over it. Not one asserted value changed.
-    fn config_json(text: &str) -> String {
+    pub(crate) fn config_json(text: &str) -> String {
         format!(
             r#"{{"model_type":"muse_glimmer","image_token_id":200092,
                  "video_token_id":200091,"out_hidden_size":6144,
@@ -442,6 +447,12 @@ mod tests {
                    "layer_norm_eps":1e-5}}}}"#
         )
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fixtures::*;
+    use super::*;
 
     fn parse(text: &str) -> Result<MuseGlimmerConfig> {
         MuseGlimmerConfig::from_json_str(&config_json(text))
