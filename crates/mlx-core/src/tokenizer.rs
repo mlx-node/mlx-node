@@ -3924,25 +3924,31 @@ mod tests {
     }
 
     /// The defect, then the fix, on the smallest template that shows it: a call
-    /// keyword argument whose value is a bare ternary is a minijinja PARSE error,
-    /// so the whole template dies before any statement runs. Asserting the raw
-    /// form really does fail is what keeps the rest of this test non-vacuous.
+    /// keyword argument whose value is a bare ternary.
+    ///
+    /// Whether the RAW spelling parses is a property of the INSTALLED minijinja,
+    /// not of this transform. minijinja <= 2.23 rejects it with a `SyntaxError`,
+    /// so the template dies before any statement runs; 2.24 accepts it natively.
+    /// The workspace declares `minijinja = "2.5"` and `Cargo.lock` is not tracked
+    /// (`.gitignore:194`), so BOTH are legal resolutions of the same commit — CI
+    /// resolved 2.24.0 while a dev machine had 2.23.0, and asserting the
+    /// rejection outright turned the suite red on CI only.
+    ///
+    /// So the version-dependent half is a `match` with a real assertion on both
+    /// arms, never a skip, and the transform's own contract is asserted
+    /// unconditionally. The transform stays either way: it is required below
+    /// 2.24 and is meaning-preserving above it, which the 2.24 arm proves
+    /// directly.
     #[test]
     fn ternary_call_kwarg_is_a_parse_error_until_it_is_parenthesized() {
         let raw = "{% set n = namespace(name=a if a else '') %}";
+        let fixed = Qwen3Tokenizer::parenthesize_ternary_call_kwargs(raw);
 
-        let mut env = Environment::new();
-        let err = env
-            .add_template("raw", raw)
-            .expect_err("minijinja must reject a bare ternary as a kwarg value");
-        assert_eq!(err.kind(), minijinja::ErrorKind::SyntaxError, "got: {err}");
-
-        // The transform's output is the parenthesized spelling, and nothing else
-        // moves — including the whitespace-control dashes.
-        assert_eq!(
-            Qwen3Tokenizer::parenthesize_ternary_call_kwargs(raw),
-            "{% set n = namespace(name=(a if a else '')) %}",
-        );
+        // UNCONDITIONAL, and what keeps this test non-vacuous on every version:
+        // the transform emits the parenthesized spelling and moves nothing else,
+        // including the whitespace-control dashes. Pure string comparisons, so no
+        // minijinja release can hollow them out.
+        assert_eq!(fixed, "{% set n = namespace(name=(a if a else '')) %}");
         assert_eq!(
             Qwen3Tokenizer::parenthesize_ternary_call_kwargs(
                 "{%- set n = namespace(name=a if a else '') -%}"
@@ -3950,13 +3956,49 @@ mod tests {
             "{%- set n = namespace(name=(a if a else '')) -%}",
         );
 
-        // And the parenthesized form parses.
+        // A probe that OUTPUTS, so the 2.24 arm can compare meaning and not just
+        // parseability.
+        let probe_raw = "{%- set n = namespace(name=a if a else 'FALLBACK') -%}{{ n.name }}";
+        let probe_fixed = Qwen3Tokenizer::parenthesize_ternary_call_kwargs(probe_raw);
+        // `std::result::Result` spelled out: this module's `Result` alias is
+        // napi's, so a bare `Result<String, minijinja::Error>` reads as
+        // `napi::Error<minijinja::Error>` and does not compile.
+        let render = |source: &str, a: &str| -> std::result::Result<String, minijinja::Error> {
+            let mut env = Environment::new();
+            env.add_template("t", source)?;
+            env.get_template("t")?.render(context! { a => a })
+        };
+
         let mut env = Environment::new();
-        env.add_template(
-            "fixed",
-            &Qwen3Tokenizer::parenthesize_ternary_call_kwargs(raw),
-        )
-        .expect("the parenthesized spelling must parse");
+        match env.add_template("raw", raw) {
+            // minijinja <= 2.23: the transform is load-bearing. This is the case
+            // it exists for, and the reason the production renderer applies it.
+            Err(err) => {
+                assert_eq!(err.kind(), minijinja::ErrorKind::SyntaxError, "got: {err}");
+            }
+            // minijinja >= 2.24: the raw spelling parses natively, so the
+            // transform is belt and braces here. That permits a STRICTLY
+            // STRONGER check than the rejection ever was — both spellings must
+            // render the same bytes on both arms of the conditional, i.e.
+            // parenthesizing changes parseability and never meaning. A transform
+            // that dropped or inverted the conditional would fail this where the
+            // old `expect_err` could not have noticed.
+            Ok(()) => {
+                for a in ["hi", ""] {
+                    let from_raw = render(probe_raw, a).expect("raw probe renders on this version");
+                    let from_fixed = render(&probe_fixed, a).expect("fixed probe renders");
+                    assert_eq!(
+                        from_raw, from_fixed,
+                        "parenthesizing changed the meaning of the ternary for a = {a:?}",
+                    );
+                }
+            }
+        }
+
+        // The transform's actual contract, on EVERY version: its output parses.
+        let mut env = Environment::new();
+        env.add_template("fixed", &fixed)
+            .expect("the parenthesized spelling must parse");
     }
 
     /// End-to-end through the production entry point, which is where the transform
