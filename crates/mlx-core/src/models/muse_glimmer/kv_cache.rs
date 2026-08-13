@@ -137,8 +137,10 @@ pub fn compute_layer_kv_cache_specs(
 /// Raising the prefill chunk raises this requirement linearly, so the caller must
 /// pass the SAME value its prefill loop actually uses — vLLM keeps the pool sizer
 /// and the runtime admission gate on one source of truth
-/// (`single_type_kv_cache_manager.py`) precisely because drift between them is
-/// either a deadlock or a mid-prefill OOM.
+/// (`single_type_kv_cache_manager.py:178-186`, whose comment names both failure
+/// modes: "re-introduce the deadlock from issue #39734 or, worse, mid-prefill
+/// OOM"; the lookup that wires that single source is `:1860-1875`) precisely
+/// because drift between them is either a deadlock or a mid-prefill OOM.
 pub fn compute_layer_kv_cache_groups(
     config: &MuseGlimmerConfig,
     block_size: u32,
@@ -163,6 +165,23 @@ pub fn compute_layer_kv_cache_groups(
     }
 
     let specs = compute_layer_kv_cache_specs(config, block_size, cache_dtype)?;
+
+    // Both halves of the `max_position_embeddings` contract, re-checked here for
+    // the same reason as the geometry above: this is `pub` and must not trust a
+    // config that skipped `from_json_str`. The zero half is the one that fails
+    // OPEN — `u32::try_from(0)` succeeds, and a 0 `max_model_len` makes the
+    // full-attention bound `div_ceil(0, block_size) == 0`. That is an `Ok`
+    // describing a pool that can hold nothing, and it stays silent all the way
+    // through a gemma4-shaped sizer: `group_reserved_blocks(Full, 0, width)` is 0
+    // at every width, so the 13 full layers contribute no bytes and no memory
+    // check ever trips.
+    if config.text_config.max_position_embeddings == 0 {
+        return Err(format!(
+            "muse_glimmer KV cache groups: max_position_embeddings must be non-zero, got {}; \
+             it is the seam's max_model_len and a 0 admits no blocks at all",
+            config.text_config.max_position_embeddings
+        ));
+    }
     let max_model_len =
         u32::try_from(config.text_config.max_position_embeddings).map_err(|_| {
             format!(
@@ -170,8 +189,51 @@ pub fn compute_layer_kv_cache_groups(
                 config.text_config.max_position_embeddings
             )
         })?;
-    group_layer_kv_cache_specs(&specs, max_model_len, max_chunk)
-        .map_err(|e| format!("muse_glimmer KV cache grouping failed: {e}"))
+    let groups = group_layer_kv_cache_specs(&specs, max_model_len, max_chunk)
+        .map_err(|e| format!("muse_glimmer KV cache grouping failed: {e}"))?;
+
+    // The two-group contract, enforced where it is produced.
+    //
+    // Downstream is told to HARD-CODE `group_id` 0 as the full group rather than
+    // discover it, and group 0's adapter is the one returned from
+    // `paged_adapter()` and the one that publishes into the content-addressed
+    // prefix cache. A single-kind `layer_types` table parses cleanly — the
+    // config's NoPE<->Full biconditional only fires on a disagreement BETWEEN
+    // the two tables, and a uniform table agrees with itself — and would collapse
+    // grouping to one group. All-sliding is the silent direction: group 0 becomes
+    // the SLIDING group, and a sliding block's contents depend on where the
+    // window was when it was written, so a later turn resumes from a prefix hit
+    // describing a different window offset. All-full is the loud one: anything
+    // indexing `groups[1]` panics.
+    //
+    // Deliberately "both kinds present" and NOT the `[S,S,S,F]` x 13 pattern —
+    // a variant with a different ratio is still a hybrid, and this guard refuses
+    // no legal Muse-Glimmer checkpoint. gemma4 carries the same half of this at
+    // `gemma4/model.rs:2108-2113`. Note ">1 full group" is unreachable here: one
+    // uniform physical layout cannot key two distinct full groups.
+    let full_groups = groups
+        .iter()
+        .filter(|group| matches!(group.attention_kind, AttentionKind::Full))
+        .count();
+    let sliding_groups = groups
+        .iter()
+        .filter(|group| matches!(group.attention_kind, AttentionKind::SlidingWindow { .. }))
+        .count();
+    if full_groups == 0 || sliding_groups == 0 {
+        return Err(format!(
+            "muse_glimmer KV cache groups: this decoder is hybrid by construction, so \
+             grouping must yield both attention kinds, but {} layers produced {} \
+             full-attention group(s) and {} sliding-window group(s). Downstream hard-codes \
+             group_id 0 as the full group — its adapter is the one published into the \
+             content-addressed prefix cache — so a single-kind layer_types table would \
+             hand that role to the wrong group instead of failing",
+            specs.len(),
+            full_groups,
+            sliding_groups
+        ));
+    }
+
+    Ok(groups)
 }
 
 /// Physical blocks to reserve for one KV group in a SHARED pool, given how many
@@ -182,14 +244,29 @@ pub fn compute_layer_kv_cache_groups(
 ///   * `max(…, scheduler_width)` — every live row needs at least one starter
 ///     block, so a window smaller than the scheduler width must not be the
 ///     binding constraint.
-///   * `+ 1` — the live window's token range is not block-aligned, so it straddles
-///     one extra block. vLLM's `SlidingWindowSpec` carries exactly this `+1` and
-///     its `ChunkedLocalAttentionSpec` does not, because chunk boundaries ARE
-///     block-aligned. Without it, freeing only whole blocks below
-///     `num_skipped_tokens / block_size` leaves the partially-in-window head
-///     block held, so blocks actually held exceed the reservation.
+///   * `+ 1` — the group's NULL BLOCK, the sentinel `remove_skipped_blocks` /
+///     `replace_block` write into retired slots. This is gemma4's
+///     `null_block_bytes` term, one block per sliding group
+///     (`gemma4/model.rs:2148-2157`), and it is what makes
+///     `required_bytes_for_width(1)` equal `minimum_pool_bytes` exactly
+///     (`gemma4/model.rs:2182-2196`). Drop it and the pool deadlocks at full
+///     occupancy with no block to retire slots into.
 ///
-/// A full group is returned unchanged: it is already bounded by `max_model_len`.
+///     It is NOT the straddled-window block. That one is a different block and is
+///     already inside `max_admission_blocks`:
+///     `AttentionKind::sliding_window_max_admission_blocks`
+///     (`transformer/kv_cache_spec.rs:64-79`) ends in its own `+ 1` for the
+///     unaligned window head, and vLLM spends it the same way —
+///     `SlidingWindowSpec.max_memory_usage_bytes` is `max_blocks *
+///     page_size_bytes` with nothing added on top, and
+///     `ChunkedLocalAttentionSpec` omits that `+1` because chunk boundaries ARE
+///     block-aligned. Two `+1`s, two blocks; reading them as one invites deleting
+///     either, and both deletions are load-bearing.
+///     `the_reservations_plus_one_is_the_null_block_not_the_straddled_window_block`
+///     pins the distinction.
+///
+/// A full group is returned unchanged: it is already bounded by `max_model_len`,
+/// and gemma4's `null_block_bytes` term excludes full groups.
 ///
 /// This number is a POOL RESERVATION and never a block-table row width. Rows are
 /// append-only while blocks are recycled — a recycled slot is overwritten with the
@@ -214,7 +291,9 @@ pub fn group_reserved_blocks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::muse_glimmer::config::fixtures::{config_json, text_config_json};
+    use crate::models::muse_glimmer::config::fixtures::{
+        config_json, layer_tables, text_config_json,
+    };
 
     /// The checkpoint-shaped config, taken through the real parser rather than
     /// hand-built: these tests must run on a config that actually validated, so
@@ -630,6 +709,128 @@ mod tests {
         );
     }
 
+    /// The sibling of the test above, and the one that actually fails OPEN
+    /// without a guard. `u32::try_from(0)` SUCCEEDS, so a 0 context length used
+    /// to reach the seam intact and produce a full-attention group with
+    /// `max_admission_blocks == div_ceil(0, 16) == 0` — an `Ok` result
+    /// describing a pool that can hold nothing.
+    ///
+    /// That zero then propagates silently through a gemma4-shaped pool sizer:
+    /// `group_reserved_blocks(Full, 0, width) == 0` at EVERY scheduler width, so
+    /// all 13 full layers contribute zero bytes to `one_sequence_bytes`, the
+    /// `memory_bytes < minimum_pool_bytes` check passes, and the
+    /// `while … required_bytes_for_width(…) > memory_bytes` loop never trips
+    /// (`gemma4/model.rs:2135-2199`). A KV pool with literally no full-attention
+    /// capacity gets allocated without a single error.
+    ///
+    /// Asserted on the "must be non-zero" wording, not merely on the field name:
+    /// the u32 guard right next to it also names `max_position_embeddings`, so a
+    /// looser assertion would stay green with this guard deleted.
+    #[test]
+    fn refuses_a_zero_max_position_embeddings_because_a_full_group_would_admit_no_blocks() {
+        let mut cfg = checkpoint_config();
+        cfg.text_config.max_position_embeddings = 0;
+        let err = compute_layer_kv_cache_groups(&cfg, 16, KVCacheDType::BFloat16, CHUNK)
+            .expect_err("a zero context length must fail closed, not admit zero blocks");
+        assert!(
+            err.contains("max_position_embeddings must be non-zero"),
+            "the error must name the field AND the zero, mirroring \
+             `config.rs`'s own guard; the u32-range guard beside it also contains \
+             \"max_position_embeddings\", got: {err}"
+        );
+
+        // Positive control on the boundary: the guard rejects 0 only, not "small".
+        // A mutation to `<= 1` or `< block_size` would trip here.
+        cfg.text_config.max_position_embeddings = 1;
+        let groups = groups(&cfg, CHUNK);
+        assert_eq!(groups[0].max_admission_blocks, 1);
+    }
+
+    /// A config whose 52 layers are all ONE kind, built by rewriting the
+    /// fixture's two parallel tables so it still goes through the real parser.
+    ///
+    /// Both directions PARSE. `from_json_str`'s NoPE<->Full biconditional only
+    /// fires on a disagreement BETWEEN the tables (`theta == 0 && kind != Full`,
+    /// or `kind == Full && theta != 0`), and a uniform table agrees with itself.
+    /// Nothing in the parser counts or positions the full layers.
+    fn uniform_kind_config(kind: &str, theta: &str) -> MuseGlimmerConfig {
+        let (kinds, thetas) = layer_tables(52);
+        let text = text_config_json(52)
+            .replace(
+                &format!("[{kinds}]"),
+                &format!("[{}]", vec![kind; 52].join(",")),
+            )
+            .replace(
+                &format!("[{thetas}]"),
+                &format!("[{}]", vec![theta; 52].join(",")),
+            );
+        MuseGlimmerConfig::from_json_str(&config_json(&text)).expect(
+            "a uniform layer table must PARSE — that is exactly why grouping has to catch it",
+        )
+    }
+
+    /// An all-sliding layer table must be refused HERE, because the parser
+    /// cannot see it and downstream is told not to look.
+    ///
+    /// "Exactly two groups, `group_id` 0 = Full" is a CONTRACT, not a discovery:
+    /// the design doc instructs M1 not to derive it at runtime, and the tests
+    /// above pin `groups[0].attention_kind == Full`. With 52 sliding layers
+    /// grouping returns ONE group, so `groups[0]` — the group whose adapter is
+    /// returned from `paged_adapter()` and the one used for prefix-cache
+    /// finalization and cold capture (`gemma4/model.rs:490-510`) — is the
+    /// SLIDING group. Sliding blocks then get published into the
+    /// content-addressed prefix cache, and a sliding block's contents depend on
+    /// where the window was when it was written: turn 2 resumes from a hit
+    /// describing a different window offset. Fluent, wrong, no error.
+    #[test]
+    fn refuses_an_all_sliding_layer_table_because_group_zero_would_not_be_the_full_group() {
+        let cfg = uniform_kind_config("\"sliding_attention\"", "500000.0");
+        assert_eq!(cfg.text_config.layer_kinds.len(), 52);
+
+        let err = compute_layer_kv_cache_groups(&cfg, 16, KVCacheDType::BFloat16, CHUNK)
+            .expect_err("a decoder with no full-attention layer must not group");
+        assert!(
+            err.contains("0 full-attention group"),
+            "the error must report the observed kind counts, and specifically the \
+             MISSING full group — the mirror case reports 0 sliding groups with the \
+             same prose, got: {err}"
+        );
+    }
+
+    /// The mirror direction: 52 full/NoPE layers also parse, also yield ONE
+    /// group, and there any consumer indexing `groups[1]` for the sliding pool
+    /// panics on an out-of-bounds index instead of misrouting. Still refused,
+    /// and with the other count named, so neither test can pass on a generic
+    /// message.
+    #[test]
+    fn refuses_an_all_full_layer_table_because_group_one_would_not_exist() {
+        let cfg = uniform_kind_config("\"full_attention\"", "0");
+
+        let err = compute_layer_kv_cache_groups(&cfg, 16, KVCacheDType::BFloat16, CHUNK)
+            .expect_err("a decoder with no sliding layer must not group");
+        assert!(
+            err.contains("0 sliding-window group"),
+            "the error must report the MISSING sliding group specifically, got: {err}"
+        );
+    }
+
+    /// The both-kinds guard must refuse no legal checkpoint. It is deliberately
+    /// NOT the `[S,S,S,F]` x 13 pattern: a future variant with a different ratio
+    /// or a different layer count is still a hybrid, and over-fitting the
+    /// pattern here would reject it. A 4-layer `[S,S,S,F]` config groups fine.
+    #[test]
+    fn the_both_kinds_guard_accepts_any_hybrid_ratio_not_just_the_reference_pattern() {
+        let cfg = MuseGlimmerConfig::from_json_str(&config_json(&text_config_json(4)))
+            .expect("a 4-layer [S,S,S,F] config must validate");
+        let groups = compute_layer_kv_cache_groups(&cfg, 16, KVCacheDType::BFloat16, CHUNK)
+            .expect("a 4-layer hybrid must still group into two groups");
+
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].attention_kind, AttentionKind::Full);
+        assert_eq!(groups[0].layer_indices, vec![3]);
+        assert_eq!(groups[1].layer_indices, vec![0, 1, 2]);
+    }
+
     /// `max_model_len` must be the context length, not some other config number
     /// that happens to be in range. 131072 is the only value that yields 8192
     /// full blocks; `sliding_window` (2048) would yield 128, `vocab_size`
@@ -748,9 +949,9 @@ mod tests {
     /// computed tokens even though the live window does not. Narrow a sliding
     /// group's reservation to the window and it overflows the moment computed
     /// tokens pass the window: the very first token past it needs a block the
-    /// budget does not contain. The `+1` covers the block the unaligned live
-    /// window straddles, which `remove_skipped_blocks` cannot free because it
-    /// frees whole blocks only.
+    /// budget does not contain. The `+1` is this group's NULL BLOCK — the
+    /// straddled window block is already inside the 161, see
+    /// `the_reservations_plus_one_is_the_null_block_not_the_straddled_window_block`.
     #[test]
     fn a_sliding_group_only_ever_widens_because_rows_are_append_only_while_blocks_are_recycled() {
         let sliding = AttentionKind::SlidingWindow {
@@ -758,7 +959,7 @@ mod tests {
         };
 
         // The real checkpoint's sliding admission (161 blocks) with room for 8
-        // live rows: admission binds, plus the straddled block.
+        // live rows: admission binds, plus this group's null block.
         assert_eq!(group_reserved_blocks(sliding, 161, 8), 162);
 
         // A window smaller than the scheduler width must not be the binding
@@ -778,6 +979,65 @@ mod tests {
             );
             assert!(reserved >= width, "width {width} reserved only {reserved}");
         }
+    }
+
+    /// TWO different blocks, one `+1` each, and this pins which is which.
+    ///
+    /// The straddled-window block is spent INSIDE `max_admission_blocks`:
+    /// `AttentionKind::sliding_window_max_admission_blocks`
+    /// (`transformer/kv_cache_spec.rs:64-79`) already ends in `+ 1`, and vLLM's
+    /// `SlidingWindowSpec.max_memory_usage_bytes` is `max_blocks *
+    /// page_size_bytes` with nothing added on top — so 161 is the whole
+    /// straddle-aware bound.
+    ///
+    /// `group_reserved_blocks`'s own `+1` is therefore a DIFFERENT block: the
+    /// group's null-block sentinel, the one `remove_skipped_blocks` /
+    /// `replace_block` write into retired slots. gemma4's pool sizer proves it —
+    /// `minimum_pool_bytes = one_sequence_bytes + null_block_bytes` where
+    /// `null_block_bytes` is one block per SLIDING group
+    /// (`gemma4/model.rs:2148-2157`), and `required_bytes_for_width(1)` equals
+    /// that exactly (`:2182-2196`), which is only true when the full group
+    /// contributes admission-and-no-more and each sliding group contributes
+    /// admission-plus-one.
+    ///
+    /// Without this test, a maintainer reading the two `+1`s as one block can
+    /// delete either — dropping the seam's under-provisions every sliding group
+    /// by the straddled block, dropping this one deadlocks the pool at full
+    /// occupancy with no null block to retire slots into.
+    #[test]
+    fn the_reservations_plus_one_is_the_null_block_not_the_straddled_window_block() {
+        let sliding = AttentionKind::SlidingWindow {
+            sliding_window: 2048,
+        };
+
+        // The straddle +1 is already inside the admission bound.
+        let admitted_tokens = (2048u32 - 1 + CHUNK).min(131_072);
+        assert_eq!(
+            admitted_tokens.div_ceil(16) + 1,
+            161,
+            "the hand formula's own trailing +1 is the straddled block"
+        );
+        assert_eq!(
+            AttentionKind::sliding_window_max_admission_blocks(2048, 131_072, CHUNK, 16)
+                .expect("the reference geometry must admit"),
+            161,
+            "so the seam's 161 already carries it"
+        );
+
+        // gemma4's pool identity at width 1: full contributes admission exactly,
+        // each sliding group contributes admission + ONE null block.
+        assert_eq!(
+            group_reserved_blocks(AttentionKind::Full, 8192, 1) as i64 - 8192,
+            0,
+            "a full group has no null block in gemma4's null_block_bytes term"
+        );
+        assert_eq!(
+            group_reserved_blocks(sliding, 161, 1) as i64 - 161,
+            1,
+            "exactly ONE block on top of the straddle-aware admission bound, and it \
+             is the null block — two +1s here would over-reserve, zero would leave \
+             no sentinel to retire recycled slots into"
+        );
     }
 
     /// A full group is returned unchanged. It is already bounded by
@@ -829,5 +1089,80 @@ mod tests {
         };
         assert_eq!(group_reserved_blocks(sliding, u32::MAX, 1), u32::MAX);
         assert_eq!(group_reserved_blocks(sliding, 1, u32::MAX), u32::MAX);
+    }
+
+    // ── Real checkpoint (gated) ────────────────────────────────────────────
+
+    /// Every number above is derived from `config::fixtures`, a hand
+    /// transcription of the reference `config.json`, and the layout/admission
+    /// literals (`(16, 2, 128, bf16)`, 8192, 161) were transcribed from the same
+    /// reading. They therefore cross-check each other and nothing else: if the
+    /// real `head_dim` were 64, or `num_key_value_heads` 4, or `sliding_window`
+    /// 4096, the fixture and the literals would agree on the wrong model and
+    /// every test in this file would stay green while production
+    /// `compute_layer_kv_cache_specs` read the real value off disk and sized a
+    /// different cache.
+    ///
+    /// This test is the one that makes the two-group claim and the 161-block
+    /// claim facts about the CHECKPOINT. It derives everything from the real
+    /// file, so a fixture that drifts from disk fails here.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn real_checkpoint_kv_geometry_and_admission_bounds() {
+        let Ok(dir) = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH") else {
+            eprintln!("skipping: MLX_TEST_MUSE_GLIMMER_MODEL_PATH not set");
+            return;
+        };
+        let cfg = MuseGlimmerConfig::from_path(std::path::Path::new(&dir))
+            .expect("the real checkpoint's config.json must parse and validate");
+
+        // The three values that determine every byte of the cache, read from
+        // disk rather than from the fixture.
+        let text = &cfg.text_config;
+        assert_eq!(text.head_dim, 128);
+        assert_eq!(text.num_key_value_heads, 2);
+        assert_eq!(text.sliding_window, 2048);
+        assert_eq!(text.max_position_embeddings, 131_072);
+
+        let specs = compute_layer_kv_cache_specs(&cfg, 16, KVCacheDType::BFloat16)
+            .expect("the real checkpoint's specs must derive");
+        assert_eq!(specs.len(), 52);
+        let expected_layout = KVCachePhysicalLayout::new(16, 2, 128, KVCacheDType::BFloat16);
+        for spec in &specs {
+            assert_eq!(
+                spec.physical_layout, expected_layout,
+                "layer {} layout drifted from the documented (16, 2, 128, bf16)",
+                spec.layer_index
+            );
+        }
+
+        let groups = compute_layer_kv_cache_groups(&cfg, 16, KVCacheDType::BFloat16, CHUNK)
+            .expect("the real checkpoint's groups must derive");
+        assert_eq!(groups.len(), 2, "the two-group contract, off the real file");
+        assert_eq!(groups[0].attention_kind, AttentionKind::Full);
+        assert_eq!(groups[0].layer_indices, FULL_LAYERS.to_vec());
+        assert_eq!(groups[0].layer_indices.len(), 13);
+        assert_eq!(
+            groups[1].attention_kind,
+            AttentionKind::SlidingWindow {
+                sliding_window: 2048
+            }
+        );
+        assert_eq!(groups[1].layer_indices.len(), 39);
+        assert_eq!(groups[0].max_admission_blocks, 8192);
+        assert_eq!(groups[1].max_admission_blocks, 161);
+
+        eprintln!(
+            "real checkpoint KV OK: {} groups, {}/{} full/sliding layers, layout \
+             (block_size {}, kv_heads {}, head_size {}), admission {}/{} blocks",
+            groups.len(),
+            groups[0].layer_indices.len(),
+            groups[1].layer_indices.len(),
+            expected_layout.block_size,
+            expected_layout.num_kv_heads,
+            expected_layout.head_size,
+            groups[0].max_admission_blocks,
+            groups[1].max_admission_blocks,
+        );
     }
 }
