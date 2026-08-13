@@ -868,8 +868,21 @@ mod tests {
         assert_eq!(full, vec![3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51]);
         assert_eq!(t.rms_norm_eps, 1e-5);
         assert_eq!(t.post_norm_eps, 1e-8);
-        // The seam's max_model_len, read from the real file rather than a
-        // transcription: 131072 => 8192 full-attention blocks at block_size 16.
+        // The four values that determine every byte of the KV cache, read from
+        // the real file rather than from the fixture. Without these, a
+        // transcription slip (or a differently-shaped Muse-Glimmer revision)
+        // would leave the fixture AND `kv_cache.rs`'s hard-coded layout
+        // literals agreeing on a model nobody runs: they were transcribed from
+        // the same reading of this file, so they cross-check each other and
+        // nothing else. `head_dim` 64 would halve the cache, kv_heads 4 would
+        // double it, and a 4096 window would move the sliding admission bound
+        // from 161 blocks to 289 — in all three cases with zero failing tests.
+        assert_eq!(t.head_dim, 128);
+        assert_eq!(t.num_key_value_heads, 2);
+        assert_eq!(t.num_attention_heads, 32);
+        assert_eq!(t.sliding_window, 2048);
+        // The seam's max_model_len: 131072 => 8192 full-attention blocks at
+        // block_size 16.
         assert_eq!(t.max_position_embeddings, 131072);
         assert_eq!(cfg.image_token_id, 200092);
 
