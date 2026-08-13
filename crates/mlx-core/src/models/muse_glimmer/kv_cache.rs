@@ -94,6 +94,27 @@ pub fn compute_layer_kv_cache_specs(
         ));
     }
 
+    // A 0-layer config is the one shape the arity check below AGREES with: empty
+    // tables give `0 == 0`, the loop iterates nothing, and this function returns
+    // `Ok(vec![])`. The refusal then lands two layers away, in
+    // `compute_layer_kv_cache_groups`' both-kinds guard, whose message reads
+    // "0 layers produced 0 full-attention group(s)" and blames grouping for a
+    // config field. Config load refuses it (`config.rs`), but this is `pub` and
+    // must not trust that its caller came through `from_json_str`.
+    //
+    // `num_attention_heads` is deliberately NOT re-checked here: this seam never
+    // reads it. The physical layout comes from `num_key_value_heads` and
+    // `head_dim`, which is exactly why a 0 query-head count is invisible to the
+    // cache and has to be caught at config load instead.
+    if text.num_hidden_layers == 0 {
+        return Err(
+            "muse_glimmer KV cache specs require num_hidden_layers > 0; a 0 agrees with \
+             empty layer tables and would derive an empty spec set, deferring the refusal \
+             to grouping where it reads as a grouping failure"
+                .to_string(),
+        );
+    }
+
     // `from_json_str` guarantees this, but the loop below indexes `layer_kinds`
     // for every layer, so the arity is checked rather than assumed: a `pub` entry
     // point must fail closed on a config assembled elsewhere, never panic.
@@ -697,6 +718,29 @@ mod tests {
             );
             assert_eq!(spec.physical_layer_index(), spec.layer_index);
         }
+    }
+
+    /// A 0-layer config is the shape the arity check AGREES with (0 == 0), so
+    /// without a dedicated guard this function returns `Ok(vec![])` and the
+    /// refusal lands in grouping, reading as a grouping failure. Config load
+    /// refuses it too (`config::tests::rejects_a_zero_num_hidden_layers_because_empty_tables_agree_with_it`);
+    /// this pins the second line of defence, because the function is `pub`.
+    ///
+    /// Mutation caught: deleting the `num_hidden_layers == 0` guard. Pinned to
+    /// this guard's own wording — the arity message also names
+    /// `num_hidden_layers`, so a looser assertion would survive the deletion.
+    #[test]
+    fn refuses_a_zero_layer_count_that_the_arity_check_agrees_with() {
+        let mut cfg = checkpoint_config();
+        cfg.text_config.num_hidden_layers = 0;
+        cfg.text_config.layer_kinds.clear();
+        cfg.text_config.layer_rope_theta.clear();
+        let err = compute_layer_kv_cache_specs(&cfg, 16, KVCacheDType::BFloat16)
+            .expect_err("a 0-layer decoder must not derive an empty spec set");
+        assert!(
+            err.contains("require num_hidden_layers > 0"),
+            "the error must name the layer count as a caller-supplied precondition, got: {err}"
+        );
     }
 
     /// Pinned to the early guard's own wording, not merely to the string
