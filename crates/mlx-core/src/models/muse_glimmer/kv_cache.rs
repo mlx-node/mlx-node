@@ -332,14 +332,18 @@ mod tests {
         }
     }
 
+    /// Pinned to the early guard's own wording, not merely to the string
+    /// "block_size". The layout validity check downstream also names block_size,
+    /// so a looser assertion would stay green with the early guard deleted and
+    /// report an "invalid physical layout" for what is really a caller error.
     #[test]
     fn refuses_a_zero_block_size() {
         let cfg = checkpoint_config();
         let err = compute_layer_kv_cache_specs(&cfg, 0, KVCacheDType::BFloat16)
             .expect_err("a zero block_size cannot produce a valid layout");
         assert!(
-            err.contains("block_size"),
-            "the error must name block_size, got: {err}"
+            err.contains("require block_size > 0"),
+            "the error must name block_size as a caller-supplied precondition, got: {err}"
         );
     }
 
@@ -354,8 +358,10 @@ mod tests {
         let err = compute_layer_kv_cache_specs(&cfg, 16, KVCacheDType::BFloat16)
             .expect_err("a short layer_kinds table must fail closed, not panic");
         assert!(
-            err.contains("layer_kinds") && err.contains("51"),
-            "the error must name the table and its observed length, got: {err}"
+            err.contains("layer_kinds has 51 entries but num_hidden_layers is 52"),
+            "the error must report the arity mismatch itself; the per-layer fallback \
+             message also contains \"layer_kinds\" and \"51\", so a looser assertion \
+             would survive deleting the arity guard, got: {err}"
         );
     }
 
@@ -691,6 +697,44 @@ mod tests {
             err.contains("block_size"),
             "the error must name block_size, got: {err}"
         );
+    }
+
+    /// Nothing on the path from config to group may be hard-coded at the
+    /// reference value. Every assertion above compares a derived number against
+    /// the SAME config field or against a constant that happens to equal the
+    /// reference (2048, 131072, block_size 16, bf16), so a baked-in literal would
+    /// satisfy all of them. Feeding non-reference values through is the only thing
+    /// that pins the plumbing — the same argument as
+    /// `config::tests::defaulted_fields_are_read_from_the_file_when_present`.
+    #[test]
+    fn no_argument_or_config_field_on_the_path_is_hard_coded_at_its_reference_value() {
+        let text = text_config_json(52)
+            .replace("\"sliding_window\": 2048", "\"sliding_window\": 1024")
+            .replace(
+                "\"max_position_embeddings\": 131072",
+                "\"max_position_embeddings\": 65536",
+            );
+        let cfg = MuseGlimmerConfig::from_json_str(&config_json(&text))
+            .expect("a non-reference window and context length must still validate");
+
+        let specs = compute_layer_kv_cache_specs(&cfg, 32, KVCacheDType::Fp8)
+            .expect("specs must derive for the non-reference config");
+        assert_eq!(
+            specs[0].attention_kind,
+            AttentionKind::SlidingWindow {
+                sliding_window: 1024
+            },
+            "the window must come from the config, not from a literal 2048"
+        );
+        assert_eq!(specs[0].physical_layout.block_size, 32);
+        assert_eq!(specs[0].physical_layout.cache_dtype, KVCacheDType::Fp8);
+
+        let groups = compute_layer_kv_cache_groups(&cfg, 32, KVCacheDType::Fp8, CHUNK)
+            .expect("groups must derive for the non-reference config");
+        // full    = div_ceil(65536, 32)                       = 2048
+        // sliding = div_ceil(min(1023 + 512, 65536), 32) + 1   = 48 + 1 = 49
+        assert_eq!(groups[0].max_admission_blocks, 2048);
+        assert_eq!(groups[1].max_admission_blocks, 49);
     }
 
     // ── Pool reservation ──────────────────────────────────────────────────
