@@ -196,7 +196,8 @@ New, under `crates/mlx-core/src/models/muse_glimmer/`:
 | `layer_cache.rs` | per-layer kind -> `RotatingKVCache` / paged / flat |
 | `vision.rs`, `vision_embedder.rs`, `vision_window.rs` | tower, patch embed + zero-pad resample, window index |
 | `image_processor.rs` | token-capped smart_resize, LANCZOS, `(t,c,ph,pw)` flatten |
-| `output_parser.rs` | `response_template`-driven ATEM parser |
+| `output_parser.rs` | `response_template`-driven ATEM parser; `terminators` = the text fields' closes UNIONED with `tokenizer_config.json`'s `eos_token` |
+| `stream_guard.rs` | per-turn streaming safety: channel routing, byte-exact header grammar, provenance-gated scan (`authority_spans`), `TurnEnd` |
 | `persistence.rs`, `sliding_sidecar.rs` | quant load, cold-tier sidecar |
 
 Reused as-is: `vision::{VisionRotaryEmbedding, encoder}`, `RotatingKVCache`,
@@ -505,6 +506,62 @@ be settled inside M0.
   build those spans, because it is the last layer that still has token ids. A parser that
   can emit an executable call from an un-provenanced string is the wrong shape regardless
   of how careful its rules are.
+- **The guard's SCAN is provenance-gated too, not just what it reports — LANDED IN M0.**
+  This was recorded as "pinned, not fixed" for one round and is now FIXED, because two
+  independent reviews flagged the same class of problem and the second one found a case the
+  first did not. The defect: `StreamGuard::scan` matched decoded TEXT while
+  `output_parser` decided on spans, so on byte-identical input the guard cut the stream
+  where the parser reported prose — and, worse, opened a channel where the parser opened
+  none. Measured on the REAL vocabulary with ordinary sampleable ids (`<`=40, `|`=104,
+  `|>`=159276), a typed `<|eom|><|start|>assistant to=user<|message|>` inside a `to=self`
+  message made the guard STREAM the chain of thought as the answer, byte for byte the text
+  the parser puts in `reasoning` with `content = None`. Second shape, not in the first
+  review: a real `<|eom|>` + a TYPED anchor + ONE real `<|message|>` forged a content
+  header, because `classify_header` is handed only the region text and never provenance.
+  Neither is privilege escalation — `tool_calls` stayed empty in every probe, since the
+  parser's action gates are all intact — but chain-of-thought reaching the user-visible
+  channel is exactly what `Channel::Reasoning` exists to prevent. The rule now:
+  **a control literal exerts structural authority only where a control token put those
+  bytes there, or where ONE id's own text contained them; the ATEM literals stay decided
+  by the recipient.** `authority_spans` is a guard-private SUPERSET of the parser's
+  `control_spans` and nothing is ever added to the latter — the second clause is what keeps
+  a single token spelling `<|eot|>` plus trailing text stopping the turn, without resting on
+  the checkpoint's vocabulary property (now pinned in the gated tier: 202,048 keys, zero
+  carriers). Each of the four gates mirrors a rule the parser already had —
+  `earliest_terminator`, `next_anchor`, `tool_header_at` — and text headers stay ungated on
+  BOTH sides, which is the standing ruling that actions are gated end to end and text is
+  not. **M1 must not re-decide this**: it is the streaming safety boundary, and its tests
+  are written against the resolved ruling.
+- **A call's completeness is `</atem:invoke>`, not its message's terminator — LANDED IN M0
+  as documentation, tests and a signal; the parser's logic is UNCHANGED and deliberately
+  so.** Two review rounds in a row asked `collect_tool_calls` to refuse calls from a
+  message whose terminator never arrived, both misreading `terminators`' doc ("will act
+  AFTER") as "will act ON". The behaviour they describe is real — a `max_tokens` seal right
+  after `</atem:invoke>` does yield a call from an unterminated message — but the fix is a
+  correctness REGRESSION: measured, it discards 2 complete calls after a cap seal and 1
+  complete call from a tool message ended by `<|end_of_text|>`, a turn that is not
+  truncated at all. The per-CALL rule already there is sufficient rather than merely
+  cautious, and the proof is `StreamGuard.raw` being append-only (`stop`/`seal`/`flush`
+  never shorten it, cap-refused ids are refused before decoding, mid-scalar bytes stay in
+  `decode_ids`): `raw` is a strict PREFIX of the model's output, so a present
+  `</atem:invoke>` proves the whole invoke arrived and truncation cannot produce a
+  closed-but-partial call. What was actually missing was a SIGNAL — `GuardOutcome::EndTurn`
+  was identical for a natural `<|eot|>` and a cap seal — so `StreamGuard::turn_end`
+  -> `TurnEnd` now says WHY a turn ended. **If M1 wants to be conservative about
+  truncation, it holds back the LAST call on `TokenCap`; it never drops the list, and never
+  in the parser, which cannot see finish_reason and for which the terminator set is not a
+  sound proxy.**
+- **`terminators` is derived from TWO shipped sources, and must stay a union — LANDED IN
+  M0.** `response_template`'s `close` lists describe what `chat_template.jinja` RENDERS
+  (`<|eot|>` 6x, `<|eom|>` 4x, `<|end_of_text|>` never), so they cannot name a
+  sampling-time stop. Before the fix a `to=user` answer ended on 200001 parsed to
+  `content = Some("The answer is 42.<|end_of_text|>")` while the guard streamed
+  `"The answer is 42."`, and `reasoning` had the same leak with no clean copy anywhere
+  since the guard never streams that channel. The extra terminator comes from
+  `tokenizer_config.json`'s top-level `eos_token` — already a marker STRING in the body the
+  parser parses, so no id->text resolution and no tokenizer. It must stay a UNION: that key
+  names 200001 and OMITS 200008, which `engine/persistence.rs` already documents as a trap
+  that makes a loader never stop. Absent stays legal; empty is refused.
 - **A tool call is recognised only where the recipient is a tool channel, and every accepted
   invoke name must equal that recipient — LANDED IN M0.** Enforced in `output_parser` (the
   invoke name is compared to `recipient` and the scan stops on a mismatch) and pinned by
