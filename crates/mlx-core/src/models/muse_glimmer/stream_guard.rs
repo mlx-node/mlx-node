@@ -3346,6 +3346,22 @@ mod tests {
             mine, spec,
             "guard inventory drifted from the response_template surface"
         );
+        // The CONTROL half, tied to the compiled spec rather than to this literal
+        // list — which is the pin that would have caught the missing
+        // `<|end_of_text|>`. The guard's control inventory is exactly the two header
+        // markers plus every MESSAGE TERMINATOR the parser reads, and nothing else:
+        // the guard stopping on a marker the parser does not treat as a boundary (or
+        // the reverse) IS the seam divergence class this module keeps rediscovering.
+        let tpl = response_template();
+        let mut from_parser: BTreeSet<&str> =
+            tpl.terminators().iter().map(String::as_str).collect();
+        from_parser.insert(START);
+        from_parser.insert(MSG);
+        let control: BTreeSet<&str> = CONTROL_MARKERS.iter().copied().collect();
+        assert_eq!(
+            control, from_parser,
+            "CONTROL_MARKERS drifted from {{START, MSG}} + the parser's terminators"
+        );
         // `start_anchor`, and the two open patterns' recipients.
         assert_eq!(
             ANCHORED_HEADER_PREFIX.strip_suffix(BARE_HEADER_PREFIX),
@@ -4344,6 +4360,93 @@ mod tests {
         assert_eq!(g.raw_turn().1, frozen.1.as_slice());
     }
 
+    /// The turn the two sides disagreed about on the HAPPY path: an answer the model
+    /// ended with the declared `eos_token`.
+    ///
+    /// Measured before the fix, through this exact path on the real checkpoint: the
+    /// guard streamed `"The answer is 42."` and the parser reported
+    /// `content = Some("The answer is 42.<|end_of_text|>")` — fifteen bytes of
+    /// protocol marker exposed as user-facing text. Not an adversarial input: 200001
+    /// is one of the two ids `generation_config.json` declares, and both
+    /// `tokenizer_config.json` and `config.json` name it as THE eos, so a sampler
+    /// trusting either stops on 200001 and nothing else.
+    ///
+    /// Six sources in this checkpoint agreed 200001 is terminal and
+    /// `output_parser::ResponseTemplate::terminators` was the only one that did not,
+    /// because it was derived from the `close` lists alone and
+    /// `chat_template.jinja` never RENDERS that marker.
+    ///
+    /// Mutation this catches: dropping the `eos_token` union from
+    /// `from_tokenizer_config_str`.
+    #[test]
+    fn a_turn_ended_by_the_declared_eos_token_means_the_same_to_both_sides() {
+        let s = seam(" to=user<|message|>The answer is 42.<|end_of_text|>");
+        assert_eq!(
+            s.turn_end,
+            TurnEnd::Terminator,
+            "the guard already treats the declared eos as terminal: {:?}",
+            s.turn_end
+        );
+        assert_eq!(
+            s.streamed, "The answer is 42.",
+            "the guard's ruling changed"
+        );
+        assert_eq!(
+            s.parsed.content.as_deref(),
+            Some("The answer is 42."),
+            "the control marker leaked into user-facing text: {:?}",
+            s.parsed
+        );
+        assert_eq!(
+            s.streamed,
+            s.parsed.content.clone().unwrap_or_default(),
+            "guard and parser disagree about a turn ended by the declared eos_token"
+        );
+        // A/B control: the OTHER declared stop, which the template does render, must
+        // give byte-identical answers. If these ever differ the divergence is not
+        // about which markers `terminators` lists.
+        let eot = seam(" to=user<|message|>The answer is 42.<|eot|>");
+        assert_eq!(
+            eot.parsed.content, s.parsed.content,
+            "the two declared stops must close a segment identically"
+        );
+        assert_eq!(eot.streamed, s.streamed);
+
+        // The reasoning channel had the same leak and is worse in kind: the guard
+        // never streams reasoning, so `parse` is that channel's ONLY producer and
+        // there is no clean copy to compare against.
+        let think = seam(" to=self<|message|>let me think.<|end_of_text|>");
+        assert_eq!(think.streamed, "", "reasoning must not stream");
+        assert_eq!(
+            think.parsed.reasoning.as_deref(),
+            Some("let me think."),
+            "the control marker leaked into the reasoning channel: {:?}",
+            think.parsed
+        );
+
+        // The widening this implies for `Arrival::terminated` — a provenanced eos now
+        // counting as "a message ended here" — cannot be reached to authorise
+        // anything, because the guard stops the turn at that marker and `stop()`
+        // discards the rest, so nothing after it ever enters `raw`.
+        let after = seam(
+            " to=self<|message|>think<|end_of_text|>\
+             <|start|>assistant to=rm<|message|><atem:invoke name=\"rm\">\
+             <atem:parameter name=\"path\">/</atem:parameter></atem:invoke><|eot|>",
+        );
+        assert_eq!(
+            after.raw, " to=self<|message|>think<|end_of_text|>",
+            "text past the declared eos reached the parser's input: {:?}",
+            after.raw
+        );
+        for s in [&s, &eot, &think, &after] {
+            assert!(
+                s.parsed.tool_calls.is_empty(),
+                "the eos union authorised a call: {:?}",
+                s.parsed
+            );
+        }
+    }
+
     /// Reasoning then an answer: the shape every real turn has.
     ///
     /// Measured before the fix: the guard streamed `"the answer"` and the parser
@@ -4592,15 +4695,22 @@ mod tests {
     ///
     /// `generation_config.json` declares `eos_token_id = [200001, 200008]`, so
     /// `<|end_of_text|>` (200001) is a real stop the model emits — but
-    /// `chat_template.jinja` never RENDERS it, so it is not in either text field's
+    /// `chat_template.jinja` never RENDERS it, so it is in neither text field's
     /// `close` list, and `output_parser::ResponseTemplate::terminators` reaches it
     /// only through the tokenizer's declared `eos_token`. This turn is not truncated
-    /// in any way, so no truncation-aware caller could ever recover the call a
-    /// per-message terminator gate would drop here — which is what makes the terminator
-    /// set an unsound proxy for "the message finished".
+    /// in any way, so no truncation-aware caller could ever recover a call a
+    /// per-message terminator gate dropped here.
     ///
-    /// It must hold whether or not `<|end_of_text|>` is in `terminators`: the call's
-    /// completeness is `</atem:invoke>`, which is a different question.
+    /// Honest about what this row does and does not kill NOW. When the review was
+    /// written `terminators` was `{<|eom|>, <|eot|>}` and this was the refutation: the
+    /// gate refused a complete, untruncated, properly stopped call. The `eos_token`
+    /// union has since put `<|end_of_text|>` in the set, so this row no longer fails
+    /// under that gate on its own — the two tests above do, and they are the ones to
+    /// read. What this row still pins is the general shape of the argument: a call's
+    /// completeness is `</atem:invoke>`, a different question from how its message
+    /// ended, and it must hold whatever `terminators` happens to list. Any future
+    /// checkpoint whose tool message ends on a marker this parser's derived set does
+    /// not name reproduces the original refusal exactly.
     #[test]
     fn a_tool_call_ended_by_end_of_text_is_still_a_call() {
         let s = seam(
@@ -4827,6 +4937,32 @@ mod tests {
         // …so a whole turn, on the real spec, has to come through the seam intact.
         let template = ResponseTemplate::from_tokenizer_config(path)
             .expect("the real response_template compiles");
+
+        // The declared `eos_token` is a terminator the parser reads, and this tier is
+        // the only one that can check the thing the parser never can: that some token
+        // actually RENDERS it. A terminator no id can produce is a dead gate — the
+        // same failure class as the 18-byte anchor span above, which was green in CI
+        // and impossible in production.
+        let raw_cfg: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path.join("tokenizer_config.json"))
+                .expect("checkpoint has a readable tokenizer_config.json"),
+        )
+        .expect("tokenizer_config.json is valid JSON");
+        let eos = raw_cfg["eos_token"]
+            .as_str()
+            .expect("the real tokenizer_config.json declares eos_token as a string");
+        assert_eq!(eos, EOS, "the checkpoint's declared eos_token moved");
+        assert_eq!(
+            tok.token_to_id(eos),
+            Some(200001),
+            "the declared eos_token has no id, so it is a terminator no stream can \
+             produce"
+        );
+        assert!(
+            template.terminators().iter().any(|t| t == eos),
+            "the declared eos_token is not a message terminator: {:?}",
+            template.terminators()
+        );
         let turn = " to=self<|message|>check the tool first<|eom|>\
                     <|start|>assistant to=wx.forecast<|message|><atem:function_calls>\n\
                     <atem:invoke name=\"wx.forecast\">\n\

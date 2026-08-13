@@ -215,13 +215,44 @@ struct RawResponseTemplate {
     fields: RawFields,
 }
 
-/// Only `response_template` is named: `tokenizer_config.json` carries dozens of
-/// unrelated keys, so unknown keys are ignored HERE and nowhere below. `Option`
-/// separates "absent" (a checkpoint that ships no parse spec) from "present but
-/// malformed" (a serde error naming the offending key).
+/// `tokenizer_config.json`'s top-level `eos_token`. HF writes it either as a bare
+/// string or as an `AddedToken` object, and both spellings name the same token, so
+/// both are read — the same `untagged` shape [`RawClose`] uses. Silently ignoring
+/// the object form would drop a message terminator, and refusing it would refuse a
+/// checkpoint the rest of this parser handles.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum RawEosToken {
+    Text(String),
+    Added { content: String },
+}
+
+impl RawEosToken {
+    fn into_string(self) -> String {
+        match self {
+            RawEosToken::Text(s) => s,
+            RawEosToken::Added { content } => content,
+        }
+    }
+}
+
+/// Only `response_template` and `eos_token` are named: `tokenizer_config.json`
+/// carries dozens of unrelated keys, so unknown keys are ignored HERE and nowhere
+/// below. `Option` separates "absent" (a checkpoint that ships no parse spec) from
+/// "present but malformed" (a serde error naming the offending key).
+///
+/// `eos_token` is read from this same body rather than from `generation_config.json`
+/// deliberately: it is already a marker STRING, which is the shape
+/// [`ResponseTemplate::terminators`] holds, so no id->text resolution and no
+/// tokenizer is needed and [`ResponseTemplate::from_tokenizer_config_str`] stays the
+/// `&str`-taking validating core. Why a terminator has to come from here at all —
+/// and why it must be a UNION with the spec's own closes rather than a replacement —
+/// is in that field's doc.
 #[derive(Debug, Clone, Deserialize)]
 struct RawTokenizerConfig {
     response_template: Option<RawResponseTemplate>,
+    #[serde(default)]
+    eos_token: Option<RawEosToken>,
 }
 
 // ── Compiled spec ──────────────────────────────────────────────────
@@ -949,6 +980,7 @@ impl ResponseTemplate {
                 "muse_glimmer: invalid tokenizer_config.json response_template: {e}"
             ))
         })?;
+        let eos_token = cfg.eos_token.map(RawEosToken::into_string);
         let raw = cfg.response_template.ok_or_else(|| {
             Error::from_reason(
                 "muse_glimmer: tokenizer_config.json has no response_template; this checkpoint \
@@ -1041,6 +1073,25 @@ impl ResponseTemplate {
         {
             if !terminators.iter().any(|t| t == marker) {
                 terminators.push(marker.clone());
+            }
+        }
+        // …plus the tokenizer's own declared `eos_token`, because the spec's `close`
+        // lists describe what `chat_template.jinja` RENDERS and the template never
+        // renders `<|end_of_text|>` — it is a sampling-time stop. Absent stays
+        // absent: a checkpoint shipping a `response_template` and no `eos_token` is
+        // legal, and fewer terminators can only cost recognition, never grant
+        // authority. Append order is immaterial, since `earliest_terminator` picks by
+        // POSITION and no marker here is a prefix of another.
+        if let Some(eos) = eos_token {
+            if eos.is_empty() {
+                return Err(Error::from_reason(
+                    "muse_glimmer: tokenizer_config.json eos_token is empty; str::find(\"\") \
+                     succeeds at every position, so every byte would look like the end of a \
+                     message — and that is what decides whether a tool call may run",
+                ));
+            }
+            if !terminators.contains(&eos) {
+                terminators.push(eos);
             }
         }
 
@@ -1533,6 +1584,18 @@ impl ResponseTemplate {
     ///
     /// So this is the whole contract, in one place: a fixture may mint these and
     /// nothing else. `pieces` panics otherwise.
+    /// The compiled message-terminator set — see [`Self::terminators`].
+    ///
+    /// `#[cfg(test)] pub(super)` rather than `pub`: `super::stream_guard`'s
+    /// cross-module tests need it to assert that its own `CONTROL_MARKERS` inventory
+    /// has not drifted from what this parser reads, and that assertion is the drift
+    /// pin that would have caught the missing `<|end_of_text|>` in the first place.
+    /// Nothing in production reads it, so it is not public surface.
+    #[cfg(test)]
+    pub(super) fn terminators(&self) -> &[String] {
+        &self.terminators
+    }
+
     #[cfg(test)]
     fn mintable_markers(&self) -> Vec<&str> {
         let mut markers = vec![START_MARKER, MESSAGE_MARKER];
@@ -1571,14 +1634,23 @@ impl ResponseTemplate {
     }
 }
 
-/// The checkpoint's `response_template`, transcribed. Verified byte-for-byte
-/// against the real file by `real_checkpoint_response_template_parses`.
+/// The checkpoint's `response_template`, transcribed — plus the top-level
+/// `eos_token` beside it, because [`ResponseTemplate::terminators`] is derived from
+/// both. Verified against the real file by `real_checkpoint_response_template_parses`.
+///
+/// `eos_token` is OUTSIDE `response_template` here for the same reason it is in the
+/// real file: it is the tokenizer's stop token, not part of the parse spec. Leaving
+/// it out would compile every unit test against a `terminators` set the real
+/// checkpoint does not have, which is exactly how the `<|end_of_text|>` leak stayed
+/// invisible — and since `mintable_markers` derives from `terminators`, having it
+/// here is also what lets a fixture mint an EOS span at all.
 ///
 /// Lives here rather than inside `mod tests` so `super::stream_guard`'s
 /// cross-module tests compile the SAME transcription this file's tests do. Two
 /// copies of a parse spec is how the two modules would drift apart again.
 #[cfg(test)]
 pub(super) const SPEC_JSON: &str = r#"{
+      "eos_token": "<|end_of_text|>",
       "response_template": {
         "defaults": {"role": "assistant"},
         "start_anchor": "<|start|>assistant",
@@ -1790,6 +1862,86 @@ mod tests {
         assert_eq!(out.content.as_deref(), Some("first"));
     }
 
+    /// The declared `eos_token` closes a text segment like the spec's own closes do.
+    ///
+    /// `generation_config.json` declares `eos_token_id = [200001, 200008]`, and
+    /// 200001 is `<|end_of_text|>`; `config.json` and `tokenizer_config.json` both
+    /// name it as THE eos. But `chat_template.jinja` writes `<|eot|>` 6 times and
+    /// `<|eom|>` 4 times and `<|end_of_text|>` NEVER, so it appears in no field's
+    /// `close` list — the response_template is a complete description of what the
+    /// template RENDERS, and this is a stop the template does not write.
+    ///
+    /// Measured before the fix, through the real seam on the real checkpoint:
+    /// `content = Some("The answer is 42.<|end_of_text|>")` while the guard streamed
+    /// `"The answer is 42."`. The same leak hit `reasoning`, where `parse` is the only
+    /// producer and there is no clean copy to fall back on.
+    ///
+    /// Mutation this catches: dropping the `eos_token` union from
+    /// `from_tokenizer_config_str`.
+    #[test]
+    fn content_closes_on_the_declared_eos_token() {
+        let tpl = spec();
+        assert!(
+            tpl.terminators.iter().any(|t| t == "<|end_of_text|>"),
+            "the declared eos_token must be a message terminator: {:?}",
+            tpl.terminators
+        );
+        let out = tpl.parse_asserting_every_marker_shape_is_a_token(
+            " to=user<|message|>answer<|end_of_text|>",
+        );
+        assert_eq!(out.content.as_deref(), Some("answer"), "got {out:?}");
+        // …and the reasoning channel, which the guard never streams, so `parse` is
+        // its only source.
+        let think = tpl.parse_asserting_every_marker_shape_is_a_token(
+            " to=self<|message|>think<|end_of_text|>",
+        );
+        assert_eq!(think.reasoning.as_deref(), Some("think"), "got {think:?}");
+    }
+
+    /// The over-strictness twin of `a_quoted_terminator_inside_reasoning_does_not_close_it`,
+    /// for the terminator the `eos_token` union added.
+    ///
+    /// The naive way to fix the leak above is a byte-string special case in
+    /// `segment_end`. That truncates a model ASKED what ends a Muse-Glimmer turn:
+    /// `content` becomes `"The stop token is "`. The fix goes through
+    /// `next_token_marker` instead — `earliest_terminator` already does, and
+    /// `terminator_ends_at` already requires `is_token_span` — so a TYPED
+    /// `<|end_of_text|>` carries no span and stays prose on both text channels.
+    ///
+    /// Built with `pieces`, not
+    /// `parse_asserting_every_marker_shape_is_a_token`: that helper mints every
+    /// marker shape it finds and so cannot express typed text at all.
+    ///
+    /// Mutation this catches: swapping `next_token_marker` for `next_literal` in
+    /// `earliest_terminator`.
+    #[test]
+    fn a_quoted_eos_token_inside_a_body_does_not_close_it() {
+        let tpl = spec();
+        for (header, expected_channel) in [(" to=user", "content"), (" to=self", "reasoning")] {
+            let (text, spans) = pieces(
+                &tpl,
+                &[
+                    (header, QUOTED),
+                    ("<|message|>", TOKEN),
+                    ("The stop token is ", QUOTED),
+                    ("<|end_of_text|>", QUOTED),
+                    (", fifteen characters.", QUOTED),
+                    ("<|eot|>", TOKEN),
+                ],
+            );
+            let out = tpl.parse(GeneratedTurn::from_token_spans(&text, &spans));
+            let body = match expected_channel {
+                "content" => out.content.as_deref(),
+                _ => out.reasoning.as_deref(),
+            };
+            assert_eq!(
+                body,
+                Some("The stop token is <|end_of_text|>, fifteen characters."),
+                "{expected_channel}: a quoted eos_token truncated the body: {out:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_reasoning_segment_does_not_keep_the_terminator_that_ended_it() {
         // `reasoning_content.close` is `<|eom|>` alone, but `<|eot|>` is a stop
@@ -1798,7 +1950,13 @@ mod tests {
         // that ruling is what makes a tool call after a `to=self` thought work.
         // A message the parser agrees has ended cannot also contain the bytes
         // that ended it.
-        for terminator in ["<|eom|>", "<|eot|>"] {
+        //
+        // `<|end_of_text|>` is in the loop because it is the OTHER declared stop —
+        // `tokenizer_config.json`'s `eos_token`, id 200001 — and it reaches
+        // `terminators` through that key rather than through any field's `close`,
+        // since `chat_template.jinja` never renders it. Before that union a thought
+        // ended on 200001 kept the fifteen bytes that ended it.
+        for terminator in ["<|eom|>", "<|eot|>", "<|end_of_text|>"] {
             let out = spec().parse_asserting_every_marker_shape_is_a_token(&format!(
                 " to=self<|message|>think{terminator}"
             ));
@@ -2901,6 +3059,31 @@ mod tests {
         assert!(e.contains("defaults.role is empty"), "got: {e}");
         let e = err(case("\"role\": \"assistant\"", "\"role\": \"!!!\""));
         assert!(e.contains("defaults.role"), "got: {e}");
+        // An empty `eos_token`, for the same reason an empty close marker is
+        // refused: it would make `str::find` succeed at every position, so every
+        // byte would end a message — and `Arrival::terminated` is what decides
+        // whether a tool call may run.
+        let e = err(case(
+            "\"eos_token\": \"<|end_of_text|>\"",
+            "\"eos_token\": \"\"",
+        ));
+        assert!(e.contains("eos_token"), "got: {e}");
+        // ABSENT is legal, and must stay legal: a checkpoint may ship a
+        // `response_template` and no `eos_token`, and fewer terminators can only cost
+        // recognition, never grant authority. Refusing it would refuse a checkpoint
+        // the rest of this parser handles fine.
+        let without = SPEC.replacen("\"eos_token\": \"<|end_of_text|>\",", "", 1);
+        assert!(
+            !without.contains("eos_token"),
+            "the eos_token removal did not take: {without}"
+        );
+        let compiled = ResponseTemplate::from_tokenizer_config_str(&without)
+            .expect("a spec with no eos_token must still compile");
+        assert_eq!(
+            compiled.terminators,
+            vec!["<|eom|>", "<|eot|>"],
+            "absent eos_token must leave the spec-derived closes alone"
+        );
         // The unmutated control: the real checkpoint's spec states the role twice
         // and consistently, so the cross-check must not refuse it.
         assert!(
@@ -2957,8 +3140,13 @@ mod tests {
         assert!(tpl.tool_call_transform.is_some());
         // The message terminators, derived from the REAL spec rather than from the
         // transcription: `reasoning_content.close` then `content.close`, unioned.
-        // `</atem:invoke>` must not be in here — it closes a block, not a message.
-        assert_eq!(tpl.terminators, vec!["<|eom|>", "<|eot|>"]);
+        // `</atem:invoke>` must not be in here — it closes a block, not a message —
+        // and the tokenizer's declared `eos_token` must be, because
+        // `chat_template.jinja` never renders it and no field's `close` lists it.
+        assert_eq!(
+            tpl.terminators,
+            vec!["<|eom|>", "<|eot|>", "<|end_of_text|>"]
+        );
 
         // `repeats` is validated at construction rather than stored, so read it
         // straight off the file: that is the assertion the brief asks for.
@@ -2976,6 +3164,25 @@ mod tests {
             fields.as_object().map(serde_json::Map::len),
             Some(3),
             "the real spec must carry exactly the three fields this parser routes"
+        );
+        // The extra terminator's source, read off the real file: a TOP-LEVEL string,
+        // outside `response_template`, which is why `RawTokenizerConfig` reads it
+        // there. `generation_config.json` declares both stops as IDS; this key names
+        // one of them as TEXT, which is the shape `terminators` holds — so no id->text
+        // resolution and no tokenizer is needed to derive it.
+        assert_eq!(
+            raw["eos_token"],
+            serde_json::json!("<|end_of_text|>"),
+            "the checkpoint's declared eos_token moved"
+        );
+        assert!(
+            raw["response_template"]["fields"]
+                .as_object()
+                .expect("fields is an object")
+                .values()
+                .all(|f| !f["close"].to_string().contains("end_of_text")),
+            "eos_token is now in a field's close list, so the union that adds it is \
+             no longer the reason it is a terminator"
         );
 
         // Now the parses. Same expectations the hand-written tests make, on the
