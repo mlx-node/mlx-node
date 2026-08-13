@@ -13916,6 +13916,399 @@ mod tests {
         }
     }
 
+    /// Geometry shared by the sliding cache-hit prefill numerics tests.
+    ///
+    /// Scaled 2x from the obvious `block_size = 4` illustration because the
+    /// Metal kernel only instantiates block sizes 8, 16 and 32 -- a
+    /// block-size-4 dispatch finds no kernel, and the C++ validator only
+    /// checks `block_size > 0`, so it would fail at pipeline lookup rather
+    /// than validation.
+    #[cfg(target_os = "macos")]
+    struct SlidingPrefillFixture {
+        adapter: PagedKVCacheAdapter,
+        null_block_id: u32,
+    }
+
+    #[cfg(target_os = "macos")]
+    const FIX_BLOCK_SIZE: u32 = 8;
+    #[cfg(target_os = "macos")]
+    const FIX_HEAD_SIZE: i64 = 64;
+    #[cfg(target_os = "macos")]
+    const FIX_NUM_Q_HEADS: i64 = 2;
+    #[cfg(target_os = "macos")]
+    const FIX_PREFIX_LEN: u32 = 32;
+    #[cfg(target_os = "macos")]
+    const FIX_CHUNK_LEN: u32 = 16;
+    #[cfg(target_os = "macos")]
+    const FIX_TOTAL: u32 = FIX_PREFIX_LEN + FIX_CHUNK_LEN;
+
+    /// Build an adapter that has already reached the state production hits at
+    /// every body chunk after the first: a written+pruned prefix, then the
+    /// chunk under test written on top.
+    ///
+    /// `window == 0` builds a full-attention adapter, which is the control:
+    /// nothing here may change for a non-windowed group.
+    ///
+    /// `V[pos] = pos + 1` broadcast across every head component, `K = 0`, so
+    /// with `Q = 0` every unmasked score is identical and each output element
+    /// is the arithmetic mean of the `V` values actually summed. The attended
+    /// position set is therefore directly readable off the output.
+    #[cfg(target_os = "macos")]
+    fn build_sliding_prefill_fixture(window: u32) -> Result<Option<SlidingPrefillFixture>, String> {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: FIX_BLOCK_SIZE,
+            num_kv_heads: 1,
+            head_size: FIX_HEAD_SIZE as u32,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            16,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => return Err(e.to_string()),
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, FIX_BLOCK_SIZE)));
+        let mut adapter = if window == 0 {
+            PagedKVCacheAdapter::new(allocator, pool, FIX_BLOCK_SIZE)?
+        } else {
+            PagedKVCacheAdapter::new_sliding(allocator, pool, FIX_BLOCK_SIZE, window, 128)?
+        };
+        adapter.reset_for_new_request(7)?;
+
+        let write_span =
+            |adapter: &mut PagedKVCacheAdapter, first_pos: u32, len: u32| -> Result<(), String> {
+                let n = len as i64;
+                let k = MxArray::zeros(&[n, 1, FIX_HEAD_SIZE], Some(DType::Float16))
+                    .map_err(|e| format!("k zeros: {e}"))?;
+                let mut v_bits = Vec::with_capacity((n * FIX_HEAD_SIZE) as usize);
+                for offset in 0..len {
+                    let bits = f16::from_f32((first_pos + offset + 1) as f32).to_bits();
+                    v_bits.extend(std::iter::repeat_n(bits, FIX_HEAD_SIZE as usize));
+                }
+                let v = MxArray::from_float16(&v_bits, &[n, 1, FIX_HEAD_SIZE])
+                    .map_err(|e| format!("v values: {e}"))?;
+                k.eval();
+                v.eval();
+                adapter.update_keys_values(0, &k, &v, first_pos)
+            };
+
+        adapter.record_tokens(&(0..FIX_PREFIX_LEN).collect::<Vec<_>>())?;
+        match write_span(&mut adapter, 0, FIX_PREFIX_LEN) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        // Production ordering: prune runs AFTER the chunk that was just
+        // written, never before the chunk about to be computed. Reversing it
+        // would turn the now-correct window into UNDER-attention.
+        adapter.prune_sliding_window_for(7)?;
+        let null_block_id = adapter
+            .null_block
+            .as_ref()
+            .map(|b| b.block_id)
+            .unwrap_or(u32::MAX);
+
+        adapter.record_tokens(&(FIX_PREFIX_LEN..FIX_TOTAL).collect::<Vec<_>>())?;
+        write_span(&mut adapter, FIX_PREFIX_LEN, FIX_CHUNK_LEN)?;
+
+        Ok(Some(SlidingPrefillFixture {
+            adapter,
+            null_block_id,
+        }))
+    }
+
+    /// Mean of `V[p] = p + 1` over the positions a correct kernel attends:
+    /// `max(0, ctx_len - window) <= p < ctx_len`, with `window == 0` meaning
+    /// full causal.
+    #[cfg(target_os = "macos")]
+    fn windowed_reference(window: u32) -> Vec<f32> {
+        (0..FIX_CHUNK_LEN)
+            .map(|i| {
+                let ctx_len = FIX_PREFIX_LEN + i + 1;
+                let lower = if window == 0 {
+                    0
+                } else {
+                    ctx_len.saturating_sub(window)
+                };
+                let count = ctx_len - lower;
+                let sum: u32 = (lower..ctx_len).map(|p| p + 1).sum();
+                sum as f32 / count as f32
+            })
+            .collect()
+    }
+
+    /// Head-0 output value per query token, for a `[1, H, T, D]` result.
+    #[cfg(target_os = "macos")]
+    fn read_bhtd_head0(out: &MxArray) -> Vec<f32> {
+        let values = out.to_float32().expect("output to_float32");
+        (0..FIX_CHUNK_LEN as usize)
+            .map(|t| values[t * FIX_HEAD_SIZE as usize])
+            .collect()
+    }
+
+    /// The two DENSE cache-hit prefill routes must respect the window.
+    ///
+    /// This is the cell no test occupied, and it is the one that mattered
+    /// most: the paged-pool SDPA route is what production Auto actually
+    /// selects on an ample-memory machine, and the host-read route runs
+    /// whenever no earlier route produced an output. Neither has a
+    /// kernel-side window, so both dense-gather the pool -- materializing the
+    /// placeholders `prune_sliding_all` installed -- and then rely entirely
+    /// on the explicit keep-mask that `forward_paged_cache_hit_prefill` now
+    /// builds. This reproduces that composition exactly: the same gather, the
+    /// same `create_causal_mask(seq_len, Some(cached_prefix_len),
+    /// Some(window))`, the same masked SDPA.
+    ///
+    /// Reverting the mask to `None` (the pre-fix host-read call, and the
+    /// pre-fix SDPA route's unmasked `_causal`) makes this fail on every
+    /// query token.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sliding_window_masks_retired_positions_on_dense_prefill_routes() {
+        const WINDOW: u32 = 16;
+        let Some(fixture) = build_sliding_prefill_fixture(WINDOW).expect("sliding fixture") else {
+            eprintln!("skipping dense-route sliding test: Metal GPU not available");
+            return;
+        };
+        let mut adapter = fixture.adapter;
+
+        // The dense gather hands back the retired placeholders -- that is
+        // precisely why the mask is mandatory on this route.
+        let (keys, values) = adapter
+            .gather_kv_for_prefill_sdpa(0, FIX_TOTAL)
+            .expect("dense gather of a sliding group's context");
+
+        let q = MxArray::zeros(
+            &[1, FIX_NUM_Q_HEADS, FIX_CHUNK_LEN as i64, FIX_HEAD_SIZE],
+            Some(DType::Float16),
+        )
+        .expect("q zeros");
+        q.eval();
+
+        let reference = windowed_reference(WINDOW);
+
+        // Exactly the mask the fixed dense arms build.
+        let mask = crate::array::mask::create_causal_mask(
+            FIX_CHUNK_LEN as i32,
+            Some(FIX_PREFIX_LEN as i32),
+            Some(WINDOW as i32),
+        )
+        .expect("windowed keep-mask");
+        let masked = crate::array::attention::scaled_dot_product_attention(
+            &q,
+            &keys,
+            &values,
+            1.0,
+            Some(&mask),
+        )
+        .expect("masked dense SDPA");
+        let masked = read_bhtd_head0(&masked);
+
+        // Control within the same test: the pre-fix behaviour of both dense
+        // routes. Kept so the test states what it is protecting against, and
+        // so a mask that silently degenerates to "keep everything" cannot
+        // pass by matching the reference.
+        let unmasked =
+            crate::array::attention::scaled_dot_product_attention_causal(&q, &keys, &values, 1.0)
+                .expect("unmasked dense SDPA");
+        let unmasked = read_bhtd_head0(&unmasked);
+
+        eprintln!("token abs_pos  reference    masked   unmasked");
+        for i in 0..FIX_CHUNK_LEN as usize {
+            eprintln!(
+                "{i:>5} {:>7}  {:>9.4} {:>9.4} {:>9.4}",
+                FIX_PREFIX_LEN as usize + i,
+                reference[i],
+                masked[i],
+                unmasked[i]
+            );
+        }
+
+        for i in 0..FIX_CHUNK_LEN as usize {
+            assert!(
+                masked[i].is_finite(),
+                "dense token {i}: non-finite output {}",
+                masked[i]
+            );
+            assert!(
+                (masked[i] - reference[i]).abs() < 0.05,
+                "dense token {i} (abs pos {}): got {}, window-masked reference {}. \
+                 The dense cache-hit prefill route attended positions the window \
+                 retired (including the never-written null block).",
+                FIX_PREFIX_LEN as usize + i,
+                masked[i],
+                reference[i]
+            );
+            // The window must actually bite here, or the assertion above
+            // would be satisfied by a no-op mask and prove nothing.
+            assert!(
+                (unmasked[i] - reference[i]).abs() > 4.0,
+                "dense token {i}: unmasked and windowed references are too close \
+                 ({} vs {}) for this test to discriminate -- fix the geometry",
+                unmasked[i],
+                reference[i]
+            );
+        }
+    }
+
+    /// After pruning, no route may read a position backed by the null block.
+    ///
+    /// `prune_sliding_window_for` documents that it relies on the attention
+    /// mask to "mask every placeholder position before dereferencing its
+    /// K/V", and `null_block` documents that "the paged attention mask
+    /// guarantees placeholder positions are outside the live window". Window
+    /// 0 broke that stated invariant. This pins it as a property of the mask
+    /// rather than of the driver: every position whose block is the null
+    /// block must be masked out for every query row.
+    ///
+    /// The pool is `StorageModePrivate` and explicitly not zeroed, so a
+    /// dereference there is formally undefined. This test deliberately does
+    /// NOT assert on the bytes -- they happen to read back as zeros on this
+    /// machine, which would make a value-based test pass for the wrong
+    /// reason. It asserts the placeholders are never reached at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pruned_null_block_positions_are_masked_out_for_every_query_row() {
+        const WINDOW: u32 = 16;
+        let Some(fixture) = build_sliding_prefill_fixture(WINDOW).expect("sliding fixture") else {
+            eprintln!("skipping null-block masking test: Metal GPU not available");
+            return;
+        };
+        let adapter = fixture.adapter;
+        let null_id = fixture.null_block_id;
+        assert_ne!(null_id, u32::MAX, "a sliding adapter reserves a null block");
+
+        // Which logical positions are backed by the null placeholder.
+        let table = adapter.block_table_for(7).expect("request table");
+        let mut placeholder_positions = Vec::new();
+        for (logical_block, entry) in table.blocks().iter().enumerate() {
+            if entry.block_id == null_id {
+                let base = logical_block as u32 * FIX_BLOCK_SIZE;
+                for off in 0..FIX_BLOCK_SIZE {
+                    let pos = base + off;
+                    if pos < FIX_TOTAL {
+                        placeholder_positions.push(pos);
+                    }
+                }
+            }
+        }
+        assert!(
+            !placeholder_positions.is_empty(),
+            "prune must have retired at least one block onto the null placeholder, \
+             or this test proves nothing"
+        );
+
+        // The keep-mask the fixed dense routes build, read back as bools.
+        let mask = crate::array::mask::create_causal_mask(
+            FIX_CHUNK_LEN as i32,
+            Some(FIX_PREFIX_LEN as i32),
+            Some(WINDOW as i32),
+        )
+        .expect("windowed keep-mask");
+        let keep = mask.to_float32().expect("mask to_float32");
+        let total = FIX_TOTAL as usize;
+
+        for row in 0..FIX_CHUNK_LEN as usize {
+            for &pos in &placeholder_positions {
+                let kept = keep[row * total + pos as usize] != 0.0;
+                assert!(
+                    !kept,
+                    "query row {row} (abs pos {}) keeps position {pos}, which is backed \
+                     by the never-written null block {null_id}. Reading it is undefined: \
+                     the pool is StorageModePrivate and not zeroed.",
+                    FIX_PREFIX_LEN as usize + row
+                );
+            }
+        }
+    }
+
+    /// CONTROL: a FULL (non-windowed) adapter must be untouched.
+    ///
+    /// Regressing full attention to fix sliding would be a far worse trade
+    /// than the bug. A global group's window is 0, which must mean "full
+    /// causal" everywhere: the kernel routes pass 0 to the Metal kernel as
+    /// the no-mask sentinel, and the dense routes must keep the fused causal
+    /// kernel with NO explicit mask -- MLX dispatches a different kernel when
+    /// a mask is present, with a different BF16 reduction order, and
+    /// paged-vs-flat parity depends on that kernel not moving.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn full_attention_prefill_routes_are_unaffected_by_the_window_plumbing() {
+        let Some(fixture) = build_sliding_prefill_fixture(0).expect("full fixture") else {
+            eprintln!("skipping full-attention control: Metal GPU not available");
+            return;
+        };
+        let mut adapter = fixture.adapter;
+        assert_eq!(
+            adapter.sliding_window(),
+            0,
+            "the control fixture must be a full-attention adapter"
+        );
+
+        let reference = windowed_reference(0);
+        let scale = 1.0_f32 / (FIX_HEAD_SIZE as f32).sqrt();
+
+        let q3 = MxArray::zeros(
+            &[FIX_CHUNK_LEN as i64, FIX_NUM_Q_HEADS, FIX_HEAD_SIZE],
+            Some(DType::Float16),
+        )
+        .expect("q zeros");
+        q3.eval();
+        let read_thd_head0 = |out: &MxArray| -> Vec<f32> {
+            let values = out.to_float32().expect("output to_float32");
+            (0..FIX_CHUNK_LEN as usize)
+                .map(|t| values[t * FIX_NUM_Q_HEADS as usize * FIX_HEAD_SIZE as usize])
+                .collect()
+        };
+
+        let varlen = adapter
+            .gather_kv_for_prefill_chunk_varlen(0, &q3, FIX_PREFIX_LEN, scale)
+            .map(|o| read_thd_head0(&o))
+            .expect("full-attention varlen prefill");
+        let legacy = adapter
+            .gather_kv_for_prefill_chunk(0, &q3, FIX_PREFIX_LEN, scale)
+            .map(|o| read_thd_head0(&o))
+            .expect("full-attention legacy prefill");
+
+        // Dense route: window 0 => no explicit mask, fused causal kernel.
+        let (keys, values) = adapter
+            .gather_kv_for_prefill_sdpa(0, FIX_TOTAL)
+            .expect("dense gather");
+        let q4 = MxArray::zeros(
+            &[1, FIX_NUM_Q_HEADS, FIX_CHUNK_LEN as i64, FIX_HEAD_SIZE],
+            Some(DType::Float16),
+        )
+        .expect("q zeros");
+        q4.eval();
+        let dense =
+            crate::array::attention::scaled_dot_product_attention_causal(&q4, &keys, &values, 1.0)
+                .map(|o| read_bhtd_head0(&o))
+                .expect("full-attention dense SDPA");
+
+        for i in 0..FIX_CHUNK_LEN as usize {
+            for (label, got) in [
+                ("varlen", varlen[i]),
+                ("legacy", legacy[i]),
+                ("dense", dense[i]),
+            ] {
+                assert!(
+                    (got - reference[i]).abs() < 0.05,
+                    "full-attention {label} token {i} (abs pos {}): got {got}, \
+                     full-causal reference {}. A non-windowed group must attend its \
+                     entire causal context.",
+                    FIX_PREFIX_LEN as usize + i,
+                    reference[i]
+                );
+            }
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_gather_kv_for_prefill_sdpa_preserves_layout_and_native_dependency() {

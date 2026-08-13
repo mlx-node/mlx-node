@@ -2987,6 +2987,189 @@ mod tests {
         );
     }
 
+    /// EVERY cache-hit prefill route must carry the group's window.
+    ///
+    /// This is the enforcement the old code only claimed. There is no route,
+    /// and no combination of mode/headroom/backend availability, that can
+    /// plan a windowed group with a window of 0 -- which is what the Metal
+    /// kernel reads as "no mask, attend the whole causal range".
+    ///
+    /// This test is why the window lives on the plan rather than being
+    /// re-derived inside each arm: a new `CacheHitPrefillPath` variant is a
+    /// compile error at the consuming match, and a route that forgot the
+    /// window fails here.
+    #[test]
+    fn every_cache_hit_prefill_route_carries_the_sliding_window() {
+        const WINDOW: u32 = 1024;
+        let modes = [
+            CacheHitPrefillMode::Auto,
+            CacheHitPrefillMode::ForceSdpa,
+            CacheHitPrefillMode::ForceVarlen,
+            CacheHitPrefillMode::ForceLegacy,
+            CacheHitPrefillMode::ForceHostRead,
+        ];
+        let headrooms = [None, Some(0), Some(64 * 1024 * 1024 * 1024)];
+        let mut paths_seen: Vec<CacheHitPrefillPath> = Vec::new();
+        for mode in modes {
+            for headroom in headrooms {
+                for backend in [true, false] {
+                    for query_tokens in [1_u64, 512] {
+                        let plan = select_cache_hit_prefill_plan(
+                            mode,
+                            WINDOW,
+                            query_tokens,
+                            1024,
+                            2048,
+                            headroom,
+                            backend,
+                        );
+                        if !paths_seen.contains(&plan.path) {
+                            paths_seen.push(plan.path);
+                        }
+                        assert_eq!(
+                            plan.sliding_window, WINDOW,
+                            "mode {mode:?} / headroom {headroom:?} / backend {backend} / \
+                             {query_tokens} query tokens planned {:?} without the window",
+                            plan.path
+                        );
+                    }
+                }
+            }
+        }
+        // The sweep must actually reach every route, or "all routes carry the
+        // window" would be vacuously true for the ones it missed.
+        for path in [
+            CacheHitPrefillPath::PagedPoolSdpa,
+            CacheHitPrefillPath::PagedVarlen,
+            CacheHitPrefillPath::PagedLegacy,
+            CacheHitPrefillPath::HostRead,
+        ] {
+            assert!(
+                paths_seen.contains(&path),
+                "the sweep never reached {path:?}, so it proves nothing about it"
+            );
+        }
+        // A global group must be plumbed as 0, which is what every route
+        // treats as full causal.
+        assert_eq!(
+            select_cache_hit_prefill_plan(
+                CacheHitPrefillMode::Auto,
+                0,
+                512,
+                1024,
+                2048,
+                None,
+                true,
+            )
+            .sliding_window,
+            0
+        );
+    }
+
+    /// The window must not steer route selection.
+    ///
+    /// Route choice is a memory/geometry decision. If the window could move
+    /// it, a windowed group could be pushed off an otherwise better route on
+    /// a byte estimate -- which is how `prefill_sdpa_cache_dtype`'s sliding
+    /// `None` used to bias the prefill estimate while enforcing nothing.
+    #[test]
+    fn cache_hit_route_choice_is_independent_of_the_sliding_window() {
+        for mode in [
+            CacheHitPrefillMode::Auto,
+            CacheHitPrefillMode::ForceSdpa,
+            CacheHitPrefillMode::ForceVarlen,
+            CacheHitPrefillMode::ForceLegacy,
+            CacheHitPrefillMode::ForceHostRead,
+        ] {
+            for headroom in [None, Some(0), Some(64 * 1024 * 1024 * 1024)] {
+                for backend in [true, false] {
+                    let global =
+                        select_cache_hit_prefill_plan(mode, 0, 512, 1024, 2048, headroom, backend);
+                    let sliding = select_cache_hit_prefill_plan(
+                        mode, 1024, 512, 1024, 2048, headroom, backend,
+                    );
+                    assert_eq!(
+                        global.path, sliding.path,
+                        "mode {mode:?} / headroom {headroom:?} / backend {backend}: the window \
+                         changed the route ({:?} vs {:?})",
+                        global.path, sliding.path
+                    );
+                }
+            }
+        }
+    }
+
+    /// The dense routes' window argument, and the global-group fast path.
+    ///
+    /// `None` for a global group is load-bearing: MLX dispatches a different
+    /// kernel when an explicit mask is present, and that kernel has a
+    /// different BF16 reduction order. Returning `Some(0)` here instead of
+    /// `None` would move every global group's kernel and drift paged-vs-flat
+    /// parity, while `create_causal_mask(.., Some(0))` would additionally
+    /// mask out every position including the diagonal.
+    #[test]
+    fn dense_cache_hit_window_arg_keeps_a_global_group_on_the_fused_causal_kernel() {
+        assert_eq!(
+            cache_hit_dense_window_arg(0),
+            None,
+            "a global group must keep the fused causal kernel, with no explicit mask"
+        );
+        assert_eq!(cache_hit_dense_window_arg(1), Some(1));
+        assert_eq!(cache_hit_dense_window_arg(1024), Some(1024));
+        assert_eq!(cache_hit_dense_window_arg(2048), Some(2048));
+    }
+
+    /// DECODE MUST NOT MOVE. A windowed group stays on the paged kernel.
+    ///
+    /// Decode was already correct and this fix does not touch it. The
+    /// mechanism is `prefill_sdpa_cache_dtype` returning `None` for a sliding
+    /// adapter, which lands in the `cache_dtype != Some(BFloat16)` arm here
+    /// and forces `PagedAttention` -- the only decode route with a
+    /// kernel-side window. This pins that chain, since the fix reworded that
+    /// accessor's contract and a future "cleanup" that drops its sliding arm
+    /// would silently break decode instead of prefill.
+    #[test]
+    fn sliding_decode_still_forces_the_paged_kernel() {
+        let sliding_like = PagedDecodePolicyInput {
+            mode: PagedDecodeMode::Auto,
+            query_dtype: DType::BFloat16,
+            // What `prefill_sdpa_cache_dtype` returns for a sliding adapter.
+            cache_dtype: None,
+            context_bucket_end: 128 * 1024,
+            num_query_heads: 16,
+            num_kv_heads: 2,
+            head_dim: 512,
+            block_size: 16,
+            logical_full_attention_invocations: 8,
+            graph_backend_available: true,
+            direct_grouped_candidate: false,
+            live_headroom_bytes: Some(64 * 1024 * 1024 * 1024),
+            sdpa_failed_in_bucket: false,
+        };
+        let plan = select_paged_decode_plan(sliding_like);
+        assert_eq!(
+            plan.path,
+            PagedDecodePath::PagedAttention,
+            "a sliding group must decode on the paged kernel: it is the only decode \
+             route that applies the window kernel-side"
+        );
+        assert_eq!(plan.reason, PagedDecodeReason::UnsupportedDtype);
+
+        // Control: the same geometry with a BF16 (global) cache is free to
+        // take the dense decode route, so the assertion above is about the
+        // sliding signal and not about the geometry being rejected anyway.
+        let global_like = PagedDecodePolicyInput {
+            cache_dtype: Some(DType::BFloat16),
+            ..sliding_like
+        };
+        assert_eq!(
+            select_paged_decode_plan(global_like).path,
+            PagedDecodePath::PagedPoolSdpa,
+            "the control geometry must be SDPA-eligible, else the sliding assertion \
+             above passes for the wrong reason"
+        );
+    }
+
     #[test]
     fn gemma4_prefill_aux_preplan_only_selects_a_v2_layout_when_safe() {
         assert_eq!(
