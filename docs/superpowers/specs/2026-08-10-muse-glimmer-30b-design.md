@@ -187,7 +187,8 @@ New, under `crates/mlx-core/src/models/muse_glimmer/`:
 
 | File | Contents |
 | ---- | -------- |
-| `config.rs` | `MuseGlimmerConfig`, text/vision sub-configs, layer-kind + NoPE tables, fail-closed asserts |
+| `config.rs` | `MuseGlimmerConfig`, text/vision sub-configs, layer-kind + NoPE tables, fail-closed asserts (both configs, including the vision tower's divisors) |
+| `kv_cache.rs` | the batching seam: per-layer specs, the two-group contract, sliding pool reservations, and the **window-carrying contract** every paged dispatch must clear (§8) |
 | `model.rs` | load, forward (flat + paged), `logits_tail()` |
 | `attention.rs` | qk-norm x 3.87, optional RoPE, sigmoid output gate |
 | `decoder_layer.rs` | 4-norm block, dual epsilon |
@@ -424,12 +425,37 @@ Tier 1 — model-free, in CI:
   `<|eot|>` rule, tool defs, **full tool round trip** (catches `.items()`), tool result
   with and without `name`, image part placement
 - ATEM parse via `response_template`, incl. malformed input and type round-trip loss
+- **the window-carrying contract** (`muse_glimmer/kv_cache.rs`): a sliding group on a
+  window-blind route is an `Err`; no admitted sliding dispatch can present a window of `0`
+  through either accessor, enumerated over all three `WindowCarrier`s rather than spot-checked;
+  a full group asks for no mask so the causal fast path survives; the window tracks the config
+  and is not a constant; a dispatch plan that forgets or permutes a group is refused. Plus the
+  source tripwire that fires the moment paged wiring appears in this family without naming the
+  seam. Contract and reasons in §8
+
+Already landed, outside this family, and the reason it belongs on this list: the
+"sliding adapter x attention numerics" cell that no test occupied is now occupied —
+`sliding_window_masks_retired_positions_on_every_prefill_route`
+(`transformer/paged_kv_cache_adapter.rs`, committed `179e826d`), pure Rust, no weights, not
+`#[ignore]`d, skips cleanly without Metal. It supersedes the "cheapest confirming test" this
+spec used to propose, whose prescribed `block_size 4` was **impossible**: the Metal kernel
+instantiates only block_size 8 / 16 / 32, and the C++ validator checks only `block_size > 0`, so
+a block_size-4 dispatch fails at kernel LOOKUP and an implementer would read the null return as
+their own bug. The landed test uses a 2x-scaled geometry (block 8, window 16, 48 tokens, prefix
+32) preserving every ratio.
 
 Tier 2 — real weights, local `#[ignore]`:
 
 - logit parity vs an HF reference dump (fixture generated once, committed if small)
 - image parity on a fixed image
-- `muse_glimmer_paged_vs_flat_parity` — byte-equal greedy, fresh and delta
+- `muse_glimmer_paged_vs_flat_parity` — byte-equal greedy, fresh and delta. Run it at **>= 2100
+  prompt tokens as well as short**: this family's sliding over-attention onset is ~2050 tokens
+  (§8), so a short-prompt-only parity gate is green for the wrong reason — gemma4's equivalent
+  matched flat at 1307 tokens and diverged at 1338
+- the real-weights **golden gate for the prompt surface** stays a local `#[ignore]` and that is
+  not a preference: the checkpoint is 59.5 GB and will not fit a macos-26 runner
+  (`ci.yml:248-253`, the documented qwen3_5-MoE position). Nothing in CI can replace it, which
+  is why the Tier 1 list above has to carry the arithmetic
 - cold-tier restore parity, single-gate binaries only
 - `__test__/models/muse-glimmer-concurrency-e2e.test.ts` — the four-assertion continuous-batching
   gate, of which only `fusedGreedyEpilogueSteps > 0` is non-vacuous. Contract in §8
@@ -456,8 +482,13 @@ it is where the one hard error lives. It found two more (traps 13 and 14).
 These are not optional polish. Each came out of an adversarial round on M0 code and cannot
 be settled inside M0.
 
-- **Token provenance must reach the output parser, and M1 must produce it.** This is the
-  one M0 finding that could not be fixed inside M0's own layer. `<|eot|>` rendered from
+- **Token provenance must reach the output parser — LANDED IN M0, both halves. Nothing left
+  for M1.** Kept as the rationale, not as a task: `StreamGuard::new` resolves `CONTROL_MARKERS`
+  to ids through the checkpoint tokenizer and accumulates `control_spans`, and
+  `GeneratedTurn::from_guard` is the only `pub` constructor — `from_token_spans` is
+  module-private, so a sibling (`stream_guard`, or M1's `model.rs`) cannot name it at all. That
+  privacy IS the boundary, and it is stronger than the `pub(super)` version an earlier round
+  shipped. Do not re-implement span building in M1. The finding that produced it: `<|eot|>` rendered from
   real token 200008 and `<|eot|>` written as seven literal characters are *the same bytes*
   once a `&str` reaches the parser, so a message terminator quoted inside an answer let the
   anchored tool call after it execute — `rm {path:"/"}` out of explanatory prose. Every
@@ -468,8 +499,11 @@ be settled inside M0.
   build those spans, because it is the last layer that still has token ids. A parser that
   can emit an executable call from an un-provenanced string is the wrong shape regardless
   of how careful its rules are.
-- **A tool call is recognised only where the recipient is a tool channel, and every
-  accepted invoke name must equal that recipient.** This supersedes an earlier reading that
+- **A tool call is recognised only where the recipient is a tool channel, and every accepted
+  invoke name must equal that recipient — LANDED IN M0.** Enforced in `output_parser` (the
+  invoke name is compared to `recipient` and the scan stops on a mismatch) and pinned by
+  `an_invoke_name_must_equal_its_recipient` plus the quoted-header case. Rationale retained
+  because it supersedes an earlier reading that
   put the check at dispatch. Dispatcher validation cannot recover a discarded recipient: it
   sees `rm`, which may be legitimately declared, and cannot know the message was addressed
   to `userX`. Equality is protocol fidelity rather than a restriction — `chat_template.jinja`
@@ -485,18 +519,31 @@ be settled inside M0.
   vocabulary keys instead of decoded output is what produced the wrong figure first time.
   Trusting a caller-supplied number is not enforcement either: a slice with one entry per
   token is, which is why `push(&[&str])` and `push_token(&str)` replaced it.
-- **Size the header allowance from the longest configured recipient.** A fixed 128 was the
+- **Size the header allowance from the longest configured recipient — LANDED IN M0.**
+  `StreamGuard::new(.., max_recipient_chars)` derives
+  `header_allowance = len(ANCHORED_HEADER_PREFIX) + max(max_recipient_chars, BUILTIN_RECIPIENT_CHARS)`,
+  clamped by `ABSOLUTE_MAX_HEADER_CHARS` — the clamp **is** the "separate absolute memory
+  bound" below. Rationale retained: a fixed 128 was the
   same mistake as the fixed 64: a 107-character advertised tool name produces a
   129-character anchored header, and the same legal name was accepted or refused depending
   on which header carried it. `FunctionDefinition` accepts unrestricted strings, so either
   derive the allowance per turn or document and enforce a maximum before rendering. Keep a
   separate absolute memory bound.
-- **Wire the session-pinned render options into the production chat path.** M0 pins
-  `current_date` only through the render entry point the golden tests use; the 4-argument
-  `apply_chat_template_sync` still cannot supply it.
-- **`ChatMessage` cannot carry `recipient` or `end_turn`.** The template reads both via
-  `.get`, so multi-part assistant turns and non-`user` recipients cannot be replayed. Both
-  fields would change the `#[napi(object)]` surface, so they are an M1 decision.
+- **Wire the session-pinned render options into the production chat path.** STILL OPEN,
+  re-verified: `apply_chat_template_sync` **and**
+  `apply_chat_template_sync_with_content_order` both hard-code
+  `RenderContextOptions::default()`, so no family's production call site can supply
+  `current_date`. M0 pins it only through the render entry point the golden tests use.
+  Mechanically this is one options-carrying overload. **The blocker is the consumer, not the
+  plumbing:** there is no muse_glimmer production render site to pin yet, and adding a 7th
+  parameter to a function nine families call is a shared-file change. Land it in the same M1
+  commit as this family's first real render, so the new parameter has a caller that proves it.
+- **`ChatMessage` cannot carry `recipient` or `end_turn`.** STILL OPEN, re-verified: neither
+  field exists in `engine/backend.rs`. The template reads both via `.get`, so multi-part
+  assistant turns and non-`user` recipients cannot be replayed. **Blocker:** both fields change
+  the `#[napi(object)]` surface, which enters the exported TS type union — and per §6 the whole
+  TS registry surface cannot land before `nativeModelClass` exists. So this is coupled to M1's
+  one-commit TS landing, not independently shippable.
 - **The whole TypeScript registry surface lands here, in one commit** — see §6.
 
 ### The continuous-batching contract — M1 builds into it, M3 completes it
@@ -541,7 +588,11 @@ All three are `pub(crate)` — in-crate only, no NAPI surface of their own.
 `run_paged_decode_step_batched` **must return `[N, 1, vocab]` with `N == rows.len()` and row
 order preserved.** The shape is not in the signature, and **nothing downstream enforces it.**
 There is exactly ONE enforcement point and you have to write it: assert the shape inside
-`run_paged_decode_step_batched`.
+`run_paged_decode_step_batched`. It **cannot** be written before M1 — the blocker is not
+convention, it is that `MuseGlimmerInner` and its `HybridSchedulerBackend` impl do not exist, so
+there is no function body to put the assert in and nothing to call it from. It is therefore an
+M1 line item rather than a deferred nicety, and the two facts below are why nothing else will
+catch it for you.
 
 - `engine/batch_sampling.rs:46-53` — `batch_greedy_tokens` errors on `ndim != 3 || shape[1] != 1`,
   but that `Err` is a **soft degrade, not enforcement**. Its only production caller is
@@ -653,14 +704,32 @@ nobody wrote. Validation is at `config.rs:346-358` — non-zero (a 0 makes the f
 bound `div_ceil(0, block_size) == 0`, a group that admits nothing) and u32-fitting — and
 `kv_cache.rs` re-checks **both** halves, because it is `pub` and must not trust a config
 assembled elsewhere. It is **not** on `MuseGlimmerVisionConfig` — the vision tower's own
-`layer_types` and `max_position_embeddings` are deliberately unparsed (`config.rs:92-110`), and
-the KV-spec seam is **text-decoder only**.
+`layer_types` and `max_position_embeddings` are deliberately unparsed, and the KV-spec seam is
+**text-decoder only**.
+
+That "no cross-field resolution" note on `MuseGlimmerVisionConfig` had become a trap of its own
+and is now closed. It was literally true and read as "nothing here needs checking", so
+`patch_size: 0`, `merge_size: 0`, `patch_temporal: 0`, `pos_emb_height/width: 0` and
+`num_attention_heads: 0` all parsed and reached the runtime while the text config next door
+refused seven separate traps. `MuseGlimmerVisionConfig::validate` now refuses every zero and
+enforces `hidden_size % num_attention_heads == 0` (1536 / 16 = 96), and `from_json_str` calls
+it. The reason each field matters is on the method, not here, but note the head rule is
+deliberately the **opposite** of the text decoder's: the tower has no `head_dim` key, so its head
+dim IS that quotient, whereas the decoder's `head_dim` is independent and `32 x 128 != 6656` on
+purpose. Copying either rule to the other side is a bug.
 
 `sliding_window` validation is already landed (`3c0c6859`): the config refuses `0` and refuses
-a value outside `u32` at load. Keep that placement. The seam would also refuse a zero window
-(`KVCacheSpecError::InvalidSlidingWindow`, `kv_cache_spec.rs:70-72`) but late and with a
-generic message, and gemma4 validates at `model.rs:8096-8101` instead of in its config, which
-is the weaker placement.
+a value outside `u32` at load. Keep that placement, and note the seam's own refusal is weaker than it looks.
+`KVCacheSpecError::InvalidSlidingWindow` is raised **only** inside
+`AttentionKind::sliding_window_max_admission_blocks` — i.e. in the admission-block
+**arithmetic**, not in validation. `validate_layer_kv_cache_specs` checks duplicate layer
+indices, layout validity and shared-anchor rules and **never inspects the window**, so the
+`KVCacheCoordinator::from_groups` -> `derive_layer_kv_cache_routes_from_groups` path, which
+calls only the `validate_*` functions, catches a zero window nowhere at all. Not live today
+(both families guard the window themselves) but the seam is `pub`. Earlier revisions of this
+line and of `config.rs`' comments said the refusal lived in validation "but late"; that
+mislocates it, and a reader relying on it would drop the config-level check. gemma4 validates at
+`model.rs:8096-8101` instead of in its config, which is the weaker placement.
 
 #### Sliding pool sizing is a function of the PREFILL CHUNK
 
@@ -765,77 +834,206 @@ specs, `find_longest_cache_hit` truncates blocks for `attention_groups[0]` only
 of 0. Muse-Glimmer's uniform geometry means one full group, so this cannot bite us; if the
 refusal is ever relaxed, the truncation must loop over **all** full groups first.
 
-#### What NOT to inherit: the window-blind cache-hit prefill
+#### The window-blind cache-hit prefill — MEASURED, and what Muse-Glimmer does about it
 
-Status: **the mechanism is confirmed by reading the code. The end-to-end quality impact is
-unquantified.** Stated at that strength deliberately.
+Status: **confirmed by reading the code, then reproduced twice and quantified on real
+weights.** Earlier revisions of this section said "the end-to-end quality impact is
+unquantified" and prescribed the wrong fix. Both are corrected below; the numbers replace the
+hedge.
 
 ```
 prefill body chunk 1..n           (cached_prefix_len = absolute_position > 0)
   model builds a real sliding mask     gemma4/model.rs:5177  create_sliding_mask(...)
   threads it in as `mask`              gemma4/model.rs:5197  kind.is_sliding() => Some
-  forward_paged                        gemma4/attention.rs:1874  explicit_prefill_mask
-    cached_prefix_len == 0  -> mask IS consumed          attention.rs:2043
+  forward_paged                        gemma4/attention.rs   explicit_prefill_mask
+    cached_prefix_len == 0  -> mask IS consumed
     cached_prefix_len != 0  -> forward_paged_cache_hit_prefill(x, q, adapter,
-                                 paged_idx, cached_prefix_len)   attention.rs:2069
-                               ^ signature has NO mask parameter  attention.rs:1569-1576
+                                 paged_idx, cached_prefix_len)
+                               ^ signature has NO mask parameter
                                  => the mask is structurally dropped
-      of its four sub-paths, only ForceLegacy passes the window:
-        PagedPoolSdpa   -> gather_kv_for_prefill_sdpa + causal SDPA, no window
-        PagedVarlen     -> gather_kv_for_prefill_chunk_varlen
-                             passes literal 0 in the sliding_window slot
-                             paged_kv_cache_adapter.rs:5842
-        HostRead        -> read_kv_range(0, total_ctx) + create_causal_mask
-        PagedLegacy     -> passes self.sliding_window   adapter.rs:6121  (diagnostic only)
+      of its four sub-paths, only ForceLegacy passed the window:
+        PagedPoolSdpa   -> gather_kv_for_prefill_sdpa + causal SDPA, no mask   <-- DEFAULT
+        PagedVarlen     -> literal 0 in the kernel's sliding_window slot
+        HostRead        -> read_kv_range(0, total_ctx) + create_causal_mask(.., None)
+        PagedLegacy     -> passes self.sliding_window                (diagnostic only)
 ```
 
-Confirmed facts:
+**The default route is the dense SDPA one, not the varlen literal.** This is the single most
+important correction, because an earlier revision led with the `0` literal and a reader would
+have fixed only that. Traced on the real checkpoint with
+`MLX_NODE_LOG=mlx_core::inference=info` at prompt 1475: `planned_path="paged_pool_sdpa"` for
+**both** KV groups including the sliding one, `effective_sdpa_dtype=None` (that `None` **is**
+the sliding group), graph constructed and not rejected. `Auto`'s branch order tests
+`estimated_sdpa_bytes <= budget` first — 171.6 MiB against `(headroom - 2 GiB) * 0.9` — so
+varlen is reached only under real memory pressure (live headroom below roughly 2.2 GiB), and
+`HostRead` only when the graph backend is unavailable. Fixing the literal alone would have left
+every default-configuration turn just as wrong **while turning the new regression test green**,
+which is the worst outcome available.
 
-- The literal `0` at `paged_kv_cache_adapter.rs:5842` is unambiguously the window slot (FFI
-  signature `.., scale, softcap, sliding_window: i32, block_size, ..`), and `0` is **not
-  inert**: the repo's own validator documents it as the "no mask" sentinel
-  (`mlx_paged_ops.cpp:482`) and the kernel's `sw > 0` guard collapses, leaving only the causal
-  bound. Every other paged call site in that file passes `self.sliding_window as i32`
-  (`:5156`, `:5267`, `:5376`, `:5547`, `:6121`) — including `gather_kv_for_ragged_graph`, which
-  is the *same varlen kernel*, so the kernel supports the window fine. `:5842` is the sole
-  outlier.
-- `forward_paged_cache_hit_prefill` takes no mask parameter, so the explicit mask is dropped by
-  construction, not by a missed branch.
-- It is reachable **by default**, not only on warm continue. `run_paged_prefill_chunk` passes
-  `absolute_position` as the third argument, which is `cached_prefix_len_for_chunk`
-  (`gemma4/model.rs:4918-4922`, signature at `:5108-5113`). Every body chunk after the first
-  therefore has `cached_prefix_len > 0`.
-- `select_cache_hit_prefill_plan` (`gemma4/attention.rs:785-792`) takes no window and no
-  cache-dtype argument, so the adapter's own `prefill_sdpa_cache_dtype()` comment — "Sliding
-  groups must remain on the paged kernel, which applies the window before touching those
-  entries" (`paged_kv_cache_adapter.rs:7713-7719`) — asserts an invariant the prefill path does
-  not enforce. On the **decode** side the same `None` return *is* load-bearing and forces the
-  paged kernel, so decode is genuinely protected.
+Measured impact, two independent measurements:
 
-Unresolved, and left unresolved here: whether the never-written reserved null block reads back
-as zeros on this hardware (`layer_kv_pool.rs:499` says the pool is explicitly **not** zeroed,
-so this is driver behaviour and must not be relied on in either direction), and how large the
-end-to-end quality hit is. No test covers it: both varlen prefill tests build a **full**
-adapter, and the two sliding-adapter tests assert block-table bookkeeping only, never numerics
-through an attention call.
+| Measurement | Result |
+| ----------- | ------ |
+| Kernel A/B, one process, one physical pool, sliding adapter window 1024, 4096 tokens written in 512-token chunks with prune after each, target chunk `[3584,4096)` | max abs delta vs the windowed reference: **0.124512** with window slot `0`, **0.000977** (1 bf16 ULP) with window slot `1024`. `rms(correct output) = 0.035562`, so the error is **3.5x the signal's own RMS** and 128x the correct route's residual — from one argument |
+| Real gemma-4-12b-it greedy continuation, flat path as ground truth, temperature 0 | default `Auto` differs from flat at **6 of 9** prompt lengths; last match 1307 tokens, first mismatch **1338**. Divergences are fluent and coherent (first differing char at ~token 13), i.e. a silently different model, which is why it went unnoticed for so long |
+| Null-block regime | varlen's output matches "full causal over the whole 4096-token context with the pruned range treated as zero K/V" to **0.000244**, below bf16 ULP — so the window-0 kernel verifiably dereferences 2560 never-written slots per row. Those slots read back `max\|K\| = max\|V\| = 0` on this machine's driver. **Do not rely on that in either direction**: `layer_kv_pool.rs:499` says the pool is `StorageModePrivate` and **not zeroed**, and the probe used `Q = 0`, so it bounds the V bytes and says nothing about a logit blow-up from garbage K under real non-zero Q |
 
-**Muse-Glimmer's requirement.** With 39 of 52 layers windowed at 2048 and a 512-token chunk,
-over-attention would begin around chunk 5 (~2050 prompt tokens) — later onset than gemma4 but
-across 75% of layers. So:
+**Two damage regimes, with corrected thresholds.** The earlier ~514 / ~1026 figures came from
+gemma4's serde default `sliding_window() -> 512`, which **never applies**: every gemma-4
+`config.json` on disk sets the key explicitly (12b-it / 26b-a4b / 31b-it = 1024; e2b = 512).
 
-- **M1/M3 must not route a windowed adapter into a window-blind kernel. A windowed adapter
-  reaching a path that cannot carry its window is an `Err`, not a silent `0`.** Fail closed and
-  keep the explicit mask alive; do not "fix" only the varlen argument, because three of the
-  four sub-paths have no window concept at all.
-- The window belongs to the **layer** and must travel with **every** dispatch. vLLM does this
-  by construction: `sliding_window_size` is a property of the `AttentionImpl` and is passed to
-  every `flash_attn_varlen_func` call — context, query and decode (`flash_attn.py:1340/1372/1447`).
-  A per-route argument list is where a window gets lost.
-- The cheapest confirming test, if anyone wants it before M3: in the adapter's own test module,
-  build a sliding adapter (`block_size 4`, `window 8`), write position-distinguishable `V`,
-  record 24 tokens, prune, then call **both** `gather_kv_for_prefill_chunk_varlen(0, q, 16, scale)`
-  and the legacy `gather_kv_for_prefill_chunk(0, q, 16, scale)` and assert they agree. Pure
-  Rust, no weights.
+| Regime | Onset (gemma-4-12b-it, window 1024, chunk 512) | Onset (Muse-Glimmer, window 2048, chunk 512) |
+| ------ | --- | --- |
+| **Over-attention**: sliding layers attend real out-of-window tokens. First body chunk with `cached_prefix > 0` and `total_ctx > window` | ~1026 prompt tokens (structural); **1338 measured** for the first greedy-token flip | ~2050 prompt tokens |
+| **Undefined read**: the block table holds the reserved null block, and the kernel dereferences K/V slots that were never written. Needs a chunk end >= `window + block_size`, and chunk ends are multiples of 512 | ~1538 prompt tokens | ~2562 prompt tokens |
+
+Muse-Glimmer's exposure is strictly worse in shape even though its onset is later: **39 of 52
+layers (75%)** are sliding versus gemma4's 40 of 48, and the wider window means each affected
+row over-attends a larger absolute span.
+
+**The fix shape — corrected.** An earlier revision said *"a windowed adapter reaching a path
+that cannot carry its window is an `Err`, not a silent `0`. Fail closed … three of the four
+sub-paths have no window concept at all."* Both halves are wrong, and the second is dangerous:
+
+- **All four sub-paths CAN express the window**, so there is nothing to refuse. The varlen
+  kernel is already per-query-row bottom-right aligned
+  (`paged_attention.metal:1860` `effective_context_len = context_len - q_len + q_pos_in_seq + 1`;
+  `sliding_lower` derives from it), so one `i32` fixes a whole multi-token chunk with no
+  per-row work by the caller. And `create_causal_mask(seq_len, offset, window_size)`
+  (`array/mask.rs:33-74`) **already has the window parameter** — `linds >= rinds && linds <
+  rinds + window`, bool `true = keep` — and the host-read call site was passing `None` into it.
+  "No window concept at all" was wrong for two of the three: the concept, the argument and the
+  builder all existed. Refusing instead of threading would turn every gemma4 prompt over ~1026
+  tokens into an error.
+- **An `Err` raised inside a gather does NOT fail closed.** Each gather failure on that path is
+  downgraded to `tracing::warn!` and chains to the next route, terminating at an
+  *unconditional* host-read. So a refusal below `forward_paged_cache_hit_prefill` is swallowed
+  and re-routed to another window-blind path — the opposite of fail-closed. Any refusal has to
+  be raised **at or above** that function.
+
+So the shape is: **thread the window, at the single choke point, unconditionally.** The window
+is a property of the layer and must travel with **every** dispatch — vLLM's rule, where
+`sliding_window` lives on the `AttentionImpl` and is passed to every `flash_attn_varlen_func`
+call, context / query / decode (`flash_attn.py:1340/1372/1447`). A per-route argument list is
+where a window gets lost.
+
+Three things must not move, each because moving it silently undoes the fix:
+
+1. **`prune_sliding_all` runs AFTER the layer loop** (`gemma4/model.rs:4913-4940`:
+   `record_tokens_all` -> `run_paged_prefill_layer_loop` -> `eval` -> `prune_sliding_all`). For
+   a chunk ending at `E` the cutoff is `E - window`, and the next chunk's earliest query row
+   needs from `E + 1 - window > cutoff`, so every position any row needs is still live.
+   Reordering prune before the layer loop converts a correct window into **under**-attention.
+   This is our version of vLLM's `sliding_window - 1 + max_in_flight_tokens` reservation
+   (`kv_cache_interface.py:618-622`).
+2. **Do not plumb the existing `sliding_mask`** from `run_paged_prefill_layer_loop` into the
+   cache-hit branch. `create_sliding_mask` builds it for the TRIMMED rotating view — width
+   `seq_len + min(cache_offset, window)` — while the paged K/V is `cached_prefix_len + seq_len`
+   wide. `trim_mask` errors on a short mask, so it fails closed rather than silently, but it is
+   still the wrong value. Build the mask inside the helper from `cached_prefix_len`. The flat
+   path keeps using the trimmed one; leave the flat path alone.
+3. **Do not reinstate a sliding guard on the prefill-side gather dtype.** Once the dense SDPA
+   route carries a window mask the gather is legal for a sliding group, and a `None` there only
+   doubles `dtype_bytes` 2->4 and biases routing on a byte estimate rather than on correctness.
+   The same guard on the **decode** side IS load-bearing — it forces the paged kernel, which is
+   why decode is correct and needs no fix — so the accessor wants splitting, not deleting.
+
+**`MLX_GEMMA4_PAGED_PREFILL_ROUTE=legacy` is not a mitigation.** It is the one route that
+passed the window, so it reads like a workaround. Measured: it diverges from flat at 2066
+prompt tokens, 3/3 independent processes, identical wrong text, and produces the *same* wrong
+continuation as `Auto`/`sdpa` there — it has its own defect at short-final-chunk geometry (a
+17-token chunk at `cached_prefix 2048`). Diagnostic reference only.
+
+**What landed for Muse-Glimmer, and the honest split.** Muse-Glimmer has no forward pass, so it
+cannot inherit the bug today — `new_sliding` / `SlidingPaged` appear nowhere under
+`models/muse_glimmer/`. It would inherit it by construction the moment M1 wires a sliding
+adapter. The contract therefore lands in the KV-cache seam first, in `muse_glimmer/kv_cache.rs`:
+
+| Item | What it is |
+| ---- | ---------- |
+| `WindowCarrier` | How a route can express a window: `KernelArgument` (the kernel's `sliding_window: i32`), `ExplicitMask` (`create_causal_mask`'s `window_size`), `Unsupported`. Supplied by the dispatch site, because capability is a fact the route knows and the group does not. A fifth route means a new variant, which is a **compile error** at the admitting match rather than a silently window-blind path |
+| `PagedWindowSlot` | The window argument for one admitted dispatch. Private fields, no `Default`, no public constructor — the only way to get one derives the window from the group's own `AttentionKind`, so **there is no parameter for a literal `0` to be written into**. Its two accessors are carrier-scoped and both return `Option`: `kernel_slot()` answers only on kernel routes, `mask_window()` only on mask routes, and each returns `None` — never a plausible `0` — when asked the other route's question |
+| `paged_window_for_kind` / `paged_window_for_group` | Admit one dispatch, or `Err`. Refuses a windowed group on an `Unsupported` route, and refuses a `SlidingWindow { sliding_window: 0 }` payload a third time (config load and spec derivation being the first two) because by the time a 0 reaches a kernel slot it is indistinguishable from "disable the mask". The group-level form names the **39 layers** in its error; "group 1" understates the blast radius |
+| `admit_paged_dispatch_plan` | The per-turn choke point. Admits every group against the routes that turn selected, before any launches. `carriers` is indexed by `group_id`, so a plan that forgets a group is an arity error and a permuted group list is refused — pairing the full group's carrier with the sliding group is the same defect with a different cause |
+
+A full-attention group is admitted on **every** route, including `Unsupported`, and asks for no
+mask. That is deliberate over-strictness avoidance: refusing it would refuse a legal global
+layer, and `mask_window() == None` for a full group is itself load-bearing — the mask-bearing
+SDPA kernel has a different bf16 reduction order from the `_causal` one, so materializing an
+all-true mask for the 13 global layers would move their numerics with no correctness gain, and
+a paged-vs-flat parity gate would then fail for a reason unrelated to windows.
+
+**Enforced today** (model-free, in CI): a windowed group paired with a window-blind route is an
+`Err`; no admitted sliding dispatch can present a window of `0` through either accessor
+(enumerated over all three carriers, not spot-checked); a full group keeps the unmasked causal
+path; the window tracks the config rather than a constant.
+
+**Only M1 can enforce** — stated as a requirement, not a hope, because the type system cannot
+prove it: **that every dispatch actually asks.** A forward pass can always call the FFI with a
+hand-written argument. The testable form that exists today is the source tripwire
+`wiring_a_sliding_adapter_without_this_seam_trips_the_tripwire`: the moment paged-attention
+wiring (`new_sliding`, `mlx_paged_attention*`, `gather_kv_for_prefill*`, `read_kv_range`,
+`scaled_dot_product_attention_causal`, `PagedKVCacheAdapter`) appears in any
+`models/muse_glimmer/*.rs`, that file must at least NAME `PagedWindowSlot`. It is **vacuously
+true today, and that is the point — it is armed, not satisfied.** It does not prove every
+dispatch is admitted; it does make "wire a sliding adapter and forget the contract entirely"
+impossible to do green, which is exactly what happened in gemma4, where no test occupied the
+"sliding adapter x attention numerics" cell at all.
+
+So M1 owes three things, each with its reason:
+
+1. **Every paged dispatch takes its `sliding_window` from `admit_paged_dispatch_plan`.** Reason:
+   the window is the layer's property and a per-route argument list is where it gets lost.
+2. **Route selection reports its real `WindowCarrier`.** Reason: a route that gains the ability
+   to carry a window should stop being refused automatically, and a route that loses it should
+   start being refused automatically. Hard-coding `KernelArgument` to silence the seam
+   reproduces the defect with the guard still in the file.
+3. **A numerics test through a real attention call, on a sliding adapter, at a cached prefix.**
+   Reason: this is the cell no gemma4 test occupied. The model-free kernel A/B separates a
+   correct fix (<= 1e-3, bf16 ULP) from the broken behaviour (0.1245) by 128x and needs no
+   weights. Add it alongside `muse_glimmer_paged_vs_flat_parity` at >= 2100 prompt tokens,
+   which is past this family's over-attention onset.
+
+**Comments elsewhere that assert this invariant and did not enforce it.** Recorded because the
+dropped mask survived behind exactly these sentences, and because a reader who trusts them will
+not look:
+
+- `paged_kv_cache_adapter.rs` `null_block` field doc — "the paged attention mask guarantees
+  placeholder positions are outside the live window before their original physical block is
+  reclaimed". This is the **stated safety invariant of the whole prune design**, and it was
+  false on three of the four cache-hit prefill routes.
+- `prune_sliding_window_for`'s doc — "masks every placeholder position before dereferencing its
+  K/V", stated as a property **of the kernel** rather than of the caller, which is precisely how
+  the caller-side hole stayed invisible. The kernel does this only when told the window.
+- `prefill_sdpa_cache_dtype()`'s "Sliding groups must remain on the paged kernel, which applies
+  the window before touching those entries" — measured false twice: traced to
+  `paged_pool_sdpa` on real weights, and `gather_kv_for_prefill_sdpa` called directly on a
+  sliding adapter succeeds and hands back a dense K/V with the retired null placeholders
+  materialized in it.
+- `paged_attention.metal`'s "zero contribution to softmax / V reduction" for a masked position.
+  The **softmax** half is enforced (`stored_logit = -INFINITY`, and `exp(-INF - qk_max)` is
+  exactly `0.0f`). The **V** half is not: both non-striped V loops zero lanes only past the
+  *causal* cutoff, never below `sliding_lower`; only the grouped striped kernel checks both. So
+  `0.0f * NaN = NaN` would poison a whole head from one stray byte, and gemma4 sliding **decode**
+  runs the generic kernel, not the guarded striped one. Measured benign today (`max|K| = max|V|
+  = 0`) — which is driver luck, not a contract.
+- `gemma4/decoder_layer.rs`'s "`mask` is normally None for global layers … which `forward_paged`
+  applies in the fresh-prefill branch". The arm it sits in handles `SlidingPaged | GlobalPaged`
+  in ONE match; for sliding layers `mask` is the sliding mask, not `None`, and "`forward_paged`
+  applies it" held only in the `cached_prefix_len == 0` branch. The comment reads as a complete
+  account of what happens to `mask` and omits the only case that matters.
+
+Two cheap hardenings, **P2 and separate**, because the undefined read measured benign today:
+add the `value_token >= sliding_lower` guard to the two non-striped V loops (mirroring the
+grouped striped kernel, and correcting the comment to claim only the softmax half), and/or
+zero the pool once in `LayerKVPool::new` with a blit `fill_buffer` at construction —
+`StorageModePrivate` is not CPU-writable — then correct the "not zeroed" doc. That is vLLM's
+`torch.zeros` (`gpu_model_runner.py:7456-7458`): one memset at startup, zero steady-state cost.
+It converts this whole class of missed mask from **undefined** to **wrong-but-bounded**, which
+is what makes the `null_block` doc's guarantee survive the next bug. Both need a metallib
+rebuild (`PATH=/usr/bin:$PATH SDKROOT=$(xcrun --show-sdk-path) yarn build:native`, never plain
+`cargo build`).
+
 
 #### Opt-in wiring: three lines, and two ways to be silently serial
 
@@ -902,15 +1100,18 @@ and recompute rather than offloading only the full group. That override is what 
 
 #### Two claims already on the record that are wrong or overstated
 
-1. **`CLAUDE.md:59` is stale, and was stale the moment it was written.** It says "Chat
+1. **`CLAUDE.md:59` was stale, and was stale the moment it was written — FIXED by `17dc2bdb`,
+   which this spec no longer needs to carry.** It now reads "Concurrent chat inference is
+   per-family, not global…", names the eligible families and both env vars, and points at
+   `docs/concurrent-inference.md`. The history, for anyone reading a pre-`17dc2bdb` checkout: it
+   said "Chat
    inference is serialized per model: one `"mlx-model"` OS thread per loaded model runs one
    whole turn at a time, and the server adds a per-model FIFO mutex." `37f1d68e` **added that
    line and contradicted it in the same commit**: `docs/concurrent-inference.md:22-31` (also
    added by `37f1d68e`) says different sessions on one eligible Qwen3 / LFM2 / Qwen3.5
    dense-or-MoE / **Gemma4** paged model may overlap, that the server admits up to the native
    scheduler's physical sequence capacity, and that the model thread advances them together.
-   `docs/concurrent-inference.md` is the accurate one. Noted here rather than fixed because
-   this spec does not own `CLAUDE.md`.
+   `docs/concurrent-inference.md` is the accurate one.
 2. **"Gemma4 cold persistence is disabled" (37f1d68e's own commit message) is overstated.**
    `gemma4` **is** in `COLD_RESTORE_FAMILIES` (`cold_tier.rs:463-470`) and in the TS list, and
    its ordinary cold path is live: `resolve_persist_cold("gemma4", ..)` at
@@ -955,7 +1156,13 @@ per-tensor overrides silently miss, falling back to the top-level bit width.
 
 59.55 GB weights on 128 GB unified leaves roughly 22 GB of allocator freelist by the
 `cache_limit.rs:79-96` formula. KV is cheap thanks to 2 KV heads: 13 full layers at 131072
-tokens = 1.745 GB, 39 sliding layers capped at 2048 = 81.8 MB. The pressure is elsewhere:
+tokens = 1.745 GB, 39 sliding layers = **102.9 MB** at `max_chunk 512`. (Not 81.8 MB: that is
+`div_ceil(2048, 16) = 128` blocks, which omits the in-flight chunk. Admission is
+`div_ceil(window - 1 + max_chunk, block) + 1 = 161` blocks — §8's sizing table is the authority,
+and the figure **rises with `max_chunk`**: 123.3 MB at 1024, 164.2 MB at 2048. This section is
+where someone sizes `paged_cache_memory_mb`, and §8 also says that must be set explicitly
+because oversizing tanks long-context decode ~10x, so understating it here is the expensive
+direction.) The pressure is elsewhere:
 202048-wide prefill logits, and `lm_head` being a 2.69 GB read **per decode step** — decode
 may be lm_head-bandwidth-bound before anything else. Vision prefill at the 4096-token cap
 means 16,384 patches, and the 13 full vision layers run 16k x 16k non-causal attention at
