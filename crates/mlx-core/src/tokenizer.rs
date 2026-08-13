@@ -4228,20 +4228,38 @@ mod tests {
         let template = std::fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
 
-        // Verbatim, the checkpoint does not parse — this is the defect, and it is
-        // also what proves the assertion below is not vacuous.
+        // Whether the checkpoint parses VERBATIM depends on the installed
+        // minijinja, not on this transform — see
+        // `ternary_call_kwarg_is_a_parse_error_until_it_is_parenthesized` for the
+        // full reasoning. <= 2.23 rejects the bare ternary kwarg, 2.24 accepts
+        // it, and `Cargo.lock` is untracked so both resolve from one commit.
+        // Asserting the rejection outright made this test fail on 2.24 while the
+        // suite stayed green on 2.23 — and because this test is `#[ignore]`d, CI
+        // never ran it, so the breakage hid behind the gate.
         let mut env = Environment::new();
         Qwen3Tokenizer::install_template_helpers(&mut env);
-        let err = env
-            .add_template("verbatim", &template)
-            .expect_err("the checkpoint's template must still be the one with the ternary kwarg");
-        assert_eq!(err.kind(), minijinja::ErrorKind::SyntaxError, "got: {err}");
+        let verbatim = env.add_template("verbatim", &template);
 
         let fixed = Qwen3Tokenizer::parenthesize_ternary_call_kwargs(&template);
+        // Version-INDEPENDENT non-vacuity: the transform is a pure string
+        // rewrite, so it must still find something to rewrite in this checkpoint
+        // whatever minijinja thinks of the result. If the checkpoint is ever
+        // re-published without the ternary kwarg, THIS is the assertion that
+        // says so.
         assert_ne!(
             fixed, template,
             "the transform must have rewritten something"
         );
+
+        // On minijinja <= 2.23 the transform is required to render this checkpoint
+        // at all, so the rejection is asserted precisely. On >= 2.24 the
+        // checkpoint parses without help and there is nothing to assert HERE —
+        // the load-bearing property becomes the transform's SAFETY, that it must
+        // not break a template which already parsed, which the `add_template`
+        // below checks on every version.
+        if let Err(err) = verbatim {
+            assert_eq!(err.kind(), minijinja::ErrorKind::SyntaxError, "got: {err}");
+        }
         let mut env = Environment::new();
         Qwen3Tokenizer::install_template_helpers(&mut env);
         env.add_template("fixed", &fixed)
