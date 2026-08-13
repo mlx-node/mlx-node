@@ -4420,6 +4420,25 @@ mod tests {
     const KNOWN_UNRENDERABLE_CAUSES: &[&str] =
         &["unknown function: strftime_now", "too many arguments"];
 
+    /// The only fixtures whose template cannot render the probe conversation,
+    /// named per FAMILY and paired with its cause.
+    ///
+    /// `KNOWN_UNRENDERABLE_CAUSES` on its own is not enough, and the gap is not
+    /// hypothetical: `"too many arguments"` is a recorded cause, so a change to
+    /// the `tojson` closure's arity makes EVERY template fail for a recorded
+    /// reason at once. The `matched` floor does not catch that, because it counts
+    /// families FOUND rather than families COMPARED. An adversarial pass
+    /// demonstrated it — a zero-arity `tojson` left this gate green while
+    /// comparing zero bytes, and widening that closure to `Kwargs` is this
+    /// filter's own documented next step.
+    ///
+    /// So a family that stops rendering must be added here deliberately, with
+    /// its reason, rather than being absorbed by a shared cause string.
+    const KNOWN_UNRENDERABLE_FAMILIES: &[(&str, &str)] = &[
+        ("lfm2.5-8b-a1b", "unknown function: strftime_now"),
+        ("step-3.7-flash", "too many arguments"),
+    ];
+
     /// THE CROSS-FAMILY SEPARATOR GATE — the `tojson` analogue of
     /// `ternary_kwarg_transform_is_byte_identity_on_every_other_installed_template`.
     ///
@@ -4485,6 +4504,7 @@ mod tests {
         let mut seen = 0usize;
         let mut uses_filter = 0usize;
         let mut exercised: Vec<String> = Vec::new();
+        let mut exercised_templates: Vec<String> = Vec::new();
         let mut unexercised: Vec<String> = Vec::new();
         let mut unrenderable: Vec<String> = Vec::new();
         for entry in entries.flatten() {
@@ -4539,6 +4559,16 @@ mod tests {
                 );
             }
             exercised.push(name);
+            // Distinct TEMPLATES, which is the unit the floor below actually
+            // wants. `exercised` holds one entry per checkpoint DIRECTORY, and
+            // the cache carries many quant variants per family — ornith alone
+            // contributes 10 — so a directory count can clear a floor of 8 from
+            // a single family while every other family silently drops out.
+            // Deduping by content is also what the comment above promises.
+            let digest = sha256_prefix(&template);
+            if !exercised_templates.contains(&digest) {
+                exercised_templates.push(digest);
+            }
         }
 
         // Two floors, for the two ways this gate can pass while proving nothing:
@@ -4548,10 +4578,11 @@ mod tests {
             "only {seen} chat template(s) found under {root} — this gate needs the real cache",
         );
         assert!(
-            exercised.len() >= 8,
-            "only {} template(s) actually hit `tojson` ({exercised:?}) out of {uses_filter} that \
-             mention it — the probe conversation stopped exercising the filter",
-            exercised.len(),
+            exercised_templates.len() >= 8,
+            "only {} DISTINCT template(s) actually hit `tojson` out of {uses_filter} \
+             directories that mention it — the probe conversation stopped exercising the \
+             filter. Directories exercised: {exercised:?}",
+            exercised_templates.len(),
         );
         eprintln!(
             "scanned {seen} templates, {uses_filter} mention `tojson`, {} exercised it: \
@@ -4678,6 +4709,9 @@ mod tests {
 
         let mut matched: Vec<&str> = Vec::new();
         let mut report: Vec<String> = Vec::new();
+        // Families whose bytes were actually compared, as opposed to merely
+        // found. See the floor at the end of this test.
+        let mut compared = 0usize;
         for entry in entries.flatten() {
             let Ok(template) = std::fs::read_to_string(entry.path().join("chat_template.jinja"))
             else {
@@ -4701,10 +4735,24 @@ mod tests {
                             .any(|cause| e.contains(cause)),
                         "{family} does not render, and not for a recorded reason: {e}",
                     );
+                    // Per-family, not just per-cause. A recorded CAUSE is shared,
+                    // so a single edit can silence every family at once; a
+                    // recorded FAMILY cannot be silenced by an edit elsewhere.
+                    assert!(
+                        KNOWN_UNRENDERABLE_FAMILIES
+                            .iter()
+                            .any(|(f, cause)| f == family && e.contains(cause)),
+                        "{family} stopped rendering with a recorded cause, but is not a \
+                         recorded unrenderable family: {e}\nIf this is expected, add it to \
+                         KNOWN_UNRENDERABLE_FAMILIES with its reason. If it is not, something \
+                         made a template that used to render stop rendering, and every other \
+                         family may have stopped with it.",
+                    );
                     report.push(format!("{family}: DOES NOT RENDER ({e})"));
                     continue;
                 }
             };
+            compared += 1;
             report.push(format!("{family}: ours {}B, HF {}B", ours.len(), hf.len()));
             if ours == *hf {
                 continue;
@@ -4738,6 +4786,20 @@ mod tests {
              fixtures/hf/render_fixture.py. Matched: {matched:?}",
             matched.len(),
             HF_GROUND_TRUTH.len(),
+        );
+        // The floor that makes the assertion above mean something. `matched`
+        // counts families FOUND; without this, every render could fail for a
+        // recorded reason and this test would pass having byte-compared NOTHING
+        // — which is the strongest evidence on this branch, so it is the last
+        // thing that should be allowed to evaporate quietly.
+        assert_eq!(
+            compared,
+            HF_GROUND_TRUTH.len() - KNOWN_UNRENDERABLE_FAMILIES.len(),
+            "byte-compared {compared} families against HuggingFace, expected {}. \
+             Every fixture except the {} recorded unrenderable one(s) must produce a real \
+             comparison; a lower number means renders are failing, not that prompts agree.",
+            HF_GROUND_TRUTH.len() - KNOWN_UNRENDERABLE_FAMILIES.len(),
+            KNOWN_UNRENDERABLE_FAMILIES.len(),
         );
         eprintln!("{}", report.join("\n"));
     }
@@ -7384,8 +7446,14 @@ mod tests {
             (2.5e-8, "2.5e-8", "2.5e-08"),
         ] {
             assert_eq!(render(value), ours, "our spelling of {value:e} moved");
+            // Compare the RENDER against CPython, not the two literals against
+            // each other: `ours` and `cpython` both come from this table, so
+            // `assert_ne!(ours, cpython)` is a tautology that can never fire and
+            // its message would never be printed. This form actually detects the
+            // case the message describes — serde_json/ryu starting to agree.
             assert_ne!(
-                ours, cpython,
+                render(value),
+                cpython,
                 "{value:e} now agrees with CPython — good news, but then this row belongs in the \
                  agreeing table above and PythonDefaultFormatter's caveat should go",
             );
