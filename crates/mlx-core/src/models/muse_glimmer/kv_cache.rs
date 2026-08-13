@@ -31,7 +31,7 @@
 
 use crate::models::muse_glimmer::config::{LayerKind, MuseGlimmerConfig};
 use crate::transformer::{
-    KVCacheDType, KVCacheGroup, KVCachePhysicalLayout, LayerKVCacheSpec,
+    AttentionKind, KVCacheDType, KVCacheGroup, KVCachePhysicalLayout, LayerKVCacheSpec,
     group_layer_kv_cache_specs, validate_layer_kv_cache_specs,
 };
 
@@ -174,11 +174,47 @@ pub fn compute_layer_kv_cache_groups(
         .map_err(|e| format!("muse_glimmer KV cache grouping failed: {e}"))
 }
 
+/// Physical blocks to reserve for one KV group in a SHARED pool, given how many
+/// sequences the scheduler may keep live at once.
+///
+/// A sliding group WIDENS: `max(max_admission_blocks, scheduler_width) + 1`.
+///
+///   * `max(…, scheduler_width)` — every live row needs at least one starter
+///     block, so a window smaller than the scheduler width must not be the
+///     binding constraint.
+///   * `+ 1` — the live window's token range is not block-aligned, so it straddles
+///     one extra block. vLLM's `SlidingWindowSpec` carries exactly this `+1` and
+///     its `ChunkedLocalAttentionSpec` does not, because chunk boundaries ARE
+///     block-aligned. Without it, freeing only whole blocks below
+///     `num_skipped_tokens / block_size` leaves the partially-in-window head
+///     block held, so blocks actually held exceed the reservation.
+///
+/// A full group is returned unchanged: it is already bounded by `max_model_len`.
+///
+/// This number is a POOL RESERVATION and never a block-table row width. Rows are
+/// append-only while blocks are recycled — a recycled slot is overwritten with the
+/// null block at its existing index, nothing shifts down — so the row width stays
+/// `div_ceil(max_model_len, block_size)` for sliding layers too. vLLM's
+/// `SlidingWindowSpec` deliberately does not override `max_num_blocks_per_req`
+/// for this reason. Keep the two numbers in separate code paths so they cannot be
+/// confused.
+pub fn group_reserved_blocks(
+    attention_kind: AttentionKind,
+    max_admission_blocks: u32,
+    scheduler_width: u32,
+) -> u32 {
+    match attention_kind {
+        AttentionKind::Full => max_admission_blocks,
+        AttentionKind::SlidingWindow { .. } => {
+            max_admission_blocks.max(scheduler_width).saturating_add(1)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::models::muse_glimmer::config::fixtures::{config_json, text_config_json};
-    use crate::transformer::AttentionKind;
 
     /// The checkpoint-shaped config, taken through the real parser rather than
     /// hand-built: these tests must run on a config that actually validated, so
@@ -655,5 +691,99 @@ mod tests {
             err.contains("block_size"),
             "the error must name block_size, got: {err}"
         );
+    }
+
+    // ── Pool reservation ──────────────────────────────────────────────────
+
+    /// A sliding group's reservation only ever grows: it WIDENS to the scheduler
+    /// width and then adds one.
+    ///
+    /// Narrowing is the trap this pins. Block-table ROWS are append-only while
+    /// BLOCKS are recycled — a retired slot is overwritten with the null block at
+    /// its existing index and nothing shifts down — so a row keeps growing with
+    /// computed tokens even though the live window does not. Narrow a sliding
+    /// group's reservation to the window and it overflows the moment computed
+    /// tokens pass the window: the very first token past it needs a block the
+    /// budget does not contain. The `+1` covers the block the unaligned live
+    /// window straddles, which `remove_skipped_blocks` cannot free because it
+    /// frees whole blocks only.
+    #[test]
+    fn a_sliding_group_only_ever_widens_because_rows_are_append_only_while_blocks_are_recycled() {
+        let sliding = AttentionKind::SlidingWindow {
+            sliding_window: 2048,
+        };
+
+        // The real checkpoint's sliding admission (161 blocks) with room for 8
+        // live rows: admission binds, plus the straddled block.
+        assert_eq!(group_reserved_blocks(sliding, 161, 8), 162);
+
+        // A window smaller than the scheduler width must not be the binding
+        // constraint: every live row still needs a starter block, plus null.
+        assert_eq!(
+            group_reserved_blocks(AttentionKind::SlidingWindow { sliding_window: 8 }, 2, 8),
+            9
+        );
+
+        // Never below the admission bound, at any width — the narrowing check.
+        for width in [0u32, 1, 2, 8, 32, 160, 161, 162, 4096] {
+            let reserved = group_reserved_blocks(sliding, 161, width);
+            assert!(
+                reserved > 161,
+                "width {width} reserved {reserved}, which does not exceed the 161-block \
+                 admission bound; a sliding reservation must never narrow"
+            );
+            assert!(reserved >= width, "width {width} reserved only {reserved}");
+        }
+    }
+
+    /// A full group is returned unchanged. It is already bounded by
+    /// `max_model_len`, so widening it by the scheduler width would over-reserve
+    /// the group that dominates the footprint (8192 of the 8354 blocks one
+    /// sequence needs here).
+    #[test]
+    fn a_full_group_is_never_widened_or_padded() {
+        assert_eq!(group_reserved_blocks(AttentionKind::Full, 8192, 8), 8192);
+        assert_eq!(group_reserved_blocks(AttentionKind::Full, 8192, 4096), 8192);
+        assert_eq!(group_reserved_blocks(AttentionKind::Full, 1, 64), 1);
+    }
+
+    /// The reservation is not a row width, and the two numbers must stay far
+    /// apart. A sliding row is still `div_ceil(max_model_len, block_size)` wide
+    /// (8192 here) because the row index IS `absolute_position / block_size`;
+    /// only the block budget shrinks to 162. Feeding this helper's output in as a
+    /// row width would cap addressable positions at ~2592 tokens.
+    #[test]
+    fn the_sliding_reservation_is_much_smaller_than_the_block_table_row_it_must_not_size() {
+        let cfg = checkpoint_config();
+        let groups = groups(&cfg, CHUNK);
+        let row_width = cfg.text_config.max_position_embeddings.div_ceil(16) as u32;
+
+        let sliding_reservation =
+            group_reserved_blocks(groups[1].attention_kind, groups[1].max_admission_blocks, 8);
+        assert_eq!(sliding_reservation, 162);
+        assert_eq!(row_width, 8192);
+        assert!(
+            sliding_reservation * 8 < row_width,
+            "the reservation ({sliding_reservation}) and the row width ({row_width}) are \
+             different numbers and must live in different code paths"
+        );
+
+        // The full group's reservation and its row width DO coincide, which is
+        // exactly why the sliding case is the one that gets confused.
+        assert_eq!(
+            group_reserved_blocks(groups[0].attention_kind, groups[0].max_admission_blocks, 8),
+            row_width
+        );
+    }
+
+    /// Saturating arithmetic: a pathological admission bound must clamp, not wrap
+    /// to a tiny reservation.
+    #[test]
+    fn reservation_saturates_instead_of_wrapping() {
+        let sliding = AttentionKind::SlidingWindow {
+            sliding_window: 2048,
+        };
+        assert_eq!(group_reserved_blocks(sliding, u32::MAX, 1), u32::MAX);
+        assert_eq!(group_reserved_blocks(sliding, 1, u32::MAX), u32::MAX);
     }
 }
