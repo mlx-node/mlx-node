@@ -528,24 +528,33 @@ All three are `pub(crate)` — in-crate only, no NAPI surface of their own.
 | `type Command` / `RestoreTicket` / `OwnerState` / `StepExecutor<'a>` | 82-88 | `OwnerState: Default` means per-owner state must be constructible empty — no "must have run a turn first" invariant |
 | `const SCHEDULER_NAME` | 89 | Interpolated into every scheduler error message; make it `"Muse-Glimmer"` so the `supports_delta` refusal below is attributable |
 | `paged_adapter` / `paged_adapter_mut` | 94/95 | Return `Option<&PagedKVCacheAdapter>` — **one** adapter. A hybrid returns its *full* group's adapter here and coordinates the rest itself, exactly as gemma4 does |
-| `max_position_embeddings` | 178 | Scheduler clamps every turn's output budget against it (`hybrid_scheduler.rs:1436`). Muse-Glimmer's text config **does not parse this field yet** — see the gap below |
+| `max_position_embeddings` | 178 | Scheduler clamps every turn's output budget against it (`hybrid_scheduler.rs:1437-1440`, `min`'d with `scheduler_per_seq_context()`). Return `text_config.max_position_embeddings` — the field is parsed and validated as of `c8287d3b` (`config.rs:134`); note the trait returns `i32` while the config holds `usize`, and the scheduler's `unwrap_or(1).max(1)` means a bad conversion degrades to a 1-token context rather than erroring |
 | `activate_paged_seq` | 194 | Rows are per-`SeqId`; the forward pass may not assume one live request |
 | `run_paged_decode_step_batched` | 199 | The single hardest requirement — see the shape rule below |
 | `replace_cached_token_history` | 200 | The scheduler swaps whole token histories between rows; a forward pass that caches a `Vec<u32>` privately must expose the swap |
 | `owner_tokens` | 201 | Static fn on `OwnerState`, no `&self` — owner history may not live inside the model |
-| `capture_owner_state` | 206 | Called on preemption; must be cheap and must not need the GPU |
+| `capture_owner_state` | 206 | **Not** preemption. Its only call site in the crate is turn completion with the owner keeping its cache: `finish_completed` (`hybrid_scheduler.rs:2124`) calls it at `:2187-2191`, guarded by `outcome.is_ok() && turn.payload.reuse_cache`. `grep` returns exactly two hits, that call and the trait decl. Preemption (`:1960-1975`) never touches it — it calls `preempt_scheduled_cache`, and the state comes BACK via `install_owner_state` (`:1404/:1641/:2040/:2142`). So the row is **not** being evicted: capture what the next turn on this owner must see, and do not skip state the live turn still needs. It runs on the "mlx-model" thread right after a completed turn, so keep it cheap — but "no GPU" is a latency preference at that site, not a hard constraint the way it would be during eviction |
 | `build_scheduled_prefix` | 218 | Constructs a `PrefixState` for an arbitrary `(cached_prefix_len, suffix_len, first_chunk)` triple. This is where a hybrid's *sliding* re-prefill boundary has to be expressible, not just the full group's |
 | `step_executor` | 281 | |
 | `execute_barrier` | 282 | Family-specific commands (media, convert, save) stay ordered barriers |
 
 `run_paged_decode_step_batched` **must return `[N, 1, vocab]` with `N == rows.len()` and row
-order preserved.** The shape is not in the signature. It is enforced downstream, in two
-places, and both failures are late:
+order preserved.** The shape is not in the signature, and **nothing downstream enforces it.**
+There is exactly ONE enforcement point and you have to write it: assert the shape inside
+`run_paged_decode_step_batched`.
 
-- `engine/batch_sampling.rs:46-53` — `batch_greedy_tokens` errors on `ndim != 3 || shape[1] != 1`.
+- `engine/batch_sampling.rs:46-53` — `batch_greedy_tokens` errors on `ndim != 3 || shape[1] != 1`,
+  but that `Err` is a **soft degrade, not enforcement**. Its only production caller is
+  `batch_greedy_tokens_or_fallback` (`batch_sampling.rs:72-84`, called at
+  `hybrid_scheduler.rs:901`), which downgrades the error to a `tracing::warn!` and returns
+  `None` — by design, so a shared optimization cannot fail a wave whose forward pass
+  succeeded. Return `[N, vocab]` or `[1, N, vocab]` and the wave completes with
+  correct-but-scalar sampling, `fusedGreedyEpilogueSteps` stays 0, and nothing fails. That is
+  precisely why gate (d) — asserting the fused epilogue actually engaged — is the only
+  non-vacuous assertion available here.
 - `hybrid_scheduler.rs:958` — `logits.slice_axis(0, index, index+1)` indexes by **row
   position**. A permuted or short batch dimension does not error; it silently hands row *i*'s
-  logits to row *j*. Write the shape assertion in `run_paged_decode_step_batched` itself.
+  logits to row *j*.
 
 Seven recurrent-state hooks (`hybrid_scheduler.rs:179-198`) are defaulted no-ops. Muse-Glimmer
 is pure-KV (no GDN, no conv state), so it omits all seven; `recurrent_state_bytes() == 0`
@@ -594,7 +603,16 @@ one `head_dim 128`, one `num_key_value_heads 2`, no global overrides, no `k_eq_v
 `KVCachePhysicalLayout` for all 52 layers. Therefore:
 
 - **exactly 2 groups**, and `group_id 0` is **Full**. Do not write code that discovers this
-  at runtime and do not assume the reverse ordering.
+  at runtime and do not assume the reverse ordering. This is safe to hard-code **because
+  `compute_layer_kv_cache_groups` fails closed when it cannot hold**: a single-kind
+  `layer_types` table parses cleanly (the config's NoPE↔Full biconditional only fires when the
+  two tables *disagree*, and a uniform table agrees with itself) and would collapse grouping to
+  ONE group. All-sliding is the silent direction — `groups[0]`, whose adapter is returned from
+  `paged_adapter()` and publishes into the content-addressed prefix cache, would be the
+  *sliding* group, and a sliding block's contents depend on where the window was when it was
+  written. `muse_glimmer/kv_cache.rs` now refuses any grouping without at least one group of
+  each kind, naming the observed counts. It deliberately does **not** enforce the
+  `[S,S,S,F] × 13` pattern: a future hybrid ratio is still a hybrid.
 - gemma4's ">1 full-attention group" refusal (`gemma4/model.rs:2100-2107`) is **structurally
   satisfied**, not merely untriggered. No special handling needed, and none of the
   `effective_head_dim(is_global)` / `effective_kv_heads(is_global)` indirection gemma4 carries
@@ -616,24 +634,27 @@ vLLM's `resolve_kv_cache_block_sizes` sets `scheduler_block_size = lcm(group blo
 per-kind geometry there quantizes prefix-cache hits to LCM boundaries. We pay none of that
 while geometry stays uniform.
 
-#### The three inputs the seam needs, and the one Muse-Glimmer cannot supply yet
+#### The three inputs the seam needs
 
 | Input | gemma4's source | Muse-Glimmer |
 | ----- | --------------- | ------------ |
 | `block_size` | `config.paged_block_size.unwrap_or(16)` (`gemma4/model.rs:2076`), a config knob | **caller argument.** This family's config is Rust-internal with no NAPI surface by design (`config.rs`), so the knob has to come from the paged-adapter construction site, not the checkpoint |
 | `cache_dtype` | `KVCacheDType::BFloat16` (`gemma4/model.rs:2085-2091`) | same — checkpoint dtype is `bfloat16`; keep it a caller argument |
-| `max_model_len` | `u32::try_from(config.max_position_embeddings)` (`gemma4/model.rs:8158`), a **required** config field | **MISSING.** No source exists today |
+| `max_model_len` | `u32::try_from(config.max_position_embeddings)` (`gemma4/model.rs:8158`), a **required** config field | `text_config.max_position_embeddings` (`config.rs:134`), **landed in `c8287d3b`** — required, no `#[serde(default)]`, validated non-zero and u32-fitting at `config.rs:346-358`. Consumed at `muse_glimmer/kv_cache.rs:166-186` |
 
-**The gap, as an M1 requirement.** The checkpoint carries `text_config.max_position_embeddings
-= 131072`, but `muse_glimmer/config.rs` does not parse it — neither `RawTextConfig` nor
-`MuseGlimmerTextConfig` has the field, and a grep for `max_position` across the module returns
-nothing. Add it to both as a **required** field with **no `#[serde(default)]`**, copied through
-in the validated `Ok(Self { .. })` block. A default is exactly the silent trap the module's own
+**Landed in `c8287d3b`; the reasoning below is kept as the rationale for why it must not be
+defaulted.** `RawTextConfig` (`config.rs:65`) and `MuseGlimmerTextConfig` (`config.rs:134`) both
+carry `max_position_embeddings` as a **required** field with **no `#[serde(default)]`**, copied
+through in the validated `Ok(Self { .. })` block. Do not re-add it, and do not add a second
+spelling. A default would be exactly the silent trap the module's own
 `defaulted_fields_are_read_from_the_file_when_present` test exists to catch: an absent key and
 a 131072 key would then be indistinguishable, and the sliding pool would be sized off a number
-nobody wrote. Do **not** add it to `MuseGlimmerVisionConfig` as a side effect — the vision
-tower's own `layer_types` and `max_position_embeddings` are deliberately unparsed
-(`config.rs:92-110`), and the KV-spec seam is **text-decoder only**.
+nobody wrote. Validation is at `config.rs:346-358` — non-zero (a 0 makes the full-attention
+bound `div_ceil(0, block_size) == 0`, a group that admits nothing) and u32-fitting — and
+`kv_cache.rs` re-checks **both** halves, because it is `pub` and must not trust a config
+assembled elsewhere. It is **not** on `MuseGlimmerVisionConfig` — the vision tower's own
+`layer_types` and `max_position_embeddings` are deliberately unparsed (`config.rs:92-110`), and
+the KV-spec seam is **text-decoder only**.
 
 `sliding_window` validation is already landed (`3c0c6859`): the config refuses `0` and refuses
 a value outside `u32` at load. Keep that placement. The seam would also refuse a zero window
@@ -668,9 +689,15 @@ Concrete, at `block_size 16`, `max_model_len 131072`, `window 2048`:
 A 50.9x block reduction on 39 of 52 layers is the whole prize, and it **scales with
 `max_chunk`**: raising the prefill chunk under-provisions a pool sized for the old chunk. The
 pool sizer and the runtime admission gate must therefore call **one** function — vLLM keeps
-them on one source of truth for exactly this reason
-(`single_type_kv_cache_manager.py:1855`, whose comment names the deadlock and the mid-prefill
-OOM). Two independently derived caps is the bug shape.
+them on one source of truth for exactly this reason. The comment that names both failure modes
+is `single_type_kv_cache_manager.py:178-186`, inside `get_num_blocks_to_allocate`'s admission
+cap: *"Drift between the two would re-introduce the deadlock from issue #39734 or, worse,
+mid-prefill OOM."* (`grep -niE "deadlock|oom"` over that file and `kv_cache_interface.py` at
+`b369f10d5c` returns exactly those two lines.) The lookup that wires the single source is
+`:1860-1875`, where `get_manager_for_kv_cache_spec` passes
+`kv_cache_spec.max_admission_blocks_per_request(...)` — the same spec method the startup sizer
+`max_memory_usage_bytes` calls — into the runtime manager. Two independently derived caps is
+the bug shape.
 
 Two more sizing facts:
 
@@ -689,7 +716,21 @@ Two more sizing facts:
   changing that constant is a **pool-sizing** change, not a perf knob.
 - Mirror gemma4's reserved-blocks rule verbatim rather than re-deriving it: a sliding group
   **widens** to `max_admission_blocks.max(scheduler_width) + 1`, a full group stays at
-  `max_admission_blocks` (`gemma4/model.rs:8169-8180`).
+  `max_admission_blocks` (`gemma4/model.rs:8169-8180`). Mirror the **reason** too, and note it
+  is a *different* `+1` from the one in the admission formula above. **That** `+1` is the
+  straddled window block and is already spent inside `max_admission_blocks` (161 =
+  `div_ceil(2047 + 512, 16) + 1`; vLLM's `max_memory_usage_bytes` is `max_blocks *
+  page_size_bytes` with nothing added on top). The reservation's `+1` is the group's
+  **null-block sentinel** — gemma4's `null_block_bytes` term, one block per sliding group
+  (`gemma4/model.rs:2148-2157`), which is why `required_bytes_for_width(1)` equals
+  `minimum_pool_bytes` exactly (`:2182-2196`) and why gemma4's own test calls it "plus its null
+  block" (`:12783-12793`). Two `+1`s, two blocks. Reading them as one invites deleting either,
+  and both deletions bite: drop the seam's and every sliding group is under-provisioned by the
+  straddled block, so the first prompt crossing a non-block-aligned window boundary allocates
+  past its admission bound; drop the reservation's and the pool deadlocks at full occupancy with
+  no null block for `remove_skipped_blocks` / `replace_block` to retire slots into. Pinned by
+  `muse_glimmer/kv_cache.rs`'s
+  `the_reservations_plus_one_is_the_null_block_not_the_straddled_window_block`.
 
 #### Hybrid KV rules, each with the reason and where it is enforced today
 
