@@ -307,14 +307,47 @@ pub struct ResponseTemplate {
     #[cfg_attr(not(test), expect(dead_code))]
     tool_call_transform: Option<serde_json::Value>,
     /// The protocol's MESSAGE terminators: the `text` fields' close markers,
-    /// unioned and deduplicated (`<|eom|>`, `<|eot|>`).
+    /// unioned and deduplicated, then unioned with the tokenizer's declared
+    /// `eos_token` (`<|eom|>`, `<|eot|>`, `<|end_of_text|>`).
     ///
-    /// Derived, not hardcoded. `chat_template.jinja` ends every assistant message
-    /// with `<|eot|>` or `<|eom|>` whatever its recipient, and those two are
-    /// exactly what `reasoning_content.close` and `content.close` list. The tool
-    /// field's `</atem:invoke>` is deliberately excluded — it closes a BLOCK
-    /// inside a message, not the message — and a tool message that omits its
-    /// terminator is therefore not one this parser will act after.
+    /// Derived, not hardcoded, and from TWO shipped sources because one of them is
+    /// structurally incomplete:
+    ///
+    /// - `chat_template.jinja` ends every assistant message with `<|eot|>` or
+    ///   `<|eom|>` whatever its recipient, and those two are exactly what
+    ///   `reasoning_content.close` and `content.close` list. Counted over the real
+    ///   template: `<|eot|>` 6 times, `<|eom|>` 4 times, `<|end_of_text|>` NEVER.
+    ///   So the `close` lists are a complete description of what the template
+    ///   RENDERS — they are not wrong — but `response_template` describes rendering,
+    ///   not stopping, and 200001 is a sampling-time stop the template never writes.
+    ///   That is why the extra terminator cannot come from `response_template` and
+    ///   has to come from a stop-set source;
+    /// - `tokenizer_config.json`'s top-level `eos_token` is `"<|end_of_text|>"`,
+    ///   i.e. id 200001, one of the two ids `generation_config.json` declares
+    ///   (`eos_token_id = [200001, 200008]`). It OMITS 200008, and
+    ///   `engine/persistence.rs`'s
+    ///   `muse_glimmer_generation_defaults_declare_both_stops` records that
+    ///   incompleteness as a trap that makes a loader never stop. It is harmless
+    ///   HERE and only here, because this is a UNION with the spec's own closes —
+    ///   so do not ever replace this derivation with `eos_token` alone.
+    ///
+    /// Without the union a `to=user` answer the model ended on 200001 kept the
+    /// fifteen bytes that ended it: `content = Some("The answer is 42.<|end_of_text|>")`
+    /// while `super::stream_guard` streamed `"The answer is 42."`. The reasoning
+    /// channel had the same leak and is worse in kind, because the guard never
+    /// streams reasoning, so `parse` is that channel's only producer and there is no
+    /// clean copy to compare against.
+    ///
+    /// The tool field's `</atem:invoke>` is deliberately excluded: it closes a BLOCK
+    /// inside a message, not the message. So this set decides only whether a message
+    /// ended BEFORE a header — [`Arrival::terminated`], i.e. whether the NEXT
+    /// message may act — and whether a text segment stops here
+    /// ([`Self::segment_end`]). It says nothing about where a message of this
+    /// parser's own ENDS for the purpose of accepting a call: a call's completeness
+    /// is `</atem:invoke>`, the spec's own `tool_calls.close`. See
+    /// [`Self::collect_tool_calls`], which is where two review rounds in a row
+    /// expected to find a message-terminator requirement and where the reason there
+    /// is none is now written down.
     ///
     /// This is what [`Arrival::terminated`] is computed from, i.e. what separates
     /// "a message ended here" from "these bytes appeared here".
@@ -1311,6 +1344,45 @@ impl ResponseTemplate {
     /// An invoke with no close inside the extent is dropped and reading this body
     /// stops — there is no structure left in it. The caller still moves on to the
     /// next validated header, so an answer that follows survives.
+    ///
+    /// # The unit of completeness is `</atem:invoke>`, not the message terminator
+    ///
+    /// Written down because two review rounds in a row read [`Self::terminators`]'
+    /// doc as "a tool message without its terminator is not one this parser will act
+    /// ON" and asked for a per-MESSAGE gate here. There is none, deliberately, and
+    /// the per-CALL rule that replaces it is not caution — it is exact:
+    ///
+    /// 1. **The spec says so.** `tool_calls.close` is `</atem:invoke>` with
+    ///    `repeats: true`, and the message terminators appear only as
+    ///    `reasoning_content.close` / `content.close`. `chat_template.jinja`'s
+    ///    `render_atem` macro writes the invoke and nothing else; the terminator is
+    ///    appended by the enclosing `{%- for tc in message['tool_calls'] -%}` loop.
+    ///    So the invoke's close closes the CALL and the terminator closes the
+    ///    MESSAGE — two different units, and this function keys on the call's.
+    /// 2. **A closed invoke is always a COMPLETE call.**
+    ///    `super::stream_guard`'s `raw` is append-only: every decoded piece is
+    ///    pushed at its end, `stop`/`seal`/`flush` never shorten it, ids refused by
+    ///    the token cap are refused BEFORE they are decoded, and a turn cut off
+    ///    mid-scalar leaves those bytes in `decode_ids` where they never reach
+    ///    `raw`. So `raw` is a strict PREFIX of what the model decoded, and a
+    ///    present `</atem:invoke>` proves the whole invoke — the opener, the name,
+    ///    and every `<atem:parameter>` between them — arrived. Truncation cannot
+    ///    produce a closed-but-partial call, so there is nothing for a terminator
+    ///    rule to catch.
+    /// 3. **Therefore end-of-input as the extent fallback is safe**, and requiring a
+    ///    message terminator would only discard COMPLETE calls. Two measured
+    ///    refusals it would cause: two fully closed invokes followed by a
+    ///    `max_tokens` cut (2 calls -> 0, all of them fully specified), and a
+    ///    correctly closed tool message ended by `<|end_of_text|>` — id 200001, a
+    ///    declared stop the chat template never renders — which is not truncated at
+    ///    all (1 call -> 0). Both are pinned in `super::stream_guard`'s seam module.
+    ///
+    /// A caller that wants to be conservative about truncation has the signal it
+    /// needs and does not need this function to lie about it:
+    /// `StreamGuard::turn_end` distinguishes a real terminator from a token-cap
+    /// seal, and holding back the LAST call is a per-call decision the dispatcher
+    /// can make. Dropping the whole list here would be irreversible and, in the
+    /// `<|end_of_text|>` case, wrong about a turn that never truncated.
     fn collect_tool_calls(
         &self,
         turn: GeneratedTurn<'_>,
@@ -1690,6 +1762,10 @@ mod tests {
 
     #[test]
     fn malformed_tool_xml_yields_no_tool_calls_and_does_not_panic() {
+        // The per-call terminator rule again, in its simplest shape: ONE invoke,
+        // never closed, and the message IS terminated. Nothing about the message's
+        // terminator saves it, and nothing about it was ever meant to — the missing
+        // `</atem:invoke>` is the whole reason. See `collect_tool_calls`' doc.
         let out = spec().parse_asserting_every_marker_shape_is_a_token(
             " to=t<|message|><atem:invoke name=\"t\"><atem:parameter name=\"x\">1<|eot|>",
         );
@@ -1916,6 +1992,12 @@ mod tests {
         // validated message and the user is entitled to it. Stopping the whole
         // scan here bought no safety once headers became arrival-only; it only
         // threw the answer away.
+        //
+        // THIS IS the per-call terminator rule, for a reader looking for one:
+        // `collect_tool_calls` breaks the moment `earliest_close` finds no
+        // `</atem:invoke>` inside the message's extent, so an invoke without its
+        // own close is dropped whatever the message did. There is no per-MESSAGE
+        // gate anywhere, and `collect_tool_calls`' doc says why.
         let out = spec().parse_asserting_every_marker_shape_is_a_token(
             " to=wx<|message|><atem:invoke name=\"wx\"><atem:parameter name=\"q\">1\
              <|start|>assistant to=user<|message|>here is the weather<|eot|>",

@@ -277,6 +277,44 @@ pub enum GuardOutcome {
     EndTurn,
 }
 
+/// **Why** a turn is over — the one thing [`GuardOutcome::EndTurn`] cannot say.
+///
+/// `EndTurn` is returned identically for a model that ended its own turn with
+/// `<|eot|>` and for a turn the token cap cut in half, and
+/// `output_parser::ParsedTurn` carries no truncation flag either. So a caller had
+/// nothing to gate on, and the first two reviews of this module both proposed
+/// fixing that inside the PARSER, by refusing tool calls from a message with no
+/// terminator. That is the wrong side: a refusal is irreversible and, measured, it
+/// discards complete calls in two cases — several fully closed invokes cut off by
+/// the cap, and a correctly closed tool message ended by `<|end_of_text|>`, which
+/// is not truncated at all. See `output_parser::ResponseTemplate::collect_tool_calls`.
+///
+/// A SIGNAL cannot silently discard anything: it only adds information the caller
+/// did not have. What a caller may reasonably do with `TokenCap` is hold back the
+/// LAST tool call, which is a per-call decision only the dispatcher can make —
+/// never drop the whole list, and never in the parser, which cannot see this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TurnEnd {
+    /// Still running. Keep feeding ids.
+    Open,
+    /// A real, provenanced turn terminator — `<|eot|>` or `<|end_of_text|>` — that
+    /// the model itself emitted. The only ending that means the model finished.
+    Terminator,
+    /// `max_tokens` was reached. The retained turn is a strict PREFIX of what the
+    /// model would have written, so whatever the parser reports from it is
+    /// byte-complete but the message it sat in may not have ended.
+    TokenCap,
+    /// The guard refused the stream and failed closed: a forged or over-long
+    /// header, `<|eom|>`/`<|start|>` inside an unterminated tool body, an id this
+    /// vocabulary does not contain, a decode error, or one of the memory bounds.
+    /// Also a prefix, and additionally one whose tail was deliberately discarded.
+    Refused,
+    /// [`StreamGuard::flush`] ended a turn nothing else had ended — i.e. the CALLER
+    /// stopped feeding ids, on its own stop-token check or its own budget. The
+    /// guard has no opinion about whether that was a completion.
+    Caller,
+}
+
 /// Which channel the current message's `to=` value selected.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Channel {
@@ -365,7 +403,10 @@ pub struct StreamGuard {
     /// One per id accepted by [`Self::push_id`]. Not a number the caller supplies:
     /// three earlier shapes all let the caller decide what counted as a token.
     tokens: usize,
-    ended: bool,
+    /// Whether the turn is over, and WHY — see [`TurnEnd`]. Replaces a bare `bool`
+    /// so there is exactly one place that records the reason, set by the single
+    /// [`Self::seal`] every terminal path already goes through.
+    end: TurnEnd,
 }
 
 impl std::fmt::Debug for StreamGuard {
@@ -380,7 +421,7 @@ impl std::fmt::Debug for StreamGuard {
             .field("control_spans", &self.control_spans.len())
             .field("messages", &self.messages)
             .field("tokens", &self.tokens)
-            .field("ended", &self.ended)
+            .field("end", &self.end)
             .finish()
     }
 }
@@ -439,7 +480,7 @@ impl StreamGuard {
             header_allowance,
             messages: 0,
             tokens: 0,
-            ended: false,
+            end: TurnEnd::Open,
         }
     }
 
@@ -471,14 +512,14 @@ impl StreamGuard {
     /// `EndTurn` is sticky: once returned, every later push returns it too, so
     /// a caller that misses the first one cannot restart a self-played turn.
     pub fn push_id(&mut self, id: u32) -> GuardOutcome {
-        if self.ended {
+        if self.ended() {
             return GuardOutcome::EndTurn;
         }
         // Cap first, before anything is decoded or retained. `seal` rather than
         // `stop`: the tail already in `pending` came from ids *within* the cap and
         // is still the caller's, so only the turn and the parked bytes end here.
         if self.tokens >= self.max_tokens {
-            self.seal();
+            self.seal(TurnEnd::TokenCap);
             return GuardOutcome::EndTurn;
         }
         // An id this vocabulary does not contain is not something to guess about.
@@ -487,7 +528,7 @@ impl StreamGuard {
         // silently charge a token and contribute nothing (measured: `decode` of an
         // id past the vocabulary returns `Ok("")`).
         if self.tokenizer.id_to_token(id).is_none() {
-            self.stop();
+            self.stop(TurnEnd::Refused);
             return GuardOutcome::EndTurn;
         }
 
@@ -512,13 +553,13 @@ impl StreamGuard {
             // Bytes buffered, no complete scalar yet.
             Ok(None) => {
                 if self.decode_ids.len() > MAX_PENDING_DECODE_IDS {
-                    self.stop();
+                    self.stop(TurnEnd::Refused);
                     return GuardOutcome::EndTurn;
                 }
                 String::new()
             }
             Err(_) => {
-                self.stop();
+                self.stop(TurnEnd::Refused);
                 return GuardOutcome::EndTurn;
             }
         };
@@ -527,7 +568,7 @@ impl StreamGuard {
             // Cumulative, never per call, so no legal token sequence can end a turn
             // because of how the caller grouped it.
             if self.raw.len().saturating_add(piece.len()) > MAX_TURN_CHARS {
-                self.stop();
+                self.stop(TurnEnd::Refused);
                 return GuardOutcome::EndTurn;
             }
             let at = self.raw.len();
@@ -550,7 +591,7 @@ impl StreamGuard {
         }
 
         self.scan();
-        if self.ended {
+        if self.ended() {
             return GuardOutcome::EndTurn;
         }
         let mut out = std::mem::take(&mut self.ready);
@@ -581,7 +622,7 @@ impl StreamGuard {
         // EMPTY batch never reaches the scalar path. The two-chunk cut sweep found
         // that: at cut n/n the tail is empty, and an ended guard answered `Hold`,
         // which tells the caller to keep decoding.
-        if self.ended {
+        if self.ended() {
             return GuardOutcome::EndTurn;
         }
         let mut emitted = String::new();
@@ -631,6 +672,25 @@ impl StreamGuard {
     /// parser.
     pub fn raw_turn(&self) -> (&str, &[Range<usize>]) {
         (&self.raw, &self.control_spans)
+    }
+
+    /// Whether this turn is over and WHY — see [`TurnEnd`].
+    ///
+    /// [`GuardOutcome::EndTurn`] answers only the first half, identically for a
+    /// model that wrote `<|eot|>` and for a turn `max_tokens` cut in half, and
+    /// `output_parser::ParsedTurn` carries no truncation flag either. This is the
+    /// missing half, and it is a signal rather than a refusal on purpose: see
+    /// [`TurnEnd`] for the two cases where refusing tool calls from an unterminated
+    /// message discards calls the model fully specified.
+    ///
+    /// Stable after [`Self::flush`], like [`Self::raw_turn`].
+    pub fn turn_end(&self) -> TurnEnd {
+        self.end
+    }
+
+    /// Whether the turn is over at all. The `bool` this field used to be.
+    fn ended(&self) -> bool {
+        self.end != TurnEnd::Open
     }
 
     /// The turn as the parser takes it: the decoded text plus the provenance of its
@@ -704,7 +764,9 @@ impl StreamGuard {
         ) {
             out.push_str(strip_partial_marker(&tail, CONTROL_MARKERS));
         }
-        self.seal();
+        // `seal` keeps whatever reason a terminal path already recorded, so this
+        // only labels a turn the CALLER stopped feeding.
+        self.seal(TurnEnd::Caller);
         out
     }
 
@@ -737,7 +799,7 @@ impl StreamGuard {
                     // ended the turn. The allowance is derived from the caller's
                     // longest recipient, so a legal long tool name is not rejected.
                     if region.chars().count() > self.header_allowance {
-                        self.stop();
+                        self.stop(TurnEnd::Refused);
                         return;
                     }
                     // Every header after the first must carry the anchor. The
@@ -745,7 +807,7 @@ impl StreamGuard {
                     // prompt, not in the stream.
                     let verdict = classify_header(region, self.messages > 0);
                     if verdict == HeaderVerdict::Invalid {
-                        self.stop();
+                        self.stop(TurnEnd::Refused);
                         return;
                     }
                     let Some((i, marker)) = end else {
@@ -755,17 +817,21 @@ impl StreamGuard {
                     // never opened; and now that the header is finished,
                     // `Incomplete` means it never was one.
                     let HeaderVerdict::Routed(channel) = verdict else {
-                        self.stop();
+                        self.stop(TurnEnd::Refused);
                         return;
                     };
+                    // The needle set here is `[MSG, EOT, EOS]`, so a marker that is
+                    // not `<|message|>` is a turn terminator arriving where the
+                    // header's own closer belonged: the model ended the turn without
+                    // ever opening this message.
                     if marker != MSG {
-                        self.stop();
+                        self.stop(TurnEnd::Terminator);
                         return;
                     }
                     self.pending.drain(..i + MSG.len());
                     self.messages += 1;
                     if self.messages > self.max_messages {
-                        self.stop();
+                        self.stop(TurnEnd::Refused);
                         return;
                     }
                     self.state = State::InMessage {
@@ -791,9 +857,15 @@ impl StreamGuard {
                     channel: Channel::ToolCall,
                     xml: true,
                 } => {
-                    if let Some((i, _)) = earliest(&self.pending, &[EOM, EOT, EOS, START]) {
+                    if let Some((i, marker)) = earliest(&self.pending, &[EOM, EOT, EOS, START]) {
                         self.resolve(i, false);
-                        self.stop();
+                        // `<|eot|>`/`<|end_of_text|>` are the model ending its turn;
+                        // `<|eom|>`/`<|start|>` are this arm failing closed on a tool
+                        // body it could not delimit, which is a refusal.
+                        self.stop(match marker {
+                            EOT | EOS => TurnEnd::Terminator,
+                            _ => TurnEnd::Refused,
+                        });
                     }
                     return;
                 }
@@ -804,7 +876,7 @@ impl StreamGuard {
                 // stops here and the seam tests say so, rather than silently
                 // suppressing prose again.
                 State::InMessage { xml: true, .. } => {
-                    self.stop();
+                    self.stop(TurnEnd::Refused);
                     return;
                 }
                 State::InMessage {
@@ -837,7 +909,7 @@ impl StreamGuard {
                     self.resolve(i, emit);
                     match marker {
                         EOT | EOS => {
-                            self.stop();
+                            self.stop(TurnEnd::Terminator);
                             return;
                         }
                         EOM => {
@@ -867,7 +939,7 @@ impl StreamGuard {
                         // closed rather than latching `xml` for a needle nobody
                         // taught this match about.
                         _ => {
-                            self.stop();
+                            self.stop(TurnEnd::Refused);
                             return;
                         }
                     }
@@ -886,8 +958,8 @@ impl StreamGuard {
     /// marker mid-buffer is not a *partial* marker and
     /// [`strip_partial_marker`] left it alone. Content resolved **before** the
     /// stop is already in `ready` and is still handed back.
-    fn stop(&mut self) {
-        self.seal();
+    fn stop(&mut self, why: TurnEnd) {
+        self.seal(why);
         self.pending.clear();
     }
 
@@ -900,8 +972,17 @@ impl StreamGuard {
     /// actually dropped. While they survived a `flush`, a later id completed the
     /// parked bytes and rewrote `raw` after the turn had been finalised; `ended`
     /// alone did not prevent it because `flush` never set `ended`.
-    fn seal(&mut self) {
-        self.ended = true;
+    ///
+    /// `why` is what [`Self::turn_end`] reports. Being the single funnel is what
+    /// makes the reason trustworthy: there is no terminal path that can end a turn
+    /// without naming one.
+    fn seal(&mut self, why: TurnEnd) {
+        // FIRST reason wins. Every terminal path already funnels through here, and
+        // `flush` funnels through it again afterwards, so overwriting would relabel
+        // a refusal or a terminator as `Caller` on the way out.
+        if self.end == TurnEnd::Open {
+            self.end = why;
+        }
         self.decode_ids.clear();
         self.decode_prefix.clear();
         self.decode_prefix_index = 0;
@@ -3890,6 +3971,11 @@ mod tests {
         parsed: ParsedTurn,
         /// The outcome of the last id the guard accepted.
         last: GuardOutcome,
+        /// The turn the guard retained, i.e. the parser's input.
+        raw: String,
+        /// WHY the turn ended — the half `last` cannot express, since
+        /// [`GuardOutcome::EndTurn`] is identical for a terminator and a cap seal.
+        turn_end: TurnEnd,
     }
 
     /// The checkpoint's compiled `response_template`, from the same transcription
@@ -3907,7 +3993,15 @@ mod tests {
     /// Honouring `EndTurn` is what makes this the real path: a harness that kept
     /// pushing would measure a turn no caller can produce.
     fn seam_of_ids(ids: &[u32], batched: bool) -> Seam {
-        let mut g = guard(8, 100_000, TEST_RECIPIENT_CHARS);
+        seam_of_ids_capped(ids, batched, 100_000)
+    }
+
+    /// [`seam_of_ids`] with an explicit `max_tokens`, for the truncation cases: the
+    /// cap is the only way to seal a turn mid-message the way `max_tokens` does in
+    /// production, and it is what distinguishes [`TurnEnd::TokenCap`] from a
+    /// terminator the model actually wrote.
+    fn seam_of_ids_capped(ids: &[u32], batched: bool, max_tokens: usize) -> Seam {
+        let mut g = guard(8, max_tokens, TEST_RECIPIENT_CHARS);
         let mut streamed = String::new();
         let mut last = GuardOutcome::Hold;
         if batched {
@@ -3935,6 +4029,8 @@ mod tests {
             streamed,
             parsed,
             last,
+            raw: g.raw_turn().0.to_owned(),
+            turn_end: g.turn_end(),
         }
     }
 
@@ -3951,6 +4047,14 @@ mod tests {
         assert_eq!(
             scalar.parsed, batched.parsed,
             "batch and scalar parsed to different turns"
+        );
+        assert_eq!(
+            scalar.raw, batched.raw,
+            "batch and scalar retained different turns"
+        );
+        assert_eq!(
+            scalar.turn_end, batched.turn_end,
+            "batch and scalar ended the turn for different reasons"
         );
         scalar
     }
@@ -3982,6 +4086,14 @@ mod tests {
         assert_eq!(
             scalar.parsed, batched.parsed,
             "batch and scalar parsed to different turns"
+        );
+        assert_eq!(
+            scalar.raw, batched.raw,
+            "batch and scalar retained different turns"
+        );
+        assert_eq!(
+            scalar.turn_end, batched.turn_end,
+            "batch and scalar ended the turn for different reasons"
         );
         scalar
     }
@@ -4342,6 +4454,178 @@ mod tests {
             "text after the fail-closed stop reached a channel: {:?}",
             two_messages.parsed
         );
+    }
+
+    // ── The unit of a call's completeness is `</atem:invoke>` ──────────
+    //
+    // Two review rounds in a row read `output_parser::ResponseTemplate::terminators`'
+    // doc as "a tool message without its terminator is not one this parser will act
+    // ON" and asked for a per-MESSAGE gate in `collect_tool_calls`. There is none,
+    // and these three tests are why — each drives BOTH modules on one stream, so a
+    // future round cannot add the gate and stay green.
+    //
+    // The rule that IS there is per-CALL: `earliest_close` returning `None` breaks
+    // the invoke scan, so an invoke without its own `</atem:invoke>` is dropped
+    // whatever the message did. It is sufficient because `raw` is append-only — a
+    // present `</atem:invoke>` proves the whole invoke arrived — and a per-message
+    // rule is not merely unnecessary but wrong: it discards complete calls in the
+    // two cases the second and third test below measure.
+
+    /// The comment's exact scenario: a turn `max_tokens` seals immediately after a
+    /// closed `</atem:invoke>`, so `raw` carries a tool message with NO terminator —
+    /// and the call is still returned, because the model fully specified it.
+    ///
+    /// Note what the guard reports: `TurnEnd::TokenCap`, not `Terminator`. That is
+    /// the signal a cautious dispatcher should gate on, and it is why the parser does
+    /// not need to guess. `GuardOutcome::EndTurn` alone cannot say this, which is the
+    /// gap `turn_end` closes.
+    ///
+    /// Mutation this catches: requiring a provenanced `<|eom|>`/`<|eot|>` after the
+    /// invoke before appending to `into` in `collect_tool_calls` — the fix the review
+    /// asked for. Under it this call count goes 1 -> 0.
+    #[test]
+    fn a_truncated_tool_message_still_yields_its_closed_invokes() {
+        let closed = " to=a<|message|><atem:function_calls>\n\
+                      <atem:invoke name=\"a\">\
+                      <atem:parameter name=\"city\">Paris</atem:parameter>\n\
+                      </atem:invoke>";
+        // The model went on to close the block and end its turn; the cap refuses
+        // every id of that tail, so none of it reaches `raw`.
+        let tail = "\n</atem:function_calls><|eot|>";
+        let head_ids = ids_for(closed);
+        let cap = head_ids.len();
+        let mut ids = head_ids;
+        ids.extend(ids_for(tail));
+
+        for batched in [false, true] {
+            let s = seam_of_ids_capped(&ids, batched, cap);
+            assert!(
+                matches!(s.last, GuardOutcome::EndTurn),
+                "batched={batched}: the cap must end the turn, got {:?}",
+                s.last
+            );
+            assert_eq!(
+                s.turn_end,
+                TurnEnd::TokenCap,
+                "batched={batched}: the cap must be reported as the reason"
+            );
+            assert_eq!(
+                s.raw, closed,
+                "batched={batched}: the retained turn is not the pre-cap prefix"
+            );
+            // The point: no terminator in `raw`, one complete call out of it.
+            assert!(
+                !s.raw.contains(EOT) && !s.raw.contains(EOM) && !s.raw.contains(EOS),
+                "batched={batched}: the fixture is not the unterminated case: {:?}",
+                s.raw
+            );
+            assert_eq!(
+                call_names(&s.parsed),
+                vec!["a"],
+                "batched={batched}: a complete call was discarded for its message's \
+                 missing terminator: {:?}",
+                s.parsed
+            );
+            assert_eq!(
+                s.parsed.tool_calls[0].arguments["city"],
+                serde_json::json!("Paris")
+            );
+        }
+    }
+
+    /// The per-call rule, in the shape that shows it is a rule and not a shrug: two
+    /// closed invokes plus a third cut off mid-parameter, no terminator anywhere. The
+    /// two complete calls survive; the incomplete one is dropped and nothing of its
+    /// body reaches an argument.
+    ///
+    /// Mutation this catches, in EITHER direction: replacing the per-call
+    /// `earliest_close` break with a per-message rule gives 0 calls (refuse the
+    /// unterminated message) or 3 (accept the message wholesale and let the open
+    /// invoke run to end of input).
+    #[test]
+    fn truncation_drops_only_the_trailing_unclosed_invoke() {
+        let invoke = |city: &str| {
+            format!(
+                "<atem:invoke name=\"a\">\
+                 <atem:parameter name=\"city\">{city}</atem:parameter></atem:invoke>"
+            )
+        };
+        let turn = format!(
+            " to=a<|message|>{}{}<atem:invoke name=\"a\">\
+             <atem:parameter name=\"city\">NEVER_A_CALL",
+            invoke("Paris"),
+            invoke("Berlin"),
+        );
+        let s = seam(&turn);
+        assert_eq!(
+            s.turn_end,
+            TurnEnd::Caller,
+            "the fixture must be the no-terminator, no-cap case: {:?}",
+            s.turn_end
+        );
+        assert_eq!(
+            call_names(&s.parsed),
+            vec!["a", "a"],
+            "the two CLOSED invokes must both survive: {:?}",
+            s.parsed
+        );
+        assert_eq!(
+            s.parsed.tool_calls[0].arguments["city"],
+            serde_json::json!("Paris")
+        );
+        assert_eq!(
+            s.parsed.tool_calls[1].arguments["city"],
+            serde_json::json!("Berlin")
+        );
+        // Nothing of the truncated invoke reaches any argument, on any channel.
+        assert!(
+            !every_channel(&s.parsed).contains("NEVER_A_CALL"),
+            "the unclosed invoke's body reached a channel: {:?}",
+            s.parsed
+        );
+        assert_eq!(s.streamed, "", "a tool body is not the answer");
+    }
+
+    /// The OVER-STRICTNESS control, and the one that fails loudly under the fix the
+    /// review asked for: a COMPLETE, correctly closed tool message ended by
+    /// `<|end_of_text|>`.
+    ///
+    /// `generation_config.json` declares `eos_token_id = [200001, 200008]`, so
+    /// `<|end_of_text|>` (200001) is a real stop the model emits — but
+    /// `chat_template.jinja` never RENDERS it, so it is not in either text field's
+    /// `close` list, and `output_parser::ResponseTemplate::terminators` reaches it
+    /// only through the tokenizer's declared `eos_token`. This turn is not truncated
+    /// in any way, so no truncation-aware caller could ever recover the call a
+    /// per-message terminator gate would drop here — which is what makes the terminator
+    /// set an unsound proxy for "the message finished".
+    ///
+    /// It must hold whether or not `<|end_of_text|>` is in `terminators`: the call's
+    /// completeness is `</atem:invoke>`, which is a different question.
+    #[test]
+    fn a_tool_call_ended_by_end_of_text_is_still_a_call() {
+        let s = seam(
+            " to=a<|message|><atem:function_calls>\n\
+             <atem:invoke name=\"a\">\
+             <atem:parameter name=\"city\">Paris</atem:parameter>\n\
+             </atem:invoke>\n</atem:function_calls><|end_of_text|>",
+        );
+        assert_eq!(
+            s.turn_end,
+            TurnEnd::Terminator,
+            "the model ended this turn itself: {:?}",
+            s.turn_end
+        );
+        assert_eq!(
+            call_names(&s.parsed),
+            vec!["a"],
+            "a complete call ended by a declared stop token was discarded: {:?}",
+            s.parsed
+        );
+        assert_eq!(
+            s.parsed.tool_calls[0].arguments["city"],
+            serde_json::json!("Paris")
+        );
+        assert_eq!(s.streamed, "", "a tool body is not the answer");
     }
 
     /// One ATEM block, as prose, in each of the three channels — the input the two
