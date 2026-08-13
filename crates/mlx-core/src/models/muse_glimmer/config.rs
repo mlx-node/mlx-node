@@ -95,11 +95,19 @@ struct RawConfig {
 /// Vision tower geometry.
 ///
 /// Deserialized straight from `config.json` with no `Raw` counterpart: unlike
-/// the text config, nothing here needs cross-field resolution. The tower's own
-/// `layer_types` table (`window_attention` / `full_attention`) is deliberately
-/// NOT read here — resolving and validating it belongs with the vision tower
-/// that consumes it, and a `#[serde(default)]` empty table would be a silent
-/// trap of exactly the kind this module exists to prevent.
+/// the text config, nothing here needs cross-field RESOLUTION — there are no two
+/// parallel tables to reconcile. Read "no resolution" narrowly: the fields are
+/// still VALIDATED, by [`MuseGlimmerVisionConfig::validate`], which
+/// `from_json_str` calls. The earlier wording said only "nothing here needs
+/// cross-field resolution", and a reader took that as "nothing here needs
+/// checking" — at which point `patch_size: 0`, `merge_size: 0` and
+/// `num_attention_heads: 0` all parsed and reached the runtime while the text
+/// config next door refused seven separate traps.
+///
+/// The tower's own `layer_types` table (`window_attention` / `full_attention`)
+/// is deliberately NOT read here — resolving and validating it belongs with the
+/// vision tower that consumes it, and a `#[serde(default)]` empty table would be
+/// a silent trap of exactly the kind this module exists to prevent.
 #[derive(Debug, Clone, Deserialize)]
 pub struct MuseGlimmerVisionConfig {
     pub hidden_size: usize,
@@ -174,6 +182,62 @@ pub struct MuseGlimmerConfig {
     pub projector_hidden_act: String,
     pub text_config: MuseGlimmerTextConfig,
     pub vision_config: MuseGlimmerVisionConfig,
+}
+
+impl MuseGlimmerVisionConfig {
+    /// Refuse a tower geometry that cannot describe a real vision stack.
+    ///
+    /// Every field below is a DIVISOR or a DIMENSION of something M2 will build,
+    /// and each zero fails in a different place far from the config:
+    ///
+    ///   * `patch_size` and `merge_size` divide the image grid. `smart_resize`
+    ///     rounds a resolution to a multiple of `patch_size * merge_size`; a 0
+    ///     there is a division by zero or an infinite loop depending on how the
+    ///     rounding is written, in M2's resize helper, on the first image.
+    ///   * `patch_temporal` is the temporal stride (2 real frames per patch).
+    ///     A 0 makes `grid_t = frames / patch_temporal` a division by zero.
+    ///   * `pos_emb_height` / `pos_emb_width` are the interpolation grid the
+    ///     position embedding is resampled FROM (32 x 32). A 0 makes the source
+    ///     grid empty, so interpolation reads from nothing.
+    ///   * `hidden_size % num_attention_heads == 0` is the tower's own head
+    ///     split (1536 / 16 = 96). Unlike the text decoder — where `head_dim` is
+    ///     an independent field and `32 x 128 != 6656` on purpose — the tower has
+    ///     no `head_dim` key, so its head dim IS the quotient and a non-dividing
+    ///     pair silently truncates or panics on reshape.
+    ///
+    /// Kept as a method rather than inlined so the tower can re-check a config it
+    /// did not parse: the type has all-`pub` fields and no private constructor,
+    /// so a struct literal bypasses `from_json_str` entirely.
+    pub fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("hidden_size", self.hidden_size),
+            ("num_hidden_layers", self.num_hidden_layers),
+            ("intermediate_size", self.intermediate_size),
+            ("num_attention_heads", self.num_attention_heads),
+            ("patch_size", self.patch_size),
+            ("merge_size", self.merge_size),
+            ("patch_temporal", self.patch_temporal),
+            ("pos_emb_height", self.pos_emb_height),
+            ("pos_emb_width", self.pos_emb_width),
+        ] {
+            if value == 0 {
+                return Err(Error::from_reason(format!(
+                    "muse_glimmer: vision_config.{name} must be non-zero; it is a divisor \
+                     or a dimension of the patch grid, so a 0 surfaces as a division by \
+                     zero or an empty tensor inside the tower rather than here"
+                )));
+            }
+        }
+        if !self.hidden_size.is_multiple_of(self.num_attention_heads) {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: vision_config.num_attention_heads {} must divide \
+                 hidden_size {} (real checkpoint: 1536 / 16 = 96); the tower has no \
+                 head_dim key, so its head dim IS this quotient",
+                self.num_attention_heads, self.hidden_size
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl MuseGlimmerTextConfig {
@@ -279,11 +343,41 @@ impl MuseGlimmerConfig {
             }
         }
 
+        // A 0-layer decoder validates without this check and fails OPEN, one
+        // layer down. Both per-layer arity checks above pass (0 == 0), the
+        // NoPE<->Full loop iterates nothing, and `compute_layer_kv_cache_specs`
+        // returns `Ok(vec![])`. The refusal that does eventually fire is
+        // `compute_layer_kv_cache_groups`' both-kinds guard, whose message reads
+        // "0 layers produced 0 full-attention group(s) and 0 sliding-window
+        // group(s)" — it points the reader at grouping when the bad value is a
+        // config field. Refuse here, where the field has a name.
+        if layers == 0 {
+            return Err(Error::from_reason(
+                "muse_glimmer: num_hidden_layers must be non-zero; a 0 passes both \
+                 per-layer arity checks against empty tables and surfaces much later as \
+                 an empty KV-cache grouping, blaming grouping for a config field",
+            ));
+        }
+
         // GQA's only real head-count invariant: the query heads must divide
         // evenly into kv groups (32 / 2 = 16 here). Note there is deliberately
         // NO `head_dim * num_attention_heads == hidden_size` check — that holds
         // in most families but not this one, and would reject the real
         // checkpoint (32 x 128 = 4096 vs hidden_size 6656).
+        //
+        // `num_attention_heads == 0` needs its own clause because divisibility
+        // does not catch it: `0.is_multiple_of(1)` is `true`, so a 0 with
+        // `num_key_value_heads: 1` passes. And it fails OPEN through the KV seam
+        // specifically — the physical layout is built from `num_key_value_heads`
+        // and `head_dim`, never from the query heads, so a 0-query-head config
+        // sizes a perfectly valid cache for a decoder with no attention.
+        if text.num_attention_heads == 0 {
+            return Err(Error::from_reason(
+                "muse_glimmer: num_attention_heads must be non-zero; the KV-cache layout \
+                 is built from num_key_value_heads and head_dim, so a 0 here sizes a valid \
+                 cache and is never caught downstream",
+            ));
+        }
         if text.num_key_value_heads == 0
             || !text
                 .num_attention_heads
@@ -319,9 +413,20 @@ impl MuseGlimmerConfig {
         //     seam, which carries the window as a `u32`. 5_000_000_000 would
         //     arrive as 705_032_704: a plausible-looking window nobody asked for.
         //
-        // Validating here rather than at spec derivation is deliberate. The seam
-        // does refuse a 0 (`KVCacheSpecError::InvalidSlidingWindow`), but only
-        // once grouping runs and without naming the config field that carried it.
+        // Validating here rather than at spec derivation is deliberate, and the
+        // reason is stronger than "earlier is better": the seam's own refusal is
+        // NOT where a reader expects it. `validate_layer_kv_cache_specs`
+        // (`transformer/kv_cache_spec.rs`) checks duplicate layer indices, layout
+        // validity and shared-anchor rules — it never looks at the window. The
+        // only `KVCacheSpecError::InvalidSlidingWindow` lives inside
+        // `AttentionKind::sliding_window_max_admission_blocks`, i.e. in the
+        // ADMISSION-BLOCK ARITHMETIC that grouping happens to call. So the
+        // `KVCacheCoordinator::from_groups` ->
+        // `derive_layer_kv_cache_routes_from_groups` path, which calls only the
+        // `validate_*` functions, catches a 0 window NOWHERE. Neither this family
+        // nor gemma4 reaches that path with an unvalidated window today, but the
+        // seam is `pub`, so this check plus `compute_layer_kv_cache_specs`' own
+        // are the refusals that actually exist.
         if text.sliding_window == 0 {
             return Err(Error::from_reason(format!(
                 "muse_glimmer: sliding_window must be non-zero, got {}; 39 of this \
@@ -357,6 +462,12 @@ impl MuseGlimmerConfig {
                 text.max_position_embeddings
             )));
         }
+
+        // The vision tower's geometry, checked here for the same reason as
+        // everything above: the fields are `pub` on a type with no private
+        // constructor, so this is the one place a real `config.json` is
+        // guaranteed to pass through.
+        raw.vision_config.validate()?;
 
         Ok(Self {
             image_token_id: raw.image_token_id,
@@ -801,9 +912,13 @@ mod tests {
     /// `sliding_window = None` (`vllm/config/model.py`, `disable_sliding_window`),
     /// and its truthiness checks read a literal 0 as "not a sliding layer", so a
     /// 0 reaching a spec would silently widen three quarters of the decoder to
-    /// full attention. The seam does refuse it
-    /// (`KVCacheSpecError::InvalidSlidingWindow`), but only at grouping time and
-    /// without naming the config field, which is too late to be actionable.
+    /// full attention. The seam's refusal is weaker than it looks:
+    /// `KVCacheSpecError::InvalidSlidingWindow` is raised only inside
+    /// `AttentionKind::sliding_window_max_admission_blocks`, so it fires at
+    /// grouping time, without naming the config field — and not at all on the
+    /// `KVCacheCoordinator::from_groups` path, which calls only
+    /// `validate_layer_kv_cache_specs` and that function never inspects the
+    /// window.
     #[test]
     fn rejects_a_zero_sliding_window() {
         let bad = text_config_json(52).replace("\"sliding_window\": 2048", "\"sliding_window\": 0");
@@ -838,6 +953,111 @@ mod tests {
         assert!(
             err.contains("head_dim"),
             "a zero head_dim would make effective_qk_scale infinite, got: {err}"
+        );
+    }
+
+    /// A 0-layer decoder is the config-level shape that fails OPEN through every
+    /// existing check: both per-layer arity checks pass against empty tables
+    /// (0 == 0), the NoPE<->Full loop iterates nothing, and
+    /// `compute_layer_kv_cache_specs` returns `Ok(vec![])`. The refusal that
+    /// eventually fires blames GROUPING ("0 layers produced 0 full-attention
+    /// group(s)") for a config field.
+    ///
+    /// Mutation caught: deleting the `layers == 0` guard. Note the assertion is
+    /// pinned to this guard's own wording — a looser `contains("num_hidden_layers")`
+    /// would stay green under the deletion, because the arity messages name the
+    /// same field.
+    #[test]
+    fn rejects_a_zero_num_hidden_layers_because_empty_tables_agree_with_it() {
+        let bad = text_config_json(0);
+        let err = parse(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("num_hidden_layers must be non-zero"),
+            "a 0-layer decoder must be refused where the field has a name, got: {err}"
+        );
+    }
+
+    /// `num_attention_heads: 0` is invisible to the GQA divisibility check —
+    /// `0.is_multiple_of(1)` is `true` — and invisible to the KV seam, which
+    /// builds its layout from `num_key_value_heads` and `head_dim` and never
+    /// looks at the query heads. So it produces a perfectly valid cache for a
+    /// decoder with no attention.
+    ///
+    /// Mutation caught: deleting the dedicated clause and relying on the
+    /// divisibility check. The fixture uses `num_key_value_heads: 1` precisely so
+    /// divisibility passes; with the checkpoint's 2 it would fail for the wrong
+    /// reason and the mutation would survive.
+    #[test]
+    fn rejects_a_zero_num_attention_heads_that_divisibility_cannot_catch() {
+        let bad = text_config_json(52)
+            .replace("\"num_attention_heads\": 32", "\"num_attention_heads\": 0")
+            .replace("\"num_key_value_heads\": 2", "\"num_key_value_heads\": 1");
+        // Sanity: the mutation this test exists to catch would let this through.
+        assert!(0usize.is_multiple_of(1usize));
+        let err = parse(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("num_attention_heads must be non-zero"),
+            "a 0 query-head count must be refused on its own clause, got: {err}"
+        );
+    }
+
+    /// The vision tower's geometry is validated, not merely deserialized. Every
+    /// field here is a divisor or a dimension of the patch grid, so a 0 surfaces
+    /// as a division by zero or an empty tensor inside M2's tower — far from the
+    /// config that carried it.
+    ///
+    /// Mutation caught: deleting the `raw.vision_config.validate()?` call, or
+    /// dropping any single field from `validate`'s table. Every field is
+    /// exercised, so dropping one is a red test rather than a silent gap.
+    #[test]
+    fn rejects_a_zero_in_any_vision_tower_dimension() {
+        for (key, real) in [
+            ("hidden_size", "1536"),
+            ("num_hidden_layers", "50"),
+            ("intermediate_size", "8960"),
+            ("num_attention_heads", "16"),
+            ("patch_size", "14"),
+            ("merge_size", "2"),
+            ("patch_temporal", "2"),
+            ("pos_emb_height", "32"),
+            ("pos_emb_width", "32"),
+        ] {
+            let good = config_json(&text_config_json(52));
+            let needle = format!("\"{key}\":{real}");
+            assert!(
+                good.contains(&needle),
+                "the fixture must spell {key} as {needle:?} for this substitution to bite"
+            );
+            let bad = good.replace(&needle, &format!("\"{key}\":0"));
+            let err = MuseGlimmerConfig::from_json_str(&bad)
+                .expect_err("a zero vision dimension must fail closed")
+                .to_string();
+            assert!(
+                err.contains(&format!("vision_config.{key} must be non-zero")),
+                "the error must name the vision field, got: {err}"
+            );
+        }
+    }
+
+    /// The tower has no `head_dim` key, so its head dim IS
+    /// `hidden_size / num_attention_heads` (1536 / 16 = 96). A non-dividing pair
+    /// truncates or panics on reshape inside the tower. Deliberately a DIFFERENT
+    /// rule from the text decoder, where `head_dim` is independent and
+    /// `32 x 128 != 6656` on purpose — see
+    /// `accepts_a_head_dim_that_is_not_hidden_size_over_heads`.
+    ///
+    /// Mutation caught: deleting the divisibility check, or copying the text
+    /// decoder's deliberate absence of one into the tower.
+    #[test]
+    fn rejects_a_vision_head_count_that_does_not_divide_its_hidden_size() {
+        let bad = config_json(&text_config_json(52))
+            .replace("\"num_attention_heads\":16", "\"num_attention_heads\":7");
+        let err = MuseGlimmerConfig::from_json_str(&bad)
+            .expect_err("1536 / 7 is not an integer head dim")
+            .to_string();
+        assert!(
+            err.contains("must divide") && err.contains("1536"),
+            "the error must name the quotient it could not form, got: {err}"
         );
     }
 

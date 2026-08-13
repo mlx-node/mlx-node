@@ -288,6 +288,294 @@ pub fn group_reserved_blocks(
     }
 }
 
+// ─── The window-carrying contract ────────────────────────────────────────────
+//
+// WHY THIS EXISTS, stated once so it cannot be dropped: a confirmed, measured
+// defect in the shipping gemma4 paged path is that a sliding group's window is
+// silently lost on the cache-hit prefill route. Measured on the real
+// gemma-4-12b-it checkpoint (window 1024, prefill chunk 512, 40 of 48 layers
+// sliding): the default `Auto` route selects the dense paged-pool SDPA gather,
+// which ran `scaled_dot_product_attention_causal` with NO mask; the varlen route
+// passed a literal `0` in the kernel's `sliding_window` FFI slot, and `0` is the
+// kernel's "disable the sliding mask" sentinel — full causal attention, not
+// "inert" (`mlx_paged_ops.cpp:482`; `paged_attention.metal:2001` collapses
+// `sliding_lower` to 0 when `sw <= 0`). Cost: max |delta| 0.124512 on the
+// attention output against a windowed reference whose own RMS is 0.035562 (3.5x
+// the signal), versus 0.000977 (1 bf16 ULP) for the one route that did pass the
+// window. Real-model effect: the greedy continuation differed from the flat
+// reference path at 6 of 9 prompt lengths from 1338 tokens up.
+//
+// Muse-Glimmer would inherit that by construction — 39 of 52 layers sliding at
+// window 2048 — the moment M1 wires a sliding adapter. It has no forward pass
+// yet, which is exactly why the contract is written here first: the family's
+// paged dispatch has to ask this seam for its window before it can launch, and
+// the seam refuses the combination that produced the defect.
+//
+// The split is honest and stated in both halves:
+//
+//   * ENFORCED TODAY (this module, model-free, tested): a windowed group paired
+//     with a route that cannot express a window is an `Err`. The window value
+//     itself cannot be typed by a call site — `PagedWindowSlot`'s fields are
+//     private and its only constructor derives them from the group's own
+//     `AttentionKind` — so there is no slot for a literal `0` to sit in.
+//   * ONLY M1 CAN ENFORCE: that every dispatch it writes actually asks. The type
+//     system cannot stop a forward pass from calling the FFI directly with a
+//     hand-written argument. That half is a stated requirement plus the source
+//     tripwire `wiring_a_sliding_adapter_without_this_seam_trips_the_tripwire`,
+//     which fails the moment paged-attention wiring appears in this family
+//     without a reference to `PagedWindowSlot`.
+
+/// How one attention route can express a sliding window.
+///
+/// This is a property of the ROUTE, supplied by the dispatch site, because that
+/// is the fact the route knows and the group does not. vLLM makes the window a
+/// property of the `AttentionImpl` and passes it to every
+/// `flash_attn_varlen_func` dispatch — context, query and decode
+/// (`vllm/v1/attention/backends/flash_attn.py:1340/1372/1447`) — precisely
+/// because a per-route argument list is where a window gets lost. This enum is
+/// the same rule spelled as data: adding a route means adding a variant, and a
+/// new variant is a compile error in [`paged_window_for_kind`]'s match rather
+/// than a silently window-blind fifth path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowCarrier {
+    /// The route hands the window to the kernel as the `sliding_window: i32` FFI
+    /// argument, and the kernel derives its own per-query-row lower bound from
+    /// it. Take the value from [`PagedWindowSlot::kernel_slot`].
+    ///
+    /// This is the varlen and legacy paged-attention dispatches, and the batched
+    /// / ragged / raw-Metal decode dispatches. It is per-row correct for a
+    /// multi-token chunk on a cached prefix without the caller recomputing
+    /// anything: the kernel bottom-right aligns via
+    /// `effective_context_len = context_len - q_len + q_pos_in_seq + 1`
+    /// (`paged_attention.metal:1860`).
+    KernelArgument,
+    /// The route builds an explicit boolean mask and hands it to SDPA. Take the
+    /// window from [`PagedWindowSlot::mask_window`] and pass it as
+    /// `create_causal_mask(seq_len, Some(cached_prefix_len), window)`
+    /// (`array/mask.rs:33`, whose third parameter already is the window —
+    /// `linds >= rinds && linds < rinds + window`, bool `true = keep`).
+    ///
+    /// This is the dense paged-pool gather and the host-read path. Both were
+    /// window-blind in gemma4 not because they lack the concept but because they
+    /// passed `None` / no mask at all.
+    ExplicitMask,
+    /// The route has no way to express a window: no kernel argument, no mask
+    /// parameter. Legal for a full-attention group and for nothing else.
+    ///
+    /// A windowed group on such a route is the defect this module refuses. It is
+    /// NOT a route to "fix later" by threading a mask in — if a route gains the
+    /// ability, it changes which variant it reports, and the refusal disappears
+    /// on its own.
+    Unsupported,
+}
+
+impl WindowCarrier {
+    /// Can this route carry a non-zero window at all?
+    ///
+    /// Spelled as a method so a caller can ask without matching, and so the
+    /// answer for a new variant has to be written down deliberately.
+    pub fn can_carry_a_window(self) -> bool {
+        match self {
+            Self::KernelArgument | Self::ExplicitMask => true,
+            Self::Unsupported => false,
+        }
+    }
+}
+
+/// The window argument for ONE admitted attention dispatch.
+///
+/// Fields are private and there is no `Default`, no public constructor and no
+/// `From`. The only way to obtain one is [`paged_window_for_kind`] /
+/// [`paged_window_for_group`] / [`admit_paged_dispatch_plan`], each of which
+/// derives the window from the group's own `AttentionKind`. So a dispatch site
+/// cannot write the literal that caused the defect: there is no parameter for it
+/// to be written into. That is strictly stronger than making the literal
+/// unwritable at one call site, because it also covers the next call site nobody
+/// has written yet.
+///
+/// The two accessors are deliberately carrier-scoped and both return `Option`:
+/// each answers only for the route that admitted it, and returns `None` — never
+/// a plausible `0` — when asked the other route's question. A `0` returned from
+/// the wrong accessor IS the defect, spelled in a different file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PagedWindowSlot {
+    carrier: WindowCarrier,
+    /// 0 means full attention. Non-zero only ever came from an
+    /// `AttentionKind::SlidingWindow` payload.
+    window: u32,
+}
+
+impl PagedWindowSlot {
+    /// The value for the kernel's `sliding_window: i32` FFI slot, or `None` when
+    /// this dispatch is not a kernel-argument route and therefore has no such
+    /// slot to fill.
+    ///
+    /// `Some(0)` appears only for a full-attention group on a kernel route,
+    /// where 0 is the correct and intended "no sliding mask" sentinel. A sliding
+    /// group can never produce `Some(0)`, which is the whole point.
+    pub fn kernel_slot(&self) -> Option<i32> {
+        match self.carrier {
+            WindowCarrier::KernelArgument => Some(self.window as i32),
+            WindowCarrier::ExplicitMask | WindowCarrier::Unsupported => None,
+        }
+    }
+
+    /// The `window_size` argument for `create_causal_mask`, or `None` when no
+    /// mask is needed.
+    ///
+    /// `None` for a full-attention group is load-bearing beyond tidiness: it
+    /// tells the caller to keep the unmasked causal fast path. The mask-bearing
+    /// SDPA kernel has a different bf16 reduction order from the `_causal` one,
+    /// so materializing an all-true mask for a global layer would move its
+    /// numerics for no correctness gain.
+    pub fn mask_window(&self) -> Option<i32> {
+        match self.carrier {
+            WindowCarrier::ExplicitMask if self.window != 0 => Some(self.window as i32),
+            _ => None,
+        }
+    }
+
+    /// Does this dispatch have a window to lose?
+    pub fn is_windowed(&self) -> bool {
+        self.window != 0
+    }
+
+    /// The route that was admitted. Exposed so a dispatch site can assert it
+    /// took the branch it thinks it took.
+    pub fn carrier(&self) -> WindowCarrier {
+        self.carrier
+    }
+}
+
+/// Admit ONE dispatch: pair an attention kind with the route that will execute
+/// it, or refuse.
+///
+/// Refuses exactly two things, each because it fails OPEN otherwise:
+///
+///   * a windowed kind on a route whose [`WindowCarrier`] cannot express a
+///     window. Silently dropping the window widens 39 of this decoder's 52
+///     layers to full causal attention over positions the block table has
+///     already retired to the reserved null block — never-written
+///     `StorageModePrivate` memory (`layer_kv_pool.rs:499`: "not zeroed ...
+///     returns whatever the driver handed out"), so the read is formally
+///     undefined on top of being wrong.
+///   * a `SlidingWindow { sliding_window: 0 }` payload. Config load and
+///     [`compute_layer_kv_cache_specs`] both refuse it already; refused a third
+///     time here because this is the last point before a kernel launch, and a 0
+///     arriving in a kernel slot is indistinguishable from "disable the mask".
+///
+/// A full-attention kind is admitted on every route including `Unsupported`,
+/// with nothing to carry. That is not laxity: refusing it would refuse a legal
+/// global layer on a legal route, and over-strictness here would push M1 to work
+/// around the seam instead of through it.
+pub fn paged_window_for_kind(
+    attention_kind: AttentionKind,
+    carrier: WindowCarrier,
+) -> std::result::Result<PagedWindowSlot, String> {
+    let window = match attention_kind {
+        AttentionKind::Full => 0,
+        AttentionKind::SlidingWindow { sliding_window: 0 } => {
+            return Err(
+                "muse_glimmer paged dispatch: a SlidingWindow { sliding_window: 0 } spec \
+                 reached dispatch admission; 0 is the Metal kernel's \"disable the sliding \
+                 mask\" sentinel (mlx_paged_ops.cpp:482), so it is full causal attention \
+                 and not a window — reject it at config load, where the field has a name"
+                    .to_string(),
+            );
+        }
+        AttentionKind::SlidingWindow { sliding_window } => sliding_window,
+    };
+
+    if window != 0 && !carrier.can_carry_a_window() {
+        return Err(format!(
+            "muse_glimmer paged dispatch: a sliding-window group (window {window}) was \
+             routed to {carrier:?}, which cannot express a window. Dropping it makes the \
+             dispatch attend every position back to 0, including positions already retired \
+             to the reserved null block — never-written StorageModePrivate memory. Either \
+             give the route a window (kernel sliding_window argument, or \
+             create_causal_mask's window_size) and report the matching WindowCarrier, or \
+             route the sliding group elsewhere"
+        ));
+    }
+
+    Ok(PagedWindowSlot { carrier, window })
+}
+
+/// [`paged_window_for_kind`] for a group produced by
+/// [`compute_layer_kv_cache_groups`].
+///
+/// Takes the group rather than the kind so the call site cannot re-type the
+/// window on the way in, and so the error can name the group whose layers are
+/// affected — with the `[S,S,S,F]` pattern that is 39 layers, and an error that
+/// says "group 1" without saying "39 layers" understates the blast radius.
+pub fn paged_window_for_group(
+    group: &KVCacheGroup,
+    carrier: WindowCarrier,
+) -> std::result::Result<PagedWindowSlot, String> {
+    paged_window_for_kind(group.attention_kind, carrier).map_err(|e| {
+        format!(
+            "{e} (group_id {}, {} layers: {:?})",
+            group.group_id,
+            group.layer_indices.len(),
+            group.layer_indices
+        )
+    })
+}
+
+/// Admit EVERY group of one turn against the routes that turn selected, before
+/// any of them launches.
+///
+/// This is the choke point M1's forward pass must call, and calling it once per
+/// turn is the requirement — not once per layer, and not "wherever convenient".
+/// The reason is the shape of the gemma4 defect rather than tidiness: there, a
+/// per-route argument list meant the sliding group and the full group were
+/// planned independently, one of them lost its window, and nothing compared the
+/// two. `carriers` is indexed by `group_id`, so a plan that forgets a group is
+/// an arity error rather than a group that quietly runs unadmitted.
+///
+/// Deliberately returns one slot per group in `group_id` order, so the caller
+/// indexes the result the same way it indexed the input.
+pub fn admit_paged_dispatch_plan(
+    groups: &[KVCacheGroup],
+    carriers: &[WindowCarrier],
+) -> std::result::Result<Vec<PagedWindowSlot>, String> {
+    if groups.is_empty() {
+        return Err(
+            "muse_glimmer paged dispatch: no KV cache groups to admit; this decoder is \
+             hybrid by construction and must present both a full and a sliding group"
+                .to_string(),
+        );
+    }
+    if groups.len() != carriers.len() {
+        return Err(format!(
+            "muse_glimmer paged dispatch: {} KV cache group(s) but {} route carrier(s); \
+             carriers are indexed by group_id, so a missing entry would leave a group \
+             dispatching unadmitted — which is how a sliding group loses its window",
+            groups.len(),
+            carriers.len()
+        ));
+    }
+
+    let mut slots = Vec::with_capacity(groups.len());
+    for (index, group) in groups.iter().enumerate() {
+        // `group_id` is the index by contract (`group_layer_kv_cache_specs`
+        // enumerates in order). Checked rather than assumed because `carriers`
+        // is indexed positionally: if the two ever disagree, every carrier is
+        // applied to the wrong group, and pairing the FULL group's carrier with
+        // the SLIDING group is precisely the defect with a different cause.
+        if group.group_id != index {
+            return Err(format!(
+                "muse_glimmer paged dispatch: group at position {index} reports group_id \
+                 {}; carriers are indexed by group_id and position, so a gap or a \
+                 permutation would apply each route to the wrong group",
+                group.group_id
+            ));
+        }
+        slots.push(paged_window_for_group(group, carriers[index])?);
+    }
+    Ok(slots)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1163,6 +1451,417 @@ mod tests {
             expected_layout.head_size,
             groups[0].max_admission_blocks,
             groups[1].max_admission_blocks,
+        );
+    }
+
+    // ── The window-carrying contract ──────────────────────────────────────
+    //
+    // These are the "sliding group x attention numerics" cell one level up from
+    // the kernel: no MLX arrays, no device, no weights. They pin the ROUTING
+    // decision that the gemma4 defect got wrong, at the only layer this family
+    // has today. Each names the mutation it would catch, because a guard whose
+    // test stays green under the mutation it exists to prevent is decoration.
+
+    /// THE defect, refused. gemma4's measured failure was a sliding group
+    /// reaching a route with no window concept (the dense paged-pool SDPA
+    /// gather, running `scaled_dot_product_attention_causal` with no mask) and
+    /// producing plausible, wrong output — max |delta| 0.124512 against a
+    /// windowed reference whose own RMS is 0.035562.
+    ///
+    /// Mutation caught: making `paged_window_for_kind` return
+    /// `Ok(PagedWindowSlot { carrier, window })` unconditionally, i.e. deleting
+    /// the `can_carry_a_window` guard.
+    #[test]
+    fn a_sliding_group_on_a_window_blind_route_is_refused() {
+        let err = paged_window_for_kind(
+            AttentionKind::SlidingWindow {
+                sliding_window: 2048,
+            },
+            WindowCarrier::Unsupported,
+        )
+        .expect_err("a windowed group must never be admitted to a window-blind route");
+        assert!(
+            err.contains("cannot express a window") && err.contains("2048"),
+            "the error must name both the incapacity and the window it dropped, so the \
+             reader knows which group and how wide, got: {err}"
+        );
+    }
+
+    /// The same refusal reached through the real grouping path, on the real
+    /// checkpoint-shaped config — so the guard is pinned against the groups this
+    /// family actually produces, not a hand-built kind. The message must name
+    /// the layer count: "group 1" understates 39 layers.
+    ///
+    /// Mutation caught: `paged_window_for_group` dropping its `map_err` context,
+    /// or being wired to `groups[0]`'s kind for every group.
+    #[test]
+    fn the_thirty_nine_sliding_layers_are_named_when_their_window_would_be_dropped() {
+        let cfg = checkpoint_config();
+        let groups = groups(&cfg, CHUNK);
+        let sliding = groups
+            .iter()
+            .find(|g| matches!(g.attention_kind, AttentionKind::SlidingWindow { .. }))
+            .expect("the checkpoint shape must produce a sliding group");
+
+        let err = paged_window_for_group(sliding, WindowCarrier::Unsupported)
+            .expect_err("the sliding group must not be admitted to a window-blind route");
+        assert!(
+            err.contains("39 layers"),
+            "the error must state how many layers lose their window, got: {err}"
+        );
+
+        // And the full group on the same route is fine: there is nothing to
+        // carry, and refusing it would refuse a legal global layer.
+        let full = groups
+            .iter()
+            .find(|g| g.attention_kind == AttentionKind::Full)
+            .expect("the checkpoint shape must produce a full group");
+        let slot = paged_window_for_group(full, WindowCarrier::Unsupported)
+            .expect("a full-attention group carries no window and needs no route capability");
+        assert!(!slot.is_windowed());
+        assert_eq!(slot.kernel_slot(), None);
+        assert_eq!(slot.mask_window(), None);
+    }
+
+    /// A kernel-argument route gets the window as the `sliding_window: i32` FFI
+    /// value and NO mask — the kernel derives its own per-query-row lower bound.
+    /// The value must be the config's 2048, and it must not be reachable as a 0.
+    ///
+    /// Mutation caught: `kernel_slot` returning `Some(0)`, which is the literal
+    /// that caused the defect (`paged_kv_cache_adapter.rs`'s varlen call site),
+    /// and is indistinguishable from a full-attention dispatch.
+    #[test]
+    fn a_kernel_route_carries_the_window_as_the_ffi_argument_and_no_mask() {
+        let slot = paged_window_for_kind(
+            AttentionKind::SlidingWindow {
+                sliding_window: 2048,
+            },
+            WindowCarrier::KernelArgument,
+        )
+        .expect("a kernel-argument route can carry a window");
+        assert_eq!(slot.kernel_slot(), Some(2048));
+        assert_eq!(
+            slot.mask_window(),
+            None,
+            "a kernel route must not also build a mask; double-masking is not the failure \
+             mode, but a caller that builds one has misread which route it is on"
+        );
+        assert!(slot.is_windowed());
+        assert_eq!(slot.carrier(), WindowCarrier::KernelArgument);
+    }
+
+    /// A mask route gets the window as `create_causal_mask`'s third argument and
+    /// NO kernel slot. `create_causal_mask(seq_len, offset, Some(w))` computes
+    /// `linds >= rinds && linds < rinds + w` (`array/mask.rs:33-74`), which is
+    /// the same predicate the kernel applies; the argument already exists and
+    /// gemma4's host-read path passed `None` into it.
+    ///
+    /// Mutation caught: `mask_window` returning `None` for a windowed
+    /// mask route — the exact `None` that shipped — or `kernel_slot` answering
+    /// on a mask route, which would put a silent 0 in a kernel argument.
+    #[test]
+    fn a_mask_route_carries_the_window_as_create_causal_mask_window_size() {
+        let slot = paged_window_for_kind(
+            AttentionKind::SlidingWindow {
+                sliding_window: 2048,
+            },
+            WindowCarrier::ExplicitMask,
+        )
+        .expect("an explicit-mask route can carry a window");
+        assert_eq!(slot.mask_window(), Some(2048));
+        assert_eq!(
+            slot.kernel_slot(),
+            None,
+            "a mask route has no kernel sliding_window slot, and answering with 0 here \
+             would reproduce the defect in a second file"
+        );
+    }
+
+    /// The accessors are carrier-scoped, and the property that matters is
+    /// negative: NO combination of a sliding kind and any admitted route can
+    /// produce a kernel slot of `Some(0)` or a mask of `Some(0)`. Enumerated
+    /// rather than spot-checked, because "the one combination nobody enumerated"
+    /// is how the defect survived.
+    #[test]
+    fn no_admitted_sliding_dispatch_can_ever_present_a_zero_window() {
+        for carrier in [
+            WindowCarrier::KernelArgument,
+            WindowCarrier::ExplicitMask,
+            WindowCarrier::Unsupported,
+        ] {
+            let admitted = paged_window_for_kind(
+                AttentionKind::SlidingWindow {
+                    sliding_window: 2048,
+                },
+                carrier,
+            );
+            let Ok(slot) = admitted else {
+                // Refused — the other half of the contract, covered above.
+                assert!(!carrier.can_carry_a_window());
+                continue;
+            };
+            assert!(
+                carrier.can_carry_a_window(),
+                "{carrier:?} reported no window capability yet was admitted with a window"
+            );
+            assert_ne!(
+                slot.kernel_slot(),
+                Some(0),
+                "{carrier:?} presented window 0"
+            );
+            assert_ne!(
+                slot.mask_window(),
+                Some(0),
+                "{carrier:?} presented window 0"
+            );
+            assert!(
+                slot.kernel_slot() == Some(2048) || slot.mask_window() == Some(2048),
+                "{carrier:?} was admitted with a window but presents it nowhere; a route \
+                 that carries the window through neither accessor is window-blind with \
+                 extra steps"
+            );
+        }
+    }
+
+    /// A full-attention group must keep the UNMASKED causal fast path. This is
+    /// not tidiness: the mask-bearing SDPA kernel has a different bf16 reduction
+    /// order from the `_causal` one, so materializing an all-true mask for the 13
+    /// global layers would move their numerics with no correctness gain — and a
+    /// paged-vs-flat parity gate would then fail for a reason unrelated to
+    /// windows.
+    ///
+    /// Mutation caught: `mask_window` returning `Some(0)` (or `Some(window)`
+    /// with `window == 0`) for a full group instead of `None`.
+    #[test]
+    fn a_full_group_asks_for_no_mask_so_the_causal_fast_path_survives() {
+        for carrier in [
+            WindowCarrier::KernelArgument,
+            WindowCarrier::ExplicitMask,
+            WindowCarrier::Unsupported,
+        ] {
+            let slot = paged_window_for_kind(AttentionKind::Full, carrier)
+                .expect("a full-attention group is admissible on every route");
+            assert_eq!(
+                slot.mask_window(),
+                None,
+                "{carrier:?} must not ask a full group to build a window mask"
+            );
+            assert!(!slot.is_windowed());
+        }
+        // On a kernel route the full group's FFI value is a real, intended 0 —
+        // the kernel's documented "disable the sliding mask" sentinel. That is
+        // the ONE place a 0 is correct, and it is reachable only from
+        // `AttentionKind::Full`.
+        let slot = paged_window_for_kind(AttentionKind::Full, WindowCarrier::KernelArgument)
+            .expect("full attention on a kernel route");
+        assert_eq!(slot.kernel_slot(), Some(0));
+    }
+
+    /// A `SlidingWindow { sliding_window: 0 }` spec is refused a third time, at
+    /// the last point before a kernel launch. Config load refuses it
+    /// (`config::tests::rejects_a_zero_sliding_window`) and spec derivation
+    /// refuses it (`refuses_a_zero_sliding_window_even_though_config_load_already_did`),
+    /// but neither runs on a group assembled by other means — and by the time a 0
+    /// reaches a kernel slot it is indistinguishable from a deliberate
+    /// "disable the mask".
+    ///
+    /// Mutation caught: deleting the `sliding_window: 0` arm, which would admit
+    /// the zero window silently on a KernelArgument route as `Some(0)`.
+    #[test]
+    fn a_zero_window_spec_is_refused_at_dispatch_admission_too() {
+        for carrier in [
+            WindowCarrier::KernelArgument,
+            WindowCarrier::ExplicitMask,
+            WindowCarrier::Unsupported,
+        ] {
+            let err =
+                paged_window_for_kind(AttentionKind::SlidingWindow { sliding_window: 0 }, carrier)
+                    .expect_err("a zero window must not reach a dispatch");
+            assert!(
+                err.contains("disable the sliding mask"),
+                "the error must say what a 0 means to the kernel, not merely that it is \
+                 invalid, got: {err}"
+            );
+        }
+    }
+
+    /// The per-turn choke point admits both groups together, in `group_id`
+    /// order, and hands back one slot per group. This is the call M1 must make
+    /// once per turn.
+    ///
+    /// Mutation caught: `admit_paged_dispatch_plan` returning slots in
+    /// iteration order of a set, or admitting only `groups[0]`.
+    #[test]
+    fn the_dispatch_plan_admits_every_group_in_group_id_order() {
+        let cfg = checkpoint_config();
+        let groups = groups(&cfg, CHUNK);
+        let slots = admit_paged_dispatch_plan(
+            &groups,
+            &[WindowCarrier::ExplicitMask, WindowCarrier::KernelArgument],
+        )
+        .expect("both groups are on window-capable routes");
+
+        assert_eq!(slots.len(), groups.len());
+        // group 0 is full, on a mask route: nothing to carry.
+        assert!(!slots[0].is_windowed());
+        assert_eq!(slots[0].mask_window(), None);
+        // group 1 is the 39 sliding layers, on a kernel route: 2048 in the slot.
+        assert!(slots[1].is_windowed());
+        assert_eq!(slots[1].kernel_slot(), Some(2048));
+    }
+
+    /// A plan that forgets a group is an arity error, not a group that
+    /// dispatches unadmitted. This is the structural half of the gemma4 shape:
+    /// there, the sliding group and the full group were planned independently
+    /// and nothing compared them.
+    ///
+    /// Mutation caught: replacing the arity check with
+    /// `carriers.get(index).copied().unwrap_or(WindowCarrier::Unsupported)` or
+    /// with `zip`, either of which silently drops the trailing group.
+    #[test]
+    fn a_dispatch_plan_that_forgets_a_group_is_an_error_not_a_default() {
+        let cfg = checkpoint_config();
+        let groups = groups(&cfg, CHUNK);
+        let err = admit_paged_dispatch_plan(&groups, &[WindowCarrier::KernelArgument])
+            .expect_err("one carrier for two groups must not be silently extended");
+        assert!(
+            err.contains("2 KV cache group(s) but 1 route carrier(s)"),
+            "the error must report both counts, got: {err}"
+        );
+
+        let err = admit_paged_dispatch_plan(&[], &[])
+            .expect_err("an empty group list is not a valid hybrid plan");
+        assert!(err.contains("hybrid by construction"), "got: {err}");
+    }
+
+    /// Carriers are positional AND keyed on `group_id`; a permutation would pair
+    /// the full group's route with the sliding group's window, which is the
+    /// defect with a different cause. Checked rather than assumed because the
+    /// two indexings are independent facts.
+    ///
+    /// Mutation caught: deleting the `group.group_id != index` check.
+    #[test]
+    fn a_permuted_group_list_is_refused_because_carriers_are_positional() {
+        let cfg = checkpoint_config();
+        let mut groups = groups(&cfg, CHUNK);
+        groups.swap(0, 1);
+        let err = admit_paged_dispatch_plan(
+            &groups,
+            &[WindowCarrier::KernelArgument, WindowCarrier::KernelArgument],
+        )
+        .expect_err("a permuted group list must not be admitted positionally");
+        assert!(
+            err.contains("reports group_id"),
+            "the error must name the mismatch between position and group_id, got: {err}"
+        );
+    }
+
+    /// The window a dispatch carries is the CONFIG's window, all the way
+    /// through: not a constant, not the admission-block count, not
+    /// `max_chunk`. 2048 is also `max_chunk * 4` and `block_size * 128` in the
+    /// reference geometry, so a wrong source is locally plausible.
+    ///
+    /// Mutation caught: `paged_window_for_kind` sourcing the window from
+    /// anything other than the `AttentionKind::SlidingWindow` payload.
+    #[test]
+    fn the_dispatch_window_tracks_the_config_and_is_not_a_constant() {
+        let mut cfg = checkpoint_config();
+        cfg.text_config.sliding_window = 777;
+        let groups = groups(&cfg, CHUNK);
+        let sliding = groups
+            .iter()
+            .find(|g| matches!(g.attention_kind, AttentionKind::SlidingWindow { .. }))
+            .expect("still a hybrid");
+        let slot = paged_window_for_group(sliding, WindowCarrier::KernelArgument)
+            .expect("a kernel route carries any non-zero window");
+        assert_eq!(slot.kernel_slot(), Some(777));
+    }
+
+    /// TRIPWIRE for the half this module cannot type-check.
+    ///
+    /// Stated plainly, because overstating it is how the dropped mask survived:
+    /// this test does NOT prove every dispatch asks the seam for its window. The
+    /// type system cannot prove that — a forward pass can always call the FFI
+    /// with a hand-written argument. What it proves is narrower and still worth
+    /// having: the moment paged-attention wiring appears anywhere in this family,
+    /// the file that wires it must at least NAME `PagedWindowSlot`. So M1 cannot
+    /// wire a sliding adapter, forget this contract entirely, and stay green —
+    /// which is exactly what happened in gemma4, where no test occupied the
+    /// "sliding adapter x attention numerics" cell at all.
+    ///
+    /// It is vacuously true today (no forward pass exists) and that is the
+    /// point: it is armed, not satisfied.
+    ///
+    /// Mutation caught: adding `let w = 0i32;` next to a
+    /// `mlx_paged_attention_varlen_forward` call in a new
+    /// `muse_glimmer/attention.rs` that never mentions the seam.
+    #[test]
+    fn wiring_a_sliding_adapter_without_this_seam_trips_the_tripwire() {
+        // Names that only real paged wiring uses. Deliberately NOT
+        // `AttentionKind::SlidingWindow` or `sliding_window`, which this seam
+        // itself talks about constantly.
+        const WIRING_MARKERS: [&str; 6] = [
+            "new_sliding",
+            "mlx_paged_attention",
+            "gather_kv_for_prefill",
+            "read_kv_range",
+            "scaled_dot_product_attention_causal",
+            "PagedKVCacheAdapter",
+        ];
+        const SEAM: &str = "PagedWindowSlot";
+
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("models")
+            .join("muse_glimmer");
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("the family's own source directory must be readable: {e}"));
+
+        let mut checked = 0usize;
+        for entry in entries {
+            let path = entry.expect("a readable directory entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{} must be readable: {e}", path.display()));
+            checked += 1;
+
+            // Strip whole-line comments so this file's own prose about the
+            // defect does not trip its own tripwire. A trailing comment after
+            // code would still trip it; that is a deliberate false-positive
+            // bias — the failure message tells the reader what to do.
+            let code: String = source
+                .lines()
+                .filter(|line| {
+                    let t = line.trim_start();
+                    !(t.starts_with("//") || t.starts_with("*") || t.starts_with("/*"))
+                })
+                .collect::<Vec<&str>>()
+                .join("\n");
+
+            let Some(marker) = WIRING_MARKERS.iter().find(|m| code.contains(**m)) else {
+                continue;
+            };
+            assert!(
+                code.contains(SEAM),
+                "{} wires paged attention (found {marker:?}) without naming {SEAM}. Every \
+                 Muse-Glimmer paged dispatch must take its sliding_window from \
+                 `admit_paged_dispatch_plan` / `paged_window_for_group` in \
+                 muse_glimmer/kv_cache.rs. 39 of this decoder's 52 layers are sliding at \
+                 window 2048; a dispatch that fills the kernel's sliding_window slot with \
+                 a literal, or runs SDPA with no mask, attends every position back to 0 \
+                 including positions already retired to the never-written null block. That \
+                 is the confirmed gemma4 defect, measured at 3.5x the correct signal's RMS \
+                 on real weights. If this file legitimately mentions a marker in a \
+                 trailing comment, move it to its own comment line.",
+                path.display()
+            );
+        }
+        assert!(
+            checked >= 3,
+            "the tripwire scanned only {checked} file(s); if the family moved, this test \
+             is silently vacuous and must be repointed"
         );
     }
 }

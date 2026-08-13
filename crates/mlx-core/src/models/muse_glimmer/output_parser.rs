@@ -415,6 +415,27 @@ impl<'a> GeneratedTurn<'a> {
     /// which is the fixture path the parser's 60-odd span tests need. A sibling
     /// cannot name it at all — not `stream_guard`, not M1's `model.rs`. See the
     /// type's contract for the sibling forgery this replaced.
+    ///
+    /// The two `debug_assert!`s below are deliberately not release checks, and the
+    /// reason has to be written down because it depends on facts that a future
+    /// caller can break. `is_token_span` uses `binary_search_by_key` over
+    /// `control_spans`, which REQUIRES sortedness — provenance is the tool-call
+    /// authorization gate, so an unenforced precondition on it deserves a hard
+    /// look. Two independent things make an assert sufficient here:
+    ///
+    ///   1. The predicate is fail-SAFE, not fail-open. A hit still requires an
+    ///      entry whose `start` AND `end` both match, so an unsorted slice can
+    ///      only produce false negatives — a dropped recognition, never a forged
+    ///      authorization.
+    ///   2. This constructor is module-private and [`Self::from_guard`] is its
+    ///      only non-test caller, which mints every span by resolving decoded
+    ///      token ids through the checkpoint tokenizer in `StreamGuard::new` —
+    ///      in stream order, hence sorted by construction.
+    ///
+    /// Point 2 is the one that expires. If a second constructor is ever added,
+    /// these asserts become the ONLY guard on a security-relevant precondition
+    /// and they are no-ops in release: promote them to a returned `Err` in the
+    /// same commit that adds the constructor.
     fn from_token_spans(text: &'a str, control_spans: &'a [Range<usize>]) -> Self {
         debug_assert!(
             control_spans.windows(2).all(|w| w[0].end <= w[1].start),
@@ -1329,12 +1350,29 @@ impl ResponseTemplate {
                 // across them, `next_message_boundary` already kept them in it.
                 Some(Message::Tool { .. }) | None => self.next_arrival(turn, here.at),
             };
-            // `next_arrival` lands past a non-empty anchor at or after an offset
-            // at least `here.at`, so the walk always advances.
-            debug_assert!(
-                arrival.is_none_or(|a| a.at > here.at),
-                "every arrival must make progress"
-            );
+            // The walk always advances: `next_arrival` -> `next_anchor` ->
+            // `next_token_prefixed_marker` returns a match at `start >= from`,
+            // and `arrival_after` sets `at = anchor + start_anchor.len()` with
+            // `start_anchor` validated non-empty at construction. So this branch
+            // is unreachable, and I could not construct an input that reaches it.
+            //
+            // It is a `break` rather than a `debug_assert!` anyway, because the
+            // consequence in release differs in kind, not degree: this is an
+            // unbounded `while let` over untrusted model output, running on the
+            // `"mlx-model"` OS thread, inside a function documented "infallible by
+            // design". A hang is the one failure a fallible parser cannot report
+            // and a `debug_assert!` cannot prevent. The guarantee above is also
+            // stated as "at or after" — "at" is exactly the hole — so one branch
+            // buys the difference between a wrong answer and a wedged thread.
+            //
+            // Breaking (rather than continuing) returns the turn parsed so far,
+            // which is the conservative direction: a tool call is only ever
+            // ADDED by a later arrival, so a truncated walk can lose a call but
+            // never invent one.
+            match arrival {
+                Some(next) if next.at > here.at => {}
+                _ => break,
+            }
         }
 
         out
@@ -1832,6 +1870,84 @@ mod tests {
             }
         }
         (text, spans)
+    }
+
+    /// `parse` walks an unbounded `while let` over untrusted model output on the
+    /// `"mlx-model"` OS thread, inside a function documented "infallible by
+    /// design". The invariant that makes it terminate is that `next_arrival`
+    /// STRICTLY advances, and that rests on one fact: `start_anchor` is non-empty,
+    /// so `arrival_after` sets `at = anchor + start_anchor.len() > anchor >= from`.
+    /// The guarantee was written down as "at or after an offset at least
+    /// `here.at`" — and "at" is exactly the hole.
+    ///
+    /// So this pins the fact rather than an input. Being honest about what this
+    /// covers: I could not construct a turn that reaches the non-advancing branch,
+    /// which is why `parse` guards it with a `break` rather than returning an
+    /// `Err` — the branch is unreachable today and the `break` costs one
+    /// comparison. What a test CAN do is fail if the invariant's premise is ever
+    /// weakened, e.g. by a spec whose `start_anchor` is empty or by an
+    /// `arrival_after` that stops adding the anchor length.
+    ///
+    /// Mutation caught: `arrival_after` computing `at = anchor` instead of
+    /// `anchor + start_anchor.len()`, which turns `parse` into an infinite loop on
+    /// any turn containing an anchor. With the `break` in place that becomes a
+    /// truncated parse; the assertions below name it either way.
+    #[test]
+    fn the_arrival_walk_strictly_advances_which_is_why_parse_terminates() {
+        let tpl = spec();
+        assert!(
+            !tpl.start_anchor.is_empty(),
+            "an empty start_anchor makes next_arrival return the offset it was given, \
+             and parse's walk would not advance"
+        );
+
+        // A turn with three real anchors, one of them immediately adjacent to the
+        // previous message's terminator (the tightest spacing the protocol can
+        // produce) so the walk is exercised where advancement is smallest.
+        let (text, spans) = pieces(
+            &tpl,
+            &[
+                (" to=self<|message|>a", false),
+                ("<|eom|>", true),
+                ("<|start|>", true),
+                ("assistant to=user<|message|>b", false),
+                ("<|eot|>", true),
+                ("<|start|>", true),
+                ("assistant to=user<|message|>c", false),
+                ("<|eot|>", true),
+            ],
+        );
+        let turn = GeneratedTurn::from_token_spans(&text, &spans);
+
+        // From EVERY byte offset, not just the ones the walk happens to visit: a
+        // single non-advancing offset anywhere is a hang reachable from some
+        // prefix of some stream.
+        let mut advanced = 0usize;
+        for from in 0..=text.len() {
+            if !text.is_char_boundary(from) {
+                continue;
+            }
+            if let Some(next) = tpl.next_arrival(turn, from) {
+                assert!(
+                    next.at > from,
+                    "next_arrival({from}) returned {} — not an advance, so parse would \
+                     revisit the same offset forever",
+                    next.at
+                );
+                advanced += 1;
+            }
+        }
+        assert!(
+            advanced >= 2,
+            "the fixture must actually contain anchors for this to prove anything; only \
+             {advanced} offset(s) produced an arrival"
+        );
+
+        // And the walk as a whole still parses the turn it was given, so the
+        // guard did not truncate a legal turn.
+        let out = tpl.parse(turn);
+        assert_eq!(out.reasoning.as_deref(), Some("a"));
+        assert_eq!(out.content.as_deref(), Some("b"));
     }
 
     #[test]
