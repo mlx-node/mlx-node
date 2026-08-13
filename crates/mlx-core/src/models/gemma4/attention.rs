@@ -76,6 +76,70 @@ fn cache_hit_dense_window_arg(sliding_window: u32) -> Option<i32> {
     (sliding_window != 0).then_some(sliding_window as i32)
 }
 
+/// Kernel a dense cache-hit route uses when the group is GLOBAL (window 0).
+///
+/// The two dense routes historically differed here and must keep differing:
+/// MLX dispatches a different kernel when an explicit mask is present, with a
+/// different BF16 reduction order, so changing either one's global-group
+/// kernel would drift paged-vs-flat parity. This only selects the window-0
+/// kernel; a windowed group always takes the explicit masked path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GlobalDenseKernel {
+    /// Fused causal SDPA, no explicit mask -- the paged-pool SDPA route.
+    FusedCausal,
+    /// Explicit full-causal mask -- the host-read fallback.
+    ExplicitCausalMask,
+}
+
+/// Attention for a DENSE (gathered-K/V) cache-hit prefill chunk.
+///
+/// The single implementation of dense cache-hit attention, shared by the
+/// paged-pool SDPA route and the host-read fallback. Neither has a
+/// kernel-side window, and both are fed a gather covering `0..total_ctx` --
+/// which includes the positions `prune_sliding_window_for` retired onto the
+/// reserved null block. So for a windowed group the explicit keep-mask built
+/// here is the ONLY thing standing between the kernel and never-written pool
+/// memory, and it is mandatory rather than an optimization.
+///
+/// `cached_prefix_len` is the mask offset, i.e. the absolute position of this
+/// chunk's first query row. That makes the mask
+/// `causal & (q_abs - kv < window)` over the full `cached_prefix_len +
+/// seq_len` gather width -- the same predicate the Metal kernel derives per
+/// row from its bottom-right alignment, and the same one vLLM's reference
+/// mask uses.
+///
+/// Do NOT substitute the `sliding_mask` that `run_paged_prefill_layer_loop`
+/// builds for the flat rotating cache: that one is only
+/// `seq_len + min(cache_offset, window)` wide, while this gather is
+/// `cached_prefix_len + seq_len` wide.
+fn dense_cache_hit_attention(
+    queries_bhtd: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    seq_len: i64,
+    cached_prefix_len: u32,
+    sliding_window: u32,
+    global_kernel: GlobalDenseKernel,
+) -> Result<MxArray> {
+    match cache_hit_dense_window_arg(sliding_window) {
+        Some(window) => {
+            let mask =
+                create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), Some(window))?;
+            scaled_dot_product_attention(queries_bhtd, keys, values, 1.0, Some(&mask))
+        }
+        None => match global_kernel {
+            GlobalDenseKernel::FusedCausal => {
+                scaled_dot_product_attention_causal(queries_bhtd, keys, values, 1.0)
+            }
+            GlobalDenseKernel::ExplicitCausalMask => {
+                let mask =
+                    create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
+                scaled_dot_product_attention(queries_bhtd, keys, values, 1.0, Some(&mask))
+            }
+        },
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct LivePrefillHeadroom {
     selected_bytes: Option<u64>,
@@ -1754,35 +1818,19 @@ impl Gemma4Attention {
             let started = std::time::Instant::now();
             match adapter.gather_kv_for_prefill_sdpa(paged_idx, total_ctx) {
                 Ok((keys, values)) => {
-                    // The dense gather materializes every position in
-                    // `0..total_ctx`, including the ones
-                    // `prune_sliding_window_for` retired onto the reserved
-                    // null block. This route has no kernel-side window, so a
-                    // windowed group MUST carry an explicit keep-mask here;
-                    // plain causal would attend the retired positions and
-                    // dereference never-written pool bytes. A global group
-                    // keeps the fused causal kernel byte-for-byte.
-                    let windowed_mask = match cache_hit_dense_window_arg(plan.sliding_window) {
-                        Some(window) => Some(create_causal_mask(
-                            seq_len as i32,
-                            Some(cached_prefix_len as i32),
-                            Some(window),
-                        )?),
-                        None => None,
-                    };
-                    let sdpa_result = match windowed_mask.as_ref() {
-                        Some(mask) => scaled_dot_product_attention(
-                            queries_bhtd,
-                            &keys,
-                            &values,
-                            1.0,
-                            Some(mask),
-                        ),
-                        None => {
-                            scaled_dot_product_attention_causal(queries_bhtd, &keys, &values, 1.0)
-                        }
-                    };
-                    match sdpa_result {
+                    // Dense route: no kernel-side window, and the gather has
+                    // the retired null placeholders in it, so the window is
+                    // applied as an explicit keep-mask. Global groups keep the
+                    // fused causal kernel byte-for-byte.
+                    match dense_cache_hit_attention(
+                        queries_bhtd,
+                        &keys,
+                        &values,
+                        seq_len,
+                        cached_prefix_len,
+                        plan.sliding_window,
+                        GlobalDenseKernel::FusedCausal,
+                    ) {
                         Ok(output) => {
                             if report_route {
                                 tracing::info!(
@@ -1932,14 +1980,18 @@ impl Gemma4Attention {
             .read_kv_range(paged_idx, 0, total_ctx)
             .map_err(napi::Error::from_reason)?;
         // Also dense, and reachable from EVERY mode: this arm runs whenever no
-        // earlier arm produced an output, not only when the plan named it. It
-        // needs the same explicit window as the paged-pool SDPA route above.
-        let mask = create_causal_mask(
-            seq_len as i32,
-            Some(cached_prefix_len as i32),
-            cache_hit_dense_window_arg(plan.sliding_window),
+        // earlier arm produced an output, not only when the plan named it, so
+        // it needs the same window as the paged-pool SDPA route above. It keeps
+        // its historical explicit full-causal mask for a global group.
+        let output = dense_cache_hit_attention(
+            queries_bhtd,
+            &keys,
+            &values,
+            seq_len,
+            cached_prefix_len,
+            plan.sliding_window,
+            GlobalDenseKernel::ExplicitCausalMask,
         )?;
-        let output = scaled_dot_product_attention(queries_bhtd, &keys, &values, 1.0, Some(&mask))?;
         tracing::warn!(
             target: "mlx_core::inference",
             event = "gemma4_cache_hit_prefill_route",
@@ -3117,6 +3169,157 @@ mod tests {
         assert_eq!(cache_hit_dense_window_arg(1), Some(1));
         assert_eq!(cache_hit_dense_window_arg(1024), Some(1024));
         assert_eq!(cache_hit_dense_window_arg(2048), Some(2048));
+    }
+
+    /// NUMERICS for the shared dense cache-hit implementation, driven against
+    /// a real pruned sliding adapter and a real Metal gather.
+    ///
+    /// `dense_cache_hit_attention` is the only implementation of dense
+    /// cache-hit attention, so this covers both dense routes -- the paged-pool
+    /// SDPA route that production Auto actually selects, and the host-read
+    /// fallback. Dropping the window inside it fails here.
+    ///
+    /// `V[pos] = pos + 1`, `K = 0`, `Q = 0`: every unmasked score is equal, so
+    /// each output element is the mean of the `V` values summed, and the
+    /// attended position set is readable straight off the output.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dense_cache_hit_attention_excludes_out_of_window_positions() {
+        use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+        use half::f16;
+        use std::sync::{Arc, Mutex};
+
+        const BLOCK: u32 = 8;
+        const WINDOW: u32 = 16;
+        const HEAD: i64 = 64;
+        const PREFIX: u32 = 32;
+        const CHUNK: u32 = 16;
+        const TOTAL: u32 = PREFIX + CHUNK;
+
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: BLOCK,
+            num_kv_heads: 1,
+            head_size: HEAD as u32,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            16,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping dense_cache_hit_attention numerics: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(16, BLOCK)));
+        let mut adapter = PagedKVCacheAdapter::new_sliding(allocator, pool, BLOCK, WINDOW, 128)
+            .expect("sliding adapter");
+        adapter.reset_for_new_request(7).expect("reset");
+
+        let write = |adapter: &mut PagedKVCacheAdapter, first: u32, len: u32| -> Result<()> {
+            let n = len as i64;
+            let k = MxArray::zeros(&[n, 1, HEAD], Some(DType::Float16))?;
+            let mut bits = Vec::with_capacity((n * HEAD) as usize);
+            for off in 0..len {
+                let b = f16::from_f32((first + off + 1) as f32).to_bits();
+                bits.extend(std::iter::repeat_n(b, HEAD as usize));
+            }
+            let v = MxArray::from_float16(&bits, &[n, 1, HEAD])?;
+            k.eval();
+            v.eval();
+            adapter
+                .update_keys_values(0, &k, &v, first)
+                .map_err(Error::from_reason)
+        };
+
+        adapter
+            .record_tokens(&(0..PREFIX).collect::<Vec<_>>())
+            .expect("record prefix");
+        match write(&mut adapter, 0, PREFIX) {
+            Ok(()) => {}
+            Err(e) if e.to_string().contains("Metal GPU not available") => {
+                eprintln!("skipping dense_cache_hit_attention numerics: {e}");
+                return;
+            }
+            Err(e) => panic!("prefix write failed: {e}"),
+        }
+        // Production ordering: prune AFTER the written chunk.
+        adapter.prune_sliding_window_for(7).expect("prune");
+        adapter
+            .record_tokens(&(PREFIX..TOTAL).collect::<Vec<_>>())
+            .expect("record chunk");
+        write(&mut adapter, PREFIX, CHUNK).expect("chunk write");
+
+        // The gather both dense routes consume -- retired placeholders included.
+        let (keys, values) = adapter
+            .gather_kv_for_prefill_sdpa(0, TOTAL)
+            .expect("dense gather");
+        let q = MxArray::zeros(&[1, 2, CHUNK as i64, HEAD], Some(DType::Float16)).expect("q");
+        q.eval();
+
+        let reference: Vec<f32> = (0..CHUNK)
+            .map(|i| {
+                let ctx = PREFIX + i + 1;
+                let lo = ctx.saturating_sub(WINDOW);
+                let sum: u32 = (lo..ctx).map(|p| p + 1).sum();
+                sum as f32 / (ctx - lo) as f32
+            })
+            .collect();
+        let read0 = |out: &MxArray| -> Vec<f32> {
+            let v = out.to_float32().expect("to_float32");
+            (0..CHUNK as usize).map(|t| v[t * HEAD as usize]).collect()
+        };
+
+        // Both dense routes, same window, same expectation.
+        for kernel in [
+            GlobalDenseKernel::FusedCausal,
+            GlobalDenseKernel::ExplicitCausalMask,
+        ] {
+            let got =
+                dense_cache_hit_attention(&q, &keys, &values, CHUNK as i64, PREFIX, WINDOW, kernel)
+                    .map(|o| read0(&o))
+                    .expect("dense cache-hit attention");
+            for i in 0..CHUNK as usize {
+                assert!(
+                    (got[i] - reference[i]).abs() < 0.05,
+                    "{kernel:?} token {i} (abs pos {}): got {}, window-masked reference {}. \
+                     The dense cache-hit path attended positions the window retired, \
+                     including the never-written null block.",
+                    PREFIX as usize + i,
+                    got[i],
+                    reference[i]
+                );
+            }
+        }
+
+        // The window must actually bite, or the assertions above would be
+        // satisfied by a no-op mask.
+        let unwindowed = dense_cache_hit_attention(
+            &q,
+            &keys,
+            &values,
+            CHUNK as i64,
+            PREFIX,
+            0,
+            GlobalDenseKernel::FusedCausal,
+        )
+        .map(|o| read0(&o))
+        .expect("global dense attention");
+        for i in 0..CHUNK as usize {
+            assert!(
+                (unwindowed[i] - reference[i]).abs() > 4.0,
+                "token {i}: windowed and full-causal results are too close ({} vs {}) \
+                 for this test to discriminate -- fix the geometry",
+                unwindowed[i],
+                reference[i]
+            );
+        }
     }
 
     /// DECODE MUST NOT MOVE. A windowed group stays on the paged kernel.
