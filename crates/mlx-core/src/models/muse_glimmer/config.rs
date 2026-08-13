@@ -58,6 +58,11 @@ struct RawTextConfig {
     num_key_value_heads: usize,
     head_dim: usize,
     vocab_size: usize,
+    /// REQUIRED, deliberately with no `#[serde(default)]`. This is the KV-cache
+    /// seam's `max_model_len`, so a guessed value silently mis-sizes every KV
+    /// pool the model allocates. The checkpoint carries it (131072); an absent
+    /// key must be a hard deserialize error, not a resolved one.
+    max_position_embeddings: usize,
     rms_norm_eps: f32,
     #[serde(default = "default_sliding_window")]
     sliding_window: usize,
@@ -122,6 +127,11 @@ pub struct MuseGlimmerTextConfig {
     pub head_dim: usize,
     pub vocab_size: usize,
     pub sliding_window: usize,
+    /// Maximum context length. Consumed by the KV-cache seam as `max_model_len`:
+    /// it is the full-attention groups' admission bound outright, and the cap on
+    /// the sliding groups' `window - 1 + max_chunk`. Never defaulted — see
+    /// [`MuseGlimmerConfig::from_json_str`].
+    pub max_position_embeddings: usize,
     /// Epsilon for the input/pre-feedforward RMS norms.
     pub rms_norm_eps: f32,
     /// Epsilon for the POST norms — three orders of magnitude smaller than
@@ -328,6 +338,26 @@ impl MuseGlimmerConfig {
             )));
         }
 
+        // `max_position_embeddings` reaches the KV-cache seam as `max_model_len`.
+        // A 0 there makes the full-attention bound `div_ceil(0, block_size) == 0`
+        // — a group that can admit no blocks — and the same `u32` truncation trap
+        // as the window applies. Both fail closed here, where the field has a
+        // name, rather than deep inside group construction.
+        if text.max_position_embeddings == 0 {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: max_position_embeddings must be non-zero, got {}; it is \
+                 the KV cache seam's max_model_len and a 0 admits no blocks at all",
+                text.max_position_embeddings
+            )));
+        }
+        if u32::try_from(text.max_position_embeddings).is_err() {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: max_position_embeddings {} does not fit in a u32; the KV \
+                 cache seam carries max_model_len as a u32 and a cast would truncate it",
+                text.max_position_embeddings
+            )));
+        }
+
         Ok(Self {
             image_token_id: raw.image_token_id,
             video_token_id: raw.video_token_id,
@@ -343,6 +373,7 @@ impl MuseGlimmerConfig {
                 head_dim: text.head_dim,
                 vocab_size: text.vocab_size,
                 sliding_window: text.sliding_window,
+                max_position_embeddings: text.max_position_embeddings,
                 rms_norm_eps: text.rms_norm_eps,
                 post_norm_eps: text.post_norm_eps,
                 qk_scale_factor: text.qk_scale_factor,
@@ -400,6 +431,7 @@ pub(crate) mod fixtures {
               "num_hidden_layers": {layers},
               "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
               "vocab_size": 202048, "sliding_window": 2048,
+              "max_position_embeddings": 131072,
               "rms_norm_eps": 1e-5, "post_norm_eps": 1e-8,
               "qk_scale_factor": 3.87,
               "output_multiplier": 0.19611613513818404,
@@ -422,6 +454,7 @@ pub(crate) mod fixtures {
               "num_hidden_layers": {layers},
               "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
               "vocab_size": 202048,
+              "max_position_embeddings": 131072,
               "rms_norm_eps": 1e-5,
               "layer_types": [{kinds}],
               "layer_rope_theta": [{thetas}]
@@ -470,6 +503,7 @@ mod tests {
         assert_eq!(t.head_dim, 128);
         assert_eq!(t.vocab_size, 202048);
         assert_eq!(t.sliding_window, 2048);
+        assert_eq!(t.max_position_embeddings, 131072);
         assert_eq!(t.qk_scale_factor, 3.87);
         assert_eq!(t.final_logit_softcapping, 20.0);
         assert_eq!(cfg.image_token_id, 200092);
@@ -705,6 +739,62 @@ mod tests {
         );
     }
 
+    /// `max_position_embeddings` is the KV-cache seam's `max_model_len`: it caps
+    /// sliding admission and IS the full group's admission bound (8192 blocks at
+    /// block_size 16 for this checkpoint's 131072). There is no defensible
+    /// default for a context length — inventing one silently mis-sizes every KV
+    /// pool the model allocates — so the field is REQUIRED, and a missing key is
+    /// a hard deserialize error rather than a resolved value. A
+    /// `#[serde(default)]` here would be indistinguishable from "silently
+    /// defaulted", the exact failure mode
+    /// `defaulted_fields_are_read_from_the_file_when_present` exists to catch.
+    #[test]
+    fn requires_max_position_embeddings_with_no_default() {
+        let bad = text_config_json(52).replace("\"max_position_embeddings\": 131072,", "");
+        let err = parse(&bad).unwrap_err().to_string();
+        // Pinned to serde's own wording, which only a genuinely required field
+        // can produce. A `#[serde(default)]` mutation would instead surface the
+        // `must be non-zero` guard below, whose message also names the field —
+        // asserting on the field name alone would let that mutation live.
+        assert!(
+            err.contains("missing field `max_position_embeddings`"),
+            "an absent context length must be a hard deserialize error, got: {err}"
+        );
+    }
+
+    /// A 0 context length makes the seam's full-attention bound
+    /// `div_ceil(0, block_size) == 0`: a full group that can admit no blocks at
+    /// all. That is a startup failure with no useful message, or worse a pool
+    /// sized to nothing, so refuse it here where the field has a name.
+    #[test]
+    fn rejects_a_zero_max_position_embeddings() {
+        let bad = text_config_json(52).replace(
+            "\"max_position_embeddings\": 131072",
+            "\"max_position_embeddings\": 0",
+        );
+        let err = parse(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("max_position_embeddings must be non-zero, got 0"),
+            "a zero context length must fail closed and name the field and value, got: {err}"
+        );
+    }
+
+    /// Same `u32` boundary as `sliding_window`: the seam takes `max_model_len` as
+    /// a `u32`, so an out-of-range `usize` must be an error, not a truncation.
+    #[test]
+    fn rejects_a_max_position_embeddings_that_does_not_fit_a_u32() {
+        let bad = text_config_json(52).replace(
+            "\"max_position_embeddings\": 131072",
+            "\"max_position_embeddings\": 5000000000",
+        );
+        let err = parse(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("max_position_embeddings") && err.contains("5000000000"),
+            "an out-of-u32 context length must fail closed and print the observed \
+             value, got: {err}"
+        );
+    }
+
     /// `sliding_window` is the window of 39 of this decoder's 52 layers, and it
     /// leaves this module as the `AttentionKind::SlidingWindow` payload of every
     /// one of them. A 0 must not survive parsing: vLLM's disable sentinel is
@@ -778,6 +868,9 @@ mod tests {
         assert_eq!(full, vec![3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51]);
         assert_eq!(t.rms_norm_eps, 1e-5);
         assert_eq!(t.post_norm_eps, 1e-8);
+        // The seam's max_model_len, read from the real file rather than a
+        // transcription: 131072 => 8192 full-attention blocks at block_size 16.
+        assert_eq!(t.max_position_embeddings, 131072);
         assert_eq!(cfg.image_token_id, 200092);
 
         // The defaulted fields' values coincide with their defaults, so the
