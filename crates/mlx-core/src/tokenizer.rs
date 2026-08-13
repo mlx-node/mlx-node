@@ -2705,6 +2705,38 @@ pub(crate) struct RenderContextOptions {
 /// A `Formatter` rather than a post-pass over the serialized string: `,` and `:`
 /// occur inside string values too, and rewriting those would corrupt the payload
 /// (`"a,b"` is not `"a, b"`).
+///
+/// Registered for EVERY family, not just Muse-Glimmer, so this is a shared
+/// surface: 40 of the 62 installed `chat_template.jinja` use `tojson` and every
+/// one of them that renders a tool turn is affected. Two gates cover that, both
+/// `#[ignore]`d behind `MLX_TEST_MODEL_CACHE_DIR`:
+/// `tojson_emits_hf_separators_in_every_installed_family_that_uses_it` (the
+/// separators reached every family's prompt) and
+/// `our_render_matches_hf_transformers_byte_for_byte` (nine families' whole
+/// prompts are byte-identical to HuggingFace's own renderer). Change this
+/// formatter and run both.
+///
+/// # Bounds on "matches HF"
+///
+/// Two, neither of which affects a JSON Schema or a tool argument, but state them
+/// so the next reader does not assume universal byte-identity:
+///
+/// 1. **Float spelling.** ryu and CPython's `repr` disagree on some
+///    small-magnitude exponents: we emit `0.00001` / `1e-7` / `2.5e-8` where
+///    CPython emits `1e-05` / `1e-07` / `2.5e-08`. Three of fourteen shapes
+///    tested; everything else — strings, escapes, control chars, non-ASCII
+///    (unescaped, matching `ensure_ascii=False`), ints, bools, nulls, empty and
+///    nested containers, insertion key order — is byte-identical. Pre-existing,
+///    unchanged by this formatter, and pinned both ways by
+///    `tojson_float_spelling_is_the_only_known_divergence_from_cpython`.
+/// 2. **Arity.** The filter takes one positional value. HF's `tojson` also accepts
+///    `ensure_ascii` / `indent` / `separators` / `sort_keys`, so a template
+///    written as `tojson(indent=4)` fails to render for us with "too many
+///    arguments". Not live: the only installed template using the kwarg form is
+///    `step-3.7-flash`, which is not a supported family, and the
+///    pre-formatter `serde_json::to_string` filter had the same arity — so this
+///    is a standing gap, not a regression. Widening the closure to take
+///    `minijinja::value::Kwargs` is a separate change with its own blast radius.
 struct PythonDefaultFormatter;
 
 impl serde_json::ser::Formatter for PythonDefaultFormatter {
@@ -7295,5 +7327,68 @@ mod tests {
             render(serde_json::json!({"k": "x, y: z"})),
             r#"{"k": "x, y: z"}"#
         );
+    }
+
+    /// The BOUND on "byte-identical to HF": floats. Everything else our `tojson`
+    /// emits matches CPython's `json.dumps` exactly, but ryu and CPython's `repr`
+    /// disagree on how to spell some small-magnitude exponents, so
+    /// [`PythonDefaultFormatter`]'s parity is true for the shapes that occur in
+    /// JSON Schema and tool arguments rather than universally.
+    ///
+    /// Pinned rather than merely documented, in both directions: the 11 agreeing
+    /// shapes must keep agreeing, and the 3 disagreeing ones are asserted AS
+    /// disagreeing. If a serde_json upgrade fixes them this test fails, which is
+    /// the correct signal — the fix is to move those rows up and to drop the caveat
+    /// from `PythonDefaultFormatter`'s doc comment, not to loosen the assertion.
+    ///
+    /// Every right-hand column was produced by running
+    /// `json.dumps(v, ensure_ascii=False, indent=None, separators=None,
+    /// sort_keys=False)` under CPython 3.14 — transformers' exact kwargs.
+    ///
+    /// Model-free: no checkpoint, no cache, not `#[ignore]`d.
+    #[test]
+    fn tojson_float_spelling_is_the_only_known_divergence_from_cpython() {
+        let mut env = Environment::new();
+        super::Qwen3Tokenizer::install_template_helpers(&mut env);
+        env.add_template("t", "{{ v | tojson }}").unwrap();
+        let render = |v: f64| {
+            env.get_template("t")
+                .unwrap()
+                .render(context! { v => v })
+                .unwrap()
+        };
+
+        // Agreeing: the shapes a tool schema or a numeric argument actually holds.
+        for (value, cpython) in [
+            (0.1f64, "0.1"),
+            (1.0, "1.0"),
+            (1.5, "1.5"),
+            (1e16, "1e+16"),
+            (1e21, "1e+21"),
+            (1e-10, "1e-10"),
+            (1e300, "1e+300"),
+            (1e-300, "1e-300"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (-0.0, "-0.0"),
+            (123456789.123, "123456789.123"),
+        ] {
+            assert_eq!(render(value), cpython, "{value:e} must match CPython");
+        }
+
+        // Diverging, all three: ryu prefers the shortest round-trip spelling and
+        // CPython pads the exponent to two digits (and prefers fixed notation up to
+        // its own threshold). Irrelevant to JSON Schema, but real.
+        for (value, ours, cpython) in [
+            (1e-5f64, "0.00001", "1e-05"),
+            (1e-7, "1e-7", "1e-07"),
+            (2.5e-8, "2.5e-8", "2.5e-08"),
+        ] {
+            assert_eq!(render(value), ours, "our spelling of {value:e} moved");
+            assert_ne!(
+                ours, cpython,
+                "{value:e} now agrees with CPython — good news, but then this row belongs in the \
+                 agreeing table above and PythonDefaultFormatter's caveat should go",
+            );
+        }
     }
 }
