@@ -5838,8 +5838,16 @@ impl PagedKVCacheAdapter {
                 k_scale.as_raw_ptr(),
                 v_scale.as_raw_ptr(),
                 scale,
-                0.0,
-                0,
+                /* softcap */ 0.0,
+                // The window travels with every dispatch. It is read from the
+                // adapter that owns it rather than taken as a parameter, so
+                // this slot has no literal for a caller to get wrong -- the
+                // shape every other paged dispatch in this file uses. A `0`
+                // here is not "inert": the Metal kernel treats 0 as the
+                // no-mask sentinel and attends the full causal range,
+                // including positions `prune_sliding_window_for` has retired
+                // onto the never-written null block.
+                self.sliding_window as i32,
                 self.block_size as i32,
                 num_query_heads as i32,
                 self.layer_kv_pool.config().num_kv_heads as i32,
@@ -7708,13 +7716,30 @@ impl PagedKVCacheAdapter {
     }
 
     /// Element dtype exposed by a graph-native paged K/V gather. `None`
-    /// means the cache requires dequantization and cannot feed plain MLX
-    /// SDPA directly.
+    /// means a caller must not feed a plain-SDPA route from this cache
+    /// without supplying its own mask.
+    ///
+    /// The `sliding_window != 0` arm is a **decode routing guard**, not a
+    /// statement about storage. On decode it is load-bearing:
+    /// `select_paged_decode_plan` turns this `None` into
+    /// `PagedDecodePath::PagedAttention`, keeping a windowed group on the
+    /// paged kernel, and `grouped_d512_decode_capability` uses it to keep a
+    /// windowed group off the direct-read D512 pipeline. Both of those
+    /// routes have no mask argument, so the window can only be applied
+    /// kernel-side.
+    ///
+    /// It is deliberately **not** a correctness barrier on prefill. A dense
+    /// gather of a sliding group does materialize the retired null
+    /// placeholders -- `gather_kv_for_prefill_sdpa` will hand them back --
+    /// so prefill correctness comes from the caller masking them out, not
+    /// from this `None`. Gemma4's cache-hit prefill does exactly that: it
+    /// carries `sliding_window` in `CacheHitPrefillPlan` and builds a
+    /// windowed `create_causal_mask` for both dense routes. On prefill this
+    /// value only scales a byte estimate. Do not re-document this as an
+    /// invariant that keeps sliding groups off the dense gather; nothing
+    /// enforces that, and after the masking fix nothing needs to.
     pub(crate) fn prefill_sdpa_cache_dtype(&self) -> Option<DType> {
         if self.sliding_window != 0 {
-            // A dense gather would materialize the null placeholders. Sliding
-            // groups must remain on the paged kernel, which applies the window
-            // before touching those entries.
             return None;
         }
         match self.layer_kv_pool.cache_dtype() {

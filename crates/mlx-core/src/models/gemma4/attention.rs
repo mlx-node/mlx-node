@@ -44,9 +44,36 @@ enum CacheHitPrefillPath {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct CacheHitPrefillPlan {
     path: CacheHitPrefillPath,
+    /// Sliding window of the KV group this chunk belongs to; `0` = global.
+    ///
+    /// The window is a property of the attention being computed, so it
+    /// belongs to the plan alongside the route rather than being re-derived
+    /// per branch. Every arm that computes attention must answer it: the two
+    /// kernel routes read it off the adapter, and the two dense routes turn
+    /// it into a mask via `cache_hit_dense_window_arg`. There is deliberately
+    /// no `Default` for this struct, so a new field or a new
+    /// `CacheHitPrefillPath` variant cannot pick up a silent `0`.
+    sliding_window: u32,
     estimated_sdpa_bytes: u64,
     estimated_varlen_bytes: u64,
     live_headroom_bytes: Option<u64>,
+}
+
+/// Window argument for a **dense** (gathered-K/V) cache-hit prefill route.
+///
+/// `None` means "plain causal is already exact" and the caller may keep the
+/// fused causal fast path; `Some(w)` means the route must apply an explicit
+/// windowed keep-mask. Both dense routes -- paged-pool SDPA and the host-read
+/// fallback -- go through this one function, so the window can be dropped for
+/// dense attention in exactly zero places.
+///
+/// Returning `None` for a global group is load-bearing, not a shortcut: MLX
+/// dispatches different kernels with and without an explicit mask, and the
+/// mask-bearing kernel uses a different BF16 reduction order. A global group
+/// must keep the exact kernel it used before this window plumbing existed or
+/// paged-vs-flat parity moves by a few ULP per layer.
+fn cache_hit_dense_window_arg(sliding_window: u32) -> Option<i32> {
+    (sliding_window != 0).then_some(sliding_window as i32)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -596,7 +623,11 @@ pub(crate) fn gemma4_paged_prefill_v2_layout_for_chunk(
                 head_dim as u64,
                 2,
             );
-            let plan = select_cache_hit_prefill_plan(
+            // Path only: this is an aux-buffer sizing decision shared by every
+            // KV group, so there is no single window to speak of here. Route
+            // choice is window-independent by construction, which is why this
+            // does not need one.
+            let path = select_cache_hit_prefill_path(
                 CacheHitPrefillMode::Auto,
                 query_tokens as u64,
                 estimated_sdpa_bytes,
@@ -604,7 +635,7 @@ pub(crate) fn gemma4_paged_prefill_v2_layout_for_chunk(
                 None,
                 true,
             );
-            match plan.path {
+            match path {
                 CacheHitPrefillPath::PagedVarlen => Some(PagedAttentionV2Layout::Varlen),
                 CacheHitPrefillPath::PagedLegacy => Some(PagedAttentionV2Layout::SingleRowBatch),
                 CacheHitPrefillPath::PagedPoolSdpa | CacheHitPrefillPath::HostRead => None,
@@ -782,15 +813,24 @@ fn live_prefill_headroom(snapshot: PagedPrefillMemorySnapshot) -> LivePrefillHea
     }
 }
 
-fn select_cache_hit_prefill_plan(
+/// Route-selection core, deliberately independent of the sliding window.
+///
+/// Route choice is a memory/geometry decision; the window is a correctness
+/// property that every route can now honour, so it must not steer routing --
+/// if it did, a windowed group could be pushed off an otherwise better route
+/// on a byte estimate. Keeping this split means the aux-buffer pre-plan
+/// (`gemma4_paged_prefill_v2_layout_for_chunk`), which has no KV group in
+/// scope because one chunk size serves every group, can ask for a path
+/// without inventing a window value it does not have.
+fn select_cache_hit_prefill_path(
     mode: CacheHitPrefillMode,
     query_tokens: u64,
     estimated_sdpa_bytes: u64,
     estimated_varlen_bytes: u64,
     live_headroom_bytes: Option<u64>,
     graph_backend_available: bool,
-) -> CacheHitPrefillPlan {
-    let path = match mode {
+) -> CacheHitPrefillPath {
+    match mode {
         CacheHitPrefillMode::ForceSdpa if graph_backend_available => {
             CacheHitPrefillPath::PagedPoolSdpa
         }
@@ -828,9 +868,35 @@ fn select_cache_hit_prefill_plan(
         CacheHitPrefillMode::Auto
         | CacheHitPrefillMode::ForceSdpa
         | CacheHitPrefillMode::ForceVarlen => CacheHitPrefillPath::HostRead,
-    };
+    }
+}
+
+/// Choose a cache-hit prefill route and bind the sliding window to it.
+///
+/// `sliding_window` is a required input with no default: it is carried on the
+/// returned plan so that every arm which computes attention has to answer it.
+/// Every route can express a window -- the two kernel routes hand it to the
+/// Metal kernel, the two dense routes mask with it -- so no route is refused
+/// and no legal turn can be rejected.
+fn select_cache_hit_prefill_plan(
+    mode: CacheHitPrefillMode,
+    sliding_window: u32,
+    query_tokens: u64,
+    estimated_sdpa_bytes: u64,
+    estimated_varlen_bytes: u64,
+    live_headroom_bytes: Option<u64>,
+    graph_backend_available: bool,
+) -> CacheHitPrefillPlan {
     CacheHitPrefillPlan {
-        path,
+        path: select_cache_hit_prefill_path(
+            mode,
+            query_tokens,
+            estimated_sdpa_bytes,
+            estimated_varlen_bytes,
+            live_headroom_bytes,
+            graph_backend_available,
+        ),
+        sliding_window,
         estimated_sdpa_bytes,
         estimated_varlen_bytes,
         live_headroom_bytes,
@@ -1586,6 +1652,13 @@ impl Gemma4Attention {
         let graph_backend_available =
             batch == 1 && crate::engine::persistence::compiled_forward_backend_available();
         let mode = cache_hit_prefill_mode();
+        // The single point where the window enters cache-hit prefill. Both
+        // entry points (`forward_paged` and `forward_paged_shared`) funnel
+        // through this method, and a `SharedOnSliding` layer is handed its
+        // anchor's group adapter -- `adapter_mut(kind.group_id())`, and a
+        // shared layer shares its anchor's `group_id` -- so this read is the
+        // sliding window for both.
+        let sliding_window = adapter.sliding_window();
         let effective_sdpa_dtype =
             prefill_sdpa_effective_dtype(queries_bhtd.dtype()?, adapter.prefill_sdpa_cache_dtype());
         let dtype_bytes = match effective_sdpa_dtype {
@@ -1600,7 +1673,16 @@ impl Gemma4Attention {
             self.num_kv_heads as u64,
             self.head_dim as u64,
             dtype_bytes,
-        );
+        )
+        // A windowed group's dense route now also materializes a
+        // `[1, 1, seq_len, total_ctx]` bool keep-mask. Charge it to the SDPA
+        // estimate so the routing probe sees memory the route actually
+        // allocates -- at 512 x 100k that is ~51 MB the estimate used to miss.
+        .saturating_add(if sliding_window != 0 {
+            (seq_len as u64).saturating_mul(total_ctx as u64)
+        } else {
+            0
+        });
         let estimated_varlen_bytes = estimate_varlen_paged_attention_bytes(
             seq_len as u64,
             total_ctx as u64,
@@ -1618,6 +1700,7 @@ impl Gemma4Attention {
         };
         let plan = select_cache_hit_prefill_plan(
             mode,
+            sliding_window,
             seq_len as u64,
             estimated_sdpa_bytes,
             estimated_varlen_bytes,
@@ -1648,6 +1731,7 @@ impl Gemma4Attention {
                 total_context_tokens = total_ctx,
                 configured_mode,
                 planned_path,
+                sliding_window = plan.sliding_window,
                 graph_backend_available,
                 effective_sdpa_dtype = ?effective_sdpa_dtype,
                 estimated_sdpa_mib = plan.estimated_sdpa_bytes as f64 / (1024.0 * 1024.0),
@@ -1670,7 +1754,35 @@ impl Gemma4Attention {
             let started = std::time::Instant::now();
             match adapter.gather_kv_for_prefill_sdpa(paged_idx, total_ctx) {
                 Ok((keys, values)) => {
-                    match scaled_dot_product_attention_causal(queries_bhtd, &keys, &values, 1.0) {
+                    // The dense gather materializes every position in
+                    // `0..total_ctx`, including the ones
+                    // `prune_sliding_window_for` retired onto the reserved
+                    // null block. This route has no kernel-side window, so a
+                    // windowed group MUST carry an explicit keep-mask here;
+                    // plain causal would attend the retired positions and
+                    // dereference never-written pool bytes. A global group
+                    // keeps the fused causal kernel byte-for-byte.
+                    let windowed_mask = match cache_hit_dense_window_arg(plan.sliding_window) {
+                        Some(window) => Some(create_causal_mask(
+                            seq_len as i32,
+                            Some(cached_prefix_len as i32),
+                            Some(window),
+                        )?),
+                        None => None,
+                    };
+                    let sdpa_result = match windowed_mask.as_ref() {
+                        Some(mask) => scaled_dot_product_attention(
+                            queries_bhtd,
+                            &keys,
+                            &values,
+                            1.0,
+                            Some(mask),
+                        ),
+                        None => {
+                            scaled_dot_product_attention_causal(queries_bhtd, &keys, &values, 1.0)
+                        }
+                    };
+                    match sdpa_result {
                         Ok(output) => {
                             if report_route {
                                 tracing::info!(
@@ -1819,7 +1931,14 @@ impl Gemma4Attention {
         let (keys, values) = adapter
             .read_kv_range(paged_idx, 0, total_ctx)
             .map_err(napi::Error::from_reason)?;
-        let mask = create_causal_mask(seq_len as i32, Some(cached_prefix_len as i32), None)?;
+        // Also dense, and reachable from EVERY mode: this arm runs whenever no
+        // earlier arm produced an output, not only when the plan named it. It
+        // needs the same explicit window as the paged-pool SDPA route above.
+        let mask = create_causal_mask(
+            seq_len as i32,
+            Some(cached_prefix_len as i32),
+            cache_hit_dense_window_arg(plan.sliding_window),
+        )?;
         let output = scaled_dot_product_attention(queries_bhtd, &keys, &values, 1.0, Some(&mask))?;
         tracing::warn!(
             target: "mlx_core::inference",
@@ -2820,53 +2939,49 @@ mod tests {
         assert_eq!(varlen, 405_012_480);
 
         assert_eq!(
-            select_cache_hit_prefill_plan(
+            select_cache_hit_prefill_path(
                 CacheHitPrefillMode::Auto,
                 2048,
                 sdpa,
                 varlen,
                 Some(16 * 1024 * 1024 * 1024),
                 true,
-            )
-            .path,
+            ),
             CacheHitPrefillPath::PagedPoolSdpa,
             "healthy headroom should match mlx-lm's matrix-prefill compute"
         );
         assert_eq!(
-            select_cache_hit_prefill_plan(
+            select_cache_hit_prefill_path(
                 CacheHitPrefillMode::Auto,
                 2048,
                 sdpa,
                 varlen,
                 Some(2560 * 1024 * 1024),
                 true,
-            )
-            .path,
+            ),
             CacheHitPrefillPath::PagedVarlen,
             "compact varlen must win when the unfused score matrix misses the reserve"
         );
         assert_eq!(
-            select_cache_hit_prefill_plan(
+            select_cache_hit_prefill_path(
                 CacheHitPrefillMode::ForceLegacy,
                 2048,
                 sdpa,
                 varlen,
                 None,
                 true,
-            )
-            .path,
+            ),
             CacheHitPrefillPath::PagedLegacy
         );
         assert_eq!(
-            select_cache_hit_prefill_plan(
+            select_cache_hit_prefill_path(
                 CacheHitPrefillMode::Auto,
                 2048,
                 sdpa,
                 varlen,
                 None,
                 false,
-            )
-            .path,
+            ),
             CacheHitPrefillPath::HostRead,
             "a non-Metal/batched caller must not enter a rank-3 paged bridge"
         );
