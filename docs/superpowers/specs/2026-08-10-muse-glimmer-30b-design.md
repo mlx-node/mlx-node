@@ -648,9 +648,12 @@ MuseGlimmerKVCacheCoordinator
 
 Verified against gemma4's constructor (`gemma4/model.rs:2262-2292`): a fresh
 `BlockAllocator` and `LayerKVPool` per group, then `new` vs `new_sliding`. **The two spans use
-the same Metal kernel**; the entire difference at dispatch is one integer, `sliding_window as i32`.
-That is why the trap in the next-but-one subsection is a dropped argument rather than a missing
-code path.
+the same Metal kernel**; the entire difference at dispatch is one integer, the kernel's
+`sliding_window: i32`. That is why the trap in the next-but-one subsection is a dropped argument
+rather than a missing code path — and why the *sign* of that integer is load-bearing too: the
+window is range-checked into an `i32` at admission rather than cast there, because a `u32 as i32`
+in that slot is how a 3-billion-token config window became `-1294967296`. See the
+`sliding_window` validation subsection.
 
 Grouping is structural, not a heuristic. `group_layer_kv_cache_specs`
 (`transformer/kv_cache_spec.rs:504`) keys a `BTreeMap` on **`(attention_kind, physical_layout)`**
@@ -725,8 +728,68 @@ deliberately the **opposite** of the text decoder's: the tower has no `head_dim`
 dim IS that quotient, whereas the decoder's `head_dim` is independent and `32 x 128 != 6656` on
 purpose. Copying either rule to the other side is a bug.
 
-`sliding_window` validation is already landed (`3c0c6859`): the config refuses `0` and refuses
-a value outside `u32` at load. Keep that placement, and note the seam's own refusal is weaker than it looks.
+`sliding_window` validation is landed (`3c0c6859`, upper bound corrected in this round): the
+config refuses `0` and refuses a value **past `i32::MAX`** at load. Keep that placement.
+
+**The bound is `i32::MAX`, not `u32::MAX`, and the reason is downstream of every type on the
+path.** `AttentionKind::SlidingWindow` stores the window as a `u32`, so `u32::MAX` reads as the
+natural bound and was the one originally shipped. But both things that consume the window take an
+`i32` — the Metal kernel's `sliding_window` FFI argument, and `create_causal_mask`'s `window_size`
+(`array/mask.rs:35`). So the band `[2^31, 2^32-1]` fits serde's `usize`, fits the config guard,
+fits the `u32` spec payload, used to fit `PagedWindowSlot`, and still arrived at a dispatch **negative**.
+Measured end to end on this seam before the fix, with `"sliding_window": 3000000000`:
+
+| stage | before | after |
+| ----- | ------ | ----- |
+| serde -> `usize` | `3000000000` | same |
+| `from_json_str` guard | `Ok` (`u32::try_from`) | **`Err`**, naming the field and `i32::MAX` |
+| `compute_layer_kv_cache_specs` guard | `Ok`, 39 sliding specs | **`Err`** |
+| `sliding_window_max_admission_blocks` | `Ok(8193)` — caps, see below | unreachable |
+| `PagedWindowSlot::kernel_slot()` | `Some(-1294967296)` | **`Err`** at admission |
+| `PagedWindowSlot::mask_window()` | `Some(-1294967296)` | **`Err`** at admission |
+
+The two routes then diverged, and only one of them was loud — which is why the fix is described
+honestly as two different things:
+
+- **`KernelArgument` already failed CLOSED.** The C++ validator rejects a negative window
+  (`mlx_paged_ops.cpp:483`, *"must be >= 0 (use 0 to disable the sliding mask)"*), the extern-C
+  entry point catches it and returns `nullptr`, and `check_handle` turns that into an `Err`. For
+  this route the new refusal is a **diagnostics** improvement only: same outcome, named at the
+  config field instead of six frames into the FFI. Do not oversell it as a security fix.
+- **`ExplicitMask` failed OPEN and SILENT, and that is the half worth closing.**
+  `create_causal_mask` keeps a cell only when `linds >= rinds && linds < rinds + window_size`, so
+  a negative width keeps **nothing**. Measured on real MLX: 0 of 96 cells kept, versus 68 for the
+  causal baseline. An all-`false` mask fed to the *fused* `scaled_dot_product_attention` does
+  **not** produce NaN and does not error — every query row comes back byte-identical to
+  `mean(v, axis=keys)`, i.e. the uniform mean of every key including future positions and
+  never-written null-block pages, `max|delta| 1.2485` against the windowed reference. (The naive
+  unfused `where(mask, s, -inf)` + softmax path *does* give all-NaN; only the fused kernel is
+  silent, and the fused kernel is the one in use.) That is the same failure shape as the gemma4
+  dropped window this whole seam exists to prevent.
+
+`PagedWindowSlot` now stores the window as the `i32` its consumers take, range-checked once in
+`paged_window_for_kind`. There is no `as i32` cast left in the type, so the invariant is
+structural rather than remembered — the same argument that makes the fields private.
+
+**Do not tighten the bound further, and specifically not to `max_model_len`.** A window larger
+than the context is legal and must stay expressible: gemma4 decides *"this window cannot bite,
+keep the unmasked causal fast path"* by comparing the window against the context
+(`cache_hit_dense_window_arg`), which requires representing it first. Note also that
+`max_position_embeddings`' guard stays `u32::try_from` — that field's carrier really is a `u32`
+(`max_model_len`), so narrowing it to `i32` would be a wrong bound copied from a neighbour.
+
+**The admission cap is deliberate and must stay silent.** `sliding_window_max_admission_blocks`
+does `min(sliding_window - 1 + max_chunk, max_model_len)` with saturating arithmetic, so an absurd
+window returns `Ok(8193)` — the same answer as a window that exactly fills the context — with no
+error. That reads like a missing guard and is not one: it is vLLM's rule line for line
+(`kv_cache_interface.py:618`, `num_tokens = min(self.sliding_window - 1 +
+max_in_flight_tokens, max_model_len)` then `cdiv(...) + 1`), and turning it into an `Err` would
+refuse the legal "window wider than the context" configuration above. Pinned by
+`kv_cache_spec::tests::a_sliding_window_wider_than_the_context_caps_silently_and_is_not_an_error`,
+which also pins that this function cannot enforce the `i32` bound itself: it never sees a config
+field, so its error could not name one.
+
+Note the seam's own refusal is weaker than it looks.
 `KVCacheSpecError::InvalidSlidingWindow` is raised **only** inside
 `AttentionKind::sliding_window_max_admission_blocks` — i.e. in the admission-block
 **arithmetic**, not in validation. `validate_layer_kv_cache_specs` checks duplicate layer
@@ -859,7 +922,8 @@ behaves this way:
 | `1904b138` | The "sliding adapter x attention numerics" cell, occupied |
 | `7a898db4` | One dense cache-hit implementation, made testable |
 | `f28e99f4` | The window is taken from the gather that produced the K/V, and a mask is asked for only when the window can bite |
-| `c0faba4a` | The adapter refuses a windowed group on a window-blind dense read, for every model |
+| `c0faba4a` | The adapter refuses a windowed group on a window-blind dense read, for every model. Weaker than its first description here: `read_kv_range` refuses by WIDTH, not outright — see the table below |
+| this round | The window is bounded at `i32::MAX` at config load, at spec derivation and at dispatch admission, and `PagedWindowSlot` stores the `i32` rather than casting a `u32`. Loud for the kernel route (already fail-closed in the C++ validator, so: diagnostics), load-bearing for the mask route (a negative width was an all-`false` mask, answered silently with the uniform mean of every key) |
 
 **Copy this shape, do not re-derive it.** `CacheHitPrefillPlan.sliding_window` is a
 `DenseAttentionWindow` (`transformer/paged_kv_cache_adapter.rs`) with no public constructor, so a
@@ -867,9 +931,31 @@ literal `0` is untypeable at every dense call site; `dense_cache_hit_attention`
 (`gemma4/attention.rs`) is the single dense implementation and takes that type as a required
 parameter; and `gather_kv_for_dense_cache_hit_prefill` /
 `read_kv_range_for_dense_attention` return the window **with** the K/V, while the window-blind
-`gather_kv_for_prefill_sdpa` / `read_kv_range` now `Err` for a windowed group. That last part is
-model-independent and already covers Muse-Glimmer: M1 cannot obtain placeholder-laden dense K/V
-without holding the window, in any file, without a compile error or an `Err`.
+`gather_kv_for_prefill_sdpa` / `read_kv_range` `Err` for a windowed group.
+
+**That last clause was overstated and is corrected here**, because M1 is meant to lean on it. The
+two window-blind readers refuse with different strengths, verified by reproduction:
+
+| reader | refuses | does NOT refuse |
+| ------ | ------- | --------------- |
+| `gather_kv_for_prefill_sdpa` | **any** sliding group, unconditionally (`if self.sliding_window != 0 { Err }`) | — |
+| `read_kv_range` | a read **wider than the window** (`num_tokens > sliding_window`) | a read whose length is `<= window` no matter how old it is; `start_pos` is not consulted |
+
+So the honest statement is: **M1 cannot obtain placeholder-laden dense K/V for a route whose
+context exceeds the window** — which is the only regime where being window-blind is wrong, since
+below it nothing is out of range and nothing has been retired. It is *not* true that
+`read_kv_range` refuses a sliding group outright. Measured on a window-16 / block-8 adapter with
+48 recorded tokens: after `prune_sliding_window_for` replaced table indices 0..3 with the reserved
+null block, `read_kv_range(0, 0, 16)` returned **`Ok`** with all-zero K/V where `1001..1016` had
+been written — i.e. the never-written null block, whose contents are formally **undefined**
+(`layer_kv_pool.rs:499`: `StorageModePrivate`, *"not zeroed … returns whatever the driver handed
+out"*). Today's all-zero readback is a driver accident, not a guarantee, in either direction.
+
+No caller bleeds that data today (`new_sliding` has one production callsite; the only sliding
+`read_kv_range` caller, gemma4's cold-tier capture, declines out-of-window ranges itself), so this
+is a prospective hole plus a documentation defect rather than a live bug. If a live-tail
+(`start_pos >= recorded - window`) arm lands in the adapter, the row above tightens and this note
+should say so; do not upgrade the wording ahead of the code.
 
 ```
 prefill body chunk 1..n           (cached_prefix_len = absolute_position > 0)   [AS OF eb5713e3^]
@@ -990,8 +1076,8 @@ adapter. The contract therefore lands in the KV-cache seam first, in `muse_glimm
 | Item | What it is |
 | ---- | ---------- |
 | `WindowCarrier` | How a route can express a window: `KernelArgument` (the kernel's `sliding_window: i32`), `ExplicitMask` (`create_causal_mask`'s `window_size`), `Unsupported`. Supplied by the dispatch site, because capability is a fact the route knows and the group does not. A fifth route means a new variant, which is a **compile error** at the admitting match rather than a silently window-blind path |
-| `PagedWindowSlot` | The window argument for one admitted dispatch. Private fields, no `Default`, no public constructor — the only way to get one derives the window from the group's own `AttentionKind`, so **there is no parameter for a literal `0` to be written into**. Its two accessors are carrier-scoped and both return `Option`: `kernel_slot()` answers only on kernel routes, `mask_window()` only on mask routes, and each returns `None` — never a plausible `0` — when asked the other route's question |
-| `paged_window_for_kind` / `paged_window_for_group` | Admit one dispatch, or `Err`. Refuses a windowed group on an `Unsupported` route, and refuses a `SlidingWindow { sliding_window: 0 }` payload a third time (config load and spec derivation being the first two) because by the time a 0 reaches a kernel slot it is indistinguishable from "disable the mask". The group-level form names the **39 layers** in its error; "group 1" understates the blast radius |
+| `PagedWindowSlot` | The window argument for one admitted dispatch. Private fields, no `Default`, no public constructor — the only way to get one derives the window from the group's own `AttentionKind`, so **there is no parameter for a literal `0` to be written into**. Its two accessors are carrier-scoped and both return `Option`: `kernel_slot()` answers only on kernel routes, `mask_window()` only on mask routes, and each returns `None` — never a plausible `0` — when asked the other route's question. The window is stored as the **`i32`** both consumers take, range-checked once at admission, so **no cast survives inside the type**: storing the spec's `u32` and casting in the accessors is what let a config window in `[2^31, 2^32-1]` present itself as a NEGATIVE window (`3000000000` -> `-1294967296`) |
+| `paged_window_for_kind` / `paged_window_for_group` | Admit one dispatch, or `Err`. Refuses **three** things: a windowed group on an `Unsupported` route; a `SlidingWindow { sliding_window: 0 }` payload, a third time (config load and spec derivation being the first two) because by the time a 0 reaches a kernel slot it is indistinguishable from "disable the mask"; and a window **past `i32::MAX`**, because both consumers take an `i32` and the mask route turns a negative width into an all-`false` mask that the fused SDPA answers with the uniform mean of every key — no NaN, no error. The group-level form names the **39 layers** in its error; "group 1" understates the blast radius |
 | `admit_paged_dispatch_plan` | The per-turn choke point. Admits every group against the routes that turn selected, before any launches. `carriers` is indexed by `group_id`, so a plan that forgets a group is an arity error and a permuted group list is refused — pairing the full group's carrier with the sliding group is the same defect with a different cause |
 
 A full-attention group is admitted on **every** route, including `Unsupported`, and asks for no
@@ -1006,12 +1092,17 @@ a paged-vs-flat parity gate would then fail for a reason unrelated to windows.
 (enumerated over all three carriers, not spot-checked); a full group keeps the unmasked causal
 path; the window tracks the config rather than a constant.
 
-**Now enforced by the adapter, for every model** (`c0faba4a`): `gather_kv_for_prefill_sdpa` and
-`read_kv_range` `Err` for a windowed group, and the only dense readers that serve one return a
-`DenseAttentionWindow` alongside the K/V. `DenseAttentionWindow` has no public constructor, so a
-Muse-Glimmer forward pass cannot obtain placeholder-laden dense K/V without holding the window,
-in any file, including a shared one this family's source tripwire never reads. That closes the
-"wiring lives outside `models/muse_glimmer/`" hole in the tripwire below.
+**Now enforced by the adapter, for every model** (`c0faba4a`): `gather_kv_for_prefill_sdpa` `Err`s
+for a windowed group unconditionally, `read_kv_range` `Err`s for a read **wider than the window**,
+and the only dense readers that serve one return a `DenseAttentionWindow` alongside the K/V.
+`DenseAttentionWindow` has no public constructor, so a Muse-Glimmer forward pass cannot obtain
+placeholder-laden dense K/V **for a context wider than the window** without holding it, in any
+file, including a shared one this family's source tripwire never reads. That closes the "wiring
+lives outside `models/muse_glimmer/`" hole in the tripwire below for the regime that matters —
+below the window there are no placeholders to be laden with. See the corrected table in
+"Copy this shape, do not re-derive it" for what each reader does and does not refuse; the earlier
+"`read_kv_range` `Err`s for a windowed group" was too strong and `read_kv_range(0, 0, window)` on
+a pruned adapter returns null-block bytes with `Ok`.
 
 **Only M1 can enforce** — stated as a requirement, not a hope, because the type system cannot
 prove it: **that every dispatch actually asks.** A forward pass can always call the FFI with a
