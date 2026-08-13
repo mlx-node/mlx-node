@@ -13659,6 +13659,238 @@ mod tests {
         }
     }
 
+    /// A multi-token cache-hit prefill on a sliding-window group must not
+    /// attend to positions the window has retired, whichever paged-attention
+    /// entry point serves it.
+    ///
+    /// Geometry: `block_size = 8`, `sliding_window = 16`, 48 recorded tokens,
+    /// `cached_prefix_len = 32`, so the chunk is 16 query tokens sitting on a
+    /// 32-token cached prefix — the exact shape Gemma4's
+    /// `run_paged_prefill_chunk` produces for every body chunk after the
+    /// first. `prune_sliding_window_for` has already retired logical blocks
+    /// 0-1 (positions 0..15) onto the reserved null block, so those positions
+    /// are both out-of-window *and* physically unwritten.
+    ///
+    /// `V[pos] = pos + 1` with `Q = K = 0`: every unmasked score is identical,
+    /// so each output element is the arithmetic mean of the `V` values the
+    /// kernel actually summed. That makes the attended position set directly
+    /// readable off the output.
+    ///
+    /// Both routes must agree with the reference window mask
+    /// `max(0, ctx_len - window) <= p < ctx_len`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sliding_window_masks_retired_positions_on_every_prefill_route() {
+        const BLOCK_SIZE: u32 = 8;
+        const WINDOW: u32 = 16;
+        const HEAD_SIZE: i64 = 64;
+        const NUM_Q_HEADS: i64 = 2;
+        const PREFIX_LEN: u32 = 32;
+        const CHUNK_LEN: u32 = 16;
+        const TOTAL: u32 = PREFIX_LEN + CHUNK_LEN;
+
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: BLOCK_SIZE,
+            num_kv_heads: 1,
+            head_size: HEAD_SIZE as u32,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            16,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping sliding_window_masks_retired_positions: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, BLOCK_SIZE)));
+        let mut adapter =
+            PagedKVCacheAdapter::new_sliding(allocator, pool, BLOCK_SIZE, WINDOW, 128)
+                .expect("sliding adapter");
+        adapter.reset_for_new_request(7).unwrap();
+
+        // `V[pos] = pos + 1`, broadcast across every head component so any
+        // component of the output reads as the mean of the attended positions.
+        let write_span =
+            |adapter: &mut PagedKVCacheAdapter, first_pos: u32, len: u32| -> Result<(), String> {
+                let n = len as i64;
+                let k = MxArray::zeros(&[n, 1, HEAD_SIZE], Some(DType::Float16))
+                    .map_err(|e| format!("k zeros: {e}"))?;
+                let mut v_bits = Vec::with_capacity((n * HEAD_SIZE) as usize);
+                for offset in 0..len {
+                    let bits = f16::from_f32((first_pos + offset + 1) as f32).to_bits();
+                    v_bits.extend(std::iter::repeat_n(bits, HEAD_SIZE as usize));
+                }
+                let v = MxArray::from_float16(&v_bits, &[n, 1, HEAD_SIZE])
+                    .map_err(|e| format!("v values: {e}"))?;
+                k.eval();
+                v.eval();
+                adapter.update_keys_values(0, &k, &v, first_pos)
+            };
+
+        // Chunk boundary that production reaches before the chunk under test:
+        // record and write the 32-token prefix, then prune. cutoff =
+        // 32 - 16 = 16 -> logical blocks 0-1 become the null placeholder.
+        adapter
+            .record_tokens(&(0..PREFIX_LEN).collect::<Vec<_>>())
+            .unwrap();
+        match write_span(&mut adapter, 0, PREFIX_LEN) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping sliding_window_masks_retired_positions: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected prefix write failure: {e}"),
+        }
+        let released = adapter.prune_sliding_window_for(7).unwrap();
+        assert_eq!(
+            released, 2,
+            "prune must retire the two blocks wholly left of the live window"
+        );
+        let null_id = adapter
+            .null_block
+            .as_ref()
+            .expect("sliding adapter reserves a null block")
+            .block_id;
+        {
+            let table = adapter.block_table_for(7).expect("request table");
+            assert!(
+                table.blocks()[..2].iter().all(|b| b.block_id == null_id),
+                "positions 0..15 must point at the never-written null block"
+            );
+        }
+
+        // The chunk under test: 16 new tokens on top of the 32 cached ones.
+        adapter
+            .record_tokens(&(PREFIX_LEN..TOTAL).collect::<Vec<_>>())
+            .unwrap();
+        write_span(&mut adapter, PREFIX_LEN, CHUNK_LEN).expect("chunk write");
+
+        // Direct read of what the retired positions actually hold. The pool is
+        // `StorageModePrivate` and explicitly not zeroed (layer_kv_pool.rs),
+        // so this is driver behaviour and formally undefined -- reported to
+        // characterise the symptom, never asserted on. The gather succeeding
+        // at all is itself the finding: the dense SDPA route materializes the
+        // null placeholders that `prefill_sdpa_cache_dtype`'s comment claims
+        // it keeps a sliding group away from.
+        let (null_k_max, null_v_max) = {
+            let (keys, values) = adapter
+                .gather_kv_for_prefill_sdpa(0, TOTAL)
+                .expect("dense gather of a sliding group's full context");
+            let k_vals = keys.to_float32().expect("K to_float32");
+            let v_vals = values.to_float32().expect("V to_float32");
+            // The two blocks `prune` retired above cover positions 0..15.
+            let span = (2 * BLOCK_SIZE * HEAD_SIZE as u32) as usize;
+            let max_abs = |slice: &[f32]| slice.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
+            (max_abs(&k_vals[..span]), max_abs(&v_vals[..span]))
+        };
+        eprintln!(
+            "never-written null block, positions 0..{}: max|K| = {null_k_max}, max|V| = {null_v_max}",
+            2 * BLOCK_SIZE - 1
+        );
+
+        let q = MxArray::zeros(
+            &[CHUNK_LEN as i64, NUM_Q_HEADS, HEAD_SIZE],
+            Some(DType::Float16),
+        )
+        .expect("q zeros");
+        q.eval();
+        let scale = 1.0_f32 / (HEAD_SIZE as f32).sqrt();
+
+        // Reference: the window mask the Metal kernel applies when it is told
+        // the window. Mean of `V[p] = p + 1` over
+        // `max(0, ctx_len - WINDOW) <= p < ctx_len`.
+        let reference: Vec<f32> = (0..CHUNK_LEN)
+            .map(|i| {
+                let ctx_len = PREFIX_LEN + i + 1;
+                let lower = ctx_len.saturating_sub(WINDOW);
+                let count = ctx_len - lower;
+                let sum: u32 = (lower..ctx_len).map(|p| p + 1).sum();
+                sum as f32 / count as f32
+            })
+            .collect();
+
+        let read_head0 = |out: &MxArray| -> Vec<f32> {
+            let values = out.to_float32().expect("output to_float32");
+            (0..CHUNK_LEN as usize)
+                .map(|t| values[t * NUM_Q_HEADS as usize * HEAD_SIZE as usize])
+                .collect()
+        };
+
+        let legacy = match adapter.gather_kv_for_prefill_chunk(0, &q, PREFIX_LEN, scale) {
+            Ok(out) => read_head0(&out),
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping sliding_window_masks_retired_positions: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected legacy prefill failure: {e}"),
+        };
+        let varlen = adapter
+            .gather_kv_for_prefill_chunk_varlen(0, &q, PREFIX_LEN, scale)
+            .map(|out| read_head0(&out))
+            .expect("varlen prefill");
+
+        eprintln!("token abs_pos  reference   legacy     varlen");
+        for i in 0..CHUNK_LEN as usize {
+            eprintln!(
+                "{i:>5} {:>7}  {:>9.4} {:>9.4} {:>9.4}",
+                PREFIX_LEN as usize + i,
+                reference[i],
+                legacy[i],
+                varlen[i]
+            );
+        }
+        // Total V mass the never-written null block contributed to the first
+        // query token, backed out of an unwindowed mean over 0..=32:
+        //   mean * 33 - sum(V[16..=32]).  Zero iff the null block reads back
+        //   as zeros. Undefined either way -- reported, never relied on.
+        let unwindowed_count = (PREFIX_LEN + 1) as f32;
+        let live_sum: u32 = (WINDOW..=PREFIX_LEN).map(|p| p + 1).sum();
+        eprintln!(
+            "null-block V mass leaked into token 0 (0 => reads as zeros): {:.4}",
+            varlen[0] * unwindowed_count - live_sum as f32
+        );
+
+        for i in 0..CHUNK_LEN as usize {
+            assert!(
+                legacy[i].is_finite() && varlen[i].is_finite(),
+                "token {i}: non-finite output (legacy={}, varlen={})",
+                legacy[i],
+                varlen[i]
+            );
+        }
+        // Tolerance: f16 V values reach 48, and the mean is accumulated in
+        // f32, so 0.05 is far tighter than the smallest disagreement a
+        // dropped window can produce here (>= 4.0).
+        for i in 0..CHUNK_LEN as usize {
+            assert!(
+                (legacy[i] - reference[i]).abs() < 0.05,
+                "legacy token {i} (abs pos {}): got {}, window-masked reference {}",
+                PREFIX_LEN as usize + i,
+                legacy[i],
+                reference[i]
+            );
+        }
+        for i in 0..CHUNK_LEN as usize {
+            assert!(
+                (varlen[i] - reference[i]).abs() < 0.05,
+                "varlen token {i} (abs pos {}): got {}, window-masked reference {}. \
+                 The varlen prefill-chunk wrapper dropped the sliding window, so the \
+                 kernel attended retired positions (including the unwritten null block).",
+                PREFIX_LEN as usize + i,
+                varlen[i],
+                reference[i]
+            );
+        }
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn test_gather_kv_for_prefill_sdpa_preserves_layout_and_native_dependency() {
