@@ -55,12 +55,32 @@ pub fn compute_layer_kv_cache_specs(
     // Config load refuses both of these already; repeated here because this
     // function is `pub` and must not trust that its caller came through
     // `MuseGlimmerConfig::from_json_str`.
-    let sliding_window = u32::try_from(text.sliding_window).map_err(|_| {
-        format!(
-            "muse_glimmer KV cache specs: sliding_window {} does not fit in a u32",
-            text.sliding_window
-        )
-    })?;
+    //
+    // The window is bounded at `i32::MAX`, not at `u32::MAX`, even though
+    // `AttentionKind` stores it as a `u32`. The reason is downstream: every
+    // consumer of the window takes an `i32` — the kernel's `sliding_window` FFI
+    // argument and `create_causal_mask`'s `window_size` — so a value in
+    // `[2^31, 2^32-1]` fits the spec type and still arrives at a dispatch
+    // negative (3_000_000_000 -> -1_294_967_296), where the mask route silently
+    // masks every key. `paged_window_for_kind` refuses it a third time; see its
+    // docs for the measurement.
+    let sliding_window = i32::try_from(text.sliding_window)
+        .map(|window| {
+            // `text.sliding_window` is a `usize`, so the checked value cannot be
+            // negative and this is the identity. Spelled `unsigned_abs` rather
+            // than `as u32` so no cast survives in this file to be copied into a
+            // context where the sign is not already known.
+            window.unsigned_abs()
+        })
+        .map_err(|_| {
+            format!(
+                "muse_glimmer KV cache specs: sliding_window {} exceeds i32::MAX ({}); \
+                 the window's consumers are an i32 kernel argument and an i32 mask \
+                 width, and a value past i32::MAX reaches them negative",
+                text.sliding_window,
+                i32::MAX
+            )
+        })?;
     if sliding_window == 0 {
         return Err(
             "muse_glimmer KV cache specs require sliding_window > 0; a 0 window would \
@@ -423,7 +443,16 @@ pub struct PagedWindowSlot {
     carrier: WindowCarrier,
     /// 0 means full attention. Non-zero only ever came from an
     /// `AttentionKind::SlidingWindow` payload.
-    window: u32,
+    ///
+    /// Stored as the `i32` both consumers actually take — the kernel's
+    /// `sliding_window` FFI slot and `create_causal_mask`'s `window_size` — and
+    /// range-checked once, in [`paged_window_for_kind`]. Storing the spec's `u32`
+    /// and casting in the accessors is what let a config-supplied
+    /// `sliding_window` in `[2^31, 2^32-1]` reach a dispatch as a NEGATIVE
+    /// window: 3_000_000_000 arrives as -1_294_967_296. There is no cast in this
+    /// type any more, so the invariant is structural rather than remembered,
+    /// which is the same argument as the private fields above.
+    window: i32,
 }
 
 impl PagedWindowSlot {
@@ -436,7 +465,7 @@ impl PagedWindowSlot {
     /// group can never produce `Some(0)`, which is the whole point.
     pub fn kernel_slot(&self) -> Option<i32> {
         match self.carrier {
-            WindowCarrier::KernelArgument => Some(self.window as i32),
+            WindowCarrier::KernelArgument => Some(self.window),
             WindowCarrier::ExplicitMask | WindowCarrier::Unsupported => None,
         }
     }
@@ -451,7 +480,7 @@ impl PagedWindowSlot {
     /// numerics for no correctness gain.
     pub fn mask_window(&self) -> Option<i32> {
         match self.carrier {
-            WindowCarrier::ExplicitMask if self.window != 0 => Some(self.window as i32),
+            WindowCarrier::ExplicitMask if self.window != 0 => Some(self.window),
             _ => None,
         }
     }
@@ -471,7 +500,7 @@ impl PagedWindowSlot {
 /// Admit ONE dispatch: pair an attention kind with the route that will execute
 /// it, or refuse.
 ///
-/// Refuses exactly two things, each because it fails OPEN otherwise:
+/// Refuses exactly three things, each because it fails OPEN otherwise:
 ///
 ///   * a windowed kind on a route whose [`WindowCarrier`] cannot express a
 ///     window. Silently dropping the window widens 39 of this decoder's 52
@@ -484,6 +513,36 @@ impl PagedWindowSlot {
 ///     [`compute_layer_kv_cache_specs`] both refuse it already; refused a third
 ///     time here because this is the last point before a kernel launch, and a 0
 ///     arriving in a kernel slot is indistinguishable from "disable the mask".
+///   * a window past `i32::MAX`. `AttentionKind` carries the window as a `u32`
+///     but BOTH consumers take an `i32` — the kernel's `sliding_window` FFI
+///     argument and `create_causal_mask`'s `window_size` (`array/mask.rs:35`) —
+///     so a spec in `[2^31, 2^32-1]` used to arrive here and be handed on as a
+///     negative number: 3_000_000_000 becomes -1_294_967_296. The two routes
+///     then diverge, and one of them is silent:
+///
+///     - KernelArgument fails CLOSED. The C++ validator rejects a negative
+///       window (`mlx_paged_ops.cpp:483`, "must be >= 0 (use 0 to disable the
+///       sliding mask)"), the entry point catches it and returns nullptr, and
+///       `check_handle` turns that into an `Err`. So for this route the refusal
+///       below only moves the diagnosis from deep inside the FFI to the field
+///       that caused it — an error-message improvement, not a new guarantee.
+///     - ExplicitMask fails OPEN and SILENTLY. `create_causal_mask`'s predicate
+///       is `linds >= rinds && linds < rinds + window_size`, so a negative
+///       `window_size` makes the second half false for every cell and the mask
+///       all-`false` (bool `true = keep`). Measured on real MLX: 0 of 96 cells
+///       kept versus 68 for the causal baseline. Fed to the fused
+///       `scaled_dot_product_attention` an all-false mask does NOT produce NaN
+///       and does not error — every query row comes back as the uniform mean of
+///       ALL V rows, finite and plausible, max|delta| 1.2485 against the
+///       windowed reference. That is the same failure shape as the gemma4
+///       dropped window this seam exists to prevent, so THIS is the half the
+///       refusal actually closes.
+///
+///     The bound is `i32::MAX`, not `max_model_len` or any context-derived
+///     value: a window larger than the context is legal and must stay
+///     expressible — gemma4's `cache_hit_dense_window_arg` decides "the window
+///     cannot bite" by comparing it against the context, which requires
+///     representing it first.
 ///
 /// A full-attention kind is admitted on every route including `Unsupported`,
 /// with nothing to carry. That is not laxity: refusing it would refuse a legal
@@ -504,7 +563,20 @@ pub fn paged_window_for_kind(
                     .to_string(),
             );
         }
-        AttentionKind::SlidingWindow { sliding_window } => sliding_window,
+        AttentionKind::SlidingWindow { sliding_window } => {
+            i32::try_from(sliding_window).map_err(|_| {
+                format!(
+                    "muse_glimmer paged dispatch: sliding window {sliding_window} exceeds \
+                     i32::MAX ({}), so it cannot reach a dispatch intact; both consumers \
+                     take an i32 — the kernel's sliding_window FFI slot, which rejects a \
+                     negative (mlx_paged_ops.cpp:483), and create_causal_mask's \
+                     window_size, where a negative width masks EVERY key with no error \
+                     and returns the uniform mean of all V rows. Reject the window at \
+                     config load, where the field has a name",
+                    i32::MAX
+                )
+            })?
+        }
     };
 
     if window != 0 && !carrier.can_carry_a_window() {
@@ -1735,6 +1807,152 @@ mod tests {
     ///
     /// Mutation caught: `admit_paged_dispatch_plan` returning slots in
     /// iteration order of a set, or admitting only `groups[0]`.
+    /// The negative-window analogue of
+    /// `no_admitted_sliding_dispatch_can_ever_present_a_zero_window`, and the one
+    /// that closes a real hole rather than restating a satisfied invariant.
+    ///
+    /// `AttentionKind` stores the window as a `u32`, but both consumers take an
+    /// `i32`, so the band `[2^31, 2^32-1]` fits every type on the way down and
+    /// still arrives at a dispatch NEGATIVE. Measured before the fix, on this
+    /// exact seam: window 3_000_000_000 gave `kernel_slot() == Some(-1294967296)`
+    /// and `mask_window() == Some(-1294967296)`; 2_147_483_648 gave
+    /// `Some(-2147483648)`; `u32::MAX` gave `Some(-1)`.
+    ///
+    /// The two routes then behave differently, and only one of them is loud:
+    ///
+    ///   * KernelArgument fails CLOSED — the C++ validator rejects a negative
+    ///     window (`mlx_paged_ops.cpp:483`), which surfaces as an `Err`. For that
+    ///     route this refusal is a DIAGNOSTICS improvement: same outcome, named at
+    ///     the config field instead of six frames into the FFI.
+    ///   * ExplicitMask fails OPEN and SILENT — `create_causal_mask` keeps a cell
+    ///     only when `linds < rinds + window_size` (`array/mask.rs:63`), so a
+    ///     negative width keeps nothing. On real MLX that is 0 of 96 cells kept
+    ///     versus 68 causal, and the fused SDPA fed an all-false mask returns the
+    ///     uniform mean of EVERY V row: finite, plausible, no NaN, no error,
+    ///     max|delta| 1.2485 against the windowed reference. This is the half the
+    ///     refusal actually closes, and it is the same failure shape as the gemma4
+    ///     dropped window.
+    ///
+    /// So the assertion is deliberately "Err", not "Some(0)" or "not negative":
+    /// there is no legal thing for the seam to substitute. Refusing is the whole
+    /// answer.
+    ///
+    /// Mutation caught: deleting the `i32::try_from` arm in
+    /// `paged_window_for_kind` — every REFUSED value becomes `Ok` and presents a
+    /// negative window on its carrier's accessor.
+    #[test]
+    fn no_admitted_dispatch_can_ever_present_a_negative_window() {
+        // Every value that fits the spec's `u32` but not an `i32`.
+        const REFUSED: [u32; 4] = [
+            i32::MAX as u32 + 1, // 2_147_483_648 -> i32::MIN
+            3_000_000_000,       // the reviewer's value -> -1_294_967_296
+            u32::MAX - 1,
+            u32::MAX, // -> -1
+        ];
+        // The real checkpoint's window, and the largest legal one. `i32::MAX` must
+        // keep round-tripping: a window bigger than the context is legal, and
+        // gemma4 decides "the window cannot bite" by comparing the two, which
+        // needs the window representable first.
+        const ACCEPTED: [u32; 3] = [2048, 1 << 30, i32::MAX as u32];
+
+        for carrier in [
+            WindowCarrier::KernelArgument,
+            WindowCarrier::ExplicitMask,
+            WindowCarrier::Unsupported,
+        ] {
+            for window in REFUSED {
+                let err = paged_window_for_kind(
+                    AttentionKind::SlidingWindow {
+                        sliding_window: window,
+                    },
+                    carrier,
+                )
+                .expect_err(
+                    "a window past i32::MAX cannot reach a dispatch intact and must be \
+                     refused, not narrowed",
+                );
+                assert!(
+                    err.contains("exceeds i32::MAX"),
+                    "{carrier:?} window {window}: the refusal must name the i32 bound \
+                     rather than reading as an unrelated failure, got: {err}"
+                );
+                assert!(
+                    err.contains("masks EVERY key"),
+                    "{carrier:?} window {window}: the refusal must say what a negative \
+                     width does to the mask route, because that is the silent half — an \
+                     error that only says \"invalid\" gets read as pedantry and deleted, \
+                     got: {err}"
+                );
+            }
+
+            for window in ACCEPTED {
+                let slot = paged_window_for_kind(
+                    AttentionKind::SlidingWindow {
+                        sliding_window: window,
+                    },
+                    carrier,
+                );
+                let Ok(slot) = slot else {
+                    // Refused for the OTHER reason — an incapable route. Covered by
+                    // `a_sliding_group_on_a_window_blind_route_is_refused`.
+                    assert!(!carrier.can_carry_a_window());
+                    continue;
+                };
+                let expected = i32::try_from(window).expect("ACCEPTED values fit an i32");
+                match carrier {
+                    WindowCarrier::KernelArgument => {
+                        assert_eq!(slot.kernel_slot(), Some(expected));
+                        assert_eq!(slot.mask_window(), None);
+                    }
+                    WindowCarrier::ExplicitMask => {
+                        assert_eq!(slot.mask_window(), Some(expected));
+                        assert_eq!(slot.kernel_slot(), None);
+                    }
+                    WindowCarrier::Unsupported => unreachable!("refused above"),
+                }
+                assert!(
+                    slot.kernel_slot().unwrap_or(1) > 0 && slot.mask_window().unwrap_or(1) > 0,
+                    "{carrier:?} window {window}: an admitted sliding dispatch must \
+                     present a strictly positive window wherever it presents one"
+                );
+            }
+        }
+    }
+
+    /// The same bound on the second line of defence. `compute_layer_kv_cache_specs`
+    /// is `pub`, so a config that never went through `from_json_str` — or one
+    /// mutated afterwards, since the fields are `pub` — must not be able to mint a
+    /// `SlidingWindow` spec that only fails later, at a dispatch. Measured before
+    /// the fix: this returned `Ok` with
+    /// `SlidingWindow { sliding_window: 3000000000 }` on all 39 sliding layers.
+    ///
+    /// Mutation caught: reverting the derivation's guard to `u32::try_from`.
+    #[test]
+    fn a_sliding_window_past_i32_max_never_becomes_a_spec() {
+        let mut cfg = checkpoint_config();
+        for window in [i32::MAX as usize + 1, 3_000_000_000, u32::MAX as usize] {
+            cfg.text_config.sliding_window = window;
+            let err = compute_layer_kv_cache_specs(&cfg, 16, KVCacheDType::BFloat16)
+                .expect_err("a window past i32::MAX must not become 39 sliding specs");
+            assert!(
+                err.contains("exceeds i32::MAX") && err.contains(&window.to_string()),
+                "the refusal must name the bound and print the observed window {window}, \
+                 got: {err}"
+            );
+        }
+
+        // And the boundary stays legal, all the way to a group.
+        cfg.text_config.sliding_window = i32::MAX as usize;
+        let specs = compute_layer_kv_cache_specs(&cfg, 16, KVCacheDType::BFloat16)
+            .expect("i32::MAX is the largest legal window and must still derive");
+        assert_eq!(
+            specs[0].attention_kind,
+            AttentionKind::SlidingWindow {
+                sliding_window: i32::MAX as u32
+            }
+        );
+    }
+
     #[test]
     fn the_dispatch_plan_admits_every_group_in_group_id_order() {
         let cfg = checkpoint_config();
@@ -1846,10 +2064,27 @@ mod tests {
     ///    the seam and launches a second one with a literal passes.
     /// 3. **This family's directory only.** Wiring placed in a shared file —
     ///    `transformer/block.rs`, a new generic paged forward — trips nothing
-    ///    here. That gap is covered from the other side, in the adapter: its
-    ///    window-blind dense readers (`gather_kv_for_prefill_sdpa`,
-    ///    `read_kv_range`) refuse a sliding group outright, so a shared route
-    ///    cannot serve one window-blind regardless of which family calls it.
+    ///    here. That gap is covered from the other side, in the adapter, but the
+    ///    two window-blind dense readers refuse with DIFFERENT strengths and the
+    ///    difference matters to whoever leans on this:
+    ///
+    ///    * `gather_kv_for_prefill_sdpa` refuses a sliding group
+    ///      unconditionally — one `if self.sliding_window != 0 { Err }`, no
+    ///      argument inspected.
+    ///    * `read_kv_range` refuses by WIDTH: a read of more tokens than the
+    ///      window. It does NOT refuse a sliding group outright, and an earlier
+    ///      revision of this comment said it did.
+    ///
+    ///    The narrower guarantee is still enough for the claim being made here,
+    ///    and that is why the wording is worth getting exact rather than
+    ///    rounding up. A window-blind dense route reads the whole context,
+    ///    `read_kv_range(layer, 0, total_ctx)`, and a window can only bite when
+    ///    `total_ctx > window` — which is exactly the width the reader refuses.
+    ///    When `total_ctx <= window` the read is served, and being window-blind
+    ///    there is numerically identical to carrying the window, because nothing
+    ///    is out of range and nothing has been retired to the null block. So a
+    ///    shared route cannot serve a sliding group window-blind in the regime
+    ///    where that would be wrong, regardless of which family calls it.
     ///
     /// The scan itself IS recursive, so a `muse_glimmer/attention/paged.rs`
     /// subdirectory is opened — this repo already ships that layout elsewhere

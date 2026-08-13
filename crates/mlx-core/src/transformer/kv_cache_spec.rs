@@ -702,6 +702,91 @@ mod tests {
         );
     }
 
+    /// The `min(max_model_len)` cap is DELIBERATE and must stay silent, and the
+    /// only refusal here is a 0 window. Recorded because the arithmetic reads like
+    /// a missing guard: an absurd window sails through with no error, so the next
+    /// reader is tempted to "harden" it into `Err`.
+    ///
+    /// Two reasons not to.
+    ///
+    ///   1. It is vLLM's rule, line for line.
+    ///      `vllm/v1/kv_cache_interface.py:618` is
+    ///      `num_tokens = min(self.sliding_window - 1 + max_in_flight_tokens,
+    ///      max_model_len)` followed by `cdiv(num_tokens, block_size) + 1`. A
+    ///      window wider than the context needs exactly the context's worth of
+    ///      blocks; capping is the correct answer, not a papered-over overflow.
+    ///   2. A window larger than the context is LEGAL and must stay expressible.
+    ///      gemma4 decides "this window cannot bite, keep the unmasked causal fast
+    ///      path" by comparing the window against the context, which requires
+    ///      representing it first. An `Err` here would refuse a legal
+    ///      configuration.
+    ///
+    /// Where the real bound lives instead: at config load, and it is `i32::MAX`,
+    /// not `max_model_len` — the window's consumers are an `i32` kernel argument
+    /// and an `i32` mask width, so `[2^31, 2^32-1]` fits this `u32` and still
+    /// reaches a dispatch negative. See
+    /// `models::muse_glimmer::config::tests::bounds_the_sliding_window_at_i32_max_not_u32_max`.
+    /// This function cannot enforce that bound: it never sees a config field, so
+    /// its error could not name one.
+    ///
+    /// Mutations caught: turning the cap into a refusal (the huge windows start
+    /// erroring); replacing `saturating_*` with `+`/`-` (`u32::MAX` panics in
+    /// debug); dropping the `min(max_model_len)` (the huge windows stop agreeing
+    /// with the exactly-`max_model_len` window).
+    #[test]
+    fn a_sliding_window_wider_than_the_context_caps_silently_and_is_not_an_error() {
+        const MAX_MODEL_LEN: u32 = 131_072;
+        const CHUNK: u32 = 512;
+        const BLOCK: u32 = 16;
+
+        // The reference answer: a window that exactly fills the context.
+        let capped = AttentionKind::sliding_window_max_admission_blocks(
+            MAX_MODEL_LEN,
+            MAX_MODEL_LEN,
+            CHUNK,
+            BLOCK,
+        )
+        .expect("a window equal to max_model_len is admissible");
+        assert_eq!(capped, 8193);
+
+        // Everything wider agrees with it, and none of it errors or wraps.
+        for window in [
+            MAX_MODEL_LEN + 1,
+            i32::MAX as u32,
+            i32::MAX as u32 + 1,
+            3_000_000_000,
+            u32::MAX - 1,
+            u32::MAX, // `saturating_add(CHUNK)` must saturate, not wrap to 511
+        ] {
+            let blocks = AttentionKind::sliding_window_max_admission_blocks(
+                window,
+                MAX_MODEL_LEN,
+                CHUNK,
+                BLOCK,
+            )
+            .unwrap_or_else(|e| {
+                panic!(
+                    "window {window} is wider than the context, which is legal and \
+                             must cap rather than fail, got: {e}"
+                )
+            });
+            assert_eq!(
+                blocks, capped,
+                "window {window} must admit the same blocks as a window that exactly \
+                 fills the context; a different answer means the cap was skipped or the \
+                 arithmetic wrapped"
+            );
+        }
+
+        // The ONE refusal this function owns. It is also the only site that
+        // produces `InvalidSlidingWindow`, which is why neither
+        // `validate_layer_kv_cache_specs` nor the coordinator path catches a 0.
+        assert!(matches!(
+            AttentionKind::sliding_window_max_admission_blocks(0, MAX_MODEL_LEN, CHUNK, BLOCK),
+            Err(KVCacheSpecError::InvalidSlidingWindow { sliding_window: 0 })
+        ));
+    }
+
     #[test]
     fn shared_kv_anchor_omits_alias_from_physical_layers() {
         let specs = vec![

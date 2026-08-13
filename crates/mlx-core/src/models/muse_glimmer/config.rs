@@ -409,9 +409,22 @@ impl MuseGlimmerConfig {
         //     0 is a DIFFERENT namespace from `layer_rope_theta`'s 0, which means
         //     NoPE; the same digit means unrelated things in the two tables and
         //     they must never be conflated.
-        //   * a value past `u32::MAX` truncates on the way into the KV-cache
-        //     seam, which carries the window as a `u32`. 5_000_000_000 would
-        //     arrive as 705_032_704: a plausible-looking window nobody asked for.
+        //   * a value past `i32::MAX` reaches a dispatch NEGATIVE. The KV-cache
+        //     seam stores the window as a `u32`, so `u32::MAX` looks like the
+        //     natural bound, but both things that consume the window take an
+        //     `i32`: the Metal kernel's `sliding_window` FFI argument and
+        //     `create_causal_mask`'s `window_size` (`array/mask.rs:35`). So the
+        //     band `[2^31, 2^32-1]` fits every type on the way down and still
+        //     arrives wrong — 3_000_000_000 becomes -1_294_967_296. The kernel
+        //     route then fails closed (the C++ validator rejects a negative
+        //     window, `mlx_paged_ops.cpp:483`), but the MASK route fails open and
+        //     silent: `create_causal_mask` keeps a cell only when
+        //     `linds < rinds + window_size`, so a negative width keeps NOTHING,
+        //     and the fused SDPA fed an all-false mask returns the uniform mean
+        //     of every V row — finite, plausible, no NaN, no error, max|delta|
+        //     1.2485 against the windowed reference on real MLX. Beyond
+        //     `u32::MAX` the value also truncates outright (5_000_000_000 would
+        //     arrive as 705_032_704), which the same check covers.
         //
         // Validating here rather than at spec derivation is deliberate, and the
         // reason is stronger than "earlier is better": the seam's own refusal is
@@ -435,11 +448,15 @@ impl MuseGlimmerConfig {
                 text.sliding_window
             )));
         }
-        if u32::try_from(text.sliding_window).is_err() {
+        if i32::try_from(text.sliding_window).is_err() {
             return Err(Error::from_reason(format!(
-                "muse_glimmer: sliding_window {} does not fit in a u32; the KV cache \
-                 seam carries the window as a u32 and a cast would truncate it",
-                text.sliding_window
+                "muse_glimmer: sliding_window {} exceeds i32::MAX ({}); the window's two \
+                 consumers are both i32 — the paged kernel's sliding_window argument and \
+                 create_causal_mask's window_size — so a larger value reaches a dispatch \
+                 negative, and a negative mask width keeps no keys at all instead of \
+                 failing",
+                text.sliding_window,
+                i32::MAX
             )));
         }
 
@@ -930,19 +947,81 @@ mod tests {
         );
     }
 
-    /// The window crosses into the KV-cache seam as a `u32`. A `usize` value
-    /// past `u32::MAX` must be an error, never a silent truncation: `as u32`
-    /// turns 5_000_000_000 into 705_032_704, a plausible-looking window that is
-    /// not the one the checkpoint asked for.
+    /// The window's bound is `i32::MAX`, not `u32::MAX`, and the boundary is
+    /// walked rather than spot-checked because the dangerous band is exactly
+    /// `[2^31, 2^32-1]` — every value there fits the `u32` the KV-cache seam
+    /// stores and still arrives at a dispatch NEGATIVE, since both consumers take
+    /// an `i32` (the kernel's `sliding_window` FFI argument and
+    /// `create_causal_mask`'s `window_size`). Measured: 3_000_000_000 reaches
+    /// `PagedWindowSlot::mask_window()` as -1_294_967_296, and a negative mask
+    /// width keeps 0 of 96 cells, which the fused SDPA turns into the uniform
+    /// mean of every V row — no NaN, no error, max|delta| 1.2485 against the
+    /// windowed reference. Past `u32::MAX` the value truncates outright
+    /// (5_000_000_000 -> 705_032_704), which the same check covers.
+    ///
+    /// `i32::MAX` itself must stay ACCEPTED. A window larger than the context is
+    /// legal, and gemma4's "the window cannot bite" fast path decides by
+    /// comparing the window against the context, which needs it representable
+    /// first. So this test pins both directions.
+    ///
+    /// Mutations caught: reverting the guard to `u32::try_from` (2_147_483_648
+    /// and 4_294_967_295 become `Ok`); tightening it below `i32::MAX`
+    /// (2_147_483_647 stops parsing). Pinned to this guard's own "exceeds
+    /// i32::MAX" wording, not merely to the token `sliding_window`, because the
+    /// zero-window guard's message also contains that token and a loose assertion
+    /// would survive deleting this one.
     #[test]
-    fn rejects_a_sliding_window_that_does_not_fit_a_u32() {
-        let bad = text_config_json(52)
-            .replace("\"sliding_window\": 2048", "\"sliding_window\": 5000000000");
-        let err = parse(&bad).unwrap_err().to_string();
+    fn bounds_the_sliding_window_at_i32_max_not_u32_max() {
+        const ACCEPTED: [usize; 3] = [2048, 1 << 30, i32::MAX as usize];
+        const REFUSED: [usize; 3] = [
+            i32::MAX as usize + 1, // 2_147_483_648: fits a u32, arrives as i32::MIN
+            u32::MAX as usize,     // 4_294_967_295: fits a u32, arrives as -1
+            u32::MAX as usize + 1, // 4_294_967_296: does not even fit a u32
+        ];
+
+        for window in ACCEPTED {
+            let json = text_config_json(52).replace(
+                "\"sliding_window\": 2048",
+                &format!("\"sliding_window\": {window}"),
+            );
+            let cfg = parse(&json).unwrap_or_else(|e| {
+                panic!("sliding_window {window} is <= i32::MAX and must parse, got: {e}")
+            });
+            assert_eq!(cfg.text_config.sliding_window, window);
+        }
+
+        for window in REFUSED {
+            let json = text_config_json(52).replace(
+                "\"sliding_window\": 2048",
+                &format!("\"sliding_window\": {window}"),
+            );
+            let err = parse(&json)
+                .expect_err("a sliding_window past i32::MAX must fail closed at config load")
+                .to_string();
+            assert!(
+                err.contains("exceeds i32::MAX") && err.contains(&window.to_string()),
+                "the refusal must name the i32 bound and print the observed value \
+                 {window}, got: {err}"
+            );
+        }
+    }
+
+    /// A literal negative window never reaches our code at all: `sliding_window`
+    /// deserializes as `usize`, so serde refuses it before any guard runs.
+    /// Recorded as a test rather than as a comment because it is the reason the
+    /// guard above only has to check the UPPER bound — if the field's type ever
+    /// widened to a signed one, this test goes red and the missing lower bound
+    /// becomes visible instead of arriving at the kernel as a negative window.
+    #[test]
+    fn a_negative_sliding_window_is_refused_by_deserialization_before_any_guard() {
+        let bad =
+            text_config_json(52).replace("\"sliding_window\": 2048", "\"sliding_window\": -1");
+        let err = parse(&bad)
+            .expect_err("a negative sliding_window must not deserialize")
+            .to_string();
         assert!(
-            err.contains("sliding_window") && err.contains("5000000000"),
-            "an out-of-u32 sliding_window must fail closed and print the observed \
-             value, got: {err}"
+            err.contains("-1"),
+            "serde must reject the negative window and name it, got: {err}"
         );
     }
 
