@@ -2062,6 +2062,12 @@ impl PagedKVCacheAdapter {
     /// Logical positions remain absolute up to `logical_max_tokens`; old
     /// physical blocks are replaced by a reserved null block after evaluation
     /// once every token in that block is older than `sliding_window`.
+    ///
+    /// `sliding_window` must fit an `i32`: the six paged dispatch sites carry
+    /// it to the kernel's signed `sliding_window` slot, and the native
+    /// validator rejects a negative one. See
+    /// [`Self::new_with_attention_kind`] for why the check lives at
+    /// construction rather than at each cast.
     pub fn new_sliding(
         allocator: Arc<Mutex<BlockAllocator>>,
         layer_kv_pool: Arc<LayerKVPool>,
@@ -2084,6 +2090,21 @@ impl PagedKVCacheAdapter {
         )
     }
 
+    /// The one choke point every constructor funnels through, so it is where
+    /// the window's representability is settled.
+    ///
+    /// `sliding_window` is stored as `u32` because logical positions and token
+    /// counts are unsigned, but every consumer downstream is signed: the six
+    /// paged dispatch sites pass `self.sliding_window as i32` into the kernel's
+    /// `sliding_window` slot, whose C++ validator rejects a negative value
+    /// ("must be >= 0 (use 0 to disable the sliding mask)"), and
+    /// `create_causal_mask`'s window width is `i32` too, where a negative width
+    /// masks EVERY key — a silent, finite, plausible-looking wrong answer
+    /// rather than an error. A window in `[2^31, 2^32-1]` is the only band that
+    /// wraps, and refusing it here is what makes those casts provably
+    /// non-negative. Checking once at construction keeps the six dispatch sites
+    /// uniform (`self.sliding_window`, never a literal) instead of scattering
+    /// six guards.
     fn new_with_attention_kind(
         allocator: Arc<Mutex<BlockAllocator>>,
         layer_kv_pool: Arc<LayerKVPool>,
@@ -2091,6 +2112,14 @@ impl PagedKVCacheAdapter {
         sliding_window: u32,
         logical_max_tokens: Option<u32>,
     ) -> Result<Self, String> {
+        if i32::try_from(sliding_window).is_err() {
+            return Err(format!(
+                "sliding_window {sliding_window} does not fit in an i32. The paged kernel's \
+                 sliding_window slot and create_causal_mask's window width are both signed, \
+                 so this window would arrive negative: the kernel rejects that, and a \
+                 negative mask width masks every key instead of erroring."
+            ));
+        }
         let (allocator_block_size, allocator_num_blocks) = {
             let guard = allocator
                 .lock()
@@ -14631,6 +14660,86 @@ mod tests {
         assert!(
             (first - 1.0).abs() < 1e-3,
             "position 0 must return the written V[0] = 1, not null-block bytes, got {first}"
+        );
+    }
+
+    /// `new_sliding` must refuse a window it cannot carry to the kernel.
+    ///
+    /// Six paged dispatch sites pass `self.sliding_window as i32`, and
+    /// `mlx_paged_ops.cpp` rejects a negative window
+    /// ("must be >= 0 (use 0 to disable the sliding mask)"). A window in
+    /// `[2^31, 2^32-1]` survives every u32-shaped guard upstream and wraps to
+    /// a negative i32 at the FFI boundary; on the kernel route that is a clean
+    /// native error, but on a `create_causal_mask` route a negative width
+    /// masks EVERY key (measured against real MLX: 0 of 96 cells kept vs 68
+    /// causal) and the fused SDPA then returns the finite, plausible-looking
+    /// uniform mean of all V rows -- no NaN, no error. Refusing at
+    /// construction makes the six casts provably non-negative instead.
+    ///
+    /// Mutation caught: deleting the `i32::try_from` arm accepts 2^31 and
+    /// 2^32-1.
+    #[test]
+    fn new_sliding_refuses_a_window_that_cannot_reach_the_kernels_i32_slot() {
+        const BLOCK: u32 = 16;
+        const NUM_BLOCKS: u32 = 16;
+        // Same pool geometry as `build_sliding_prefill_fixture`, which is known
+        // to construct on this machine -- a config that failed to build a pool
+        // would make this test skip and pass for the wrong reason.
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: BLOCK,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            NUM_BLOCKS,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping new_sliding i32-window test: {e}");
+                return;
+            }
+        };
+        let new_sliding = |window: u32| {
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK)));
+            PagedKVCacheAdapter::new_sliding(allocator, Arc::clone(&pool), BLOCK, window, 128)
+        };
+
+        for window in [1u32 << 31, u32::MAX] {
+            let refused = match new_sliding(window) {
+                Ok(_) => {
+                    panic!("sliding_window {window} wraps to a negative i32 and must be refused")
+                }
+                Err(e) => e,
+            };
+            assert!(
+                refused.contains("i32") && refused.contains(&window.to_string()),
+                "the refusal must name i32 and the offending value, got: {refused}"
+            );
+        }
+
+        // CONTROL: every window a real checkpoint can carry stays accepted,
+        // including the exact i32 boundary. Tightening this to a
+        // context-derived bound would be wrong -- a window larger than the
+        // context is legal and must stay representable.
+        for window in [1u32, 512, 1024, 2048, i32::MAX as u32] {
+            new_sliding(window)
+                .unwrap_or_else(|e| panic!("sliding_window {window} must stay accepted, got: {e}"));
+        }
+        // And the pre-existing zero refusal keeps its own wording.
+        let refused = match new_sliding(0) {
+            Ok(_) => panic!("a zero window is not a sliding group"),
+            Err(e) => e,
+        };
+        assert!(
+            refused.contains("must be positive"),
+            "the zero refusal must keep its wording, got: {refused}"
         );
     }
 
