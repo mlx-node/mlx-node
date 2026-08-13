@@ -6459,16 +6459,46 @@ impl PagedKVCacheAdapter {
     /// length × `num_kv_heads * head_size` (typically a few MB per layer).
     /// ## Windowed groups
     ///
-    /// A read wider than this adapter's sliding window is **refused**. For a
-    /// windowed group the positions below `end - sliding_window` are either
-    /// stale (out of window) or, once `prune_sliding_window_for` has fired,
-    /// physically on the reserved null block and never written -- and this
+    /// For a windowed group this refuses any range that is not inside the LIVE
+    /// window, on two independent counts:
+    ///
+    /// - **Too wide** — `num_tokens > sliding_window` can never fit the window
+    ///   wherever it starts.
+    /// - **Too old** — `start_pos` below
+    ///   `block_table.num_tokens() - sliding_window`. Width alone does not
+    ///   imply liveness: a range exactly as long as the window is still
+    ///   entirely retired if it starts far enough back, and the width check is
+    ///   offset-blind.
+    ///
+    /// Positions below that floor are either stale (out of window) or, once
+    /// `prune_sliding_window_for` has fired, physically on the reserved null
+    /// block, which `LayerKVPool` allocates `StorageModePrivate` and never
+    /// zeroes — so their bytes are formally undefined, and "they happen to read
+    /// back as zeros" is a property of the driver, not a contract. This
     /// signature has nowhere to return the window a caller would have to mask
-    /// them out with. Callers that legitimately need the whole context for a
-    /// dense attention route use [`Self::read_kv_range_for_dense_attention`],
-    /// which returns the window with the K/V. Cold-tier sliding capture is
-    /// unaffected: it reads `min(boundary, sliding_window)` tokens by
-    /// construction.
+    /// them out with, so it refuses instead. Callers that legitimately need the
+    /// whole context for a dense attention route use
+    /// [`Self::read_kv_range_for_dense_attention`], which returns the window
+    /// with the K/V.
+    ///
+    /// The floor is the same quantity `prune_sliding_window_for` derives its
+    /// cutoff from, but token-granular where the prune is block-granular. So
+    /// this is deliberately stricter than "touches the null block": it also
+    /// refuses out-of-window positions that happen to still be resident,
+    /// because attending them is the defect, not merely dereferencing them.
+    ///
+    /// ## Reading for attention vs reading for persistence
+    ///
+    /// The refusal is blanket because no caller has the second intent. Reading
+    /// a retired range in order to PERSIST it would be legitimate, but the one
+    /// candidate — gemma4 cold-tier sliding capture — never asks for one: it
+    /// reads `min(boundary, sliding_window)` tokens from
+    /// `boundary - live_tokens`, and declines outright when
+    /// `recorded - start > sliding_window`, which is algebraically this same
+    /// live-tail rule. If a persistence caller ever does appear, the honest
+    /// shape is a separate reader that checks each covered block id against the
+    /// reserved null id and errs when a block is gone — never one that hands
+    /// undefined bytes back as data.
     #[cfg(target_os = "macos")]
     pub fn read_kv_range(
         &mut self,
@@ -6476,16 +6506,46 @@ impl PagedKVCacheAdapter {
         start_pos: u32,
         num_tokens: u32,
     ) -> Result<(MxArray, MxArray), String> {
-        if self.sliding_window != 0 && num_tokens > self.sliding_window {
-            return Err(format!(
-                "read_kv_range: refusing to read {num_tokens} tokens from a sliding group \
-                 (sliding_window = {}). Positions older than the window are out of window, \
-                 and once prune_sliding_window_for has run they sit on the never-written \
-                 null block. Call read_kv_range_for_dense_attention, which returns \
-                 (keys, values, DenseAttentionWindow), and apply the window as an explicit \
-                 keep-mask.",
-                self.sliding_window
-            ));
+        if self.sliding_window != 0 {
+            if num_tokens > self.sliding_window {
+                return Err(format!(
+                    "read_kv_range: refusing to read {num_tokens} tokens from a sliding group \
+                     (sliding_window = {}). Positions older than the window are out of window, \
+                     and once prune_sliding_window_for has run they sit on the never-written \
+                     null block. Call read_kv_range_for_dense_attention, which returns \
+                     (keys, values, DenseAttentionWindow), and apply the window as an explicit \
+                     keep-mask.",
+                    self.sliding_window
+                ));
+            }
+            // `block_table.num_tokens()`, NOT `current_token_count()`: this is
+            // a guard about physical liveness, and the block table's count is
+            // the exact quantity `prune_sliding_window_for` derives its cutoff
+            // from, so the floor here tracks the prune's floor by construction.
+            // It is also the bound `read_kv_range_unchecked` range-checks
+            // against. The two counters are advanced together at every site, so
+            // swapping them passes the whole suite today -- which is precisely
+            // why the choice is spelled out rather than left to look arbitrary.
+            // With no table there is nothing recorded, so the floor is 0 and the
+            // unchecked read produces the "before reset_for_new_request" error.
+            let recorded = self
+                .block_table
+                .as_ref()
+                .map_or(0, |table| table.num_tokens());
+            let live_floor = recorded.saturating_sub(self.sliding_window);
+            if start_pos < live_floor {
+                return Err(format!(
+                    "read_kv_range: refusing range [{start_pos}, {}) on a sliding group \
+                     (sliding_window = {}, recorded = {recorded}): positions below \
+                     {live_floor} are out of window, and once prune_sliding_window_for has \
+                     run they sit on the never-written null block whose contents are \
+                     undefined. Call read_kv_range_for_dense_attention, which returns \
+                     (keys, values, DenseAttentionWindow), and apply the window as an \
+                     explicit keep-mask.",
+                    start_pos.saturating_add(num_tokens),
+                    self.sliding_window
+                ));
+            }
         }
         self.read_kv_range_unchecked(layer_idx, start_pos, num_tokens)
     }
@@ -14438,6 +14498,140 @@ mod tests {
             .read_kv_range_for_dense_attention(0, FIX_TOTAL)
             .expect("windowed host read on a full group");
         assert_eq!(window.tokens(), 0);
+    }
+
+    /// A sliding read must be refused for being OLD, not merely for being WIDE.
+    ///
+    /// The width refusal (`num_tokens > sliding_window`) is offset-blind, so a
+    /// range whose length exactly equals the window slips through no matter
+    /// how far below the live floor it starts. Measured on this fixture before
+    /// the offset arm existed: the block table after prune is
+    /// `[null, null, null, null, 5, 6]`, and `read_kv_range(0, 0, 16)`
+    /// returned `Ok` with K/V reading back as all zeros where 1001..1016 /
+    /// 1..16 were demonstrably written -- i.e. the reserved null block, which
+    /// `LayerKVPool` allocates `StorageModePrivate` and never zeroes, so those
+    /// bytes are formally UNDEFINED. The same read returns the written values
+    /// before the prune, and the live tail still does after it, which is how
+    /// we know the zeros are the null block and not the data.
+    ///
+    /// The floor is `block_table.num_tokens() - sliding_window`, the exact
+    /// quantity `prune_sliding_window_for` derives its cutoff from. It is
+    /// token-granular while the prune is block-granular, so this is strictly
+    /// stricter than "touches the null block": it also refuses out-of-window
+    /// positions still physically resident. That is deliberate -- those are
+    /// the positions whose over-attention measured max|delta| 0.1245 against
+    /// a windowed reference whose own RMS is 0.0356.
+    ///
+    /// Mutation caught: deleting the `start_pos < live_floor` arm makes this
+    /// `Ok` and hands back null-block bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_retired_sliding_range_is_refused_even_when_its_width_fits_the_window() {
+        const WINDOW: u32 = 16;
+        let Some(fixture) = build_sliding_prefill_fixture(WINDOW).expect("sliding fixture") else {
+            eprintln!("skipping retired-range refusal test: Metal GPU not available");
+            return;
+        };
+        let mut adapter = fixture.adapter;
+        assert_eq!(
+            adapter.current_token_count(),
+            FIX_TOTAL,
+            "the fixture must have recorded the whole prefix plus chunk"
+        );
+
+        let refused = match adapter.read_kv_range(0, 0, WINDOW) {
+            Ok(_) => panic!(
+                "a retired sliding range must be refused: [0, {WINDOW}) is entirely below the \
+                 live floor {} and sits on the never-written null block",
+                FIX_TOTAL - WINDOW
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            refused.contains("read_kv_range_for_dense_attention"),
+            "the refusal must name the windowed reader, got: {refused}"
+        );
+        assert!(
+            refused.contains("out of window"),
+            "the refusal must say the positions are out of window, got: {refused}"
+        );
+
+        // NON-REGRESSION, in the same test so the guard cannot silently become
+        // over-strictness. The live tail starts exactly AT the floor, so the
+        // comparison must be `<` and not `<=`.
+        let (_k, values) = adapter
+            .read_kv_range(0, FIX_TOTAL - WINDOW, WINDOW)
+            .expect("a read starting exactly at the live floor stays legal");
+        let first = values.to_float32().expect("live tail to_float32")[0];
+        assert!(
+            (first - (FIX_TOTAL - WINDOW + 1) as f32).abs() < 1e-3,
+            "the live tail must return the written V[{}] = {}, got {first}",
+            FIX_TOTAL - WINDOW,
+            FIX_TOTAL - WINDOW + 1
+        );
+    }
+
+    /// CONTROL for the live-tail guard: the two shapes it must never refuse.
+    ///
+    /// (1) A full-attention group. `sliding_window == 0` has no floor at all
+    /// and the outer `if` must short-circuit, or every non-sliding paged model
+    /// loses its host read.
+    ///
+    /// (2) gemma4 cold-tier sliding capture, which reads for PERSISTENCE and
+    /// legitimately starts at position 0: `read_sliding_groups_at` computes
+    /// `live_tokens = min(boundary, sliding_window)` then
+    /// `start = boundary - live_tokens`, so `start == 0` whenever
+    /// `boundary <= sliding_window`. It is not refused because it never asks
+    /// for a retired range -- its own decline,
+    /// `recorded.saturating_sub(start) > sliding_window -> Ok(None)`, is
+    /// algebraically the same rule as `start < recorded - sliding_window`.
+    /// Replaying its arithmetic over 729 (window, recorded, boundary) triples
+    /// accepted 79 ranges and 0 of them violate the live-tail rule. Reading a
+    /// retired range to persist it would be a legitimate intent, but no caller
+    /// has it: the only candidate declines instead. So the refusal is blanket,
+    /// and a persistence reader -- which must check block ids against the
+    /// reserved null id rather than hand back undefined bytes -- stays unbuilt
+    /// until something needs it.
+    ///
+    /// Window `FIX_TOTAL` reproduces (2): prune's cutoff saturates to 0 so
+    /// nothing is retired, and the floor is 0, so the position-0 read lands on
+    /// real data.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_live_tail_guard_spares_full_groups_and_the_cold_capture_shape() {
+        const WINDOW: u32 = 16;
+
+        let Some(fixture) = build_sliding_prefill_fixture(0).expect("full fixture") else {
+            eprintln!("skipping live-tail control test: Metal GPU not available");
+            return;
+        };
+        let mut full = fixture.adapter;
+        full.read_kv_range(0, 0, WINDOW)
+            .expect("a full group has no live floor: a position-0 read stays legal");
+        full.read_kv_range(0, 0, FIX_TOTAL)
+            .expect("a full group keeps the whole-context host read");
+
+        // Cold-capture shape: recorded <= window, so nothing was retired and
+        // `start = 0` is inside the live window by construction.
+        let Some(fixture) = build_sliding_prefill_fixture(FIX_TOTAL).expect("wide-window fixture")
+        else {
+            eprintln!("skipping live-tail control test: Metal GPU not available");
+            return;
+        };
+        let mut unpruned = fixture.adapter;
+        assert_eq!(
+            unpruned.current_token_count().saturating_sub(FIX_TOTAL),
+            0,
+            "with window == recorded the live floor must be 0"
+        );
+        let (_k, values) = unpruned
+            .read_kv_range(0, 0, FIX_TOTAL)
+            .expect("the cold-capture shape reads from position 0 by design");
+        let first = values.to_float32().expect("cold capture to_float32")[0];
+        assert!(
+            (first - 1.0).abs() < 1e-3,
+            "position 0 must return the written V[0] = 1, not null-block bytes, got {first}"
+        );
     }
 
     /// After pruning, no route may read a position backed by the null block.
