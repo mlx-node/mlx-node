@@ -286,11 +286,14 @@ impl CompiledField {
 #[derive(Debug)]
 pub struct ResponseTemplate {
     /// `defaults.role`. Checkpoint spec surface: validated so a spec that omits
-    /// it is refused, but not consumed here — M0 knows it is parsing an
-    /// assistant turn. Reserved for M1's streaming path, which has to label the
-    /// messages it emits. Private (not `pub`) on purpose: that is what keeps
-    /// `dead_code` firing, so the `expect` below is a real reminder and gets
-    /// deleted the moment M1 reads it.
+    /// it is refused, and cross-checked against the role in
+    /// [`Self::start_anchor`] at construction — the spec spells the same role
+    /// twice and this parser has no third source to break a tie — but not
+    /// consumed at PARSE time, because M0 knows it is parsing an assistant turn.
+    /// Reserved for M1's streaming path, which has to label the messages it
+    /// emits. Private (not `pub`) on purpose: that is what keeps `dead_code`
+    /// firing, so the `expect` below is a real reminder and gets deleted the
+    /// moment M1 reads it.
     #[cfg_attr(not(test), expect(dead_code))]
     default_role: String,
     /// `start_anchor` (`<|start|>assistant`). The spec's own marker for "a new
@@ -953,6 +956,34 @@ impl ResponseTemplate {
                  role — user, tool, system — would begin an assistant message"
             )));
         }
+        // The spec states the assistant role TWICE — `defaults.role` and the tail
+        // of `start_anchor` — and nothing else in it names a role. Two spellings of
+        // one fact that are never compared is a fact that can be wrong in one
+        // place, and here the failure is SILENT rather than wrong-answered:
+        // `super::stream_guard`'s `ANCHORED_HEADER_PREFIX` is the literal
+        // `"<|start|>assistant to="`, so a spec whose anchor names another role
+        // makes the guard refuse every header this parser would accept and the turn
+        // dies at its second message with no diagnostic. Measured on the real
+        // checkpoint, both spellings are `assistant`.
+        //
+        // Emptiness is refused separately from disagreement: the anchor's role is
+        // already known non-empty, so a bare inequality would report two spellings
+        // disagreeing when the real fault is one missing value.
+        if raw.defaults.role.is_empty() {
+            return Err(Error::from_reason(
+                "muse_glimmer: response_template defaults.role is empty; it is the label M1 \
+                 puts on every message this parser emits and the only cross-check on \
+                 start_anchor's role",
+            ));
+        }
+        if role != raw.defaults.role {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: response_template start_anchor {:?} names role {role:?} but \
+                 defaults.role is {:?}; the two spell the same fact and this parser has no \
+                 third source to break the tie",
+                raw.start_anchor, raw.defaults.role
+            )));
+        }
 
         let transform = raw.fields.tool_calls.transform.clone();
         let fields = vec![
@@ -1166,7 +1197,10 @@ impl ResponseTemplate {
     ///   ambiguity, which is indistinguishable and out of scope;
     /// - a tool header a terminator DID precede — a real message, and the reason
     ///   `to=self<|message|>think<|eot|>` followed by a tool call still works even
-    ///   though `<|eot|>` is not in `reasoning_content.close`;
+    ///   though `<|eot|>` is not in `reasoning_content.close`. The thought's BODY
+    ///   no longer keeps that `<|eot|>`: [`Self::segment_end`] closes on any
+    ///   message terminator, so the two rulings agree about where the message
+    ///   ended instead of only one of them acting on it;
     /// - bytes that are no header at all — the grammar is broken there either way,
     ///   and running a segment through it republishes whatever follows, which is
     ///   `a_malformed_anchor_is_not_a_message_start`.
@@ -1184,10 +1218,36 @@ impl ResponseTemplate {
         None
     }
 
+    /// Earliest MESSAGE TERMINATOR at or after `from` that a real control token
+    /// produced.
+    ///
+    /// Provenance-gated exactly as [`CompiledField::earliest_close`] is, and for
+    /// the same reason: marker-shaped prose closes nothing, so a model explaining
+    /// that `<|eot|>` ends a turn must not have its explanation truncated at the
+    /// quote.
+    ///
+    /// [`Self::terminators`] is the SET, not a new literal: it is derived at
+    /// construction from the union of the `text` fields' own `close` lists, and it
+    /// is the same set [`Arrival::terminated`] is computed from. That identity is
+    /// the point — see [`Self::segment_end`].
+    fn earliest_terminator(&self, turn: GeneratedTurn<'_>, from: usize) -> Option<(usize, usize)> {
+        self.terminators
+            .iter()
+            .filter_map(|marker| turn.next_token_marker(marker, from))
+            .min_by_key(|(start, _)| *start)
+    }
+
     /// Where a text segment that starts at `body_start` ends. The earliest of
     /// three things wins, and only the third runs to the end of the input:
     ///
-    /// 1. one of the field's own `close` markers — properly terminated;
+    /// 1. one of the field's own `close` markers, or any MESSAGE TERMINATOR — a
+    ///    real `<|eot|>` ends the message whether or not this field lists it, and
+    ///    [`Arrival::terminated`] already rules that way. `reasoning_content.close`
+    ///    is `<|eom|>` alone while `<|eot|>` is a stop token the model really does
+    ///    end turns on, so without the union a thought ended by `<|eot|>` kept the
+    ///    seven bytes that ended it — the parser saying "this message ended here"
+    ///    and "those bytes are its body" at once. `content.close` already lists
+    ///    both terminators, so only `reasoning_content` changes;
     /// 2. the next MESSAGE BOUNDARY — a new message began, so this one never
     ///    closed. Not merely the next `start_anchor`: see
     ///    [`Self::next_message_boundary`], because an anchor the model quoted is
@@ -1201,7 +1261,15 @@ impl ResponseTemplate {
         turn: GeneratedTurn<'_>,
         body_start: usize,
     ) -> SegmentEnd {
-        let close = field.earliest_close(turn, body_start);
+        // The field's own close OR any message terminator, whichever is earlier.
+        // Both halves are provenance-gated, so neither can be reached by prose.
+        let close = match (
+            field.earliest_close(turn, body_start),
+            self.earliest_terminator(turn, body_start),
+        ) {
+            (Some(own), Some(term)) => Some(if own.0 <= term.0 { own } else { term }),
+            (own, term) => own.or(term),
+        };
         let anchor = self.next_message_boundary(turn, body_start);
         match (close, anchor) {
             // Ties go to the close: a properly terminated segment stays one.
@@ -1458,6 +1526,46 @@ pub(super) const SPEC_JSON: &str = r#"{
       }
     }"#;
 
+/// Turns whose HEADER GRAMMAR the two modules read differently: this parser
+/// accepts them, `super::stream_guard` refuses them.
+///
+/// The guard reimplements the header grammar over decoded text because it needs
+/// only a tokenizer, not a checkpoint directory — a deliberate architecture choice
+/// its own module docs defend. The cost is two grammars, and they have drifted in
+/// two measured places:
+///
+/// - **byte-0 leading space.** [`AT_START_PREFIXES`] is `["", " "]`, so this parser
+///   opens a message at `to=user<|message|>`; the guard requires
+///   `BARE_HEADER_PREFIX` (`" to="`) byte for byte.
+/// - **`<` in a recipient.** The guard's `is_recipient` rejects ANY `<`; this parser
+///   rejects only whitespace and a recipient containing the whole `start_anchor`, so
+///   `a<b` is a legal tool recipient here.
+///
+/// Lives here rather than in `mod tests` for the same reason [`SPEC_JSON`] does:
+/// both halves of the pin compile the SAME inputs, so neither can drift into
+/// testing a case the other no longer covers. The halves are
+/// `the_parsers_header_grammar_is_the_laxer_of_the_two` (below) and
+/// `super::stream_guard`'s
+/// `a_header_the_guard_refuses_never_reaches_this_parser` — read them together;
+/// either alone proves nothing about the seam.
+///
+/// **Not a defect today, and the reason is the whole point of pinning it.** The
+/// guard is the STRICTER side at both points, and `stop()` discards the rest of the
+/// turn, so these bytes never reach `parse` in production: measured through the
+/// seam, all of them attribute nothing and authorise nothing. Unifying the two
+/// grammars is M1's call — it means the guard depending on a `ResponseTemplate` —
+/// and the direction that matters is that it must not be unified by RELAXING the
+/// guard, because case 2 shows the laxer grammar reaching an ACTION.
+#[cfg(test)]
+pub(super) const GRAMMAR_DIVERGENCES: &[&str] = &[
+    // 1. No leading space. This parser: `content = Some("hello")`.
+    "to=user<|message|>hello<|eot|>",
+    // 2. `<` in the recipient, carrying a real ATEM block. This parser:
+    //    `tool_calls = [a<b { p: 1 }]` — a CALL, not merely some text.
+    " to=a<b<|message|><atem:invoke name=\"a<b\">\
+     <atem:parameter name=\"p\">1</atem:parameter></atem:invoke><|eot|>",
+];
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1604,6 +1712,87 @@ mod tests {
         let out =
             spec().parse_asserting_every_marker_shape_is_a_token(" to=user<|message|>first<|eom|>");
         assert_eq!(out.content.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn a_reasoning_segment_does_not_keep_the_terminator_that_ended_it() {
+        // `reasoning_content.close` is `<|eom|>` alone, but `<|eot|>` is a stop
+        // token (`generation_config.json` eos_token_id = [200001, 200008]) and
+        // `Arrival::terminated` already rules that a `<|eot|>` ENDED the message —
+        // that ruling is what makes a tool call after a `to=self` thought work.
+        // A message the parser agrees has ended cannot also contain the bytes
+        // that ended it.
+        for terminator in ["<|eom|>", "<|eot|>"] {
+            let out = spec().parse_asserting_every_marker_shape_is_a_token(&format!(
+                " to=self<|message|>think{terminator}"
+            ));
+            assert_eq!(out.reasoning.as_deref(), Some("think"), "{terminator}");
+        }
+        // A following message does not save it either: the anchor sits PAST the
+        // terminator, so the boundary branch never trimmed these bytes.
+        let out = spec().parse_asserting_every_marker_shape_is_a_token(
+            " to=self<|message|>think<|eot|><|start|>assistant to=user<|message|>answer<|eot|>",
+        );
+        assert_eq!(out.reasoning.as_deref(), Some("think"));
+        assert_eq!(out.content.as_deref(), Some("answer"));
+    }
+
+    #[test]
+    fn a_quoted_terminator_inside_reasoning_does_not_close_it() {
+        // The over-strictness guard, and the reason
+        // `ResponseTemplate::earliest_terminator` goes through
+        // `next_token_marker` rather than a text scan. A model explaining the
+        // wire format types these seven characters; nothing ended.
+        //
+        // `parse_asserting_every_marker_shape_is_a_token` CANNOT express this —
+        // it mints every marker shape it finds — so this must use `pieces`.
+        let tpl = spec();
+        let (text, spans) = pieces(
+            &tpl,
+            &[
+                (" to=self", QUOTED),
+                ("<|message|>", TOKEN),
+                ("the marker is ", QUOTED),
+                ("<|eot|>", QUOTED),
+                (", seven characters.", QUOTED),
+                ("<|eom|>", TOKEN),
+            ],
+        );
+        let out = tpl.parse(GeneratedTurn::from_token_spans(&text, &spans));
+        assert_eq!(
+            out.reasoning.as_deref(),
+            Some("the marker is <|eot|>, seven characters."),
+        );
+    }
+
+    /// Half one of the [`GRAMMAR_DIVERGENCES`] pin: what THIS module's header
+    /// grammar makes of each input. Half two is `super::stream_guard`'s
+    /// `a_header_the_guard_refuses_never_reaches_this_parser`, which shows the guard
+    /// refusing the same strings — and that is what makes the divergence harmless
+    /// today. Neither half means anything alone.
+    ///
+    /// Mutation caught: tightening `AT_START_PREFIXES` to `[" "]` breaks case 1;
+    /// adding `|| recipient.contains('<')` to `tool_header_at`'s recipient checks
+    /// breaks case 2. Either would silently make the guard's stricter rule the only
+    /// rule, which is one legitimate resolution — but it must be a decision, not a
+    /// drift, so it has to edit this test.
+    #[test]
+    fn the_parsers_header_grammar_is_the_laxer_of_the_two() {
+        let no_leading_space =
+            spec().parse_asserting_every_marker_shape_is_a_token(GRAMMAR_DIVERGENCES[0]);
+        assert_eq!(
+            no_leading_space.content.as_deref(),
+            Some("hello"),
+            "this parser opens a message at byte 0 with no leading space: {no_leading_space:?}"
+        );
+        let bracket_recipient =
+            spec().parse_asserting_every_marker_shape_is_a_token(GRAMMAR_DIVERGENCES[1]);
+        assert_eq!(
+            out_names(&bracket_recipient),
+            vec!["a<b"],
+            "this parser accepts `<` in a recipient, all the way to a CALL: \
+             {bracket_recipient:?}"
+        );
     }
 
     #[test]
@@ -2604,6 +2793,38 @@ mod tests {
             "\"close\": [\"<|eot|>\", \"\"]",
         ));
         assert!(e.contains("empty close marker"), "got: {e}");
+        // The spec states the assistant role TWICE and nothing else in it names a
+        // role, so the two spellings must agree or the parser has no third source
+        // to break the tie. All four of these were ACCEPTED before this check
+        // existed, and the resulting failure is SILENT rather than wrong-answered:
+        // `stream_guard::ANCHORED_HEADER_PREFIX` is the literal
+        // `"<|start|>assistant to="`, so an anchor naming another role makes the
+        // guard refuse every header the parser would accept and the turn simply
+        // dies at its second message with no diagnostic.
+        let e = err(case(
+            "\"start_anchor\": \"<|start|>assistant\"",
+            "\"start_anchor\": \"<|start|>user\"",
+        ));
+        assert!(e.contains("defaults.role"), "got: {e}");
+        let e = err(case(
+            "\"start_anchor\": \"<|start|>assistant\"",
+            "\"start_anchor\": \"<|start|>NOTAROLE\"",
+        ));
+        assert!(e.contains("defaults.role"), "got: {e}");
+        // An empty `defaults.role` was accepted too, and it cannot be caught by
+        // the cross-check alone — the anchor's role is non-empty by the check
+        // above, so `role != ""` would refuse it with a confusing message about
+        // two spellings disagreeing when the real fault is one missing value.
+        let e = err(case("\"role\": \"assistant\"", "\"role\": \"\""));
+        assert!(e.contains("defaults.role is empty"), "got: {e}");
+        let e = err(case("\"role\": \"assistant\"", "\"role\": \"!!!\""));
+        assert!(e.contains("defaults.role"), "got: {e}");
+        // The unmutated control: the real checkpoint's spec states the role twice
+        // and consistently, so the cross-check must not refuse it.
+        assert!(
+            ResponseTemplate::from_tokenizer_config_str(SPEC).is_ok(),
+            "the transcribed spec must still compile"
+        );
     }
 
     // ── Real checkpoint (gated) ────────────────────────────────────────
