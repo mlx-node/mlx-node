@@ -395,6 +395,38 @@ impl MuseGlimmerConfig {
             ));
         }
 
+        // The three decoder dimensions nothing else reaches. In most families a
+        // 0 `hidden_size` would be caught by `head_dim * num_attention_heads ==
+        // hidden_size`, and this family deliberately does NOT have that check
+        // (see the GQA clause above: 32 x 128 = 4096 against the checkpoint's
+        // hidden_size of 6656), so the usual backstop is absent by design. The
+        // head tables do not reach these either — they describe per-layer kinds,
+        // not widths.
+        //
+        // Each one fails far from here and in a way that does not name the
+        // config: a 0 `hidden_size` is a zero-width residual stream, a 0
+        // `intermediate_size` is an FFN projecting to nothing, and a 0
+        // `vocab_size` is an empty embedding and an empty logits table. All three
+        // surface inside M1's decoder as an invalid tensor construction or a
+        // silently unusable model.
+        //
+        // Named individually rather than in a loop so a dropped clause is a red
+        // test rather than a gap that still reads as covered.
+        for (field, value) in [
+            ("hidden_size", text.hidden_size),
+            ("intermediate_size", text.intermediate_size),
+            ("vocab_size", text.vocab_size),
+        ] {
+            if value == 0 {
+                return Err(Error::from_reason(format!(
+                    "muse_glimmer: {field} must be non-zero; nothing downstream catches a 0 \
+                     here because this family has no head_dim * num_attention_heads == \
+                     hidden_size invariant, so it would surface as an invalid tensor inside \
+                     the decoder rather than as a config error"
+                )));
+            }
+        }
+
         // `sliding_window` leaves this module as the `AttentionKind::SlidingWindow`
         // payload of 39 of the 52 layers, so a bad value here mis-describes three
         // quarters of the decoder. Two traps, both of which fail OPEN without a
@@ -1078,6 +1110,48 @@ mod tests {
             err.contains("num_attention_heads must be non-zero"),
             "a 0 query-head count must be refused on its own clause, got: {err}"
         );
+    }
+
+    /// The three decoder dimensions that no other invariant reaches.
+    ///
+    /// `num_attention_heads` and `head_dim` have their own clauses, and the head
+    /// tables catch a bad layer count -- but `hidden_size`, `intermediate_size`
+    /// and `vocab_size` are checked by NOTHING today. In most families
+    /// `head_dim * num_attention_heads == hidden_size` would catch a 0, and this
+    /// family deliberately does NOT have that check (see the comment on the GQA
+    /// clause: the real checkpoint is 32 x 128 = 4096 against a hidden_size of
+    /// 6656), so the usual backstop is absent by design.
+    ///
+    /// Each one fails far from the config that carried it: a 0 `hidden_size` is a
+    /// zero-width residual stream, a 0 `intermediate_size` is an FFN that
+    /// projects to nothing, and a 0 `vocab_size` is an empty embedding and an
+    /// empty logits table -- an invalid tensor construction or an unusable model,
+    /// surfacing inside M1's decoder rather than at load.
+    ///
+    /// Mutation caught: deleting any one of the three clauses. Each field is
+    /// asserted separately, so dropping one is a red test rather than a silent
+    /// gap in a shared loop.
+    #[test]
+    fn rejects_a_zero_decoder_dimension_that_no_other_invariant_reaches() {
+        for (field, original) in [
+            ("hidden_size", "6656"),
+            ("intermediate_size", "19968"),
+            ("vocab_size", "202048"),
+        ] {
+            let bad = text_config_json(52).replace(
+                &format!("\"{field}\": {original}"),
+                &format!("\"{field}\": 0"),
+            );
+            assert!(
+                bad.contains(&format!("\"{field}\": 0")),
+                "fixture edit missed {field}; the test would pass for the wrong reason",
+            );
+            let err = parse(&bad).unwrap_err().to_string();
+            assert!(
+                err.contains(field) && err.contains("non-zero"),
+                "a 0 {field} must be refused by name, got: {err}",
+            );
+        }
     }
 
     /// The vision tower's geometry is validated, not merely deserialized. Every
