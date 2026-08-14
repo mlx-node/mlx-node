@@ -7172,13 +7172,13 @@ mod tests {
     /// `sanitize_tools` and this turns red — `weather lookup` is refused with the
     /// whitespace message — while every other test here stays green.
     ///
-    /// What it does NOT catch, stated so nobody mistakes it for covered: weakening
-    /// the condition to `!control_markers.is_empty()`. Today
-    /// `detect_control_markers` returns only the Muse set or `&[]`, so the two
-    /// spellings are behaviourally identical and no fixture can separate them. The
-    /// equality spelling is the right one anyway — the day a second family registers
-    /// a marker set, `!is_empty()` silently hands it ATEM's wire grammar, and this
-    /// test would only start catching that once such a family exists.
+    /// This test cannot catch a *weakening* of the condition to
+    /// `!control_markers.is_empty()`, because it drives a loaded tokenizer and
+    /// `detect_control_markers` yields only the Muse set or `&[]` today. That
+    /// mutation is covered instead by
+    /// [`the_muse_tool_name_grammar_is_gated_on_the_marker_set_not_on_it_being_nonempty`],
+    /// which calls `sanitize_tools` directly and so can supply the third case the
+    /// vocabulary cannot yet produce.
     #[test]
     fn the_muse_tool_name_grammar_does_not_reach_another_family() {
         let dir = TestModelDir::new("non-muse-tool-name");
@@ -7206,6 +7206,53 @@ mod tests {
             assert!(
                 rendered.contains(&format!("<tools>{}</tools>", serde_json::json!(name))),
                 "the name did not survive for a non-Muse family: {rendered}",
+            );
+        }
+    }
+
+    /// The gate is `control_markers == MUSE_GLIMMER_CONTROL_MARKERS`, and this pins
+    /// the `==` against the tempting `!control_markers.is_empty()`.
+    ///
+    /// A loaded tokenizer cannot tell those two apart: `detect_control_markers`
+    /// returns the Muse set or `&[]` and nothing in between, so both spellings agree
+    /// on every vocabulary that exists today. `sanitize_tools` takes the slice as an
+    /// argument, though, so calling it directly supplies the third case — a marker
+    /// set that is non-empty and is not Muse's, i.e. the second family that registers
+    /// one. Under `!is_empty()` that family inherits ATEM's wire grammar and
+    /// `weather lookup` is refused; under `==` it is not this family's rule.
+    ///
+    /// Measured: swapping the condition to `!control_markers.is_empty()` turns this
+    /// test red and leaves every other test in the file green.
+    #[test]
+    fn the_muse_tool_name_grammar_is_gated_on_the_marker_set_not_on_it_being_nonempty() {
+        // A plausible second family: markers of its own, none of them Muse's.
+        let other_family: &[&str] = &["<|im_start|>", "<|im_end|>"];
+        assert_ne!(
+            other_family,
+            super::MUSE_GLIMMER_CONTROL_MARKERS,
+            "the stand-in must not be the Muse set, or the test proves nothing",
+        );
+        assert!(
+            !other_family.is_empty(),
+            "the stand-in must be non-empty, or it cannot separate `==` from `!is_empty()`",
+        );
+
+        for name in MUSE_NAMES_THE_WIRE_CANNOT_CARRY
+            .iter()
+            .map(|(name, _)| *name)
+        {
+            let sanitized = Qwen3Tokenizer::sanitize_tools(Some(&[tool_named(name)]), other_family)
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "tool name {name:?} is refused for a family that never asked for \
+                             ATEM's grammar, so the gate is testing the marker set for \
+                             emptiness rather than for identity: {e}"
+                    )
+                })
+                .expect("tools were supplied");
+            assert_eq!(
+                sanitized[0].function.name, name,
+                "the name must reach the template unchanged for a non-Muse family",
             );
         }
     }
