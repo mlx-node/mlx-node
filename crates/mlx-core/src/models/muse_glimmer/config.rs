@@ -204,6 +204,13 @@ impl MuseGlimmerVisionConfig {
     ///     an independent field and `32 x 128 != 6656` on purpose — the tower has
     ///     no `head_dim` key, so its head dim IS the quotient and a non-dividing
     ///     pair silently truncates or panics on reshape.
+    ///   * `layer_norm_eps` is the only FLOAT here, so the usize table above
+    ///     cannot reach it and it needs its own clause. It is the `eps` of
+    ///     `sqrt(var + eps)` in every LayerNorm of the tower: a negative one
+    ///     drives that argument negative and the activation to NaN, and a `+inf`
+    ///     one drives the normalized activation to zero. Required finite and
+    ///     strictly positive — a FLOOR, not a sanity check, since `1e-30` passes
+    ///     and is still not a usable epsilon.
     ///
     /// Kept as a method rather than inlined so the tower can re-check a config it
     /// did not parse: the type has all-`pub` fields and no private constructor,
@@ -234,6 +241,15 @@ impl MuseGlimmerVisionConfig {
                  hidden_size {} (real checkpoint: 1536 / 16 = 96); the tower has no \
                  head_dim key, so its head dim IS this quotient",
                 self.num_attention_heads, self.hidden_size
+            )));
+        }
+        if !self.layer_norm_eps.is_finite() || self.layer_norm_eps <= 0.0 {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: vision_config.layer_norm_eps must be finite and strictly \
+                 positive, got {}; it is the eps of sqrt(var + eps) in every LayerNorm of \
+                 the tower, so a negative one turns the activation NaN and an infinite one \
+                 turns it to zero — neither raises anything",
+                self.layer_norm_eps
             )));
         }
         Ok(())
@@ -341,6 +357,43 @@ impl MuseGlimmerConfig {
                      leaves unrotated"
                 )));
             }
+            // The two clauses above partition on zero-vs-nonzero and say NOTHING
+            // about the sign, magnitude or finiteness of the non-zero half. There
+            // is no backstop: MLX validates only `dims` on this path
+            // (`fast.cpp:411`) and has no base check anywhere. Worse, the two
+            // backends disagree about what a bad base does, and the PRODUCTION
+            // one is the silent one:
+            //
+            //   * CPU (`fast.cpp:463`, `exp(arange * log(base) / hd)`): a base of
+            //     -500000 gives 1024/1024 NaN. Loud, and not what runs.
+            //   * Metal (`rope.cpp:123`, `std::log2(base_)`): the same base gives
+            //     0 NaN and 1024/1024 EXACT ZEROS. q and k come back all-zero and
+            //     attention degenerates to the plain causal mean of V — measured
+            //     max|good - bad| = 1.5308 against the correct output, and
+            //     max|bad - causal_mean_of_V| = 1.19e-07. Finite, plausible, no
+            //     error: the same fail-open shape as the negative `sliding_window`
+            //     documented below.
+            //
+            // `is_finite` is not redundant with `> 0.0` here, and the reason is
+            // the `as f32` narrowing serde does on the way in: `1e400` is refused
+            // at parse ("number out of range"), but `1e40` is valid JSON, fits
+            // the f64 serde reads it into, and lands in this f32 field as `+inf`
+            // with nothing raised. A `+inf` base zeroes 16/1024 lanes on Metal and
+            // NaNs on CPU.
+            //
+            // Only the rotated entries are checked, and that is deliberate:
+            // `-0.0 == 0.0` in IEEE 754, so a `-0.0` never reaches this clause —
+            // it is NoPE, which is correct, and is pinned by
+            // `a_negative_zero_rope_theta_on_a_full_layer_is_still_nope_and_still_accepted`.
+            if *theta != 0.0 && (!theta.is_finite() || *theta <= 0.0) {
+                return Err(Error::from_reason(format!(
+                    "muse_glimmer: layer {i} has layer_rope_theta {theta}; a rotated layer's \
+                     RoPE base must be finite and strictly positive. MLX validates only the \
+                     `dims` argument, never the base, and on the Metal path a non-positive \
+                     base produces all-zero q/k rather than a NaN — attention then returns \
+                     the causal mean of V, which is finite, plausible and wrong"
+                )));
+            }
         }
 
         // A 0-layer decoder validates without this check and fails OPEN, one
@@ -423,6 +476,83 @@ impl MuseGlimmerConfig {
                      here because this family has no head_dim * num_attention_heads == \
                      hidden_size invariant, so it would surface as an invalid tensor inside \
                      the decoder rather than as a config error"
+                )));
+            }
+        }
+
+        // Every remaining f32 of the text config. Not one of them has a guard
+        // today and not one has a non-test consumer yet, so this is LATENT rather
+        // than live — but each entry below is a measured failure, and none of
+        // them is caught anywhere downstream.
+        //
+        // One rule for all five: FINITE and STRICTLY POSITIVE. `is_finite` is not
+        // redundant with `> 0.0`, for the same `as f32` reason as the RoPE base
+        // above: `1e400` is refused at parse, `1e40` is valid JSON and arrives
+        // here as `+inf`. Bare `NaN` / `Infinity` literals are not valid JSON at
+        // all, so serde covers those.
+        //
+        // Strictly positive is a FLOOR, not a sanity check: `1e-30` passes every
+        // clause here and is still not a usable epsilon or a usable multiplier.
+        // What the guard buys is that the values which provably destroy the
+        // forward pass are named here instead of surfacing as NaN, as zeros, or
+        // as plausible-looking wrong output. `effective_qk_scale` needs no clause
+        // of its own — it is `qk_scale_factor * head_dim^-0.5`, and `head_dim`'s
+        // own non-zero check is above, so guarding the factor covers the product.
+        //
+        // Each field carries its own consequence rather than sharing one message,
+        // so dropping a row is a red test rather than a gap that still reads as
+        // covered — and so the softcapping row can say what is actually true of
+        // it, which is not what is true of the others.
+        for (field, value, consequence) in [
+            (
+                "rms_norm_eps",
+                text.rms_norm_eps,
+                "it is the eps of the input and pre-feedforward RMS norms; -1.0 measured \
+                 64/64 NaN on GPU and CPU alike, and +inf drives the whole normalized \
+                 activation to zero. A small negative such as -1e-8 does not even fail \
+                 reliably — it survives while mean(x^2) stays larger than its magnitude — \
+                 so the harm is data-dependent, which is precisely why it is refused at \
+                 load rather than left to the forward pass",
+            ),
+            (
+                "post_norm_eps",
+                text.post_norm_eps,
+                "same class as rms_norm_eps, on the POST norms; it is a separate field \
+                 carrying this family's smaller epsilon (1e-8), so it needs its own clause",
+            ),
+            (
+                "qk_scale_factor",
+                text.qk_scale_factor,
+                "it multiplies q on top of 1/sqrt(head_dim), so a 0 flattens every \
+                 attention logit and makes attention uniform over the whole context, while \
+                 a negative one inverts the ranking outright — the model attends hardest to \
+                 what it should attend to least. Both stay finite and fluent",
+            ),
+            (
+                "output_multiplier",
+                text.output_multiplier,
+                "it scales the final hidden state into the logits, so a 0 zeroes every \
+                 logit and makes sampling uniform over the vocabulary, while a negative one \
+                 flips the sign of every logit and inverts argmax — greedy decoding then \
+                 picks the LEAST likely token",
+            ),
+            (
+                "final_logit_softcapping",
+                text.final_logit_softcapping,
+                "cap * tanh(x / cap) with cap = 0 flattens EVERY logit to +/-0, i.e. a \
+                 uniform distribution over the vocabulary — and 0 is not a \"disabled\" \
+                 sentinel, because the default is 20.0 and this family has no \
+                 representation for disabled at all. A NEGATIVE cap is the other case and \
+                 the honest description differs: the formula is EVEN in cap, so -20.0 \
+                 computes exactly what +20.0 computes and corrupts nothing. It is refused \
+                 because a config that says -20.0 is silently equivalent to its magnitude, \
+                 and the magnitude is what should have been written",
+            ),
+        ] {
+            if !value.is_finite() || value <= 0.0 {
+                return Err(Error::from_reason(format!(
+                    "muse_glimmer: {field} must be finite and strictly positive, got \
+                     {value}; {consequence}"
                 )));
             }
         }
@@ -510,6 +640,52 @@ impl MuseGlimmerConfig {
                  cache seam carries max_model_len as a u32 and a cast would truncate it",
                 text.max_position_embeddings
             )));
+        }
+
+        // The two projector dimensions. Both are top-level and REQUIRED (no
+        // serde default), and both reach the resolved config completely
+        // unchecked: `from_json_str` validates the text config and the vision
+        // config, and nothing at all in between.
+        //
+        // Nothing reads either field yet — the projector module does not exist —
+        // so this is hardening ahead of the consumer, not a live bug fix. The
+        // reference dimensions all three projector stages from these two ints
+        // (`modeling_muse_glimmer.py:990-1004`), and a 0 in either is not
+        // symmetric:
+        //
+        //   * `projector_hidden_size: 0` makes fc1 emit a `[n_tokens, 0]` tensor.
+        //     No error whatsoever — a degenerate value that just flows on.
+        //   * `out_hidden_size: 0` ABORTS THE PROCESS. The fc1 matmul
+        //     `[8, 6144] @ [0, 4096]` throws a C++ exception out of MLX and
+        //     across the FFI boundary, where Rust cannot catch it: "fatal runtime
+        //     error: Rust cannot catch foreign exceptions", SIGABRT, and no
+        //     diagnostic naming the config. Strictly worse than an `Err`.
+        //
+        // Zero only. `out_hidden_size` happens to equal
+        // `vision_config.hidden_size * merge_size^2` (1536 * 4 = 6144) on this
+        // checkpoint, and enforcing that equality WOULD catch more — it is
+        // deliberately NOT enforced, because the HF reference does not enforce it
+        // either and it would reject a variant checkpoint with a different merge
+        // geometry. Negatives need no clause: both fields are `usize`, so serde
+        // already refuses them with a message that names the field.
+        //
+        // `projector_hidden_act` is deliberately left alone despite sitting right
+        // next to these. No family in this repo validates an activation name at
+        // config load — they all resolve it at the use site (see
+        // `pp_doclayout_v3/persistence.rs:211`) — and the supported set is not
+        // known until the projector exists.
+        for (field, value) in [
+            ("out_hidden_size", raw.out_hidden_size),
+            ("projector_hidden_size", raw.projector_hidden_size),
+        ] {
+            if value == 0 {
+                return Err(Error::from_reason(format!(
+                    "muse_glimmer: {field} must be non-zero; both projector dimensions are \
+                     unchecked by the text and vision validators, and a 0 here is either a \
+                     degenerate zero-width tensor or an MLX C++ exception thrown across the \
+                     FFI boundary, which aborts the process instead of returning an error"
+                )));
+            }
         }
 
         // The vision tower's geometry, checked here for the same reason as
@@ -1153,6 +1329,321 @@ mod tests {
             );
         }
     }
+
+    /// The two projector dimensions, which sit between the two sub-configs and
+    /// are therefore reached by NEITHER validator. Both are top-level and both
+    /// are required, so a 0 in either survives parsing today.
+    ///
+    /// The two zeros do not fail the same way. `projector_hidden_size: 0` makes
+    /// fc1 emit a `[n_tokens, 0]` tensor and raises nothing at all;
+    /// `out_hidden_size: 0` makes the fc1 matmul `[8, 6144] @ [0, 4096]` throw a
+    /// C++ exception out of MLX across the FFI boundary, which Rust cannot catch
+    /// — "fatal runtime error: Rust cannot catch foreign exceptions", SIGABRT,
+    /// and nothing naming the config. A refusal here is strictly better than
+    /// either.
+    ///
+    /// No negative case: both fields are `usize`, so serde already refuses a
+    /// negative by name. And deliberately no `out_hidden_size ==
+    /// vision_config.hidden_size * merge_size^2` check (1536 * 4 = 6144 here) —
+    /// see the comment on the guard for why that stronger invariant is out of
+    /// scope.
+    ///
+    /// Mutation caught: deleting either row of the guard's table. Each field is
+    /// asserted by name.
+    #[test]
+    fn rejects_a_zero_projector_dimension_that_neither_sub_config_validator_reaches() {
+        for (field, real) in [
+            ("out_hidden_size", "6144"),
+            ("projector_hidden_size", "4096"),
+        ] {
+            let good = config_json(&text_config_json(52));
+            let needle = format!("\"{field}\":{real}");
+            assert!(
+                good.contains(&needle),
+                "the fixture must spell {field} as {needle:?} for this substitution to bite"
+            );
+            let bad = good.replace(&needle, &format!("\"{field}\":0"));
+            let err = MuseGlimmerConfig::from_json_str(&bad)
+                .expect_err("a zero projector dimension must fail closed")
+                .to_string();
+            assert!(
+                err.contains(&format!("{field} must be non-zero")),
+                "the refusal must name the projector field, got: {err}"
+            );
+        }
+    }
+
+    /// Every f32 of the text config, none of which had any guard: the existing
+    /// theta check partitions on zero-vs-nonzero and nothing else looks at a
+    /// float at all.
+    ///
+    /// Three bad values per field, and the third is the one that motivates
+    /// `is_finite`: `1e40` is valid JSON, fits the f64 serde reads it into, and
+    /// becomes `+inf` on the `as f32` narrowing with nothing raised. The
+    /// assertion pins the DISPLAYED value ("inf") rather than the literal, so it
+    /// also records that narrowing actually happens — see
+    /// `an_f32_overflowing_literal_arrives_as_infinity_instead_of_a_deserialize_error`.
+    ///
+    /// Mutation caught: dropping any single row of the guard's table (each field
+    /// is asserted by name), and weakening `!is_finite() || <= 0.0` to either
+    /// half alone — dropping `is_finite` leaves `1e40` green, dropping `<= 0.0`
+    /// leaves `-1.0` and `0` green.
+    #[test]
+    fn rejects_a_non_finite_or_non_positive_float_in_the_text_config() {
+        for (field, real) in [
+            ("rms_norm_eps", "1e-5"),
+            ("post_norm_eps", "1e-8"),
+            ("qk_scale_factor", "3.87"),
+            ("output_multiplier", "0.19611613513818404"),
+            ("final_logit_softcapping", "20.0"),
+        ] {
+            // (JSON literal, how f32's Display renders what it becomes)
+            for (literal, shown) in [("-1.0", "-1"), ("0", "0"), ("1e40", "inf")] {
+                let good = text_config_json(52);
+                let needle = format!("\"{field}\": {real}");
+                assert!(
+                    good.contains(&needle),
+                    "the fixture must spell {field} as {needle:?} for this substitution \
+                     to bite"
+                );
+                let bad = good.replace(&needle, &format!("\"{field}\": {literal}"));
+                let err = parse(&bad)
+                    .err()
+                    .unwrap_or_else(|| {
+                        panic!("{field} = {literal} must fail closed at config load")
+                    })
+                    .to_string();
+                assert!(
+                    err.contains(&format!(
+                        "{field} must be finite and strictly positive, got {shown};"
+                    )),
+                    "{field} = {literal} must be refused by name and print the value the \
+                     parser actually holds ({shown}), got: {err}"
+                );
+            }
+        }
+    }
+
+    /// Why the guard above tests `is_finite` and not only `> 0.0`.
+    ///
+    /// Serde's number handling has a seam exactly one order of magnitude wide in
+    /// the exponent: `1e400` is out of range for the f64 it parses into and is
+    /// refused before any guard runs, while `1e40` is a perfectly ordinary f64
+    /// that only overflows on the `as f32` narrowing into the field — silently,
+    /// as `+inf`. So an out-of-range literal is serde's problem and an
+    /// out-of-f32-range literal is OURS, and the second one has no other reader.
+    ///
+    /// Measured harm of a `+inf` RoPE base: 16/1024 lanes zeroed on Metal, all
+    /// NaN on CPU. For the epsilons it drives the normalized activation to zero.
+    ///
+    /// Mutation caught: dropping `!value.is_finite()` from the float guard —
+    /// `1e40` then parses `Ok` and the first assertion goes red. Recorded as its
+    /// own test because the pair of literals is the evidence, and a reader who
+    /// sees only `1e400` rejected would conclude serde already handles this.
+    #[test]
+    fn an_f32_overflowing_literal_arrives_as_infinity_instead_of_a_deserialize_error() {
+        let overflows_f32 =
+            text_config_json(52).replace("\"rms_norm_eps\": 1e-5", "\"rms_norm_eps\": 1e40");
+        let err = parse(&overflows_f32)
+            .expect_err("1e40 reaches the f32 field as +inf and only our guard sees it")
+            .to_string();
+        assert!(
+            err.contains("rms_norm_eps must be finite and strictly positive, got inf"),
+            "1e40 is valid JSON and in range for the f64 serde reads it into; the `as f32` \
+             narrowing is what makes it +inf, got: {err}"
+        );
+
+        let overflows_f64 =
+            text_config_json(52).replace("\"rms_norm_eps\": 1e-5", "\"rms_norm_eps\": 1e400");
+        let err = parse(&overflows_f64)
+            .expect_err("1e400 is out of range for the f64 too")
+            .to_string();
+        assert!(
+            err.contains("invalid config.json") && !err.contains("must be finite"),
+            "the neighbouring literal is refused by serde BEFORE any guard runs; if this \
+             ever became our guard's message instead, the boundary moved, got: {err}"
+        );
+    }
+
+    /// The rotated half of `layer_rope_theta`, which the biconditional above it
+    /// says nothing about: it partitions on zero-vs-nonzero only, so any non-zero
+    /// value at all passes on a sliding layer.
+    ///
+    /// This is the field where the consequence was measured on real MLX, and it
+    /// fails OPEN on the path that actually runs. With base -500000: the CPU
+    /// kernel (`fast.cpp:463`, `exp(arange * log(base) / hd)`) gives 1024/1024
+    /// NaN, but Metal (`rope.cpp:123`, `std::log2(base_)`) gives 0 NaN and
+    /// 1024/1024 exact zeros — q and k come back all-zero and attention collapses
+    /// to the plain causal mean of V (max|good - bad| = 1.5308 against the
+    /// correct output; max|bad - causal_mean_of_V| = 1.19e-07). Finite,
+    /// plausible, no error. MLX itself validates only `dims`, never the base.
+    ///
+    /// Mutation caught: deleting the clause (both literals parse `Ok`), and
+    /// dropping `is_finite` from it (the `1e40` case parses `Ok`). Pinned to this
+    /// clause's own "must be finite and strictly positive" wording rather than to
+    /// the token `layer_rope_theta`, which the two arity messages and both
+    /// biconditional messages also contain.
+    #[test]
+    fn rejects_a_rope_theta_that_is_negative_or_infinite_on_a_rotated_layer() {
+        // Layer 0 is sliding_attention, so it is a ROTATED layer and the
+        // biconditional cannot fire on it — this clause is the only refusal.
+        for (literal, shown) in [("-500000.0", "-500000"), ("1e40", "inf")] {
+            let bad = text_config_json(52).replacen("500000.0", literal, 1);
+            assert!(
+                bad.contains(&format!("[{literal},500000.0")),
+                "fixture edit missed layer 0's theta; the test would pass for the wrong \
+                 reason"
+            );
+            let err = parse(&bad)
+                .err()
+                .unwrap_or_else(|| panic!("a theta of {literal} must fail closed"))
+                .to_string();
+            assert!(
+                err.contains(&format!("layer 0 has layer_rope_theta {shown};"))
+                    && err.contains("must be finite and strictly positive"),
+                "a rotated layer's theta of {literal} must be refused by layer index and \
+                 value, got: {err}"
+            );
+        }
+    }
+
+    /// `-0.0` is NoPE, and must stay accepted.
+    ///
+    /// IEEE 754 makes `-0.0 == 0.0` true, so a `-0.0` theta satisfies the
+    /// NoPE<->Full biconditional and `rope_theta_for` correctly returns `None`
+    /// for it. That is not a hole in the sign guard added alongside this test —
+    /// it is the reason that guard is written `*theta != 0.0 && …` instead of
+    /// `*theta <= 0.0`.
+    ///
+    /// Mutation caught: writing the theta guard as a bare `*theta <= 0.0`, or
+    /// dropping the `!= 0.0` qualifier from it. Either turns a legitimate NoPE
+    /// layer into a parse error, and this is the only test that would say so.
+    #[test]
+    fn a_negative_zero_rope_theta_on_a_full_layer_is_still_nope_and_still_accepted() {
+        // Layer 3 is the first full_attention layer, so its theta is a NoPE 0.
+        let json = text_config_json(52).replacen(
+            "500000.0,500000.0,500000.0,0,",
+            "500000.0,500000.0,500000.0,-0.0,",
+            1,
+        );
+        assert!(
+            json.contains("500000.0,-0.0,"),
+            "fixture edit missed layer 3's theta; the test would pass for the wrong reason"
+        );
+        let t = parse(&json)
+            .expect("-0.0 == 0.0 in IEEE 754, so a -0.0 theta is NoPE and must be accepted")
+            .text_config;
+        assert!(
+            t.layer_rope_theta[3].is_sign_negative(),
+            "the -0.0 must reach the resolved config as a NEGATIVE zero, otherwise this \
+             test never exercised the sign at all"
+        );
+        assert_eq!(t.layer_kinds[3], LayerKind::Full);
+        assert_eq!(
+            t.rope_theta_for(3),
+            None,
+            "a -0.0 theta is NoPE exactly as a +0.0 theta is"
+        );
+    }
+
+    /// The tower's only float, and the one field its usize table cannot reach.
+    /// `layer_norm_eps` is the `eps` of `sqrt(var + eps)` in every LayerNorm of
+    /// the tower: negative turns the activation NaN, `+inf` turns it to zero, and
+    /// neither raises. Same class as the two text-side epsilons, checked in
+    /// `validate` rather than in `from_json_str` for the reason that method
+    /// exists — the type's fields are all `pub` with no private constructor, so
+    /// the tower can re-check a config it did not parse.
+    ///
+    /// Mutation caught: deleting the clause from `validate`. Pinned to
+    /// `vision_config.layer_norm_eps`, so the text-side guard cannot satisfy it.
+    #[test]
+    fn rejects_a_non_finite_or_non_positive_vision_layer_norm_eps() {
+        for (literal, shown) in [("-1.0", "-1"), ("0", "0"), ("1e40", "inf")] {
+            let good = config_json(&text_config_json(52));
+            assert!(
+                good.contains("\"layer_norm_eps\":1e-5"),
+                "the fixture must spell the tower's epsilon without a space after the colon"
+            );
+            let bad = good.replace(
+                "\"layer_norm_eps\":1e-5",
+                &format!("\"layer_norm_eps\":{literal}"),
+            );
+            let err = MuseGlimmerConfig::from_json_str(&bad)
+                .err()
+                .unwrap_or_else(|| panic!("a layer_norm_eps of {literal} must fail closed"))
+                .to_string();
+            assert!(
+                err.contains(&format!(
+                    "vision_config.layer_norm_eps must be finite and strictly positive, \
+                     got {shown};"
+                )),
+                "the tower's epsilon must be refused by name and value, got: {err}"
+            );
+        }
+    }
+
+    /// The acceptance half of every guard above. A validator that refuses more
+    /// than it should is worse than the gap it closed, and every clause added
+    /// here sits on the path the REAL config takes, so the fixture has to keep
+    /// parsing untouched — in both its forms, since the minimal one exercises the
+    /// `#[serde(default)]` values instead of the file's.
+    ///
+    /// The on-disk file itself is covered by the gated
+    /// `real_checkpoint_config_parses` below; this one runs everywhere.
+    ///
+    /// Mutation caught: any guard written with the comparison inverted, or with
+    /// `>=` where `>` belongs — the checkpoint's own values would start failing
+    /// and no other test in this module distinguishes "refuses correctly" from
+    /// "refuses everything".
+    #[test]
+    fn the_unmodified_checkpoint_fixture_passes_every_finiteness_and_positivity_guard() {
+        for (label, text) in [
+            ("full", text_config_json(52)),
+            (
+                "minimal (every #[serde(default)] field omitted)",
+                minimal_text_config_json(52),
+            ),
+        ] {
+            let cfg = parse(&text)
+                .unwrap_or_else(|e| panic!("the {label} checkpoint fixture must parse: {e}"));
+            let t = &cfg.text_config;
+            for (field, value) in [
+                ("rms_norm_eps", t.rms_norm_eps),
+                ("post_norm_eps", t.post_norm_eps),
+                ("qk_scale_factor", t.qk_scale_factor),
+                ("output_multiplier", t.output_multiplier),
+                ("final_logit_softcapping", t.final_logit_softcapping),
+                (
+                    "vision_config.layer_norm_eps",
+                    cfg.vision_config.layer_norm_eps,
+                ),
+            ] {
+                assert!(
+                    value.is_finite() && value > 0.0,
+                    "{label}: {field} is {value}, which the new guard would refuse"
+                );
+            }
+            assert_eq!(cfg.out_hidden_size, 6144);
+            assert_eq!(cfg.projector_hidden_size, 4096);
+            // The real theta distribution: 39 rotated layers at 500000.0 and 13
+            // NoPE zeros. The sign/finiteness clause must leave both alone.
+            assert_eq!(
+                t.layer_rope_theta
+                    .iter()
+                    .filter(|v| **v == 500_000.0)
+                    .count(),
+                39,
+                "{label}: the rotated layers must survive the theta guard"
+            );
+            assert_eq!(
+                t.layer_rope_theta.iter().filter(|v| **v == 0.0).count(),
+                13,
+                "{label}: the NoPE layers must survive the theta guard"
+            );
+        }
+    }
+
+    /// The vision tower's geometry is validated, not merely deserialized. Every
 
     /// The vision tower's geometry is validated, not merely deserialized. Every
     /// field here is a divisor or a dimension of the patch grid, so a 0 surfaces
