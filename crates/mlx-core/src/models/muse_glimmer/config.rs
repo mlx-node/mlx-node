@@ -1644,8 +1644,6 @@ mod tests {
     }
 
     /// The vision tower's geometry is validated, not merely deserialized. Every
-
-    /// The vision tower's geometry is validated, not merely deserialized. Every
     /// field here is a divisor or a dimension of the patch grid, so a 0 surfaces
     /// as a division by zero or an empty tensor inside M2's tower — far from the
     /// config that carried it.
