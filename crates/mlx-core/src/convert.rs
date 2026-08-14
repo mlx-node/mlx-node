@@ -1824,6 +1824,64 @@ pub(crate) mod recipe {
         }
     }
 
+    /// Muse-Glimmer. Hugging Face nests the decoder below
+    /// `model.language_model`, while the MLX quantization metadata and future
+    /// native loader use the same `language_model.model.*` namespace as the
+    /// other conditional-generation families. Vision/projector weights stay
+    /// prefix-free and dense.
+    pub(crate) struct MuseGlimmerRecipe;
+
+    impl ConversionRecipe for MuseGlimmerRecipe {
+        fn model_types(&self) -> &'static [&'static str] {
+            &["muse_glimmer"]
+        }
+
+        fn sanitize(
+            &self,
+            weights: HashMap<String, MxArray>,
+            _config: &serde_json::Value,
+            _target_dtype_str: &str,
+            tie_word_embeddings: bool,
+            verbose: bool,
+        ) -> Result<HashMap<String, MxArray>> {
+            let mut sanitized = HashMap::with_capacity(weights.len());
+            let mut skipped = 0usize;
+
+            for (source_key, array) in weights {
+                let key = if let Some(rest) = source_key.strip_prefix("model.language_model.") {
+                    format!("language_model.model.{rest}")
+                } else if source_key.starts_with("language_model.model.") {
+                    source_key.clone()
+                } else if source_key == "lm_head.weight" {
+                    if tie_word_embeddings {
+                        skipped += 1;
+                        continue;
+                    }
+                    "language_model.model.lm_head.weight".to_string()
+                } else if let Some(rest) = source_key.strip_prefix("model.") {
+                    rest.to_string()
+                } else {
+                    source_key.clone()
+                };
+
+                if sanitized.insert(key.clone(), array).is_some() {
+                    return Err(Error::from_reason(format!(
+                        "Muse-Glimmer conversion produced duplicate canonical tensor key '{key}'"
+                    )));
+                }
+            }
+
+            if verbose || skipped > 0 {
+                info!(
+                    "  Muse-Glimmer sanitize: kept {} tensors, skipped {} tied heads",
+                    sanitized.len(),
+                    skipped
+                );
+            }
+            Ok(sanitized)
+        }
+    }
+
     /// Gemma4 (text + vision/audio towers). Thinnest family: post-cast prefix
     /// strip + expert gate_up split, no FP8/norm-shift/MTP. Its `sanitize` body
     /// is the real transform (set via [`set_gemma4_sanitize`] to avoid a
@@ -1989,6 +2047,7 @@ pub(crate) mod recipe {
         "paddleocr-vl",
         "qianfan-ocr",
         "privacy-filter",
+        "muse_glimmer",
         "gemma4",
         "gemma4_unified",
     ];
@@ -2005,6 +2064,7 @@ pub(crate) mod recipe {
             "paddleocr-vl" => Some(Box::new(PaddleOcrVlRecipe)),
             "qianfan-ocr" => Some(Box::new(QianfanOcrRecipe)),
             "privacy-filter" => Some(Box::new(PrivacyFilterRecipe)),
+            "muse_glimmer" => Some(Box::new(MuseGlimmerRecipe)),
             "gemma4" | "gemma4_unified" => Some(Box::new(Gemma4Recipe)),
             _ => None,
         }
@@ -3172,7 +3232,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             _ => None,
         };
         if let Some(kind) = official_unsloth_kind {
-            validate_gemma4_official_unsloth_shapes(&converted_tensors, kind)
+            validate_official_unsloth_shapes(&converted_tensors, kind)
                 .map_err(Error::from_reason)?;
         }
 
@@ -3279,14 +3339,29 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 } else {
                     predicate
                 };
+            // Muse's fixed map has exactly one packed format: every selected
+            // matrix is MXFP4/32 and every promoted/protected class stays
+            // dense. Record that honest global default instead of serializing
+            // 409 identical overrides below an unused affine-3 default. The
+            // dynamic boundary is represented by which tensors have `.scales`,
+            // not by a second packed mode.
+            let uniform_default = official_unsloth_uniform_default(official_unsloth_kind);
+            let (recipe_bits, recipe_group_size, recipe_mode) =
+                uniform_default.unwrap_or((quant_bits, quant_group_size, quant_mode.as_str()));
             per_layer_overrides = quantize_weights_with_recipe_pub(
                 &mut converted_tensors,
-                quant_bits,
-                quant_group_size,
-                &quant_mode,
+                recipe_bits,
+                recipe_group_size,
+                recipe_mode,
                 &*predicate,
                 embed_quantizable,
             )?;
+            if uniform_default.is_some() {
+                quant_bits_effective = recipe_bits;
+                quant_group_size_effective = recipe_group_size;
+                quant_mode_effective = recipe_mode.to_string();
+                debug_assert!(per_layer_overrides.is_empty());
+            }
         } else {
             // No recipe, non-privacy-filter. NVFP4 cannot land here — the
             // legacy `quantize_weights` path uniformly applies the global
@@ -4762,6 +4837,18 @@ pub(crate) enum OfficialUnslothRecipeKind {
     Gemma4MoeMxfp,
     /// Gemma4 MoE map, preserving NVFP4/plain E4M3 FP8.
     Gemma4MoeNvfp4,
+    /// Muse-Glimmer UD-Q4_K_XL class map, translated to MXFP4 plus BF16
+    /// preservation for the upstream Q5_K tensors.
+    MuseGlimmerMxfp,
+}
+
+/// A fixed map may use one packed format for every selected tensor, allowing
+/// that format to be the top-level default with no per-layer overrides. The
+/// Qwen and Gemma maps are genuinely mixed-format and therefore return none.
+fn official_unsloth_uniform_default(
+    kind: Option<OfficialUnslothRecipeKind>,
+) -> Option<(i32, i32, &'static str)> {
+    (kind == Some(OfficialUnslothRecipeKind::MuseGlimmerMxfp)).then_some((4, 32, "mxfp4"))
 }
 
 /// User-facing warning for a verified fixed Unsloth map without calibration.
@@ -4808,8 +4895,8 @@ pub(crate) fn validate_unsloth_imatrix_after_selection(
     }
     Err(
         "unsloth without --imatrix-path is supported only for a verified Qwen3.5/Qwen3.6 \
-         hybrid or Gemma4 MoE SafeTensors checkpoint using the fixed --q-mxfp or \
-         --q-mode nvfp4 class map; family/requested-model/shape validation did not \
+         hybrid, Gemma4 MoE, or Muse-Glimmer SafeTensors checkpoint using a supported \
+         fixed class map; family/requested-model/shape validation did not \
          select a fixed map, so refusing to fall back to legacy Dynamic 2.0 without \
          AWQ calibration"
             .to_string(),
@@ -4909,6 +4996,132 @@ fn is_gemma4_moe_checkpoint(
         && has_gemma4_moe_weight_shape(weight_keys)
 }
 
+/// Require the exact published Muse-Glimmer-30B SafeTensors inventory before
+/// selecting its fixed Unsloth map. The released UD-Q4_K_XL GGUF assigns Q4_K
+/// to 410 matrices: the token embedding plus 409 text-body matrices. Its Q5_K
+/// class is the LM head plus the final seven attention output projections.
+/// MLX keeps both vocabulary matrices in BF16 per the native design, so the
+/// translated map selects the remaining 409 matrices for MXFP4 and preserves
+/// the entire Q5_K class in BF16.
+pub(crate) fn has_muse_glimmer_weight_shape(weight_keys: &[String]) -> bool {
+    if weight_keys.len() != 1_436 {
+        return false;
+    }
+
+    let mut expected = HashSet::with_capacity(1_436);
+    for layer in 0..52 {
+        for suffix in [
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "pre_feedforward_layernorm.weight",
+            "post_feedforward_layernorm.weight",
+            "mlp.gate_proj.weight",
+            "mlp.up_proj.weight",
+            "mlp.down_proj.weight",
+            "self_attn.gate_proj.weight",
+            "self_attn.q_proj.weight",
+            "self_attn.k_proj.weight",
+            "self_attn.v_proj.weight",
+            "self_attn.o_proj.weight",
+        ] {
+            expected.insert(format!("language_model.model.layers.{layer}.{suffix}"));
+        }
+    }
+    for layer in 0..50 {
+        for suffix in [
+            "attn.q_proj.weight",
+            "attn.q_proj.bias",
+            "attn.k_proj.weight",
+            "attn.k_proj.bias",
+            "attn.v_proj.weight",
+            "attn.v_proj.bias",
+            "attn.proj.weight",
+            "attn.proj.bias",
+            "mlp.fc1.weight",
+            "mlp.fc1.bias",
+            "mlp.fc2.weight",
+            "mlp.fc2.bias",
+            "norm1.weight",
+            "norm1.bias",
+            "norm2.weight",
+            "norm2.bias",
+        ] {
+            expected.insert(format!("vision_tower.layers.{layer}.{suffix}"));
+        }
+    }
+    expected.extend(
+        [
+            "language_model.model.embed_tokens.weight",
+            "language_model.model.norm.weight",
+            "language_model.model.lm_head.weight",
+            "vision_adapter.fc1.weight",
+            "vision_adapter.fc2.weight",
+            "vision_projection.weight",
+            "vision_tower.ln_pre.weight",
+            "vision_tower.ln_pre.bias",
+            "vision_tower.ln_post.weight",
+            "vision_tower.ln_post.bias",
+            "vision_tower.patch_embedder.patch_embedding.weight",
+            "vision_tower.patch_embedder.position_embedding_table.weight",
+        ]
+        .into_iter()
+        .map(str::to_string),
+    );
+    debug_assert_eq!(expected.len(), 1_436);
+
+    let actual = weight_keys
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    actual.len() == weight_keys.len()
+        && expected
+            .iter()
+            .all(|expected_key| actual.contains(expected_key.as_str()))
+}
+
+fn is_muse_glimmer_checkpoint(
+    config: &serde_json::Value,
+    requested_model_type: Option<&str>,
+    weight_keys: &[String],
+) -> bool {
+    let text = config.get("text_config");
+    config.get("model_type").and_then(|value| value.as_str()) == Some("muse_glimmer")
+        && text
+            .and_then(|value| value.get("model_type"))
+            .and_then(|value| value.as_str())
+            == Some("muse_glimmer_text")
+        && requested_model_type == Some("muse_glimmer")
+        && config
+            .get("architectures")
+            .and_then(|value| value.as_array())
+            .is_some_and(|architectures| {
+                architectures
+                    .iter()
+                    .any(|value| value.as_str() == Some("MuseGlimmerForConditionalGeneration"))
+            })
+        && text
+            .and_then(|value| value.get("num_hidden_layers"))
+            .and_then(|value| value.as_u64())
+            == Some(52)
+        && text
+            .and_then(|value| value.get("hidden_size"))
+            .and_then(|value| value.as_u64())
+            == Some(6_656)
+        && text
+            .and_then(|value| value.get("intermediate_size"))
+            .and_then(|value| value.as_u64())
+            == Some(19_968)
+        && text
+            .and_then(|value| value.get("vocab_size"))
+            .and_then(|value| value.as_u64())
+            == Some(202_048)
+        && text
+            .and_then(|value| value.get("tie_word_embeddings"))
+            .and_then(|value| value.as_bool())
+            == Some(false)
+        && has_muse_glimmer_weight_shape(weight_keys)
+}
+
 /// Select and validate the SafeTensors fixed Unsloth class map from the input
 /// config, requested sanitizer family, and sanitized tensor inventory.
 ///
@@ -4927,10 +5140,14 @@ fn select_and_validate_official_unsloth_recipe(
 ) -> std::result::Result<Option<OfficialUnslothRecipeKind>, String> {
     let is_qwen35_hybrid = is_qwen35_hybrid_checkpoint(config, requested_model_type, weight_keys);
     let is_gemma4_moe = is_gemma4_moe_checkpoint(config, requested_model_type, weight_keys);
+    let is_muse_glimmer = is_muse_glimmer_checkpoint(config, requested_model_type, weight_keys);
     let requests_fixed_map = recipe == "unsloth" && (quant_mxfp || quant_mode == "nvfp4");
     let config_declares_gemma4 =
         config.get("model_type").and_then(|value| value.as_str()) == Some("gemma4");
     let requested_gemma4 = requested_model_type == Some("gemma4");
+    let config_declares_muse =
+        config.get("model_type").and_then(|value| value.as_str()) == Some("muse_glimmer");
+    let requested_muse = requested_model_type == Some("muse_glimmer");
     if requests_fixed_map
         && (config_declares_gemma4 || requested_gemma4)
         && !is_gemma4_moe
@@ -4946,8 +5163,21 @@ fn select_and_validate_official_unsloth_recipe(
                 .to_string(),
         );
     }
+    if requests_fixed_map
+        && (config_declares_muse || requested_muse)
+        && (!is_muse_glimmer || !quant_mxfp || quant_mode != "affine")
+    {
+        return Err(
+            "Muse-Glimmer fixed Unsloth map validation failed: only --q-mxfp on the exact \
+             Muse-Glimmer-30B SafeTensors config and complete 1436-tensor canonical inventory \
+             is supported. NVFP4 and partial or renamed checkpoints are refused."
+                .to_string(),
+        );
+    }
     let official_kind = if is_qwen35_hybrid {
         select_official_unsloth_recipe(recipe, quant_mxfp, quant_mode, true)
+    } else if recipe == "unsloth" && is_muse_glimmer && quant_mxfp && quant_mode == "affine" {
+        Some(OfficialUnslothRecipeKind::MuseGlimmerMxfp)
     } else if recipe == "unsloth" && is_gemma4_moe && quant_mxfp {
         Some(OfficialUnslothRecipeKind::Gemma4MoeMxfp)
     } else if recipe == "unsloth" && is_gemma4_moe && quant_mode == "nvfp4" {
@@ -4961,8 +5191,9 @@ fn select_and_validate_official_unsloth_recipe(
 
 /// Build a verified fixed Unsloth tensor-class map.
 ///
-/// Selected for verified Qwen hybrids or Gemma4 MoE SafeTensors under either
-/// `--q-mxfp` or `--q-mode nvfp4`. The existing
+/// Selected for verified Qwen hybrids, Gemma4 MoE, or Muse-Glimmer
+/// SafeTensors. Qwen/Gemma support either `--q-mxfp` or `--q-mode nvfp4`;
+/// Muse is MXFP4-only. The existing
 /// [`build_unsloth_recipe`] remains unchanged for plain affine and as the safe
 /// fallback for unverified/ambiguous inputs. AWQ pre-scaling is unchanged.
 ///
@@ -4971,7 +5202,10 @@ fn select_and_validate_official_unsloth_recipe(
 /// attention q/k/v/o projection uses the high format; every dense MLP and
 /// sanitized `experts.switch_glu` gate/up/down projection uses the low format
 /// at every depth. Gemma router, embeddings, vision/audio, norms, head, and all
-/// other tensors remain BF16.
+/// other tensors remain BF16. Muse mirrors the published UD-Q4_K_XL class
+/// boundary: all eligible text-body matrices use MXFP4 except the last seven
+/// attention output projections, which join both vocabulary matrices, norms,
+/// projector, and vision tower in BF16 because MXFP has no 5-bit class.
 pub(crate) fn build_official_unsloth_recipe(
     weight_keys: &[String],
     kind: OfficialUnslothRecipeKind,
@@ -4995,9 +5229,12 @@ pub(crate) fn build_official_unsloth_recipe(
         kind,
         OfficialUnslothRecipeKind::QwenMxfp | OfficialUnslothRecipeKind::QwenNvfp4
     );
+    let is_muse = kind == OfficialUnslothRecipeKind::MuseGlimmerMxfp;
     let use_mxfp = matches!(
         kind,
-        OfficialUnslothRecipeKind::QwenMxfp | OfficialUnslothRecipeKind::Gemma4MoeMxfp
+        OfficialUnslothRecipeKind::QwenMxfp
+            | OfficialUnslothRecipeKind::Gemma4MoeMxfp
+            | OfficialUnslothRecipeKind::MuseGlimmerMxfp
     );
 
     Box::new(move |key: &str| -> QuantDecision {
@@ -5023,6 +5260,33 @@ pub(crate) fn build_official_unsloth_recipe(
         };
         let low_ffn = || if use_mxfp { mxfp4() } else { nvfp4() };
         let high = || if use_mxfp { mxfp8() } else { fp8_e4m3() };
+
+        if is_muse {
+            let Some(layer) = key
+                .strip_prefix("language_model.model.layers.")
+                .and_then(|rest| rest.split_once('.'))
+                .and_then(|(layer, _)| layer.parse::<usize>().ok())
+            else {
+                return QuantDecision::Skip;
+            };
+            if layer >= 52 || !should_quantize(key, /* embed_quantizable */ false) {
+                return QuantDecision::Skip;
+            }
+
+            let low_attention = key.ends_with(".self_attn.gate_proj.weight")
+                || key.ends_with(".self_attn.q_proj.weight")
+                || key.ends_with(".self_attn.k_proj.weight")
+                || key.ends_with(".self_attn.v_proj.weight")
+                || (key.ends_with(".self_attn.o_proj.weight") && layer < 45);
+            let low_mlp = key.ends_with(".mlp.gate_proj.weight")
+                || key.ends_with(".mlp.up_proj.weight")
+                || key.ends_with(".mlp.down_proj.weight");
+            return if low_attention || low_mlp {
+                mxfp4()
+            } else {
+                QuantDecision::Skip
+            };
+        }
 
         if !is_qwen {
             // Gemma's fixed map is language-model-only. Requiring the exact
@@ -5120,16 +5384,19 @@ pub(crate) fn build_official_unsloth_recipe(
 /// a wrong-rank expert or an unaligned input dimension would otherwise be
 /// silently skipped by the generic emission gate, producing a mixed checkpoint
 /// that no longer matches the claimed fixed recipe.
-fn validate_gemma4_official_unsloth_shapes(
+fn validate_official_unsloth_shapes(
     weights: &HashMap<String, MxArray>,
     kind: OfficialUnslothRecipeKind,
 ) -> std::result::Result<(), String> {
-    if !matches!(
+    let is_gemma = matches!(
         kind,
         OfficialUnslothRecipeKind::Gemma4MoeMxfp | OfficialUnslothRecipeKind::Gemma4MoeNvfp4
-    ) {
+    );
+    let is_muse = kind == OfficialUnslothRecipeKind::MuseGlimmerMxfp;
+    if !is_gemma && !is_muse {
         return Ok(());
     }
+    let family = if is_muse { "Muse-Glimmer" } else { "Gemma4" };
 
     let weight_keys = weights.keys().cloned().collect::<Vec<_>>();
     let predicate = build_official_unsloth_recipe(&weight_keys, kind);
@@ -5143,23 +5410,25 @@ fn validate_gemma4_official_unsloth_shapes(
         let expected_rank = if is_expert { 3 } else { 2 };
         let rank = weight
             .ndim()
-            .map_err(|error| format!("failed to inspect Gemma4 tensor '{key}': {error}"))?;
+            .map_err(|error| format!("failed to inspect {family} tensor '{key}': {error}"))?;
         if rank != expected_rank {
             return Err(format!(
-                "Gemma4 fixed Unsloth map tensor '{key}' must be rank {expected_rank}, got rank \
-                 {rank}; refusing to emit a partial fixed-map checkpoint"
+                "{} fixed Unsloth map tensor '{key}' must be rank {expected_rank}, got rank \
+                 {rank}; refusing to emit a partial fixed-map checkpoint",
+                family
             ));
         }
         let shape = weight
             .shape()
-            .map_err(|error| format!("failed to inspect Gemma4 tensor '{key}': {error}"))?;
-        let input_dim = *shape
-            .last()
-            .ok_or_else(|| format!("Gemma4 fixed Unsloth map tensor '{key}' has an empty shape"))?;
+            .map_err(|error| format!("failed to inspect {family} tensor '{key}': {error}"))?;
+        let input_dim = *shape.last().ok_or_else(|| {
+            format!("{family} fixed Unsloth map tensor '{key}' has an empty shape")
+        })?;
         if input_dim <= 0 || input_dim % 32 != 0 {
             return Err(format!(
-                "Gemma4 fixed Unsloth map tensor '{key}' has input dimension {input_dim}; \
-                 the verified MXFP4/NVFP4 recipe requires K % 32 == 0"
+                "{} fixed Unsloth map tensor '{key}' has input dimension {input_dim}; \
+                 the verified MXFP4/NVFP4 recipe requires K % 32 == 0",
+                family
             ));
         }
 
@@ -5169,10 +5438,12 @@ fn validate_gemma4_official_unsloth_shapes(
             high_count += 1;
         }
     }
-    if (low_count, high_count) != (180, 115) {
+    let expected = if is_muse { (409, 0) } else { (180, 115) };
+    if (low_count, high_count) != expected {
         return Err(format!(
-            "Gemma4 fixed Unsloth map selected {low_count} low-format and {high_count} \
-             high-format tensors; expected exactly 180 MLP/expert and 115 attention tensors"
+            "{} fixed Unsloth map selected {low_count} low-format and {high_count} \
+             high-format tensors; expected exactly {} low-format and {} high-format tensors",
+            family, expected.0, expected.1,
         ));
     }
     Ok(())
@@ -14224,6 +14495,20 @@ mod tests {
             select_official_unsloth_recipe("nvidia", true, "affine", true),
             None
         );
+
+        assert_eq!(
+            official_unsloth_uniform_default(Some(OfficialUnslothRecipeKind::MuseGlimmerMxfp)),
+            Some((4, 32, "mxfp4"))
+        );
+        for mixed in [
+            None,
+            Some(OfficialUnslothRecipeKind::QwenMxfp),
+            Some(OfficialUnslothRecipeKind::QwenNvfp4),
+            Some(OfficialUnslothRecipeKind::Gemma4MoeMxfp),
+            Some(OfficialUnslothRecipeKind::Gemma4MoeNvfp4),
+        ] {
+            assert_eq!(official_unsloth_uniform_default(mixed), None);
+        }
     }
 
     #[test]
@@ -14263,6 +14548,7 @@ mod tests {
             OfficialUnslothRecipeKind::QwenNvfp4,
             OfficialUnslothRecipeKind::Gemma4MoeMxfp,
             OfficialUnslothRecipeKind::Gemma4MoeNvfp4,
+            OfficialUnslothRecipeKind::MuseGlimmerMxfp,
         ] {
             validate_unsloth_imatrix_after_selection("unsloth", None, Some(kind))
                 .expect("a verified fixed map may run without an imatrix");
@@ -14384,6 +14670,251 @@ mod tests {
             Some("qwen3_5"),
             &["model.layers.0.self_attn.q_proj.weight".to_string()],
         ));
+    }
+
+    fn muse_glimmer_test_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "muse_glimmer",
+            "architectures": ["MuseGlimmerForConditionalGeneration"],
+            "text_config": {
+                "model_type": "muse_glimmer_text",
+                "num_hidden_layers": 52,
+                "hidden_size": 6656,
+                "intermediate_size": 19968,
+                "vocab_size": 202048,
+                "tie_word_embeddings": false
+            }
+        })
+    }
+
+    fn muse_glimmer_test_keys() -> Vec<String> {
+        let mut keys = Vec::with_capacity(1_436);
+        for layer in 0..52 {
+            for suffix in [
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+                "pre_feedforward_layernorm.weight",
+                "post_feedforward_layernorm.weight",
+                "mlp.gate_proj.weight",
+                "mlp.up_proj.weight",
+                "mlp.down_proj.weight",
+                "self_attn.gate_proj.weight",
+                "self_attn.q_proj.weight",
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.o_proj.weight",
+            ] {
+                keys.push(format!("language_model.model.layers.{layer}.{suffix}"));
+            }
+        }
+        keys.extend(
+            [
+                "language_model.model.embed_tokens.weight",
+                "language_model.model.norm.weight",
+                "language_model.model.lm_head.weight",
+                "vision_adapter.fc1.weight",
+                "vision_adapter.fc2.weight",
+                "vision_projection.weight",
+                "vision_tower.ln_pre.weight",
+                "vision_tower.ln_pre.bias",
+                "vision_tower.ln_post.weight",
+                "vision_tower.ln_post.bias",
+                "vision_tower.patch_embedder.patch_embedding.weight",
+                "vision_tower.patch_embedder.position_embedding_table.weight",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        for layer in 0..50 {
+            for suffix in [
+                "attn.q_proj.weight",
+                "attn.q_proj.bias",
+                "attn.k_proj.weight",
+                "attn.k_proj.bias",
+                "attn.v_proj.weight",
+                "attn.v_proj.bias",
+                "attn.proj.weight",
+                "attn.proj.bias",
+                "mlp.fc1.weight",
+                "mlp.fc1.bias",
+                "mlp.fc2.weight",
+                "mlp.fc2.bias",
+                "norm1.weight",
+                "norm1.bias",
+                "norm2.weight",
+                "norm2.bias",
+            ] {
+                keys.push(format!("vision_tower.layers.{layer}.{suffix}"));
+            }
+        }
+        assert_eq!(keys.len(), 1_436, "test fixture must mirror the release");
+        keys
+    }
+
+    #[test]
+    fn muse_glimmer_recipe_canonicalizes_hf_names_and_is_idempotent() {
+        use recipe::ConversionRecipe;
+
+        let weight = || MxArray::zeros(&[1, 32], Some(DType::BFloat16)).expect("weight");
+        let source = HashMap::from([
+            (
+                "model.language_model.layers.0.self_attn.q_proj.weight".to_string(),
+                weight(),
+            ),
+            ("lm_head.weight".to_string(), weight()),
+            ("model.vision_adapter.fc1.weight".to_string(), weight()),
+            (
+                "model.vision_tower.layers.0.attn.q_proj.weight".to_string(),
+                weight(),
+            ),
+        ]);
+        let recipe = recipe::MuseGlimmerRecipe;
+        let once = recipe
+            .sanitize(source, &serde_json::json!({}), "bfloat16", false, false)
+            .expect("first sanitize");
+        assert!(once.contains_key("language_model.model.layers.0.self_attn.q_proj.weight"));
+        assert!(once.contains_key("language_model.model.lm_head.weight"));
+        assert!(once.contains_key("vision_adapter.fc1.weight"));
+        assert!(once.contains_key("vision_tower.layers.0.attn.q_proj.weight"));
+
+        let twice = recipe
+            .sanitize(once, &serde_json::json!({}), "bfloat16", false, false)
+            .expect("second sanitize");
+        assert_eq!(
+            twice.len(),
+            4,
+            "canonical keys must not grow another prefix"
+        );
+        assert!(twice.contains_key("language_model.model.layers.0.self_attn.q_proj.weight"));
+    }
+
+    #[test]
+    fn unsloth_muse_glimmer_selector_requires_the_exact_release_and_mxfp4() {
+        let config = muse_glimmer_test_config();
+        let keys = muse_glimmer_test_keys();
+        assert!(has_muse_glimmer_weight_shape(&keys));
+        assert!(is_muse_glimmer_checkpoint(
+            &config,
+            Some("muse_glimmer"),
+            &keys
+        ));
+        assert_eq!(
+            select_and_validate_official_unsloth_recipe(
+                "unsloth",
+                None,
+                true,
+                "affine",
+                &config,
+                Some("muse_glimmer"),
+                &keys,
+            )
+            .expect("verified Muse MXFP selector"),
+            Some(OfficialUnslothRecipeKind::MuseGlimmerMxfp),
+        );
+
+        let mut incomplete = keys.clone();
+        incomplete.retain(|key| key != "language_model.model.layers.51.mlp.up_proj.weight");
+        let mut renamed = keys.clone();
+        *renamed
+            .iter_mut()
+            .find(|key| key.as_str() == "language_model.model.layers.51.mlp.up_proj.weight")
+            .expect("published key") =
+            "language_model.model.layers.51.renamed.mlp.up_proj.weight".to_string();
+        for (bad_config, requested, bad_keys) in [
+            (&config, Some("qwen3_5"), keys.as_slice()),
+            (&config, None, keys.as_slice()),
+            (&config, Some("muse_glimmer"), incomplete.as_slice()),
+            (&config, Some("muse_glimmer"), renamed.as_slice()),
+        ] {
+            let err = select_and_validate_official_unsloth_recipe(
+                "unsloth", None, true, "affine", bad_config, requested, bad_keys,
+            )
+            .expect_err("mismatched Muse identity or inventory must fail closed");
+            assert!(
+                err.contains("Muse-Glimmer fixed Unsloth map validation failed"),
+                "unexpected error: {err}"
+            );
+        }
+
+        let err = select_and_validate_official_unsloth_recipe(
+            "unsloth",
+            None,
+            false,
+            "nvfp4",
+            &config,
+            Some("muse_glimmer"),
+            &keys,
+        )
+        .expect_err("Muse is MXFP4-only");
+        assert!(err.contains("NVFP4"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn unsloth_muse_glimmer_map_emits_409_mxfp4_matrices_and_preserves_q5_class() {
+        let keys = muse_glimmer_test_keys();
+        let predicate =
+            build_official_unsloth_recipe(&keys, OfficialUnslothRecipeKind::MuseGlimmerMxfp);
+        let mut mxfp4 = 0usize;
+        for key in &keys {
+            match predicate(key) {
+                QuantDecision::Custom {
+                    bits: 4,
+                    group_size: 32,
+                    ref mode,
+                } if mode == "mxfp4" => mxfp4 += 1,
+                QuantDecision::Skip => {}
+                other => panic!("unexpected Muse decision for {key}: {other:?}"),
+            }
+        }
+        assert_eq!(mxfp4, 409);
+
+        for key in [
+            "language_model.model.embed_tokens.weight",
+            "language_model.model.lm_head.weight",
+            "language_model.model.layers.45.self_attn.o_proj.weight",
+            "language_model.model.layers.51.self_attn.o_proj.weight",
+            "language_model.model.layers.51.input_layernorm.weight",
+            "vision_adapter.fc1.weight",
+            "vision_tower.layers.0.attn.q_proj.weight",
+        ] {
+            assert_eq!(
+                predicate(key),
+                QuantDecision::Skip,
+                "published high-precision class must remain BF16: {key}"
+            );
+        }
+        assert!(matches!(
+            predicate("language_model.model.layers.44.self_attn.o_proj.weight"),
+            QuantDecision::Custom { ref mode, .. } if mode == "mxfp4"
+        ));
+    }
+
+    #[test]
+    fn unsloth_muse_glimmer_shape_preflight_checks_count_rank_and_alignment() {
+        let keys = muse_glimmer_test_keys();
+        let predicate =
+            build_official_unsloth_recipe(&keys, OfficialUnslothRecipeKind::MuseGlimmerMxfp);
+        let mut weights = keys
+            .iter()
+            .filter(|key| !matches!(predicate(key), QuantDecision::Skip))
+            .map(|key| {
+                (
+                    key.clone(),
+                    MxArray::zeros(&[2, 32], Some(DType::BFloat16)).expect("Muse recipe weight"),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        validate_official_unsloth_shapes(&weights, OfficialUnslothRecipeKind::MuseGlimmerMxfp)
+            .expect("published Muse ranks and alignment");
+
+        weights.insert(
+            "language_model.model.layers.0.self_attn.q_proj.weight".into(),
+            MxArray::zeros(&[2, 48], Some(DType::BFloat16)).unwrap(),
+        );
+        let err =
+            validate_official_unsloth_shapes(&weights, OfficialUnslothRecipeKind::MuseGlimmerMxfp)
+                .expect_err("K % 32 mismatch must reject");
+        assert!(err.contains("K % 32"), "{err}");
     }
 
     fn gemma4_moe_test_config() -> serde_json::Value {
@@ -14656,7 +15187,7 @@ mod tests {
             OfficialUnslothRecipeKind::Gemma4MoeNvfp4,
         ] {
             let good = gemma4_moe_shape_test_weights();
-            validate_gemma4_official_unsloth_shapes(&good, kind)
+            validate_official_unsloth_shapes(&good, kind)
                 .expect("published Gemma4 module ranks and K alignment must pass");
 
             let mut bad_rank = gemma4_moe_shape_test_weights();
@@ -14664,7 +15195,7 @@ mod tests {
                 "language_model.model.layers.0.experts.switch_glu.gate_proj.weight".into(),
                 MxArray::zeros(&[3, 32], Some(DType::BFloat16)).unwrap(),
             );
-            let err = validate_gemma4_official_unsloth_shapes(&bad_rank, kind)
+            let err = validate_official_unsloth_shapes(&bad_rank, kind)
                 .expect_err("2-D expert storage must reject");
             assert!(err.contains("must be rank 3"), "{err}");
 
@@ -14673,7 +15204,7 @@ mod tests {
                 "language_model.model.layers.0.self_attn.q_proj.weight".into(),
                 MxArray::zeros(&[3, 48], Some(DType::BFloat16)).unwrap(),
             );
-            let err = validate_gemma4_official_unsloth_shapes(&bad_alignment, kind)
+            let err = validate_official_unsloth_shapes(&bad_alignment, kind)
                 .expect_err("K % 32 mismatch must reject");
             assert!(err.contains("K % 32"), "{err}");
         }

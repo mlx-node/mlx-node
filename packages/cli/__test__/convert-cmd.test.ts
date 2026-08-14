@@ -241,6 +241,10 @@ describe('mlx convert model-type auto-detection', () => {
     expect(await detectModelType('gemma4_text')).toBe('gemma4');
   });
 
+  it("passes 'muse_glimmer' through unchanged", async () => {
+    expect(await detectModelType('muse_glimmer')).toBe('muse_glimmer');
+  });
+
   it.each(['internvl_chat', 'qianfan-ocr'])(
     "canonicalizes Qianfan raw model_type '%s' to 'qianfan-ocr'",
     async (rawModelType) => {
@@ -248,21 +252,13 @@ describe('mlx convert model-type auto-detection', () => {
     },
   );
 
-  it("forwards auto-detected Qianfan to the native dense-only quantization guard when -m is omitted", async () => {
+  it('forwards auto-detected Qianfan to the native dense-only quantization guard when -m is omitted', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const inputDir = mkdtempSync(join(tmpdir(), 'mlx-convert-qianfan-quant-'));
     writeFileSync(join(inputDir, 'config.json'), JSON.stringify({ model_type: 'internvl_chat' }));
 
-    await runConvert([
-      '--input',
-      inputDir,
-      '--output',
-      join(tmp, 'out'),
-      '--quantize',
-      '--q-mode',
-      'mxfp4',
-    ]);
+    await runConvert(['--input', inputDir, '--output', join(tmp, 'out'), '--quantize', '--q-mode', 'mxfp4']);
 
     expect(vi.mocked(convertModel)).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -335,6 +331,9 @@ describe('mlx convert Unsloth MXFP messaging', () => {
     expect(help).toContain('early FFNs=mxfp4');
     expect(help).toContain('Gemma-4-26B-A4B MoE:');
     expect(help).toContain('all dense/expert FFNs=mxfp4');
+    expect(help).toContain('Muse-Glimmer-30B:');
+    expect(help).toContain('final seven attention output projections');
+    expect(help).toContain('accepts no NVFP4 mode');
     expect(help).toContain('Use --q-mode nvfp4 for the fixed DGX weight map');
     expect(help).toContain('attention/GDN/head=fp8_e4m3');
     expect(help).toContain('q/k/v/o=fp8_e4m3');
@@ -393,9 +392,9 @@ describe('mlx convert Unsloth MXFP messaging', () => {
 
     const warnings = warnSpy.mock.calls.map((call) => String(call[0])).join('\n');
     expect(warnings).toContain(
-      'backend validation selects the requested fixed Qwen hybrid or exact SafeTensors Gemma4 MoE',
+      'backend validation selects the requested fixed Qwen hybrid, exact SafeTensors Gemma4 MoE, or exact Muse-Glimmer MXFP map',
     );
-    expect(warnings).toContain('NVFP4/plain-FP8');
+    expect(warnings).toContain('Muse-Glimmer MXFP map');
     expect(warnings).toContain('AWQ pre-scaling will be skipped');
     expect(warnings).toContain('quality may be lower');
     expect(warnings).toContain('unsupported inputs will be rejected');
@@ -470,9 +469,7 @@ describe('mlx convert Unsloth MXFP messaging', () => {
 
     const logs = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
     expect(logs).toContain('requested fixed Unsloth DGX/NVFP4 weight map');
-    expect(logs).toContain(
-      'backend verifies Qwen hybrid or exact SafeTensors Gemma4 MoE family/shape',
-    );
+    expect(logs).toContain('backend verifies Qwen hybrid or exact SafeTensors Gemma4 MoE family/shape');
     expect(logs).toContain('early FFN=nvfp4');
     expect(logs).toContain('final 8 FFN + attention/GDN/head=fp8_e4m3');
     expect(logs).toContain('all dense/expert FFN=nvfp4');
@@ -516,7 +513,7 @@ describe('mlx convert Unsloth MXFP messaging', () => {
     const logs = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
     expect(logs).toContain('requested fixed Unsloth MXFP map');
     expect(logs).toContain(
-      'backend verifies Qwen hybrid or exact SafeTensors Gemma4 MoE family/shape',
+      'backend verifies Qwen hybrid, exact SafeTensors Gemma4 MoE, or exact Muse-Glimmer family/shape',
     );
     expect(logs).toContain('early FFN=mxfp4');
     expect(logs).toContain('final 8 FFN + attention/GDN/head=mxfp8');
@@ -535,6 +532,63 @@ describe('mlx convert Unsloth MXFP messaging', () => {
         imatrixPath,
       }),
     );
+  });
+
+  it('reports and forwards the exact Muse-Glimmer MXFP-only selector', async () => {
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ model_type: 'muse_glimmer' }));
+
+    await runConvert(['--input', tmp, '--output', join(tmp, 'out'), '--quantize', '--q-recipe', 'unsloth', '--q-mxfp']);
+
+    const logs = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    const warnings = warnSpy.mock.calls.map((call) => String(call[0])).join('\n');
+    expect(logs).toContain('Auto-detected model type: muse_glimmer');
+    expect(logs).toContain('Muse: text body=mxfp4 except final 7 o_proj');
+    expect(logs).toContain(
+      'backend verifies Qwen hybrid, exact SafeTensors Gemma4 MoE, or exact Muse-Glimmer family/shape',
+    );
+    expect(warnings).toContain('exact Muse-Glimmer MXFP map');
+    expect(vi.mocked(convertModel)).toHaveBeenCalledWith(
+      expect.objectContaining({
+        modelType: 'muse_glimmer',
+        quantize: true,
+        quantRecipe: 'unsloth',
+        quantMxfp: true,
+        quantMode: undefined,
+      }),
+    );
+  });
+
+  it('rejects Muse-Glimmer NVFP4 before native tensor loading', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    writeFileSync(join(tmp, 'config.json'), JSON.stringify({ model_type: 'muse_glimmer' }));
+
+    await expect(
+      runConvert([
+        '--input',
+        tmp,
+        '--output',
+        join(tmp, 'out'),
+        '--quantize',
+        '--q-recipe',
+        'unsloth',
+        '--q-mode',
+        'nvfp4',
+      ]),
+    ).rejects.toThrow('process.exit(1)');
+
+    expect(errSpy.mock.calls.map((call) => String(call[0])).join('\n')).toContain(
+      'Muse-Glimmer fixed Unsloth conversion is MXFP4-only',
+    );
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(convertModel).not.toHaveBeenCalled();
   });
 
   it('preserves the generic --q-mxfp upgrade messaging for other recipes', async () => {
@@ -599,7 +653,7 @@ describe('mlx convert Unsloth MXFP messaging', () => {
     const logs = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
     expect(logs).toContain('requested fixed Unsloth MXFP map');
     expect(logs).toContain(
-      'backend verifies Qwen hybrid or exact SafeTensors Gemma4 MoE family/shape',
+      'backend verifies Qwen hybrid, exact SafeTensors Gemma4 MoE, or exact Muse-Glimmer family/shape',
     );
     expect(logs).not.toContain('Quantize:   fixed Unsloth MXFP map');
   });
@@ -626,7 +680,7 @@ describe('mlx convert Unsloth MXFP messaging', () => {
     const logs = logSpy.mock.calls.map((call) => String(call[0])).join('\n');
     expect(logs).toContain('requested fixed Unsloth MXFP map');
     expect(logs).toContain(
-      'backend verifies Qwen hybrid or exact SafeTensors Gemma4 MoE family/shape',
+      'backend verifies Qwen hybrid, exact SafeTensors Gemma4 MoE, or exact Muse-Glimmer family/shape',
     );
     expect(logs).not.toContain('Quantize:   fixed Unsloth MXFP map');
     expect(vi.mocked(convertGgufToSafetensors)).toHaveBeenCalledWith(

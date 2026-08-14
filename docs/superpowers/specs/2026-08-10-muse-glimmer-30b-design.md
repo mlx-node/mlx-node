@@ -1,6 +1,6 @@
 # Muse-Glimmer-30B support — design
 
-**Status:** approved scope, pending spec review
+**Status:** implementation roadmap; M0 and the conversion-only M5 slice are landed
 **Checkpoint:** `meta-models/Muse-Glimmer-30B` @ `f84ecc3a0ea984a4c04542a84269e3d065350a6e`
 **Local path:** `.cache/models/muse-glimmer-30b` (59.55 GB, 1436 tensors, all BF16)
 **Reference:** `transformers/src/transformers/models/muse_glimmer/` (added upstream in `fe95f5423d`)
@@ -479,7 +479,7 @@ green under an injected `+1` on the final norm is not a gate.
 | M2 | image path end to end | image parity; both wrapper tokens present; N+2 accounting |
 | M3 | paged adapter | byte-equal vs flat, **then** A/B before defaulting on |
 | M4 | cold tier: sidecar + both allowlists + drift guard | restore parity, process-restart test |
-| M5 | `mlx convert` recipe | quantized vs bf16 quality check |
+| M5 | fixed Unsloth `mlx convert` recipe (**converter landed; runtime quality gate follows M1**) | artifact structure and dequantization checks now; quantized vs bf16 inference after M1 |
 
 M0 first is deliberate: it needs no GPU, it unblocks every later test's prompt path, and
 it is where the one hard error lives. It found two more (traps 13 and 14).
@@ -1354,10 +1354,15 @@ gemma4's paged constructor hard-errors if spec grouping yields more than one
 full-attention KV group; Muse-Glimmer's 13 full layers are uniform (2 kv heads, 128, bf16)
 so they group to one.
 
-**M5 needs a new recipe.** None of the existing ones fit: `nvidia` is family-gated,
-fixed `unsloth` is shape-gated, `qwen3_5` leaves both 2.69 GB vocab tensors bf16, and
-`mixed_*` cannot distinguish `self_attn.gate_proj [4096,6656]` from
-`mlp.gate_proj [19968,6656]`. Byte budget:
+**The conversion-only M5 slice now has its own fixed recipe.** None of the previous
+recipes fit: `nvidia` is family-gated, the earlier fixed `unsloth` selectors were
+shape-gated to Qwen/Gemma, and `mixed_*` cannot distinguish
+`self_attn.gate_proj [4096,6656]` from `mlp.gate_proj [19968,6656]`. The Muse selector
+now requires the exact 1436-tensor canonical inventory and emits MXFP4/32 for the 409
+text-body matrices in the released UD-Q4_K_XL Q4_K class after excluding the token
+embedding. It preserves the final seven `o_proj` matrices and `lm_head` (the published
+Q5_K class), both vocabulary matrices, every norm, the projector, and the vision tower
+in BF16. NVFP4, partial inventories, and family mismatches fail closed. Byte budget:
 
 | bucket | GB bf16 | share |
 | ------ | ------: | ----: |
@@ -1368,10 +1373,11 @@ fixed `unsloth` is shape-gated, `qwen3_5` leaves both 2.69 GB vocab tensors bf16
 | projector | 0.14 | 0.2% |
 | text norms (209 tensors) | 0.00 | 0.0% |
 
-Quantize `text_body`; keep norms, both vocab tensors, the vision tower and the projector
-high precision. Also check `normalize_override_key` (`utils/mod.rs:27-35`): it strips
-`model.` then prefixes `language_model.model.`, so raw-HF text keys double-prefix and
-per-tensor overrides silently miss, falling back to the top-level bit width.
+The converter canonicalizes raw HF text keys before recipe selection, so quantization
+metadata and tensor names share the `language_model.model.*` namespace. The converted
+artifact can be checked structurally and by independently dequantizing sampled rows now;
+the milestone's quantized-vs-BF16 logits and generation-quality gate still requires the
+M1 forward path and must not be claimed by M0.
 
 ## 9. Capacity
 
