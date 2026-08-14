@@ -1,0 +1,11 @@
+<|begin_of_text|><|im_start|>system
+List of tools: [{"type": "function", "function": {"name": "wx.forecast", "description": "Get a forecast.", "parameters": {"type": "object", "properties": {"city": {"type": "string"}, "days": {"type": "integer"}}, "required": ["city", "days"]}}}]<|im_end|>
+<|im_start|>user
+weather in Paris?<|im_end|>
+<|im_start|>assistant
+<|im_end|>
+<|im_start|>tool
+18C, clear<|im_end|>
+<|im_start|>assistant
+18C and clear.<|im_end|>
+<|im_start|>assistant

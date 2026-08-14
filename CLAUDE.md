@@ -56,7 +56,7 @@ oxnode <file.ts>                                 # run a TS file (NOT tsx)
 
 - Primary platform: macOS / Apple Silicon (Metal) — full inference + training + VLM
 - Experimental: Linux aarch64 (glibc) + NVIDIA CUDA — **inference-only preview**. Qwen3.6 dense/MoE validated on GB10 / DGX Spark (`sm_121`, CUDA 13.0) via device-agnostic eager fallbacks (no custom CUDA kernels; paged-attn forced off; perf below Apple Silicon). Training, other model families, and x86_64 Linux are untested. See README "Platform Support" + `docs/cuda-poc-benchmark.md`.
-- Chat inference is serialized per model: one `"mlx-model"` OS thread per loaded model runs one whole turn at a time, and the server adds a per-model FIFO mutex. Different loaded models run in parallel (MLX state is thread-local; residual coupling is the process-wide Metal allocator pool and wired limit). See `docs/concurrent-inference.md`.
+- Concurrent chat inference is per-family, not global. Sessions on one eligible **paged** Qwen3, LFM2, Qwen3.5 dense/MoE, or Gemma4 model overlap in a continuous-batching scheduler on that model's single `"mlx-model"` OS thread. Qwen3.5 dense and MoE need `MLX_CONTINUOUS_BATCHING=1`; the rest are on by default, and `MLX_SERVE_FORCE_SERIAL=1` rolls any of them back to whole-turn for A/B. Everything else still runs one whole turn at a time in the exclusive/barrier lane: flat-cache models, Gemma4 media and MTP/DSpark owners, training, save, and reset. One `ChatSession` always allows only one turn in flight. Different loaded models run in parallel, one model thread each (MLX state is thread-local; residual coupling is the process-wide Metal allocator pool and wired limit). See `docs/concurrent-inference.md`.
 
 ---
 

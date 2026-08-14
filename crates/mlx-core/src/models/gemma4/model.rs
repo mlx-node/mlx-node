@@ -9581,7 +9581,11 @@ fn create_sliding_mask(seq_len: i64, offset: i32, window_size: i64) -> Result<Mx
     valid.reshape(&[1, 1, seq_len, total_len])
 }
 
-fn sliding_mask_offset_for_chunk(seq_len: i64, cache_offset: i32, window_size: i64) -> Option<i32> {
+pub(super) fn sliding_mask_offset_for_chunk(
+    seq_len: i64,
+    cache_offset: i32,
+    window_size: i64,
+) -> Option<i32> {
     if seq_len <= 1 || window_size <= 0 {
         return None;
     }

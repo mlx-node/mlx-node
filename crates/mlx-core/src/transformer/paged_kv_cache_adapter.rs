@@ -716,6 +716,50 @@ pub struct PagedPrefillMemorySnapshot {
     pub paged_pool_allocated_bytes: Option<u64>,
 }
 
+/// The sliding window a **dense** (gathered-K/V) attention route must apply,
+/// handed out only by the adapter that owns the K/V.
+///
+/// This is the crate's default-deny gate for the defect class where a route
+/// that has no kernel-side window silently attends the whole context. The
+/// dense readers ([`PagedKVCacheAdapter::gather_kv_for_dense_cache_hit_prefill`]
+/// and [`PagedKVCacheAdapter::read_kv_range_for_dense_attention`]) return one
+/// of these **alongside** the K/V, so a caller cannot obtain
+/// placeholder-laden dense K/V for a windowed group without also holding the
+/// window it has to mask with. The window-blind spellings
+/// ([`PagedKVCacheAdapter::gather_kv_for_prefill_sdpa`],
+/// [`PagedKVCacheAdapter::read_kv_range`]) refuse a windowed group instead of
+/// serving it, which is vLLM's `AttentionBackend::supports_sliding_window()`
+/// defaulting to `False` expressed in Rust: a route that cannot express a
+/// window is not selectable, model-independently
+/// (`vllm/v1/attention/backend.py:260-262`, refusal assembled at `:385-386`).
+///
+/// There is deliberately no public constructor, no `Default` and no public
+/// field, so a literal `0` cannot be substituted for a live adapter read at
+/// any dense call site -- `dense_attention(.., 0, ..)` does not type-check.
+/// The `#[cfg(test)]` constructor exists for table-driven policy tests and is
+/// unavailable to production code.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DenseAttentionWindow(u32);
+
+impl DenseAttentionWindow {
+    /// Window in tokens. `0` means the group is global (full causal).
+    pub fn tokens(self) -> u32 {
+        self.0
+    }
+
+    /// Whether this group has a window at all.
+    pub fn is_windowed(self) -> bool {
+        self.0 != 0
+    }
+
+    /// Policy-test constructor. Not available to production code, so the only
+    /// production source of a window remains the adapter that owns the K/V.
+    #[cfg(test)]
+    pub(crate) fn for_test(tokens: u32) -> Self {
+        Self(tokens)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PagedBlockTelemetry {
     pub total_blocks: u32,
@@ -2018,6 +2062,12 @@ impl PagedKVCacheAdapter {
     /// Logical positions remain absolute up to `logical_max_tokens`; old
     /// physical blocks are replaced by a reserved null block after evaluation
     /// once every token in that block is older than `sliding_window`.
+    ///
+    /// `sliding_window` must fit an `i32`: the six paged dispatch sites carry
+    /// it to the kernel's signed `sliding_window` slot, and the native
+    /// validator rejects a negative one. See
+    /// [`Self::new_with_attention_kind`] for why the check lives at
+    /// construction rather than at each cast.
     pub fn new_sliding(
         allocator: Arc<Mutex<BlockAllocator>>,
         layer_kv_pool: Arc<LayerKVPool>,
@@ -2040,6 +2090,21 @@ impl PagedKVCacheAdapter {
         )
     }
 
+    /// The one choke point every constructor funnels through, so it is where
+    /// the window's representability is settled.
+    ///
+    /// `sliding_window` is stored as `u32` because logical positions and token
+    /// counts are unsigned, but every consumer downstream is signed: the six
+    /// paged dispatch sites pass `self.sliding_window as i32` into the kernel's
+    /// `sliding_window` slot, whose C++ validator rejects a negative value
+    /// ("must be >= 0 (use 0 to disable the sliding mask)"), and
+    /// `create_causal_mask`'s window width is `i32` too, where a negative width
+    /// masks EVERY key — a silent, finite, plausible-looking wrong answer
+    /// rather than an error. A window in `[2^31, 2^32-1]` is the only band that
+    /// wraps, and refusing it here is what makes those casts provably
+    /// non-negative. Checking once at construction keeps the six dispatch sites
+    /// uniform (`self.sliding_window`, never a literal) instead of scattering
+    /// six guards.
     fn new_with_attention_kind(
         allocator: Arc<Mutex<BlockAllocator>>,
         layer_kv_pool: Arc<LayerKVPool>,
@@ -2047,6 +2112,14 @@ impl PagedKVCacheAdapter {
         sliding_window: u32,
         logical_max_tokens: Option<u32>,
     ) -> Result<Self, String> {
+        if i32::try_from(sliding_window).is_err() {
+            return Err(format!(
+                "sliding_window {sliding_window} does not fit in an i32. The paged kernel's \
+                 sliding_window slot and create_causal_mask's window width are both signed, \
+                 so this window would arrive negative: the kernel rejects that, and a \
+                 negative mask width masks every key instead of erroring."
+            ));
+        }
         let (allocator_block_size, allocator_num_blocks) = {
             let guard = allocator
                 .lock()
@@ -5838,8 +5911,16 @@ impl PagedKVCacheAdapter {
                 k_scale.as_raw_ptr(),
                 v_scale.as_raw_ptr(),
                 scale,
-                0.0,
-                0,
+                /* softcap */ 0.0,
+                // The window travels with every dispatch. It is read from the
+                // adapter that owns it rather than taken as a parameter, so
+                // this slot has no literal for a caller to get wrong -- the
+                // shape every other paged dispatch in this file uses. A `0`
+                // here is not "inert": the Metal kernel treats 0 as the
+                // no-mask sentinel and attends the full causal range,
+                // including positions `prune_sliding_window_for` has retired
+                // onto the never-written null block.
+                self.sliding_window as i32,
                 self.block_size as i32,
                 num_query_heads as i32,
                 self.layer_kv_pool.config().num_kv_heads as i32,
@@ -5867,8 +5948,58 @@ impl PagedKVCacheAdapter {
     /// The native pool arrays are used directly, retaining any lazy
     /// `paged_kv_write` dependency. This path intentionally rejects FP8: a
     /// plain `take` cannot apply the per-layer dequantization scales.
+    ///
+    /// **Refuses a windowed group.** A dense gather materializes the retired
+    /// null placeholders `prune_sliding_window_for` installed, and this
+    /// signature has nowhere to return the window a caller would have to mask
+    /// them out with. Windowed callers use
+    /// [`Self::gather_kv_for_dense_cache_hit_prefill`], which hands back the
+    /// window with the K/V. Refusing here is the model-independent half of the
+    /// fix: `transformer/block.rs`, `qwen3_5` and `lfm2` all consume this
+    /// gather window-blind, so a future sliding group in any of them fails
+    /// closed instead of silently over-attending.
     #[cfg(target_os = "macos")]
     pub fn gather_kv_for_prefill_sdpa(
+        &mut self,
+        layer_idx: u32,
+        total_context: u32,
+    ) -> Result<(MxArray, MxArray), String> {
+        if self.sliding_window != 0 {
+            return Err(format!(
+                "gather_kv_for_prefill_sdpa: refusing a sliding group (sliding_window = {}). \
+                 A dense gather materializes the positions prune_sliding_window_for retired \
+                 onto the never-written null block, and this signature cannot return the \
+                 window needed to mask them. Call \
+                 gather_kv_for_dense_cache_hit_prefill, which returns \
+                 (keys, values, DenseAttentionWindow), and apply the window as an explicit \
+                 keep-mask.",
+                self.sliding_window
+            ));
+        }
+        self.gather_kv_dense_unchecked(layer_idx, total_context)
+    }
+
+    /// Dense K/V gather for a cache-hit prefill chunk, **with** the window the
+    /// caller must apply.
+    ///
+    /// The only way to obtain dense K/V for a windowed group. The returned
+    /// [`DenseAttentionWindow`] is derived from this adapter's own group, so
+    /// the window travels with the data rather than through a per-route
+    /// argument list -- which is exactly where vLLM's design note says a
+    /// window gets lost.
+    #[cfg(target_os = "macos")]
+    pub fn gather_kv_for_dense_cache_hit_prefill(
+        &mut self,
+        layer_idx: u32,
+        total_context: u32,
+    ) -> Result<(MxArray, MxArray, DenseAttentionWindow), String> {
+        let window = DenseAttentionWindow(self.sliding_window);
+        let (keys, values) = self.gather_kv_dense_unchecked(layer_idx, total_context)?;
+        Ok((keys, values, window))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn gather_kv_dense_unchecked(
         &mut self,
         layer_idx: u32,
         total_context: u32,
@@ -5987,6 +6118,18 @@ impl PagedKVCacheAdapter {
         _total_context: u32,
     ) -> Result<(MxArray, MxArray), String> {
         Err("gather_kv_for_prefill_sdpa is only supported on macOS (Metal backend)".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn gather_kv_for_dense_cache_hit_prefill(
+        &mut self,
+        _layer_idx: u32,
+        _total_context: u32,
+    ) -> Result<(MxArray, MxArray, DenseAttentionWindow), String> {
+        Err(
+            "gather_kv_for_dense_cache_hit_prefill is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
     }
 
     /// Run MLX-graph paged attention for a multi-token prefill suffix chunk.
@@ -6343,8 +6486,118 @@ impl PagedKVCacheAdapter {
     /// (system-prompt prefix cache reuse) the cost is amortized across the
     /// reused tokens, so the host-side cost is bounded by the prefix
     /// length × `num_kv_heads * head_size` (typically a few MB per layer).
+    /// ## Windowed groups
+    ///
+    /// For a windowed group this refuses any range that is not inside the LIVE
+    /// window, on two independent counts:
+    ///
+    /// - **Too wide** — `num_tokens > sliding_window` can never fit the window
+    ///   wherever it starts.
+    /// - **Too old** — `start_pos` below
+    ///   `block_table.num_tokens() - sliding_window`. Width alone does not
+    ///   imply liveness: a range exactly as long as the window is still
+    ///   entirely retired if it starts far enough back, and the width check is
+    ///   offset-blind.
+    ///
+    /// Positions below that floor are either stale (out of window) or, once
+    /// `prune_sliding_window_for` has fired, physically on the reserved null
+    /// block, which `LayerKVPool` allocates `StorageModePrivate` and never
+    /// zeroes — so their bytes are formally undefined, and "they happen to read
+    /// back as zeros" is a property of the driver, not a contract. This
+    /// signature has nowhere to return the window a caller would have to mask
+    /// them out with, so it refuses instead. Callers that legitimately need the
+    /// whole context for a dense attention route use
+    /// [`Self::read_kv_range_for_dense_attention`], which returns the window
+    /// with the K/V.
+    ///
+    /// The floor is the same quantity `prune_sliding_window_for` derives its
+    /// cutoff from, but token-granular where the prune is block-granular. So
+    /// this is deliberately stricter than "touches the null block": it also
+    /// refuses out-of-window positions that happen to still be resident,
+    /// because attending them is the defect, not merely dereferencing them.
+    ///
+    /// ## Reading for attention vs reading for persistence
+    ///
+    /// The refusal is blanket because no caller has the second intent. Reading
+    /// a retired range in order to PERSIST it would be legitimate, but the one
+    /// candidate — gemma4 cold-tier sliding capture — never asks for one: it
+    /// reads `min(boundary, sliding_window)` tokens from
+    /// `boundary - live_tokens`, and declines outright when
+    /// `recorded - start > sliding_window`, which is algebraically this same
+    /// live-tail rule. If a persistence caller ever does appear, the honest
+    /// shape is a separate reader that checks each covered block id against the
+    /// reserved null id and errs when a block is gone — never one that hands
+    /// undefined bytes back as data.
     #[cfg(target_os = "macos")]
     pub fn read_kv_range(
+        &mut self,
+        layer_idx: u32,
+        start_pos: u32,
+        num_tokens: u32,
+    ) -> Result<(MxArray, MxArray), String> {
+        if self.sliding_window != 0 {
+            if num_tokens > self.sliding_window {
+                return Err(format!(
+                    "read_kv_range: refusing to read {num_tokens} tokens from a sliding group \
+                     (sliding_window = {}). Positions older than the window are out of window, \
+                     and once prune_sliding_window_for has run they sit on the never-written \
+                     null block. Call read_kv_range_for_dense_attention, which returns \
+                     (keys, values, DenseAttentionWindow), and apply the window as an explicit \
+                     keep-mask.",
+                    self.sliding_window
+                ));
+            }
+            // `block_table.num_tokens()`, NOT `current_token_count()`: this is
+            // a guard about physical liveness, and the block table's count is
+            // the exact quantity `prune_sliding_window_for` derives its cutoff
+            // from, so the floor here tracks the prune's floor by construction.
+            // It is also the bound `read_kv_range_unchecked` range-checks
+            // against. The two counters are advanced together at every site, so
+            // swapping them passes the whole suite today -- which is precisely
+            // why the choice is spelled out rather than left to look arbitrary.
+            // With no table there is nothing recorded, so the floor is 0 and the
+            // unchecked read produces the "before reset_for_new_request" error.
+            let recorded = self
+                .block_table
+                .as_ref()
+                .map_or(0, |table| table.num_tokens());
+            let live_floor = recorded.saturating_sub(self.sliding_window);
+            if start_pos < live_floor {
+                return Err(format!(
+                    "read_kv_range: refusing range [{start_pos}, {}) on a sliding group \
+                     (sliding_window = {}, recorded = {recorded}): positions below \
+                     {live_floor} are out of window, and once prune_sliding_window_for has \
+                     run they sit on the never-written null block whose contents are \
+                     undefined. Call read_kv_range_for_dense_attention, which returns \
+                     (keys, values, DenseAttentionWindow), and apply the window as an \
+                     explicit keep-mask.",
+                    start_pos.saturating_add(num_tokens),
+                    self.sliding_window
+                ));
+            }
+        }
+        self.read_kv_range_unchecked(layer_idx, start_pos, num_tokens)
+    }
+
+    /// Host-read the full `[0, total_context)` K/V for a **dense** attention
+    /// route, with the window the caller must apply.
+    ///
+    /// The only way to host-read past a windowed group's live window. Same
+    /// contract as [`Self::gather_kv_for_dense_cache_hit_prefill`]: the window
+    /// travels with the data.
+    #[cfg(target_os = "macos")]
+    pub fn read_kv_range_for_dense_attention(
+        &mut self,
+        layer_idx: u32,
+        total_context: u32,
+    ) -> Result<(MxArray, MxArray, DenseAttentionWindow), String> {
+        let window = DenseAttentionWindow(self.sliding_window);
+        let (keys, values) = self.read_kv_range_unchecked(layer_idx, 0, total_context)?;
+        Ok((keys, values, window))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn read_kv_range_unchecked(
         &mut self,
         layer_idx: u32,
         start_pos: u32,
@@ -6602,6 +6855,19 @@ impl PagedKVCacheAdapter {
         _num_tokens: u32,
     ) -> Result<(MxArray, MxArray), String> {
         Err("read_kv_range is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn read_kv_range_for_dense_attention(
+        &mut self,
+        _layer_idx: u32,
+        _total_context: u32,
+    ) -> Result<(MxArray, MxArray, DenseAttentionWindow), String> {
+        Err(
+            "read_kv_range_for_dense_attention is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
     }
 
     /// Register the request's FULL blocks in the prefix cache so future
@@ -7410,6 +7676,15 @@ impl PagedKVCacheAdapter {
         self.sliding_window
     }
 
+    /// This group's window as the type a dense attention route must carry.
+    ///
+    /// Use this rather than [`Self::sliding_window`] anywhere the value ends up
+    /// in an attention dispatch: [`DenseAttentionWindow`] has no public
+    /// constructor, so a literal cannot be written where one is expected.
+    pub fn dense_attention_window(&self) -> DenseAttentionWindow {
+        DenseAttentionWindow(self.sliding_window)
+    }
+
     /// Number of physical blocks shared by the allocator and layer pool.
     pub fn block_capacity(&self) -> u32 {
         self.layer_kv_pool.num_blocks()
@@ -7708,13 +7983,32 @@ impl PagedKVCacheAdapter {
     }
 
     /// Element dtype exposed by a graph-native paged K/V gather. `None`
-    /// means the cache requires dequantization and cannot feed plain MLX
-    /// SDPA directly.
+    /// means a caller must not feed a plain-SDPA route from this cache
+    /// without supplying its own mask.
+    ///
+    /// The `sliding_window != 0` arm is a **decode routing guard**, not a
+    /// statement about storage. On decode it is load-bearing:
+    /// `select_paged_decode_plan` turns this `None` into
+    /// `PagedDecodePath::PagedAttention`, keeping a windowed group on the
+    /// paged kernel, and `grouped_d512_decode_capability` uses it to keep a
+    /// windowed group off the direct-read D512 pipeline. Both of those
+    /// routes have no mask argument, so the window can only be applied
+    /// kernel-side.
+    ///
+    /// On **prefill** it is only a byte estimate, and it never was the barrier
+    /// its first doc claimed. What keeps a sliding group off a window-blind
+    /// dense prefill route is now a refusal in the gather itself:
+    /// `gather_kv_for_prefill_sdpa` and `read_kv_range` **Err** for a windowed
+    /// group, and the only dense readers that serve one --
+    /// `gather_kv_for_dense_cache_hit_prefill` / `read_kv_range_for_dense_attention`
+    /// -- hand back a [`DenseAttentionWindow`] with the K/V so the caller
+    /// cannot hold the placeholders without holding the window. Do not
+    /// re-document *this accessor* as that barrier: routing on a byte estimate
+    /// is not a correctness gate, and reading it as one is how the dropped
+    /// mask survived. Gemma4's cache-hit prefill takes the windowed readers and
+    /// builds a windowed `create_causal_mask` for both dense routes.
     pub(crate) fn prefill_sdpa_cache_dtype(&self) -> Option<DType> {
         if self.sliding_window != 0 {
-            // A dense gather would materialize the null placeholders. Sliding
-            // groups must remain on the paged kernel, which applies the window
-            // before touching those entries.
             return None;
         }
         match self.layer_kv_pool.cache_dtype() {
@@ -13654,6 +13948,954 @@ mod tests {
                 assert!(
                     (actual - expected).abs() < 0.05,
                     "compact token {token_idx} head {head_idx}: got {actual}, expected {expected}"
+                );
+            }
+        }
+    }
+
+    /// A multi-token cache-hit prefill on a sliding-window group must not
+    /// attend to positions the window has retired, whichever paged-attention
+    /// entry point serves it.
+    ///
+    /// Geometry: `block_size = 8`, `sliding_window = 16`, 48 recorded tokens,
+    /// `cached_prefix_len = 32`, so the chunk is 16 query tokens sitting on a
+    /// 32-token cached prefix — the exact shape Gemma4's
+    /// `run_paged_prefill_chunk` produces for every body chunk after the
+    /// first. `prune_sliding_window_for` has already retired logical blocks
+    /// 0-1 (positions 0..15) onto the reserved null block, so those positions
+    /// are both out-of-window *and* physically unwritten.
+    ///
+    /// `V[pos] = pos + 1` with `Q = K = 0`: every unmasked score is identical,
+    /// so each output element is the arithmetic mean of the `V` values the
+    /// kernel actually summed. That makes the attended position set directly
+    /// readable off the output.
+    ///
+    /// Both routes must agree with the reference window mask
+    /// `max(0, ctx_len - window) <= p < ctx_len`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sliding_window_masks_retired_positions_on_every_prefill_route() {
+        const BLOCK_SIZE: u32 = 8;
+        const WINDOW: u32 = 16;
+        const HEAD_SIZE: i64 = 64;
+        const NUM_Q_HEADS: i64 = 2;
+        const PREFIX_LEN: u32 = 32;
+        const CHUNK_LEN: u32 = 16;
+        const TOTAL: u32 = PREFIX_LEN + CHUNK_LEN;
+
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: BLOCK_SIZE,
+            num_kv_heads: 1,
+            head_size: HEAD_SIZE as u32,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            16,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping sliding_window_masks_retired_positions: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, BLOCK_SIZE)));
+        let mut adapter =
+            PagedKVCacheAdapter::new_sliding(allocator, pool, BLOCK_SIZE, WINDOW, 128)
+                .expect("sliding adapter");
+        adapter.reset_for_new_request(7).unwrap();
+
+        // `V[pos] = pos + 1`, broadcast across every head component so any
+        // component of the output reads as the mean of the attended positions.
+        let write_span =
+            |adapter: &mut PagedKVCacheAdapter, first_pos: u32, len: u32| -> Result<(), String> {
+                let n = len as i64;
+                let k = MxArray::zeros(&[n, 1, HEAD_SIZE], Some(DType::Float16))
+                    .map_err(|e| format!("k zeros: {e}"))?;
+                let mut v_bits = Vec::with_capacity((n * HEAD_SIZE) as usize);
+                for offset in 0..len {
+                    let bits = f16::from_f32((first_pos + offset + 1) as f32).to_bits();
+                    v_bits.extend(std::iter::repeat_n(bits, HEAD_SIZE as usize));
+                }
+                let v = MxArray::from_float16(&v_bits, &[n, 1, HEAD_SIZE])
+                    .map_err(|e| format!("v values: {e}"))?;
+                k.eval();
+                v.eval();
+                adapter.update_keys_values(0, &k, &v, first_pos)
+            };
+
+        // Chunk boundary that production reaches before the chunk under test:
+        // record and write the 32-token prefix, then prune. cutoff =
+        // 32 - 16 = 16 -> logical blocks 0-1 become the null placeholder.
+        adapter
+            .record_tokens(&(0..PREFIX_LEN).collect::<Vec<_>>())
+            .unwrap();
+        match write_span(&mut adapter, 0, PREFIX_LEN) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping sliding_window_masks_retired_positions: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected prefix write failure: {e}"),
+        }
+        let released = adapter.prune_sliding_window_for(7).unwrap();
+        assert_eq!(
+            released, 2,
+            "prune must retire the two blocks wholly left of the live window"
+        );
+        let null_id = adapter
+            .null_block
+            .as_ref()
+            .expect("sliding adapter reserves a null block")
+            .block_id;
+        {
+            let table = adapter.block_table_for(7).expect("request table");
+            assert!(
+                table.blocks()[..2].iter().all(|b| b.block_id == null_id),
+                "positions 0..15 must point at the never-written null block"
+            );
+        }
+
+        // The chunk under test: 16 new tokens on top of the 32 cached ones.
+        adapter
+            .record_tokens(&(PREFIX_LEN..TOTAL).collect::<Vec<_>>())
+            .unwrap();
+        write_span(&mut adapter, PREFIX_LEN, CHUNK_LEN).expect("chunk write");
+
+        // Direct read of what the retired positions actually hold. The pool is
+        // `StorageModePrivate` and explicitly not zeroed (layer_kv_pool.rs),
+        // so this is driver behaviour and formally undefined -- reported to
+        // characterise the symptom, never asserted on. The gather handing them
+        // back at all is the finding, which is why the windowed reader is the
+        // only spelling that serves a sliding group.
+        let (null_k_max, null_v_max) = {
+            let (keys, values, _window) = adapter
+                .gather_kv_for_dense_cache_hit_prefill(0, TOTAL)
+                .expect("dense gather of a sliding group's full context");
+            let k_vals = keys.to_float32().expect("K to_float32");
+            let v_vals = values.to_float32().expect("V to_float32");
+            // The two blocks `prune` retired above cover positions 0..15.
+            let span = (2 * BLOCK_SIZE * HEAD_SIZE as u32) as usize;
+            let max_abs = |slice: &[f32]| slice.iter().fold(0.0_f32, |m, x| m.max(x.abs()));
+            (max_abs(&k_vals[..span]), max_abs(&v_vals[..span]))
+        };
+        eprintln!(
+            "never-written null block, positions 0..{}: max|K| = {null_k_max}, max|V| = {null_v_max}",
+            2 * BLOCK_SIZE - 1
+        );
+
+        let q = MxArray::zeros(
+            &[CHUNK_LEN as i64, NUM_Q_HEADS, HEAD_SIZE],
+            Some(DType::Float16),
+        )
+        .expect("q zeros");
+        q.eval();
+        let scale = 1.0_f32 / (HEAD_SIZE as f32).sqrt();
+
+        // Reference: the window mask the Metal kernel applies when it is told
+        // the window. Mean of `V[p] = p + 1` over
+        // `max(0, ctx_len - WINDOW) <= p < ctx_len`.
+        let reference: Vec<f32> = (0..CHUNK_LEN)
+            .map(|i| {
+                let ctx_len = PREFIX_LEN + i + 1;
+                let lower = ctx_len.saturating_sub(WINDOW);
+                let count = ctx_len - lower;
+                let sum: u32 = (lower..ctx_len).map(|p| p + 1).sum();
+                sum as f32 / count as f32
+            })
+            .collect();
+
+        let read_head0 = |out: &MxArray| -> Vec<f32> {
+            let values = out.to_float32().expect("output to_float32");
+            (0..CHUNK_LEN as usize)
+                .map(|t| values[t * NUM_Q_HEADS as usize * HEAD_SIZE as usize])
+                .collect()
+        };
+
+        let legacy = match adapter.gather_kv_for_prefill_chunk(0, &q, PREFIX_LEN, scale) {
+            Ok(out) => read_head0(&out),
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping sliding_window_masks_retired_positions: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected legacy prefill failure: {e}"),
+        };
+        let varlen = adapter
+            .gather_kv_for_prefill_chunk_varlen(0, &q, PREFIX_LEN, scale)
+            .map(|out| read_head0(&out))
+            .expect("varlen prefill");
+
+        eprintln!("token abs_pos  reference   legacy     varlen");
+        for i in 0..CHUNK_LEN as usize {
+            eprintln!(
+                "{i:>5} {:>7}  {:>9.4} {:>9.4} {:>9.4}",
+                PREFIX_LEN as usize + i,
+                reference[i],
+                legacy[i],
+                varlen[i]
+            );
+        }
+        // Total V mass the never-written null block contributed to the first
+        // query token, backed out of an unwindowed mean over 0..=32:
+        //   mean * 33 - sum(V[16..=32]).  Zero iff the null block reads back
+        //   as zeros. Undefined either way -- reported, never relied on.
+        let unwindowed_count = (PREFIX_LEN + 1) as f32;
+        let live_sum: u32 = (WINDOW..=PREFIX_LEN).map(|p| p + 1).sum();
+        eprintln!(
+            "null-block V mass leaked into token 0 (0 => reads as zeros): {:.4}",
+            varlen[0] * unwindowed_count - live_sum as f32
+        );
+
+        for i in 0..CHUNK_LEN as usize {
+            assert!(
+                legacy[i].is_finite() && varlen[i].is_finite(),
+                "token {i}: non-finite output (legacy={}, varlen={})",
+                legacy[i],
+                varlen[i]
+            );
+        }
+        // Tolerance: f16 V values reach 48, and the mean is accumulated in
+        // f32, so 0.05 is far tighter than the smallest disagreement a
+        // dropped window can produce here (>= 4.0).
+        for i in 0..CHUNK_LEN as usize {
+            assert!(
+                (legacy[i] - reference[i]).abs() < 0.05,
+                "legacy token {i} (abs pos {}): got {}, window-masked reference {}",
+                PREFIX_LEN as usize + i,
+                legacy[i],
+                reference[i]
+            );
+        }
+        for i in 0..CHUNK_LEN as usize {
+            assert!(
+                (varlen[i] - reference[i]).abs() < 0.05,
+                "varlen token {i} (abs pos {}): got {}, window-masked reference {}. \
+                 The varlen prefill-chunk wrapper dropped the sliding window, so the \
+                 kernel attended retired positions (including the unwritten null block).",
+                PREFIX_LEN as usize + i,
+                varlen[i],
+                reference[i]
+            );
+        }
+    }
+
+    /// Geometry shared by the sliding cache-hit prefill numerics tests.
+    ///
+    /// Scaled 2x from the obvious `block_size = 4` illustration because the
+    /// Metal kernel only instantiates block sizes 8, 16 and 32 -- a
+    /// block-size-4 dispatch finds no kernel, and the C++ validator only
+    /// checks `block_size > 0`, so it would fail at pipeline lookup rather
+    /// than validation.
+    #[cfg(target_os = "macos")]
+    struct SlidingPrefillFixture {
+        adapter: PagedKVCacheAdapter,
+        null_block_id: u32,
+    }
+
+    #[cfg(target_os = "macos")]
+    const FIX_BLOCK_SIZE: u32 = 8;
+    #[cfg(target_os = "macos")]
+    const FIX_HEAD_SIZE: i64 = 64;
+    #[cfg(target_os = "macos")]
+    const FIX_NUM_Q_HEADS: i64 = 2;
+    #[cfg(target_os = "macos")]
+    const FIX_PREFIX_LEN: u32 = 32;
+    #[cfg(target_os = "macos")]
+    const FIX_CHUNK_LEN: u32 = 16;
+    #[cfg(target_os = "macos")]
+    const FIX_TOTAL: u32 = FIX_PREFIX_LEN + FIX_CHUNK_LEN;
+
+    /// Build an adapter that has already reached the state production hits at
+    /// every body chunk after the first: a written+pruned prefix, then the
+    /// chunk under test written on top.
+    ///
+    /// `window == 0` builds a full-attention adapter, which is the control:
+    /// nothing here may change for a non-windowed group.
+    ///
+    /// `V[pos] = pos + 1` broadcast across every head component, `K = 0`, so
+    /// with `Q = 0` every unmasked score is identical and each output element
+    /// is the arithmetic mean of the `V` values actually summed. The attended
+    /// position set is therefore directly readable off the output.
+    #[cfg(target_os = "macos")]
+    fn build_sliding_prefill_fixture(window: u32) -> Result<Option<SlidingPrefillFixture>, String> {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: FIX_BLOCK_SIZE,
+            num_kv_heads: 1,
+            head_size: FIX_HEAD_SIZE as u32,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            16,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => return Err(e.to_string()),
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, FIX_BLOCK_SIZE)));
+        let mut adapter = if window == 0 {
+            PagedKVCacheAdapter::new(allocator, pool, FIX_BLOCK_SIZE)?
+        } else {
+            PagedKVCacheAdapter::new_sliding(allocator, pool, FIX_BLOCK_SIZE, window, 128)?
+        };
+        adapter.reset_for_new_request(7)?;
+
+        let write_span =
+            |adapter: &mut PagedKVCacheAdapter, first_pos: u32, len: u32| -> Result<(), String> {
+                let n = len as i64;
+                let k = MxArray::zeros(&[n, 1, FIX_HEAD_SIZE], Some(DType::Float16))
+                    .map_err(|e| format!("k zeros: {e}"))?;
+                let mut v_bits = Vec::with_capacity((n * FIX_HEAD_SIZE) as usize);
+                for offset in 0..len {
+                    let bits = f16::from_f32((first_pos + offset + 1) as f32).to_bits();
+                    v_bits.extend(std::iter::repeat_n(bits, FIX_HEAD_SIZE as usize));
+                }
+                let v = MxArray::from_float16(&v_bits, &[n, 1, FIX_HEAD_SIZE])
+                    .map_err(|e| format!("v values: {e}"))?;
+                k.eval();
+                v.eval();
+                adapter.update_keys_values(0, &k, &v, first_pos)
+            };
+
+        adapter.record_tokens(&(0..FIX_PREFIX_LEN).collect::<Vec<_>>())?;
+        match write_span(&mut adapter, 0, FIX_PREFIX_LEN) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        // Production ordering: prune runs AFTER the chunk that was just
+        // written, never before the chunk about to be computed. Reversing it
+        // would turn the now-correct window into UNDER-attention.
+        adapter.prune_sliding_window_for(7)?;
+        let null_block_id = adapter
+            .null_block
+            .as_ref()
+            .map(|b| b.block_id)
+            .unwrap_or(u32::MAX);
+
+        adapter.record_tokens(&(FIX_PREFIX_LEN..FIX_TOTAL).collect::<Vec<_>>())?;
+        write_span(&mut adapter, FIX_PREFIX_LEN, FIX_CHUNK_LEN)?;
+
+        Ok(Some(SlidingPrefillFixture {
+            adapter,
+            null_block_id,
+        }))
+    }
+
+    /// Mean of `V[p] = p + 1` over the positions a correct kernel attends:
+    /// `max(0, ctx_len - window) <= p < ctx_len`, with `window == 0` meaning
+    /// full causal.
+    #[cfg(target_os = "macos")]
+    fn windowed_reference(window: u32) -> Vec<f32> {
+        (0..FIX_CHUNK_LEN)
+            .map(|i| {
+                let ctx_len = FIX_PREFIX_LEN + i + 1;
+                let lower = if window == 0 {
+                    0
+                } else {
+                    ctx_len.saturating_sub(window)
+                };
+                let count = ctx_len - lower;
+                let sum: u32 = (lower..ctx_len).map(|p| p + 1).sum();
+                sum as f32 / count as f32
+            })
+            .collect()
+    }
+
+    /// Head-0 output value per query token, for a `[1, H, T, D]` result.
+    #[cfg(target_os = "macos")]
+    fn read_bhtd_head0(out: &MxArray) -> Vec<f32> {
+        let values = out.to_float32().expect("output to_float32");
+        (0..FIX_CHUNK_LEN as usize)
+            .map(|t| values[t * FIX_HEAD_SIZE as usize])
+            .collect()
+    }
+
+    /// The two DENSE cache-hit prefill routes must respect the window.
+    ///
+    /// This is the cell no test occupied, and it is the one that mattered
+    /// most: the paged-pool SDPA route is what production Auto actually
+    /// selects on an ample-memory machine, and the host-read route runs
+    /// whenever no earlier route produced an output. Neither has a
+    /// kernel-side window, so both dense-gather the pool -- materializing the
+    /// placeholders `prune_sliding_all` installed -- and then rely entirely
+    /// on the explicit keep-mask that `forward_paged_cache_hit_prefill` now
+    /// builds. This reproduces that composition exactly: the same gather, the
+    /// same `create_causal_mask(seq_len, Some(cached_prefix_len),
+    /// Some(window))`, the same masked SDPA.
+    ///
+    /// Reverting the mask to `None` (the pre-fix host-read call, and the
+    /// pre-fix SDPA route's unmasked `_causal`) makes this fail on every
+    /// query token.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sliding_window_masks_retired_positions_on_dense_prefill_routes() {
+        const WINDOW: u32 = 16;
+        let Some(fixture) = build_sliding_prefill_fixture(WINDOW).expect("sliding fixture") else {
+            eprintln!("skipping dense-route sliding test: Metal GPU not available");
+            return;
+        };
+        let mut adapter = fixture.adapter;
+
+        // The dense gather hands back the retired placeholders -- that is
+        // precisely why the mask is mandatory on this route.
+        let (keys, values, window) = adapter
+            .gather_kv_for_dense_cache_hit_prefill(0, FIX_TOTAL)
+            .expect("dense gather of a sliding group's context");
+        assert_eq!(
+            window.tokens(),
+            WINDOW,
+            "the windowed dense reader must report the group's own window"
+        );
+
+        let q = MxArray::zeros(
+            &[1, FIX_NUM_Q_HEADS, FIX_CHUNK_LEN as i64, FIX_HEAD_SIZE],
+            Some(DType::Float16),
+        )
+        .expect("q zeros");
+        q.eval();
+
+        let reference = windowed_reference(WINDOW);
+
+        // Exactly the mask the fixed dense arms build, from the window the
+        // gather handed back rather than from the local constant.
+        let mask = crate::array::mask::create_causal_mask(
+            FIX_CHUNK_LEN as i32,
+            Some(FIX_PREFIX_LEN as i32),
+            Some(window.tokens() as i32),
+        )
+        .expect("windowed keep-mask");
+        let masked = crate::array::attention::scaled_dot_product_attention(
+            &q,
+            &keys,
+            &values,
+            1.0,
+            Some(&mask),
+        )
+        .expect("masked dense SDPA");
+        let masked = read_bhtd_head0(&masked);
+
+        // Control within the same test: the pre-fix behaviour of both dense
+        // routes. Kept so the test states what it is protecting against, and
+        // so a mask that silently degenerates to "keep everything" cannot
+        // pass by matching the reference.
+        let unmasked =
+            crate::array::attention::scaled_dot_product_attention_causal(&q, &keys, &values, 1.0)
+                .expect("unmasked dense SDPA");
+        let unmasked = read_bhtd_head0(&unmasked);
+
+        eprintln!("token abs_pos  reference    masked   unmasked");
+        for i in 0..FIX_CHUNK_LEN as usize {
+            eprintln!(
+                "{i:>5} {:>7}  {:>9.4} {:>9.4} {:>9.4}",
+                FIX_PREFIX_LEN as usize + i,
+                reference[i],
+                masked[i],
+                unmasked[i]
+            );
+        }
+
+        for i in 0..FIX_CHUNK_LEN as usize {
+            assert!(
+                masked[i].is_finite(),
+                "dense token {i}: non-finite output {}",
+                masked[i]
+            );
+            assert!(
+                (masked[i] - reference[i]).abs() < 0.05,
+                "dense token {i} (abs pos {}): got {}, window-masked reference {}. \
+                 The dense cache-hit prefill route attended positions the window \
+                 retired (including the never-written null block).",
+                FIX_PREFIX_LEN as usize + i,
+                masked[i],
+                reference[i]
+            );
+            // The window must actually bite here, or the assertion above
+            // would be satisfied by a no-op mask and prove nothing.
+            assert!(
+                (unmasked[i] - reference[i]).abs() > 4.0,
+                "dense token {i}: unmasked and windowed references are too close \
+                 ({} vs {}) for this test to discriminate -- fix the geometry",
+                unmasked[i],
+                reference[i]
+            );
+        }
+    }
+
+    /// DEFAULT-DENY: the window-blind dense readers refuse a sliding group.
+    ///
+    /// This is the model-independent half of the fix, and the reason it is
+    /// here rather than in gemma4: `transformer/block.rs:423`,
+    /// `qwen3_5/attention.rs:1129`/`:1323` and `lfm2/attention.rs:391` all
+    /// consume these two readers window-blind. None is reachable today because
+    /// `new_sliding` has exactly one production caller, so nothing but this
+    /// refusal stops the next family that wires a sliding adapter from
+    /// re-deriving the same defect in a shared file. It mirrors vLLM's
+    /// `AttentionBackend.supports_sliding_window()` defaulting to `False`
+    /// (`vllm/v1/attention/backend.py:260-262`): a route that cannot express a
+    /// window is not selectable.
+    ///
+    /// Mutations caught: deleting either `sliding_window != 0` refusal (the
+    /// windowed group would be served window-blind again); returning
+    /// `DenseAttentionWindow(0)` from either windowed reader (the reported
+    /// window would stop tracking the group).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn window_blind_dense_readers_refuse_a_sliding_group() {
+        const WINDOW: u32 = 16;
+        let Some(fixture) = build_sliding_prefill_fixture(WINDOW).expect("sliding fixture") else {
+            eprintln!("skipping dense-reader refusal test: Metal GPU not available");
+            return;
+        };
+        let mut adapter = fixture.adapter;
+
+        let refused = match adapter.gather_kv_for_prefill_sdpa(0, FIX_TOTAL) {
+            Ok(_) => panic!("the window-blind dense gather must refuse a sliding group"),
+            Err(e) => e,
+        };
+        assert!(
+            refused.contains("gather_kv_for_dense_cache_hit_prefill"),
+            "the refusal must name the windowed reader, got: {refused}"
+        );
+
+        // Wider than the window: the host read would hand back out-of-window
+        // and null-block positions with no way to report the window.
+        let refused = match adapter.read_kv_range(0, 0, FIX_TOTAL) {
+            Ok(_) => panic!("a sliding read wider than the window must be refused"),
+            Err(e) => e,
+        };
+        assert!(
+            refused.contains("read_kv_range_for_dense_attention"),
+            "the refusal must name the windowed reader, got: {refused}"
+        );
+
+        // Within the window it is still legal -- this is the shape cold-tier
+        // sliding capture uses (`min(boundary, sliding_window)` tokens), and
+        // refusing it would break a working path.
+        adapter
+            .read_kv_range(0, FIX_TOTAL - WINDOW, WINDOW)
+            .expect("a sliding read inside the live window stays legal");
+
+        // Both windowed readers serve the group AND report its window.
+        let (_k, _v, window) = adapter
+            .gather_kv_for_dense_cache_hit_prefill(0, FIX_TOTAL)
+            .expect("the windowed dense gather serves a sliding group");
+        assert_eq!(window.tokens(), WINDOW);
+        assert!(window.is_windowed());
+        let (_k, _v, window) = adapter
+            .read_kv_range_for_dense_attention(0, FIX_TOTAL)
+            .expect("the windowed host read serves a sliding group");
+        assert_eq!(window.tokens(), WINDOW);
+    }
+
+    /// CONTROL: a full-attention group is served by every reader, window 0.
+    ///
+    /// The refusal above must not become over-strictness. A global group has
+    /// no window to lose, and both window-blind readers are its historical
+    /// path -- refusing it would break every non-sliding paged model.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn dense_readers_serve_a_full_attention_group_and_report_window_zero() {
+        let Some(fixture) = build_sliding_prefill_fixture(0).expect("full fixture") else {
+            eprintln!("skipping full-attention dense-reader test: Metal GPU not available");
+            return;
+        };
+        let mut adapter = fixture.adapter;
+
+        adapter
+            .gather_kv_for_prefill_sdpa(0, FIX_TOTAL)
+            .expect("a full group keeps the window-blind dense gather");
+        adapter
+            .read_kv_range(0, 0, FIX_TOTAL)
+            .expect("a full group keeps the window-blind host read");
+
+        let (_k, _v, window) = adapter
+            .gather_kv_for_dense_cache_hit_prefill(0, FIX_TOTAL)
+            .expect("windowed gather on a full group");
+        assert_eq!(window.tokens(), 0, "a full group has no window");
+        assert!(!window.is_windowed());
+        let (_k, _v, window) = adapter
+            .read_kv_range_for_dense_attention(0, FIX_TOTAL)
+            .expect("windowed host read on a full group");
+        assert_eq!(window.tokens(), 0);
+    }
+
+    /// A sliding read must be refused for being OLD, not merely for being WIDE.
+    ///
+    /// The width refusal (`num_tokens > sliding_window`) is offset-blind, so a
+    /// range whose length exactly equals the window slips through no matter
+    /// how far below the live floor it starts. Measured on this fixture before
+    /// the offset arm existed: the block table after prune is
+    /// `[null, null, null, null, 5, 6]`, and `read_kv_range(0, 0, 16)`
+    /// returned `Ok` with K/V reading back as all zeros where 1001..1016 /
+    /// 1..16 were demonstrably written -- i.e. the reserved null block, which
+    /// `LayerKVPool` allocates `StorageModePrivate` and never zeroes, so those
+    /// bytes are formally UNDEFINED. The same read returns the written values
+    /// before the prune, and the live tail still does after it, which is how
+    /// we know the zeros are the null block and not the data.
+    ///
+    /// The floor is `block_table.num_tokens() - sliding_window`, the exact
+    /// quantity `prune_sliding_window_for` derives its cutoff from. It is
+    /// token-granular while the prune is block-granular, so this is strictly
+    /// stricter than "touches the null block": it also refuses out-of-window
+    /// positions still physically resident. That is deliberate -- those are
+    /// the positions whose over-attention measured max|delta| 0.1245 against
+    /// a windowed reference whose own RMS is 0.0356.
+    ///
+    /// Mutation caught: deleting the `start_pos < live_floor` arm makes this
+    /// `Ok` and hands back null-block bytes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_retired_sliding_range_is_refused_even_when_its_width_fits_the_window() {
+        const WINDOW: u32 = 16;
+        let Some(fixture) = build_sliding_prefill_fixture(WINDOW).expect("sliding fixture") else {
+            eprintln!("skipping retired-range refusal test: Metal GPU not available");
+            return;
+        };
+        let mut adapter = fixture.adapter;
+        assert_eq!(
+            adapter.current_token_count(),
+            FIX_TOTAL,
+            "the fixture must have recorded the whole prefix plus chunk"
+        );
+
+        let refused = match adapter.read_kv_range(0, 0, WINDOW) {
+            Ok(_) => panic!(
+                "a retired sliding range must be refused: [0, {WINDOW}) is entirely below the \
+                 live floor {} and sits on the never-written null block",
+                FIX_TOTAL - WINDOW
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            refused.contains("read_kv_range_for_dense_attention"),
+            "the refusal must name the windowed reader, got: {refused}"
+        );
+        assert!(
+            refused.contains("out of window"),
+            "the refusal must say the positions are out of window, got: {refused}"
+        );
+
+        // NON-REGRESSION, in the same test so the guard cannot silently become
+        // over-strictness. The live tail starts exactly AT the floor, so the
+        // comparison must be `<` and not `<=`.
+        let (_k, values) = adapter
+            .read_kv_range(0, FIX_TOTAL - WINDOW, WINDOW)
+            .expect("a read starting exactly at the live floor stays legal");
+        let first = values.to_float32().expect("live tail to_float32")[0];
+        assert!(
+            (first - (FIX_TOTAL - WINDOW + 1) as f32).abs() < 1e-3,
+            "the live tail must return the written V[{}] = {}, got {first}",
+            FIX_TOTAL - WINDOW,
+            FIX_TOTAL - WINDOW + 1
+        );
+    }
+
+    /// CONTROL for the live-tail guard: the two shapes it must never refuse.
+    ///
+    /// (1) A full-attention group. `sliding_window == 0` has no floor at all
+    /// and the outer `if` must short-circuit, or every non-sliding paged model
+    /// loses its host read.
+    ///
+    /// (2) gemma4 cold-tier sliding capture, which reads for PERSISTENCE and
+    /// legitimately starts at position 0: `read_sliding_groups_at` computes
+    /// `live_tokens = min(boundary, sliding_window)` then
+    /// `start = boundary - live_tokens`, so `start == 0` whenever
+    /// `boundary <= sliding_window`. It is not refused because it never asks
+    /// for a retired range -- its own decline,
+    /// `recorded.saturating_sub(start) > sliding_window -> Ok(None)`, is
+    /// algebraically the same rule as `start < recorded - sliding_window`.
+    /// Replaying its arithmetic over 729 (window, recorded, boundary) triples
+    /// accepted 79 ranges and 0 of them violate the live-tail rule. Reading a
+    /// retired range to persist it would be a legitimate intent, but no caller
+    /// has it: the only candidate declines instead. So the refusal is blanket,
+    /// and a persistence reader -- which must check block ids against the
+    /// reserved null id rather than hand back undefined bytes -- stays unbuilt
+    /// until something needs it.
+    ///
+    /// Window `FIX_TOTAL` reproduces (2): prune's cutoff saturates to 0 so
+    /// nothing is retired, and the floor is 0, so the position-0 read lands on
+    /// real data.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_live_tail_guard_spares_full_groups_and_the_cold_capture_shape() {
+        const WINDOW: u32 = 16;
+
+        let Some(fixture) = build_sliding_prefill_fixture(0).expect("full fixture") else {
+            eprintln!("skipping live-tail control test: Metal GPU not available");
+            return;
+        };
+        let mut full = fixture.adapter;
+        full.read_kv_range(0, 0, WINDOW)
+            .expect("a full group has no live floor: a position-0 read stays legal");
+        full.read_kv_range(0, 0, FIX_TOTAL)
+            .expect("a full group keeps the whole-context host read");
+
+        // Cold-capture shape: recorded <= window, so nothing was retired and
+        // `start = 0` is inside the live window by construction.
+        let Some(fixture) = build_sliding_prefill_fixture(FIX_TOTAL).expect("wide-window fixture")
+        else {
+            eprintln!("skipping live-tail control test: Metal GPU not available");
+            return;
+        };
+        let mut unpruned = fixture.adapter;
+        assert_eq!(
+            unpruned.current_token_count().saturating_sub(FIX_TOTAL),
+            0,
+            "with window == recorded the live floor must be 0"
+        );
+        let (_k, values) = unpruned
+            .read_kv_range(0, 0, FIX_TOTAL)
+            .expect("the cold-capture shape reads from position 0 by design");
+        let first = values.to_float32().expect("cold capture to_float32")[0];
+        assert!(
+            (first - 1.0).abs() < 1e-3,
+            "position 0 must return the written V[0] = 1, not null-block bytes, got {first}"
+        );
+    }
+
+    /// `new_sliding` must refuse a window it cannot carry to the kernel.
+    ///
+    /// Six paged dispatch sites pass `self.sliding_window as i32`, and
+    /// `mlx_paged_ops.cpp` rejects a negative window
+    /// ("must be >= 0 (use 0 to disable the sliding mask)"). A window in
+    /// `[2^31, 2^32-1]` survives every u32-shaped guard upstream and wraps to
+    /// a negative i32 at the FFI boundary; on the kernel route that is a clean
+    /// native error, but on a `create_causal_mask` route a negative width
+    /// masks EVERY key (measured against real MLX: 0 of 96 cells kept vs 68
+    /// causal) and the fused SDPA then returns the finite, plausible-looking
+    /// uniform mean of all V rows -- no NaN, no error. Refusing at
+    /// construction makes the six casts provably non-negative instead.
+    ///
+    /// Mutation caught: deleting the `i32::try_from` arm accepts 2^31 and
+    /// 2^32-1.
+    #[test]
+    fn new_sliding_refuses_a_window_that_cannot_reach_the_kernels_i32_slot() {
+        const BLOCK: u32 = 16;
+        const NUM_BLOCKS: u32 = 16;
+        // Same pool geometry as `build_sliding_prefill_fixture`, which is known
+        // to construct on this machine -- a config that failed to build a pool
+        // would make this test skip and pass for the wrong reason.
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: BLOCK,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(1),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            NUM_BLOCKS,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(p) => Arc::new(p),
+            // Skip only for an absent GPU, the same specific string the rest of
+            // this module matches on. The comment above says a pool failure
+            // would make this test "pass for the wrong reason" -- a blanket skip
+            // is exactly how that happens, so match the reason rather than
+            // trusting the geometry.
+            Err(e) if e.to_string().contains("Metal GPU not available") => {
+                eprintln!("skipping new_sliding i32-window test: {e}");
+                return;
+            }
+            Err(e) => panic!("pool construction failed for a non-GPU reason: {e}"),
+        };
+        let new_sliding = |window: u32| {
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK)));
+            PagedKVCacheAdapter::new_sliding(allocator, Arc::clone(&pool), BLOCK, window, 128)
+        };
+
+        for window in [1u32 << 31, u32::MAX] {
+            let refused = match new_sliding(window) {
+                Ok(_) => {
+                    panic!("sliding_window {window} wraps to a negative i32 and must be refused")
+                }
+                Err(e) => e,
+            };
+            assert!(
+                refused.contains("i32") && refused.contains(&window.to_string()),
+                "the refusal must name i32 and the offending value, got: {refused}"
+            );
+        }
+
+        // CONTROL: every window a real checkpoint can carry stays accepted,
+        // including the exact i32 boundary. Tightening this to a
+        // context-derived bound would be wrong -- a window larger than the
+        // context is legal and must stay representable.
+        for window in [1u32, 512, 1024, 2048, i32::MAX as u32] {
+            new_sliding(window)
+                .unwrap_or_else(|e| panic!("sliding_window {window} must stay accepted, got: {e}"));
+        }
+        // And the pre-existing zero refusal keeps its own wording.
+        let refused = match new_sliding(0) {
+            Ok(_) => panic!("a zero window is not a sliding group"),
+            Err(e) => e,
+        };
+        assert!(
+            refused.contains("must be positive"),
+            "the zero refusal must keep its wording, got: {refused}"
+        );
+    }
+
+    /// After pruning, no route may read a position backed by the null block.
+    ///
+    /// `prune_sliding_window_for` documents that it relies on the attention
+    /// mask to "mask every placeholder position before dereferencing its
+    /// K/V", and `null_block` documents that "the paged attention mask
+    /// guarantees placeholder positions are outside the live window". Window
+    /// 0 broke that stated invariant. This pins it as a property of the mask
+    /// rather than of the driver: every position whose block is the null
+    /// block must be masked out for every query row.
+    ///
+    /// The pool is `StorageModePrivate` and explicitly not zeroed, so a
+    /// dereference there is formally undefined. This test deliberately does
+    /// NOT assert on the bytes -- they happen to read back as zeros on this
+    /// machine, which would make a value-based test pass for the wrong
+    /// reason. It asserts the placeholders are never reached at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pruned_null_block_positions_are_masked_out_for_every_query_row() {
+        const WINDOW: u32 = 16;
+        let Some(fixture) = build_sliding_prefill_fixture(WINDOW).expect("sliding fixture") else {
+            eprintln!("skipping null-block masking test: Metal GPU not available");
+            return;
+        };
+        let adapter = fixture.adapter;
+        let null_id = fixture.null_block_id;
+        assert_ne!(null_id, u32::MAX, "a sliding adapter reserves a null block");
+
+        // Which logical positions are backed by the null placeholder.
+        let table = adapter.block_table_for(7).expect("request table");
+        let mut placeholder_positions = Vec::new();
+        for (logical_block, entry) in table.blocks().iter().enumerate() {
+            if entry.block_id == null_id {
+                let base = logical_block as u32 * FIX_BLOCK_SIZE;
+                for off in 0..FIX_BLOCK_SIZE {
+                    let pos = base + off;
+                    if pos < FIX_TOTAL {
+                        placeholder_positions.push(pos);
+                    }
+                }
+            }
+        }
+        assert!(
+            !placeholder_positions.is_empty(),
+            "prune must have retired at least one block onto the null placeholder, \
+             or this test proves nothing"
+        );
+
+        // The keep-mask the fixed dense routes build, read back as bools.
+        let mask = crate::array::mask::create_causal_mask(
+            FIX_CHUNK_LEN as i32,
+            Some(FIX_PREFIX_LEN as i32),
+            Some(WINDOW as i32),
+        )
+        .expect("windowed keep-mask");
+        let keep = mask.to_float32().expect("mask to_float32");
+        let total = FIX_TOTAL as usize;
+
+        for row in 0..FIX_CHUNK_LEN as usize {
+            for &pos in &placeholder_positions {
+                let kept = keep[row * total + pos as usize] != 0.0;
+                assert!(
+                    !kept,
+                    "query row {row} (abs pos {}) keeps position {pos}, which is backed \
+                     by the never-written null block {null_id}. Reading it is undefined: \
+                     the pool is StorageModePrivate and not zeroed.",
+                    FIX_PREFIX_LEN as usize + row
+                );
+            }
+        }
+    }
+
+    /// CONTROL: a FULL (non-windowed) adapter must be untouched.
+    ///
+    /// Regressing full attention to fix sliding would be a far worse trade
+    /// than the bug. A global group's window is 0, which must mean "full
+    /// causal" everywhere: the kernel routes pass 0 to the Metal kernel as
+    /// the no-mask sentinel, and the dense routes must keep the fused causal
+    /// kernel with NO explicit mask -- MLX dispatches a different kernel when
+    /// a mask is present, with a different BF16 reduction order, and
+    /// paged-vs-flat parity depends on that kernel not moving.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn full_attention_prefill_routes_are_unaffected_by_the_window_plumbing() {
+        let Some(fixture) = build_sliding_prefill_fixture(0).expect("full fixture") else {
+            eprintln!("skipping full-attention control: Metal GPU not available");
+            return;
+        };
+        let mut adapter = fixture.adapter;
+        assert_eq!(
+            adapter.sliding_window(),
+            0,
+            "the control fixture must be a full-attention adapter"
+        );
+
+        let reference = windowed_reference(0);
+        let scale = 1.0_f32 / (FIX_HEAD_SIZE as f32).sqrt();
+
+        let q3 = MxArray::zeros(
+            &[FIX_CHUNK_LEN as i64, FIX_NUM_Q_HEADS, FIX_HEAD_SIZE],
+            Some(DType::Float16),
+        )
+        .expect("q zeros");
+        q3.eval();
+        let read_thd_head0 = |out: &MxArray| -> Vec<f32> {
+            let values = out.to_float32().expect("output to_float32");
+            (0..FIX_CHUNK_LEN as usize)
+                .map(|t| values[t * FIX_NUM_Q_HEADS as usize * FIX_HEAD_SIZE as usize])
+                .collect()
+        };
+
+        let varlen = adapter
+            .gather_kv_for_prefill_chunk_varlen(0, &q3, FIX_PREFIX_LEN, scale)
+            .map(|o| read_thd_head0(&o))
+            .expect("full-attention varlen prefill");
+        let legacy = adapter
+            .gather_kv_for_prefill_chunk(0, &q3, FIX_PREFIX_LEN, scale)
+            .map(|o| read_thd_head0(&o))
+            .expect("full-attention legacy prefill");
+
+        // Dense route: window 0 => no explicit mask, fused causal kernel.
+        let (keys, values) = adapter
+            .gather_kv_for_prefill_sdpa(0, FIX_TOTAL)
+            .expect("dense gather");
+        let q4 = MxArray::zeros(
+            &[1, FIX_NUM_Q_HEADS, FIX_CHUNK_LEN as i64, FIX_HEAD_SIZE],
+            Some(DType::Float16),
+        )
+        .expect("q zeros");
+        q4.eval();
+        let dense =
+            crate::array::attention::scaled_dot_product_attention_causal(&q4, &keys, &values, 1.0)
+                .map(|o| read_bhtd_head0(&o))
+                .expect("full-attention dense SDPA");
+
+        for i in 0..FIX_CHUNK_LEN as usize {
+            for (label, got) in [
+                ("varlen", varlen[i]),
+                ("legacy", legacy[i]),
+                ("dense", dense[i]),
+            ] {
+                assert!(
+                    (got - reference[i]).abs() < 0.05,
+                    "full-attention {label} token {i} (abs pos {}): got {got}, \
+                     full-causal reference {}. A non-windowed group must attend its \
+                     entire causal context.",
+                    FIX_PREFIX_LEN as usize + i,
+                    reference[i]
                 );
             }
         }

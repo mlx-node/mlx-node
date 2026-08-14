@@ -286,6 +286,23 @@ async fn gemma4_paged_vs_flat_greedy_token_parity() {
 // ---------------------------------------------------------------------------
 // Test (b): two-turn dialog parity (exercises prefix-reuse)
 // ---------------------------------------------------------------------------
+//
+// WHAT THIS DOES NOT COVER, stated plainly because it is easy to assume
+// otherwise: it does not gate the sliding window on the cache-hit dense prefill
+// route. `parity_prompts()` plus 32 generated tokens plus the follow-up turn is
+// under ~100 tokens of context, and `default_sliding_window()` is 512, so
+// `cache_hit_dense_window_arg` answers `None` on every chunk here -- the window
+// cannot bite, no keep-mask is built, and `prune_sliding_window_for` retires
+// nothing (`cutoff = num_tokens - 512` saturates to 0). Measured: with both
+// dense arms reverted to their window-dropping form this test is byte-identical
+// to the fixed code, so it would pass on the defect. Raising the hardcoded
+// `paged_cache_memory_mb` does not change that.
+//
+// What actually gates that window: `both_dense_cache_hit_arms_apply_the_window_
+// through_the_dispatcher` (model-free, runs on every `cargo test`) and the
+// `dense_cache_hit` module boundary, which makes the bypass a compile error. A
+// real-weight lane here would need prompts past the window AND a second turn,
+// and would be defence in depth on top of those -- not a substitute.
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Gemma4 checkpoint"]

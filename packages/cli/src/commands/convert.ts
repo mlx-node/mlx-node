@@ -36,7 +36,7 @@ Optional Arguments:
   --model-type, -m      Model type (auto-detected if not specified)
                         Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_asr,
                         qwen3_5, qwen3_5_moe, lfm2_moe, lfm2, qianfan-ocr,
-                        privacy-filter
+                        privacy-filter, muse_glimmer
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
@@ -70,6 +70,12 @@ Quantization Arguments:
                         unchanged but quality may be lower. --q-bits/
                         --q-group-size do not alter this map.
 
+                        Muse-Glimmer-30B: text-body matrices=mxfp4 except the
+                        final seven attention output projections; those seven,
+                        both vocab tensors, norms, projector, and vision tower
+                        stay bf16. This translates the released UD-Q4_K_XL
+                        Q4_K/Q5_K boundary and accepts no NVFP4 mode.
+
                         With other recipes (or no recipe), applies after the
                         recipe predicate: any 8-bit affine decision becomes
                         mxfp8, any 4-bit becomes mxfp4 — except
@@ -97,8 +103,8 @@ Quantization Arguments:
                         The fixed --q-mxfp / --q-mode nvfp4 maps may omit it;
                         AWQ pre-scaling is then skipped and quality may be lower.
                         A matching imatrix remains preferred when available.
-                        Add --q-mxfp for the verified Qwen hybrid or SafeTensors
-                        Gemma4 MoE fixed class map
+                        Add --q-mxfp for a verified Qwen hybrid, SafeTensors
+                        Gemma4 MoE, or Muse-Glimmer fixed class map
                         (NVFP4 translated to MXFP4, FP8 translated to MXFP8).
                         Use --q-mode nvfp4 for the fixed DGX weight map. Qwen
                         uses early FFNs=nvfp4 and final-eight FFNs +
@@ -332,8 +338,9 @@ export async function run(argv: string[]) {
     // Based on Unsloth's per-tensor KLD analysis. Legacy affine requires an
     // imatrix for AWQ correction on attention/SSM projections. The fixed
     // --q-mxfp / --q-mode nvfp4 tensor-class maps may run data-free, but the
-    // backend must still verify the Qwen family + hybrid tensor shape before
-    // it is allowed to skip AWQ rather than fall back to Dynamic 2.0.
+    // backend must still verify the Qwen hybrid, Gemma4 MoE, or Muse-Glimmer
+    // family + tensor shape before it may skip AWQ rather than fall back to
+    // Dynamic 2.0.
     if (quantRecipe === 'unsloth' && !args['q-bits'] && quantMode !== 'nvfp4' && !args['q-mxfp']) {
       console.log('Note: unsloth recipe defaults to 3-bit base (override with --q-bits)');
     }
@@ -347,8 +354,11 @@ export async function run(argv: string[]) {
         console.error('       Generate with: llama-imatrix -m model.gguf -f calibration.txt -o imatrix.gguf');
         process.exit(1);
       }
+      const fixedMapFamilies = args['q-mxfp']
+        ? 'fixed Qwen hybrid, exact SafeTensors Gemma4 MoE, or exact Muse-Glimmer MXFP map'
+        : 'fixed Qwen hybrid or exact SafeTensors Gemma4 MoE DGX map';
       console.warn(
-        'Warning: no --imatrix-path was provided. If backend validation selects the requested fixed Qwen hybrid or exact SafeTensors Gemma4 MoE MXFP4/MXFP8 or NVFP4/plain-FP8 map, AWQ pre-scaling will be skipped and quality may be lower; unsupported inputs will be rejected.',
+        `Warning: no --imatrix-path was provided. If backend validation selects the requested ${fixedMapFamilies}, AWQ pre-scaling will be skipped and quality may be lower; unsupported inputs will be rejected.`,
       );
     }
     // The nvidia recipe is a data-free port with a fixed format map: it reads
@@ -395,10 +405,16 @@ export async function run(argv: string[]) {
   const usesOfficialUnslothNvfp4 = quantRecipe === 'unsloth' && quantMode === 'nvfp4';
   const fixedUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') => {
     const highFormat = lowFormat === 'nvfp4' ? 'fp8_e4m3' : 'mxfp8';
-    return `fixed Unsloth ${lowFormat === 'nvfp4' ? 'DGX/NVFP4 weight' : 'MXFP'} map (Qwen: early FFN=${lowFormat}, final 8 FFN + attention/GDN/head=${highFormat}; Gemma4 MoE: all dense/expert FFN=${lowFormat}, attention q/k/v/o=${highFormat}; protected classes=bf16)`;
+    const muse = lowFormat === 'mxfp4' ? '; Muse: text body=mxfp4 except final 7 o_proj' : '';
+    return `fixed Unsloth ${lowFormat === 'nvfp4' ? 'DGX/NVFP4 weight' : 'MXFP'} map (Qwen: early FFN=${lowFormat}, final 8 FFN + attention/GDN/head=${highFormat}; Gemma4 MoE: all dense/expert FFN=${lowFormat}, attention q/k/v/o=${highFormat}${muse}; protected classes=bf16)`;
   };
-  const requestedFixedUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') =>
-    `requested ${fixedUnslothSummary(lowFormat)}; backend verifies Qwen hybrid or exact SafeTensors Gemma4 MoE family/shape`;
+  const requestedFixedUnslothSummary = (lowFormat: 'mxfp4' | 'nvfp4') => {
+    const families =
+      lowFormat === 'mxfp4'
+        ? 'Qwen hybrid, exact SafeTensors Gemma4 MoE, or exact Muse-Glimmer family/shape'
+        : 'Qwen hybrid or exact SafeTensors Gemma4 MoE family/shape';
+    return `requested ${fixedUnslothSummary(lowFormat)}; backend verifies ${families}`;
+  };
   // Render the `Quantize:` line body shared by the GGUF and SafeTensors paths.
   // `qGsLabel` carries the group-size text (the GGUF path never reaches sym8,
   // so it always passes `group_size=N`); `mtp` is `'off'` on the GGUF path,
@@ -664,17 +680,26 @@ export async function run(argv: string[]) {
       } else if (config.model_type === 'openai_privacy_filter') {
         modelType = 'privacy-filter';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'muse_glimmer') {
+        modelType = config.model_type;
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
     } catch {
       // config.json not found or invalid
     }
   }
 
+  if (modelType === 'muse_glimmer' && args.quantize && quantRecipe === 'unsloth' && quantMode === 'nvfp4') {
+    console.error(
+      'Error: Muse-Glimmer fixed Unsloth conversion is MXFP4-only; use --q-mxfp with --q-mode affine (the default), not --q-mode nvfp4.',
+    );
+    process.exit(1);
+  }
+
   if (
     modelType === 'qwen3_asr' &&
     args.quantize &&
-    ((quantMode !== undefined && !['affine', 'mxfp4', 'mxfp8'].includes(quantMode)) ||
-      args['q-recipe'] !== undefined)
+    ((quantMode !== undefined && !['affine', 'mxfp4', 'mxfp8'].includes(quantMode)) || args['q-recipe'] !== undefined)
   ) {
     console.error(
       'Error: Qwen3-ASR packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit --q-recipe',
