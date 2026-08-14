@@ -1537,6 +1537,18 @@ impl Qwen3Tokenizer {
                             &tool.function.name,
                             control_markers,
                         )?;
+                        // Family-gated, on the SAME authority the marker sanitizer
+                        // uses: `detect_control_markers` hands out
+                        // `MUSE_GLIMMER_CONTROL_MARKERS` only for a vocabulary
+                        // carrying all 15, and `&[]` for everyone else. The gate is
+                        // written out rather than left implicit in an empty loop
+                        // because the rule below is ATEM's wire grammar, not a
+                        // universal one — a name with a space is perfectly legal for
+                        // the families that `tojson` it, and `!is_empty()` would hand
+                        // this grammar to the next family that registers a marker set.
+                        if control_markers == MUSE_GLIMMER_CONTROL_MARKERS {
+                            Self::validate_muse_recipient_name(&tool.function.name)?;
+                        }
                         Ok(ToolDefinition {
                             // Not a render site; see the field invariant on
                             // [`Self::sanitize_messages`].
@@ -1637,6 +1649,128 @@ impl Qwen3Tokenizer {
                     Self::bounded_for_error(value),
                 ));
             }
+        }
+        Ok(())
+    }
+
+    /// Refuse a tool name Muse-Glimmer's own wire format cannot carry back.
+    ///
+    /// **Muse-Glimmer only.** The caller gates this on
+    /// [`MUSE_GLIMMER_CONTROL_MARKERS`]; see the comment at that call site for why
+    /// the gate is explicit. Every rule below is derived from a site that renders
+    /// the name UNESCAPED and a consumer that then has to match it byte for byte.
+    /// For a family whose template `tojson`s the name — lfm2.5 and the Qwen-derived
+    /// agents checkpoints both do — none of it applies and a name with a space or a
+    /// quote is entirely legal, so applying this to every family would turn working
+    /// tools into hard render errors.
+    ///
+    /// The name reaches five unescaped sites: `'<|start|>assistant to=' + name`,
+    /// `'<atem:invoke name="' + name + '">'`, `'<|start|>tool ' + name`,
+    /// `'<tool_output name="' + name + '">'`, and the `# Valid recipients: "<ns>.*"`
+    /// line. Only the schema block is `tojson`'d, and only the recipients line is
+    /// prose no consumer parses.
+    ///
+    /// # Why refuse rather than escape
+    ///
+    /// Same reason as [`Self::validate_identifier`], and it is load-bearing here:
+    /// `output_parser` accepts an `<atem:invoke name=…>` only when the captured name
+    /// EQUALS the recipient it appeared under, and `stream_guard` sizes its header
+    /// allowance from the longest CONFIGURED name. Both derive from the caller's own
+    /// bytes, so a rewrite in the prompt desynchronises them from a model echoing
+    /// what it was trained on.
+    ///
+    /// # The rules, and the measurement behind each
+    ///
+    /// It is a BLACKLIST of four characters plus two reserved words, not a
+    /// `[A-Za-z0-9_.-]` whitelist. Measured round-trips through
+    /// `StreamGuard::push_id` → `flush` → `generated_turn` →
+    /// `ResponseTemplate::parse` against the real checkpoint show `>`, `&`, `|`,
+    /// `=`, `'`, `.`, `-`, `_` and non-ASCII (`天気.予報`) all surviving IDENTICALLY.
+    /// The checkpoint's own template example is
+    /// `to=example_tool_name.example_function_name`, so a no-dot rule would fail the
+    /// model's own documentation.
+    ///
+    /// 1. **Non-empty.** `stream_guard::is_recipient` requires it, `output_parser`
+    ///    rejects an empty recipient, and the parse spec's `name="([^"]+)"` is
+    ///    one-or-more.
+    /// 2. **No Unicode whitespace anywhere** — `char::is_whitespace`, so space, tab,
+    ///    CR, LF and NBSP. The header is byte-exact ` to=<name><|message|>`;
+    ///    whitespace leaves room for a second `to=`. Both `stream_guard` and
+    ///    `output_parser` check this independently.
+    /// 3. **No `<`.** `stream_guard::is_recipient` refuses it. (The parser is laxer
+    ///    here — a divergence deliberately pinned in `output_parser`'s
+    ///    `GRAMMAR_DIVERGENCES` — but the stricter side runs first.) This subsumes
+    ///    the marker check above for the name field specifically, since every marker
+    ///    opens with `<`; the marker path still runs first because its message is the
+    ///    more specific one.
+    /// 4. **No `"`.** The checkpoint's own `response_template` open pattern is
+    ///    `<atem:invoke\b[^>]*?\bname="(?P<name>[^"]+)">`, and `[^"]+` cannot cross a
+    ///    quote. It also lands unescaped in `<tool_output name="…">`.
+    /// 5. **Not `user`, not `self`.** `stream_guard` routes those two recipients to
+    ///    `Channel::Content` and `Channel::Reasoning`. A tool named `user` does not
+    ///    merely fail to fire: the raw `<atem:invoke …>` markup is STREAMED to the
+    ///    end user as the answer.
+    ///
+    /// Measured failure without this gate, for each class — all silent, none
+    /// surfacing an error anywhere in the stack: a whitespace or `<` name makes the
+    /// guard `stop()` (empty answer, empty reasoning, no call); a `"` name passes the
+    /// guard and parses to nothing (also empty); `user`/`self` deliver the markup to
+    /// the user or into reasoning. There is NO mis-attribution — `output_parser`'s
+    /// recipient-equality check kills `a">`, verified by reproduction.
+    ///
+    /// # Not checked: length
+    ///
+    /// There is a real bound — `ABSOLUTE_MAX_HEADER_CHARS` (4096) minus
+    /// `len("<|start|>assistant to=")` (22), so 4074 characters; measured, 4000
+    /// passes and 4100 is refused. It is deliberately NOT enforced here. Both
+    /// constants are private to `stream_guard`, and a copy of `4074` in this file is
+    /// exactly the kind of made-up number `StreamGuard::new`'s derived allowance
+    /// exists to replace — the fixed 128 it deleted had refused a real 107-character
+    /// name. Re-export the constants and add it here if a 4000-character tool name
+    /// ever stops being hypothetical.
+    fn validate_muse_recipient_name(name: &str) -> std::result::Result<(), String> {
+        let refuse = |reason: &str| -> std::result::Result<(), String> {
+            Err(format!(
+                "invalid tool name {:?}: {reason}. This checkpoint renders a tool name \
+                 unescaped into the recipient header `<|start|>assistant to=<name><|message|>` \
+                 and into `<atem:invoke name=\"<name>\">`, and both are matched back byte for \
+                 byte, so a name outside that grammar advertises a tool the model cannot call \
+                 — it is refused here rather than becoming a silently dead tool at generation \
+                 time. Fix the value.",
+                Self::bounded_for_error(name),
+            ))
+        };
+
+        if name.is_empty() {
+            return refuse(
+                "it is empty, and the recipient grammar requires at least one character",
+            );
+        }
+        if name == "user" || name == "self" {
+            return refuse(
+                "`user` and `self` are the protocol's own reserved recipients, routed to the \
+                 answer and reasoning channels — a tool with this name is never called, and its \
+                 call markup is delivered to the end user as content instead",
+            );
+        }
+        if let Some(bad) = name.chars().find(|c| c.is_whitespace()) {
+            return refuse(&format!(
+                "it contains the whitespace character {bad:?}, which the byte-exact recipient \
+                 header cannot carry — the model's own reply would be unroutable",
+            ));
+        }
+        if name.contains('<') {
+            return refuse(
+                "it contains '<', which the recipient grammar rejects outright — the model's \
+                 own reply would be unroutable",
+            );
+        }
+        if name.contains('"') {
+            return refuse(
+                "it contains '\"', and the name is rendered unescaped into \
+                 `<atem:invoke name=\"…\">` whose parse pattern `[^\"]+` cannot cross a quote — \
+                 the call would parse to nothing",
+            );
         }
         Ok(())
     }
@@ -6893,6 +7027,329 @@ mod tests {
             clean.contains(r#"# Valid recipients: "self", "wx.*", "user"."#),
             "got: {clean}",
         );
+    }
+
+    // ── The Muse-Glimmer tool-name wire grammar ────────────────────────────────
+    //
+    // The marker check above is about forging a turn boundary. This is a different
+    // failure: a name that carries no marker at all but that the checkpoint's own
+    // consumers cannot match back, so the tool is advertised and then silently
+    // uncallable. Both halves are gated below, and the ACCEPTANCE half is the more
+    // important one — over-strictness here would turn working tools into hard render
+    // errors, for this family and (without the gate) for every other one.
+
+    /// Names the wire grammar cannot carry, each with the substring the error must
+    /// name so a failure says WHICH rule fired rather than just "refused".
+    ///
+    /// Every entry was reproduced end to end against the real checkpoint through
+    /// `StreamGuard` → `ResponseTemplate::parse`: whitespace and `<` make the guard
+    /// stop with an empty turn, `"` passes the guard and parses to nothing, and
+    /// `user`/`self` deliver the raw call markup to the user or into reasoning.
+    const MUSE_NAMES_THE_WIRE_CANNOT_CARRY: &[(&str, &str)] = &[
+        ("weather lookup", "whitespace"),
+        ("a\tb", "whitespace"),
+        ("a\nb", "whitespace"),
+        ("a\u{a0}b", "whitespace"),
+        (" ab", "whitespace"),
+        ("ab ", "whitespace"),
+        ("", "empty"),
+        ("a<b", "'<'"),
+        ("a\"b", "cannot cross a quote"),
+        ("a\">", "cannot cross a quote"),
+        ("user", "reserved recipients"),
+        ("self", "reserved recipients"),
+    ];
+
+    /// Names that round-trip IDENTICALLY today and must keep rendering. This is the
+    /// anti-over-strictness gate: the rule is a four-character blacklist plus two
+    /// reserved words, NOT `[A-Za-z0-9_.-]`.
+    ///
+    /// `>` is here deliberately. The review comment that prompted this rule named
+    /// `>` as breaking routing; measured, `a>b` parses back to `("a>b", …)` because
+    /// the open pattern's `[^>]*?` sits before `\bname=`, not inside the capture.
+    /// Banning it would be the exact over-strictness this list exists to catch.
+    /// `wx.forecast` and `example_tool_name.example_function_name` are the repo's own
+    /// fixture and the checkpoint template's own example.
+    const MUSE_NAMES_THE_WIRE_CARRIES: &[&str] = &[
+        "wx.forecast",
+        "get_weather",
+        "a.b.c",
+        "Get-Weather_2",
+        "a>b",
+        "a&b",
+        "a|b",
+        "a=b",
+        "a'b",
+        ".foo",
+        "天気.予報",
+        "example_tool_name.example_function_name",
+    ];
+
+    /// `tool_with` renamed, so the rest of the definition stays the known-clean one.
+    fn tool_named(name: &str) -> ToolDefinition {
+        let mut tool = tool_with(BENIGN_FIELD, BENIGN_KEY);
+        tool.function.name = name.to_string();
+        tool
+    }
+
+    /// A synthetic vocabulary carrying all 15 markers, so `control_markers` is the
+    /// Muse set and the gate below is live — the same fixture the marker gates use,
+    /// and the reason this runs in CI without the 59.5 GB checkpoint.
+    fn muse_family_fixture(dir: &TestModelDir) -> Qwen3Tokenizer {
+        let tokenizer =
+            dir.load_with_template(super::MUSE_GLIMMER_CONTROL_MARKERS, HOSTILE_FIELD_TEMPLATE);
+        assert_eq!(
+            tokenizer.control_markers,
+            super::MUSE_GLIMMER_CONTROL_MARKERS,
+            "the fixture vocabulary did not enable the family gate, so the test is vacuous",
+        );
+        tokenizer
+    }
+
+    #[test]
+    fn a_tool_name_outside_the_muse_wire_grammar_is_refused() {
+        let dir = TestModelDir::new("muse-tool-name-refusals");
+        let tokenizer = muse_family_fixture(&dir);
+        for (name, reason) in MUSE_NAMES_THE_WIRE_CANNOT_CARRY {
+            let error = tokenizer
+                .render_chat_template_sync(
+                    &[user_msg("weather?", 0)],
+                    Some(true),
+                    Some(&[tool_named(name)]),
+                    None,
+                )
+                .map(|rendered| format!("RENDERED: {rendered}"))
+                .expect_err(&format!("tool name {name:?} must fail the render"))
+                .to_string();
+            assert!(
+                error.contains("tool name") && error.contains(reason),
+                "the error for {name:?} must name the field and the reason ({reason:?}): {error}",
+            );
+            // The offending value is echoed (debug-quoted, as the marker path does),
+            // so the developer can see which of their tools it was.
+            assert!(
+                error.contains(&format!("{name:?}")),
+                "the error for {name:?} does not echo the name: {error}",
+            );
+        }
+    }
+
+    #[test]
+    fn a_tool_name_the_muse_wire_grammar_allows_still_renders() {
+        let dir = TestModelDir::new("muse-tool-name-acceptances");
+        let tokenizer = muse_family_fixture(&dir);
+        for name in MUSE_NAMES_THE_WIRE_CARRIES {
+            let rendered = tokenizer
+                .render_chat_template_sync(
+                    &[user_msg("weather?", 0)],
+                    Some(true),
+                    Some(&[tool_named(name)]),
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("tool name {name:?} is legal but was refused: {e}"));
+            assert!(
+                rendered.contains(&format!("[def={name}|")),
+                "tool name {name:?} did not reach the prompt unchanged: {rendered}",
+            );
+        }
+    }
+
+    /// A stand-in for the families that `tojson` the name — lfm2.5 and the
+    /// Qwen-derived `agents-a1*` checkpoints both render
+    /// `{"name": "weather lookup", …}` today, and gemma4 uses a third form again.
+    const TOJSON_NAME_TEMPLATE: &str = concat!(
+        "{%- for t in tools or [] -%}",
+        "<tools>{{ t.function.name | tojson }}</tools>",
+        "{%- endfor -%}",
+        "{%- for m in messages -%}[{{ m.role }}]{{ m.content }}{%- endfor -%}",
+    );
+
+    /// **The gate that proves the family gate.** `tokenizer.rs` is shared by every
+    /// family; a name legal in a JSON-encoding template must stay legal.
+    ///
+    /// Mutation this catches, measured: delete the
+    /// `control_markers == MUSE_GLIMMER_CONTROL_MARKERS` condition in
+    /// `sanitize_tools` and this turns red — `weather lookup` is refused with the
+    /// whitespace message — while every other test here stays green.
+    ///
+    /// What it does NOT catch, stated so nobody mistakes it for covered: weakening
+    /// the condition to `!control_markers.is_empty()`. Today
+    /// `detect_control_markers` returns only the Muse set or `&[]`, so the two
+    /// spellings are behaviourally identical and no fixture can separate them. The
+    /// equality spelling is the right one anyway — the day a second family registers
+    /// a marker set, `!is_empty()` silently hands it ATEM's wire grammar, and this
+    /// test would only start catching that once such a family exists.
+    #[test]
+    fn the_muse_tool_name_grammar_does_not_reach_another_family() {
+        let dir = TestModelDir::new("non-muse-tool-name");
+        // No added tokens, so `detect_control_markers` yields `&[]`.
+        let tokenizer = dir.load_with_template(&[], TOJSON_NAME_TEMPLATE);
+        assert_eq!(
+            tokenizer.control_markers,
+            &[] as &[&str],
+            "this fixture must NOT be the Muse family, or the test proves nothing",
+        );
+        for name in ["weather lookup", "a\"b", "a<b", "user", "self", ""] {
+            let rendered = tokenizer
+                .render_chat_template_sync(
+                    &[user_msg("weather?", 0)],
+                    Some(true),
+                    Some(&[tool_named(name)]),
+                    None,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "tool name {name:?} is legal for a family that tojsons it, but the \
+                         Muse grammar leaked and refused it: {e}"
+                    )
+                });
+            assert!(
+                rendered.contains(&format!("<tools>{}</tools>", serde_json::json!(name))),
+                "the name did not survive for a non-Muse family: {rendered}",
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn the_real_checkpoint_refuses_and_accepts_the_same_tool_names() {
+        let tokenizer = real_muse_tokenizer();
+        for (name, reason) in MUSE_NAMES_THE_WIRE_CANNOT_CARRY {
+            let error = tokenizer
+                .render_chat_template_sync(
+                    &[user_msg("weather?", 0)],
+                    Some(true),
+                    Some(&[tool_named(name)]),
+                    None,
+                )
+                .map(|rendered| format!("RENDERED: {rendered}"))
+                .expect_err(&format!("tool name {name:?} must fail the real render"))
+                .to_string();
+            assert!(
+                error.contains("tool name") && error.contains(reason),
+                "the error for {name:?} must name the field and the reason: {error}",
+            );
+        }
+        for name in MUSE_NAMES_THE_WIRE_CARRIES {
+            let rendered = tokenizer
+                .render_chat_template_sync(
+                    &[user_msg("weather?", 0)],
+                    Some(true),
+                    Some(&[tool_named(name)]),
+                    None,
+                )
+                .unwrap_or_else(|e| panic!("tool name {name:?} is legal but was refused: {e}"));
+            assert!(
+                rendered.contains(*name),
+                "the real template did not carry {name:?}: {rendered}",
+            );
+        }
+    }
+
+    /// **The gate that makes the acceptance list a measurement rather than an
+    /// opinion.** For every accepted name, play back the tool call the model would
+    /// emit for it through the production seam — `StreamGuard::push_id` → `flush` →
+    /// `generated_turn` → `ResponseTemplate::parse` — and require the call to come
+    /// back with that exact name.
+    ///
+    /// Mutation this catches: add `'>'` to the blacklist and the acceptance list
+    /// shrinks for no reason this test can justify; drop `'"'` from it and
+    /// `a"b` renders and then parses to NOTHING, which only a seam test sees.
+    #[test]
+    #[ignore = "requires the local Muse-Glimmer checkpoint; set MLX_TEST_MUSE_GLIMMER_MODEL_PATH and run with --ignored"]
+    fn every_accepted_tool_name_survives_the_generation_seam() {
+        use crate::models::muse_glimmer::output_parser::ResponseTemplate;
+        use crate::models::muse_glimmer::stream_guard::{GuardOutcome, StreamGuard};
+
+        let dir = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH").expect(
+            "set MLX_TEST_MUSE_GLIMMER_MODEL_PATH to the Muse-Glimmer checkpoint directory",
+        );
+        let template = ResponseTemplate::from_tokenizer_config_str(
+            &std::fs::read_to_string(Path::new(&dir).join("tokenizer_config.json"))
+                .expect("the checkpoint has a readable tokenizer_config.json"),
+        )
+        .expect("the checkpoint's own response_template compiles");
+        let tok = real_muse_tokenizer().tokenizer.clone();
+
+        for name in MUSE_NAMES_THE_WIRE_CARRIES {
+            // Byte for byte what the template renders for a call to `name`.
+            let turn = format!(
+                " to={name}<|message|><atem:function_calls>\n\
+                 <atem:invoke name=\"{name}\">\n\
+                 <atem:parameter name=\"city\">SF</atem:parameter>\n\
+                 </atem:invoke>\n</atem:function_calls><|eom|>"
+            );
+            let ids: Vec<u32> = tok
+                .encode(turn.as_str(), false)
+                .expect("the turn encodes")
+                .get_ids()
+                .to_vec();
+            let mut guard = StreamGuard::new(tok.clone(), 8, 4096, name.chars().count().max(16));
+            let mut streamed = String::new();
+            for id in &ids {
+                match guard.push_id(*id) {
+                    GuardOutcome::Emit(s) => streamed.push_str(&s),
+                    GuardOutcome::Hold => {}
+                    GuardOutcome::EndTurn => break,
+                }
+            }
+            streamed.push_str(&guard.flush());
+            let parsed = template.parse(guard.generated_turn());
+            assert_eq!(
+                parsed
+                    .tool_calls
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>(),
+                vec![*name],
+                "an ACCEPTED tool name did not survive the seam: streamed={streamed:?} \
+                 parsed={parsed:?}",
+            );
+            assert_eq!(
+                parsed.tool_calls[0].arguments["city"],
+                serde_json::json!("SF"),
+                "arguments lost for {name:?}",
+            );
+        }
+    }
+
+    /// The cross-family control against REAL checkpoints, not a fixture: both of
+    /// these `tojson` the tool name, so `weather lookup` and `a"b` are legal for them
+    /// and must keep rendering.
+    #[test]
+    #[ignore = "requires a local model cache; set MLX_TEST_MODEL_CACHE_DIR and run with --ignored"]
+    fn other_real_families_still_render_a_tool_name_muse_would_refuse() {
+        let root = std::env::var("MLX_TEST_MODEL_CACHE_DIR")
+            .expect("set MLX_TEST_MODEL_CACHE_DIR to the directory holding checkpoint directories");
+        for family in ["lfm2.5-1.2b-thinking", "agents-a1-4b"] {
+            let path = Path::new(&root).join(family).join("tokenizer.json");
+            if !path.exists() {
+                panic!("{family} is not in the model cache at {}", path.display());
+            }
+            let tokenizer =
+                Qwen3Tokenizer::from_file(&path).expect("the checkpoint's tokenizer.json loads");
+            assert_ne!(
+                tokenizer.control_markers,
+                super::MUSE_GLIMMER_CONTROL_MARKERS,
+                "{family} was detected as the Muse family",
+            );
+            for name in ["weather lookup", "a\"b"] {
+                let rendered = tokenizer
+                    .render_chat_template_sync(
+                        &[user_msg("weather?", 0)],
+                        Some(true),
+                        Some(&[tool_named(name)]),
+                        None,
+                    )
+                    .unwrap_or_else(|e| panic!("{family} refused the legal name {name:?}: {e}"));
+                // Both families JSON-encode it, so the escaped spelling is what to
+                // look for.
+                assert!(
+                    rendered.contains(&serde_json::json!(name).to_string()),
+                    "{family} lost the tool name {name:?}: {rendered}",
+                );
+            }
+        }
     }
 
     /// A stand-in for Muse-Glimmer's `chat_template.jinja` that renders every field
