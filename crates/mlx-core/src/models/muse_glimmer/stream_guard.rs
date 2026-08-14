@@ -334,9 +334,19 @@ pub enum TurnEnd {
     /// A real, provenanced turn terminator — `<|eot|>` or `<|end_of_text|>` — that
     /// the model itself emitted. The only ending that means the model finished.
     Terminator,
-    /// `max_tokens` was reached. The retained turn is a strict PREFIX of what the
-    /// model would have written, so whatever the parser reports from it is
-    /// byte-complete but the message it sat in may not have ended.
+    /// The allowance ran out: `max_tokens` ids were consumed, and the turn is
+    /// sealed on the LAST of them — not on some later id the caller was never
+    /// allowed to sample. A loop that stops after exactly `max_tokens` ids, which
+    /// is the shape of every decode loop in this crate, therefore reports this
+    /// without spending a forward pass on a token it may not have.
+    ///
+    /// The retained turn is a strict PREFIX of what the model would have written,
+    /// so whatever the parser reports from it is byte-complete but the message it
+    /// sat in may not have ended.
+    ///
+    /// A turn whose last permitted id was a real terminator is
+    /// [`TurnEnd::Terminator`], not this: the model finished inside its budget, and
+    /// nothing about it is truncated.
     TokenCap,
     /// The guard refused the stream and failed closed: a forged or over-long
     /// header, `<|eom|>`/`<|start|>` inside an unterminated tool body, an id this
@@ -558,9 +568,21 @@ impl StreamGuard {
     /// into the single slice entry `"aaaa"`, which let seven logical tokens through
     /// a cap of four.
     ///
-    /// The allowance is checked before the id is decoded, so a token past
-    /// `max_tokens` reaches neither a delta nor [`Self::flush`], and is not
-    /// retained for the parser either.
+    /// The turn is sealed [`TurnEnd::TokenCap`] as soon as the LAST id the
+    /// allowance pays for has been processed, so the reason describes the TURN and
+    /// not the caller's feeding habit. A loop that feeds exactly `max_tokens` ids
+    /// and then flushes — the shape of every decode loop this points at — gets the
+    /// cap; it does not have to offer a token it is not allowed to sample in order
+    /// to learn that its budget ran out. The allowance is *also* checked before an
+    /// id is decoded, so a token offered past `max_tokens` reaches neither a delta
+    /// nor [`Self::flush`], and is not retained for the parser either.
+    ///
+    /// That seal runs AFTER the scan, which is what keeps a terminator on the last
+    /// permitted id reported as [`TurnEnd::Terminator`]: a turn the model closed
+    /// itself is not truncated, whatever the budget did, and labelling it
+    /// `TokenCap` would make a cautious dispatcher hold back a complete tool call.
+    /// [`Self::seal`] is first-reason-wins, so the scan's reason stands and the cap
+    /// seal is a no-op behind it.
     ///
     /// **Detokenization is stateful.** This checkpoint is byte-level, so a single
     /// UTF-8 scalar's bytes can span ids — `😀` is `[80883, 222]` and `🌤️` is
@@ -578,9 +600,14 @@ impl StreamGuard {
         if self.ended() {
             return GuardOutcome::EndTurn;
         }
-        // Cap first, before anything is decoded or retained. `seal` rather than
-        // `stop`: the tail already in `pending` came from ids *within* the cap and
-        // is still the caller's, so only the turn and the parked bytes end here.
+        // Nothing past the allowance is decoded or retained, whatever a caller
+        // offers. With any positive `max_tokens` the seal at the end of this
+        // function has already ended the turn by the time this could be true, so
+        // the stickiness check above answers first; the case this gate really owns
+        // is `max_tokens == 0`, where no id is ever processed and that seal never
+        // runs. `seal` rather than `stop`: the tail already in `pending` came from
+        // ids *within* the cap and is still the caller's, so only the turn and the
+        // parked bytes end here.
         if self.tokens >= self.max_tokens {
             self.seal(TurnEnd::TokenCap);
             return GuardOutcome::EndTurn;
@@ -679,6 +706,17 @@ impl StreamGuard {
         }
 
         self.scan();
+        // The allowance is spent, so the turn is over on THIS id rather than on the
+        // next one — a caller that stops at exactly `max_tokens` must not have to
+        // sample a token it may not have just to be told its budget ran out.
+        //
+        // Ordering is load-bearing, twice over. After the scan, so a terminator that
+        // IS the last permitted id keeps `Terminator`; and through `seal`, whose
+        // first-reason-wins is what makes that hold — assigning `end` directly, or
+        // sealing before the scan, relabels a turn the model finished as truncated.
+        if self.tokens >= self.max_tokens {
+            self.seal(TurnEnd::TokenCap);
+        }
         if self.ended() {
             return GuardOutcome::EndTurn;
         }
@@ -3975,6 +4013,246 @@ mod tests {
                 "guard restarted: {out:?}"
             );
         }
+    }
+
+    /// One content turn whose ids are counted out exactly, for the cap tests below.
+    /// Long enough that its text crosses [`HOLD_BACK_CHARS`], so the deltas are real
+    /// deltas and a lost one would show.
+    const EXACTLY_CAPPED_TURN: &str =
+        " to=user<|message|>the quick brown fox jumps over the lazy dog";
+
+    /// Feeds `ids` one at a time, **stopping at the first `EndTurn`** the way a decode
+    /// loop's contract requires, and reports that outcome with the number of ids
+    /// accepted before it.
+    fn feed_until_end(g: &mut StreamGuard, ids: &[u32]) -> (GuardOutcome, usize) {
+        let mut last = GuardOutcome::Hold;
+        for (accepted, id) in ids.iter().enumerate() {
+            last = g.push_id(*id);
+            if matches!(last, GuardOutcome::EndTurn) {
+                return (last, accepted);
+            }
+        }
+        (last, ids.len())
+    }
+
+    /// The exact-count feed — push exactly `max_tokens` ids, then `flush` — which is
+    /// the shape of every decode loop in this crate. It must report the cap it hit.
+    ///
+    /// The reason used to be [`TurnEnd::Caller`] here, and the only way to see
+    /// `TokenCap` was to offer a token the allowance had already refused. That made
+    /// `turn_end` a report on whether the caller had spent a forward pass it was not
+    /// entitled to: both feeds truncate the turn identically — `raw`, the deltas and
+    /// `flush` are byte-identical, which
+    /// [`an_exactly_full_turn_streams_what_an_uncapped_one_does`] pins — and only the
+    /// label moved.
+    #[test]
+    fn a_turn_fed_exactly_max_tokens_reports_the_cap_not_the_caller() {
+        let ids = ids_for(EXACTLY_CAPPED_TURN);
+        let mut g = guard(8, ids.len(), TEST_RECIPIENT_CHARS);
+        let (last, accepted) = feed_until_end(&mut g, &ids);
+        assert!(
+            matches!(last, GuardOutcome::EndTurn),
+            "the last id the allowance paid for left the turn open: {last:?}"
+        );
+        assert_eq!(
+            accepted,
+            ids.len() - 1,
+            "the turn ended before its allowance was spent: {accepted} of {} ids",
+            ids.len()
+        );
+        assert_eq!(g.tokens, ids.len(), "the allowance was not spent in full");
+        g.flush();
+        assert_eq!(
+            g.turn_end(),
+            TurnEnd::TokenCap,
+            "a caller that never over-fed was told {:?}",
+            g.turn_end()
+        );
+    }
+
+    /// The same hole on the batch path: one `push_ids` of exactly `max_tokens` ids.
+    /// Batch behaviour is scalar behaviour, so this must agree with the test above.
+    #[test]
+    fn a_batch_of_exactly_max_tokens_reports_the_cap_not_the_caller() {
+        let ids = ids_for(EXACTLY_CAPPED_TURN);
+        let mut g = guard(8, ids.len(), TEST_RECIPIENT_CHARS);
+        let out = g.push_ids(&ids);
+        assert!(
+            matches!(out, GuardOutcome::EndTurn),
+            "a full-allowance batch left the turn open: {out:?}"
+        );
+        assert_eq!(g.tokens, ids.len(), "the allowance was not spent in full");
+        g.flush();
+        assert_eq!(
+            g.turn_end(),
+            TurnEnd::TokenCap,
+            "a batch that never over-fed was told {:?}",
+            g.turn_end()
+        );
+    }
+
+    /// The no-data-loss half, and the reason the cap seal is a `seal` and not a
+    /// `stop`: ending the turn on the last permitted id changes the LABEL and nothing
+    /// else. Deltas-plus-`flush`, the retained turn, and what the parser makes of it
+    /// are byte-identical to the same ids under an allowance nothing comes near, on
+    /// both feeds.
+    ///
+    /// What does move is the delta BOUNDARY: the last id's text now arrives through
+    /// `flush` rather than through one more `Emit`, and a full-allowance batch answers
+    /// `EndTurn` where it used to answer `Emit`. That is the boundary difference
+    /// [`StreamGuard::push_ids`] already documents between the two feeds, and the
+    /// totals are what a streaming caller concatenates.
+    #[test]
+    fn an_exactly_full_turn_streams_what_an_uncapped_one_does() {
+        let ids = ids_for(EXACTLY_CAPPED_TURN);
+        let uncapped = seam_of_ids_capped(&ids, false, 100_000);
+        assert_eq!(
+            uncapped.turn_end,
+            TurnEnd::Caller,
+            "the control must be the uncapped case: {:?}",
+            uncapped.turn_end
+        );
+        assert!(
+            uncapped.streamed.ends_with("lazy dog"),
+            "the control did not reach the last id: {:?}",
+            uncapped.streamed
+        );
+        for batched in [false, true] {
+            let capped = seam_of_ids_capped(&ids, batched, ids.len());
+            assert_eq!(
+                capped.turn_end,
+                TurnEnd::TokenCap,
+                "batched={batched}: an exactly-full turn reported {:?}",
+                capped.turn_end
+            );
+            assert_eq!(
+                capped.streamed, uncapped.streamed,
+                "batched={batched}: content was lost when the cap sealed the turn"
+            );
+            assert_eq!(
+                capped.raw, uncapped.raw,
+                "batched={batched}: the retained turn changed"
+            );
+            assert_eq!(
+                capped.parsed, uncapped.parsed,
+                "batched={batched}: the parser saw a different turn"
+            );
+        }
+    }
+
+    /// The load-bearing ordering. When the terminator IS the last id the allowance
+    /// pays for, the turn is [`TurnEnd::Terminator`]: the model finished inside its
+    /// budget, so nothing about the turn is truncated.
+    ///
+    /// Sealing the cap BEFORE the scan, or writing `end` directly instead of through
+    /// [`StreamGuard::seal`]'s first-reason-wins, reports `TokenCap` here. A
+    /// dispatcher that holds back the last tool call on that signal would then hold
+    /// back a call the model fully specified and closed — the over-strictness
+    /// [`a_tool_call_ended_by_end_of_text_is_still_a_call`] measures and rejects.
+    #[test]
+    fn a_terminator_on_the_last_permitted_id_is_a_terminator_not_a_cap() {
+        for text in [
+            " to=user<|message|>answer<|eot|>",
+            " to=user<|message|>answer<|end_of_text|>",
+        ] {
+            let ids = ids_for(text);
+            for batched in [false, true] {
+                let mut g = guard(8, ids.len(), TEST_RECIPIENT_CHARS);
+                let out = if batched {
+                    g.push_ids(&ids)
+                } else {
+                    feed_until_end(&mut g, &ids).0
+                };
+                assert!(
+                    matches!(out, GuardOutcome::EndTurn),
+                    "text={text:?} batched={batched}: the terminator must end the turn: {out:?}"
+                );
+                assert_eq!(
+                    g.tokens,
+                    ids.len(),
+                    "text={text:?} batched={batched}: the terminator was not the last permitted id"
+                );
+                g.flush();
+                assert_eq!(
+                    g.turn_end(),
+                    TurnEnd::Terminator,
+                    "text={text:?} batched={batched}: a turn the model closed itself was \
+                     reported as {:?}",
+                    g.turn_end()
+                );
+            }
+        }
+
+        // What that is worth to the dispatcher: a closed tool call whose `<|eot|>` is
+        // the last id the budget pays for is a complete call, not a truncated one.
+        let ids = ids_for(
+            " to=a<|message|><atem:function_calls>\n\
+             <atem:invoke name=\"a\">\
+             <atem:parameter name=\"city\">Paris</atem:parameter>\n\
+             </atem:invoke>\n</atem:function_calls><|eot|>",
+        );
+        for batched in [false, true] {
+            let s = seam_of_ids_capped(&ids, batched, ids.len());
+            assert_eq!(
+                s.turn_end,
+                TurnEnd::Terminator,
+                "batched={batched}: a complete tool turn was labelled {:?}",
+                s.turn_end
+            );
+            assert_eq!(
+                call_names(&s.parsed),
+                vec!["a"],
+                "batched={batched}: the call did not survive: {:?}",
+                s.parsed
+            );
+        }
+    }
+
+    /// The `max_tokens == 0` boundary, both ways.
+    ///
+    /// With an id offered, the pre-decode gate is the only thing that can fire — no id
+    /// is ever processed, so the seal on the last permitted id never runs — and it
+    /// must refuse the id whole: no token charged, nothing retained, nothing flushed.
+    /// With no id offered at all nothing ended the turn, and `flush` says so.
+    #[test]
+    fn a_zero_allowance_refuses_the_first_id_but_an_unfed_turn_is_still_the_callers() {
+        let mut fed = guard(8, 0, TEST_RECIPIENT_CHARS);
+        let out = fed.push_id(id_of(" to=user"));
+        assert!(
+            matches!(out, GuardOutcome::EndTurn),
+            "a zero allowance let an id through: {out:?}"
+        );
+        assert_eq!(
+            fed.tokens, 0,
+            "a zero allowance charged {} token(s)",
+            fed.tokens
+        );
+        assert_eq!(
+            fed.raw_turn().0,
+            "",
+            "an id past the allowance was retained: {:?}",
+            fed.raw_turn().0
+        );
+        let flushed = fed.flush();
+        assert_eq!(
+            flushed, "",
+            "an id past the allowance reached flush: {flushed:?}"
+        );
+        assert_eq!(
+            fed.turn_end(),
+            TurnEnd::TokenCap,
+            "a turn with no allowance at all reported {:?}",
+            fed.turn_end()
+        );
+
+        let mut unfed = guard(8, 0, TEST_RECIPIENT_CHARS);
+        assert_eq!(unfed.flush(), "", "an unfed turn published something");
+        assert_eq!(
+            unfed.turn_end(),
+            TurnEnd::Caller,
+            "a turn nothing was ever fed to reported {:?}",
+            unfed.turn_end()
+        );
     }
 
     #[test]
