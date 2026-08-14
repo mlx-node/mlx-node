@@ -694,6 +694,21 @@ impl MuseGlimmerConfig {
         // guaranteed to pass through.
         raw.vision_config.validate()?;
 
+        // Media placeholders enter the text token stream after expansion, so
+        // both ids must be representable by the decoder embedding table. Catch a
+        // malformed checkpoint at load instead of on its first image or video.
+        for (field, id) in [
+            ("image_token_id", raw.image_token_id),
+            ("video_token_id", raw.video_token_id),
+        ] {
+            if id >= text.vocab_size {
+                return Err(Error::from_reason(format!(
+                    "muse_glimmer: {field} {id} must be less than text_config.vocab_size {}",
+                    text.vocab_size
+                )));
+            }
+        }
+
         Ok(Self {
             image_token_id: raw.image_token_id,
             video_token_id: raw.video_token_id,
@@ -846,6 +861,27 @@ mod tests {
         assert_eq!(cfg.video_token_id, 200091);
         assert_eq!(cfg.out_hidden_size, 6144);
         assert_eq!(cfg.projector_hidden_size, 4096);
+    }
+
+    #[test]
+    fn rejects_media_token_ids_outside_the_text_vocabulary() {
+        for (field, original) in [("image_token_id", "200092"), ("video_token_id", "200091")] {
+            for id in [202048, 202049] {
+                let good = config_json(&text_config_json(52));
+                let bad = good.replace(
+                    &format!("\"{field}\":{original}"),
+                    &format!("\"{field}\":{id}"),
+                );
+                assert_ne!(bad, good, "fixture edit missed {field}");
+                let err = MuseGlimmerConfig::from_json_str(&bad)
+                    .unwrap_err()
+                    .to_string();
+                assert!(
+                    err.contains(field) && err.contains("vocab_size"),
+                    "out-of-vocabulary {field}={id} was not refused by name: {err}"
+                );
+            }
+        }
     }
 
     #[test]

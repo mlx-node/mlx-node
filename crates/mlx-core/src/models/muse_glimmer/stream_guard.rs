@@ -227,8 +227,8 @@ pub(super) const MARKER_LITERALS: &[&str] = &[
     "<|eom|>",
     "<|eot|>",
     "<|end_of_text|>",
-    "<atem:function_calls>",
-    "</atem:function_calls>",
+    ATEM_CALLS_OPEN,
+    ATEM_CALLS_CLOSE,
     "<atem:invoke name=\"",
     "</atem:invoke>",
     "<atem:parameter name=\"",
@@ -273,20 +273,40 @@ const MAX_PENDING_DECODE_IDS: usize = 64;
 /// claiming one would be inventing a span.
 const CONTROL_MARKERS: &[&str] = &[MSG, START, EOM, EOT, EOS];
 
+// The literals shared below are `pub(super)` so the parser's load checks and
+// runtime grammar use the same spellings as this guard's hardcoded surface. The
+// seam otherwise fails silently, because the guard is built from a `Tokenizer`
+// alone and never sees a response spec.
+//
+// The dependency runs PARSER -> GUARD and only that way. Nothing here reads a
+// `ResponseTemplate`, which is what keeps this module's tokenizer-only dependency (see
+// the module docs) intact; making the guard derive its prefixes from a spec is the
+// unification M1 owes, not this.
+
 /// Closes the routing header; anywhere else it is a marker the model must not
 /// be able to put into a content delta.
-const MSG: &str = "<|message|>";
+pub(super) const MSG: &str = "<|message|>";
 /// Opens a new message. Only ever legal at the very front of a header, and only
 /// followed by `assistant` — see [`ANCHORED_HEADER_PREFIX`].
-const START: &str = "<|start|>";
+pub(super) const START: &str = "<|start|>";
 /// End of message — explicitly **not** a stop token.
-const EOM: &str = "<|eom|>";
+pub(super) const EOM: &str = "<|eom|>";
 /// End of turn (200008) and end of text (200001): both terminal.
-const EOT: &str = "<|eot|>";
-const EOS: &str = "<|end_of_text|>";
+pub(super) const EOT: &str = "<|eot|>";
+pub(super) const EOS: &str = "<|end_of_text|>";
 /// Detection prefixes for the whole `<atem:*>` surface.
-const ATEM_OPEN: &str = "<atem:";
-const ATEM_CLOSE: &str = "</atem:";
+pub(super) const ATEM_OPEN: &str = "<atem:";
+pub(super) const ATEM_CLOSE: &str = "</atem:";
+pub(super) const ATEM_CALLS_OPEN: &str = "<atem:function_calls>";
+pub(super) const ATEM_CALLS_CLOSE: &str = "</atem:function_calls>";
+/// The only role this guard recognizes on generated-message headers.
+pub(super) const ASSISTANT_ROLE: &str = "assistant";
+/// The two recipients the protocol reserves for TEXT, named rather than spelled
+/// inline in [`channel_for`] so that one source of truth answers both "which channel
+/// does the guard route this recipient to" and "which header must the spec's
+/// `open_pattern` open".
+pub(super) const CONTENT_RECIPIENT: &str = "user";
+pub(super) const REASONING_RECIPIENT: &str = "self";
 /// The turn's **first** header, byte for byte: one ASCII space then `to=`. Its
 /// `<|start|>assistant` came from the generation prompt, not the stream.
 const BARE_HEADER_PREFIX: &str = " to=";
@@ -1363,8 +1383,8 @@ fn is_recipient(candidate: &str) -> bool {
 /// tool name, and a tool call is never content.
 fn channel_for(recipient: &str) -> Channel {
     match recipient {
-        "user" => Channel::Content,
-        "self" => Channel::Reasoning,
+        CONTENT_RECIPIENT => Channel::Content,
+        REASONING_RECIPIENT => Channel::Reasoning,
         _ => Channel::ToolCall,
     }
 }

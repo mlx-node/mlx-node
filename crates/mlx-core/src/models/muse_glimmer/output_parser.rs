@@ -118,7 +118,9 @@ use std::path::Path;
 // way to build one, so this edge is the security boundary; see that method. Nothing
 // here reads the guard's private state — `raw_turn()` is its public accessor — so the
 // two modules stay independent apart from that one signature.
-use super::stream_guard::StreamGuard;
+use super::stream_guard::{
+    ASSISTANT_ROLE, ATEM_CALLS_CLOSE, ATEM_CALLS_OPEN, MSG, START, StreamGuard,
+};
 
 // ── On-disk spec ───────────────────────────────────────────────────
 
@@ -672,6 +674,15 @@ fn check_kind(field: &str, got: RawContentKind, want: RawContentKind) -> Result<
 /// A `text` field: `reasoning_content` or `content`.
 fn compile_text_field(name: &str, raw: RawField, sink: Sink) -> Result<CompiledField> {
     check_kind(name, raw.content_kind, RawContentKind::Text)?;
+    // ParsedTurn has one slot for each text channel. Accepting `repeats: true`
+    // while `set_once` keeps only the first segment would silently implement a
+    // different response spec from the checkpoint's declaration.
+    if raw.repeats {
+        return Err(Error::from_reason(format!(
+            "muse_glimmer: response_template field {name:?} is marked repeats, but this parser \
+             only implements one segment for each text field"
+        )));
+    }
     let close = raw.close.into_vec();
     check_close(name, &close)?;
     Ok(CompiledField {
@@ -743,19 +754,39 @@ fn parse_value(raw: &str) -> serde_json::Value {
     serde_json::from_str(raw).unwrap_or_else(|_| serde_json::Value::String(raw.to_owned()))
 }
 
-/// Build one call's arguments from the `<atem:parameter>` tags in its body.
-fn parse_arguments(tag: &Regex, body: &str) -> serde_json::Value {
+/// Advance over inter-tag whitespace without allocating a trimmed copy.
+fn skip_whitespace(body: &str, from: usize) -> usize {
+    let trimmed = body[from..].trim_start_matches(char::is_whitespace);
+    body.len() - trimmed.len()
+}
+
+/// Build one call's arguments from `<atem:parameter>` tags, but only if they
+/// consume the complete body. `None` means the closed invoke was malformed and
+/// must not become an executable call.
+fn parse_arguments(tag: &Regex, body: &str) -> Option<serde_json::Value> {
     // `serde_json::Map` is `preserve_order`-backed: insertion order IS the
     // model's emission order, which some tools are sensitive to and which a
     // sorted map would quietly destroy.
     let mut map = serde_json::Map::new();
-    for caps in tag.captures_iter(body) {
-        let (Some(key), Some(value)) = (caps.name("key"), caps.name("value")) else {
-            continue;
-        };
+    let mut pos = 0;
+    loop {
+        pos = skip_whitespace(body, pos);
+        if pos == body.len() {
+            break;
+        }
+        let caps = tag.captures_at(body, pos)?;
+        let whole = caps.get(0)?;
+        if whole.start() != pos {
+            return None;
+        }
+        let (key, value) = (caps.name("key")?, caps.name("value")?);
+        if map.contains_key(key.as_str()) {
+            return None;
+        }
         map.insert(key.as_str().to_owned(), parse_value(value.as_str()));
+        pos = whole.end();
     }
-    serde_json::Value::Object(map)
+    Some(serde_json::Value::Object(map))
 }
 
 /// Fill a single-valued text channel, first segment wins.
@@ -854,7 +885,7 @@ fn header_prefixes(arrival: usize) -> &'static [&'static str] {
 /// `MUSE_GLIMMER_CONTROL_MARKERS` in `crate::tokenizer` names the same markers
 /// for the same reason.
 const RECIPIENT_PREFIX: &str = "to=";
-const MESSAGE_MARKER: &str = "<|message|>";
+const MESSAGE_MARKER: &str = MSG;
 
 /// The control TOKEN inside `start_anchor`. `chat_template.jinja` renders a header
 /// as `'<|start|>' + role`, so the spec's `<|start|>assistant` is one special
@@ -873,7 +904,7 @@ const MESSAGE_MARKER: &str = "<|message|>";
 ///
 /// `MUSE_GLIMMER_CONTROL_MARKERS` in `crate::tokenizer` and `stream_guard`'s
 /// `CONTROL_MARKERS` name the same token, for the same reason.
-const START_MARKER: &str = "<|start|>";
+const START_MARKER: &str = START;
 
 /// What the message at a header is, once its recipient has been read.
 enum Message<'a> {
@@ -1006,7 +1037,7 @@ impl ResponseTemplate {
         // anchor that is ONLY the marker would make `<|start|>user to=user…` an
         // assistant message, because nothing else in this parser reads the role.
         // Both are refused rather than half-honoured.
-        let Some(role) = raw.start_anchor.strip_prefix(START_MARKER) else {
+        let Some(role) = raw.start_anchor.strip_prefix(START) else {
             return Err(Error::from_reason(format!(
                 "muse_glimmer: response_template start_anchor {:?} does not begin with \
                  {START_MARKER:?}; that marker is the only part of it a control token \
@@ -1047,6 +1078,16 @@ impl ResponseTemplate {
                  defaults.role is {:?}; the two spell the same fact and this parser has no \
                  third source to break the tie",
                 raw.start_anchor, raw.defaults.role
+            )));
+        }
+        // Agreement between the two fields is necessary but not sufficient:
+        // StreamGuard recognizes exactly `<|start|>assistant to=`. A mutually
+        // consistent `bot`/`bot` spec would otherwise compile here and then be
+        // refused by the guard at the second message, losing the rest of the turn.
+        if role != ASSISTANT_ROLE {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: response_template role is {role:?}; this parser is paired with \
+                 a stream guard that only recognizes the {ASSISTANT_ROLE:?} role"
             )));
         }
 
@@ -1452,33 +1493,78 @@ impl ResponseTemplate {
             .unwrap_or(turn.text.len());
         let message = turn.truncated(extent);
         let body = message.text;
-        let mut pos = body_start;
-        while pos <= extent {
+        let body_end = self
+            .earliest_terminator(message, body_start)
+            .map_or(extent, |(start, _)| start.min(extent));
+        let mut pos = skip_whitespace(body, body_start);
+        let wrapped = body[pos..body_end].starts_with(ATEM_CALLS_OPEN);
+        if wrapped {
+            pos += ATEM_CALLS_OPEN.len();
+        }
+
+        // Validate the complete grammar before publishing any calls. A final
+        // invoke may be unfinished because generation was token-capped; completed
+        // invokes before that truncation survive. Arbitrary skipped bytes, a
+        // malformed closed parameter region, or trailing junk invalidate the
+        // whole message instead of manufacturing a partial call.
+        let mut parsed = Vec::new();
+        let mut valid = true;
+        while pos <= body_end {
+            pos = skip_whitespace(body, pos);
+            if pos == body_end {
+                break;
+            }
+            if wrapped && body[pos..body_end].starts_with(ATEM_CALLS_CLOSE) {
+                pos += ATEM_CALLS_CLOSE.len();
+                pos = skip_whitespace(body, pos);
+                valid = pos == body_end;
+                break;
+            }
             let Some(caps) = field.open.captures_at(body, pos) else {
+                valid = false;
                 break;
             };
             let Some(whole) = caps.get(0) else {
+                valid = false;
                 break;
             };
+            if whole.start() != pos || whole.end() > body_end {
+                valid = false;
+                break;
+            }
             // `require_group` proved the group exists at construction; a match
             // that somehow lacks it is a body this parser cannot vouch for.
             let Some(name) = caps.name("name") else {
+                valid = false;
                 break;
             };
             if name.as_str() != recipient {
+                valid = false;
                 break;
             }
             let Some((close_start, close_end)) = field.earliest_close(message, whole.end()) else {
+                // An unfinished final invoke is truncation, not evidence that
+                // completed invokes before it were malformed.
                 break;
             };
-            into.push(ParsedToolCall {
+            if close_end > body_end {
+                break;
+            }
+            let Some(arguments) = parse_arguments(tag, &body[whole.end()..close_start]) else {
+                valid = false;
+                break;
+            };
+            parsed.push(ParsedToolCall {
                 name: name.as_str().to_owned(),
-                arguments: parse_arguments(tag, &body[whole.end()..close_start]),
+                arguments,
             });
             // Every close marker is non-empty (checked at construction), so this
             // is strictly past `pos` and the scan cannot spin.
             debug_assert!(close_end > pos, "the invoke scan must advance");
             pos = close_end;
+        }
+        if valid {
+            into.extend(parsed);
         }
     }
 
@@ -1845,6 +1931,23 @@ mod tests {
             out.tool_calls.is_empty(),
             "unterminated invoke must not produce a call"
         );
+    }
+
+    #[test]
+    fn malformed_bytes_in_a_closed_tool_body_invalidate_every_call() {
+        for body in [
+            "garbage<atem:invoke name=\"reboot\"><atem:parameter name=\"delay\">broken</atem:invoke>",
+            "<atem:invoke name=\"reboot\"><atem:parameter name=\"delay\">broken</atem:invoke>",
+            "<atem:invoke name=\"reboot\"></atem:invoke>garbage",
+            "<atem:invoke name=\"reboot\"><atem:parameter name=\"delay\">1</atem:parameter><atem:parameter name=\"delay\">2</atem:parameter></atem:invoke>",
+        ] {
+            let turn = format!(" to=reboot<|message|>{body}<|eot|>");
+            let out = spec().parse_asserting_every_marker_shape_is_a_token(&turn);
+            assert!(
+                out.tool_calls.is_empty(),
+                "malformed tool body produced a call: {body:?} -> {out:?}"
+            );
+        }
     }
 
     #[test]
@@ -2827,23 +2930,15 @@ mod tests {
     }
 
     #[test]
-    fn a_closed_tool_body_is_not_rescanned_for_more_calls() {
-        // The cursor must resume PAST a segment's close, not inside its body.
-        // Nested openers are the observable case: rescanning the body of the
-        // outer invoke invents a second call the model never made, whose
-        // arguments are a slice of the first one's.
-        //
-        // NAMES REWRITTEN in fix round 4: recipient and BOTH invokes are `a`, so
-        // that the invented second call would be accepted. With the old
-        // `to=t`/`a`/`b` fixture the recipient check would have rejected the
-        // rescanned call for the wrong reason and this test would have passed
-        // while the resume bug was live.
+    fn a_nested_invoke_invalidates_the_tool_body() {
+        // An invoke inside another invoke is not a parameter and is not a second
+        // sibling call. Accepting the outer call while skipping the nested opener
+        // would execute a body the declared grammar cannot represent.
         let out = spec().parse_asserting_every_marker_shape_is_a_token(
             " to=a<|message|><atem:invoke name=\"a\"><atem:invoke name=\"a\">\
              <atem:parameter name=\"q\">1</atem:parameter></atem:invoke><|eot|>",
         );
-        assert_eq!(out.tool_calls.len(), 1, "got {out:?}");
-        assert_eq!(out.tool_calls[0].name, "a");
+        assert!(out.tool_calls.is_empty(), "got {out:?}");
     }
 
     #[test]
@@ -2871,9 +2966,9 @@ mod tests {
             "an unanchored opener mid-message must not open a channel, got {out:?}"
         );
         assert_eq!(out.content, None);
-        // The tool block itself still parses — this is a tool message.
-        assert_eq!(out.tool_calls.len(), 1);
-        assert_eq!(out.tool_calls[0].arguments["q"], serde_json::json!(1));
+        // The trailing bytes also invalidate the preceding call: publishing a
+        // prefix would execute a message whose complete body is not in grammar.
+        assert!(out.tool_calls.is_empty(), "got {out:?}");
 
         // The same bytes WITH the anchor are a real message, and do open the
         // answer channel. Without this the test would also pass on a parser that
@@ -2977,6 +3072,13 @@ mod tests {
         // repeats must be set: `parse` always collects every invoke.
         let e = err(case("\"repeats\": true", "\"repeats\": false"));
         assert!(e.contains("repeats"), "got: {e}");
+        // Conversely, neither single-valued text channel implements repeats.
+        for field in ["reasoning_content", "content"] {
+            let mut value: serde_json::Value = serde_json::from_str(SPEC).unwrap();
+            value["response_template"]["fields"][field]["repeats"] = serde_json::Value::Bool(true);
+            let e = err(value.to_string());
+            assert!(e.contains(field) && e.contains("repeats"), "got: {e}");
+        }
         // Only the permissive json value parser is implemented.
         let e = err(case(
             "\"allow_non_json\": true",
@@ -3059,6 +3161,19 @@ mod tests {
         assert!(e.contains("defaults.role is empty"), "got: {e}");
         let e = err(case("\"role\": \"assistant\"", "\"role\": \"!!!\""));
         assert!(e.contains("defaults.role"), "got: {e}");
+        // Two mutually consistent non-assistant spellings still disagree with
+        // the paired StreamGuard's hardcoded generated-header role.
+        let non_assistant = SPEC
+            .replace("\"role\": \"assistant\"", "\"role\": \"bot\"")
+            .replace(
+                "\"start_anchor\": \"<|start|>assistant\"",
+                "\"start_anchor\": \"<|start|>bot\"",
+            );
+        let e = err(non_assistant);
+        assert!(
+            e.contains("only recognizes") && e.contains("assistant"),
+            "got: {e}"
+        );
         // An empty `eos_token`, for the same reason an empty close marker is
         // refused: it would make `str::find` succeed at every position, so every
         // byte would end a message — and `Arrival::terminated` is what decides
