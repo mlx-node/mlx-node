@@ -407,10 +407,38 @@ pub struct SourceProvenance {
 /// Only 2-byte float source tensors (bf16/f16) are recorded — their safetensors
 /// on-disk bytes are a pure little-endian bit layout byte-identical to what the
 /// MLX writer emits. Other dtypes are excluded conservatively.
+///
+/// Tensors below [`raw_passthrough_threshold_bytes`] are ALSO excluded, because
+/// each recorded entry pins its source array alive (see `_keep_alive`) for the
+/// whole conversion. The writer's raw path is gated on
+/// `dest_len >= raw_threshold`, so an entry below it can never be consulted —
+/// recording one buys nothing and costs the tensor's full resident footprint
+/// once something materializes it. On an AWQ run that is the difference between
+/// holding two tensors and holding the entire bf16 checkpoint: AWQ pre-scaling
+/// forces each source to materialize, and a pinned clone then keeps every one
+/// of them resident. Excluding a tensor cannot reintroduce the ABA hazard the
+/// pin defends against — an entry that was never inserted has no pointer for a
+/// recycled address to collide with, and the entries that remain are still
+/// pinned.
 pub fn record_passthrough_sources<P: AsRef<Path>>(
     source_file: P,
     loaded: &HashMap<String, MxArray>,
     out: &mut HashMap<usize, SourceProvenance>,
+) -> Result<()> {
+    record_passthrough_sources_with(source_file, loaded, out, raw_passthrough_threshold_bytes())
+}
+
+/// [`record_passthrough_sources`] with the size gate lifted into an argument.
+///
+/// The threshold is a parameter purely so it is assertable without
+/// `std::env::set_var`: that is `unsafe` and races every other test thread in
+/// this binary, and several tests here call [`save_safetensors`], which reads
+/// the same variable on its own raw path.
+pub(crate) fn record_passthrough_sources_with<P: AsRef<Path>>(
+    source_file: P,
+    loaded: &HashMap<String, MxArray>,
+    out: &mut HashMap<usize, SourceProvenance>,
+    raw_threshold: u64,
 ) -> Result<()> {
     let path = source_file.as_ref();
     let st = SafeTensorsFile::load(path)?;
@@ -425,6 +453,12 @@ pub fn record_passthrough_sources<P: AsRef<Path>>(
             _ => continue,
         };
         let byte_len = info.data_offsets[1] - info.data_offsets[0];
+        // Below the writer's raw-path size gate this entry is unusable, and the
+        // `_keep_alive` clone below would pin the source for the whole convert
+        // for nothing. See fn doc.
+        if (byte_len as u64) < raw_threshold {
+            continue;
+        }
         let file_offset = (st.data_offset + info.data_offsets[0]) as u64;
         // Keep the source array alive (clone shares the `Arc<MxHandle>`) so its
         // raw handle pointer is PINNED for the whole convert. This closes an ABA
@@ -1223,6 +1257,57 @@ mod tests {
         // And both must equal the original little-endian u16 input.
         let expected: Vec<u8> = bits.iter().flat_map(|&x| x.to_le_bytes()).collect();
         assert_eq!(raw_bytes, expected);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Provenance must only be recorded for tensors the writer's raw path can
+    /// actually use, because every recorded entry pins its source array alive
+    /// for the whole conversion. Recording sub-threshold tensors is what kept
+    /// an entire AWQ-prescaled bf16 checkpoint resident.
+    #[test]
+    fn passthrough_provenance_skips_tensors_below_the_raw_threshold() {
+        let dir = std::env::temp_dir().join(format!("st_prov_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+
+        // Two bf16 tensors: "small" at 32 B, "big" at 512 B.
+        let small = MxArray::from_bfloat16(&[0x3F80u16; 16], &[4, 4]).unwrap();
+        let big = MxArray::from_bfloat16(&[0x4000u16; 256], &[16, 16]).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert("small".to_string(), small);
+        tensors.insert("big".to_string(), big);
+        save_safetensors(&path, &mut tensors, None).unwrap();
+
+        let loaded = SafeTensorsFile::load(&path)
+            .unwrap()
+            .load_tensors(&path)
+            .unwrap();
+        let small_ptr = loaded.get("small").unwrap().as_raw_ptr() as usize;
+        let big_ptr = loaded.get("big").unwrap().as_raw_ptr() as usize;
+
+        // Threshold between the two (512 B > 100 ≥ 32 B), passed directly.
+        // Setting MLX_CONVERT_RAW_THRESHOLD_BYTES here instead would be
+        // `unsafe` and would race the sibling tests that call
+        // `save_safetensors`, which reads that variable.
+        let mut out = HashMap::new();
+        record_passthrough_sources_with(&path, &loaded, &mut out, 100).unwrap();
+
+        assert!(
+            out.contains_key(&big_ptr),
+            "a tensor at or above the raw threshold must keep its provenance"
+        );
+        assert!(
+            !out.contains_key(&small_ptr),
+            "a sub-threshold tensor must NOT be recorded: the writer could never \
+             use the entry and the pinned clone would hold the source resident"
+        );
+        assert_eq!(
+            out.len(),
+            1,
+            "exactly one entry expected, got {}",
+            out.len()
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
