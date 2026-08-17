@@ -2685,13 +2685,22 @@ fn prepare_muse_secondary_config(
     })?;
 
     if !profiles.is_empty() {
+        let companion_quantization = preserved_source_quantization(gguf, import_k_quants)?
+            .ok_or_else(|| {
+                Error::from_reason(
+                    "Muse-Glimmer companion has quantized profiles but no quantization metadata",
+                )
+            })?;
         for key in ["quantization", "quantization_config"] {
+            if config.get(key).is_none() {
+                config[key] = companion_quantization.clone();
+            }
             let quant = config
                 .get_mut(key)
                 .and_then(serde_json::Value::as_object_mut)
                 .ok_or_else(|| {
                     Error::from_reason(format!(
-                        "Muse-Glimmer companion GGUF is K-quantized but {} has no object-valued '{key}' from the primary GGUF conversion",
+                        "Muse-Glimmer companion GGUF is K-quantized but {} has a non-object '{key}'",
                         config_path.display()
                     ))
                 })?;
@@ -5395,6 +5404,56 @@ mod tests {
         )
         .expect_err("DFlash hidden size must match the target");
         assert!(error.reason.contains("does not match target hidden_size"));
+    }
+
+    #[test]
+    fn kquant_dflash_initializes_quantization_for_a_dense_target() {
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 1,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors: vec![GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_string(),
+                n_dims: 2,
+                dims: vec![256, 1],
+                tensor_type: GgufTensorType::Q4K,
+                offset: 0,
+            }],
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-dense-target-quant-draft-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&valid_muse_target_config()).expect("serialize dense target config"),
+        )
+        .expect("write dense target config");
+
+        let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("prepare K-quant DFlash with dense target")
+            .expect("companion config update");
+        let config: serde_json::Value =
+            serde_json::from_str(&prepared).expect("parse companion config");
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(config[block]["bits"], 4);
+            assert_eq!(config[block]["group_size"], 32);
+            assert_eq!(config[block]["mode"], "q4k");
+            assert_eq!(
+                config[block]["language_model.model.layers.0.self_attn.q_proj"]["mode"],
+                "q4k"
+            );
+        }
+        assert_eq!(config["dflash_config"]["block_size"], 16);
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]
