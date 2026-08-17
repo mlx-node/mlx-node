@@ -934,11 +934,19 @@ impl ChatBackend for NemotronHInner {
     }
 
     fn extra_eos_ids(&self) -> Vec<u32> {
-        self.config
+        // UNION of the checkpoint config's EOS set and `generation_config.json`
+        // (the engine contract: `eos_token_ids` is a union, never an override —
+        // see ChatParams::extra_eos_ids). The released Nemotron checkpoint adds
+        // a generation-config EOS absent from config.json; without this every
+        // chat path would decode past it.
+        let mut ids: Vec<u32> = self
+            .config
             .eos_token_ids
             .iter()
             .map(|&v| v as u32)
-            .collect()
+            .collect();
+        ids.extend(self.gen_defaults.eos_token_ids.iter().copied());
+        ids
     }
 
     fn policy(&self) -> ThinkingPolicy {

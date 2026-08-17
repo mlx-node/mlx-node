@@ -3257,6 +3257,14 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // above already caught it there).
     let is_nemotron_h_ingest = model_type.as_deref() == Some("nemotron_h")
         || config.get("model_type").and_then(|v| v.as_str()) == Some("nemotron_h");
+    // Effective model type for the recipe dispatch below: when the caller
+    // omitted model_type but the config declares this family, resolve it here
+    // so NemotronHRecipe::sanitize actually runs (a config-detected Nemotron
+    // with model_type=None previously fell through the dispatch's `None` arm
+    // and saved un-repacked U8/F8 tensors + modelopt sidecars).
+    let recipe_model_type = model_type
+        .clone()
+        .or_else(|| is_nemotron_h_ingest.then(|| "nemotron_h".to_string()));
     validate_nemotron_h_ingest_options(
         model_type.as_deref(),
         Some(&config),
@@ -3797,7 +3805,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         // sanitizer-managed quantize block (gated by `is_privacy_filter`), because
         // it needs access to the bits/group_size/mode from the outer scope and we
         // want to suppress the generic quantize pass for it.
-        match model_type.as_deref() {
+        match recipe_model_type.as_deref() {
             Some(mt) => match recipe::recipe_for(mt) {
                 Some(recipe) => {
                     info!("Applying {mt} weight sanitization via conversion recipe...");

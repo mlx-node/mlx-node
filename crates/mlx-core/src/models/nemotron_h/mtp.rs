@@ -539,11 +539,13 @@ mod mtp_turn_tests {
             .expect("run_mtp_turn");
             let _ = outcome;
 
-            let summary = profiler
-                .mtp_acceptance_summary()
-                .expect("MTP cycles must be recorded: the draft+verify stepper ran");
+            // Random-weights EOS exits can land before the first cycle:
+            // mtp_acceptance_summary() is None then (no cycle recorded), which
+            // is a valid zero-cycle exit — retry fresh rather than panicking.
+            let Some(summary) = profiler.mtp_acceptance_summary() else {
+                continue;
+            };
             if summary.2 < 1 || generated.is_empty() {
-                // Random-weights EOS exit before any cycle; retry fresh.
                 continue;
             }
             // STRICTNESS contract at T=0, verified against the plain AR
