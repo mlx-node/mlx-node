@@ -117,24 +117,25 @@ impl NemotronHMtpModule {
         let concat = MxArray::concatenate(&e_norm, &h_norm, -1)?;
         let mut h = self.eh_proj.forward(&concat)?;
 
-        for (idx, layer) in self.layers.iter().enumerate() {
+        for layer in self.layers.iter() {
+            // Pre-norm residual: the skip connection carries the PRE-norm
+            // hidden (NemotronHBlock: residual = h; h = norm(h); h =
+            // mixer(h); return residual + h). Adding the normed value here
+            // would replace the residual stream with its normalized self
+            // and corrupt the draft logits.
             let normed = layer.norm.forward(&h)?;
-            h = match &layer.mixer {
+            let out = match &layer.mixer {
                 NemotronHMtpMixer::Attention(attn) => {
                     let kv = target_kv.ok_or_else(|| {
                         Error::from_reason(
                             "NemotronH MTP draft: attention layer requires the target KV cache",
                         )
                     })?;
-                    let attn_out = attn.forward_read_only(&normed, kv, position)?;
-                    normed.add(&attn_out)?
+                    attn.forward_read_only(&normed, kv, position)?
                 }
-                NemotronHMtpMixer::MoE(moe) => {
-                    let moe_out = moe.forward(&normed)?;
-                    normed.add(&moe_out)?
-                }
+                NemotronHMtpMixer::MoE(moe) => moe.forward(&normed)?,
             };
-            let _ = idx;
+            h = h.add(&out)?;
         }
 
         self.final_layernorm.forward(&h)
@@ -479,10 +480,12 @@ mod mtp_turn_tests {
             .squeeze(Some(&[1]))
             .expect("last squeeze");
 
-        let mut chat_cfg = ChatConfig::default();
-        chat_cfg.temperature = Some(0.0);
-        chat_cfg.max_new_tokens = Some(6);
-        chat_cfg.enable_mtp = Some(true);
+        let chat_cfg = ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(6),
+            enable_mtp: Some(true),
+            ..ChatConfig::default()
+        };
         let p = extract_chat_params(&chat_cfg);
         let y = crate::sampling::sample(&last, p.sampling_config).expect("sample y");
         let mut profiler = DecodeProfiler::new("nemotron_mtp_test", "nemotron_h");
@@ -582,8 +585,10 @@ mod mtp_turn_tests {
 
         // The family's run_paged_turn override compensates: any sync
         // MTP-requested turn on an MTP-capable model routes flat.
-        let mut chat_cfg = ChatConfig::default();
-        chat_cfg.enable_mtp = Some(true);
+        let mut chat_cfg = ChatConfig {
+            enable_mtp: Some(true),
+            ..ChatConfig::default()
+        };
         let p = extract_chat_params(&chat_cfg);
         assert!(
             inner.mtp_flat_routing_required(&p, false),

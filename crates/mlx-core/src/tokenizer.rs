@@ -2423,12 +2423,10 @@ impl Qwen3Tokenizer {
         // Caller-provided globals as a fallback layer, with the same precedence
         // as the `context!` spread: explicit keys above always win.
         let fallback = Self::build_render_context(render_ctx);
-        if let Some(obj) = fallback.as_object() {
-            if let Some(pairs) = obj.try_iter_pairs() {
-                for (key, value) in pairs {
-                    if let Some(key) = key.as_str() {
-                        ctx_map.entry(key.to_string()).or_insert(value);
-                    }
+        if let Some(pairs) = fallback.as_object().and_then(|obj| obj.try_iter_pairs()) {
+            for (key, value) in pairs {
+                if let Some(key) = key.as_str() {
+                    ctx_map.entry(key.to_string()).or_insert(value);
                 }
             }
         }

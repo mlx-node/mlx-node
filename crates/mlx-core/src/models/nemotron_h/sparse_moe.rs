@@ -86,25 +86,21 @@ impl NemotronHExperts {
     /// Install both stacked projections at once. The two sides must agree
     /// on the quantized/dense representation.
     pub fn set_experts(&mut self, up: ExpertProj, down: ExpertProj) -> Result<()> {
-        let (up, down) = match (up, down) {
+        let experts = match (up, down) {
             (ExpertProj::Quantized(u), ExpertProj::Quantized(d)) => {
-                (NemotronHExperts::Quantized(u, d), ())
+                NemotronHExperts::Quantized(u, d)
             }
-            (ExpertProj::Dense(u), ExpertProj::Dense(d)) => (
-                NemotronHExperts::Dense {
-                    up_t: u.transpose(Some(&[0, 2, 1]))?,
-                    down_t: d.transpose(Some(&[0, 2, 1]))?,
-                },
-                (),
-            ),
+            (ExpertProj::Dense(u), ExpertProj::Dense(d)) => NemotronHExperts::Dense {
+                up_t: u.transpose(Some(&[0, 2, 1]))?,
+                down_t: d.transpose(Some(&[0, 2, 1]))?,
+            },
             _ => {
                 return Err(Error::from_reason(
                     "NemotronHExperts::set_experts: cannot mix quantized and dense sides",
                 ));
             }
         };
-        *self = up;
-        let _ = down;
+        *self = experts;
         Ok(())
     }
 

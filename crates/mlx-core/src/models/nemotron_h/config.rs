@@ -267,10 +267,21 @@ fn parse_eos_ids(raw: &Value) -> Result<Vec<i32>> {
 /// list length, and unsupported optional features (`moe_latent_size`) are
 /// rejected.
 pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
+    // The architecture is authoritative, matching the TypeScript registry's
+    // architecture probe and the native gemma4 loader: a config that
+    // declares NemotronHForCausalLM is this family even when model_type is
+    // absent or malformed. Without the architecture, model_type must match.
     let model_type = raw.get("model_type").and_then(Value::as_str).unwrap_or("");
-    if model_type != "nemotron_h" {
+    let architectures_declare_nemotron = raw
+        .get("architectures")
+        .and_then(Value::as_array)
+        .is_some_and(|arr| {
+            arr.iter()
+                .any(|a| a.as_str() == Some("NemotronHForCausalLM"))
+        });
+    if model_type != "nemotron_h" && !architectures_declare_nemotron {
         return Err(Error::from_reason(format!(
-            "config.json model_type must be 'nemotron_h', got '{model_type}'"
+            "config.json model_type must be 'nemotron_h' (or architectures must declare 'NemotronHForCausalLM'), got model_type '{model_type}'"
         )));
     }
     if raw.get("moe_latent_size").is_some_and(|v| !v.is_null()) {
@@ -568,9 +579,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_model_type() {
+    fn architecture_is_authoritative_over_wrong_model_type() {
+        // Wrong model_type WITH the architecture present is accepted (the
+        // registry's architecture probe selects this family for the same
+        // config, so the native loader must agree).
         let mut v = lightning_json();
         v["model_type"] = json!("qwen3");
+        assert!(parse_config(&v).is_ok());
+    }
+
+    #[test]
+    fn rejects_wrong_model_type_without_architecture() {
+        let mut v = lightning_json();
+        v["model_type"] = json!("qwen3");
+        v.as_object_mut().unwrap().remove("architectures");
         let err = parse_config(&v).unwrap_err();
         assert!(err.reason.contains("model_type"), "{}", err.reason);
     }

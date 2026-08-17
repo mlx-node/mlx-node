@@ -200,9 +200,9 @@ fn fresh_caches(
 ) -> Result<Vec<NemotronHLayerCache>> {
     let num_layers = config.num_hidden_layers as usize;
     let mut caches = Vec::with_capacity(num_layers);
-    for i in 0..num_layers {
+    for (i, layer) in layers.iter().enumerate() {
         caches.push(if config.is_mamba_layer(i) {
-            let m = match &layers[i].mixer {
+            let m = match &layer.mixer {
                 NemotronHMixer::Mamba(m) => m,
                 _ => unreachable!("kind mismatch"),
             };
@@ -1500,7 +1500,7 @@ pub(crate) fn chunk_aligned_prefill_slices(
 ) -> Vec<(u32, u32)> {
     let mut slices = Vec::new();
     let mut s = start;
-    if s % chunk_size != 0 {
+    if !s.is_multiple_of(chunk_size) {
         let a = s.div_ceil(chunk_size).saturating_mul(chunk_size);
         if a < end {
             slices.push((s, a));

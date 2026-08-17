@@ -736,12 +736,12 @@ mod tests {
                         let xv = x[(tt * h + hh) * d_dim + dd];
                         for ss in 0..ns {
                             let idx = (hh * d_dim + dd) * ns + ss;
-                            let bv = b[(tt * g + 0) * ns + ss];
+                            let bv = b[tt * g * ns + ss];
                             state[idx] = state[idx] * (a[hh] * dt_v).exp() + dt_v * bv * xv;
                         }
                         let mut y = 0.0f32;
                         for ss in 0..ns {
-                            y += state[(hh * d_dim + dd) * ns + ss] * c[(tt * g + 0) * ns + ss];
+                            y += state[(hh * d_dim + dd) * ns + ss] * c[tt * g * ns + ss];
                         }
                         out[(tt * h + hh) * d_dim + dd] = y + d[hh] * xv;
                     }

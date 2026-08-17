@@ -352,15 +352,17 @@ fn apply_weights(
     };
 
     // Embedding (always dense bf16 for this family).
-    if let Some(w) = params.get("embedding.weight") {
-        crate::models::quant_dispatch::ensure_dense_weight_floating("embedding.weight", w)?;
-        inner.embedding.set_weight(w)?;
-    }
+    let emb = params.get("embedding.weight").ok_or_else(|| {
+        Error::from_reason("Checkpoint missing required tensor 'embedding.weight'")
+    })?;
+    crate::models::quant_dispatch::ensure_dense_weight_floating("embedding.weight", emb)?;
+    inner.embedding.set_weight(emb)?;
 
     // final_norm.
-    if let Some(w) = params.get("final_norm.weight") {
-        inner.final_norm.set_weight(w)?;
-    }
+    let final_norm = params.get("final_norm.weight").ok_or_else(|| {
+        Error::from_reason("Checkpoint missing required tensor 'final_norm.weight'")
+    })?;
+    inner.final_norm.set_weight(final_norm)?;
 
     // lm_head - NVFP4 quantized on the modelopt checkpoint, dense bf16
     // otherwise. The model has an UNTIED lm_head (tie_word_embeddings
@@ -398,118 +400,133 @@ fn apply_weights(
     for (i, layer) in inner.layers.iter_mut().enumerate() {
         let prefix = format!("layers.{}", i);
 
-        match layer.mamba_mut() {
-            Some(m) => {
-                if let Some(ql) = try_build_ql(params, &format!("{}.mixer.in_proj", prefix)) {
-                    m.in_proj.set_quantized(ql);
-                } else if let Some(w) = params.get(&format!("{}.mixer.in_proj.weight", prefix)) {
+        if let Some(m) = layer.mamba_mut() {
+            let in_key = format!("{prefix}.mixer.in_proj");
+            if let Some(ql) = try_build_ql(params, &in_key) {
+                m.in_proj.set_quantized(ql);
+            } else if let Some(w) = params.get(&format!("{in_key}.weight")) {
+                crate::models::quant_dispatch::ensure_dense_weight_floating(
+                    &format!("{in_key}.weight"),
+                    w,
+                )?;
+                m.in_proj.set_weight(w, "in_proj")?;
+            } else {
+                return Err(Error::from_reason(format!(
+                    "Mamba layer {i}: missing required projection '{in_key}' (quantized or dense)"
+                )));
+            }
+            let out_key = format!("{prefix}.mixer.out_proj");
+            if let Some(ql) = try_build_ql(params, &out_key) {
+                m.out_proj.set_quantized(ql);
+            } else if let Some(w) = params.get(&format!("{out_key}.weight")) {
+                crate::models::quant_dispatch::ensure_dense_weight_floating(
+                    &format!("{out_key}.weight"),
+                    w,
+                )?;
+                m.out_proj.set_weight(w, "out_proj")?;
+            } else {
+                return Err(Error::from_reason(format!(
+                    "Mamba layer {i}: missing required projection '{out_key}' (quantized or dense)"
+                )));
+            }
+            for name in [
+                "conv1d.weight",
+                "conv1d.bias",
+                "dt_bias",
+                "A_log",
+                "D",
+                "norm.weight",
+            ] {
+                let key = format!("{prefix}.mixer.{name}");
+                let w = params.get(&key).ok_or_else(|| {
+                    Error::from_reason(format!("Mamba layer {i}: missing required tensor '{key}'"))
+                })?;
+                match name {
+                    "conv1d.weight" => m.conv1d.set_weight(w)?,
+                    "conv1d.bias" => m.conv1d.set_bias(Some(w))?,
+                    "dt_bias" => m.dt_bias = w.astype(DType::Float32)?,
+                    "A_log" => m.a_log = w.astype(DType::Float32)?,
+                    "D" => m.d = w.astype(DType::Float32)?,
+                    _ => m.norm_weight = w.astype(DType::Float32)?,
+                }
+            }
+        }
+
+        if let Some(a) = layer.attention_mut() {
+            for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
+                let key = format!("{prefix}.mixer.{proj}.weight");
+                let w = params.get(&key).ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Attention layer {i}: missing required tensor '{key}'"
+                    ))
+                })?;
+                crate::models::quant_dispatch::ensure_dense_weight_floating(&key, w)?;
+                match proj {
+                    "q_proj" => a.q_proj.set_weight(w, "q_proj")?,
+                    "k_proj" => a.k_proj.set_weight(w, "k_proj")?,
+                    "v_proj" => a.v_proj.set_weight(w, "v_proj")?,
+                    _ => a.o_proj.set_weight(w, "o_proj")?,
+                }
+            }
+        }
+
+        if let Some(m) = layer.moe_mut() {
+            let gate_key = format!("{prefix}.mixer.gate.weight");
+            let gate_w = params.get(&gate_key).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "MoE layer {i}: missing required tensor '{gate_key}'"
+                ))
+            })?;
+            m.gate.set_weight(&gate_w.astype(DType::Float32)?, "gate")?;
+            let bias_key = format!("{prefix}.mixer.gate.e_score_correction_bias");
+            let bias_w = params.get(&bias_key).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "MoE layer {i}: missing required tensor '{bias_key}'"
+                ))
+            })?;
+            m.e_score_correction_bias = bias_w.astype(DType::Float32)?;
+            // Stacked experts (NVFP4 quantized or dense fallback) — both
+            // sides are required for a usable expert layer.
+            let up_key = format!("{prefix}.mixer.experts.up_proj");
+            let down_key = format!("{prefix}.mixer.experts.down_proj");
+            let up = build_expert_stack(params, &up_key, &try_build_qsl)?.ok_or_else(|| {
+                Error::from_reason(format!("MoE layer {i}: missing experts.up_proj weight"))
+            })?;
+            let down = build_expert_stack(params, &down_key, &try_build_qsl)?.ok_or_else(|| {
+                Error::from_reason(format!("MoE layer {i}: missing experts.down_proj weight"))
+            })?;
+            m.experts.set_experts(up, down)?;
+            // Shared experts (NVFP4 quantized or dense fallback) — both
+            // sides are required.
+            for proj in ["up_proj", "down_proj"] {
+                let key = format!("{prefix}.mixer.shared_experts.{proj}");
+                if let Some(ql) = try_build_ql(params, &key) {
+                    match proj {
+                        "up_proj" => m.shared_experts.up_proj.set_quantized(ql),
+                        _ => m.shared_experts.down_proj.set_quantized(ql),
+                    }
+                } else if let Some(w) = params.get(&format!("{key}.weight")) {
                     crate::models::quant_dispatch::ensure_dense_weight_floating(
-                        &format!("{}.mixer.in_proj.weight", prefix),
+                        &format!("{key}.weight"),
                         w,
                     )?;
-                    m.in_proj.set_weight(w, "in_proj")?;
-                }
-                if let Some(ql) = try_build_ql(params, &format!("{}.mixer.out_proj", prefix)) {
-                    m.out_proj.set_quantized(ql);
-                } else if let Some(w) = params.get(&format!("{}.mixer.out_proj.weight", prefix)) {
-                    crate::models::quant_dispatch::ensure_dense_weight_floating(
-                        &format!("{}.mixer.out_proj.weight", prefix),
-                        w,
-                    )?;
-                    m.out_proj.set_weight(w, "out_proj")?;
-                }
-                if let Some(w) = params.get(&format!("{}.mixer.conv1d.weight", prefix)) {
-                    m.conv1d.set_weight(w)?;
-                }
-                if let Some(w) = params.get(&format!("{}.mixer.conv1d.bias", prefix)) {
-                    m.conv1d.set_bias(Some(w))?;
-                }
-                if let Some(w) = params.get(&format!("{}.mixer.dt_bias", prefix)) {
-                    m.dt_bias = w.astype(DType::Float32)?;
-                }
-                if let Some(w) = params.get(&format!("{}.mixer.A_log", prefix)) {
-                    m.a_log = w.astype(DType::Float32)?;
-                }
-                if let Some(w) = params.get(&format!("{}.mixer.D", prefix)) {
-                    m.d = w.astype(DType::Float32)?;
-                }
-                if let Some(w) = params.get(&format!("{}.mixer.norm.weight", prefix)) {
-                    m.norm_weight = w.astype(DType::Float32)?;
-                }
-            }
-            None => {}
-        }
-
-        match layer.attention_mut() {
-            Some(a) => {
-                for proj in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-                    let key = format!("{}.mixer.{}.weight", prefix, proj);
-                    if let Some(w) = params.get(&key) {
-                        crate::models::quant_dispatch::ensure_dense_weight_floating(&key, w)?;
-                        match proj {
-                            "q_proj" => a.q_proj.set_weight(w, "q_proj")?,
-                            "k_proj" => a.k_proj.set_weight(w, "k_proj")?,
-                            "v_proj" => a.v_proj.set_weight(w, "v_proj")?,
-                            _ => a.o_proj.set_weight(w, "o_proj")?,
-                        }
+                    match proj {
+                        "up_proj" => m.shared_experts.up_proj.set_weight(w, "shared_up")?,
+                        _ => m.shared_experts.down_proj.set_weight(w, "shared_down")?,
                     }
+                } else {
+                    return Err(Error::from_reason(format!(
+                        "MoE layer {i}: missing required projection '{key}' (quantized or dense)"
+                    )));
                 }
             }
-            None => {}
         }
 
-        match layer.moe_mut() {
-            Some(m) => {
-                if let Some(w) = params.get(&format!("{}.mixer.gate.weight", prefix)) {
-                    m.gate.set_weight(&w.astype(DType::Float32)?, "gate")?;
-                }
-                if let Some(w) =
-                    params.get(&format!("{}.mixer.gate.e_score_correction_bias", prefix))
-                {
-                    m.e_score_correction_bias = w.astype(DType::Float32)?;
-                }
-                // Stacked experts (NVFP4 quantized or dense fallback).
-                let up_key = format!("{}.mixer.experts.up_proj", prefix);
-                let down_key = format!("{}.mixer.experts.down_proj", prefix);
-                let up = build_expert_stack(params, &up_key, &try_build_qsl)?;
-                let down = build_expert_stack(params, &down_key, &try_build_qsl)?;
-                if up.is_some() || down.is_some() {
-                    let up = up.ok_or_else(|| {
-                        Error::from_reason(format!("MoE layer {i}: missing experts.up_proj weight"))
-                    })?;
-                    let down = down.ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "MoE layer {i}: missing experts.down_proj weight"
-                        ))
-                    })?;
-                    m.experts.set_experts(up, down)?;
-                }
-                // Shared experts (NVFP4 quantized or dense fallback).
-                for proj in ["up_proj", "down_proj"] {
-                    let key = format!("{}.mixer.shared_experts.{}", prefix, proj);
-                    if let Some(ql) = try_build_ql(params, &key) {
-                        match proj {
-                            "up_proj" => m.shared_experts.up_proj.set_quantized(ql),
-                            _ => m.shared_experts.down_proj.set_quantized(ql),
-                        }
-                    } else if let Some(w) = params.get(&format!("{}.weight", key)) {
-                        crate::models::quant_dispatch::ensure_dense_weight_floating(
-                            &format!("{}.weight", key),
-                            w,
-                        )?;
-                        match proj {
-                            "up_proj" => m.shared_experts.up_proj.set_weight(w, "shared_up")?,
-                            _ => m.shared_experts.down_proj.set_weight(w, "shared_down")?,
-                        }
-                    }
-                }
-            }
-            None => {}
-        }
-
-        if let Some(w) = params.get(&format!("{}.norm.weight", prefix)) {
-            layer.set_norm_weight(w)?;
-        }
+        let norm_key = format!("{prefix}.norm.weight");
+        let norm_w = params.get(&norm_key).ok_or_else(|| {
+            Error::from_reason(format!("Layer {i}: missing required tensor '{norm_key}'"))
+        })?;
+        layer.set_norm_weight(norm_w)?;
     }
 
     /// Build one stacked expert projection (up or down) from the checkpoint,
