@@ -393,6 +393,13 @@ fn build_paged_runtime(config: &MuseGlimmerConfig) -> Result<Option<MusePagedRun
     }))
 }
 
+fn load_target_safetensors(path: &Path) -> Result<HashMap<String, MxArray>> {
+    // Muse-Glimmer execution is text-only today. Keep the optional
+    // vision.safetensors sidecar out of residency accounting and cold-tier
+    // materialization until a vision forward path consumes it.
+    load_all_safetensors(path, false)
+}
+
 fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
     let config = MuseGlimmerConfig::from_path(path)?;
     let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
@@ -406,7 +413,7 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
     } else {
         None
     };
-    let params = load_all_safetensors(path, true)?;
+    let params = load_target_safetensors(path)?;
     let shard_snapshot_at_mmap = if persist_cold {
         snapshot_shard_identities(path)
     } else {
@@ -616,10 +623,22 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
 
 #[cfg(test)]
 mod tests {
-    use super::{load_lm_head, quant_lookup_prefix};
+    use super::{load_lm_head, load_target_safetensors, quant_lookup_prefix};
     use crate::array::MxArray;
     use crate::models::gemma4::quantized_linear::{PerLayerMode, PerLayerQuant};
+    use crate::utils::safetensors::save_safetensors;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn save_one(path: &std::path::Path, key: &str, value: f32) {
+        let mut tensors = HashMap::from([(
+            key.to_string(),
+            MxArray::from_float32(&[value], &[1]).expect("create test tensor"),
+        )]);
+        save_safetensors(path, &mut tensors, None).expect("save test safetensors");
+    }
 
     #[test]
     fn target_and_dflash_quantization_namespaces_stay_distinct() {
@@ -636,6 +655,25 @@ mod tests {
             "language_model.embed_tokens"
         );
         assert_eq!(quant_lookup_prefix("lm_head"), "lm_head");
+    }
+
+    #[test]
+    fn text_runtime_excludes_the_unused_vision_sidecar() {
+        let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "muse_glimmer_text_weights_{}_{}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&dir).expect("create model directory");
+        save_one(&dir.join("model.safetensors"), "text.weight", 1.0);
+        save_one(&dir.join("vision.safetensors"), "vision.weight", 2.0);
+
+        let weights = load_target_safetensors(&dir).expect("load Muse target weights");
+        assert!(weights.contains_key("text.weight"));
+        assert!(!weights.contains_key("vision.weight"));
+
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
