@@ -840,8 +840,21 @@ export async function run(argv: string[]) {
       } else if (config.model_type === 'muse_glimmer') {
         modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'nemotron_h') {
-        modelType = config.model_type;
+      } else if (
+        config.model_type === 'nemotron_h' ||
+        (Array.isArray(config.architectures) &&
+          config.architectures.includes('NemotronHForCausalLM'))
+      ) {
+        // The architecture-only arm (no `model_type`, only
+        // `architectures: ['NemotronHForCausalLM']`) mirrors the runtime
+        // loader (model-loader.ts architectureProbe) and the native parser
+        // (nemotron_h/config.rs makes the architecture authoritative), so a
+        // config that omits or misspells model_type still routes through
+        // NemotronHRecipe::sanitize instead of being copied un-repacked.
+        // The recipe key is always 'nemotron_h' (there is no alternate raw
+        // string), so a misspelled model_type with the matching architecture
+        // still canonicalizes to the ingest recipe.
+        modelType = 'nemotron_h';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
     } catch {

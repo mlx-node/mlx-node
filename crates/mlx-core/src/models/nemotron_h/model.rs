@@ -1742,7 +1742,14 @@ impl NemotronHInner {
         if args.tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
-        let p = args.params;
+        // The shared parameter resolver leaves `extra_eos_ids` empty for the
+        // executor to populate (see ChatParams::extra_eos_ids). Union in the
+        // checkpoint's full EOS set (config eos_token_ids: 2 and 11) so MTP
+        // turns stop on the alternate terminators, matching the paged
+        // executor (paged_turn.rs `backend.extra_eos_ids()`).
+        let mut p = args.params.clone();
+        p.extra_eos_ids = self.extra_eos_ids();
+        let p = &p;
         let eos_id = args.eos_id;
         let thinking = args.thinking;
         let tokenizer = args.tokenizer.clone();
@@ -1757,8 +1764,15 @@ impl NemotronHInner {
             None
         };
         let mut generated_tokens: Vec<u32> = Vec::new();
-        let mut token_history = self.cached_token_history.clone();
-        let mut finish_reason = String::from("stop");
+        // Penalty history must start from the FULL rendered prompt (same as the
+        // flat/paged executors' `args.tokens` seeding); `cached_token_history`
+        // is empty on fresh turns and only holds the prior boundary on
+        // continuations, so repetition/presence/frequency/consecutive/ngram
+        // controls would otherwise ignore the prompt.
+        let mut token_history = tokens.clone();
+        // Initialize as "length" like the other decode paths; run_mtp_turn only
+        // overrides it on an actual EOS stop.
+        let mut finish_reason = String::from("length");
         let mut first_token_instant: Option<std::time::Instant> = None;
 
         let generation_stream = Stream::new(DeviceType::Gpu);
