@@ -1,5 +1,5 @@
-import { readFileSync, existsSync, statSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { readFileSync, existsSync, rmSync, statSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { convertModel, convertForeignWeights, convertGgufToSafetensors } from '@mlx-node/core';
@@ -604,6 +604,29 @@ export async function run(argv: string[]) {
         console.log('\nConverted tensors:');
         for (const name of result.tensorNames) {
           console.log(`  - ${name}`);
+        }
+      }
+
+      // A successful target-only Muse conversion rewrites config.json without
+      // DFlash metadata. Remove an older companion only after that primary
+      // conversion commits; otherwise the loader sees draft.safetensors beside
+      // a config with no dflash_config and refuses the whole checkpoint.
+      if (!draftPath) {
+        let isMuseOutput = false;
+        try {
+          const outputConfig = JSON.parse(readFileSync(join(outputDir, 'config.json'), 'utf-8')) as {
+            model_type?: unknown;
+          };
+          isMuseOutput = outputConfig.model_type === 'muse_glimmer';
+        } catch {
+          // The native conversion owns config validation. If a third-party
+          // backend did not emit a readable Muse config, do not delete files
+          // based on an unproven family guess.
+        }
+        if (isMuseOutput) {
+          // Once the family is proven, a deletion failure must fail the command
+          // rather than report a checkpoint that the loader will reject.
+          rmSync(join(outputDir, 'draft.safetensors'), { force: true });
         }
       }
 

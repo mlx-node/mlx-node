@@ -656,6 +656,12 @@ export declare class MuseGlimmerModel {
   autoEnablesMtp(): boolean;
   hasBlockPagedCache(): boolean;
   maxConcurrentSequences(): number;
+  /**
+   * Conservative model-wide context snapshot used by higher layers for
+   * compaction. It includes the paged AR limit even when DFlash is present,
+   * because DFlash is opt-in per request and can be disabled by the caller.
+   */
+  contextLimits(): MuseGlimmerContextLimits;
   schedulerStats(): Promise<SchedulerStats>;
   /**
    * Reset all caches and clear cached token history. Async so a reset
@@ -4100,6 +4106,19 @@ export interface ModelConfig {
 export declare const enum MultimodalContentOrder {
   TextThenMedia = 'textThenMedia',
   ImagesThenText = 'imagesThenText',
+}
+
+/**
+ * Trained and physically available active-context limits for one loaded
+ * Muse-Glimmer model. The effective window is conservative across both
+ * execution modes: DFlash may use the flat cache, but callers can disable it
+ * per request and fall back to the paged AR scheduler.
+ */
+export interface MuseGlimmerContextLimits {
+  trainedWindowTokens: number;
+  effectiveWindowTokens: number;
+  pagedBlockCapacity: number;
+  pagedBlockSize: number;
 }
 
 /** Result from document orientation classification. */

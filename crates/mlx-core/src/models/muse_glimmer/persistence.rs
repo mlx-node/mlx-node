@@ -686,6 +686,7 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
                 .map_err(Error::from_reason)?
                 .unwrap_or(0);
             let paged_active = inner.paged.is_some();
+            let context_limits = super::model::MuseGlimmerContextLimits::from_inner(&inner);
             let max_concurrent_sequences =
                 crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(
                     inner.paged.as_ref().map_or(1, |paged| {
@@ -701,6 +702,7 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
                     has_dflash,
                     paged_active,
                     max_concurrent_sequences,
+                    context_limits,
                     guard,
                     pool_guard,
                 ),
@@ -712,6 +714,7 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
         has_dflash,
         paged_active,
         max_concurrent_sequences,
+        context_limits,
         cache_limit_guard,
         pool_cache_limit_guard,
     ) = init_rx
@@ -722,6 +725,7 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
         has_dflash,
         paged_active,
         max_concurrent_sequences,
+        context_limits,
         _cache_limit_guard: cache_limit_guard,
         _pool_cache_limit_guard: pool_cache_limit_guard,
     })

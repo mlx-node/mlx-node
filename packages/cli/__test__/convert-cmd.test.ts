@@ -11,7 +11,7 @@
  * conversion runs; `process.exit` is mocked to throw so the test proves
  * validation halts before reaching the (mocked) native call.
  */
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -135,6 +135,29 @@ describe('mlx convert GGUF validation', () => {
     expect(convertGgufToSafetensors).toHaveBeenCalledWith(
       expect.objectContaining({ importKQuants: true, quantize: false }),
     );
+  });
+
+  it('removes a stale Muse DFlash sidecar after a successful target-only conversion', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const outputDir = join(tmp, 'out');
+    mkdirSync(outputDir);
+    const staleDraft = join(outputDir, 'draft.safetensors');
+    writeFileSync(staleDraft, 'stale draft');
+    vi.mocked(convertGgufToSafetensors).mockImplementationOnce(async () => {
+      writeFileSync(join(outputDir, 'config.json'), JSON.stringify({ model_type: 'muse_glimmer' }));
+      return {
+        numTensors: 1,
+        numParameters: 1,
+        sourceFormat: 'Q4_K',
+        outputPath: outputDir,
+        tensorNames: ['weight'],
+      };
+    });
+
+    await runConvert(['--input', ggufPath, '--output', outputDir, '--gguf-kquant']);
+
+    expect(existsSync(staleDraft)).toBe(false);
   });
 
   it('rejects --config-dir when the path is not a directory', async () => {
