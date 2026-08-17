@@ -1605,14 +1605,32 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
             )));
         }
         let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
-        let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
+        // Verify one token at a time through the AR DECODE path. A batched
+        // [1, depth+1] forward routes every stateful mamba layer through the
+        // chunk-scan, whose padded-chunk arithmetic differs from the
+        // recurrent decode_step in f32 rounding (measured up to ~1.5 logits
+        // on the real checkpoint). Over accepted cycles that state drift
+        // flips near-tie argmaxes, so the committed token stops being the
+        // true AR greedy token at T=0 - a lossless-contract violation that
+        // also derails the continuation into loops. Sequential 1-token
+        // forwards are bit-identical to the AR path: the anchor's forward
+        // equals the AR decode that committed it, and each accepted draft's
+        // forward equals the AR decode of that draft.
+        let mut logits_rows: Vec<MxArray> = Vec::with_capacity(depth + 1);
+        let mut hidden_rows: Vec<MxArray> = Vec::with_capacity(depth + 1);
+        for &tok in &id_slice {
+            let one = MxArray::from_int32(&[tok], &[1, 1])?;
+            let (logits, hidden) = self.inner.forward_with_hidden_3d(&one, embedding)?;
+            logits_rows.push(logits);
+            hidden_rows.push(hidden);
+        }
+        let logits = MxArray::concatenate_many(logits_rows.iter().collect::<Vec<_>>(), Some(1))?;
+        let hiddens = MxArray::concatenate_many(hidden_rows.iter().collect::<Vec<_>>(), Some(1))?;
         // The engine slices verify_hiddens[:, K, :], so hiddens must stay
-        // [1, depth+1, hidden] - the raw 3D forward (forward_with_hidden
-        // itself squeezes the Step-A seed down to [1, hidden]).
-        let (logits, hidden) = self.inner.forward_with_hidden_3d(&verify_in, embedding)?;
+        // [1, depth+1, hidden] (each row is the raw 3D per-token hidden).
         Ok(crate::models::qwen3_5::mtp_decode::MtpVerifyOutput {
             logits: Some(logits),
-            hiddens: hidden,
+            hiddens,
             target_argmax: None,
             target_sparse: None,
         })

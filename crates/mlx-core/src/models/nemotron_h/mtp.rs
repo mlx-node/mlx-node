@@ -453,94 +453,116 @@ mod mtp_turn_tests {
             eprintln!("skipping (no Metal backend)");
             return;
         }
-        let cfg = tiny_mtp_config();
-        let mut inner = NemotronHInner::new(cfg).expect("inner builds");
-        install_dense_moe(&mut inner).expect("dense backbone MoE");
-        let h = inner.config.hidden_size as u32;
-        let v = inner.config.vocab_size as u32;
-        inner.lm_head = Some(LinearProj::Standard(
-            Linear::new(h, v, Some(false)).expect("lm_head builds"),
-        ));
-        inner.mtp_weights_loaded = true;
-        assert!(inner.has_mtp_weights(), "MTP head must be active");
-
+        // The fixture's weights are random per construction; a greedy run
+        // can land on EOS (token 2) before the first MTP cycle, which is a
+        // valid zero-cycle exit. Retry with a fresh random inner so the test
+        // is robust while still exercising the draft+verify cycle.
         let prompt: Vec<u32> = vec![1, 5, 9, 3];
-        let oracle = greedy_ar_oracle(&mut inner, &prompt, 6).expect("AR oracle");
-        assert!(!oracle.is_empty(), "oracle must decode at least one token");
+        let mut attempts = 0;
+        loop {
+            attempts += 1;
+            assert!(attempts <= 8, "failed to get an MTP cycle in 8 attempts");
+            let cfg = tiny_mtp_config();
+            let mut inner = NemotronHInner::new(cfg).expect("inner builds");
+            install_dense_moe(&mut inner).expect("dense backbone MoE");
+            let h = inner.config.hidden_size as u32;
+            let v = inner.config.vocab_size as u32;
+            inner.lm_head = Some(LinearProj::Standard(
+                Linear::new(h, v, Some(false)).expect("lm_head builds"),
+            ));
+            inner.mtp_weights_loaded = true;
+            assert!(inner.has_mtp_weights(), "MTP head must be active");
 
-        // Fresh flat state for the speculative run.
-        inner.reset_caches_internal();
-        let stream = Stream::new(DeviceType::Gpu);
-        let arr = MxArray::from_uint32(&prompt, &[1, prompt.len() as i64]).expect("prompt arr");
-        let logits = inner.chunked_prefill(&arr, stream).expect("prefill");
-        let seq_len = logits.shape_at(1).expect("seq len");
-        let last = logits
-            .slice_axis(1, seq_len - 1, seq_len)
-            .expect("last slice")
-            .squeeze(Some(&[1]))
-            .expect("last squeeze");
+            // Plain greedy AR oracle on the SAME inner: the target greedy
+            // tokens the MTP commit path must reproduce exactly.
+            let oracle = greedy_ar_oracle(&mut inner, &prompt, 6).expect("AR oracle");
+            assert!(!oracle.is_empty(), "oracle must decode at least one token");
 
-        let chat_cfg = ChatConfig {
-            temperature: Some(0.0),
-            max_new_tokens: Some(6),
-            enable_mtp: Some(true),
-            ..ChatConfig::default()
-        };
-        let p = extract_chat_params(&chat_cfg);
-        let y = crate::sampling::sample(&last, p.sampling_config).expect("sample y");
-        let mut profiler = DecodeProfiler::new("nemotron_mtp_test", "nemotron_h");
-        profiler.set_prompt_tokens(prompt.len() as u32);
-        let mut tracker = ReasoningTracker::from_setup(
-            &ThinkingSetup {
-                enabled: false,
-                budget: None,
-            },
-            None,
-        );
-        let mut generated: Vec<u32> = Vec::new();
-        let mut hist: Vec<u32> = Vec::new();
-        let mut finish = String::new();
-        let mut first_tok: Option<std::time::Instant> = None;
-        let mut rng = rand::rng();
-        let outcome = run_mtp_turn(
-            &mut inner,
-            &mut rng,
-            MtpTurnArgs {
-                y,
-                depth: 1,
-                params: &p,
-                reasoning_tracker: &mut tracker,
-                profiler: &mut profiler,
-                max_new_tokens: 6,
-                eos_id: 2,
-                generated_tokens: &mut generated,
-                token_history: &mut hist,
-                finish_reason: &mut finish,
-                first_token_instant: &mut first_tok,
-                report_perf: true,
-                generation_stream: stream,
-                prompt_hidden: None,
-                prompt_hidden_ids: None,
-                prompt_hidden_position_base: 0,
-                cancel_flag: None,
-            },
-            None,
-        )
-        .expect("run_mtp_turn");
-        let _ = outcome;
+            // Fresh flat state for the speculative run.
+            inner.reset_caches_internal();
+            let stream = Stream::new(DeviceType::Gpu);
+            let arr = MxArray::from_uint32(&prompt, &[1, prompt.len() as i64]).expect("prompt arr");
+            let logits = inner.chunked_prefill(&arr, stream).expect("prefill");
+            let seq_len = logits.shape_at(1).expect("seq len");
+            let last = logits
+                .slice_axis(1, seq_len - 1, seq_len)
+                .expect("last slice")
+                .squeeze(Some(&[1]))
+                .expect("last squeeze");
 
-        let summary = profiler
-            .mtp_acceptance_summary()
-            .expect("MTP cycles must be recorded: the draft+verify stepper ran");
-        assert!(
-            summary.2 >= 1,
-            "at least one MTP cycle must run: {summary:?}"
-        );
-        assert!(!generated.is_empty(), "MTP loop must emit tokens");
-        assert_eq!(
-            generated, oracle,
-            "T=0 MTP output must match plain greedy AR (lossless contract)"
-        );
+            let chat_cfg = ChatConfig {
+                temperature: Some(0.0),
+                max_new_tokens: Some(6),
+                enable_mtp: Some(true),
+                ..ChatConfig::default()
+            };
+            let p = extract_chat_params(&chat_cfg);
+            let y = crate::sampling::sample(&last, p.sampling_config).expect("sample y");
+            let mut profiler = DecodeProfiler::new("nemotron_mtp_test", "nemotron_h");
+            profiler.set_prompt_tokens(prompt.len() as u32);
+            let mut tracker = ReasoningTracker::from_setup(
+                &ThinkingSetup {
+                    enabled: false,
+                    budget: None,
+                },
+                None,
+            );
+            let mut generated: Vec<u32> = Vec::new();
+            let mut hist: Vec<u32> = Vec::new();
+            let mut finish = String::new();
+            let mut first_tok: Option<std::time::Instant> = None;
+            let mut rng = rand::rng();
+            let outcome = run_mtp_turn(
+                &mut inner,
+                &mut rng,
+                MtpTurnArgs {
+                    y,
+                    depth: 1,
+                    params: &p,
+                    reasoning_tracker: &mut tracker,
+                    profiler: &mut profiler,
+                    max_new_tokens: 6,
+                    eos_id: 2,
+                    generated_tokens: &mut generated,
+                    token_history: &mut hist,
+                    finish_reason: &mut finish,
+                    first_token_instant: &mut first_tok,
+                    report_perf: true,
+                    generation_stream: stream,
+                    prompt_hidden: None,
+                    prompt_hidden_ids: None,
+                    prompt_hidden_position_base: 0,
+                    cancel_flag: None,
+                },
+                None,
+            )
+            .expect("run_mtp_turn");
+            let _ = outcome;
+
+            let summary = profiler
+                .mtp_acceptance_summary()
+                .expect("MTP cycles must be recorded: the draft+verify stepper ran");
+            if summary.2 < 1 || generated.is_empty() {
+                // Random-weights EOS exit before any cycle; retry fresh.
+                continue;
+            }
+            // STRICTNESS contract at T=0, verified against the plain AR
+            // oracle of the same inner: every committed token must equal the
+            // target greedy token. An accepted draft therefore equals
+            // argmax(target logits) and a rejected draft is replaced by that
+            // argmax - otherwise generated would diverge from oracle.
+            assert!(
+                generated.len() <= oracle.len(),
+                "MTP emitted more tokens than AR: {} vs {}",
+                generated.len(),
+                oracle.len()
+            );
+            assert_eq!(
+                generated, oracle,
+                "T=0 MTP output must match plain greedy AR (lossless contract):                  strict accept/commit violated"
+            );
+            break;
+        }
     }
 
     /// On a paged model the engine still resolves an MTP-requested turn to
@@ -608,6 +630,132 @@ mod mtp_turn_tests {
         assert!(
             !inner.mtp_flat_routing_required(&p, false),
             "MTP requested without a loaded head must not route flat"
+        );
+    }
+
+    /// Real-checkpoint T=0 lossless gate (env-gated: set
+    /// MLX_TEST_NEMOTRON_H_MODEL_PATH). Runs plain greedy AR and the MTP
+    /// loop from the same prompt and asserts the committed token sequences
+    /// are IDENTICAL. Set MLX_MTP_TRACE_ACCEPTANCE=1 to also see the
+    /// per-slot accept trace (draft_id / target_argmax / accepted).
+    #[test]
+    fn real_mtp_t0_lossless_gate() {
+        if !compiled_forward_backend_available() {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        }
+        let Ok(model_path) = std::env::var("MLX_TEST_NEMOTRON_H_MODEL_PATH") else {
+            eprintln!("skipping: MLX_TEST_NEMOTRON_H_MODEL_PATH unset");
+            return;
+        };
+        let (mut inner, _bytes) =
+            crate::models::nemotron_h::persistence::load_inner(&model_path).expect("load real");
+        if !inner.has_mtp_weights() {
+            eprintln!("skipping: no MTP weights in checkpoint");
+            return;
+        }
+        let eos = inner.config.eos_token_ids.first().copied().unwrap_or(2);
+        let n = 60;
+        // A real tokenized prompt (the model dir ships tokenizer.json) so the
+        // draft head sees in-distribution context and the acceptance rate is
+        // meaningful; the token ids are still opaque to the forward itself.
+        let prompt: Vec<u32> = crate::tokenizer::Qwen3Tokenizer::from_file(
+            &std::path::Path::new(&model_path).join("tokenizer.json"),
+        )
+        .ok()
+        .and_then(|tok| {
+            tok.encode_sync("What is 2+2? Answer in one sentence.", None)
+                .ok()
+        })
+        .unwrap_or_else(|| vec![1, 5, 9, 3, 7, 13, 21, 34]);
+
+        // ---- plain greedy AR oracle ----
+        let ar = greedy_ar_oracle(&mut inner, &prompt, n).expect("AR oracle");
+
+        // ---- MTP loop from the same cold prefix ----
+        inner.reset_caches_internal();
+        let stream = Stream::new(DeviceType::Gpu);
+        let arr = MxArray::from_uint32(&prompt, &[1, prompt.len() as i64]).expect("prompt arr");
+        let logits = inner.chunked_prefill(&arr, stream).expect("prefill");
+        let seq_len = logits.shape_at(1).expect("seq len");
+        let last = logits
+            .slice_axis(1, seq_len - 1, seq_len)
+            .expect("last slice")
+            .squeeze(Some(&[1]))
+            .expect("last squeeze");
+        let chat_cfg = ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(n as i32),
+            enable_mtp: Some(true),
+            ..ChatConfig::default()
+        };
+        let p = extract_chat_params(&chat_cfg);
+        let y = crate::sampling::sample(&last, p.sampling_config).expect("sample y");
+        let mut profiler = DecodeProfiler::new("nemotron_real_mtp_diag", "nemotron_h");
+        let mut tracker = ReasoningTracker::from_setup(
+            &ThinkingSetup {
+                enabled: false,
+                budget: None,
+            },
+            None,
+        );
+        let mut generated: Vec<u32> = Vec::new();
+        let mut hist: Vec<u32> = Vec::new();
+        let mut finish = String::new();
+        let mut first_tok: Option<std::time::Instant> = None;
+        let mut rng = rand::rng();
+        let outcome = run_mtp_turn(
+            &mut inner,
+            &mut rng,
+            MtpTurnArgs {
+                y,
+                depth: 1,
+                params: &p,
+                reasoning_tracker: &mut tracker,
+                profiler: &mut profiler,
+                max_new_tokens: n as i32,
+                eos_id: eos as u32,
+                generated_tokens: &mut generated,
+                token_history: &mut hist,
+                finish_reason: &mut finish,
+                first_token_instant: &mut first_tok,
+                report_perf: true,
+                generation_stream: stream,
+                prompt_hidden: None,
+                prompt_hidden_ids: None,
+                prompt_hidden_position_base: 0,
+                cancel_flag: None,
+            },
+            None,
+        )
+        .expect("run_mtp_turn");
+        let _ = outcome;
+
+        let mut first_div = None;
+        for i in 0..ar.len().min(generated.len()) {
+            if ar[i] != generated[i] {
+                first_div = Some(i);
+                break;
+            }
+        }
+        eprintln!("DIAG AR({}): {:?}", ar.len(), &ar[..ar.len().min(40)]);
+        eprintln!(
+            "DIAG MTP({}): {:?}",
+            generated.len(),
+            &generated[..generated.len().min(40)]
+        );
+        eprintln!(
+            "DIAG first divergence: {:?}",
+            first_div.map(|i| (i, ar[i], generated[i]))
+        );
+        eprintln!("DIAG acceptance: {:?}", profiler.mtp_acceptance_summary());
+        assert!(
+            first_div.is_none(),
+            "T=0 lossless violated: MTP[{}]={} != AR[{}]={}",
+            first_div.map(|i| i.to_string()).unwrap_or_default(),
+            first_div.map(|i| generated[i]).unwrap_or(0),
+            first_div.map(|i| i.to_string()).unwrap_or_default(),
+            first_div.map(|i| ar[i]).unwrap_or(0),
         );
     }
 }
