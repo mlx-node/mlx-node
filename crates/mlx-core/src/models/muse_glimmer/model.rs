@@ -10,7 +10,7 @@ use crate::array::MxArray;
 use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
-    SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
+    SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, TurnTokenObserver, WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, FromChatCmd};
 use crate::engine::params::ChatParams;
@@ -941,7 +941,22 @@ impl DecodeStep for MuseGlimmerDecode<'_> {
 
 struct MuseGlimmerEmitter {
     guard: StreamGuard,
-    pending: VecDeque<(u32, Option<String>)>,
+}
+
+struct MuseGlimmerTurnObserver {
+    tokenizer: Arc<tokenizers::Tokenizer>,
+    guard: StreamGuard,
+    observed_tokens: Vec<u32>,
+}
+
+impl MuseGlimmerTurnObserver {
+    fn new(tokenizer: Arc<tokenizers::Tokenizer>) -> Self {
+        Self {
+            guard: StreamGuard::new(tokenizer.clone(), 1024, usize::MAX, 4096),
+            tokenizer,
+            observed_tokens: Vec::new(),
+        }
+    }
 }
 
 impl MuseGlimmerEmitter {
@@ -969,18 +984,20 @@ impl MuseGlimmerEmitter {
     }
 }
 
-impl StreamEmitter for MuseGlimmerEmitter {
+impl TurnTokenObserver for MuseGlimmerTurnObserver {
     fn observe_token_id(&mut self, token_id: u32) -> bool {
-        let outcome = self.guard.push_id(token_id);
-        let ended = matches!(outcome, GuardOutcome::EndTurn);
-        let text = match outcome {
-            GuardOutcome::Emit(text) => Some(text),
-            GuardOutcome::Hold | GuardOutcome::EndTurn => None,
-        };
-        self.pending.push_back((token_id, text));
-        ended
+        self.observed_tokens.push(token_id);
+        matches!(self.guard.push_id(token_id), GuardOutcome::EndTurn)
     }
 
+    fn rollback_last_token(&mut self) {
+        let _ = self.observed_tokens.pop();
+        self.guard = StreamGuard::new(self.tokenizer.clone(), 1024, usize::MAX, 4096);
+        let _ = self.guard.push_ids(&self.observed_tokens);
+    }
+}
+
+impl StreamEmitter for MuseGlimmerEmitter {
     fn on_token_id(
         &mut self,
         token_id: u32,
@@ -989,14 +1006,9 @@ impl StreamEmitter for MuseGlimmerEmitter {
         _include_reasoning: bool,
         sink: &dyn ChunkSink,
     ) {
-        let text = match self.pending.front() {
-            Some((pending_id, _)) if *pending_id == token_id => {
-                self.pending.pop_front().and_then(|(_, text)| text)
-            }
-            _ => match self.guard.push_id(token_id) {
-                GuardOutcome::Emit(text) => Some(text),
-                GuardOutcome::Hold | GuardOutcome::EndTurn => None,
-            },
+        let text = match self.guard.push_id(token_id) {
+            GuardOutcome::Emit(text) => Some(text),
+            GuardOutcome::Hold | GuardOutcome::EndTurn => None,
         };
         if let Some(text) = text {
             Self::emit(text, sink);
@@ -1364,8 +1376,16 @@ impl ChatBackend for MuseGlimmerInner {
             .inner_arc();
         Box::new(MuseGlimmerEmitter {
             guard: StreamGuard::new(tokenizer, 1024, usize::MAX, 4096),
-            pending: VecDeque::new(),
         })
+    }
+
+    fn turn_token_observer(&self) -> Option<Box<dyn TurnTokenObserver>> {
+        let tokenizer = self
+            .tokenizer
+            .as_ref()
+            .expect("loaded Muse-Glimmer tokenizer")
+            .inner_arc();
+        Some(Box::new(MuseGlimmerTurnObserver::new(tokenizer)))
     }
 
     fn eos_before_emit(&self) -> bool {

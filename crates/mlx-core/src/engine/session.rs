@@ -1195,6 +1195,7 @@ fn chat_turn_core<B: ChatBackend>(
     // `begin_decode` takes the long &mut borrow of the backend.
     let mut emitter: Option<Box<dyn StreamEmitter>> =
         streaming.as_ref().map(|_| backend.stream_emitter());
+    let turn_token_observer = backend.turn_token_observer();
 
     // From prefill onward, every fallible operation runs inside one error
     // boundary. The temporary closure ensures a decode stepper borrowing the
@@ -1265,6 +1266,7 @@ fn chat_turn_core<B: ChatBackend>(
                     report_perf,
                     generation_stream,
                     cancel_flag: turn_cancel,
+                    turn_token_observer,
                 },
                 streaming_ctx,
             )?;

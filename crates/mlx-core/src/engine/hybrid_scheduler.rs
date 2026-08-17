@@ -16,6 +16,7 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChunkSink, PagedBackend, PagedPrefix, StreamEmitter, ThinkingSetup, TurnOutput,
+    TurnTokenObserver,
 };
 use crate::engine::cmd::{ChatCmd, FromChatCmd};
 use crate::engine::scheduler::{
@@ -416,6 +417,7 @@ pub(crate) struct ScheduledTurn<P> {
     pub(crate) generation_stream: Stream,
     pub(crate) profiler: crate::decode_profiler::DecodeProfiler,
     pub(crate) emitter: Option<Box<dyn StreamEmitter>>,
+    pub(crate) turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
     pub(crate) stream_skip_special: bool,
     pub(crate) decode_ids: Vec<u32>,
     pub(crate) decode_prefix: String,
@@ -447,7 +449,7 @@ struct PreparedDecodeRow {
     stops_at_eos: bool,
     cancelled: bool,
     repetition: Option<&'static str>,
-    emitter_stopped: bool,
+    observer_stopped: bool,
     batch_index: Option<usize>,
 }
 
@@ -725,7 +727,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             if turn.payload.response.sink().is_some() {
                 Self::stream_token(turn, row.token_id, is_reasoning);
             }
-            if row.emitter_stopped || row.stops_at_eos {
+            if row.observer_stopped || row.stops_at_eos {
                 turn.payload.finish_reason = String::from("stop");
             } else if let Some(reason) = row.repetition {
                 turn.payload.finish_reason = reason.to_string();
@@ -809,16 +811,15 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 turn.payload.params.max_ngram_repeats,
                 turn.payload.params.ngram_size,
             );
-            let emitter_stopped = !planned.cancel_snapshot
+            let observer_stopped = !planned.cancel_snapshot
                 && !(stops_at_eos && !B::STREAM_EOS_TOKEN)
-                && turn.payload.response.sink().is_some()
                 && turn
                     .payload
-                    .emitter
+                    .turn_token_observer
                     .as_mut()
-                    .is_some_and(|emitter| emitter.observe_token_id(token_id));
+                    .is_some_and(|observer| observer.observe_token_id(token_id));
             let terminal =
-                stops_at_eos || planned.cancel_snapshot || repetition.is_some() || emitter_stopped;
+                stops_at_eos || planned.cancel_snapshot || repetition.is_some() || observer_stopped;
             let at_length = turn.payload.generated_tokens.len()
                 >= turn.payload.params.max_new_tokens.max(0) as usize;
             // GDN state is not rewindable. A terminal/length token is never
@@ -837,7 +838,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 stops_at_eos,
                 cancelled: planned.cancel_snapshot,
                 repetition,
-                emitter_stopped,
+                observer_stopped,
                 batch_index,
             });
         }
@@ -963,6 +964,11 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 (Err(error), Some(_)) if is_paged_allocation_blocked(&error.reason) => {
                     let rolled_back = turn.payload.generated_tokens.pop();
                     debug_assert_eq!(rolled_back, Some(row.token_id));
+                    if rolled_back.is_some()
+                        && let Some(observer) = turn.payload.turn_token_observer.as_mut()
+                    {
+                        observer.rollback_last_token();
+                    }
                     results.push((row.plan_index, Self::blocked(planned)));
                     continue;
                 }
@@ -1751,6 +1757,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             generation_stream,
             profiler,
             emitter: is_streaming.then(|| self.inner.stream_emitter()),
+            turn_token_observer: self.inner.turn_token_observer(),
             stream_skip_special: self.inner.stream_skip_special_tokens(),
             decode_ids: Vec::new(),
             decode_prefix: String::new(),

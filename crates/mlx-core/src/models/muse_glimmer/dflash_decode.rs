@@ -420,6 +420,7 @@ impl MuseGlimmerInner {
         let mut last_is_reasoning = args.thinking.enabled;
         let mut emitter: Option<Box<dyn StreamEmitter>> =
             args.sink.map(|_| ChatBackend::stream_emitter(self));
+        let turn_token_observer = ChatBackend::turn_token_observer(self);
         let block_size = self
             .dflash
             .as_ref()
@@ -458,6 +459,7 @@ impl MuseGlimmerInner {
                     report_perf: report_performance,
                     generation_stream,
                     cancel_flag: args.cancelled,
+                    turn_token_observer,
                 },
                 streaming,
             )

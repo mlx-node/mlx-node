@@ -20,7 +20,7 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
-use crate::engine::backend::{ChunkSink, DecodeStep, StreamEmitter};
+use crate::engine::backend::{ChunkSink, DecodeStep, StreamEmitter, TurnTokenObserver};
 use crate::engine::params::ChatParams;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::stream::{Stream, StreamContext};
@@ -144,6 +144,10 @@ pub(crate) struct DecodeLoopArgs<'a> {
     pub first_token_instant: &'a mut Option<Instant>,
     pub report_perf: bool,
     pub generation_stream: Stream,
+    /// Optional family protocol guard. Unlike streaming emission, this is
+    /// present on synchronous turns too, so token-level boundaries stop the
+    /// next forward and the persisted cache at the same prefix.
+    pub turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
     /// Whole-turn cooperative cancel flag, populated for BOTH sync and
     /// streaming turns (H2). Streaming callers pass the SAME atomic that
     /// backs [`StreamingCtx::cancelled`], so the per-step snapshot below
@@ -231,6 +235,7 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         report_perf,
         generation_stream,
         cancel_flag,
+        mut turn_token_observer,
     } = args;
 
     for step_idx in 0..max_new_tokens {
@@ -311,12 +316,12 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         // subsequent forward is scheduled. For Muse-Glimmer this catches a
         // StreamGuard terminator/self-play boundary even when it is not in
         // the model's ordinary EOS set.
-        let emitter_stopped = !cancelled
+        let observer_stopped = !cancelled
             && !(eos_before_emit && stops_at_eos)
-            && streaming
-                .as_mut()
-                .is_some_and(|s| s.emitter.observe_token_id(token_id));
-        let is_terminal = stops_at_eos || cancelled || repetition.is_some() || emitter_stopped;
+            && turn_token_observer
+                .as_deref_mut()
+                .is_some_and(|observer| observer.observe_token_id(token_id));
+        let is_terminal = stops_at_eos || cancelled || repetition.is_some() || observer_stopped;
 
         // This loop builds the next forward HERE — before the streaming
         // emit block further down — whereas origin/main's paged loop
@@ -510,10 +515,6 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
                 p.include_reasoning,
                 s.callback,
             );
-            if emitter_stopped {
-                *finish_reason = String::from("stop");
-                break;
-            }
         } else if cancelled {
             // NON-streaming cancel break (H2): same snapshot, same
             // position in the iteration as the ChatML streaming
@@ -524,6 +525,11 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             // here). The sync session wrapper maps this finish_reason to
             // the distinguished `"chat session cancelled"` rejection.
             *finish_reason = String::from("cancelled");
+            break;
+        }
+
+        if observer_stopped {
+            *finish_reason = String::from("stop");
             break;
         }
 
@@ -564,7 +570,9 @@ mod run_decode_loop_tests {
     use super::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
     use crate::array::MxArray;
     use crate::decode_profiler::DecodeProfiler;
-    use crate::engine::backend::{ChunkSink, DecodeStep, DefaultStreamEmitter, StreamEmitter};
+    use crate::engine::backend::{
+        ChunkSink, DecodeStep, DefaultStreamEmitter, StreamEmitter, TurnTokenObserver,
+    };
     use crate::engine::params::{ChatParams, extract_chat_params};
     use crate::engine::penalties::ReasoningTracker;
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
@@ -676,6 +684,29 @@ mod run_decode_loop_tests {
         eos_id: u32,
         extra_eos_ids: &[u32],
     ) -> Result<LoopOutcome> {
+        drive_with_observer(
+            step,
+            first_token,
+            params,
+            tracker,
+            max_new_tokens,
+            eos_id,
+            extra_eos_ids,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive_with_observer(
+        step: &mut MockStep,
+        first_token: u32,
+        params: &ChatParams,
+        tracker: &mut ReasoningTracker,
+        max_new_tokens: i32,
+        eos_id: u32,
+        extra_eos_ids: &[u32],
+        turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
+    ) -> Result<LoopOutcome> {
         let y = MxArray::from_int32(&[first_token as i32], &[1])?;
         let mut profiler = DecodeProfiler::new("test", "mock");
         let mut generated_tokens: Vec<u32> = Vec::new();
@@ -702,6 +733,7 @@ mod run_decode_loop_tests {
                 report_perf: false,
                 generation_stream,
                 cancel_flag: None,
+                turn_token_observer,
             },
             None,
         )?;
@@ -928,6 +960,7 @@ mod run_decode_loop_tests {
                 report_perf: false,
                 generation_stream,
                 cancel_flag: Some(&cancelled),
+                turn_token_observer: None,
             },
             Some(StreamingCtx {
                 callback: &sink,
@@ -1016,6 +1049,7 @@ mod run_decode_loop_tests {
                 report_perf: false,
                 generation_stream,
                 cancel_flag: Some(&cancelled),
+                turn_token_observer: None,
             },
             Some(StreamingCtx {
                 callback: &sink,
@@ -1175,6 +1209,7 @@ mod run_decode_loop_tests {
                 report_perf: false,
                 generation_stream,
                 cancel_flag: Some(&cancelled),
+                turn_token_observer: None,
             },
             Some(StreamingCtx {
                 callback: &sink,
@@ -1273,6 +1308,7 @@ mod run_decode_loop_tests {
                     report_perf: false,
                     generation_stream,
                     cancel_flag: wire_flag.then_some(&cancelled),
+                    turn_token_observer: None,
                 },
                 None,
             )
@@ -1308,6 +1344,7 @@ mod run_decode_loop_tests {
         extra_eos_ids: &[u32],
         eos_before_emit: bool,
         emitter: &mut dyn StreamEmitter,
+        turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
         cancelled_pre_set: bool,
     ) -> (Vec<u32>, String, Vec<ChatStreamChunk>) {
         let tokenizer = tiny_tokenizer();
@@ -1346,6 +1383,7 @@ mod run_decode_loop_tests {
                 report_perf: false,
                 generation_stream,
                 cancel_flag: Some(&cancelled),
+                turn_token_observer,
             },
             Some(StreamingCtx {
                 callback: &sink,
@@ -1422,6 +1460,7 @@ mod run_decode_loop_tests {
                 &[],
                 eos_before_emit,
                 &mut emitter,
+                None,
                 false,
             );
 
@@ -1458,6 +1497,7 @@ mod run_decode_loop_tests {
                 &[],
                 eos_before_emit,
                 &mut emitter,
+                None,
                 true, // cancellation already pending
             );
 
@@ -1504,47 +1544,22 @@ mod run_decode_loop_tests {
         }
     }
 
-    struct StoppingEmitter {
+    struct StoppingObserver {
         stop_id: u32,
-        seen: Vec<String>,
     }
 
-    impl StreamEmitter for StoppingEmitter {
+    impl TurnTokenObserver for StoppingObserver {
         fn observe_token_id(&mut self, token_id: u32) -> bool {
             token_id == self.stop_id
         }
-
-        fn on_token_text(
-            &mut self,
-            token_text: &str,
-            _is_reasoning: bool,
-            _include_reasoning: bool,
-            _sink: &dyn ChunkSink,
-        ) {
-            self.seen.push(token_text.to_string());
-        }
-
-        fn on_residual(
-            &mut self,
-            _residual: &str,
-            _is_reasoning: bool,
-            _include_reasoning: bool,
-            _sink: &dyn ChunkSink,
-        ) {
-        }
-
-        fn finish(&mut self, _result: &ChatResult, _sink: &dyn ChunkSink) {}
     }
 
     #[test]
-    fn emitter_terminal_token_stops_before_the_next_forward() {
+    fn turn_observer_stops_streaming_before_the_next_forward() {
         let params = greedy_params(|_| {});
         let mut tracker = ReasoningTracker::new(false, None, None);
         let mut step = MockStep::new(vec![3, 4], 7);
-        let mut emitter = StoppingEmitter {
-            stop_id: 3,
-            seen: Vec::new(),
-        };
+        let mut emitter = DefaultStreamEmitter;
 
         let (generated, finish, chunks) = drive_streaming(
             &mut step,
@@ -1555,14 +1570,38 @@ mod run_decode_loop_tests {
             &[],
             false,
             &mut emitter,
+            Some(Box::new(StoppingObserver { stop_id: 3 })),
             false,
         );
 
         assert_eq!(generated, vec![1, 3]);
         assert_eq!(finish, "stop");
-        assert_eq!(step.forward_calls, 1, "no forward after emitter stop");
-        assert_eq!(emitter.seen, vec![String::from("t1"), String::from(" c3")]);
-        assert!(chunks.is_empty(), "the custom emitter owns the sink");
+        assert_eq!(step.forward_calls, 1, "no forward after observer stop");
+        let texts: Vec<&str> = chunks.iter().map(|chunk| chunk.text.as_str()).collect();
+        assert_eq!(texts, vec!["t1", " c3"]);
+    }
+
+    #[test]
+    fn turn_observer_stops_synchronous_before_the_next_forward() {
+        let params = greedy_params(|_| {});
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = MockStep::new(vec![3, 4], 7);
+
+        let out = drive_with_observer(
+            &mut step,
+            1,
+            &params,
+            &mut tracker,
+            10,
+            5,
+            &[],
+            Some(Box::new(StoppingObserver { stop_id: 3 })),
+        )
+        .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+
+        assert_eq!(out.generated, vec![1, 3]);
+        assert_eq!(out.finish_reason, "stop");
+        assert_eq!(step.forward_calls, 1, "no forward after observer stop");
     }
 
     #[test]
@@ -1592,6 +1631,7 @@ mod run_decode_loop_tests {
             &[],
             false,
             &mut emitter,
+            None,
             false,
         );
 
@@ -1682,6 +1722,7 @@ mod run_decode_loop_tests {
                 report_perf: false,
                 generation_stream,
                 cancel_flag: None,
+                turn_token_observer: None,
             },
             None,
         )
