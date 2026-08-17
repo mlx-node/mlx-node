@@ -1,8 +1,13 @@
 import { readFileSync, existsSync, rmSync, statSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import { convertModel, convertForeignWeights, convertGgufToSafetensors } from '@mlx-node/core';
+import {
+  convertModel,
+  convertForeignWeights,
+  convertGgufToSafetensors,
+  preflightMuseDflashGguf,
+} from '@mlx-node/core';
 
 // Canonical per-mode defaults for quantization bits/group_size.
 // Mirrors crates/mlx-core/src/convert.rs and crates/mlx-core/src/utils/gguf.rs.
@@ -577,6 +582,11 @@ export async function run(argv: string[]) {
     console.log('');
 
     try {
+      if (draftPath) {
+        // Header and target-geometry validation must precede the primary
+        // conversion: that conversion owns and overwrites config.json.
+        preflightMuseDflashGguf(draftPath, configSourceDir ?? dirname(inputPath));
+      }
       const result = await convertGgufToSafetensors({
         inputPath,
         outputDir,

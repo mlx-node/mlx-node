@@ -4292,6 +4292,12 @@ export interface PhaseProfile {
 }
 
 /**
+ * Header-only DFlash validation for the CLI's transactional ordering. This
+ * runs before the primary conversion touches its output directory.
+ */
+export declare function preflightMuseDflashGguf(inputPath: string, targetConfigDir: string): void;
+
+/**
  * Per-call Viterbi calibration overrides.
  *
  * Any field set to `Some(_)` overrides the corresponding bias from the

@@ -20,6 +20,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vite-plus/test'
 vi.mock('@mlx-node/core', () => ({
   convertModel: vi.fn(async () => ({ numTensors: 0, numParameters: 0, outputPath: '', tensorNames: [] })),
   convertForeignWeights: vi.fn(() => ({})),
+  preflightMuseDflashGguf: vi.fn(() => {}),
   convertGgufToSafetensors: vi.fn(async () => ({
     numTensors: 0,
     numParameters: 0,
@@ -29,7 +30,12 @@ vi.mock('@mlx-node/core', () => ({
   })),
 }));
 
-import { convertModel, convertForeignWeights, convertGgufToSafetensors } from '@mlx-node/core';
+import {
+  convertModel,
+  convertForeignWeights,
+  convertGgufToSafetensors,
+  preflightMuseDflashGguf,
+} from '@mlx-node/core';
 
 import { run as runConvert } from '../src/commands/convert.js';
 
@@ -158,6 +164,39 @@ describe('mlx convert GGUF validation', () => {
     await runConvert(['--input', ggufPath, '--output', outputDir, '--gguf-kquant']);
 
     expect(existsSync(staleDraft)).toBe(false);
+  });
+
+  it('preflights --draft before the primary conversion can mutate the output', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    const configDir = join(tmp, 'hf-config');
+    const draftPath = join(tmp, 'not-dflash.gguf');
+    mkdirSync(configDir);
+    writeFileSync(join(configDir, 'config.json'), '{}');
+    writeFileSync(draftPath, '');
+    vi.mocked(preflightMuseDflashGguf).mockImplementationOnce(() => {
+      throw new Error('requires a DFlash GGUF');
+    });
+
+    await expect(
+      runConvert([
+        '--input',
+        ggufPath,
+        '--output',
+        join(tmp, 'out'),
+        '--config-dir',
+        configDir,
+        '--draft',
+        draftPath,
+      ]),
+    ).rejects.toThrow('process.exit(1)');
+
+    expect(preflightMuseDflashGguf).toHaveBeenCalledWith(draftPath, configDir);
+    expect(convertGgufToSafetensors).not.toHaveBeenCalled();
+    expect(exitSpy).toHaveBeenCalledWith(1);
   });
 
   it('rejects --config-dir when the path is not a directory', async () => {

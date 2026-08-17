@@ -2593,6 +2593,68 @@ fn source_quantization_profiles(
     Ok(profiles)
 }
 
+fn muse_dflash_config_value(gguf: &GgufFile) -> Result<serde_json::Value> {
+    if !is_muse_glimmer_dflash_gguf(&gguf.metadata) {
+        let architecture = gguf
+            .metadata
+            .get("general.architecture")
+            .and_then(GgufMetaValue::as_str)
+            .unwrap_or("<missing>");
+        return Err(Error::from_reason(format!(
+            "Muse-Glimmer --draft requires a DFlash GGUF (general.architecture=dflash), got '{architecture}'"
+        )));
+    }
+    let read_u32 = |key: &str| -> Result<u32> {
+        gguf.metadata
+            .get(key)
+            .and_then(GgufMetaValue::as_u32)
+            .ok_or_else(|| Error::from_reason(format!("DFlash GGUF is missing '{key}'")))
+    };
+    let target_layers = match gguf.metadata.get("dflash.target_layers") {
+        Some(GgufMetaValue::ArrayU32(values)) => values.clone(),
+        Some(GgufMetaValue::ArrayI32(values)) => values
+            .iter()
+            .map(|&value| u32::try_from(value))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|_| Error::from_reason("DFlash target_layers contains a negative index"))?,
+        _ => {
+            return Err(Error::from_reason(
+                "DFlash GGUF is missing its target_layers array",
+            ));
+        }
+    };
+    let target_layers = target_layers
+        .into_iter()
+        .map(|layer| {
+            layer.checked_sub(1).ok_or_else(|| {
+                Error::from_reason("DFlash target_layers are 1-based and cannot contain 0")
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(serde_json::json!({
+        "num_hidden_layers": read_u32("dflash.block_count")?,
+        "block_size": read_u32("dflash.block_size")?,
+        "hidden_size": read_u32("dflash.embedding_length")?,
+        "intermediate_size": read_u32("dflash.feed_forward_length")?,
+        "num_attention_heads": read_u32("dflash.attention.head_count")?,
+        "num_key_value_heads": read_u32("dflash.attention.head_count_kv")?,
+        "head_dim": read_u32("dflash.attention.key_length")?,
+        "sliding_window": read_u32("dflash.attention.sliding_window")?,
+        "max_position_embeddings": read_u32("dflash.context_length")?,
+        "rms_norm_eps": gguf.metadata
+            .get("dflash.attention.layer_norm_rms_epsilon")
+            .and_then(GgufMetaValue::as_f32)
+            .ok_or_else(|| Error::from_reason("DFlash GGUF is missing its RMS epsilon"))?,
+        "rope_theta": gguf.metadata
+            .get("dflash.rope.freq_base")
+            .and_then(GgufMetaValue::as_f32)
+            .ok_or_else(|| Error::from_reason("DFlash GGUF is missing its RoPE theta"))?,
+        "target_layers": target_layers,
+        "mask_token_id": read_u32("tokenizer.ggml.mask_token_id")?,
+        "causal": false,
+    }))
+}
+
 /// Secondary Muse mmproj files share the target's config.json. Unlike a
 /// uniform affine companion, Meta's file deliberately mixes Q4_K and Q6_K,
 /// so every packed projection needs an explicit mode entry in that shared
@@ -2658,61 +2720,14 @@ fn prepare_muse_secondary_config(
     }
 
     if is_dflash {
-        let read_u32 = |key: &str| -> Result<u32> {
-            gguf.metadata
-                .get(key)
-                .and_then(GgufMetaValue::as_u32)
-                .ok_or_else(|| Error::from_reason(format!("DFlash GGUF is missing '{key}'")))
-        };
-        let target_layers = match gguf.metadata.get("dflash.target_layers") {
-            Some(GgufMetaValue::ArrayU32(values)) => values.clone(),
-            Some(GgufMetaValue::ArrayI32(values)) => values
-                .iter()
-                .map(|&value| u32::try_from(value))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|_| {
-                    Error::from_reason("DFlash target_layers contains a negative index")
-                })?,
-            _ => {
-                return Err(Error::from_reason(
-                    "DFlash GGUF is missing its target_layers array",
-                ));
-            }
-        };
-        let target_layers = target_layers
-            .into_iter()
-            .map(|layer| {
-                layer.checked_sub(1).ok_or_else(|| {
-                    Error::from_reason("DFlash target_layers are 1-based and cannot contain 0")
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        config["dflash_config"] = serde_json::json!({
-            "num_hidden_layers": read_u32("dflash.block_count")?,
-            "block_size": read_u32("dflash.block_size")?,
-            "hidden_size": read_u32("dflash.embedding_length")?,
-            "intermediate_size": read_u32("dflash.feed_forward_length")?,
-            "num_attention_heads": read_u32("dflash.attention.head_count")?,
-            "num_key_value_heads": read_u32("dflash.attention.head_count_kv")?,
-            "head_dim": read_u32("dflash.attention.key_length")?,
-            "sliding_window": read_u32("dflash.attention.sliding_window")?,
-            "max_position_embeddings": read_u32("dflash.context_length")?,
-            "rms_norm_eps": gguf.metadata
-                .get("dflash.attention.layer_norm_rms_epsilon")
-                .and_then(GgufMetaValue::as_f32)
-                .ok_or_else(|| Error::from_reason("DFlash GGUF is missing its RMS epsilon"))?,
-            "rope_theta": gguf.metadata
-                .get("dflash.rope.freq_base")
-                .and_then(GgufMetaValue::as_f32)
-                .ok_or_else(|| Error::from_reason("DFlash GGUF is missing its RoPE theta"))?,
-            "target_layers": target_layers,
-            "mask_token_id": read_u32("tokenizer.ggml.mask_token_id")?,
-            "causal": false,
-        });
+        config["dflash_config"] = muse_dflash_config_value(gguf)?;
     }
 
     let output = serde_json::to_string_pretty(&config)
         .map_err(|e| Error::from_reason(format!("Failed to serialize config: {e}")))?;
+    if is_dflash {
+        crate::models::muse_glimmer::config::MuseGlimmerConfig::from_json_str(&output)?;
+    }
     Ok(Some(output))
 }
 
@@ -2727,6 +2742,30 @@ fn convert_tensor_dtype(arr: MxArray, target: DType) -> Result<MxArray> {
 }
 
 // ── NAPI Export ──────────────────────────────────────────────────────────────
+
+/// Header-only DFlash validation for the CLI's transactional ordering. This
+/// runs before the primary conversion touches its output directory.
+#[napi]
+pub fn preflight_muse_dflash_gguf(input_path: String, target_config_dir: String) -> Result<()> {
+    let gguf = parse_gguf(&input_path)?;
+    source_quantization_profiles(&gguf, true)?;
+    let mut target: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(Path::new(&target_config_dir).join("config.json")).map_err(
+            |error| {
+                Error::from_reason(format!(
+                    "Muse-Glimmer --draft preflight could not read target config: {error}"
+                ))
+            },
+        )?,
+    )
+    .map_err(|error| Error::from_reason(format!("Invalid Muse-Glimmer target config: {error}")))?;
+    target["dflash_config"] = muse_dflash_config_value(&gguf)?;
+    let merged = serde_json::to_string(&target).map_err(|error| {
+        Error::from_reason(format!("Failed to serialize DFlash preflight: {error}"))
+    })?;
+    crate::models::muse_glimmer::config::MuseGlimmerConfig::from_json_str(&merged)?;
+    Ok(())
+}
 
 #[napi(object)]
 pub struct GgufConversionOptions {
@@ -5093,7 +5132,7 @@ mod tests {
         for (key, value) in [
             ("dflash.block_count", 5),
             ("dflash.block_size", 16),
-            ("dflash.embedding_length", 512),
+            ("dflash.embedding_length", 6656),
             ("dflash.feed_forward_length", 1536),
             ("dflash.attention.head_count", 8),
             ("dflash.attention.head_count_kv", 2),
@@ -5117,6 +5156,14 @@ mod tests {
             GgufMetaValue::Float32(10_000.0),
         );
         metadata
+    }
+
+    fn valid_muse_target_config() -> serde_json::Value {
+        let text = crate::models::muse_glimmer::config::fixtures::text_config_json(52);
+        serde_json::from_str(&crate::models::muse_glimmer::config::fixtures::config_json(
+            &text,
+        ))
+        .expect("parse Muse target fixture")
     }
 
     #[test]
@@ -5230,7 +5277,11 @@ mod tests {
             "mlx-node-muse-dflash-{}-{unique}.json",
             std::process::id()
         ));
-        fs::write(&config_path, "{}").expect("write primary config");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&valid_muse_target_config()).expect("serialize target config"),
+        )
+        .expect("write primary config");
 
         let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
             .expect("prepare floating-point DFlash metadata")
@@ -5246,6 +5297,43 @@ mod tests {
         assert_eq!(dflash["target_layers"], serde_json::json!([0, 7, 15]));
         assert_eq!(dflash["mask_token_id"], 201_818);
         assert!(config.get("quantization").is_none());
+    }
+
+    #[test]
+    fn dflash_preflight_rejects_wrong_architecture_and_target_geometry() {
+        let wrong_arch = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 0,
+            metadata: muse_glimmer_metadata(),
+            tensors: Vec::new(),
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let error = muse_dflash_config_value(&wrong_arch)
+            .expect_err("a main-model GGUF cannot be accepted as --draft");
+        assert!(error.reason.contains("requires a DFlash GGUF"));
+
+        let mut metadata = complete_muse_glimmer_dflash_metadata();
+        metadata.insert(
+            "dflash.embedding_length".to_string(),
+            GgufMetaValue::Uint32(1),
+        );
+        let incompatible = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 0,
+            metadata,
+            tensors: Vec::new(),
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let mut target = valid_muse_target_config();
+        target["dflash_config"] =
+            muse_dflash_config_value(&incompatible).expect("complete DFlash metadata");
+        let error = crate::models::muse_glimmer::config::MuseGlimmerConfig::from_json_str(
+            &serde_json::to_string(&target).expect("serialize incompatible target"),
+        )
+        .expect_err("DFlash hidden size must match the target");
+        assert!(error.reason.contains("does not match target hidden_size"));
     }
 
     #[test]
@@ -5275,23 +5363,22 @@ mod tests {
         fs::create_dir_all(&root).expect("create config directory");
         let config_path = root.join("config.json");
         let target = serde_json::json!({"bits": 6, "group_size": 16, "mode": "q6k"});
+        let mut primary = valid_muse_target_config();
+        primary["quantization"] = serde_json::json!({
+            "bits": 6,
+            "group_size": 16,
+            "mode": "q6k",
+            "language_model.model.layers.0.self_attn.q_proj": target.clone(),
+        });
+        primary["quantization_config"] = serde_json::json!({
+            "bits": 6,
+            "group_size": 16,
+            "mode": "q6k",
+            "language_model.model.layers.0.self_attn.q_proj": target,
+        });
         fs::write(
             &config_path,
-            serde_json::to_vec(&serde_json::json!({
-                "quantization": {
-                    "bits": 6,
-                    "group_size": 16,
-                    "mode": "q6k",
-                    "language_model.model.layers.0.self_attn.q_proj": target.clone(),
-                },
-                "quantization_config": {
-                    "bits": 6,
-                    "group_size": 16,
-                    "mode": "q6k",
-                    "language_model.model.layers.0.self_attn.q_proj": target,
-                }
-            }))
-            .expect("serialize primary config"),
+            serde_json::to_vec(&primary).expect("serialize primary config"),
         )
         .expect("write primary config");
 
