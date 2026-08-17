@@ -82,6 +82,7 @@ impl MuseGlimmerDecoderLayer {
         paged_idx: u32,
         rows: &[(SeqId, u32)],
         window: PagedWindowSlot,
+        preserve_singleton_projection_graphs: bool,
     ) -> Result<MxArray> {
         let attn = self.attention.forward_paged_batched(
             &self.input_layernorm.forward(x)?,
@@ -89,11 +90,15 @@ impl MuseGlimmerDecoderLayer {
             paged_idx,
             rows,
             window,
+            preserve_singleton_projection_graphs,
         )?;
         let h = x.add(&self.post_attention_layernorm.forward(&attn)?)?;
-        let ffn = self
-            .mlp
-            .forward(&self.pre_feedforward_layernorm.forward(&h)?)?;
+        let normed = self.pre_feedforward_layernorm.forward(&h)?;
+        let ffn = if preserve_singleton_projection_graphs {
+            super::row_exact::forward_rows_independently(&normed, |row| self.mlp.forward(row))?
+        } else {
+            self.mlp.forward(&normed)?
+        };
         h.add(&self.post_feedforward_layernorm.forward(&ffn)?)
     }
 }

@@ -12,6 +12,7 @@ pub mod mlp;
 pub mod model;
 pub mod output_parser;
 pub mod persistence;
+mod row_exact;
 pub mod stream_guard;
 
 pub use model::MuseGlimmerModel;

@@ -16,7 +16,7 @@ use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, effective_plq_for, ensure_affine_biases_present,
     ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    load_quant_settings_from_disk, mode_to_str, normalize_per_layer_key,
+    has_kquant_mode, load_quant_settings_from_disk, mode_to_str, normalize_per_layer_key,
 };
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::tokenizer::Qwen3Tokenizer;
@@ -400,6 +400,17 @@ fn load_target_safetensors(path: &Path) -> Result<HashMap<String, MxArray>> {
     load_all_safetensors(path, false)
 }
 
+fn requires_row_exact_decode_projections(
+    top_mode: Option<PerLayerMode>,
+    overrides: &HashMap<String, PerLayerQuant>,
+) -> bool {
+    has_kquant_mode(top_mode, overrides)
+        || top_mode == Some(PerLayerMode::Affine)
+        || overrides
+            .values()
+            .any(|quant| quant.mode == PerLayerMode::Affine)
+}
+
 fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
     let config = MuseGlimmerConfig::from_path(path)?;
     let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
@@ -545,6 +556,8 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
         dflash,
         paged,
     );
+    inner.row_exact_decode_projections =
+        requires_row_exact_decode_projections(top_mode, &overrides);
     if let Some(weights_resident) = weights_resident.as_ref()
         && let Some(context) =
             inner.build_cold_tier_context(&path.to_string_lossy(), weights_resident)
@@ -623,7 +636,10 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
 
 #[cfg(test)]
 mod tests {
-    use super::{load_lm_head, load_target_safetensors, quant_lookup_prefix};
+    use super::{
+        load_lm_head, load_target_safetensors, quant_lookup_prefix,
+        requires_row_exact_decode_projections,
+    };
     use crate::array::MxArray;
     use crate::models::gemma4::quantized_linear::{PerLayerMode, PerLayerQuant};
     use crate::utils::safetensors::save_safetensors;
@@ -674,6 +690,34 @@ mod tests {
         assert!(!weights.contains_key("vision.weight"));
 
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn packed_checkpoints_enable_row_exact_concurrent_decode() {
+        let mut overrides = HashMap::new();
+        assert!(requires_row_exact_decode_projections(
+            Some(PerLayerMode::Q4K),
+            &overrides
+        ));
+        assert!(requires_row_exact_decode_projections(
+            Some(PerLayerMode::Affine),
+            &overrides
+        ));
+        assert!(!requires_row_exact_decode_projections(
+            Some(PerLayerMode::Mxfp4),
+            &overrides
+        ));
+
+        overrides.insert(
+            "language_model.layers.0.self_attn.q_proj".to_string(),
+            PerLayerQuant {
+                bits: 5,
+                group_size: 32,
+                mode: PerLayerMode::Q5K,
+                input_amax: None,
+            },
+        );
+        assert!(requires_row_exact_decode_projections(None, &overrides));
     }
 
     #[test]

@@ -116,6 +116,10 @@ pub(crate) struct MuseGlimmerInner {
     pub(crate) dflash_turn_state: Option<super::dflash_decode::DFlashTurnState>,
     pub(crate) dflash_context: Option<super::dflash::DFlashContextCache>,
     pub(crate) paged: Option<MusePagedRuntime>,
+    /// Affine and GGML K-quant projections can select numerically distinct
+    /// Metal reduction kernels for `B > 1`. Preserve each decode row's
+    /// singleton projection graph while paged attention remains batched.
+    pub(crate) row_exact_decode_projections: bool,
     pub(crate) active_paged_seq: u32,
     pub(crate) active_flat_session: bool,
     sliding_cold_checkpoints: HashMap<SeqId, VecDeque<MuseSlidingColdCheckpoint>>,
@@ -167,6 +171,7 @@ impl MuseGlimmerInner {
             dflash_turn_state: None,
             dflash_context: None,
             paged,
+            row_exact_decode_projections: false,
             active_paged_seq: 0,
             active_flat_session: false,
             sliding_cold_checkpoints: HashMap::new(),
@@ -870,9 +875,16 @@ impl MuseGlimmerInner {
                 })?,
                 &planned,
                 window,
+                self.row_exact_decode_projections,
             )?;
         }
-        self.project_logits(&hidden, false)
+        if self.row_exact_decode_projections && rows.len() > 1 {
+            super::row_exact::forward_rows_independently(&hidden, |row| {
+                self.project_logits(row, false)
+            })
+        } else {
+            self.project_logits(&hidden, false)
+        }
     }
 }
 

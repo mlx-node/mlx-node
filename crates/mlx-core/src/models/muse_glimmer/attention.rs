@@ -290,6 +290,7 @@ impl MuseGlimmerAttention {
         paged_idx: u32,
         rows: &[(SeqId, u32)],
         window: PagedWindowSlot,
+        preserve_singleton_projection_graphs: bool,
     ) -> Result<MxArray> {
         let shape = x.shape()?;
         if rows.is_empty()
@@ -321,18 +322,28 @@ impl MuseGlimmerAttention {
             .collect::<Result<Vec<_>>>()?;
         let offsets = MxArray::from_int32(&offsets, &[batch])?;
         let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
-        let q = self
-            .q_proj
-            .forward(x)?
-            .reshape(&[batch, 1, self.num_heads, self.head_dim])?;
-        let k = self
-            .k_proj
-            .forward(x)?
-            .reshape(&[batch, 1, self.num_kv_heads, self.head_dim])?;
-        let v = self
-            .v_proj
-            .forward(x)?
-            .reshape(&[batch, 1, self.num_kv_heads, self.head_dim])?;
+        // Keep packed affine/K-quant matmuls on their established singleton
+        // graph. Metal can choose a different reduction path for `B > 1`,
+        // changing greedy tokens near ties. K/V writes and attention below
+        // remain one genuine paged batch.
+        let (q, k, v, gate) = if preserve_singleton_projection_graphs {
+            (
+                super::row_exact::forward_rows_independently(x, |row| self.q_proj.forward(row))?,
+                super::row_exact::forward_rows_independently(x, |row| self.k_proj.forward(row))?,
+                super::row_exact::forward_rows_independently(x, |row| self.v_proj.forward(row))?,
+                super::row_exact::forward_rows_independently(x, |row| self.gate_proj.forward(row))?,
+            )
+        } else {
+            (
+                self.q_proj.forward(x)?,
+                self.k_proj.forward(x)?,
+                self.v_proj.forward(x)?,
+                self.gate_proj.forward(x)?,
+            )
+        };
+        let q = q.reshape(&[batch, 1, self.num_heads, self.head_dim])?;
+        let k = k.reshape(&[batch, 1, self.num_kv_heads, self.head_dim])?;
+        let v = v.reshape(&[batch, 1, self.num_kv_heads, self.head_dim])?;
         let q = self
             .scaleless_rms_norm(&q)?
             .mul_scalar(self.qk_scale_factor)?
@@ -360,7 +371,11 @@ impl MuseGlimmerAttention {
             .map_err(Error::from_reason)?
             .astype(x.dtype()?)?
             .reshape(&[batch, 1, self.num_heads * self.head_dim])?;
-        let gate = Activations::sigmoid(&self.gate_proj.forward(x)?)?;
-        self.o_proj.forward(&attended.mul(&gate)?)
+        let output = attended.mul(&Activations::sigmoid(&gate)?)?;
+        if preserve_singleton_projection_graphs {
+            super::row_exact::forward_rows_independently(&output, |row| self.o_proj.forward(row))
+        } else {
+            self.o_proj.forward(&output)
+        }
     }
 }
