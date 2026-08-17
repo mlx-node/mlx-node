@@ -485,15 +485,23 @@ fn canonicalize_target_weights(
     Ok(canonical)
 }
 
-fn load_target_safetensors(path: &Path) -> Result<HashMap<String, MxArray>> {
+fn load_target_safetensors(
+    path: &Path,
+    tie_word_embeddings: bool,
+) -> Result<HashMap<String, MxArray>> {
     // Muse-Glimmer execution is text-only today. Keep the optional
     // vision.safetensors sidecar and any vision tensors embedded in the
     // primary shards out of residency accounting and cold-tier materialization
-    // until a vision forward path consumes them.
+    // until a vision forward path consumes them. Tied checkpoints may also
+    // carry a redundant lm_head quantization group; logits use the embedding
+    // table, so exclude the whole unused group before the same accounting.
     let norms_are_direct = primary_safetensor_is_mlx(path)?;
     let mut params =
         canonicalize_target_weights(load_all_safetensors(path, false)?, norms_are_direct)?;
-    params.retain(|key, _| key.starts_with("model.language_model.") || key.starts_with("lm_head."));
+    params.retain(|key, _| {
+        key.starts_with("model.language_model.")
+            || (!tie_word_embeddings && key.starts_with("lm_head."))
+    });
     Ok(params)
 }
 
@@ -521,7 +529,7 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
     } else {
         None
     };
-    let params = load_target_safetensors(path)?;
+    let params = load_target_safetensors(path, config.text_config.tie_word_embeddings)?;
     let shard_snapshot_at_mmap = if persist_cold {
         snapshot_shard_identities(path)
     } else {
@@ -882,7 +890,7 @@ mod tests {
     }
 
     #[test]
-    fn text_runtime_excludes_inline_vision_weights_and_the_unused_sidecar() {
+    fn text_runtime_excludes_unused_weights_before_residency() {
         let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "muse_glimmer_text_weights_{}_{}",
@@ -903,6 +911,18 @@ mod tests {
                 "vision_adapter.fc1.weight".to_string(),
                 MxArray::from_float32(&[3.0], &[1]).expect("create adapter tensor"),
             ),
+            (
+                "language_model.model.lm_head.weight".to_string(),
+                MxArray::from_float32(&[4.0], &[1]).expect("create lm head weight"),
+            ),
+            (
+                "language_model.model.lm_head.scales".to_string(),
+                MxArray::from_float32(&[5.0], &[1]).expect("create lm head scales"),
+            ),
+            (
+                "language_model.model.lm_head.biases".to_string(),
+                MxArray::from_float32(&[6.0], &[1]).expect("create lm head biases"),
+            ),
         ]);
         save_safetensors(
             dir.join("model.safetensors"),
@@ -912,11 +932,21 @@ mod tests {
         .expect("save mixed Muse safetensors");
         save_one(&dir.join("vision.safetensors"), "vision.weight", 2.0);
 
-        let weights = load_target_safetensors(&dir).expect("load Muse target weights");
-        assert!(weights.contains_key("model.language_model.embed_tokens.weight"));
-        assert!(!weights.contains_key("vision_tower.layers.0.attn.q_proj.weight"));
-        assert!(!weights.contains_key("vision_adapter.fc1.weight"));
-        assert!(!weights.contains_key("vision.weight"));
+        let untied = load_target_safetensors(&dir, false).expect("load untied Muse weights");
+        assert!(untied.contains_key("model.language_model.embed_tokens.weight"));
+        assert!(untied.contains_key("lm_head.weight"));
+        assert!(untied.contains_key("lm_head.scales"));
+        assert!(untied.contains_key("lm_head.biases"));
+        assert!(!untied.contains_key("vision_tower.layers.0.attn.q_proj.weight"));
+        assert!(!untied.contains_key("vision_adapter.fc1.weight"));
+        assert!(!untied.contains_key("vision.weight"));
+
+        let tied = load_target_safetensors(&dir, true).expect("load tied Muse weights");
+        assert!(tied.contains_key("model.language_model.embed_tokens.weight"));
+        assert!(!tied.keys().any(|key| key.starts_with("lm_head.")));
+        assert!(!tied.contains_key("vision_tower.layers.0.attn.q_proj.weight"));
+        assert!(!tied.contains_key("vision_adapter.fc1.weight"));
+        assert!(!tied.contains_key("vision.weight"));
 
         std::fs::remove_dir_all(dir).ok();
     }
