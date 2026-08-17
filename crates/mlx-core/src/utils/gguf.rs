@@ -2597,15 +2597,15 @@ fn source_quantization_profiles(
 /// uniform affine companion, Meta's file deliberately mixes Q4_K and Q6_K,
 /// so every packed projection needs an explicit mode entry in that shared
 /// config; the text model's top-level default cannot describe both.
-fn merge_muse_secondary_quantization(
+fn prepare_muse_secondary_config(
     config_path: &Path,
     gguf: &GgufFile,
     import_k_quants: bool,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let profiles = source_quantization_profiles(gguf, import_k_quants)?;
     let is_dflash = is_muse_glimmer_dflash_gguf(&gguf.metadata);
     if profiles.is_empty() && !is_dflash {
-        return Ok(());
+        return Ok(None);
     }
     let data = fs::read_to_string(config_path).map_err(|e| {
         Error::from_reason(format!(
@@ -2628,6 +2628,29 @@ fn merge_muse_secondary_quantization(
                         config_path.display()
                     ))
                 })?;
+            // SafeTensors conversion writes target overrides as
+            // `language_model.model.layers.*`, which the shared parser reduces
+            // to the same bare `layers.*` namespace used by DFlash. Scope the
+            // target entries one wrapper deeper before adding companion
+            // profiles so target and draft layer 0 cannot overwrite each
+            // other. Main-GGUF conversion already emits this scoped form.
+            let target_keys = quant
+                .keys()
+                .filter_map(|entry| {
+                    entry
+                        .strip_prefix("language_model.model.layers.")
+                        .map(|rest| (entry.clone(), rest.to_string()))
+                })
+                .collect::<Vec<_>>();
+            for (source, rest) in target_keys {
+                let value = quant.remove(&source).expect("collected quantization key");
+                let target = format!("language_model.model.language_model.layers.{rest}");
+                if quant.insert(target.clone(), value).is_some() {
+                    return Err(Error::from_reason(format!(
+                        "Muse-Glimmer companion quantization collides with existing scoped target override '{target}'"
+                    )));
+                }
+            }
             for (prefix, profile) in &profiles {
                 quant.insert(prefix.clone(), profile.to_json());
             }
@@ -2690,10 +2713,7 @@ fn merge_muse_secondary_quantization(
 
     let output = serde_json::to_string_pretty(&config)
         .map_err(|e| Error::from_reason(format!("Failed to serialize config: {e}")))?;
-    fs::write(config_path, output).map_err(|e| {
-        Error::from_reason(format!("Failed to update {}: {e}", config_path.display()))
-    })?;
-    Ok(())
+    Ok(Some(output))
 }
 
 // ── Dtype Conversion ────────────────────────────────────────────────────────
@@ -3081,6 +3101,21 @@ pub async fn convert_gguf_to_safetensors(
             "Muse-Glimmer GGUF conversion requires the authoritative base-model config and tokenizer assets. Pass --config-dir pointing to meta-models/Muse-Glimmer-30B (or place config.json beside the GGUF); the GGUF header alone does not contain the multimodal token IDs and complete vision layer table.",
         ));
     }
+
+    // Validate and serialize every companion-driven config mutation before
+    // loading tensor payloads or opening the destination SafeTensors file.
+    // `save_safetensors` truncates an existing sidecar immediately; a missing
+    // primary config or malformed DFlash header must therefore fail here while
+    // the previous `vision.safetensors` / `draft.safetensors` is still intact.
+    let muse_secondary_config_path = output_dir.join("config.json");
+    let prepared_muse_secondary_config = if !is_primary_model
+        && (is_muse_glimmer_mmproj_gguf(&gguf.metadata)
+            || is_muse_glimmer_dflash_gguf(&gguf.metadata))
+    {
+        prepare_muse_secondary_config(&muse_secondary_config_path, &gguf, import_k_quants)?
+    } else {
+        None
+    };
 
     // A synthesized config gets its KV head counts from
     // `apply_gemma4_attention_geometry`, which can only tell the sliding count
@@ -3601,14 +3636,13 @@ pub async fn convert_gguf_to_safetensors(
             }
         }
     } else {
-        if is_muse_glimmer_mmproj_gguf(&gguf.metadata)
-            || is_muse_glimmer_dflash_gguf(&gguf.metadata)
-        {
-            merge_muse_secondary_quantization(
-                &output_dir.join("config.json"),
-                &gguf,
-                import_k_quants,
-            )?;
+        if let Some(config) = prepared_muse_secondary_config {
+            fs::write(&muse_secondary_config_path, config).map_err(|error| {
+                Error::from_reason(format!(
+                    "Failed to update {}: {error}",
+                    muse_secondary_config_path.display()
+                ))
+            })?;
             info!("Merged Muse-Glimmer companion GGUF metadata into config.json");
         }
         info!(
@@ -5054,6 +5088,37 @@ mod tests {
         )])
     }
 
+    fn complete_muse_glimmer_dflash_metadata() -> HashMap<String, GgufMetaValue> {
+        let mut metadata = muse_glimmer_dflash_metadata();
+        for (key, value) in [
+            ("dflash.block_count", 5),
+            ("dflash.block_size", 16),
+            ("dflash.embedding_length", 512),
+            ("dflash.feed_forward_length", 1536),
+            ("dflash.attention.head_count", 8),
+            ("dflash.attention.head_count_kv", 2),
+            ("dflash.attention.key_length", 64),
+            ("dflash.attention.sliding_window", 2048),
+            ("dflash.context_length", 131_072),
+            ("tokenizer.ggml.mask_token_id", 201_818),
+        ] {
+            metadata.insert(key.to_string(), GgufMetaValue::Uint32(value));
+        }
+        metadata.insert(
+            "dflash.target_layers".to_string(),
+            GgufMetaValue::ArrayU32(vec![1, 8, 16]),
+        );
+        metadata.insert(
+            "dflash.attention.layer_norm_rms_epsilon".to_string(),
+            GgufMetaValue::Float32(1e-6),
+        );
+        metadata.insert(
+            "dflash.rope.freq_base".to_string(),
+            GgufMetaValue::Float32(10_000.0),
+        );
+        metadata
+    }
+
     #[test]
     fn muse_glimmer_mapping_matches_canonical_text_checkpoint() {
         let metadata = muse_glimmer_metadata();
@@ -5149,37 +5214,10 @@ mod tests {
 
     #[test]
     fn floating_point_dflash_still_writes_runtime_metadata() {
-        let mut metadata = muse_glimmer_dflash_metadata();
-        for (key, value) in [
-            ("dflash.block_count", 5),
-            ("dflash.block_size", 16),
-            ("dflash.embedding_length", 512),
-            ("dflash.feed_forward_length", 1536),
-            ("dflash.attention.head_count", 8),
-            ("dflash.attention.head_count_kv", 2),
-            ("dflash.attention.key_length", 64),
-            ("dflash.attention.sliding_window", 2048),
-            ("dflash.context_length", 131_072),
-            ("tokenizer.ggml.mask_token_id", 201_818),
-        ] {
-            metadata.insert(key.to_string(), GgufMetaValue::Uint32(value));
-        }
-        metadata.insert(
-            "dflash.target_layers".to_string(),
-            GgufMetaValue::ArrayU32(vec![1, 8, 16]),
-        );
-        metadata.insert(
-            "dflash.attention.layer_norm_rms_epsilon".to_string(),
-            GgufMetaValue::Float32(1e-6),
-        );
-        metadata.insert(
-            "dflash.rope.freq_base".to_string(),
-            GgufMetaValue::Float32(10_000.0),
-        );
         let gguf = GgufFile {
             version: GGUF_VERSION_3,
             tensor_count: 0,
-            metadata,
+            metadata: complete_muse_glimmer_dflash_metadata(),
             tensors: Vec::new(),
             alignment: GGUF_DEFAULT_ALIGNMENT,
             data_offset: 0,
@@ -5194,11 +5232,11 @@ mod tests {
         ));
         fs::write(&config_path, "{}").expect("write primary config");
 
-        merge_muse_secondary_quantization(&config_path, &gguf, true)
-            .expect("merge floating-point DFlash metadata");
+        let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("prepare floating-point DFlash metadata")
+            .expect("DFlash config update");
         let config: serde_json::Value =
-            serde_json::from_slice(&fs::read(&config_path).expect("read merged config"))
-                .expect("parse merged config");
+            serde_json::from_str(&prepared).expect("parse prepared config");
         fs::remove_file(&config_path).ok();
 
         let dflash = config
@@ -5208,6 +5246,134 @@ mod tests {
         assert_eq!(dflash["target_layers"], serde_json::json!([0, 7, 15]));
         assert_eq!(dflash["mask_token_id"], 201_818);
         assert!(config.get("quantization").is_none());
+    }
+
+    #[test]
+    fn companion_quantization_keeps_target_and_dflash_layers_distinct() {
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 1,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors: vec![GgufTensorInfo {
+                name: "blk.0.attn_q.weight".to_string(),
+                n_dims: 2,
+                dims: vec![256, 1],
+                tensor_type: GgufTensorType::Q4K,
+                offset: 0,
+            }],
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-quant-scope-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        let target = serde_json::json!({"bits": 6, "group_size": 16, "mode": "q6k"});
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&serde_json::json!({
+                "quantization": {
+                    "bits": 6,
+                    "group_size": 16,
+                    "mode": "q6k",
+                    "language_model.model.layers.0.self_attn.q_proj": target.clone(),
+                },
+                "quantization_config": {
+                    "bits": 6,
+                    "group_size": 16,
+                    "mode": "q6k",
+                    "language_model.model.layers.0.self_attn.q_proj": target,
+                }
+            }))
+            .expect("serialize primary config"),
+        )
+        .expect("write primary config");
+
+        let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("prepare companion quantization")
+            .expect("companion config update");
+        let config: serde_json::Value =
+            serde_json::from_str(&prepared).expect("parse companion config");
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                config[block]["language_model.model.language_model.layers.0.self_attn.q_proj"]["mode"],
+                "q6k"
+            );
+            assert_eq!(
+                config[block]["language_model.model.layers.0.self_attn.q_proj"]["mode"],
+                "q4k"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn invalid_dflash_metadata_does_not_replace_an_existing_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-dflash-preflight-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let output = root.join("output");
+        fs::create_dir_all(&output).expect("create output directory");
+        fs::write(output.join("config.json"), "{}").expect("write primary config");
+        let sidecar = output.join("draft.safetensors");
+        let sentinel = b"previous valid DFlash sidecar";
+        fs::write(&sidecar, sentinel).expect("write sidecar sentinel");
+
+        let scalar = 1.0f32.to_le_bytes();
+        let gguf = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("dflash".to_string()),
+            )],
+            &[("output_norm.weight", &[1], GgufTensorType::F32, &scalar)],
+        );
+        let input = root.join("draft.gguf");
+        fs::write(&input, gguf).expect("write malformed DFlash GGUF");
+
+        let outcome = convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: None,
+            dtype: None,
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: Some("draft.safetensors".to_string()),
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(true),
+        })
+        .await;
+        let error = match outcome {
+            Ok(_) => panic!("missing DFlash metadata must fail preflight"),
+            Err(error) => error,
+        };
+        assert!(
+            error.reason.contains("target_layers"),
+            "unexpected preflight error: {}",
+            error.reason
+        );
+        assert_eq!(
+            fs::read(&sidecar).expect("read preserved sidecar"),
+            sentinel,
+            "failed companion validation replaced the existing sidecar"
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

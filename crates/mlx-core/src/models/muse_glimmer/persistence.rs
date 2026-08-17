@@ -13,16 +13,16 @@ use crate::models::gemma4::quantized_linear::{
     try_build_nvfp4_quantized_linear, try_build_quantized_linear, try_build_sym8_quantized_linear,
 };
 use crate::models::quant_dispatch::{
-    PerLayerMode, PerLayerQuant, effective_plq_for, ensure_affine_biases_present,
-    ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
-    ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    has_kquant_mode, load_quant_settings_from_disk, mode_to_str, normalize_per_layer_key,
+    PerLayerMode, PerLayerQuant, ensure_affine_biases_present, ensure_dense_weight_floating,
+    ensure_int8_storage_resolves_sym8, ensure_kquant_storage_resolves_kquant,
+    ensure_plain_fp8_storage_resolves_fp8_e4m3, has_kquant_mode, load_quant_settings_from_disk,
+    mode_to_str, normalize_per_layer_key,
 };
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::{AttentionKind, KVCacheDType};
-use crate::utils::safetensors::load_safetensors_lazy;
+use crate::utils::safetensors::{SafeTensorsFile, load_safetensors_lazy};
 
 use super::attention::MuseGlimmerAttention;
 use super::config::MuseGlimmerConfig;
@@ -46,14 +46,27 @@ fn quant_lookup_prefix(prefix: &str) -> String {
     normalize_per_layer_key(&crate::utils::normalize_override_key(prefix))
 }
 
+fn muse_projection_quant(
+    prefix: &str,
+    overrides: &HashMap<String, PerLayerQuant>,
+    default: PerLayerQuant,
+) -> PerLayerQuant {
+    let scoped = quant_lookup_prefix(prefix);
+    let bare = normalize_per_layer_key(prefix);
+    overrides
+        .get(&scoped)
+        .or_else(|| overrides.get(&bare))
+        .copied()
+        .unwrap_or(default)
+}
+
 pub(super) fn build_projection(
     params: &HashMap<String, MxArray>,
     prefix: &str,
     default: PerLayerQuant,
     overrides: &HashMap<String, PerLayerQuant>,
 ) -> Result<LinearProj> {
-    let quant_prefix = quant_lookup_prefix(prefix);
-    let plq = effective_plq_for(&quant_prefix, overrides, default, None);
+    let plq = muse_projection_quant(prefix, overrides, default);
     let scales_key = format!("{prefix}.scales");
     if params.contains_key(&scales_key) {
         ensure_int8_storage_resolves_sym8(params, prefix, plq.mode, "muse_glimmer")?;
@@ -99,8 +112,7 @@ fn load_embedding(
     let mut embedding = Embedding::new_uninitialized(vocab as u32, hidden as u32)?;
     let weight = required(params, &format!("{prefix}.weight"))?;
     if let Some(scales) = params.get(&format!("{prefix}.scales")) {
-        let quant_prefix = quant_lookup_prefix(prefix);
-        let plq = effective_plq_for(&quant_prefix, overrides, default, None);
+        let plq = muse_projection_quant(prefix, overrides, default);
         if matches!(plq.mode, PerLayerMode::Sym8 | PerLayerMode::Fp8E4m3) {
             return Err(Error::from_reason(format!(
                 "Muse-Glimmer embedding '{prefix}' does not support {:?}",
@@ -393,11 +405,92 @@ fn build_paged_runtime(config: &MuseGlimmerConfig) -> Result<Option<MusePagedRun
     }))
 }
 
+fn primary_safetensor_is_mlx(path: &Path) -> Result<bool> {
+    let primary = if path.join("weights.safetensors").is_file() {
+        path.join("weights.safetensors")
+    } else if path.join("model.safetensors").is_file() {
+        path.join("model.safetensors")
+    } else {
+        let mut shards = std::fs::read_dir(path)
+            .map_err(|error| {
+                Error::from_reason(format!(
+                    "Failed to inspect Muse-Glimmer checkpoint directory: {error}"
+                ))
+            })?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|file| {
+                let name = file
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default();
+                (name.starts_with("model-") || name.starts_with("model.safetensors-"))
+                    && name.ends_with(".safetensors")
+                    && name.contains("-of-")
+            })
+            .collect::<Vec<_>>();
+        shards.sort();
+        shards.into_iter().next().ok_or_else(|| {
+            Error::from_reason(format!(
+                "No model SafeTensors file found in {}",
+                path.display()
+            ))
+        })?
+    };
+    Ok(SafeTensorsFile::load(&primary)?
+        .metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("format"))
+        .and_then(serde_json::Value::as_str)
+        == Some("mlx"))
+}
+
+fn canonicalize_target_weights(
+    params: HashMap<String, MxArray>,
+    norms_are_direct: bool,
+) -> Result<HashMap<String, MxArray>> {
+    let mut canonical = HashMap::with_capacity(params.len());
+    for (source_key, array) in params {
+        let key = if let Some(rest) = source_key.strip_prefix("language_model.model.lm_head.") {
+            format!("lm_head.{rest}")
+        } else if let Some(rest) = source_key.strip_prefix("language_model.lm_head.") {
+            format!("lm_head.{rest}")
+        } else if let Some(rest) = source_key.strip_prefix("language_model.model.") {
+            format!("model.language_model.{rest}")
+        } else {
+            source_key.clone()
+        };
+        let is_centered_sandwich_norm = key
+            .strip_prefix("model.language_model.layers.")
+            .is_some_and(|rest| {
+                [
+                    ".input_layernorm.weight",
+                    ".post_attention_layernorm.weight",
+                    ".pre_feedforward_layernorm.weight",
+                    ".post_feedforward_layernorm.weight",
+                ]
+                .iter()
+                .any(|suffix| rest.ends_with(suffix))
+            });
+        let array = if !norms_are_direct && is_centered_sandwich_norm {
+            array.add_scalar(1.0)?
+        } else {
+            array
+        };
+        if canonical.insert(key.clone(), array).is_some() {
+            return Err(Error::from_reason(format!(
+                "Muse-Glimmer checkpoint contains duplicate canonical tensor '{key}'"
+            )));
+        }
+    }
+    Ok(canonical)
+}
+
 fn load_target_safetensors(path: &Path) -> Result<HashMap<String, MxArray>> {
     // Muse-Glimmer execution is text-only today. Keep the optional
     // vision.safetensors sidecar out of residency accounting and cold-tier
     // materialization until a vision forward path consumes it.
-    load_all_safetensors(path, false)
+    let norms_are_direct = primary_safetensor_is_mlx(path)?;
+    canonicalize_target_weights(load_all_safetensors(path, false)?, norms_are_direct)
 }
 
 fn requires_row_exact_decode_projections(
@@ -637,8 +730,8 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
 #[cfg(test)]
 mod tests {
     use super::{
-        load_lm_head, load_target_safetensors, quant_lookup_prefix,
-        requires_row_exact_decode_projections,
+        canonicalize_target_weights, load_lm_head, load_target_safetensors, muse_projection_quant,
+        primary_safetensor_is_mlx, quant_lookup_prefix, requires_row_exact_decode_projections,
     };
     use crate::array::MxArray;
     use crate::models::gemma4::quantized_linear::{PerLayerMode, PerLayerQuant};
@@ -671,6 +764,113 @@ mod tests {
             "language_model.embed_tokens"
         );
         assert_eq!(quant_lookup_prefix("lm_head"), "lm_head");
+
+        let fallback = PerLayerQuant {
+            bits: 6,
+            group_size: 16,
+            mode: PerLayerMode::Q6K,
+            input_amax: None,
+        };
+        let overrides = HashMap::from([(
+            "layers.0.self_attn.q_proj".to_string(),
+            PerLayerQuant {
+                bits: 4,
+                group_size: 32,
+                mode: PerLayerMode::Q4K,
+                input_amax: None,
+            },
+        )]);
+        assert_eq!(
+            muse_projection_quant(
+                "model.language_model.layers.0.self_attn.q_proj",
+                &overrides,
+                fallback
+            )
+            .mode,
+            PerLayerMode::Q4K,
+            "SafeTensors-converter overrides use the bare target namespace"
+        );
+    }
+
+    #[test]
+    fn converter_namespace_and_centered_hf_norms_reach_one_runtime_form() {
+        let converter = HashMap::from([
+            (
+                "language_model.model.layers.0.input_layernorm.weight".to_string(),
+                MxArray::from_float32(&[1.25], &[1]).expect("direct norm"),
+            ),
+            (
+                "language_model.model.lm_head.weight".to_string(),
+                MxArray::from_float32(&[2.0], &[1]).expect("lm head"),
+            ),
+        ]);
+        let converter = canonicalize_target_weights(converter, true).expect("converter namespace");
+        assert_eq!(
+            converter["model.language_model.layers.0.input_layernorm.weight"]
+                .item_at_float32(0)
+                .expect("direct value"),
+            1.25
+        );
+        assert!(converter.contains_key("lm_head.weight"));
+
+        let mut raw_hf = HashMap::from([(
+            "model.language_model.norm.weight".to_string(),
+            MxArray::from_float32(&[0.5], &[1]).expect("final norm"),
+        )]);
+        for norm in [
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        ] {
+            raw_hf.insert(
+                format!("model.language_model.layers.0.{norm}.weight"),
+                MxArray::from_float32(&[0.25], &[1]).expect("centered norm"),
+            );
+        }
+        let raw_hf = canonicalize_target_weights(raw_hf, false).expect("raw HF namespace");
+        for norm in [
+            "input_layernorm",
+            "post_attention_layernorm",
+            "pre_feedforward_layernorm",
+            "post_feedforward_layernorm",
+        ] {
+            assert_eq!(
+                raw_hf[&format!("model.language_model.layers.0.{norm}.weight")]
+                    .item_at_float32(0)
+                    .expect("shifted sandwich norm"),
+                1.25
+            );
+        }
+        assert_eq!(
+            raw_hf["model.language_model.norm.weight"]
+                .item_at_float32(0)
+                .expect("unchanged final norm"),
+            0.5
+        );
+    }
+
+    #[test]
+    fn mlx_metadata_marks_direct_norm_weights() {
+        let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "muse_glimmer_norm_metadata_{}_{}",
+            std::process::id(),
+            id
+        ));
+        std::fs::create_dir_all(&dir).expect("create model directory");
+        let mut tensors = HashMap::from([(
+            "weight".to_string(),
+            MxArray::from_float32(&[1.0], &[1]).expect("weight"),
+        )]);
+        save_safetensors(
+            dir.join("model.safetensors"),
+            &mut tensors,
+            Some(serde_json::json!({"format": "mlx"})),
+        )
+        .expect("save MLX checkpoint");
+        assert!(primary_safetensor_is_mlx(&dir).expect("read metadata"));
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
