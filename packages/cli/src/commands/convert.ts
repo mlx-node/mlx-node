@@ -683,7 +683,15 @@ export async function run(argv: string[]) {
     return;
   }
 
-  // Below here the input is SafeTensors, where --gguf-kquant has no meaning.
+  // Below here the input is SafeTensors. Companion DFlash import is a GGUF
+  // conversion feature; accepting the flag here would silently produce no
+  // draft.safetensors and no matching dflash_config.
+  if (draftPath) {
+    console.error('Error: --draft is only supported when --input is a GGUF file');
+    process.exit(1);
+  }
+
+  // SafeTensors input also gives --gguf-kquant no meaning.
   if (args['gguf-kquant']) {
     console.error('Error: --gguf-kquant applies only to GGUF input; ' + `'${inputPath}' is not a .gguf file`);
     process.exit(1);

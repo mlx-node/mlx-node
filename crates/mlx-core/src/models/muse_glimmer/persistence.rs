@@ -487,10 +487,14 @@ fn canonicalize_target_weights(
 
 fn load_target_safetensors(path: &Path) -> Result<HashMap<String, MxArray>> {
     // Muse-Glimmer execution is text-only today. Keep the optional
-    // vision.safetensors sidecar out of residency accounting and cold-tier
-    // materialization until a vision forward path consumes it.
+    // vision.safetensors sidecar and any vision tensors embedded in the
+    // primary shards out of residency accounting and cold-tier materialization
+    // until a vision forward path consumes them.
     let norms_are_direct = primary_safetensor_is_mlx(path)?;
-    canonicalize_target_weights(load_all_safetensors(path, false)?, norms_are_direct)
+    let mut params =
+        canonicalize_target_weights(load_all_safetensors(path, false)?, norms_are_direct)?;
+    params.retain(|key, _| key.starts_with("model.language_model.") || key.starts_with("lm_head."));
+    Ok(params)
 }
 
 fn requires_row_exact_decode_projections(
@@ -878,7 +882,7 @@ mod tests {
     }
 
     #[test]
-    fn text_runtime_excludes_the_unused_vision_sidecar() {
+    fn text_runtime_excludes_inline_vision_weights_and_the_unused_sidecar() {
         let id = TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
             "muse_glimmer_text_weights_{}_{}",
@@ -886,11 +890,32 @@ mod tests {
             id
         ));
         std::fs::create_dir_all(&dir).expect("create model directory");
-        save_one(&dir.join("model.safetensors"), "text.weight", 1.0);
+        let mut primary = HashMap::from([
+            (
+                "language_model.model.embed_tokens.weight".to_string(),
+                MxArray::from_float32(&[1.0], &[1]).expect("create text tensor"),
+            ),
+            (
+                "vision_tower.layers.0.attn.q_proj.weight".to_string(),
+                MxArray::from_float32(&[2.0], &[1]).expect("create vision tensor"),
+            ),
+            (
+                "vision_adapter.fc1.weight".to_string(),
+                MxArray::from_float32(&[3.0], &[1]).expect("create adapter tensor"),
+            ),
+        ]);
+        save_safetensors(
+            dir.join("model.safetensors"),
+            &mut primary,
+            Some(serde_json::json!({"format": "mlx"})),
+        )
+        .expect("save mixed Muse safetensors");
         save_one(&dir.join("vision.safetensors"), "vision.weight", 2.0);
 
         let weights = load_target_safetensors(&dir).expect("load Muse target weights");
-        assert!(weights.contains_key("text.weight"));
+        assert!(weights.contains_key("model.language_model.embed_tokens.weight"));
+        assert!(!weights.contains_key("vision_tower.layers.0.attn.q_proj.weight"));
+        assert!(!weights.contains_key("vision_adapter.fc1.weight"));
         assert!(!weights.contains_key("vision.weight"));
 
         std::fs::remove_dir_all(dir).ok();

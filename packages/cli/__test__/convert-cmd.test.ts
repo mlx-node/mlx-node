@@ -112,6 +112,29 @@ describe('mlx convert GGUF validation', () => {
     expect(convertGgufToSafetensors).not.toHaveBeenCalled();
   });
 
+  it('rejects --draft for SafeTensors input instead of silently ignoring it', async () => {
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    const stDir = join(tmp, 'st-in');
+    const draftPath = join(tmp, 'draft.gguf');
+    mkdirSync(stDir, { recursive: true });
+    writeFileSync(join(stDir, 'config.json'), JSON.stringify({ model_type: 'muse_glimmer' }));
+    writeFileSync(draftPath, '');
+
+    await expect(
+      runConvert(['--input', stDir, '--output', join(tmp, 'out'), '--draft', draftPath]),
+    ).rejects.toThrow('process.exit(1)');
+
+    const errors = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
+    expect(errors).toContain('--draft is only supported when --input is a GGUF file');
+    expect(exitSpy).toHaveBeenCalledWith(1);
+    expect(convertModel).not.toHaveBeenCalled();
+    expect(convertGgufToSafetensors).not.toHaveBeenCalled();
+  });
+
   it('rejects --gguf-kquant combined with --imatrix-path for .gguf input upfront', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     vi.spyOn(console, 'log').mockImplementation(() => {});
