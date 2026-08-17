@@ -272,6 +272,10 @@ impl DFlashContextCache {
         Ok(())
     }
 
+    pub(crate) fn logical_len(&self) -> i32 {
+        self.logical_len
+    }
+
     pub(crate) fn eval(&self) -> Result<()> {
         let mut arrays = Vec::new();
         for cache in &self.layers {

@@ -12,6 +12,7 @@ use crate::engine::scheduler::PreemptionMode;
 use crate::engine::types::ChatConfig;
 use crate::model_thread::ResponseTx;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
+use crate::models::muse_glimmer::dflash::DFlashContextCache;
 use crate::models::muse_glimmer::kv_cache::PagedWindowSlot;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
@@ -45,6 +46,7 @@ impl HybridSchedulerCommand for MuseGlimmerCmd {
 pub(crate) struct MuseOwnerState {
     history: Vec<u32>,
     flat_caches: Option<Vec<Gemma4LayerCache>>,
+    dflash_context: Option<DFlashContextCache>,
 }
 
 pub(crate) type MuseSchedulerState = HybridSchedulerState<MuseGlimmerInner>;
@@ -212,6 +214,7 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
         MuseOwnerState {
             history: self.cached_token_history.clone(),
             flat_caches: None,
+            dflash_context: None,
         }
     }
 
@@ -354,6 +357,7 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
         let state = owners.owner_states.remove(&owner).unwrap_or_default();
         if flat_lane {
             self.install_flat_owner_caches(state.flat_caches);
+            self.dflash_context = state.dflash_context;
             self.cached_token_history = state.history;
             handle_chat_cmd(self, command);
             if ChatBackend::has_live_session(self) {
@@ -362,6 +366,7 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
                     MuseOwnerState {
                         history: self.cached_token_history.clone(),
                         flat_caches: Some(self.take_flat_owner_caches()),
+                        dflash_context: self.dflash_context.take(),
                     },
                 );
             } else {
@@ -387,6 +392,7 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
                     MuseOwnerState {
                         history: self.cached_token_history.clone(),
                         flat_caches: None,
+                        dflash_context: None,
                     },
                 );
             } else {

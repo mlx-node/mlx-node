@@ -114,6 +114,7 @@ pub(crate) struct MuseGlimmerInner {
     pub(crate) gen_defaults: crate::engine::ModelGenerationDefaults,
     pub(crate) dflash: Option<DFlashModel>,
     pub(crate) dflash_turn_state: Option<super::dflash_decode::DFlashTurnState>,
+    pub(crate) dflash_context: Option<super::dflash::DFlashContextCache>,
     pub(crate) paged: Option<MusePagedRuntime>,
     pub(crate) active_paged_seq: u32,
     pub(crate) active_flat_session: bool,
@@ -164,6 +165,7 @@ impl MuseGlimmerInner {
             gen_defaults,
             dflash,
             dflash_turn_state: None,
+            dflash_context: None,
             paged,
             active_paged_seq: 0,
             active_flat_session: false,
@@ -939,6 +941,7 @@ impl DecodeStep for MuseGlimmerDecode<'_> {
 
 struct MuseGlimmerEmitter {
     guard: StreamGuard,
+    pending: VecDeque<(u32, Option<String>)>,
 }
 
 impl MuseGlimmerEmitter {
@@ -967,6 +970,17 @@ impl MuseGlimmerEmitter {
 }
 
 impl StreamEmitter for MuseGlimmerEmitter {
+    fn observe_token_id(&mut self, token_id: u32) -> bool {
+        let outcome = self.guard.push_id(token_id);
+        let ended = matches!(outcome, GuardOutcome::EndTurn);
+        let text = match outcome {
+            GuardOutcome::Emit(text) => Some(text),
+            GuardOutcome::Hold | GuardOutcome::EndTurn => None,
+        };
+        self.pending.push_back((token_id, text));
+        ended
+    }
+
     fn on_token_id(
         &mut self,
         token_id: u32,
@@ -975,7 +989,16 @@ impl StreamEmitter for MuseGlimmerEmitter {
         _include_reasoning: bool,
         sink: &dyn ChunkSink,
     ) {
-        if let GuardOutcome::Emit(text) = self.guard.push_id(token_id) {
+        let text = match self.pending.front() {
+            Some((pending_id, _)) if *pending_id == token_id => {
+                self.pending.pop_front().and_then(|(_, text)| text)
+            }
+            _ => match self.guard.push_id(token_id) {
+                GuardOutcome::Emit(text) => Some(text),
+                GuardOutcome::Hold | GuardOutcome::EndTurn => None,
+            },
+        };
+        if let Some(text) = text {
             Self::emit(text, sink);
         }
     }
@@ -1219,6 +1242,8 @@ impl ChatBackend for MuseGlimmerInner {
     fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
         self.caches = init_caches(&self.config);
         self.cached_token_history.clear();
+        self.dflash_turn_state = None;
+        self.dflash_context = None;
         if let Some(paged) = self.paged.as_mut()
             && _scope == ResetScope::Command
         {
@@ -1339,6 +1364,7 @@ impl ChatBackend for MuseGlimmerInner {
             .inner_arc();
         Box::new(MuseGlimmerEmitter {
             guard: StreamGuard::new(tokenizer, 1024, usize::MAX, 4096),
+            pending: VecDeque::new(),
         })
     }
 

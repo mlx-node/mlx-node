@@ -307,7 +307,16 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             p.max_ngram_repeats,
             p.ngram_size,
         );
-        let is_terminal = stops_at_eos || cancelled || repetition.is_some();
+        // Protocol-aware emitters must inspect the current token before a
+        // subsequent forward is scheduled. For Muse-Glimmer this catches a
+        // StreamGuard terminator/self-play boundary even when it is not in
+        // the model's ordinary EOS set.
+        let emitter_stopped = !cancelled
+            && !(eos_before_emit && stops_at_eos)
+            && streaming
+                .as_mut()
+                .is_some_and(|s| s.emitter.observe_token_id(token_id));
+        let is_terminal = stops_at_eos || cancelled || repetition.is_some() || emitter_stopped;
 
         // This loop builds the next forward HERE — before the streaming
         // emit block further down — whereas origin/main's paged loop
@@ -501,6 +510,10 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
                 p.include_reasoning,
                 s.callback,
             );
+            if emitter_stopped {
+                *finish_reason = String::from("stop");
+                break;
+            }
         } else if cancelled {
             // NON-streaming cancel break (H2): same snapshot, same
             // position in the iteration as the ChatML streaming
@@ -1489,6 +1502,67 @@ mod run_decode_loop_tests {
         fn finish(&mut self, _result: &ChatResult, _sink: &dyn ChunkSink) {
             self.finished += 1;
         }
+    }
+
+    struct StoppingEmitter {
+        stop_id: u32,
+        seen: Vec<String>,
+    }
+
+    impl StreamEmitter for StoppingEmitter {
+        fn observe_token_id(&mut self, token_id: u32) -> bool {
+            token_id == self.stop_id
+        }
+
+        fn on_token_text(
+            &mut self,
+            token_text: &str,
+            _is_reasoning: bool,
+            _include_reasoning: bool,
+            _sink: &dyn ChunkSink,
+        ) {
+            self.seen.push(token_text.to_string());
+        }
+
+        fn on_residual(
+            &mut self,
+            _residual: &str,
+            _is_reasoning: bool,
+            _include_reasoning: bool,
+            _sink: &dyn ChunkSink,
+        ) {
+        }
+
+        fn finish(&mut self, _result: &ChatResult, _sink: &dyn ChunkSink) {}
+    }
+
+    #[test]
+    fn emitter_terminal_token_stops_before_the_next_forward() {
+        let params = greedy_params(|_| {});
+        let mut tracker = ReasoningTracker::new(false, None, None);
+        let mut step = MockStep::new(vec![3, 4], 7);
+        let mut emitter = StoppingEmitter {
+            stop_id: 3,
+            seen: Vec::new(),
+        };
+
+        let (generated, finish, chunks) = drive_streaming(
+            &mut step,
+            1,
+            &params,
+            &mut tracker,
+            5,
+            &[],
+            false,
+            &mut emitter,
+            false,
+        );
+
+        assert_eq!(generated, vec![1, 3]);
+        assert_eq!(finish, "stop");
+        assert_eq!(step.forward_calls, 1, "no forward after emitter stop");
+        assert_eq!(emitter.seen, vec![String::from("t1"), String::from(" c3")]);
+        assert!(chunks.is_empty(), "the custom emitter owns the sink");
     }
 
     #[test]

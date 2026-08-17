@@ -37,6 +37,26 @@ pub(crate) struct MuseGlimmerDFlashStepper<'a> {
     tapped: Option<Vec<MxArray>>,
 }
 
+fn reusable_dflash_prefix(
+    is_delta: bool,
+    token_len: usize,
+    prior_cached: usize,
+    verified_hit: usize,
+    retained_context_len: Option<i32>,
+) -> usize {
+    let candidate = if is_delta { prior_cached } else { verified_hit };
+    if candidate > 0
+        && candidate < token_len
+        && i32::try_from(candidate)
+            .ok()
+            .is_some_and(|candidate| retained_context_len == Some(candidate))
+    {
+        candidate
+    } else {
+        0
+    }
+}
+
 impl MuseGlimmerDFlashStepper<'_> {
     fn ensure_clean(&self, operation: &str) -> Result<()> {
         if self.rollback.is_some() || self.tapped.is_some() {
@@ -77,16 +97,7 @@ impl DsparkStepper for MuseGlimmerDFlashStepper<'_> {
     }
 
     fn enter_ar_fallback(&mut self) -> Result<()> {
-        self.ensure_clean("AR fallback")?;
-        let config = self
-            .inner
-            .dflash
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Muse-Glimmer DFlash model disappeared"))?
-            .config
-            .clone();
-        self.context = DFlashContextCache::new_at(&config, self.next_position);
-        Ok(())
+        self.ensure_clean("AR fallback")
     }
 
     fn materialize_adaptive_state(&self) -> Result<()> {
@@ -170,6 +181,11 @@ impl DsparkStepper for MuseGlimmerDFlashStepper<'_> {
         self.append_tapped(&tapped, keep)
     }
 
+    fn finish(self) -> Result<()> {
+        self.inner.dflash_context = Some(self.context);
+        Ok(())
+    }
+
     fn eval_boundary(&self, token: &MxArray) {
         MxArray::async_eval_arrays(&[token]);
     }
@@ -231,7 +247,22 @@ impl MuseGlimmerInner {
             .as_ref()
             .ok_or_else(|| Error::from_reason("Muse-Glimmer has no loaded DFlash companion"))?;
         let tap_layers = draft.config.target_layers.clone();
-        let mut context = DFlashContextCache::new_at(&draft.config, position_base);
+        let draft_config = draft.config.clone();
+        let mut context = match self.dflash_context.take() {
+            Some(context) if context.logical_len() == position_base => context,
+            Some(context) => {
+                return Err(Error::from_reason(format!(
+                    "Muse-Glimmer DFlash context length {} does not match cached prefix {position_base}",
+                    context.logical_len()
+                )));
+            }
+            None if position_base == 0 => DFlashContextCache::new_at(&draft_config, 0),
+            None => {
+                return Err(Error::from_reason(format!(
+                    "Muse-Glimmer DFlash cached prefix {position_base} has no retained draft context"
+                )));
+            }
+        };
         let mut offset = 0usize;
         let mut last_logits = None;
         while offset < tokens.len() {
@@ -284,9 +315,32 @@ impl MuseGlimmerInner {
     }
 
     fn dflash_materialize_final(&mut self, token: u32, stream: Stream) -> Result<()> {
+        let tap_layers = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Muse-Glimmer DFlash model disappeared"))?
+            .config
+            .target_layers
+            .clone();
         let input = MxArray::from_int32(&[token as i32], &[1, 1])?;
         let _stream = StreamContext::new(stream);
-        let _ = self.forward(&input)?;
+        let (_, taps) = self.forward_with_taps(&input, &tap_layers)?;
+        let fused = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Muse-Glimmer DFlash model disappeared"))?
+            .fuse_context(&taps)?;
+        let mut context = self.dflash_context.take().ok_or_else(|| {
+            Error::from_reason("Muse-Glimmer DFlash final token has no retained draft context")
+        })?;
+        let base = context.logical_len();
+        let append_result = self
+            .dflash
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Muse-Glimmer DFlash model disappeared"))
+            .and_then(|draft| context.append(draft, &fused, base));
+        self.dflash_context = Some(context);
+        append_result?;
         self.eval_caches()
     }
 
@@ -302,16 +356,27 @@ impl MuseGlimmerInner {
         } else {
             0
         };
-        let (prefill, cached_prefix) = if is_delta {
-            (tokens[prior_cached..].to_vec(), prior_cached)
+        let retained_context_len = self
+            .dflash_context
+            .as_ref()
+            .map(DFlashContextCache::logical_len);
+        let verified_hit = if is_delta {
+            0
         } else {
-            let hit = ChatBackend::verify_cache_prefix(self, &tokens, params.reuse_cache);
-            if hit > 0 && hit < tokens.len() {
-                (tokens[hit..].to_vec(), hit)
-            } else {
-                ChatBackend::reset_caches(self, ResetScope::PrefixMiss)?;
-                (tokens.clone(), 0)
-            }
+            ChatBackend::verify_cache_prefix(self, &tokens, params.reuse_cache)
+        };
+        let cached_prefix = reusable_dflash_prefix(
+            is_delta,
+            tokens.len(),
+            prior_cached,
+            verified_hit,
+            retained_context_len,
+        );
+        let prefill = if cached_prefix > 0 {
+            tokens[cached_prefix..].to_vec()
+        } else {
+            ChatBackend::reset_caches(self, ResetScope::PrefixMiss)?;
+            tokens.clone()
         };
 
         let generation_stream = Stream::new(DeviceType::Gpu);
@@ -471,5 +536,19 @@ impl MuseGlimmerInner {
         } else {
             Ok(TurnOutput::Complete(Box::new(result)))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reusable_dflash_prefix;
+
+    #[test]
+    fn continuation_reuses_only_a_matching_retained_dflash_context() {
+        assert_eq!(reusable_dflash_prefix(true, 14, 10, 0, Some(10)), 10);
+        assert_eq!(reusable_dflash_prefix(true, 14, 10, 0, None), 0);
+        assert_eq!(reusable_dflash_prefix(true, 14, 10, 0, Some(9)), 0);
+        assert_eq!(reusable_dflash_prefix(false, 14, 0, 10, Some(10)), 10);
+        assert_eq!(reusable_dflash_prefix(false, 14, 0, 10, Some(9)), 0);
     }
 }

@@ -222,6 +222,18 @@ impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
 /// the done-chunk carrying `text: ""` and the parser-accumulated
 /// `tool_calls()` / `thinking()` instead of `result.text`.
 pub(crate) trait StreamEmitter {
+    /// Observe a committed token before the decode loop schedules any
+    /// subsequent model work. Family protocol guards may return `true` to
+    /// terminate the turn at this token; ordinary text emitters keep the
+    /// default `false` behavior.
+    ///
+    /// The later [`Self::on_token_id`] call remains responsible for sending
+    /// chunks. Keeping observation separate lets speculative loops clamp and
+    /// commit the exact accepted prefix before exposing it to the sink.
+    fn observe_token_id(&mut self, _token_id: u32) -> bool {
+        false
+    }
+
     /// Token-aware entry point. The default preserves the historical text-only
     /// emitter contract; protocol parsers that require special-token
     /// provenance override this method.
@@ -1806,6 +1818,17 @@ pub(crate) trait DsparkStepper {
     /// unconditionally kept); the cycle's boundary token has NO K/V slot —
     /// it becomes the next cycle's anchor.
     fn commit(&mut self, keep: usize, total_written: usize) -> Result<()>;
+
+    /// Publish model-private state retained by a successful speculative turn.
+    /// Most steppers keep all persistent state behind their backend and need
+    /// no action. Draft models with a turn-local context owner can move it
+    /// back into the backend here for the next live-session continuation.
+    fn finish(self) -> Result<()>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
 
     /// Schedule async eval for the boundary token that becomes the next
     /// cycle's anchor. `&self` — schedules only, no mutation. Called at the
