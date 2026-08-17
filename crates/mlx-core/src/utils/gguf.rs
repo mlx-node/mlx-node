@@ -215,9 +215,9 @@ impl GgufMetaValue {
     pub fn as_u32(&self) -> Option<u32> {
         match self {
             Self::Uint32(v) => Some(*v),
-            Self::Int32(v) => Some(*v as u32),
-            Self::Uint64(v) => Some(*v as u32),
-            Self::Int64(v) => Some(*v as u32),
+            Self::Int32(v) => u32::try_from(*v).ok(),
+            Self::Uint64(v) => u32::try_from(*v).ok(),
+            Self::Int64(v) => u32::try_from(*v).ok(),
             _ => None,
         }
     }
@@ -2605,10 +2605,15 @@ fn muse_dflash_config_value(gguf: &GgufFile) -> Result<serde_json::Value> {
         )));
     }
     let read_u32 = |key: &str| -> Result<u32> {
-        gguf.metadata
+        let value = gguf
+            .metadata
             .get(key)
-            .and_then(GgufMetaValue::as_u32)
-            .ok_or_else(|| Error::from_reason(format!("DFlash GGUF is missing '{key}'")))
+            .ok_or_else(|| Error::from_reason(format!("DFlash GGUF is missing '{key}'")))?;
+        value.as_u32().ok_or_else(|| {
+            Error::from_reason(format!(
+                "DFlash GGUF metadata '{key}' must be a nonnegative integer that fits u32"
+            ))
+        })
     };
     let target_layers = match gguf.metadata.get("dflash.target_layers") {
         Some(GgufMetaValue::ArrayU32(values)) => values.clone(),
@@ -5156,6 +5161,62 @@ mod tests {
             GgufMetaValue::Float32(10_000.0),
         );
         metadata
+    }
+
+    #[test]
+    fn gguf_u32_metadata_conversion_is_checked() {
+        assert_eq!(GgufMetaValue::Uint32(u32::MAX).as_u32(), Some(u32::MAX));
+        assert_eq!(GgufMetaValue::Int32(i32::MAX).as_u32(), Some(2_147_483_647));
+        assert_eq!(GgufMetaValue::Int32(-1).as_u32(), None);
+        assert_eq!(
+            GgufMetaValue::Uint64(u64::from(u32::MAX)).as_u32(),
+            Some(u32::MAX)
+        );
+        assert_eq!(
+            GgufMetaValue::Uint64(u64::from(u32::MAX) + 1).as_u32(),
+            None
+        );
+        assert_eq!(
+            GgufMetaValue::Int64(i64::from(u32::MAX)).as_u32(),
+            Some(u32::MAX)
+        );
+        assert_eq!(GgufMetaValue::Int64(-1).as_u32(), None);
+        assert_eq!(GgufMetaValue::Int64(i64::from(u32::MAX) + 1).as_u32(), None);
+    }
+
+    #[test]
+    fn dflash_config_rejects_negative_and_overflowing_integer_metadata() {
+        for (label, value) in [
+            ("negative i32", GgufMetaValue::Int32(-1)),
+            ("negative i64", GgufMetaValue::Int64(-1)),
+            (
+                "overflowing u64",
+                GgufMetaValue::Uint64(u64::from(u32::MAX) + 1),
+            ),
+            (
+                "overflowing i64",
+                GgufMetaValue::Int64(i64::from(u32::MAX) + 1),
+            ),
+        ] {
+            let mut metadata = complete_muse_glimmer_dflash_metadata();
+            metadata.insert("dflash.block_count".to_string(), value);
+            let gguf = GgufFile {
+                version: GGUF_VERSION_3,
+                tensor_count: 0,
+                metadata,
+                tensors: Vec::new(),
+                alignment: GGUF_DEFAULT_ALIGNMENT,
+                data_offset: 0,
+            };
+
+            let error = muse_dflash_config_value(&gguf)
+                .expect_err("out-of-range DFlash metadata must fail");
+            assert!(
+                error.reason.contains("dflash.block_count") && error.reason.contains("fits u32"),
+                "unexpected error for {label}: {}",
+                error.reason
+            );
+        }
     }
 
     fn valid_muse_target_config() -> serde_json::Value {
