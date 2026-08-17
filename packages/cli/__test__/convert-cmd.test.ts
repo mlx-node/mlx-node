@@ -11,7 +11,7 @@
  * conversion runs; `process.exit` is mocked to throw so the test proves
  * validation halts before reaching the (mocked) native call.
  */
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -30,12 +30,7 @@ vi.mock('@mlx-node/core', () => ({
   })),
 }));
 
-import {
-  convertModel,
-  convertForeignWeights,
-  convertGgufToSafetensors,
-  preflightMuseDflashGguf,
-} from '@mlx-node/core';
+import { convertModel, convertForeignWeights, convertGgufToSafetensors, preflightMuseDflashGguf } from '@mlx-node/core';
 
 import { run as runConvert } from '../src/commands/convert.js';
 
@@ -124,9 +119,9 @@ describe('mlx convert GGUF validation', () => {
     writeFileSync(join(stDir, 'config.json'), JSON.stringify({ model_type: 'muse_glimmer' }));
     writeFileSync(draftPath, '');
 
-    await expect(
-      runConvert(['--input', stDir, '--output', join(tmp, 'out'), '--draft', draftPath]),
-    ).rejects.toThrow('process.exit(1)');
+    await expect(runConvert(['--input', stDir, '--output', join(tmp, 'out'), '--draft', draftPath])).rejects.toThrow(
+      'process.exit(1)',
+    );
 
     const errors = errSpy.mock.calls.map((c) => String(c[0])).join('\n');
     expect(errors).toContain('--draft is only supported when --input is a GGUF file');
@@ -172,14 +167,16 @@ describe('mlx convert GGUF validation', () => {
     const outputDir = join(tmp, 'out');
     mkdirSync(outputDir);
     const staleDraft = join(outputDir, 'draft.safetensors');
+    const preservedExtra = join(outputDir, 'keep.txt');
     writeFileSync(staleDraft, 'stale draft');
-    vi.mocked(convertGgufToSafetensors).mockImplementationOnce(async () => {
-      writeFileSync(join(outputDir, 'config.json'), JSON.stringify({ model_type: 'muse_glimmer' }));
+    writeFileSync(preservedExtra, 'keep me');
+    vi.mocked(convertGgufToSafetensors).mockImplementationOnce(async (options) => {
+      writeFileSync(join(options.outputDir, 'config.json'), JSON.stringify({ model_type: 'muse_glimmer' }));
       return {
         numTensors: 1,
         numParameters: 1,
         sourceFormat: 'Q4_K',
-        outputPath: outputDir,
+        outputPath: options.outputDir,
         tensorNames: ['weight'],
       };
     });
@@ -187,6 +184,49 @@ describe('mlx convert GGUF validation', () => {
     await runConvert(['--input', ggufPath, '--output', outputDir, '--gguf-kquant']);
 
     expect(existsSync(staleDraft)).toBe(false);
+    expect(readFileSync(preservedExtra, 'utf-8')).toBe('keep me');
+  });
+
+  it('leaves an existing Muse output untouched when the staged draft payload is corrupt', async () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    vi.spyOn(console, 'log').mockImplementation(() => {});
+    const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+      throw new Error(`process.exit(${code})`);
+    }) as never);
+    const outputDir = join(tmp, 'out');
+    const draftPath = join(tmp, 'draft.gguf');
+    mkdirSync(outputDir);
+    writeFileSync(draftPath, 'header followed by a truncated payload');
+    const sentinels = {
+      'model.safetensors': 'previous model',
+      'config.json': '{"model_type":"muse_glimmer","dflash_config":{"block_size":16}}',
+      'draft.safetensors': 'previous draft',
+    } as const;
+    for (const [name, value] of Object.entries(sentinels)) writeFileSync(join(outputDir, name), value);
+
+    vi.mocked(convertGgufToSafetensors)
+      .mockImplementationOnce(async (options) => {
+        writeFileSync(join(options.outputDir, 'model.safetensors'), 'new staged model');
+        writeFileSync(join(options.outputDir, 'config.json'), JSON.stringify({ model_type: 'muse_glimmer' }));
+        return {
+          numTensors: 1,
+          numParameters: 1,
+          sourceFormat: 'Q4_K',
+          outputPath: options.outputDir,
+          tensorNames: ['weight'],
+        };
+      })
+      .mockRejectedValueOnce(new Error('unexpected EOF in DFlash tensor payload'));
+
+    await expect(runConvert(['--input', ggufPath, '--output', outputDir, '--draft', draftPath])).rejects.toThrow(
+      'process.exit(1)',
+    );
+
+    for (const [name, value] of Object.entries(sentinels)) {
+      expect(readFileSync(join(outputDir, name), 'utf-8')).toBe(value);
+    }
+    expect(readdirSync(tmp).some((name) => name.startsWith('.mlx-convert-stage-'))).toBe(false);
+    expect(exitSpy).toHaveBeenCalledWith(1);
   });
 
   it('preflights --draft before the primary conversion can mutate the output', async () => {
@@ -205,16 +245,7 @@ describe('mlx convert GGUF validation', () => {
     });
 
     await expect(
-      runConvert([
-        '--input',
-        ggufPath,
-        '--output',
-        join(tmp, 'out'),
-        '--config-dir',
-        configDir,
-        '--draft',
-        draftPath,
-      ]),
+      runConvert(['--input', ggufPath, '--output', join(tmp, 'out'), '--config-dir', configDir, '--draft', draftPath]),
     ).rejects.toThrow('process.exit(1)');
 
     expect(preflightMuseDflashGguf).toHaveBeenCalledWith(draftPath, configDir);

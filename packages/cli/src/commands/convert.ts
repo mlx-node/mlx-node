@@ -1,13 +1,8 @@
-import { readFileSync, existsSync, rmSync, statSync } from 'node:fs';
+import { readFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
-import {
-  convertModel,
-  convertForeignWeights,
-  convertGgufToSafetensors,
-  preflightMuseDflashGguf,
-} from '@mlx-node/core';
+import { convertModel, convertForeignWeights, convertGgufToSafetensors, preflightMuseDflashGguf } from '@mlx-node/core';
 
 // Canonical per-mode defaults for quantization bits/group_size.
 // Mirrors crates/mlx-core/src/convert.rs and crates/mlx-core/src/utils/gguf.rs.
@@ -21,6 +16,74 @@ const QUANT_MODE_DEFAULTS: Record<string, [number, number]> = {
   // layers; sym8 layers themselves carry one f32 scale per output row).
   sym8: [8, 64],
 };
+
+/**
+ * Install a fully converted sibling directory without exposing partial GGUF
+ * output. Existing non-conflicting files are moved into the new directory so
+ * conversion retains the CLI's historical in-place behavior. If any rename
+ * fails, the previous directory is restored before the error escapes.
+ */
+function commitStagedOutput(stageDir: string, outputDir: string, omitPrevious: ReadonlySet<string>): void {
+  if (!existsSync(outputDir)) {
+    renameSync(stageDir, outputDir);
+    return;
+  }
+
+  const parentDir = dirname(outputDir);
+  const backupRoot = mkdtempSync(join(parentDir, '.mlx-convert-backup-'));
+  const previousDir = join(backupRoot, 'previous');
+  const preservedEntries: string[] = [];
+  let previousMoved = false;
+  let stageInstalled = false;
+
+  try {
+    renameSync(outputDir, previousDir);
+    previousMoved = true;
+    renameSync(stageDir, outputDir);
+    stageInstalled = true;
+
+    for (const entry of readdirSync(previousDir)) {
+      if (omitPrevious.has(entry) || existsSync(join(outputDir, entry))) continue;
+      renameSync(join(previousDir, entry), join(outputDir, entry));
+      preservedEntries.push(entry);
+    }
+  } catch (error) {
+    let rollbackError: unknown;
+    try {
+      if (stageInstalled) {
+        for (const entry of preservedEntries.reverse()) {
+          renameSync(join(outputDir, entry), join(previousDir, entry));
+        }
+        renameSync(outputDir, stageDir);
+        stageInstalled = false;
+      }
+      if (previousMoved) {
+        renameSync(previousDir, outputDir);
+        previousMoved = false;
+      }
+    } catch (rollbackFailure) {
+      rollbackError = rollbackFailure;
+    }
+    if (rollbackError) {
+      const commitMessage = error instanceof Error ? error.message : 'unknown commit error';
+      const rollbackMessage = rollbackError instanceof Error ? rollbackError.message : 'unknown rollback error';
+      throw new Error(
+        `Failed to commit staged GGUF output and rollback also failed: ${commitMessage}; rollback: ${rollbackMessage}. Recovery files remain under ${backupRoot}`,
+      );
+    }
+    rmSync(backupRoot, { recursive: true, force: true });
+    throw error;
+  }
+
+  try {
+    rmSync(backupRoot, { recursive: true, force: true });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'unknown cleanup error';
+    console.warn(
+      `Warning: converted output was committed, but its backup could not be removed (${backupRoot}): ${message}`,
+    );
+  }
+}
 
 function printHelp() {
   console.log(`
@@ -581,15 +644,21 @@ export async function run(argv: string[]) {
     }
     console.log('');
 
+    let stagedOutputDir: string | undefined;
     try {
+      const outputParent = dirname(outputDir);
+      mkdirSync(outputParent, { recursive: true });
+      stagedOutputDir = mkdtempSync(join(outputParent, '.mlx-convert-stage-'));
+
       if (draftPath) {
         // Header and target-geometry validation must precede the primary
-        // conversion: that conversion owns and overwrites config.json.
+        // conversion. Payload validation happens when the draft is converted
+        // into stagedOutputDir below, before anything is committed.
         preflightMuseDflashGguf(draftPath, configSourceDir ?? dirname(inputPath));
       }
       const result = await convertGgufToSafetensors({
         inputPath,
-        outputDir,
+        outputDir: stagedOutputDir,
         dtype,
         verbose,
         quantize: args.quantize,
@@ -607,7 +676,7 @@ export async function run(argv: string[]) {
       const duration = ((Date.now() - startTime) / 1000).toFixed(2);
       console.log(`\n✓ Converted ${result.numTensors} tensors (source: ${result.sourceFormat})`);
       console.log(`✓ Total parameters: ${result.numParameters.toLocaleString()}`);
-      console.log(`✓ Output directory: ${result.outputPath}`);
+      console.log(`✓ Output directory: ${outputDir}`);
       console.log(`✓ Duration: ${duration}s`);
 
       if (verbose) {
@@ -617,14 +686,15 @@ export async function run(argv: string[]) {
         }
       }
 
-      // A successful target-only Muse conversion rewrites config.json without
-      // DFlash metadata. Remove an older companion only after that primary
-      // conversion commits; otherwise the loader sees draft.safetensors beside
-      // a config with no dflash_config and refuses the whole checkpoint.
+      // A successful target-only Muse conversion writes config.json without
+      // DFlash metadata. Mark an older companion for omission from the final
+      // directory swap; the live output remains untouched until every staged
+      // conversion has succeeded.
+      let omitPreviousDraft = false;
       if (!draftPath) {
         let isMuseOutput = false;
         try {
-          const outputConfig = JSON.parse(readFileSync(join(outputDir, 'config.json'), 'utf-8')) as {
+          const outputConfig = JSON.parse(readFileSync(join(stagedOutputDir, 'config.json'), 'utf-8')) as {
             model_type?: unknown;
           };
           isMuseOutput = outputConfig.model_type === 'muse_glimmer';
@@ -634,9 +704,7 @@ export async function run(argv: string[]) {
           // based on an unproven family guess.
         }
         if (isMuseOutput) {
-          // Once the family is proven, a deletion failure must fail the command
-          // rather than report a checkpoint that the loader will reject.
-          rmSync(join(outputDir, 'draft.safetensors'), { force: true });
+          omitPreviousDraft = true;
         }
       }
 
@@ -645,7 +713,7 @@ export async function run(argv: string[]) {
         console.log('\nConverting mmproj (vision encoder)...');
         const visionResult = await convertGgufToSafetensors({
           inputPath: mmprojPath,
-          outputDir,
+          outputDir: stagedOutputDir,
           dtype: 'bfloat16',
           verbose,
           quantize: false,
@@ -663,7 +731,7 @@ export async function run(argv: string[]) {
         console.log('\nConverting DFlash speculative drafter...');
         const draftResult = await convertGgufToSafetensors({
           inputPath: draftPath,
-          outputDir,
+          outputDir: stagedOutputDir,
           dtype: 'bfloat16',
           verbose,
           quantize: false,
@@ -673,7 +741,18 @@ export async function run(argv: string[]) {
         });
         console.log(`✓ Converted ${draftResult.numTensors} DFlash tensors`);
       }
+
+      commitStagedOutput(stagedOutputDir, outputDir, omitPreviousDraft ? new Set(['draft.safetensors']) : new Set());
+      stagedOutputDir = undefined;
     } catch (error: any) {
+      if (stagedOutputDir) {
+        try {
+          rmSync(stagedOutputDir, { recursive: true, force: true });
+        } catch (cleanupError) {
+          const message = cleanupError instanceof Error ? cleanupError.message : 'unknown cleanup error';
+          console.warn(`Warning: failed to remove staged GGUF output (${stagedOutputDir}): ${message}`);
+        }
+      }
       console.error('\nGGUF conversion failed:', error.message);
       if (error.stack && verbose) {
         console.error('\nStack trace:', error.stack);
