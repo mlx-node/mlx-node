@@ -132,7 +132,7 @@ async fn drain_stream_outcome(
     mut receiver: tokio::sync::mpsc::Receiver<napi::Result<ChatStreamChunk>>,
 ) -> Result<ChatStreamChunk, String> {
     while let Some(chunk) = receiver.recv().await {
-        let chunk = chunk.map_err(|error| error.reason)?;
+        let chunk = chunk.map_err(|error| error.reason.clone())?;
         if chunk.done {
             return Ok(chunk);
         }

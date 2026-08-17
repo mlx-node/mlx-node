@@ -101,7 +101,11 @@ pub(crate) struct MuseGlimmerInner {
     pub(crate) embed_tokens: Embedding,
     pub(crate) layers: Vec<MuseGlimmerDecoderLayer>,
     pub(crate) final_norm: RMSNorm,
-    pub(crate) lm_head: LinearProj,
+    /// Explicit output projection for untied checkpoints. Tied checkpoints
+    /// project through `embed_tokens.as_linear()` so packed embeddings remain
+    /// packed-resident and a separate `lm_head.weight` is neither required nor
+    /// consulted.
+    pub(crate) lm_head: Option<LinearProj>,
     pub(crate) caches: Vec<Gemma4LayerCache>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) response_template: Arc<ResponseTemplate>,
@@ -138,7 +142,7 @@ impl MuseGlimmerInner {
         embed_tokens: Embedding,
         layers: Vec<MuseGlimmerDecoderLayer>,
         final_norm: RMSNorm,
-        lm_head: LinearProj,
+        lm_head: Option<LinearProj>,
         tokenizer: Arc<Qwen3Tokenizer>,
         response_template: ResponseTemplate,
         gen_defaults: crate::engine::ModelGenerationDefaults,
@@ -605,10 +609,11 @@ impl MuseGlimmerInner {
             hidden.clone()
         };
         let normed = self.final_norm.forward(&hidden)?;
-        let logits = self
-            .lm_head
-            .forward(&normed)?
-            .mul_scalar(self.config.text_config.output_multiplier as f64)?;
+        let logits = match self.lm_head.as_ref() {
+            Some(lm_head) => lm_head.forward(&normed)?,
+            None => self.embed_tokens.as_linear(&normed)?,
+        }
+        .mul_scalar(self.config.text_config.output_multiplier as f64)?;
         let cap = self.config.text_config.final_logit_softcapping as f64;
         logits.div_scalar(cap)?.tanh()?.mul_scalar(cap)
     }

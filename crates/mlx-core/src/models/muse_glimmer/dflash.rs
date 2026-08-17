@@ -53,19 +53,6 @@ fn parallel_query_ids(anchor: u32, mask: usize, draft_len: usize) -> Vec<i32> {
     ids
 }
 
-#[cfg(test)]
-mod tests {
-    use super::parallel_query_ids;
-
-    #[test]
-    fn block_sixteen_has_one_anchor_and_sixteen_sampled_mask_rows() {
-        let ids = parallel_query_ids(7, 201_818, 16);
-        assert_eq!(ids.len(), 17);
-        assert_eq!(ids[0], 7);
-        assert!(ids[1..].iter().all(|&id| id == 201_818));
-    }
-}
-
 fn non_causal_sliding_mask(
     query_base: i32,
     query_len: i64,
@@ -339,7 +326,7 @@ impl DFlashModel {
     pub(crate) fn forward_block(
         &self,
         target_embedding: &Embedding,
-        target_lm_head: &LinearProj,
+        target_lm_head: Option<&LinearProj>,
         target_config: &MuseGlimmerTextConfig,
         block_ids: &MxArray,
         query_base: i32,
@@ -358,9 +345,11 @@ impl DFlashModel {
             hidden = layer.forward(&hidden, cached.as_ref(), context_base, query_base)?;
         }
         let hidden = self.norm.forward(&hidden)?;
-        let logits = target_lm_head
-            .forward(&hidden)?
-            .mul_scalar(target_config.output_multiplier as f64)?;
+        let logits = match target_lm_head {
+            Some(lm_head) => lm_head.forward(&hidden)?,
+            None => target_embedding.as_linear(&hidden)?,
+        }
+        .mul_scalar(target_config.output_multiplier as f64)?;
         let cap = target_config.final_logit_softcapping as f64;
         logits.div_scalar(cap)?.tanh()?.mul_scalar(cap)
     }
@@ -368,7 +357,7 @@ impl DFlashModel {
     pub(crate) fn propose<R: Rng + ?Sized>(
         &self,
         target_embedding: &Embedding,
-        target_lm_head: &LinearProj,
+        target_lm_head: Option<&LinearProj>,
         target_config: &MuseGlimmerTextConfig,
         context: &DFlashContextCache,
         anchor: u32,
@@ -413,5 +402,18 @@ impl DFlashModel {
             }
         }
         Ok((draft_ids, distributions))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parallel_query_ids;
+
+    #[test]
+    fn block_sixteen_has_one_anchor_and_sixteen_sampled_mask_rows() {
+        let ids = parallel_query_ids(7, 201_818, 16);
+        assert_eq!(ids.len(), 17);
+        assert_eq!(ids[0], 7);
+        assert!(ids[1..].iter().all(|&id| id == 201_818));
     }
 }

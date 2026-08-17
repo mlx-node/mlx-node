@@ -2603,7 +2603,8 @@ fn merge_muse_secondary_quantization(
     import_k_quants: bool,
 ) -> Result<()> {
     let profiles = source_quantization_profiles(gguf, import_k_quants)?;
-    if profiles.is_empty() {
+    let is_dflash = is_muse_glimmer_dflash_gguf(&gguf.metadata);
+    if profiles.is_empty() && !is_dflash {
         return Ok(());
     }
     let data = fs::read_to_string(config_path).map_err(|e| {
@@ -2616,22 +2617,24 @@ fn merge_muse_secondary_quantization(
         Error::from_reason(format!("Failed to parse {}: {e}", config_path.display()))
     })?;
 
-    for key in ["quantization", "quantization_config"] {
-        let quant = config
-            .get_mut(key)
-            .and_then(serde_json::Value::as_object_mut)
-            .ok_or_else(|| {
-                Error::from_reason(format!(
-                    "Muse-Glimmer companion GGUF is K-quantized but {} has no object-valued '{key}' from the primary GGUF conversion",
-                    config_path.display()
-                ))
-            })?;
-        for (prefix, profile) in &profiles {
-            quant.insert(prefix.clone(), profile.to_json());
+    if !profiles.is_empty() {
+        for key in ["quantization", "quantization_config"] {
+            let quant = config
+                .get_mut(key)
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "Muse-Glimmer companion GGUF is K-quantized but {} has no object-valued '{key}' from the primary GGUF conversion",
+                        config_path.display()
+                    ))
+                })?;
+            for (prefix, profile) in &profiles {
+                quant.insert(prefix.clone(), profile.to_json());
+            }
         }
     }
 
-    if is_muse_glimmer_dflash_gguf(&gguf.metadata) {
+    if is_dflash {
         let read_u32 = |key: &str| -> Result<u32> {
             gguf.metadata
                 .get(key)
@@ -5142,6 +5145,69 @@ mod tests {
                 "mapping mismatch for {source}"
             );
         }
+    }
+
+    #[test]
+    fn floating_point_dflash_still_writes_runtime_metadata() {
+        let mut metadata = muse_glimmer_dflash_metadata();
+        for (key, value) in [
+            ("dflash.block_count", 5),
+            ("dflash.block_size", 16),
+            ("dflash.embedding_length", 512),
+            ("dflash.feed_forward_length", 1536),
+            ("dflash.attention.head_count", 8),
+            ("dflash.attention.head_count_kv", 2),
+            ("dflash.attention.key_length", 64),
+            ("dflash.attention.sliding_window", 2048),
+            ("dflash.context_length", 131_072),
+            ("tokenizer.ggml.mask_token_id", 201_818),
+        ] {
+            metadata.insert(key.to_string(), GgufMetaValue::Uint32(value));
+        }
+        metadata.insert(
+            "dflash.target_layers".to_string(),
+            GgufMetaValue::ArrayU32(vec![1, 8, 16]),
+        );
+        metadata.insert(
+            "dflash.attention.layer_norm_rms_epsilon".to_string(),
+            GgufMetaValue::Float32(1e-6),
+        );
+        metadata.insert(
+            "dflash.rope.freq_base".to_string(),
+            GgufMetaValue::Float32(10_000.0),
+        );
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 0,
+            metadata,
+            tensors: Vec::new(),
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock after epoch")
+            .as_nanos();
+        let config_path = std::env::temp_dir().join(format!(
+            "mlx-node-muse-dflash-{}-{unique}.json",
+            std::process::id()
+        ));
+        fs::write(&config_path, "{}").expect("write primary config");
+
+        merge_muse_secondary_quantization(&config_path, &gguf, true)
+            .expect("merge floating-point DFlash metadata");
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).expect("read merged config"))
+                .expect("parse merged config");
+        fs::remove_file(&config_path).ok();
+
+        let dflash = config
+            .get("dflash_config")
+            .expect("floating-point DFlash must still write its config");
+        assert_eq!(dflash["block_size"], 16);
+        assert_eq!(dflash["target_layers"], serde_json::json!([0, 7, 15]));
+        assert_eq!(dflash["mask_token_id"], 201_818);
+        assert!(config.get("quantization").is_none());
     }
 
     #[test]

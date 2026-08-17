@@ -123,25 +123,16 @@ fn load_embedding(
     Ok(embedding)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::quant_lookup_prefix;
-
-    #[test]
-    fn target_and_dflash_quantization_namespaces_stay_distinct() {
-        assert_eq!(
-            quant_lookup_prefix("model.language_model.layers.0.self_attn.q_proj"),
-            "language_model.layers.0.self_attn.q_proj"
-        );
-        assert_eq!(
-            quant_lookup_prefix("layers.0.self_attn.q_proj"),
-            "layers.0.self_attn.q_proj"
-        );
-        assert_eq!(
-            quant_lookup_prefix("model.language_model.embed_tokens"),
-            "language_model.embed_tokens"
-        );
-        assert_eq!(quant_lookup_prefix("lm_head"), "lm_head");
+fn load_lm_head(
+    params: &HashMap<String, MxArray>,
+    tie_word_embeddings: bool,
+    default: PerLayerQuant,
+    overrides: &HashMap<String, PerLayerQuant>,
+) -> Result<Option<LinearProj>> {
+    if tie_word_embeddings {
+        Ok(None)
+    } else {
+        build_projection(params, "lm_head", default, overrides).map(Some)
     }
 }
 
@@ -446,7 +437,7 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
         default,
         &overrides,
     )?;
-    let lm_head = build_projection(&params, "lm_head", default, &overrides)?;
+    let lm_head = load_lm_head(&params, text.tie_word_embeddings, default, &overrides)?;
     let final_norm = norm(
         &params,
         "model.language_model.norm.weight",
@@ -621,4 +612,52 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
         _cache_limit_guard: cache_limit_guard,
         _pool_cache_limit_guard: pool_cache_limit_guard,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{load_lm_head, quant_lookup_prefix};
+    use crate::array::MxArray;
+    use crate::models::gemma4::quantized_linear::{PerLayerMode, PerLayerQuant};
+    use std::collections::HashMap;
+
+    #[test]
+    fn target_and_dflash_quantization_namespaces_stay_distinct() {
+        assert_eq!(
+            quant_lookup_prefix("model.language_model.layers.0.self_attn.q_proj"),
+            "language_model.layers.0.self_attn.q_proj"
+        );
+        assert_eq!(
+            quant_lookup_prefix("layers.0.self_attn.q_proj"),
+            "layers.0.self_attn.q_proj"
+        );
+        assert_eq!(
+            quant_lookup_prefix("model.language_model.embed_tokens"),
+            "language_model.embed_tokens"
+        );
+        assert_eq!(quant_lookup_prefix("lm_head"), "lm_head");
+    }
+
+    #[test]
+    fn tied_embeddings_do_not_require_an_lm_head_tensor() {
+        let params = HashMap::<String, MxArray>::new();
+        let overrides = HashMap::new();
+        let default = PerLayerQuant {
+            bits: 4,
+            group_size: 64,
+            mode: PerLayerMode::Affine,
+            input_amax: None,
+        };
+
+        assert!(
+            load_lm_head(&params, true, default, &overrides)
+                .expect("tied embedding head")
+                .is_none()
+        );
+        let error = match load_lm_head(&params, false, default, &overrides) {
+            Ok(_) => panic!("untied checkpoint must still require lm_head.weight"),
+            Err(error) => error,
+        };
+        assert!(error.reason.contains("lm_head.weight"), "{error}");
+    }
 }

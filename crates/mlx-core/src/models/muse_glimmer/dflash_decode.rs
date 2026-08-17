@@ -122,7 +122,7 @@ impl DsparkStepper for MuseGlimmerDFlashStepper<'_> {
         let sampling = params.sampling_config.unwrap_or_default();
         let (draft_ids, draft_dists) = draft.propose(
             &self.inner.embed_tokens,
-            &self.inner.lm_head,
+            self.inner.lm_head.as_ref(),
             &self.inner.config.text_config,
             &self.context,
             anchor_id,
