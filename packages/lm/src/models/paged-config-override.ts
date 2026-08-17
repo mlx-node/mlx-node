@@ -15,7 +15,15 @@ import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
 /** Every chat-capable family currently discovered by `@mlx-node/agent`. */
-export const AGENT_PAGED_MODEL_TYPES = ['qwen3', 'qwen3_5', 'qwen3_5_moe', 'gemma4', 'lfm2', 'lfm2_moe'] as const;
+export const AGENT_PAGED_MODEL_TYPES = [
+  'qwen3',
+  'qwen3_5',
+  'qwen3_5_moe',
+  'gemma4',
+  'muse_glimmer',
+  'lfm2',
+  'lfm2_moe',
+] as const;
 
 /** Families historically forced paged by `mlx launch claude`. */
 export const QWEN35_PAGED_MODEL_TYPES = ['qwen3_5', 'qwen3_5_moe'] as const;

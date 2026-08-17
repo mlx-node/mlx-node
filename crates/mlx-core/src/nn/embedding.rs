@@ -81,6 +81,22 @@ pub struct Embedding {
 }
 
 impl Embedding {
+    /// Construct only the embedding metadata plus a tiny placeholder. Loaders
+    /// that immediately install mmap-backed dense or packed weights avoid
+    /// building a checkpoint-sized random initialization graph first.
+    pub(crate) fn new_uninitialized(num_embeddings: u32, embedding_dim: u32) -> Result<Self> {
+        Ok(Self {
+            weight: MxArray::zeros(&[1, 1], None)?,
+            num_embeddings,
+            embedding_dim,
+            is_quantized_flag: false,
+            quantized_packed: None,
+            sharded: None,
+            #[cfg(test)]
+            packed_full_dequant_calls: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
     /// Create a new Embedding layer
     pub fn new(num_embeddings: u32, embedding_dim: u32) -> Result<Self> {
         // Initialize with normal distribution

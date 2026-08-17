@@ -436,6 +436,9 @@ pub(crate) fn sidecar_counter_test_lock() -> std::sync::MutexGuard<'static, ()> 
 ///    The full-attention chain is the authority; a `ColdGroup::SlidingWindow`
 ///    sidecar stores every sliding group at the same exact block boundary. A
 ///    restore installs every group atomically or discards the candidate.
+///  * `muse_glimmer` uses the same grouped hybrid contract: its 13 full layers
+///    own the persisted K/V chain and one sidecar restores all 39 sliding
+///    layers at the reconciled boundary.
 ///  * `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
 ///    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
 ///    `ColdGroup::GdnState` sidecar (`crate::models::qwen3_5::gdn_sidecar`). A
@@ -465,6 +468,7 @@ const COLD_RESTORE_FAMILIES: &[&str] = &[
     "qwen3_5",
     "qwen3_5_moe",
     "gemma4",
+    "muse_glimmer",
     "lfm2",
     "lfm2_moe",
 ];
@@ -1350,6 +1354,8 @@ mod tests {
         // Gemma4 restores full and sliding groups at one exact boundary.
         assert!(cold_restore_supported("gemma4"));
         assert!(resolve_persist_cold("gemma4", Some("1"), Some(true)));
+        assert!(cold_restore_supported("muse_glimmer"));
+        assert!(resolve_persist_cold("muse_glimmer", Some("1"), Some(true)));
         // Hybrid, admitted only because its out-of-pool GDN recurrent state is
         // persisted as a `ColdGroup::GdnState` sidecar AND its restart-parity
         // gate passes on real weights
@@ -1374,6 +1380,8 @@ mod tests {
             "qwen3_5 ",
             "Gemma4",
             "gemma4_text",
+            "Muse_Glimmer",
+            "muse_glimmer_text",
             "",
         ] {
             assert!(
@@ -1390,6 +1398,7 @@ mod tests {
                 "qwen3_5".to_string(),
                 "qwen3_5_moe".to_string(),
                 "gemma4".to_string(),
+                "muse_glimmer".to_string(),
                 "lfm2".to_string(),
                 "lfm2_moe".to_string()
             ]

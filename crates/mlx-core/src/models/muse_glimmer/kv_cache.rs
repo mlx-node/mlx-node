@@ -2112,7 +2112,7 @@ mod tests {
         // `AttentionKind::SlidingWindow` or `sliding_window`, which this seam
         // itself talks about constantly.
         const WIRING_MARKERS: [&str; 6] = [
-            "new_sliding",
+            "PagedKVCacheAdapter::new_sliding",
             "mlx_paged_attention",
             "gather_kv_for_prefill",
             "read_kv_range",
@@ -2191,7 +2191,7 @@ mod tests {
         // scan still reaches everything" can be checked at all, since a scan
         // that silently stopped descending would otherwise just report fewer
         // files and still pass a loose floor.
-        const FAMILY_FILES: usize = 5; // config, kv_cache, mod, output_parser, stream_guard
+        const FAMILY_FILES: usize = 14;
         assert!(
             checked >= FAMILY_FILES,
             "the tripwire scanned only {checked} file(s), fewer than the {FAMILY_FILES} this \

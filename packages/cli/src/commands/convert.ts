@@ -43,6 +43,8 @@ Optional Arguments:
 Vision Arguments:
   --mmproj <path>       Path to mmproj GGUF file (vision encoder weights)
                         Converts and merges vision weights into output directory
+  --draft <path>        Path to Muse-Glimmer DFlash GGUF file
+                        Converts it to draft.safetensors beside the target
 
 Quantization Arguments:
   --quantize, -q        Enable quantization of converted weights
@@ -213,6 +215,7 @@ export async function run(argv: string[]) {
       'imatrix-path': { type: 'string' },
       'config-dir': { type: 'string' },
       mmproj: { type: 'string' },
+      draft: { type: 'string' },
       'gguf-kquant': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
@@ -474,6 +477,18 @@ export async function run(argv: string[]) {
     }
   }
 
+  const draftPath = args.draft ? resolve(args.draft) : undefined;
+  if (draftPath !== undefined) {
+    if (!existsSync(draftPath)) {
+      console.error(`Error: draft file not found: ${draftPath}`);
+      process.exit(1);
+    }
+    if (!draftPath.endsWith('.gguf')) {
+      console.error('Error: --draft must point to a .gguf file');
+      process.exit(1);
+    }
+  }
+
   const imatrixPath = args['imatrix-path'] ? resolve(args['imatrix-path']) : undefined;
   if (imatrixPath !== undefined) {
     if (!existsSync(imatrixPath)) {
@@ -553,6 +568,9 @@ export async function run(argv: string[]) {
     if (mmprojPath) {
       console.log(`mmproj:     ${mmprojPath}`);
     }
+    if (draftPath) {
+      console.log(`DFlash:    ${draftPath}`);
+    }
     if (configSourceDir) {
       console.log(`Config dir: ${configSourceDir}`);
     }
@@ -606,6 +624,21 @@ export async function run(argv: string[]) {
           outputFilename: 'vision.safetensors',
         });
         console.log(`✓ Converted ${visionResult.numTensors} vision tensors`);
+      }
+
+      if (draftPath) {
+        console.log('\nConverting DFlash speculative drafter...');
+        const draftResult = await convertGgufToSafetensors({
+          inputPath: draftPath,
+          outputDir,
+          dtype: 'bfloat16',
+          verbose,
+          quantize: false,
+          importKQuants: args['gguf-kquant'],
+          configSourceDir,
+          outputFilename: 'draft.safetensors',
+        });
+        console.log(`✓ Converted ${draftResult.numTensors} DFlash tensors`);
       }
     } catch (error: any) {
       console.error('\nGGUF conversion failed:', error.message);

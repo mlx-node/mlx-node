@@ -11,6 +11,7 @@ import {
   Gemma4Model as NativeGemma4Model,
   HarrierModel,
   Lfm2Model as NativeLfm2Model,
+  MuseGlimmerModel as NativeMuseGlimmerModel,
   QianfanOCRModel,
   Qwen3Model as NativeQwen3Model,
   Qwen35Model as NativeQwen35Model,
@@ -18,7 +19,7 @@ import {
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
-import { Gemma4Model, Lfm2Model, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
+import { Gemma4Model, Lfm2Model, MuseGlimmerModel, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
 /** Optional settings for {@link loadModel} / {@link loadSession}. */
 export interface LoadModelOptions {
@@ -116,6 +117,16 @@ const MODEL_FAMILY_REGISTRY = [
       ),
     nativeModelClass: NativeGemma4Model,
     acceptsDraftModel: true,
+  },
+  {
+    modelType: 'muse_glimmer',
+    kind: 'loadable',
+    match: {
+      rawModelTypes: ['muse_glimmer', 'muse_glimmer_text'],
+      architectureProbe: ({ architectures }) => architectures.has('MuseGlimmerForConditionalGeneration'),
+    },
+    load: (modelPath: string) => MuseGlimmerModel.load(modelPath),
+    nativeModelClass: NativeMuseGlimmerModel,
   },
   {
     modelType: 'harrier',

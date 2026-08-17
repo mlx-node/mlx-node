@@ -107,7 +107,7 @@ pub(crate) struct Gemma4KVCacheCoordinator {
 }
 
 impl Gemma4KVCacheCoordinator {
-    fn new(
+    pub(crate) fn new(
         specs: &[LayerKVCacheSpec],
         groups: Vec<KVCacheGroup>,
         adapters: Vec<PagedKVCacheAdapter>,
@@ -158,11 +158,11 @@ impl Gemma4KVCacheCoordinator {
         })
     }
 
-    fn routes(&self) -> &[LayerKVCacheRoute] {
+    pub(crate) fn routes(&self) -> &[LayerKVCacheRoute] {
         self.inner.routes()
     }
 
-    fn sliding_capacity_summary(&self) -> (usize, u32, u32) {
+    pub(crate) fn sliding_capacity_summary(&self) -> (usize, u32, u32) {
         self.inner
             .groups()
             .iter()
@@ -199,7 +199,7 @@ impl Gemma4KVCacheCoordinator {
         })
     }
 
-    fn prepare_scheduled_request(
+    pub(crate) fn prepare_scheduled_request(
         &mut self,
         seq_id: u32,
         tokens: &[u32],
@@ -211,7 +211,10 @@ impl Gemma4KVCacheCoordinator {
         Ok(0)
     }
 
-    fn reset_scheduled_request(&mut self, seq_id: u32) -> std::result::Result<(), String> {
+    pub(crate) fn reset_scheduled_request(
+        &mut self,
+        seq_id: u32,
+    ) -> std::result::Result<(), String> {
         let _ = self.release_request_all(seq_id);
         for group_id in 0..self.inner.groups().len() {
             let result = self.adapter_mut(group_id)?.begin_request(seq_id);
@@ -225,7 +228,10 @@ impl Gemma4KVCacheCoordinator {
         Ok(())
     }
 
-    fn reset_sliding_requests(&mut self, seq_id: u32) -> std::result::Result<(), String> {
+    pub(crate) fn reset_sliding_requests(
+        &mut self,
+        seq_id: u32,
+    ) -> std::result::Result<(), String> {
         for group_id in 0..self.inner.groups().len() {
             if let Some(Gemma4KVCacheGroupManager::SlidingWindow { adapter, .. }) =
                 self.inner.manager_mut(group_id)
@@ -237,7 +243,7 @@ impl Gemma4KVCacheCoordinator {
         Ok(())
     }
 
-    fn restore_sliding_groups(
+    pub(crate) fn restore_sliding_groups(
         &mut self,
         seq_id: u32,
         prompt_tokens: &[u32],
@@ -268,7 +274,7 @@ impl Gemma4KVCacheCoordinator {
         Ok(())
     }
 
-    fn read_sliding_groups_at(
+    pub(crate) fn read_sliding_groups_at(
         &mut self,
         seq_id: u32,
         boundary: u32,
@@ -302,7 +308,10 @@ impl Gemma4KVCacheCoordinator {
         Ok(Some(layer_kv))
     }
 
-    fn adapter(&self, group_id: usize) -> std::result::Result<&PagedKVCacheAdapter, String> {
+    pub(crate) fn adapter(
+        &self,
+        group_id: usize,
+    ) -> std::result::Result<&PagedKVCacheAdapter, String> {
         if group_id == self.full_group_id {
             return Ok(&self.full_adapter);
         }
@@ -316,7 +325,7 @@ impl Gemma4KVCacheCoordinator {
         }
     }
 
-    fn adapter_mut(
+    pub(crate) fn adapter_mut(
         &mut self,
         group_id: usize,
     ) -> std::result::Result<&mut PagedKVCacheAdapter, String> {
@@ -344,14 +353,14 @@ impl Gemma4KVCacheCoordinator {
         Ok(())
     }
 
-    fn activate_request_all(&mut self, seq_id: u32) -> std::result::Result<(), String> {
+    pub(crate) fn activate_request_all(&mut self, seq_id: u32) -> std::result::Result<(), String> {
         for group_id in 0..self.inner.groups().len() {
             self.adapter_mut(group_id)?.activate_request(seq_id)?;
         }
         Ok(())
     }
 
-    fn can_continue_all(&self, seq_id: u32, prompt_tokens: &[u32]) -> bool {
+    pub(crate) fn can_continue_all(&self, seq_id: u32, prompt_tokens: &[u32]) -> bool {
         (0..self.inner.groups().len()).all(|group_id| {
             let Ok(adapter) = self.adapter(group_id) else {
                 return false;
@@ -363,14 +372,14 @@ impl Gemma4KVCacheCoordinator {
         })
     }
 
-    fn is_live_all(&self, seq_id: u32) -> bool {
+    pub(crate) fn is_live_all(&self, seq_id: u32) -> bool {
         (0..self.inner.groups().len()).all(|group_id| {
             self.adapter(group_id)
                 .is_ok_and(|adapter| adapter.is_live_for_continue_for(seq_id))
         })
     }
 
-    fn request_token_count_all(&self, seq_id: u32) -> std::result::Result<u32, String> {
+    pub(crate) fn request_token_count_all(&self, seq_id: u32) -> std::result::Result<u32, String> {
         let mut count = None;
         for group_id in 0..self.inner.groups().len() {
             let adapter = self.adapter(group_id)?;
@@ -390,7 +399,7 @@ impl Gemma4KVCacheCoordinator {
         count.ok_or_else(|| "Gemma4 hybrid KV coordinator has no groups".to_string())
     }
 
-    fn continue_turn_all(
+    pub(crate) fn continue_turn_all(
         &mut self,
         seq_id: u32,
         prompt_tokens: &[u32],
@@ -413,7 +422,7 @@ impl Gemma4KVCacheCoordinator {
         Ok(boundary.unwrap_or(0))
     }
 
-    fn continue_sliding_all(
+    pub(crate) fn continue_sliding_all(
         &mut self,
         seq_id: u32,
         prompt_tokens: &[u32],
@@ -437,7 +446,7 @@ impl Gemma4KVCacheCoordinator {
         Ok(())
     }
 
-    fn record_tokens_all(
+    pub(crate) fn record_tokens_all(
         &mut self,
         seq_id: u32,
         tokens: &[u32],
@@ -459,7 +468,7 @@ impl Gemma4KVCacheCoordinator {
         Ok(())
     }
 
-    fn prune_sliding_all(&mut self, seq_id: u32) -> std::result::Result<u32, String> {
+    pub(crate) fn prune_sliding_all(&mut self, seq_id: u32) -> std::result::Result<u32, String> {
         let mut released = 0u32;
         for group_id in 0..self.inner.groups().len() {
             released = released.saturating_add(
@@ -470,14 +479,14 @@ impl Gemma4KVCacheCoordinator {
         Ok(released)
     }
 
-    fn eval_pending_pool_writes_all(&mut self) -> std::result::Result<(), String> {
+    pub(crate) fn eval_pending_pool_writes_all(&mut self) -> std::result::Result<(), String> {
         for group_id in 0..self.inner.groups().len() {
             self.adapter_mut(group_id)?.eval_pending_pool_writes()?;
         }
         Ok(())
     }
 
-    fn finalize_keep_live_all(
+    pub(crate) fn finalize_keep_live_all(
         &mut self,
         seq_id: u32,
         extra_keys_per_block: &[Vec<u64>],
@@ -496,7 +505,7 @@ impl Gemma4KVCacheCoordinator {
         Ok(())
     }
 
-    fn register_full_for_cold_capture(
+    pub(crate) fn register_full_for_cold_capture(
         &mut self,
         seq_id: u32,
         extra_keys_per_block: &[Vec<u64>],
@@ -509,7 +518,7 @@ impl Gemma4KVCacheCoordinator {
             .map(|_| ())
     }
 
-    fn rollback_last_tokens_all(
+    pub(crate) fn rollback_last_tokens_all(
         &mut self,
         seq_id: u32,
         token_count: u32,
@@ -526,7 +535,7 @@ impl Gemma4KVCacheCoordinator {
         first_error.map_or(Ok(()), Err)
     }
 
-    fn release_request_all(&mut self, seq_id: u32) -> std::result::Result<u32, String> {
+    pub(crate) fn release_request_all(&mut self, seq_id: u32) -> std::result::Result<u32, String> {
         let mut released = 0u32;
         let mut first_error = None;
         for group_id in 0..self.inner.groups().len() {
@@ -540,7 +549,7 @@ impl Gemma4KVCacheCoordinator {
         first_error.map_or(Ok(released), Err)
     }
 
-    fn release_all_and_purge(&mut self) -> std::result::Result<u32, String> {
+    pub(crate) fn release_all_and_purge(&mut self) -> std::result::Result<u32, String> {
         let mut released = 0u32;
         let mut first_error = None;
         for group_id in 0..self.inner.groups().len() {
@@ -6344,7 +6353,7 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         if self.pending_cache_error.is_none() {
             let seq_id = self.inner.active_paged_seq;
             if let Err(error) = self.inner.settle_grouped_kv_step(seq_id) {
-                self.pending_cache_error = Some(error.reason);
+                self.pending_cache_error = Some(error.reason.clone());
             }
         }
         // Paged cadence — the per-step
@@ -6356,7 +6365,7 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         if self.pending_cache_error.is_none() {
             let seq_id = self.inner.active_paged_seq;
             if let Err(error) = self.inner.settle_grouped_kv_step(seq_id) {
-                self.pending_cache_error = Some(error.reason);
+                self.pending_cache_error = Some(error.reason.clone());
             }
         }
         self.pending_cache_error

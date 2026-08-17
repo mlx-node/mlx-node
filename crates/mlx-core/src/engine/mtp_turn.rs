@@ -1438,7 +1438,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
                     *s.streamed_text_len,
                 );
                 *s.streamed_text_len += token_text.len();
-                s.emitter.on_token_text(
+                s.emitter.on_token_id(
+                    initial_token_id,
                     &token_text,
                     _is_reasoning,
                     p.include_reasoning,
@@ -1637,7 +1638,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
                     *s.streamed_text_len,
                 );
                 *s.streamed_text_len += token_text.len();
-                s.emitter.on_token_text(
+                s.emitter.on_token_id(
+                    token_id,
                     &token_text,
                     _is_reasoning,
                     p.include_reasoning,
@@ -1946,7 +1948,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
                     *s.streamed_text_len,
                 );
                 *s.streamed_text_len += token_text.len();
-                s.emitter.on_token_text(
+                s.emitter.on_token_id(
+                    tok_id,
                     &token_text,
                     _is_reasoning,
                     p.include_reasoning,

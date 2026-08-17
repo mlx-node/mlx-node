@@ -1144,6 +1144,31 @@ fn is_gemma4_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
                 == Some("gemma4ua"))
 }
 
+fn is_muse_glimmer_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("muse-glimmer")
+}
+
+fn is_muse_glimmer_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("clip")
+        && metadata
+            .get("clip.projector_type")
+            .and_then(GgufMetaValue::as_str)
+            == Some("muse-glimmer")
+}
+
+fn is_muse_glimmer_dflash_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("dflash")
+}
+
 /// The three names a quantized tensor group ships under. Both GGUF quant
 /// importers emit the same trio: `load_quantized_tensor` (affine Q4_0/Q4_1/Q8_0)
 /// and `load_kquant_repack` (Q4_K/Q5_K/Q6_K) each write `{base}.weight` plus a
@@ -1249,6 +1274,123 @@ fn gemma4_mmproj_name_to_hf(name: &str) -> Option<String> {
     Some(mapped.to_string())
 }
 
+/// Map the official Meta Muse-Glimmer text GGUF onto the canonical
+/// `MuseGlimmerForConditionalGeneration` SafeTensors namespace.
+///
+/// llama.cpp materializes scale-free Q/K RMSNorms as explicit all-one
+/// tensors. The HF/MLX architecture has no parameters for those operations,
+/// so they are intentionally omitted rather than becoming unused checkpoint
+/// keys. Query pre-scaling remains a config value (`qk_scale_factor`).
+fn muse_glimmer_name_to_hf(name: &str) -> Option<String> {
+    if name.ends_with(".attn_q_norm.weight") || name.ends_with(".attn_k_norm.weight") {
+        return None;
+    }
+    if name == "rope_freqs.weight" {
+        return None;
+    }
+
+    let mut result = name.to_string();
+    if result.starts_with("blk.") {
+        result = result.replacen("blk.", "model.language_model.layers.", 1);
+    }
+    result = result.replace(".attn_q.", ".self_attn.q_proj.");
+    result = result.replace(".attn_k.", ".self_attn.k_proj.");
+    result = result.replace(".attn_v.", ".self_attn.v_proj.");
+    result = result.replace(".attn_output.", ".self_attn.o_proj.");
+    result = result.replace(".attn_gate.", ".self_attn.gate_proj.");
+    result = result.replace(".ffn_gate.", ".mlp.gate_proj.");
+    result = result.replace(".ffn_down.", ".mlp.down_proj.");
+    result = result.replace(".ffn_up.", ".mlp.up_proj.");
+    result = result.replace(".attn_norm.", ".input_layernorm.");
+    result = result.replace(".post_attention_norm.", ".post_attention_layernorm.");
+    result = result.replace(".ffn_norm.", ".pre_feedforward_layernorm.");
+    result = result.replace(".post_ffw_norm.", ".post_feedforward_layernorm.");
+
+    if let Some(renamed) =
+        rename_global_quant_group(&result, "token_embd", "model.language_model.embed_tokens")
+    {
+        result = renamed;
+    } else if result == "output_norm.weight" {
+        result = "model.language_model.norm.weight".to_string();
+    } else if let Some(renamed) = rename_global_quant_group(&result, "output", "lm_head") {
+        result = renamed;
+    }
+    Some(result)
+}
+
+/// Map Meta's separate `mmproj-*.gguf` file onto the same namespace used by
+/// the original Muse-Glimmer SafeTensors release.
+fn muse_glimmer_mmproj_name_to_hf(name: &str) -> Option<String> {
+    let mut result = name.to_string();
+    if result.starts_with("v.blk.") {
+        result = result.replacen("v.blk.", "model.vision_tower.layers.", 1);
+        result = result.replace(".attn_q.", ".attn.q_proj.");
+        result = result.replace(".attn_k.", ".attn.k_proj.");
+        result = result.replace(".attn_v.", ".attn.v_proj.");
+        result = result.replace(".attn_out.", ".attn.proj.");
+        result = result.replace(".ffn_up.", ".mlp.fc1.");
+        result = result.replace(".ffn_down.", ".mlp.fc2.");
+        result = result.replace(".ln1.", ".norm1.");
+        result = result.replace(".ln2.", ".norm2.");
+        return Some(result);
+    }
+
+    for (from, to) in [
+        (
+            "v.patch_embd",
+            "model.vision_tower.patch_embedder.patch_embedding",
+        ),
+        (
+            "v.position_embd",
+            "model.vision_tower.patch_embedder.position_embedding_table",
+        ),
+        ("v.pre_ln", "model.vision_tower.ln_pre"),
+        ("v.post_ln", "model.vision_tower.ln_post"),
+        ("mm.0", "model.vision_adapter.fc1"),
+        ("mm.1", "model.vision_adapter.fc2"),
+        ("mm.2", "model.vision_projection"),
+    ] {
+        if let Some(renamed) = rename_global_quant_group(name, from, to) {
+            return Some(renamed);
+        }
+        if let Some(suffix) = name.strip_prefix(from)
+            && matches!(suffix, ".bias")
+        {
+            return Some(format!("{to}{suffix}"));
+        }
+    }
+    Some(result)
+}
+
+/// Map the companion DFlash GGUF to a compact, self-contained drafter
+/// namespace. The target embedding and lm_head are intentionally absent from
+/// this file: Meta's drafter shares both with the target model.
+fn muse_glimmer_dflash_name_to_hf(name: &str) -> Option<String> {
+    let mut result = name.to_string();
+    if result.starts_with("blk.") {
+        result = result.replacen("blk.", "layers.", 1);
+        result = result.replace(".attn_q.", ".self_attn.q_proj.");
+        result = result.replace(".attn_k.", ".self_attn.k_proj.");
+        result = result.replace(".attn_v.", ".self_attn.v_proj.");
+        result = result.replace(".attn_output.", ".self_attn.o_proj.");
+        result = result.replace(".attn_q_norm.", ".self_attn.q_norm.");
+        result = result.replace(".attn_k_norm.", ".self_attn.k_norm.");
+        result = result.replace(".ffn_gate.", ".mlp.gate_proj.");
+        result = result.replace(".ffn_up.", ".mlp.up_proj.");
+        result = result.replace(".ffn_down.", ".mlp.down_proj.");
+        result = result.replace(".attn_norm.", ".input_layernorm.");
+        result = result.replace(".ffn_norm.", ".post_attention_layernorm.");
+        return Some(result);
+    }
+    if let Some(renamed) = rename_global_quant_group(name, "enc.output_norm", "hidden_norm") {
+        return Some(renamed);
+    }
+    if let Some(renamed) = rename_global_quant_group(name, "output_norm", "norm") {
+        return Some(renamed);
+    }
+    Some(result)
+}
+
 fn gguf_name_to_hf_for_metadata(
     name: &str,
     metadata: &HashMap<String, GgufMetaValue>,
@@ -1257,6 +1399,12 @@ fn gguf_name_to_hf_for_metadata(
         gemma4_name_to_hf(name)
     } else if is_gemma4_mmproj_gguf(metadata) {
         gemma4_mmproj_name_to_hf(name)
+    } else if is_muse_glimmer_main_gguf(metadata) {
+        muse_glimmer_name_to_hf(name)
+    } else if is_muse_glimmer_mmproj_gguf(metadata) {
+        muse_glimmer_mmproj_name_to_hf(name)
+    } else if is_muse_glimmer_dflash_gguf(metadata) {
+        muse_glimmer_dflash_name_to_hf(name)
     } else {
         Some(gguf_name_to_hf(name))
     }
@@ -1900,10 +2048,11 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
     // with existing Gemma4 K-quant conversions and because neither GGUF value is
     // the whole story there.
     let is_qwen_family = matches!(arch.as_str(), "qwen3" | "qwen35" | "qwen35moe");
+    let has_independent_head_dim = is_qwen_family || arch == "muse-glimmer";
     // A key_length of 0 is not a head dim; fall through to the derivation
     // rather than writing a config that divides by it downstream. Same guard
     // the `heads > 0` arm below applies to the derived value.
-    let key_length = if is_qwen_family {
+    let key_length = if has_independent_head_dim {
         metadata
             .get(&format!("{arch}.attention.key_length"))
             .and_then(|v| v.as_u32())
@@ -2370,30 +2519,9 @@ fn preserved_source_quantization(
     gguf: &GgufFile,
     import_k_quants: bool,
 ) -> Result<Option<serde_json::Value>> {
-    let mut profiles = std::collections::BTreeMap::<String, SourceQuantProfile>::new();
+    let profiles = source_quantization_profiles(gguf, import_k_quants)?;
     let mut profile_counts = HashMap::<SourceQuantProfile, usize>::new();
-
-    for tensor in &gguf.tensors {
-        if !import_k_quants && tensor.tensor_type.k_quant_format().is_some() {
-            continue;
-        }
-        let Some(profile) = SourceQuantProfile::for_gguf_type(tensor.tensor_type) else {
-            continue;
-        };
-        let Some(mapped) = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata) else {
-            continue;
-        };
-        let prefix = mapped.strip_suffix(".weight").unwrap_or(&mapped);
-        let prefix = super::normalize_override_key(prefix);
-        if let Some(previous) = profiles.insert(prefix.clone(), profile)
-            && previous != profile
-        {
-            return Err(Error::from_reason(format!(
-                "GGUF source quantization collision: '{prefix}' resolves to both {} and {} tensors",
-                previous.describe(),
-                profile.describe()
-            )));
-        }
+    for &profile in profiles.values() {
         *profile_counts.entry(profile).or_default() += 1;
     }
 
@@ -2433,6 +2561,136 @@ fn preserved_source_quantization(
         }
     }
     Ok(Some(serde_json::Value::Object(quant)))
+}
+
+fn source_quantization_profiles(
+    gguf: &GgufFile,
+    import_k_quants: bool,
+) -> Result<std::collections::BTreeMap<String, SourceQuantProfile>> {
+    let mut profiles = std::collections::BTreeMap::new();
+    for tensor in &gguf.tensors {
+        if !import_k_quants && tensor.tensor_type.k_quant_format().is_some() {
+            continue;
+        }
+        let Some(profile) = SourceQuantProfile::for_gguf_type(tensor.tensor_type) else {
+            continue;
+        };
+        let Some(mapped) = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata) else {
+            continue;
+        };
+        let prefix = mapped.strip_suffix(".weight").unwrap_or(&mapped);
+        let prefix = super::normalize_override_key(prefix);
+        if let Some(previous) = profiles.insert(prefix.clone(), profile)
+            && previous != profile
+        {
+            return Err(Error::from_reason(format!(
+                "GGUF source quantization collision: '{prefix}' resolves to both {} and {} tensors",
+                previous.describe(),
+                profile.describe()
+            )));
+        }
+    }
+    Ok(profiles)
+}
+
+/// Secondary Muse mmproj files share the target's config.json. Unlike a
+/// uniform affine companion, Meta's file deliberately mixes Q4_K and Q6_K,
+/// so every packed projection needs an explicit mode entry in that shared
+/// config; the text model's top-level default cannot describe both.
+fn merge_muse_secondary_quantization(
+    config_path: &Path,
+    gguf: &GgufFile,
+    import_k_quants: bool,
+) -> Result<()> {
+    let profiles = source_quantization_profiles(gguf, import_k_quants)?;
+    if profiles.is_empty() {
+        return Ok(());
+    }
+    let data = fs::read_to_string(config_path).map_err(|e| {
+        Error::from_reason(format!(
+            "Muse-Glimmer companion GGUF needs the primary model config at {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    let mut config: serde_json::Value = serde_json::from_str(&data).map_err(|e| {
+        Error::from_reason(format!("Failed to parse {}: {e}", config_path.display()))
+    })?;
+
+    for key in ["quantization", "quantization_config"] {
+        let quant = config
+            .get_mut(key)
+            .and_then(serde_json::Value::as_object_mut)
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Muse-Glimmer companion GGUF is K-quantized but {} has no object-valued '{key}' from the primary GGUF conversion",
+                    config_path.display()
+                ))
+            })?;
+        for (prefix, profile) in &profiles {
+            quant.insert(prefix.clone(), profile.to_json());
+        }
+    }
+
+    if is_muse_glimmer_dflash_gguf(&gguf.metadata) {
+        let read_u32 = |key: &str| -> Result<u32> {
+            gguf.metadata
+                .get(key)
+                .and_then(GgufMetaValue::as_u32)
+                .ok_or_else(|| Error::from_reason(format!("DFlash GGUF is missing '{key}'")))
+        };
+        let target_layers = match gguf.metadata.get("dflash.target_layers") {
+            Some(GgufMetaValue::ArrayU32(values)) => values.clone(),
+            Some(GgufMetaValue::ArrayI32(values)) => values
+                .iter()
+                .map(|&value| u32::try_from(value))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|_| {
+                    Error::from_reason("DFlash target_layers contains a negative index")
+                })?,
+            _ => {
+                return Err(Error::from_reason(
+                    "DFlash GGUF is missing its target_layers array",
+                ));
+            }
+        };
+        let target_layers = target_layers
+            .into_iter()
+            .map(|layer| {
+                layer.checked_sub(1).ok_or_else(|| {
+                    Error::from_reason("DFlash target_layers are 1-based and cannot contain 0")
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        config["dflash_config"] = serde_json::json!({
+            "num_hidden_layers": read_u32("dflash.block_count")?,
+            "block_size": read_u32("dflash.block_size")?,
+            "hidden_size": read_u32("dflash.embedding_length")?,
+            "intermediate_size": read_u32("dflash.feed_forward_length")?,
+            "num_attention_heads": read_u32("dflash.attention.head_count")?,
+            "num_key_value_heads": read_u32("dflash.attention.head_count_kv")?,
+            "head_dim": read_u32("dflash.attention.key_length")?,
+            "sliding_window": read_u32("dflash.attention.sliding_window")?,
+            "max_position_embeddings": read_u32("dflash.context_length")?,
+            "rms_norm_eps": gguf.metadata
+                .get("dflash.attention.layer_norm_rms_epsilon")
+                .and_then(GgufMetaValue::as_f32)
+                .ok_or_else(|| Error::from_reason("DFlash GGUF is missing its RMS epsilon"))?,
+            "rope_theta": gguf.metadata
+                .get("dflash.rope.freq_base")
+                .and_then(GgufMetaValue::as_f32)
+                .ok_or_else(|| Error::from_reason("DFlash GGUF is missing its RoPE theta"))?,
+            "target_layers": target_layers,
+            "mask_token_id": read_u32("tokenizer.ggml.mask_token_id")?,
+            "causal": false,
+        });
+    }
+
+    let output = serde_json::to_string_pretty(&config)
+        .map_err(|e| Error::from_reason(format!("Failed to serialize config: {e}")))?;
+    fs::write(config_path, output).map_err(|e| {
+        Error::from_reason(format!("Failed to update {}: {e}", config_path.display()))
+    })?;
+    Ok(())
 }
 
 // ── Dtype Conversion ────────────────────────────────────────────────────────
@@ -2765,6 +3023,8 @@ pub async fn convert_gguf_to_safetensors(
     // Header-only, like the two guards above — `parse_gguf` has read the header,
     // metadata and tensor descriptors and nothing else.
     if !is_primary_model
+        && !is_muse_glimmer_mmproj_gguf(&gguf.metadata)
+        && !is_muse_glimmer_dflash_gguf(&gguf.metadata)
         && let Some((tensor, profile)) = gguf.tensors.iter().find_map(|t| {
             if !import_k_quants && t.tensor_type.k_quant_format().is_some() {
                 return None;
@@ -2806,6 +3066,18 @@ pub async fn convert_gguf_to_safetensors(
     let asset_dir = config_source_dir.clone().unwrap_or(gguf_dir);
     let src_config = asset_dir.join("config.json");
     let synthesized_config = !src_config.exists();
+
+    // The text GGUF contains the decoder geometry, but the runtime contract is
+    // the multimodal HF config: it also carries image/video token IDs, the
+    // projector dimensions, vision layer kinds, and Muse's independent
+    // per-layer RoPE table. Inventing those fields would make a text-only
+    // smoke test pass while producing an artifact that cannot safely attach
+    // Meta's mmproj. Require the authoritative base-model assets instead.
+    if is_primary_model && is_muse_glimmer_main_gguf(&gguf.metadata) && synthesized_config {
+        return Err(Error::from_reason(
+            "Muse-Glimmer GGUF conversion requires the authoritative base-model config and tokenizer assets. Pass --config-dir pointing to meta-models/Muse-Glimmer-30B (or place config.json beside the GGUF); the GGUF header alone does not contain the multimodal token IDs and complete vision layer table.",
+        ));
+    }
 
     // A synthesized config gets its KV head counts from
     // `apply_gemma4_attention_geometry`, which can only tell the sliding count
@@ -3147,7 +3419,7 @@ pub async fn convert_gguf_to_safetensors(
     }
 
     // Remap LLM keys for VLM compatibility when requested
-    if options.vlm_key_prefix.unwrap_or(false) {
+    if options.vlm_key_prefix.unwrap_or(false) && !is_muse_glimmer_main_gguf(&gguf.metadata) {
         let keys: Vec<String> = weights.keys().cloned().collect();
         for key in keys {
             if key.starts_with("model.") || key.starts_with("lm_head.") {
@@ -3241,6 +3513,14 @@ pub async fn convert_gguf_to_safetensors(
             }
         }
 
+        if is_muse_glimmer_main_gguf(&gguf.metadata) {
+            // llama.cpp's official converter unpermutes decoder and vision Q/K
+            // rows into ggml's interleaved RoPE layout before K-quantization.
+            // Reordering packed rows here would violate lossless import.
+            config_json["muse_glimmer_gguf_rope_layout"] =
+                serde_json::Value::String("interleaved".to_string());
+        }
+
         if do_quantize {
             let quant_obj = crate::convert::build_quantization_object(
                 quant_bits,
@@ -3318,6 +3598,16 @@ pub async fn convert_gguf_to_safetensors(
             }
         }
     } else {
+        if is_muse_glimmer_mmproj_gguf(&gguf.metadata)
+            || is_muse_glimmer_dflash_gguf(&gguf.metadata)
+        {
+            merge_muse_secondary_quantization(
+                &output_dir.join("config.json"),
+                &gguf,
+                import_k_quants,
+            )?;
+            info!("Merged Muse-Glimmer companion GGUF metadata into config.json");
+        }
         info!(
             "Skipping config.json and tokenizer writes for secondary output file: {safetensors_filename}"
         );
@@ -4732,6 +5022,126 @@ mod tests {
                 GgufMetaValue::String("gemma4uv".to_string()),
             ),
         ])
+    }
+
+    fn muse_glimmer_metadata() -> HashMap<String, GgufMetaValue> {
+        HashMap::from([(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("muse-glimmer".to_string()),
+        )])
+    }
+
+    fn muse_glimmer_mmproj_metadata() -> HashMap<String, GgufMetaValue> {
+        HashMap::from([
+            (
+                "general.architecture".to_string(),
+                GgufMetaValue::String("clip".to_string()),
+            ),
+            (
+                "clip.projector_type".to_string(),
+                GgufMetaValue::String("muse-glimmer".to_string()),
+            ),
+        ])
+    }
+
+    fn muse_glimmer_dflash_metadata() -> HashMap<String, GgufMetaValue> {
+        HashMap::from([(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("dflash".to_string()),
+        )])
+    }
+
+    #[test]
+    fn muse_glimmer_mapping_matches_canonical_text_checkpoint() {
+        let metadata = muse_glimmer_metadata();
+        let cases = [
+            (
+                "blk.7.attn_gate.weight",
+                Some("model.language_model.layers.7.self_attn.gate_proj.weight"),
+            ),
+            (
+                "blk.7.ffn_norm.weight",
+                Some("model.language_model.layers.7.pre_feedforward_layernorm.weight"),
+            ),
+            (
+                "blk.7.post_ffw_norm.weight",
+                Some("model.language_model.layers.7.post_feedforward_layernorm.weight"),
+            ),
+            (
+                "token_embd.scales",
+                Some("model.language_model.embed_tokens.scales"),
+            ),
+            ("output.weight", Some("lm_head.weight")),
+            (
+                "output_norm.weight",
+                Some("model.language_model.norm.weight"),
+            ),
+            ("blk.7.attn_q_norm.weight", None),
+            ("blk.7.attn_k_norm.weight", None),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(source, &metadata).as_deref(),
+                expected,
+                "mapping mismatch for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn muse_glimmer_mmproj_mapping_matches_canonical_checkpoint() {
+        let metadata = muse_glimmer_mmproj_metadata();
+        let cases = [
+            (
+                "v.blk.4.attn_q.weight",
+                "model.vision_tower.layers.4.attn.q_proj.weight",
+            ),
+            (
+                "v.blk.4.ffn_down.bias",
+                "model.vision_tower.layers.4.mlp.fc2.bias",
+            ),
+            (
+                "v.patch_embd.weight",
+                "model.vision_tower.patch_embedder.patch_embedding.weight",
+            ),
+            ("mm.0.weight", "model.vision_adapter.fc1.weight"),
+            ("mm.1.weight", "model.vision_adapter.fc2.weight"),
+            ("mm.2.weight", "model.vision_projection.weight"),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(source, &metadata).as_deref(),
+                Some(expected),
+                "mapping mismatch for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn muse_glimmer_dflash_mapping_matches_runtime_namespace() {
+        let metadata = muse_glimmer_dflash_metadata();
+        let cases = [
+            ("blk.2.attn_q.weight", "layers.2.self_attn.q_proj.weight"),
+            (
+                "blk.2.attn_q_norm.weight",
+                "layers.2.self_attn.q_norm.weight",
+            ),
+            ("blk.2.ffn_down.weight", "layers.2.mlp.down_proj.weight"),
+            (
+                "blk.2.ffn_norm.weight",
+                "layers.2.post_attention_layernorm.weight",
+            ),
+            ("enc.output_norm.weight", "hidden_norm.weight"),
+            ("output_norm.weight", "norm.weight"),
+            ("fc.weight", "fc.weight"),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(source, &metadata).as_deref(),
+                Some(expected),
+                "mapping mismatch for {source}"
+            );
+        }
     }
 
     #[test]

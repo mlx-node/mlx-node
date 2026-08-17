@@ -545,7 +545,13 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         };
         payload.streamed_text_len = payload.streamed_text_len.saturating_add(text.len());
         if let (Some(sink), Some(emitter)) = (payload.response.sink(), payload.emitter.as_mut()) {
-            emitter.on_token_text(&text, is_reasoning, payload.params.include_reasoning, sink);
+            emitter.on_token_id(
+                token_id,
+                &text,
+                is_reasoning,
+                payload.params.include_reasoning,
+                sink,
+            );
         }
     }
 
@@ -1953,7 +1959,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             Ok(Some(snapshot)) => snapshot.bytes_per_block,
             Ok(None) => 1,
             Err(error) => {
-                self.fail_preempted(turn, error.reason);
+                self.fail_preempted(turn, error.reason.clone());
                 return;
             }
         };
@@ -1969,7 +1975,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.inner.release_scheduled_recurrent_for(turn.seq_id);
         if let Err(error) = lifecycle {
             let _ = self.inner.release_scheduled_cache(turn.seq_id);
-            self.fail_preempted(turn, error.reason);
+            self.fail_preempted(turn, error.reason.clone());
             return;
         }
         turn.payload.preemption_replay = Some(replay);
@@ -1992,7 +1998,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let cache_snapshot = match self.inner.scheduler_cache_snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.fail_preempted(turn, error.reason);
+                self.fail_preempted(turn, error.reason.clone());
                 return;
             }
         };
@@ -2043,7 +2049,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             turn.payload.params.cache_root_owner_id.as_deref(),
         );
         if let Err(error) = self.inner.activate_scheduled_recurrent(turn.seq_id) {
-            self.fail_preempted(turn, error.reason);
+            self.fail_preempted(turn, error.reason.clone());
             return;
         }
         let prefix_admission = match self.inner.prepare_scheduled_prefix(
@@ -2067,7 +2073,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             Err(error) => {
                 let _ = self.inner.release_scheduled_cache(turn.seq_id);
                 self.inner.release_scheduled_recurrent_for(turn.seq_id);
-                self.fail_preempted(turn, error.reason);
+                self.fail_preempted(turn, error.reason.clone());
                 return;
             }
         };

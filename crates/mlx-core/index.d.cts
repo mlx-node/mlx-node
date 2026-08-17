@@ -650,6 +650,91 @@ export declare class Lfm2Model {
   ): Promise<ChatStreamHandle>;
 }
 
+export declare class MuseGlimmerModel {
+  static load(modelPath: string): Promise<MuseGlimmerModel>;
+  hasMtpWeights(): boolean;
+  autoEnablesMtp(): boolean;
+  hasBlockPagedCache(): boolean;
+  maxConcurrentSequences(): number;
+  schedulerStats(): Promise<SchedulerStats>;
+  /**
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
+   */
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
+   * Start a new chat session.
+   *
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
+   */
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /** Streaming variant of `chatSessionStart`. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinue`. */
+  chatStreamSessionContinue(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinueTool`. */
+  chatStreamSessionContinueTool(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+}
+
 export declare class MxArray {
   equal(other: MxArray): MxArray;
   notEqual(other: MxArray): MxArray;
@@ -2518,6 +2603,10 @@ export interface ChatConfig {
    * - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
    *   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
    *   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
+   * - Muse-Glimmer DFlash follows DSpark's external-draft rules: unset
+   *   uses the checkpoint block size (16 for Muse-Glimmer-30B), while an
+   *   explicit value clamps to `[1, block_size]` and pins that depth unless
+   *   `mtpAdaptiveDepth: true` explicitly enables the break-even guard.
    *
    * `mtpAdaptiveDepth` is ignored for the Gemma4 assistant variant.
    */
@@ -2532,9 +2621,9 @@ export interface ChatConfig {
    * `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
    * When false, the loop pins `mtpDepth` for every cycle.
    *
-   * Default: false, except Gemma4 DSpark enables its measured break-even
-   * guard when both this field and `mtpDepth` are unset. An explicit value
-   * always wins over the family default.
+   * Default: false, except Gemma4 DSpark and Muse-Glimmer DFlash enable the
+   * measured break-even guard when both this field and `mtpDepth` are unset.
+   * An explicit value always wins over the family default.
    */
   mtpAdaptiveDepth?: boolean | undefined;
 }

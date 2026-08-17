@@ -85,6 +85,10 @@ const FAMILY_TRAITS: Record<string, FamilyTraits> = {
     },
     fallbackContextWindow: 131072,
   },
+  muse_glimmer: {
+    reasoning: true,
+    fallbackContextWindow: 131072,
+  },
   lfm2: { reasoning: true, fallbackContextWindow: 128000 },
   lfm2_moe: { reasoning: true, fallbackContextWindow: 128000 },
 };

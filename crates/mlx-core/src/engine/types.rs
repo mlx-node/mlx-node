@@ -147,6 +147,10 @@ pub struct ChatConfig {
     /// - Assistant (Google `gemma-4-*-it-assistant`): an unset `mtpDepth`
     ///   drafts 3 tokens per cycle (`ASSISTANT_DEFAULT_DEPTH`), and an
     ///   explicit `mtpDepth` clamps to `[1, 8]` (`ASSISTANT_MAX_DEPTH`).
+    /// - Muse-Glimmer DFlash follows DSpark's external-draft rules: unset
+    ///   uses the checkpoint block size (16 for Muse-Glimmer-30B), while an
+    ///   explicit value clamps to `[1, block_size]` and pins that depth unless
+    ///   `mtpAdaptiveDepth: true` explicitly enables the break-even guard.
     ///
     /// `mtpAdaptiveDepth` is ignored for the Gemma4 assistant variant.
     #[napi(ts_type = "number | undefined")]
@@ -160,9 +164,9 @@ pub struct ChatConfig {
     /// `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
     /// When false, the loop pins `mtpDepth` for every cycle.
     ///
-    /// Default: false, except Gemma4 DSpark enables its measured break-even
-    /// guard when both this field and `mtpDepth` are unset. An explicit value
-    /// always wins over the family default.
+    /// Default: false, except Gemma4 DSpark and Muse-Glimmer DFlash enable the
+    /// measured break-even guard when both this field and `mtpDepth` are unset.
+    /// An explicit value always wins over the family default.
     #[napi(ts_type = "boolean | undefined")]
     pub mtp_adaptive_depth: Option<bool>,
 }

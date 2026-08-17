@@ -494,8 +494,13 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             // emitter applies the gate then emits the chunk). Detokenize +
             // length-advance above stay OUTSIDE the emitter so
             // DecodeStream sees every token.
-            s.emitter
-                .on_token_text(&token_text, is_reasoning, p.include_reasoning, s.callback);
+            s.emitter.on_token_id(
+                token_id,
+                &token_text,
+                is_reasoning,
+                p.include_reasoning,
+                s.callback,
+            );
         } else if cancelled {
             // NON-streaming cancel break (H2): same snapshot, same
             // position in the iteration as the ChatML streaming

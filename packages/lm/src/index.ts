@@ -19,6 +19,9 @@ export { Qwen3Model } from './stream.js';
 // Gemma4 models
 export { Gemma4Model } from './stream.js';
 
+// Muse-Glimmer models
+export { MuseGlimmerModel } from './stream.js';
+
 // Embedding models
 export { HarrierModel } from '@mlx-node/core';
 export { Qwen35Model } from './stream.js';

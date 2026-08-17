@@ -222,6 +222,20 @@ impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
 /// the done-chunk carrying `text: ""` and the parser-accumulated
 /// `tool_calls()` / `thinking()` instead of `result.text`.
 pub(crate) trait StreamEmitter {
+    /// Token-aware entry point. The default preserves the historical text-only
+    /// emitter contract; protocol parsers that require special-token
+    /// provenance override this method.
+    fn on_token_id(
+        &mut self,
+        _token_id: u32,
+        token_text: &str,
+        is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        self.on_token_text(token_text, is_reasoning, include_reasoning, sink);
+    }
+
     /// One committed token's incremental detokenized text (may be empty
     /// for partial-grapheme steps). `is_reasoning` is the
     /// [`crate::engine::penalties::ReasoningTracker`] tag for this

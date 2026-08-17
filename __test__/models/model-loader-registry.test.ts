@@ -2,12 +2,20 @@ import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { detectModelType, Gemma4Model, loadModel, loadSession, type ModelType } from '@mlx-node/lm';
+import {
+  detectModelType,
+  Gemma4Model,
+  loadModel,
+  loadSession,
+  MuseGlimmerModel,
+  type ModelType,
+} from '@mlx-node/lm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 const RAW_MODEL_TYPE_ALIASES = {
   harrier: ['harrier'],
   gemma4: ['gemma4', 'gemma4_text', 'gemma4_unified'],
+  muse_glimmer: ['muse_glimmer', 'muse_glimmer_text'],
   qwen3: ['qwen3'],
   qwen3_5: ['qwen3_5'],
   qwen3_5_moe: ['qwen3_5_moe'],
@@ -77,6 +85,11 @@ describe.sequential('declarative model loader registry', () => {
 
     await writeConfig({ architectures: 'Qwen3Model' });
     await expect(detectModelType(tempDir)).resolves.toBe('harrier');
+  });
+
+  it('detects Muse-Glimmer from its authoritative architecture', async () => {
+    await writeConfig({ model_type: 'unknown', architectures: ['MuseGlimmerForConditionalGeneration'] });
+    await expect(detectModelType(tempDir)).resolves.toBe('muse_glimmer');
   });
 
   it('fails closed for an unknown model_type', async () => {
@@ -174,5 +187,14 @@ describe.sequential('declarative model loader registry', () => {
     await expect(loadModel(tempDir, { draftModelPath: '/tmp/draft' })).resolves.toBe(loadedModel);
     expect(loadSpy).toHaveBeenCalledOnce();
     expect(loadSpy).toHaveBeenCalledWith(tempDir, { draftModelPath: '/tmp/draft' });
+  });
+
+  it('loads Muse-Glimmer through its streaming wrapper', async () => {
+    await writeConfig({ model_type: 'muse_glimmer' });
+    const loadedModel = { model: 'muse_glimmer' };
+    const loadSpy = vi.spyOn(MuseGlimmerModel, 'load').mockResolvedValue(loadedModel as never);
+
+    await expect(loadModel(tempDir)).resolves.toBe(loadedModel);
+    expect(loadSpy).toHaveBeenCalledWith(tempDir);
   });
 });
