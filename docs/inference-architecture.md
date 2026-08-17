@@ -58,7 +58,7 @@ cross-attention, and other state remains model-owned. Do not add a global
 Scheduling policy is nevertheless engine-owned. `HybridSchedulerState<B>`
 owns admission, owner/sequence mapping, block and recurrent-state reservation,
 prefill/decode planning, SSD waits, preemption, completion, and barriers for
-Qwen3, LFM2/2.5, Qwen3.5 Dense/MoE, and Gemma4. `HybridSchedulerBackend` is the
+Qwen3, LFM2/2.5, Qwen3.5 Dense/MoE, Gemma4, and Nemotron 3.5 Lightning. `HybridSchedulerBackend` is the
 model-runner boundary: a family exposes its paged cache manager, auxiliary-state
 lifecycle, prefix construction/restore, and batched decode implementation.
 Environment-derived limits remain shared engine policy, not pass-through
@@ -121,6 +121,7 @@ both routes propose and verify tokens.
 | Qwen3.5 dense | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP, including paged target state and supported image-context continuation | plain paged AR may use the two-row GDN scheduler; multimedia/MTP retain the ordered path                                  |
 | Qwen3.5 MoE   | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP on flat target state                                                   | plain paged AR may use the two-row GDN/MoE scheduler; multimedia/MTP retain the ordered path                              |
 | Gemma4        | image/audio components that have a paged adapter             | fresh and delta | external draft on flat text-only state                                            | ordinary paged text AR uses grouped full/sliding batching; media and MTP/DSpark remain ordered barriers                   |
+| nemotron_h    | none                                                         | fresh and delta | native MTP on flat target state                                                   | plain paged AR may use the hybrid continuous-batching scheduler; MTP retains the ordered path                             |
 
 The table is a conformance description, not dispatch code. The source of truth
 is each model's `execution_plan()` plus its executor implementations.

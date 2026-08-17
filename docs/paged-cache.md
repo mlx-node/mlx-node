@@ -42,6 +42,7 @@ rather than accepting an arbitrary client-selected namespace.
 | **Gemma4**        | **on**  | Serial/concurrent start and continuation parity on Gemma-4-E2B-IT with a real occupancy-2 wave. Full and sliding layers use distinct paged groups; expired sliding blocks are replaced by a null sentinel; KV-shared layers alias their global/sliding anchor. Same-owner continuation is live; cross-owner prefix hits currently fail closed.                                                                                                                                                                                                    |
 | **Qwen3.5 Dense** | **on**  | Single-turn greedy parity and paged construction are verified on Qwen3.5-0.8B BF16. Full-attention K/V is paged; GDN recurrent state remains request-local and is checkpointed beside K/V for SSD restore. Explicit false and the environment override retain a rollback path.                                                                                                                                                                                                                                                                    |
 | **Qwen3.5 MoE**   | **on**  | Uses the same paged full-attention, exact-boundary GDN sidecar, and two-row text scheduler contract as dense. Sparse expert routing stays batched over `[N,1,H]`; checkpoint-specific projections preserve exact greedy parity while K/V gather/attention remains batched. MTP/media turns remain exclusive. Real `Qwen3.6-35B-A3B-mxfp4-mlx` decode and SSD-restart parity gates remain local-only because no small published checkpoint fits the standard CI runner; synthetic Metal gates cover paged construction and N=2 token parity in CI. |
+| **NemotronH**     | **on**  | Hybrid Mamba-2 SSM + GQA + MoE-FFN: only the six `full_attention` layers route through the adapter (32 Q / 2 KV heads, head_dim 128 — the generic batched paged route, no per-family kernel). Mamba recurrent state stays request-local (per-request `[3,6144]` conv + `[64,64,128]` SSM f32 rows per SSM layer, stacked/scattered around each batched decode) and is checkpointed only in-process (no SSD sidecar yet — the family is NOT cold-restore eligible). The scheduled lane is default-on; the pinned prefill break-set is re-split at Mamba-2 chunk-128 boundaries inside `run_scheduled_prefill_slice`. MTP-enabled turns stay on the exclusive ordered lane and fall back to paged AR on paged models. Real-checkpoint parity/concurrency gates remain local-only (30B checkpoint); synthetic Metal gates cover paged construction, N=2 batched==serial T=0 parity, and the break-set boundary rule in CI. |
 
 ### Gemma4 hybrid groups and draft coexistence
 
@@ -110,6 +111,7 @@ exact-boundary sidecar or a second paged group:
 | `qwen3_5` (dense)   | GDN recurrent state                           | exact-boundary GDN sidecar                                          |     **yes**      |
 | `qwen3_5_moe`       | GDN recurrent state (same as dense)           | exact-boundary GDN sidecar                                          |     **yes**      |
 | `lfm2` / `lfm2_moe` | ShortConv recurrent state                     | exact-boundary `ConvState` sidecar                                  |     **yes**      |
+| `nemotron_h`        | Mamba-2 SSM recurrent state                   | none yet (in-process only)                                          |      **no**      |
 
 The allowlist is enforced **natively**, not only in the agent:
 `cold_tier::resolve_persist_cold` consults `cold_restore_supported(model_type)`
@@ -844,6 +846,7 @@ Before `use_block_paged_cache` defaults can flip from `Some(false)` to enabled, 
 | `crates/mlx-core/tests/gemma4_paged_vs_flat_parity.rs`      | `MLX_TEST_MODEL_PATH`           |
 | `crates/mlx-core/tests/qwen3_5_paged_vs_flat_parity.rs`     | `MLX_TEST_MODEL_PATH`           |
 | `crates/mlx-core/tests/qwen3_5_moe_paged_vs_flat_parity.rs` | `MLX_TEST_MODEL_PATH`           |
+| `crates/mlx-core/tests/nemotron_h_paged_vs_flat_parity.rs`  | `MLX_TEST_MODEL_PATH`           |
 | `__test__/models/qwen3-paged-parity.test.ts`                | `QWEN3_PAGED_PARITY_MODEL_PATH` |
 
 All Rust tests are `#[ignore]` and skip cleanly without the env var; the TS test uses `it.runIf`. Example invocation:

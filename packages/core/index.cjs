@@ -761,6 +761,7 @@ module.exports.Lfm2Model = nativeBinding.Lfm2Model;
 module.exports.MuseGlimmerModel = nativeBinding.MuseGlimmerModel;
 module.exports.MxArray = nativeBinding.MxArray;
 module.exports.NativeRewardRegistry = nativeBinding.NativeRewardRegistry;
+module.exports.NemotronHModel = nativeBinding.NemotronHModel;
 module.exports.OutputStore = nativeBinding.OutputStore;
 module.exports.PrivacyFilterModel = nativeBinding.PrivacyFilterModel;
 module.exports.PrivacyFilterModelJs = nativeBinding.PrivacyFilterModelJs;

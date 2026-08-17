@@ -35,6 +35,9 @@ export { LFM2_CONFIGS, getLfm2Config } from './models/lfm2-configs.js';
 export { Qwen35MoeModel } from './stream.js';
 export type { Qwen35MoeConfig } from '@mlx-node/core';
 
+// Nemotron H models
+export { NemotronHModel } from './stream.js';
+
 // Memory hygiene: most management is automatic — the decode loop
 // inside `@mlx-node/core` calls `mlx_clear_cache()` every 256 generated
 // tokens to prevent unbounded free-pool growth during long

@@ -118,7 +118,7 @@ struct ShardedModelIndex {
 /// logic. The recipe transforms must stay byte-identical to the free
 /// `sanitize_*` functions they wrap.
 pub(crate) mod recipe {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     use napi::bindgen_prelude::{Error, Result};
     use tracing::{info, warn};
@@ -2057,6 +2057,581 @@ pub(crate) mod recipe {
         }
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Nemotron-H (NVIDIA Nemotron 3.5 Lightning, model_type "nemotron_h")
+    //
+    // NVIDIA ships these checkpoints ALREADY QUANTIZED by modelopt, so convert
+    // runs in INGEST mode only (--quantize / --q-recipe / --q-mxfp /
+    // --imatrix-path / --q-mtp are rejected): the NVFP4 / FP8 codes are
+    // repacked losslessly into the MLX nvfp4 / mxfp8 checkpoint layouts and the
+    // matching per-layer quantization block is recorded in config.json.
+    //
+    // Source layout (verified against the released 30B-A3B-NVFP4 checkpoint):
+    //   - MoE experts / shared_experts / lm_head: NVFP4.
+    //     {base}.weight         U8  [N, K/2]   two E2M1 fp4 codes per byte
+    //     {base}.weight_scale   F8_E4M3 [N, K/16]  block scales (u8 storage)
+    //     {base}.weight_scale_2 F32 scalar      per-tensor global scale
+    //   - mamba mixer.in_proj / mixer.out_proj: plain FP8.
+    //     {base}.weight       F8_E4M3 [N, K]      (u8 storage)
+    //     {base}.weight_scale F32 scalar          per-tensor weight scale
+    //     {base}.input_scale  F32 [1]             static activation scale
+    //   - attention k_proj.k_scale / v_proj.v_scale: FP8 KV-cache scales (v1
+    //     runs bf16 KV) — dropped after the ingest.
+    //
+    // MLX output layout:
+    //   - experts fused to backbone.layers.{L}.mixer.experts.{up,down}_proj
+    //     {base}.weight u32 [E, N, K/8] (QuantizedSwitchLinear nvfp4 pair)
+    //     {base}.scales u8  [E, N, K/16] (folded E4M3 = e4m3(scale_8*scale_2))
+    //   - shared_experts stay 2-D in the same nvfp4 pair shape.
+    //   - lm_head dequantized to BF16 (it is dense in the runtime).
+    //   - mamba in/out_proj re-quantized to mxfp8 (u32 weight + u8 E8M0
+    //     scales); the source input_scale is recorded as the per-layer
+    //     input_amax config override (= 448 * input_scale) so the runtime
+    //     fake-quants activations at modelopt parity.
+    //   - everything else BF16 passthrough (embeddings, attention q/k/v/o,
+    //     conv1d, norms, A_log/D/dt_bias, gate.*); mtp.* retained verbatim.
+    //
+    // Nibble-order contract (pinned by nemotron_nvfp4_u8_repack_matches_mlx_oracle):
+    // NVIDIA stores fp4 code pairs low-nibble-first (element 2j in the low
+    // nibble of byte j), and MLX packs the same byte stream into u32 words by
+    // plain little-endian byte concatenation — so the U8 [N, K/2] tensor is
+    // reinterpreted as u32 [N, K/8] without any nibble shuffling.
+    /// Decode one F8_E4M3FN byte (sign bit 7, 4-bit exponent, 3-bit mantissa)
+    /// to f32. 0x7f is the only NaN pattern; NVIDIA saturates scales at 448.
+    /// Reference implementation for the ingest tests — the production fold uses
+    /// the MLX from_fp8/to_fp8 ops so runtime rounding can never diverge.
+    #[allow(dead_code)]
+    pub(crate) fn decode_e4m3(byte: u8) -> f32 {
+        let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
+        let exp = ((byte >> 3) & 0x0F) as i32;
+        let mant = (byte & 0x07) as f32;
+        if exp == 0 && mant == 0.0 {
+            return 0.0;
+        }
+        let magnitude = if exp == 15 {
+            if mant == 7.0 {
+                448.0
+            } else {
+                256.0 * (1.0 + mant / 8.0)
+            }
+        } else if exp == 0 {
+            2.0_f32.powi(1 - 7) * mant / 8.0
+        } else {
+            2.0_f32.powi(exp - 7) * (1.0 + mant / 8.0)
+        };
+        sign * magnitude
+    }
+
+    /// Round v to the nearest F8_E4M3FN byte, saturating at ±448 (the MLX
+    /// ToFP8 semantics). Reference implementation for the ingest tests.
+    #[allow(dead_code)]
+    pub(crate) fn encode_e4m3_round(v: f32) -> u8 {
+        if !v.is_finite() || v >= 448.0 {
+            return 0x7E;
+        }
+        if v <= -448.0 {
+            return 0xFE;
+        }
+        let neg = v < 0.0;
+        let mag = v.abs();
+        if mag == 0.0 {
+            return 0x00;
+        }
+        // Find the nearest representable magnitude by scanning the decode
+        // table (only 224 positive codes) — simple and exact for a reference.
+        let mut best_byte = 0u8;
+        let mut best_dist = f32::INFINITY;
+        for byte in 1u8..=0x7E {
+            let m = decode_e4m3(byte).abs();
+            let d = (mag - m).abs();
+            if d < best_dist {
+                best_dist = d;
+                best_byte = byte;
+            }
+        }
+        best_byte | if neg { 0x80 } else { 0 }
+    }
+
+    /// Reinterpret an NVIDIA NVFP4 U8 [N, K/2] weight (two fp4 codes per byte,
+    /// low nibble first) as the MLX nvfp4 packed u32 [N, K/8] layout. This is a
+    /// pure little-endian byte concatenation; see the module doc.
+    pub(crate) fn repack_nvfp4_u8_to_u32(weight: &MxArray) -> Result<MxArray> {
+        let shape = weight.shape()?;
+        if shape.len() != 2 {
+            return Err(Error::from_reason(format!(
+                "Nemotron-H NVFP4 repack: expected rank-2 U8 weight [N, K/2], got shape {:?}",
+                shape.as_ref()
+            )));
+        }
+        let rows = shape[0];
+        let bytes_per_row = shape[1];
+        if bytes_per_row % 4 != 0 {
+            return Err(Error::from_reason(format!(
+                "Nemotron-H NVFP4 repack: K/2 = {bytes_per_row} is not divisible by the 4-byte u32 word"
+            )));
+        }
+        let bytes = weight.to_uint8()?;
+        let mut words = Vec::with_capacity(bytes.len() / 4);
+        for chunk in bytes.chunks_exact(4) {
+            words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        MxArray::from_uint32(&words, &[rows, bytes_per_row / 4])
+    }
+
+    /// Fold an NVFP4 scale pair into a single E4M3 scale byte: the MLX nvfp4
+    /// format stores one u8 E4M3 scale per group, while NVIDIA stores a
+    /// per-group E4M3 weight_scale plus a per-tensor F32 weight_scale_2.
+    /// Output = e4m3_round(e4m3_decode(weight_scale) * weight_scale_2),
+    /// computed with the runtime's own from_fp8/to_fp8 so the dequantized
+    /// value MLX produces (from_fp8(scales_out) * fp4_lut) matches NVIDIA's
+    /// (fp4_lut * e4m3_decode(weight_scale) * weight_scale_2) up to the
+    /// mandated one-ulp e4m3 re-round of the product.
+    pub(crate) fn fold_nvfp4_scales(
+        weight_scale: &MxArray,
+        weight_scale_2: &MxArray,
+    ) -> Result<MxArray> {
+        if weight_scale.dtype()? != DType::Uint8 {
+            return Err(Error::from_reason(format!(
+                "Nemotron-H NVFP4 weight_scale must be U8 (F8_E4M3 storage), got {:?}",
+                weight_scale.dtype()?
+            )));
+        }
+        let s2 = weight_scale_2.item_at_float32(0)?;
+        if !s2.is_finite() {
+            return Err(Error::from_reason(format!(
+                "Nemotron-H NVFP4 weight_scale_2 must be finite, got {s2}"
+            )));
+        }
+        let decoded = weight_scale.from_fp8(DType::Float32)?;
+        let scaled = decoded.mul_scalar(s2 as f64)?;
+        scaled.to_fp8()
+    }
+
+    /// Dequantize an NVFP4 weight back to BF16 (the dense lm_head path):
+    /// repack to u32, fold the scales, then mlx_dequantize(mode="nvfp4").
+    pub(crate) fn dequant_nvfp4_to_bf16(
+        weight: &MxArray,
+        weight_scale: &MxArray,
+        weight_scale_2: &MxArray,
+    ) -> Result<MxArray> {
+        let packed = repack_nvfp4_u8_to_u32(weight)?;
+        let folded = fold_nvfp4_scales(weight_scale, weight_scale_2)?;
+        let mode_c = std::ffi::CString::new("nvfp4")
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {e}")))?;
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                packed.as_raw_ptr(),
+                folded.as_raw_ptr(),
+                std::ptr::null_mut(),
+                16,
+                4,
+                DType::BFloat16 as i32,
+                mode_c.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            return Err(Error::from_reason(
+                "mlx_dequantize failed for Nemotron-H NVFP4 weight (lm_head)",
+            ));
+        }
+        MxArray::from_handle(handle, "nemotron_h_nvfp4_dequant")
+    }
+
+    /// Re-quantize a plain FP8 (E4M3) weight into the MLX mxfp8 layout:
+    /// from_fp8(weight) * weight_scale then mlx_quantize(mode="mxfp8").
+    /// Returns (u32 packed weight, u8 E8M0 scales).
+    pub(crate) fn fp8_to_mxfp8(
+        weight: &MxArray,
+        weight_scale: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        if weight.dtype()? != DType::Uint8 {
+            return Err(Error::from_reason(format!(
+                "Nemotron-H FP8 weight must be U8 (F8_E4M3 storage), got {:?}",
+                weight.dtype()?
+            )));
+        }
+        let s = weight_scale.item_at_float32(0)?;
+        if !s.is_finite() {
+            return Err(Error::from_reason(format!(
+                "Nemotron-H FP8 weight_scale must be finite, got {s}"
+            )));
+        }
+        let decoded = weight.from_fp8(DType::Float32)?;
+        let scaled = decoded.mul_scalar(s as f64)?;
+        let mode_c = std::ffi::CString::new("mxfp8")
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {e}")))?;
+        let (packed, scales, biases) = super::quantize_with_optional_tiling(
+            &scaled,
+            32,
+            8,
+            &mode_c,
+            "nemotron_h_fp8_requant",
+        )?;
+        if biases.is_some() {
+            return Err(Error::from_reason(
+                "mlx_quantize unexpectedly returned biases for Nemotron-H mxfp8 requant",
+            ));
+        }
+        Ok((packed, scales))
+    }
+
+    /// Derive the input_amax activation-scale override from modelopt's static
+    /// FP8 input_scale (activations quantize as x / input_scale, clamped to the
+    /// E4M3 range), matching the runtime's fp8_fake_quant convention
+    /// (x * 448/amax maps [-amax, amax] onto [-448, 448]).
+    fn input_amax_from_input_scale(input_scale: &MxArray) -> Result<f32> {
+        let s = input_scale.item_at_float32(0)?;
+        if !s.is_finite() || s <= 0.0 {
+            return Err(Error::from_reason(format!(
+                "Nemotron-H FP8 input_scale must be positive and finite, got {s}"
+            )));
+        }
+        Ok(448.0 * s)
+    }
+
+    /// Scan the PRE-ingest tensor map for mamba mixer.{in,out}_proj FP8
+    /// input_scale tensors and return the per-layer mxfp8 quantization
+    /// overrides (including input_amax) the driver must write into
+    /// config.json["quantization"]. Runs before sanitize consumes the source
+    /// tensors; the loader normalizes the emitted keys the same way it
+    /// normalizes every other family's (the language_model.model. wrapper added
+    /// by build_quantization_object is stripped back on read).
+    pub(crate) fn nemotron_h_quant_metadata(
+        weights: &HashMap<String, MxArray>,
+    ) -> Result<HashMap<String, serde_json::Value>> {
+        let mut overrides = HashMap::new();
+        for key in weights.keys() {
+            let Some(base) = key.strip_suffix(".input_scale") else {
+                continue;
+            };
+            let input_scale = weights
+                .get(key)
+                .ok_or_else(|| Error::from_reason(format!("missing input_scale tensor '{key}'")))?;
+            let amax = input_amax_from_input_scale(input_scale)?;
+            overrides.insert(
+                base.to_string(),
+                serde_json::json!({
+                    "bits": 8,
+                    "group_size": 32,
+                    "mode": "mxfp8",
+                    "input_amax": amax,
+                }),
+            );
+        }
+        Ok(overrides)
+    }
+
+    /// True for the NVIDIA scale sidecars the ingest consumes or discards.
+    fn is_nemotron_h_drop_key(key: &str) -> bool {
+        key.ends_with(".weight_scale")
+            || key.ends_with(".weight_scale_2")
+            || key.ends_with(".input_scale")
+            || key.ends_with(".k_scale")
+            || key.ends_with(".v_scale")
+    }
+
+    /// Parse a per-expert NVFP4 base (backbone.layers.{L}.mixer.experts.{i}.
+    /// {up,down}_proj) into (layer, expert_index, proj).
+    fn parse_nemotron_expert_base(base: &str) -> Option<(usize, usize, &str)> {
+        let rest = base.strip_prefix("backbone.layers.")?;
+        let (layer_s, rest) = rest.split_once('.')?;
+        let rest = rest.strip_prefix("mixer.experts.")?;
+        let (expert_s, proj) = rest.rsplit_once('.')?;
+        if !matches!(proj, "up_proj" | "down_proj") {
+            return None;
+        }
+        Some((layer_s.parse().ok()?, expert_s.parse().ok()?, proj))
+    }
+
+    /// One Nemotron-H source tensor's ingest action, decided up front so the
+    /// owned-map pass can consume group members without borrow conflicts.
+    enum NemotronAction {
+        /// mtp.* — retained verbatim (BF16, never stacked/re-quantized).
+        Mtp,
+        /// NVIDIA scale sidecar consumed by a group or dropped outright.
+        Drop,
+        /// NVFP4 group — repack + fold; base is the key minus .weight.
+        Nvfp4(String),
+        /// Plain FP8 group — dequant + mxfp8 requant; base as above.
+        Fp8(String),
+        /// Ordinary float tensor — cast to BF16 and pass through.
+        Passthrough,
+    }
+
+    fn classify_nemotron_key(
+        key: &str,
+        weights: &HashMap<String, MxArray>,
+    ) -> Result<NemotronAction> {
+        if key.starts_with("mtp.") {
+            return Ok(NemotronAction::Mtp);
+        }
+        if is_nemotron_h_drop_key(key) {
+            return Ok(NemotronAction::Drop);
+        }
+        let Some(base) = key.strip_suffix(".weight") else {
+            return Ok(NemotronAction::Passthrough);
+        };
+        if let Some(weight_scale) = weights.get(&format!("{base}.weight_scale")) {
+            let ndim = weight_scale.ndim()? as usize;
+            if ndim == 2 {
+                return Ok(NemotronAction::Nvfp4(base.to_string()));
+            }
+            if ndim == 0 || (ndim == 1 && weight_scale.size()? == 1) {
+                return Ok(NemotronAction::Fp8(base.to_string()));
+            }
+            return Err(Error::from_reason(format!(
+                "Nemotron-H: '{base}.weight_scale' has unexpected rank {ndim} (NVFP4 groups carry [N, K/16] F8_E4M3 scales; FP8 groups carry a scalar)"
+            )));
+        }
+        Ok(NemotronAction::Passthrough)
+    }
+
+    /// The Nemotron-H ingest: consume the source map and produce the MLX
+    /// checkpoint layout described in the module doc.
+    pub(crate) fn ingest_nemotron_h(
+        weights: HashMap<String, MxArray>,
+        layers_block_type: &[String],
+        n_routed_experts: usize,
+        verbose: bool,
+    ) -> Result<HashMap<String, MxArray>> {
+        if layers_block_type.is_empty() {
+            return Err(Error::from_reason(
+                "Nemotron-H config.json must declare a non-empty layers_block_type array",
+            ));
+        }
+        for (i, block) in layers_block_type.iter().enumerate() {
+            if !matches!(block.as_str(), "mamba" | "moe" | "attention") {
+                return Err(Error::from_reason(format!(
+                    "Nemotron-H layers_block_type[{i}] = '{block}' is not one of mamba/moe/attention"
+                )));
+            }
+        }
+
+        // Pass 1: classify every key and pre-clone the quant-group members
+        // (MxArray clone is a cheap handle Arc — no tensor data is copied) so
+        // the owned-map pass never needs to borrow a partially-moved map.
+        let mut actions: HashMap<String, NemotronAction> = HashMap::with_capacity(weights.len());
+        // base -> (weight, weight_scale, weight_scale_2?) for NVFP4/FP8 groups.
+        let mut groups: HashMap<String, (MxArray, MxArray, Option<MxArray>)> = HashMap::new();
+        // Every source key consumed by a quant group (skipped in pass 2).
+        let mut consumed: HashSet<String> = HashSet::new();
+        for key in weights.keys() {
+            let action = classify_nemotron_key(key, &weights)?;
+            match &action {
+                NemotronAction::Nvfp4(base) => {
+                    let weight =
+                        weights
+                            .get(&format!("{base}.weight"))
+                            .cloned()
+                            .ok_or_else(|| {
+                                Error::from_reason(format!(
+                                    "Nemotron-H NVFP4 group '{base}' is missing .weight"
+                                ))
+                            })?;
+                    let weight_scale = weights
+                        .get(&format!("{base}.weight_scale"))
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "Nemotron-H NVFP4 group '{base}' is missing .weight_scale"
+                            ))
+                        })?;
+                    let weight_scale_2 = weights
+                        .get(&format!("{base}.weight_scale_2"))
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "Nemotron-H NVFP4 group '{base}' is missing .weight_scale_2"
+                            ))
+                        })?;
+                    groups.insert(base.clone(), (weight, weight_scale, Some(weight_scale_2)));
+                    consumed.insert(format!("{base}.weight"));
+                    consumed.insert(format!("{base}.weight_scale"));
+                    consumed.insert(format!("{base}.weight_scale_2"));
+                }
+                NemotronAction::Fp8(base) => {
+                    let weight =
+                        weights
+                            .get(&format!("{base}.weight"))
+                            .cloned()
+                            .ok_or_else(|| {
+                                Error::from_reason(format!(
+                                    "Nemotron-H FP8 group '{base}' is missing .weight"
+                                ))
+                            })?;
+                    let weight_scale = weights
+                        .get(&format!("{base}.weight_scale"))
+                        .cloned()
+                        .ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "Nemotron-H FP8 group '{base}' is missing .weight_scale"
+                            ))
+                        })?;
+                    groups.insert(base.clone(), (weight, weight_scale, None));
+                    consumed.insert(format!("{base}.weight"));
+                    consumed.insert(format!("{base}.weight_scale"));
+                }
+                _ => {}
+            }
+            actions.insert(key.clone(), action);
+        }
+
+        let mut out: HashMap<String, MxArray> = HashMap::with_capacity(weights.len());
+        // (layer, proj) -> (expert_index, packed_weight, scales)
+        let mut expert_stack: HashMap<(usize, String), Vec<(usize, MxArray, MxArray)>> =
+            HashMap::new();
+
+        // Group pass: repack/fold NVFP4 and requant FP8 from the pre-cloned
+        // members; route expert groups into the stack, lm_head to dequant, and
+        // shared_experts to inline nvfp4 pairs.
+        for (base, (weight, weight_scale, weight_scale_2)) in groups {
+            match weight_scale_2 {
+                Some(weight_scale_2) => {
+                    if weight.dtype()? != DType::Uint8 {
+                        return Err(Error::from_reason(format!(
+                            "Nemotron-H NVFP4 '{base}.weight' must be U8, got {:?}",
+                            weight.dtype()?
+                        )));
+                    }
+                    let packed = repack_nvfp4_u8_to_u32(&weight)?;
+                    let scales = fold_nvfp4_scales(&weight_scale, &weight_scale_2)?;
+                    if let Some((layer, expert_idx, proj)) = parse_nemotron_expert_base(&base) {
+                        expert_stack
+                            .entry((layer, proj.to_string()))
+                            .or_default()
+                            .push((expert_idx, packed, scales));
+                    } else if base == "lm_head" {
+                        let dequant =
+                            dequant_nvfp4_to_bf16(&weight, &weight_scale, &weight_scale_2)?;
+                        out.insert("lm_head.weight".to_string(), dequant);
+                    } else {
+                        // shared_experts (and any other non-expert NVFP4 group).
+                        out.insert(format!("{base}.weight"), packed);
+                        out.insert(format!("{base}.scales"), scales);
+                    }
+                }
+                None => {
+                    let (packed, scales) = fp8_to_mxfp8(&weight, &weight_scale)?;
+                    out.insert(format!("{base}.weight"), packed);
+                    out.insert(format!("{base}.scales"), scales);
+                }
+            }
+        }
+
+        // Pass 2: move the remaining (non-group) tensors. Quant-group members
+        // were consumed above; everything else dispatches on its action.
+        for (key, array) in weights {
+            if consumed.contains(&key) {
+                continue;
+            }
+            match actions.remove(&key).unwrap_or(NemotronAction::Passthrough) {
+                NemotronAction::Mtp | NemotronAction::Nvfp4(_) | NemotronAction::Fp8(_) => {
+                    // mtp.* is retained verbatim; Nvfp4/Fp8 bases cannot reach
+                    // here because their members are all in the consumed set.
+                    out.insert(key, array);
+                }
+                NemotronAction::Drop => {}
+                NemotronAction::Passthrough => {
+                    let dt = array.dtype()?;
+                    if !matches!(dt, DType::Float32 | DType::Float16 | DType::BFloat16) {
+                        return Err(Error::from_reason(format!(
+                            "Nemotron-H: non-float tensor '{key}' ({dt:?}) has no quant sidecar (weight_scale / weight_scale_2 / input_scale) — unexpected pre-quantized source"
+                        )));
+                    }
+                    let arr = if dt == DType::BFloat16 {
+                        array
+                    } else {
+                        array.astype(DType::BFloat16)?
+                    };
+                    out.insert(key, arr);
+                }
+            }
+        }
+
+        // Stack the per-expert NVFP4 pairs into the fused [E, N, K/8] /
+        // [E, N, K/16] QuantizedSwitchLinear layout, in expert order.
+        for ((layer, proj), mut entries) in expert_stack {
+            entries.sort_by_key(|(idx, _, _)| *idx);
+            if entries.len() != n_routed_experts {
+                return Err(Error::from_reason(format!(
+                    "Nemotron-H layer {layer} mixer.experts.{proj}: stacked {} of {} experts (missing per-expert weights)",
+                    entries.len(),
+                    n_routed_experts
+                )));
+            }
+            for (i, (idx, _, _)) in entries.iter().enumerate() {
+                if *idx != i {
+                    return Err(Error::from_reason(format!(
+                        "Nemotron-H layer {layer} mixer.experts.{proj}: expert index {idx} at position {i} — non-contiguous expert set"
+                    )));
+                }
+            }
+            let weight_refs: Vec<&MxArray> = entries.iter().map(|(_, w, _)| w).collect();
+            let scale_refs: Vec<&MxArray> = entries.iter().map(|(_, _, s)| s).collect();
+            let stacked_weight = MxArray::stack(weight_refs, Some(0))?;
+            let stacked_scales = MxArray::stack(scale_refs, Some(0))?;
+            let base = format!("backbone.layers.{layer}.mixer.experts.{proj}");
+            out.insert(format!("{base}.weight"), stacked_weight);
+            out.insert(format!("{base}.scales"), stacked_scales);
+            if verbose {
+                info!(
+                    "  Nemotron-H layer {}: stacked {} experts ({proj})",
+                    layer, n_routed_experts
+                );
+            }
+        }
+
+        if verbose {
+            info!("  Nemotron-H ingest: {} output tensors", out.len());
+        }
+        Ok(out)
+    }
+
+    /// NVIDIA Nemotron 3.5 Lightning (model_type "nemotron_h"). The source is
+    /// already quantized by modelopt — see the module doc for the ingest
+    /// contract. owns_dtype_cast is true so every source tensor (including the
+    /// packed U8 / F8 storage and the F32 scales) reaches sanitize untouched.
+    pub(crate) struct NemotronHRecipe;
+
+    impl ConversionRecipe for NemotronHRecipe {
+        fn model_types(&self) -> &'static [&'static str] {
+            &["nemotron_h"]
+        }
+
+        fn owns_dtype_cast(&self) -> bool {
+            true
+        }
+
+        fn sanitize(
+            &self,
+            weights: HashMap<String, MxArray>,
+            config: &serde_json::Value,
+            _target_dtype_str: &str,
+            _tie_word_embeddings: bool,
+            verbose: bool,
+        ) -> Result<HashMap<String, MxArray>> {
+            let layers_block_type: Vec<String> = config
+                .get("layers_block_type")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let n_routed_experts = config
+                .get("n_routed_experts")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+            if n_routed_experts == 0 {
+                return Err(Error::from_reason(
+                    "Nemotron-H config.json must declare a positive n_routed_experts",
+                ));
+            }
+            ingest_nemotron_h(weights, &layers_block_type, n_routed_experts, verbose)
+        }
+    }
+
     /// Every convertible `model_type` the registry accepts, in dispatch order.
     /// Single source of truth for the "unknown model type" error message and
     /// the registry-consistency test; each entry MUST resolve via
@@ -2073,6 +2648,7 @@ pub(crate) mod recipe {
         "muse_glimmer",
         "gemma4",
         "gemma4_unified",
+        "nemotron_h",
     ];
 
     /// Resolve a [`ConversionRecipe`] for an exact HuggingFace `model_type`
@@ -2089,6 +2665,7 @@ pub(crate) mod recipe {
             "privacy-filter" => Some(Box::new(PrivacyFilterRecipe)),
             "muse_glimmer" => Some(Box::new(MuseGlimmerRecipe)),
             "gemma4" | "gemma4_unified" => Some(Box::new(Gemma4Recipe)),
+            "nemotron_h" => Some(Box::new(NemotronHRecipe)),
             _ => None,
         }
     }
@@ -2221,6 +2798,48 @@ fn validate_qwen3_asr_quantization(
     if !matches!(quant_mode, "affine" | "mxfp4" | "mxfp8") || quant_recipe.is_some() {
         return Err(Error::from_reason(
             "Qwen3-ASR packed conversion supports uniform affine, mxfp4, or mxfp8 quantization; omit quant_recipe",
+        ));
+    }
+    Ok(())
+}
+
+/// Reject quantize-time flags for the NVIDIA Nemotron-H ("nemotron_h") ingest
+/// source. The checkpoint ships pre-quantized by modelopt (NVFP4 experts /
+/// shared experts / lm_head, FP8 mamba projections), so convert only repacks
+/// the existing codes into the MLX nvfp4/mxfp8 layouts — there is nothing to
+/// re-quantize, and running the generic packer on the already-packed U8/U32
+/// storage would corrupt it. Mirrors the gemma-QAT already-quantized guard;
+/// the pre-config fast path (an explicit -m nemotron_h) still needs the clean
+/// rejection before the MTP-policy validation runs.
+fn validate_nemotron_h_ingest_options(
+    model_type: Option<&str>,
+    config: Option<&serde_json::Value>,
+    do_quantize: bool,
+    quant_recipe: Option<&str>,
+    quant_mxfp: bool,
+    imatrix_path: Option<&str>,
+    quant_mtp: &str,
+) -> Result<()> {
+    let is_nemotron_h = model_type == Some("nemotron_h")
+        || config
+            .and_then(|c| c.get("model_type"))
+            .and_then(|v| v.as_str())
+            == Some("nemotron_h");
+    if !is_nemotron_h {
+        return Ok(());
+    }
+    if do_quantize
+        || quant_recipe.is_some()
+        || quant_mxfp
+        || imatrix_path.is_some()
+        || quant_mtp != "off"
+    {
+        return Err(Error::from_reason(
+            "Nemotron-H (nemotron_h) checkpoints are already quantized by NVIDIA (NVFP4 \
+             experts/shared_experts/lm_head, FP8 mamba projections) and convert in INGEST mode \
+             only: omit --quantize, --q-recipe, --q-mxfp, --imatrix-path, and --q-mtp. The \
+             NVFP4/FP8 codes are repacked losslessly into the MLX nvfp4/mxfp8 layouts."
+                .to_string(),
         ));
     }
     Ok(())
@@ -2408,6 +3027,19 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         do_quantize,
         &quant_mode,
         quant_recipe.as_deref(),
+    )?;
+    // Nemotron-H is an already-quantized ingest source; reject quantize-time
+    // flags up front (config is not loaded yet, so this fast path keys on the
+    // caller-supplied -m only; the config-driven check after config load below
+    // closes the direct-NAPI path where model_type is omitted).
+    validate_nemotron_h_ingest_options(
+        model_type.as_deref(),
+        None,
+        do_quantize,
+        quant_recipe.as_deref(),
+        quant_mxfp,
+        imatrix_path.as_deref(),
+        &quant_mtp,
     )?;
 
     // "drafter" is accepted as an alias for "split" and normalized above.
@@ -2617,6 +3249,22 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         model_type.as_deref(),
         do_quantize,
         &quant_mode,
+    )?;
+
+    // Nemotron-H: already-quantized ingest source. The config-driven check
+    // closes the direct-NAPI path where model_type was omitted (the CLI
+    // auto-detect forwards the config's own model_type, so the early guard
+    // above already caught it there).
+    let is_nemotron_h_ingest = model_type.as_deref() == Some("nemotron_h")
+        || config.get("model_type").and_then(|v| v.as_str()) == Some("nemotron_h");
+    validate_nemotron_h_ingest_options(
+        model_type.as_deref(),
+        Some(&config),
+        do_quantize,
+        quant_recipe.as_deref(),
+        quant_mxfp,
+        imatrix_path.as_deref(),
+        &quant_mtp,
     )?;
 
     // The nvidia recipe is documented + validated only for qwen3_5 /
@@ -2996,6 +3644,9 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     };
 
     let mut gemma_pre_overrides: Option<HashMap<String, serde_json::Value>> = None;
+    // Nemotron-H: per-layer mxfp8 overrides derived from the source tensors
+    // (input_scale -> input_amax) before sanitize consumes them.
+    let mut nemotron_h_quant_overrides: HashMap<String, serde_json::Value> = HashMap::new();
     let converted_tensors = if is_gemma_e2b_import {
         let dtype = match target_dtype.as_str() {
             "float32" | "f32" => DType::Float32,
@@ -3129,6 +3780,13 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
             tensor_names.push(name);
         }
 
+        // Nemotron-H: derive the per-layer mxfp8 quantization overrides from the
+        // SOURCE tensor map BEFORE sanitize consumes it (the input_scale values
+        // become the per-layer input_amax config overrides).
+        if is_nemotron_h_ingest {
+            nemotron_h_quant_overrides = recipe::nemotron_h_quant_metadata(&converted_tensors)?;
+        }
+
         // Apply model-specific weight sanitization. Every convertible family is a
         // `ConversionRecipe` in the registry, so this is one dispatch: resolve the
         // recipe for the model_type and run its `sanitize`. An unrecognized
@@ -3181,6 +3839,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Apply quantization if requested
     let mut per_layer_overrides: HashMap<String, serde_json::Value> =
         gemma_pre_overrides.unwrap_or_default();
+    per_layer_overrides.extend(nemotron_h_quant_overrides);
     // Effective mode/group_size/bits recorded in config.json. The no-recipe
     // path updates mode/group_size when --q-mxfp upgrades the global mode to
     // mxfp4/mxfp8 so downstream loaders dispatch to the correct builder.
@@ -3200,6 +3859,13 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         quant_bits_effective = bits;
         quant_group_size_effective = group_size;
         quant_mode_effective = mode;
+    } else if is_nemotron_h_ingest {
+        // Nemotron-H ingest: the default NVFP4 block (bits 4 / group 16) with
+        // per-layer mxfp8 overrides for the mamba projections. The generic CLI
+        // defaults (affine / 4 / 64) would mis-describe the emitted storage.
+        quant_bits_effective = 4;
+        quant_group_size_effective = 16;
+        quant_mode_effective = "nvfp4".to_string();
     }
     // lfm2/lfm2_moe opt INTO quantizing the token embedding: their
     // `nn::Embedding` installs a PACKED-quantized backend (gather-dequant
@@ -3589,7 +4255,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     strip_symmetric_zero_point(&mut output_config);
 
     // Inject quantization metadata if quantized
-    if do_quantize || is_gemma_e2b_import {
+    if do_quantize || is_gemma_e2b_import || is_nemotron_h_ingest {
         // sym8 has NO quant group (one f32 scale per output channel), so the
         // top-level group_size is written as `null` — the loader must dispatch
         // on mode=="sym8" and never read group_size for sym8 layers. Per-layer
@@ -8498,7 +9164,10 @@ mod tests {
             // owns_dtype_cast == old has_custom_sanitizer match.
             assert_eq!(
                 r.owns_dtype_cast(),
-                matches!(mt, "qwen3_5_moe" | "qwen3_5" | "lfm2_moe" | "lfm2"),
+                matches!(
+                    mt,
+                    "qwen3_5_moe" | "qwen3_5" | "lfm2_moe" | "lfm2" | "nemotron_h"
+                ),
                 "{mt}: owns_dtype_cast mismatch vs inline has_custom_sanitizer"
             );
 
@@ -16819,5 +17488,587 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    // ── Nemotron-H ingest tests ────────────────────────────────────────────────
+    /// Pin the NVFP4 byte-layout contract. NVIDIA stores fp4 codes two per
+    /// byte with the even-indexed element in the LOW nibble, and MLX packs
+    /// the same byte stream into u32 words by plain little-endian byte
+    /// concatenation (backend/cpu/quantized.cpp _qmm: low nibble first,
+    /// uint32_t* w), so repack_nvfp4_u8_to_u32 is a pure LE reinterpretation.
+    /// The first assertion pins that byte-for-byte against hand-computed
+    /// words (codes cover both signs, every magnitude, and the sign-zero
+    /// code 8). The second feeds the repacked tensor to MLX's own nvfp4
+    /// dequantizer and compares against the FP4 LUT decode with a unit E4M3
+    /// scale, proving the runtime reads our repacked bytes exactly like its
+    /// own packing. (Dequant-based code recovery is deliberately NOT used:
+    /// MLX's dequant collapses sign-zero codes 8 -> +0.0, making them
+    /// unrecoverable that way.)
+    #[test]
+    fn nemotron_nvfp4_u8_repack_matches_mlx_oracle() {
+        use crate::convert::recipe::repack_nvfp4_u8_to_u32;
+
+        let codes: Vec<u8> = vec![
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 0, 8, 1, 9, 2, 10, 3, 11, 4, 12,
+            5, 13, 6, 14, 7, 15,
+        ];
+        // NVIDIA U8 layout: byte j = codes[2j] | (codes[2j+1] << 4).
+        let bytes: Vec<u8> = codes.chunks(2).map(|c| c[0] | (c[1] << 4)).collect();
+        assert_eq!(
+            bytes,
+            vec![
+                0x10, 0x32, 0x54, 0x76, 0x98, 0xba, 0xdc, 0xfe, 0x80, 0x91, 0xa2, 0xb3, 0xc4, 0xd5,
+                0xe6, 0xf7,
+            ]
+        );
+        let u8_arr = MxArray::from_uint8(&bytes, &[2, 8]).unwrap();
+        let repacked = repack_nvfp4_u8_to_u32(&u8_arr).unwrap();
+        assert_eq!(
+            repacked.to_uint32().unwrap().to_vec(),
+            vec![0x76543210u32, 0xfedcba98, 0xb3a29180, 0xf7e6d5c4],
+            "nvfp4 U8->u32 repack must be plain LE byte concatenation"
+        );
+
+        // MLX's own decoder must agree: dequantize(repacked) with a unit
+        // E4M3 scale byte (0x38 == 1.0) equals the FP4 LUT values.
+        let scales = MxArray::from_uint8(&[0x38, 0x38], &[2, 1]).unwrap();
+        let mode_c = std::ffi::CString::new("nvfp4").unwrap();
+        let dequant_handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                repacked.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                std::ptr::null_mut(),
+                16,
+                4,
+                0, // float32
+                mode_c.as_ptr(),
+            )
+        };
+        assert!(!dequant_handle.is_null(), "mlx_dequantize for nvfp4 failed");
+        let dequant = MxArray::from_handle(dequant_handle, "nvfp4_dequant").unwrap();
+        let decoded: Vec<f32> = dequant.to_float32().unwrap().to_vec();
+        let lut: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        assert_eq!(decoded.len(), codes.len());
+        for (i, (got, code)) in decoded.iter().zip(codes.iter()).enumerate() {
+            // MLX's dequantizer normalizes the sign-zero code 8 to +0.0
+            // (numerically identical to code 0).
+            let want = if *code == 8 {
+                0.0f32
+            } else {
+                lut[*code as usize]
+            };
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "nvfp4 dequant of repacked element {i}: code {code}"
+            );
+        }
+    }
+
+    /// E4M3 reference decode/encode round-trips on known bit patterns, and the
+    /// production scale fold (MLX from_fp8 * scalar -> to_fp8) reproduces the
+    /// reference e4m3_round(e4m3_decode * scale_2) within one e4m3 ulp.
+    #[test]
+    fn nemotron_e4m3_decode_and_fold_roundtrip() {
+        use crate::convert::recipe::decode_e4m3;
+        use crate::convert::recipe::encode_e4m3_round;
+        use crate::convert::recipe::fold_nvfp4_scales;
+
+        assert_eq!(decode_e4m3(0x00), 0.0, "zero");
+        assert_eq!(decode_e4m3(0x80), -0.0, "negative zero");
+        // 0x3E = sign 0, exp 0b0111 = 7, mant 0b110 = 6 -> 2^0 * 1.75
+        assert_eq!(decode_e4m3(0x3E), 1.75, "normal 1.75");
+        // e4m3 max finite: exp 15, mant 6 -> 2^8 * 1.75 = 448
+        assert_eq!(decode_e4m3(0x7E), 448.0, "max positive");
+        assert_eq!(decode_e4m3(0xFE), -448.0, "max negative");
+        // subnormal: exp 0, mant 1 -> 2^-6 * 1/8
+        assert!((decode_e4m3(0x01) - 0.001953125).abs() < 1e-9, "subnormal");
+
+        assert_eq!(encode_e4m3_round(448.0), 0x7E, "saturate positive");
+        assert_eq!(encode_e4m3_round(500.0), 0x7E, "clamp positive");
+        assert_eq!(encode_e4m3_round(-500.0), 0xFE, "clamp negative");
+        assert_eq!(encode_e4m3_round(0.0), 0x00, "zero encodes zero");
+        assert_eq!(encode_e4m3_round(1.75), 0x3E, "exact representable");
+
+        // Fold: production MLX-op fold vs the reference decode/round. Input
+        // bytes avoid exact e4m3 midpoints so the two rounding paths agree.
+        let ws_bytes: Vec<u8> = (0..16).map(|i| 0x20 + i * 2).collect();
+        let ws = MxArray::from_uint8(&ws_bytes, &[4, 4]).unwrap();
+        let s2 = MxArray::from_float32(&[1.5], &[1]).unwrap();
+        let folded = fold_nvfp4_scales(&ws, &s2).unwrap();
+        assert!(matches!(folded.dtype().unwrap(), DType::Uint8));
+        let folded_bytes = folded.to_uint8().unwrap();
+        for (i, (b, fb)) in ws_bytes.iter().zip(&folded_bytes).enumerate() {
+            let want = decode_e4m3(*b) * 1.5;
+            let got = decode_e4m3(*fb);
+            let rel = (got - want).abs() / want.max(1e-12);
+            assert!(
+                rel < 0.07,
+                "fold[{i}]: decoded {got} vs expected {want} (rel {rel:.4}) exceeds one e4m3 ulp"
+            );
+        }
+        // Reference encode matches the production fold byte-for-byte on these
+        // non-tie inputs.
+        for (i, (b, fb)) in ws_bytes.iter().zip(&folded_bytes).enumerate() {
+            let want = encode_e4m3_round(decode_e4m3(*b) * 1.5);
+            assert_eq!(*fb, want, "fold[{i}]: reference e4m3_round mismatch");
+        }
+    }
+
+    /// The FP8 -> mxfp8 requant path keeps reconstruction error within the
+    /// E8M0 block-scale budget for smooth inputs.
+    #[test]
+    fn nemotron_fp8_to_mxfp8_requant_error_within_tolerance() {
+        use crate::convert::recipe::fp8_to_mxfp8;
+
+        let rows = 4i64;
+        let cols = 64i64;
+        let values: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) - 128.0) * 0.05)
+            .collect();
+        let w_f32 = MxArray::from_float32(&values, &[rows, cols]).unwrap();
+        // Encode to E4M3 storage (simulating the checkpoint's F8_E4M3 tensor).
+        let w_fp8 = w_f32.to_fp8().unwrap();
+        let scale = MxArray::from_float32(&[1.0], &[1]).unwrap();
+        let (packed, scales) = fp8_to_mxfp8(&w_fp8, &scale).unwrap();
+        assert!(
+            matches!(packed.dtype().unwrap(), DType::Uint32),
+            "mxfp8 weight u32"
+        );
+        assert!(
+            matches!(scales.dtype().unwrap(), DType::Uint8),
+            "mxfp8 scales u8"
+        );
+        let packed_shape: Vec<i64> = packed.shape().unwrap().to_vec();
+        assert_eq!(
+            packed_shape,
+            vec![rows, cols / 4],
+            "mxfp8 packed cols = K/4"
+        );
+        let scale_shape: Vec<i64> = scales.shape().unwrap().to_vec();
+        assert_eq!(
+            scale_shape,
+            vec![rows, cols / 32],
+            "mxfp8 scale cols = K/32"
+        );
+
+        let mode_c = std::ffi::CString::new("mxfp8").unwrap();
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                packed.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                std::ptr::null_mut(),
+                32,
+                8,
+                0, // float32
+                mode_c.as_ptr(),
+            )
+        };
+        assert!(!handle.is_null(), "mlx_dequantize for mxfp8 failed");
+        let dequant = MxArray::from_handle(handle, "mxfp8_dequant").unwrap();
+        let restored: Vec<f32> = dequant.to_float32().unwrap().to_vec();
+        assert_eq!(restored.len(), values.len());
+        let max_abs = values
+            .iter()
+            .zip(&restored)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let range = values.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+        assert!(
+            max_abs < range * 0.10 + 1e-3,
+            "mxfp8 requant max abs error {max_abs} exceeds 10% of range {range}"
+        );
+    }
+
+    /// The config quantization block for a Nemotron-H ingest: top-level
+    /// nvfp4 default (bits 4 / group 16) plus per-layer mxfp8 overrides with
+    /// input_amax, in the exact serialization shape quant_dispatch parses.
+    #[test]
+    fn nemotron_h_config_quant_block_emission_shape() {
+        use crate::convert::recipe::nemotron_h_quant_metadata;
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        weights.insert(
+            "backbone.layers.0.mixer.in_proj.input_scale".to_string(),
+            MxArray::from_float32(&[0.25], &[1]).unwrap(),
+        );
+        weights.insert(
+            "backbone.layers.0.mixer.out_proj.input_scale".to_string(),
+            MxArray::from_float32(&[0.5], &[1]).unwrap(),
+        );
+        // A non-mamba tensor with a .input_scale-looking tail must not match.
+        weights.insert(
+            "backbone.layers.12.mixer.k_proj.k_scale".to_string(),
+            MxArray::from_float32(&[0.125], &[1]).unwrap(),
+        );
+        let overrides = nemotron_h_quant_metadata(&weights).unwrap();
+        assert_eq!(overrides.len(), 2, "only in_proj/out_proj input_scales");
+
+        let quant_obj = build_quantization_object(
+            4,
+            Some(16),
+            "nvfp4",
+            &overrides,
+            /* is_privacy_filter */ false,
+            /* skip_mtp */ true,
+        );
+        let obj = quant_obj.as_object().unwrap();
+        assert_eq!(obj["bits"], 4);
+        assert_eq!(obj["group_size"], 16);
+        assert_eq!(obj["mode"], "nvfp4");
+        let in_proj = obj
+            .get("language_model.model.backbone.layers.0.mixer.in_proj")
+            .expect("normalized per-layer override present");
+        assert_eq!(in_proj["mode"], "mxfp8");
+        assert_eq!(in_proj["bits"], 8);
+        assert_eq!(in_proj["group_size"], 32);
+        let amax = in_proj["input_amax"].as_f64().unwrap();
+        assert!(
+            (amax - 448.0 * 0.25).abs() < 1e-6,
+            "input_amax = 448 * input_scale"
+        );
+        let out_proj = obj
+            .get("language_model.model.backbone.layers.0.mixer.out_proj")
+            .expect("out_proj override present");
+        assert!((out_proj["input_amax"].as_f64().unwrap() - 448.0 * 0.5).abs() < 1e-6);
+        assert!(
+            !obj.contains_key("language_model.model.backbone.layers.12.mixer.k_proj"),
+            "k_scale is not an activation-fp8 site"
+        );
+    }
+
+    /// End-to-end synthetic ingest: NVFP4 expert stacking, shared_experts,
+    /// lm_head dequant, FP8 -> mxfp8 requant, gate BF16 cast, mtp retention,
+    /// and scale/k_scale/v_scale dropping.
+    #[test]
+    fn nemotron_h_ingest_classifies_and_stacks_synthetic_fixture() {
+        use crate::convert::recipe::ConversionRecipe;
+        use crate::convert::recipe::NemotronHRecipe;
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        // NVFP4 expert groups (K = 16 -> U8 [4, 8] weight, U8 [4, 1] scales).
+        for e in 0..2 {
+            for proj in ["up_proj", "down_proj"] {
+                let base = format!("backbone.layers.0.mixer.experts.{e}.{proj}");
+                weights.insert(
+                    format!("{base}.weight"),
+                    MxArray::from_uint8(
+                        &[
+                            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78,
+                            0x9A, 0xBC, 0xDE, 0xF0, 0x02, 0x46, 0x8A, 0xCE, 0x13, 0x57, 0x9B, 0xDF,
+                            0x24, 0x68, 0xAC, 0xE0, 0x35, 0x79, 0xBD, 0xF1,
+                        ],
+                        &[4, 8],
+                    )
+                    .unwrap(),
+                );
+                weights.insert(
+                    format!("{base}.weight_scale"),
+                    MxArray::from_uint8(&[0x3E, 0x3F, 0x40, 0x41], &[4, 1]).unwrap(),
+                );
+                weights.insert(
+                    format!("{base}.weight_scale_2"),
+                    MxArray::from_float32(&[2.0], &[1]).unwrap(),
+                );
+            }
+        }
+        // shared_experts NVFP4 group.
+        for proj in ["up_proj", "down_proj"] {
+            let base = format!("backbone.layers.0.mixer.shared_experts.{proj}");
+            weights.insert(
+                format!("{base}.weight"),
+                MxArray::from_uint8(
+                    &[
+                        0x10, 0x32, 0x54, 0x76, 0x98, 0xBA, 0xDC, 0xFE, 0x11, 0x33, 0x55, 0x77,
+                        0x99, 0xBB, 0xDD, 0xFF, 0x20, 0x42, 0x64, 0x86, 0xA8, 0xCA, 0xEC, 0x0F,
+                        0x21, 0x43, 0x65, 0x87, 0xA9, 0xCB, 0xED, 0x0E,
+                    ],
+                    &[4, 8],
+                )
+                .unwrap(),
+            );
+            weights.insert(
+                format!("{base}.weight_scale"),
+                MxArray::from_uint8(&[0x42, 0x43, 0x44, 0x45], &[4, 1]).unwrap(),
+            );
+            weights.insert(
+                format!("{base}.weight_scale_2"),
+                MxArray::from_float32(&[3.0], &[1]).unwrap(),
+            );
+        }
+        // lm_head NVFP4 -> dense BF16.
+        weights.insert(
+            "lm_head.weight".to_string(),
+            MxArray::from_uint8(
+                &[
+                    0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A,
+                    0xBC, 0xDE, 0xF0, 0x02, 0x46, 0x8A, 0xCE, 0x13, 0x57, 0x9B, 0xDF, 0x24, 0x68,
+                    0xAC, 0xE0, 0x35, 0x79, 0xBD, 0xF1,
+                ],
+                &[4, 8],
+            )
+            .unwrap(),
+        );
+        weights.insert(
+            "lm_head.weight_scale".to_string(),
+            MxArray::from_uint8(&[0x3E, 0x3F, 0x40, 0x41], &[4, 1]).unwrap(),
+        );
+        weights.insert(
+            "lm_head.weight_scale_2".to_string(),
+            MxArray::from_float32(&[1.5], &[1]).unwrap(),
+        );
+        // mamba layer FP8 in_proj/out_proj (K = 64).
+        for proj in ["in_proj", "out_proj"] {
+            let base = format!("backbone.layers.1.mixer.{proj}");
+            let f32v: Vec<f32> = (0..4 * 64).map(|i| ((i as f32) - 128.0) * 0.02).collect();
+            let fp8 = MxArray::from_float32(&f32v, &[4, 64])
+                .unwrap()
+                .to_fp8()
+                .unwrap();
+            weights.insert(format!("{base}.weight"), fp8);
+            weights.insert(
+                format!("{base}.weight_scale"),
+                MxArray::from_float32(&[0.5], &[1]).unwrap(),
+            );
+            weights.insert(
+                format!("{base}.input_scale"),
+                MxArray::from_float32(&[0.0625], &[1]).unwrap(),
+            );
+        }
+        // Attention KV scales to drop.
+        weights.insert(
+            "backbone.layers.2.mixer.k_proj.k_scale".to_string(),
+            MxArray::from_float32(&[0.1], &[1]).unwrap(),
+        );
+        weights.insert(
+            "backbone.layers.2.mixer.v_proj.v_scale".to_string(),
+            MxArray::from_float32(&[0.2], &[1]).unwrap(),
+        );
+        // Passthrough floats.
+        weights.insert(
+            "backbone.embeddings.weight".to_string(),
+            MxArray::from_float32(&[0.0; 16], &[4, 4]).unwrap(),
+        );
+        weights.insert(
+            "backbone.layers.0.norm.weight".to_string(),
+            MxArray::from_float32(&[1.0; 4], &[4]).unwrap(),
+        );
+        weights.insert(
+            "backbone.layers.0.mixer.gate.weight".to_string(),
+            MxArray::from_float32(&[0.5; 8], &[2, 4]).unwrap(),
+        );
+        weights.insert(
+            "backbone.layers.0.mixer.gate.e_score_correction_bias".to_string(),
+            MxArray::from_float32(&[0.25; 2], &[2]).unwrap(),
+        );
+        weights.insert(
+            "backbone.layers.1.mixer.conv1d.weight".to_string(),
+            MxArray::from_float32(&[1.0; 16], &[4, 1, 4]).unwrap(),
+        );
+        weights.insert(
+            "backbone.layers.1.mixer.conv1d.bias".to_string(),
+            MxArray::from_float32(&[0.0; 4], &[4]).unwrap(),
+        );
+        weights.insert(
+            "backbone.layers.1.mixer.A_log".to_string(),
+            MxArray::from_float32(&[0.1; 4], &[4]).unwrap(),
+        );
+        weights.insert(
+            "backbone.norm_f.weight".to_string(),
+            MxArray::from_float32(&[1.0; 4], &[4]).unwrap(),
+        );
+        // MTP retained verbatim (BF16).
+        weights.insert(
+            "mtp.layers.0.mixer.q_proj.weight".to_string(),
+            MxArray::from_float32(&[1.0; 16], &[4, 4]).unwrap(),
+        );
+        weights.insert(
+            "mtp.layers.1.mixer.experts.0.up_proj.weight".to_string(),
+            MxArray::from_float32(&[2.0; 16], &[4, 4]).unwrap(),
+        );
+        weights.insert(
+            "mtp.layers.1.final_layernorm.weight".to_string(),
+            MxArray::from_float32(&[1.0; 4], &[4]).unwrap(),
+        );
+
+        let config = serde_json::json!({
+            "layers_block_type": ["moe", "mamba"],
+            "n_routed_experts": 2,
+        });
+        let out = NemotronHRecipe
+            .sanitize(weights, &config, "bfloat16", false, false)
+            .expect("ingest must succeed");
+
+        // Expert stacking -> fused [E, N, K/8] + [E, N, K/16].
+        let up_w = &out["backbone.layers.0.mixer.experts.up_proj.weight"];
+        assert!(matches!(up_w.dtype().unwrap(), DType::Uint32));
+        assert_eq!(up_w.shape().unwrap().as_ref(), &[2, 4, 2]);
+        let up_s = &out["backbone.layers.0.mixer.experts.up_proj.scales"];
+        assert!(matches!(up_s.dtype().unwrap(), DType::Uint8));
+        assert_eq!(up_s.shape().unwrap().as_ref(), &[2, 4, 1]);
+        let dn_w = &out["backbone.layers.0.mixer.experts.down_proj.weight"];
+        assert_eq!(dn_w.shape().unwrap().as_ref(), &[2, 4, 2]);
+
+        // shared_experts stay 2-D nvfp4 pairs.
+        let sh_w = &out["backbone.layers.0.mixer.shared_experts.up_proj.weight"];
+        assert!(matches!(sh_w.dtype().unwrap(), DType::Uint32));
+        assert_eq!(sh_w.shape().unwrap().as_ref(), &[4, 2]);
+        assert!(out.contains_key("backbone.layers.0.mixer.shared_experts.up_proj.scales"));
+
+        // lm_head dequantized to BF16 [N, K].
+        let head = &out["lm_head.weight"];
+        assert!(matches!(head.dtype().unwrap(), DType::BFloat16));
+        assert_eq!(head.shape().unwrap().as_ref(), &[4, 16]);
+
+        // mamba projections re-quantized to mxfp8.
+        let ip = &out["backbone.layers.1.mixer.in_proj.weight"];
+        assert!(matches!(ip.dtype().unwrap(), DType::Uint32));
+        assert_eq!(ip.shape().unwrap().as_ref(), &[4, 16]);
+        assert!(out.contains_key("backbone.layers.1.mixer.in_proj.scales"));
+        assert!(out.contains_key("backbone.layers.1.mixer.out_proj.weight"));
+
+        // Gate cast to BF16; embeddings/norms stay BF16.
+        assert!(matches!(
+            out["backbone.layers.0.mixer.gate.weight"].dtype().unwrap(),
+            DType::BFloat16
+        ));
+        assert!(matches!(
+            out["backbone.layers.0.mixer.gate.e_score_correction_bias"]
+                .dtype()
+                .unwrap(),
+            DType::BFloat16
+        ));
+        assert!(matches!(
+            out["backbone.embeddings.weight"].dtype().unwrap(),
+            DType::BFloat16
+        ));
+        assert!(matches!(
+            out["backbone.layers.1.mixer.A_log"].dtype().unwrap(),
+            DType::BFloat16
+        ));
+        assert!(matches!(
+            out["backbone.layers.1.mixer.conv1d.weight"]
+                .dtype()
+                .unwrap(),
+            DType::BFloat16
+        ));
+
+        // MTP retained verbatim.
+        assert!(out.contains_key("mtp.layers.0.mixer.q_proj.weight"));
+        assert!(out.contains_key("mtp.layers.1.mixer.experts.0.up_proj.weight"));
+        assert!(out.contains_key("mtp.layers.1.final_layernorm.weight"));
+
+        // Every scale sidecar and KV scale is gone.
+        assert!(!out.keys().any(|k| k.ends_with(".weight_scale")));
+        assert!(!out.keys().any(|k| k.ends_with(".weight_scale_2")));
+        assert!(!out.keys().any(|k| k.ends_with(".input_scale")));
+        assert!(!out.keys().any(|k| k.ends_with(".k_scale")));
+        assert!(!out.keys().any(|k| k.ends_with(".v_scale")));
+        // No per-expert (indexed) keys remain in the body — the fused
+        // backbone.layers.*.mixer.experts.{up,down}_proj pairs replace them.
+        // (mtp.* experts legitimately keep their indices.)
+        assert!(!out.keys().any(|k| {
+            k.starts_with("backbone.layers.") && {
+                let Some(rest) = k.split_once(".mixer.experts.") else {
+                    return false;
+                };
+                rest.1
+                    .split('.')
+                    .next()
+                    .is_some_and(|i| !i.is_empty() && i.chars().all(|c| c.is_ascii_digit()))
+            }
+        }));
+    }
+
+    /// The ingest guard rejects every quantize-time flag and accepts a clean
+    /// convert, keyed on either the CLI model_type or the source config.
+    #[test]
+    fn nemotron_h_ingest_options_guard() {
+        assert!(
+            validate_nemotron_h_ingest_options(
+                Some("nemotron_h"),
+                None,
+                true,
+                None,
+                false,
+                None,
+                "off"
+            )
+            .is_err(),
+            "--quantize must be rejected"
+        );
+        assert!(
+            validate_nemotron_h_ingest_options(
+                Some("nemotron_h"),
+                None,
+                false,
+                Some("unsloth"),
+                false,
+                None,
+                "off"
+            )
+            .is_err(),
+            "--q-recipe must be rejected"
+        );
+        assert!(
+            validate_nemotron_h_ingest_options(
+                Some("nemotron_h"),
+                None,
+                false,
+                None,
+                true,
+                None,
+                "off"
+            )
+            .is_err(),
+            "--q-mxfp must be rejected"
+        );
+        assert!(
+            validate_nemotron_h_ingest_options(
+                Some("nemotron_h"),
+                None,
+                false,
+                None,
+                false,
+                Some("/tmp/imatrix.gguf"),
+                "off"
+            )
+            .is_err(),
+            "--imatrix-path must be rejected"
+        );
+        assert!(
+            validate_nemotron_h_ingest_options(
+                Some("nemotron_h"),
+                None,
+                false,
+                None,
+                false,
+                None,
+                "all"
+            )
+            .is_err(),
+            "--q-mtp must be rejected"
+        );
+        validate_nemotron_h_ingest_options(
+            Some("nemotron_h"),
+            None,
+            false,
+            None,
+            false,
+            None,
+            "off",
+        )
+        .expect("clean convert accepted");
+        // Config-driven detection (direct-NAPI path with model_type omitted).
+        let cfg = serde_json::json!({ "model_type": "nemotron_h" });
+        assert!(
+            validate_nemotron_h_ingest_options(None, Some(&cfg), true, None, false, None, "off")
+                .is_err()
+        );
+        // Unrelated families are unaffected.
+        validate_nemotron_h_ingest_options(Some("qwen3_5"), None, true, None, false, None, "off")
+            .expect("other families unaffected");
     }
 }

@@ -41,7 +41,7 @@
 //! - Random internet downloads
 //! - User-uploaded files without verification
 //! - Untrusted third-party sources
-use minijinja::{Environment, context};
+use minijinja::Environment;
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use serde::{Deserialize, Serialize};
@@ -2380,19 +2380,59 @@ impl Qwen3Tokenizer {
         // shadowed). A key the caller left unset is absent from that layer and
         // therefore still `undefined` to the template — see
         // [`RenderContextOptions`].
-        let ctx = context! {
-            messages => messages_value,
-            tools => tools_value,
-            add_generation_prompt => add_generation_prompt,
-            enable_thinking => enable_thinking.unwrap_or(true),
-            preserve_thinking => true,
-            // LFM2.5-1.2B-Thinking predates the shared
-            // `preserve_thinking` name and uses this equivalent flag.
-            keep_past_thinking => true,
-            bos_token => bos_token,
-            eos_token => eos_token,
-            ..Self::build_render_context(render_ctx),
-        };
+        // Build the context as a map so a key can be OMITTED (template sees
+        // `undefined`) instead of set to `none` when absent. HuggingFace
+        // templates branch on `is defined` — Nemotron-H's chat template does
+        // `{% if not tools is defined %} {% set tools = [] %}` then
+        // `{% if tools is iterable and tools | length > 0 %}` — and
+        // minijinja's `context!` macro inserts `tools: none` here, which
+        // makes the first guard false (none IS defined) and then throws on
+        // `tools | length`. Omitting the key keeps `tools` `undefined` to
+        // the template, exactly like the HF renderer, so the template's own
+        // fallback engages. Other families (Qwen3/3.5, Gemma4, LFM2) guard
+        // tools with truthiness (`{% if tools %}`), which behaves identically
+        // for an absent key.
+        let mut ctx_map = std::collections::BTreeMap::<String, minijinja::Value>::new();
+        ctx_map.insert(
+            "messages".to_string(),
+            minijinja::Value::from_serialize(&messages_value),
+        );
+        if let Some(tools) = &tools_value {
+            ctx_map.insert("tools".to_string(), minijinja::Value::from_serialize(tools));
+        }
+        ctx_map.insert(
+            "add_generation_prompt".to_string(),
+            minijinja::Value::from(add_generation_prompt),
+        );
+        ctx_map.insert(
+            "enable_thinking".to_string(),
+            minijinja::Value::from(enable_thinking.unwrap_or(true)),
+        );
+        ctx_map.insert(
+            "preserve_thinking".to_string(),
+            minijinja::Value::from(true),
+        );
+        // LFM2.5-1.2B-Thinking predates the shared
+        // `preserve_thinking` name and uses this equivalent flag.
+        ctx_map.insert(
+            "keep_past_thinking".to_string(),
+            minijinja::Value::from(true),
+        );
+        ctx_map.insert("bos_token".to_string(), minijinja::Value::from(bos_token));
+        ctx_map.insert("eos_token".to_string(), minijinja::Value::from(eos_token));
+        // Caller-provided globals as a fallback layer, with the same precedence
+        // as the `context!` spread: explicit keys above always win.
+        let fallback = Self::build_render_context(render_ctx);
+        if let Some(obj) = fallback.as_object() {
+            if let Some(pairs) = obj.try_iter_pairs() {
+                for (key, value) in pairs {
+                    if let Some(key) = key.as_str() {
+                        ctx_map.entry(key.to_string()).or_insert(value);
+                    }
+                }
+            }
+        }
+        let ctx = minijinja::Value::from_serialize(&ctx_map);
 
         tmpl.render(ctx)
             .map_err(|e| format!("Template render error: {}", e))

@@ -1187,6 +1187,41 @@ A convert-time tripwire, `verify_override_coverage`
 (`crates/mlx-core/src/convert_gemma_import.rs:268`), **fails the conversion** if any `.scales`-bearing
 output lacks a per-layer override. It exists only here — see gotchas.
 
+### modelopt NVFP4 ingest (nemotron_h)
+
+`nemotron_h` (source `model_type: "nemotron_h"`, `quantization_config.quant_method == "modelopt"`,
+producer `modelopt`) is an ingest of an already-quantized checkpoint, not a quantizer. The
+`hf_quant_config.json` declares `MIXED_PRECISION`: `W4A16_NVFP4` (group_size 16) on every expert,
+`shared_experts`, and `lm_head`, plus plain `FP8` on the Mamba-2 `mixer.in_proj` / `mixer.out_proj`,
+with `kv_cache_quant_algo: "FP8"`. The convert pass repacks those formats into MLX storage and drops
+what v1 cannot use:
+
+- **NVFP4 experts / shared experts / `lm_head`** — source `weight` is U8 with two E2M1 4-bit codes
+  per byte, `weight_scale` is per-16-group E4M3 `[N, K/16]`, and `weight_scale_2` is an F32 scalar
+  (**not** a power of two). Ingest packs the E2M1 codes into MLX nvfp4 u32 weight storage **bit-exact**
+  and folds `weight_scale_2` into each per-group E4M3 scale
+  (`scale[o,g] = weight_scale[o,g] * weight_scale_2`), so the MLX nvfp4 4/g16 path needs no
+  global-scale field — MLX writes no NVFP4 global scale ever.
+- **`lm_head`** — NVFP4 in the source, **dequantized to bf16** at ingest (a single dense matmul;
+  keeping the widest matrix in bf16 avoids a 4-bit gather on it).
+- **FP8 Mamba-2 projections** (`mixer.in_proj` / `mixer.out_proj`) — source `weight` is raw E4M3
+  `[N,K]` with an F32 scalar `weight_scale` and a static `input_scale` `[1]`. Ingest maps them to
+  **mxfp8 8/32** and threads the checkpoint's `input_scale` as a **static `input_amax`** on each
+  mxfp8 per-layer override, so at load the projection fake-quantizes its activation
+  (`from_fp8(to_fp8(x·448/amax))·amax/448`). Divergence: modelopt's runtime scales activations
+  **per-token dynamically**, while the exported `input_scale` is a fixed value — v1 keeps it as a
+  static amax (same mechanics as `mlx calibrate`'s sites, minus the calibration pass).
+- **`k_scale` / `v_scale`** (attention FP8 KV-cache scales, F32 `[1]`) — **dropped**. v1 keeps a
+  bf16 KV cache, so the FP8 KV scales have no consumer and are discarded, not carried.
+- **`mtp.*`** — already bf16 in the source; retained bf16 verbatim.
+- Everything else (norms, `embeddings`, `A_log`/`D`/`dt_bias`, `conv1d`, attention q/k/v/o
+  projections, router gates) is bf16 and passes through as-is.
+
+Because the source is already quantized, the re-quantization flags
+(`-q`/`--quantize`, `--q-recipe`, `--q-mxfp`, `--imatrix-path`, `--q-mtp`) are **rejected
+upfront** on a modelopt nemotron_h source — repacking quantized weights through the recipe
+decision engine would double-quantize them.
+
 ## Provenance: `config.json` and the loader contract
 
 ### The two aliases

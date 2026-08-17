@@ -53,6 +53,17 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     description: 'Compact (mxfp4 MLP + mxfp8 attention), fits smaller machines',
     hidden: true,
   },
+  {
+    // Converted from the modelopt NVFP4 checkpoint via
+    // `mlx convert -m nemotron_h` (NVFP4 preserved; FP8 Mamba-2 projections
+    // mapped to mxfp8). Provisional slug — the user finalizes it on HF
+    // upload; entry stays hidden until the repo exists.
+    label: 'Nemotron-3.5-Lightning-30B-A3B',
+    hfRepo: 'Brooooooklyn/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-nvfp4-mlx',
+    sizeGb: 23,
+    description: 'Hybrid Mamba-2 + MoE, native MTP, 1M context',
+    hidden: true,
+  },
 ];
 
 /** Catalog entries the wizard offers (hidden entries filtered out). */

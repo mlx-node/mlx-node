@@ -12,8 +12,13 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 | **Gemma4**        |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark + assistant-MTP spec. decoding |
 | **Muse-Glimmer**  |     yes      |     yes     |     —      | Text decoder; Q4_K import; DFlash; hybrid paged AR                              |
 | **LFM2.5**        |     yes      |     yes     |     —      | Hybrid conv + attention                                                          |
+| **Nemotron 3.5 Lightning** |     yes      |     yes     |     —      | Hybrid Mamba-2 + MoE + attention; native MTP; inference-only                     |
 
-`Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Gemma4 and LFM2.5 are inference-only.
+`Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Gemma4, Muse-Glimmer, LFM2.5, and Nemotron 3.5 Lightning are inference-only.
+
+**Nemotron 3.5 Lightning reasoning note.** On the NVFP4 checkpoint, greedy (T=0) turns with thinking enabled can loop inside the `<think>` block for hundreds of tokens on simple prompts before closing it (characteristic 4-bit expert noise on this heavy reasoning checkpoint; the same prompts answer crisply once thinking ends). The runtime behaves as designed — an unclosed `<think>` at the token budget is redacted to `text=""` by `finalize.rs`. For deterministic short answers prefer `reasoningEffort: 'none'`; for reasoning output allow a generous `maxNewTokens` or set `thinkingTokenBudget` to force the block closed.
+
+**MTP & flat/paged numerics note.** Synchronous MTP turns run the flat target path (`run_mtp_whole_turn`) even on paged models, while `enableMtp: false` runs the paged executor. On quantized checkpoints the flat and paged paths are not greedy-identical — kernel ULP noise amplified by the Mamba-2 recurrence — so MTP-on vs MTP-off cross-path `T=0` text equality is not guaranteed. Within the flat path MTP is target-verified (lossless), though the flat path is itself more loop-prone than the paged path on the NVFP4 checkpoint.
 
 ## Embedding model
 
@@ -61,8 +66,9 @@ const result = await pipeline.analyze(imageBuffer);
 Every role-aware turn sends the full structured history to native code. The checkpoint-provided chat template renders that history, and native KV reuse is allowed only when the rendered token sequence exactly extends the committed cache. A template mismatch safely falls back to full prefill; Rust never manufactures user/tool wire-format strings.
 
 All generative wrappers (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE, Gemma4,
-Muse-Glimmer, LFM2.5, and the VLM `QianfanOCRModel`) structurally satisfy
-`SessionCapableModel` — any of them can be passed to `new ChatSession(model)`.
+Muse-Glimmer, LFM2.5, Nemotron 3.5 Lightning, and the VLM
+`QianfanOCRModel`) structurally satisfy `SessionCapableModel` — any of
+them can be passed to `new ChatSession(model)`.
 
 ## Streaming
 

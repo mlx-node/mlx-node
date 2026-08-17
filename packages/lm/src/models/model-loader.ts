@@ -12,6 +12,7 @@ import {
   HarrierModel,
   Lfm2Model as NativeLfm2Model,
   MuseGlimmerModel as NativeMuseGlimmerModel,
+  NemotronHModel as NativeNemotronHModel,
   QianfanOCRModel,
   Qwen3Model as NativeQwen3Model,
   Qwen35Model as NativeQwen35Model,
@@ -19,7 +20,7 @@ import {
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
-import { Gemma4Model, Lfm2Model, MuseGlimmerModel, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
+import { Gemma4Model, Lfm2Model, MuseGlimmerModel, NemotronHModel, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
 /** Optional settings for {@link loadModel} / {@link loadSession}. */
 export interface LoadModelOptions {
@@ -174,6 +175,16 @@ const MODEL_FAMILY_REGISTRY = [
     match: { rawModelTypes: ['lfm2_moe'] },
     load: (modelPath: string) => Lfm2Model.load(modelPath),
     nativeModelClass: NativeLfm2Model,
+  },
+  {
+    modelType: 'nemotron_h',
+    kind: 'loadable',
+    match: {
+      rawModelTypes: ['nemotron_h'],
+      architectureProbe: ({ architectures }) => architectures.has('NemotronHForCausalLM'),
+    },
+    load: (modelPath: string) => NemotronHModel.load(modelPath),
+    nativeModelClass: NativeNemotronHModel,
   },
   {
     modelType: 'internvl_chat',

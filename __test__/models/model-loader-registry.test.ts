@@ -21,6 +21,7 @@ const RAW_MODEL_TYPE_ALIASES = {
   qwen3_5_moe: ['qwen3_5_moe'],
   lfm2: ['lfm2'],
   lfm2_moe: ['lfm2_moe'],
+  nemotron_h: ['nemotron_h'],
   internvl_chat: ['internvl_chat'],
   'qianfan-ocr': ['qianfan-ocr'],
 } as const satisfies Record<ModelType, readonly string[]>;

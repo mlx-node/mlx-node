@@ -15,7 +15,7 @@ use napi::bindgen_prelude::*;
 /// per-layer host sync. When disabled, the synchronous `update_keys_values`
 /// (a raw Metal write outside the graph scheduler) is used instead. The sync
 /// path is also taken automatically when the native write fails.
-fn native_kv_write_enabled() -> bool {
+pub(crate) fn native_kv_write_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         crate::inference_trace::env_flag_enabled_or_default("MLX_LFM2_NATIVE_KV_WRITE", true)
@@ -28,7 +28,7 @@ fn native_kv_write_enabled() -> bool {
 /// synchronous `gather_kv_for_decode` (which forces a pending-write eval and
 /// reads the pool outside the graph) is used. The sync path is also taken
 /// automatically when the graph gather is unavailable for the inputs.
-fn graph_decode_gather_enabled() -> bool {
+pub(crate) fn graph_decode_gather_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
         crate::inference_trace::env_flag_enabled_or_default("MLX_LFM2_GRAPH_DECODE_GATHER", true)

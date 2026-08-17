@@ -104,7 +104,7 @@ Optional Arguments:
   --model-type, -m      Model type (auto-detected if not specified)
                         Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_asr,
                         qwen3_5, qwen3_5_moe, lfm2_moe, lfm2, qianfan-ocr,
-                        privacy-filter, muse_glimmer
+                        privacy-filter, muse_glimmer, nemotron_h
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
@@ -234,6 +234,10 @@ Model Types:
   pp-lcnet-ori          PP-LCNet orientation classifier (Paddle -> SafeTensors)
   uvdoc                 UVDoc unwarping model (Paddle/PyTorch -> SafeTensors)
   qianfan-ocr           Qianfan-OCR InternVL model (key renaming, conv2d transposition)
+  nemotron_h            NVIDIA Nemotron 3.5 Lightning (NVFP4/FP8 ingest: repacks
+                        the shipped quantized codes into MLX nvfp4/mxfp8 layouts;
+                        --quantize/--q-recipe/--q-mxfp/--imatrix-path/--q-mtp are
+                        rejected — ingest is the only mode)
 
 GGUF Support:
   When --input points to a .gguf file, the converter automatically parses the
@@ -836,10 +840,23 @@ export async function run(argv: string[]) {
       } else if (config.model_type === 'muse_glimmer') {
         modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'nemotron_h') {
+        modelType = config.model_type;
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
     } catch {
       // config.json not found or invalid
     }
+  }
+
+  if (
+    modelType === 'nemotron_h' &&
+    (args.quantize || quantRecipe !== undefined || args['q-mxfp'] || imatrixPath !== undefined || quantMtp !== 'off')
+  ) {
+    console.error(
+      'Error: Nemotron-H (nemotron_h) checkpoints are already quantized by NVIDIA (NVFP4 experts/shared_experts/lm_head, FP8 mamba projections) and convert in INGEST mode only: omit --quantize, --q-recipe, --q-mxfp, --imatrix-path, and --q-mtp. The NVFP4/FP8 codes are repacked losslessly into the MLX nvfp4/mxfp8 layouts.',
+    );
+    process.exit(1);
   }
 
   if (modelType === 'muse_glimmer' && args.quantize && quantRecipe === 'unsloth' && quantMode === 'nvfp4') {

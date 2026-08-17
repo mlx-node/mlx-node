@@ -160,6 +160,24 @@ mlx convert -m qwen3_5_moe -q --q-recipe nvidia \
   -i ./qwen3.6-35b-a3b -o ./qwen3.6-35b-a3b-nvidia-mxfp4-mlx
 ```
 
+### modelopt NVFP4 ingest (nemotron_h)
+
+`nemotron_h` is an ingest, not a recipe run: the source is NVIDIA's modelopt
+checkpoint `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`, which is
+**already quantized** (experts, shared experts, and `lm_head` in NVFP4; the
+Mamba-2 `in_proj`/`out_proj` in FP8). Ingest preserves NVFP4 — the fp4 codes are
+carried bit-exact and the checkpoint's `weight_scale_2` scalar is folded into the
+per-group E4M3 scales — and maps the FP8 Mamba-2 projections to mxfp8 with the
+checkpoint's static `input_scale` threaded as `input_amax`. No re-quantization
+flags apply (`-q`/`--q-recipe` are rejected on this already-quantized source);
+the convert is a format/repack pass, not a recipe.
+
+```bash
+mlx convert -m nemotron_h \
+  -i .cache/models/nvidia-nemotron-3.5-lightning-30b-a3b-nvfp4 \
+  -o .cache/models/nemotron-3.5-lightning-30b-a3b-nvfp4-mlx
+```
+
 ### Qwen MTP quantization conversion
 
 ```bash
