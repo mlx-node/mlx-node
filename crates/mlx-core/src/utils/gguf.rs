@@ -2660,6 +2660,97 @@ fn muse_dflash_config_value(gguf: &GgufFile) -> Result<serde_json::Value> {
     }))
 }
 
+fn validate_muse_dflash_tensor_descriptors(
+    gguf: &GgufFile,
+    config: &crate::models::muse_glimmer::config::MuseGlimmerDFlashConfig,
+) -> Result<()> {
+    let dimension = |name: &str, value: usize| {
+        u64::try_from(value).map_err(|_| {
+            Error::from_reason(format!(
+                "DFlash {name} {value} cannot be represented as a GGUF dimension"
+            ))
+        })
+    };
+    let hidden = dimension("hidden_size", config.hidden_size)?;
+    let intermediate = dimension("intermediate_size", config.intermediate_size)?;
+    let head_dim = dimension("head_dim", config.head_dim)?;
+    let query_width = dimension(
+        "query width",
+        config
+            .num_attention_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| Error::from_reason("DFlash query width overflows usize"))?,
+    )?;
+    let kv_width = dimension(
+        "KV width",
+        config
+            .num_key_value_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| Error::from_reason("DFlash KV width overflows usize"))?,
+    )?;
+    let context_width = dimension(
+        "context projection width",
+        config
+            .hidden_size
+            .checked_mul(config.target_layers.len())
+            .ok_or_else(|| Error::from_reason("DFlash context projection width overflows usize"))?,
+    )?;
+
+    let mut required = Vec::<(String, Vec<u64>)>::with_capacity(
+        3usize.saturating_add(config.num_hidden_layers.saturating_mul(11)),
+    );
+    required.push(("fc.weight".to_string(), vec![hidden, context_width]));
+    required.push(("enc.output_norm.weight".to_string(), vec![hidden]));
+    required.push(("output_norm.weight".to_string(), vec![hidden]));
+    for index in 0..config.num_hidden_layers {
+        let base = format!("blk.{index}");
+        required.extend([
+            (format!("{base}.attn_norm.weight"), vec![hidden]),
+            (format!("{base}.ffn_norm.weight"), vec![hidden]),
+            (format!("{base}.attn_q_norm.weight"), vec![head_dim]),
+            (format!("{base}.attn_k_norm.weight"), vec![head_dim]),
+            (format!("{base}.attn_q.weight"), vec![query_width, hidden]),
+            (format!("{base}.attn_k.weight"), vec![kv_width, hidden]),
+            (format!("{base}.attn_v.weight"), vec![kv_width, hidden]),
+            (
+                format!("{base}.attn_output.weight"),
+                vec![hidden, query_width],
+            ),
+            (
+                format!("{base}.ffn_gate.weight"),
+                vec![intermediate, hidden],
+            ),
+            (format!("{base}.ffn_up.weight"), vec![intermediate, hidden]),
+            (
+                format!("{base}.ffn_down.weight"),
+                vec![hidden, intermediate],
+            ),
+        ]);
+    }
+
+    let mut descriptors = HashMap::with_capacity(gguf.tensors.len());
+    for tensor in &gguf.tensors {
+        if descriptors.insert(tensor.name.as_str(), tensor).is_some() {
+            return Err(Error::from_reason(format!(
+                "DFlash GGUF contains duplicate tensor descriptor '{}'",
+                tensor.name
+            )));
+        }
+    }
+    for (name, expected) in required {
+        let tensor = descriptors.get(name.as_str()).ok_or_else(|| {
+            Error::from_reason(format!("DFlash GGUF is missing required tensor '{name}'"))
+        })?;
+        let actual = tensor.dims.iter().rev().copied().collect::<Vec<_>>();
+        if actual != expected {
+            return Err(Error::from_reason(format!(
+                "DFlash GGUF tensor '{name}' has MLX shape {actual:?}; expected {expected:?} from dflash_config"
+            )));
+        }
+    }
+    Ok(())
+}
+
 /// Secondary Muse mmproj files share the target's config.json. Unlike a
 /// uniform affine companion, Meta's file deliberately mixes Q4_K and Q6_K,
 /// so every packed projection needs an explicit mode entry in that shared
@@ -2740,7 +2831,15 @@ fn prepare_muse_secondary_config(
     let output = serde_json::to_string_pretty(&config)
         .map_err(|e| Error::from_reason(format!("Failed to serialize config: {e}")))?;
     if is_dflash {
-        crate::models::muse_glimmer::config::MuseGlimmerConfig::from_json_str(&output)?;
+        let validated =
+            crate::models::muse_glimmer::config::MuseGlimmerConfig::from_json_str(&output)?;
+        validate_muse_dflash_tensor_descriptors(
+            gguf,
+            validated
+                .dflash_config
+                .as_ref()
+                .expect("validated DFlash config must be present"),
+        )?;
     }
     Ok(Some(output))
 }
@@ -2777,7 +2876,14 @@ pub fn preflight_muse_dflash_gguf(input_path: String, target_config_dir: String)
     let merged = serde_json::to_string(&target).map_err(|error| {
         Error::from_reason(format!("Failed to serialize DFlash preflight: {error}"))
     })?;
-    crate::models::muse_glimmer::config::MuseGlimmerConfig::from_json_str(&merged)?;
+    let validated = crate::models::muse_glimmer::config::MuseGlimmerConfig::from_json_str(&merged)?;
+    validate_muse_dflash_tensor_descriptors(
+        &gguf,
+        validated
+            .dflash_config
+            .as_ref()
+            .expect("validated DFlash config must be present"),
+    )?;
     Ok(())
 }
 
@@ -5172,6 +5278,48 @@ mod tests {
         metadata
     }
 
+    fn dflash_tensor(name: impl Into<String>, mlx_shape: &[u64]) -> GgufTensorInfo {
+        GgufTensorInfo {
+            name: name.into(),
+            n_dims: mlx_shape.len() as u32,
+            dims: mlx_shape.iter().rev().copied().collect(),
+            tensor_type: GgufTensorType::F32,
+            offset: 0,
+        }
+    }
+
+    fn complete_muse_glimmer_dflash_tensors() -> Vec<GgufTensorInfo> {
+        const LAYERS: usize = 5;
+        const HIDDEN: u64 = 6656;
+        const INTERMEDIATE: u64 = 1536;
+        const HEAD_DIM: u64 = 64;
+        const QUERY_WIDTH: u64 = 8 * HEAD_DIM;
+        const KV_WIDTH: u64 = 2 * HEAD_DIM;
+        const CONTEXT_WIDTH: u64 = 3 * HIDDEN;
+
+        let mut tensors = Vec::with_capacity(3 + LAYERS * 11);
+        tensors.push(dflash_tensor("fc.weight", &[HIDDEN, CONTEXT_WIDTH]));
+        tensors.push(dflash_tensor("enc.output_norm.weight", &[HIDDEN]));
+        tensors.push(dflash_tensor("output_norm.weight", &[HIDDEN]));
+        for index in 0..LAYERS {
+            let base = format!("blk.{index}");
+            tensors.extend([
+                dflash_tensor(format!("{base}.attn_norm.weight"), &[HIDDEN]),
+                dflash_tensor(format!("{base}.ffn_norm.weight"), &[HIDDEN]),
+                dflash_tensor(format!("{base}.attn_q_norm.weight"), &[HEAD_DIM]),
+                dflash_tensor(format!("{base}.attn_k_norm.weight"), &[HEAD_DIM]),
+                dflash_tensor(format!("{base}.attn_q.weight"), &[QUERY_WIDTH, HIDDEN]),
+                dflash_tensor(format!("{base}.attn_k.weight"), &[KV_WIDTH, HIDDEN]),
+                dflash_tensor(format!("{base}.attn_v.weight"), &[KV_WIDTH, HIDDEN]),
+                dflash_tensor(format!("{base}.attn_output.weight"), &[HIDDEN, QUERY_WIDTH]),
+                dflash_tensor(format!("{base}.ffn_gate.weight"), &[INTERMEDIATE, HIDDEN]),
+                dflash_tensor(format!("{base}.ffn_up.weight"), &[INTERMEDIATE, HIDDEN]),
+                dflash_tensor(format!("{base}.ffn_down.weight"), &[HIDDEN, INTERMEDIATE]),
+            ]);
+        }
+        tensors
+    }
+
     #[test]
     fn gguf_u32_metadata_conversion_is_checked() {
         assert_eq!(GgufMetaValue::Uint32(u32::MAX).as_u32(), Some(u32::MAX));
@@ -5331,11 +5479,12 @@ mod tests {
 
     #[test]
     fn floating_point_dflash_still_writes_runtime_metadata() {
+        let tensors = complete_muse_glimmer_dflash_tensors();
         let gguf = GgufFile {
             version: GGUF_VERSION_3,
-            tensor_count: 0,
+            tensor_count: tensors.len() as u64,
             metadata: complete_muse_glimmer_dflash_metadata(),
-            tensors: Vec::new(),
+            tensors,
             alignment: GGUF_DEFAULT_ALIGNMENT,
             data_offset: 0,
         };
@@ -5407,18 +5556,84 @@ mod tests {
     }
 
     #[test]
+    fn dflash_descriptor_inventory_matches_runtime_geometry() {
+        let config = crate::models::muse_glimmer::config::MuseGlimmerDFlashConfig {
+            num_hidden_layers: 5,
+            block_size: 16,
+            hidden_size: 6656,
+            intermediate_size: 1536,
+            num_attention_heads: 8,
+            num_key_value_heads: 2,
+            head_dim: 64,
+            sliding_window: 2048,
+            max_position_embeddings: 131_072,
+            rms_norm_eps: 1e-6,
+            rope_theta: 10_000.0,
+            target_layers: vec![0, 7, 15],
+            mask_token_id: 201_818,
+            causal: false,
+        };
+        let gguf_with = |tensors: Vec<GgufTensorInfo>| GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+
+        validate_muse_dflash_tensor_descriptors(
+            &gguf_with(complete_muse_glimmer_dflash_tensors()),
+            &config,
+        )
+        .expect("complete descriptor inventory");
+
+        let mut missing = complete_muse_glimmer_dflash_tensors();
+        missing.retain(|tensor| tensor.name != "fc.weight");
+        let error = validate_muse_dflash_tensor_descriptors(&gguf_with(missing), &config)
+            .expect_err("missing context projection must fail");
+        assert!(error.reason.contains("missing required tensor 'fc.weight'"));
+
+        let mut wrong_shape = complete_muse_glimmer_dflash_tensors();
+        let output = wrong_shape
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.2.attn_output.weight")
+            .expect("complete descriptor inventory");
+        output.dims[0] -= 1;
+        let error = validate_muse_dflash_tensor_descriptors(&gguf_with(wrong_shape), &config)
+            .expect_err("wrong output projection shape must fail");
+        assert!(
+            error.reason.contains("blk.2.attn_output.weight")
+                && error.reason.contains("expected [6656, 512]"),
+            "unexpected shape error: {}",
+            error.reason
+        );
+    }
+
+    #[test]
+    #[ignore = "requires the official Muse-Glimmer DFlash GGUF and target config"]
+    fn real_muse_glimmer_dflash_descriptors_pass_preflight() {
+        let input = std::env::var("MLX_TEST_MUSE_GLIMMER_DFLASH_GGUF")
+            .expect("set MLX_TEST_MUSE_GLIMMER_DFLASH_GGUF");
+        let target = std::env::var("MLX_TEST_MUSE_GLIMMER_MODEL_PATH")
+            .expect("set MLX_TEST_MUSE_GLIMMER_MODEL_PATH");
+        preflight_muse_dflash_gguf(input, target)
+            .expect("official DFlash descriptor inventory must pass preflight");
+    }
+
+    #[test]
     fn kquant_dflash_initializes_quantization_for_a_dense_target() {
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
         let gguf = GgufFile {
             version: GGUF_VERSION_3,
-            tensor_count: 1,
+            tensor_count: tensors.len() as u64,
             metadata: complete_muse_glimmer_dflash_metadata(),
-            tensors: vec![GgufTensorInfo {
-                name: "blk.0.attn_q.weight".to_string(),
-                n_dims: 2,
-                dims: vec![256, 1],
-                tensor_type: GgufTensorType::Q4K,
-                offset: 0,
-            }],
+            tensors,
             alignment: GGUF_DEFAULT_ALIGNMENT,
             data_offset: 0,
         };
@@ -5458,17 +5673,17 @@ mod tests {
 
     #[test]
     fn companion_quantization_keeps_target_and_dflash_layers_distinct() {
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
         let gguf = GgufFile {
             version: GGUF_VERSION_3,
-            tensor_count: 1,
+            tensor_count: tensors.len() as u64,
             metadata: complete_muse_glimmer_dflash_metadata(),
-            tensors: vec![GgufTensorInfo {
-                name: "blk.0.attn_q.weight".to_string(),
-                n_dims: 2,
-                dims: vec![256, 1],
-                tensor_type: GgufTensorType::Q4K,
-                offset: 0,
-            }],
+            tensors,
             alignment: GGUF_DEFAULT_ALIGNMENT,
             data_offset: 0,
         };
@@ -5579,6 +5794,103 @@ mod tests {
             fs::read(&sidecar).expect("read preserved sidecar"),
             sentinel,
             "failed companion validation replaced the existing sidecar"
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn incomplete_dflash_inventory_fails_preflight_and_preserves_sidecar() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-dflash-inventory-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let output = root.join("output");
+        fs::create_dir_all(&output).expect("create output directory");
+        fs::write(
+            output.join("config.json"),
+            serde_json::to_vec(&valid_muse_target_config()).expect("serialize target config"),
+        )
+        .expect("write primary config");
+        let sidecar = output.join("draft.safetensors");
+        let sentinel = b"previous complete DFlash sidecar";
+        fs::write(&sidecar, sentinel).expect("write sidecar sentinel");
+
+        let scalar = 1.0f32.to_le_bytes();
+        let gguf = build_minimal_gguf(
+            &[
+                (
+                    "general.architecture",
+                    GgufMetaValue::String("dflash".to_string()),
+                ),
+                ("dflash.block_count", GgufMetaValue::Uint32(5)),
+                ("dflash.block_size", GgufMetaValue::Uint32(16)),
+                ("dflash.embedding_length", GgufMetaValue::Uint32(6656)),
+                ("dflash.feed_forward_length", GgufMetaValue::Uint32(1536)),
+                ("dflash.attention.head_count", GgufMetaValue::Uint32(8)),
+                ("dflash.attention.head_count_kv", GgufMetaValue::Uint32(2)),
+                ("dflash.attention.key_length", GgufMetaValue::Uint32(64)),
+                (
+                    "dflash.attention.sliding_window",
+                    GgufMetaValue::Uint32(2048),
+                ),
+                ("dflash.context_length", GgufMetaValue::Uint32(131_072)),
+                (
+                    "dflash.target_layers",
+                    GgufMetaValue::ArrayI32(vec![1, 8, 16]),
+                ),
+                (
+                    "dflash.attention.layer_norm_rms_epsilon",
+                    GgufMetaValue::Float32(1e-6),
+                ),
+                ("dflash.rope.freq_base", GgufMetaValue::Float32(10_000.0)),
+                (
+                    "tokenizer.ggml.mask_token_id",
+                    GgufMetaValue::Uint32(201_818),
+                ),
+            ],
+            &[("output_norm.weight", &[6656], GgufTensorType::F32, &scalar)],
+        );
+        let input = root.join("draft.gguf");
+        fs::write(&input, gguf).expect("write incomplete DFlash GGUF");
+
+        let error = preflight_muse_dflash_gguf(
+            input.to_string_lossy().into_owned(),
+            output.to_string_lossy().into_owned(),
+        )
+        .expect_err("preflight must reject an incomplete tensor inventory");
+        assert!(error.reason.contains("missing required tensor 'fc.weight'"));
+
+        let outcome = convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: None,
+            dtype: None,
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: Some("draft.safetensors".to_string()),
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(true),
+        })
+        .await;
+        let error = match outcome {
+            Ok(_) => panic!("direct conversion must reject incomplete DFlash"),
+            Err(error) => error,
+        };
+        assert!(error.reason.contains("missing required tensor 'fc.weight'"));
+        assert_eq!(
+            fs::read(&sidecar).expect("read preserved sidecar"),
+            sentinel,
+            "incomplete companion replaced the existing sidecar"
         );
         fs::remove_dir_all(root).ok();
     }
