@@ -567,6 +567,32 @@ mod mtp_turn_tests {
         }
     }
 
+    /// The mid-cycle-stop desync latch must reach the engine through the
+    /// ChatBackend trait: the physical flat caches can be ahead of the saved
+    /// token history after a partial MTP cycle (EOS/cancel/repetition
+    /// cutoff), and cache recovery resets + re-prefills only when
+    /// flat_caches_desynced() reports it (the qwen3_5/qwen3_5_moe contract).
+    #[test]
+    fn flat_cache_desync_latch_reaches_the_backend_trait() {
+        let cfg = tiny_mtp_config();
+        let mut inner = NemotronHInner::new(cfg).expect("inner builds");
+        inner.mtp_weights_loaded = true;
+        assert!(
+            !inner.flat_caches_desynced(),
+            "fresh inner must report in-sync caches"
+        );
+        inner.flat_mtp_caches_desynced = true;
+        assert!(
+            inner.flat_caches_desynced(),
+            "a mid-cycle MTP stop must surface the latch to the engine"
+        );
+        inner.clear_flat_caches_desynced();
+        assert!(
+            !inner.flat_caches_desynced(),
+            "the engine's heal must clear the latch"
+        );
+    }
+
     /// On a paged model the engine still resolves an MTP-requested turn to
     /// the Paged path (paged attention takes precedence and the family's
     /// SpeculativePlan truthfully declares supports_paged_attention=false),

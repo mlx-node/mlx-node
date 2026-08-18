@@ -949,6 +949,18 @@ impl ChatBackend for NemotronHInner {
         ids
     }
 
+    /// Mid-cycle MTP stops (EOS/cancel/repetition cutoff) leave the physical
+    /// flat caches ahead of the saved token history; the engine must see that
+    /// latch so cache recovery resets + re-prefills instead of reusing the
+    /// advanced recurrent state (the qwen3_5/qwen3_5_moe contract).
+    fn flat_caches_desynced(&self) -> bool {
+        self.flat_mtp_caches_desynced
+    }
+
+    fn clear_flat_caches_desynced(&mut self) {
+        self.flat_mtp_caches_desynced = false;
+    }
+
     fn policy(&self) -> ThinkingPolicy {
         ThinkingPolicy::TemplateHonoring
     }

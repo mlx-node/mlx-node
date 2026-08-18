@@ -2993,6 +2993,17 @@ fn strip_symmetric_zero_point(config: &mut serde_json::Value) {
 /// of the native parser (nemotron_h/config.rs) and the TypeScript registry
 /// probe: model_type == "nemotron_h" OR an architectures entry of
 /// "NemotronHForCausalLM" (even when model_type is absent or malformed).
+/// Dtype-cast ownership: the recipe's sanitizer owns the cast when the
+/// EFFECTIVE model type (caller-supplied or config-detected) resolves to a
+/// recipe that declares it. Deriving this from the caller's raw model_type
+/// would let the generic cast round the source F32 scale sidecars before a
+/// config-detected sanitizer folds them.
+fn dtype_cast_owned_by_sanitizer(effective_model_type: Option<&str>) -> bool {
+    effective_model_type
+        .and_then(recipe::recipe_for)
+        .is_some_and(|r| r.owns_dtype_cast())
+}
+
 fn is_nemotron_h_config(config: &serde_json::Value) -> bool {
     config.get("model_type").and_then(|v| v.as_str()) == Some("nemotron_h")
         || config
@@ -3608,10 +3619,12 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
 
     // For models with a sanitizer that handles FP8 dequant + dtype conversion
     // (e.g. qwen3_5_moe), skip the generic dtype conversion and let the sanitizer do it.
-    let has_custom_sanitizer = model_type
-        .as_deref()
-        .and_then(recipe::recipe_for)
-        .is_some_and(|r| r.owns_dtype_cast());
+    // Use the EFFECTIVE model type (recipe_model_type): a config-detected
+    // Nemotron with model_type omitted must still let the ingest sanitizer
+    // own the cast — the generic loop would otherwise round the source F32
+    // weight_scale_2 / input_scale sidecars to the target dtype BEFORE the
+    // fold/repack, silently changing the quantization scales.
+    let has_custom_sanitizer = dtype_cast_owned_by_sanitizer(recipe_model_type.as_deref());
 
     // True for models whose sanitizer arm manages quantization itself — the
     // generic quantize block below must skip these to avoid double-quantizing.
@@ -18132,5 +18145,24 @@ mod tests {
 
         let empty = serde_json::json!({});
         assert!(!is_nemotron_h_config(&empty));
+    }
+
+    /// The dtype-cast ownership decision must use the EFFECTIVE model type:
+    /// a config-detected nemotron_h (caller model_type omitted) resolves to
+    /// the ingest recipe whose sanitizer owns the cast, so the generic cast
+    /// never pre-rounds the source F32 scale sidecars before the fold.
+    #[test]
+    fn nemotron_dtype_cast_ownership_uses_effective_model_type() {
+        assert!(
+            dtype_cast_owned_by_sanitizer(Some("nemotron_h")),
+            "the ingest sanitizer must own the cast"
+        );
+        assert!(
+            !dtype_cast_owned_by_sanitizer(None),
+            "no effective family means the generic cast runs"
+        );
+        assert!(!dtype_cast_owned_by_sanitizer(Some("qwen3")));
+        // The registry gate above independently pins owns_dtype_cast per
+        // family; this test pins WHICH model type the driver feeds it.
     }
 }
