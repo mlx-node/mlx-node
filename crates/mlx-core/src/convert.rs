@@ -2988,6 +2988,22 @@ fn strip_symmetric_zero_point(config: &mut serde_json::Value) {
     }
 }
 
+/// Config-driven Nemotron-H family predicate, shared by the conversion
+/// driver and the unit tests. Mirrors the authoritative-architecture policy
+/// of the native parser (nemotron_h/config.rs) and the TypeScript registry
+/// probe: model_type == "nemotron_h" OR an architectures entry of
+/// "NemotronHForCausalLM" (even when model_type is absent or malformed).
+fn is_nemotron_h_config(config: &serde_json::Value) -> bool {
+    config.get("model_type").and_then(|v| v.as_str()) == Some("nemotron_h")
+        || config
+            .get("architectures")
+            .and_then(|v| v.as_array())
+            .is_some_and(|arr| {
+                arr.iter()
+                    .any(|a| a.as_str() == Some("NemotronHForCausalLM"))
+            })
+}
+
 async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionResult> {
     let input_dir = PathBuf::from(&options.input_dir);
     let output_dir = PathBuf::from(&options.output_dir);
@@ -3254,9 +3270,13 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // Nemotron-H: already-quantized ingest source. The config-driven check
     // closes the direct-NAPI path where model_type was omitted (the CLI
     // auto-detect forwards the config's own model_type, so the early guard
-    // above already caught it there).
-    let is_nemotron_h_ingest = model_type.as_deref() == Some("nemotron_h")
-        || config.get("model_type").and_then(|v| v.as_str()) == Some("nemotron_h");
+    // above already caught it there). The architecture arm mirrors the
+    // authoritative-architecture policy of the native parser
+    // (nemotron_h/config.rs) and the TS registry probe, so an
+    // architecture-only config converts through the ingest sanitizer from
+    // the direct convertModel path too.
+    let is_nemotron_h_ingest =
+        model_type.as_deref() == Some("nemotron_h") || is_nemotron_h_config(&config);
     // Effective model type for the recipe dispatch below: when the caller
     // omitted model_type but the config declares this family, resolve it here
     // so NemotronHRecipe::sanitize actually runs (a config-detected Nemotron
@@ -18078,5 +18098,39 @@ mod tests {
         // Unrelated families are unaffected.
         validate_nemotron_h_ingest_options(Some("qwen3_5"), None, true, None, false, None, "off")
             .expect("other families unaffected");
+    }
+
+    /// The config-driven family predicate mirrors the native parser's
+    /// authoritative-architecture policy: model_type alone, the architecture
+    /// alone, or a wrong model_type with the architecture all resolve to
+    /// nemotron_h; a wrong model_type without the architecture does not.
+    #[test]
+    fn nemotron_h_config_predicate_matches_parser_policy() {
+        let by_type = serde_json::json!({ "model_type": "nemotron_h" });
+        assert!(is_nemotron_h_config(&by_type));
+
+        let by_arch_only = serde_json::json!({ "architectures": ["NemotronHForCausalLM"] });
+        assert!(
+            is_nemotron_h_config(&by_arch_only),
+            "architecture-only config must resolve to the family"
+        );
+
+        let wrong_type_with_arch = serde_json::json!({
+            "model_type": "llama",
+            "architectures": ["NemotronHForCausalLM"]
+        });
+        assert!(
+            is_nemotron_h_config(&wrong_type_with_arch),
+            "the architecture is authoritative over a wrong model_type"
+        );
+
+        let wrong_type_no_arch = serde_json::json!({
+            "model_type": "llama",
+            "architectures": ["LlamaForCausalLM"]
+        });
+        assert!(!is_nemotron_h_config(&wrong_type_no_arch));
+
+        let empty = serde_json::json!({});
+        assert!(!is_nemotron_h_config(&empty));
     }
 }
