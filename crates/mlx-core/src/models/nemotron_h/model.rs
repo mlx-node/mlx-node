@@ -1226,7 +1226,12 @@ impl PagedBackend for NemotronHInner {
         }
         let cached = prefix.effective_cached_prefix_len as u32;
         let end = cached + suffix_tokens.len() as u32;
-        let slices = chunk_aligned_prefill_slices(cached, end, PREFILL_STEP_SIZE as u32, 128);
+        let slices = chunk_aligned_prefill_slices(
+            cached,
+            end,
+            PREFILL_STEP_SIZE as u32,
+            self.config.chunk_size as u32,
+        );
         let mut last = None;
         for (s, e) in slices {
             let skip = prefix.mamba_state_reusable || s > cached;
@@ -1425,10 +1430,16 @@ impl HybridSchedulerBackend for NemotronHInner {
     ) -> Result<Option<MxArray>> {
         self.activate_paged_seq(seq_id)?;
         // The engine's pinned break-set is a 2048-token grid from the
-        // effective prefix; re-split every slice at Mamba-2 chunk-128
-        // boundaries so no executed prefill forward splits a chunk.
-        let slices =
-            chunk_aligned_prefill_slices(start as u32, end as u32, PREFILL_STEP_SIZE as u32, 128);
+        // effective prefix; re-split every slice at the CONFIGURED Mamba-2
+        // chunk-size boundaries so no executed prefill forward splits a
+        // chunk (a hard-coded 128 would misalign checkpoints that declare a
+        // different chunk_size and change the recurrence's reduction order).
+        let slices = chunk_aligned_prefill_slices(
+            start as u32,
+            end as u32,
+            PREFILL_STEP_SIZE as u32,
+            self.config.chunk_size as u32,
+        );
         let mut last = None;
         for (index, (s, e)) in slices.into_iter().enumerate() {
             let prefix = self.build_scheduled_prefix(
@@ -1535,10 +1546,11 @@ impl NemotronHInner {
 
 /// Split the absolute token range [start, end) into sub-slices of at most
 /// slice_tokens tokens whose internal boundaries are all multiples of the
-/// Mamba-2 chunk_size (128). The first sub-slice starts at start (the
-/// effective cached-prefix boundary, possibly unaligned); every later
-/// boundary is a chunk multiple, so no executed prefill forward splits a
-/// chunk relative to the model's chunk-scan arithmetic.
+/// Mamba-2 chunk_size (taken from the checkpoint config; 128 for the
+/// released model). The first sub-slice starts at start (the effective
+/// cached-prefix boundary, possibly unaligned); every later boundary is a
+/// chunk multiple, so no executed prefill forward splits a chunk relative
+/// to the model's chunk-scan arithmetic.
 pub(crate) fn chunk_aligned_prefill_slices(
     start: u32,
     end: u32,
@@ -2168,6 +2180,11 @@ mod scheduler_tests {
             (112, 140, 2048, 128),
             // Exact multiples.
             (128, 1280, 2048, 128),
+            // A valid checkpoint may declare a different chunk_size (e.g.
+            // 256): the boundaries must follow it, not a hard-coded 128.
+            (0, 3000, 2048, 256),
+            (112, 2160, 2048, 256),
+            (256, 1280, 2048, 256),
         ];
         for &(start, end, slice_tokens, chunk_size) in cases {
             let slices = chunk_aligned_prefill_slices(start, end, slice_tokens, chunk_size);
