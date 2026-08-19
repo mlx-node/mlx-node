@@ -27,6 +27,31 @@ use crate::stream::Stream;
 
 use crate::engine::decode::{StreamingCtx, mtp_trace_logits, trace_top2};
 
+/// Rows this turn's speculative reservation must cover per verify cycle —
+/// the plan's [`crate::engine::plan::SpeculativePlan::lookahead_rows`] at
+/// the deepest depth any cycle of the turn can pick (I1: the plan property
+/// is the single source; no reserver re-derives `depth + 1`).
+///
+/// Fixed-depth turns verify exactly `params.mtp_depth` drafts per cycle.
+/// Adaptive turns are not bounded by the requested seed depth: the
+/// throughput policy's `Explore` state sweeps every depth up to
+/// [`crate::models::qwen3_5::adaptive_depth::MAX_DEPTH`]
+/// (`AdaptiveDepthPolicy::maybe_explore_transition`), so the reservation
+/// must cover that ladder too.
+pub(crate) fn turn_lookahead_rows(
+    plan: crate::engine::plan::SpeculativePlan,
+    params: &ChatParams,
+) -> usize {
+    let max_cycle_depth = if params.mtp_adaptive_depth {
+        params
+            .mtp_depth
+            .max(crate::models::qwen3_5::adaptive_depth::MAX_DEPTH as usize)
+    } else {
+        params.mtp_depth
+    };
+    plan.lookahead_rows(max_cycle_depth)
+}
+
 /// One MTP draft+verify cycle, generic over [`MtpStepper`] — a VERBATIM,
 /// mechanical relocation of
 /// [`crate::models::qwen3_5::mtp_decode::run_mtp_cycle_inner`], calling
@@ -1271,11 +1296,21 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // stepper at `begin_mtp_decode` (the analog of `begin_paged_decode`). The
     // macro threaded `embedding_weight` as `$emb`; the stepper now owns it and
     // exposes it via `embedding_weight()`. Read once at turn entry.
+    // Speculative lookahead margin threaded to `begin_mtp_decode` so a paged
+    // stepper reserves its verify rows before any cycle writes (I1: read off
+    // the backend's `SpeculativePlan`, never a local `depth + 1`). `0` ⇒ the
+    // backend declares no speculative plan, so no margin is defined and the
+    // stepper reserves nothing.
+    let lookahead_rows = backend
+        .execution_plan()
+        .speculative
+        .map_or(0, |plan| turn_lookahead_rows(plan, p));
     let setup = MtpTurnSetup {
         prompt_hidden: prompt_hidden.as_ref(),
         prompt_hidden_ids: prompt_hidden_ids.as_deref(),
         prompt_hidden_position_base,
         first_sampled_token,
+        lookahead_rows,
     };
     let mut step = backend.begin_mtp_decode(&setup)?;
     if inference_info_enabled {
@@ -3923,6 +3958,9 @@ mod tests {
         /// (see [`MockMtpStepper::state_pos`]), readable after `run_mtp_turn`
         /// consumed the stepper.
         state_pos: Rc<std::cell::Cell<i64>>,
+        /// The `setup.lookahead_rows` value `begin_mtp_decode` received —
+        /// pins the engine's plan-property threading (I1).
+        lookahead_rows_seen: std::cell::Cell<usize>,
     }
 
     impl MockMtpBackend {
@@ -3946,6 +3984,7 @@ mod tests {
                 flip_cancel_on_forward: None,
                 flip_cancel_on_commit: None,
                 state_pos: Rc::new(std::cell::Cell::new(0)),
+                lookahead_rows_seen: std::cell::Cell::new(usize::MAX),
             }
         }
 
@@ -3973,10 +4012,25 @@ mod tests {
         }
     }
 
-    // Minimal `ChatBackend` surface — `run_mtp_turn` calls NONE of these (it
-    // only drives `begin_mtp_decode` + the `MtpStepper`), so the never-reached
-    // methods propagate an error instead of panicking.
+    // Minimal `ChatBackend` surface — apart from `execution_plan` (read once
+    // at turn entry for the lookahead margin), `run_mtp_turn` calls none of
+    // these (it only drives `begin_mtp_decode` + the `MtpStepper`), so the
+    // never-reached methods propagate an error instead of panicking.
     impl ChatBackend for MockMtpBackend {
+        fn execution_plan(&self) -> crate::engine::plan::ExecutionPlan {
+            // Publish a flat NativeMtp plan so `run_mtp_turn`'s
+            // `turn_lookahead_rows` read is exercised (recorded via
+            // `lookahead_rows_seen`); everything else stays text-only.
+            crate::engine::plan::ExecutionPlan {
+                speculative: Some(crate::engine::plan::SpeculativePlan {
+                    kind: crate::engine::plan::SpeculativeKind::NativeMtp,
+                    supported_input_media: crate::engine::plan::MediaCapabilities::NONE,
+                    supported_context_media: crate::engine::plan::MediaCapabilities::NONE,
+                    supports_paged_attention: false,
+                }),
+                ..crate::engine::plan::ExecutionPlan::TEXT_ONLY
+            }
+        }
         fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
             Err(Error::from_reason(
                 "MockMtpBackend::tokenizer must not run (run_mtp_turn never reads it)",
@@ -4029,8 +4083,9 @@ mod tests {
         where
             Self: 'a;
 
-        fn begin_mtp_decode(&mut self, _setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>> {
+        fn begin_mtp_decode(&mut self, setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>> {
             self.begin_calls.set(self.begin_calls.get() + 1);
+            self.lookahead_rows_seen.set(setup.lookahead_rows);
             let mut step = MockMtpStepper::with_turn(
                 self.vocab,
                 self.hidden,
@@ -4157,6 +4212,61 @@ mod tests {
     /// Count ledger entries matching a predicate.
     fn count(ledger: &[Call], pred: impl Fn(&Call) -> bool) -> usize {
         ledger.iter().filter(|c| pred(c)).count()
+    }
+
+    /// Catches: a reserver re-deriving `depth + 1` locally instead of reading
+    /// the plan property, and the adaptive ladder being sized by the requested
+    /// seed depth (the throughput policy's Explore state sweeps to
+    /// `MAX_DEPTH` regardless of the seed).
+    #[test]
+    fn turn_lookahead_rows_reads_the_plan_property() {
+        use super::turn_lookahead_rows;
+        use crate::models::qwen3_5::adaptive_depth::MAX_DEPTH;
+        let plan = crate::engine::plan::SpeculativePlan {
+            kind: crate::engine::plan::SpeculativeKind::NativeMtp,
+            supported_input_media: crate::engine::plan::MediaCapabilities::NONE,
+            supported_context_media: crate::engine::plan::MediaCapabilities::NONE,
+            supports_paged_attention: true,
+        };
+
+        let mut params = greedy_params();
+        params.mtp_depth = 3;
+        assert_eq!(turn_lookahead_rows(plan, &params), 4);
+
+        params.mtp_adaptive_depth = true;
+        params.mtp_depth = 1;
+        assert_eq!(
+            turn_lookahead_rows(plan, &params),
+            MAX_DEPTH as usize + 1,
+            "adaptive turns must cover the full explore ladder"
+        );
+
+        params.mtp_depth = MAX_DEPTH as usize + 2;
+        assert_eq!(
+            turn_lookahead_rows(plan, &params),
+            MAX_DEPTH as usize + 3,
+            "a requested depth above the ladder still bounds the margin"
+        );
+    }
+
+    /// Catches: the engine dropping the plan→setup threading — every
+    /// `begin_mtp_decode` must receive the plan-derived lookahead margin,
+    /// not a default or a locally re-derived value.
+    #[test]
+    fn run_mtp_turn_threads_plan_lookahead_into_setup() {
+        let _chained_off = force_chained_off();
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4, 5],
+            verify_argmax: vec![4, 5, 6],
+        };
+        let mut backend = MockMtpBackend::new(16, 4, vec![7, 8, 9], vec![cycle; 4], false);
+        let out = drive_turn(&mut backend, 3, 8, 15, 2);
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(
+            backend.lookahead_rows_seen.get(),
+            3,
+            "fixed depth-2 turn: the setup must carry lookahead_rows(2) = 3"
+        );
     }
 
     #[test]

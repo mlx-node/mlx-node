@@ -4699,6 +4699,52 @@ impl Qwen35Inner {
         Ok(())
     }
 
+    /// Pre-cycle speculative admission for the paged MTP arm: reserve this
+    /// turn's lookahead rows past the (post-prefill) prompt cursor, sized by
+    /// `engine::mtp_turn::turn_lookahead_rows` off the model's
+    /// [`SpeculativePlan`] (I1 — the plan property is the single source).
+    ///
+    /// `Ok(false)` means the pool cannot hold even one verify cycle: the
+    /// caller must run the turn autoregressively instead of erroring it
+    /// (vLLM schedules such a request without its spec tokens rather than
+    /// failing it). AR decode grows one row at a time against the same
+    /// lazily-allocated tail, so it can still make progress where a
+    /// `depth + 1`-row verify write could not. Non-capacity errors (missing
+    /// adapter, poisoned allocator) still fail the turn.
+    fn reserve_paged_mtp_lookahead(&mut self, p: &engine::ChatParams, site: &str) -> Result<bool> {
+        let Some(plan) = self.execution_plan().speculative else {
+            // The MTP arms gate on `has_mtp_weights()`, which is exactly what
+            // publishes the speculative plan — unreachable, but proceeding
+            // without a reservation only restores lazy allocation.
+            debug_assert!(
+                false,
+                "{site}: paged MTP admission without a speculative plan"
+            );
+            return Ok(true);
+        };
+        let rows = u32::try_from(crate::engine::mtp_turn::turn_lookahead_rows(plan, p))
+            .unwrap_or(u32::MAX);
+        let adapter = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason(format!("{site}: paged_adapter is None")))?;
+        match adapter.reserve_rows(rows) {
+            Ok(_) => Ok(true),
+            Err(e) if e.starts_with("context_length_exceeded:") => {
+                tracing::warn!(
+                    target: "mlx_core::qwen3_5::paged",
+                    lookahead_rows = rows,
+                    "{site}: speculative lookahead reservation exhausted the \
+                     paged pool; falling back to autoregressive decode: {e}"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(Error::from_reason(format!(
+                "{site}: speculative lookahead reservation: {e}"
+            ))),
+        }
+    }
+
     /// Block-paged variant of [`Self::vision_mtp_whole_turn_core`].
     ///
     /// Mirrors the flat path's control flow (penalty stack, decode
@@ -5139,6 +5185,12 @@ impl Qwen35Inner {
             self.has_mtp_weights(),
             eager_mtp_paged
         );
+
+        // Pre-cycle lookahead reservation while AR fallback is still an
+        // option — allocator exhaustion inside the verify loop would instead
+        // surface as a turn error and invalidate the paged session.
+        let eager_mtp_paged =
+            eager_mtp_paged && self.reserve_paged_mtp_lookahead(p, "paged_turn_sync_core_inner")?;
 
         if eager_mtp_paged {
             // Pure-Rust ("eager") paged MTP.
@@ -6774,6 +6826,11 @@ impl Qwen35Inner {
         let mut decode_progress_window_start = decode_progress_start;
         let mut decode_progress_last_generated = 0usize;
         let mut decode_progress_next_generated = 32usize;
+
+        // Pre-cycle lookahead reservation while AR fallback is still an
+        // option — same rationale as the sync twin.
+        let eager_mtp_paged = eager_mtp_paged
+            && self.reserve_paged_mtp_lookahead(p, "paged_turn_stream_core_inner")?;
 
         if eager_mtp_paged {
             // Pure-Rust ("eager") paged MTP — streaming twin of the sync core's
@@ -10929,7 +10986,25 @@ impl MtpBackend for Qwen35Inner {
         // (restored by `Drop`); the flat cores have none and run flat. The
         // paged forwards need the per-layer kind classification (unused flat).
         let (mode, layer_kinds) = match self.paged_adapter.take() {
-            Some(adapter) => {
+            Some(mut adapter) => {
+                // Reserve the speculative lookahead region before any cycle
+                // writes (I1: `setup.lookahead_rows` comes from the
+                // `SpeculativePlan` property — never a local `depth + 1`).
+                // The paged cores reserved this same margin at their
+                // AR-fallback gate, so this normally takes the covered no-op
+                // branch; a caller that skips that gate still fails HERE,
+                // pre-cycle with untouched state, instead of mid-verify.
+                if setup.lookahead_rows > 0 {
+                    let rows = u32::try_from(setup.lookahead_rows).unwrap_or(u32::MAX);
+                    if let Err(e) = adapter.reserve_rows(rows) {
+                        // `mode` does not exist yet, so `Drop` cannot restore
+                        // the adapter — put it back before erroring out.
+                        self.paged_adapter = Some(adapter);
+                        return Err(Error::from_reason(format!(
+                            "eager paged MTP lookahead reservation ({rows} rows): {e}"
+                        )));
+                    }
+                }
                 // Cached once at construction (see the field rustdoc); clone is
                 // a copy of the turn-constant classification.
                 let layer_kinds = self.layer_kinds.clone();
@@ -14512,11 +14587,17 @@ mod paged_construction_tests {
     }
 
     fn paged_inner_or_skip(test_name: &str) -> Option<(Qwen35Inner, Qwen3_5Config)> {
+        paged_inner_with_cfg_or_skip(test_name, tiny_paged_forward_cfg())
+    }
+
+    fn paged_inner_with_cfg_or_skip(
+        test_name: &str,
+        cfg: Qwen3_5Config,
+    ) -> Option<(Qwen35Inner, Qwen3_5Config)> {
         // Only a device-less host licenses a skip. A `LayerKVPool::new: ...
         // must be > 0` means the test config stopped producing a usable pool,
         // and skipping on that is a silent green — see `metal_device_absent`.
         let unavailable = crate::test_support::metal_device_absent;
-        let cfg = tiny_paged_forward_cfg();
         match Qwen35Inner::new(cfg.clone()) {
             Ok(mut inner) => match inner.initialize_paged_adapter() {
                 Ok(()) => Some((inner, cfg)),
@@ -16558,6 +16639,236 @@ mod paged_construction_tests {
         let _ = adapter.register_full_blocks_for_reuse(&[], 0);
         adapter.release_request().expect("release_request");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Cross-module gate for the reserve→verify seam (T1/T2/T3 wiring):
+    /// `begin_mtp_decode` must reserve the plan-derived lookahead region
+    /// (`SpeculativePlan::lookahead_rows`, threaded through
+    /// `MtpTurnSetup.lookahead_rows`) so a REAL paged verify cycle writes
+    /// its `depth + 1` rows into pre-allocated blocks.
+    ///
+    /// Catches: I1 drift (the property diverging from what verify actually
+    /// writes), a dead reserve→record seam (reservation not reaching the
+    /// adapter, or advancing the cursor), and a verify/rollback pair whose
+    /// net adapter growth escapes the reserved margin.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn paged_mtp_lookahead_reservation_covers_verify() {
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.n_mtp_layers = 1;
+        let Some((mut inner, _cfg)) =
+            paged_inner_with_cfg_or_skip("paged_mtp_lookahead_reservation_covers_verify", cfg)
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        // Random-init MTP module + loaded marker so `execution_plan()`
+        // publishes the speculative plan (the drafter itself never runs
+        // here — the driven cycle is snapshot → verify → rollback).
+        inner.mtp_weights_loaded = true;
+
+        // Exactly one full block of prompt: the lookahead region then starts
+        // ON a block boundary, the worst case for a mid-verify allocation.
+        let block_size = inner.paged_adapter.as_ref().expect("adapter").block_size();
+        let prompt: Vec<u32> = (0..block_size).map(|i| (i * 5 + 7) % 257).collect();
+        reset_paged_request(&mut inner, &prompt);
+        run_dense_paged_prefill_with_size(&mut inner, &prompt, &prompt, 0, 2048)
+            .expect("dense paged prefill")
+            .eval();
+
+        let depth = 3usize;
+        let plan = inner
+            .execution_plan()
+            .speculative
+            .expect("dense MTP checkpoint must publish a speculative plan");
+        let lookahead = plan.lookahead_rows(depth);
+        assert_eq!(lookahead, depth + 1);
+
+        let (pre_blocks, prompt_len) = {
+            let adapter = inner.paged_adapter.as_ref().expect("adapter");
+            (
+                adapter.num_allocated_blocks(),
+                adapter.current_token_count(),
+            )
+        };
+        assert_eq!(prompt_len, prompt.len() as u32);
+
+        let setup = MtpTurnSetup {
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
+            prompt_hidden_position_base: 0,
+            first_sampled_token: 21,
+            lookahead_rows: lookahead,
+        };
+        let mut step = inner.begin_mtp_decode(&setup).expect("begin_mtp_decode");
+
+        // Reservation: blocks grow to cover prompt + lookahead, the cursor
+        // does not move.
+        let MtpStepMode::Paged(adapter) = &step.mode else {
+            panic!("paged model must take the paged stepper mode");
+        };
+        let reserved_blocks = adapter.num_allocated_blocks();
+        assert_eq!(
+            reserved_blocks,
+            (prompt.len() + lookahead).div_ceil(block_size as usize),
+            "reservation must cover prompt + lookahead rows"
+        );
+        assert!(reserved_blocks > pre_blocks);
+        assert_eq!(
+            adapter.current_token_count(),
+            prompt_len,
+            "reservation must not advance the cursor"
+        );
+
+        // One REAL verify cycle in the engine's order: snapshot → batched
+        // verify over depth+1 ids → partial-accept rollback.
+        let embedding = step.embedding().clone();
+        step.snapshot_main_linear();
+        let verify_ids =
+            MxArray::from_int32(&[21, 22, 23, 24], &[1, (depth + 1) as i64]).expect("verify ids");
+        let verify = step
+            .verify_step(&verify_ids, &embedding, depth)
+            .expect("paged verify step");
+        verify.hiddens.eval();
+
+        let MtpStepMode::Paged(adapter) = &step.mode else {
+            panic!("mode must stay paged across the cycle");
+        };
+        assert_eq!(
+            adapter.num_allocated_blocks(),
+            reserved_blocks,
+            "the verify write must allocate ZERO new blocks after the reservation"
+        );
+        assert_eq!(adapter.current_token_count(), prompt_len + lookahead as u32);
+
+        step.rollback(/* accepted_drafts */ 1, depth);
+        assert!(
+            step.take_replay_error().is_none(),
+            "GDN tape replay must succeed on the partial accept"
+        );
+        let MtpStepMode::Paged(adapter) = &step.mode else {
+            panic!("mode must stay paged across the rollback");
+        };
+        assert_eq!(
+            adapter.num_allocated_blocks(),
+            reserved_blocks,
+            "rollback is bookkeeping-only — no block may move"
+        );
+        let growth = adapter.current_token_count() - prompt_len;
+        assert_eq!(growth, 2, "committed rows = accepted drafts + anchor");
+        assert!(
+            (growth as usize) <= lookahead,
+            "total adapter growth must fit the reserved lookahead region"
+        );
+
+        drop(step);
+        assert!(
+            inner.paged_adapter.is_some(),
+            "the stepper Drop must restore the adapter"
+        );
+    }
+
+    /// Failure path of the same seam: a reservation the pool cannot hold
+    /// must signal AR fallback (`Ok(false)`) with adapter state untouched —
+    /// never a turn error — and plain AR decode must still make progress on
+    /// the same request afterwards.
+    ///
+    /// Catches: exhaustion routed to `Err` (turn error → session
+    /// invalidation), and a failed reservation corrupting the request's
+    /// block table or cursor.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn paged_mtp_lookahead_exhaustion_falls_back_to_ar() {
+        use crate::engine::types::ChatConfig;
+
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.n_mtp_layers = 1;
+        let Some((mut inner, _cfg)) =
+            paged_inner_with_cfg_or_skip("paged_mtp_lookahead_exhaustion_falls_back_to_ar", cfg)
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        inner.mtp_weights_loaded = true;
+
+        let block_size = inner.paged_adapter.as_ref().expect("adapter").block_size();
+        let prompt: Vec<u32> = (0..block_size).map(|i| (i * 5 + 7) % 257).collect();
+        reset_paged_request(&mut inner, &prompt);
+        run_dense_paged_prefill_with_size(&mut inner, &prompt, &prompt, 0, 2048)
+            .expect("dense paged prefill")
+            .eval();
+
+        let mut p = extract_chat_params(&ChatConfig {
+            enable_mtp: Some(true),
+            ..ChatConfig::default()
+        });
+        // The public surface clamps `mtp_depth` to [1, 5]; drive the params
+        // struct directly so the reservation exceeds `max_capacity_tokens`.
+        p.mtp_depth = inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .max_capacity_tokens() as usize;
+
+        let (blocks_before, cursor_before) = {
+            let adapter = inner.paged_adapter.as_ref().expect("adapter");
+            (
+                adapter.num_allocated_blocks(),
+                adapter.current_token_count(),
+            )
+        };
+        let admitted = inner
+            .reserve_paged_mtp_lookahead(&p, "exhaustion_test")
+            .expect("capacity exhaustion must not error the turn");
+        assert!(
+            !admitted,
+            "an over-capacity reservation must signal AR fallback"
+        );
+        {
+            let adapter = inner.paged_adapter.as_ref().expect("adapter");
+            assert_eq!(adapter.num_allocated_blocks(), blocks_before);
+            assert_eq!(adapter.current_token_count(), cursor_before);
+        }
+
+        // A cycle-sized reservation still fits and admits MTP.
+        p.mtp_depth = 3;
+        assert!(
+            inner
+                .reserve_paged_mtp_lookahead(&p, "exhaustion_test")
+                .expect("in-capacity reservation"),
+            "a reservation the pool can hold must admit the MTP arm"
+        );
+
+        // The AR fallback can proceed: one real paged decode step on the
+        // same request.
+        let logits = {
+            let layer_kinds = inner.layer_kinds.clone();
+            let embed = inner.embedding.clone();
+            let caches_ref = inner.caches.as_mut().expect("caches");
+            let adapter = inner.paged_adapter.as_mut().expect("adapter");
+            super::super::paged_forward::run_paged_decode_step(
+                21,
+                &embed,
+                &mut inner.layers,
+                caches_ref,
+                &inner.final_norm,
+                &inner.lm_head,
+                &layer_kinds,
+                adapter,
+                0,
+            )
+            .expect("AR decode step after fallback")
+        };
+        logits.eval();
+        assert_eq!(
+            inner
+                .paged_adapter
+                .as_ref()
+                .expect("adapter")
+                .current_token_count(),
+            cursor_before + 1,
+            "AR decode must advance one row past the prompt"
+        );
     }
 }
 #[cfg(test)]

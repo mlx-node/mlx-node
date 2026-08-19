@@ -1433,6 +1433,15 @@ pub(crate) struct MtpTurnSetup<'a> {
     /// committed run `[prompt_ids[1..], y]`. == the eager block's
     /// `y.item_at_int32(0)` read.
     pub first_sampled_token: u32,
+    /// Speculative lookahead margin, in target-cache rows:
+    /// `engine::mtp_turn::turn_lookahead_rows` of the backend's
+    /// [`crate::engine::plan::SpeculativePlan`] (I1 — the plan property is
+    /// the single source; consumers never re-derive `depth + 1`). A paged
+    /// stepper reserves this many rows past the prompt cursor in
+    /// `begin_mtp_decode` so verify writes land in pre-reserved blocks. `0`
+    /// ⇒ the backend declares no speculative plan: no margin is defined and
+    /// nothing is reserved (flat steppers ignore the field entirely).
+    pub lookahead_rows: usize,
 }
 
 /// Sub-trait of [`ChatBackend`] for families whose MTP speculative-decode

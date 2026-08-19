@@ -197,7 +197,6 @@ impl SpeculativePlan {
     /// The single source for the speculative slot margin (vLLM's
     /// `num_lookahead_tokens`): every reserver reads this; none re-derives
     /// `depth + 1` locally.
-    #[cfg_attr(not(test), expect(dead_code))]
     pub const fn lookahead_rows(self, depth: usize) -> usize {
         depth + 1
     }
