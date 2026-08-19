@@ -597,6 +597,55 @@ mod mtp_turn_tests {
     /// the Paged path (paged attention takes precedence and the family's
     /// SpeculativePlan truthfully declares supports_paged_attention=false),
     /// so run_paged_turn must re-route it to the flat speculative core -
+    /// Prefix reuse must require the sequence's recurrent (Mamba) state to
+    /// have SURVIVED: a preempted sequence releases its state while its KV
+    /// blocks and owner history remain reusable, so a token-only predicate
+    /// would skip the Pass-1 reconstruction and resume with KV at the prefix
+    /// boundary but Mamba state at position zero.
+    #[test]
+    fn recurrent_state_survival_gates_prefix_reuse() {
+        let cfg = tiny_mtp_paged_config();
+        let mut inner = NemotronHInner::new(cfg).expect("inner builds");
+        // Fresh activation (no parked state for this seq) must report the
+        // state as NOT survived.
+        inner.activate_paged_seq(0).expect("activate fresh seq");
+        assert!(
+            !inner.active_seq_recurrent_survived,
+            "fresh zero-state caches must not count as survived state"
+        );
+        // Park (state survives in the map) and re-activate: now it survived.
+        inner.park_active_scheduled_caches();
+        inner.activate_paged_seq(0).expect("reactivate parked seq");
+        assert!(
+            inner.active_seq_recurrent_survived,
+            "parked caches restored at the exact boundary must count as survived"
+        );
+        // Preemption releases the state; the next activation is fresh again.
+        inner.park_active_scheduled_caches();
+        inner.release_scheduled_caches_for(0);
+        inner
+            .activate_paged_seq(0)
+            .expect("reactivate after preemption");
+        assert!(
+            !inner.active_seq_recurrent_survived,
+            "preemption-released state must force Pass-1 reconstruction"
+        );
+    }
+
+    /// A zero (or out-of-set) paged block size must fail the load with a
+    /// clear error instead of panicking inside the capacity math.
+    #[test]
+    fn rejects_invalid_paged_block_size() {
+        let mut cfg = tiny_mtp_paged_config();
+        cfg.paged_block_size = Some(0);
+        let err = NemotronHInner::new(cfg).err().expect("must fail");
+        assert!(err.reason.contains("paged_block_size"), "{}", err.reason);
+        let mut cfg2 = tiny_mtp_paged_config();
+        cfg2.paged_block_size = Some(64);
+        let err2 = NemotronHInner::new(cfg2).err().expect("must fail");
+        assert!(err2.reason.contains("paged_block_size"), "{}", err2.reason);
+    }
+
     /// the exact wiring the real-checkpoint E2E was missing.
     #[test]
     fn mtp_request_on_paged_model_routes_to_flat_core() {

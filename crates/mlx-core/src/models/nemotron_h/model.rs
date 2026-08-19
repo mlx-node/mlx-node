@@ -135,6 +135,10 @@ pub(crate) struct NemotronHInner {
     /// (Pass 1 skipped). Read by `paged_perf_prefill_tokens` so telemetry
     /// reports the suffix-scale numerator when Pass 1 did not run.
     pub(crate) last_paged_prefill_reused_mamba_state: bool,
+    /// Whether the currently active scheduled sequence's recurrent (Mamba)
+    /// state was RESTORED from parked caches (true) or freshly
+    /// zero-initialized (false — e.g. after preemption released it).
+    pub(crate) active_seq_recurrent_survived: bool,
     /// Quantized checkpoints (NVFP4/MXFP8) dispatch different matmul kernels
     /// for M=1 vs M>=2 rows, so a batched `[N,1]` projection differs from the
     /// single-row decode by a few ULP. NemotronH's 23 mamba layers amplify
@@ -187,6 +191,7 @@ impl NemotronHInner {
             scheduled_caches: HashMap::new(),
             active_scheduled_seq: None,
             last_paged_prefill_reused_mamba_state: false,
+            active_seq_recurrent_survived: false,
             row_exact_decode_projections: false,
         })
     }
@@ -231,6 +236,11 @@ fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAd
         return Ok(None);
     }
     let block_size = config.paged_block_size.unwrap_or(16);
+    if ![8, 16, 32].contains(&block_size) {
+        return Err(Error::from_reason(format!(
+            "NemotronH block-paged adapter: invalid paged_block_size {block_size} (must be 8, 16, or 32)"
+        )));
+    }
     let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
     let pa_config = mlx_paged_attn::PagedAttentionConfig {
         block_size,
@@ -485,18 +495,28 @@ impl NemotronHInner {
             .activate_request(seq_id)
             .map_err(Error::from_reason)?;
         if self.active_scheduled_seq == Some(seq_id) {
+            // Already live: the caches in self.caches are exactly at the
+            // boundary of the tokens decoded so far.
+            self.active_seq_recurrent_survived = true;
             return Ok(());
         }
+        // Capture BEFORE the remove: a preempted sequence's recurrent state
+        // was released, so the remove below falls back to FRESH zero-state
+        // caches. The reuse predicate must know the state did not survive —
+        // otherwise a cached KV prefix matching the saved history would skip
+        // the Pass-1 reconstruction and resume with Mamba state at zero.
+        let had_state = self.scheduled_caches.contains_key(&seq_id);
         self.park_active_scheduled_caches();
         self.caches = self
             .scheduled_caches
             .remove(&seq_id)
             .unwrap_or_else(|| fresh_caches(&self.config, &self.layers).expect("fresh caches"));
         self.active_scheduled_seq = Some(seq_id);
+        self.active_seq_recurrent_survived = had_state;
         Ok(())
     }
 
-    fn park_active_scheduled_caches(&mut self) {
+    pub(crate) fn park_active_scheduled_caches(&mut self) {
         let Some(seq_id) = self.active_scheduled_seq.take() else {
             return;
         };
@@ -514,7 +534,7 @@ impl NemotronHInner {
         }
     }
 
-    fn release_scheduled_caches_for(&mut self, seq_id: SeqId) {
+    pub(crate) fn release_scheduled_caches_for(&mut self, seq_id: SeqId) {
         if self.active_scheduled_seq == Some(seq_id) {
             self.active_scheduled_seq = None;
             self.caches = fresh_caches(&self.config, &self.layers).expect("fresh caches");
@@ -1481,7 +1501,14 @@ impl NemotronHInner {
             )
             .map_err(Error::from_reason)?;
         let cached_prefix_len = turn_plan.cached_prefix_len as usize;
-        let reused_state = mamba_state_reusable(plan, owner_history, cached_prefix_len);
+        // Reuse requires BOTH a token-exact prefix match AND the sequence's
+        // recurrent (Mamba) state actually surviving at that boundary. A
+        // preempted sequence releases its recurrent state while its history
+        // and KV blocks remain reusable: a token-only match would then skip
+        // Pass-1 reconstruction and continue with KV at the prefix boundary
+        // but Mamba state at position zero.
+        let reused_state = self.active_seq_recurrent_survived
+            && mamba_state_reusable(plan, owner_history, cached_prefix_len);
         self.last_paged_prefill_reused_mamba_state = reused_state;
         // A turn that is NOT a live continuation of the currently live request
         // (fresh owner, or a same-owner continue that had to reset) cannot

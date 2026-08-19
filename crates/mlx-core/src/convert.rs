@@ -3006,6 +3006,24 @@ fn dtype_cast_owned_by_sanitizer(effective_model_type: Option<&str>) -> bool {
         .is_some_and(|r| r.owns_dtype_cast())
 }
 
+/// Effective recipe-model-type for dispatch. The Nemotron family is
+/// authoritative by ANY detection (caller-supplied nemotron_h, or the
+/// config's model_type / NemotronHForCausalLM architecture): dispatch must
+/// canonicalize to nemotron_h even when the caller explicitly supplied
+/// another recognized type, otherwise that family's sanitizer runs while
+/// the Nemotron-specific branches emit NVFP4/MXFP8 metadata.
+fn effective_recipe_model_type(
+    model_type: Option<&str>,
+    config: &serde_json::Value,
+) -> Option<String> {
+    let is_nemotron = model_type == Some("nemotron_h") || is_nemotron_h_config(config);
+    if is_nemotron {
+        Some("nemotron_h".to_string())
+    } else {
+        model_type.map(str::to_string)
+    }
+}
+
 fn is_nemotron_h_config(config: &serde_json::Value) -> bool {
     config.get("model_type").and_then(|v| v.as_str()) == Some("nemotron_h")
         || config
@@ -3295,9 +3313,13 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // so NemotronHRecipe::sanitize actually runs (a config-detected Nemotron
     // with model_type=None previously fell through the dispatch's `None` arm
     // and saved un-repacked U8/F8 tensors + modelopt sidecars).
-    let recipe_model_type = model_type
-        .clone()
-        .or_else(|| is_nemotron_h_ingest.then(|| "nemotron_h".to_string()));
+    // The architecture (and the caller-supplied nemotron_h) is
+    // authoritative over any OTHER recognized model type the caller may have
+    // supplied: dispatch must agree with the Nemotron-specific branches below
+    // (quant metadata emission, mxfp8 overrides) — an explicit -m qwen3_5 on
+    // a Nemotron config would otherwise run qwen3_5's sanitizer and emit
+    // Nemotron NVFP4/MXFP8 metadata, producing an invalid checkpoint.
+    let recipe_model_type = effective_recipe_model_type(model_type.as_deref(), &config);
     validate_nemotron_h_ingest_options(
         model_type.as_deref(),
         Some(&config),
@@ -18186,5 +18208,37 @@ mod tests {
         assert!(!dtype_cast_owned_by_sanitizer(Some("qwen3")));
         // The registry gate above independently pins owns_dtype_cast per
         // family; this test pins WHICH model type the driver feeds it.
+    }
+
+    /// Dispatch canonicalization: the authoritative architecture wins over
+    /// an explicit but conflicting recognized model type, while non-Nemotron
+    /// callers keep their supplied type unchanged.
+    #[test]
+    fn effective_recipe_model_type_canonicalizes_authoritative_nemotron() {
+        let nemotron_cfg = serde_json::json!({
+            "model_type": "qwen3_5",
+            "architectures": ["NemotronHForCausalLM"]
+        });
+        assert_eq!(
+            effective_recipe_model_type(Some("qwen3_5"), &nemotron_cfg).as_deref(),
+            Some("nemotron_h"),
+            "-m qwen3_5 on a Nemotron config must dispatch the Nemotron ingest"
+        );
+        assert_eq!(
+            effective_recipe_model_type(None, &nemotron_cfg).as_deref(),
+            Some("nemotron_h"),
+            "omitted -m with a Nemotron config must dispatch the ingest"
+        );
+        let other_cfg = serde_json::json!({ "model_type": "qwen3_5" });
+        assert_eq!(
+            effective_recipe_model_type(Some("qwen3_5"), &other_cfg).as_deref(),
+            Some("qwen3_5"),
+            "non-Nemotron callers keep their supplied type"
+        );
+        assert_eq!(
+            effective_recipe_model_type(None, &other_cfg),
+            None,
+            "no family detected and no supplied type stays None"
+        );
     }
 }

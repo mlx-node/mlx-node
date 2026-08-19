@@ -443,7 +443,19 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
         ssm_state_size,
         n_groups,
         conv_kernel: req_i32(raw, "conv_kernel")?,
-        chunk_size: req_i32(raw, "chunk_size")?,
+        chunk_size: {
+            // Fail-closed: the Mamba-2 chunk scan divides by chunk_size, so a
+            // zero (or negative) value from checkpoint metadata would panic
+            // the model thread on the first multi-token forward instead of
+            // failing the load.
+            let chunk_size = req_i32(raw, "chunk_size")?;
+            if chunk_size <= 0 {
+                return Err(Error::from_reason(format!(
+                    "config.json chunk_size must be positive, got {chunk_size}"
+                )));
+            }
+            chunk_size
+        },
         time_step_min: req_f64(raw, "time_step_min")?,
         n_routed_experts,
         num_experts_per_tok,
@@ -619,6 +631,14 @@ mod tests {
         v["layers_block_type"] = json!(["mamba", "moe"]);
         let err = parse_config(&v).unwrap_err();
         assert!(err.reason.contains("num_hidden_layers"), "{}", err.reason);
+    }
+
+    #[test]
+    fn rejects_zero_chunk_size() {
+        let mut v = lightning_json();
+        v["chunk_size"] = json!(0);
+        let err = parse_config(&v).unwrap_err();
+        assert!(err.reason.contains("chunk_size"), "{}", err.reason);
     }
 
     #[test]
