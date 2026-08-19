@@ -790,17 +790,25 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
             let mtp_active = inner.has_mtp_weights();
             let paged_active = inner.paged_adapter.is_some();
+            let context_limits =
+                super::model::NemotronHContextLimits::from_tuple(inner.paged_context_limits());
             let config = inner.config.clone();
             let scheduler = NemotronHSchedulerState::new(inner)?;
             Ok((
                 scheduler,
-                (config, cache_limit_guard, mtp_active, paged_active),
+                (
+                    config,
+                    cache_limit_guard,
+                    mtp_active,
+                    paged_active,
+                    context_limits,
+                ),
             ))
         },
         |state, receiver| state.drive(receiver),
     );
 
-    let (config, cache_limit_guard, mtp_active, paged_active) = init_rx
+    let (config, cache_limit_guard, mtp_active, paged_active, context_limits) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
@@ -809,6 +817,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
         config,
         mtp_active,
         paged_active,
+        context_limits,
         _cache_limit_guard: cache_limit_guard,
     })
 }

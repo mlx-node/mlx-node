@@ -1009,9 +1009,6 @@ export declare class NativeRewardRegistry {
 }
 
 /**
- * NVIDIA Nemotron 3.5 Lightning language model.
- *
- * Hybrid MoE architecture (Mamba-2 SSM + GQA + pure MoE-FFN layers) with
  * an optional in-checkpoint MTP head. All model state lives on a
  * dedicated OS thread; NAPI methods dispatch commands via channels. When
  * the block-paged adapter is active the thread runs the engine-owned
@@ -1033,6 +1030,13 @@ export declare class NemotronHModel {
    * instance (default-on unless `use_block_paged_cache: false`).
    */
   hasBlockPagedCache(): boolean;
+  /**
+   * Physical/trained context limits captured at load: the ChatSession
+   * preflight compacts or rejects against effective_window_tokens instead
+   * of the trained 1M-token window, so long conversations fail the
+   * preflight rather than inside paged-cache allocation.
+   */
+  contextLimits(): NemotronHContextLimits;
   /** Get the model configuration. */
   getConfig(): NemotronHConfig;
   /**
@@ -4333,6 +4337,23 @@ export interface NemotronHConfig {
    * `Some(false)` reverts to the flat-cache whole-turn path.
    */
   useBlockPagedCache?: boolean;
+}
+
+/**
+ * NVIDIA Nemotron 3.5 Lightning language model.
+ *
+ * Hybrid MoE architecture (Mamba-2 SSM + GQA + pure MoE-FFN layers) with
+ * Physical and trained context limits captured at load time, surfaced
+ * through `context_limits()` so the ChatSession preflight can compact or
+ * reject against the paged pool's ACTUAL capacity instead of the trained
+ * window (the 2 GiB default pool is far below the checkpoint's 1M-token
+ * claim).
+ */
+export interface NemotronHContextLimits {
+  trainedWindowTokens: number;
+  effectiveWindowTokens: number;
+  pagedBlockCapacity: number;
+  pagedBlockSize: number;
 }
 
 /** Result from document orientation classification. */

@@ -422,8 +422,21 @@ impl NemotronHInner {
         generation_stream: Stream,
     ) -> Result<MxArray> {
         let total_len = prompt.shape_at(1)?;
-        let mut offset: i64 = 0;
-        while total_len - offset > PREFILL_STEP_SIZE {
+        // Chunk-aligned slices: the Mamba-2 chunk scan pads the LAST chunk of
+        // each forward, so every intermediate boundary must land on the
+        // configured chunk grid — a fixed 2048 step would split chunks when
+        // chunk_size does not divide 2048, changing the recurrence's reduction
+        // grouping relative to an unsplit cold forward (same invariant as the
+        // paged prefill path).
+        let slices = chunk_aligned_prefill_slices(
+            0,
+            total_len as u32,
+            PREFILL_STEP_SIZE as u32,
+            self.config.chunk_size as u32,
+        );
+        let last_idx = slices.len().saturating_sub(1);
+        let mut last = None;
+        for (idx, (s, e)) in slices.into_iter().enumerate() {
             if self
                 .turn_cancel
                 .as_ref()
@@ -431,28 +444,17 @@ impl NemotronHInner {
             {
                 return Err(Error::from_reason("prefill cancelled"));
             }
-            let chunk = prompt.slice_axis(1, offset, offset + PREFILL_STEP_SIZE)?;
+            let chunk = prompt.slice_axis(1, s as i64, e as i64)?;
             {
                 let _stream_ctx = StreamContext::new(generation_stream);
-                let _ = self.forward(&chunk)?;
+                last = Some(self.forward(&chunk)?);
             }
-            self.eval_caches_internal()?;
-            crate::array::clear_cache();
-            offset += PREFILL_STEP_SIZE;
+            if idx != last_idx {
+                self.eval_caches_internal()?;
+                crate::array::clear_cache();
+            }
         }
-        if offset > 0
-            && self
-                .turn_cancel
-                .as_ref()
-                .is_some_and(|f| f.load(Ordering::Relaxed))
-        {
-            return Err(Error::from_reason("prefill cancelled"));
-        }
-        let remaining = prompt.slice_axis(1, offset, total_len)?;
-        {
-            let _stream_ctx = StreamContext::new(generation_stream);
-            self.forward(&remaining)
-        }
+        last.ok_or_else(|| Error::from_reason("chunked_prefill produced no chunks"))
     }
 }
 
@@ -483,6 +485,25 @@ impl NemotronHInner {
 
     pub(crate) fn has_scheduled_caches_for(&self, seq_id: SeqId) -> bool {
         self.active_scheduled_seq == Some(seq_id) || self.scheduled_caches.contains_key(&seq_id)
+    }
+
+    /// Physical vs trained context limits (qwen3_5/qwen3_5_moe contract):
+    /// (trained window, effective window capped by the paged pool's token
+    /// capacity, block capacity, block size). Without an adapter the flat
+    /// cache owns no block pool and the trained window is the limit.
+    pub(crate) fn paged_context_limits(&self) -> (u32, u32, u32, u32) {
+        let trained = self.config.max_position_embeddings.max(0) as u32;
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return (trained, trained, 0, 0);
+        };
+        let blocks = adapter.block_capacity();
+        let block_size = adapter.block_size();
+        (
+            trained,
+            trained.min(adapter.max_capacity_tokens()),
+            blocks,
+            block_size,
+        )
     }
 
     /// Activate the adapter request and swap the sequence's per-request caches
@@ -1983,6 +2004,31 @@ impl MtpBackend for NemotronHInner {
 /// NVIDIA Nemotron 3.5 Lightning language model.
 ///
 /// Hybrid MoE architecture (Mamba-2 SSM + GQA + pure MoE-FFN layers) with
+/// Physical and trained context limits captured at load time, surfaced
+/// through `context_limits()` so the ChatSession preflight can compact or
+/// reject against the paged pool's ACTUAL capacity instead of the trained
+/// window (the 2 GiB default pool is far below the checkpoint's 1M-token
+/// claim).
+#[napi(object)]
+#[derive(Clone, Copy)]
+pub struct NemotronHContextLimits {
+    pub trained_window_tokens: u32,
+    pub effective_window_tokens: u32,
+    pub paged_block_capacity: u32,
+    pub paged_block_size: u32,
+}
+
+impl NemotronHContextLimits {
+    pub(crate) fn from_tuple(value: (u32, u32, u32, u32)) -> Self {
+        Self {
+            trained_window_tokens: value.0,
+            effective_window_tokens: value.1,
+            paged_block_capacity: value.2,
+            paged_block_size: value.3,
+        }
+    }
+}
+
 /// an optional in-checkpoint MTP head. All model state lives on a
 /// dedicated OS thread; NAPI methods dispatch commands via channels. When
 /// the block-paged adapter is active the thread runs the engine-owned
@@ -1998,6 +2044,9 @@ pub struct NemotronHModel {
     /// Surfaced through `hasBlockPagedCache()` so the server can rely on
     /// native content-addressed block reuse instead of the JS warm slot.
     pub(crate) paged_active: bool,
+    /// Load-time physical/trained context limits snapshot (paged adapter
+    /// block capacity vs the checkpoint's trained window).
+    pub(crate) context_limits: NemotronHContextLimits,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
@@ -2024,6 +2073,15 @@ impl NemotronHModel {
     #[napi]
     pub fn has_block_paged_cache(&self) -> bool {
         self.paged_active
+    }
+
+    /// Physical/trained context limits captured at load: the ChatSession
+    /// preflight compacts or rejects against effective_window_tokens instead
+    /// of the trained 1M-token window, so long conversations fail the
+    /// preflight rather than inside paged-cache allocation.
+    #[napi]
+    pub fn context_limits(&self) -> NemotronHContextLimits {
+        self.context_limits
     }
 
     /// Get the model configuration.
