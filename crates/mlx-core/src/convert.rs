@@ -3025,14 +3025,14 @@ fn effective_recipe_model_type(
 }
 
 fn is_nemotron_h_config(config: &serde_json::Value) -> bool {
-    config.get("model_type").and_then(|v| v.as_str()) == Some("nemotron_h")
-        || config
-            .get("architectures")
-            .and_then(|v| v.as_array())
-            .is_some_and(|arr| {
-                arr.iter()
-                    .any(|a| a.as_str() == Some("NemotronHForCausalLM"))
-            })
+    let declares_arch = match config.get("architectures") {
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .any(|a| a.as_str() == Some("NemotronHForCausalLM")),
+        Some(serde_json::Value::String(s)) => s == "NemotronHForCausalLM",
+        _ => false,
+    };
+    config.get("model_type").and_then(|v| v.as_str()) == Some("nemotron_h") || declares_arch
 }
 
 async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionResult> {
@@ -18179,6 +18179,14 @@ mod tests {
         assert!(
             is_nemotron_h_config(&wrong_type_with_arch),
             "the architecture is authoritative over a wrong model_type"
+        );
+
+        let bare_string_arch = serde_json::json!({
+            "architectures": "NemotronHForCausalLM"
+        });
+        assert!(
+            is_nemotron_h_config(&bare_string_arch),
+            "the registry-blessed bare-string architectures form must resolve to the family"
         );
 
         let wrong_type_no_arch = serde_json::json!({

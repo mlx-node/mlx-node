@@ -272,13 +272,16 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
     // declares NemotronHForCausalLM is this family even when model_type is
     // absent or malformed. Without the architecture, model_type must match.
     let model_type = raw.get("model_type").and_then(Value::as_str).unwrap_or("");
-    let architectures_declare_nemotron = raw
-        .get("architectures")
-        .and_then(Value::as_array)
-        .is_some_and(|arr| {
-            arr.iter()
-                .any(|a| a.as_str() == Some("NemotronHForCausalLM"))
-        });
+    // Accept BOTH registry-blessed forms: the array and the bare string
+    // (the TS normalizeConfig contract explicitly converts the string form
+    // into a single-element architecture set, so this parser must agree).
+    let architectures_declare_nemotron = match raw.get("architectures") {
+        Some(serde_json::Value::Array(values)) => values
+            .iter()
+            .any(|a| a.as_str() == Some("NemotronHForCausalLM")),
+        Some(serde_json::Value::String(s)) => s == "NemotronHForCausalLM",
+        _ => false,
+    };
     if model_type != "nemotron_h" && !architectures_declare_nemotron {
         return Err(Error::from_reason(format!(
             "config.json model_type must be 'nemotron_h' (or architectures must declare 'NemotronHForCausalLM'), got model_type '{model_type}'"
@@ -597,6 +600,17 @@ mod tests {
         // config, so the native loader must agree).
         let mut v = lightning_json();
         v["model_type"] = json!("qwen3");
+        assert!(parse_config(&v).is_ok());
+    }
+
+    #[test]
+    fn accepts_bare_string_architecture_form() {
+        // The TS registry's normalizeConfig blesses the bare-string
+        // architectures form as a single-element set; the native parser must
+        // agree or detectModelType() would select a family load() rejects.
+        let mut v = lightning_json();
+        v.as_object_mut().unwrap().remove("model_type");
+        v["architectures"] = json!("NemotronHForCausalLM");
         assert!(parse_config(&v).is_ok());
     }
 
