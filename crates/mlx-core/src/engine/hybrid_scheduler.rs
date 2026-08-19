@@ -1179,8 +1179,25 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             && !Self::chat_has_explicit_owner(command)
     }
 
+    /// The model's Barrier-vs-Scheduled speculative lane. Both the barrier
+    /// routing gate and the scheduled-lane admission reject consult this one
+    /// decision (`SpeculativePlan::lane`); neither may re-derive it. A model
+    /// without a speculative plan barriers its `enable_mtp` turns: they
+    /// resolve to autoregressive execution, and the exclusive lane is the
+    /// only lane that fallback is validated for.
+    fn speculative_lane(&self) -> engine::plan::SpeculativeLane {
+        self.inner
+            .execution_plan()
+            .speculative
+            .map_or(engine::plan::SpeculativeLane::Barrier, |speculative| {
+                speculative.lane()
+            })
+    }
+
     fn chat_requires_barrier(&self, command: &ChatCmd) -> bool {
-        if Self::chat_config(command).is_some_and(|config| config.enable_mtp == Some(true)) {
+        if Self::chat_config(command).is_some_and(|config| config.enable_mtp == Some(true))
+            && self.speculative_lane() != engine::plan::SpeculativeLane::Scheduled
+        {
             return true;
         }
         let (messages, is_continue) = match command {
@@ -1437,10 +1454,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     return None;
                 }
             };
+        // `chat_requires_barrier` already routes Barrier-lane MTP turns to
+        // the exclusive lane; admission re-consults the same single-sourced
+        // lane decision so a routing gap can never execute speculation on
+        // the scheduled lane.
         if admitted.plan.path() != engine::plan::TurnPath::Paged
             || !admitted.images.is_empty()
             || !admitted.audio.is_empty()
-            || admitted.params.enable_mtp
+            || (admitted.params.enable_mtp
+                && self.speculative_lane() != engine::plan::SpeculativeLane::Scheduled)
         {
             if newly_assigned {
                 self.owner_sequences.remove(&owner_id);
@@ -2551,6 +2573,37 @@ mod tests {
             !moe_state.enabled,
             "Qwen3.5 MoE must keep the generic scheduler opt-in"
         );
+    }
+
+    #[test]
+    fn mtp_chat_turns_require_barrier_while_lane_is_barrier() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let state = HybridSchedulerState::new(inner).expect("construct scheduler");
+
+        let (mtp_reply, _mtp_result) = tokio::sync::oneshot::channel();
+        let mtp_start = ChatCmd::SessionStart {
+            messages: Vec::new(),
+            config: ChatConfig {
+                enable_mtp: Some(true),
+                ..ChatConfig::default()
+            },
+            reply: mtp_reply,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(
+            state.chat_requires_barrier(&mtp_start),
+            "an enable_mtp turn must stay on the exclusive lane while the \
+             speculative lane decision is Barrier"
+        );
+
+        let (plain_reply, _plain_result) = tokio::sync::oneshot::channel();
+        let plain_start = ChatCmd::SessionStart {
+            messages: Vec::new(),
+            config: ChatConfig::default(),
+            reply: plain_reply,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(!state.chat_requires_barrier(&plain_start));
     }
 
     #[test]

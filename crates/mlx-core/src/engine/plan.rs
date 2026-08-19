@@ -146,6 +146,20 @@ pub(crate) enum SpeculativeKind {
     DraftModel,
 }
 
+/// Execution lane for an admitted speculative turn.
+///
+/// Computed only by [`SpeculativePlan::lane`] and consulted by every
+/// admission gate, so de-barriering speculation is a one-property flip
+/// rather than a per-gate hunt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpeculativeLane {
+    /// Whole-turn exclusive execution through the ordered command lane.
+    Barrier,
+    /// Admission into the continuous-batching scheduler alongside plain
+    /// autoregressive rows.
+    Scheduled,
+}
+
 /// Load-time admission policy for a speculative decoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SpeculativePlan {
@@ -160,6 +174,33 @@ pub(crate) struct SpeculativePlan {
     /// Whether proposal/verification is implemented against the target's
     /// paged attention state.
     pub supports_paged_attention: bool,
+}
+
+impl SpeculativePlan {
+    /// The one Barrier-vs-Scheduled decision every admission gate consults.
+    ///
+    /// Always [`SpeculativeLane::Barrier`] today. Flipping any configuration
+    /// to `Scheduled` (planned behind `MLX_MTP_SCHEDULED=1`) requires the
+    /// scheduler to reserve [`Self::lookahead_rows`] slots per verify cycle,
+    /// roll back rejected rows per sequence, and key drafter state by owner;
+    /// none of that machinery exists yet. The gemma4/muse `execute_barrier`
+    /// flat-lane owner installs are cache-layout decisions (which cache
+    /// representation a live owner occupies), not lane decisions, and remain
+    /// family-owned regardless of this value.
+    pub const fn lane(self) -> SpeculativeLane {
+        SpeculativeLane::Barrier
+    }
+
+    /// Rows one speculative verify cycle appends to attention state: the
+    /// anchor row plus `depth` draft rows.
+    ///
+    /// The single source for the speculative slot margin (vLLM's
+    /// `num_lookahead_tokens`): every reserver reads this; none re-derives
+    /// `depth + 1` locally.
+    #[cfg_attr(not(test), expect(dead_code))]
+    pub const fn lookahead_rows(self, depth: usize) -> usize {
+        depth + 1
+    }
 }
 
 /// Immutable inference features resolved when a model is loaded.
@@ -308,6 +349,42 @@ mod tests {
             context_media,
             speculative_requested,
         }
+    }
+
+    #[test]
+    fn all_current_speculative_plans_are_barrier() {
+        let media_shapes = [
+            MediaCapabilities::NONE,
+            MediaCapabilities::IMAGES,
+            MediaCapabilities::AUDIO,
+            MediaCapabilities::IMAGES_AND_AUDIO,
+        ];
+        for kind in [SpeculativeKind::NativeMtp, SpeculativeKind::DraftModel] {
+            for supported_input_media in media_shapes {
+                for supported_context_media in media_shapes {
+                    for supports_paged_attention in [false, true] {
+                        let plan = SpeculativePlan {
+                            kind,
+                            supported_input_media,
+                            supported_context_media,
+                            supports_paged_attention,
+                        };
+                        assert_eq!(
+                            plan.lane(),
+                            SpeculativeLane::Barrier,
+                            "no speculative configuration may reach the scheduled lane \
+                             before its admission accounting exists: {plan:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lookahead_rows_counts_anchor_plus_drafts() {
+        assert_eq!(MTP_PAGED.lookahead_rows(1), 2);
+        assert_eq!(MTP_PAGED.lookahead_rows(4), 5);
     }
 
     #[test]
