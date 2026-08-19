@@ -1648,6 +1648,20 @@ pub(crate) trait MtpStepper {
     /// arg the engine loop passes. == `MtpOps::begin_cycle` (the `B` closure).
     fn begin_cycle(&mut self, chained_anchor: bool);
 
+    /// Reserve the speculative lookahead region for the cycle about to run,
+    /// measured past the stepper's CURRENT committed frontier. The engine
+    /// calls this once per cycle, right before the cycle's drafts/verify —
+    /// the turn-entry reservation in `begin_mtp_decode` only guarantees the
+    /// FIRST cycle's rows, because every committed token moves the frontier.
+    /// `Ok(true)` = the verify write is covered (or this stepper has no
+    /// reservation semantics — the default for flat/MoE). `Ok(false)` = pool
+    /// exhaustion with untouched state: the engine skips the cycle and lets
+    /// Step A decode one token autoregressively instead of erroring the
+    /// turn. Non-capacity failures are `Err`.
+    fn reserve_cycle_lookahead(&mut self, _rows: usize) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Schedule async eval for an emitted token (+ logits on the
     /// budget-forced path). `&self` — schedules only, no mutation. ==
     /// `MtpOps::eval_step` (the `E` closure, which is `Fn`).

@@ -1793,6 +1793,24 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             );
             continue;
         }
+        // Per-cycle speculative admission: the turn-entry reservation only
+        // covered the first cycle's cursor — every committed token moves the
+        // frontier, so re-reserve the lookahead region for THIS cycle (a
+        // covered no-op while the region still holds). Both the
+        // Step-A-seeded and chained paths pass through here, so every cycle
+        // is covered. Exhaustion skips the cycle instead of erroring the
+        // turn: `chained_hidden_opt` is `None` at this point, so the next
+        // iteration's Step A AR-decodes one token and retries — the same
+        // pre-cycle AR fallback the paged cores apply at turn admission.
+        if lookahead_rows > 0 && !step.reserve_cycle_lookahead(lookahead_rows)? {
+            tracing::debug!(
+                target: "mlx_core::mtp",
+                lookahead_rows,
+                "MTP cycle skipped: speculative lookahead reservation \
+                 exhausted; AR-decoding instead"
+            );
+            continue;
+        }
 
         let prev_h = prev_hidden_opt.take().ok_or_else(|| {
             napi::Error::from_reason("prev_hidden seeded by Step A or chained path")
@@ -2184,6 +2202,7 @@ mod tests {
         RestoreAndReplayMain { accepted: usize },
         CommitMtp { anchor: MtpCommitAnchor, k: usize },
         BeginCycle { chained: bool },
+        ReserveCycleLookahead { rows: usize },
         EvalStep { budget_forced: bool },
         EvalStepWithChainedHidden,
         RollbackUnemitted { unemitted: usize },
@@ -2268,6 +2287,13 @@ mod tests {
         // Frontier captured by `snapshot_main_linear` — the base `rollback`
         // rewinds to (mirrors the pre-verify GDN snapshot).
         snap_pos: std::cell::Cell<i64>,
+        // ---- per-cycle lookahead reservation script ----
+        // `None` ⇒ every reservation succeeds (the trait's default-`Ok(true)`
+        // contract). `Some(n)` ⇒ the first n reservations succeed and every
+        // later one reports exhaustion (`Ok(false)`), emulating a paged pool
+        // with room for exactly n more verify cycles.
+        reserve_ok_budget: Option<usize>,
+        reserve_calls: std::cell::Cell<usize>,
     }
 
     /// Canned per-cycle script for the `run_mtp_cycle` integration tests.
@@ -2349,6 +2375,8 @@ mod tests {
                 flip_cancel_on_commit: None,
                 state_pos: std::rc::Rc::new(std::cell::Cell::new(0)),
                 snap_pos: std::cell::Cell::new(0),
+                reserve_ok_budget: None,
+                reserve_calls: std::cell::Cell::new(0),
             }
         }
 
@@ -2719,6 +2747,13 @@ mod tests {
             self.record(Call::BeginCycle {
                 chained: chained_anchor,
             });
+        }
+
+        fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
+            self.record(Call::ReserveCycleLookahead { rows });
+            let n = self.reserve_calls.get();
+            self.reserve_calls.set(n + 1);
+            Ok(self.reserve_ok_budget.is_none_or(|budget| n < budget))
         }
 
         fn eval_step(&self, _token: &MxArray, _logits: &MxArray, budget_forced: bool) {
@@ -3961,6 +3996,9 @@ mod tests {
         /// The `setup.lookahead_rows` value `begin_mtp_decode` received —
         /// pins the engine's plan-property threading (I1).
         lookahead_rows_seen: std::cell::Cell<usize>,
+        /// Per-cycle reservation budget forwarded into the constructed
+        /// stepper — see [`MockMtpStepper::reserve_ok_budget`].
+        reserve_ok_budget: Option<usize>,
     }
 
     impl MockMtpBackend {
@@ -3985,11 +4023,19 @@ mod tests {
                 flip_cancel_on_commit: None,
                 state_pos: Rc::new(std::cell::Cell::new(0)),
                 lookahead_rows_seen: std::cell::Cell::new(usize::MAX),
+                reserve_ok_budget: None,
             }
         }
 
         fn with_replay_error(mut self, reason: &'static str) -> Self {
             self.replay_error = Some(reason);
+            self
+        }
+
+        /// Admit only the first `budget` per-cycle lookahead reservations;
+        /// every later one reports exhaustion (`Ok(false)`).
+        fn with_reserve_ok_budget(mut self, budget: usize) -> Self {
+            self.reserve_ok_budget = Some(budget);
             self
         }
 
@@ -4100,6 +4146,7 @@ mod tests {
             step.flip_cancel_on_forward = self.flip_cancel_on_forward.clone();
             step.flip_cancel_on_commit = self.flip_cancel_on_commit.clone();
             step.state_pos = Rc::clone(&self.state_pos);
+            step.reserve_ok_budget = self.reserve_ok_budget;
             Ok(step)
         }
 
@@ -4267,6 +4314,66 @@ mod tests {
             3,
             "fixed depth-2 turn: the setup must carry lookahead_rows(2) = 3"
         );
+    }
+
+    /// Catches: the per-cycle lookahead reservation being skipped on cycle
+    /// ≥ 2 (the turn-entry reservation in `begin_mtp_decode` only covers the
+    /// first cycle's cursor), and the engine routing a later cycle's
+    /// exhaustion to a turn error instead of the pre-cycle AR fallback.
+    #[test]
+    fn run_mtp_turn_reserves_lookahead_per_cycle_and_falls_back_to_ar() {
+        let _chained_off = force_chained_off();
+        // depth 2, full-accept cycles scripted for FOUR cycles — but the
+        // reservation budget admits only the FIRST. Cycle 1 runs MTP and
+        // commits [4, 5, bonus 6]; every later iteration's reservation
+        // reports exhaustion, so the engine skips the cycle and Step A
+        // AR-decodes one token per iteration until the length budget.
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4, 5],
+            verify_argmax: vec![4, 5, 6],
+        };
+        let mut backend =
+            MockMtpBackend::new(16, 4, vec![7, 8, 9, 10, 11, 12], vec![cycle; 4], false)
+                .with_reserve_ok_budget(1);
+        // Budget 8: seed(3) + StepA(7) + cycle1(4,5,6) = 5 tokens, then
+        // AR-only StepA(8)=6, StepA(9)=7, StepA(10)=8 → length stop right
+        // after the 4th Step A (before its iteration reaches the cycle).
+        let out = drive_turn(&mut backend, 3, 8, 15, 2);
+
+        assert_eq!(
+            out.generated,
+            vec![3, 7, 4, 5, 6, 8, 9, 10],
+            "cycle 1 commits via MTP; cycles ≥ 2 fall back to Step-A AR decode"
+        );
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::VerifyStep { .. })),
+            1,
+            "the exhausted reservation must gate every cycle after the first"
+        );
+        assert_eq!(
+            count(&out.ledger, |c| matches!(c, Call::ForwardWithHidden)),
+            4,
+            "one Step A per outer iteration: the MTP iteration + 3 AR fallbacks"
+        );
+        // The reservation runs before EVERY cycle attempt (iterations 0-2;
+        // iteration 3's Step A trips the length cap before the pre-cycle
+        // point), each asking for the plan-derived depth-2 margin — never
+        // once per turn.
+        assert_eq!(
+            out.ledger
+                .iter()
+                .filter_map(|c| match c {
+                    Call::ReserveCycleLookahead { rows } => Some(*rows),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![3, 3, 3],
+            "the lookahead reservation must run before every cycle with \
+             lookahead_rows(2) = 3"
+        );
+        assert!(!out.desynced, "AR fallback is not a mid-cycle stop");
+        assert_eq!(out.rollback_unemitted, 0);
     }
 
     #[test]

@@ -3339,24 +3339,68 @@ impl Qwen35Inner {
         continued_live_prefix: bool,
         image_key: u64,
     ) -> Result<bool> {
+        let dirty = self.paged_gdn_state_dirty;
+        let result = self.prepare_dense_gdn_vlm_prefix_state_inner(
+            tokens,
+            cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+            continued_live_prefix,
+            image_key,
+        );
+        if result.is_ok() && dirty {
+            // The armed latch skipped every live/history reuse arm inside, so
+            // this preparation came from a recompute source (a prefill-time
+            // prefix checkpoint, or fresh caches followed by the caller's
+            // full image merge from position zero) — the skew is healed.
+            // Mirrors the text twin's wrapper.
+            self.paged_gdn_state_dirty = false;
+        }
+        result
+    }
+
+    fn prepare_dense_gdn_vlm_prefix_state_inner(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        continued_live_prefix: bool,
+        image_key: u64,
+    ) -> Result<bool> {
         if cached_prefix_len == 0 {
             self.caches = Some(fresh_dense_layer_caches(&self.config));
             return Ok(false);
         }
 
+        // While the refuse-to-persist latch is armed, the live /
+        // active-history / history-checkpoint arms are skipped exactly like
+        // the text twin's: that state's frontier disagreed with its token key
+        // at the last epilogue. The prefix-checkpoint arm below stays
+        // available — it is prefill-time state keyed on grid positions, not
+        // on the skewed end-of-turn history (the wrapper clears the latch
+        // once a recompute arm has run).
+        let gdn_state_dirty = self.paged_gdn_state_dirty;
         let caches_ready = dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
-        if caches_ready && continued_live_prefix && self.cached_image_key == Some(image_key) {
+        if !gdn_state_dirty
+            && caches_ready
+            && continued_live_prefix
+            && self.cached_image_key == Some(image_key)
+        {
             return Ok(true);
         }
         let active_history_matches = caches_ready
             && self.cached_image_key == Some(image_key)
             && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
-        if active_history_matches {
+        if !gdn_state_dirty && active_history_matches {
             return Ok(true);
         }
-        if let Some(checkpoint) =
-            self.find_dense_gdn_history_checkpoint(tokens, cached_prefix_len, Some(image_key))
+        if !gdn_state_dirty
+            && let Some(checkpoint) =
+                self.find_dense_gdn_history_checkpoint(tokens, cached_prefix_len, Some(image_key))
         {
             self.caches = Some(checkpoint);
             return Ok(true);
@@ -4699,10 +4743,14 @@ impl Qwen35Inner {
         Ok(())
     }
 
-    /// Pre-cycle speculative admission for the paged MTP arm: reserve this
-    /// turn's lookahead rows past the (post-prefill) prompt cursor, sized by
+    /// Turn-admission speculative reservation for the paged MTP arm: reserve
+    /// the lookahead rows past the (post-prefill) prompt cursor, sized by
     /// `engine::mtp_turn::turn_lookahead_rows` off the model's
     /// [`SpeculativePlan`] (I1 — the plan property is the single source).
+    /// This guarantees the FIRST cycle; the engine loop re-reserves the same
+    /// margin before every later cycle through
+    /// [`MtpStepper::reserve_cycle_lookahead`], where exhaustion degrades
+    /// that cycle to a Step-A AR token instead of gating the whole turn.
     ///
     /// `Ok(false)` means the pool cannot hold even one verify cycle: the
     /// caller must run the turn autoregressively instead of erroring it
@@ -9951,8 +9999,10 @@ impl PagedBackend for Qwen35Inner {
         // replaying GDN over it. Runs BEFORE the release below, which resets the
         // captured-chain frontier to 0. Skipped when the finalize failed: the
         // K/V chain the sidecar would anchor on was not published, so nothing
-        // could ever select it.
-        if finalize_error.is_none() {
+        // could ever select it. Also skipped while the refuse-to-persist latch
+        // is armed — same gate as the manual epilogue, so no durable GDN state
+        // is enqueued anywhere while a frontier disagreement stands.
+        if finalize_error.is_none() && !self.paged_gdn_state_dirty {
             self.capture_dense_gdn_cold_sidecar(
                 &self.cached_paged_image_token_positions,
                 cache_salt,
@@ -10852,6 +10902,34 @@ impl MtpStepper for DenseMtpStepper<'_> {
         }
     }
 
+    // Per-cycle paged twin of `reserve_paged_mtp_lookahead`: re-reserve the
+    // lookahead region past the adapter's CURRENT cursor so this cycle's
+    // verify writes land in pre-allocated blocks (the turn-entry reservation
+    // only covered the first cycle's cursor). Exhaustion reports AR fallback
+    // with untouched adapter state; the flat mode has no reservation
+    // semantics and is always covered.
+    fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
+        let MtpStepMode::Paged(adapter) = &mut self.mode else {
+            return Ok(true);
+        };
+        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+        match adapter.reserve_rows(rows) {
+            Ok(_) => Ok(true),
+            Err(e) if e.starts_with("context_length_exceeded:") => {
+                tracing::warn!(
+                    target: "mlx_core::qwen3_5::paged",
+                    lookahead_rows = rows,
+                    "eager paged MTP per-cycle lookahead reservation exhausted \
+                     the paged pool; falling back to autoregressive decode: {e}"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(Error::from_reason(format!(
+                "eager paged MTP per-cycle lookahead reservation ({rows} rows): {e}"
+            ))),
+        }
+    }
+
     // Bound the lazy graph: materialize the token plus the main GDN/full-attn
     // caches; on a budget-forced step also the logits.
     fn eval_step(&self, token: &MxArray, logits: &MxArray, budget_forced: bool) {
@@ -10994,6 +11072,8 @@ impl MtpBackend for Qwen35Inner {
                 // AR-fallback gate, so this normally takes the covered no-op
                 // branch; a caller that skips that gate still fails HERE,
                 // pre-cycle with untouched state, instead of mid-verify.
+                // Later cycles are covered by the engine loop's per-cycle
+                // `reserve_cycle_lookahead` call on the stepper.
                 if setup.lookahead_rows > 0 {
                     let rows = u32::try_from(setup.lookahead_rows).unwrap_or(u32::MAX);
                     if let Err(e) = adapter.reserve_rows(rows) {
@@ -16868,6 +16948,198 @@ mod paged_construction_tests {
                 .current_token_count(),
             cursor_before + 1,
             "AR decode must advance one row past the prompt"
+        );
+    }
+
+    /// Cycle-2 twin of the exhaustion gate, driving the SAME stepper seam
+    /// the engine loop calls (`MtpStepper::reserve_cycle_lookahead`) on a
+    /// REAL paged model. After a first verify cycle + partial-accept
+    /// rollback has moved the frontier, the per-cycle reservation must
+    /// (a) grow the block table to cover the NEW cursor + lookahead before
+    /// cycle 2's verify — the prompt is sized so that margin CROSSES a block
+    /// boundary the turn-entry reservation never covered, so a
+    /// "reservation skipped on cycle ≥ 2" mutation fails the pre-verify
+    /// block count — (b) report AR fallback (`Ok(false)`) with untouched
+    /// adapter state on a reservation the pool cannot hold — never a turn
+    /// error — and (c) leave Step-A-style AR decode advancing on the same
+    /// request afterwards.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn paged_mtp_lookahead_cycle2_exhaustion_falls_back_to_ar() {
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.n_mtp_layers = 1;
+        let Some((mut inner, _cfg)) = paged_inner_with_cfg_or_skip(
+            "paged_mtp_lookahead_cycle2_exhaustion_falls_back_to_ar",
+            cfg,
+        ) else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        inner.mtp_weights_loaded = true;
+
+        // `prompt = 2 * block_size - 4`: the turn-entry reservation covers
+        // exactly 2 blocks (cursor + lookahead = 2 * block_size), cycle 1's
+        // verify fills them, and the partial-accept rollback leaves the
+        // cursor at `2 * block_size - 2` — cycle 2's `+lookahead` margin then
+        // needs a 3rd block only a per-cycle reservation can pre-allocate.
+        let block_size = inner.paged_adapter.as_ref().expect("adapter").block_size();
+        assert!(block_size >= 5, "prompt sizing needs block_size >= 5");
+        let prompt: Vec<u32> = (0..(2 * block_size - 4))
+            .map(|i| (i * 5 + 7) % 257)
+            .collect();
+        reset_paged_request(&mut inner, &prompt);
+        run_dense_paged_prefill_with_size(&mut inner, &prompt, &prompt, 0, 2048)
+            .expect("dense paged prefill")
+            .eval();
+
+        let depth = 3usize;
+        let plan = inner
+            .execution_plan()
+            .speculative
+            .expect("dense MTP checkpoint must publish a speculative plan");
+        let lookahead = plan.lookahead_rows(depth);
+        assert_eq!(lookahead, depth + 1);
+        let prompt_len = prompt.len() as u32;
+
+        let setup = MtpTurnSetup {
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
+            prompt_hidden_position_base: 0,
+            first_sampled_token: 21,
+            lookahead_rows: lookahead,
+        };
+        let mut step = inner.begin_mtp_decode(&setup).expect("begin_mtp_decode");
+
+        // Cycle 1 in the engine's order: snapshot → verify → partial accept.
+        let embedding = step.embedding().clone();
+        step.snapshot_main_linear();
+        let verify_ids =
+            MxArray::from_int32(&[21, 22, 23, 24], &[1, (depth + 1) as i64]).expect("verify ids");
+        step.verify_step(&verify_ids, &embedding, depth)
+            .expect("cycle-1 verify")
+            .hiddens
+            .eval();
+        step.rollback(/* accepted_drafts */ 1, depth);
+        assert!(
+            step.take_replay_error().is_none(),
+            "cycle-1 replay must succeed"
+        );
+        let (blocks_after_cycle1, cursor_after_cycle1) = {
+            let MtpStepMode::Paged(adapter) = &step.mode else {
+                panic!("paged model must take the paged stepper mode");
+            };
+            (
+                adapter.num_allocated_blocks(),
+                adapter.current_token_count(),
+            )
+        };
+        assert_eq!(cursor_after_cycle1, prompt_len + 2);
+        assert_eq!(
+            blocks_after_cycle1,
+            (prompt.len() + lookahead).div_ceil(block_size as usize),
+            "cycle 1 stays inside the turn-entry reservation"
+        );
+
+        // (a) Cycle 2's reservation covers the MOVED cursor + lookahead.
+        assert!(
+            step.reserve_cycle_lookahead(lookahead)
+                .expect("in-capacity per-cycle reservation"),
+            "a reservation the pool can hold must admit cycle 2"
+        );
+        let reserved_blocks = {
+            let MtpStepMode::Paged(adapter) = &step.mode else {
+                panic!("mode must stay paged across the reservation");
+            };
+            assert_eq!(
+                adapter.current_token_count(),
+                cursor_after_cycle1,
+                "the reservation must not advance the cursor"
+            );
+            adapter.num_allocated_blocks()
+        };
+        assert_eq!(
+            reserved_blocks,
+            (cursor_after_cycle1 as usize + lookahead).div_ceil(block_size as usize),
+            "cycle 2's reservation must cover cursor + lookahead rows"
+        );
+        assert!(
+            reserved_blocks > blocks_after_cycle1,
+            "cycle 2's margin crosses a block boundary — skipping the \
+             per-cycle reservation would leave the turn-entry block count"
+        );
+
+        // Cycle 2's verify then writes into pre-allocated blocks only.
+        step.snapshot_main_linear();
+        let verify_ids2 =
+            MxArray::from_int32(&[25, 26, 27, 28], &[1, (depth + 1) as i64]).expect("verify ids");
+        step.verify_step(&verify_ids2, &embedding, depth)
+            .expect("cycle-2 verify")
+            .hiddens
+            .eval();
+        {
+            let MtpStepMode::Paged(adapter) = &step.mode else {
+                panic!("mode must stay paged across the cycle");
+            };
+            assert_eq!(
+                adapter.num_allocated_blocks(),
+                reserved_blocks,
+                "cycle 2's verify must allocate ZERO new blocks after its reservation"
+            );
+        }
+        step.rollback(/* accepted_drafts */ 1, depth);
+        assert!(
+            step.take_replay_error().is_none(),
+            "cycle-2 replay must succeed"
+        );
+
+        // (b) A reservation the pool cannot hold: AR fallback, state untouched.
+        let (blocks_before, cursor_before, over_capacity) = {
+            let MtpStepMode::Paged(adapter) = &step.mode else {
+                panic!("mode must stay paged across the rollback");
+            };
+            (
+                adapter.num_allocated_blocks(),
+                adapter.current_token_count(),
+                adapter.max_capacity_tokens() as usize,
+            )
+        };
+        let admitted = step
+            .reserve_cycle_lookahead(over_capacity)
+            .expect("capacity exhaustion must not error the cycle");
+        assert!(
+            !admitted,
+            "an over-capacity per-cycle reservation must signal AR fallback"
+        );
+        {
+            let MtpStepMode::Paged(adapter) = &step.mode else {
+                panic!("mode must stay paged across the failed reservation");
+            };
+            assert_eq!(adapter.num_allocated_blocks(), blocks_before);
+            assert_eq!(adapter.current_token_count(), cursor_before);
+        }
+
+        // (c) The AR fallback still advances: one Step-A-style forward on the
+        // SAME stepper (the engine's next-iteration path after the skip).
+        let next_ids = MxArray::from_int32(&[29], &[1, 1]).expect("ar ids");
+        let (logits, _hidden, _needs_squeeze) = step
+            .forward_with_hidden(&next_ids, &embedding)
+            .expect("AR forward after fallback");
+        logits.eval();
+        {
+            let MtpStepMode::Paged(adapter) = &step.mode else {
+                panic!("mode must stay paged across the AR forward");
+            };
+            assert_eq!(
+                adapter.current_token_count(),
+                cursor_before + 1,
+                "AR decode must advance one row past the rewound frontier"
+            );
+        }
+
+        drop(step);
+        assert!(
+            inner.paged_adapter.is_some(),
+            "the stepper Drop must restore the adapter"
         );
     }
 }
