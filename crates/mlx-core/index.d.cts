@@ -1009,6 +1009,121 @@ export declare class NativeRewardRegistry {
 }
 
 /**
+ * NVIDIA Nemotron 3.5 Lightning language model.
+ *
+ * Hybrid MoE architecture (Mamba-2 SSM + GQA + pure MoE-FFN layers) with
+ * an optional in-checkpoint MTP head. All model state lives on a
+ * dedicated OS thread; NAPI methods dispatch commands via channels. When
+ * the block-paged adapter is active the thread runs the engine-owned
+ * `HybridSchedulerState` continuous-batching loop.
+ */
+export declare class NemotronHModel {
+  /**
+   * Load a NemotronH model from a directory containing safetensors and
+   * config.json.
+   */
+  static load(modelPath: string): Promise<NemotronHModel>;
+  /**
+   * Whether this checkpoint shipped a complete MTP head (speculative
+   * decoding is available when enableMtp is set on the request).
+   */
+  hasMtpWeights(): boolean;
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance (default-on unless `use_block_paged_cache: false`).
+   */
+  hasBlockPagedCache(): boolean;
+  /** Get the model configuration. */
+  getConfig(): NemotronHConfig;
+  /**
+   * Native admission capacity for the server's per-model semaphore.
+   * Paged models advertise the scheduler lane (up to 8 default); flat
+   * models and forced-serial processes report 1.
+   */
+  maxConcurrentSequences(): number;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
+  /** Estimated number of model parameters. */
+  numParameters(): number;
+  /**
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
+   */
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
+   * Start a new chat session.
+   *
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
+   */
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /** Streaming variant of `chatSessionStart`. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinue`. */
+  chatStreamSessionContinue(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinueTool`. */
+  chatStreamSessionContinueTool(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+}
+
+/**
  * OutputStore - Persistence layer for training outputs
  *
  * Stores all model outputs during GRPO training for debugging and research.
@@ -4119,6 +4234,105 @@ export interface MuseGlimmerContextLimits {
   effectiveWindowTokens: number;
   pagedBlockCapacity: number;
   pagedBlockSize: number;
+}
+
+/**
+ * NVIDIA Nemotron 3.5 Lightning ("nemotron_h") model configuration.
+ *
+ * Hybrid MoE architecture: 52 layers alternating between three mixer kinds
+ * (`layers_block_type`): `mamba` (Mamba-2 SSM), `moe` (pure MoE-FFN), and
+ * `attention` (GQA). Each layer is a single pre-RMSNorm + ONE mixer + a
+ * residual connection; the final `norm_f` + a separate untied `lm_head`
+ * complete the stack.
+ *
+ * Parsed fail-closed from the checkpoint `config.json`; unknown layer block
+ * types, missing mandatory fields, and unsupported optional features
+ * (e.g. `moe_latent_size`) are rejected at load time rather than silently
+ * mis-decoded.
+ */
+export interface NemotronHConfig {
+  /** Vocabulary size (131072 for the 30B Lightning checkpoint). */
+  vocabSize: number;
+  /** Hidden dimension (2688). */
+  hiddenSize: number;
+  /** Total number of decoder layers (52). */
+  numHiddenLayers: number;
+  /** Number of query heads in the GQA attention layers (32). */
+  numAttentionHeads: number;
+  /** Number of KV heads in the GQA attention layers (2). */
+  numKeyValueHeads: number;
+  /** Per-head attention dimension (128). */
+  headDim: number;
+  /** Maximum position embeddings (context length). */
+  maxPositionEmbeddings: number;
+  /** RMSNorm epsilon for every norm in the model (1e-5). */
+  layerNormEpsilon: number;
+  /** RoPE base frequency for the attention layers (10000). */
+  ropeTheta: number;
+  /**
+   * Per-layer mixer kind, remapped from the checkpoint's
+   * `layers_block_type`: "mamba" -> "linear_attention", "attention" ->
+   * "full_attention", "moe" -> "moe" (the HF `MIXER_TYPES` names).
+   */
+  layersBlockType: Array<string>;
+  /** Number of SSM heads (64). */
+  mambaNumHeads: number;
+  /** SSM head dimension (64). */
+  mambaHeadDim: number;
+  /** SSM state size per head per group (128). */
+  ssmStateSize: number;
+  /** Number of SSM groups (8); each head belongs to group h / (H / G). */
+  nGroups: number;
+  /** Depthwise causal conv1d kernel size (4). */
+  convKernel: number;
+  /** Mamba-2 chunk-scan chunk size (128). */
+  chunkSize: number;
+  /**
+   * Minimum discretized time step (1e-3); softplus(dt + dt_bias) is
+   * clamped to [time_step_min, inf).
+   */
+  timeStepMin: number;
+  /** Total routed experts (128). */
+  nRoutedExperts: number;
+  /** Experts selected per token (6). */
+  numExpertsPerTok: number;
+  /** Post-normalization routing weight scale (2.5). */
+  routedScalingFactor: number;
+  /** Number of expert groups (1 - grouping degenerates to a flat top-k). */
+  nGroup: number;
+  /** Number of top groups selected (1). */
+  topkGroup: number;
+  /** Renormalize the gathered top-k weights to sum to 1 before scaling. */
+  normTopkProb: boolean;
+  /** Per-expert MLP intermediate size (1856; non-gated up->relu2->down). */
+  intermediateSize: number;
+  /** Shared-expert MLP intermediate size (3712), applied on ALL tokens. */
+  moeSharedExpertIntermediateSize: number;
+  /** Tie the lm_head to the embedding table. False for Nemotron. */
+  tieWordEmbeddings: boolean;
+  bosTokenId: number;
+  /** EOS token ids (config.json scalar; generation_config carries {2, 11}). */
+  eosTokenIds: number[];
+  padTokenId: number;
+  /** Compute only the last `num_logits_to_keep` logits (1). */
+  numLogitsToKeep: number;
+  /** MTP layer kinds, remapped like `layers_block_type` (["attention","moe"]). */
+  mtpLayersBlockType: string[];
+  /** Number of MTP predictor steps (`num_nextn_predict_layers`; 1). */
+  nMtpLayers: number;
+  /**
+   * Optional block-paged KV cache memory cap in MiB. None resolves to the
+   * default 2048 MiB pool; explicit values are honored.
+   */
+  pagedCacheMemoryMb?: number;
+  /** Optional paged block size in tokens (default 16). */
+  pagedBlockSize?: number;
+  /**
+   * Opt in/out of the block-paged KV adapter. None (the default) enables
+   * the paged pool and the continuous-batching scheduler lane; explicit
+   * `Some(false)` reverts to the flat-cache whole-turn path.
+   */
+  useBlockPagedCache?: boolean;
 }
 
 /** Result from document orientation classification. */
