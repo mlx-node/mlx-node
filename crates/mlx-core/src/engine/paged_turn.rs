@@ -255,6 +255,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     let mut streamed_text_len = 0usize;
     let mut last_is_reasoning = thinking.enabled;
     let mut emitter: Option<Box<dyn StreamEmitter>> = args.sink.map(|_| backend.stream_emitter());
+    let turn_token_observer = backend.turn_token_observer();
 
     // ---- prefill ----
     // ABORT-ON-ERROR: every fallible step from here through `end_decode`
@@ -349,6 +350,7 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
                 // turns too — the engine passes it via
                 // `WholeTurnArgs::cancelled` regardless of sink presence.
                 cancel_flag: args.cancelled,
+                turn_token_observer,
             },
             streaming_ctx,
         )?;

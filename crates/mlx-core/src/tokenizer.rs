@@ -297,6 +297,12 @@ impl KwargFrame {
 
 #[napi]
 impl Qwen3Tokenizer {
+    /// Internal tokenizers handle for protocol-aware stream parsers that must
+    /// retain special-token provenance. This never crosses N-API.
+    pub(crate) fn inner_arc(&self) -> Arc<Tokenizer> {
+        self.tokenizer.clone()
+    }
+
     /// Load tokenizer from tokenizer.json file
     ///
     /// # Arguments

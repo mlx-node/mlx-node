@@ -1848,6 +1848,24 @@ pub(crate) mod recipe {
             let mut skipped = 0usize;
 
             for (source_key, array) in weights {
+                // Canonical HF Muse stores the four sandwich-norm parameters
+                // centered around zero and applies them as `(1 + weight)`.
+                // SafeTensors conversion emits `format: mlx`, so bake the
+                // offset exactly once while the source namespace still tells
+                // raw HF (`model.language_model.*`) from an already-sanitized
+                // `language_model.model.*` artifact.
+                let shift_sandwich_norm = source_key
+                    .strip_prefix("model.language_model.layers.")
+                    .is_some_and(|rest| {
+                        [
+                            ".input_layernorm.weight",
+                            ".post_attention_layernorm.weight",
+                            ".pre_feedforward_layernorm.weight",
+                            ".post_feedforward_layernorm.weight",
+                        ]
+                        .iter()
+                        .any(|suffix| rest.ends_with(suffix))
+                    });
                 let key = if let Some(rest) = source_key.strip_prefix("model.language_model.") {
                     format!("language_model.model.{rest}")
                 } else if source_key.starts_with("language_model.model.") {
@@ -1862,6 +1880,11 @@ pub(crate) mod recipe {
                     rest.to_string()
                 } else {
                     source_key.clone()
+                };
+                let array = if shift_sandwich_norm {
+                    array.add_scalar(1.0)?
+                } else {
+                    array
                 };
 
                 if sanitized.insert(key.clone(), array).is_some() {
@@ -14767,6 +14790,14 @@ mod tests {
                 "model.vision_tower.layers.0.attn.q_proj.weight".to_string(),
                 weight(),
             ),
+            (
+                "model.language_model.layers.0.input_layernorm.weight".to_string(),
+                MxArray::from_float32(&[0.25], &[1]).expect("centered norm"),
+            ),
+            (
+                "model.language_model.norm.weight".to_string(),
+                MxArray::from_float32(&[0.5], &[1]).expect("final norm"),
+            ),
         ]);
         let recipe = recipe::MuseGlimmerRecipe;
         let once = recipe
@@ -14776,16 +14807,34 @@ mod tests {
         assert!(once.contains_key("language_model.model.lm_head.weight"));
         assert!(once.contains_key("vision_adapter.fc1.weight"));
         assert!(once.contains_key("vision_tower.layers.0.attn.q_proj.weight"));
+        assert_eq!(
+            once["language_model.model.layers.0.input_layernorm.weight"]
+                .item_at_float32(0)
+                .expect("shifted norm"),
+            1.25
+        );
+        assert_eq!(
+            once["language_model.model.norm.weight"]
+                .item_at_float32(0)
+                .expect("unchanged final norm"),
+            0.5
+        );
 
         let twice = recipe
             .sanitize(once, &serde_json::json!({}), "bfloat16", false, false)
             .expect("second sanitize");
         assert_eq!(
             twice.len(),
-            4,
+            6,
             "canonical keys must not grow another prefix"
         );
         assert!(twice.contains_key("language_model.model.layers.0.self_attn.q_proj.weight"));
+        assert_eq!(
+            twice["language_model.model.layers.0.input_layernorm.weight"]
+                .item_at_float32(0)
+                .expect("idempotent norm"),
+            1.25
+        );
     }
 
     #[test]

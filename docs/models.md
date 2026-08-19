@@ -10,6 +10,7 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 | **Qwen3.5 Dense** |     yes      |     yes     | GRPO + SFT | Compiled C++ forward (see [ffi-cpp.md](ffi-cpp.md)); VLM variant                 |
 | **Qwen3.5 MoE**   |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant                            |
 | **Gemma4**        |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark + assistant-MTP spec. decoding |
+| **Muse-Glimmer**  |     yes      |     yes     |     —      | Text decoder; Q4_K import; DFlash; hybrid paged AR                              |
 | **LFM2.5**        |     yes      |     yes     |     —      | Hybrid conv + attention                                                          |
 
 `Qwen3Model | Qwen35Model | Qwen35MoeModel` is the public `TrainableModel` union in `@mlx-node/lm` — Gemma4 and LFM2.5 are inference-only.
@@ -59,7 +60,9 @@ const result = await pipeline.analyze(imageBuffer);
 
 Every role-aware turn sends the full structured history to native code. The checkpoint-provided chat template renders that history, and native KV reuse is allowed only when the rendered token sequence exactly extends the committed cache. A template mismatch safely falls back to full prefill; Rust never manufactures user/tool wire-format strings.
 
-All generative wrappers (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE, Gemma4, LFM2.5, and the VLM `QianfanOCRModel`) structurally satisfy `SessionCapableModel` — any of them can be passed to `new ChatSession(model)`.
+All generative wrappers (Qwen3, Qwen3.5 Dense, Qwen3.5 MoE, Gemma4,
+Muse-Glimmer, LFM2.5, and the VLM `QianfanOCRModel`) structurally satisfy
+`SessionCapableModel` — any of them can be passed to `new ChatSession(model)`.
 
 ## Streaming
 
@@ -73,6 +76,48 @@ for await (const event of session.sendStream("Hello!")) {
 ```
 
 The streaming bridge is implemented in `packages/lm/src/stream.ts`: native callback-based methods are captured at module load and re-exposed as `AsyncGenerator` via `_runChatStream`.
+
+## Muse-Glimmer Q4_K and DFlash
+
+Convert Meta's GGUF target, vision projector, and DFlash companion together.
+`--gguf-kquant` imports Q4_K, Q5_K, and Q6_K blocks without dequantizing or
+requantizing them:
+
+```bash
+yarn mlx convert \
+  -i ./Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf \
+  -o ./muse-glimmer-30b-q4k \
+  --config-dir ./Muse-Glimmer-30B \
+  --mmproj ./mmproj-kquant.gguf \
+  --draft ./dflash-kquant.gguf \
+  --gguf-kquant
+```
+
+The output contains `model.safetensors`, `vision.safetensors`, and
+`draft.safetensors`. The current inference path is text-only; the converter
+preserves the vision sidecar, but Muse image/video execution is not wired yet.
+
+When `draft.safetensors` is present, `hasMtpWeights()` and
+`autoEnablesMtp()` return true and `ChatSession` enables DFlash unless a call
+sets `enableMtp: false`. Muse DFlash uses the checkpoint's 16-token parallel
+infill block by default. An explicit `mtpDepth` clamps to `[1, 16]`; leaving
+both depth knobs unset enables the measured target-AR fallback guard.
+
+Ordinary AR requests use the hybrid full/sliding paged cache and continuous
+batching. The default 2 GiB cache admits up to eight sequences for the release
+geometry. DFlash uses owner-isolated flat target and draft caches and is a
+scheduler barrier, so simultaneous DFlash turns are serialized; set
+`enableMtp: false` for request pools where batched concurrency is preferred.
+
+Paged AR prefixes can also survive hot-cache eviction and process restart via
+the SSD cold tier. Enable it with `persist_paged_cache: true` in the model
+config or `MLX_PERSIST_PAGED_CACHE=1`; `mlx agent` enables persistence by
+default for supported families. Muse persists the 13 full-attention layers as
+the authoritative block chain and all 39 sliding layers as a companion sidecar
+at the same token boundary. A missing, corrupt, or mismatched sidecar discards
+the full-group hit and recomputes from the start. DFlash's flat caches are not
+persisted, and an unfinished in-flight AR turn uses recompute preemption rather
+than publishing partial state.
 
 ## Speculative decoding: Gemma4 drafts (DSpark + assistant MTP)
 

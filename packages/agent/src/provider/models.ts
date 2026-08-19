@@ -9,10 +9,10 @@
  * `contextWindow` starts as the checkpoint's trained window, read from the model dir's
  * `config.json` `max_position_embeddings` (root first, then the
  * `text_config` nesting used by qwen3_5 / qwen3_5_moe / gemma4 unified
- * checkpoints). Once a Qwen model loads, the provider narrows this shared
- * model metadata to the physical paged-cache window so pi's later
- * auto-compaction thresholds match reality. When both config fields are
- * absent the documented per-family fallback below applies.
+ * checkpoints). Once a Qwen or Muse-Glimmer model loads, the provider narrows
+ * this shared model metadata to the physical paged-cache window so pi's later
+ * auto-compaction thresholds match reality. When both config fields are absent
+ * the documented per-family fallback below applies.
  */
 
 import type { Dirent } from 'node:fs';
@@ -83,6 +83,10 @@ const FAMILY_TRAITS: Record<string, FamilyTraits> = {
       medium: null,
       high: 'high',
     },
+    fallbackContextWindow: 131072,
+  },
+  muse_glimmer: {
+    reasoning: true,
     fallbackContextWindow: 131072,
   },
   lfm2: { reasoning: true, fallbackContextWindow: 128000 },

@@ -247,7 +247,14 @@ fn layout_carrying(
 /// every `b > 0`.
 pub(crate) fn policy(config: &Gemma4Config) -> Option<ColdSidecarPolicy> {
     let geo = geometry(config)?;
-    ColdSidecarPolicy::new_boundary_scaled(template_layout(&geo), 2).ok()
+    policy_for_geometry(&geo)
+}
+
+/// Build the same exact-boundary policy for another hybrid family using this
+/// codec. Keeping the constructor beside the codec prevents its template from
+/// drifting from [`layout_at`].
+pub(crate) fn policy_for_geometry(geo: &SlidingSidecarGeometry) -> Option<ColdSidecarPolicy> {
+    ColdSidecarPolicy::new_boundary_scaled(template_layout(geo), 2).ok()
 }
 
 /// Encode the live K/V suffix read from a paged sliding-group adapter.

@@ -41,6 +41,8 @@ import type { ModelType } from '@mlx-node/lm';
  *  - `gemma4` owns full and sliding attention in distinct paged groups. The
  *    full-attention chain is authoritative and one grouped sliding sidecar
  *    restores every sliding group at the same exact boundary, atomically.
+ *  - `muse_glimmer` uses the same hybrid contract for its 13 full-attention
+ *    and 39 sliding-attention layers.
  *  - `qwen3_5` (dense) sizes its pool over the full-attention layers only, but
  *    persists its out-of-pool GDN recurrent state (conv + recurrent) as a
  *    `ColdGroup::GdnState` sidecar, and its `ColdSidecarPolicy` reconciles the
@@ -75,6 +77,7 @@ export const COLD_TIER_RESTORE_FAMILIES: ReadonlySet<string> = new Set<ModelType
   'qwen3_5',
   'qwen3_5_moe',
   'gemma4',
+  'muse_glimmer',
   'lfm2',
   'lfm2_moe',
 ]);

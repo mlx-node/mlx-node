@@ -222,6 +222,20 @@ impl ChunkSink for crate::model_thread::StreamTx<ChatStreamChunk> {
 /// the done-chunk carrying `text: ""` and the parser-accumulated
 /// `tool_calls()` / `thinking()` instead of `result.text`.
 pub(crate) trait StreamEmitter {
+    /// Token-aware entry point. The default preserves the historical text-only
+    /// emitter contract; protocol parsers that require special-token
+    /// provenance override this method.
+    fn on_token_id(
+        &mut self,
+        _token_id: u32,
+        token_text: &str,
+        is_reasoning: bool,
+        include_reasoning: bool,
+        sink: &dyn ChunkSink,
+    ) {
+        self.on_token_text(token_text, is_reasoning, include_reasoning, sink);
+    }
+
     /// One committed token's incremental detokenized text (may be empty
     /// for partial-grapheme steps). `is_reasoning` is the
     /// [`crate::engine::penalties::ReasoningTracker`] tag for this
@@ -255,6 +269,22 @@ pub(crate) trait StreamEmitter {
     /// family-controlled end to end: a family's finalize override feeds
     /// its own parse into its emitter's terminal chunk.
     fn finish(&mut self, result: &ChatResult, sink: &dyn ChunkSink);
+}
+
+/// Per-turn protocol observer, independent of whether the caller requested a
+/// streaming sink.
+///
+/// Families with token-level turn boundaries use this hook to stop generation
+/// before another forward is scheduled. Keeping it separate from
+/// [`StreamEmitter`] ensures synchronous turns stop and persist the same token
+/// prefix as streaming turns, while speculative loops can clamp before commit.
+pub(crate) trait TurnTokenObserver {
+    /// Observe one committed token. Return `true` when it terminates the turn.
+    fn observe_token_id(&mut self, token_id: u32) -> bool;
+
+    /// Rewind the most recently observed non-terminal token when a recoverable
+    /// scheduler allocation failure rolls that token back for replay.
+    fn rollback_last_token(&mut self) {}
 }
 
 /// Default [`StreamEmitter`]: the raw ChatML streaming emission — raw
@@ -954,6 +984,13 @@ pub(crate) trait ChatBackend {
     /// for the full mapping).
     fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
         Box::new(DefaultStreamEmitter)
+    }
+
+    /// Build the turn-local token protocol observer, when the family needs
+    /// boundaries beyond the ordinary EOS token set. Called for both
+    /// synchronous and streaming turns.
+    fn turn_token_observer(&self) -> Option<Box<dyn TurnTokenObserver>> {
+        None
     }
 
     /// Byte budget for the turn's `WiredLimitContext`, or `None` for NO
@@ -1792,6 +1829,17 @@ pub(crate) trait DsparkStepper {
     /// unconditionally kept); the cycle's boundary token has NO K/V slot —
     /// it becomes the next cycle's anchor.
     fn commit(&mut self, keep: usize, total_written: usize) -> Result<()>;
+
+    /// Publish model-private state retained by a successful speculative turn.
+    /// Most steppers keep all persistent state behind their backend and need
+    /// no action. Draft models with a turn-local context owner can move it
+    /// back into the backend here for the next live-session continuation.
+    fn finish(self) -> Result<()>
+    where
+        Self: Sized,
+    {
+        Ok(())
+    }
 
     /// Schedule async eval for the boundary token that becomes the next
     /// cycle's anchor. `&self` — schedules only, no mutation. Called at the

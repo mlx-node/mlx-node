@@ -90,6 +90,41 @@ struct RawConfig {
     projector_hidden_act: String,
     text_config: RawTextConfig,
     vision_config: MuseGlimmerVisionConfig,
+    #[serde(default)]
+    muse_glimmer_gguf_rope_layout: Option<String>,
+    #[serde(default)]
+    dflash_config: Option<MuseGlimmerDFlashConfig>,
+    #[serde(default)]
+    use_block_paged_cache: Option<bool>,
+    #[serde(default)]
+    paged_block_size: Option<u32>,
+    #[serde(default)]
+    paged_cache_memory_mb: Option<u32>,
+    #[serde(default)]
+    persist_paged_cache: Option<bool>,
+}
+
+/// Configuration written from Meta's companion DFlash GGUF header.
+///
+/// The draft intentionally shares the target embedding and LM head, so these
+/// are the complete independent geometry and protocol fields needed to build
+/// it from `draft.safetensors`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct MuseGlimmerDFlashConfig {
+    pub num_hidden_layers: usize,
+    pub block_size: usize,
+    pub hidden_size: usize,
+    pub intermediate_size: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    pub head_dim: usize,
+    pub sliding_window: usize,
+    pub max_position_embeddings: usize,
+    pub rms_norm_eps: f32,
+    pub rope_theta: f32,
+    pub target_layers: Vec<usize>,
+    pub mask_token_id: usize,
+    pub causal: bool,
 }
 
 /// Vision tower geometry.
@@ -182,6 +217,96 @@ pub struct MuseGlimmerConfig {
     pub projector_hidden_act: String,
     pub text_config: MuseGlimmerTextConfig,
     pub vision_config: MuseGlimmerVisionConfig,
+    /// Official llama.cpp GGUFs store decoder and vision Q/K rows in
+    /// interleaved RoPE layout. Base SafeTensors keep HF's half-split layout.
+    pub rope_traditional: bool,
+    pub dflash_config: Option<MuseGlimmerDFlashConfig>,
+    /// Block-paged KV is enabled by default on Metal. `false` is an explicit
+    /// flat-cache opt-out for diagnostics and parity checks.
+    pub use_block_paged_cache: Option<bool>,
+    pub paged_block_size: Option<u32>,
+    pub paged_cache_memory_mb: Option<u32>,
+    /// Persist full-attention blocks plus the exact-boundary sliding sidecar
+    /// to the process-global SSD cold tier.
+    pub persist_paged_cache: Option<bool>,
+}
+
+impl MuseGlimmerDFlashConfig {
+    fn validate(&self, target: &RawTextConfig) -> Result<()> {
+        for (name, value) in [
+            ("num_hidden_layers", self.num_hidden_layers),
+            ("block_size", self.block_size),
+            ("hidden_size", self.hidden_size),
+            ("intermediate_size", self.intermediate_size),
+            ("num_attention_heads", self.num_attention_heads),
+            ("num_key_value_heads", self.num_key_value_heads),
+            ("head_dim", self.head_dim),
+            ("sliding_window", self.sliding_window),
+            ("max_position_embeddings", self.max_position_embeddings),
+        ] {
+            if value == 0 {
+                return Err(Error::from_reason(format!(
+                    "muse_glimmer: dflash_config.{name} must be non-zero"
+                )));
+            }
+        }
+        if self.hidden_size != target.hidden_size {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: DFlash hidden_size {} does not match target hidden_size {}",
+                self.hidden_size, target.hidden_size
+            )));
+        }
+        if !self
+            .num_attention_heads
+            .is_multiple_of(self.num_key_value_heads)
+        {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: DFlash num_key_value_heads {} must divide num_attention_heads {}",
+                self.num_key_value_heads, self.num_attention_heads
+            )));
+        }
+        if self.target_layers.is_empty() {
+            return Err(Error::from_reason(
+                "muse_glimmer: DFlash target_layers must not be empty",
+            ));
+        }
+        let mut previous = None;
+        for &layer in &self.target_layers {
+            if layer >= target.num_hidden_layers.saturating_sub(1) {
+                return Err(Error::from_reason(format!(
+                    "muse_glimmer: DFlash target layer {layer} is not a non-final target layer"
+                )));
+            }
+            if previous.is_some_and(|prior| layer <= prior) {
+                return Err(Error::from_reason(
+                    "muse_glimmer: DFlash target_layers must be strictly ascending",
+                ));
+            }
+            previous = Some(layer);
+        }
+        if self.mask_token_id >= target.vocab_size {
+            return Err(Error::from_reason(format!(
+                "muse_glimmer: DFlash mask_token_id {} is outside target vocab_size {}",
+                self.mask_token_id, target.vocab_size
+            )));
+        }
+        if !self.rms_norm_eps.is_finite() || self.rms_norm_eps <= 0.0 {
+            return Err(Error::from_reason(
+                "muse_glimmer: DFlash rms_norm_eps must be finite and positive",
+            ));
+        }
+        if !self.rope_theta.is_finite() || self.rope_theta <= 0.0 {
+            return Err(Error::from_reason(
+                "muse_glimmer: DFlash rope_theta must be finite and positive",
+            ));
+        }
+        if self.causal {
+            return Err(Error::from_reason(
+                "muse_glimmer: Meta's DFlash companion must use non-causal query attention",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl MuseGlimmerVisionConfig {
@@ -304,6 +429,9 @@ impl MuseGlimmerConfig {
         let raw: RawConfig = serde_json::from_str(json)
             .map_err(|e| Error::from_reason(format!("muse_glimmer: invalid config.json: {e}")))?;
         let text = raw.text_config;
+        if let Some(dflash) = raw.dflash_config.as_ref() {
+            dflash.validate(&text)?;
+        }
         let layers = text.num_hidden_layers;
 
         // Resolve the layer kinds first so an unrecognized span names itself.
@@ -709,6 +837,16 @@ impl MuseGlimmerConfig {
             }
         }
 
+        let rope_traditional = match raw.muse_glimmer_gguf_rope_layout.as_deref() {
+            None | Some("half_split") => false,
+            Some("interleaved") => true,
+            Some(layout) => {
+                return Err(Error::from_reason(format!(
+                    "muse_glimmer: unsupported muse_glimmer_gguf_rope_layout '{layout}'"
+                )));
+            }
+        };
+
         Ok(Self {
             image_token_id: raw.image_token_id,
             video_token_id: raw.video_token_id,
@@ -735,6 +873,12 @@ impl MuseGlimmerConfig {
                 layer_rope_theta: text.layer_rope_theta,
             },
             vision_config: raw.vision_config,
+            rope_traditional,
+            dflash_config: raw.dflash_config,
+            use_block_paged_cache: raw.use_block_paged_cache,
+            paged_block_size: raw.paged_block_size,
+            paged_cache_memory_mb: raw.paged_cache_memory_mb,
+            persist_paged_cache: raw.persist_paged_cache,
         })
     }
 }

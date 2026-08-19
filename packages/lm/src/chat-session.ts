@@ -369,7 +369,8 @@ export interface SessionCapableModel {
   expandedPromptTokenCount?(promptTokens: Uint32Array, messages: ChatMessage[]): Promise<number> | number;
   /**
    * Optional synchronous load-time snapshot of the model's usable context.
-   * Qwen3.5 dense/MoE expose this when adaptive paged-cache sizing is active.
+   * Qwen3.5 dense/MoE and Muse-Glimmer expose this when paged-cache sizing is
+   * active.
    */
   contextLimits?(): SessionContextLimits;
   /**

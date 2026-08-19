@@ -202,8 +202,9 @@ pub(crate) struct ChatParams {
     ///     `mtpAdaptiveDepth=true` explicitly to enable the adaptive
     ///     policy.
     ///
-    /// Families may post-resolve this generic default. Gemma4 DSpark enables
-    /// its measured target-AR break-even guard when both raw fields are unset.
+    /// Families may post-resolve this generic default. Gemma4 DSpark and
+    /// Muse-Glimmer DFlash enable their measured target-AR break-even guard
+    /// when both raw fields are unset.
     pub mtp_adaptive_depth: bool,
 }
 

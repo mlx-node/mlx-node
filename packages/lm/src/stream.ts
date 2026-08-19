@@ -3,6 +3,7 @@ import { join } from "node:path";
 import {
   Gemma4Model as Gemma4ModelNative,
   Lfm2Model as Lfm2ModelNative,
+  MuseGlimmerModel as MuseGlimmerModelNative,
   Qwen3Tokenizer,
   Qwen3Model as Qwen3ModelNative,
   Qwen35Model as Qwen35ModelNative,
@@ -848,6 +849,11 @@ export class Gemma4Model extends makeStreamingModel(Gemma4ModelNative, {
   recordModelPath: true,
 }) {}
 
+/** Muse-Glimmer text model with embedded DFlash speculative decoding. */
+export class MuseGlimmerModel extends makeStreamingModel(MuseGlimmerModelNative, {
+  recordModelPath: true,
+}) {}
+
 /**
  * Qwen3 (first-gen, text-only) model.
  *
@@ -874,11 +880,13 @@ function _assertSessionCapable(): void {
   const _moe: SessionCapableModel = null as unknown as Qwen35MoeModel;
   const _lfm2: SessionCapableModel = null as unknown as Lfm2Model;
   const _gemma4: SessionCapableModel = null as unknown as Gemma4Model;
+  const _museGlimmer: SessionCapableModel = null as unknown as MuseGlimmerModel;
   const _qwen3: SessionCapableModel = null as unknown as Qwen3Model;
   void _qwen35;
   void _moe;
   void _lfm2;
   void _gemma4;
+  void _museGlimmer;
   void _qwen3;
 }
 void _assertSessionCapable;
@@ -921,10 +929,13 @@ function _assertPreservedNativeSurfaces(): void {
     null as unknown as Lfm2Model;
   const _gemma4: PreservedNativeSurface<typeof Gemma4ModelNative> =
     null as unknown as Gemma4Model;
+  const _museGlimmer: PreservedNativeSurface<typeof MuseGlimmerModelNative> =
+    null as unknown as MuseGlimmerModel;
   void _qwen3;
   void _qwen35;
   void _moe;
   void _lfm2;
   void _gemma4;
+  void _museGlimmer;
 }
 void _assertPreservedNativeSurfaces;

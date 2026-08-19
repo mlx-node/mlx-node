@@ -19,7 +19,7 @@ use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
-use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper};
+use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, TurnTokenObserver};
 use crate::engine::decode::StreamingCtx;
 use crate::engine::params::ChatParams;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
@@ -59,6 +59,8 @@ pub(crate) struct DsparkTurnArgs<'a> {
     /// Streaming turns carry the SAME flag in `StreamingCtx.cancelled`;
     /// the polls are idempotent, so double-polling is harmless.
     pub cancel_flag: Option<&'a AtomicBool>,
+    /// Family protocol guard, present independently of a streaming sink.
+    pub turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
 }
 
 /// Terminal outs of [`run_dspark_turn`] the caller threads into its save /
@@ -283,6 +285,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         report_perf: report,
         generation_stream,
         cancel_flag,
+        mut turn_token_observer,
     } = args;
     // One closure for every cancel snapshot point below — sync turns poll
     // `cancel_flag` directly; streaming turns pass the same flag, so a
@@ -299,6 +302,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     // the last cached token is the prompt's last token, which IS in cache.
     let mut last_in_cache = true;
     let mut last_clear_at: usize = generated.len();
+    let mut observer_stopped = false;
 
     // Same nonpositive-budget clamp as `run_mtp_turn` (see its PARITY-FIX
     // comment): a negative `max` must behave as 0, not wrap to a huge usize.
@@ -320,6 +324,11 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         hist.push(initial_token_id);
         profiler.step();
         let _is_reasoning = tracker.observe_token(initial_token_id);
+        if !turn_cancelled() {
+            observer_stopped = turn_token_observer
+                .as_deref_mut()
+                .is_some_and(|observer| observer.observe_token_id(initial_token_id));
+        }
         if let Some(s) = streaming.as_mut() {
             *s.last_is_reasoning = _is_reasoning;
             if !s.cancelled.load(Ordering::Relaxed) {
@@ -331,7 +340,8 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                     *s.streamed_text_len,
                 );
                 *s.streamed_text_len += token_text.len();
-                s.emitter.on_token_text(
+                s.emitter.on_token_id(
+                    initial_token_id,
                     &token_text,
                     _is_reasoning,
                     p.include_reasoning,
@@ -395,6 +405,11 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     // gemma4 has no post-commit heal path, so a mid-emit cancel must never
     // be observed AFTER the cycle's commit already kept its slots.
     loop {
+        if observer_stopped {
+            *reason = String::from("stop");
+            break;
+        }
+
         // Pre-cycle stop checks — `run_mtp_turn`'s exact order and reason
         // strings: zero budget → EOS/extra-EOS → cancel → repetition → max.
         if max_as_usize == 0 {
@@ -680,6 +695,13 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                     stop = Some(CycleStop::Cancelled);
                     break;
                 }
+                if turn_token_observer
+                    .as_deref_mut()
+                    .is_some_and(|observer| observer.observe_token_id(tok))
+                {
+                    stop = Some(CycleStop::Stop);
+                    break;
+                }
                 if tok == eos_id || p.extra_eos_ids.contains(&tok) {
                     stop = Some(CycleStop::Stop);
                     break;
@@ -824,7 +846,8 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                     *s.streamed_text_len,
                 );
                 *s.streamed_text_len += token_text.len();
-                s.emitter.on_token_text(
+                s.emitter.on_token_id(
+                    tok_id,
                     &token_text,
                     _is_reasoning,
                     p.include_reasoning,
@@ -868,6 +891,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         step.eval_boundary(&y_arr);
     }
 
+    step.finish()?;
     profiler.snapshot_memory_after();
     profiler.report();
 
@@ -897,7 +921,7 @@ mod tests {
     use crate::decode_profiler::DecodeProfiler;
     use crate::engine::backend::{
         ChatBackend, ChunkSink, DefaultStreamEmitter, DsparkBackend, DsparkProposal, DsparkStepper,
-        DsparkVerifyOutput, FinalizeArgs, ResetScope, SaveStateArgs, TurnSetup,
+        DsparkVerifyOutput, FinalizeArgs, ResetScope, SaveStateArgs, TurnSetup, TurnTokenObserver,
     };
     use crate::engine::decode::StreamingCtx;
     use crate::engine::params::ChatParams;
@@ -1420,7 +1444,16 @@ mod tests {
         block_size: usize,
         rng: &mut R,
     ) -> RawTurnOut {
-        drive_turn_raw_with_cancel(backend, params, first_token, eos_id, block_size, rng, None)
+        drive_turn_raw_with_cancel(
+            backend,
+            params,
+            first_token,
+            eos_id,
+            block_size,
+            rng,
+            None,
+            None,
+        )
     }
 
     /// [`drive_turn_raw`] with an H2 sync cancel flag threaded into
@@ -1434,6 +1467,7 @@ mod tests {
         block_size: usize,
         rng: &mut R,
         cancel_flag: Option<&AtomicBool>,
+        turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
     ) -> RawTurnOut {
         let mut tracker = ReasoningTracker::new(false, None, None);
         let mut profiler = DecodeProfiler::new("dspark_turn_test", "test");
@@ -1464,6 +1498,7 @@ mod tests {
                 report_perf: false,
                 generation_stream,
                 cancel_flag,
+                turn_token_observer,
             },
             None,
         );
@@ -2159,13 +2194,15 @@ mod tests {
     /// Drive the STREAMING turn over the scripted backend. `pre_cancelled`
     /// sets the cancel flag before the turn starts; the backend's
     /// `cancel_on_verify` can flip it mid-cycle instead.
-    fn drive_streaming_turn(
+    fn drive_streaming_turn_with_emitter(
         backend: &mut MockDsparkBackend,
         params: ChatParams,
         first_token: u32,
         eos_id: u32,
         block_size: usize,
         cancelled: Arc<AtomicBool>,
+        emitter: &mut dyn crate::engine::backend::StreamEmitter,
+        turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
     ) -> StreamOut {
         let mut tracker = ReasoningTracker::new(false, None, None);
         let mut profiler = DecodeProfiler::new("dspark_stream_test", "test");
@@ -2186,8 +2223,6 @@ mod tests {
         };
         let mut streamed_text_len = 0usize;
         let mut last_is_reasoning = false;
-        let mut emitter = DefaultStreamEmitter;
-
         let outcome = run_dspark_turn(
             backend,
             &mut rng,
@@ -2209,6 +2244,7 @@ mod tests {
                 // isolation — production (gemma4 `draft_chat_turn`) also
                 // wires the same flag here.
                 cancel_flag: None,
+                turn_token_observer,
             },
             Some(StreamingCtx {
                 callback: &sink,
@@ -2217,7 +2253,7 @@ mod tests {
                 tokenizer: &tokenizer,
                 streamed_text_len: &mut streamed_text_len,
                 last_is_reasoning: &mut last_is_reasoning,
-                emitter: &mut emitter,
+                emitter,
             }),
         )
         .unwrap_or_else(|e| panic!("run_dspark_turn (streaming) failed: {}", e.reason));
@@ -2238,6 +2274,27 @@ mod tests {
             ledger: backend.ledger_snapshot(),
             streamed_text_len,
         }
+    }
+
+    fn drive_streaming_turn(
+        backend: &mut MockDsparkBackend,
+        params: ChatParams,
+        first_token: u32,
+        eos_id: u32,
+        block_size: usize,
+        cancelled: Arc<AtomicBool>,
+    ) -> StreamOut {
+        let mut emitter = DefaultStreamEmitter;
+        drive_streaming_turn_with_emitter(
+            backend,
+            params,
+            first_token,
+            eos_id,
+            block_size,
+            cancelled,
+            &mut emitter,
+            None,
+        )
     }
 
     /// The residual the whole-turn core's post-loop flush would emit:
@@ -2299,6 +2356,75 @@ mod tests {
             "",
             "an uncancelled turn leaves nothing for the residual flush"
         );
+    }
+
+    struct StoppingObserver {
+        stop_id: u32,
+    }
+
+    impl TurnTokenObserver for StoppingObserver {
+        fn observe_token_id(&mut self, token_id: u32) -> bool {
+            token_id == self.stop_id
+        }
+    }
+
+    #[test]
+    fn dspark_streaming_observer_stop_clamps_before_commit() {
+        let mut backend =
+            MockDsparkBackend::greedy(7, vec![CycleScript::greedy(vec![1, 3], vec![1, 3, 4])]);
+        let mut emitter = DefaultStreamEmitter;
+        let out = drive_streaming_turn_with_emitter(
+            &mut backend,
+            greedy_params(),
+            0,
+            5,
+            2,
+            Arc::new(AtomicBool::new(false)),
+            &mut emitter,
+            Some(Box::new(StoppingObserver { stop_id: 3 })),
+        );
+
+        assert_eq!(out.generated, vec![0, 1, 3]);
+        assert_eq!(out.finish_reason, "stop");
+        assert!(!out.last_in_cache, "the stopping token is not persisted");
+        assert_eq!(out.chunks, vec!["t0", " t1", " c3"]);
+        assert_eq!(commits(&out.ledger), vec![(2, 3)]);
+        assert_eq!(
+            count(&out.ledger, |call| matches!(
+                call,
+                Call::EvalBoundary { .. }
+            )),
+            0,
+            "no next speculative cycle is scheduled"
+        );
+    }
+
+    #[test]
+    fn dspark_sync_observer_stop_clamps_before_commit() {
+        let mut backend =
+            MockDsparkBackend::greedy(7, vec![CycleScript::greedy(vec![1, 3], vec![1, 3, 4])]);
+        let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(0xD5_9A2B_C0DE);
+        let raw = drive_turn_raw_with_cancel(
+            &mut backend,
+            greedy_params(),
+            0,
+            5,
+            2,
+            &mut rng,
+            None,
+            Some(Box::new(StoppingObserver { stop_id: 3 })),
+        );
+        let outcome = raw
+            .result
+            .unwrap_or_else(|e| panic!("run_dspark_turn failed: {}", e.reason));
+
+        assert_eq!(raw.generated, vec![0, 1, 3]);
+        assert_eq!(raw.finish_reason, "stop");
+        assert!(
+            !outcome.last_in_cache,
+            "the stopping token is not persisted"
+        );
+        assert_eq!(commits(&backend.ledger_snapshot()), vec![(2, 3)]);
     }
 
     #[test]
@@ -2414,6 +2540,7 @@ mod tests {
             2,
             &mut rng,
             Some(cancel.as_ref()),
+            None,
         );
         let outcome = raw
             .result
@@ -2453,6 +2580,7 @@ mod tests {
             2,
             &mut rng,
             Some(cancel.as_ref()),
+            None,
         );
         let outcome = raw
             .result

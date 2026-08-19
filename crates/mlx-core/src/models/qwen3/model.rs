@@ -420,7 +420,13 @@ impl QwenStepExecutor<'_> {
         };
         payload.streamed_text_len = payload.streamed_text_len.saturating_add(text.len());
         if let (Some(sink), Some(emitter)) = (payload.response.sink(), payload.emitter.as_mut()) {
-            emitter.on_token_text(&text, is_reasoning, payload.params.include_reasoning, sink);
+            emitter.on_token_id(
+                token_id,
+                &text,
+                is_reasoning,
+                payload.params.include_reasoning,
+                sink,
+            );
         }
     }
 

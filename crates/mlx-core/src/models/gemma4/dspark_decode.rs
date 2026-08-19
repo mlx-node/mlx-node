@@ -782,6 +782,7 @@ impl Gemma4Inner {
                     // streaming turns it is the SAME flag StreamingCtx
                     // carries — the polls are idempotent.
                     cancel_flag: args.cancelled,
+                    turn_token_observer: None,
                 },
                 streaming_ctx,
             );
