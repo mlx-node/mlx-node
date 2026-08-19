@@ -1090,7 +1090,14 @@ pub(crate) struct MtpTurnOutcome {
     /// Whether a mid-cycle stop left the FLAT caches desynced
     /// (`rollback_unemitted` with `unemitted > 0`). Flat / MoE set it;
     /// the paged stepper's [`MtpStepper::into_desynced`] MUST return
-    /// `false`. The caller propagates it into
+    /// `false`. Postcondition backing that contract: after
+    /// [`MtpStepper::rollback_unemitted`] returns, ALL of the paged
+    /// stepper's target-state kinds (paged K/V cursor AND recurrent/GDN
+    /// state) sit at the drop-last-of-emitted frontier — the same frontier
+    /// the family's saved history is truncated to — so no heal latch is
+    /// needed; a rewind failure must instead surface through
+    /// [`MtpStepper::take_replay_error`] (polled right after the rollback)
+    /// and fail the turn closed. The caller propagates this flag into
     /// `self.flat_mtp_caches_desynced` exactly as the post-macro code does.
     pub desynced: bool,
     /// Number of accepted cycle tokens that could not be emitted before the
@@ -2215,6 +2222,17 @@ mod tests {
         // emit-loop poll.
         flip_cancel_on_forward: Option<Arc<AtomicBool>>,
         flip_cancel_on_commit: Option<Arc<AtomicBool>>,
+        // ---- target-state frontier model ----
+        // Counts generated tokens the mock's "target state" has consumed,
+        // with the PAGED stepper's rewind semantics: Step A +1, verify
+        // +(depth+1), rollback = snapshot + accepted + 1, rollback_unemitted
+        // −unemitted. Shared (`Rc`) with the owning `MockMtpBackend` so a
+        // test can read the final frontier AFTER `into_desynced` consumes
+        // the stepper.
+        state_pos: std::rc::Rc<std::cell::Cell<i64>>,
+        // Frontier captured by `snapshot_main_linear` — the base `rollback`
+        // rewinds to (mirrors the pre-verify GDN snapshot).
+        snap_pos: std::cell::Cell<i64>,
     }
 
     /// Canned per-cycle script for the `run_mtp_cycle` integration tests.
@@ -2294,6 +2312,8 @@ mod tests {
                 commit_payload: RefCell::new(None),
                 flip_cancel_on_forward: None,
                 flip_cancel_on_commit: None,
+                state_pos: std::rc::Rc::new(std::cell::Cell::new(0)),
+                snap_pos: std::cell::Cell::new(0),
             }
         }
 
@@ -2430,6 +2450,8 @@ mod tests {
             _embedding: &Embedding,
         ) -> Result<(MxArray, MxArray, bool)> {
             self.record(Call::ForwardWithHidden);
+            // Step A consumes the fed token: target state advances one row.
+            self.state_pos.set(self.state_pos.get() + 1);
             // H2 knob: emulate a client disconnect landing DURING the Step-A
             // forward — the Step-A sync cancel poll (after the token push)
             // must observe it on this very step.
@@ -2508,6 +2530,8 @@ mod tests {
             depth: usize,
         ) -> Result<MtpVerifyOutput> {
             self.record(Call::VerifyStep { depth });
+            // Verify consumes [anchor, d_0..d_{D-1}]: depth + 1 rows.
+            self.state_pos.set(self.state_pos.get() + depth as i64 + 1);
             if let Some(t) = self.turn.as_ref() {
                 // logits [1, depth+1, vocab] with per-position argmax driven by
                 // the current cycle's `verify_argmax`; hiddens
@@ -2595,6 +2619,7 @@ mod tests {
 
         fn snapshot_main_linear(&mut self) {
             self.record(Call::SnapshotMainLinear);
+            self.snap_pos.set(self.state_pos.get());
         }
 
         fn rollback(&mut self, accepted_drafts: usize, depth: usize) {
@@ -2602,6 +2627,10 @@ mod tests {
                 accepted: accepted_drafts,
                 depth,
             });
+            // Replay semantics: snapshot + [anchor, d_0..d_{K-1}] — the
+            // accepted frontier, dropping the rejected verify tail.
+            self.state_pos
+                .set(self.snap_pos.get() + accepted_drafts as i64 + 1);
         }
 
         fn restore_and_replay_main(
@@ -2667,6 +2696,10 @@ mod tests {
 
         fn rollback_unemitted(&mut self, unemitted: usize) {
             self.record(Call::RollbackUnemitted { unemitted });
+            // Paged rewind semantics: BOTH target-state kinds drop the
+            // accepted-but-unemitted tail, landing on the drop-last-of-emitted
+            // frontier (the mid-cycle-stop postcondition).
+            self.state_pos.set(self.state_pos.get() - unemitted as i64);
         }
 
         fn take_replay_error(&mut self) -> Option<Error> {
@@ -3886,6 +3919,10 @@ mod tests {
         /// [`MockMtpStepper::flip_cancel_on_commit`].
         flip_cancel_on_forward: Option<Arc<AtomicBool>>,
         flip_cancel_on_commit: Option<Arc<AtomicBool>>,
+        /// Shared with the constructed stepper: the mock target-state frontier
+        /// (see [`MockMtpStepper::state_pos`]), readable after `run_mtp_turn`
+        /// consumed the stepper.
+        state_pos: Rc<std::cell::Cell<i64>>,
     }
 
     impl MockMtpBackend {
@@ -3908,6 +3945,7 @@ mod tests {
                 recorded_counts: std::cell::RefCell::new(None),
                 flip_cancel_on_forward: None,
                 flip_cancel_on_commit: None,
+                state_pos: Rc::new(std::cell::Cell::new(0)),
             }
         }
 
@@ -4006,6 +4044,7 @@ mod tests {
             step.shared_ledger = Some(Rc::clone(&self.ledger));
             step.flip_cancel_on_forward = self.flip_cancel_on_forward.clone();
             step.flip_cancel_on_commit = self.flip_cancel_on_commit.clone();
+            step.state_pos = Rc::clone(&self.state_pos);
             Ok(step)
         }
 
@@ -4459,6 +4498,68 @@ mod tests {
             "rollback_unemitted(2) — the 2 accepted-but-unemitted cycle tokens"
         );
         assert_eq!(count(&out.ledger, |c| matches!(c, Call::IntoDesynced)), 1);
+    }
+
+    #[test]
+    fn run_mtp_turn_mid_cycle_stop_rewinds_paged_state() {
+        let _chained_off = force_chained_off();
+        // PAGED twin of `run_mtp_turn_mid_cycle_stop_rolls_back_unemitted`:
+        // same mid-cycle EOS script, but the stepper models the paged
+        // target-state frontier (`state_pos`) with the paged rewind semantics
+        // and reports `desynced == false` (the paged contract — no heal
+        // latch, the state itself is rewound).
+        //
+        // Frontier accounting for this script (positions count consumed
+        // generated tokens): Step A(seed 3) -> 1; snapshot -> base 1;
+        // verify(depth 3: anchor 9 + drafts 4,15,6) -> 5; full-accept
+        // rollback -> snap+3+1 = 5; emit 4 then EOS 15 stops the emit loop
+        // with 2 of outcome.tokens=[4,15,6,7] emitted -> unemitted 2 ->
+        // rollback_unemitted(2) -> 3 = generated.len() - 1, the
+        // drop-last-of-emitted frontier the saved history is truncated to.
+        //
+        // Catches: dropping the paged rewind (frontier stays 5 ≠ 3) and the
+        // u-vs-u−1 off-by-one (frontier 4 ≠ 3) — plus the engine passing
+        // anything other than exactly `outcome.tokens.len() - cycle_emitted`.
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4, 15, 6],
+            verify_argmax: vec![4, 15, 6, 7],
+        };
+        let mut backend = MockMtpBackend::new(
+            16,
+            4,
+            vec![9, 10, 11],
+            vec![cycle; 4],
+            /* desynced */ false,
+        );
+        let out = drive_turn(&mut backend, 3, 64, 15, 3);
+
+        assert_eq!(out.generated, vec![3, 9, 4, 15]);
+        assert_eq!(out.finish_reason, "stop");
+        assert!(
+            !out.desynced,
+            "paged mid-cycle stop must NOT report desynced — the state is rewound instead"
+        );
+        assert_eq!(
+            out.rollback_unemitted, 2,
+            "engine outcome must report the rolled-back cycle tail"
+        );
+        assert_eq!(
+            out.ledger
+                .iter()
+                .filter_map(|c| match c {
+                    Call::RollbackUnemitted { unemitted } => Some(*unemitted),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![2],
+            "the engine must pass exactly outcome.tokens.len() - cycle_emitted, once"
+        );
+        assert_eq!(
+            backend.state_pos.get(),
+            (out.generated.len() - 1) as i64,
+            "after rollback_unemitted every paged target-state kind must sit at \
+             the drop-last-of-emitted frontier"
+        );
     }
 
     #[test]

@@ -713,6 +713,47 @@ fn dense_paged_linear_caches_ready(
     true
 }
 
+/// Signed skew between the adapter's recorded token count and the drop-last
+/// token history a dense paged epilogue is about to persist, `None` when they
+/// agree. Both sides drop the SAME unforwarded final token (the paged decode
+/// loop never forwards the last sampled token, and the saved history drops it
+/// too), so agreement is STRICT equality — any ±1 tolerance here would either
+/// mask a real one-token skew or arm the refuse-to-persist latch forever.
+fn dense_paged_frontier_skew(adapter_recorded_len: usize, history_len: usize) -> Option<i64> {
+    let skew = adapter_recorded_len as i64 - history_len as i64;
+    (skew != 0).then_some(skew)
+}
+
+/// Exact bit-level equality of two arrays (test oracle only). 16-bit floats
+/// compare on their raw bit patterns via the native extraction; everything
+/// else round-trips through f32 and compares `to_bits`, so `-0.0 != 0.0` and
+/// differing NaN payloads count as differences — exactly what a
+/// state-equals-its-key audit needs.
+fn arrays_bits_equal_for_test(a: &MxArray, b: &MxArray) -> Result<bool> {
+    a.eval();
+    b.eval();
+    let (da, db) = (a.dtype()?, b.dtype()?);
+    if da != db {
+        return Ok(false);
+    }
+    match da {
+        crate::array::DType::BFloat16 | crate::array::DType::Float16 => {
+            Ok(a.to_uint16_native()? == b.to_uint16_native()?)
+        }
+        _ => {
+            let av = a.to_float32()?;
+            let bv = b.to_float32()?;
+            if av.len() != bv.len() {
+                return Ok(false);
+            }
+            Ok(av
+                .iter()
+                .zip(bv.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits()))
+        }
+    }
+}
+
 fn clone_dense_linear_layer_caches(
     config: &Qwen3_5Config,
     caches: &[Qwen3_5LayerCache],
@@ -838,6 +879,38 @@ pub(crate) struct Qwen35Inner {
     /// stepper handles the rollback, so tests can verify that a positive tail
     /// actually arms the family latch.
     pub(crate) flat_mtp_last_rollback_unemitted: usize,
+    /// Paged twin of `flat_mtp_last_rollback_unemitted`: the engine-computed
+    /// accepted-but-unemitted tail of the most recent PAGED MTP turn. The
+    /// paged epilogues record it (instead of discarding the turn outcome) so
+    /// tests can verify the mid-cycle GDN rewind actually had a tail to act on.
+    pub(crate) paged_mtp_last_rollback_unemitted: usize,
+    /// Count of paged MTP mid-cycle stops whose GDN recurrent state was
+    /// tape-replayed back to the drop-last-of-emitted frontier
+    /// (`DenseMtpStepper::rollback_unemitted`, Paged arm). A rewind path that
+    /// silently goes dead shows up as this staying flat while
+    /// `paged_mtp_gdn_invalidations` climbs.
+    paged_mtp_gdn_rewinds: u64,
+    /// Count of paged GDN invalidations: a failed mid-cycle GDN rewind, or an
+    /// epilogue frontier disagreement that armed `paged_gdn_state_dirty`.
+    paged_mtp_gdn_invalidations: u64,
+    /// Refuse-to-persist latch for the paged dense GDN state. Armed when a
+    /// paged epilogue's frontier check finds the adapter's recorded token
+    /// count disagreeing with the drop-last history it is about to persist.
+    /// While armed: `remember_dense_gdn_history_checkpoint` refuses to store
+    /// (and drops the stale checkpoint), and `prepare_dense_gdn_prefix_state`
+    /// skips every live/history reuse arm, falling to a recompute source
+    /// (checkpoint-ladder replay, cold sidecar, or full GDN re-prefill).
+    /// Cleared after a recompute arm runs and on release/reset. The heal is
+    /// GDN-only — the adapter's content-addressed K/V stays live/registered.
+    paged_gdn_state_dirty: bool,
+    /// Test-only one-shot: force the next epilogue frontier check to report a
+    /// mismatch so the `paged_gdn_state_dirty` refuse-and-heal path can be
+    /// exercised deterministically (pattern of `ForceFlatMtpDesyncForTest`).
+    paged_gdn_force_mismatch_for_test: bool,
+    /// The arm the most recent `prepare_dense_gdn_prefix_state` resolved to
+    /// (`"live"`, `"last_history"`, …). Test observability only — the trace
+    /// line carrying the same value needs a tracing subscriber to see.
+    last_gdn_prefix_prepare_state: &'static str,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -954,6 +1027,31 @@ fn apply_qwen35_dense_planned_decoder(config: &mut ChatConfig, decoder: DecoderP
     planned_mtp
 }
 
+/// Test-only between-turn snapshot of the paged-MTP GDN bookkeeping, read via
+/// [`Qwen35Cmd::MtpPagedGdnStateForTest`]. Serialized behind the model thread,
+/// so it observes the fully-finalized preceding turn.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct MtpPagedGdnStateForTest {
+    /// Whether the block-paged adapter is installed (the paged MTP lane).
+    pub paged_active: bool,
+    /// `cached_token_history.len()` — the committed drop-last history.
+    pub history_len: usize,
+    /// Engine-computed accepted-but-unemitted tail of the most recent paged
+    /// MTP turn (`paged_mtp_last_rollback_unemitted`).
+    pub last_rollback_unemitted: usize,
+    /// Mid-cycle GDN rewinds performed (`paged_mtp_gdn_rewinds`).
+    pub gdn_rewinds: u64,
+    /// GDN invalidations: failed rewinds + epilogue frontier disagreements.
+    pub gdn_invalidations: u64,
+    /// Whether the refuse-to-persist latch is currently armed.
+    pub state_dirty: bool,
+    /// Whether a GDN history checkpoint is currently stored.
+    pub has_history_checkpoint: bool,
+    /// The arm the most recent `prepare_dense_gdn_prefix_state` resolved to.
+    pub last_prefix_prepare_state: &'static str,
+}
+
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35Cmd {
     /// All chat-session traffic (sync + streaming starts/continues/tool
@@ -1008,6 +1106,25 @@ pub(crate) enum Qwen35Cmd {
     /// mid-cycle cancel.
     #[doc(hidden)]
     ForceFlatMtpDesyncForTest { reply: ResponseTx<()> },
+    /// Test-only: snapshot the paged-MTP GDN bookkeeping between turns — see
+    /// [`MtpPagedGdnStateForTest`].
+    #[doc(hidden)]
+    MtpPagedGdnStateForTest {
+        reply: ResponseTx<MtpPagedGdnStateForTest>,
+    },
+    /// Test-only: arm the one-shot forced frontier mismatch so the NEXT paged
+    /// epilogue takes the refuse-to-persist branch deterministically (the
+    /// natural trigger is a swallowed adapter-truncate failure, which no test
+    /// can provoke on demand). Pattern of `ForceFlatMtpDesyncForTest`.
+    #[doc(hidden)]
+    ForcePagedGdnMismatchForTest { reply: ResponseTx<()> },
+    /// Test-only state oracle: recompute GDN over the persisted history
+    /// checkpoint's own token key from FRESH caches and bit-compare the
+    /// conv/recurrent arrays against the checkpoint. `Ok(true)` iff every
+    /// linear layer matches exactly — i.e. the persisted state equals what
+    /// its key claims it is.
+    #[doc(hidden)]
+    GdnHistoryCheckpointOracleForTest { reply: ResponseTx<bool> },
     /// Training-session commands shared with the model-neutral engine. The
     /// thread loop routes these to
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
@@ -1160,6 +1277,25 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         Qwen35Cmd::ForceFlatMtpDesyncForTest { reply } => {
             inner.flat_mtp_caches_desynced = true;
             let _ = reply.send(Ok(()));
+        }
+        Qwen35Cmd::MtpPagedGdnStateForTest { reply } => {
+            let _ = reply.send(Ok(MtpPagedGdnStateForTest {
+                paged_active: inner.paged_adapter.is_some(),
+                history_len: inner.cached_token_history.len(),
+                last_rollback_unemitted: inner.paged_mtp_last_rollback_unemitted,
+                gdn_rewinds: inner.paged_mtp_gdn_rewinds,
+                gdn_invalidations: inner.paged_mtp_gdn_invalidations,
+                state_dirty: inner.paged_gdn_state_dirty,
+                has_history_checkpoint: inner.gdn_last_history_checkpoint.is_some(),
+                last_prefix_prepare_state: inner.last_gdn_prefix_prepare_state,
+            }));
+        }
+        Qwen35Cmd::ForcePagedGdnMismatchForTest { reply } => {
+            inner.paged_gdn_force_mismatch_for_test = true;
+            let _ = reply.send(Ok(()));
+        }
+        Qwen35Cmd::GdnHistoryCheckpointOracleForTest { reply } => {
+            let _ = reply.send(inner.gdn_history_checkpoint_recompute_matches_for_test());
         }
         // --- Training commands ---
         Qwen35Cmd::Train(train_cmd) => {
@@ -1452,6 +1588,12 @@ impl Qwen35Inner {
             flat_mtp_caches_desynced: false,
             flat_full_reprefill_count: 0,
             flat_mtp_last_rollback_unemitted: 0,
+            paged_mtp_last_rollback_unemitted: 0,
+            paged_mtp_gdn_rewinds: 0,
+            paged_mtp_gdn_invalidations: 0,
+            paged_gdn_state_dirty: false,
+            paged_gdn_force_mismatch_for_test: false,
+            last_gdn_prefix_prepare_state: "",
             training_state: None,
             mtp,
             mtp_weights_loaded: false,
@@ -2062,6 +2204,9 @@ impl Qwen35Inner {
         self.gdn_root_cache_owner_id = None;
         self.gdn_root_cache_owner_is_explicit = false;
         self.paged_finalize_failed = false;
+        // A released/reset session has no GDN state left to refuse persisting.
+        self.paged_gdn_state_dirty = false;
+        self.paged_gdn_force_mismatch_for_test = false;
     }
 
     /// Tear down a partially prepared or partially executed paged turn.
@@ -2101,6 +2246,37 @@ impl Qwen35Inner {
         self.discard_dense_paged_session();
     }
 
+    /// I4 frontier agreement for a dense paged epilogue: the adapter's
+    /// recorded tokens and the drop-last history about to be persisted must
+    /// sit at ONE frontier before any GDN state is keyed on that history.
+    /// STRICT equality (see [`dense_paged_frontier_skew`]). Disagreement arms
+    /// the `paged_gdn_state_dirty` refuse-to-persist latch consumed by
+    /// [`Self::remember_dense_gdn_history_checkpoint`] (refuses + drops the
+    /// stale checkpoint) and [`Self::prepare_dense_gdn_prefix_state`] (next
+    /// turn falls to a recompute arm); the adapter K/V itself stays —
+    /// content-addressed prefix reuse is unaffected by a GDN-side skew.
+    fn check_dense_paged_frontier(&mut self, history_len: usize, context: &str) {
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return;
+        };
+        let adapter_recorded_len = adapter.request_tokens().len();
+        let skew = if std::mem::take(&mut self.paged_gdn_force_mismatch_for_test) {
+            Some(1)
+        } else {
+            dense_paged_frontier_skew(adapter_recorded_len, history_len)
+        };
+        if let Some(skew) = skew {
+            tracing::error!(
+                target: "mlx_core::qwen3_5::paged",
+                "dense paged epilogue frontier disagreement ({context}): adapter \
+                 recorded {adapter_recorded_len} tokens, drop-last history has \
+                 {history_len} (skew {skew}); refusing to persist GDN state",
+            );
+            self.paged_gdn_state_dirty = true;
+            self.paged_mtp_gdn_invalidations += 1;
+        }
+    }
+
     /// Fallible terminal lifecycle for the hand-written paged cores.
     ///
     /// Unlike [`PagedBackend::finalize_paged_turn`], these cores can propagate
@@ -2113,11 +2289,17 @@ impl Qwen35Inner {
     /// Unlike the engine hook there is no release to order against: these cores
     /// only ever keep the request live, so the adapter's cold-chain frontier is
     /// still set when the capture reads it.
+    ///
+    /// `expected_history_len` is the drop-last history length the caller is
+    /// about to publish; the frontier check runs here because these cores set
+    /// `cached_token_history` only after finalization returns.
     fn finalize_dense_manual_paged_turn(
         &mut self,
         image_token_positions: &[(u32, u64)],
         cache_salt: u64,
+        expected_history_len: usize,
     ) -> Result<()> {
+        self.check_dense_paged_frontier(expected_history_len, "manual epilogue");
         let finalize_result = self
             .paged_adapter
             .as_mut()
@@ -2132,7 +2314,13 @@ impl Qwen35Inner {
             });
         match finalize_result {
             Ok(_) => {
-                self.capture_dense_gdn_cold_sidecar(image_token_positions, cache_salt);
+                // A frontier disagreement must not enqueue new durable GDN
+                // state this turn; the prefill-time checkpoints the capture
+                // reads are clean, but the persist surface is refused as a
+                // class while the latch is armed.
+                if !self.paged_gdn_state_dirty {
+                    self.capture_dense_gdn_cold_sidecar(image_token_positions, cache_salt);
+                }
                 Ok(())
             }
             Err(error) => {
@@ -2187,6 +2375,15 @@ impl Qwen35Inner {
             self.gdn_last_history_checkpoint = None;
             return Ok(trace.finish(total_start));
         }
+        if self.paged_gdn_state_dirty {
+            // Refuse-to-persist: this turn's epilogue found the adapter and
+            // the saved history disagreeing on the frontier, so the live GDN
+            // state cannot be keyed on `cached_token_history`. Drop the stale
+            // checkpoint too so no later lookup resurrects state that does not
+            // match its token key. GDN-only — the adapter K/V stays.
+            self.gdn_last_history_checkpoint = None;
+            return Ok(trace.finish(total_start));
+        }
 
         let eval_start = trace_enabled.then(std::time::Instant::now);
         eval_layer_caches(&self.caches)?;
@@ -2216,6 +2413,61 @@ impl Qwen35Inner {
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
         Ok(trace.finish(total_start))
+    }
+
+    /// Test-only state oracle behind
+    /// [`Qwen35Cmd::GdnHistoryCheckpointOracleForTest`]: recompute GDN over
+    /// the persisted history checkpoint's OWN token key from fresh caches and
+    /// bit-compare every linear layer's conv/recurrent arrays against the
+    /// checkpoint. `Ok(true)` iff the persisted state equals what its key
+    /// claims. Catches any persistence surface holding state ahead of (or
+    /// behind) its token count — including future ones.
+    fn gdn_history_checkpoint_recompute_matches_for_test(&mut self) -> Result<bool> {
+        let Some(checkpoint) = self.gdn_last_history_checkpoint.as_ref() else {
+            return Err(Error::from_reason(
+                "GDN state oracle: no history checkpoint is stored",
+            ));
+        };
+        let tokens = checkpoint.tokens.clone();
+        let reference = clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
+            .ok_or_else(|| {
+                Error::from_reason("GDN state oracle: checkpoint caches are not ready")
+            })?;
+        let mut recomputed = fresh_dense_layer_caches(&self.config);
+        let embed = self.embedding.clone();
+        super::paged_forward::run_gdn_only_prefill_materialized(
+            &tokens,
+            &embed,
+            &mut self.layers,
+            &mut recomputed,
+            None,
+        )?;
+        for layer_idx in 0..self.config.num_layers as usize {
+            if !self.config.is_linear_layer(layer_idx) {
+                continue;
+            }
+            let (
+                Qwen3_5LayerCache::Linear(checkpoint_arrays),
+                Qwen3_5LayerCache::Linear(recomputed_arrays),
+            ) = (&reference[layer_idx], &recomputed[layer_idx])
+            else {
+                return Err(Error::from_reason(format!(
+                    "GDN state oracle: layer {layer_idx} is not Linear on both sides",
+                )));
+            };
+            for slot in 0..2 {
+                match (checkpoint_arrays.get(slot), recomputed_arrays.get(slot)) {
+                    (None, None) => {}
+                    (Some(a), Some(b)) => {
+                        if !arrays_bits_equal_for_test(a, b)? {
+                            return Ok(false);
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn find_dense_gdn_prefix_checkpoint(
@@ -2846,6 +3098,37 @@ impl Qwen35Inner {
         cache_salt: u64,
         continued_live_prefix: bool,
     ) -> Result<DenseGdnPrefixPreparation> {
+        let dirty = self.paged_gdn_state_dirty;
+        let result = self.prepare_dense_gdn_prefix_state_inner(
+            tokens,
+            cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+            continued_live_prefix,
+        );
+        if let Ok(preparation) = &result {
+            self.last_gdn_prefix_prepare_state = preparation.state;
+            if dirty {
+                // The armed latch skipped every live/history reuse arm inside,
+                // so this preparation came from a recompute source
+                // (checkpoint-ladder replay, cold sidecar, or full GDN
+                // re-prefill over the prompt tokens) — the skew is healed.
+                self.paged_gdn_state_dirty = false;
+            }
+        }
+        result
+    }
+
+    fn prepare_dense_gdn_prefix_state_inner(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        continued_live_prefix: bool,
+    ) -> Result<DenseGdnPrefixPreparation> {
         let image_aware_prefix = extra_keys_per_block.iter().any(|keys| !keys.is_empty());
         let trace_enabled = inference_trace_enabled();
         let inference_info_enabled =
@@ -2884,20 +3167,27 @@ impl Qwen35Inner {
             );
             preparation
         };
+        // While the refuse-to-persist latch is armed, every arm that would
+        // hand back live or history-keyed GDN state is skipped: that state's
+        // frontier disagreed with its token key at the last epilogue. Control
+        // falls to the recompute arms below, which derive state purely from
+        // the prompt tokens (the wrapper clears the latch after one of them
+        // runs).
+        let gdn_state_dirty = self.paged_gdn_state_dirty;
         let gdn_caches_ready =
             dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
-        if gdn_caches_ready && continued_live_prefix {
+        if !gdn_state_dirty && gdn_caches_ready && continued_live_prefix {
             return Ok(finish("live", cached_prefix_len, 0));
         }
 
         let gdn_prefix_from_history = cached_prefix_len > 0
             && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
-        if gdn_caches_ready && gdn_prefix_from_history {
+        if !gdn_state_dirty && gdn_caches_ready && gdn_prefix_from_history {
             return Ok(finish("last_history", cached_prefix_len, 0));
         }
 
-        if cached_prefix_len > 0 {
+        if !gdn_state_dirty && cached_prefix_len > 0 {
             let history_lookup_start = trace_enabled.then(std::time::Instant::now);
             let history_checkpoint =
                 self.find_dense_gdn_history_checkpoint(tokens, cached_prefix_len, None);
@@ -4656,7 +4946,13 @@ impl Qwen35Inner {
         let (generated_tokens, finish_reason, mtp_profiler) = match forward_result {
             Ok(t) => {
                 let image_token_positions = self.cached_paged_image_token_positions.clone();
-                self.finalize_dense_manual_paged_turn(&image_token_positions, cache_salt)?;
+                // Drop-last history length published below (frontier check).
+                let expected_history_len = tokens.len() + t.0.len().saturating_sub(1);
+                self.finalize_dense_manual_paged_turn(
+                    &image_token_positions,
+                    cache_salt,
+                    expected_history_len,
+                )?;
                 t
             }
             Err(e) => {
@@ -4887,7 +5183,8 @@ impl Qwen35Inner {
             // stepper's `Drop` restores the adapter into `self.paged_adapter`
             // before this call returns, so the paged-history save below finds
             // it. The paged path commits cache state through its own
-            // paged-history save, so `outcome.last_in_cache` is unused here.
+            // paged-history save; the turn outcome's rewind tail is consumed
+            // below (`last_in_cache` stays inert — dense paged is drop-last).
             let outcome = crate::engine::mtp_turn::run_mtp_turn(
                 self,
                 &mut rng,
@@ -4914,7 +5211,11 @@ impl Qwen35Inner {
                 },
                 None,
             )?;
-            let _ = outcome.last_in_cache;
+            // dense paged always saves drop-last, so `last_in_cache` is inert
+            // here; the engine-computed rewind tail is recorded so the
+            // epilogue's frontier check (and tests) can see the mid-cycle
+            // stop was acted on rather than discarded.
+            self.paged_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
 
             // `self.caches` already holds the live GDN state (the eager paged
             // forwards wrote it directly) — nothing to export.
@@ -5315,7 +5616,11 @@ impl Qwen35Inner {
         // already-successful generation output.
         let keep_live_ok = p.reuse_cache
             && self
-                .finalize_dense_manual_paged_turn(&image_token_positions, p.cache_salt)
+                .finalize_dense_manual_paged_turn(
+                    &image_token_positions,
+                    p.cache_salt,
+                    full_history.len(),
+                )
                 .is_ok();
         let continuable = if keep_live_ok {
             self.cached_token_history = full_history;
@@ -5708,7 +6013,11 @@ impl Qwen35Inner {
         // failure downgrades to NON-continuable rather than discarding output.
         let keep_live_ok = p.reuse_cache
             && self
-                .finalize_dense_manual_paged_turn(&image_token_positions, p.cache_salt)
+                .finalize_dense_manual_paged_turn(
+                    &image_token_positions,
+                    p.cache_salt,
+                    full_history.len(),
+                )
                 .is_ok();
         let continuable = if keep_live_ok {
             self.cached_token_history = full_history;
@@ -6126,7 +6435,13 @@ impl Qwen35Inner {
         let (generated_tokens, finish_reason, decode_profiler) = match result {
             Ok(t) => {
                 let image_token_positions = self.cached_paged_image_token_positions.clone();
-                self.finalize_dense_manual_paged_turn(&image_token_positions, cache_salt)?;
+                // Drop-last history length published below (frontier check).
+                let expected_history_len = tokens.len() + t.0.len().saturating_sub(1);
+                self.finalize_dense_manual_paged_turn(
+                    &image_token_positions,
+                    cache_salt,
+                    expected_history_len,
+                )?;
                 t
             }
             Err(e) => {
@@ -6507,8 +6822,9 @@ impl Qwen35Inner {
             // shared incremental detokenizer + the default ChatML emitter so
             // accepted tokens stream out `cb` per token; the stepper's `Drop`
             // restores `self.paged_adapter` before this call returns (the
-            // paged-history save below relies on it). `outcome.last_in_cache` is
-            // unused (the paged-history save owns cache state).
+            // paged-history save below relies on it). The turn outcome's rewind
+            // tail is consumed below (`last_in_cache` stays inert — dense paged
+            // is drop-last; the paged-history save owns cache state).
             let mut emitter = crate::engine::backend::DefaultStreamEmitter;
             let streaming = crate::engine::decode::StreamingCtx {
                 callback: cb.0,
@@ -6546,7 +6862,11 @@ impl Qwen35Inner {
                 },
                 Some(streaming),
             )?;
-            let _ = outcome.last_in_cache;
+            // dense paged always saves drop-last, so `last_in_cache` is inert
+            // here; the engine-computed rewind tail is recorded so the
+            // epilogue's frontier check (and tests) can see the mid-cycle
+            // stop was acted on rather than discarded.
+            self.paged_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
 
             return Ok((generated_tokens, finish_reason, Some(profiler)));
         }
@@ -9654,6 +9974,11 @@ impl PagedBackend for Qwen35Inner {
             full_history.extend_from_slice(&generated[..upto]);
         }
         self.cached_token_history = full_history;
+        // I4 frontier agreement before any GDN state is keyed on the history
+        // just published. A disagreement arms the refuse-to-persist latch the
+        // checkpoint store below consumes.
+        let history_len = self.cached_token_history.len();
+        self.check_dense_paged_frontier(history_len, "paged history save");
         // GDN history checkpoint — must run AFTER the history is set (it
         // snapshots the live recurrent caches keyed on `cached_token_history`),
         // BEFORE clearing the image key. A checkpoint/eval failure here
@@ -9994,6 +10319,13 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// GDN tape recorded by `verify_step`, consumed by `rollback`. == the
     /// closures' `tape_cell`.
     tape: Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    /// Number of tape steps the retained snapshot + tape currently represent
+    /// as the cycle's committed GDN frontier: set to the recorded step count
+    /// (`depth + 1`) by `verify_step`, overwritten to `accepted_steps`
+    /// (`accepted_drafts + 1`) by `rollback`. `rollback_unemitted` subtracts
+    /// `unemitted` in these SAME units, so the mid-cycle rewind target
+    /// (`last_cycle_steps - unemitted`) is immune to tape-step-unit skew.
+    last_cycle_steps: usize,
     /// Error stashed by the infallible `rollback` replay, surfaced by
     /// `take_replay_error`. == the closures' `replay_err_cell`.
     replay_err: Option<Error>,
@@ -10034,6 +10366,111 @@ impl Drop for DenseMtpStepper<'_> {
         if let MtpStepMode::Paged(adapter) = std::mem::replace(&mut self.mode, MtpStepMode::Flat) {
             self.inner.paged_adapter = Some(*adapter);
         }
+    }
+}
+
+impl DenseMtpStepper<'_> {
+    /// Restore the pre-verify snapshot and replay the first `steps` recorded
+    /// tape steps into the live main caches — the shared GDN replay both
+    /// `rollback` (to `accepted_steps`) and the paged `rollback_unemitted`
+    /// (to `last_cycle_steps - unemitted`) drive. Pure over
+    /// `(snapshot, tape, steps)`: `steps == 0` degenerates to a bare snapshot
+    /// restore. On the flat path full-attention layers rewind via `kv.trim`;
+    /// on the paged path their K/V lives in the pool (rewound by the adapter)
+    /// and the flat shells are skipped.
+    fn replay_main_linear_to(&mut self, steps: usize) -> Result<()> {
+        let paged = matches!(self.mode, MtpStepMode::Paged(_));
+        let snap = match self.snap.as_ref() {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                return Err(Error::from_reason(format!(
+                    "eager MTP replay: snapshot failed: {}",
+                    e.reason
+                )));
+            }
+            None => {
+                return Err(Error::from_reason(
+                    "eager MTP replay: snapshot missing (snapshot_main_linear \
+                     did not run)",
+                ));
+            }
+        };
+        let tape = &self.tape;
+        let inner = &mut *self.inner;
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("eager MTP replay: inner.caches is None"))?;
+        if caches.len() != snap.len() || caches.len() != tape.len() {
+            return Err(Error::from_reason(format!(
+                "eager MTP replay: length mismatch (caches {}, snapshot {}, \
+                 tape {})",
+                caches.len(),
+                snap.len(),
+                tape.len(),
+            )));
+        }
+        for (idx, cache) in caches.iter_mut().enumerate() {
+            let Some(layer_tape) = tape[idx].as_ref() else {
+                if paged {
+                    // Full-attention layer on the paged path: K/V lives in
+                    // the paged pool and is rewound through the adapter. The
+                    // `inner.caches` FullAttention slot is unused on the
+                    // paged path, so skip it.
+                    continue;
+                }
+                // Full-attention layer: rewind the offset to
+                // `snapshot_offset + steps` so the next forward
+                // overwrites the discarded rows. No-op on full accept.
+                match &snap[idx] {
+                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset } => {
+                        let kv = cache.as_kv_cache_mut().ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "eager MTP replay: layer {idx} has a \
+                                 FullAttention snapshot but its cache slot is \
+                                 not FullAttention",
+                            ))
+                        })?;
+                        let target = *offset + steps as i32;
+                        kv.trim(target);
+                    }
+                    super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
+                        return Err(Error::from_reason(format!(
+                            "eager MTP replay: layer {idx} has no GDN tape \
+                             but a Linear snapshot",
+                        )));
+                    }
+                }
+                continue;
+            };
+            let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
+                Error::from_reason(format!(
+                    "eager MTP replay: layer {idx} has a GDN tape but its \
+                     cache slot is not Linear",
+                ))
+            })?;
+            let (snap_conv, snap_rec) = match &snap[idx] {
+                super::layer_cache::Qwen3_5LayerSnapshot::Linear {
+                    conv_state,
+                    recurrent_state,
+                } => (conv_state.as_ref(), recurrent_state.as_ref()),
+                super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { .. } => {
+                    return Err(Error::from_reason(format!(
+                        "eager MTP replay: layer {idx} GDN tape but \
+                         FullAttention snapshot",
+                    )));
+                }
+            };
+            let window = layer_tape.kernel.window_len()? as usize;
+            if steps > window {
+                return Err(Error::from_reason(format!(
+                    "eager MTP replay: target steps {steps} \
+                     exceeds recorded window {window} at layer {idx}",
+                )));
+            }
+            layer_tape.replay_into(arrays, snap_conv, snap_rec, steps)?;
+        }
+        Ok(())
     }
 }
 
@@ -10132,9 +10569,8 @@ impl MtpStepper for DenseMtpStepper<'_> {
         embedding: &Embedding,
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
-        match &mut self.mode {
+        let output = match &mut self.mode {
             MtpStepMode::Flat => {
-                let _ = depth;
                 let inner = &mut *self.inner;
                 let tape = &mut self.tape;
                 eager_verify_step(
@@ -10186,7 +10622,13 @@ impl MtpStepper for DenseMtpStepper<'_> {
                     rope_deltas,
                 )
             }
+        };
+        if output.is_ok() {
+            // The recorded tape step count for this cycle: the anchor plus D
+            // drafts. `rollback` overwrites it with the accepted count.
+            self.last_cycle_steps = depth + 1;
         }
+        output
     }
 
     // No native argmax-only / sparse verify on the eager path — the accept
@@ -10223,7 +10665,6 @@ impl MtpStepper for DenseMtpStepper<'_> {
         // tape replay. On full accept `rejected == 0` (no-op). Flat layers keep
         // their full-attention K/V in `inner.caches` and rewind it via `kv.trim`
         // inside the replay loop instead.
-        let paged = matches!(self.mode, MtpStepMode::Paged(_));
         if let MtpStepMode::Paged(adapter) = &mut self.mode {
             let rejected = depth.saturating_sub(accepted_drafts);
             if rejected > 0
@@ -10237,112 +10678,27 @@ impl MtpStepper for DenseMtpStepper<'_> {
             }
         }
         let accepted_steps = accepted_drafts + 1;
-        let result: Result<()> = (|| {
-            let snap = match self.snap.as_ref() {
-                Some(Ok(s)) => s,
-                Some(Err(e)) => {
-                    return Err(Error::from_reason(format!(
-                        "eager MTP rollback: snapshot failed: {}",
-                        e.reason
-                    )));
-                }
-                None => {
-                    return Err(Error::from_reason(
-                        "eager MTP rollback: snapshot missing (snapshot_main_linear \
-                         did not run)",
-                    ));
-                }
-            };
-            let tape = &self.tape;
-            let inner = &mut *self.inner;
-            let caches = inner
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("eager MTP rollback: inner.caches is None"))?;
-            if caches.len() != snap.len() || caches.len() != tape.len() {
-                return Err(Error::from_reason(format!(
-                    "eager MTP rollback: length mismatch (caches {}, snapshot {}, \
-                     tape {})",
-                    caches.len(),
-                    snap.len(),
-                    tape.len(),
-                )));
-            }
-            for (idx, cache) in caches.iter_mut().enumerate() {
-                let Some(layer_tape) = tape[idx].as_ref() else {
-                    if paged {
-                        // Full-attention layer on the paged path: K/V lives in
-                        // the paged pool and was already rewound by
-                        // `adapter.rollback_last_tokens` above. The
-                        // `inner.caches` FullAttention slot is unused on the
-                        // paged path, so skip it.
-                        continue;
-                    }
-                    // Full-attention layer: rewind the offset to
-                    // `snapshot_offset + accepted_steps` so the next forward
-                    // overwrites the rejected drafts. No-op on full accept.
-                    match &snap[idx] {
-                        super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset } => {
-                            let kv = cache.as_kv_cache_mut().ok_or_else(|| {
-                                Error::from_reason(format!(
-                                    "eager MTP rollback: layer {idx} has a \
-                                     FullAttention snapshot but its cache slot is \
-                                     not FullAttention",
-                                ))
-                            })?;
-                            let target = *offset + accepted_steps as i32;
-                            kv.trim(target);
-                        }
-                        super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
-                            return Err(Error::from_reason(format!(
-                                "eager MTP rollback: layer {idx} has no GDN tape \
-                                 but a Linear snapshot",
-                            )));
-                        }
-                    }
-                    continue;
-                };
-                let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "eager MTP rollback: layer {idx} has a GDN tape but its \
-                         cache slot is not Linear",
-                    ))
-                })?;
-                let (snap_conv, snap_rec) = match &snap[idx] {
-                    super::layer_cache::Qwen3_5LayerSnapshot::Linear {
-                        conv_state,
-                        recurrent_state,
-                    } => (conv_state.as_ref(), recurrent_state.as_ref()),
-                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { .. } => {
-                        return Err(Error::from_reason(format!(
-                            "eager MTP rollback: layer {idx} GDN tape but \
-                             FullAttention snapshot",
-                        )));
-                    }
-                };
-                let window = layer_tape.kernel.window_len()? as usize;
-                if accepted_steps > window {
-                    return Err(Error::from_reason(format!(
-                        "eager MTP rollback: accepted_steps {accepted_steps} \
-                         exceeds recorded window {window} at layer {idx}",
-                    )));
-                }
-                layer_tape.replay_into(arrays, snap_conv, snap_rec, accepted_steps)?;
-            }
-            Ok(())
-        })();
-        if let Err(e) = result {
+        self.last_cycle_steps = accepted_steps;
+        if let Err(e) = self.replay_main_linear_to(accepted_steps) {
             self.replay_err = Some(e);
         }
     }
 
     // On rejection (partial accept): the GDN tape replay in `rollback`
     // already reconstructed the AR-exact main cache state, so no re-forward
-    // loop is needed. This only surfaces a stashed replay error and clears
-    // the per-cycle snapshot + tape.
+    // loop is needed. This only surfaces a stashed replay error.
+    //
+    // The per-cycle snapshot + tape are deliberately RETAINED: both are
+    // re-armed by the next cycle anyway (`snapshot_main_linear` overwrites
+    // `snap`; the verify cores clear + re-record `tape` at record time), and
+    // a mid-cycle stop after THIS cycle still needs them — the paged
+    // `rollback_unemitted` replays the GDN state back to the emitted frontier
+    // from exactly this snapshot + tape. The accept shapes were asymmetric
+    // before this retention: full-accept cycles skip this hook entirely (the
+    // engine only replays on rejection), so their snapshot + tape always
+    // survived to the emit loop; retention merely extends that same lifetime
+    // to partial accepts.
     fn restore_and_replay_main(&mut self, _accepted: &[u32], _embedding: &Embedding) -> Result<()> {
-        self.snap = None;
-        self.tape.clear();
         if let Some(e) = self.replay_err.take() {
             return Err(e);
         }
@@ -10463,17 +10819,54 @@ impl MtpStepper for DenseMtpStepper<'_> {
                 if unemitted > 0 {
                     self.mtp_desynced = true;
                 }
+                return;
             }
             MtpStepMode::Paged(adapter) => {
                 // Truncate the live paged adapter by the accepted-but-unemitted
-                // tokens; the paged path never sets the FLAT desync latch.
+                // tokens; the paged path never sets the FLAT desync latch. An
+                // adapter truncate failure is not fatal here: the epilogue's
+                // frontier check sees the skew and refuses to persist.
                 if let Err(e) = adapter.rollback_last_tokens(unemitted as u32) {
                     tracing::warn!(
                         target: "mlx_core::qwen3_5::paged",
-                        "eager MTP-paged rollback_unemitted({unemitted}) failed \
-                         (ignored): {e}",
+                        "eager MTP-paged rollback_unemitted({unemitted}) adapter \
+                         truncate failed (epilogue frontier check refuses to \
+                         persist): {e}",
                     );
                 }
+            }
+        }
+        // Paged GDN rewind twin of the adapter truncate above: replay the
+        // retained snapshot + tape to `last_cycle_steps - unemitted` steps so
+        // the recurrent state lands on the SAME drop-last-of-emitted frontier
+        // as the adapter and the to-be-saved history. The skew vs the saved
+        // history is exactly `unemitted` tokens (the history also drops the
+        // last emitted token, which the adapter/GDN never consumed);
+        // `unemitted == last_cycle_steps` degenerates to a pure snapshot
+        // restore (a stop before any cycle token was emitted). A replay
+        // failure is stashed in `replay_err` — the engine polls
+        // `take_replay_error` right after this hook and fail-closes the turn
+        // through `invalidate_dense_paged_session`.
+        if self.replay_err.is_some() {
+            // The turn is already failing; the stashed error aborts it and
+            // invalidates the session, so a second (snapshot-less) replay
+            // attempt would only shadow the root cause.
+            return;
+        }
+        let Some(target) = self.last_cycle_steps.checked_sub(unemitted) else {
+            self.inner.paged_mtp_gdn_invalidations += 1;
+            self.replay_err = Some(Error::from_reason(format!(
+                "eager MTP-paged rollback_unemitted: unemitted {unemitted} exceeds \
+                 the cycle's committed steps {}",
+                self.last_cycle_steps
+            )));
+            return;
+        };
+        match self.replay_main_linear_to(target) {
+            Ok(()) => self.inner.paged_mtp_gdn_rewinds += 1,
+            Err(e) => {
+                self.inner.paged_mtp_gdn_invalidations += 1;
+                self.replay_err = Some(e);
             }
         }
     }
@@ -10483,8 +10876,12 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     fn into_desynced(self) -> bool {
-        // Paged truncates its adapter in `rollback_unemitted` and never touches
-        // the FLAT desync latch, so it always reports `false`. The adapter is
+        // Paged rewinds BOTH sides of a mid-cycle stop in `rollback_unemitted`
+        // — the adapter cursor by truncation and the GDN recurrent state by
+        // tape replay — so every paged target-state kind already sits at the
+        // drop-last-of-emitted frontier and reporting `false` is honest; it
+        // never touches the FLAT desync latch. A rewind failure routes through
+        // `take_replay_error` → session invalidation instead. The adapter is
         // restored into `inner.paged_adapter` by the `Drop` impl that runs as
         // `self` falls out of scope here. (`self` is consumed by value rather
         // than destructured because the `Drop` impl forbids moving fields out.)
@@ -10549,6 +10946,7 @@ impl MtpBackend for Qwen35Inner {
             chained_cycles_supported: has_prompt_seed,
             snap: None,
             tape: Vec::new(),
+            last_cycle_steps: 0,
             replay_err: None,
             mtp_desynced: false,
             embedding,
@@ -11374,6 +11772,38 @@ impl Qwen3_5Model {
     pub async fn force_flat_mtp_desync_for_test(&self) -> Result<()> {
         crate::model_thread::send_and_await(&self.thread, |reply| {
             Qwen35Cmd::ForceFlatMtpDesyncForTest { reply }
+        })
+        .await
+    }
+
+    /// Test-only between-turn snapshot of the paged-MTP GDN bookkeeping —
+    /// the paged twin of [`Self::mtp_flat_state_for_test`]. See
+    /// [`MtpPagedGdnStateForTest`].
+    #[doc(hidden)]
+    pub async fn mtp_paged_gdn_state_for_test(&self) -> Result<MtpPagedGdnStateForTest> {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::MtpPagedGdnStateForTest { reply }
+        })
+        .await
+    }
+
+    /// Test-only: force the NEXT paged epilogue's frontier check to report a
+    /// mismatch, arming the GDN refuse-to-persist latch deterministically.
+    #[doc(hidden)]
+    pub async fn force_paged_gdn_mismatch_for_test(&self) -> Result<()> {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::ForcePagedGdnMismatchForTest { reply }
+        })
+        .await
+    }
+
+    /// Test-only state oracle: recompute GDN over the persisted history
+    /// checkpoint's own token key from fresh caches and bit-compare against
+    /// the checkpoint arrays. `Ok(true)` iff every linear layer matches.
+    #[doc(hidden)]
+    pub async fn gdn_history_checkpoint_oracle_for_test(&self) -> Result<bool> {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::GdnHistoryCheckpointOracleForTest { reply }
         })
         .await
     }
@@ -15013,7 +15443,7 @@ mod paged_construction_tests {
         seed_dense_paged_image_session(&mut inner);
 
         let error = inner
-            .finalize_dense_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)], 0)
+            .finalize_dense_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)], 0, 4)
             .expect_err("missing adapter must fail manual finalization");
         assert!(error.to_string().contains("paged finalization failed"));
         assert!(inner.caches.is_none());
@@ -15820,7 +16250,7 @@ mod paged_construction_tests {
         let _serialized = crate::cold_tier::sidecar_counter_test_lock();
         let before = crate::cold_tier::cold_sidecar_telemetry();
         inner
-            .finalize_dense_manual_paged_turn(&[], 0)
+            .finalize_dense_manual_paged_turn(&[], 0, prompt.len())
             .expect("manual paged finalization must succeed");
         let after = crate::cold_tier::cold_sidecar_telemetry();
 
@@ -15885,7 +16315,7 @@ mod paged_construction_tests {
         let _serialized = crate::cold_tier::sidecar_counter_test_lock();
         let before = crate::cold_tier::cold_sidecar_telemetry();
         inner
-            .finalize_dense_manual_paged_turn(&[(4, 99)], 0)
+            .finalize_dense_manual_paged_turn(&[(4, 99)], 0, prompt.len())
             .expect("manual paged finalization must succeed");
         let after = crate::cold_tier::cold_sidecar_telemetry();
 
@@ -16185,6 +16615,136 @@ mod layer_kinds_cache_tests {
             inner.layer_kinds, fresh,
             "cached layer classification must equal a fresh compute over the same config"
         );
+    }
+}
+
+#[cfg(test)]
+mod paged_gdn_frontier_tests {
+    //! Cheap no-Metal tests for the dense paged epilogue frontier check and
+    //! the GDN refuse-to-persist latch (arrays stay lazy; every asserted path
+    //! returns before an eval).
+
+    use super::*;
+    use crate::models::qwen3_5::config::Qwen3_5Config;
+
+    fn tiny_cfg() -> Qwen3_5Config {
+        Qwen3_5Config {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        }
+    }
+
+    /// Catches: replacing the strict equality with a ±1 tolerance. Either
+    /// direction of a one-token skew must register as disagreement — the
+    /// exact off-by-one this check exists to refuse.
+    #[test]
+    fn frontier_skew_is_strict_equality_both_directions() {
+        assert_eq!(dense_paged_frontier_skew(10, 10), None);
+        assert_eq!(dense_paged_frontier_skew(11, 10), Some(1));
+        assert_eq!(dense_paged_frontier_skew(9, 10), Some(-1));
+        assert_eq!(dense_paged_frontier_skew(0, 0), None);
+        assert_eq!(dense_paged_frontier_skew(1, 0), Some(1));
+        assert_eq!(dense_paged_frontier_skew(0, 1), Some(-1));
+    }
+
+    /// Catches: persist-while-dirty (the latch set but never consumed by the
+    /// checkpoint store) and the store forgetting to drop the stale
+    /// checkpoint alongside its refusal.
+    #[test]
+    fn dirty_latch_refuses_history_checkpoint_persist() {
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
+        inner.cached_token_history = vec![1, 2, 3];
+        // Ready linear caches so the ONLY reason not to store is the latch.
+        let mut caches = fresh_dense_layer_caches(&inner.config);
+        for (idx, cache) in caches.iter_mut().enumerate() {
+            if !inner.config.is_linear_layer(idx) {
+                continue;
+            }
+            let Qwen3_5LayerCache::Linear(arrays) = cache else {
+                panic!("linear layer slot must be Linear");
+            };
+            arrays
+                .set(0, MxArray::from_float32(&[0.0], &[1]).expect("conv"))
+                .expect("set conv");
+            arrays
+                .set(1, MxArray::from_float32(&[0.0], &[1]).expect("rec"))
+                .expect("set rec");
+        }
+        inner.caches = Some(caches);
+        inner.gdn_last_history_checkpoint = Some(DenseGdnHistoryCheckpoint {
+            owner_id: String::new(),
+            image_key: None,
+            tokens: vec![1, 2],
+            caches: fresh_dense_layer_caches(&inner.config),
+        });
+        inner.paged_gdn_state_dirty = true;
+
+        let trace = inner
+            .remember_dense_gdn_history_checkpoint()
+            .expect("remember must not error while dirty");
+        assert!(!trace.stored, "the dirty latch must refuse to store");
+        assert!(
+            inner.gdn_last_history_checkpoint.is_none(),
+            "the stale checkpoint must be dropped alongside the refusal"
+        );
+        assert!(
+            inner.paged_gdn_state_dirty,
+            "the store must not clear the latch — the next turn's prepare does"
+        );
+    }
+
+    /// Catches: a latch that is never cleared (a permanent recompute cliff) —
+    /// after a recompute arm runs, the latch must drop.
+    #[test]
+    fn dirty_latch_clears_after_recompute_arm() {
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
+        inner.paged_gdn_state_dirty = true;
+        let prep = inner
+            .prepare_dense_gdn_prefix_state(&[1, 2, 3], 0, 16, &[], 0, false)
+            .expect("cold prepare");
+        assert_eq!(prep.state, "cold", "no prefix -> the cold recompute arm");
+        assert!(
+            !inner.paged_gdn_state_dirty,
+            "a recompute arm must clear the refuse-to-persist latch"
+        );
+        assert_eq!(inner.last_gdn_prefix_prepare_state, "cold");
+    }
+
+    /// Catches: the release/reset path forgetting the latch — a fresh session
+    /// must never inherit a refuse-to-persist state.
+    #[test]
+    fn reset_clears_dirty_latch_and_armer() {
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
+        inner.paged_gdn_state_dirty = true;
+        inner.paged_gdn_force_mismatch_for_test = true;
+        inner.reset_caches_sync().expect("reset");
+        assert!(!inner.paged_gdn_state_dirty);
+        assert!(!inner.paged_gdn_force_mismatch_for_test);
     }
 }
 
