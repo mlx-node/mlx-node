@@ -396,6 +396,24 @@ describe('mlx convert model-type auto-detection', () => {
       'gemma4_unified',
     );
   });
+
+  it("detects an architecture-only Nemotron config (no model_type) as 'nemotron_h'", async () => {
+    expect(
+      await detectModelTypeFromConfig({ architectures: ['NemotronHForCausalLM'] }),
+    ).toBe('nemotron_h');
+  });
+
+  it("the Nemotron architecture beats a stale recognized model_type", async () => {
+    // The architecture is authoritative (native parser + runtime registry):
+    // a Nemotron checkpoint carrying a stale-but-recognized model_type must
+    // not route to another family's sanitizer.
+    expect(
+      await detectModelTypeFromConfig({
+        model_type: 'qwen3_5',
+        architectures: ['NemotronHForCausalLM'],
+      }),
+    ).toBe('nemotron_h');
+  });
 });
 
 describe('mlx convert foreign-weight quantization validation', () => {

@@ -2820,11 +2820,13 @@ fn validate_nemotron_h_ingest_options(
     imatrix_path: Option<&str>,
     quant_mtp: &str,
 ) -> Result<()> {
-    let is_nemotron_h = model_type == Some("nemotron_h")
-        || config
-            .and_then(|c| c.get("model_type"))
-            .and_then(|v| v.as_str())
-            == Some("nemotron_h");
+    // Architecture-aware: a config identified only by the architecture
+    // declaration must be rejected just like a model_type-declared one —
+    // otherwise the quant flags flow through to the generic quantize block
+    // after the ingest sanitizer ran (the driver recognizes the family via
+    // the same predicate).
+    let is_nemotron_h =
+        model_type == Some("nemotron_h") || config.is_some_and(is_nemotron_h_config);
     if !is_nemotron_h {
         return Ok(());
     }
@@ -18108,6 +18110,26 @@ mod tests {
             validate_nemotron_h_ingest_options(None, Some(&cfg), true, None, false, None, "off")
                 .is_err()
         );
+        // Architecture-only detection must reject quant flags too: the driver
+        // recognizes the family via the same authoritative-architecture
+        // predicate, so the guard has to agree or the generic quantize block
+        // would run after the ingest sanitizer.
+        let arch_only = serde_json::json!({ "architectures": ["NemotronHForCausalLM"] });
+        assert!(
+            validate_nemotron_h_ingest_options(
+                None,
+                Some(&arch_only),
+                true,
+                None,
+                false,
+                None,
+                "off"
+            )
+            .is_err(),
+            "architecture-only Nemotron config must reject --quantize"
+        );
+        validate_nemotron_h_ingest_options(None, Some(&arch_only), false, None, false, None, "off")
+            .expect("architecture-only Nemotron accepted without quant flags");
         // Unrelated families are unaffected.
         validate_nemotron_h_ingest_options(Some("qwen3_5"), None, true, None, false, None, "off")
             .expect("other families unaffected");

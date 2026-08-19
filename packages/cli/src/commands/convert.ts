@@ -786,7 +786,17 @@ export async function run(argv: string[]) {
     try {
       const configPath = resolve(inputPath, 'config.json');
       const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-      if (config.model_type === 'paddleocr_vl') {
+      if (
+        Array.isArray(config.architectures) &&
+        config.architectures.includes('NemotronHForCausalLM')
+      ) {
+        // The Nemotron architecture is authoritative (native parser +
+        // runtime registry probe): check it BEFORE the model_type branches
+        // so a stale-but-recognized model_type (e.g. qwen3_5) cannot route
+        // a Nemotron checkpoint to another family's sanitizer.
+        modelType = 'nemotron_h';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'paddleocr_vl') {
         modelType = 'paddleocr-vl';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       } else if (config.model_type === 'internvl_chat' || config.model_type === 'qianfan-ocr') {
@@ -840,20 +850,10 @@ export async function run(argv: string[]) {
       } else if (config.model_type === 'muse_glimmer') {
         modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (
-        config.model_type === 'nemotron_h' ||
-        (Array.isArray(config.architectures) &&
-          config.architectures.includes('NemotronHForCausalLM'))
-      ) {
-        // The architecture-only arm (no `model_type`, only
-        // `architectures: ['NemotronHForCausalLM']`) mirrors the runtime
-        // loader (model-loader.ts architectureProbe) and the native parser
-        // (nemotron_h/config.rs makes the architecture authoritative), so a
-        // config that omits or misspells model_type still routes through
-        // NemotronHRecipe::sanitize instead of being copied un-repacked.
-        // The recipe key is always 'nemotron_h' (there is no alternate raw
-        // string), so a misspelled model_type with the matching architecture
-        // still canonicalizes to the ingest recipe.
+      } else if (config.model_type === 'nemotron_h') {
+        // The architecture-only arm is handled FIRST in this chain (the
+        // architecture is authoritative); this arm covers checkpoints that
+        // declare the plain model_type.
         modelType = 'nemotron_h';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
