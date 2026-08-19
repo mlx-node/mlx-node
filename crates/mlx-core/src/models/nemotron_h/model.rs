@@ -1567,7 +1567,24 @@ pub(crate) fn chunk_aligned_prefill_slices(
         }
     }
     while s < end {
-        let e = (s + slice_tokens).min(end);
+        let candidate = (s + slice_tokens).min(end);
+        let e = if candidate < end {
+            // NONTERMINAL boundary: round DOWN to a chunk multiple so the
+            // next slice starts exactly on the chunk grid. (slice_tokens
+            // itself need not divide the chunk size — 2048 vs 192 leaves
+            // 2048 = 10*192 + 128, which would otherwise end mid-chunk.)
+            let snapped = (candidate / chunk_size) * chunk_size;
+            if snapped > s {
+                snapped
+            } else {
+                // slice_tokens smaller than one chunk: advance a full chunk.
+                (s + chunk_size).min(end)
+            }
+        } else {
+            // FINAL boundary: reach the range end exactly; the chunk scan
+            // pads the last chunk of each slice internally.
+            end
+        };
         slices.push((s, e));
         s = e;
     }
@@ -2185,6 +2202,10 @@ mod scheduler_tests {
             (0, 3000, 2048, 256),
             (112, 2160, 2048, 256),
             (256, 1280, 2048, 256),
+            // chunk_size that does NOT divide the slice grid: every
+            // nonterminal end must round down to a chunk multiple.
+            (0, 3000, 2048, 192),
+            (192, 2240, 2048, 192),
         ];
         for &(start, end, slice_tokens, chunk_size) in cases {
             let slices = chunk_aligned_prefill_slices(start, end, slice_tokens, chunk_size);

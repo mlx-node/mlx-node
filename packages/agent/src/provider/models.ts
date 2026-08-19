@@ -91,6 +91,10 @@ const FAMILY_TRAITS: Record<string, FamilyTraits> = {
   },
   lfm2: { reasoning: true, fallbackContextWindow: 128000 },
   lfm2_moe: { reasoning: true, fallbackContextWindow: 128000 },
+  nemotron_h: {
+    reasoning: true,
+    fallbackContextWindow: 131072,
+  },
 };
 
 function positiveInteger(value: unknown): number | undefined {
