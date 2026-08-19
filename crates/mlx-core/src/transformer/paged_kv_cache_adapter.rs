@@ -3700,6 +3700,34 @@ impl PagedKVCacheAdapter {
         Ok(to_allocate)
     }
 
+    /// Reserve block capacity for `extra` rows past the current cursor
+    /// WITHOUT advancing `request_tokens` or `block_table.num_tokens` —
+    /// vLLM's speculative lookahead region (`num_lookahead_tokens` in
+    /// `vllm/v1/core/kv_cache_manager.py::allocate_slots`). A speculative
+    /// verify pass can then write its anchor + draft rows knowing the
+    /// per-token `record_tokens` calls will land in already-reserved
+    /// blocks (the `needed_total_blocks <= current_blocks` no-op branch)
+    /// instead of hitting the allocator mid-cycle.
+    ///
+    /// Returns the number of NEW blocks allocated. On allocator
+    /// exhaustion the partial allocation is rolled back and the request's
+    /// block table is unchanged (see `ensure_blocks_for_total_tokens`),
+    /// so the caller can fall back to plain autoregressive decode.
+    pub fn reserve_rows(&mut self, extra: u32) -> Result<u32, String> {
+        let current = self.request_tokens.len() as u32;
+        let new_total = current.checked_add(extra).ok_or_else(|| {
+            format!("reserve_rows: token cursor overflow (current={current}, extra={extra})")
+        })?;
+        self.ensure_blocks_for_total_tokens(new_total)
+    }
+
+    /// Reserve lookahead rows for exactly one sequence. See
+    /// [`Self::reserve_rows`].
+    pub fn reserve_rows_for(&mut self, seq_id: SeqId, extra: u32) -> Result<u32, String> {
+        self.activate_request(seq_id)?;
+        self.reserve_rows(extra)
+    }
+
     /// Release physical blocks that are wholly older than this adapter's
     /// sliding window while preserving an absolute-position block table.
     ///
@@ -4000,6 +4028,16 @@ impl PagedKVCacheAdapter {
         #[cfg(target_os = "macos")]
         self.clear_prefill_attention_inputs_cache();
         Ok(())
+    }
+
+    /// Roll back the most recent `n` tokens of exactly one sequence.
+    /// Bookkeeping-only, like [`Self::rollback_last_tokens`]: no block is
+    /// freed, and the next `record_tokens_for` on this sequence overwrites
+    /// the vacated slots in place (vLLM's rejected-draft subtraction,
+    /// `vllm/v1/core/sched/scheduler.py::update_from_output`).
+    pub fn rollback_last_tokens_for(&mut self, seq_id: SeqId, n: u32) -> Result<(), String> {
+        self.activate_request(seq_id)?;
+        self.rollback_last_tokens(n)
     }
 
     /// Build the slot mapping for a contiguous chunk of tokens starting
