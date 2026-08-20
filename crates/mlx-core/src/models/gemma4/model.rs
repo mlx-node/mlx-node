@@ -10,7 +10,7 @@ use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
-    SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
+    SaveStateArgs, SpecFrontier, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::params::ChatParams;
@@ -468,12 +468,127 @@ impl Gemma4KVCacheCoordinator {
         Ok(())
     }
 
+    /// Reserve block capacity for `rows` rows past `seq_id`'s cursor in EVERY
+    /// KV group, or in none of them — the speculative lookahead region
+    /// ([`PagedKVCacheAdapter::reserve_rows`]) held atomically across the
+    /// full+sliding groups so a verify write can never find one group covered
+    /// and another exhausted mid-cycle.
+    ///
+    /// The adapter has no primitive that returns freshly reserved blocks to
+    /// its allocator (reservation extends the block table in place), so
+    /// cross-group atomicity is an exact admission pre-flight rather than a
+    /// rollback: a group can satisfy `needed` new blocks iff its allocator
+    /// holds `free + reclaimable >= needed` (the `BlockAllocator::can_allocate`
+    /// contract — reclaimable counts exactly the cache-only blocks `allocate`
+    /// may evict), and nothing else can allocate between the pre-flight and
+    /// the reservation because every group's allocator is owned by this
+    /// coordinator and driven only from the model thread. A reservation that
+    /// still fails after its group passed the pre-flight is therefore an
+    /// invariant violation, not a capacity signal, and surfaces as a
+    /// non-capacity `Err`.
+    ///
+    /// Capacity exhaustion in ANY group fails the whole call with a
+    /// `context_length_exceeded:` error and zero net block growth; callers
+    /// map that onto the skip-cycle/AR-fallback path.
+    ///
+    /// Returns the total number of NEW blocks allocated across groups.
+    pub(crate) fn reserve_rows_all(
+        &mut self,
+        seq_id: u32,
+        rows: u32,
+    ) -> std::result::Result<u32, String> {
+        for group_id in 0..self.inner.groups().len() {
+            let adapter = self.adapter_mut(group_id)?;
+            adapter.activate_request(seq_id)?;
+            let current_tokens = adapter
+                .request_tokens_for(seq_id)
+                .map(|tokens| tokens.len() as u32)
+                .ok_or_else(|| {
+                    format!("Gemma4 KV group {group_id} has no sequence {seq_id} to reserve for")
+                })?;
+            let new_total = current_tokens.checked_add(rows).ok_or_else(|| {
+                format!(
+                    "Gemma4 KV group {group_id} reservation overflows the token cursor \
+                     (current={current_tokens}, rows={rows})"
+                )
+            })?;
+            let capacity = adapter.max_capacity_tokens();
+            if new_total > capacity {
+                return Err(format!(
+                    "context_length_exceeded: Gemma4 KV group {group_id} cannot reserve \
+                     {rows} lookahead row(s) at cursor {current_tokens} (capacity \
+                     {capacity} tokens)"
+                ));
+            }
+            let block_size = adapter.block_size();
+            if block_size == 0 {
+                return Err(format!("Gemma4 KV group {group_id} has block_size 0"));
+            }
+            let current_blocks = adapter
+                .block_table_for(seq_id)
+                .map(|table| table.num_blocks() as u32)
+                .ok_or_else(|| {
+                    format!("Gemma4 KV group {group_id} has no block table for {seq_id}")
+                })?;
+            let needed_blocks = new_total
+                .div_ceil(block_size)
+                .saturating_sub(current_blocks);
+            let telemetry = adapter.block_telemetry()?;
+            let available = telemetry
+                .free_blocks
+                .saturating_add(telemetry.reclaimable_blocks);
+            if needed_blocks > available {
+                return Err(format!(
+                    "context_length_exceeded: Gemma4 KV group {group_id} needs \
+                     {needed_blocks} block(s) for {rows} lookahead row(s) but only \
+                     {available} are free or reclaimable"
+                ));
+            }
+        }
+        let mut new_blocks = 0u32;
+        for group_id in 0..self.inner.groups().len() {
+            let reserved = self
+                .adapter_mut(group_id)?
+                .reserve_rows_for(seq_id, rows)
+                .map_err(|error| {
+                    format!(
+                        "Gemma4 KV group {group_id} reservation failed after its admission \
+                         pre-flight passed (invariant violation, earlier groups keep their \
+                         reservation): {error}"
+                    )
+                })?;
+            new_blocks = new_blocks.saturating_add(reserved);
+        }
+        Ok(new_blocks)
+    }
+
     pub(crate) fn prune_sliding_all(&mut self, seq_id: u32) -> std::result::Result<u32, String> {
         let mut released = 0u32;
         for group_id in 0..self.inner.groups().len() {
             released = released.saturating_add(
                 self.adapter_mut(group_id)?
                     .prune_sliding_window_for(seq_id)?,
+            );
+        }
+        Ok(released)
+    }
+
+    /// [`Self::prune_sliding_all`] anchored at the COMMITTED frontier instead
+    /// of each group's write cursor
+    /// ([`PagedKVCacheAdapter::prune_sliding_window_for_committed`]): between
+    /// a speculative verify write and its commit the cursor sits up to the
+    /// whole lookahead ahead, and a cursor-basis prune in that gap can retire
+    /// a block the rollback returns the committed window into (I9/I10).
+    pub(crate) fn prune_sliding_all_committed(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: u32,
+    ) -> std::result::Result<u32, String> {
+        let mut released = 0u32;
+        for group_id in 0..self.inner.groups().len() {
+            released = released.saturating_add(
+                self.adapter_mut(group_id)?
+                    .prune_sliding_window_for_committed(seq_id, committed_tokens)?,
             );
         }
         Ok(released)
@@ -562,6 +677,70 @@ impl Gemma4KVCacheCoordinator {
             }
         }
         first_error.map_or(Ok(released), Err)
+    }
+}
+
+/// Coordinator-scope conformance to the paged speculative cache contract
+/// (`engine::spec_paged`). Muse Glimmer reuses this coordinator type, so this
+/// one impl is the facade for both grouped-attention families.
+///
+/// `settle_committed` covers the coordinator-owned settle work — pending-write
+/// eval plus the committed-basis sliding prune. The family-level settle
+/// ([`Gemma4Inner::settle_grouped_kv_step_at`]) layers the cold-checkpoint
+/// rung walk between those same two coordinator calls; it is what a paged
+/// speculative stepper that owns the model drives, and it routes through the
+/// same committed-cutoff prune, so L-SETTLE holds at either scope.
+impl crate::engine::spec_paged::SpecPagedCache for Gemma4KVCacheCoordinator {
+    fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> std::result::Result<bool, String> {
+        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+        match self.reserve_rows_all(seq_id, rows) {
+            Ok(_) => Ok(true),
+            Err(error) if error.starts_with("context_length_exceeded:") => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn record_verify(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
+        self.record_tokens_all(seq_id, tokens)
+    }
+
+    fn commit_cycle(
+        &mut self,
+        seq_id: u32,
+        keep: usize,
+        total: usize,
+    ) -> std::result::Result<(), String> {
+        let rollback = crate::engine::spec_paged::commit_rollback_rows(keep, total);
+        if rollback == 0 {
+            return Ok(());
+        }
+        let rollback = u32::try_from(rollback)
+            .map_err(|_| format!("Gemma4 commit rollback of {rollback} rows does not fit u32"))?;
+        self.rollback_last_tokens_all(seq_id, rollback)
+    }
+
+    fn settle_committed(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: u64,
+    ) -> std::result::Result<(), String> {
+        let committed = u32::try_from(committed_tokens).map_err(|_| {
+            format!("Gemma4 committed frontier {committed_tokens} does not fit u32")
+        })?;
+        self.eval_pending_pool_writes_all()?;
+        self.prune_sliding_all_committed(seq_id, committed)
+            .map(|_| ())
+    }
+
+    fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
+        // Pure-attention family: the adapters' recorded rows are the whole
+        // per-token state, so `recurrent_tokens` is structurally `None`.
+        self.request_token_count_all(seq_id)
+            .ok()
+            .map(|attn_tokens| SpecFrontier {
+                attn_tokens: u64::from(attn_tokens),
+                recurrent_tokens: None,
+            })
     }
 }
 
@@ -2632,6 +2811,21 @@ impl Gemma4Inner {
     }
 
     fn remember_grouped_sliding_cold_checkpoint(&mut self, seq_id: u32) -> Result<()> {
+        self.remember_grouped_sliding_cold_checkpoint_at_frontier(seq_id, None)
+    }
+
+    /// [`Self::remember_grouped_sliding_cold_checkpoint`] with the rung walk
+    /// capped at a COMMITTED frontier. `None` keeps the write-cursor basis
+    /// (every recorded token is committed — the autoregressive shape);
+    /// `Some(committed)` refuses any rung past the committed length so a
+    /// durable checkpoint can never capture rows a speculative rollback may
+    /// still retract (I3/I9). A committed frontier past the cursor is clamped
+    /// to it — the committed frontier trails the cursor by definition.
+    fn remember_grouped_sliding_cold_checkpoint_at_frontier(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: Option<u32>,
+    ) -> Result<()> {
         let candidates = {
             let Some(coordinator) = self.kv_cache_coordinator.as_ref() else {
                 return Ok(());
@@ -2644,16 +2838,14 @@ impl Gemma4Inner {
             let Some(recorded) = full.current_token_count_for(seq_id) else {
                 return Ok(());
             };
+            let frontier = committed_tokens.map_or(recorded, |committed| committed.min(recorded));
             let block_size = full.block_size();
             let caps = gemma4_sliding_retention_caps_for_cold_tier(&self.config, cold, block_size);
             let Some(tokens) = full.request_tokens_for(seq_id) else {
                 return Ok(());
             };
-            caps.anchors
-                .as_slice()
-                .iter()
-                .copied()
-                .filter(|&boundary| boundary <= recorded)
+            gemma4_cold_rung_candidates(caps.anchors.as_slice(), frontier)
+                .into_iter()
                 .filter_map(|boundary| {
                     tokens
                         .get(..boundary as usize)
@@ -2706,18 +2898,40 @@ impl Gemma4Inner {
     }
 
     fn settle_grouped_kv_step(&mut self, seq_id: u32) -> Result<()> {
+        self.settle_grouped_kv_step_at_basis(seq_id, None)
+    }
+
+    /// [`Self::settle_grouped_kv_step`] anchored at a COMMITTED frontier: the
+    /// settle a paged speculative turn runs post-commit, where the cold-rung
+    /// walk and the sliding prune both consume the committed length instead
+    /// of the write cursor (I9). The autoregressive callers stay on
+    /// [`Self::settle_grouped_kv_step`], whose cursor basis is unchanged.
+    #[allow(dead_code)]
+    fn settle_grouped_kv_step_at(&mut self, seq_id: u32, committed_tokens: u32) -> Result<()> {
+        self.settle_grouped_kv_step_at_basis(seq_id, Some(committed_tokens))
+    }
+
+    fn settle_grouped_kv_step_at_basis(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: Option<u32>,
+    ) -> Result<()> {
         self.kv_cache_coordinator
             .as_mut()
             .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
             .eval_pending_pool_writes_all()
             .map_err(Error::from_reason)?;
-        self.remember_grouped_sliding_cold_checkpoint(seq_id)?;
-        self.kv_cache_coordinator
+        self.remember_grouped_sliding_cold_checkpoint_at_frontier(seq_id, committed_tokens)?;
+        let coordinator = self
+            .kv_cache_coordinator
             .as_mut()
-            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
-            .prune_sliding_all(seq_id)
-            .map(|_| ())
-            .map_err(Error::from_reason)
+            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?;
+        match committed_tokens {
+            None => coordinator.prune_sliding_all(seq_id),
+            Some(committed) => coordinator.prune_sliding_all_committed(seq_id, committed),
+        }
+        .map(|_| ())
+        .map_err(Error::from_reason)
     }
 
     pub(crate) fn scheduled_cold_anchor_rungs(&self) -> Vec<u32> {
@@ -4845,6 +5059,22 @@ impl Gemma4Inner {
         })
     }
 
+    /// [`project_paged_hidden_rows`] over this model's head — the shared
+    /// projection tail of the paged forwards. `last_only == true` is the
+    /// prefill tails' last-token projection; `last_only == false` is the
+    /// all-rows verify shape.
+    fn project_paged_hidden(&self, hidden_states: &MxArray, last_only: bool) -> Result<MxArray> {
+        project_paged_hidden_rows(
+            hidden_states,
+            &self.final_norm,
+            &self.embed_tokens,
+            &self.lm_head,
+            self.embed_weight_t.as_ref(),
+            &self.config,
+            last_only,
+        )
+    }
+
     /// Run a paged-attention prefill over the full prompt, dispatching
     /// per-layer between the adapter (global layers) and the existing
     /// flat path (sliding layers).
@@ -4929,6 +5159,7 @@ impl Gemma4Inner {
                 absolute_position as u32,
                 absolute_position as u32,
                 &layer_kinds,
+                None,
             )?;
             hidden.eval();
             let coordinator = self
@@ -4957,11 +5188,12 @@ impl Gemma4Inner {
             .record_tokens_all(self.active_paged_seq, final_token)
             .map_err(Error::from_reason)?;
         let final_position = suffix_start.saturating_add(final_index);
-        let mut hidden_states = self.run_paged_prefill_layer_loop(
+        let hidden_states = self.run_paged_prefill_layer_loop(
             final_token,
             final_position as u32,
             final_position as u32,
             &layer_kinds,
+            None,
         )?;
         self.kv_cache_coordinator
             .as_mut()
@@ -4970,27 +5202,7 @@ impl Gemma4Inner {
             .map_err(Error::from_reason)?;
         self.remember_grouped_sliding_cold_checkpoint(self.active_paged_seq)?;
 
-        hidden_states = self.final_norm.forward(&hidden_states)?;
-        let logits = if let Some(ref head) = self.lm_head {
-            head.forward(&hidden_states)?
-        } else if self.embed_tokens.is_packed_quantized() {
-            self.embed_tokens.as_linear(&hidden_states)?
-        } else if let Some(ref weight_t) = self.embed_weight_t {
-            hidden_states.matmul(weight_t)?
-        } else {
-            hidden_states.matmul(&self.embed_tokens.get_weight().transpose(Some(&[1, 0]))?)?
-        };
-        let logits = if let Some(cap) = self.config.final_logit_softcapping {
-            let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
-            let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
-            MxArray::from_handle(handle, "logit_softcap")?
-        } else {
-            logits
-        };
-        let last_seq_len = logits.shape_at(1)?;
-        logits
-            .slice_axis(1, last_seq_len - 1, last_seq_len)?
-            .squeeze(Some(&[0, 1]))
+        self.project_paged_hidden(&hidden_states, true)
     }
 
     /// Execute one scheduler-pinned Gemma 4 prefill slice.
@@ -5038,6 +5250,7 @@ impl Gemma4Inner {
                 first_logical_position,
                 first_logical_position,
                 &layer_kinds,
+                None,
             )?;
             hidden.eval();
             let coordinator = self
@@ -5073,25 +5286,14 @@ impl Gemma4Inner {
             final_position,
             final_position,
             &layer_kinds,
+            None,
         )?;
         self.kv_cache_coordinator
             .as_mut()
             .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
             .eval_pending_pool_writes_all()
             .map_err(Error::from_reason)?;
-        let hidden = self.final_norm.forward(&hidden)?;
-        let logits = lm_head_logits(
-            &hidden,
-            &self.embed_tokens,
-            &self.lm_head,
-            self.embed_weight_t.as_ref(),
-            &self.config,
-        )?;
-        Ok(Some(
-            logits
-                .slice_axis(1, logits.shape_at(1)? - 1, logits.shape_at(1)?)?
-                .squeeze(Some(&[0, 1]))?,
-        ))
+        Ok(Some(self.project_paged_hidden(&hidden, true)?))
     }
 
     /// One forward pass through the embed → PLE → layer-loop pipeline
@@ -5120,6 +5322,7 @@ impl Gemma4Inner {
         first_logical_position: u32,
         cached_prefix_len_for_chunk: u32,
         layer_kinds: &[Gemma4LayerKind],
+        mut tap: Option<&mut DsparkTap<'_>>,
     ) -> Result<MxArray> {
         let chunk_len = chunk_tokens.len() as u32;
         if chunk_len == 0 {
@@ -5127,6 +5330,7 @@ impl Gemma4Inner {
                 "run_paged_prefill_layer_loop: chunk_tokens must be non-empty",
             ));
         }
+        validate_paged_tap_layer_ids(tap.as_deref(), self.layers.len())?;
         let trace_enabled = inference_trace_enabled();
         let trace_start = trace_enabled.then(std::time::Instant::now);
         if trace_enabled {
@@ -5271,6 +5475,15 @@ impl Gemma4Inner {
             }
             hidden_states = next_hidden_states;
 
+            // Residual-stream hidden of layer `layer_idx` (post residual add,
+            // pre final-norm) — the same capture point as `forward_body`'s
+            // flat tap; the compute graph is otherwise unchanged.
+            if let Some(t) = tap.as_deref_mut()
+                && t.layer_ids.contains(&layer_idx)
+            {
+                t.captured.push(hidden_states.clone());
+            }
+
             // Smooth the prefill memory peak: every K layers, materialize the
             // residual stream so MLX can release the upstream graph nodes
             // (embedding + every prior layer's attention/MLP/PLE intermediates)
@@ -5317,6 +5530,7 @@ impl Gemma4Inner {
         cached_prefix_len_for_chunk: u32,
         layer_kinds: &[Gemma4LayerKind],
         overlay_type_ids: Option<&MxArray>,
+        mut tap: Option<&mut DsparkTap<'_>>,
     ) -> Result<MxArray> {
         let chunk_len = chunk_token_ids.len() as u32;
         if chunk_len == 0 {
@@ -5324,6 +5538,7 @@ impl Gemma4Inner {
                 "run_paged_vlm_prefill_layer_loop: chunk_token_ids must be non-empty",
             ));
         }
+        validate_paged_tap_layer_ids(tap.as_deref(), self.layers.len())?;
 
         let input_ids = MxArray::from_uint32(chunk_token_ids, &[1, chunk_len as i64])?;
         let mut hidden_states = chunk_embeds.clone();
@@ -5454,6 +5669,15 @@ impl Gemma4Inner {
                 shared_inputs,
             )?;
             hidden_states = next_hidden_states;
+
+            // Residual-stream hidden of layer `layer_idx` (post residual add,
+            // pre final-norm) — the same capture point as `forward_body`'s
+            // flat tap; the compute graph is otherwise unchanged.
+            if let Some(t) = tap.as_deref_mut()
+                && t.layer_ids.contains(&layer_idx)
+            {
+                t.captured.push(hidden_states.clone());
+            }
 
             crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
         }
@@ -5643,6 +5867,7 @@ impl Gemma4Inner {
                     pass1_position,
                     layer_kinds,
                     chunk_type_ids.as_ref(),
+                    None,
                 )?;
                 _hidden.eval();
                 if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
@@ -5686,6 +5911,7 @@ impl Gemma4Inner {
             layer_kinds,
             // Pass 2 is the single final token (seq_len==1); the overlay never
             // applies to a single-token query.
+            None,
             None,
         )?;
         if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
@@ -7815,6 +8041,56 @@ pub(crate) fn lm_head_logits(
     }
 }
 
+/// Final-norm + LM-head + softcap projection over a paged residual
+/// `[1, T, hidden]` — the tail every paged forward runs after its layer loop.
+///
+/// `last_only == false` keeps every row (`[1, T, vocab]`): the speculative
+/// verify shape, one logit row per drafted position, reusing the decode
+/// tail's head/softcap idiom unchanged over T rows. `last_only == true`
+/// reproduces the paged prefill tails' last-token projection exactly —
+/// project all rows, then slice row T-1 and squeeze to `[vocab]` — so the
+/// two modes differ only in the final slice.
+pub(crate) fn project_paged_hidden_rows(
+    hidden_states: &MxArray,
+    final_norm: &RMSNorm,
+    embedding: &Embedding,
+    lm_head: &Option<LinearProj>,
+    embed_weight_t: Option<&MxArray>,
+    config: &Gemma4Config,
+    last_only: bool,
+) -> Result<MxArray> {
+    let hidden = final_norm.forward(hidden_states)?;
+    let logits = lm_head_logits(&hidden, embedding, lm_head, embed_weight_t, config)?;
+    if !last_only {
+        return Ok(logits);
+    }
+    let last_seq_len = logits.shape_at(1)?;
+    logits
+        .slice_axis(1, last_seq_len - 1, last_seq_len)?
+        .squeeze(Some(&[0, 1]))
+}
+
+/// The paged layer loops' twin of `forward_body`'s tap validation: capture
+/// order is push-in-loop, so `layer_ids` must be strictly ascending decoder
+/// indices below the layer count.
+fn validate_paged_tap_layer_ids(tap: Option<&DsparkTap<'_>>, num_layers: usize) -> Result<()> {
+    let Some(t) = tap else {
+        return Ok(());
+    };
+    let mut previous: Option<usize> = None;
+    for &id in t.layer_ids {
+        if id >= num_layers || previous.is_some_and(|prev| id <= prev) {
+            return Err(Error::from_reason(format!(
+                "paged layer loop: tap layer_ids {:?} must be strictly ascending decoder \
+                 indices below {num_layers}",
+                t.layer_ids
+            )));
+        }
+        previous = Some(id);
+    }
+    Ok(())
+}
+
 /// Run the target over a `[1, T]` verify block at the current cache offset,
 /// capturing the tapped hidden states, and return the `[1, T, vocab]` logits.
 ///
@@ -8478,6 +8754,21 @@ fn gemma4_sliding_retention_caps(
 fn gemma4_sliding_cold_ladder_wanted(cold: Option<&ColdTierContext>) -> bool {
     cold.and_then(|cold| cold.sidecar_policy.as_ref())
         .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::SlidingWindow)
+}
+
+/// Anchor rungs the grouped cold-checkpoint walk may capture at `frontier`
+/// tokens: every rung at or below the frontier, INCLUSIVE — a rung landing
+/// exactly on the frontier is exactly the boundary a settle is entitled to
+/// capture. The frontier is the write cursor on the autoregressive basis and
+/// the committed length on the speculative basis; the comparison is the same
+/// either way, which is what keeps the two settle bases bit-equal when
+/// committed == cursor.
+fn gemma4_cold_rung_candidates(anchors: &[u32], frontier: u32) -> Vec<u32> {
+    anchors
+        .iter()
+        .copied()
+        .filter(|&boundary| boundary <= frontier)
+        .collect()
 }
 
 /// Retention caps for a turn whose adapter carries `cold`.
@@ -14721,6 +15012,644 @@ mod dspark_tap_tests {
                 &mut tap,
             )
             .is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod spec_paged_substrate_tests {
+    //! T-D0.3 gating tests: the committed-frontier settle, the atomic
+    //! cross-group reservation, the all-rows projection, and the paged-loop
+    //! tap — every one behavior-neutral for the autoregressive lane.
+
+    use super::dspark_tap_tests::assert_bitwise_eq;
+    use super::*;
+    use crate::engine::spec_paged::SpecPagedCache;
+
+    /// Tiny hybrid config whose PAGED coordinator builds for real in
+    /// `Gemma4Inner::new`: production pool constraints require block size
+    /// 8/16/32 and head size >= 32, and `paged_cache_memory_mb` keeps the
+    /// full group's Metal pool at ~8 MiB.
+    fn tiny_paged_config_value() -> serde_json::Value {
+        serde_json::json!({
+            "vocab_size": 64,
+            "hidden_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 256,
+            "sliding_window": 16,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "use_block_paged_cache": true,
+            "paged_block_size": 8,
+            "paged_cache_memory_mb": 8,
+            "final_logit_softcapping": 30.0,
+            "eos_token_ids": []
+        })
+    }
+
+    fn tiny_paged_config() -> Gemma4Config {
+        serde_json::from_value(tiny_paged_config_value())
+            .expect("tiny paged Gemma4 config must deserialize")
+    }
+
+    /// [`tiny_paged_config`] with the FULL-attention group first in
+    /// `layer_types`, so grouping assigns it the lower group id — the
+    /// atomicity test's mutation (partial reservation leaking the earlier
+    /// group's blocks) needs the full group reserved before the sliding
+    /// group's exhaustion is reached.
+    fn tiny_paged_config_full_first() -> Gemma4Config {
+        let mut value = tiny_paged_config_value();
+        value["layer_types"] = serde_json::json!([
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention"
+        ]);
+        serde_json::from_value(value).expect("tiny paged Gemma4 config must deserialize")
+    }
+
+    /// Placeholder pool sized to the allocator, or `None` (skip) without a
+    /// Metal device — the `paged_kv_cache_adapter` test-shim pattern.
+    fn maybe_test_pool(
+        num_blocks: u32,
+        block_size: u32,
+    ) -> Option<Arc<mlx_paged_attn::LayerKVPool>> {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            num_kv_heads: 1,
+            head_size: 32,
+            num_layers: 2,
+            ..mlx_paged_attn::PagedAttentionConfig::default()
+        };
+        match mlx_paged_attn::LayerKVPool::new_for_test(
+            cfg,
+            num_blocks,
+            2,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(pool) => Some(Arc::new(pool)),
+            Err(error) if error.contains("No Metal device found") => None,
+            Err(error) => panic!("unexpected new_for_test failure: {error}"),
+        }
+    }
+
+    /// Real grouped coordinator over the tiny full-first config, with
+    /// per-kind allocator sizes so a test can seed exhaustion in exactly one
+    /// group. Returns `None` (skip) without Metal.
+    fn maybe_grouped_coordinator(
+        full_blocks: u32,
+        sliding_blocks: u32,
+    ) -> Option<Gemma4KVCacheCoordinator> {
+        let config = tiny_paged_config_full_first();
+        let block_size = 8u32;
+        let specs = compute_layer_kv_cache_specs(&config, block_size, KVCacheDType::BFloat16)
+            .expect("tiny specs must build");
+        let groups = compute_layer_kv_cache_groups(
+            &config,
+            block_size,
+            KVCacheDType::BFloat16,
+            gemma4_paged_prefill_group_max_chunk(),
+        )
+        .expect("tiny groups must build");
+        let mut adapters = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let blocks = match group.attention_kind {
+                AttentionKind::Full => full_blocks,
+                AttentionKind::SlidingWindow { .. } => sliding_blocks,
+            };
+            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+                blocks, block_size,
+            )));
+            let pool = maybe_test_pool(blocks, block_size)?;
+            let adapter = match group.attention_kind {
+                AttentionKind::Full => PagedKVCacheAdapter::new(allocator, pool, block_size),
+                AttentionKind::SlidingWindow { sliding_window } => {
+                    PagedKVCacheAdapter::new_sliding(
+                        allocator,
+                        pool,
+                        block_size,
+                        sliding_window,
+                        256,
+                    )
+                }
+            }
+            .expect("tiny adapter must construct");
+            adapters.push(adapter);
+        }
+        Some(
+            Gemma4KVCacheCoordinator::new(&specs, groups, adapters, 4)
+                .expect("tiny coordinator must construct"),
+        )
+    }
+
+    fn group_count(coordinator: &Gemma4KVCacheCoordinator) -> usize {
+        coordinator.inner.groups().len()
+    }
+
+    fn allocated_per_group(coordinator: &Gemma4KVCacheCoordinator) -> Vec<usize> {
+        (0..group_count(coordinator))
+            .map(|group_id| {
+                coordinator
+                    .adapter(group_id)
+                    .expect("group adapter")
+                    .num_allocated_blocks()
+            })
+            .collect()
+    }
+
+    /// Seed exhaustion in the sliding group AFTER the full group could
+    /// reserve: the whole call must fail as capacity exhaustion with zero net
+    /// block growth in EVERY group. Mutation this catches: dropping the
+    /// cross-group admission pre-flight, which reserves the full group's
+    /// blocks and then leaks them when the sliding group exhausts.
+    #[test]
+    fn reserve_rows_all_is_atomic_across_groups() {
+        let Some(mut coordinator) = maybe_grouped_coordinator(64, 4) else {
+            return;
+        };
+        // Precondition of the mutation this test exists to catch: the full
+        // group must be reserved BEFORE the sliding group exhausts, i.e. it
+        // must iterate first. If grouping order ever flips, fail loudly here
+        // rather than silently weakening the gate.
+        assert_eq!(
+            coordinator
+                .adapter(0)
+                .expect("group 0 adapter")
+                .sliding_window(),
+            0,
+            "test precondition: the full-attention group must have the lower group id"
+        );
+
+        coordinator.reset_scheduled_request(7).expect("reset");
+        coordinator
+            .record_tokens_all(7, &(0..12).collect::<Vec<_>>())
+            .expect("seed 12 tokens");
+        // Sliding group: 4 blocks = null + 2 recorded, 1 free. 24 lookahead
+        // rows need ceil(36/8) - 2 = 3 new blocks per group.
+        let before = allocated_per_group(&coordinator);
+        let error = coordinator
+            .reserve_rows_all(7, 24)
+            .expect_err("sliding exhaustion must fail the whole reservation");
+        assert!(
+            error.starts_with("context_length_exceeded:"),
+            "exhaustion must keep the adapter's capacity error shape, got: {error}"
+        );
+        assert_eq!(
+            allocated_per_group(&coordinator),
+            before,
+            "a failed cross-group reservation must leak zero blocks in any group"
+        );
+        assert_eq!(
+            coordinator.request_token_count_all(7).expect("token count"),
+            12,
+            "a failed reservation must not advance any cursor"
+        );
+
+        // The facade maps the same exhaustion onto the skip-cycle signal.
+        assert!(
+            !SpecPagedCache::reserve_lookahead(&mut coordinator, 7, 24)
+                .expect("exhaustion is not an error at the facade"),
+            "facade must report pool exhaustion as Ok(false)"
+        );
+        assert_eq!(allocated_per_group(&coordinator), before);
+
+        // A coverable reservation lands in every group without advancing the
+        // cursor, and the following verify-shaped write allocates nothing.
+        let groups = group_count(&coordinator) as u32;
+        let new_blocks = coordinator
+            .reserve_rows_all(7, 8)
+            .expect("8 lookahead rows fit every group");
+        assert_eq!(new_blocks, groups, "ceil(20/8) - 2 = 1 new block per group");
+        assert_eq!(
+            coordinator.request_token_count_all(7).expect("token count"),
+            12,
+            "reservation must not advance the cursor"
+        );
+        let reserved = allocated_per_group(&coordinator);
+        coordinator
+            .record_tokens_all(7, &(12..20).collect::<Vec<_>>())
+            .expect("verify write into the reserved region");
+        assert_eq!(
+            allocated_per_group(&coordinator),
+            reserved,
+            "the reserved lookahead region must absorb the verify write with zero allocation"
+        );
+
+        // Facade conformance on the same real coordinator: frontier is the
+        // one count every group agrees on, commit is exact cursor arithmetic,
+        // and the committed settle reaches the committed-cutoff prune (whose
+        // adapter guard rejects a frontier past the cursor).
+        assert_eq!(
+            SpecPagedCache::frontier(&coordinator, 7),
+            Some(SpecFrontier {
+                attn_tokens: 20,
+                recurrent_tokens: None
+            })
+        );
+        assert_eq!(SpecPagedCache::frontier(&coordinator, 99), None);
+        SpecPagedCache::record_verify(&mut coordinator, 7, &[40, 41, 42]).expect("record verify");
+        SpecPagedCache::commit_cycle(&mut coordinator, 7, 1, 3).expect("commit keep=1 of 3");
+        assert_eq!(
+            SpecPagedCache::frontier(&coordinator, 7),
+            Some(SpecFrontier {
+                attn_tokens: 21,
+                recurrent_tokens: None
+            })
+        );
+        SpecPagedCache::settle_committed(&mut coordinator, 7, 21).expect("committed settle");
+        assert!(
+            SpecPagedCache::settle_committed(&mut coordinator, 7, 22)
+                .expect_err("a committed frontier past the cursor must be rejected")
+                .contains("exceeds recorded token count"),
+            "the committed settle must route through the committed-cutoff prune's guard"
+        );
+    }
+
+    /// Bit-equal row `T-1`: the all-rows projection's last row must be the
+    /// last-only projection exactly. Mutation this catches: a projection row
+    /// off-by-one in either mode.
+    #[test]
+    fn paged_all_rows_logits_row_minus_one_matches_last_only() {
+        let config = tiny_paged_config();
+        let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)
+            .expect("tiny embedding");
+        let final_norm = RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps))
+            .expect("tiny final norm");
+        let hidden = MxArray::random_uniform(&[1, 4, config.hidden_size as i64], -1.0, 1.0, None)
+            .expect("random hidden");
+
+        let all_rows = project_paged_hidden_rows(
+            &hidden,
+            &final_norm,
+            &embedding,
+            &None,
+            None,
+            &config,
+            false,
+        )
+        .expect("all-rows projection");
+        assert_eq!(
+            all_rows.shape().unwrap().to_vec(),
+            vec![1, 4, config.vocab_size as i64],
+            "all-rows mode must keep one logit row per position"
+        );
+        let last_only =
+            project_paged_hidden_rows(&hidden, &final_norm, &embedding, &None, None, &config, true)
+                .expect("last-only projection");
+        assert_eq!(
+            last_only.shape().unwrap().to_vec(),
+            vec![config.vocab_size as i64],
+            "last-only mode must squeeze to [vocab]"
+        );
+
+        let row_t_minus_1 = all_rows
+            .slice_axis(1, 3, 4)
+            .and_then(|row| row.squeeze(Some(&[0, 1])))
+            .expect("slice row T-1");
+        assert_bitwise_eq(&row_t_minus_1, &last_only, "all-rows row T-1 vs last-only");
+
+        // The rows must be genuinely per-position, not one row broadcast.
+        let row_0 = all_rows
+            .slice_axis(1, 0, 1)
+            .and_then(|row| row.squeeze(Some(&[0, 1])))
+            .expect("slice row 0");
+        row_0.eval();
+        assert_ne!(
+            row_0.to_float32().unwrap().to_vec(),
+            last_only.to_float32().unwrap().to_vec(),
+            "distinct positions must project to distinct logit rows"
+        );
+    }
+
+    /// One sequence's full settle trace: per-settle block-id snapshots for
+    /// every group, the cursor at each settle, and the captured cold rungs.
+    struct SettleTrace {
+        step_block_ids: Vec<Vec<Vec<u32>>>,
+        cursors: Vec<u32>,
+        rungs: Vec<(u32, Vec<u32>)>,
+    }
+
+    fn drive_settles(inner: &mut Gemma4Inner, seq_id: u32, committed_basis: bool) -> SettleTrace {
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .reset_scheduled_request(seq_id)
+            .expect("reset");
+        // Chunks of 3 keep the prune cutoff off block alignment; the 5-chunk
+        // lands one settle exactly on the first cold anchor rung
+        // (block_size * 4 = 32) so the rung walk actually captures.
+        let schedule = [3u32, 3, 3, 3, 3, 3, 3, 3, 3, 5, 3, 3];
+        let mut next_token = 0u32;
+        let mut step_block_ids = Vec::new();
+        let mut cursors = Vec::new();
+        for chunk_len in schedule {
+            let tokens: Vec<u32> = (next_token..next_token + chunk_len).collect();
+            next_token += chunk_len;
+            inner
+                .kv_cache_coordinator
+                .as_mut()
+                .expect("coordinator")
+                .record_tokens_all(seq_id, &tokens)
+                .expect("record chunk");
+            let cursor = inner
+                .kv_cache_coordinator
+                .as_ref()
+                .expect("coordinator")
+                .full_adapter()
+                .current_token_count_for(seq_id)
+                .expect("cursor");
+            if committed_basis {
+                inner
+                    .settle_grouped_kv_step_at(seq_id, cursor)
+                    .expect("committed-basis settle");
+            } else {
+                inner
+                    .settle_grouped_kv_step(seq_id)
+                    .expect("cursor-basis settle");
+            }
+            cursors.push(cursor);
+            let coordinator = inner.kv_cache_coordinator.as_ref().expect("coordinator");
+            let groups = (0..group_count(coordinator))
+                .map(|group_id| {
+                    coordinator
+                        .adapter(group_id)
+                        .expect("group adapter")
+                        .block_table_for(seq_id)
+                        .expect("block table")
+                        .blocks()
+                        .iter()
+                        .map(|block| block.block_id)
+                        .collect::<Vec<u32>>()
+                })
+                .collect::<Vec<_>>();
+            step_block_ids.push(groups);
+        }
+        let rungs = inner
+            .grouped_sliding_cold_checkpoints
+            .get(&seq_id)
+            .map(|checkpoints| {
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| (checkpoint.boundary, checkpoint.tokens.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .release_request_all(seq_id)
+            .expect("release");
+        SettleTrace {
+            step_block_ids,
+            cursors,
+            rungs,
+        }
+    }
+
+    /// Per-step nulled-position patterns for one trace: a position is nulled
+    /// iff its block id equals the trace-final id of position 0 (the shared
+    /// null sentinel once the window has passed block 0; the sentinel block
+    /// is adapter-owned and never freed, so no live block can alias it).
+    fn null_patterns(trace: &SettleTrace) -> Vec<Vec<Vec<bool>>> {
+        let final_step = trace.step_block_ids.last().expect("at least one settle");
+        let null_ids: Vec<u32> = final_step.iter().map(|ids| ids[0]).collect();
+        trace
+            .step_block_ids
+            .iter()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .zip(&null_ids)
+                    .map(|(ids, &null_id)| ids.iter().map(|&id| id == null_id).collect())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// When committed == cursor (every autoregressive step), the
+    /// committed-basis settle must be indistinguishable from the cursor-basis
+    /// settle: bit-equal nulled-block sets in every group at every step, and
+    /// identical captured checkpoint rungs. Mutations this catches: the
+    /// settle refactor changing autoregressive behavior (either basis arm
+    /// drifting by even one token moves a retirement boundary or drops the
+    /// on-frontier rung).
+    #[test]
+    fn settle_at_committed_equals_cursor_when_equal() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping settle_at_committed_equals_cursor_when_equal: Metal unavailable");
+            return;
+        }
+        let mut inner =
+            Gemma4Inner::new(tiny_paged_config()).expect("tiny paged Gemma4Inner must construct");
+        if inner.kv_cache_coordinator.is_none() {
+            eprintln!(
+                "skipping settle_at_committed_equals_cursor_when_equal: no paged coordinator"
+            );
+            return;
+        }
+
+        // A real sliding cold tier so the rung walk actually captures — an
+        // empty-ladder run would compare nothing.
+        let root = std::env::temp_dir().join(format!(
+            "mlx-gemma4-spec-paged-settle-{}",
+            std::process::id()
+        ));
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        let policy = sliding_sidecar::policy(&inner.config)
+            .expect("tiny geometry must yield a sliding sidecar policy");
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .full_adapter_mut()
+            .set_cold_tier(ColdTierContext {
+                manager: Arc::new(manager),
+                fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                    b"gemma4-spec-paged-settle".as_slice(),
+                ]),
+                sidecar_policy: Some(policy),
+            });
+
+        let cursor_trace = drive_settles(&mut inner, 21, false);
+        let committed_trace = drive_settles(&mut inner, 22, true);
+
+        assert_eq!(cursor_trace.cursors, committed_trace.cursors);
+        assert_eq!(
+            null_patterns(&cursor_trace),
+            null_patterns(&committed_trace),
+            "committed == cursor must null bit-equal block sets in every group at every settle"
+        );
+
+        // Non-vacuity: the window actually retired blocks...
+        let final_patterns = null_patterns(&cursor_trace);
+        let final_step = final_patterns.last().expect("final settle");
+        assert!(
+            final_step
+                .iter()
+                .any(|pattern| pattern.iter().filter(|&&nulled| nulled).count() >= 2),
+            "the schedule must drive at least two blocks out of a sliding window"
+        );
+        // ...and the rung walk captured the on-frontier anchor, identically.
+        let expected_rungs = vec![(32u32, (0..32).collect::<Vec<u32>>())];
+        assert_eq!(
+            cursor_trace.rungs, expected_rungs,
+            "the cursor-basis settle must capture the rung landing exactly on the frontier"
+        );
+        assert_eq!(
+            committed_trace.rungs, expected_rungs,
+            "the committed-basis settle must capture the same rung at committed == cursor"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Tap purity on the REAL paged layer loops (text and VLM), driven on a
+    /// real checkpoint: threading a `DsparkTap` must leave the residual
+    /// stream bit-identical to a tap-less run while capturing one
+    /// `[1, T, hidden]` per tapped layer. Mutation this catches: the tap
+    /// perturbing the forward.
+    ///
+    /// Env-gated (the paged K/V write path requires bf16 weights, which the
+    /// random-init tiny model cannot provide):
+    /// `MLX_TEST_GEMMA4_MODEL_PATH` — a bf16 Gemma4 checkout (the
+    /// `gemma4_dspark.rs` target). Unset -> skip with a message.
+    #[test]
+    fn paged_layer_loop_tap_purity_is_bit_identical() {
+        let Ok(model_path) = std::env::var("MLX_TEST_GEMMA4_MODEL_PATH") else {
+            eprintln!(
+                "skipping paged_layer_loop_tap_purity_is_bit_identical: set \
+                 MLX_TEST_GEMMA4_MODEL_PATH (bf16 Gemma4 checkout)"
+            );
+            return;
+        };
+        let (mut inner, _weight_bytes) =
+            Gemma4Inner::load_from_dir(&model_path, None).expect("gemma4 checkout must load");
+        assert!(
+            inner.kv_cache_coordinator.is_some(),
+            "a bf16 Gemma4 checkout must build its paged coordinator"
+        );
+        let layer_kinds = inner.compute_layer_kinds().expect("layer kinds");
+        let tokens = [3u32, 9, 17, 25, 33, 41];
+        let layer_ids = [0usize, inner.layers.len() / 2, inner.layers.len() - 1];
+
+        let fresh_chunk = |inner: &mut Gemma4Inner, seq_id: u32| {
+            let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+            coordinator.reset_scheduled_request(seq_id).expect("reset");
+            coordinator
+                .record_tokens_all(seq_id, &tokens)
+                .expect("record chunk");
+        };
+
+        // Text loop: pass A tap-less, pass B tapped, separate sequences of
+        // the same loaded model (fresh chunks at position 0 attend only to
+        // in-chunk K/V, so the two passes see identical inputs).
+        fresh_chunk(&mut inner, 11);
+        let hidden_a = inner
+            .run_paged_prefill_layer_loop(&tokens, 0, 0, &layer_kinds, None)
+            .expect("tap-less paged loop");
+        hidden_a.eval();
+
+        fresh_chunk(&mut inner, 12);
+        let mut tap = DsparkTap::new(&layer_ids);
+        let hidden_b = inner
+            .run_paged_prefill_layer_loop(&tokens, 0, 0, &layer_kinds, Some(&mut tap))
+            .expect("tapped paged loop");
+        hidden_b.eval();
+
+        assert_bitwise_eq(&hidden_a, &hidden_b, "paged text loop hidden");
+        assert_eq!(tap.captured.len(), layer_ids.len());
+        let hidden_size = inner.config.hidden_size as i64;
+        for capture in &tap.captured {
+            assert_eq!(
+                capture.shape().unwrap().to_vec(),
+                vec![1, tokens.len() as i64, hidden_size]
+            );
+        }
+        let first = tap.captured[0].to_float32().unwrap().to_vec();
+        let second = tap.captured[1].to_float32().unwrap().to_vec();
+        assert_ne!(first, second, "captures must differ across layers");
+
+        // Unsorted / out-of-range tap ids are rejected before any compute.
+        for bad in [vec![2usize, 0], vec![1, 1], vec![inner.layers.len()]] {
+            let mut bad_tap = DsparkTap::new(&bad);
+            fresh_chunk(&mut inner, 13);
+            assert!(
+                inner
+                    .run_paged_prefill_layer_loop(&tokens, 0, 0, &layer_kinds, Some(&mut bad_tap))
+                    .is_err(),
+                "tap layer_ids {bad:?} must be rejected"
+            );
+        }
+
+        // VLM loop: identical A/B purity over caller-provided embeddings.
+        let ids = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64]).expect("ids");
+        let embeds = inner
+            .embed_tokens
+            .forward(&ids)
+            .and_then(|embeds| embeds.mul_scalar((inner.config.hidden_size as f64).sqrt()))
+            .expect("chunk embeds");
+
+        fresh_chunk(&mut inner, 14);
+        let vlm_a = inner
+            .run_paged_vlm_prefill_layer_loop(&tokens, &embeds, 0, 0, &layer_kinds, None, None)
+            .expect("tap-less paged VLM loop");
+        vlm_a.eval();
+
+        fresh_chunk(&mut inner, 15);
+        let mut vlm_tap = DsparkTap::new(&layer_ids);
+        let vlm_b = inner
+            .run_paged_vlm_prefill_layer_loop(
+                &tokens,
+                &embeds,
+                0,
+                0,
+                &layer_kinds,
+                None,
+                Some(&mut vlm_tap),
+            )
+            .expect("tapped paged VLM loop");
+        vlm_b.eval();
+
+        assert_bitwise_eq(&vlm_a, &vlm_b, "paged VLM loop hidden");
+        assert_eq!(vlm_tap.captured.len(), layer_ids.len());
+        for capture in &vlm_tap.captured {
+            assert_eq!(
+                capture.shape().unwrap().to_vec(),
+                vec![1, tokens.len() as i64, hidden_size]
+            );
+        }
+    }
+
+    /// The rung-candidate walk is inclusive at the frontier and identical
+    /// for the two bases when committed == cursor — the pure half of the
+    /// settle-equality gate. Mutation this catches: an exclusive (`<`)
+    /// frontier comparison dropping the rung a settle lands on exactly.
+    #[test]
+    fn cold_rung_candidates_include_the_on_frontier_anchor() {
+        let anchors = [32u32, 128, 512];
+        assert_eq!(gemma4_cold_rung_candidates(&anchors, 31), Vec::<u32>::new());
+        assert_eq!(
+            gemma4_cold_rung_candidates(&anchors, 32),
+            vec![32],
+            "a rung landing exactly on the frontier is capturable"
+        );
+        assert_eq!(gemma4_cold_rung_candidates(&anchors, 200), vec![32, 128]);
+        assert_eq!(
+            gemma4_cold_rung_candidates(&anchors, 512),
+            vec![32, 128, 512]
         );
     }
 }
