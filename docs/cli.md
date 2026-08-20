@@ -165,12 +165,19 @@ mlx convert -m qwen3_5_moe -q --q-recipe nvidia \
 `nemotron_h` is an ingest, not a recipe run: the source is NVIDIA's modelopt
 checkpoint `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`, which is
 **already quantized** (experts, shared experts, and `lm_head` in NVFP4; the
-Mamba-2 `in_proj`/`out_proj` in FP8). Ingest preserves NVFP4 — the fp4 codes are
-carried bit-exact and the checkpoint's `weight_scale_2` scalar is folded into the
-per-group E4M3 scales — and maps the FP8 Mamba-2 projections to mxfp8 with the
-checkpoint's static `input_scale` threaded as `input_amax`. No re-quantization
-flags apply (`-q`/`--q-recipe` are rejected on this already-quantized source);
-the convert is a format/repack pass, not a recipe.
+Mamba-2 `in_proj`/`out_proj` in FP8). Ingest preserves NVFP4 byte-for-byte — the
+fp4 E2M1 codes and the per-group E4M3 `weight_scale` bytes are both carried
+verbatim, and the checkpoint's `weight_scale_2` is carried **separately** as a
+Float32 `.global_scale` key (an `[E]` vector for the stacked experts, since it
+varies per expert) applied as a scalar on the projection output at runtime.
+Folding it into the E4M3 group scales, as an earlier revision did, cost ~8% mean
+relative error because the product lands in E4M3's subnormal band; **checkpoints
+converted before this change must be regenerated** — the loader rejects one that
+has no `.global_scale`. Ingest also maps the FP8 Mamba-2 projections to mxfp8
+with the checkpoint's static `input_scale` threaded as `input_amax`. No
+re-quantization flags apply (`-q`/`--q-recipe` are rejected on this
+already-quantized source); the convert is a format/repack pass, not a recipe.
+One consequence: the output is no longer loadable by mlx-lm as plain nvfp4.
 
 ```bash
 mlx convert -m nemotron_h \

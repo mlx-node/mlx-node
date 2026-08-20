@@ -2063,8 +2063,11 @@ pub(crate) mod recipe {
     // NVIDIA ships these checkpoints ALREADY QUANTIZED by modelopt, so convert
     // runs in INGEST mode only (--quantize / --q-recipe / --q-mxfp /
     // --imatrix-path / --q-mtp are rejected): the NVFP4 / FP8 codes are
-    // repacked losslessly into the MLX nvfp4 / mxfp8 checkpoint layouts and the
-    // matching per-layer quantization block is recorded in config.json.
+    // repacked into the MLX nvfp4 / mxfp8 checkpoint layouts and the matching
+    // per-layer quantization block is recorded in config.json. The NVFP4 half
+    // is byte-preserving on BOTH halves of the encoding (E2M1 codes AND the
+    // per-group E4M3 scale bytes); the FP8 mamba half is a lossy re-quantize
+    // into mxfp8.
     //
     // Source layout (verified against the released 30B-A3B-NVFP4 checkpoint):
     //   - MoE experts / shared_experts / lm_head: NVFP4.
@@ -2080,10 +2083,27 @@ pub(crate) mod recipe {
     //
     // MLX output layout:
     //   - experts fused to backbone.layers.{L}.mixer.experts.{up,down}_proj
-    //     {base}.weight u32 [E, N, K/8] (QuantizedSwitchLinear nvfp4 pair)
-    //     {base}.scales u8  [E, N, K/16] (folded E4M3 = e4m3(scale_8*scale_2))
-    //   - shared_experts stay 2-D in the same nvfp4 pair shape.
-    //   - lm_head dequantized to BF16 (it is dense in the runtime).
+    //     {base}.weight       u32 [E, N, K/8]  (QuantizedSwitchLinear nvfp4)
+    //     {base}.scales       u8  [E, N, K/16] (source weight_scale VERBATIM)
+    //     {base}.global_scale f32 [E]          (source weight_scale_2, one per
+    //       expert — it VARIES per expert on the real checkpoint), gathered by
+    //       the routing indices and multiplied into the projection OUTPUT.
+    //   - shared_experts stay 2-D in the same nvfp4 pair shape, with a rank-1
+    //     [1] f32 {base}.global_scale applied as a scalar on their output.
+    //   - lm_head dequantized to BF16 (it is dense in the runtime); its
+    //     weight_scale_2 is folded into the DEQUANT, so it emits no
+    //     .global_scale.
+    //
+    // weight_scale_2 is NEVER folded into the E4M3 group scales. On the real
+    // checkpoint weight_scale_2 ~ 8.65e-5, so the product lands in E4M3's
+    // subnormal band for 99.77% of groups and the re-encode costs a mean 8.15%
+    // of every group scale. Carrying it out-of-band is EXACT instead (the
+    // matmul is linear in the weight) and is what vLLM does
+    // (nvfp4_marlin_process_global_scale / modelopt.py's weight_global_scale).
+    // Consequence: the output is no longer a plain mlx-lm-loadable nvfp4
+    // checkpoint, and the nemotron loader is fail-closed on a missing
+    // .global_scale so a checkpoint from the old folding ingest errors loudly
+    // instead of running ~8% wrong.
     //   - mamba in/out_proj re-quantized to mxfp8 (u32 weight + u8 E8M0
     //     scales); the source input_scale is recorded as the per-layer
     //     input_amax config override (= 448 * input_scale) so the runtime
@@ -2098,8 +2118,15 @@ pub(crate) mod recipe {
     // reinterpreted as u32 [N, K/8] without any nibble shuffling.
     /// Decode one F8_E4M3FN byte (sign bit 7, 4-bit exponent, 3-bit mantissa)
     /// to f32. 0x7f is the only NaN pattern; NVIDIA saturates scales at 448.
-    /// Reference implementation for the ingest tests — the production fold uses
-    /// the MLX from_fp8/to_fp8 ops so runtime rounding can never diverge.
+    ///
+    /// Reference implementation for the ingest tests ONLY. Production never
+    /// decodes or re-encodes a NemotronH group scale: the source E4M3 bytes
+    /// are emitted verbatim and `weight_scale_2` rides along in a separate
+    /// `.global_scale` key (see the module doc). This helper exists so the
+    /// tests can build the exact `LUT[code] * decode_e4m3(ws) * s2` reference
+    /// the checkpoint must reproduce, and so
+    /// `nemotron_e4m3_decode_roundtrip_and_subnormal_fold_is_lossy` can pin
+    /// why folding is not an option.
     #[allow(dead_code)]
     pub(crate) fn decode_e4m3(byte: u8) -> f32 {
         let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
@@ -2123,7 +2150,11 @@ pub(crate) mod recipe {
     }
 
     /// Round v to the nearest F8_E4M3FN byte, saturating at ±448 (the MLX
-    /// ToFP8 semantics). Reference implementation for the ingest tests.
+    /// ToFP8 semantics). Reference implementation for the ingest tests only
+    /// (see [`decode_e4m3`]); nothing in production re-encodes a group scale.
+    /// Note it never returns 0x00 for a tiny non-zero magnitude — it is a
+    /// nearest-code scan over 0x01..=0x7E — so it is only meaningful for
+    /// inputs at or above E4M3's smallest subnormal (2^-9).
     #[allow(dead_code)]
     pub(crate) fn encode_e4m3_round(v: f32) -> u8 {
         if !v.is_finite() || v >= 448.0 {
@@ -2178,54 +2209,67 @@ pub(crate) mod recipe {
         MxArray::from_uint32(&words, &[rows, bytes_per_row / 4])
     }
 
-    /// Fold an NVFP4 scale pair into a single E4M3 scale byte: the MLX nvfp4
-    /// format stores one u8 E4M3 scale per group, while NVIDIA stores a
-    /// per-group E4M3 weight_scale plus a per-tensor F32 weight_scale_2.
-    /// Output = e4m3_round(e4m3_decode(weight_scale) * weight_scale_2),
-    /// computed with the runtime's own from_fp8/to_fp8 so the dequantized
-    /// value MLX produces (from_fp8(scales_out) * fp4_lut) matches NVIDIA's
-    /// (fp4_lut * e4m3_decode(weight_scale) * weight_scale_2) up to the
-    /// mandated one-ulp e4m3 re-round of the product.
-    pub(crate) fn fold_nvfp4_scales(
+    /// Validate an NVFP4 group's scale sidecars and extract the per-tensor
+    /// global scale (NVIDIA's `weight_scale_2`) as a plain f32.
+    ///
+    /// The per-group `weight_scale` stays UNTOUCHED — it is emitted verbatim
+    /// as `.scales`. The global scale is carried out-of-band in a
+    /// `.global_scale` key and applied on the projection output at runtime;
+    /// folding it into the E4M3 group scales costs a mean 8.15% relative
+    /// error because the product is subnormal in E4M3 (see the module doc).
+    pub(crate) fn nvfp4_global_scale(
+        base: &str,
         weight_scale: &MxArray,
         weight_scale_2: &MxArray,
-    ) -> Result<MxArray> {
+    ) -> Result<f32> {
         if weight_scale.dtype()? != DType::Uint8 {
             return Err(Error::from_reason(format!(
                 "Nemotron-H NVFP4 weight_scale must be U8 (F8_E4M3 storage), got {:?}",
                 weight_scale.dtype()?
             )));
         }
-        let s2 = weight_scale_2.item_at_float32(0)?;
-        if !s2.is_finite() {
+        if weight_scale_2.size()? != 1 {
             return Err(Error::from_reason(format!(
-                "Nemotron-H NVFP4 weight_scale_2 must be finite, got {s2}"
+                "Nemotron-H NVFP4 '{base}.weight_scale_2' must be a single per-tensor scalar, got shape {:?}",
+                weight_scale_2.shape()?.as_ref()
             )));
         }
-        let decoded = weight_scale.from_fp8(DType::Float32)?;
-        let scaled = decoded.mul_scalar(s2 as f64)?;
-        scaled.to_fp8()
+        let s2 = weight_scale_2.item_at_float32(0)?;
+        if !s2.is_finite() || s2 <= 0.0 {
+            return Err(Error::from_reason(format!(
+                "Nemotron-H NVFP4 weight_scale_2 must be finite and positive, got {s2}"
+            )));
+        }
+        Ok(s2)
     }
 
-    /// Dequantize an NVFP4 weight back to BF16 (the dense lm_head path):
-    /// repack to u32, fold the scales, then mlx_dequantize(mode="nvfp4").
-    pub(crate) fn dequant_nvfp4_to_bf16(
+    /// Dequantize an NVFP4 weight back to BF16 (the dense lm_head path) at
+    /// FULL precision: repack to u32, dequantize against the UNMODIFIED
+    /// per-group E4M3 scales into F32, multiply by the per-tensor global
+    /// scale, then cast to BF16.
+    ///
+    /// The global scale is applied AFTER the dequant, not folded into the
+    /// E4M3 scale bytes: folding rounds `decode_e4m3(ws) * s2` back through
+    /// E4M3, which for the real `s2` ~ 8.65e-5 is subnormal and ~8% lossy.
+    /// The intermediate |code * decode_e4m3(ws)| is bounded by 6 * 448 = 2688,
+    /// so F32 carries it trivially and the only rounding is the final BF16
+    /// cast (which the runtime would apply anyway).
+    pub(crate) fn dequant_nvfp4_to_bf16_exact(
         weight: &MxArray,
         weight_scale: &MxArray,
-        weight_scale_2: &MxArray,
+        global_scale: f32,
     ) -> Result<MxArray> {
         let packed = repack_nvfp4_u8_to_u32(weight)?;
-        let folded = fold_nvfp4_scales(weight_scale, weight_scale_2)?;
         let mode_c = std::ffi::CString::new("nvfp4")
             .map_err(|e| Error::from_reason(format!("Invalid mode string: {e}")))?;
         let handle = unsafe {
             mlx_sys::mlx_dequantize(
                 packed.as_raw_ptr(),
-                folded.as_raw_ptr(),
+                weight_scale.as_raw_ptr(),
                 std::ptr::null_mut(),
                 16,
                 4,
-                DType::BFloat16 as i32,
+                DType::Float32 as i32,
                 mode_c.as_ptr(),
             )
         };
@@ -2234,7 +2278,10 @@ pub(crate) mod recipe {
                 "mlx_dequantize failed for Nemotron-H NVFP4 weight (lm_head)",
             ));
         }
-        MxArray::from_handle(handle, "nemotron_h_nvfp4_dequant")
+        let dequant = MxArray::from_handle(handle, "nemotron_h_nvfp4_dequant")?;
+        dequant
+            .mul_scalar(global_scale as f64)?
+            .astype(DType::BFloat16)
     }
 
     /// Re-quantize a plain FP8 (E4M3) weight into the MLX mxfp8 layout:
@@ -2477,8 +2524,8 @@ pub(crate) mod recipe {
         }
 
         let mut out: HashMap<String, MxArray> = HashMap::with_capacity(weights.len());
-        // (layer, proj) -> (expert_index, packed_weight, scales)
-        let mut expert_stack: HashMap<(usize, String), Vec<(usize, MxArray, MxArray)>> =
+        // (layer, proj) -> (expert_index, packed_weight, scales, global_scale)
+        let mut expert_stack: HashMap<(usize, String), Vec<(usize, MxArray, MxArray, f32)>> =
             HashMap::new();
 
         // Group pass: repack/fold NVFP4 and requant FP8 from the pre-cloned
@@ -2494,20 +2541,30 @@ pub(crate) mod recipe {
                         )));
                     }
                     let packed = repack_nvfp4_u8_to_u32(&weight)?;
-                    let scales = fold_nvfp4_scales(&weight_scale, &weight_scale_2)?;
+                    // The per-group E4M3 scale bytes are emitted VERBATIM; the
+                    // per-tensor global scale rides along out-of-band.
+                    let s2 = nvfp4_global_scale(&base, &weight_scale, &weight_scale_2)?;
                     if let Some((layer, expert_idx, proj)) = parse_nemotron_expert_base(&base) {
                         expert_stack
                             .entry((layer, proj.to_string()))
                             .or_default()
-                            .push((expert_idx, packed, scales));
+                            .push((expert_idx, packed, weight_scale.clone(), s2));
                     } else if base == "lm_head" {
-                        let dequant =
-                            dequant_nvfp4_to_bf16(&weight, &weight_scale, &weight_scale_2)?;
+                        // lm_head is dense at runtime: fold the global scale
+                        // into the dequant instead of emitting a sidecar.
+                        let dequant = dequant_nvfp4_to_bf16_exact(&weight, &weight_scale, s2)?;
                         out.insert("lm_head.weight".to_string(), dequant);
                     } else {
                         // shared_experts (and any other non-expert NVFP4 group).
                         out.insert(format!("{base}.weight"), packed);
-                        out.insert(format!("{base}.scales"), scales);
+                        out.insert(format!("{base}.scales"), weight_scale.clone());
+                        // Float32 by construction — bf16 would round s2 with
+                        // ~0.4% error, and nemotron owns its own dtype cast so
+                        // nothing downstream re-casts this key.
+                        out.insert(
+                            format!("{base}.global_scale"),
+                            MxArray::from_float32(&[s2], &[1])?,
+                        );
                     }
                 }
                 None => {
@@ -2551,7 +2608,7 @@ pub(crate) mod recipe {
         // Stack the per-expert NVFP4 pairs into the fused [E, N, K/8] /
         // [E, N, K/16] QuantizedSwitchLinear layout, in expert order.
         for ((layer, proj), mut entries) in expert_stack {
-            entries.sort_by_key(|(idx, _, _)| *idx);
+            entries.sort_by_key(|(idx, _, _, _)| *idx);
             if entries.len() != n_routed_experts {
                 return Err(Error::from_reason(format!(
                     "Nemotron-H layer {layer} mixer.experts.{proj}: stacked {} of {} experts (missing per-expert weights)",
@@ -2559,20 +2616,30 @@ pub(crate) mod recipe {
                     n_routed_experts
                 )));
             }
-            for (i, (idx, _, _)) in entries.iter().enumerate() {
+            for (i, (idx, _, _, _)) in entries.iter().enumerate() {
                 if *idx != i {
                     return Err(Error::from_reason(format!(
                         "Nemotron-H layer {layer} mixer.experts.{proj}: expert index {idx} at position {i} — non-contiguous expert set"
                     )));
                 }
             }
-            let weight_refs: Vec<&MxArray> = entries.iter().map(|(_, w, _)| w).collect();
-            let scale_refs: Vec<&MxArray> = entries.iter().map(|(_, _, s)| s).collect();
+            let weight_refs: Vec<&MxArray> = entries.iter().map(|(_, w, _, _)| w).collect();
+            let scale_refs: Vec<&MxArray> = entries.iter().map(|(_, _, s, _)| s).collect();
+            // weight_scale_2 VARIES per expert on the real checkpoint (up to a
+            // 4.18x spread over 94 distinct values), so this is an [E] vector
+            // gathered by the routing indices, never a scalar. The entries are
+            // sorted and index-contiguous (asserted above), so position i is
+            // expert i by construction.
+            let global_scales: Vec<f32> = entries.iter().map(|(_, _, _, g)| *g).collect();
             let stacked_weight = MxArray::stack(weight_refs, Some(0))?;
             let stacked_scales = MxArray::stack(scale_refs, Some(0))?;
             let base = format!("backbone.layers.{layer}.mixer.experts.{proj}");
             out.insert(format!("{base}.weight"), stacked_weight);
             out.insert(format!("{base}.scales"), stacked_scales);
+            out.insert(
+                format!("{base}.global_scale"),
+                MxArray::from_float32(&global_scales, &[n_routed_experts as i64])?,
+            );
             if verbose {
                 info!(
                     "  Nemotron-H layer {}: stacked {} experts ({proj})",
@@ -2840,7 +2907,9 @@ fn validate_nemotron_h_ingest_options(
             "Nemotron-H (nemotron_h) checkpoints are already quantized by NVIDIA (NVFP4 \
              experts/shared_experts/lm_head, FP8 mamba projections) and convert in INGEST mode \
              only: omit --quantize, --q-recipe, --q-mxfp, --imatrix-path, and --q-mtp. The \
-             NVFP4/FP8 codes are repacked losslessly into the MLX nvfp4/mxfp8 layouts."
+             NVFP4 codes and their per-group E4M3 scale bytes are repacked byte-for-byte into \
+             the MLX nvfp4 layout (with weight_scale_2 carried as a separate .global_scale), \
+             and the FP8 mamba projections are re-quantized to mxfp8."
                 .to_string(),
         ));
     }
@@ -17632,14 +17701,23 @@ mod tests {
         }
     }
 
-    /// E4M3 reference decode/encode round-trips on known bit patterns, and the
-    /// production scale fold (MLX from_fp8 * scalar -> to_fp8) reproduces the
-    /// reference e4m3_round(e4m3_decode * scale_2) within one e4m3 ulp.
+    /// E4M3 reference decode/encode round-trips on known bit patterns, PLUS
+    /// the pinned reason the ingest no longer folds `weight_scale_2` into the
+    /// per-group E4M3 scale.
+    ///
+    /// The fixture this replaced (`nemotron_e4m3_decode_and_fold_roundtrip`)
+    /// used `s2 = 1.5`, which keeps every product inside E4M3's NORMAL range,
+    /// so a `rel < 0.07` tolerance passed and the fold looked like a one-ulp
+    /// re-round. The REAL checkpoint's `weight_scale_2` is ~8.6e-5: the
+    /// product falls into E4M3's subnormal band and the re-encode is lossy by
+    /// a median 25% over this byte range. This test pins the fold as LOSSY.
+    ///
+    /// MUTATION CAUGHT: someone re-adding `fold_nvfp4_scales` and justifying
+    /// it with the old `rel < 0.07` tolerance measured at a fictional scale.
     #[test]
-    fn nemotron_e4m3_decode_and_fold_roundtrip() {
+    fn nemotron_e4m3_decode_roundtrip_and_subnormal_fold_is_lossy() {
         use crate::convert::recipe::decode_e4m3;
         use crate::convert::recipe::encode_e4m3_round;
-        use crate::convert::recipe::fold_nvfp4_scales;
 
         assert_eq!(decode_e4m3(0x00), 0.0, "zero");
         assert_eq!(decode_e4m3(0x80), -0.0, "negative zero");
@@ -17657,29 +17735,273 @@ mod tests {
         assert_eq!(encode_e4m3_round(0.0), 0x00, "zero encodes zero");
         assert_eq!(encode_e4m3_round(1.75), 0x3E, "exact representable");
 
-        // Fold: production MLX-op fold vs the reference decode/round. Input
-        // bytes avoid exact e4m3 midpoints so the two rounding paths agree.
-        let ws_bytes: Vec<u8> = (0..16).map(|i| 0x20 + i * 2).collect();
-        let ws = MxArray::from_uint8(&ws_bytes, &[4, 4]).unwrap();
-        let s2 = MxArray::from_float32(&[1.5], &[1]).unwrap();
-        let folded = fold_nvfp4_scales(&ws, &s2).unwrap();
-        assert!(matches!(folded.dtype().unwrap(), DType::Uint8));
-        let folded_bytes = folded.to_uint8().unwrap();
-        for (i, (b, fb)) in ws_bytes.iter().zip(&folded_bytes).enumerate() {
-            let want = decode_e4m3(*b) * 1.5;
-            let got = decode_e4m3(*fb);
-            let rel = (got - want).abs() / want.max(1e-12);
-            assert!(
-                rel < 0.07,
-                "fold[{i}]: decoded {got} vs expected {want} (rel {rel:.4}) exceeds one e4m3 ulp"
+        // The real per-tensor global scale from
+        // nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4.
+        const S2: f32 = 8.646647e-5;
+        // E4M3's smallest NORMAL magnitude is 2^-6; below that the format has
+        // 3 bits of mantissa spread over a fixed 2^-9 step, so relative
+        // precision collapses.
+        const E4M3_MIN_NORMAL: f32 = 0.015625; // 2^-6
+
+        let mut subnormal = 0usize;
+        let mut lossy = 0usize;
+        let mut total = 0usize;
+        // Start at 0x38 (= 1.0): below it the product underflows E4M3
+        // entirely, which would make the point trivially.
+        for b in 0x38u8..=0x7E {
+            let product = decode_e4m3(b) * S2;
+            let reencoded = decode_e4m3(encode_e4m3_round(product));
+            let rel = (reencoded - product).abs() / product;
+            total += 1;
+            if product < E4M3_MIN_NORMAL {
+                subnormal += 1;
+            }
+            if rel > 0.05 {
+                lossy += 1;
+            }
+        }
+        assert_eq!(total, 71);
+        assert!(
+            subnormal * 3 >= total * 2,
+            "expected the great majority of decode_e4m3(b) * {S2} products to be E4M3-subnormal, got {subnormal}/{total}"
+        );
+        assert!(
+            lossy * 2 > total,
+            "expected re-encoding decode_e4m3(b) * {S2} through E4M3 to lose >5% for a majority of bytes, got {lossy}/{total}"
+        );
+
+        // Two concrete anchors so a future reader sees the magnitude rather
+        // than a ratio. 0x60 decodes to 32.0; 32.0 * S2 = 2.767e-3, which
+        // E4M3 can only represent as 1.953e-3 (= 2^-9), a 29.4% loss.
+        let p60 = decode_e4m3(0x60) * S2;
+        assert!(p60 < E4M3_MIN_NORMAL);
+        let r60 = (decode_e4m3(encode_e4m3_round(p60)) - p60).abs() / p60;
+        assert!(
+            r60 > 0.25,
+            "0x60 fold error {r60} should be ~0.294, not within an ulp"
+        );
+        // 0x70 decodes to 128.0; the product is still subnormal and 5.9% off.
+        let p70 = decode_e4m3(0x70) * S2;
+        assert!(p70 < E4M3_MIN_NORMAL);
+        let r70 = (decode_e4m3(encode_e4m3_round(p70)) - p70).abs() / p70;
+        assert!(r70 > 0.05, "0x70 fold error {r70} should be ~0.059");
+    }
+
+    /// The NVFP4 ingest keeps NVIDIA's per-group E4M3 `weight_scale` bytes
+    /// BYTE-IDENTICAL in `.scales` and emits `weight_scale_2` as a separate
+    /// Float32 `.global_scale` sidecar ([E] for the stacked experts), so the
+    /// reconstruction is EXACT rather than ~8% off.
+    ///
+    /// MUTATION CAUGHT: any reintroduction of the fold. Assertion (i) fails on
+    /// the first scale byte; assertion (iii) fails by ~8-30%. The scales here
+    /// deliberately span E4M3's subnormal band (0x01) through its max finite
+    /// code (0x7E), and `weight_scale_2` is a RANK-0 array holding the real
+    /// checkpoint value — the fixture this supersedes used a rank-1 [1.5],
+    /// which hid both the rank and the subnormal collapse.
+    #[test]
+    fn nemotron_nvfp4_ingest_keeps_e4m3_scales_byte_identical_and_emits_global_scale() {
+        use crate::convert::recipe::ConversionRecipe;
+        use crate::convert::recipe::NemotronHRecipe;
+        use crate::convert::recipe::decode_e4m3;
+
+        // Realistic per-expert global scales: the real checkpoint spreads
+        // weight_scale_2 over ~4x across experts, so a scalar implementation
+        // would mis-scale all but one.
+        const S2: [f32; 3] = [8.646647e-5, 5.658e-5, 2.124e-4];
+        // Scale bytes spanning the subnormal band (0x01), the normal range,
+        // and the max finite code (0x7E).
+        const WS: [u8; 8] = [0x01, 0x08, 0x20, 0x3E, 0x5A, 0x70, 0x7E, 0x38];
+        // Two fp4 codes per byte, low nibble first. [N=2, K/2=32] => K = 64,
+        // i.e. four 16-wide groups per row, matching WS's 8 scale bytes.
+        const W: [u8; 64] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC,
+            0xDE, 0xF0, 0x02, 0x46, 0x8A, 0xCE, 0x13, 0x57, 0x9B, 0xDF, 0x24, 0x68, 0xAC, 0xE0,
+            0x35, 0x79, 0xBD, 0xF1, 0x0F, 0x1E, 0x2D, 0x3C, 0x4B, 0x5A, 0x69, 0x78, 0x87, 0x96,
+            0xA5, 0xB4, 0xC3, 0xD2, 0xE1, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+            0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00,
+        ];
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        for (e, s2) in S2.iter().enumerate() {
+            for proj in ["up_proj", "down_proj"] {
+                let base = format!("backbone.layers.0.mixer.experts.{e}.{proj}");
+                weights.insert(
+                    format!("{base}.weight"),
+                    MxArray::from_uint8(&W, &[2, 32]).unwrap(),
+                );
+                weights.insert(
+                    format!("{base}.weight_scale"),
+                    MxArray::from_uint8(&WS, &[2, 4]).unwrap(),
+                );
+                // RANK-0 scalar, exactly like the real tensor.
+                weights.insert(
+                    format!("{base}.weight_scale_2"),
+                    MxArray::from_float32(&[*s2], &[]).unwrap(),
+                );
+            }
+        }
+        // Minimal non-expert body so the ingest has something to pass through.
+        weights.insert(
+            "backbone.layers.0.norm.weight".to_string(),
+            MxArray::from_float32(&[1.0; 4], &[4]).unwrap(),
+        );
+
+        let config = serde_json::json!({
+            "layers_block_type": ["moe"],
+            "n_routed_experts": 3,
+        });
+        let out = NemotronHRecipe
+            .sanitize(weights, &config, "bfloat16", false, false)
+            .expect("ingest must succeed");
+
+        let base = "backbone.layers.0.mixer.experts.up_proj";
+        // (i) .scales are byte-identical to the source weight_scale, per expert.
+        let scales = &out[&format!("{base}.scales")];
+        assert!(matches!(scales.dtype().unwrap(), DType::Uint8));
+        assert_eq!(scales.shape().unwrap().as_ref(), &[3, 2, 4]);
+        let scale_bytes = scales.to_uint8().unwrap();
+        for e in 0..3 {
+            for (g, want) in WS.iter().enumerate() {
+                assert_eq!(
+                    scale_bytes[e * WS.len() + g],
+                    *want,
+                    "expert {e} group {g}: .scales byte must equal the source weight_scale byte VERBATIM (the fold is gone)"
+                );
+            }
+        }
+
+        // (ii) .global_scale exists, is Float32 [E], and carries s2 bit-for-bit.
+        let gs = &out[&format!("{base}.global_scale")];
+        assert!(
+            matches!(gs.dtype().unwrap(), DType::Float32),
+            "global_scale must stay Float32 — bf16 rounds 8.6e-5 with ~0.4% error"
+        );
+        assert_eq!(gs.shape().unwrap().as_ref(), &[3]);
+        let gs_vals: Vec<f32> = gs.to_float32().unwrap().to_vec();
+        for (e, want) in S2.iter().enumerate() {
+            assert_eq!(
+                gs_vals[e].to_bits(),
+                want.to_bits(),
+                "global_scale[{e}] must be the source weight_scale_2 bit-for-bit"
             );
         }
-        // Reference encode matches the production fold byte-for-byte on these
-        // non-tie inputs.
-        for (i, (b, fb)) in ws_bytes.iter().zip(&folded_bytes).enumerate() {
-            let want = encode_e4m3_round(decode_e4m3(*b) * 1.5);
-            assert_eq!(*fb, want, "fold[{i}]: reference e4m3_round mismatch");
+        assert!(out.contains_key(&format!("{base}.weight")));
+
+        // (iii) dequant(.weight, .scales) * global_scale[e] reproduces the
+        // exact NVIDIA reference LUT[code] * decode_e4m3(ws) * s2.
+        let packed = &out[&format!("{base}.weight")];
+        let mode_c = std::ffi::CString::new("nvfp4").unwrap();
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                packed.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                std::ptr::null_mut(),
+                16,
+                4,
+                0, // float32
+                mode_c.as_ptr(),
+            )
+        };
+        assert!(!handle.is_null());
+        let dequant = MxArray::from_handle(handle, "nvfp4_dequant").unwrap();
+        assert_eq!(dequant.shape().unwrap().as_ref(), &[3, 2, 64]);
+        let got: Vec<f32> = dequant.to_float32().unwrap().to_vec();
+
+        let lut: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        // Source codes in element order: byte j holds element 2j (low nibble)
+        // and element 2j+1 (high nibble).
+        let mut codes: Vec<usize> = Vec::with_capacity(128);
+        for b in W.iter() {
+            codes.push((b & 0x0F) as usize);
+            codes.push((b >> 4) as usize);
         }
+        // Tolerance 1e-6 relative: the only arithmetic between the reference
+        // and the checkpoint is one f32 multiply of two exactly-representable
+        // factors, so 1e-6 is ~8 orders of magnitude tighter than the ~8%
+        // (and up to 30%) error the fold introduced.
+        let mut max_rel = 0.0f64;
+        for e in 0..3usize {
+            for row in 0..2usize {
+                for col in 0..64usize {
+                    let elem = row * 64 + col;
+                    let group = col / 16;
+                    let want = lut[codes[elem]] as f64
+                        * decode_e4m3(WS[row * 4 + group]) as f64
+                        * S2[e] as f64;
+                    // The runtime applies global_scale[e] on the OUTPUT.
+                    let g = got[e * 128 + elem] as f64 * gs_vals[e] as f64;
+                    if want == 0.0 {
+                        assert_eq!(g, 0.0);
+                        continue;
+                    }
+                    max_rel = max_rel.max((g - want).abs() / want.abs());
+                }
+            }
+        }
+        assert!(
+            max_rel < 1e-6,
+            "reconstruction vs the exact NVIDIA reference: max rel {max_rel:e} (the fold scored ~8e-2)"
+        );
+    }
+
+    /// lm_head is dequantized to bf16 at ingest, and that dequant must use the
+    /// EXACT scale (raw weight_scale into F32, then * weight_scale_2) rather
+    /// than the folded E4M3 scale.
+    ///
+    /// MUTATION CAUGHT: leaving lm_head on `fold_nvfp4_scales`, which at the
+    /// real s2 is ~8% (and up to 30%) off — 20x+ outside bf16's tolerance.
+    #[test]
+    fn nemotron_lm_head_dequant_uses_the_exact_global_scale() {
+        use crate::convert::recipe::decode_e4m3;
+        use crate::convert::recipe::dequant_nvfp4_to_bf16_exact;
+
+        const S2: f32 = 8.646647e-5;
+        const WS: [u8; 4] = [0x60, 0x70, 0x3E, 0x7E];
+        const W: [u8; 32] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC,
+            0xDE, 0xF0, 0x02, 0x46, 0x8A, 0xCE, 0x13, 0x57, 0x9B, 0xDF, 0x24, 0x68, 0xAC, 0xE0,
+            0x35, 0x79, 0xBD, 0xF1,
+        ];
+        // [N=2, K/2=16] -> K = 32, two groups of 16 per row.
+        let weight = MxArray::from_uint8(&W, &[2, 16]).unwrap();
+        let ws = MxArray::from_uint8(&WS, &[2, 2]).unwrap();
+
+        let head = dequant_nvfp4_to_bf16_exact(&weight, &ws, S2).unwrap();
+        assert!(matches!(head.dtype().unwrap(), DType::BFloat16));
+        assert_eq!(head.shape().unwrap().as_ref(), &[2, 32]);
+        let got: Vec<f32> = head.to_float32().unwrap().to_vec();
+
+        let lut: [f32; 16] = [
+            0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+        ];
+        let mut codes: Vec<usize> = Vec::with_capacity(64);
+        for b in W.iter() {
+            codes.push((b & 0x0F) as usize);
+            codes.push((b >> 4) as usize);
+        }
+        // bf16 keeps 8 significant bits -> 2^-8 = 0.39% worst-case relative
+        // rounding. The folded path would be ~5.9% (0x70) to ~29% (0x60).
+        let mut max_rel = 0.0f64;
+        for row in 0..2usize {
+            for col in 0..32usize {
+                let elem = row * 32 + col;
+                let want = lut[codes[elem]] as f64
+                    * decode_e4m3(WS[row * 2 + col / 16]) as f64
+                    * S2 as f64;
+                let g = got[elem] as f64;
+                if want == 0.0 {
+                    assert_eq!(g, 0.0);
+                    continue;
+                }
+                max_rel = max_rel.max((g - want).abs() / want.abs());
+            }
+        }
+        assert!(
+            max_rel < 0.004,
+            "lm_head dequant max rel {max_rel:e} exceeds the bf16 budget (0.4%) — the folded scale scores 0.059..0.29"
+        );
     }
 
     /// The FP8 -> mxfp8 requant path keeps reconstruction error within the
@@ -17976,11 +18298,24 @@ mod tests {
         let dn_w = &out["backbone.layers.0.mixer.experts.down_proj.weight"];
         assert_eq!(dn_w.shape().unwrap().as_ref(), &[2, 4, 2]);
 
+        // Stacked experts carry an [E] Float32 global scale (weight_scale_2
+        // varies per expert on the real checkpoint).
+        for proj in ["up_proj", "down_proj"] {
+            let gs = &out[&format!("backbone.layers.0.mixer.experts.{proj}.global_scale")];
+            assert!(matches!(gs.dtype().unwrap(), DType::Float32));
+            assert_eq!(gs.shape().unwrap().as_ref(), &[2]);
+            assert_eq!(gs.to_float32().unwrap().to_vec(), vec![2.0f32, 2.0]);
+        }
+
         // shared_experts stay 2-D nvfp4 pairs.
         let sh_w = &out["backbone.layers.0.mixer.shared_experts.up_proj.weight"];
         assert!(matches!(sh_w.dtype().unwrap(), DType::Uint32));
         assert_eq!(sh_w.shape().unwrap().as_ref(), &[4, 2]);
         assert!(out.contains_key("backbone.layers.0.mixer.shared_experts.up_proj.scales"));
+        let sh_gs = &out["backbone.layers.0.mixer.shared_experts.up_proj.global_scale"];
+        assert!(matches!(sh_gs.dtype().unwrap(), DType::Float32));
+        assert_eq!(sh_gs.shape().unwrap().as_ref(), &[1]);
+        assert_eq!(sh_gs.to_float32().unwrap().to_vec(), vec![3.0f32]);
 
         // lm_head dequantized to BF16 [N, K].
         let head = &out["lm_head.weight"];
@@ -18027,7 +18362,34 @@ mod tests {
 
         // Every scale sidecar and KV scale is gone.
         assert!(!out.keys().any(|k| k.ends_with(".weight_scale")));
+        // weight_scale_2 is CONSUMED (into .global_scale), never passed through.
         assert!(!out.keys().any(|k| k.ends_with(".weight_scale_2")));
+
+        // Key-set contract: every nvfp4 group emits .weight + .scales +
+        // .global_scale; the mxfp8 mamba projections emit no .global_scale,
+        // and lm_head (dequantized to bf16) emits none either.
+        //
+        // MUTATION CAUGHT: emitting .global_scale only for the stacked
+        // experts (leaving shared_experts silently 1.15e4x wrong), or leaking
+        // one onto the mxfp8/dense paths where nothing would ever read it.
+        for key in out.keys() {
+            let Some(base) = key.strip_suffix(".scales") else {
+                continue;
+            };
+            let is_nvfp4 =
+                base.contains(".mixer.experts.") || base.contains(".mixer.shared_experts.");
+            assert_eq!(
+                out.contains_key(&format!("{base}.global_scale")),
+                is_nvfp4,
+                "{base}: .global_scale presence must track nvfp4-ness"
+            );
+        }
+        assert!(
+            !out.contains_key("lm_head.global_scale"),
+            "lm_head is dequantized to bf16 at convert; its global scale is folded into the dequant"
+        );
+        assert!(!out.contains_key("backbone.layers.1.mixer.in_proj.global_scale"));
+        assert!(!out.contains_key("backbone.layers.1.mixer.out_proj.global_scale"));
         assert!(!out.keys().any(|k| k.ends_with(".input_scale")));
         assert!(!out.keys().any(|k| k.ends_with(".k_scale")));
         assert!(!out.keys().any(|k| k.ends_with(".v_scale")));

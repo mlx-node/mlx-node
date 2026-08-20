@@ -1,20 +1,28 @@
 //! NemotronH GQA attention mixer.
 //!
 //! Port of the HuggingFace NemotronHAttention: GQA (32 query / 2 KV heads,
-//! head_dim 128), standard RoPE (theta 10000, full rotary), bias-free
-//! projections, BF16. No Q/K RMSNorm and no softcap for this family.
+//! head_dim 128), bias-free projections, BF16. No Q/K RMSNorm and no
+//! softcap for this family.
+//!
+//! NemotronH attention is NoPE - no positional rotation is applied
+//! anywhere. All three references agree: HF `NemotronHAttention.forward`
+//! projects Q/K/V, updates the cache and calls the attention interface
+//! (`apply_rotary_pos_emb` is defined in that module but never called from
+//! this class), vLLM's `NemotronHAttention.forward(self, hidden_states,
+//! **kwargs)` takes no `positions` at all, and mlx-lm's `__call__` goes
+//! straight from the projections to SDPA. Position information reaches the
+//! model through the Mamba-2 mixers instead.
 //!
 //! The same layer serves both the backbone attention blocks and the MTP
-//! head's attention layer. The MTP attention additionally exposes a
-//! read-only forward that attends over a TARGET KV cache (the backbone's
-//! final attention layer) at the next absolute position without writing
-//! K/V - the vLLM NemotronH-MTP "attention at positions t+1 reading
-//! target KV" contract.
+//! head's attention layer. The MTP head is a real decoder layer with its
+//! OWN KV cache group (vLLM `NemotronHMTPAttentionDecoderLayer` ->
+//! `NemotronHAttention` -> its own `Attention(...)`), so it drives the very
+//! same `forward` as the backbone, with its own per-layer cache.
 
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::{DType, MxArray};
 use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
-use crate::nn::{Linear, RoPE};
+use crate::nn::Linear;
 use crate::transformer::KVCache;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::bindgen_prelude::*;
@@ -26,7 +34,6 @@ pub struct NemotronHAttention {
     pub(crate) k_proj: LinearProj,
     pub(crate) v_proj: LinearProj,
     pub(crate) o_proj: LinearProj,
-    pub(crate) rope: RoPE,
     pub(crate) num_heads: i32,
     pub(crate) num_kv_heads: i32,
     pub(crate) head_dim: i32,
@@ -44,13 +51,6 @@ impl NemotronHAttention {
         let v_proj = LinearProj::Standard(Linear::new(h, kv_dim, Some(false))?);
         let o_proj = LinearProj::Standard(Linear::new(q_dim, h, Some(false))?);
 
-        let rope = RoPE::new(
-            config.head_dim,
-            Some(false), // traditional=false (neox-style)
-            Some(config.rope_theta),
-            None,
-        );
-
         let scale = (config.head_dim as f64).powf(-0.5);
 
         Ok(Self {
@@ -58,7 +58,6 @@ impl NemotronHAttention {
             k_proj,
             v_proj,
             o_proj,
-            rope,
             num_heads: config.num_attention_heads,
             num_kv_heads: config.num_key_value_heads,
             head_dim: config.head_dim,
@@ -102,10 +101,6 @@ impl NemotronHAttention {
         ])?;
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
 
-        let offset = cache.as_ref().map_or(0, |c| c.get_offset());
-        let queries = self.rope.forward(&queries, Some(offset))?;
-        let keys = self.rope.forward(&keys, Some(offset))?;
-
         let (keys, values) = if let Some(c) = cache {
             c.update_and_fetch(&keys, &values)?
         } else {
@@ -120,35 +115,6 @@ impl NemotronHAttention {
             scaled_dot_product_attention(&queries, &keys, &values, self.scale, None)?
         };
 
-        let output = output.transpose(Some(&[0, 2, 1, 3]))?;
-        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
-
-        self.o_proj.forward(&output)
-    }
-
-    /// Read-only attention over a TARGET KV cache (the MTP draft path).
-    ///
-    /// x is [1, 1, hidden]; the queries are placed at absolute RoPE
-    /// position position and attend over ALL stored K/V positions in kv
-    /// (no causal mask - every stored position precedes the query).
-    /// K/V are never written.
-    pub fn forward_read_only(&self, x: &MxArray, kv: &KVCache, position: i32) -> Result<MxArray> {
-        let batch = x.shape_at(0)?;
-        let seq_len = x.shape_at(1)?;
-
-        let queries = self.q_proj.forward(x)?;
-        let queries =
-            queries.reshape(&[batch, seq_len, self.num_heads as i64, self.head_dim as i64])?;
-        let queries = queries.transpose(Some(&[0, 2, 1, 3]))?;
-        let queries = self.rope.forward(&queries, Some(position))?;
-
-        let (keys, values) = kv.keys_ref().zip(kv.values_ref()).ok_or_else(|| {
-            Error::from_reason(
-                "NemotronH MTP attention: target KV cache is empty (no committed tokens)",
-            )
-        })?;
-
-        let output = scaled_dot_product_attention(&queries, keys, values, self.scale, None)?;
         let output = output.transpose(Some(&[0, 2, 1, 3]))?;
         let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
@@ -205,10 +171,6 @@ impl NemotronHAttention {
             self.head_dim as i64,
         ])?;
         let values_bhtd = values.transpose(Some(&[0, 2, 1, 3]))?;
-
-        let rope_offset = first_logical_position as i32;
-        let queries_bhtd = self.rope.forward(&queries_bhtd, Some(rope_offset))?;
-        let keys_bhtd = self.rope.forward(&keys_bhtd, Some(rope_offset))?;
 
         // Paged layout [num_tokens, n_kv_heads, head_dim] (batch == 1 on the
         // single-row prefill path).
@@ -360,10 +322,11 @@ impl NemotronHAttention {
 
     /// Uniform batched paged decode for the continuous-batching lane.
     ///
-    /// One token per row: queries [N, H, D], K/V [N, kvH, D] with per-row
-    /// RoPE offsets, one batched native K/V write and one graph-native
-    /// batched attention gather. No serial fallback - a genuine N-row wave
-    /// must share the weight stream.
+    /// One token per row: queries [N, H, D], K/V [N, kvH, D], one batched
+    /// native K/V write and one graph-native batched attention gather. No
+    /// serial fallback - a genuine N-row wave must share the weight stream.
+    /// `rows` carries the per-row (seq id, logical position) pairs the
+    /// adapter needs for slot mapping; no rotation is applied to them.
     pub(crate) fn forward_paged_batched(
         &self,
         x: &MxArray,
@@ -392,17 +355,6 @@ impl NemotronHAttention {
         }
 
         let batch = rows.len() as i64;
-        let offsets = rows
-            .iter()
-            .map(|&(seq_id, position)| {
-                i32::try_from(position).map_err(|_| {
-                    Error::from_reason(format!(
-                        "NemotronH batched decode sequence {seq_id} position {position} exceeds i32::MAX"
-                    ))
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let offsets = MxArray::from_int32(&offsets, &[batch])?;
         let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
 
         let queries = self
@@ -410,13 +362,11 @@ impl NemotronHAttention {
             .forward(x)?
             .reshape(&[batch, 1, self.num_heads as i64, self.head_dim as i64])?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let queries = self.rope.forward_with_offsets(&queries, &offsets)?;
         let keys = self
             .k_proj
             .forward(x)?
             .reshape(&[batch, 1, self.num_kv_heads as i64, self.head_dim as i64])?
             .transpose(Some(&[0, 2, 1, 3]))?;
-        let keys = self.rope.forward_with_offsets(&keys, &offsets)?;
         let values = self
             .v_proj
             .forward(x)?
@@ -469,6 +419,7 @@ mod tests {
             conv_kernel: 4,
             chunk_size: 2,
             time_step_min: 0.001,
+            time_step_limit: None,
             n_routed_experts: 2,
             num_experts_per_tok: 1,
             routed_scaling_factor: 1.0,
@@ -546,41 +497,52 @@ mod tests {
         let _ = out3;
     }
 
-    /// Read-only MTP attention: empty target KV fails closed; populated
-    /// target KV returns the projected output at the next position.
+    /// Regression: NemotronH attention is NoPE (HF `NemotronHAttention.forward`
+    /// never calls `apply_rotary_pos_emb`; vLLM's takes no `positions`; mlx-lm
+    /// goes straight from the projections to SDPA). Without a positional
+    /// rotation the decode output depends only on the SET of cached (K, V)
+    /// pairs, so feeding the same two-token history in the opposite ORDER must
+    /// give a bit-comparable result. With RoPE the two histories rotate K by
+    /// swapped offsets and the outputs diverge.
     #[test]
-    fn read_only_attention_reads_target_kv() {
+    fn attention_has_no_positional_rotation() {
         let cfg = tiny_cfg();
         let attn = NemotronHAttention::new(&cfg).expect("attention builds");
-        let h = cfg.hidden_size as usize;
+        let h = cfg.hidden_size as i64;
+        let tok = |seed: f32| -> Vec<f32> {
+            (0..h)
+                .map(|i| ((i as f32 + seed) * 0.29) % 1.0 - 0.5)
+                .collect()
+        };
+        let (a, b, q) = (tok(0.0), tok(3.0), tok(7.0));
 
-        let kv = KVCache::new();
-        let x = MxArray::from_float32(&vec![0.1f32; h], &[1, 1, h as i64])
-            .unwrap()
-            .astype(DType::BFloat16)
-            .unwrap();
+        let pair = |first: &[f32], second: &[f32]| -> MxArray {
+            let mut buf = first.to_vec();
+            buf.extend_from_slice(second);
+            MxArray::from_float32(&buf, &[1, 2, h]).unwrap()
+        };
+        let query = MxArray::from_float32(&q, &[1, 1, h]).unwrap();
+
+        let run = |hist: MxArray| -> Vec<f32> {
+            let mut cache = KVCache::new();
+            let _ = attn.forward(&hist, None, Some(&mut cache)).unwrap();
+            assert_eq!(cache.get_offset(), 2);
+            attn.forward(&query, None, Some(&mut cache))
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec()
+        };
+
+        let ab = run(pair(&a, &b));
+        let ba = run(pair(&b, &a));
+        let mut max_d = 0.0f32;
+        for (l, r) in ab.iter().zip(ba.iter()) {
+            max_d = max_d.max((l - r).abs());
+        }
         assert!(
-            attn.forward_read_only(&x, &kv, 0).is_err(),
-            "empty target KV must fail closed"
+            max_d <= 1e-5,
+            "attention is order-sensitive, i.e. a positional rotation is applied: max |diff| = {max_d}"
         );
-
-        let mut kv = KVCache::new();
-        let seq: Vec<f32> = (0..2 * h)
-            .map(|i| ((i as f32) * 0.31) % 1.0 - 0.5)
-            .collect();
-        let mx = MxArray::from_float32(&seq, &[1, 2, h as i64])
-            .unwrap()
-            .astype(DType::BFloat16)
-            .unwrap();
-        let attn2 = NemotronHAttention::new(&cfg).expect("attention builds 2");
-        let _ = attn2.forward(&mx, None, Some(&mut kv)).unwrap();
-        assert_eq!(kv.get_offset(), 2);
-
-        let out = attn
-            .forward_read_only(&x, &kv, 2)
-            .expect("read-only attention with populated KV");
-        let vals = out.to_float32().unwrap().to_vec();
-        assert_eq!(vals.len(), h);
-        assert!(vals.iter().all(|v| v.is_finite()));
     }
 }

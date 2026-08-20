@@ -250,7 +250,9 @@ jobs:
   # QAT (wNa8o8) leg (~2.9GB) runs on PR opt-in but is SKIPPED on the push/release
   # gate (its run step early-exits) until CI's HUGGINGFACE_TOKEN is confirmed to
   # reach the gated google/gemma-4-E2B-it-qat-mobile-transformers repo — otherwise
-  # a download failure would block releases.
+  # a download failure would block releases. The nemotron_h leg is PR-opt-in for
+  # the same "must not block a release" reason, but because of SIZE: the only
+  # published checkpoint is the 30B-A3B NVFP4 one (~17GB source, similar output).
   model-test:
     name: e2e ${{ matrix.name }}
     needs: build
@@ -354,6 +356,51 @@ jobs:
             stage1_ts: ''
             stage2_rust: ''
             tests: __test__/models/gemma4-qat-e2e.test.ts
+          # nemotron_h: modelopt NVFP4 INGEST, not a bf16 recipe run. The
+          # shared convert line still passes `-d bf16`, which is a no-op here:
+          # NemotronHRecipe::owns_dtype_cast() is true, so convert.rs skips the
+          # generic dtype pass entirely (crates/mlx-core/src/convert.rs:3006).
+          # `-q`/`--q-recipe`/`--q-mxfp`/`--imatrix-path`/`--q-mtp` ARE rejected
+          # on this source (packages/cli/src/commands/convert.ts:865-873), so
+          # none of them may be added to this leg.
+          #
+          # The `-mlx-bf16` suffix the shared script appends to `out` is a
+          # misnomer for this family — the output is NVFP4/mxfp8. It is only a
+          # directory name; do not "fix" it by special-casing the script.
+          #
+          # Two env vars, deliberately: nemotron_h_paged_vs_flat_parity.rs:140
+          # reads MLX_TEST_MODEL_PATH while
+          # nemotron_h_concurrent_batched_parity.rs:22 reads
+          # MLX_TEST_NEMOTRON_H_MODEL_PATH. Wiring only one silently self-skips
+          # the other gate — it early-returns and libtest counts it as passed.
+          #
+          # PR-opt-in only (the run step skips it on push/dispatch). SIZE IS THE
+          # OPEN RISK: the modelopt source is ~17 GB and the converted output is
+          # ~21 GB, so the leg needs ~38 GB free at once — the convert reads the
+          # source and writes the output side by side, and neither can be
+          # deleted before the tests run. Whether a hosted macos-26 runner has
+          # that much free disk is UNVERIFIED. If this leg fails on ENOSPC the
+          # fix is a self-hosted runner (or a smaller published checkpoint, of
+          # which there is none today), NOT dropping the gates. Keeping it off
+          # the release gate means such a failure cannot block publish, exactly
+          # as for the gemma4 leg.
+          #
+          # Disk is the only extra cost: nemotron_h_paged_vs_flat_parity clones
+          # the checkpoint dir with SYMLINKS (:31-65), copying config.json only,
+          # so its two flat/paged clones add kilobytes, not gigabytes.
+          - name: nemotron_h
+            model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+            slug: nvidia-nemotron-3.5-lightning-30b-a3b-nvfp4
+            mtype: nemotron_h
+            kind: cargo
+            env: MLX_TEST_MODEL_PATH MLX_TEST_NEMOTRON_H_MODEL_PATH
+            stage0_ts: ''
+            stage1_rust: ''
+            stage1_ts: ''
+            stage2_rust: ''
+            tests: >-
+              --test nemotron_h_paged_vs_flat_parity
+              --test nemotron_h_concurrent_batched_parity
     steps:
       - uses: actions/checkout@v6
         with:
@@ -410,6 +457,14 @@ jobs:
           # block releases.
           if [ "${{ matrix.name }}" = "gemma4" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "::notice::Skipping gemma4 QAT leg on ${{ github.event_name }} (PR opt-in only; gated HF repo)."
+            exit 0
+          fi
+          # nemotron_h needs ~38 GB free (a ~17 GB modelopt source plus a ~21 GB
+          # converted output, both live at once). Same treatment as the gemma4
+          # leg: PR opt-in only, so a download/disk failure cannot block a
+          # release. See the matrix entry's comment for the ENOSPC caveat.
+          if [ "${{ matrix.name }}" = "nemotron_h" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "::notice::Skipping nemotron_h leg on ${{ github.event_name }} (PR opt-in only; 30B checkpoint)."
             exit 0
           fi
           # Same reason as the `test` job: `yarn mlx` needs @mlx-node/server's

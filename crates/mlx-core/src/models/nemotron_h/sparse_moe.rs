@@ -37,8 +37,21 @@ pub(crate) fn relu2(x: &MxArray) -> Result<MxArray> {
 /// fused gather_qmm on the packed payload.
 pub enum NemotronHExperts {
     /// Quantized (NVFP4) stacked experts.
-    Quantized(QuantizedSwitchLinear, QuantizedSwitchLinear),
+    ///
+    /// Each side carries an `[E]` Float32 `global_scale`: NVIDIA's
+    /// `weight_scale_2` is NOT folded into the per-group E4M3 scales (that
+    /// costs ~8% — see the convert module doc), so it rides along and is
+    /// gathered by the routing indices onto the projection OUTPUT. It varies
+    /// per expert on the real checkpoint, so a scalar would mis-scale all but
+    /// one of the 128 experts.
+    Quantized {
+        up: QuantizedSwitchLinear,
+        up_global_scale: MxArray,
+        down: QuantizedSwitchLinear,
+        down_global_scale: MxArray,
+    },
     /// Dense bf16 stacked experts (MTP head), pre-transposed [E, K, N].
+    /// Dense weights carry no global scale.
     Dense { up_t: MxArray, down_t: MxArray },
 }
 
@@ -62,17 +75,42 @@ impl NemotronHExperts {
                 shape.to_vec()
             )));
         };
-        let out = match self {
-            NemotronHExperts::Quantized(u, d) => {
-                let ql = if up { u } else { d };
-                ql.forward(&x4, indices, false)?
+        match self {
+            NemotronHExperts::Quantized {
+                up: u,
+                up_global_scale,
+                down: d,
+                down_global_scale,
+            } => {
+                let (ql, gs) = if up {
+                    (u, up_global_scale)
+                } else {
+                    (d, down_global_scale)
+                };
+                // Squeeze FIRST: the gather output is [ne, k, 1, N] and the
+                // gathered scale is [ne, k, 1]. Multiplying before the squeeze
+                // would broadcast the scale against N instead of the expert
+                // dim and silently produce garbage.
+                let out = ql.forward(&x4, indices, false)?.squeeze(Some(&[-2]))?;
+                let dtype = out.dtype()?;
+                // gs is [E] Float32; take(indices, 0) -> [ne, k]; expand to
+                // [ne, k, 1] so it broadcasts across the N columns.
+                let scale = gs.take(indices, 0)?.expand_dims(-1)?;
+                let scaled = out.mul(&scale)?;
+                // The f32 scale promotes the bf16 activation; restore the
+                // routed activation dtype at this projection boundary so the
+                // rest of the block keeps running in bf16.
+                if scaled.dtype()? == dtype {
+                    Ok(scaled)
+                } else {
+                    scaled.astype(dtype)
+                }
             }
             NemotronHExperts::Dense { up_t, down_t } => {
                 let wt = if up { up_t } else { down_t };
-                x4.gather_mm(wt, indices, false)?
+                x4.gather_mm(wt, indices, false)?.squeeze(Some(&[-2]))
             }
-        };
-        out.squeeze(Some(&[-2]))
+        }
     }
 
     fn forward_up(&self, x: &MxArray, indices: &MxArray) -> Result<MxArray> {
@@ -87,8 +125,13 @@ impl NemotronHExperts {
     /// on the quantized/dense representation.
     pub fn set_experts(&mut self, up: ExpertProj, down: ExpertProj) -> Result<()> {
         let experts = match (up, down) {
-            (ExpertProj::Quantized(u), ExpertProj::Quantized(d)) => {
-                NemotronHExperts::Quantized(u, d)
+            (ExpertProj::Quantized(u, ugs), ExpertProj::Quantized(d, dgs)) => {
+                NemotronHExperts::Quantized {
+                    up: u,
+                    up_global_scale: ugs,
+                    down: d,
+                    down_global_scale: dgs,
+                }
             }
             (ExpertProj::Dense(u), ExpertProj::Dense(d)) => NemotronHExperts::Dense {
                 up_t: u.transpose(Some(&[0, 2, 1]))?,
@@ -106,7 +149,7 @@ impl NemotronHExperts {
 
     /// Whether the experts hold quantized backends.
     pub fn is_quantized(&self) -> bool {
-        matches!(self, NemotronHExperts::Quantized(..))
+        matches!(self, NemotronHExperts::Quantized { .. })
     }
 
     /// Test-only: install dense stacked weights (used by the tiny forward
@@ -122,8 +165,10 @@ impl NemotronHExperts {
 }
 
 /// One side of the stacked expert projections, installed by the loader.
+/// The quantized arm carries the mandatory `[E]` Float32 NVFP4 global scale
+/// alongside the packed payload; the loader is fail-closed on its absence.
 pub enum ExpertProj {
-    Quantized(QuantizedSwitchLinear),
+    Quantized(QuantizedSwitchLinear, MxArray),
     Dense(MxArray),
 }
 
@@ -132,6 +177,11 @@ pub enum ExpertProj {
 pub struct NemotronHSharedExpert {
     pub(crate) up_proj: LinearProj,
     pub(crate) down_proj: LinearProj,
+    /// NVFP4 per-tensor global scale (`weight_scale_2`) for each projection,
+    /// applied on that projection's OUTPUT. `None` for dense bf16 projections
+    /// (the MTP head), which have no global scale at all.
+    pub(crate) up_global_scale: Option<f64>,
+    pub(crate) down_global_scale: Option<f64>,
 }
 
 impl NemotronHSharedExpert {
@@ -141,13 +191,24 @@ impl NemotronHSharedExpert {
         Ok(Self {
             up_proj: LinearProj::Standard(crate::nn::Linear::new(h, inter, Some(false))?),
             down_proj: LinearProj::Standard(crate::nn::Linear::new(inter, h, Some(false))?),
+            up_global_scale: None,
+            down_global_scale: None,
         })
     }
 
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
-        let up = self.up_proj.forward(x)?;
+        let mut up = self.up_proj.forward(x)?;
+        // relu2 is homogeneous of degree 2, so the up-projection's global
+        // scale MUST land before it — applying it afterwards would square it.
+        if let Some(g) = self.up_global_scale {
+            up = up.mul_scalar(g)?;
+        }
         let activated = relu2(&up)?;
-        self.down_proj.forward(&activated)
+        let mut out = self.down_proj.forward(&activated)?;
+        if let Some(g) = self.down_global_scale {
+            out = out.mul_scalar(g)?;
+        }
+        Ok(out)
     }
 
     pub fn is_quantized(&self) -> bool {
@@ -199,8 +260,13 @@ impl NemotronHMoE {
             let down = MxArray::zeros(&[e as i64, h as i64, inter as i64], Some(DType::Uint8))?;
             let scales = MxArray::zeros(&[e as i64, inter as i64, 1], Some(DType::Uint8))?;
             let scales_d = MxArray::zeros(&[e as i64, h as i64, 1], Some(DType::Uint8))?;
-            NemotronHExperts::Quantized(
-                QuantizedSwitchLinear::new(
+            // Placeholder payload; the loader replaces both sides (and their
+            // global scales) via set_experts. Unit global scales keep the
+            // placeholder a no-op rather than a hidden 1.0 default on a real
+            // checkpoint — the loader never reaches these.
+            let unit = MxArray::from_float32(&vec![1.0f32; num_experts as usize], &[e as i64])?;
+            NemotronHExperts::Quantized {
+                up: QuantizedSwitchLinear::new(
                     up,
                     scales,
                     None,
@@ -208,7 +274,8 @@ impl NemotronHMoE {
                     4,
                     crate::models::qwen3_5::quantized_linear::NVFP4_MODE.to_string(),
                 ),
-                QuantizedSwitchLinear::new(
+                up_global_scale: unit.clone(),
+                down: QuantizedSwitchLinear::new(
                     down,
                     scales_d,
                     None,
@@ -216,7 +283,8 @@ impl NemotronHMoE {
                     4,
                     crate::models::qwen3_5::quantized_linear::NVFP4_MODE.to_string(),
                 ),
-            )
+                down_global_scale: unit,
+            }
         };
 
         Ok(Self {
@@ -303,6 +371,7 @@ mod tests {
             conv_kernel: 4,
             chunk_size: 2,
             time_step_min: 0.001,
+            time_step_limit: None,
             n_routed_experts: 4,
             num_experts_per_tok: 2,
             routed_scaling_factor: 2.5,
@@ -519,5 +588,194 @@ mod tests {
             max_excess <= 0.0,
             "MoE forward vs dense reference exceeded atol=1e-3, rtol=1e-3 by {max_excess} (got={got:?} want={want:?})"
         );
+    }
+
+    /// THE CROSS-MODULE SEAM. `convert` emits `.global_scale`; this is the
+    /// only test that pins how the runtime consumes it.
+    ///
+    /// Three experts with DISTINCT, unequal global scales, one token routed to
+    /// each. The unscaled `gather_qmm` output is measured from the very same
+    /// `QuantizedSwitchLinear`, so the assertion isolates the scale hook.
+    ///
+    /// MUTATIONS CAUGHT (all of which a 1-expert or equal-scale fixture would
+    /// pass): using `gs[0]` for every token; gathering on the wrong axis;
+    /// broadcasting the `[E]` vector against the trailing N dim instead of the
+    /// expert dim; applying the multiply BEFORE `squeeze(-2)` (which
+    /// broadcasts [ne,k,1,N] against [ne,k,1] into [ne,k,ne,N] and changes the
+    /// shape); and dropping the hook entirely (leaving every projection
+    /// ~1/weight_scale_2 too large).
+    #[test]
+    fn nemotron_experts_global_scale_is_gathered_per_expert() {
+        const E: i64 = 3;
+        const N: i64 = 8;
+        const K: i64 = 32;
+
+        // NVFP4 payload: u32 [E, N, K/8] codes + u8 [E, N, K/16] E4M3 scales.
+        let words: Vec<u32> = (0..(E * N * K / 8) as u32)
+            .map(|i| i.wrapping_mul(0x9E37_79B9) ^ 0x5BF0_3635)
+            .collect();
+        let weight = MxArray::from_uint32(&words, &[E, N, K / 8]).unwrap();
+        // E4M3 bytes in the normal range (0x38 = 1.0 .. 0x40 = 2.0).
+        let scale_bytes: Vec<u8> = (0..(E * N * K / 16) as usize)
+            .map(|i| 0x38u8 + (i % 9) as u8)
+            .collect();
+        let scales = MxArray::from_uint8(&scale_bytes, &[E, N, K / 16]).unwrap();
+
+        let qsl = |w: &MxArray, s: &MxArray| {
+            QuantizedSwitchLinear::new(
+                w.clone(),
+                s.clone(),
+                None,
+                16,
+                4,
+                crate::models::qwen3_5::quantized_linear::NVFP4_MODE.to_string(),
+            )
+        };
+
+        // Deliberately unequal, and none of them 1.0.
+        let gs_vals = [1.0f32, 4.0, 16.0];
+        let gs = MxArray::from_float32(&gs_vals, &[E]).unwrap();
+
+        let experts = NemotronHExperts::Quantized {
+            up: qsl(&weight, &scales),
+            up_global_scale: gs.clone(),
+            down: qsl(&weight, &scales),
+            down_global_scale: gs.clone(),
+        };
+
+        // One token per expert, top_k = 1.
+        let indices = MxArray::from_uint32(&[0, 1, 2], &[3, 1]).unwrap();
+        let xv: Vec<f32> = (0..(3 * K) as usize)
+            .map(|i| ((i as f32) * 0.037).sin())
+            .collect();
+        let x = MxArray::from_float32(&xv, &[3, K])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        let got = experts.forward_up(&x, &indices).unwrap();
+        assert_eq!(got.shape().unwrap().to_vec(), vec![3, 1, N]);
+        let got_v: Vec<f32> = got.to_float32().unwrap().to_vec();
+
+        // Unscaled reference straight from the same packed payload.
+        let x4 = x.reshape(&[3, 1, 1, K]).unwrap();
+        let base = qsl(&weight, &scales)
+            .forward(&x4, &indices, false)
+            .unwrap()
+            .squeeze(Some(&[-2]))
+            .unwrap();
+        let base_v: Vec<f32> = base.to_float32().unwrap().to_vec();
+
+        // The scales are powers of two, so bf16 carries the product exactly.
+        let mut nonzero = 0usize;
+        for (t, gs_t) in gs_vals.iter().enumerate() {
+            for n in 0..N as usize {
+                let idx = t * N as usize + n;
+                let want = base_v[idx] * gs_t;
+                if want.abs() > 1e-6 {
+                    nonzero += 1;
+                }
+                assert!(
+                    (got_v[idx] - want).abs() <= 1e-5 * want.abs().max(1e-3),
+                    "token {t} (expert {t}) col {n}: got {} want {} (= unscaled {} x global_scale[{t}] = {})",
+                    got_v[idx],
+                    want,
+                    base_v[idx],
+                    gs_t
+                );
+            }
+        }
+        assert!(
+            nonzero >= 12,
+            "fixture is degenerate: only {nonzero} non-zero outputs, the scale would be unobservable"
+        );
+
+        // And the scales really are distinguishable: expert 2's row must NOT
+        // equal expert 0's scaling of the same unscaled values.
+        let differ = (0..N as usize).any(|n| {
+            let a = got_v[2 * N as usize + n];
+            let b = base_v[2 * N as usize + n] * gs_vals[0];
+            (a - b).abs() > 1e-4 * a.abs().max(1e-3)
+        });
+        assert!(
+            differ,
+            "using global_scale[0] for every token would be indistinguishable — fixture is broken"
+        );
+    }
+
+    /// The shared expert's global scales must straddle relu2 correctly:
+    /// `g_d * down(relu2(g_u * up(x)))`. relu2 is homogeneous of degree 2, so
+    /// applying `g_u` AFTER relu2 scales that term by `g_u` instead of
+    /// `g_u^2`.
+    ///
+    /// MUTATION CAUGHT: moving the up-scale to the wrong side of relu2, and
+    /// dropping either scale.
+    #[test]
+    fn shared_expert_global_scales_straddle_relu2() {
+        let cfg = tiny_cfg(); // hidden 4, shared intermediate 8
+        let mut sh = NemotronHSharedExpert::new(&cfg).expect("shared expert builds");
+
+        let up_w: Vec<f32> = (0..32).map(|i| (i as f32) * 0.11 - 1.5).collect();
+        let down_w: Vec<f32> = (0..32).map(|i| (i as f32) * 0.05 - 0.6).collect();
+        sh.up_proj
+            .set_weight(&MxArray::from_float32(&up_w, &[8, 4]).unwrap(), "up")
+            .unwrap();
+        sh.down_proj
+            .set_weight(&MxArray::from_float32(&down_w, &[4, 8]).unwrap(), "down")
+            .unwrap();
+
+        let g_u = 3.0f32;
+        let g_d = 0.5f32;
+        sh.up_global_scale = Some(g_u as f64);
+        sh.down_global_scale = Some(g_d as f64);
+
+        let xrow = [0.5f32, -1.0, 0.25, 0.75];
+        let x = MxArray::from_float32(&xrow, &[1, 4]).unwrap();
+        let got: Vec<f32> = sh.forward(&x).unwrap().to_float32().unwrap().to_vec();
+
+        // Reference: g_d * down(relu2(g_u * up(x))).
+        let mut mid = [0.0f32; 8];
+        for (i, m) in mid.iter_mut().enumerate() {
+            let v: f32 = (0..4).map(|j| up_w[i * 4 + j] * xrow[j]).sum();
+            *m = (g_u * v).max(0.0).powi(2);
+        }
+        let mut want = [0.0f32; 4];
+        for (i, w) in want.iter_mut().enumerate() {
+            *w = g_d * (0..8).map(|j| down_w[i * 8 + j] * mid[j]).sum::<f32>();
+        }
+        // And the WRONG order: g_u applied after relu2 (one power of g_u short).
+        let mut wrong = [0.0f32; 4];
+        for (i, w) in wrong.iter_mut().enumerate() {
+            let mut m2 = [0.0f32; 8];
+            for (k, mm) in m2.iter_mut().enumerate() {
+                let v: f32 = (0..4).map(|j| up_w[k * 4 + j] * xrow[j]).sum();
+                *mm = g_u * v.max(0.0).powi(2);
+            }
+            *w = g_d * (0..8).map(|j| down_w[i * 8 + j] * m2[j]).sum::<f32>();
+        }
+
+        for i in 0..4 {
+            assert!(
+                (got[i] - want[i]).abs() <= 1e-3 + 1e-3 * want[i].abs(),
+                "shared expert[{i}]: got {} want {}",
+                got[i],
+                want[i]
+            );
+        }
+        assert!(
+            (0..4).any(|i| (want[i] - wrong[i]).abs() > 1e-2),
+            "fixture is degenerate: the correct and wrong relu2 orderings agree"
+        );
+    }
+
+    /// Dense (MTP-head) experts must NOT receive any global scale — the
+    /// Quantized arm is the only one that carries one.
+    #[test]
+    fn dense_experts_carry_no_global_scale() {
+        let cfg = tiny_cfg();
+        let moe = NemotronHMoE::new(&cfg, true).expect("moe builds");
+        assert!(matches!(moe.experts, NemotronHExperts::Dense { .. }));
+        assert!(moe.shared_experts.up_global_scale.is_none());
+        assert!(moe.shared_experts.down_global_scale.is_none());
     }
 }

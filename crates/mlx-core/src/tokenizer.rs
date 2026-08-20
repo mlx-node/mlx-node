@@ -2418,6 +2418,26 @@ impl Qwen3Tokenizer {
             "keep_past_thinking".to_string(),
             minijinja::Value::from(true),
         );
+        // Nemotron-H's spelling of the same knob, inverted. Its template does
+        //   `{%- set truncate_history_thinking =
+        //        truncate_history_thinking if truncate_history_thinking is defined else True %}`
+        //   `{%- if not (truncate_history_thinking and loop.index0 < ns.last_user_idx) %}`
+        // so it defaults to True and an ABSENT key strips the `<think>` body of
+        // every assistant turn older than the last user message. That is the
+        // exact prefix flip the `preserve_thinking` rationale above describes:
+        // our session cache holds the UN-stripped tokens, so from turn 2 the
+        // re-rendered prompt stops matching `cached_token_history` and the turn
+        // cold-prefills. Pinning it false keeps the rendered prompt byte-stable
+        // turn over turn.
+        //
+        // Safe to insert unconditionally: of the 68 installed chat templates,
+        // only Nemotron-H's two (the modelopt source checkpoint and our
+        // converted copy, identical bytes) reference this name at all, so no
+        // other family's render can move.
+        ctx_map.insert(
+            "truncate_history_thinking".to_string(),
+            minijinja::Value::from(false),
+        );
         ctx_map.insert("bos_token".to_string(), minijinja::Value::from(bos_token));
         ctx_map.insert("eos_token".to_string(), minijinja::Value::from(eos_token));
         // Caller-provided globals as a fallback layer, with the same precedence
@@ -3989,6 +4009,83 @@ mod tests {
         .expect("LFM compatibility template should render");
 
         assert_eq!(rendered, "<think>first</think>one<think>second</think>two",);
+    }
+
+    /// Nemotron-H's SHIPPED template strips the `<think>` body of every assistant
+    /// turn older than the last user message unless `truncate_history_thinking`
+    /// is pinned false — the family's spelling of the same knob
+    /// `preserve_thinking` (Qwen3.5/3.6) and `keep_past_thinking` (LFM2.5) name.
+    /// Its guard is
+    ///   `{%- if not (truncate_history_thinking and loop.index0 < ns.last_user_idx) %}`
+    /// with a `is defined else True` default, so an ABSENT key strips.
+    ///
+    /// Rendered against the real checkpoint template, whose sha256 prefix is
+    /// asserted to be the one the HF ground-truth fixture was generated from, so
+    /// this gate cannot be satisfied by a hand-written approximation of the
+    /// branch and cannot silently drift away from the shipped bytes.
+    ///
+    /// Mutation this catches: deleting the `truncate_history_thinking` insert
+    /// from `ctx_map`. Verified RED — without the pin the older assistant turn
+    /// renders `<think></think>answer` and `earlier chain` is gone, which flips
+    /// the token prefix at the first reasoning boundary so every turn from the
+    /// second onward cold-prefills the whole conversation.
+    #[test]
+    fn nemotron_history_gate_keeps_older_assistant_thinking() {
+        const NEMOTRON_TEMPLATE: &str =
+            include_str!("tokenizer/fixtures/nemotron-3.5-lightning-58933db77d30.jinja");
+        assert_eq!(
+            sha256_prefix(NEMOTRON_TEMPLATE),
+            "58933db77d30",
+            "the checked-in Nemotron template must stay the same bytes the HF \
+             ground-truth fixture was rendered from",
+        );
+
+        let plain = |role: &str, content: &str| ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+        let mut answered = plain("assistant", "answer");
+        answered.reasoning_content = Some("earlier chain".to_string());
+        answered.thinking_enabled = Some(true);
+        // The shape that breaks prefix reuse: a NEW user message arrives after
+        // an assistant turn that reasoned, so `ns.last_user_idx` moves past it.
+        let messages = vec![plain("user", "first"), answered, plain("user", "second")];
+
+        let rendered = Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+            NEMOTRON_TEMPLATE,
+            &messages,
+            None,
+            true,
+            Some(true),
+            BOS_PROBE,
+            EOS_PROBE,
+            MultimodalContentOrder::TextThenMedia,
+            None,
+            RenderContextOptions {
+                current_date: Some(PROBE_DATE.to_string()),
+                reasoning_strength: None,
+            },
+        )
+        .expect("Nemotron template should render");
+
+        assert!(
+            rendered.contains("<think>\nearlier chain</think>answer"),
+            "the older assistant turn must keep its reasoning body, or the cached \
+             token prefix stops matching from turn 2 on. Rendered:\n{rendered}",
+        );
+        assert!(
+            !rendered.contains("<think></think>answer"),
+            "the older assistant turn was truncated to an empty think block, which \
+             is exactly the prefix flip this pin exists to prevent. \
+             Rendered:\n{rendered}",
+        );
     }
 
     /// Unit coverage of the scanner across every dash/whitespace variant and

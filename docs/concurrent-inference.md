@@ -58,7 +58,7 @@ step's remaining token budget.
 | Native thread | One scheduler and executor live beside the model on its dedicated OS thread; `MxArray` never crosses threads. Idle waits block, while busy periods poll commands only between steps. Qwen3, LFM2/2.5, Qwen3.5 Dense/MoE, Gemma4, and NemotronH instantiate the same engine-owned `HybridSchedulerState<B>`; their backends provide cache/recurrent/prefix/decode hooks rather than duplicating request lifecycle code.                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | Scheduler     | One global token ceiling serves decode rows first, then pinned prefill slices. Exclusive commands run only with an empty running set; reset/generate/save/train are barriers. Block growth and hybrid recurrent-state bytes share one unified-memory admission watermark; an actual lazy-allocation squeeze preempts exactly one newest running victim.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | Cache         | `PagedKVCacheAdapter` owns a request table keyed by sequence id over a refcounted block pool. Hybrid families add one manager per compatible KV group. Gemma4 owns distinct full/sliding pools; expired sliding blocks become null sentinels so logical positions remain absolute. A preempted victim releases its live tables and replays safely. Sidecar-free SSD reads can park in `WaitingForSsd`; hybrid exact-boundary restores currently reconcile their K/V and companion state synchronously.                                                                                                                                                                                                                                                                                                                                      |
-| Executor      | Dense Qwen3 defaults to uniform `[N,1]` decode plus bounded prefill; `MLX_SCHED_RAGGED_STEP=1` instead packs every planned slice. LFM2 stacks/scatters private ShortConv rows. Text-only Qwen3.5 dense and MoE stack/scatter private GDN rows; MoE expert routing consumes the same `[N,1,H]` tensor rather than falling back to one forward per row. NemotronH stacks/scatters per-request Mamba-2 rows (conv `[3,6144]` + SSM `[64,64,128]` f32 per SSM layer) around each SSM layer, routes its pure MoE-FFN layers over the shared `[N,1,H]` tensor, and drives its six GQA layers through the batched paged kernels; every executed prefill slice is re-split at Mamba-2 chunk-128 boundaries so no break lands inside a chunk. Gemma4 fuses ordinary `[N,1]` rows through full and sliding paged groups, including KV-shared anchors and PLE. Eligible all-greedy rows stay batched through one argmax/eval epilogue; mixed sampling or penalties retain scalar per-row semantics. `schedulerStats().fusedGreedyEpilogueSteps` counts executor-confirmed fused epilogues rather than inferring them from planned occupancy. Every request retains private penalties, sampling, stop, stream, and cancellation state. |
+| Executor      | Dense Qwen3 defaults to uniform `[N,1]` decode plus bounded prefill; `MLX_SCHED_RAGGED_STEP=1` instead packs every planned slice. LFM2 stacks/scatters private ShortConv rows. Text-only Qwen3.5 dense and MoE stack/scatter private GDN rows; MoE expert routing consumes the same `[N,1,H]` tensor rather than falling back to one forward per row. NemotronH has a fused lane — stacking/scattering per-request Mamba-2 rows (conv `[3,6144]` + SSM `[64,64,128]` f32 per SSM layer) around each SSM layer, routing its pure MoE-FFN layers over the shared `[N,1,H]` tensor, and driving its six GQA layers through the batched paged kernels — but that lane is reachable only on a **dense/bf16** checkpoint. `persistence.rs:754` sets `row_exact_decode_projections` for **any** quantized checkpoint (a top-level quant mode or any per-layer override), which the only published NemotronH checkpoint (NVFP4 30B-A3B) always is, so `models/nemotron_h/model.rs:836` instead runs one single-row decode per row and concatenates the logits — bit-identical to N serial decodes, but N full weight streams. On that checkpoint the batching win is the shared scheduler (prefill/decode interleaving, shared prefix blocks, no whole-turn TTFT queueing), **not** one fused decode forward; the fused branch is currently dead code there. Gemma4 fuses ordinary `[N,1]` rows through full and sliding paged groups, including KV-shared anchors and PLE. Eligible all-greedy rows stay batched through one argmax/eval epilogue; mixed sampling or penalties retain scalar per-row semantics. `schedulerStats().fusedGreedyEpilogueSteps` counts executor-confirmed fused epilogues rather than inferring them from planned occupancy. Every request retains private penalties, sampling, stop, stream, and cancellation state. |
 | Transport     | SSE writes honor Node backpressure and stop native pulls until drain or close. The 30-second default drain deadline aborts a connected stalled peer and releases admission. The chat model-thread output mailbox, native callback queue, and JS callback queue are independently capped at 64 events.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 
 Per-request prefix verification remains all-or-nothing. A miss releases and
@@ -133,12 +133,17 @@ phase-free scheduler   ✓ token budget, watermark, occupancy histogram
 recompute preemption   ✓ LIFO victim, no same-step readmit, hot-prefix resume
 Qwen3/LFM2/Qwen3.5/NemotronH adapters  ✓ per-sequence request table + shared prefix blocks
 Gemma4 grouped adapters      ✓ full + sliding pools, null-block retirement
-Qwen3/LFM2/Qwen3.5/NemotronH executors ✓ one uniform [N,1] decode forward
+Qwen3/LFM2/Qwen3.5 executors ✓ one uniform [N,1] decode forward
 Gemma4 executor              ✓ one fused [N,1] hybrid decode forward
+NemotronH executor           ~ fused [N,1] on a DENSE checkpoint only; any
+                               quantized one (the only published checkpoint)
+                               runs N serial single-row decodes instead
 LFM2 recurrent state   ✓ private [l_cache-1, hidden] row per conv layer/request
 Qwen3.5 GDN state      ✓ private conv + recurrent row per linear layer/request
 NemotronH mamba state  ✓ private conv [3,6144] + SSM [64,64,128] f32 row per SSM layer/request
-NemotronH prefill      ✓ chunk-128-aligned break-set (no break inside a chunk)
+NemotronH prefill      ~ executed slices are re-split on the config chunk grid;
+                         the slice's own start/end still follow the engine's
+                         token-budget grid and can land mid-chunk
 BlockAllocator         ✓ refcounts + prefix hash (vLLM-style pool)
 FFI / Metal kernels    ✓ num_seqs = q.shape(0), grid.y = sequence
 ragged mixed step      ✓ Qwen3 env-gated SEAM B executor swap; scheduler unchanged
@@ -345,14 +350,37 @@ above as a cooled median-of-three 4-bit result.
   and is ineligible for this lane. Scheduled rows therefore always use the
   per-step recurrent-state representation described above.
   NemotronH joins the scheduled lane default-on: its six GQA layers use the
-  generic batched paged route (32/2 heads, head_dim 128), per-request Mamba-2
-  rows are stacked/scattered around each SSM layer for one `[N,1]` decode
-  forward, and the prefill break-set is re-split at chunk-128 boundaries so
-  no executed slice splits a chunk. MTP-requested turns stay exclusive (the
+  generic batched paged route (32/2 heads, head_dim 128) and per-request
+  Mamba-2 rows are stacked/scattered around each SSM layer for one `[N,1]`
+  decode forward — on a dense checkpoint. Quantized checkpoints (the only
+  published one included) take the `row_exact_decode_projections` branch
+  instead: N serial single-row decodes, bit-identical to serial, no fused
+  decode forward. Prefill chunk alignment is best-effort, not an invariant:
+  the engine's break-set is a plain `MLX_SCHED_LONG_PREFILL_TOKENS` (2048)
+  grid walked from the effective cached-prefix length
+  (`engine/hybrid_scheduler.rs:1772-1793`), NemotronH overrides neither
+  `scheduler_prefill_slice_tokens` nor `extra_prefill_breaks`, and the
+  per-step planner budgets decode rows first, so a step with D concurrent
+  decode rows hands the prefill at most `budget - D` tokens
+  (`engine/scheduler.rs:1123-1140`). `run_scheduled_prefill_slice`
+  (`models/nemotron_h/model.rs:1443-1480`) re-splits whatever range it is
+  handed with `chunk_aligned_prefill_slices` on `config.chunk_size` (128 on
+  the released checkpoint — read from config, never hardcoded), so every
+  boundary *interior to one scheduled slice* is a chunk multiple; the
+  slice's own start and end are not, and can land mid-chunk. That is safe
+  rather than wrong: the chunk scan pads the final chunk of each forward
+  (`models/nemotron_h/mamba2.rs:474`) and carries the recurrent state
+  across, so a mid-chunk boundary changes the reduction order, not the
+  semantics. MTP-requested turns stay exclusive (the
   engine's `enable_mtp` barrier) and fall back to paged AR on paged models.
-  The tiny random-weight fixture proves N=2 batched==serial T=0 identity;
-  the 30B checkpoint is too large for CI, so real-checkpoint gates stay
-  local-only.
+  The tiny random-weight fixture proves N=2 batched==serial T=0 identity in
+  CI on every run. The two real-checkpoint gates
+  (`nemotron_h_paged_vs_flat_parity`, `nemotron_h_concurrent_batched_parity`)
+  now have a `nemotron_h` leg in the `model-e2e` matrix, but it is **PR
+  opt-in only** — the leg needs ~38 GB free for the 30B source plus its
+  converted output, so it is skipped on push and dispatch and cannot block a
+  release. Treat local runs as the primary evidence until that leg has gone
+  green once.
   Gemma4 replaces the former per-row rotating-cache no-go with a vLLM-style
   hybrid coordinator: full and sliding groups have paged storage, expired
   sliding blocks become null sentinels, KV-shared layers alias physical anchors,

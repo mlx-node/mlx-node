@@ -188,8 +188,10 @@ Output dtypes `{uint32, uint8}` are hard-coded in `fp_quantize`
 Checked on `[4096,4096]`: mxfp4 = 8,388,608 + 524,288 = 8,912,896 B ⇒ 4.25 ✓; nvfp4 = 8,388,608 +
 1,048,576 = 9,437,184 ⇒ 4.50 ✓.
 
-**No NVFP4 global scale is ever written** — `global_scale` has zero hits in `crates/mlx-core/src/`.
-The DGX port does not carry Unsloth's calibrated global scales.
+**The MLX nvfp4 quantizer writes no global scale.** The DGX port does not carry Unsloth's calibrated
+global scales. The `nemotron_h` modelopt *ingest* is the one exception — it emits a `.global_scale`
+sidecar rather than folding `weight_scale_2` into the per-group E4M3 scales; see the Nemotron-H NVFP4
+section below.
 
 ### fp8_e4m3 — plain per-output-channel E4M3
 
@@ -1198,12 +1200,51 @@ what v1 cannot use:
 
 - **NVFP4 experts / shared experts / `lm_head`** — source `weight` is U8 with two E2M1 4-bit codes
   per byte, `weight_scale` is per-16-group E4M3 `[N, K/16]`, and `weight_scale_2` is an F32 scalar
-  (**not** a power of two). Ingest packs the E2M1 codes into MLX nvfp4 u32 weight storage **bit-exact**
-  and folds `weight_scale_2` into each per-group E4M3 scale
-  (`scale[o,g] = weight_scale[o,g] * weight_scale_2`), so the MLX nvfp4 4/g16 path needs no
-  global-scale field — MLX writes no NVFP4 global scale ever.
+  per tensor (**not** a power of two). Ingest is byte-preserving on **both** halves of the NVFP4
+  encoding:
+  - the E2M1 codes are packed into MLX nvfp4 u32 weight storage **bit-exact**, and
+  - the per-group E4M3 scale bytes are copied **verbatim** into `.scales` — byte-identical to the
+    source `weight_scale`.
+
+  `weight_scale_2` is **not** folded into those scales. It is carried out-of-band as a separate
+  **Float32 `.global_scale`** key and applied at runtime as a scalar multiply on the projection
+  output. This is vLLM's convention (`nvfp4_marlin_process_global_scale` in
+  `vllm/model_executor/layers/quantization/utils/marlin_utils_fp4.py`; `modelopt.py` renames
+  `weight_scale_2 → weight_global_scale` and never folds it — the only thing vLLM ever multiplies
+  into an E4M3 group scale is a power of two, which is exact by construction).
+
+  Shapes, because `weight_scale_2` is **per expert**, not per layer: for the stacked
+  `[E, N, K]` switch-linear pairs `.global_scale` is an `[E]` F32 vector gathered by the routing
+  indices (measured on the real checkpoint, layer 1: `up_proj` 5.658e-5 … 2.124e-4, a 3.75×
+  spread over 80 distinct values across 128 experts; `down_proj` 4.18× over 94 values — a single
+  scalar would mis-scale 127 of 128 experts). `shared_experts` gets a per-tensor scalar.
+  `lm_head` gets none (see below).
+
+  **Why the fold was removed.** `weight_scale_2` ≈ 8.6e-5, so
+  `weight_scale[o,g] * weight_scale_2` lands in E4M3's **subnormal** band for 99.77% of groups and
+  the re-encode loses a median 6.67% / mean 8.15% of each group scale. Measured weight relative
+  Frobenius error against the exact NVIDIA weight on three real tensors: **8.99% / 8.04% / 8.21%**.
+  Carrying the global scale separately is exact instead — the matmul is linear in the weight, so
+  `(code · decode_e4m3(weight_scale)) @ xᵀ · weight_scale_2` reproduces NVIDIA's intended weight
+  with 0.0 max-abs weight error (measured activation error 2.2e-13%, i.e. f64 round-off).
+
+  **Consequences, stated plainly:**
+  - Reconstruction is now exact rather than ~8% off on every MoE expert projection.
+  - The output is **no longer a plain mlx-lm-loadable nvfp4 checkpoint** — mlx-lm has no
+    `.global_scale` concept. (Precedent: the symmetric Q4_0/Q8_0 derived-bias drop.)
+  - `.global_scale` must stay **Float32**; bf16 would round `weight_scale_2` with ~0.4% error and
+    silently reintroduce a smaller version of the same bug. NemotronH owns its dtype cast
+    (`owns_dtype_cast() == true`), so the key bypasses convert's BF16 pass.
+  - The loader is **fail-closed**: a missing, wrong-dtype, or wrong-length `.global_scale` on an
+    nvfp4 NemotronH prefix is a hard error. It is never defaulted to `1.0` — that would leave the
+    projection ~1.15e4× too large with no diagnostic.
+  - **Existing converted checkpoints must be regenerated.** Anything produced by the folding
+    ingest carries pre-multiplied `.scales` and no `.global_scale`; the fail-closed check turns
+    such a checkpoint into a loud load error rather than a silently-8%-wrong model.
 - **`lm_head`** — NVFP4 in the source, **dequantized to bf16** at ingest (a single dense matmul;
-  keeping the widest matrix in bf16 avoids a 4-bit gather on it).
+  keeping the widest matrix in bf16 avoids a 4-bit gather on it). The dequant uses the **exact**
+  scale: dequantize with the unmodified `weight_scale` into F32, multiply by `weight_scale_2`,
+  then cast to bf16. It therefore needs no runtime hook and emits no `.global_scale` key.
 - **FP8 Mamba-2 projections** (`mixer.in_proj` / `mixer.out_proj`) — source `weight` is raw E4M3
   `[N,K]` with an F32 scalar `weight_scale` and a static `input_scale` `[1]`. Ingest maps them to
   **mxfp8 8/32** and threads the checkpoint's `input_scale` as a **static `input_amax`** on each

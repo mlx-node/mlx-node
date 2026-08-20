@@ -42,7 +42,7 @@ rather than accepting an arbitrary client-selected namespace.
 | **Gemma4**        | **on**  | Serial/concurrent start and continuation parity on Gemma-4-E2B-IT with a real occupancy-2 wave. Full and sliding layers use distinct paged groups; expired sliding blocks are replaced by a null sentinel; KV-shared layers alias their global/sliding anchor. Same-owner continuation is live; cross-owner prefix hits currently fail closed.                                                                                                                                                                                                    |
 | **Qwen3.5 Dense** | **on**  | Single-turn greedy parity and paged construction are verified on Qwen3.5-0.8B BF16. Full-attention K/V is paged; GDN recurrent state remains request-local and is checkpointed beside K/V for SSD restore. Explicit false and the environment override retain a rollback path.                                                                                                                                                                                                                                                                    |
 | **Qwen3.5 MoE**   | **on**  | Uses the same paged full-attention, exact-boundary GDN sidecar, and two-row text scheduler contract as dense. Sparse expert routing stays batched over `[N,1,H]`; checkpoint-specific projections preserve exact greedy parity while K/V gather/attention remains batched. MTP/media turns remain exclusive. Real `Qwen3.6-35B-A3B-mxfp4-mlx` decode and SSD-restart parity gates remain local-only because no small published checkpoint fits the standard CI runner; synthetic Metal gates cover paged construction and N=2 token parity in CI. |
-| **NemotronH**     | **on**  | Hybrid Mamba-2 SSM + GQA + MoE-FFN: only the six `full_attention` layers route through the adapter (32 Q / 2 KV heads, head_dim 128 — the generic batched paged route, no per-family kernel). Mamba recurrent state stays request-local (per-request `[3,6144]` conv + `[64,64,128]` SSM f32 rows per SSM layer, stacked/scattered around each batched decode) and is checkpointed only in-process (no SSD sidecar yet — the family is NOT cold-restore eligible). The scheduled lane is default-on; the pinned prefill break-set is re-split at Mamba-2 chunk-128 boundaries inside `run_scheduled_prefill_slice`. MTP-enabled turns stay on the exclusive ordered lane and fall back to paged AR on paged models. Real-checkpoint parity/concurrency gates remain local-only (30B checkpoint); synthetic Metal gates cover paged construction, N=2 batched==serial T=0 parity, and the break-set boundary rule in CI. |
+| **NemotronH**     | **on**  | Hybrid Mamba-2 SSM + GQA + MoE-FFN: only the six `full_attention` layers route through the adapter (32 Q / 2 KV heads, head_dim 128 — the generic batched paged route, no per-family kernel). Mamba recurrent state stays request-local (per-request `[3,6144]` conv + `[64,64,128]` SSM f32 rows per SSM layer, stacked/scattered around each batched decode) and is checkpointed only in-process (no SSD sidecar yet — the family is NOT cold-restore eligible). The scheduled lane is default-on, but the fused `[N,1]` decode is reachable only on a dense/bf16 checkpoint: `persistence.rs:754` sets `row_exact_decode_projections` for any quantized checkpoint — including the only published one — so `model.rs:836` runs N serial single-row decodes (bit-identical to serial, but N full weight streams) and the fused branch is dead code there. `run_scheduled_prefill_slice` re-splits each scheduled range on `config.chunk_size` (128 on the released checkpoint), so boundaries *inside* one scheduled slice are chunk multiples; the slice's own start/end come from the engine's plain 2048-token grid minus that step's decode rows and can land mid-chunk, which the chunk scan absorbs by padding the final chunk (reduction order changes, semantics do not). MTP-enabled turns stay on the exclusive ordered lane and fall back to paged AR on paged models. The two real-checkpoint gates have a `nemotron_h` leg in the `model-e2e` matrix, but it is PR-opt-in only (~38 GB of source + converted checkpoint) and is skipped on push/dispatch, so local runs remain the primary evidence; synthetic Metal gates cover paged construction, N=2 batched==serial T=0 parity, and the break-set boundary rule in CI on every run. |
 
 ### Gemma4 hybrid groups and draft coexistence
 
@@ -837,7 +837,7 @@ and must run with `--test-threads=1`.
 
 ## Parity gate
 
-Before `use_block_paged_cache` defaults can flip from `Some(false)` to enabled, four parity tests must pass on real weights:
+Before `use_block_paged_cache` defaults can flip from `Some(false)` to enabled, every parity test below must pass on real weights:
 
 | Test                                                        | Gate env var                    |
 | ----------------------------------------------------------- | ------------------------------- |
@@ -847,7 +847,12 @@ Before `use_block_paged_cache` defaults can flip from `Some(false)` to enabled, 
 | `crates/mlx-core/tests/qwen3_5_paged_vs_flat_parity.rs`     | `MLX_TEST_MODEL_PATH`           |
 | `crates/mlx-core/tests/qwen3_5_moe_paged_vs_flat_parity.rs` | `MLX_TEST_MODEL_PATH`           |
 | `crates/mlx-core/tests/nemotron_h_paged_vs_flat_parity.rs`  | `MLX_TEST_MODEL_PATH`           |
+| `crates/mlx-core/tests/nemotron_h_concurrent_batched_parity.rs` | `MLX_TEST_NEMOTRON_H_MODEL_PATH` |
 | `__test__/models/qwen3-paged-parity.test.ts`                | `QWEN3_PAGED_PARITY_MODEL_PATH` |
+
+The two NemotronH gates read **different** env vars — `nemotron_h_paged_vs_flat_parity.rs:140`
+reads `MLX_TEST_MODEL_PATH`, `nemotron_h_concurrent_batched_parity.rs:22` reads
+`MLX_TEST_NEMOTRON_H_MODEL_PATH`. Export both when running the family's full set.
 
 All Rust tests are `#[ignore]` and skip cleanly without the env var; the TS test uses `it.runIf`. Example invocation:
 

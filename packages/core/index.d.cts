@@ -4271,7 +4271,16 @@ export interface NemotronHConfig {
   maxPositionEmbeddings: number;
   /** RMSNorm epsilon for every norm in the model (1e-5). */
   layerNormEpsilon: number;
-  /** RoPE base frequency for the attention layers (10000). */
+  /**
+   * RoPE base frequency carried in some checkpoint `config.json` files.
+   *
+   * UNUSED: NemotronH attention is NoPE. No reference implementation
+   * declares or consumes `rope_theta` (HF `NemotronHConfig` has no such
+   * field, vLLM's attention takes no positions, mlx-lm never rotates), so
+   * it is parsed leniently with a 10000.0 default and never read. The
+   * field is retained only so the napi object shape - and the two
+   * hand-synced `index.d.cts` artifacts - stay stable.
+   */
   ropeTheta: number;
   /**
    * Per-layer mixer kind, remapped from the checkpoint's
@@ -4292,10 +4301,30 @@ export interface NemotronHConfig {
   /** Mamba-2 chunk-scan chunk size (128). */
   chunkSize: number;
   /**
-   * Minimum discretized time step (1e-3); softplus(dt + dt_bias) is
-   * clamped to [time_step_min, inf).
+   * Declared minimum discretized time step (1e-3 in the released
+   * checkpoint).
+   *
+   * UNUSED BY THE RUNTIME. No production reference clamps dt to it: the
+   * HF fused path builds `dt_limit_kwargs` from `time_step_limit` only
+   * (modeling_nemotron_h.py:281) and the released config declares no
+   * `time_step_limit`, so mamba_ssm's `dt_limit=(0.0, inf)` applies;
+   * vLLM hardcodes `dt_limit=(0.0, inf)` (mamba_mixer2.py:672, :890);
+   * mlx-lm defaults `time_step_limit` to `(0.0, inf)` and clips to that
+   * (nemotron_h.py:56-65 + ssm.py:8-11). Only the HF *torch fallback*
+   * (:417-418, :465-466) clamps to `time_step_min`, and that path is not
+   * what the checkpoint was trained/served with. Parsed leniently and
+   * retained only so the napi object shape - and the two hand-synced
+   * `index.d.cts` artifacts - stay stable. Use `time_step_limit_pair()`
+   * for the clamp the mixer actually applies.
    */
   timeStepMin: number;
+  /**
+   * Optional `[min, max]` bounds for the discretized time step, matching
+   * mlx-lm's `ModelArgs.time_step_limit`. Absent (`None`) means the
+   * mamba_ssm/vLLM/mlx-lm default `(0.0, +inf)`, i.e. no clamp; the
+   * released 30B checkpoint declares no `time_step_limit`.
+   */
+  timeStepLimit?: number[];
   /** Total routed experts (128). */
   nRoutedExperts: number;
   /** Experts selected per token (6). */

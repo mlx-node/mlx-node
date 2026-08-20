@@ -144,6 +144,23 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
     expect(await manager.resolve(source, 'qwen3', true)).toBe(enabled);
   });
 
+  // A family missing from AGENT_PAGED_MODEL_TYPES is not "unpaged by policy" —
+  // `resolveInternal` returns the SOURCE path untouched, so `mlx agent` /
+  // `mlx launch claude` load it with whatever `use_block_paged_cache` the
+  // downloaded checkpoint carries (absent on the shipped nemotron_h build =
+  // flat), silently dropping continuous batching, prefix reuse, and the cold
+  // tier for that family. Mutation caught: deleting `'nemotron_h'` from
+  // AGENT_PAGED_MODEL_TYPES makes both assertions below fail.
+  it('forces the paged overlay for a nemotron_h checkpoint', async () => {
+    const source = await makeModelDir({ model_type: 'nemotron_h' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'nemotron_h');
+    expect(resolved).not.toBe(source);
+    expect((await readOverrideConfig(resolved)).use_block_paged_cache).toBe(true);
+  });
+
   it('leaves persist untouched for an undirected (undefined) resolve', async () => {
     const source = await makeModelDir({ model_type: 'qwen3' });
     const manager = new PagedConfigOverrideManager();

@@ -80,7 +80,12 @@ pub struct NemotronHMamba2Mixer {
     pub(crate) ssm_state_size: i32,
     pub(crate) conv_kernel: i32,
     pub(crate) chunk_size: i32,
-    pub(crate) time_step_min: f64,
+    /// `(min, max)` bounds applied to `softplus(dt + dt_bias)`, from
+    /// `NemotronHConfig::time_step_limit_pair()`. Defaults to the unbounded
+    /// `(0.0, +inf)`, matching mamba_ssm's `dt_limit` default, vLLM's
+    /// hardcoded `(0.0, inf)` and mlx-lm's `time_step_limit`. NOT derived
+    /// from `time_step_min`.
+    pub(crate) dt_limit: (f64, f64),
 }
 
 /// Build a fresh (random-initialized) Mamba mixer sized from config.
@@ -122,7 +127,7 @@ pub fn new_mamba_mixer(config: &NemotronHConfig) -> Result<NemotronHMamba2Mixer>
         ssm_state_size: config.ssm_state_size,
         conv_kernel: config.conv_kernel,
         chunk_size: config.chunk_size,
-        time_step_min: config.time_step_min,
+        dt_limit: config.time_step_limit_pair(),
     })
 }
 
@@ -193,13 +198,16 @@ impl NemotronHMamba2Mixer {
             .slice_axis(2, d_inner + group_state, d_inner + 2 * group_state)?
             .reshape(&[batch, seq, self.n_groups as i64, self.ssm_state_size as i64])?;
 
-        // dt = softplus(dt + dt_bias), clamped to [time_step_min, inf).
+        // dt = clip(softplus(dt + dt_bias), time_step_limit). The default
+        // limit is (0.0, +inf) - i.e. no clamp - so this matches mlx-lm's
+        // `compute_dt` and mamba_ssm's `dt_limit` default. `time_step_min`
+        // is deliberately not consulted (see NemotronHConfig::time_step_min).
         let dt = Activations::softplus(
             &dt_raw
                 .astype(DType::Float32)?
                 .add(&self.dt_bias.astype(DType::Float32)?)?,
         )?
-        .clip(Some(self.time_step_min), None)?;
+        .clip(Some(self.dt_limit.0), Some(self.dt_limit.1))?;
 
         // A = -exp(A_log)
         let a = self.a_log.astype(DType::Float32)?.exp()?.mul_scalar(-1.0)?;
@@ -649,6 +657,7 @@ mod tests {
             conv_kernel: 4,
             chunk_size: 3,
             time_step_min: 0.001,
+            time_step_limit: None,
             n_routed_experts: 2,
             num_experts_per_tok: 1,
             routed_scaling_factor: 1.0,
@@ -670,9 +679,31 @@ mod tests {
         }
     }
 
+    /// The reference default time-step limit: `(0.0, +inf)`, i.e. no clamp.
+    /// mamba_ssm's `dt_limit` default, vLLM's hardcoded pair, and mlx-lm's
+    /// `ModelArgs.__post_init__` fallback all agree on it.
+    const NO_DT_LIMIT: (f64, f64) = (0.0, f64::INFINITY);
+
+    /// Input amplitude for the dt-clamp regression tests. The SSM term
+    /// `dt * B * x * C` is cubic in the input while the `D * x` skip is
+    /// linear, so a larger input widens the gap a clamped dt opens up -
+    /// without it the whole difference hides under the 5e-3 parity
+    /// tolerance and the regression assertions would be vacuous.
+    const SIGNAL: f32 = 4.0;
+
     fn softplus(v: f32) -> f32 {
         // softplus(x) = max(x,0) + log1p(exp(-|x|))
         v.max(0.0) + (-v.abs()).exp().ln_1p()
+    }
+
+    /// Apply a `time_step_limit` pair to a raw `softplus(dt + dt_bias)`,
+    /// exactly as `NemotronHMamba2Mixer::forward` does.
+    ///
+    /// These oracles used to hardcode `.max(0.001)` - the same clamp the
+    /// mixer wrongly derived from `time_step_min` - so no parity assertion
+    /// could see the clamp at all. They now take the limit as data.
+    fn apply_dt_limit(v: f32, limit: (f64, f64)) -> f32 {
+        v.clamp(limit.0 as f32, limit.1 as f32)
     }
 
     fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
@@ -731,7 +762,7 @@ mod tests {
             let mut out = vec![0.0f32; t * h * d_dim];
             for tt in 0..t {
                 for hh in 0..h {
-                    let dt_v = softplus(dt[tt * h + hh] + dt_bias[hh]).max(0.001);
+                    let dt_v = apply_dt_limit(softplus(dt[tt * h + hh] + dt_bias[hh]), NO_DT_LIMIT);
                     for dd in 0..d_dim {
                         let xv = x[(tt * h + hh) * d_dim + dd];
                         for ss in 0..ns {
@@ -753,7 +784,7 @@ mod tests {
         // The chunk scan receives PRE-PROCESSED dt (the mixer forward applies
         // softplus(dt + dt_bias) + the time-step clamp before calling it).
         let dt_proc: Vec<f32> = (0..t * h)
-            .map(|i| softplus(dt[i] + dt_bias[i % h]).max(0.001))
+            .map(|i| apply_dt_limit(softplus(dt[i] + dt_bias[i % h]), NO_DT_LIMIT))
             .collect();
         let mx_x = MxArray::from_float32(&x, &[1, t as i64, h as i64, d_dim as i64]).unwrap();
         let mx_dt = MxArray::from_float32(&dt_proc, &[1, t as i64, h as i64]).unwrap();
@@ -797,7 +828,7 @@ mod tests {
         let mx_x = MxArray::from_float32(&x, &[1, t as i64, h as i64]).unwrap();
 
         // Reference: full mixer math in pure Rust.
-        let (ref_out, ref_state) = mixer_reference(&mixer, &x, t, 1);
+        let (ref_out, ref_state) = mixer_reference(&mixer, &x, t, 1, mixer.dt_limit);
 
         // Full prefill.
         let mut state = mixer.fresh_state(1).expect("fresh state");
@@ -847,6 +878,7 @@ mod tests {
         x: &[f32],
         t: usize,
         batch: usize,
+        dt_limit: (f64, f64),
     ) -> (Vec<f32>, Vec<f32>) {
         let hidden = mixer.in_proj.get_weight().shape_at(1).unwrap() as usize;
         let in_rows = mixer.in_proj.get_weight().shape_at(0).unwrap() as usize;
@@ -951,7 +983,8 @@ mod tests {
         for tt in 0..t {
             for hh in 0..num_heads {
                 let group = hh / hg;
-                let dt_v = softplus(dt[tt * num_heads + hh] + dt_bias[hh]).max(0.001);
+                let dt_v =
+                    apply_dt_limit(softplus(dt[tt * num_heads + hh] + dt_bias[hh]), dt_limit);
                 for dd in 0..head_dim {
                     let xv = x_inner[(tt * d_inner) + hh * head_dim + dd];
                     for ss in 0..ns {
@@ -1008,6 +1041,224 @@ mod tests {
         v / (1.0 + (-v).exp())
     }
 
+    /// Build a tiny mixer with an explicit per-head `dt_bias` and a non-zero
+    /// `D` skip. The `D` skip matters: with `D == 0` the SSM output is
+    /// (near-)proportional to `dt`, and the gated RMSNorm that follows
+    /// divides that common factor straight back out - a clamp on `dt` would
+    /// be invisible at the mixer output. A non-zero `D` anchors the scale.
+    fn mixer_with_dt_bias(cfg: &NemotronHConfig, dt_bias: &[f32]) -> NemotronHMamba2Mixer {
+        let mut mixer = new_mamba_mixer(cfg).expect("mixer builds");
+        let heads = cfg.mamba_num_heads as i64;
+        assert_eq!(dt_bias.len() as i64, heads, "dt_bias must be per-head");
+
+        // Every projection is overwritten with deterministic values.
+        // `new_mamba_mixer` seeds them from MLX's PROCESS-GLOBAL RNG, so
+        // under `cargo test`'s parallel harness the draw depends on which
+        // other tests happened to run first - and the "a clamp would change
+        // the output by more than X" assertions below are weight-dependent.
+        // Random weights made these tests pass alone and fail in a full-module
+        // run.
+        let hidden = cfg.hidden_size as i64;
+        let in_rows = cfg.mamba_in_proj_size() as i64;
+        let d_inner = cfg.mamba_intermediate_size() as i64;
+        let conv_dim = cfg.mamba_conv_dim() as i64;
+        let k = cfg.conv_kernel as i64;
+
+        let w_in = det_weights(0, (in_rows * hidden) as usize, 0.5);
+        mixer.in_proj = LinearProj::Standard(
+            crate::nn::Linear::from_weights(
+                &MxArray::from_float32(&w_in, &[in_rows, hidden]).unwrap(),
+                None,
+            )
+            .unwrap(),
+        );
+        let w_out = det_weights(1, (hidden * d_inner) as usize, 0.5);
+        mixer.out_proj = LinearProj::Standard(
+            crate::nn::Linear::from_weights(
+                &MxArray::from_float32(&w_out, &[hidden, d_inner]).unwrap(),
+                None,
+            )
+            .unwrap(),
+        );
+        let w_conv = det_weights(2, (conv_dim * k) as usize, 0.6);
+        let b_conv = det_weights(3, conv_dim as usize, 0.2);
+        mixer.conv1d = Conv1d::from_weights(
+            &MxArray::from_float32(&w_conv, &[conv_dim, k, 1]).unwrap(),
+            Some(&MxArray::from_float32(&b_conv, &[conv_dim]).unwrap()),
+            None,
+            None,
+            None,
+            Some(conv_dim as u32),
+        )
+        .unwrap();
+        mixer.norm_weight = MxArray::ones(&[d_inner], Some(DType::Float32)).unwrap();
+        mixer.a_log = MxArray::from_float32(&[0.0, 0.3], &[heads]).unwrap();
+        mixer.dt_bias = MxArray::from_float32(dt_bias, &[heads]).unwrap();
+        mixer.d = MxArray::from_float32(&[0.5, -0.3], &[heads]).unwrap();
+        mixer
+    }
+
+    /// Deterministic pseudo-random weights in `[-scale/2, scale/2)`.
+    fn det_weights(stream: u64, n: usize, scale: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| {
+                let mut v = (i as u64) ^ (stream << 32);
+                v = v.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                v ^= v >> 33;
+                v = v.wrapping_mul(0xff51_afd7_ed55_8ccd);
+                scale * (((v >> 40) % 1024) as f32 / 1024.0 - 0.5)
+            })
+            .collect()
+    }
+
+    /// REGRESSION: `time_step_min` must never bind the runtime clamp.
+    ///
+    /// The mixer used to compute `softplus(dt + dt_bias).clip(time_step_min,
+    /// None)`. No production reference does that: the HF fused path keys off
+    /// `time_step_limit` (absent in the released config, so mamba_ssm's
+    /// `dt_limit=(0.0, inf)` applies), vLLM hardcodes `(0.0, inf)`, and
+    /// mlx-lm clips to a `time_step_limit` that defaults to `(0.0, inf)`.
+    /// Only the HF torch *fallback* clamps to `time_step_min`.
+    ///
+    /// Mutation caught: restoring `.clip(Some(self.time_step_min), None)` (or
+    /// any bound derived from `time_step_min`) in `forward`. `time_step_min`
+    /// is set to 0.5 here so a revived clamp is unmistakable; on the released
+    /// checkpoint (`time_step_min = 1e-3`) ~9% of the 1472 SSM heads have
+    /// `softplus(dt_bias) < 1e-3`, so the clamp was live in production too.
+    #[test]
+    fn time_step_min_does_not_clamp_dt() {
+        let mut cfg = tiny_cfg();
+        cfg.time_step_min = 0.5;
+        assert!(
+            cfg.time_step_limit.is_none(),
+            "checkpoint declares no limit"
+        );
+
+        // softplus(-12) ~= 6.1e-6, far below both 1e-3 and time_step_min.
+        let mixer = mixer_with_dt_bias(&cfg, &[-12.0, -12.0]);
+        assert_eq!(
+            mixer.dt_limit,
+            (0.0, f64::INFINITY),
+            "an absent time_step_limit must resolve to the unbounded default"
+        );
+
+        let h = cfg.hidden_size as usize;
+        let t = 4usize;
+        let x: Vec<f32> = (0..t * h)
+            .map(|i| SIGNAL * ((((i as f32) * 0.91) % 2.0) - 1.0))
+            .collect();
+        let mx_x = MxArray::from_float32(&x, &[1, t as i64, h as i64]).unwrap();
+
+        let mut state = mixer.fresh_state(1).expect("fresh state");
+        let got = mixer
+            .forward(&mx_x, Some(&mut state))
+            .expect("prefill runs")
+            .to_float32()
+            .unwrap()
+            .to_vec();
+
+        let (ref_unclamped, _) = mixer_reference(&mixer, &x, t, 1, NO_DT_LIMIT);
+        assert_close(&got, &ref_unclamped, "mixer vs UNCLAMPED reference", 5e-3);
+
+        // Teeth: the old, wrong clamp produces a materially different output,
+        // so the assertion above is not vacuous.
+        let (ref_clamped, _) =
+            mixer_reference(&mixer, &x, t, 1, (cfg.time_step_min, f64::INFINITY));
+        let drift = max_abs_diff(&got, &ref_clamped);
+        assert!(
+            drift > 1e-2,
+            "clamping to time_step_min must change the output (drift {drift})"
+        );
+    }
+
+    /// The clamp the references DO apply: an explicit `time_step_limit` pair
+    /// bounds dt at both ends.
+    ///
+    /// Mutation caught: dropping `time_step_limit` from the config parse, or
+    /// hardcoding `dt_limit` to `(0.0, inf)` in `new_mamba_mixer`.
+    #[test]
+    fn time_step_limit_clamps_dt_at_both_ends() {
+        let mut cfg = tiny_cfg();
+        cfg.time_step_limit = Some(vec![0.5, 2.0]);
+
+        // Head 0: softplus(-12) ~= 6.1e-6 -> raised to 0.5.
+        // Head 1: softplus(+6)  ~= 6.0    -> lowered to 2.0.
+        let mixer = mixer_with_dt_bias(&cfg, &[-12.0, 6.0]);
+        assert_eq!(mixer.dt_limit, (0.5, 2.0));
+
+        let h = cfg.hidden_size as usize;
+        let t = 4usize;
+        let x: Vec<f32> = (0..t * h)
+            .map(|i| SIGNAL * ((((i as f32) * 0.57) % 2.0) - 1.0))
+            .collect();
+        let mx_x = MxArray::from_float32(&x, &[1, t as i64, h as i64]).unwrap();
+
+        let mut state = mixer.fresh_state(1).expect("fresh state");
+        let got = mixer
+            .forward(&mx_x, Some(&mut state))
+            .expect("prefill runs")
+            .to_float32()
+            .unwrap()
+            .to_vec();
+
+        let (ref_clamped, _) = mixer_reference(&mixer, &x, t, 1, (0.5, 2.0));
+        assert_close(&got, &ref_clamped, "mixer vs clamped reference", 5e-3);
+
+        let (ref_unclamped, _) = mixer_reference(&mixer, &x, t, 1, NO_DT_LIMIT);
+        let drift = max_abs_diff(&got, &ref_unclamped);
+        assert!(
+            drift > 1e-2,
+            "an explicit time_step_limit must change the output (drift {drift})"
+        );
+    }
+
+    /// The same regression on the single-token recurrent decode path, which
+    /// computes dt through the same `forward` prologue but runs
+    /// `decode_step` instead of the chunk scan.
+    ///
+    /// Mutation caught: same as `time_step_min_does_not_clamp_dt`, but proves
+    /// the decode branch is covered too.
+    #[test]
+    fn decode_step_does_not_clamp_dt_to_time_step_min() {
+        let mut cfg = tiny_cfg();
+        cfg.time_step_min = 0.5;
+        let mixer = mixer_with_dt_bias(&cfg, &[-12.0, -12.0]);
+
+        let h = cfg.hidden_size as usize;
+        let t = 4usize;
+        let x: Vec<f32> = (0..t * h)
+            .map(|i| SIGNAL * ((((i as f32) * 0.91) % 2.0) - 1.0))
+            .collect();
+
+        // Prefill t-1 tokens, then take the last one through decode_step so
+        // the recurrent update runs against a real (non-zero) SSM state.
+        let mx_prefix =
+            MxArray::from_float32(&x[..(t - 1) * h], &[1, (t - 1) as i64, h as i64]).unwrap();
+        let mx_last = MxArray::from_float32(&x[(t - 1) * h..], &[1, 1, h as i64]).unwrap();
+        let mut state = mixer.fresh_state(1).expect("fresh state");
+        let _ = mixer
+            .forward(&mx_prefix, Some(&mut state))
+            .expect("prefix prefill");
+        let got = mixer
+            .forward(&mx_last, Some(&mut state))
+            .expect("decode runs")
+            .to_float32()
+            .unwrap()
+            .to_vec();
+
+        let (ref_unclamped, _) = mixer_reference(&mixer, &x, t, 1, NO_DT_LIMIT);
+        let last_unclamped = &ref_unclamped[(t - 1) * h..];
+        assert_close(&got, last_unclamped, "decode vs UNCLAMPED reference", 5e-3);
+
+        let (ref_clamped, _) =
+            mixer_reference(&mixer, &x, t, 1, (cfg.time_step_min, f64::INFINITY));
+        let drift = max_abs_diff(&got, &ref_clamped[(t - 1) * h..]);
+        assert!(
+            drift > 1e-2,
+            "clamping to time_step_min must change the decode output (drift {drift})"
+        );
+    }
+
     #[test]
     fn decode_single_token_matches_reference() {
         let cfg = tiny_cfg();
@@ -1019,7 +1270,7 @@ mod tests {
         let mut state = mixer.fresh_state(1).expect("fresh state");
         let out = mixer.forward(&mx_x, Some(&mut state)).expect("decode runs");
         let got = out.to_float32().unwrap().to_vec();
-        let (ref_out, _) = mixer_reference(&mixer, &x, 1, 1);
+        let (ref_out, _) = mixer_reference(&mixer, &x, 1, 1, mixer.dt_limit);
         assert_close(&got, &ref_out, "single-token decode vs reference", 5e-3);
     }
 }

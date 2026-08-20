@@ -121,10 +121,27 @@ both routes propose and verify tokens.
 | Qwen3.5 dense | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP, including paged target state and supported image-context continuation | plain paged AR may use the two-row GDN scheduler; multimedia/MTP retain the ordered path                                  |
 | Qwen3.5 MoE   | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP on flat target state                                                   | plain paged AR may use the two-row GDN/MoE scheduler; multimedia/MTP retain the ordered path                              |
 | Gemma4        | image/audio components that have a paged adapter             | fresh and delta | external draft on flat text-only state                                            | ordinary paged text AR uses grouped full/sliding batching; media and MTP/DSpark remain ordered barriers                   |
-| nemotron_h    | none                                                         | fresh and delta | native MTP on flat target state                                                   | plain paged AR may use the hybrid continuous-batching scheduler; MTP retains the ordered path                             |
+| nemotron_h    | none                                                         | fresh and delta | native depth-1 MTP on flat target state; the draft head owns its own KV cache | plain paged AR may use the hybrid continuous-batching scheduler; MTP retains the ordered path                             |
 
 The table is a conformance description, not dispatch code. The source of truth
 is each model's `execution_plan()` plus its executor implementations.
+
+**nemotron_h draft head.** Unlike the earlier read-only shape, the NemotronH MTP
+head is **stateful**: it has its own `k_proj`/`v_proj` and its own causal KV
+cache, matching vLLM (`nemotron_h_mtp.py`'s
+`NemotronHMTPAttentionDecoderLayer` extends the ordinary attention decoder
+layer, so its `Attention` is a real KV-cache group). That cache is **per turn**,
+owned by the MTP stepper, and never reads the backbone's KV. It is seeded across
+the whole prompt during prefill using vLLM's EAGLE token shift — drafter slot
+`p` fuses `enorm(emb(t_{p+1}))` with `hnorm(h_p)`, and the final prompt slot
+takes the newly sampled token — then rewound on rejection by a cursor `trim` to
+the committed length, never by a snapshot restore (the same rewind-and-overwrite
+model the KV cache uses everywhere else). Attention is **NoPE** throughout;
+causality comes from the cache offset plus the causal mask. Depth stays clamped
+to 1: vLLM reaches depth > 1 by looping the single MTP layer, which is
+architecturally available here but out of scope. A seed failure is fail-closed —
+it disarms the head for the rest of the model's life and the turn retries on the
+AR lane.
 
 ## Extension boundary
 

@@ -7,9 +7,18 @@
 //! the per-layer paged routing agrees with the flat path on the attention
 //! layers without disturbing the mamba states on the others.
 //!
-//! Gated on `MLX_TEST_MODEL_PATH` so a plain `cargo test --ignored` without
-//! the env var still passes (the early-return short-circuits the body before
-//! any model load).
+//! ## Env var
+//!
+//! This gate reads the GENERIC **`MLX_TEST_MODEL_PATH`** (see
+//! `resolve_source_model` below) so a plain `cargo test --ignored` without
+//! the env var still passes: the early return short-circuits the body before
+//! any model load.
+//!
+//! The other two nemotron gates read a DIFFERENT, family-specific variable —
+//! `nemotron_h_concurrent_batched_parity.rs` and
+//! `nemotron_h_mtp_midcycle_state.rs` both read
+//! `MLX_TEST_NEMOTRON_H_MODEL_PATH`. Set BOTH to the same checkpoint when
+//! running the whole nemotron gate set, or two of the three silently skip.
 //!
 //! Run locally with:
 //!

@@ -33,7 +33,14 @@ pub struct NemotronHConfig {
     pub max_position_embeddings: i32,
     /// RMSNorm epsilon for every norm in the model (1e-5).
     pub layer_norm_epsilon: f64,
-    /// RoPE base frequency for the attention layers (10000).
+    /// RoPE base frequency carried in some checkpoint `config.json` files.
+    ///
+    /// UNUSED: NemotronH attention is NoPE. No reference implementation
+    /// declares or consumes `rope_theta` (HF `NemotronHConfig` has no such
+    /// field, vLLM's attention takes no positions, mlx-lm never rotates), so
+    /// it is parsed leniently with a 10000.0 default and never read. The
+    /// field is retained only so the napi object shape - and the two
+    /// hand-synced `index.d.cts` artifacts - stay stable.
     pub rope_theta: f64,
     /// Per-layer mixer kind, remapped from the checkpoint's
     /// `layers_block_type`: "mamba" -> "linear_attention", "attention" ->
@@ -53,9 +60,28 @@ pub struct NemotronHConfig {
     pub conv_kernel: i32,
     /// Mamba-2 chunk-scan chunk size (128).
     pub chunk_size: i32,
-    /// Minimum discretized time step (1e-3); softplus(dt + dt_bias) is
-    /// clamped to [time_step_min, inf).
+    /// Declared minimum discretized time step (1e-3 in the released
+    /// checkpoint).
+    ///
+    /// UNUSED BY THE RUNTIME. No production reference clamps dt to it: the
+    /// HF fused path builds `dt_limit_kwargs` from `time_step_limit` only
+    /// (modeling_nemotron_h.py:281) and the released config declares no
+    /// `time_step_limit`, so mamba_ssm's `dt_limit=(0.0, inf)` applies;
+    /// vLLM hardcodes `dt_limit=(0.0, inf)` (mamba_mixer2.py:672, :890);
+    /// mlx-lm defaults `time_step_limit` to `(0.0, inf)` and clips to that
+    /// (nemotron_h.py:56-65 + ssm.py:8-11). Only the HF *torch fallback*
+    /// (:417-418, :465-466) clamps to `time_step_min`, and that path is not
+    /// what the checkpoint was trained/served with. Parsed leniently and
+    /// retained only so the napi object shape - and the two hand-synced
+    /// `index.d.cts` artifacts - stay stable. Use `time_step_limit_pair()`
+    /// for the clamp the mixer actually applies.
     pub time_step_min: f64,
+    /// Optional `[min, max]` bounds for the discretized time step, matching
+    /// mlx-lm's `ModelArgs.time_step_limit`. Absent (`None`) means the
+    /// mamba_ssm/vLLM/mlx-lm default `(0.0, +inf)`, i.e. no clamp; the
+    /// released 30B checkpoint declares no `time_step_limit`.
+    #[napi(ts_type = "number[]")]
+    pub time_step_limit: Option<Vec<f64>>,
 
     // --- MoE mixer ---
     /// Total routed experts (128).
@@ -111,6 +137,17 @@ pub struct NemotronHConfig {
 }
 
 impl NemotronHConfig {
+    /// The `(min, max)` bounds the Mamba-2 mixer clips `softplus(dt +
+    /// dt_bias)` to. Defaults to `(0.0, +inf)` - no clamp - exactly as
+    /// mlx-lm's `ModelArgs.__post_init__` does. `time_step_min` is
+    /// deliberately NOT consulted; see its doc comment.
+    pub fn time_step_limit_pair(&self) -> (f64, f64) {
+        match self.time_step_limit.as_deref() {
+            Some([lo, hi]) => (*lo, *hi),
+            _ => (0.0, f64::INFINITY),
+        }
+    }
+
     /// Mamba mixer intermediate size = mamba_num_heads * mamba_head_dim.
     pub fn mamba_intermediate_size(&self) -> i32 {
         self.mamba_num_heads * self.mamba_head_dim
@@ -223,6 +260,48 @@ fn req_f64(raw: &Value, key: &str) -> Result<f64> {
             "config.json missing or invalid required field '{key}'"
         ))
     })
+}
+
+/// Parse an optional f64 config field, falling back to `default` when the key
+/// is absent or not a number.
+fn opt_f64(raw: &Value, key: &str, default: f64) -> f64 {
+    raw.get(key).and_then(Value::as_f64).unwrap_or(default)
+}
+
+/// Parse the optional `time_step_limit` as a `[min, max]` pair.
+///
+/// Absent or `null` yields `None`, which `time_step_limit_pair()` resolves to
+/// the reference default `(0.0, +inf)`. Anything present but not a two-element
+/// numeric array with `min <= max` is rejected rather than silently ignored -
+/// a mis-shaped limit would otherwise change every SSM time step.
+fn parse_time_step_limit(raw: &Value) -> Result<Option<Vec<f64>>> {
+    let Some(v) = raw.get("time_step_limit") else {
+        return Ok(None);
+    };
+    if v.is_null() {
+        return Ok(None);
+    }
+    let pair: Vec<f64> = v
+        .as_array()
+        .map(|items| items.iter().filter_map(Value::as_f64).collect())
+        .unwrap_or_default();
+    if pair.len() != 2 || v.as_array().map(Vec::len) != Some(2) {
+        return Err(Error::from_reason(format!(
+            "config.json time_step_limit must be a [min, max] pair of numbers, got {v}"
+        )));
+    }
+    // `partial_cmp` rather than `!(a <= b)` so a NaN bound is rejected
+    // explicitly instead of by comparison fallthrough.
+    let ordered = matches!(
+        pair[0].partial_cmp(&pair[1]),
+        Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+    );
+    if !ordered {
+        return Err(Error::from_reason(format!(
+            "config.json time_step_limit min must be <= max, got {v}"
+        )));
+    }
+    Ok(Some(pair))
 }
 
 /// Parse a required bool config field, failing closed when missing or invalid.
@@ -439,7 +518,10 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
         head_dim,
         max_position_embeddings: req_i32(raw, "max_position_embeddings")?,
         layer_norm_epsilon: req_f64(raw, "layer_norm_epsilon")?,
-        rope_theta: req_f64(raw, "rope_theta")?,
+        // Optional: no reference config class declares `rope_theta` and
+        // nothing reads it (NemotronH attention is NoPE). Requiring it
+        // would reject a spec-conformant checkpoint.
+        rope_theta: opt_f64(raw, "rope_theta", 10_000.0),
         layers_block_type,
         mamba_num_heads,
         mamba_head_dim,
@@ -459,7 +541,12 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
             }
             chunk_size
         },
-        time_step_min: req_f64(raw, "time_step_min")?,
+        // Optional: mlx-lm declares `time_step_min` as `Optional[float] =
+        // None` and never clips to it. Parsed leniently so a config that
+        // omits it still loads; the runtime clamp comes from
+        // `time_step_limit` alone.
+        time_step_min: opt_f64(raw, "time_step_min", 0.001),
+        time_step_limit: parse_time_step_limit(raw)?,
         n_routed_experts,
         num_experts_per_tok,
         routed_scaling_factor: req_f64(raw, "routed_scaling_factor")?,
@@ -541,6 +628,91 @@ mod tests {
             "mtp_layers_block_type": ["attention", "moe"],
             "num_nextn_predict_layers": 1,
         })
+    }
+
+    /// The released 30B checkpoint declares `time_step_min`/`time_step_max`/
+    /// `time_step_floor` but NO `time_step_limit`, so the runtime clamp must
+    /// resolve to the reference default `(0.0, +inf)` - i.e. no clamp.
+    ///
+    /// Mutation caught: resolving an absent `time_step_limit` to anything
+    /// derived from `time_step_min` (the shipped bug clamped to `(1e-3,
+    /// inf)`, which bound ~9% of the checkpoint's 1472 SSM heads).
+    #[test]
+    fn absent_time_step_limit_is_unbounded() {
+        let raw = lightning_json();
+        assert!(
+            raw.get("time_step_limit").is_none(),
+            "the released config declares no time_step_limit"
+        );
+        let cfg = parse_config(&raw).expect("lightning config parses");
+        assert_eq!(cfg.time_step_min, 0.001, "still parsed, just unused");
+        assert_eq!(cfg.time_step_limit, None);
+        assert_eq!(cfg.time_step_limit_pair(), (0.0, f64::INFINITY));
+    }
+
+    /// A declared `time_step_limit` pair is honoured verbatim, matching
+    /// mlx-lm's `ModelArgs.time_step_limit` / mamba_ssm's `dt_limit`.
+    #[test]
+    fn declared_time_step_limit_is_parsed() {
+        let mut raw = lightning_json();
+        raw.as_object_mut()
+            .unwrap()
+            .insert("time_step_limit".into(), json!([0.0, 0.1]));
+        let cfg = parse_config(&raw).expect("config with time_step_limit parses");
+        assert_eq!(cfg.time_step_limit, Some(vec![0.0, 0.1]));
+        assert_eq!(cfg.time_step_limit_pair(), (0.0, 0.1));
+    }
+
+    /// A mis-shaped `time_step_limit` must fail the load rather than be
+    /// silently ignored - ignoring it would change every SSM time step.
+    #[test]
+    fn malformed_time_step_limit_is_rejected() {
+        for bad in [
+            json!([0.1]),
+            json!([0.0, 0.1, 0.2]),
+            json!(0.1),
+            json!(["a", "b"]),
+        ] {
+            let mut raw = lightning_json();
+            raw.as_object_mut()
+                .unwrap()
+                .insert("time_step_limit".into(), bad.clone());
+            assert!(
+                parse_config(&raw).is_err(),
+                "time_step_limit {bad} must be rejected"
+            );
+        }
+        // min > max is nonsense too.
+        let mut raw = lightning_json();
+        raw.as_object_mut()
+            .unwrap()
+            .insert("time_step_limit".into(), json!([1.0, 0.5]));
+        assert!(parse_config(&raw).is_err(), "min > max must be rejected");
+    }
+
+    /// mlx-lm declares `time_step_min` as `Optional[float] = None`; a
+    /// checkpoint that omits it must still load now that nothing reads it.
+    /// Regression against parsing it with `req_f64`.
+    #[test]
+    fn time_step_min_is_optional() {
+        let mut raw = lightning_json();
+        raw.as_object_mut().unwrap().remove("time_step_min");
+        let cfg = parse_config(&raw).expect("config without time_step_min parses");
+        assert_eq!(cfg.time_step_min, 0.001);
+        assert_eq!(cfg.time_step_limit_pair(), (0.0, f64::INFINITY));
+    }
+
+    /// `rope_theta` is declared by no reference config class (HF, vLLM and
+    /// mlx-lm all describe NemotronH attention without a rotation), so a
+    /// checkpoint that omits it must still load. Regression against parsing
+    /// it with `req_f64`.
+    #[test]
+    fn rope_theta_is_optional_and_defaults() {
+        let mut raw = lightning_json();
+        assert!(raw.get("rope_theta").is_some());
+        raw.as_object_mut().unwrap().remove("rope_theta");
+        let cfg = parse_config(&raw).expect("config without rope_theta parses");
+        assert_eq!(cfg.rope_theta, 10_000.0);
     }
 
     #[test]
