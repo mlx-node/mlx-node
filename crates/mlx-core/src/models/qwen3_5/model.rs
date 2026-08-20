@@ -10448,6 +10448,14 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// `unemitted` in these SAME units, so the mid-cycle rewind target
     /// (`last_cycle_steps - unemitted`) is immune to tape-step-unit skew.
     last_cycle_steps: usize,
+    /// The paged verify cycle [`MtpStepper::verify_step`] opened around the
+    /// verify core's own row write, consumed by [`MtpStepper::rollback`]'s
+    /// facade commit — the one place the adapter's speculative rows are
+    /// retracted, so the commit arithmetic cannot drift from the
+    /// conformance surface. `None` in flat mode, between cycles, and when
+    /// the adapter names no active sequence (the verify core then fails on
+    /// its own `record_tokens` and the turn never reaches a rollback).
+    open_cycle: Option<crate::engine::spec_paged::VerifyTicket>,
     /// Absolute tokens the GDN recurrent state has consumed, reported by
     /// [`MtpStepper::frontier`] against the ATTENTION side's ground truth
     /// (adapter recorded rows / flat full-attention offset). Seeded from the
@@ -10492,6 +10500,12 @@ enum MtpStepMode {
 
 impl Drop for DenseMtpStepper<'_> {
     fn drop(&mut self) {
+        // A turn that failed between the verify write and its rollback (any
+        // `?` in the engine's accept path) leaves the cycle open; close it
+        // before the adapter moves back out of `mode`, or the ticket's
+        // abandoned-cycle guard turns that error return into a debug-build
+        // panic.
+        self.close_abandoned_cycle();
         // Restore the paged adapter into the model so the post-turn
         // paged-history save (which runs AFTER `run_mtp_turn` returns) finds
         // `inner.paged_adapter == Some`. Firing in `Drop` covers EVERY exit
@@ -10645,6 +10659,119 @@ impl DenseMtpStepper<'_> {
                 .to_string()),
         }
     }
+
+    /// The paged half of [`MtpStepper::verify_step`]: slice `ids` to exactly
+    /// the `depth + 1` rows the core records, OPEN the facade cycle around
+    /// that write, then run it. The open is pure — it reads the pre-write
+    /// frontier off the adapter and mints the ticket — so a verify that
+    /// fails afterwards leaves the adapter exactly where the un-ticketed
+    /// path left it.
+    ///
+    /// The cycle is opened AFTER the fallible id work so a malformed `ids`
+    /// never mints a ticket, and BEFORE the write so the ticket's basis is
+    /// the pre-write cursor: the commit checks the cursor moved by exactly
+    /// the promised rows, which is what refuses a core that wrote a
+    /// different width.
+    fn paged_verify_step(
+        &mut self,
+        ids: &MxArray,
+        depth: usize,
+    ) -> Result<mtp_decode::MtpVerifyOutput> {
+        // Slice `ids` to exactly `depth+1` defensively so the adapter
+        // records exactly K+1 tokens — the rollback count depends on it.
+        let id_window = ids.to_int32().map_err(|e| {
+            Error::from_reason(format!(
+                "eager paged MTP verify_step: ids to_int32: {}",
+                e.reason
+            ))
+        })?;
+        if id_window.len() < depth + 1 {
+            return Err(Error::from_reason(format!(
+                "eager paged MTP verify_step: ids has {} elements, need {}",
+                id_window.len(),
+                depth + 1
+            )));
+        }
+        let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
+        let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
+        self.open_verify_cycle(depth + 1);
+        let MtpStepMode::Paged(adapter) = &mut self.mode else {
+            unreachable!("paged_verify_step is only reached in paged mode");
+        };
+        let inner = &mut *self.inner;
+        // Cross-turn M-RoPE delta carried by a text turn that warm-
+        // continues an image prefill; 0 for pure-text sessions.
+        let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("eager paged MTP verify_step: caches is None"))?;
+        let tape = &mut self.tape;
+        super::paged_forward::run_paged_verify_step(
+            &verify_in,
+            &inner.embedding,
+            &mut inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &self.layer_kinds,
+            adapter,
+            tape,
+            rope_deltas,
+        )
+    }
+
+    /// Mint the cycle ticket the verify core's own row write belongs to.
+    ///
+    /// Failure is not fatal and not silent: the only way to reach it is an
+    /// adapter with no active request, whose `record_tokens` fails the
+    /// verify a few lines later with the message it always did, so the
+    /// pre-facade error semantics stand.
+    fn open_verify_cycle(&mut self, rows: usize) {
+        self.close_abandoned_cycle();
+        let seq_id = match &self.mode {
+            MtpStepMode::Paged(adapter) => adapter.active_seq_id(),
+            MtpStepMode::Flat => None,
+        };
+        let Some(seq_id) = seq_id else {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                "eager MTP-paged verify cycle left unopened: the adapter names no \
+                 active sequence",
+            );
+            return;
+        };
+        match crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq_id, rows) {
+            Ok(ticket) => self.open_cycle = Some(ticket),
+            Err(e) => tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                "eager MTP-paged verify cycle ({rows} rows) could not be opened \
+                 (the rollback falls back to a direct adapter retraction): {e}",
+            ),
+        }
+    }
+
+    /// Close a cycle abandoned between its verify write and its rollback.
+    /// Keeping every written row is what the un-ticketed path did — they
+    /// stay recorded past the emitted frontier and the epilogue's
+    /// length-agreement check refuses to persist the turn — so a full keep
+    /// retracts nothing and this consumes the ticket instead of letting its
+    /// abandoned-cycle guard fire.
+    fn close_abandoned_cycle(&mut self) {
+        let Some(ticket) = self.open_cycle.take() else {
+            return;
+        };
+        let (seq_id, rows) = (ticket.seq_id(), ticket.rows());
+        if let Err(e) =
+            crate::engine::spec_paged::SpecPagedCache::commit_cycle(self, seq_id, ticket, rows)
+        {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                "eager MTP-paged abandoned verify cycle on sequence {seq_id} \
+                 ({rows} rows) could not be closed cleanly (ignored): {e}",
+            );
+        }
+    }
 }
 
 impl MtpStepper for DenseMtpStepper<'_> {
@@ -10742,66 +10869,29 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     // Batched verify: run the K+1 verify ids through the main stack,
-    // advancing `inner.caches` by K+1, recording the GDN tape.
+    // advancing `inner.caches` by K+1, recording the GDN tape. The paged
+    // half also opens the facade cycle its core write belongs to
+    // ([`DenseMtpStepper::paged_verify_step`]); `rollback` closes it.
     fn verify_step(
         &mut self,
         ids: &MxArray,
         embedding: &Embedding,
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
-        let output = match &mut self.mode {
-            MtpStepMode::Flat => {
-                let inner = &mut *self.inner;
-                let tape = &mut self.tape;
-                eager_verify_step(
-                    &mut inner.layers,
-                    &mut inner.caches,
-                    &inner.final_norm,
-                    &inner.lm_head,
-                    ids,
-                    embedding,
-                    Some(tape),
-                )
-            }
-            MtpStepMode::Paged(adapter) => {
-                // Slice `ids` to exactly `depth+1` defensively so the adapter
-                // records exactly K+1 tokens — the rollback count depends on it.
-                let id_window = ids.to_int32().map_err(|e| {
-                    Error::from_reason(format!(
-                        "eager paged MTP verify_step: ids to_int32: {}",
-                        e.reason
-                    ))
-                })?;
-                if id_window.len() < depth + 1 {
-                    return Err(Error::from_reason(format!(
-                        "eager paged MTP verify_step: ids has {} elements, need {}",
-                        id_window.len(),
-                        depth + 1
-                    )));
-                }
-                let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
-                let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
-                let inner = &mut *self.inner;
-                // Cross-turn M-RoPE delta carried by a text turn that warm-
-                // continues an image prefill; 0 for pure-text sessions.
-                let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
-                let caches = inner.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("eager paged MTP verify_step: caches is None")
-                })?;
-                let tape = &mut self.tape;
-                super::paged_forward::run_paged_verify_step(
-                    &verify_in,
-                    &inner.embedding,
-                    &mut inner.layers,
-                    caches,
-                    &inner.final_norm,
-                    &inner.lm_head,
-                    &self.layer_kinds,
-                    adapter,
-                    tape,
-                    rope_deltas,
-                )
-            }
+        let output = if matches!(self.mode, MtpStepMode::Paged(_)) {
+            self.paged_verify_step(ids, depth)
+        } else {
+            let inner = &mut *self.inner;
+            let tape = &mut self.tape;
+            eager_verify_step(
+                &mut inner.layers,
+                &mut inner.caches,
+                &inner.final_norm,
+                &inner.lm_head,
+                ids,
+                embedding,
+                Some(tape),
+            )
         };
         if output.is_ok() {
             // The recorded tape step count for this cycle: the anchor plus D
@@ -10850,16 +10940,51 @@ impl MtpStepper for DenseMtpStepper<'_> {
         // tape replay. On full accept `rejected == 0` (no-op). Flat layers keep
         // their full-attention K/V in `inner.caches` and rewind it via `kv.trim`
         // inside the replay loop instead.
-        if let MtpStepMode::Paged(adapter) = &mut self.mode {
-            let rejected = depth.saturating_sub(accepted_drafts);
-            if rejected > 0
-                && let Err(e) = adapter.rollback_last_tokens(rejected as u32)
-            {
-                tracing::warn!(
-                    target: "mlx_core::qwen3_5::paged",
-                    "eager MTP-paged rollback_last_tokens({rejected}) failed \
-                     (ignored): {e}",
-                );
+        //
+        // The retraction goes through the cycle `verify_step` opened, so the
+        // adapter half of this rollback and the facade's conformance surface
+        // are the same arithmetic: the commit derives its rollback as
+        // `rows - keep` = `(depth + 1) - (accepted_drafts + 1)`, which is the
+        // `depth - accepted_drafts` this path always applied.
+        if matches!(self.mode, MtpStepMode::Paged(_)) {
+            match self.open_cycle.take() {
+                Some(ticket) => {
+                    let seq_id = ticket.seq_id();
+                    // `keep` is CLAMPED to the rows the cycle wrote, exactly
+                    // as the `saturating_sub` it replaces clamped the rejected
+                    // count. `accepted_drafts <= depth` is an engine
+                    // invariant; were it ever broken, the clamp keeps this on
+                    // the commit's checked path — retracting zero rows, as the
+                    // `saturating_sub` did — instead of leaving through an Err
+                    // and a log line.
+                    let keep = (accepted_drafts + 1).min(ticket.rows());
+                    if let Err(e) = crate::engine::spec_paged::SpecPagedCache::commit_cycle(
+                        self, seq_id, ticket, keep,
+                    ) {
+                        tracing::warn!(
+                            target: "mlx_core::qwen3_5::paged",
+                            "eager MTP-paged verify commit (keep {keep} of the cycle's \
+                             rows) failed (ignored): {e}",
+                        );
+                    }
+                }
+                None => {
+                    // No cycle to close: `verify_step` could not name the
+                    // turn's sequence, which also fails the verify itself, so
+                    // production never lands here. Retract directly rather
+                    // than leave rejected rows recorded.
+                    let rejected = depth.saturating_sub(accepted_drafts);
+                    if let MtpStepMode::Paged(adapter) = &mut self.mode
+                        && rejected > 0
+                        && let Err(e) = adapter.rollback_last_tokens(rejected as u32)
+                    {
+                        tracing::warn!(
+                            target: "mlx_core::qwen3_5::paged",
+                            "eager MTP-paged rollback_last_tokens({rejected}) outside a \
+                             verify cycle failed (ignored): {e}",
+                        );
+                    }
+                }
             }
         }
         let accepted_steps = accepted_drafts + 1;
@@ -11130,21 +11255,39 @@ impl MtpStepper for DenseMtpStepper<'_> {
 /// Facade conformance for the dense paged MTP turn (`engine::spec_paged`):
 /// the cache is the [`MtpStepMode::Paged`] adapter, addressed by the turn's
 /// single active sequence ([`DenseMtpStepper::paged_cache_for`] refuses any
-/// other id). Every method maps onto the primitive the paged turn already
-/// drives, so conformance and production cannot drift apart:
-/// `reserve_lookahead` is [`MtpStepper::reserve_cycle_lookahead`]'s
-/// mechanism ([`PagedKVCacheAdapter::reserve_rows`] plus the
-/// capacity-exhaustion mapping — the stepper hook delegates here),
-/// `record_rows` is the verify cores'
-/// [`PagedKVCacheAdapter::record_tokens`], and `rollback_rows` is the
-/// [`PagedKVCacheAdapter::rollback_last_tokens`] cursor arithmetic that
-/// `rollback` / `rollback_unemitted` drive (their GDN tape replay stays
-/// theirs — the facade covers the paged-KV bookkeeping only).
+/// other id).
 ///
-/// The dense verify core records its `[anchor, drafts..]` slice as part of
-/// the forward, so a driver here opens the cycle with
-/// `open_core_write_cycle` around that write rather than through
-/// `record_verify`; the commit is checked either way.
+/// # What production routes through here, and what it does not
+///
+/// PRODUCTION-ROUTED — these are the turn's only path, so conformance and
+/// production cannot drift:
+///
+/// * `reserve_lookahead` — [`MtpStepper::reserve_cycle_lookahead`] delegates
+///   here for the mechanism ([`PagedKVCacheAdapter::reserve_rows`] plus the
+///   capacity-exhaustion mapping) and only names the active sequence.
+/// * `open_core_write_cycle` + `commit_cycle` — the dense verify core
+///   records its `[anchor, drafts..]` slice as part of the forward, so
+///   [`MtpStepper::verify_step`] opens the cycle AROUND that write and
+///   [`MtpStepper::rollback`] closes it. The commit is the adapter half of
+///   that rollback; the GDN tape replay and the recurrent frontier update
+///   are layered on top of it and stay the stepper's.
+///
+/// NOT production-routed — conformance surface only:
+///
+/// * `record_verify` (and the `record_rows` primitive under it) covers the
+///   KV half ALONE. It writes rows the verify forward never wrote, so it
+///   must never be paired with `verify_step` on the same cycle — the rows
+///   would be recorded twice — and a cycle it opens must be committed with
+///   a keep of ZERO, because any kept row advances the adapter while the
+///   recurrent state stands still and the two frontiers desync (the skew
+///   [`Qwen35Inner::check_dense_paged_frontier`] cannot see, since it
+///   compares the adapter against the history, not against the GDN count).
+/// * `settle_committed` / `settle_captures_durable_state` — see below.
+///
+/// `rollback_unemitted` retracts COMMITTED rows after a mid-cycle stop, past
+/// the end of the cycle the commit already closed, so it stays a direct
+/// [`PagedKVCacheAdapter::rollback_last_tokens`] and is outside this
+/// contract.
 ///
 /// `settle_committed` is the IDENTITY for this family, by construction: the
 /// dense adapter is full-attention-only (`sliding_window == 0`, so no
@@ -11291,6 +11434,7 @@ impl MtpBackend for Qwen35Inner {
             snap: None,
             tape: Vec::new(),
             last_cycle_steps: 0,
+            open_cycle: None,
             recurrent_frontier: None,
             recurrent_snapshot_base: None,
             replay_err: None,
@@ -16951,19 +17095,137 @@ mod paged_construction_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// Cross-module gate for the reserve→verify seam (T1/T2/T3 wiring):
-    /// `begin_mtp_decode` must reserve the plan-derived lookahead region
-    /// (`SpeculativePlan::lookahead_rows`, threaded through
-    /// `MtpTurnSetup.lookahead_rows`) so a REAL paged verify cycle writes
-    /// its `depth + 1` rows into pre-allocated blocks.
+    /// Cross-module gate for the reserve→verify seam (T1/T2/T3 wiring) and
+    /// for the facade cycle the dense paged commit is routed through
+    /// (`engine::spec_paged`). Every cycle here is a REAL verify forward, so
+    /// every row the block table holds was written by one.
     ///
-    /// Catches: I1 drift (the property diverging from what verify actually
-    /// writes), a dead reserve→record seam (reservation not reaching the
-    /// adapter, or advancing the cursor), and a verify/rollback pair whose
-    /// net adapter growth escapes the reserved margin.
+    /// Geometry: exactly one block of prompt, then production cycles until a
+    /// cycle's `+lookahead` margin crosses out of the allocated tail. The
+    /// TURN-ENTRY reservation is pinned by the first crossing (prompt block
+    /// → prompt + lookahead), the PER-CYCLE facade reservation by the second
+    /// — a reservation that never reaches the allocator then shows up as a
+    /// mid-verify allocation on that cycle instead of passing vacuously.
+    ///
+    /// Catches: I1 drift (the plan property diverging from what verify
+    /// actually writes), a dead reserve→record seam (reservation not
+    /// reaching the adapter, or advancing the cursor), a verify/rollback
+    /// pair whose net adapter growth escapes the reserved margin, and a
+    /// ONE-SIDED commit — an adapter rollback that does not land the
+    /// recurrent state with it, which the full `SpecFrontier` equality after
+    /// every cycle pins. That last shape is invisible to the release
+    /// backstop `check_dense_paged_frontier`, which compares the adapter
+    /// against the history and never against the GDN count.
     #[test]
     #[ignore = "requires Metal GPU; run with --ignored"]
     fn paged_mtp_lookahead_reservation_covers_verify() {
+        use crate::engine::spec_paged::{NoSettleInCycle, SpecPagedCache};
+
+        /// `(allocated blocks, recorded rows)` of the turn's paged adapter.
+        fn adapter_stats(step: &DenseMtpStepper<'_>) -> (usize, u32) {
+            let MtpStepMode::Paged(adapter) = &step.mode else {
+                panic!("mode must stay paged for the whole turn");
+            };
+            (
+                adapter.num_allocated_blocks(),
+                adapter.current_token_count(),
+            )
+        }
+
+        /// One production cycle in the engine's order: per-cycle facade
+        /// reservation → snapshot → verify over `depth + 1` real ids →
+        /// partial-accept rollback keeping the anchor and one draft. Asserts
+        /// what must hold on EVERY cycle, and returns the block count before
+        /// and after the reservation so the caller can see which cycle's
+        /// margin crossed a block boundary.
+        fn run_cycle(
+            step: &mut DenseMtpStepper<'_>,
+            seq_id: u32,
+            embedding: &Embedding,
+            depth: usize,
+            lookahead: usize,
+            block_size: u32,
+            first_id: i32,
+        ) -> (usize, usize) {
+            use crate::engine::spec_paged::SpecPagedCache;
+
+            let (pre_blocks, pre_cursor) = adapter_stats(step);
+            assert!(
+                SpecPagedCache::reserve_lookahead(step, seq_id, lookahead)
+                    .expect("per-cycle facade reservation"),
+                "a reservation the pool can hold must cover the cycle"
+            );
+            let (reserved_blocks, reserved_cursor) = adapter_stats(step);
+            assert_eq!(
+                reserved_cursor, pre_cursor,
+                "the reservation must not advance the cursor"
+            );
+
+            step.snapshot_main_linear();
+            let ids: Vec<i32> = (0..=depth as i32).map(|i| first_id + i).collect();
+            let verify_ids =
+                MxArray::from_int32(&ids, &[1, (depth + 1) as i64]).expect("verify ids");
+            step.verify_step(&verify_ids, embedding, depth)
+                .expect("paged verify step")
+                .hiddens
+                .eval();
+            assert!(
+                step.open_cycle.is_some(),
+                "the verify write must OPEN the cycle its rollback closes — an \
+                 un-ticketed write leaves the retraction outside the facade"
+            );
+            let (verify_blocks, verify_cursor) = adapter_stats(step);
+            assert_eq!(
+                verify_blocks, reserved_blocks,
+                "the verify write must allocate ZERO new blocks after the reservation"
+            );
+            assert_eq!(
+                verify_blocks,
+                (pre_cursor as usize + lookahead).div_ceil(block_size as usize),
+                "the reservation must cover exactly cursor + lookahead rows"
+            );
+            assert_eq!(
+                verify_cursor,
+                pre_cursor + lookahead as u32,
+                "the verify write must record exactly the reserved rows"
+            );
+
+            step.rollback(/* accepted_drafts */ 1, depth);
+            assert!(
+                step.take_replay_error().is_none(),
+                "the GDN tape replay must succeed on the partial accept"
+            );
+            assert!(
+                step.open_cycle.is_none(),
+                "the rollback must CONSUME the cycle's ticket"
+            );
+            let (committed_blocks, committed_cursor) = adapter_stats(step);
+            assert_eq!(
+                committed_blocks, reserved_blocks,
+                "rollback is bookkeeping-only — no block may move"
+            );
+            let growth = committed_cursor - pre_cursor;
+            assert_eq!(growth, 2, "committed rows = accepted drafts + anchor");
+            assert!(
+                (growth as usize) <= lookahead,
+                "total adapter growth must fit the reserved lookahead region"
+            );
+            // The facade commit is the ADAPTER half of `rollback`; the GDN
+            // tape replay is the other half. A commit that retracts only the
+            // adapter leaves the recurrent side `depth - accepted` rows
+            // ahead, which is exactly what one frontier catches.
+            assert_eq!(
+                MtpStepper::frontier(step),
+                Some(SpecFrontier {
+                    attn_tokens: u64::from(committed_cursor),
+                    recurrent_tokens: Some(u64::from(committed_cursor)),
+                }),
+                "the cycle's commit must land the adapter AND the recurrent state on \
+                 ONE frontier"
+            );
+            (pre_blocks, reserved_blocks)
+        }
+
         let mut cfg = tiny_paged_forward_cfg();
         cfg.n_mtp_layers = 1;
         let Some((mut inner, _cfg)) =
@@ -16974,7 +17236,7 @@ mod paged_construction_tests {
         cast_qwen35_inner_weights_bf16(&mut inner);
         // Random-init MTP module + loaded marker so `execution_plan()`
         // publishes the speculative plan (the drafter itself never runs
-        // here — the driven cycle is snapshot → verify → rollback).
+        // here — every driven cycle is snapshot → verify → rollback).
         inner.mtp_weights_loaded = true;
 
         // Exactly one full block of prompt: the lookahead region then starts
@@ -17012,86 +17274,27 @@ mod paged_construction_tests {
         };
         let mut step = inner.begin_mtp_decode(&setup).expect("begin_mtp_decode");
 
-        // Reservation: blocks grow to cover prompt + lookahead, the cursor
-        // does not move.
-        let MtpStepMode::Paged(adapter) = &step.mode else {
-            panic!("paged model must take the paged stepper mode");
-        };
-        let reserved_blocks = adapter.num_allocated_blocks();
+        // Turn-entry reservation: blocks grow to cover prompt + lookahead,
+        // the cursor does not move.
+        let (entry_blocks, entry_cursor) = adapter_stats(&step);
         assert_eq!(
-            reserved_blocks,
+            entry_blocks,
             (prompt.len() + lookahead).div_ceil(block_size as usize),
-            "reservation must cover prompt + lookahead rows"
+            "the turn-entry reservation must cover prompt + lookahead rows"
         );
-        assert!(reserved_blocks > pre_blocks);
-        assert_eq!(
-            adapter.current_token_count(),
-            prompt_len,
-            "reservation must not advance the cursor"
-        );
-
-        // One REAL verify cycle in the engine's order: snapshot → batched
-        // verify over depth+1 ids → partial-accept rollback.
-        let embedding = step.embedding().clone();
-        step.snapshot_main_linear();
-        let verify_ids =
-            MxArray::from_int32(&[21, 22, 23, 24], &[1, (depth + 1) as i64]).expect("verify ids");
-        let verify = step
-            .verify_step(&verify_ids, &embedding, depth)
-            .expect("paged verify step");
-        verify.hiddens.eval();
-
-        let MtpStepMode::Paged(adapter) = &step.mode else {
-            panic!("mode must stay paged across the cycle");
-        };
-        assert_eq!(
-            adapter.num_allocated_blocks(),
-            reserved_blocks,
-            "the verify write must allocate ZERO new blocks after the reservation"
-        );
-        assert_eq!(adapter.current_token_count(), prompt_len + lookahead as u32);
-
-        step.rollback(/* accepted_drafts */ 1, depth);
         assert!(
-            step.take_replay_error().is_none(),
-            "GDN tape replay must succeed on the partial accept"
+            entry_blocks > pre_blocks,
+            "the prompt ends ON a block boundary, so the turn-entry reservation must \
+             cross into a new block"
         );
-        let MtpStepMode::Paged(adapter) = &step.mode else {
-            panic!("mode must stay paged across the rollback");
-        };
         assert_eq!(
-            adapter.num_allocated_blocks(),
-            reserved_blocks,
-            "rollback is bookkeeping-only — no block may move"
-        );
-        let growth = adapter.current_token_count() - prompt_len;
-        assert_eq!(growth, 2, "committed rows = accepted drafts + anchor");
-        assert!(
-            (growth as usize) <= lookahead,
-            "total adapter growth must fit the reserved lookahead region"
+            entry_cursor, prompt_len,
+            "the reservation must not advance the cursor"
         );
 
-        // ── Facade-driven cycle (engine ↔ qwen3_5 cross-module gate) ──
-        // The same seam through `SpecPagedCache` itself — the method
-        // `reserve_cycle_lookahead` delegates to, not a private
-        // re-derivation: reservation coverage, commit arithmetic, and the
-        // frontier, all asserted on real block accounting. (The GDN tape
-        // replay stays `rollback`'s job, exercised above — the facade covers
-        // the paged-KV bookkeeping only.)
-        use crate::engine::spec_paged::SpecPagedCache;
-
-        let adapter_stats = |step: &DenseMtpStepper<'_>| -> (usize, u32) {
-            let MtpStepMode::Paged(adapter) = &step.mode else {
-                panic!("mode must stay paged across the facade cycle");
-            };
-            (
-                adapter.num_allocated_blocks(),
-                adapter.current_token_count(),
-            )
-        };
         let seq_id = {
             let MtpStepMode::Paged(adapter) = &step.mode else {
-                panic!("mode must stay paged across the facade cycle");
+                panic!("paged model must take the paged stepper mode");
             };
             adapter.active_seq_id().expect("active request")
         };
@@ -17106,120 +17309,126 @@ mod paged_construction_tests {
             "a sequence that is not the turn's must have no facade frontier"
         );
 
-        // Park the cursor one row short of the allocated tail so the next
-        // lookahead margin CROSSES a block boundary: a dead facade
-        // reservation (never reaching the allocator) then fails the
-        // zero-allocation assert on the verify below. The filler rows travel
-        // the lawful facade order with a full-keep commit (zero rollback).
-        let (parked_blocks, cursor) = adapter_stats(&step);
-        let capacity_rows = parked_blocks * block_size as usize;
-        let filler = (capacity_rows as u32).saturating_sub(cursor + lookahead as u32 - 1);
-        assert!(
-            filler > 0,
-            "geometry: the allocated tail must leave room to park in"
+        // Decode real cycles until one cycle's `+lookahead` margin crosses
+        // out of the allocated tail. Only the PER-CYCLE facade reservation
+        // covers that block — the turn-entry one is long spent — so that
+        // cycle is where a dead reservation surfaces as a mid-verify
+        // allocation.
+        let embedding = step.embedding().clone();
+        let mut crossing_cycle = None;
+        for cycle in 0..block_size as usize {
+            let (before, after) = run_cycle(
+                &mut step,
+                seq_id,
+                &embedding,
+                depth,
+                lookahead,
+                block_size,
+                21 + 10 * cycle as i32,
+            );
+            if after > before {
+                crossing_cycle = Some(cycle);
+                break;
+            }
+        }
+        let crossing_cycle = crossing_cycle.expect(
+            "some cycle's lookahead margin must cross a block boundary, or the \
+             per-cycle reservation is never exercised",
         );
         assert!(
-            SpecPagedCache::reserve_lookahead(&mut step, seq_id, filler as usize)
-                .expect("filler reservation"),
-            "the filler rows fit the already-allocated tail"
+            crossing_cycle > 0,
+            "the crossing must be paid for by a PER-CYCLE reservation, not by the \
+             turn-entry one"
         );
-        let filler_tokens: Vec<u32> = (0..filler).map(|i| 30 + i).collect();
-        let filler_ticket = SpecPagedCache::record_verify(&mut step, seq_id, &filler_tokens)
-            .expect("filler record");
-        SpecPagedCache::commit_cycle(&mut step, seq_id, filler_ticket, filler as usize)
-            .expect("a full-keep commit rolls back exactly zero rows");
-        let (pre_blocks, cursor) = adapter_stats(&step);
-        assert_eq!(
-            pre_blocks, parked_blocks,
-            "parking must stay inside the allocated tail"
-        );
-        assert_eq!(
-            cursor as usize + lookahead,
-            capacity_rows + 1,
-            "the next lookahead margin crosses the block boundary by one row"
-        );
-
-        // After `reserve_lookahead`, one full verify cycle allocates ZERO
-        // new blocks and total growth stays <= the plan's lookahead_rows().
-        assert!(
-            SpecPagedCache::reserve_lookahead(&mut step, seq_id, lookahead)
-                .expect("facade per-cycle reservation"),
-            "a reservation the pool can hold must cover the cycle"
-        );
-        let (reserved_blocks, reserved_cursor) = adapter_stats(&step);
-        assert_eq!(
-            reserved_blocks,
-            (cursor as usize + lookahead).div_ceil(block_size as usize),
-            "the facade reservation must pre-allocate the boundary-crossing block"
-        );
-        assert!(reserved_blocks > pre_blocks);
-        assert_eq!(
-            reserved_cursor, cursor,
-            "the facade reservation must not advance the cursor"
-        );
-
-        // The verify core writes its own rows, so the cycle opens around
-        // that write instead of through `record_verify`.
-        let facade_ticket = SpecPagedCache::open_core_write_cycle(&mut step, seq_id, lookahead)
-            .expect("open the core-write cycle");
-        step.snapshot_main_linear();
-        let facade_verify_ids =
-            MxArray::from_int32(&[41, 42, 43, 44], &[1, (depth + 1) as i64]).expect("verify ids");
-        step.verify_step(&facade_verify_ids, &embedding, depth)
-            .expect("facade-covered verify")
-            .hiddens
-            .eval();
-        let (post_verify_blocks, post_verify_cursor) = adapter_stats(&step);
-        assert_eq!(
-            post_verify_blocks, reserved_blocks,
-            "the verify write must allocate ZERO new blocks after the facade reservation"
-        );
-        assert_eq!(post_verify_cursor, cursor + lookahead as u32);
-
-        // The facade commit is the exact cursor arithmetic `rollback`
-        // drives: keep the anchor plus one draft of the depth + 1 rows.
-        SpecPagedCache::commit_cycle(&mut step, seq_id, facade_ticket, 2).expect("facade commit");
         let (committed_blocks, committed_cursor) = adapter_stats(&step);
-        assert_eq!(
-            committed_blocks, reserved_blocks,
-            "rollback is bookkeeping-only — no block may move"
-        );
-        let facade_growth = committed_cursor - cursor;
-        assert_eq!(
-            facade_growth, 2,
-            "committed rows = accepted drafts + anchor"
-        );
+
+        // ── L-SETTLE, executable on the real stepper ──
+        // The cycle transaction's KV half (`record_verify` → `commit_cycle`)
+        // covers no forward, so it is driven here with a keep of ZERO: the
+        // rows are retracted whole, which is what keeps this segment
+        // frontier-neutral and every surviving block-table row backed by a
+        // real verify write (see the facade impl docs).
+        let mut cache = NoSettleInCycle::new(step);
+        let kv_rows: [u32; 2] = [71, 72];
         assert!(
-            (facade_growth as usize) <= lookahead,
-            "total adapter growth must fit the reserved lookahead region"
+            cache
+                .reserve_lookahead(seq_id, kv_rows.len())
+                .expect("KV-half reservation"),
+            "two rows fit the tail the crossing cycle allocated"
         );
+        let (kv_blocks, _) = adapter_stats(cache.inner());
+        let ticket = cache
+            .record_verify(seq_id, &kv_rows)
+            .expect("record the KV-half rows");
         assert_eq!(
-            SpecPagedCache::frontier(&step, seq_id)
-                .expect("facade frontier")
-                .attn_tokens,
-            u64::from(committed_cursor),
-            "the facade frontier must land on the committed row count"
+            adapter_stats(cache.inner()),
+            (kv_blocks, committed_cursor + kv_rows.len() as u32),
+            "the KV-half write must land in the reserved tail"
         );
 
-        // The identity settle: legal at the frontier the commit landed on,
-        // refuses a frontier past the cursor, and touches nothing — this
-        // family's settle work lives in the turn epilogue (see the impl
-        // docs), so the real conformance surface is the block accounting
-        // asserted above.
+        // The ordering law is executable on the real stepper. This family's
+        // identity settle is lawful at exactly this basis once the cycle is
+        // closed (asserted below), so the refusal here is the checker's, not
+        // the implementation's argument validation.
+        let err = cache
+            .settle_committed(seq_id, u64::from(committed_cursor))
+            .expect_err("an in-cycle settle must trip the order check");
+        assert!(err.contains("L-SETTLE"), "unexpected error text: {err}");
+
+        cache
+            .commit_cycle(seq_id, ticket, 0)
+            .expect("a keep of zero retracts the whole KV-half write");
         assert!(
-            !SpecPagedCache::settle_captures_durable_state(&step),
+            !cache.settle_captures_durable_state(),
             "the identity settle captures nothing; this family's durable surfaces run \
              in the turn epilogue, and a `true` here would bar the in-cycle settle a \
              permissive call-order checker admits"
         );
-        SpecPagedCache::settle_committed(&mut step, seq_id, u64::from(committed_cursor))
-            .expect("identity settle at the committed frontier");
-        SpecPagedCache::settle_committed(&mut step, seq_id, u64::from(committed_cursor) + 1)
+        cache
+            .settle_committed(seq_id, u64::from(committed_cursor))
+            .expect("the identity settle is lawful once the cycle is closed");
+        cache
+            .settle_committed(seq_id, u64::from(committed_cursor) + 1)
             .expect_err("a committed frontier past the cursor must be refused");
+
+        let mut step = cache.into_inner();
         assert_eq!(
             adapter_stats(&step),
-            (committed_blocks, committed_cursor),
-            "the identity settle must move neither a block nor the cursor"
+            (kv_blocks, committed_cursor),
+            "a fully retracted KV-half cycle must leave the block table and the cursor \
+             exactly where it found them"
+        );
+        assert_eq!(
+            MtpStepper::frontier(&step),
+            Some(SpecFrontier {
+                attn_tokens: u64::from(committed_cursor),
+                recurrent_tokens: Some(u64::from(committed_cursor)),
+            }),
+            "the KV half touches no recurrent state, so a fully retracted cycle must be \
+             frontier-neutral"
+        );
+
+        // Real decode still advances on the same request, and both sides
+        // move together.
+        let next_ids = MxArray::from_int32(&[29], &[1, 1]).expect("ar ids");
+        let (logits, _hidden, _needs_squeeze) = step
+            .forward_with_hidden(&next_ids, &embedding)
+            .expect("AR forward after the facade cycles");
+        logits.eval();
+        let (ar_blocks, ar_cursor) = adapter_stats(&step);
+        assert_eq!(
+            ar_cursor,
+            committed_cursor + 1,
+            "AR decode must advance one row past the committed frontier"
+        );
+        assert_eq!(ar_blocks, committed_blocks);
+        assert_eq!(
+            MtpStepper::frontier(&step),
+            Some(SpecFrontier {
+                attn_tokens: u64::from(ar_cursor),
+                recurrent_tokens: Some(u64::from(ar_cursor)),
+            }),
+            "an AR step must move the adapter and the recurrent state together"
         );
 
         drop(step);
