@@ -15745,6 +15745,174 @@ mod spec_paged_substrate_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The model-level committed-basis settle BELOW the cursor — the gap
+    /// [`settle_at_committed_equals_cursor_when_equal`] cannot see: with
+    /// committed < cursor, the rung walk and the sliding prune must both
+    /// consume the committed frontier, never the write cursor.
+    ///
+    /// Geometry (window 16, block 8, first anchor rung 32): the cursor lands
+    /// exactly on the rung, committed 26 sits below it. The committed cutoff
+    /// (26 - 16 = 10) retires sliding block 0 only; a cursor cutoff
+    /// (32 - 16 = 16) would also null block 1, which holds live positions
+    /// 10-15 of the committed window [10, 26). The boundary-32 rows are still
+    /// live at settle time (`read_sliding_groups_at` succeeds only while the
+    /// sliding cursor sits exactly on the boundary), so a cursor-basis rung
+    /// walk WOULD capture a durable checkpoint a rollback below it can no
+    /// longer retract.
+    ///
+    /// Mutations this catches:
+    /// `remember_grouped_sliding_cold_checkpoint_at_frontier` ignoring
+    /// `committed_tokens` in its frontier (captures boundary 32 > committed);
+    /// the `Some(committed)` arm of `settle_grouped_kv_step_at_basis` routing
+    /// to the cursor-basis `prune_sliding_all`.
+    #[test]
+    fn settle_below_cursor_stays_on_the_committed_basis() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!(
+                "skipping settle_below_cursor_stays_on_the_committed_basis: Metal unavailable"
+            );
+            return;
+        }
+        let mut inner =
+            Gemma4Inner::new(tiny_paged_config()).expect("tiny paged Gemma4Inner must construct");
+        if inner.kv_cache_coordinator.is_none() {
+            eprintln!(
+                "skipping settle_below_cursor_stays_on_the_committed_basis: no paged coordinator"
+            );
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-gemma4-spec-paged-settle-below-{}",
+            std::process::id()
+        ));
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        let policy = sliding_sidecar::policy(&inner.config)
+            .expect("tiny geometry must yield a sliding sidecar policy");
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .full_adapter_mut()
+            .set_cold_tier(ColdTierContext {
+                manager: Arc::new(manager),
+                fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                    b"gemma4-spec-paged-settle-below".as_slice(),
+                ]),
+                sidecar_policy: Some(policy),
+            });
+        assert_eq!(
+            inner.scheduled_cold_anchor_rungs().first(),
+            Some(&32),
+            "test precondition: the ladder must publish the rung the cursor lands on"
+        );
+
+        let seq_id = 23u32;
+        let committed = 26u32;
+        {
+            let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+            coordinator.reset_scheduled_request(seq_id).expect("reset");
+            coordinator
+                .record_tokens_all(seq_id, &(0..32).collect::<Vec<_>>())
+                .expect("record 26 committed + 6 speculative rows up to the rung edge");
+            assert!(
+                coordinator
+                    .read_sliding_groups_at(seq_id, 32)
+                    .expect("boundary read")
+                    .is_some(),
+                "test precondition: the boundary-32 rows must be live, so only the \
+                 committed basis refuses the capture"
+            );
+        }
+        let coordinator = inner.kv_cache_coordinator.as_ref().expect("coordinator");
+        let sliding_group = sliding_group_id(coordinator);
+        let sliding_block_ids = |inner: &Gemma4Inner| -> Vec<u32> {
+            inner
+                .kv_cache_coordinator
+                .as_ref()
+                .expect("coordinator")
+                .adapter(sliding_group)
+                .expect("sliding adapter")
+                .block_table_for(seq_id)
+                .expect("sliding block table")
+                .blocks()
+                .iter()
+                .map(|block| block.block_id)
+                .collect()
+        };
+        let ids_before = sliding_block_ids(&inner);
+        let allocated_before = allocated_per_group(coordinator);
+
+        inner
+            .settle_grouped_kv_step_at(seq_id, committed)
+            .expect("committed-basis settle below the cursor");
+
+        let captured: Vec<u32> = inner
+            .grouped_sliding_cold_checkpoints
+            .get(&seq_id)
+            .map(|checkpoints| {
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| checkpoint.boundary)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            captured.iter().all(|&boundary| boundary <= committed),
+            "the rung walk must never capture a boundary past the committed frontier, \
+             got {captured:?}"
+        );
+
+        let allocated_after =
+            allocated_per_group(inner.kv_cache_coordinator.as_ref().expect("coordinator"));
+        for (group_id, (before, after)) in allocated_before.iter().zip(&allocated_after).enumerate()
+        {
+            let expected = if group_id == sliding_group { 1 } else { 0 };
+            assert_eq!(
+                before - after,
+                expected,
+                "group {group_id}: the committed cutoff (26 - 16 = 10) retires sliding \
+                 block 0 only — a cursor cutoff (32 - 16 = 16) would take 2"
+            );
+        }
+        let ids_after = sliding_block_ids(&inner);
+        assert_ne!(
+            ids_after[0], ids_before[0],
+            "block 0 sits wholly below the committed window and must be remapped to \
+             the null sentinel"
+        );
+        assert_eq!(
+            ids_after[1..],
+            ids_before[1..],
+            "every block the committed window [10, 26) still touches must keep its \
+             physical backing"
+        );
+
+        let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+        coordinator
+            .rollback_last_tokens_all(seq_id, 6)
+            .expect("roll back the 6 speculative rows");
+        assert_eq!(
+            coordinator.request_token_count_all(seq_id).expect("count"),
+            committed
+        );
+        coordinator
+            .adapter_mut(sliding_group)
+            .expect("sliding adapter")
+            .read_kv_range(0, 10, 16)
+            .expect("the committed window [10, 26) must be readable after the rollback");
+        let null_id = ids_after[0];
+        assert!(
+            sliding_block_ids(&inner)[1..]
+                .iter()
+                .all(|&id| id != null_id),
+            "the rollback range the settle preserved must remain physically backed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Tap purity on the REAL paged layer loops (text and VLM), driven on a
     /// real checkpoint: threading a `DsparkTap` must leave the residual
     /// stream bit-identical to a tap-less run while capturing one
