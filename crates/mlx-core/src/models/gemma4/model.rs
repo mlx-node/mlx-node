@@ -15275,6 +15275,235 @@ mod spec_paged_substrate_tests {
         );
     }
 
+    fn sliding_group_id(coordinator: &Gemma4KVCacheCoordinator) -> usize {
+        (0..group_count(coordinator))
+            .find(|&group_id| {
+                coordinator
+                    .adapter(group_id)
+                    .expect("group adapter")
+                    .sliding_window()
+                    > 0
+            })
+            .expect("the tiny hybrid config must build a sliding group")
+    }
+
+    /// Cross-module gate (engine ↔ gemma4, T-D0.2 ↔ T-D0.3): the REAL
+    /// grouped coordinator driven through the facade call order the
+    /// `spec_paged` mock tests verified — reserve → record D+1 →
+    /// commit(keep, total) → settle at the committed frontier — wrapped in
+    /// `SettleOrderChecked` so L-SETTLE stays executable on the real type.
+    /// Anti-vacuity: every step is asserted through real block accounting
+    /// (the reservation grows each group, the verify write allocates
+    /// nothing, no settle work fires inside the cycle), never method
+    /// presence.
+    ///
+    /// Geometry (window 16, block 8): committed prompt 36, verify anchor +
+    /// 4 drafts → cursor 41, so the verify rows straddle a window edge.
+    ///
+    /// Mutation this catches: a coordinator impl satisfying the trait but
+    /// violating the ordering laws — `record_verify` settling at the write
+    /// cursor mid-cycle frees sliding blocks the commit's rollback returns
+    /// the window into (fails the mid-cycle accounting AND the post-commit
+    /// live-window backing); a commit rolling back anything but exactly
+    /// `total - keep` fails the cross-group frontier equality.
+    #[test]
+    fn gemma4_coordinator_conforms_to_the_facade_call_order() {
+        use crate::engine::spec_paged::SettleOrderChecked;
+
+        let Some(mut coordinator) = maybe_grouped_coordinator(64, 16) else {
+            return;
+        };
+        let sliding_group = sliding_group_id(&coordinator);
+        coordinator.reset_scheduled_request(7).expect("reset");
+        coordinator
+            .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
+            .expect("seed the committed prompt");
+        let mut cache = SettleOrderChecked::new(coordinator);
+
+        let seeded = allocated_per_group(cache.inner());
+        assert!(
+            cache.reserve_lookahead(7, 5).expect("reserve"),
+            "5 lookahead rows fit every group"
+        );
+        let reserved = allocated_per_group(cache.inner());
+        for (group_id, (before, after)) in seeded.iter().zip(&reserved).enumerate() {
+            assert_eq!(
+                after - before,
+                1,
+                "group {group_id}: ceil(41/8) - ceil(36/8) = 1 new block"
+            );
+        }
+        assert_eq!(
+            cache.inner().request_token_count_all(7).expect("count"),
+            36,
+            "the reservation must not advance any group's cursor"
+        );
+
+        cache
+            .record_verify(7, &[100, 101, 102, 103, 104])
+            .expect("record anchor + 4 drafts");
+        assert_eq!(
+            allocated_per_group(cache.inner()),
+            reserved,
+            "the verify write must allocate ZERO new blocks and free none — \
+             no settle work may fire inside the cycle (L-SETTLE)"
+        );
+        assert_eq!(cache.inner().request_token_count_all(7).expect("count"), 41);
+
+        // The ordering law is executable on the real coordinator too.
+        let err = cache
+            .settle_committed(7, 36)
+            .expect_err("an in-cycle settle must trip the order check");
+        assert!(err.contains("L-SETTLE"), "unexpected error text: {err}");
+        assert_eq!(
+            allocated_per_group(cache.inner()),
+            reserved,
+            "the refused settle must never reach the coordinator"
+        );
+
+        cache
+            .commit_cycle(7, 1, 5)
+            .expect("keep the anchor, roll back the 4 rejected drafts");
+        assert_eq!(
+            cache.frontier(7),
+            Some(SpecFrontier {
+                attn_tokens: 37,
+                recurrent_tokens: None
+            }),
+            "the facade frontier must land on the committed row count"
+        );
+        for group_id in 0..group_count(cache.inner()) {
+            assert_eq!(
+                cache
+                    .inner()
+                    .adapter(group_id)
+                    .expect("group adapter")
+                    .current_token_count_for(7),
+                Some(37),
+                "group {group_id} must agree on the committed frontier after the commit"
+            );
+        }
+        assert_eq!(
+            allocated_per_group(cache.inner()),
+            reserved,
+            "rollback is bookkeeping-only — no block may move"
+        );
+
+        // The lawful settle, post-commit at the frontier the commit landed
+        // on: cutoff 37 - 16 = 21 retires exactly sliding blocks 0-1 and
+        // leaves the window the rollback returned into backed.
+        cache.settle_committed(7, 37).expect("post-commit settle");
+        let settled = allocated_per_group(cache.inner());
+        for (group_id, (before, after)) in reserved.iter().zip(&settled).enumerate() {
+            let expected = if group_id == sliding_group { 2 } else { 0 };
+            assert_eq!(
+                before - after,
+                expected,
+                "group {group_id}: the committed settle must retire exactly the \
+                 out-of-window blocks"
+            );
+        }
+        let sliding = cache
+            .inner()
+            .adapter(sliding_group)
+            .expect("sliding adapter");
+        let ids: Vec<u32> = sliding
+            .block_table_for(7)
+            .expect("sliding block table")
+            .blocks()
+            .iter()
+            .map(|block| block.block_id)
+            .collect();
+        assert_eq!(ids[0], ids[1], "retired blocks share the null sentinel");
+        assert!(
+            ids[2..].iter().all(|&id| id != ids[0]),
+            "the live window the commit returned into must remain physically backed"
+        );
+    }
+
+    /// Cross-module gate (adapter ↔ gemma4, T-D0.1 ↔ T-D0.3): the
+    /// coordinator's committed settle must route through the ADAPTER's
+    /// committed-cutoff prune — the rollback-range read-back gate
+    /// (`prune_committed_cutoff_never_nulls_rollback_range`) re-run at
+    /// coordinator level. The settle here fires between the verify write and
+    /// the commit ON PURPOSE: that gap is what the committed basis exists
+    /// for (the family layer loop settles per chunk while speculative rows
+    /// are pending), and exactly where a cursor-basis prune retires a block
+    /// the commit's rollback returns the window into.
+    ///
+    /// Geometry (window 16, block 8): committed 36 → cutoff 20 retires
+    /// sliding blocks 0-1; a cursor-basis cutoff (41 - 16 = 25) would also
+    /// null block 2, which holds live positions 21-23 of the post-rollback
+    /// window [21, 37).
+    ///
+    /// Mutation this catches: the coordinator (`settle_committed` /
+    /// `prune_sliding_all_committed`) calling the cursor-basis prune.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn settle_committed_never_nulls_the_rollback_range_at_coordinator_level() {
+        let Some(mut coordinator) = maybe_grouped_coordinator(64, 16) else {
+            return;
+        };
+        let sliding_group = sliding_group_id(&coordinator);
+        coordinator.reset_scheduled_request(7).expect("reset");
+        coordinator
+            .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
+            .expect("seed the committed prompt");
+
+        assert!(
+            SpecPagedCache::reserve_lookahead(&mut coordinator, 7, 5).expect("reserve"),
+            "5 lookahead rows fit every group"
+        );
+        SpecPagedCache::record_verify(&mut coordinator, 7, &[100, 101, 102, 103, 104])
+            .expect("record anchor + 4 drafts");
+
+        let recorded = allocated_per_group(&coordinator);
+        SpecPagedCache::settle_committed(&mut coordinator, 7, 36)
+            .expect("settle at the pre-verify committed frontier");
+        let settled = allocated_per_group(&coordinator);
+        for (group_id, (before, after)) in recorded.iter().zip(&settled).enumerate() {
+            let expected = if group_id == sliding_group { 2 } else { 0 };
+            assert_eq!(
+                before - after,
+                expected,
+                "group {group_id}: the committed cutoff (36 - 16 = 20) retires \
+                 blocks 0-1 only — a cursor cutoff (41 - 16 = 25) would take 3"
+            );
+        }
+
+        SpecPagedCache::commit_cycle(&mut coordinator, 7, 1, 5)
+            .expect("roll back the 4 rejected drafts");
+        assert_eq!(coordinator.request_token_count_all(7).expect("count"), 37);
+
+        // The post-rollback live window [21, 37) reads back...
+        coordinator
+            .adapter_mut(sliding_group)
+            .expect("sliding adapter")
+            .read_kv_range(0, 21, 16)
+            .expect("the post-rollback live window must be readable");
+        // ...and is physically backed. `read_kv_range`'s liveness floor is
+        // cursor-derived and cannot see a null placeholder behind an
+        // in-window position, so the Ok alone does not prove backing — the
+        // block ids are the proof.
+        let ids: Vec<u32> = coordinator
+            .adapter(sliding_group)
+            .expect("sliding adapter")
+            .block_table_for(7)
+            .expect("sliding block table")
+            .blocks()
+            .iter()
+            .map(|block| block.block_id)
+            .collect();
+        assert_eq!(
+            ids[0], ids[1],
+            "blocks wholly out of the committed window share the null sentinel"
+        );
+        assert!(
+            ids[2..5].iter().all(|&id| id != ids[0]),
+            "the rollback range the commit returned into must remain physically backed"
+        );
+    }
+
     /// Bit-equal row `T-1`: the all-rows projection's last row must be the
     /// last-only projection exactly. Mutation this catches: a projection row
     /// off-by-one in either mode.
