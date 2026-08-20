@@ -18,6 +18,7 @@ use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
 };
+use crate::engine::spec_paged::SpecPagedCache;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -664,6 +665,21 @@ impl Gemma4KVCacheCoordinator {
         first_error.map_or(Ok(released), Err)
     }
 
+    /// The one frontier every cache group agrees on for `seq_id`, in the
+    /// shape both paged speculative facade scopes report it
+    /// ([`PruneOnlySpecPagedCache`], [`Gemma4SpecPagedCache`]).
+    ///
+    /// Pure-attention family: the adapters' recorded rows are the whole
+    /// per-token state, so `recurrent_tokens` is structurally `None`.
+    fn spec_frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
+        self.request_token_count_all(seq_id)
+            .ok()
+            .map(|attn_tokens| SpecFrontier {
+                attn_tokens: u64::from(attn_tokens),
+                recurrent_tokens: None,
+            })
+    }
+
     pub(crate) fn release_all_and_purge(&mut self) -> std::result::Result<u32, String> {
         let mut released = 0u32;
         let mut first_error = None;
@@ -680,20 +696,44 @@ impl Gemma4KVCacheCoordinator {
     }
 }
 
-/// Coordinator-scope conformance to the paged speculative cache contract
-/// (`engine::spec_paged`). Muse Glimmer reuses this coordinator type, so this
-/// one impl is the facade for both grouped-attention families.
+/// The paged speculative cache contract (`engine::spec_paged`) at
+/// COORDINATOR scope: the four cycle primitives, and a settle that covers
+/// only the settle work the coordinator itself owns — pending-write eval plus
+/// the committed-basis sliding prune.
 ///
-/// `settle_committed` covers the coordinator-owned settle work — pending-write
-/// eval plus the committed-basis sliding prune. The family-level settle
-/// ([`Gemma4Inner::settle_grouped_kv_step_at`]) layers the cold-checkpoint
-/// rung walk between those same two coordinator calls; it is what a paged
-/// speculative stepper that owns the model drives, and it routes through the
-/// same committed-cutoff prune, so L-SETTLE holds at either scope.
-impl crate::engine::spec_paged::SpecPagedCache for Gemma4KVCacheCoordinator {
+/// That settle is a strict SUBSET of either owning family's settle. Both
+/// families that hold this coordinator layer a durable cold-checkpoint rung
+/// walk between those same two coordinator calls — gemma4 in
+/// [`Gemma4Inner::settle_grouped_kv_step_at`], Muse Glimmer in its
+/// `settle_paged_kv_step` — so a driver that settles through this type
+/// instead of its family's settle skips rung capture. That costs acceptance
+/// on a warm restore and never correctness, which is why no correctness gate
+/// can see it; the name is the warning, and
+/// `family_settle_at_the_committed_frontier_captures_the_cold_rung` is the
+/// gate.
+///
+/// A gemma4 driver therefore takes [`Gemma4SpecPagedCache`], which routes the
+/// settle through the family frontier. What is left for this type: the
+/// coordinator-scope conformance gates (the L-SETTLE prune proofs, which are
+/// about the prune and want nothing else running), and a caller that owns no
+/// family-level settle at all.
+pub(crate) struct PruneOnlySpecPagedCache<'a>(&'a mut Gemma4KVCacheCoordinator);
+
+#[allow(dead_code)]
+impl<'a> PruneOnlySpecPagedCache<'a> {
+    pub(crate) fn new(coordinator: &'a mut Gemma4KVCacheCoordinator) -> Self {
+        Self(coordinator)
+    }
+
+    pub(crate) fn coordinator(&self) -> &Gemma4KVCacheCoordinator {
+        self.0
+    }
+}
+
+impl SpecPagedCache for PruneOnlySpecPagedCache<'_> {
     fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> std::result::Result<bool, String> {
         let rows = u32::try_from(rows).unwrap_or(u32::MAX);
-        match self.reserve_rows_all(seq_id, rows) {
+        match self.0.reserve_rows_all(seq_id, rows) {
             Ok(_) => Ok(true),
             Err(error) if error.starts_with("context_length_exceeded:") => Ok(false),
             Err(error) => Err(error),
@@ -701,13 +741,13 @@ impl crate::engine::spec_paged::SpecPagedCache for Gemma4KVCacheCoordinator {
     }
 
     fn record_rows(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
-        self.record_tokens_all(seq_id, tokens)
+        self.0.record_tokens_all(seq_id, tokens)
     }
 
     fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
         let rows = u32::try_from(rows)
             .map_err(|_| format!("Gemma4 commit rollback of {rows} rows does not fit u32"))?;
-        self.rollback_last_tokens_all(seq_id, rows)
+        self.0.rollback_last_tokens_all(seq_id, rows)
     }
 
     fn settle_committed(
@@ -718,29 +758,90 @@ impl crate::engine::spec_paged::SpecPagedCache for Gemma4KVCacheCoordinator {
         let committed = u32::try_from(committed_tokens).map_err(|_| {
             format!("Gemma4 committed frontier {committed_tokens} does not fit u32")
         })?;
-        self.eval_pending_pool_writes_all()?;
-        self.prune_sliding_all_committed(seq_id, committed)
+        self.0.eval_pending_pool_writes_all()?;
+        self.0
+            .prune_sliding_all_committed(seq_id, committed)
             .map(|_| ())
     }
 
     fn settle_captures_durable_state(&self) -> bool {
         // The settle above is pending-write eval plus a committed-basis
         // prune: nothing published, nothing freed above the cutoff. The
-        // cold-rung walk lives one level up in
-        // `Gemma4Inner::settle_grouped_kv_step_at`, out of this facade's
-        // reach — a family-scope impl would have to answer `true`.
+        // cold-rung walk lives one level up, out of this scope's reach —
+        // which is what [`Gemma4SpecPagedCache`] answers `true` for.
         false
     }
 
     fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
-        // Pure-attention family: the adapters' recorded rows are the whole
-        // per-token state, so `recurrent_tokens` is structurally `None`.
-        self.request_token_count_all(seq_id)
-            .ok()
-            .map(|attn_tokens| SpecFrontier {
-                attn_tokens: u64::from(attn_tokens),
-                recurrent_tokens: None,
-            })
+        self.0.spec_frontier(seq_id)
+    }
+}
+
+/// The same contract at FAMILY scope, and the one a gemma4 paged speculative
+/// driver holds.
+///
+/// The four cycle primitives are the coordinator's, delegated to
+/// [`PruneOnlySpecPagedCache`] so the cycle arithmetic stays single-sourced;
+/// the settle is the family's ([`Gemma4Inner::settle_grouped_kv_step_at`]),
+/// which walks the cold-checkpoint rungs the coordinator cannot reach before
+/// running that same committed-basis prune. The rung walk is what makes this
+/// settle irreversible, so [`SpecPagedCache::settle_captures_durable_state`]
+/// answers `true` and L-SETTLE keeps it out of an open cycle entirely.
+pub(crate) struct Gemma4SpecPagedCache<'a>(&'a mut Gemma4Inner);
+
+#[allow(dead_code)]
+impl<'a> Gemma4SpecPagedCache<'a> {
+    pub(crate) fn new(inner: &'a mut Gemma4Inner) -> Self {
+        Self(inner)
+    }
+
+    pub(crate) fn model(&self) -> &Gemma4Inner {
+        self.0
+    }
+
+    fn coordinator_cache(&mut self) -> std::result::Result<PruneOnlySpecPagedCache<'_>, String> {
+        self.0
+            .kv_cache_coordinator
+            .as_mut()
+            .map(PruneOnlySpecPagedCache::new)
+            .ok_or_else(|| "Gemma4 hybrid KV coordinator missing".to_string())
+    }
+}
+
+impl SpecPagedCache for Gemma4SpecPagedCache<'_> {
+    fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> std::result::Result<bool, String> {
+        self.coordinator_cache()?.reserve_lookahead(seq_id, rows)
+    }
+
+    fn record_rows(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
+        self.coordinator_cache()?.record_rows(seq_id, tokens)
+    }
+
+    fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
+        self.coordinator_cache()?.rollback_rows(seq_id, rows)
+    }
+
+    fn settle_committed(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: u64,
+    ) -> std::result::Result<(), String> {
+        let committed = u32::try_from(committed_tokens).map_err(|_| {
+            format!("Gemma4 committed frontier {committed_tokens} does not fit u32")
+        })?;
+        self.0
+            .settle_grouped_kv_step_at(seq_id, committed)
+            .map_err(|error| error.reason)
+    }
+
+    fn settle_captures_durable_state(&self) -> bool {
+        // The family settle walks the cold-checkpoint rungs, and a captured
+        // checkpoint is not retractable by a rollback.
+        true
+    }
+
+    fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
+        self.0.kv_cache_coordinator.as_ref()?.spec_frontier(seq_id)
     }
 }
 
@@ -2906,7 +3007,9 @@ impl Gemma4Inner {
     /// walk and the sliding prune both consume the committed length instead
     /// of the write cursor (I9). The autoregressive callers stay on
     /// [`Self::settle_grouped_kv_step`], whose cursor basis is unchanged.
-    #[allow(dead_code)]
+    ///
+    /// This is what [`Gemma4SpecPagedCache::settle_committed`] routes to; the
+    /// rung walk is the half [`PruneOnlySpecPagedCache`] cannot reach.
     fn settle_grouped_kv_step_at(&mut self, seq_id: u32, committed_tokens: u32) -> Result<()> {
         self.settle_grouped_kv_step_at_basis(seq_id, Some(committed_tokens))
     }
@@ -15217,7 +15320,8 @@ mod spec_paged_substrate_tests {
 
         // The facade maps the same exhaustion onto the skip-cycle signal.
         assert!(
-            !SpecPagedCache::reserve_lookahead(&mut coordinator, 7, 24)
+            !PruneOnlySpecPagedCache::new(&mut coordinator)
+                .reserve_lookahead(7, 24)
                 .expect("exhaustion is not an error at the facade"),
             "facade must report pool exhaustion as Ok(false)"
         );
@@ -15249,27 +15353,32 @@ mod spec_paged_substrate_tests {
         // one count every group agrees on, commit is exact cursor arithmetic,
         // and the committed settle reaches the committed-cutoff prune (whose
         // adapter guard rejects a frontier past the cursor).
+        let mut cache = PruneOnlySpecPagedCache::new(&mut coordinator);
         assert_eq!(
-            SpecPagedCache::frontier(&coordinator, 7),
+            cache.frontier(7),
             Some(SpecFrontier {
                 attn_tokens: 20,
                 recurrent_tokens: None
             })
         );
-        assert_eq!(SpecPagedCache::frontier(&coordinator, 99), None);
-        let ticket = SpecPagedCache::record_verify(&mut coordinator, 7, &[40, 41, 42])
+        assert_eq!(cache.frontier(99), None);
+        let ticket = cache
+            .record_verify(7, &[40, 41, 42])
             .expect("record verify");
-        SpecPagedCache::commit_cycle(&mut coordinator, 7, ticket, 1).expect("commit keep=1 of 3");
+        cache
+            .commit_cycle(7, ticket, 1)
+            .expect("commit keep=1 of 3");
         assert_eq!(
-            SpecPagedCache::frontier(&coordinator, 7),
+            cache.frontier(7),
             Some(SpecFrontier {
                 attn_tokens: 21,
                 recurrent_tokens: None
             })
         );
-        SpecPagedCache::settle_committed(&mut coordinator, 7, 21).expect("committed settle");
+        cache.settle_committed(7, 21).expect("committed settle");
         assert!(
-            SpecPagedCache::settle_committed(&mut coordinator, 7, 22)
+            cache
+                .settle_committed(7, 22)
                 .expect_err("a committed frontier past the cursor must be rejected")
                 .contains("exceeds recorded token count"),
             "the committed settle must route through the committed-cutoff prune's guard"
@@ -15329,14 +15438,14 @@ mod spec_paged_substrate_tests {
         coordinator
             .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
             .expect("seed the committed prompt");
-        let mut cache = NoSettleInCycle::new(coordinator);
+        let mut cache = NoSettleInCycle::new(PruneOnlySpecPagedCache::new(&mut coordinator));
 
-        let seeded = allocated_per_group(cache.inner());
+        let seeded = allocated_per_group(cache.inner().coordinator());
         assert!(
             cache.reserve_lookahead(7, 5).expect("reserve"),
             "5 lookahead rows fit every group"
         );
-        let reserved = allocated_per_group(cache.inner());
+        let reserved = allocated_per_group(cache.inner().coordinator());
         for (group_id, (before, after)) in seeded.iter().zip(&reserved).enumerate() {
             assert_eq!(
                 after - before,
@@ -15345,7 +15454,11 @@ mod spec_paged_substrate_tests {
             );
         }
         assert_eq!(
-            cache.inner().request_token_count_all(7).expect("count"),
+            cache
+                .inner()
+                .coordinator()
+                .request_token_count_all(7)
+                .expect("count"),
             36,
             "the reservation must not advance any group's cursor"
         );
@@ -15354,12 +15467,19 @@ mod spec_paged_substrate_tests {
             .record_verify(7, &[100, 101, 102, 103, 104])
             .expect("record anchor + 4 drafts");
         assert_eq!(
-            allocated_per_group(cache.inner()),
+            allocated_per_group(cache.inner().coordinator()),
             reserved,
             "the verify write must allocate ZERO new blocks and free none — \
              no settle work may fire inside the cycle (L-SETTLE)"
         );
-        assert_eq!(cache.inner().request_token_count_all(7).expect("count"), 41);
+        assert_eq!(
+            cache
+                .inner()
+                .coordinator()
+                .request_token_count_all(7)
+                .expect("count"),
+            41
+        );
 
         // The ordering law is executable on the real coordinator too.
         let err = cache
@@ -15367,7 +15487,7 @@ mod spec_paged_substrate_tests {
             .expect_err("an in-cycle settle must trip the order check");
         assert!(err.contains("L-SETTLE"), "unexpected error text: {err}");
         assert_eq!(
-            allocated_per_group(cache.inner()),
+            allocated_per_group(cache.inner().coordinator()),
             reserved,
             "the refused settle must never reach the coordinator"
         );
@@ -15383,10 +15503,11 @@ mod spec_paged_substrate_tests {
             }),
             "the facade frontier must land on the committed row count"
         );
-        for group_id in 0..group_count(cache.inner()) {
+        for group_id in 0..group_count(cache.inner().coordinator()) {
             assert_eq!(
                 cache
                     .inner()
+                    .coordinator()
                     .adapter(group_id)
                     .expect("group adapter")
                     .current_token_count_for(7),
@@ -15395,7 +15516,7 @@ mod spec_paged_substrate_tests {
             );
         }
         assert_eq!(
-            allocated_per_group(cache.inner()),
+            allocated_per_group(cache.inner().coordinator()),
             reserved,
             "rollback is bookkeeping-only — no block may move"
         );
@@ -15404,7 +15525,7 @@ mod spec_paged_substrate_tests {
         // on: cutoff 37 - 16 = 21 retires exactly sliding blocks 0-1 and
         // leaves the window the rollback returned into backed.
         cache.settle_committed(7, 37).expect("post-commit settle");
-        let settled = allocated_per_group(cache.inner());
+        let settled = allocated_per_group(cache.inner().coordinator());
         for (group_id, (before, after)) in reserved.iter().zip(&settled).enumerate() {
             let expected = if group_id == sliding_group { 2 } else { 0 };
             assert_eq!(
@@ -15416,6 +15537,7 @@ mod spec_paged_substrate_tests {
         }
         let sliding = cache
             .inner()
+            .coordinator()
             .adapter(sliding_group)
             .expect("sliding adapter");
         let ids: Vec<u32> = sliding
@@ -15465,11 +15587,11 @@ mod spec_paged_substrate_tests {
             .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
             .expect("seed the committed prompt");
         assert!(
-            !SpecPagedCache::settle_captures_durable_state(&coordinator),
-            "the coordinator settle is pending-write eval plus a committed-basis prune; \
-             the cold-rung walk lives one level up, out of this facade's reach"
+            !PruneOnlySpecPagedCache::new(&mut coordinator).settle_captures_durable_state(),
+            "the coordinator-scope settle is pending-write eval plus a committed-basis \
+             prune; the cold-rung walk lives one level up, out of this facade's reach"
         );
-        let mut cache = NoDurableSettleInCycle::new(coordinator);
+        let mut cache = NoDurableSettleInCycle::new(PruneOnlySpecPagedCache::new(&mut coordinator));
 
         assert!(
             cache.reserve_lookahead(7, 5).expect("reserve"),
@@ -15478,7 +15600,7 @@ mod spec_paged_substrate_tests {
         let ticket = cache
             .record_verify(7, &[100, 101, 102, 103, 104])
             .expect("record anchor + 4 drafts");
-        let recorded = allocated_per_group(cache.inner());
+        let recorded = allocated_per_group(cache.inner().coordinator());
 
         // Write-cursor basis: refused, and it must not reach the coordinator.
         let err = cache
@@ -15486,7 +15608,7 @@ mod spec_paged_substrate_tests {
             .expect_err("a cursor-basis settle inside a cycle must trip");
         assert!(err.contains("L-SETTLE"), "unexpected error text: {err}");
         assert_eq!(
-            allocated_per_group(cache.inner()),
+            allocated_per_group(cache.inner().coordinator()),
             recorded,
             "the refused settle must never reach the coordinator"
         );
@@ -15495,7 +15617,7 @@ mod spec_paged_substrate_tests {
         cache
             .settle_committed(7, 36)
             .expect("a committed-basis settle is lawful inside an open cycle");
-        let settled = allocated_per_group(cache.inner());
+        let settled = allocated_per_group(cache.inner().coordinator());
         for (group_id, (before, after)) in recorded.iter().zip(&settled).enumerate() {
             let expected = if group_id == sliding_group { 2 } else { 0 };
             assert_eq!(
@@ -15518,8 +15640,9 @@ mod spec_paged_substrate_tests {
             "the facade frontier must land on the committed row count"
         );
 
-        let coordinator = cache.into_inner();
-        let ids: Vec<u32> = coordinator
+        let cache = cache.into_inner();
+        let ids: Vec<u32> = cache
+            .coordinator()
             .adapter(sliding_group)
             .expect("sliding adapter")
             .block_table_for(7)
@@ -15564,17 +15687,20 @@ mod spec_paged_substrate_tests {
             .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
             .expect("seed the committed prompt");
 
+        let mut cache = PruneOnlySpecPagedCache::new(&mut coordinator);
         assert!(
-            SpecPagedCache::reserve_lookahead(&mut coordinator, 7, 5).expect("reserve"),
+            cache.reserve_lookahead(7, 5).expect("reserve"),
             "5 lookahead rows fit every group"
         );
-        let ticket = SpecPagedCache::record_verify(&mut coordinator, 7, &[100, 101, 102, 103, 104])
+        let ticket = cache
+            .record_verify(7, &[100, 101, 102, 103, 104])
             .expect("record anchor + 4 drafts");
 
-        let recorded = allocated_per_group(&coordinator);
-        SpecPagedCache::settle_committed(&mut coordinator, 7, 36)
+        let recorded = allocated_per_group(cache.coordinator());
+        cache
+            .settle_committed(7, 36)
             .expect("settle at the pre-verify committed frontier");
-        let settled = allocated_per_group(&coordinator);
+        let settled = allocated_per_group(cache.coordinator());
         for (group_id, (before, after)) in recorded.iter().zip(&settled).enumerate() {
             let expected = if group_id == sliding_group { 2 } else { 0 };
             assert_eq!(
@@ -15585,7 +15711,8 @@ mod spec_paged_substrate_tests {
             );
         }
 
-        SpecPagedCache::commit_cycle(&mut coordinator, 7, ticket, 1)
+        cache
+            .commit_cycle(7, ticket, 1)
             .expect("roll back the 4 rejected drafts");
         assert_eq!(coordinator.request_token_count_all(7).expect("count"), 37);
 
@@ -15615,6 +15742,63 @@ mod spec_paged_substrate_tests {
         assert!(
             ids[2..5].iter().all(|&id| id != ids[0]),
             "the rollback range the commit returned into must remain physically backed"
+        );
+    }
+
+    /// The facade checks the ticket's sequence FIRST, before the full-accept
+    /// path can return: a commit that rolls back nothing still names a
+    /// sequence, and committing sequence A's cycle against sequence B must
+    /// not pass just because the arithmetic happens to work out.
+    ///
+    /// Both sequences are parked on the SAME frontier here on purpose, so the
+    /// ticket's basis-plus-width check and the landing post-condition both
+    /// pass against the wrong sequence — the sequence id is the only thing
+    /// left that can catch it. The full accept (`keep == rows`) is the shape
+    /// that has no other reason to touch the cache at all.
+    ///
+    /// Mutation this catches: moving the ticket's sequence check after the
+    /// zero-rollback path in `engine::spec_paged::SpecPagedCache::commit_cycle`
+    /// — the foreign commit then returns `Ok`.
+    #[test]
+    fn a_foreign_ticket_is_refused_on_the_full_accept_path() {
+        let Some(mut coordinator) = maybe_grouped_coordinator(64, 16) else {
+            return;
+        };
+        coordinator.reset_scheduled_request(7).expect("reset 7");
+        coordinator.reset_scheduled_request(8).expect("reset 8");
+        coordinator
+            .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
+            .expect("seed sequence 7");
+        // Sequence 8 sits exactly where sequence 7's cycle will END, so the
+        // ticket describes 8's cursor just as well as 7's.
+        coordinator
+            .record_tokens_all(8, &(0..39).collect::<Vec<_>>())
+            .expect("seed sequence 8 at the frontier 7's cycle lands on");
+
+        let mut cache = PruneOnlySpecPagedCache::new(&mut coordinator);
+        let ticket = cache
+            .record_verify(7, &[100, 101, 102])
+            .expect("open sequence 7's cycle");
+        assert_eq!(ticket.pre_attn_tokens(), 36);
+        assert_eq!(cache.frontier(7).expect("frontier 7").attn_tokens, 39);
+        assert_eq!(cache.frontier(8).expect("frontier 8").attn_tokens, 39);
+
+        let err = cache
+            .commit_cycle(8, ticket, 3)
+            .expect_err("sequence 8 may not be committed with sequence 7's ticket");
+        assert!(
+            err.contains("sequence 7's verify ticket"),
+            "the sequence mismatch must be what is reported, got: {err}"
+        );
+        assert_eq!(
+            cache.frontier(7).expect("frontier 7").attn_tokens,
+            39,
+            "the refused commit must leave sequence 7's open cycle untouched"
+        );
+        assert_eq!(
+            cache.frontier(8).expect("frontier 8").attn_tokens,
+            39,
+            "the refused commit must not roll back the sequence it named"
         );
     }
 
@@ -16025,6 +16209,299 @@ mod spec_paged_substrate_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One speculative cycle at whichever facade scope is handed in, landing
+    /// the committed frontier exactly on the first cold anchor rung: 29
+    /// committed rows, a 5-row verify write to cursor 34, commit keep=3 →
+    /// committed 32, then the settle under test. The rung is capturable only
+    /// while the sliding cursor sits exactly on the boundary
+    /// (`read_sliding_groups_at`), which the rollback is what establishes.
+    fn drive_cycle_onto_the_cold_rung<C: SpecPagedCache>(cache: &mut C, seq_id: u32) {
+        assert!(
+            cache.reserve_lookahead(seq_id, 5).expect("reserve"),
+            "5 lookahead rows fit every group"
+        );
+        let ticket = cache
+            .record_verify(seq_id, &[200, 201, 202, 203, 204])
+            .expect("record anchor + 4 drafts");
+        assert_eq!(
+            cache.frontier(seq_id).expect("frontier").attn_tokens,
+            34,
+            "the verify write must sit 5 rows past the committed prompt"
+        );
+        cache
+            .commit_cycle(seq_id, ticket, 3)
+            .expect("keep the anchor and 2 drafts");
+        assert_eq!(
+            cache.frontier(seq_id).expect("frontier").attn_tokens,
+            32,
+            "the commit must land the committed frontier on the anchor rung"
+        );
+        cache
+            .settle_committed(seq_id, 32)
+            .expect("settle at the committed frontier");
+    }
+
+    /// Settle OWNERSHIP: a family-level driver settling at the committed
+    /// frontier must get the cold-rung walk. [`Gemma4SpecPagedCache`] routes
+    /// its settle through [`Gemma4Inner::settle_grouped_kv_step_at`] and
+    /// captures the rung; [`PruneOnlySpecPagedCache`] structurally cannot
+    /// reach it — its settle is the coordinator's pending-write eval plus the
+    /// committed prune — so a driver holding the coordinator scope loses rung
+    /// capture silently. The loss costs acceptance on a warm restore and
+    /// never correctness, which is why no other gate can see it.
+    ///
+    /// Both scopes are driven through the SAME call order
+    /// ([`drive_cycle_onto_the_cold_rung`]), so the facade is the only
+    /// variable, and the coordinator scope is asserted to still prune — it is
+    /// lossy, not broken.
+    ///
+    /// Mutation this catches: routing `Gemma4SpecPagedCache::settle_committed`
+    /// through the coordinator's prune-only settle — the rung map stays empty.
+    #[test]
+    fn family_settle_at_the_committed_frontier_captures_the_cold_rung() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!(
+                "skipping family_settle_at_the_committed_frontier_captures_the_cold_rung: \
+                 Metal unavailable"
+            );
+            return;
+        }
+        let mut inner =
+            Gemma4Inner::new(tiny_paged_config()).expect("tiny paged Gemma4Inner must construct");
+        if inner.kv_cache_coordinator.is_none() {
+            eprintln!(
+                "skipping family_settle_at_the_committed_frontier_captures_the_cold_rung: \
+                 no paged coordinator"
+            );
+            return;
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("mlx-gemma4-spec-paged-rung-{}", std::process::id()));
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        let policy = sliding_sidecar::policy(&inner.config)
+            .expect("tiny geometry must yield a sliding sidecar policy");
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .full_adapter_mut()
+            .set_cold_tier(ColdTierContext {
+                manager: Arc::new(manager),
+                fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                    b"gemma4-spec-paged-rung".as_slice(),
+                ]),
+                sidecar_policy: Some(policy),
+            });
+        assert_eq!(
+            inner.scheduled_cold_anchor_rungs().first(),
+            Some(&32),
+            "test precondition: the ladder must publish the rung the commit lands on"
+        );
+
+        fn seed(inner: &mut Gemma4Inner, seq_id: u32) {
+            let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+            coordinator
+                .reset_scheduled_request(seq_id)
+                .expect("reset the sequence");
+            coordinator
+                .record_tokens_all(seq_id, &(0..29).collect::<Vec<_>>())
+                .expect("seed 29 committed rows");
+        }
+
+        /// Both settles prune; `ids[0] == ids[1]` is the cutoff (32 - 16 =
+        /// 16) having retired sliding blocks 0-1 onto the shared null
+        /// sentinel, with the live window still physically backed.
+        fn assert_pruned(inner: &Gemma4Inner, sliding_group: usize, seq_id: u32) {
+            let ids: Vec<u32> = inner
+                .kv_cache_coordinator
+                .as_ref()
+                .expect("coordinator")
+                .adapter(sliding_group)
+                .expect("sliding adapter")
+                .block_table_for(seq_id)
+                .expect("sliding block table")
+                .blocks()
+                .iter()
+                .map(|block| block.block_id)
+                .collect();
+            assert_eq!(
+                ids[0], ids[1],
+                "sequence {seq_id}: the settle must retire the two out-of-window \
+                 sliding blocks onto the null sentinel"
+            );
+            assert!(
+                ids[2..].iter().all(|&id| id != ids[0]),
+                "sequence {seq_id}: the committed window must remain physically backed"
+            );
+        }
+
+        let sliding_group =
+            sliding_group_id(inner.kv_cache_coordinator.as_ref().expect("coordinator"));
+
+        // Family scope: the settle walks the rungs.
+        let family_seq = 24u32;
+        seed(&mut inner, family_seq);
+        drive_cycle_onto_the_cold_rung(&mut Gemma4SpecPagedCache::new(&mut inner), family_seq);
+        let captured: Vec<(u32, usize)> = inner
+            .grouped_sliding_cold_checkpoints
+            .get(&family_seq)
+            .map(|checkpoints| {
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| (checkpoint.boundary, checkpoint.tokens.len()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            captured,
+            vec![(32, 32)],
+            "the family settle must capture the rung the committed frontier landed on"
+        );
+        assert_pruned(&inner, sliding_group, family_seq);
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .release_request_all(family_seq)
+            .expect("release the family sequence");
+
+        // Coordinator scope: the same call order prunes exactly as the family
+        // settle did and captures nothing, because the rung walk lives one
+        // level up.
+        let prune_only_seq = 25u32;
+        seed(&mut inner, prune_only_seq);
+        drive_cycle_onto_the_cold_rung(
+            &mut PruneOnlySpecPagedCache::new(
+                inner.kv_cache_coordinator.as_mut().expect("coordinator"),
+            ),
+            prune_only_seq,
+        );
+        assert!(
+            inner
+                .grouped_sliding_cold_checkpoints
+                .get(&prune_only_seq)
+                .is_none_or(|checkpoints| checkpoints.is_empty()),
+            "the coordinator scope cannot reach the rung walk"
+        );
+        assert_pruned(&inner, sliding_group, prune_only_seq);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of settle ownership: the family settle can capture a
+    /// cold checkpoint, which no rollback retracts, so it must DECLARE
+    /// itself durable and L-SETTLE must keep it out of an open cycle
+    /// entirely. The coordinator scope is admitted for the identical
+    /// in-cycle call (`gemma4_coordinator_is_lawful_under_the_permissive_checker`)
+    /// — the split between the two verdicts is the whole reason the
+    /// declaration exists.
+    ///
+    /// Geometry (window 16, block 8): committed 36, verify anchor + 4 drafts
+    /// → cursor 41, commit keep=1 → 37, whose post-commit cutoff (37 - 16 =
+    /// 21) retires exactly the two out-of-window sliding blocks.
+    ///
+    /// Mutation this catches: `Gemma4SpecPagedCache::settle_captures_durable_state`
+    /// answering `false` — the permissive checker then admits an in-cycle
+    /// family settle, which is where a rung capture lands on a frontier the
+    /// commit can still roll back under.
+    #[test]
+    fn the_family_settle_is_refused_inside_an_open_cycle() {
+        use crate::engine::spec_paged::NoDurableSettleInCycle;
+
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!(
+                "skipping the_family_settle_is_refused_inside_an_open_cycle: Metal unavailable"
+            );
+            return;
+        }
+        let mut inner =
+            Gemma4Inner::new(tiny_paged_config()).expect("tiny paged Gemma4Inner must construct");
+        if inner.kv_cache_coordinator.is_none() {
+            eprintln!(
+                "skipping the_family_settle_is_refused_inside_an_open_cycle: no paged coordinator"
+            );
+            return;
+        }
+
+        let seq_id = 27u32;
+        {
+            let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+            coordinator
+                .reset_scheduled_request(seq_id)
+                .expect("reset the sequence");
+            coordinator
+                .record_tokens_all(seq_id, &(0..36).collect::<Vec<_>>())
+                .expect("seed the committed prompt");
+        }
+        let sliding_group =
+            sliding_group_id(inner.kv_cache_coordinator.as_ref().expect("coordinator"));
+
+        let mut cache = NoDurableSettleInCycle::new(Gemma4SpecPagedCache::new(&mut inner));
+        assert!(
+            cache.reserve_lookahead(seq_id, 5).expect("reserve"),
+            "5 lookahead rows fit every group"
+        );
+        let ticket = cache
+            .record_verify(seq_id, &[100, 101, 102, 103, 104])
+            .expect("record anchor + 4 drafts");
+        let recorded = allocated_per_group(
+            cache
+                .inner()
+                .model()
+                .kv_cache_coordinator
+                .as_ref()
+                .expect("coordinator"),
+        );
+
+        // The committed basis is not enough at family scope: a durable
+        // capture may not run inside a cycle at any basis.
+        let err = cache
+            .settle_committed(seq_id, 36)
+            .expect_err("an in-cycle family settle must trip the durability check");
+        assert!(
+            err.contains("captures durable state"),
+            "unexpected error text: {err}"
+        );
+        assert_eq!(
+            allocated_per_group(
+                cache
+                    .inner()
+                    .model()
+                    .kv_cache_coordinator
+                    .as_ref()
+                    .expect("coordinator")
+            ),
+            recorded,
+            "the refused settle must never reach the coordinator"
+        );
+
+        cache
+            .commit_cycle(seq_id, ticket, 1)
+            .expect("keep the anchor, roll back the 4 rejected drafts");
+        cache
+            .settle_committed(seq_id, 37)
+            .expect("post-commit the family settle is lawful");
+        let settled = allocated_per_group(
+            cache
+                .inner()
+                .model()
+                .kv_cache_coordinator
+                .as_ref()
+                .expect("coordinator"),
+        );
+        for (group_id, (before, after)) in recorded.iter().zip(&settled).enumerate() {
+            let expected = if group_id == sliding_group { 2 } else { 0 };
+            assert_eq!(
+                before - after,
+                expected,
+                "group {group_id}: the post-commit family settle must retire exactly \
+                 the out-of-window blocks (37 - 16 = 21)"
+            );
+        }
     }
 
     /// Tap purity on the REAL paged layer loops (text and VLM), driven on a
