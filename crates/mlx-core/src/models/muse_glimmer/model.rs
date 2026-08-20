@@ -80,10 +80,16 @@ pub(crate) struct MusePagedRuntime {
 /// Settle basis for one [`MuseGlimmerInner::run_paged_layer_loop`] call. This
 /// family's per-step settle (pending-write eval, cold-checkpoint rung walk,
 /// sliding prune) is inlined at the tail of the unified loop rather than run
-/// by its callers, so the basis has to travel as a parameter: a speculative
-/// verify write must not prune or capture durable checkpoints while its rows
-/// can still be rolled back (I9), and the post-commit settle consumes the
-/// committed length instead of the write cursor.
+/// by its callers, so the basis has to travel as a parameter.
+///
+/// Of the two durable halves, only one is unlawful while a speculative
+/// verify write is pending. The committed-basis PRUNE is safe by itself: its
+/// cutoff trails the committed frontier, so it can never null a block a
+/// rollback returns the live window into (L-SETTLE, `engine::spec_paged`).
+/// The rung walk is not — a captured cold checkpoint is durable and no
+/// rollback retracts it. Both run under [`Self::Committed`] here, so that
+/// basis is this family's POST-COMMIT settle, and a chunk written inside an
+/// open verify cycle takes [`Self::Suppressed`] instead (I9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MusePagedSettle {
     /// Settle at the write cursor — every recorded token is committed (the
@@ -94,12 +100,16 @@ pub(crate) enum MusePagedSettle {
     /// committed-cutoff variant. A frontier past the cursor is clamped by
     /// the rung walk and refused by the prune — the committed frontier
     /// trails the cursor by definition.
+    ///
+    /// Still carries the rung walk, so this is the settle a speculative
+    /// owner runs once the commit has landed, never inside its cycle.
     #[allow(dead_code)]
     Committed(u32),
     /// No settle: pending pool writes are still evaluated (a compute flush,
     /// not a durable action), but no rung is captured and nothing is pruned
     /// — the shape of a verify write whose rows a commit may still retract;
-    /// the owner settles post-commit at the committed frontier.
+    /// the owner settles post-commit at the committed frontier. The only
+    /// mode lawful inside an open verify cycle.
     #[allow(dead_code)]
     Suppressed,
 }

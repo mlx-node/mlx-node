@@ -175,10 +175,31 @@ impl Drop for VerifyTicket {
 /// reading: `prune_committed_cutoff_never_nulls_rollback_range`
 /// (`transformer::paged_kv_cache_adapter`) at adapter scope, and
 /// `settle_committed_never_nulls_the_rollback_range_at_coordinator_level`
-/// (`models::gemma4::model`) at coordinator scope. Muse's per-chunk settle
-/// on the unified paged layer loop (`MusePagedSettle`) is legal for exactly
-/// this reason, which is what lets a DFlash driver settle inside a cycle at
-/// all.
+/// (`models::gemma4::model`) at coordinator scope.
+///
+/// Which CACHE that settle may come from is a separate question, and the
+/// answer is scope-by-scope. `PruneOnlySpecPagedCache`
+/// (`models::gemma4::model`) settles at coordinator scope — pending-write
+/// eval plus that prune, nothing else — so it declares
+/// [`SpecPagedCache::settle_captures_durable_state`] `false`, and
+/// `gemma4_coordinator_is_lawful_under_the_permissive_checker` drives the
+/// in-cycle committed-basis call through it. Every FAMILY scope layers a
+/// cold-checkpoint rung walk over that same prune and answers `true`
+/// instead: gemma4's `Gemma4SpecPagedCache`, refused in-cycle at any basis
+/// by `the_family_settle_is_refused_inside_an_open_cycle`, and muse's
+/// `MuseGlimmerInner::settle_paged_kv_step`, whose `MusePagedSettle::Cursor`
+/// and `MusePagedSettle::Committed` arms BOTH reach
+/// `remember_sliding_cold_checkpoints_at_frontier` — the committed arm's
+/// capture is what `settle_at_committed_equals_cursor_when_equal`
+/// (`models::muse_glimmer::model`) asserts. Muse therefore has NO mode that
+/// prunes without capturing: a muse-scope handle must declare `true` exactly
+/// as gemma4's does, and the one muse mode lawful inside an open cycle is
+/// `MusePagedSettle::Suppressed` — pending-write eval alone, no rung and no
+/// prune, which is not a settle through this facade at all. A DFlash driver
+/// therefore runs its per-chunk loop on `Suppressed` and defers the
+/// committed settle to post-commit, the shape
+/// `suppressed_settle_defers_prune_and_checkpoints_to_the_committed_settle`
+/// (`models::muse_glimmer::model`) pins.
 ///
 /// [`NoDurableSettleInCycle`] is the executable form of this law.
 /// [`NoSettleInCycle`] enforces the stricter shape — no settle of any kind
@@ -218,6 +239,12 @@ pub(crate) trait SpecPagedCache {
     /// blocks. Atomic per slice: on failure no partial suffix stays
     /// recorded. Drivers call [`Self::record_verify`], which wraps this in a
     /// cycle; this primitive exists so the wrapping lives once.
+    ///
+    /// A family whose verify core records its own rows has no facade write
+    /// at all, and refuses both this and [`Self::record_verify`] with an
+    /// `Err` pointing at [`Self::open_core_write_cycle`] — a facade-written
+    /// row would be one no forward produced, and one the commit may KEEP.
+    /// `DenseMtpStepper` (`models::qwen3_5::model`) is that shape.
     fn record_rows(&mut self, seq_id: u32, tokens: &[u32]) -> Result<(), String>;
 
     /// Retract the last `rows` recorded rows of `seq_id`. Cursor arithmetic
@@ -254,7 +281,8 @@ pub(crate) trait SpecPagedCache {
     fn frontier(&self, seq_id: u32) -> Option<SpecFrontier>;
 
     /// Record the cycle's verify write `[anchor, drafts..]` and OPEN the
-    /// cycle it belongs to.
+    /// cycle it belongs to. Refused by a family whose core writes its own
+    /// rows — see [`Self::record_rows`].
     fn record_verify(&mut self, seq_id: u32, tokens: &[u32]) -> Result<VerifyTicket, String> {
         let pre_attn_tokens = committed_attn_tokens(self, seq_id)?;
         self.record_rows(seq_id, tokens)?;
@@ -391,6 +419,15 @@ impl<C> NoSettleInCycle<C> {
         &self.inner
     }
 
+    /// Mutable access to the wrapped cache, for the out-of-band write an
+    /// [`SpecPagedCache::open_core_write_cycle`] cycle is opened around: the
+    /// family's own core performs it, so it cannot go through the facade.
+    /// Only calls made THROUGH the wrapper are checked — a settle issued on
+    /// the inner cache escapes the bookkeeping.
+    pub(crate) fn inner_mut(&mut self) -> &mut C {
+        &mut self.inner
+    }
+
     pub(crate) fn into_inner(self) -> C {
         self.inner
     }
@@ -486,6 +523,14 @@ impl<C> NoDurableSettleInCycle<C> {
 
     pub(crate) fn inner(&self) -> &C {
         &self.inner
+    }
+
+    /// Mutable access to the wrapped cache, with the same caveat as
+    /// [`NoSettleInCycle::inner_mut`]: it is the way a family core performs
+    /// the write an `open_core_write_cycle` cycle wraps, and calls made on
+    /// it are outside the checker.
+    pub(crate) fn inner_mut(&mut self) -> &mut C {
+        &mut self.inner
     }
 
     pub(crate) fn into_inner(self) -> C {
@@ -1008,10 +1053,10 @@ mod tests {
     }
 
     /// The permissive checker is the one a real driver fits in: a
-    /// committed-basis settle inside an open cycle is LAWFUL (muse's
-    /// per-chunk settle, gemma4's coordinator settle) and must pass through,
-    /// while the two irreversible shapes must not — a cache whose settle
-    /// captures durable state, and a settle at the write cursor.
+    /// committed-basis settle inside an open cycle is LAWFUL (the
+    /// coordinator-scope settle a per-chunk layer loop runs) and must pass
+    /// through, while the two irreversible shapes must not — a cache whose
+    /// settle captures durable state, and a settle at the write cursor.
     ///
     /// Mutations this catches: (a) letting a durable-capture cache settle
     /// in-cycle; (b) letting a cursor-basis settle through; (c) refusing the

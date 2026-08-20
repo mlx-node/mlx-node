@@ -11252,6 +11252,16 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 }
 
+/// The refusal both facade writers return for this family; see the
+/// `SpecPagedCache` impl docs below.
+fn dense_core_writes_its_own_rows(seq_id: u32) -> String {
+    format!(
+        "dense paged MTP facade: the verify core records sequence {seq_id}'s rows \
+         itself — open the cycle with open_core_write_cycle around that write \
+         instead of record_verify/record_rows"
+    )
+}
+
 /// Facade conformance for the dense paged MTP turn (`engine::spec_paged`):
 /// the cache is the [`MtpStepMode::Paged`] adapter, addressed by the turn's
 /// single active sequence ([`DenseMtpStepper::paged_cache_for`] refuses any
@@ -11272,16 +11282,20 @@ impl MtpStepper for DenseMtpStepper<'_> {
 ///   that rollback; the GDN tape replay and the recurrent frontier update
 ///   are layered on top of it and stay the stepper's.
 ///
+/// REFUSED — the verify core writes this family's rows:
+///
+/// * `record_verify` and the `record_rows` primitive under it would write
+///   rows the verify forward never wrote. Paired with `verify_step` they
+///   record the cycle's rows twice; on their own, every row a commit KEEPS
+///   advances the adapter while the recurrent state stands still, and the
+///   two frontiers desync — the skew
+///   [`Qwen35Inner::check_dense_paged_frontier`] cannot see, since it
+///   compares the adapter against the history and never against the GDN
+///   count. Both return `Err`, so `open_core_write_cycle` is the only way to
+///   open a cycle here and no facade row can outlive one.
+///
 /// NOT production-routed — conformance surface only:
 ///
-/// * `record_verify` (and the `record_rows` primitive under it) covers the
-///   KV half ALONE. It writes rows the verify forward never wrote, so it
-///   must never be paired with `verify_step` on the same cycle — the rows
-///   would be recorded twice — and a cycle it opens must be committed with
-///   a keep of ZERO, because any kept row advances the adapter while the
-///   recurrent state stands still and the two frontiers desync (the skew
-///   [`Qwen35Inner::check_dense_paged_frontier`] cannot see, since it
-///   compares the adapter against the history, not against the GDN count).
 /// * `settle_committed` / `settle_captures_durable_state` — see below.
 ///
 /// `rollback_unemitted` retracts COMMITTED rows after a mid-cycle stop, past
@@ -11317,8 +11331,16 @@ impl crate::engine::spec_paged::SpecPagedCache for DenseMtpStepper<'_> {
         }
     }
 
-    fn record_rows(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
-        self.paged_cache_for(seq_id)?.record_tokens(tokens)
+    fn record_rows(&mut self, seq_id: u32, _tokens: &[u32]) -> std::result::Result<(), String> {
+        Err(dense_core_writes_its_own_rows(seq_id))
+    }
+
+    fn record_verify(
+        &mut self,
+        seq_id: u32,
+        _tokens: &[u32],
+    ) -> std::result::Result<crate::engine::spec_paged::VerifyTicket, String> {
+        Err(dense_core_writes_its_own_rows(seq_id))
     }
 
     fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
@@ -17116,6 +17138,10 @@ mod paged_construction_tests {
     /// every cycle pins. That last shape is invisible to the release
     /// backstop `check_dense_paged_frontier`, which compares the adapter
     /// against the history and never against the GDN count.
+    ///
+    /// The tail segment catches one more: `record_verify` / `record_rows`
+    /// answering anything but `Err` on this family, which would hand a
+    /// driver a cycle whose kept rows the recurrent state never saw.
     #[test]
     #[ignore = "requires Metal GPU; run with --ignored"]
     fn paged_mtp_lookahead_reservation_covers_verify() {
@@ -17343,13 +17369,37 @@ mod paged_construction_tests {
         let (committed_blocks, committed_cursor) = adapter_stats(&step);
 
         // ── L-SETTLE, executable on the real stepper ──
-        // The cycle transaction's KV half (`record_verify` → `commit_cycle`)
-        // covers no forward, so it is driven here with a keep of ZERO: the
-        // rows are retracted whole, which is what keeps this segment
-        // frontier-neutral and every surviving block-table row backed by a
-        // real verify write (see the facade impl docs).
+        // The facade's own writers are REFUSED on this family — the verify
+        // core records its rows itself, and a facade row a commit kept would
+        // advance the adapter while the recurrent state stood still.
         let mut cache = NoSettleInCycle::new(step);
         let kv_rows: [u32; 2] = [71, 72];
+        let err = cache
+            .record_verify(seq_id, &kv_rows)
+            .expect_err("record_verify must be refused on the dense stepper");
+        assert!(
+            err.contains("open_core_write_cycle"),
+            "the refusal must name the opener that replaces it: {err}"
+        );
+        let err = cache
+            .record_rows(seq_id, &kv_rows)
+            .expect_err("record_rows must be refused on the dense stepper");
+        assert!(
+            err.contains("open_core_write_cycle"),
+            "the refusal must name the opener that replaces it: {err}"
+        );
+        assert_eq!(
+            adapter_stats(cache.inner()),
+            (committed_blocks, committed_cursor),
+            "a refused facade write must leave the adapter exactly where it was"
+        );
+
+        // So the law runs on the PRODUCTION shape: the cycle
+        // `open_core_write_cycle` opens around a write the core performs —
+        // here the adapter `record_tokens` the paged verify core makes —
+        // committed with a keep of ZERO. The rows are retracted whole, which
+        // keeps this segment frontier-neutral and leaves every surviving
+        // block-table row backed by a real verify write.
         assert!(
             cache
                 .reserve_lookahead(seq_id, kv_rows.len())
@@ -17358,12 +17408,20 @@ mod paged_construction_tests {
         );
         let (kv_blocks, _) = adapter_stats(cache.inner());
         let ticket = cache
-            .record_verify(seq_id, &kv_rows)
-            .expect("record the KV-half rows");
+            .open_core_write_cycle(seq_id, kv_rows.len())
+            .expect("open the cycle around the core write");
+        {
+            let MtpStepMode::Paged(adapter) = &mut cache.inner_mut().mode else {
+                panic!("mode must stay paged for the whole turn");
+            };
+            adapter
+                .record_tokens(&kv_rows)
+                .expect("the core write the cycle was opened around");
+        }
         assert_eq!(
             adapter_stats(cache.inner()),
             (kv_blocks, committed_cursor + kv_rows.len() as u32),
-            "the KV-half write must land in the reserved tail"
+            "the core write must land in the reserved tail"
         );
 
         // The ordering law is executable on the real stepper. This family's
@@ -17377,7 +17435,7 @@ mod paged_construction_tests {
 
         cache
             .commit_cycle(seq_id, ticket, 0)
-            .expect("a keep of zero retracts the whole KV-half write");
+            .expect("a keep of zero retracts the whole core write");
         assert!(
             !cache.settle_captures_durable_state(),
             "the identity settle captures nothing; this family's durable surfaces run \
@@ -17395,8 +17453,8 @@ mod paged_construction_tests {
         assert_eq!(
             adapter_stats(&step),
             (kv_blocks, committed_cursor),
-            "a fully retracted KV-half cycle must leave the block table and the cursor \
-             exactly where it found them"
+            "a fully retracted out-of-band cycle must leave the block table and the \
+             cursor exactly where it found them"
         );
         assert_eq!(
             MtpStepper::frontier(&step),
@@ -17404,8 +17462,8 @@ mod paged_construction_tests {
                 attn_tokens: u64::from(committed_cursor),
                 recurrent_tokens: Some(u64::from(committed_cursor)),
             }),
-            "the KV half touches no recurrent state, so a fully retracted cycle must be \
-             frontier-neutral"
+            "an out-of-band write touches no recurrent state, so a fully retracted \
+             cycle must be frontier-neutral"
         );
 
         // Real decode still advances on the same request, and both sides
