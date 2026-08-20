@@ -26,7 +26,7 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
-    ResetScope, StreamEmitter, TurnOutput, WholeTurnArgs,
+    ResetScope, SpecFrontier, StreamEmitter, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::StreamingCtx;
 use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
@@ -37,7 +37,9 @@ use crate::stream::{DeviceType, Stream, StreamContext};
 
 use super::assistant_decode::{AssistantTurnState, Gemma4AssistantStepper};
 use super::dspark::{DsparkContextCache, DsparkTap, truncate_by_confidence};
-use super::layer_cache::{Gemma4VerifyRollback, commit_after_verify, snapshot_before_verify};
+use super::layer_cache::{
+    Gemma4VerifyRollback, active_cache_frontier, commit_after_verify, snapshot_before_verify,
+};
 use super::model::{
     GEMMA4_PREFILL_STEP_SIZE, Gemma4Draft, Gemma4Inner, assistant_kv_source_indices, compute_ple,
     dspark_shared_slot_mask, dspark_verify_forward, eval_gemma4_caches, forward_body,
@@ -432,6 +434,17 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         // decode eval pattern: token only, never the logits).
         MxArray::async_eval_arrays(&[token]);
     }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        // Pure-attention target: the frontier is the common offset every
+        // active target cache sits at ([`active_cache_frontier`]); the
+        // drafter's private context cache is not target state.
+        let caches = self.inner.caches.as_ref()?;
+        Some(SpecFrontier {
+            attn_tokens: active_cache_frontier(caches, &self.shared_slots)?,
+            recurrent_tokens: None,
+        })
+    }
 }
 
 /// Per-turn stepper dispatch: [`DsparkBackend::DsparkDecode`] is ONE
@@ -516,6 +529,13 @@ impl DsparkStepper for Gemma4DraftStepper<'_> {
         match self {
             Self::Dspark(stepper) => stepper.eval_boundary(token),
             Self::Assistant(stepper) => stepper.eval_boundary(token),
+        }
+    }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        match self {
+            Self::Dspark(stepper) => stepper.frontier(),
+            Self::Assistant(stepper) => stepper.frontier(),
         }
     }
 }

@@ -59,7 +59,7 @@ use super::persistence;
 use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::engine;
-use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
+use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup, SpecFrontier};
 use crate::engine::{
     apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
     save_cache_state_direct, verify_cache_prefix_direct,
@@ -8942,6 +8942,17 @@ pub(crate) struct MoeMtpStepper<'a> {
     /// GDN tape recorded by [`Self::verify_step`], consumed by
     /// [`Self::rollback`].
     tape: Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    /// Absolute tokens the GDN recurrent state has consumed, reported by
+    /// [`MtpStepper::frontier`] against the flat full-attention offset.
+    /// Seeded from that offset at construction (the two sides are aligned at
+    /// turn entry) and moved only where the recurrent state actually moves:
+    /// `forward_with_hidden` +1, `verify_step` +depth+1, `rollback` to
+    /// `recurrent_snapshot_base + accepted_steps`. `None` after a failed
+    /// replay — the count is then unknown and the stashed error fail-closes
+    /// the turn. Mirrors `DenseMtpStepper`'s bookkeeping, flat-only.
+    recurrent_frontier: Option<u64>,
+    /// [`Self::recurrent_frontier`] captured by `snapshot_main_linear`.
+    recurrent_snapshot_base: Option<u64>,
     /// Error stashed by the infallible [`Self::rollback`] replay, surfaced by
     /// [`Self::take_replay_error`].
     replay_err: Option<Error>,
@@ -8992,6 +9003,10 @@ impl MtpStepper for MoeMtpStepper<'_> {
         let h3 = inner.final_norm.forward(&pre)?;
         let logits = project_logits_from_hidden(&h3, &inner.lm_head, embedding)?;
         let hidden = h3.squeeze(Some(&[1]))?;
+        if let Some(frontier) = self.recurrent_frontier.as_mut() {
+            // The main forward consumed one token on the GDN side.
+            *frontier += 1;
+        }
         Ok((logits, hidden, true))
     }
 
@@ -9025,10 +9040,9 @@ impl MtpStepper for MoeMtpStepper<'_> {
         embedding: &Embedding,
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
-        let _ = depth;
         let inner = &mut *self.inner;
         let tape = &mut self.tape;
-        eager_verify_step(
+        let output = eager_verify_step(
             &mut inner.layers,
             &mut inner.caches,
             &inner.final_norm,
@@ -9037,7 +9051,14 @@ impl MtpStepper for MoeMtpStepper<'_> {
             ids,
             embedding,
             Some(tape),
-        )
+        );
+        if output.is_ok()
+            && let Some(frontier) = self.recurrent_frontier.as_mut()
+        {
+            // Verify consumed the anchor plus D drafts on the GDN side.
+            *frontier += depth as u64 + 1;
+        }
+        output
     }
 
     // No native argmax-only / sparse verify on the eager path — the accept
@@ -9054,6 +9075,7 @@ impl MtpStepper for MoeMtpStepper<'_> {
             )),
         };
         self.snap = Some(snap);
+        self.recurrent_snapshot_base = self.recurrent_frontier;
     }
 
     // Pure-Rust GDN tape replay — fires on BOTH full and partial accept.
@@ -9150,8 +9172,16 @@ impl MtpStepper for MoeMtpStepper<'_> {
             }
             Ok(())
         })();
-        if let Err(e) = result {
-            self.replay_err = Some(e);
+        match result {
+            Ok(()) => {
+                self.recurrent_frontier = self
+                    .recurrent_snapshot_base
+                    .map(|base| base + accepted_steps as u64);
+            }
+            Err(e) => {
+                self.recurrent_frontier = None;
+                self.replay_err = Some(e);
+            }
         }
     }
 
@@ -9283,6 +9313,23 @@ impl MtpStepper for MoeMtpStepper<'_> {
         }
     }
 
+    fn frontier(&self) -> Option<SpecFrontier> {
+        // Flat-only: the full-attention offset is the attention side's
+        // ground truth. A flat mid-cycle stop leaves BOTH sides ahead of the
+        // emitted frontier together (the desync latch heals that), so the
+        // two counts stay equal at every post-rollback point.
+        let attn_tokens = self
+            .inner
+            .caches
+            .as_ref()?
+            .get(self.fa_idx)
+            .map(|cache| cache.offset().max(0) as u64)?;
+        Some(SpecFrontier {
+            attn_tokens,
+            recurrent_tokens: self.recurrent_frontier,
+        })
+    }
+
     fn take_replay_error(&mut self) -> Option<Error> {
         self.replay_err.take()
     }
@@ -9321,12 +9368,23 @@ impl MtpBackend for Qwen35MoeInner {
             use_committed,
             snap: None,
             tape: Vec::new(),
+            recurrent_frontier: None,
+            recurrent_snapshot_base: None,
             replay_err: None,
             mtp_desynced: false,
             embedding,
             config,
             fa_idx,
         };
+        // The GDN recurrent state is aligned with the attention state at turn
+        // entry (both consumed exactly the prefilled history), so the
+        // recurrent bookkeeping seeds from the attention side's ground truth.
+        stepper.recurrent_frontier = stepper
+            .inner
+            .caches
+            .as_ref()
+            .and_then(|caches| caches.get(stepper.fa_idx))
+            .map(|cache| cache.offset().max(0) as u64);
 
         // Prompt-prefix seed (v2 committed-history only). Mirrors
         // `DenseMtpStepper::begin_mtp_decode`'s prompt-prefix seed block

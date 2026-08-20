@@ -1489,6 +1489,23 @@ pub(crate) trait MtpBackend: ChatBackend {
     fn record_turn_mtp_acceptance(&mut self, _accepted: u64, _attempted: u64) {}
 }
 
+/// One named count per target-state kind a speculative stepper tracks —
+/// the I4 frontier. Counts are ABSOLUTE consumed-token totals (prompt
+/// included), so the two sides of a hybrid stack compare directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpecFrontier {
+    /// Tokens the attention K/V state has consumed — the paged adapter's
+    /// recorded rows, or a flat full-attention cache offset.
+    pub attn_tokens: u64,
+    /// Tokens the recurrent (GDN) state has consumed, when the stepper
+    /// tracks one. `None` for pure-attention families AND for a hybrid
+    /// stepper that cannot currently name the count (e.g. after a failed
+    /// tape replay, where the stashed error fail-closes the turn instead).
+    /// When `Some`, it must equal `attn_tokens` at every post-rollback
+    /// point — a disagreement is a one-sided rewind.
+    pub recurrent_tokens: Option<u64>,
+}
+
 /// Per-turn MTP stepper the engine-owned propose/verify loop drives — the
 /// 11 closures of the former `MtpOps` bundle (now removed) as trait
 /// methods, plus the macro-level orchestration hooks the engine takes
@@ -1681,6 +1698,16 @@ pub(crate) trait MtpStepper {
     /// `MtpOps::rollback_unemitted` (the `RU` closure).
     fn rollback_unemitted(&mut self, unemitted: usize);
 
+    /// The stepper's CURRENT target-state frontier ([`SpecFrontier`]), or
+    /// `None` when it cannot name one (missing caches). REQUIRED — no
+    /// default, so a new stepper cannot silently omit its recurrent side.
+    /// The engine reads it in debug builds right after [`Self::rollback`]
+    /// (post-replay) and [`Self::rollback_unemitted`] and asserts
+    /// `recurrent_tokens == attn_tokens` whenever the recurrent count is
+    /// known — the I4 tripwire against one-sided rewinds. Release builds
+    /// rely on the families' epilogue length-agreement checks instead.
+    fn frontier(&self) -> Option<SpecFrontier>;
+
     /// Take any error stashed by an infallible [`Self::rollback`] replay,
     /// so the engine can surface it with `?` after the (infallible)
     /// rollback call. `None` = the cycle's replay (if any) succeeded.
@@ -1869,6 +1896,20 @@ pub(crate) trait DsparkStepper {
     /// iteration boundary on the continue path (the analog of
     /// [`MtpStepper::eval_step_with_chained_hidden`]'s placement).
     fn eval_boundary(&self, token: &MxArray);
+
+    /// The stepper's current target-state frontier ([`SpecFrontier`]), or
+    /// `None` when it cannot name one (missing caches, or active target
+    /// caches disagreeing with each other). The draft-model targets are
+    /// pure attention, so `recurrent_tokens` is `None`; `attn_tokens` is
+    /// the common offset every ACTIVE target cache sits at — the same
+    /// per-cache totals `gemma4::layer_cache::commit_after_verify`
+    /// validates on every commit. REQUIRED for the same reason as
+    /// [`MtpStepper::frontier`]. No engine call site consumes it yet — the
+    /// `SpecPagedCache` facade's `frontier()` debug contract does; until
+    /// then it exists so every stepper answers the same question the
+    /// `run_mtp_turn` asserts already put to [`MtpStepper`].
+    #[allow(dead_code)]
+    fn frontier(&self) -> Option<SpecFrontier>;
 }
 
 /// Per-family training backend the model-neutral training-command handler

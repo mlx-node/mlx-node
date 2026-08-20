@@ -14,8 +14,8 @@ use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
-    PagedPrefix, ResetScope, SaveStateArgs, ThinkingSetup, TrainBackend, TurnOutput, TurnSetup,
-    WholeTurnArgs,
+    PagedPrefix, ResetScope, SaveStateArgs, SpecFrontier, ThinkingSetup, TrainBackend, TurnOutput,
+    TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
@@ -2383,6 +2383,21 @@ impl Qwen35Inner {
             // match its token key. GDN-only — the adapter K/V stays.
             self.gdn_last_history_checkpoint = None;
             return Ok(trace.finish(total_start));
+        }
+        // L-KEY (I4): the state cloned below is keyed on
+        // `cached_token_history`, and a paged session's GDN state sits at the
+        // adapter's recorded frontier (the paged forwards and rollbacks move
+        // both together). A caller that publishes without first running
+        // `check_dense_paged_frontier` (which arms the latch consumed above)
+        // trips this in debug builds instead of storing state ≠ its key.
+        #[cfg(debug_assertions)]
+        if let Some(adapter) = self.paged_adapter.as_ref() {
+            let gdn_frontier = adapter.request_tokens().len();
+            debug_assert_eq!(
+                gdn_frontier,
+                self.cached_token_history.len(),
+                "GDN history checkpoint key disagrees with the paged frontier",
+            );
         }
 
         let eval_start = trace_enabled.then(std::time::Instant::now);
@@ -10433,6 +10448,19 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// `unemitted` in these SAME units, so the mid-cycle rewind target
     /// (`last_cycle_steps - unemitted`) is immune to tape-step-unit skew.
     last_cycle_steps: usize,
+    /// Absolute tokens the GDN recurrent state has consumed, reported by
+    /// [`MtpStepper::frontier`] against the ATTENTION side's ground truth
+    /// (adapter recorded rows / flat full-attention offset). Seeded from the
+    /// attention frontier at construction (the two sides are aligned at turn
+    /// entry) and moved ONLY where the recurrent state actually moves:
+    /// `forward_with_hidden` +1, `verify_step` +depth+1, replay-driven
+    /// rollbacks to `recurrent_snapshot_base + steps`. `None` after a failed
+    /// replay — the count is then unknown and the stashed error fail-closes
+    /// the turn.
+    recurrent_frontier: Option<u64>,
+    /// [`Self::recurrent_frontier`] captured by `snapshot_main_linear` — the
+    /// base the replay-driven rollbacks land relative to.
+    recurrent_snapshot_base: Option<u64>,
     /// Error stashed by the infallible `rollback` replay, surfaced by
     /// `take_replay_error`. == the closures' `replay_err_cell`.
     replay_err: Option<Error>,
@@ -10579,6 +10607,21 @@ impl DenseMtpStepper<'_> {
         }
         Ok(())
     }
+
+    /// The attention side's ground-truth frontier: the paged adapter's
+    /// recorded rows, or the first flat FullAttention cache's offset.
+    fn attention_frontier(&self) -> Option<u64> {
+        match &self.mode {
+            MtpStepMode::Paged(adapter) => Some(adapter.request_tokens().len() as u64),
+            MtpStepMode::Flat => {
+                let caches = self.inner.caches.as_ref()?;
+                caches
+                    .iter()
+                    .find(|c| matches!(c, Qwen3_5LayerCache::FullAttention(_)))
+                    .map(|c| c.offset().max(0) as u64)
+            }
+        }
+    }
 }
 
 impl MtpStepper for DenseMtpStepper<'_> {
@@ -10610,7 +10653,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
         ids: &MxArray,
         embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)> {
-        match &mut self.mode {
+        let output = match &mut self.mode {
             MtpStepMode::Flat => {
                 let inner = &mut *self.inner;
                 let pre =
@@ -10643,7 +10686,14 @@ impl MtpStepper for DenseMtpStepper<'_> {
                 )?;
                 Ok((logits, hidden, true))
             }
+        };
+        if output.is_ok()
+            && let Some(frontier) = self.recurrent_frontier.as_mut()
+        {
+            // The main forward consumed one token on the GDN side.
+            *frontier += 1;
         }
+        output
     }
 
     // One MTP draft step on the eager drafter. `h_next` is `[1, 1, hidden]`;
@@ -10734,6 +10784,10 @@ impl MtpStepper for DenseMtpStepper<'_> {
             // The recorded tape step count for this cycle: the anchor plus D
             // drafts. `rollback` overwrites it with the accepted count.
             self.last_cycle_steps = depth + 1;
+            if let Some(frontier) = self.recurrent_frontier.as_mut() {
+                // Verify consumed the anchor plus D drafts on the GDN side.
+                *frontier += depth as u64 + 1;
+            }
         }
         output
     }
@@ -10758,6 +10812,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
             )),
         };
         self.snap = Some(snap);
+        self.recurrent_snapshot_base = self.recurrent_frontier;
     }
 
     // Pure-Rust GDN tape replay — the correctness keystone. Fires on BOTH
@@ -10786,8 +10841,16 @@ impl MtpStepper for DenseMtpStepper<'_> {
         }
         let accepted_steps = accepted_drafts + 1;
         self.last_cycle_steps = accepted_steps;
-        if let Err(e) = self.replay_main_linear_to(accepted_steps) {
-            self.replay_err = Some(e);
+        match self.replay_main_linear_to(accepted_steps) {
+            Ok(()) => {
+                self.recurrent_frontier = self
+                    .recurrent_snapshot_base
+                    .map(|base| base + accepted_steps as u64);
+            }
+            Err(e) => {
+                self.recurrent_frontier = None;
+                self.replay_err = Some(e);
+            }
         }
     }
 
@@ -10990,6 +11053,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
         }
         let Some(target) = self.last_cycle_steps.checked_sub(unemitted) else {
             self.inner.paged_mtp_gdn_invalidations += 1;
+            self.recurrent_frontier = None;
             self.replay_err = Some(Error::from_reason(format!(
                 "eager MTP-paged rollback_unemitted: unemitted {unemitted} exceeds \
                  the cycle's committed steps {}",
@@ -10998,12 +11062,25 @@ impl MtpStepper for DenseMtpStepper<'_> {
             return;
         };
         match self.replay_main_linear_to(target) {
-            Ok(()) => self.inner.paged_mtp_gdn_rewinds += 1,
+            Ok(()) => {
+                self.recurrent_frontier = self
+                    .recurrent_snapshot_base
+                    .map(|base| base + target as u64);
+                self.inner.paged_mtp_gdn_rewinds += 1;
+            }
             Err(e) => {
+                self.recurrent_frontier = None;
                 self.inner.paged_mtp_gdn_invalidations += 1;
                 self.replay_err = Some(e);
             }
         }
+    }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        Some(SpecFrontier {
+            attn_tokens: self.attention_frontier()?,
+            recurrent_tokens: self.recurrent_frontier,
+        })
     }
 
     fn take_replay_error(&mut self) -> Option<Error> {
@@ -11102,6 +11179,8 @@ impl MtpBackend for Qwen35Inner {
             snap: None,
             tape: Vec::new(),
             last_cycle_steps: 0,
+            recurrent_frontier: None,
+            recurrent_snapshot_base: None,
             replay_err: None,
             mtp_desynced: false,
             embedding,
@@ -11109,6 +11188,11 @@ impl MtpBackend for Qwen35Inner {
             mode,
             layer_kinds,
         };
+        // The GDN recurrent state is aligned with the attention state at turn
+        // entry (both consumed exactly the prefilled history), so the
+        // recurrent bookkeeping seeds from the attention side's ground truth;
+        // cross-turn skew is the epilogue length-agreement checks' job.
+        stepper.recurrent_frontier = stepper.attention_frontier();
 
         // Prompt-prefix seed (v2 committed-history only): commit the
         // contiguous run
@@ -16495,6 +16579,40 @@ mod paged_construction_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// L-KEY (I4) tripwire: a publish site that keys GDN state on a history
+    /// disagreeing with the paged frontier — without first running
+    /// `check_dense_paged_frontier`, which would arm the refuse-to-persist
+    /// latch — must trip the debug assert inside
+    /// `remember_dense_gdn_history_checkpoint` instead of storing state that
+    /// does not match its token key.
+    ///
+    /// Catches: removing that assert — the publish then proceeds silently
+    /// and this test fails on the missing panic. (`catch_unwind` rather than
+    /// `#[should_panic]` so the no-Metal self-skip can still pass.)
+    #[test]
+    fn history_checkpoint_publish_asserts_the_paged_frontier() {
+        let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
+            "history_checkpoint_publish_asserts_the_paged_frontier",
+        ) else {
+            return;
+        };
+        let prompt: Vec<u32> = (0u32..32).collect();
+        record_whole_paged_request(&mut inner, &prompt);
+        // One token short of the adapter's 32 recorded rows with the latch
+        // NOT armed — the exact shape a future check-less publish site would
+        // hand the store.
+        inner.cached_token_history = prompt[..prompt.len() - 1].to_vec();
+        assert!(!inner.paged_gdn_state_dirty);
+
+        let publish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = inner.remember_dense_gdn_history_checkpoint();
+        }));
+        assert!(
+            publish.is_err(),
+            "a checkpoint publish keyed off the paged frontier must trip the L-KEY debug assert"
+        );
     }
 
     /// The chunk size every paged prefill reads. Single-shot materializes no GDN

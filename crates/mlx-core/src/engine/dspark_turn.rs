@@ -921,7 +921,8 @@ mod tests {
     use crate::decode_profiler::DecodeProfiler;
     use crate::engine::backend::{
         ChatBackend, ChunkSink, DefaultStreamEmitter, DsparkBackend, DsparkProposal, DsparkStepper,
-        DsparkVerifyOutput, FinalizeArgs, ResetScope, SaveStateArgs, TurnSetup, TurnTokenObserver,
+        DsparkVerifyOutput, FinalizeArgs, ResetScope, SaveStateArgs, SpecFrontier, TurnSetup,
+        TurnTokenObserver,
     };
     use crate::engine::decode::StreamingCtx;
     use crate::engine::params::ChatParams;
@@ -1214,6 +1215,12 @@ mod tests {
             self.ledger
                 .borrow_mut()
                 .push(Call::EvalBoundary { token: id });
+        }
+
+        fn frontier(&self) -> Option<SpecFrontier> {
+            // The mock scripts logits only — it models no target cache, so
+            // it honestly reports no nameable frontier.
+            None
         }
     }
 

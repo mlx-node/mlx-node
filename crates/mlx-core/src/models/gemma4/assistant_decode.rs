@@ -26,14 +26,16 @@
 use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
-use crate::engine::backend::{DsparkProposal, DsparkStepper, DsparkVerifyOutput};
+use crate::engine::backend::{DsparkProposal, DsparkStepper, DsparkVerifyOutput, SpecFrontier};
 use crate::engine::params::ChatParams;
 use crate::sampling;
 use crate::stream::{Stream, StreamContext};
 
 use super::assistant::AssistantSharedKv;
 use super::dspark::sample_index_from_probs;
-use super::layer_cache::{Gemma4VerifyRollback, commit_after_verify, snapshot_before_verify};
+use super::layer_cache::{
+    Gemma4VerifyRollback, active_cache_frontier, commit_after_verify, snapshot_before_verify,
+};
 use super::model::{
     AssistantKvSources, GEMMA4_PREFILL_STEP_SIZE, Gemma4Inner, assistant_verify_forward,
     compute_ple, eval_gemma4_caches, forward_body, lm_head_logits,
@@ -314,6 +316,17 @@ impl DsparkStepper for Gemma4AssistantStepper<'_> {
         // Schedule-only async eval of the next cycle's anchor (gemma4's
         // decode eval pattern: token only, never the logits).
         MxArray::async_eval_arrays(&[token]);
+    }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        // Pure-attention target the Q-only draft reads through KV sharing:
+        // the frontier is the common offset every active target cache sits
+        // at ([`active_cache_frontier`]); the draft owns no cache of its own.
+        let caches = self.inner.caches.as_ref()?;
+        Some(SpecFrontier {
+            attn_tokens: active_cache_frontier(caches, &self.shared_slots)?,
+            recurrent_tokens: None,
+        })
     }
 }
 

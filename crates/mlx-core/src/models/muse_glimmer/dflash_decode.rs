@@ -8,7 +8,7 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
-    ResetScope, StreamEmitter, TurnOutput, WholeTurnArgs,
+    ResetScope, SpecFrontier, StreamEmitter, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::StreamingCtx;
 use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
@@ -16,7 +16,7 @@ use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::generated_capacity_hint;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::models::gemma4::layer_cache::{
-    Gemma4VerifyRollback, commit_after_verify, snapshot_before_verify,
+    Gemma4VerifyRollback, active_cache_frontier, commit_after_verify, snapshot_before_verify,
 };
 use crate::stream::{DeviceType, Stream, StreamContext};
 
@@ -188,6 +188,16 @@ impl DsparkStepper for MuseGlimmerDFlashStepper<'_> {
 
     fn eval_boundary(&self, token: &MxArray) {
         MxArray::async_eval_arrays(&[token]);
+    }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        // Pure-attention target with no KV-shared slots (the empty mask
+        // counts every cache as active); the DFlash context cache is
+        // drafter-private, not target state.
+        Some(SpecFrontier {
+            attn_tokens: active_cache_frontier(&self.inner.caches, &[])?,
+            recurrent_tokens: None,
+        })
     }
 }
 

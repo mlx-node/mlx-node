@@ -52,6 +52,23 @@ pub(crate) fn turn_lookahead_rows(
     plan.lookahead_rows(max_cycle_depth)
 }
 
+/// I4 tripwire: right after a rollback every target-state kind the stepper
+/// tracks must sit at ONE frontier — when the stepper knows its recurrent
+/// count, it must equal the attention count. Debug builds only (`cargo test`
+/// exercises it); release builds rely on the families' epilogue
+/// length-agreement checks, which fail closed instead of panicking.
+fn debug_assert_one_frontier<S: MtpStepper>(step: &S, site: &str) {
+    if cfg!(debug_assertions)
+        && let Some(frontier) = step.frontier()
+        && let Some(recurrent_tokens) = frontier.recurrent_tokens
+    {
+        debug_assert_eq!(
+            recurrent_tokens, frontier.attn_tokens,
+            "{site} left the recurrent state at a different frontier than the attention state",
+        );
+    }
+}
+
 /// One MTP draft+verify cycle, generic over [`MtpStepper`] — a VERBATIM,
 /// mechanical relocation of
 /// [`crate::models::qwen3_5::mtp_decode::run_mtp_cycle_inner`], calling
@@ -1011,6 +1028,10 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         profiler.end();
         replay_res?;
     }
+    // Post-rollback frontier point: the rollback + (on rejection) replay
+    // transaction is complete on BOTH accept shapes, so every state kind the
+    // stepper tracks must have converged on the accepted frontier.
+    debug_assert_one_frontier(step, "MTP cycle rollback");
 
     let _ = rejection_residual; // documented above; only used for clarity
     // `prev_hidden` / `prev_emb` are no longer needed (they were the
@@ -2058,6 +2079,12 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             if unemitted > 0 {
                 rollback_unemitted = unemitted;
                 step.rollback_unemitted(unemitted);
+                // Post-rollback frontier point: a paged stepper just rewound
+                // BOTH its adapter cursor and its recurrent state to the
+                // drop-last-of-emitted frontier; a one-sided rewind must not
+                // survive past this line. (A flat stepper leaves both sides
+                // ahead together and heals via the desync latch instead.)
+                debug_assert_one_frontier(&step, "MTP mid-cycle stop rewind");
             }
             break;
         }
@@ -2172,7 +2199,7 @@ mod tests {
     use napi::bindgen_prelude::*;
 
     use crate::array::MxArray;
-    use crate::engine::backend::MtpStepper;
+    use crate::engine::backend::{MtpStepper, SpecFrontier};
     use crate::engine::params::ChatParams;
     use crate::models::qwen3_5::adaptive_depth::ExpectedValueDepthPolicy;
     use crate::models::qwen3_5::mtp_decode::{
@@ -2287,6 +2314,16 @@ mod tests {
         // Frontier captured by `snapshot_main_linear` — the base `rollback`
         // rewinds to (mirrors the pre-verify GDN snapshot).
         snap_pos: std::cell::Cell<i64>,
+        // ---- recurrent-side frontier model ----
+        // Recurrent twin of `state_pos`, moved by the same operations so
+        // `frontier()` reports ONE consistent frontier by default. The
+        // `forget_recurrent_on_*` knobs skip the matching rewind, modeling a
+        // stepper that rewinds only its attention side — the engine's
+        // post-rollback frontier asserts must trip on exactly that.
+        recurrent_pos: std::cell::Cell<i64>,
+        recurrent_snap: std::cell::Cell<i64>,
+        forget_recurrent_on_rollback: bool,
+        forget_recurrent_on_rollback_unemitted: bool,
         // ---- per-cycle lookahead reservation script ----
         // `None` ⇒ every reservation succeeds (the trait's default-`Ok(true)`
         // contract). `Some(n)` ⇒ the first n reservations succeed and every
@@ -2375,6 +2412,10 @@ mod tests {
                 flip_cancel_on_commit: None,
                 state_pos: std::rc::Rc::new(std::cell::Cell::new(0)),
                 snap_pos: std::cell::Cell::new(0),
+                recurrent_pos: std::cell::Cell::new(0),
+                recurrent_snap: std::cell::Cell::new(0),
+                forget_recurrent_on_rollback: false,
+                forget_recurrent_on_rollback_unemitted: false,
                 reserve_ok_budget: None,
                 reserve_calls: std::cell::Cell::new(0),
             }
@@ -2515,6 +2556,7 @@ mod tests {
             self.record(Call::ForwardWithHidden);
             // Step A consumes the fed token: target state advances one row.
             self.state_pos.set(self.state_pos.get() + 1);
+            self.recurrent_pos.set(self.recurrent_pos.get() + 1);
             // H2 knob: emulate a client disconnect landing DURING the Step-A
             // forward — the Step-A sync cancel poll (after the token push)
             // must observe it on this very step.
@@ -2595,6 +2637,8 @@ mod tests {
             self.record(Call::VerifyStep { depth });
             // Verify consumes [anchor, d_0..d_{D-1}]: depth + 1 rows.
             self.state_pos.set(self.state_pos.get() + depth as i64 + 1);
+            self.recurrent_pos
+                .set(self.recurrent_pos.get() + depth as i64 + 1);
             if let Some(t) = self.turn.as_ref() {
                 // logits [1, depth+1, vocab] with per-position argmax driven by
                 // the current cycle's `verify_argmax`; hiddens
@@ -2683,6 +2727,7 @@ mod tests {
         fn snapshot_main_linear(&mut self) {
             self.record(Call::SnapshotMainLinear);
             self.snap_pos.set(self.state_pos.get());
+            self.recurrent_snap.set(self.recurrent_pos.get());
         }
 
         fn rollback(&mut self, accepted_drafts: usize, depth: usize) {
@@ -2694,6 +2739,10 @@ mod tests {
             // accepted frontier, dropping the rejected verify tail.
             self.state_pos
                 .set(self.snap_pos.get() + accepted_drafts as i64 + 1);
+            if !self.forget_recurrent_on_rollback {
+                self.recurrent_pos
+                    .set(self.recurrent_snap.get() + accepted_drafts as i64 + 1);
+            }
         }
 
         fn restore_and_replay_main(
@@ -2770,6 +2819,20 @@ mod tests {
             // accepted-but-unemitted tail, landing on the drop-last-of-emitted
             // frontier (the mid-cycle-stop postcondition).
             self.state_pos.set(self.state_pos.get() - unemitted as i64);
+            if !self.forget_recurrent_on_rollback_unemitted {
+                self.recurrent_pos
+                    .set(self.recurrent_pos.get() - unemitted as i64);
+            }
+        }
+
+        // NOT recorded in the ledger: the engine reads the frontier only
+        // inside debug asserts, so recording it would make the call ledger
+        // differ between debug and release builds.
+        fn frontier(&self) -> Option<SpecFrontier> {
+            Some(SpecFrontier {
+                attn_tokens: self.state_pos.get().max(0) as u64,
+                recurrent_tokens: Some(self.recurrent_pos.get().max(0) as u64),
+            })
         }
 
         fn take_replay_error(&mut self) -> Option<Error> {
@@ -3999,6 +4062,10 @@ mod tests {
         /// Per-cycle reservation budget forwarded into the constructed
         /// stepper — see [`MockMtpStepper::reserve_ok_budget`].
         reserve_ok_budget: Option<usize>,
+        /// One-sided-rewind knobs forwarded into the constructed stepper —
+        /// see [`MockMtpStepper::recurrent_pos`].
+        forget_recurrent_on_rollback: bool,
+        forget_recurrent_on_rollback_unemitted: bool,
     }
 
     impl MockMtpBackend {
@@ -4024,7 +4091,23 @@ mod tests {
                 state_pos: Rc::new(std::cell::Cell::new(0)),
                 lookahead_rows_seen: std::cell::Cell::new(usize::MAX),
                 reserve_ok_budget: None,
+                forget_recurrent_on_rollback: false,
+                forget_recurrent_on_rollback_unemitted: false,
             }
+        }
+
+        /// Model a stepper whose `rollback` rewinds only its attention side,
+        /// leaving `recurrent_tokens` stale at the verify frontier.
+        fn with_forgotten_recurrent_on_rollback(mut self) -> Self {
+            self.forget_recurrent_on_rollback = true;
+            self
+        }
+
+        /// Model a stepper whose `rollback_unemitted` rewinds only its
+        /// attention side, leaving `recurrent_tokens` stale.
+        fn with_forgotten_recurrent_on_rollback_unemitted(mut self) -> Self {
+            self.forget_recurrent_on_rollback_unemitted = true;
+            self
         }
 
         fn with_replay_error(mut self, reason: &'static str) -> Self {
@@ -4147,6 +4230,9 @@ mod tests {
             step.flip_cancel_on_commit = self.flip_cancel_on_commit.clone();
             step.state_pos = Rc::clone(&self.state_pos);
             step.reserve_ok_budget = self.reserve_ok_budget;
+            step.forget_recurrent_on_rollback = self.forget_recurrent_on_rollback;
+            step.forget_recurrent_on_rollback_unemitted =
+                self.forget_recurrent_on_rollback_unemitted;
             Ok(step)
         }
 
@@ -4777,6 +4863,65 @@ mod tests {
             "after rollback_unemitted every paged target-state kind must sit at \
              the drop-last-of-emitted frontier"
         );
+    }
+
+    /// The I4 frontier tripwire behind the paged mid-cycle rewind: a stepper
+    /// whose `rollback_unemitted` rewinds only its attention side (stale
+    /// `recurrent_tokens`) must trip the engine's post-`rollback_unemitted`
+    /// debug assert. Catches: removing that assert — this test then FAILS
+    /// (no panic) instead of passing.
+    #[test]
+    #[should_panic(expected = "recurrent state at a different frontier")]
+    fn run_mtp_turn_mid_cycle_stop_stale_recurrent_trips_frontier_assert() {
+        let _chained_off = force_chained_off();
+        // Same mid-cycle EOS script as
+        // `run_mtp_turn_mid_cycle_stop_rewinds_paged_state`: full-accept
+        // depth-3 cycle, EOS lands as the 2nd emitted token, unemitted = 2.
+        // The forgetful stepper drops attn by 2 but leaves recurrent at the
+        // rollback frontier — the assert right after `rollback_unemitted`
+        // must see the disagreement. (The cycle-rollback assert stays quiet:
+        // this stepper's `rollback` is symmetric.)
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4, 15, 6],
+            verify_argmax: vec![4, 15, 6, 7],
+        };
+        let mut backend = MockMtpBackend::new(
+            16,
+            4,
+            vec![9, 10, 11],
+            vec![cycle; 4],
+            /* desynced */ false,
+        )
+        .with_forgotten_recurrent_on_rollback_unemitted();
+        let _ = drive_turn(&mut backend, 3, 64, 15, 3);
+    }
+
+    /// The same tripwire at the cycle-rollback point: a stepper whose
+    /// `rollback` replays only its attention side must trip the engine's
+    /// post-rollback frontier assert on a PARTIAL accept (a full accept
+    /// leaves both counts at the verify end, where a stale recurrent count
+    /// is indistinguishable). Catches: removing the `run_mtp_cycle` assert —
+    /// this test then FAILS (no panic) instead of passing.
+    #[test]
+    #[should_panic(expected = "recurrent state at a different frontier")]
+    fn run_mtp_cycle_partial_accept_stale_recurrent_trips_frontier_assert() {
+        let _chained_off = force_chained_off();
+        // drafts [4, 5, 6]; verify [4, 9, ..] → d0 accepted, d1 rejected →
+        // rollback(accepted=1, depth=3) lands attn at snapshot+2 while the
+        // forgetful recurrent side stays at the verify end (snapshot+4).
+        let cycle = CycleArgmax {
+            draft_argmax: vec![4, 5, 6],
+            verify_argmax: vec![4, 9, 9, 9],
+        };
+        let mut backend = MockMtpBackend::new(
+            16,
+            4,
+            vec![9, 10, 11],
+            vec![cycle; 4],
+            /* desynced */ false,
+        )
+        .with_forgotten_recurrent_on_rollback();
+        let _ = drive_turn(&mut backend, 3, 64, 15, 3);
     }
 
     #[test]
