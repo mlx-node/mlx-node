@@ -29,6 +29,10 @@ use crate::sampling::SamplingConfig;
 use crate::stream::Stream;
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 
+/// The reasoning-close tag used by every family whose template writes
+/// `</think>`; [`ChatBackend::reasoning_close_tag`] overrides it per family.
+pub(crate) const REASONING_CLOSE_TAG_DEFAULT: &str = "</think>";
+
 /// Per-step decode operations for one generation turn.
 ///
 /// Implementations capture every turn-constant — including the embedding
@@ -1118,6 +1122,17 @@ pub(crate) trait ChatBackend {
     /// whenever identity cannot be proven.
     fn session_media_matches_payloads(&self, _images: &[Vec<u8>], _audio: &[Vec<u8>]) -> bool {
         false
+    }
+
+    /// The tag a checkpoint template writes to close a rendered reasoning
+    /// block, and the model writes to end a generated one.
+    ///
+    /// The continuation verifier normalizes template-owned whitespace around
+    /// exactly this tag, so a family whose reasoning channel closes with
+    /// anything else must say so here or every reasoning turn ends its live
+    /// session. Gemma4 closes with `<channel|>`.
+    fn reasoning_close_tag(&self) -> &'static str {
+        REASONING_CLOSE_TAG_DEFAULT
     }
 
     /// Convert a live cached-history token stream to the logical form emitted

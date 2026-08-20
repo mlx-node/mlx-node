@@ -7468,6 +7468,10 @@ impl ChatBackend for Gemma4Inner {
         )
     }
 
+    fn reasoning_close_tag(&self) -> &'static str {
+        crate::models::gemma4::output_parser::reasoning_close_tag()
+    }
+
     fn template_history_comparison_tokens<'a>(
         &self,
         tokens: &'a [u32],

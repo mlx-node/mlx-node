@@ -524,6 +524,38 @@ impl Qwen3Tokenizer {
         )
     }
 
+    /// Teach Gemma4 templates to honor the replay-only `preserve_thinking`
+    /// context flag on assistant turns that carry no tool call.
+    ///
+    /// Gemma4 gates historical reasoning on `loop.index0 >
+    /// ns_turn.last_user_idx` and grants `preserve_thinking` only to tool-call
+    /// turns, so re-rendering a completed transcript deletes the
+    /// `<|channel>thought` block of every plain assistant answer. The live KV
+    /// still holds those tokens, so the next turn's render is not an extension
+    /// of the committed prefix and a warm session can never continue — it cold-
+    /// replays the whole conversation instead.
+    ///
+    /// The rewrite is deliberately narrow:
+    /// - only the two published Gemma4 gate spellings are extended, and each
+    ///   is widened by a leading `preserve_thinking or`, so the flag being
+    ///   false reproduces upstream exactly;
+    /// - the parentheses are load-bearing on the second spelling, whose gate
+    ///   sits inside an `{%- if thinking_text and … -%}` conjunction;
+    /// - ordinary renders still behave exactly like upstream because the
+    ///   compatibility flag is supplied only by our chat-template context.
+    fn enable_gemma4_preserve_thinking(template: &str) -> String {
+        const GEMMA4_GATES: [&str; 2] = [
+            "(loop.index0 > ns_turn.last_user_idx) or (preserve_thinking and message.get('tool_calls'))",
+            "loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')",
+        ];
+        for gate in GEMMA4_GATES {
+            if template.contains(gate) {
+                return template.replace(gate, &format!("(preserve_thinking or ({gate}))"));
+            }
+        }
+        template.to_string()
+    }
+
     /// Parenthesize a call keyword argument whose value is a bare conditional
     /// expression, so a stock minijinja `Environment` can parse the template.
     ///
@@ -2292,6 +2324,7 @@ impl Qwen3Tokenizer {
         // they never alter the rendered output (LFM2.5 et al. use them only to
         // mark assistant-generated token spans for training masks).
         let template_str = Self::enable_legacy_preserve_thinking(template_str);
+        let template_str = Self::enable_gemma4_preserve_thinking(&template_str);
         let template_str = Self::neutralize_generation_tags(&template_str);
         // Parenthesize any call kwarg whose value is a bare ternary — minijinja
         // parses that value with `parse_expr_noif` and hard-fails at PARSE time,
@@ -5720,6 +5753,183 @@ mod tests {
         assert!(
             rendered.contains("response:do_thing") && !rendered.contains("response:unknown"),
             "got: {rendered}",
+        );
+    }
+
+    /// The two Gemma4 historical-reasoning gates, copied verbatim from
+    /// `.cache/models/gemma-4-{12b,26b-a4b,e2b}-it/chat_template.jinja:240` and
+    /// `.cache/models/gemma-4-{31b-it,12b-it-qat-q4_0-mlx,26b-a4b-nvfp4-mlx}
+    /// /chat_template.jinja:239`. Kept as source here rather than behind a
+    /// checkpoint, so the property is gated in CI too;
+    /// [`gemma4_real_template_preserves_prior_turn_thinking`] proves the copy
+    /// still matches a shipped template.
+    const GEMMA4_THINKING_GATES: [&str; 2] = [
+        "(loop.index0 > ns_turn.last_user_idx) or (preserve_thinking and message.get('tool_calls'))",
+        "loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')",
+    ];
+
+    /// Minimal stand-in for the Gemma4 reasoning channel: the same
+    /// `last_user_idx` scan, the same `{gate}` conjunction shape, and the same
+    /// emitted block, with everything else stripped.
+    fn gemma4_thinking_channel_template(gate: &str) -> String {
+        format!(
+            "{{%- set ns_turn = namespace(last_user_idx=0) -%}}\
+             {{%- for i in range(messages | length) -%}}\
+             {{%- if messages[i]['role'] == 'user' -%}}\
+             {{%- set ns_turn.last_user_idx = i -%}}{{%- endif -%}}{{%- endfor -%}}\
+             {{%- set preserve_thinking = preserve_thinking | default(false) -%}}\
+             {{%- for message in messages -%}}\
+             {{%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}}\
+             {{%- if thinking_text and {gate} -%}}\
+             {{{{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}}}{{%- endif -%}}\
+             {{{{- message['content'] -}}}}{{%- endfor -%}}"
+        )
+    }
+
+    /// A Gemma4 session commits the `<|channel>thought` block it generated into
+    /// the KV cache, so a re-render that drops it on the next user turn is not
+    /// an extension of the committed prefix and the warm session cold-replays
+    /// (`cached_tokens = 0` on every continuation). Both shipped gate spellings
+    /// must therefore honor the `preserve_thinking` flag our render context
+    /// pins, exactly as the legacy Qwen gate does.
+    #[test]
+    fn gemma4_history_gate_honors_preserve_thinking() {
+        let mut assistant = user_msg("Paris", 0);
+        assistant.role = "assistant".to_string();
+        assistant.reasoning_content = Some("The capital of France is Paris.".to_string());
+        let history = [
+            user_msg("What is the capital of France?", 0),
+            assistant,
+            user_msg("And of Italy?", 0),
+        ];
+
+        for gate in GEMMA4_THINKING_GATES {
+            let template = gemma4_thinking_channel_template(gate);
+            let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+                &template,
+                &history,
+                None,
+                false,
+                Some(true),
+                "<bos>",
+                "<eos>",
+            )
+            .unwrap_or_else(|e| panic!("render failed for gate {gate}: {e}"));
+            assert_eq!(
+                rendered,
+                "What is the capital of France?\
+                 <|channel>thought\nThe capital of France is Paris.\n<channel|>Paris\
+                 And of Italy?",
+                "gate {gate} dropped the committed reasoning block",
+            );
+
+            // Both spellings sit inside a `thinking_text and …` conjunction, so
+            // the widened disjunct has to stay parenthesized: a message with
+            // tool_calls and no reasoning would otherwise satisfy the gate and
+            // render `'<|channel>thought\n' + none`.
+            let mut calling = user_msg("", 0);
+            calling.role = "assistant".to_string();
+            calling.tool_calls = Some(vec![tool_call(Some("call_1"), "do_thing")]);
+            let no_reasoning = [user_msg("Do it.", 0), calling];
+            let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+                &template,
+                &no_reasoning,
+                None,
+                false,
+                Some(true),
+                "<bos>",
+                "<eos>",
+            )
+            .unwrap_or_else(|e| panic!("render failed for gate {gate}: {e}"));
+            assert_eq!(
+                rendered, "Do it.",
+                "gate {gate} rendered a channel block for a message with no reasoning",
+            );
+        }
+    }
+
+    /// The rewrite must be invisible to every template that is not Gemma4, and
+    /// must widen the gate by exactly one `preserve_thinking or` disjunct — the
+    /// flag being false has to reproduce the shipped condition, and the
+    /// parentheses have to survive the `{%- if thinking_text and … -%}`
+    /// conjunction the second spelling sits inside.
+    #[test]
+    fn gemma4_preserve_thinking_rewrite_is_narrow() {
+        for untouched in [
+            "{%- if thinking_text and loop.index0 > ns.last_query_index -%}x{%- endif -%}",
+            "{%- set thinking_gate = preserve_thinking -%}",
+            "",
+        ] {
+            assert_eq!(
+                Qwen3Tokenizer::enable_gemma4_preserve_thinking(untouched),
+                untouched,
+                "non-Gemma4 template was rewritten",
+            );
+        }
+        for gate in GEMMA4_THINKING_GATES {
+            assert_eq!(
+                Qwen3Tokenizer::enable_gemma4_preserve_thinking(gate),
+                format!("(preserve_thinking or ({gate}))"),
+            );
+        }
+    }
+
+    /// Guard the inline copies above against checkpoint drift, and prove the
+    /// property end to end on the real template. Opt in with
+    /// `MLX_TEST_GEMMA4_TEMPLATE_PATH=/path/to/gemma-4-*/chat_template.jinja`.
+    #[test]
+    #[ignore = "requires a local Gemma4 checkpoint; set MLX_TEST_GEMMA4_TEMPLATE_PATH to its chat_template.jinja"]
+    fn gemma4_real_template_preserves_prior_turn_thinking() {
+        let Ok(path) = std::env::var("MLX_TEST_GEMMA4_TEMPLATE_PATH") else {
+            panic!("set MLX_TEST_GEMMA4_TEMPLATE_PATH to a Gemma4 chat_template.jinja");
+        };
+        let tmpl = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        assert!(
+            GEMMA4_THINKING_GATES.iter().any(|gate| tmpl.contains(gate)),
+            "{path} spells its historical-reasoning gate in neither form this file pins",
+        );
+
+        let thinking_assistant = || {
+            let mut assistant = user_msg("Paris", 0);
+            assistant.role = "assistant".to_string();
+            assistant.reasoning_content = Some("The capital of France is Paris.".to_string());
+            assistant
+        };
+        let completed = [
+            user_msg("What is the capital of France?", 0),
+            thinking_assistant(),
+        ];
+        let with_follow_up = [
+            user_msg("What is the capital of France?", 0),
+            thinking_assistant(),
+            user_msg("And of Italy?", 0),
+        ];
+        let render = |messages: &[ChatMessage], generation_prompt: bool| {
+            Qwen3Tokenizer::render_chat_template_jinja2(
+                &tmpl,
+                messages,
+                None,
+                generation_prompt,
+                Some(true),
+                "<bos>",
+                "<eos>",
+            )
+            .unwrap_or_else(|e| panic!("Gemma4 thinking-history render failed: {e}"))
+        };
+
+        let completed_render = render(&completed, false);
+        let full_render = render(&with_follow_up, true);
+        assert!(
+            completed_render
+                .contains("<|channel>thought\nThe capital of France is Paris.\n<channel|>Paris"),
+            "committed turn did not re-render its reasoning block:\n{completed_render}",
+        );
+        // The reuse contract the session engine checks: the next turn's render
+        // extends the completed one, so the committed KV prefix stays valid.
+        assert!(
+            full_render.starts_with(&completed_render),
+            "continuation render is not an extension of the committed render\n\
+             completed:\n{completed_render}\nfull:\n{full_render}",
         );
     }
 
