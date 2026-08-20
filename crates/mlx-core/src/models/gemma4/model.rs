@@ -15291,12 +15291,22 @@ mod spec_paged_substrate_tests {
     /// Cross-module gate (engine ↔ gemma4, T-D0.2 ↔ T-D0.3): the REAL
     /// grouped coordinator driven through the facade call order the
     /// `spec_paged` mock tests verified — reserve → record D+1 →
-    /// commit(keep, total) → settle at the committed frontier — wrapped in
-    /// `SettleOrderChecked` so L-SETTLE stays executable on the real type.
-    /// Anti-vacuity: every step is asserted through real block accounting
-    /// (the reservation grows each group, the verify write allocates
-    /// nothing, no settle work fires inside the cycle), never method
-    /// presence.
+    /// `commit_cycle(ticket, keep)` → settle at the committed frontier —
+    /// wrapped in `NoSettleInCycle` so an ordering law stays executable on
+    /// the real type. Anti-vacuity: every step is asserted through real
+    /// block accounting (the reservation grows each group, the verify write
+    /// allocates nothing, no settle work fires inside the cycle), never
+    /// method presence.
+    ///
+    /// The checker here is the STRICTER of the two on purpose: it refuses a
+    /// settle of ANY basis inside an open cycle, which is the shape of a
+    /// driver that settles only post-commit. The identical in-cycle
+    /// committed-basis call is LAWFUL under `NoDurableSettleInCycle` — see
+    /// the sibling gates `gemma4_coordinator_is_lawful_under_the_permissive_checker`
+    /// and `settle_committed_never_nulls_the_rollback_range_at_coordinator_level`,
+    /// which drive it and assert it prunes correctly. The two verdicts are a
+    /// deliberate split between the two checkers, not a contradiction about
+    /// the coordinator.
     ///
     /// Geometry (window 16, block 8): committed prompt 36, verify anchor +
     /// 4 drafts → cursor 41, so the verify rows straddle a window edge.
@@ -15305,8 +15315,8 @@ mod spec_paged_substrate_tests {
     /// violating the ordering laws — `record_verify` settling at the write
     /// cursor mid-cycle frees sliding blocks the commit's rollback returns
     /// the window into (fails the mid-cycle accounting AND the post-commit
-    /// live-window backing); a commit rolling back anything but exactly
-    /// `total - keep` fails the cross-group frontier equality.
+    /// live-window backing); a commit rolling back anything but exactly the
+    /// cycle's unaccepted rows fails the cross-group frontier equality.
     #[test]
     fn gemma4_coordinator_conforms_to_the_facade_call_order() {
         use crate::engine::spec_paged::NoSettleInCycle;
@@ -15409,6 +15419,109 @@ mod spec_paged_substrate_tests {
             .adapter(sliding_group)
             .expect("sliding adapter");
         let ids: Vec<u32> = sliding
+            .block_table_for(7)
+            .expect("sliding block table")
+            .blocks()
+            .iter()
+            .map(|block| block.block_id)
+            .collect();
+        assert_eq!(ids[0], ids[1], "retired blocks share the null sentinel");
+        assert!(
+            ids[2..].iter().all(|&id| id != ids[0]),
+            "the live window the commit returned into must remain physically backed"
+        );
+    }
+
+    /// Cross-module gate (engine ↔ gemma4): the REAL coordinator under the
+    /// PERMISSIVE checker — the executable form of L-SETTLE as written, and
+    /// the only wrapper a per-chunk-settling driver can be built inside.
+    /// Inside an open cycle it must ADMIT the committed-basis settle (this
+    /// family's per-chunk settle, which is what the committed basis exists
+    /// for) and REFUSE the write-cursor basis, and the admitted settle must
+    /// reach the real prune: cutoff 36 - 16 = 20 retires exactly the two
+    /// out-of-window sliding blocks.
+    ///
+    /// The sibling gate `gemma4_coordinator_conforms_to_the_facade_call_order`
+    /// runs the same call order through the stricter `NoSettleInCycle`,
+    /// where the identical settle is refused — a deliberate split between
+    /// the two checkers.
+    ///
+    /// Mutations this catches: (a) the coordinator declaring
+    /// `settle_captures_durable_state() == true`, which would make the
+    /// permissive checker refuse the lawful settle; (b) the checker admitting
+    /// the cursor-basis settle; (c) the admitted settle not reaching the
+    /// coordinator's prune.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_coordinator_is_lawful_under_the_permissive_checker() {
+        use crate::engine::spec_paged::NoDurableSettleInCycle;
+
+        let Some(mut coordinator) = maybe_grouped_coordinator(64, 16) else {
+            return;
+        };
+        let sliding_group = sliding_group_id(&coordinator);
+        coordinator.reset_scheduled_request(7).expect("reset");
+        coordinator
+            .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
+            .expect("seed the committed prompt");
+        assert!(
+            !SpecPagedCache::settle_captures_durable_state(&coordinator),
+            "the coordinator settle is pending-write eval plus a committed-basis prune; \
+             the cold-rung walk lives one level up, out of this facade's reach"
+        );
+        let mut cache = NoDurableSettleInCycle::new(coordinator);
+
+        assert!(
+            cache.reserve_lookahead(7, 5).expect("reserve"),
+            "5 lookahead rows fit every group"
+        );
+        let ticket = cache
+            .record_verify(7, &[100, 101, 102, 103, 104])
+            .expect("record anchor + 4 drafts");
+        let recorded = allocated_per_group(cache.inner());
+
+        // Write-cursor basis: refused, and it must not reach the coordinator.
+        let err = cache
+            .settle_committed(7, 41)
+            .expect_err("a cursor-basis settle inside a cycle must trip");
+        assert!(err.contains("L-SETTLE"), "unexpected error text: {err}");
+        assert_eq!(
+            allocated_per_group(cache.inner()),
+            recorded,
+            "the refused settle must never reach the coordinator"
+        );
+
+        // Committed basis: admitted, and it reaches the committed-cutoff prune.
+        cache
+            .settle_committed(7, 36)
+            .expect("a committed-basis settle is lawful inside an open cycle");
+        let settled = allocated_per_group(cache.inner());
+        for (group_id, (before, after)) in recorded.iter().zip(&settled).enumerate() {
+            let expected = if group_id == sliding_group { 2 } else { 0 };
+            assert_eq!(
+                before - after,
+                expected,
+                "group {group_id}: the admitted settle must retire exactly the \
+                 out-of-window blocks (36 - 16 = 20)"
+            );
+        }
+
+        cache
+            .commit_cycle(7, ticket, 1)
+            .expect("keep the anchor, roll back the 4 rejected drafts");
+        assert_eq!(
+            cache.frontier(7),
+            Some(SpecFrontier {
+                attn_tokens: 37,
+                recurrent_tokens: None
+            }),
+            "the facade frontier must land on the committed row count"
+        );
+
+        let coordinator = cache.into_inner();
+        let ids: Vec<u32> = coordinator
+            .adapter(sliding_group)
+            .expect("sliding adapter")
             .block_table_for(7)
             .expect("sliding block table")
             .blocks()

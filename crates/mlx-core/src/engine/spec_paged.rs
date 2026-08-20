@@ -7,11 +7,14 @@
 //! gemma4 assistant) lands on the same call order instead of re-deriving it
 //! against raw adapter/coordinator surfaces.
 //!
-//! The middle two moves are one TRANSACTION: the write opens a cycle and
-//! hands back a [`VerifyTicket`] carrying the pre-cycle frontier and the row
-//! width, and only that ticket can close it. A driver therefore cannot hand
-//! the commit two independently-derived counts that disagree — the shape
-//! that lets an oversized rollback eat pre-cycle history.
+//! The middle two moves are one TRANSACTION: opening a cycle reads the
+//! pre-cycle frontier OFF THE CACHE and hands back a [`VerifyTicket`]
+//! carrying it alongside the row width, and only that ticket can close the
+//! cycle. The commit is therefore handed exactly one caller-derived number,
+//! the accepted row count, and derives the rollback itself — instead of a
+//! second count that can disagree with the first and turn a partial accept
+//! into a truncation of committed history. The ticket's mint is
+//! module-private to keep it that way: the two openers are the only way in.
 //!
 //! # Not ported: vLLM's per-group metadata capture
 //!
@@ -29,12 +32,13 @@ use crate::engine::backend::SpecFrontier;
 
 /// An OPEN speculative verify cycle for one sequence.
 ///
-/// Minted where the cycle's rows are written and consumed by
+/// Minted by the two cycle openers and consumed by
 /// [`SpecPagedCache::commit_cycle`], which is the only way to close a cycle.
 /// It carries the two facts the commit would otherwise have to trust a
 /// caller for — which sequence the cycle belongs to, and how far the cursor
-/// sat before the write — so the commit needs exactly ONE caller-supplied
-/// number (the accepted row count) and derives the rollback itself.
+/// sat before the write, read off the cache at the open — so the commit
+/// needs exactly ONE caller-supplied number (the accepted row count) and
+/// derives the rollback itself.
 ///
 /// Not `Clone`/`Copy`: one cycle, one close.
 #[allow(dead_code)]
@@ -44,31 +48,31 @@ pub(crate) struct VerifyTicket {
     seq_id: u32,
     pre_attn_tokens: u64,
     rows: usize,
+    /// Set by [`SpecPagedCache::commit_cycle`], the ticket's only consumer.
+    /// A ticket dropped with this clear is a cycle abandoned between the
+    /// open and the commit — see the [`Drop`] impl.
+    closed: bool,
 }
 
 #[allow(dead_code)]
 impl VerifyTicket {
-    /// Mint a ticket for a verify write this facade did NOT perform.
+    /// The one mint, deliberately module-private.
     ///
-    /// Some families record the verify rows inside their verify core rather
-    /// than through [`SpecPagedCache::record_verify`] — the qwen3_5 dense
-    /// paged verify writes its `[anchor, drafts..]` slice as part of the
-    /// forward, and routing that write back out through the facade would
-    /// mean recording the rows twice. Those drivers open the cycle around
-    /// the core write instead, and this is the mint that keeps such a cycle
-    /// expressible while still yielding a CHECKED commit: the commit
-    /// verifies the cursor actually moved by `rows` and lands on
-    /// `pre_attn_tokens + keep`, so an out-of-band write that wrote a
-    /// different number of rows is caught before anything is rolled back.
-    ///
-    /// Prefer [`SpecPagedCache::open_core_write_cycle`], which reads
-    /// `pre_attn_tokens` off the cache instead of trusting a caller to
-    /// remember it.
-    pub(crate) fn from_core_write(seq_id: u32, pre_attn_tokens: u64, rows: usize) -> Self {
+    /// It takes the pre-cycle frontier as an argument, and both openers
+    /// ([`SpecPagedCache::record_verify`] and
+    /// [`SpecPagedCache::open_core_write_cycle`]) read that frontier off the
+    /// cache before calling it. Widening this to `pub(crate)` would let a
+    /// driver supply a REMEMBERED basis instead, and a basis whose staleness
+    /// the row width absorbs passes every check the commit can make — the
+    /// commit only ever sees their sum. The test named for this constructor
+    /// (`a_forged_basis_is_why_the_mint_is_module_private`) runs that shape
+    /// and shows the rollback reaching into committed history.
+    fn open(seq_id: u32, pre_attn_tokens: u64, rows: usize) -> Self {
         Self {
             seq_id,
             pre_attn_tokens,
             rows,
+            closed: false,
         }
     }
 
@@ -85,6 +89,35 @@ impl VerifyTicket {
     /// Rows the verify write added. The commit's `keep` may not exceed it.
     pub(crate) fn rows(&self) -> usize {
         self.rows
+    }
+}
+
+/// Diagnostic for a cycle abandoned between its open and its commit — the
+/// shape an early `?` in a driver takes, which the `#[must_use]` above
+/// cannot see because the ticket was bound to a variable. The cache is left
+/// with the verify rows recorded past the committed frontier and no handle
+/// to retract them, so this is a driver bug rather than a recoverable state.
+impl Drop for VerifyTicket {
+    fn drop(&mut self) {
+        // Firing while the thread already unwinds would abort the process
+        // and bury the original panic.
+        if self.closed || std::thread::panicking() {
+            return;
+        }
+        let (seq_id, pre_attn_tokens, rows) = (self.seq_id, self.pre_attn_tokens, self.rows);
+        tracing::error!(
+            target: "mlx_core::engine::spec_paged",
+            seq_id,
+            pre_attn_tokens,
+            rows,
+            "a speculative verify cycle was abandoned without a commit — the write \
+             cursor is left ahead of the committed frontier"
+        );
+        debug_assert!(
+            false,
+            "the verify cycle for sequence {seq_id} ({rows} rows opened at \
+             {pre_attn_tokens} attention tokens) was dropped without commit_cycle"
+        );
     }
 }
 
@@ -105,7 +138,11 @@ impl VerifyTicket {
 /// must not be re-derived per family — that is what keeps the commit
 /// arithmetic single-sourced. A wrapper that enforces call order overrides
 /// the transaction methods; it must override BOTH cycle openers and the
-/// commit, or an out-of-band cycle escapes its bookkeeping.
+/// commit, or an out-of-band cycle escapes its bookkeeping. Those two
+/// openers are exhaustive only because [`VerifyTicket`]'s mint is
+/// module-private — a driver that could mint its own ticket would open
+/// cycles a wrapper never sees, and its conformance gate would stay green
+/// while enforcing nothing.
 ///
 /// # L-SETTLE (I9) — settle at the committed frontier, never the cursor
 ///
@@ -221,20 +258,23 @@ pub(crate) trait SpecPagedCache {
     fn record_verify(&mut self, seq_id: u32, tokens: &[u32]) -> Result<VerifyTicket, String> {
         let pre_attn_tokens = committed_attn_tokens(self, seq_id)?;
         self.record_rows(seq_id, tokens)?;
-        Ok(VerifyTicket::from_core_write(
-            seq_id,
-            pre_attn_tokens,
-            tokens.len(),
-        ))
+        Ok(VerifyTicket::open(seq_id, pre_attn_tokens, tokens.len()))
     }
 
-    /// Open a cycle for a verify write the family's own core performs (see
-    /// [`VerifyTicket::from_core_write`]). Call this BEFORE the core write —
-    /// it reads the pre-cycle frontier off the cache — and pass the exact
-    /// row width the core is about to write.
+    /// Open a cycle for a verify write the family's own core performs.
+    ///
+    /// Some families record the verify rows inside their verify core rather
+    /// than through [`Self::record_verify`] — the qwen3_5 dense paged verify
+    /// writes its `[anchor, drafts..]` slice as part of the forward, and
+    /// routing that write back out through the facade would record the rows
+    /// twice. Call this BEFORE the core write, so it reads the pre-cycle
+    /// frontier off the cache, and pass the exact row width the core is
+    /// about to write: the commit checks the cursor actually moved by that
+    /// many rows, so an out-of-band write of a different width is caught
+    /// before anything is rolled back.
     fn open_core_write_cycle(&mut self, seq_id: u32, rows: usize) -> Result<VerifyTicket, String> {
         let pre_attn_tokens = committed_attn_tokens(self, seq_id)?;
-        Ok(VerifyTicket::from_core_write(seq_id, pre_attn_tokens, rows))
+        Ok(VerifyTicket::open(seq_id, pre_attn_tokens, rows))
     }
 
     /// Close the cycle `ticket` opened: of the rows the verify wrote, keep
@@ -247,19 +287,33 @@ pub(crate) trait SpecPagedCache {
     ///    that happens to roll back zero rows;
     /// 2. `keep <= ticket.rows()` — `Err`, never a panic;
     /// 3. the cursor sits exactly `ticket.rows()` past the frontier the
-    ///    ticket opened at, i.e. the ticket describes THIS cycle. An
-    ///    oversized or stale ticket is refused here, before any rollback,
-    ///    which is what makes it impossible for one to eat pre-cycle
-    ///    history.
+    ///    ticket opened at, i.e. the ticket describes THIS cycle. That
+    ///    refuses a ticket left over from an earlier cycle, and one whose
+    ///    row width does not match what an out-of-band core actually wrote,
+    ///    before any rollback runs. What it cannot separate is a basis and a
+    ///    width that drifted TOGETHER — their sum is all the cache has to
+    ///    compare against — which is why the ticket mint is module-private
+    ///    and both openers read the basis off the cache.
     ///
     /// Then the rollback runs, and the post-commit frontier must be exactly
-    /// `ticket.pre_attn_tokens() + keep`.
+    /// `ticket.pre_attn_tokens() + keep`; a family whose `rollback_rows`
+    /// retracts a different count than it was asked for is reported here.
+    ///
+    /// The ticket is consumed on EVERY path. A refused commit therefore
+    /// leaves the cycle open — rows still recorded past the committed
+    /// frontier, no handle left to retract them — which is fail-closed on
+    /// purpose: the caller must fail the turn rather than settle or persist
+    /// that sequence. A call-order wrapper keeps refusing that sequence's
+    /// settles until a later cycle on it commits cleanly.
     fn commit_cycle(
         &mut self,
         seq_id: u32,
-        ticket: VerifyTicket,
+        mut ticket: VerifyTicket,
         keep: usize,
     ) -> Result<(), String> {
+        // The commit consumes the handle on refusals too, so the
+        // abandoned-cycle guard must not fire for any path below.
+        ticket.closed = true;
         if ticket.seq_id != seq_id {
             return Err(format!(
                 "commit_cycle(seq={seq_id}) was handed sequence {}'s verify ticket",
@@ -519,6 +573,10 @@ mod tests {
         cursors: HashMap<u32, u64>,
         calls: Vec<String>,
         durable_settle: bool,
+        /// Rows every `rollback_rows` call fails to retract while still
+        /// reporting success — the shape a family's clamping or partially
+        /// failing rollback takes.
+        rollback_shortfall: usize,
     }
 
     impl MockCursorCache {
@@ -553,12 +611,13 @@ mod tests {
 
         fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> Result<(), String> {
             self.calls.push(format!("rollback({seq_id},{rows})"));
+            let retracted = rows.saturating_sub(self.rollback_shortfall);
             let cursor = self
                 .cursors
                 .get_mut(&seq_id)
                 .ok_or_else(|| format!("rollback_rows: sequence {seq_id} is not open"))?;
             *cursor = cursor
-                .checked_sub(rows as u64)
+                .checked_sub(retracted as u64)
                 .ok_or_else(|| format!("rollback of {rows} rows underflows the cursor"))?;
             Ok(())
         }
@@ -718,9 +777,12 @@ mod tests {
 
         // An oversized ticket over a shorter cycle: refused before it can
         // roll back past what the cycle wrote.
+        let honest = cache
+            .open_core_write_cycle(7, 2)
+            .expect("open a cycle around a write the facade does not perform");
         cache.record_rows(7, &[6, 7]).expect("out-of-band write");
         let cursor_before = cache.cursor(7);
-        let oversized = VerifyTicket::from_core_write(7, HISTORY + 3, 9);
+        let oversized = VerifyTicket::open(7, HISTORY + 3, 9);
         let err = cache
             .commit_cycle(7, oversized, 0)
             .expect_err("a ticket that does not describe the open cycle must be refused");
@@ -735,9 +797,174 @@ mod tests {
         );
 
         // The honest ticket for that same out-of-band write commits.
-        let honest = VerifyTicket::from_core_write(7, HISTORY + 3, 2);
         cache.commit_cycle(7, honest, 1).expect("keep 1 of 2");
         assert_eq!(cache.cursor(7), Some(HISTORY + 4));
+    }
+
+    /// A cycle the facade does not write opens through
+    /// [`SpecPagedCache::open_core_write_cycle`], and the basis in its
+    /// ticket comes off the CACHE — never off what the driver remembers.
+    /// Over a sequence that already committed one cycle this turn, those two
+    /// differ, and only the cache's answer lands the commit on the row the
+    /// cycle actually started from.
+    ///
+    /// Mutation this catches: `open_core_write_cycle` minting with anything
+    /// but the live frontier (a basis carried in from the turn's start, say)
+    /// — it fails both the basis assert and the commit itself.
+    #[test]
+    fn an_out_of_band_cycle_takes_its_basis_from_the_cache() {
+        const TURN_START: u64 = 100;
+        let mut cache = MockCursorCache::default();
+        cache.open_seq(7, TURN_START);
+
+        // Cycle 1 moves the committed frontier off the turn's start.
+        let ticket = cache.record_verify(7, &[1, 2, 3, 4, 5]).unwrap();
+        cache.commit_cycle(7, ticket, 3).expect("keep 3 of 5");
+        assert_eq!(cache.cursor(7), Some(103));
+
+        // Cycle 2's rows are written by the family's own verify core.
+        let ticket = cache.open_core_write_cycle(7, 5).expect("open cycle 2");
+        assert_eq!(
+            ticket.pre_attn_tokens(),
+            103,
+            "the opener must read the live frontier, not the turn's start"
+        );
+        cache
+            .record_rows(7, &[6, 7, 8, 9, 10])
+            .expect("the core write");
+        cache.commit_cycle(7, ticket, 1).expect("keep the anchor");
+        assert_eq!(
+            cache.cursor(7),
+            Some(104),
+            "the commit must land on cycle 2's own frontier plus the kept row"
+        );
+    }
+
+    /// Why the mint is module-private. A ticket whose basis did NOT come off
+    /// the cache is indistinguishable from an honest one as soon as the row
+    /// width absorbs the same drift: the commit can only compare their SUM
+    /// against the live cursor. Forged here from inside the module — `mod
+    /// tests` is a child and can still reach the mint — the commit accepts
+    /// it and the rollback reaches three rows INTO committed history.
+    ///
+    /// This is not a check the commit can add; it is the reason
+    /// `VerifyTicket::open` is not `pub(crate)`, so no driver can express
+    /// the shape at all. Should the ticket ever carry a basis the cache can
+    /// authenticate, this test must fail and be deleted.
+    #[test]
+    fn a_forged_basis_is_why_the_mint_is_module_private() {
+        const TURN_START: u64 = 100;
+        let mut cache = MockCursorCache::default();
+        cache.open_seq(7, TURN_START);
+
+        let ticket = cache.record_verify(7, &[1, 2, 3, 4, 5]).unwrap();
+        cache.commit_cycle(7, ticket, 3).expect("keep 3 of 5");
+        cache
+            .record_rows(7, &[6, 7, 8, 9, 10])
+            .expect("the core write");
+        assert_eq!(cache.cursor(7), Some(108));
+
+        // Basis stale by 3 (the turn's start), width wide by 3 (cursor minus
+        // that basis): the sum still lands on the live cursor.
+        let forged = VerifyTicket::open(7, TURN_START, 8);
+        cache
+            .commit_cycle(7, forged, 1)
+            .expect("the sum check cannot tell a co-drifted basis apart");
+        assert_eq!(
+            cache.cursor(7),
+            Some(101),
+            "the forged basis ate the 3 rows cycle 1 committed — an honest cycle-2 \
+             ticket lands on 104"
+        );
+    }
+
+    /// The landing post-condition. The commit must end on the pre-cycle
+    /// frontier plus the kept rows whatever the family's `rollback_rows`
+    /// actually did; a family that clamps its retraction and reports success
+    /// leaves the cursor ahead of the committed frontier, and this is the
+    /// only check that sees it.
+    ///
+    /// Mutation this catches: deleting the landing post-condition — every
+    /// other gate stays green without it, because every other mock retracts
+    /// exactly the count it was asked for.
+    #[test]
+    fn commit_cycle_reports_a_rollback_that_lands_short() {
+        let mut cache = MockCursorCache::default();
+        cache.open_seq(7, 20);
+        cache.rollback_shortfall = 1;
+
+        let ticket = cache.record_verify(7, &[1, 2, 3, 4, 5]).unwrap();
+        let err = cache
+            .commit_cycle(7, ticket, 1)
+            .expect_err("a rollback that retracts 3 of the 4 rejected rows must be reported");
+        assert!(
+            err.contains(
+                "landed on 22 attention tokens, not the pre-cycle frontier 20 plus the 1 \
+                 kept rows (21)"
+            ),
+            "unexpected error text: {err}"
+        );
+        assert_eq!(
+            cache.cursor(7),
+            Some(22),
+            "the short landing stays visible to the caller"
+        );
+    }
+
+    /// A cycle abandoned between its open and its commit — the shape an
+    /// early `?` in a driver takes. `#[must_use]` cannot see it, because the
+    /// ticket was bound to a variable; the Drop guard is the only diagnostic.
+    ///
+    /// Mutation this catches: removing the `Drop` impl, or making it return
+    /// unconditionally. (The opposite mutation — `commit_cycle` failing to
+    /// mark the ticket closed — trips every other gate in this module, since
+    /// each of them commits a ticket.)
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "was dropped without commit_cycle")]
+    fn an_abandoned_cycle_trips_the_drop_guard() {
+        let mut cache = MockCursorCache::default();
+        cache.open_seq(7, 12);
+        let _open_cycle = cache.record_verify(7, &[1, 2, 3]).unwrap();
+    }
+
+    /// A refused commit consumes the handle and leaves the cycle OPEN: the
+    /// verify rows stay recorded past the committed frontier with nothing
+    /// left to retract them. A call-order wrapper must keep refusing that
+    /// sequence's settles — fail-closed, not a bug — until a later cycle on
+    /// the same sequence commits cleanly and clears the bookkeeping.
+    ///
+    /// Mutation this catches: a wrapper clearing its open-cycle bookkeeping
+    /// on a REFUSED commit, which would admit a settle over rows the cache
+    /// still holds past the committed frontier.
+    #[test]
+    fn a_refused_commit_leaves_the_cycle_open() {
+        let mut inner = MockCursorCache::default();
+        inner.open_seq(3, 0);
+        let mut cache = NoSettleInCycle::new(inner);
+
+        // Refused for the cycle's OWN sequence — the shape that tells a
+        // remove-on-`Ok` wrapper apart from a remove-on-every-path one.
+        let ticket = cache.record_verify(3, &[1, 2]).unwrap();
+        cache
+            .commit_cycle(3, ticket, 5)
+            .expect_err("keep may never exceed the rows the cycle wrote");
+        let err = cache
+            .settle_committed(3, 0)
+            .expect_err("the refused commit left sequence 3's cycle open");
+        assert!(err.contains("L-SETTLE"), "unexpected error text: {err}");
+        assert_eq!(
+            cache.inner().cursor(3),
+            Some(2),
+            "the abandoned cycle's rows are still recorded"
+        );
+
+        // A later clean cycle on the same sequence clears the bookkeeping.
+        let ticket = cache.record_verify(3, &[3]).unwrap();
+        cache.commit_cycle(3, ticket, 1).expect("a clean commit");
+        cache
+            .settle_committed(3, 0)
+            .expect("the wrapper's bookkeeping heals on the next clean commit");
     }
 
     #[test]

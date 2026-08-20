@@ -17206,6 +17206,12 @@ mod paged_construction_tests {
         // family's settle work lives in the turn epilogue (see the impl
         // docs), so the real conformance surface is the block accounting
         // asserted above.
+        assert!(
+            !SpecPagedCache::settle_captures_durable_state(&step),
+            "the identity settle captures nothing; this family's durable surfaces run \
+             in the turn epilogue, and a `true` here would bar the in-cycle settle a \
+             permissive call-order checker admits"
+        );
         SpecPagedCache::settle_committed(&mut step, seq_id, u64::from(committed_cursor))
             .expect("identity settle at the committed frontier");
         SpecPagedCache::settle_committed(&mut step, seq_id, u64::from(committed_cursor) + 1)
