@@ -160,6 +160,20 @@ pub(crate) enum SpeculativeLane {
     Scheduled,
 }
 
+/// Drafted rows one speculative verify cycle carries, tagged by the
+/// quantity's origin so a native MTP chain depth and an external draft
+/// block size can never be conflated: they are different load-time numbers
+/// that only coincidentally share the `+ 1` anchor arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum SpeculativeDraftWidth {
+    /// Native MTP chain depth `D` — `D` chained head steps per cycle.
+    Depth(usize),
+    /// External draft-model block size `L` — one drafted block per cycle
+    /// (gemma4 DSpark block size, muse DFlash mask width).
+    DraftBlockSize(usize),
+}
+
 /// Load-time admission policy for a speculative decoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SpeculativePlan {
@@ -197,8 +211,49 @@ impl SpeculativePlan {
     /// The single source for the speculative slot margin (vLLM's
     /// `num_lookahead_tokens`): every reserver reads this; none re-derives
     /// `depth + 1` locally.
+    ///
+    /// Depth-parameterized form for the engine MTP loop
+    /// (`engine::mtp_turn::turn_lookahead_rows`), whose per-cycle quantity
+    /// is a chain depth. Reservers sized by an external draft block cannot
+    /// use it — this form has no way to know a block size — and go through
+    /// [`Self::lookahead_rows_for`] with
+    /// [`SpeculativeDraftWidth::DraftBlockSize`] instead.
     pub const fn lookahead_rows(self, depth: usize) -> usize {
         depth + 1
+    }
+
+    /// [`Self::lookahead_rows`], per kind: the TARGET-side verify rows one
+    /// cycle appends — [`SpeculativeKind::NativeMtp`] writes `depth + 1`
+    /// (anchor + `D` chained drafts), [`SpeculativeKind::DraftModel`]
+    /// (DSpark, DFlash, assistant) writes `draft_block_size + 1` (anchor +
+    /// `L` block drafts). The width must be the plan kind's own quantity;
+    /// a mismatched pairing is a reservation-accounting bug at the call
+    /// site and panics rather than sizing the pool from the wrong number.
+    ///
+    /// Divergence from vLLM, deliberate: vLLM's `num_lookahead_tokens`
+    /// counts drafter-WRITTEN rows (DFlash reserves `K + 1` for the
+    /// drafter, `config/vllm.py:622-646`) because its drafter KV is
+    /// pool-resident; our drafter KV is off-pool (non-goal N1 — it dies
+    /// with its owner and never registers), so the reservation counts the
+    /// target's verify rows only. vLLM's harmless over-reserve for its
+    /// read-only gemma4_mtp drafter is likewise not copied.
+    ///
+    /// No production reserver consumes it yet — the external-draft paged
+    /// steppers (`SpecPagedCache::reserve_lookahead` callers) do; until
+    /// then it exists so their reservations are sized by the plan property
+    /// rather than a re-derived local formula (I1).
+    #[allow(dead_code)]
+    pub const fn lookahead_rows_for(self, width: SpeculativeDraftWidth) -> usize {
+        match (self.kind, width) {
+            (SpeculativeKind::NativeMtp, SpeculativeDraftWidth::Depth(depth)) => depth + 1,
+            (SpeculativeKind::DraftModel, SpeculativeDraftWidth::DraftBlockSize(block)) => {
+                block + 1
+            }
+            (SpeculativeKind::NativeMtp, SpeculativeDraftWidth::DraftBlockSize(_))
+            | (SpeculativeKind::DraftModel, SpeculativeDraftWidth::Depth(_)) => {
+                panic!("speculative draft width kind does not match the plan's kind")
+            }
+        }
     }
 }
 
@@ -384,6 +439,51 @@ mod tests {
     fn lookahead_rows_counts_anchor_plus_drafts() {
         assert_eq!(MTP_PAGED.lookahead_rows(1), 2);
         assert_eq!(MTP_PAGED.lookahead_rows(4), 5);
+    }
+
+    #[test]
+    fn lookahead_rows_per_kind() {
+        let native = MTP_PAGED;
+        let draft = SpeculativePlan {
+            kind: SpeculativeKind::DraftModel,
+            ..MTP_PAGED
+        };
+
+        // NativeMtp: anchor + D chained drafts.
+        assert_eq!(
+            native.lookahead_rows_for(SpeculativeDraftWidth::Depth(1)),
+            2
+        );
+        assert_eq!(
+            native.lookahead_rows_for(SpeculativeDraftWidth::Depth(4)),
+            5
+        );
+
+        // DraftModel (DSpark/DFlash/assistant): anchor + L block drafts.
+        assert_eq!(
+            draft.lookahead_rows_for(SpeculativeDraftWidth::DraftBlockSize(7)),
+            8
+        );
+        assert_eq!(
+            draft.lookahead_rows_for(SpeculativeDraftWidth::DraftBlockSize(4)),
+            5
+        );
+
+        // The two quantities are not interchangeable: sizing a kind's
+        // reservation from the other kind's number must refuse, not return
+        // a uniformly-`depth + 1` answer.
+        assert!(
+            std::panic::catch_unwind(
+                || native.lookahead_rows_for(SpeculativeDraftWidth::DraftBlockSize(7))
+            )
+            .is_err(),
+            "a NativeMtp plan accepted an external draft block size"
+        );
+        assert!(
+            std::panic::catch_unwind(|| draft.lookahead_rows_for(SpeculativeDraftWidth::Depth(1)))
+                .is_err(),
+            "a DraftModel plan accepted a native MTP chain depth"
+        );
     }
 
     #[test]
