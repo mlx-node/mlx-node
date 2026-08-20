@@ -3737,6 +3737,36 @@ impl PagedKVCacheAdapter {
     /// K/V. Pending native writes are evaluated before any block id can be
     /// returned to the allocator and reused by another sequence.
     pub fn prune_sliding_window_for(&mut self, seq_id: SeqId) -> Result<u32, String> {
+        self.prune_sliding_window_at_basis(seq_id, None)
+    }
+
+    /// [`Self::prune_sliding_window_for`] with the window anchored at the
+    /// COMMITTED frontier instead of the write cursor.
+    ///
+    /// Between a speculative verify write and its commit/rollback the write
+    /// cursor (`block_table.num_tokens`) sits ahead of the committed frontier
+    /// by up to the whole lookahead. A cursor-basis prune in that gap can
+    /// retire a block that is still inside the committed window, so after
+    /// `rollback_last_tokens_for` rewinds the rejected rows those in-window
+    /// positions would sit on the never-written null block. Anchoring the
+    /// cutoff at `committed_len` prunes only what is out of window at the
+    /// frontier the rollback can return to.
+    ///
+    /// `committed_len` may never exceed the recorded cursor — the committed
+    /// frontier trails the optimistic one by definition.
+    pub fn prune_sliding_window_for_committed(
+        &mut self,
+        seq_id: SeqId,
+        committed_len: u32,
+    ) -> Result<u32, String> {
+        self.prune_sliding_window_at_basis(seq_id, Some(committed_len))
+    }
+
+    fn prune_sliding_window_at_basis(
+        &mut self,
+        seq_id: SeqId,
+        committed_len: Option<u32>,
+    ) -> Result<u32, String> {
         if self.sliding_window == 0 {
             return Ok(0);
         }
@@ -3754,7 +3784,20 @@ impl PagedKVCacheAdapter {
             .block_table
             .as_mut()
             .ok_or_else(|| "prune_sliding_window_for called before begin_request".to_string())?;
-        let cutoff = table.num_tokens().saturating_sub(self.sliding_window);
+        let recorded = table.num_tokens();
+        let basis = match committed_len {
+            Some(committed) => {
+                if committed > recorded {
+                    return Err(format!(
+                        "prune_sliding_window_for_committed: committed_len {committed} exceeds \
+                         recorded token count {recorded}"
+                    ));
+                }
+                committed
+            }
+            None => recorded,
+        };
+        let cutoff = basis.saturating_sub(self.sliding_window);
         let first_live_block = cutoff / self.block_size;
         let replace_count = usize::try_from(first_live_block)
             .unwrap_or(usize::MAX)
@@ -9014,6 +9057,127 @@ mod tests {
         adapter.prune_sliding_window_for(12).unwrap();
         assert_eq!(adapter.request_tokens(), prompt);
         assert!(adapter.num_allocated_blocks() <= 3);
+    }
+
+    /// A prune anchored at the committed frontier must never retire a block
+    /// the pending speculative rows' rollback can return the window into.
+    ///
+    /// Geometry: window 8, block size 4, committed frontier 16. The verify
+    /// pass records anchor + 4 drafts (cursor 21), the prune runs at
+    /// committed 16 (cutoff 8 → blocks 0-1 retired), then 4 rejected drafts
+    /// roll back (cursor 17). The live window [9, 17) covers table blocks
+    /// 2-4; block 2 is the one a cursor-basis cutoff (21 − 8 = 13 → block 3
+    /// floor) would have nulled while the rows were still uncommitted.
+    ///
+    /// `read_kv_range`'s liveness floor is cursor-derived and cannot see a
+    /// null placeholder behind an in-window position, so the Ok alone does
+    /// not prove physical backing — the block-id assertions do.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn prune_committed_cutoff_never_nulls_rollback_range() {
+        let Some(mut adapter) = maybe_sliding_adapter(8, 4, 8, 64) else {
+            return;
+        };
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.record_tokens(&(0..16).collect::<Vec<_>>()).unwrap();
+
+        adapter.reserve_rows_for(7, 5).unwrap();
+        adapter
+            .record_tokens_for(7, &(16..21).collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(adapter.block_table_for(7).unwrap().num_tokens(), 21);
+
+        let released = adapter.prune_sliding_window_for_committed(7, 16).unwrap();
+        assert_eq!(
+            released, 2,
+            "blocks wholly out of the committed window must still be retired"
+        );
+
+        adapter.rollback_last_tokens_for(7, 4).unwrap();
+        assert_eq!(adapter.block_table_for(7).unwrap().num_tokens(), 17);
+
+        adapter
+            .read_kv_range(0, 9, 8)
+            .expect("post-rollback live window must be readable");
+
+        let null_id = adapter
+            .null_block
+            .as_ref()
+            .expect("sliding adapter reserves a null block")
+            .block_id;
+        let table = adapter.block_table_for(7).expect("request table");
+        assert!(
+            table.blocks()[..2].iter().all(|b| b.block_id == null_id),
+            "positions wholly out of the committed window must be retired"
+        );
+        assert!(
+            table.blocks()[2..5].iter().all(|b| b.block_id != null_id),
+            "the post-rollback live window must remain physically backed"
+        );
+    }
+
+    /// With `committed_len` equal to the write cursor the committed-basis
+    /// prune must be indistinguishable from the cursor-basis prune — the
+    /// autoregressive shape, where every recorded token is committed. Chunks
+    /// of 3 keep the cutoff off block-alignment so any ±1 drift in the
+    /// committed basis moves the retirement boundary.
+    #[test]
+    fn prune_committed_equals_cursor_prune_when_equal() {
+        let Some(mut cursor_adapter) = maybe_sliding_adapter(8, 4, 8, 64) else {
+            return;
+        };
+        let Some(mut committed_adapter) = maybe_sliding_adapter(8, 4, 8, 64) else {
+            return;
+        };
+        cursor_adapter.reset_for_new_request(7).unwrap();
+        committed_adapter.reset_for_new_request(7).unwrap();
+
+        let null_pattern = |adapter: &PagedKVCacheAdapter| -> Vec<bool> {
+            let null_id = adapter.null_block.as_ref().unwrap().block_id;
+            adapter
+                .block_table_for(7)
+                .expect("request table")
+                .blocks()
+                .iter()
+                .map(|b| b.block_id == null_id)
+                .collect()
+        };
+
+        for chunk in 0..8u32 {
+            let tokens = (chunk * 3..chunk * 3 + 3).collect::<Vec<_>>();
+            cursor_adapter.record_tokens(&tokens).unwrap();
+            committed_adapter.record_tokens(&tokens).unwrap();
+            let cursor = committed_adapter.block_table_for(7).unwrap().num_tokens();
+
+            let released_cursor = cursor_adapter.prune_sliding_window_for(7).unwrap();
+            let released_committed = committed_adapter
+                .prune_sliding_window_for_committed(7, cursor)
+                .unwrap();
+
+            assert_eq!(
+                released_cursor, released_committed,
+                "released counts diverged at cursor {cursor}"
+            );
+            assert_eq!(
+                null_pattern(&cursor_adapter),
+                null_pattern(&committed_adapter),
+                "nulled-block sets diverged at cursor {cursor}"
+            );
+            assert_eq!(
+                cursor_adapter.num_allocated_blocks(),
+                committed_adapter.num_allocated_blocks(),
+                "allocated block counts diverged at cursor {cursor}"
+            );
+        }
+
+        let cursor = committed_adapter.block_table_for(7).unwrap().num_tokens();
+        let err = committed_adapter
+            .prune_sliding_window_for_committed(7, cursor + 1)
+            .unwrap_err();
+        assert!(
+            err.contains("exceeds recorded token count"),
+            "a committed frontier past the cursor must be rejected, got: {err}"
+        );
     }
 
     #[test]
