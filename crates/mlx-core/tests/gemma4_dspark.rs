@@ -3,8 +3,13 @@
 //! Loads ONE Gemma4 target model per test WITH the DSpark draft attached
 //! (`Gemma4LoadOptions::draft_model_path`); the plain-AR oracle runs on the
 //! SAME instance with `enableMtp: false` (the draft never touches the target
-//! weights, so this is the exact byte-parity reference —
-//! and only one ~24 GB target is resident at a time).
+//! weights, and only one ~24 GB target is resident at a time).
+//!
+//! `enableMtp` also picks the cache lane — `enable_mtp == Some(true)` claims
+//! the FLAT lane, so the AR oracle runs paged while DSpark runs on a
+//! RotatingKVCache. That is NOT what separates them numerically: a depth-1
+//! DSpark run byte-matches the paged AR run over 600 tokens. What separates
+//! them is the verify block's row count, below.
 //!
 //! PRIMARY ORACLE: speculative decoding must be LOSSLESS at T=0 — the
 //! DSpark turn's text/raw_text/finish_reason must byte-match the AR run.
@@ -30,6 +35,17 @@
 //! The byte-equal oracle is therefore kept STRICT and the fixtures are
 //! chosen to be tie-free: constrained generations (counting, single-word
 //! answers, recipes) whose greedy top-2 gaps are far above kernel noise.
+//!
+//! The constrained-generation rule covers the WHOLE decode, not just the
+//! visible answer. A Gemma4 turn opens with a free-form `<|channel>thought`
+//! block that no fixture can constrain, and a tie inside it is enough to
+//! spend the budget differently and truncate the visible tail — that is what
+//! `decode_wrap` hit (exact tie at `27.500` between ids 623 and 98936, the
+//! T=8 verify row resolving to the lower id where the T=1 AR decode read a
+//! 1-ULP gap). Fixtures whose thought is not itself constrained therefore
+//! suppress it with `reasoning_effort: "none"`, which makes the template
+//! emit `<|channel>thought\n<channel|>` in the PROMPT.
+//!
 //! Every fixture below was screened to be byte-equal AR-vs-DSpark on this
 //! checkpoint; MLX runs are deterministic, so green is stable per
 //! machine + MLX pin. If one of these tests diverges after an MLX bump,
@@ -136,6 +152,20 @@ fn chat_config(max_new_tokens: i32, enable_mtp: bool) -> ChatConfig {
     }
 }
 
+/// `chat_config` with the free-form reasoning preamble suppressed.
+///
+/// `reasoning_effort: "none"` resolves `enable_thinking` to `false`, and the
+/// Gemma4 template answers that by closing the channel in the generation
+/// prompt itself (`<|turn>model\n<|channel>thought\n<channel|>`), so decode
+/// starts on the constrained text the fixture screens. Gemma4's thinking
+/// policy carries no budget machinery, so nothing else about the decode moves.
+fn chat_config_no_reasoning(max_new_tokens: i32, enable_mtp: bool) -> ChatConfig {
+    ChatConfig {
+        reasoning_effort: Some("none".to_string()),
+        ..chat_config(max_new_tokens, enable_mtp)
+    }
+}
+
 fn user_message(content: &str) -> ChatMessage {
     ChatMessage {
         role: "user".to_string(),
@@ -174,16 +204,53 @@ fn assistant_message(result: &ChatResult) -> ChatMessage {
     }
 }
 
+/// Report where two greedy trajectories part, in the form the module doc's
+/// triage rule asks for: a divergence deep inside a free-form span is a
+/// fixture problem, one at byte 0 or in mid-count is a wiring problem.
+fn divergence_report(field: &str, dspark: &str, ar: &str) -> String {
+    let common = dspark
+        .bytes()
+        .zip(ar.bytes())
+        .position(|(a, b)| a != b)
+        .unwrap_or(dspark.len().min(ar.len()));
+    let window = |text: &str| {
+        let start = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= common.saturating_sub(48))
+            .last()
+            .unwrap_or(0);
+        let end = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .find(|index| *index >= common + 48)
+            .unwrap_or(text.len());
+        text[start..end].to_string()
+    };
+    format!(
+        "{field} diverged after {common} common bytes \
+         (dspark {} bytes, ar {} bytes)\n  dspark: {:?}\n  ar:     {:?}",
+        dspark.len(),
+        ar.len(),
+        window(dspark),
+        window(ar),
+    )
+}
+
 /// Assert the DSpark run byte-matches the AR reference AND actually ran
 /// DSpark cycles (not a silent AR fallback), then print the headline stats.
 fn assert_matches_ar(label: &str, dspark: &ChatResult, ar: &ChatResult) {
     assert_eq!(
-        dspark.text, ar.text,
-        "[{label}] DSpark text diverged from AR at T=0"
+        dspark.text,
+        ar.text,
+        "[{label}] DSpark {}",
+        divergence_report("text", &dspark.text, &ar.text),
     );
     assert_eq!(
-        dspark.raw_text, ar.raw_text,
-        "[{label}] DSpark raw_text diverged from AR at T=0"
+        dspark.raw_text,
+        ar.raw_text,
+        "[{label}] DSpark {}",
+        divergence_report("raw_text", &dspark.raw_text, &ar.raw_text),
     );
     assert_eq!(
         dspark.finish_reason, ar.finish_reason,
@@ -216,6 +283,47 @@ fn assert_matches_ar(label: &str, dspark: &ChatResult, ar: &ChatResult) {
         perf.decode_tokens_per_second,
         ar_perf.decode_tokens_per_second,
     );
+}
+
+/// The triage the module doc asks for is only usable if the message names
+/// WHERE the trajectories parted; a bare `left`/`right` dump of two 1 KB
+/// strings does not. Runs without a checkpoint.
+#[test]
+fn divergence_report_names_the_split_point() {
+    let report = divergence_report("text", "1\n2\n3\n", "1\n2\n4\n");
+    assert!(
+        report.starts_with("text diverged after 4 common bytes (dspark 6 bytes, ar 6 bytes)"),
+        "got: {report}"
+    );
+    assert!(report.contains("\"1\\n2\\n3\\n\""), "got: {report}");
+    assert!(report.contains("\"1\\n2\\n4\\n\""), "got: {report}");
+
+    // The +/-48-byte window around the divergence must land on char
+    // boundaries: a 2-byte character straddling either clamp would panic the
+    // slice, turning a diagnostic into a second failure.
+    let straddle = |divergent: &str| {
+        format!(
+            "{}é{}{divergent}{}é{}",
+            "x".repeat(151),
+            "x".repeat(47),
+            "y".repeat(46),
+            "y".repeat(20),
+        )
+    };
+    let dspark = straddle("A");
+    let ar = straddle("B");
+    assert_eq!(
+        dspark.bytes().zip(ar.bytes()).position(|(a, b)| a != b),
+        Some(200),
+        "the fixture must diverge exactly 48 bytes past a straddling character",
+    );
+    let report = divergence_report("raw_text", &dspark, &ar);
+    assert!(report.contains("éxxx"), "got: {report}");
+    assert!(
+        report.contains("Ayyy") && report.contains("Byyy"),
+        "got: {report}"
+    );
+    assert!(report.contains("yyyé"), "got: {report}");
 }
 
 // ---------------------------------------------------------------------------
@@ -271,7 +379,8 @@ async fn dspark_greedy_matches_ar_across_sliding_wrap() {
     // (a) Sub-window prompt (~832 tokens) + 600-token budget: the
     // 1024-token sliding window wraps MID-DECODE, so verify blocks append
     // to (and partially roll back from) rotated RotatingKVCache state.
-    // The decode tail is a constrained count (tie-free; module doc).
+    // The whole decode is a constrained count (tie-free; module doc) — the
+    // free-form thought is suppressed rather than screened.
     let mut mid_prompt = String::new();
     for _ in 0..15 {
         mid_prompt.push_str(paragraph);
@@ -283,10 +392,16 @@ async fn dspark_greedy_matches_ar_across_sliding_wrap() {
     let ar_a = model
         .chat_session_start(
             vec![user_message(&mid_prompt)],
-            Some(chat_config(600, false)),
+            Some(chat_config_no_reasoning(600, false)),
         )
         .await
         .expect("AR (decode wrap) failed");
+    assert!(
+        !ar_a.raw_text.contains("<channel|>"),
+        "decode-wrap fixture must decode only constrained text; a closed reasoning \
+         channel means the thought was generated after all: {:?}",
+        ar_a.raw_text.chars().take(200).collect::<String>(),
+    );
     assert!(
         ar_a.prompt_tokens < 1024,
         "decode-wrap fixture must START below the sliding window, got {} prompt tokens",
@@ -302,7 +417,7 @@ async fn dspark_greedy_matches_ar_across_sliding_wrap() {
     let dspark_a = model
         .chat_session_start(
             vec![user_message(&mid_prompt)],
-            Some(chat_config(600, true)),
+            Some(chat_config_no_reasoning(600, true)),
         )
         .await
         .expect("DSpark (decode wrap) failed");
