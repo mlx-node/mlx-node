@@ -11135,11 +11135,16 @@ impl MtpStepper for DenseMtpStepper<'_> {
 /// `reserve_lookahead` is [`MtpStepper::reserve_cycle_lookahead`]'s
 /// mechanism ([`PagedKVCacheAdapter::reserve_rows`] plus the
 /// capacity-exhaustion mapping — the stepper hook delegates here),
-/// `record_verify` is the verify cores'
-/// [`PagedKVCacheAdapter::record_tokens`], and `commit_cycle` is the
+/// `record_rows` is the verify cores'
+/// [`PagedKVCacheAdapter::record_tokens`], and `rollback_rows` is the
 /// [`PagedKVCacheAdapter::rollback_last_tokens`] cursor arithmetic that
 /// `rollback` / `rollback_unemitted` drive (their GDN tape replay stays
 /// theirs — the facade covers the paged-KV bookkeeping only).
+///
+/// The dense verify core records its `[anchor, drafts..]` slice as part of
+/// the forward, so a driver here opens the cycle with
+/// `open_core_write_cycle` around that write rather than through
+/// `record_verify`; the commit is checked either way.
 ///
 /// `settle_committed` is the IDENTITY for this family, by construction: the
 /// dense adapter is full-attention-only (`sliding_window == 0`, so no
@@ -11169,24 +11174,15 @@ impl crate::engine::spec_paged::SpecPagedCache for DenseMtpStepper<'_> {
         }
     }
 
-    fn record_verify(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
+    fn record_rows(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
         self.paged_cache_for(seq_id)?.record_tokens(tokens)
     }
 
-    fn commit_cycle(
-        &mut self,
-        seq_id: u32,
-        keep: usize,
-        total: usize,
-    ) -> std::result::Result<(), String> {
-        let rollback = crate::engine::spec_paged::commit_rollback_rows(keep, total);
-        if rollback == 0 {
-            return Ok(());
-        }
-        let rollback = u32::try_from(rollback).map_err(|_| {
-            format!("dense paged MTP commit rollback of {rollback} rows does not fit u32")
+    fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
+        let rows = u32::try_from(rows).map_err(|_| {
+            format!("dense paged MTP commit rollback of {rows} rows does not fit u32")
         })?;
-        self.paged_cache_for(seq_id)?.rollback_last_tokens(rollback)
+        self.paged_cache_for(seq_id)?.rollback_last_tokens(rows)
     }
 
     fn settle_committed(
@@ -11203,6 +11199,11 @@ impl crate::engine::spec_paged::SpecPagedCache for DenseMtpStepper<'_> {
             ));
         }
         Ok(())
+    }
+
+    fn settle_captures_durable_state(&self) -> bool {
+        // The identity settle (see the impl docs) touches nothing at all.
+        false
     }
 
     fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
@@ -17123,8 +17124,9 @@ mod paged_construction_tests {
             "the filler rows fit the already-allocated tail"
         );
         let filler_tokens: Vec<u32> = (0..filler).map(|i| 30 + i).collect();
-        SpecPagedCache::record_verify(&mut step, seq_id, &filler_tokens).expect("filler record");
-        SpecPagedCache::commit_cycle(&mut step, seq_id, filler as usize, filler as usize)
+        let filler_ticket = SpecPagedCache::record_verify(&mut step, seq_id, &filler_tokens)
+            .expect("filler record");
+        SpecPagedCache::commit_cycle(&mut step, seq_id, filler_ticket, filler as usize)
             .expect("a full-keep commit rolls back exactly zero rows");
         let (pre_blocks, cursor) = adapter_stats(&step);
         assert_eq!(
@@ -17156,6 +17158,10 @@ mod paged_construction_tests {
             "the facade reservation must not advance the cursor"
         );
 
+        // The verify core writes its own rows, so the cycle opens around
+        // that write instead of through `record_verify`.
+        let facade_ticket = SpecPagedCache::open_core_write_cycle(&mut step, seq_id, lookahead)
+            .expect("open the core-write cycle");
         step.snapshot_main_linear();
         let facade_verify_ids =
             MxArray::from_int32(&[41, 42, 43, 44], &[1, (depth + 1) as i64]).expect("verify ids");
@@ -17172,7 +17178,7 @@ mod paged_construction_tests {
 
         // The facade commit is the exact cursor arithmetic `rollback`
         // drives: keep the anchor plus one draft of the depth + 1 rows.
-        SpecPagedCache::commit_cycle(&mut step, seq_id, 2, lookahead).expect("facade commit");
+        SpecPagedCache::commit_cycle(&mut step, seq_id, facade_ticket, 2).expect("facade commit");
         let (committed_blocks, committed_cursor) = adapter_stats(&step);
         assert_eq!(
             committed_blocks, reserved_blocks,

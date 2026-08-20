@@ -700,23 +700,14 @@ impl crate::engine::spec_paged::SpecPagedCache for Gemma4KVCacheCoordinator {
         }
     }
 
-    fn record_verify(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
+    fn record_rows(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
         self.record_tokens_all(seq_id, tokens)
     }
 
-    fn commit_cycle(
-        &mut self,
-        seq_id: u32,
-        keep: usize,
-        total: usize,
-    ) -> std::result::Result<(), String> {
-        let rollback = crate::engine::spec_paged::commit_rollback_rows(keep, total);
-        if rollback == 0 {
-            return Ok(());
-        }
-        let rollback = u32::try_from(rollback)
-            .map_err(|_| format!("Gemma4 commit rollback of {rollback} rows does not fit u32"))?;
-        self.rollback_last_tokens_all(seq_id, rollback)
+    fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
+        let rows = u32::try_from(rows)
+            .map_err(|_| format!("Gemma4 commit rollback of {rows} rows does not fit u32"))?;
+        self.rollback_last_tokens_all(seq_id, rows)
     }
 
     fn settle_committed(
@@ -730,6 +721,15 @@ impl crate::engine::spec_paged::SpecPagedCache for Gemma4KVCacheCoordinator {
         self.eval_pending_pool_writes_all()?;
         self.prune_sliding_all_committed(seq_id, committed)
             .map(|_| ())
+    }
+
+    fn settle_captures_durable_state(&self) -> bool {
+        // The settle above is pending-write eval plus a committed-basis
+        // prune: nothing published, nothing freed above the cutoff. The
+        // cold-rung walk lives one level up in
+        // `Gemma4Inner::settle_grouped_kv_step_at`, out of this facade's
+        // reach — a family-scope impl would have to answer `true`.
+        false
     }
 
     fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
@@ -15257,8 +15257,9 @@ mod spec_paged_substrate_tests {
             })
         );
         assert_eq!(SpecPagedCache::frontier(&coordinator, 99), None);
-        SpecPagedCache::record_verify(&mut coordinator, 7, &[40, 41, 42]).expect("record verify");
-        SpecPagedCache::commit_cycle(&mut coordinator, 7, 1, 3).expect("commit keep=1 of 3");
+        let ticket = SpecPagedCache::record_verify(&mut coordinator, 7, &[40, 41, 42])
+            .expect("record verify");
+        SpecPagedCache::commit_cycle(&mut coordinator, 7, ticket, 1).expect("commit keep=1 of 3");
         assert_eq!(
             SpecPagedCache::frontier(&coordinator, 7),
             Some(SpecFrontier {
@@ -15308,7 +15309,7 @@ mod spec_paged_substrate_tests {
     /// `total - keep` fails the cross-group frontier equality.
     #[test]
     fn gemma4_coordinator_conforms_to_the_facade_call_order() {
-        use crate::engine::spec_paged::SettleOrderChecked;
+        use crate::engine::spec_paged::NoSettleInCycle;
 
         let Some(mut coordinator) = maybe_grouped_coordinator(64, 16) else {
             return;
@@ -15318,7 +15319,7 @@ mod spec_paged_substrate_tests {
         coordinator
             .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
             .expect("seed the committed prompt");
-        let mut cache = SettleOrderChecked::new(coordinator);
+        let mut cache = NoSettleInCycle::new(coordinator);
 
         let seeded = allocated_per_group(cache.inner());
         assert!(
@@ -15339,7 +15340,7 @@ mod spec_paged_substrate_tests {
             "the reservation must not advance any group's cursor"
         );
 
-        cache
+        let ticket = cache
             .record_verify(7, &[100, 101, 102, 103, 104])
             .expect("record anchor + 4 drafts");
         assert_eq!(
@@ -15362,7 +15363,7 @@ mod spec_paged_substrate_tests {
         );
 
         cache
-            .commit_cycle(7, 1, 5)
+            .commit_cycle(7, ticket, 1)
             .expect("keep the anchor, roll back the 4 rejected drafts");
         assert_eq!(
             cache.frontier(7),
@@ -15454,7 +15455,7 @@ mod spec_paged_substrate_tests {
             SpecPagedCache::reserve_lookahead(&mut coordinator, 7, 5).expect("reserve"),
             "5 lookahead rows fit every group"
         );
-        SpecPagedCache::record_verify(&mut coordinator, 7, &[100, 101, 102, 103, 104])
+        let ticket = SpecPagedCache::record_verify(&mut coordinator, 7, &[100, 101, 102, 103, 104])
             .expect("record anchor + 4 drafts");
 
         let recorded = allocated_per_group(&coordinator);
@@ -15471,7 +15472,7 @@ mod spec_paged_substrate_tests {
             );
         }
 
-        SpecPagedCache::commit_cycle(&mut coordinator, 7, 1, 5)
+        SpecPagedCache::commit_cycle(&mut coordinator, 7, ticket, 1)
             .expect("roll back the 4 rejected drafts");
         assert_eq!(coordinator.request_token_count_all(7).expect("count"), 37);
 
