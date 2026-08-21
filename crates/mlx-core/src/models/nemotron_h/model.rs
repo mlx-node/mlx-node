@@ -284,7 +284,15 @@ fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAd
             "NemotronH block-paged adapter: invalid paged_block_size {block_size} (must be 8, 16, or 32)"
         )));
     }
-    let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or(2048);
+    let gpu_memory_mb = config.paged_cache_memory_mb.unwrap_or_else(|| {
+        mlx_paged_attn::PagedAttentionConfig::memory_mb_for_one_full_sequence(
+            config.max_position_embeddings.max(0) as u32,
+            block_size,
+            config.head_dim as u32,
+            config.num_key_value_heads as u32,
+            attn_layer_count,
+        )
+    });
     let pa_config = mlx_paged_attn::PagedAttentionConfig {
         block_size,
         gpu_memory_mb,

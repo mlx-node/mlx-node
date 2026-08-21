@@ -1,8 +1,5 @@
 use napi_derive::napi;
 
-const BYTES_PER_MIB: u64 = 1024 * 1024;
-const QWEN35_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB: u32 = 256;
-
 /// Derive the default paged-KV budget from the model's advertised context.
 ///
 /// Qwen3.5 checkpoints commonly advertise 262,144 tokens. The former fixed
@@ -18,23 +15,13 @@ pub(crate) fn qwen35_default_paged_cache_memory_mb(
     num_kv_heads: u32,
     num_layers: u32,
 ) -> u32 {
-    if max_seq_len == 0 || block_size == 0 || head_size == 0 || num_kv_heads == 0 || num_layers == 0
-    {
-        return QWEN35_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB;
-    }
-
-    let max_blocks = u64::from(max_seq_len.div_ceil(block_size));
-    let bytes_per_block = 2u64
-        .saturating_mul(u64::from(num_kv_heads))
-        .saturating_mul(u64::from(head_size))
-        .saturating_mul(u64::from(block_size))
-        .saturating_mul(2)
-        .saturating_mul(u64::from(num_layers));
-    let required_mb = bytes_per_block
-        .saturating_mul(max_blocks)
-        .div_ceil(BYTES_PER_MIB)
-        .max(u64::from(QWEN35_PAGED_CACHE_MIN_DEFAULT_MEMORY_MB));
-    u32::try_from(required_mb).unwrap_or(u32::MAX)
+    mlx_paged_attn::PagedAttentionConfig::memory_mb_for_one_full_sequence(
+        max_seq_len,
+        block_size,
+        head_size,
+        num_kv_heads,
+        num_layers,
+    )
 }
 
 pub(crate) fn qwen35_resolve_paged_cache_memory_mb(
