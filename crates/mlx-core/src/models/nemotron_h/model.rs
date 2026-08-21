@@ -25,7 +25,7 @@ use crate::engine::hybrid_scheduler::{
     NoRestoreTicket, ScheduledPrefixAdmission, scheduler_max_num_seqs_for,
 };
 use crate::engine::plan::{
-    ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
+    DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
 };
 use crate::engine::{self};
@@ -355,32 +355,6 @@ impl NemotronHInner {
     /// Whether a complete MTP head was loaded.
     pub(crate) fn has_mtp_weights(&self) -> bool {
         self.mtp.is_some() && self.mtp_weights_loaded
-    }
-
-    /// MTP-routing predicate for the whole-turn executors: run the FLAT speculative
-    /// core exactly when the request opted in, a complete MTP head is loaded, and the
-    /// turn is not streaming (the flat core has no streaming arm, so streaming MTP
-    /// turns keep the paged AR fallback).
-    pub(crate) fn mtp_flat_routing_required(
-        &self,
-        params: &crate::engine::params::ChatParams,
-        streaming: bool,
-    ) -> bool {
-        let requested = params.enable_mtp && self.has_mtp_weights();
-        if requested && streaming {
-            // Process-wide one-shot: a streaming server would otherwise emit
-            // one line per turn.
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                tracing::warn!(
-                    target: "mlx_core::nemotron_h",
-                    "enableMtp is set on a STREAMING NemotronH turn: the flat MTP core \
-                     has no streaming arm, so this turn decodes plain autoregressively \
-                     with no speculation. Use a non-streaming turn for MTP."
-                );
-            });
-        }
-        !streaming && requested
     }
 
     /// Full forward over input_ids [1, T]: returns [1, T, vocab] logits.
@@ -1319,10 +1293,12 @@ impl ChatBackend for NemotronHInner {
                 kind: SpeculativeKind::NativeMtp,
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
-                // Native MTP is flat-cache only here (the draft head reads the
-                // FLAT KV); the plan keeps the paged adapter exposed for plain AR
-                // turns, and run_paged_turn re-routes sync MTP turns to the flat core.
+                // Native MTP is flat-cache only here: the draft head reads the
+                // FLAT KV, so an admitted MTP turn takes the flat lane with its
+                // target and the paged adapter serves the autoregressive turns.
                 supports_paged_attention: false,
+                // `run_mtp_whole_turn` only ever returns `TurnOutput::Complete`.
+                supports_streaming: false,
             }),
         }
     }
@@ -1332,24 +1308,15 @@ impl ChatBackend for NemotronHInner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Native MTP is flat-cache only, but a paged adapter still resolves every fresh
-        // turn to this path. Route sync MTP-requested turns to the flat speculative core;
-        // streaming MTP turns keep the paged AR fallback (the flat core has no streaming
-        // arm).
-        if self.mtp_flat_routing_required(args.params, args.sink.is_some()) {
-            return self.run_mtp_whole_turn(args);
-        }
+        debug_assert!(matches!(args.plan.decoder, DecoderPlan::Autoregressive));
         crate::engine::paged_turn::run_paged_turn(self, args)
     }
 
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Same gate `run_paged_turn` applies. Reached on a model with MTP weights and NO
-        // paged adapter — the one route where the engine cannot fall back for us. The
-        // flat core returns `TurnOutput::Complete`, which `whole_turn_outcome` rejects
-        // outright on a sink-bearing turn, so streaming goes to plain AR.
-        if !self.mtp_flat_routing_required(args.params, args.sink.is_some()) {
-            return self.run_flat_ar_turn(args);
-        }
+        debug_assert!(
+            args.sink.is_none(),
+            "the flat MTP core has no streaming arm"
+        );
         self.run_mtp_whole_turn(args)
     }
 }
@@ -2466,7 +2433,14 @@ impl NemotronHInner {
         // The partial seed left the backbone caches mid-prompt; the AR lane
         // must start from a clean slate.
         self.reset_caches_internal();
-        if self.paged_adapter.is_some() {
+        // The head is disarmed, so `execution_plan` no longer offers a
+        // speculative decoder: re-state the turn's plan as the planner would
+        // now resolve it. The paged core reads `plan.decoder` to decide
+        // whether to admit a verify cycle, and a stale `Speculative` here
+        // would send the fallback straight back into speculation.
+        args.plan.decoder = DecoderPlan::Autoregressive;
+        args.plan.use_paged_attention = self.paged_adapter.is_some();
+        if args.plan.use_paged_attention {
             crate::engine::paged_turn::run_paged_turn(self, args)
         } else {
             self.run_flat_ar_turn(args)
@@ -2878,7 +2852,7 @@ mod scheduler_tests {
     use super::*;
     use crate::engine::backend::{ChunkSink, ThinkingSetup};
     use crate::engine::persistence::compiled_forward_backend_available;
-    use crate::engine::plan::{DecoderPlan, MediaInputs, TurnPlan};
+    use crate::engine::plan::{MediaInputs, TurnPath, TurnPlan, TurnRequest};
     use crate::engine::types::{ChatConfig, ChatStreamChunk};
 
     /// Tiny hybrid config: mamba(0) + moe(1) + attention(2), dense bf16
@@ -3677,11 +3651,35 @@ mod scheduler_tests {
         Arc::new(tok)
     }
 
-    /// A STREAMING MTP request on an adapter-less model must generate through the AR
-    /// fallback: the flat MTP core returns `TurnOutput::Complete`, which
-    /// `whole_turn_outcome` rejects on a sink-bearing turn.
+    /// The turn the engine planner resolves for a text-only request against
+    /// this inner's live execution plan. The family no longer holds a second
+    /// opinion, so every routing assertion below reads this one.
+    fn planned_turn(
+        inner: &NemotronHInner,
+        speculative_requested: bool,
+        streaming: bool,
+    ) -> TurnPlan {
+        TurnPlan::resolve(
+            ChatBackend::execution_plan(inner),
+            TurnRequest {
+                is_delta: false,
+                input_media: crate::engine::plan::MediaCapabilities::NONE,
+                context_media: crate::engine::plan::MediaCapabilities::NONE,
+                speculative_requested,
+                streaming,
+            },
+        )
+    }
+
+    /// A STREAMING MTP request must be refused by the PLANNER, not by the family
+    /// mid-turn: the flat MTP core has no streaming arm, so the plan names the
+    /// target's own autoregressive lane and that lane really streams the budget.
+    ///
+    /// MUTATION: flip `supports_streaming` to `true` in `execution_plan` — the
+    /// plan resolves `Speculative`/`TurnPath::Speculative` and the two planner
+    /// assertions fail.
     #[test]
-    fn streaming_mtp_request_falls_back_to_ar_streaming() {
+    fn a_streaming_mtp_request_plans_autoregressive_and_still_streams() {
         if !compiled_forward_backend_available() {
             eprintln!("skipping (no Metal backend)");
             return;
@@ -3706,21 +3704,28 @@ mod scheduler_tests {
         };
         let mut params = crate::engine::params::extract_chat_params(&config);
         params.enable_mtp = true;
-        assert!(
-            !inner.mtp_flat_routing_required(&params, /* streaming */ true),
-            "the flat MTP core must decline a streaming turn"
+        let plan = planned_turn(
+            &inner, /* speculative_requested */ true, /* streaming */ true,
+        );
+        assert_eq!(
+            plan.decoder,
+            DecoderPlan::Autoregressive,
+            "the flat MTP core must be declined on a sink-bearing turn"
+        );
+        assert_eq!(
+            plan.path(),
+            TurnPath::Generic,
+            "an adapter-less target serves the refused turn on its own AR lane"
+        );
+        // The same request without a sink still plans MTP.
+        assert_eq!(
+            planned_turn(&inner, true, false).decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
         );
 
         let sink = CollectSink::default();
         let cancelled = AtomicBool::new(false);
         let tokens = vec![1u32, 5, 9, 3];
-        let plan = TurnPlan {
-            is_delta: false,
-            input_media: crate::engine::plan::MediaCapabilities::NONE,
-            context_media: crate::engine::plan::MediaCapabilities::NONE,
-            use_paged_attention: false,
-            decoder: DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
-        };
         let mut args = WholeTurnArgs {
             tokens: &tokens,
             tokenizer: &tokenizer,
@@ -3741,8 +3746,9 @@ mod scheduler_tests {
             },
         };
 
-        let out = ChatBackend::run_speculative_turn(&mut inner, &mut args)
-            .unwrap_or_else(|e| panic!("streaming MTP turn errored: {}", e.reason));
+        let out = inner
+            .run_flat_ar_turn(&mut args)
+            .unwrap_or_else(|e| panic!("streaming AR turn errored: {}", e.reason));
         assert!(
             matches!(out, TurnOutput::Streamed),
             "a sink-bearing turn must report Streamed"
@@ -3795,9 +3801,10 @@ mod scheduler_tests {
         };
         let mut params = crate::engine::params::extract_chat_params(&config);
         params.enable_mtp = true;
-        assert!(
-            inner.mtp_flat_routing_required(&params, /* streaming */ false),
-            "a sync MTP turn must still route to the flat MTP core"
+        assert_eq!(
+            planned_turn(&inner, true, false).decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            "a sync MTP turn must still plan the flat MTP core"
         );
 
         let tokens = vec![1u32, 5, 9, 3];
@@ -3849,9 +3856,10 @@ mod scheduler_tests {
             inner.execution_plan().speculative.is_none(),
             "the speculative plan must go dark for every later turn"
         );
-        assert!(
-            !inner.mtp_flat_routing_required(&params, false),
-            "later turns must not route back into the MTP core"
+        assert_eq!(
+            planned_turn(&inner, true, false).decoder,
+            DecoderPlan::Autoregressive,
+            "later turns must not plan back into the MTP core"
         );
     }
 
@@ -3893,9 +3901,10 @@ mod scheduler_tests {
         };
         let mut params = crate::engine::params::extract_chat_params(&config);
         params.enable_mtp = true;
-        assert!(
-            inner.mtp_flat_routing_required(&params, /* streaming */ false),
-            "a sync MTP turn must route to the flat MTP core"
+        assert_eq!(
+            planned_turn(&inner, true, false).decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            "a sync MTP turn must plan the flat MTP core"
         );
 
         let tokens = vec![1u32, 5, 9, 3];
@@ -3943,9 +3952,10 @@ mod scheduler_tests {
             inner.execution_plan().speculative.is_some(),
             "later turns on this model must still see the speculative plan"
         );
-        assert!(
-            inner.mtp_flat_routing_required(&params, false),
-            "later MTP requests must still route into the MTP core"
+        assert_eq!(
+            planned_turn(&inner, true, false).decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            "later MTP requests must still plan the MTP core"
         );
         assert!(
             inner.pending_mtp_draft_seed.is_none(),

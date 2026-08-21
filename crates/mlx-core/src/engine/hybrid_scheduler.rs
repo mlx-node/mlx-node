@@ -1179,24 +1179,39 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             && !Self::chat_has_explicit_owner(command)
     }
 
-    /// The model's Barrier-vs-Scheduled speculative lane. Both the barrier
-    /// routing gate and the scheduled-lane admission reject consult this one
-    /// decision (`SpeculativePlan::lane`); neither may re-derive it. A model
-    /// without a speculative plan barriers its `enable_mtp` turns: they
-    /// resolve to autoregressive execution, and the exclusive lane is the
-    /// only lane that fallback is validated for.
-    fn speculative_lane(&self) -> engine::plan::SpeculativeLane {
+    const fn chat_is_streaming(command: &ChatCmd) -> bool {
+        matches!(
+            command,
+            ChatCmd::StreamSessionStart { .. }
+                | ChatCmd::StreamSessionContinue { .. }
+                | ChatCmd::StreamSessionContinueTool { .. }
+        )
+    }
+
+    /// Whether a speculative decoder this model would actually admit for a
+    /// turn of this shape needs the exclusive lane. Both the barrier routing
+    /// gate and the scheduled-lane admission reject consult this; neither
+    /// derives the answer from `enable_mtp` alone, so a request the planner
+    /// will resolve autoregressive — no decoder loaded, or no streaming arm —
+    /// keeps the scheduled lane instead of stalling the whole model.
+    ///
+    /// Media and live-context narrowing stay in `TurnPlan::resolve`, which
+    /// runs after prompt rendering: this gate only ever admits MORE turns to
+    /// the barrier than the planner will speculate on, which costs a lane and
+    /// never correctness.
+    fn speculation_requires_exclusive_lane(&self, streaming: bool) -> bool {
         self.inner
             .execution_plan()
             .speculative
-            .map_or(engine::plan::SpeculativeLane::Barrier, |speculative| {
-                speculative.lane()
+            .is_some_and(|speculative| {
+                speculative.admits_streaming(streaming)
+                    && speculative.lane() != engine::plan::SpeculativeLane::Scheduled
             })
     }
 
     fn chat_requires_barrier(&self, command: &ChatCmd) -> bool {
         if Self::chat_config(command).is_some_and(|config| config.enable_mtp == Some(true))
-            && self.speculative_lane() != engine::plan::SpeculativeLane::Scheduled
+            && self.speculation_requires_exclusive_lane(Self::chat_is_streaming(command))
         {
             return true;
         }
@@ -1442,27 +1457,35 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
         let owner_state = self.owner_states.entry(owner_id.clone()).or_default();
         self.inner.install_owner_state(seq_id, owner_state);
-        let mut admitted =
-            match engine::session::admit_paged_turn(&mut self.inner, messages, config, kind) {
-                Ok(admitted) => admitted,
-                Err(error) => {
-                    if newly_assigned {
-                        self.owner_sequences.remove(&owner_id);
-                        self.owner_states.remove(&owner_id);
-                    }
-                    response.send_error(error, cancelled.as_ref());
-                    return None;
+        let streaming = matches!(response, ScheduledReply::Stream(_));
+        let mut admitted = match engine::session::admit_paged_turn(
+            &mut self.inner,
+            messages,
+            config,
+            kind,
+            streaming,
+        ) {
+            Ok(admitted) => admitted,
+            Err(error) => {
+                if newly_assigned {
+                    self.owner_sequences.remove(&owner_id);
+                    self.owner_states.remove(&owner_id);
                 }
-            };
-        // `chat_requires_barrier` already routes Barrier-lane MTP turns to
-        // the exclusive lane; admission re-consults the same single-sourced
-        // lane decision so a routing gap can never execute speculation on
-        // the scheduled lane.
+                response.send_error(error, cancelled.as_ref());
+                return None;
+            }
+        };
+        // `chat_requires_barrier` already routes Barrier-lane speculation to
+        // the exclusive lane; admission re-consults the SAME lane decision
+        // against the decoder the planner actually resolved, so a routing gap
+        // can never execute speculation on the scheduled lane.
         if admitted.plan.path() != engine::plan::TurnPath::Paged
             || !admitted.images.is_empty()
             || !admitted.audio.is_empty()
-            || (admitted.params.enable_mtp
-                && self.speculative_lane() != engine::plan::SpeculativeLane::Scheduled)
+            || (matches!(
+                admitted.plan.decoder,
+                engine::plan::DecoderPlan::Speculative(_)
+            ) && self.speculation_requires_exclusive_lane(streaming))
         {
             if newly_assigned {
                 self.owner_sequences.remove(&owner_id);
@@ -2474,6 +2497,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::backend::ChatBackend;
+    use crate::engine::plan::{DecoderPlan, MediaCapabilities, TurnPath, TurnPlan, TurnRequest};
+    use crate::models::nemotron_h::config::NemotronHConfig;
+    use crate::models::nemotron_h::model::NemotronHInner;
     use crate::models::qwen3_5::config::Qwen3_5Config;
     use crate::models::qwen3_5::model::{Qwen35Cmd, Qwen35Inner};
     use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
@@ -2575,34 +2602,209 @@ mod tests {
         );
     }
 
+    /// Paged adapter + a complete native MTP head whose flat core has no
+    /// streaming arm: the shape whose lane and decoder answers used to be
+    /// derived in two different places.
+    fn tiny_nemotron_paged_mtp_config() -> NemotronHConfig {
+        NemotronHConfig {
+            vocab_size: 32,
+            hidden_size: 256,
+            num_hidden_layers: 3,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 128,
+            max_position_embeddings: 512,
+            layer_norm_epsilon: 1e-5,
+            layers_block_type: vec![
+                "linear_attention".into(),
+                "moe".into(),
+                "full_attention".into(),
+            ],
+            mamba_num_heads: 2,
+            mamba_head_dim: 2,
+            ssm_state_size: 2,
+            n_groups: 1,
+            conv_kernel: 4,
+            chunk_size: 4,
+            time_step_min: 0.001,
+            time_step_limit: None,
+            n_routed_experts: 4,
+            num_experts_per_tok: 1,
+            routed_scaling_factor: 1.0,
+            norm_topk_prob: true,
+            intermediate_size: 6,
+            moe_shared_expert_intermediate_size: 8,
+            eos_token_ids: vec![2],
+            mtp_layers_block_type: vec!["full_attention".into(), "moe".into()],
+            n_mtp_layers: 1,
+            paged_cache_memory_mb: Some(256),
+            paged_block_size: Some(16),
+            use_block_paged_cache: Some(true),
+        }
+    }
+
+    fn mtp_config() -> ChatConfig {
+        ChatConfig {
+            enable_mtp: Some(true),
+            ..ChatConfig::default()
+        }
+    }
+
+    fn sync_start(
+        config: ChatConfig,
+    ) -> (ChatCmd, tokio::sync::oneshot::Receiver<Result<ChatResult>>) {
+        let (reply, result) = tokio::sync::oneshot::channel();
+        (
+            ChatCmd::SessionStart {
+                messages: Vec::new(),
+                config,
+                reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+            result,
+        )
+    }
+
+    fn streaming_start(
+        config: ChatConfig,
+    ) -> (
+        ChatCmd,
+        tokio::sync::mpsc::Receiver<Result<crate::engine::types::ChatStreamChunk>>,
+    ) {
+        let (stream_tx, rx) = crate::model_thread::stream_channel(4);
+        (
+            ChatCmd::StreamSessionStart {
+                messages: Vec::new(),
+                config,
+                stream_tx,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            },
+            rx,
+        )
+    }
+
+    /// L-LANE, the seam this whole gate exists for: whenever the scheduler
+    /// declines to barrier a turn, the PLANNER must resolve that same turn to
+    /// an autoregressive decoder. A model that speculates on the scheduled
+    /// lane has no per-row drafter state, so a gap here is a correctness bug,
+    /// not a perf one.
+    ///
+    /// Driven against a REAL NemotronH plan, whose speculative decoder is
+    /// admitted for sync turns and refused for streaming ones — the one
+    /// family where the two answers can differ.
+    ///
+    /// MUTATIONS, each verified to fail exactly this test:
+    ///   * barrier on `config.enable_mtp` alone (drop the
+    ///     `speculation_requires_exclusive_lane` conjunct) — the streaming and
+    ///     no-head legs report a barrier the planner does not need;
+    ///   * drop `admits_streaming` from `speculation_requires_exclusive_lane`
+    ///     — the streaming leg barriers while the plan says autoregressive.
     #[test]
-    fn mtp_chat_turns_require_barrier_while_lane_is_barrier() {
-        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+    fn the_barrier_gate_never_declines_a_turn_the_planner_will_speculate_on() {
+        let mut inner =
+            NemotronHInner::new(tiny_nemotron_paged_mtp_config()).expect("construct tiny nemotron");
+        inner.mtp_weights_loaded = true;
+        assert!(
+            inner.paged_adapter.is_some(),
+            "the seam needs the paged adapter exposed"
+        );
         let state = HybridSchedulerState::new(inner).expect("construct scheduler");
 
-        let (mtp_reply, _mtp_result) = tokio::sync::oneshot::channel();
-        let mtp_start = ChatCmd::SessionStart {
-            messages: Vec::new(),
-            config: ChatConfig {
-                enable_mtp: Some(true),
-                ..ChatConfig::default()
-            },
-            reply: mtp_reply,
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
+        for streaming in [false, true] {
+            let (command, _keepalive): (ChatCmd, Box<dyn std::any::Any>) = if streaming {
+                let (command, rx) = streaming_start(mtp_config());
+                (command, Box::new(rx))
+            } else {
+                let (command, rx) = sync_start(mtp_config());
+                (command, Box::new(rx))
+            };
+            let barriers = state.chat_requires_barrier(&command);
+            let plan = TurnPlan::resolve(
+                ChatBackend::execution_plan(&state.inner),
+                TurnRequest {
+                    is_delta: false,
+                    input_media: MediaCapabilities::NONE,
+                    context_media: MediaCapabilities::NONE,
+                    speculative_requested: true,
+                    streaming,
+                },
+            );
+            let speculates = matches!(plan.decoder, DecoderPlan::Speculative(_));
+            assert_eq!(
+                barriers, speculates,
+                "lane gate and planner disagree (streaming={streaming}): \
+                 barriers={barriers}, plan={plan:?}"
+            );
+        }
+
+        // The two answers, spelled out, so a mutation that flips BOTH in step
+        // cannot pass on the equality above alone.
+        let (sync, _sync_rx) = sync_start(mtp_config());
         assert!(
-            state.chat_requires_barrier(&mtp_start),
-            "an enable_mtp turn must stay on the exclusive lane while the \
-             speculative lane decision is Barrier"
+            state.chat_requires_barrier(&sync),
+            "a sync MTP turn runs the flat speculative core and needs the exclusive lane"
+        );
+        let (streamed, _stream_rx) = streaming_start(mtp_config());
+        assert!(
+            !state.chat_requires_barrier(&streamed),
+            "the flat MTP core has no streaming arm, so a streaming MTP turn is plain \
+             paged AR and must not stall the whole model"
+        );
+        assert_eq!(
+            TurnPlan::resolve(
+                ChatBackend::execution_plan(&state.inner),
+                TurnRequest {
+                    is_delta: false,
+                    input_media: MediaCapabilities::NONE,
+                    context_media: MediaCapabilities::NONE,
+                    speculative_requested: true,
+                    streaming: true,
+                },
+            )
+            .path(),
+            TurnPath::Paged,
+            "the refused streaming turn belongs to the scheduler's own paged AR lane"
+        );
+    }
+
+    /// A model with NO speculative decoder must not barrier on `enable_mtp`:
+    /// the flag is a request, and the plan for it is plain autoregressive.
+    ///
+    /// MUTATION: barrier on `config.enable_mtp` alone — the first assertion
+    /// fails, since this dense fixture carries no MTP head.
+    #[test]
+    fn enable_mtp_without_a_loaded_decoder_keeps_the_scheduled_lane() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        assert!(
+            ChatBackend::execution_plan(&state.inner)
+                .speculative
+                .is_none(),
+            "the fixture must carry no MTP head"
         );
 
-        let (plain_reply, _plain_result) = tokio::sync::oneshot::channel();
-        let plain_start = ChatCmd::SessionStart {
-            messages: Vec::new(),
-            config: ChatConfig::default(),
-            reply: plain_reply,
-            cancelled: Arc::new(AtomicBool::new(false)),
-        };
+        let (mtp_start, _mtp_result) = sync_start(mtp_config());
+        assert!(
+            !state.chat_requires_barrier(&mtp_start),
+            "an enable_mtp turn on a model with nothing to speculate with resolves \
+             autoregressive and belongs on the scheduled lane"
+        );
+        assert_eq!(
+            TurnPlan::resolve(
+                ChatBackend::execution_plan(&state.inner),
+                TurnRequest {
+                    is_delta: false,
+                    input_media: MediaCapabilities::NONE,
+                    context_media: MediaCapabilities::NONE,
+                    speculative_requested: true,
+                    streaming: false,
+                },
+            )
+            .decoder,
+            DecoderPlan::Autoregressive,
+        );
+
+        let (plain_start, _plain_result) = sync_start(ChatConfig::default());
         assert!(!state.chat_requires_barrier(&plain_start));
     }
 

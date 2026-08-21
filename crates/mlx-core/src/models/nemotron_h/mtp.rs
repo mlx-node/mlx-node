@@ -427,7 +427,9 @@ mod mtp_turn_tests {
     use crate::engine::params::extract_chat_params;
     use crate::engine::penalties::ReasoningTracker;
     use crate::engine::persistence::compiled_forward_backend_available;
-    use crate::engine::plan::{MediaCapabilities, TurnPath, TurnPlan, TurnRequest};
+    use crate::engine::plan::{
+        DecoderPlan, MediaCapabilities, SpeculativeKind, TurnPath, TurnPlan, TurnRequest,
+    };
     use crate::engine::types::ChatConfig;
     use crate::models::nemotron_h::config::NemotronHConfig;
     use crate::models::nemotron_h::layer_cache::NemotronHLayerCache;
@@ -1384,7 +1386,13 @@ mod mtp_turn_tests {
         assert!(err2.reason.contains("paged_block_size"), "{}", err2.reason);
     }
 
-    /// the exact wiring the real-checkpoint E2E was missing.
+    /// The PLAN itself routes an MTP-requested turn to the flat speculative
+    /// core on a paged model — the family has no re-routing override left to
+    /// compensate with, so anything the plan gets wrong here decodes wrong.
+    ///
+    /// MUTATION: flip `supports_streaming` to `true` in `execution_plan` —
+    /// the streaming leg then resolves `Speculative`/`TurnPath::Speculative`
+    /// and both of its assertions fail.
     #[test]
     fn mtp_request_on_paged_model_routes_to_flat_core() {
         if !compiled_forward_backend_available() {
@@ -1403,49 +1411,41 @@ mod mtp_turn_tests {
         assert!(exec.paged_attention.is_some(), "paged adapter exposed");
         assert!(exec.speculative.is_some(), "MTP plan present");
 
-        // Engine resolution: paged attention wins, the speculative decoder
-        // is not admitted, and the turn resolves to the Paged path.
-        let plan = TurnPlan::resolve(
-            exec,
-            TurnRequest {
-                is_delta: false,
-                input_media: MediaCapabilities::NONE,
-                context_media: MediaCapabilities::NONE,
-                speculative_requested: true,
-            },
-        );
-        assert_eq!(
-            plan.path(),
-            TurnPath::Paged,
-            "engine resolves paged+MTP to the paged path (the override compensates)"
-        );
-
-        // The family's run_paged_turn override compensates: any sync
-        // MTP-requested turn on an MTP-capable model routes flat.
-        let mut chat_cfg = ChatConfig {
-            enable_mtp: Some(true),
-            ..ChatConfig::default()
+        let request = |speculative_requested: bool, streaming: bool| TurnRequest {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            speculative_requested,
+            streaming,
         };
-        let p = extract_chat_params(&chat_cfg);
-        assert!(
-            inner.mtp_flat_routing_required(&p, false),
-            "sync enable_mtp turn on an MTP-capable paged model must route flat"
+
+        // A sync MTP request takes the flat lane WITH its target: the draft
+        // head reads the flat KV, so the paged pools step aside.
+        let sync = TurnPlan::resolve(exec, request(true, false));
+        assert_eq!(
+            sync.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            "a sync enable_mtp turn on an MTP-capable paged model must plan MTP"
         );
-        assert!(
-            !inner.mtp_flat_routing_required(&p, true),
-            "streaming MTP turns keep the paged AR fallback"
-        );
-        chat_cfg.enable_mtp = None;
-        let p_ar = extract_chat_params(&chat_cfg);
-        assert!(
-            !inner.mtp_flat_routing_required(&p_ar, false),
-            "plain AR turns must stay on the paged lane"
-        );
+        assert_eq!(sync.path(), TurnPath::Speculative);
+        assert!(!sync.use_paged_attention);
+
+        // The flat MTP core has no streaming arm, so a streaming request keeps
+        // the target's own paged autoregressive lane.
+        let streamed = TurnPlan::resolve(exec, request(true, true));
+        assert_eq!(streamed.decoder, DecoderPlan::Autoregressive);
+        assert_eq!(streamed.path(), TurnPath::Paged);
+
+        // Plain AR turns stay on the paged lane.
+        let plain = TurnPlan::resolve(exec, request(false, false));
+        assert_eq!(plain.decoder, DecoderPlan::Autoregressive);
+        assert_eq!(plain.path(), TurnPath::Paged);
+
+        // With no loaded head there is no speculative plan to admit.
         inner.mtp_weights_loaded = false;
-        assert!(
-            !inner.mtp_flat_routing_required(&p, false),
-            "MTP requested without a loaded head must not route flat"
-        );
+        let disarmed = TurnPlan::resolve(inner.execution_plan(), request(true, false));
+        assert_eq!(disarmed.decoder, DecoderPlan::Autoregressive);
+        assert_eq!(disarmed.path(), TurnPath::Paged);
     }
 
     /// Real-checkpoint T=0 lossless gate (env-gated:

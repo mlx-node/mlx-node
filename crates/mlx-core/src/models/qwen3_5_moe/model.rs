@@ -9198,6 +9198,7 @@ fn qwen35_moe_speculative_plan() -> SpeculativePlan {
         supported_input_media: MediaCapabilities::NONE,
         supported_context_media: MediaCapabilities::NONE,
         supports_paged_attention: true,
+        supports_streaming: true,
     }
 }
 
@@ -12310,6 +12311,7 @@ mod paged_speculative_routing_tests {
             input_media: MediaCapabilities::NONE,
             context_media: MediaCapabilities::NONE,
             speculative_requested: true,
+            streaming: false,
         }
     }
 
@@ -12367,6 +12369,7 @@ mod paged_speculative_routing_tests {
             input_media: MediaCapabilities::IMAGES,
             context_media: MediaCapabilities::NONE,
             speculative_requested: true,
+            streaming: false,
         };
         for paged in [false, true] {
             let plan = TurnPlan::resolve(execution(paged, true), request);

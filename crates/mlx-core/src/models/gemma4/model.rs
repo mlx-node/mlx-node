@@ -7433,6 +7433,7 @@ impl ChatBackend for Gemma4Inner {
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
                 supports_paged_attention: true,
+                supports_streaming: true,
             }),
             // The assistant drafter reads the target's flat `Gemma4LayerCache`
             // K/V arrays directly for its Q-only attention, which the pools
@@ -7443,6 +7444,7 @@ impl ChatBackend for Gemma4Inner {
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
                 supports_paged_attention: false,
+                supports_streaming: true,
             }),
             None => None,
         };
@@ -12205,6 +12207,7 @@ pub(crate) mod tests {
             input_media: MediaCapabilities::NONE,
             context_media: MediaCapabilities::NONE,
             speculative_requested: true,
+            streaming: false,
         };
         let plan = TurnPlan::resolve(execution, request);
         assert_eq!(
@@ -12267,6 +12270,7 @@ pub(crate) mod tests {
                 input_media: MediaCapabilities::NONE,
                 context_media: MediaCapabilities::NONE,
                 speculative_requested: true,
+                streaming: false,
             },
         );
         assert_eq!(
@@ -12315,6 +12319,7 @@ pub(crate) mod tests {
                 input_media: MediaCapabilities::NONE,
                 context_media: inner.media_session_context,
                 speculative_requested: true,
+                streaming: false,
             },
         );
         assert_eq!(
@@ -12338,6 +12343,7 @@ pub(crate) mod tests {
                 input_media: MediaCapabilities::NONE,
                 context_media: MediaCapabilities::NONE,
                 speculative_requested: true,
+                streaming: false,
             },
         );
         assert_eq!(
@@ -12383,6 +12389,7 @@ pub(crate) mod tests {
                 input_media: MediaCapabilities::NONE,
                 context_media: MediaCapabilities::NONE,
                 speculative_requested: true,
+                streaming: false,
             },
         );
         assert_eq!(
@@ -12400,6 +12407,7 @@ pub(crate) mod tests {
                 input_media: MediaCapabilities::NONE,
                 context_media: MediaCapabilities::NONE,
                 speculative_requested: false,
+                streaming: false,
             },
         );
         assert_eq!(ar_plan.path(), TurnPath::Paged);

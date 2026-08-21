@@ -1653,6 +1653,7 @@ mod tests {
                         supported_input_media: crate::engine::plan::MediaCapabilities::NONE,
                         supported_context_media: crate::engine::plan::MediaCapabilities::NONE,
                         supports_paged_attention: true,
+                        supports_streaming: true,
                     }),
                 ..crate::engine::plan::ExecutionPlan::TEXT_ONLY
             }

@@ -1609,6 +1609,7 @@ impl ChatBackend for MuseGlimmerInner {
                 supported_input_media: crate::engine::plan::MediaCapabilities::NONE,
                 supported_context_media: crate::engine::plan::MediaCapabilities::NONE,
                 supports_paged_attention: false,
+                supports_streaming: true,
             }),
         }
     }
@@ -1857,6 +1858,63 @@ mod spec_paged_settle_tests {
             active_flat_session: false,
             sliding_cold_checkpoints: HashMap::new(),
         })
+    }
+
+    /// Cache-lane selection and the engine planner must agree about an
+    /// `enable_mtp` command on a checkpoint with NO DFlash drafter: the plan
+    /// is plain paged autoregressive, so the barrier must leave the pools
+    /// visible instead of installing flat caches the next turn cannot
+    /// continue from.
+    ///
+    /// MUTATION: drop the `self.dflash.is_some()` conjunct from
+    /// `requires_flat_lane` — the first assertion fails while the planner
+    /// still reports paged AR, which is exactly the split this pins shut.
+    #[test]
+    fn a_drafterless_enable_mtp_command_keeps_the_paged_cache_lane() {
+        let Some(inner) = maybe_tiny_inner() else {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        };
+        assert!(
+            inner.dflash.is_none(),
+            "fixture must carry no DFlash drafter"
+        );
+        assert!(inner.paged.is_some(), "fixture must own the paged pools");
+
+        let (reply, _result) = tokio::sync::oneshot::channel();
+        let command = ChatCmd::SessionStart {
+            messages: Vec::new(),
+            config: ChatConfig {
+                enable_mtp: Some(true),
+                ..ChatConfig::default()
+            },
+            reply,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(
+            !inner.requires_flat_lane(&command),
+            "with no drafter loaded there is nothing the flat target caches would serve"
+        );
+
+        let plan = crate::engine::plan::TurnPlan::resolve(
+            ChatBackend::execution_plan(&inner),
+            crate::engine::plan::TurnRequest {
+                is_delta: false,
+                input_media: crate::engine::plan::MediaCapabilities::NONE,
+                context_media: crate::engine::plan::MediaCapabilities::NONE,
+                speculative_requested: true,
+                streaming: false,
+            },
+        );
+        assert_eq!(
+            plan.decoder,
+            crate::engine::plan::DecoderPlan::Autoregressive
+        );
+        assert_eq!(
+            plan.path(),
+            crate::engine::plan::TurnPath::Paged,
+            "the lane the barrier selects must be the lane the planner names"
+        );
     }
 
     /// A real sliding cold tier at a temp dir, so the rung walk actually

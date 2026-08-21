@@ -969,11 +969,15 @@ fn render_live_continuation<B: ChatBackend>(
 // The turn core
 // =====================================================================
 
+/// `streaming` is the turn's sink fact, carried into [`TurnRequest`] so the
+/// planner and the scheduler's lane gate answer "will this turn speculate?"
+/// from the same inputs.
 pub(crate) fn admit_paged_turn<B: ChatBackend>(
     backend: &mut B,
     messages: Vec<ChatMessage>,
     config: ChatConfig,
     turn_kind: TurnKind,
+    streaming: bool,
 ) -> Result<AdmittedPagedTurn> {
     let tokenizer = backend.tokenizer()?;
     let eos_id = backend.session_eos_id(&tokenizer)?;
@@ -1069,6 +1073,7 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
             input_media,
             context_media,
             speculative_requested: params.enable_mtp,
+            streaming,
         },
     );
     Ok(AdmittedPagedTurn {
@@ -1109,7 +1114,7 @@ fn chat_turn_core<B: ChatBackend>(
     streaming: Option<StreamingHooks<'_>>,
     turn_cancel: Option<&AtomicBool>,
 ) -> Result<Option<ChatResult>> {
-    let admitted = admit_paged_turn(backend, messages, config, turn_kind)?;
+    let admitted = admit_paged_turn(backend, messages, config, turn_kind, streaming.is_some())?;
     let tokenizer = admitted.tokenizer;
     let eos_id = admitted.eos_id;
     let think_end_id = admitted.think_end_id;

@@ -11739,6 +11739,7 @@ impl ChatBackend for Qwen35Inner {
                 // MTP probe and dense `paged_turn` handled MTP directly.
                 supported_context_media: MediaCapabilities::IMAGES,
                 supports_paged_attention: true,
+                supports_streaming: true,
             }),
         }
     }

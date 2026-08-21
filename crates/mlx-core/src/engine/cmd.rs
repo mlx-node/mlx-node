@@ -800,6 +800,7 @@ mod mock_backend_tests {
                     supported_input_media: MediaCapabilities::NONE,
                     supported_context_media: MediaCapabilities::NONE,
                     supports_paged_attention: false,
+                    supports_streaming: true,
                 }),
             }
         }
