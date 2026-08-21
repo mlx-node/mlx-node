@@ -2788,55 +2788,74 @@ fn prepare_muse_secondary_config(
                     "Muse-Glimmer companion has quantized profiles but no quantization metadata",
                 )
             })?;
-        // A target config may carry only one alias. Seed the missing one from its
-        // SIBLING, not from the companion block: seeding from the companion gives
-        // the two aliases different top-level geometry and different overrides, and
-        // the loader rejects a config whose aliases disagree.
-        let seed = config
-            .get("quantization")
-            .or_else(|| config.get("quantization_config"))
-            .cloned()
-            .unwrap_or_else(|| companion_quantization.clone());
+        // The two aliases name one block, so it is built once and written to
+        // both: a target carrying only `quantization` must not gain a
+        // `quantization_config` that describes a different checkpoint, and the
+        // loader rejects a config whose aliases disagree.
+        let mut target_block = None;
         for key in ["quantization", "quantization_config"] {
-            if config.get(key).is_none() {
-                config[key] = seed.clone();
-            }
-            let quant = config
-                .get_mut(key)
-                .and_then(serde_json::Value::as_object_mut)
-                .ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "Muse-Glimmer companion GGUF is K-quantized but {} has a non-object '{key}'",
-                        config_path.display()
-                    ))
-                })?;
-            // SafeTensors conversion writes target overrides as
-            // `language_model.model.layers.*`, which the shared parser reduces
-            // to the same bare `layers.*` namespace used by DFlash. Scope the
-            // target entries one wrapper deeper before adding companion
-            // profiles so target and draft layer 0 cannot overwrite each
-            // other. Main-GGUF conversion already emits this scoped form.
-            let target_keys = quant
-                .keys()
-                .filter_map(|entry| {
-                    entry
-                        .strip_prefix("language_model.model.layers.")
-                        .map(|rest| (entry.clone(), rest.to_string()))
-                })
-                .collect::<Vec<_>>();
-            for (source, rest) in target_keys {
-                let value = quant.remove(&source).expect("collected quantization key");
-                let target = format!("language_model.model.language_model.layers.{rest}");
-                if quant.insert(target.clone(), value).is_some() {
+            let Some(alias) = config.get(key) else {
+                continue;
+            };
+            let alias = alias.as_object().ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Muse-Glimmer companion GGUF is K-quantized but {} has a non-object '{key}'",
+                    config_path.display()
+                ))
+            })?;
+            if let Some(sibling) = &target_block {
+                if sibling != alias {
                     return Err(Error::from_reason(format!(
-                        "Muse-Glimmer companion quantization collides with existing scoped target override '{target}'"
+                        "Muse-Glimmer target {} has conflicting 'quantization' and \
+                         'quantization_config' blocks; they must be identical",
+                        config_path.display()
                     )));
                 }
-            }
-            for (prefix, profile) in &profiles {
-                quant.insert(prefix.clone(), profile.to_json());
+            } else {
+                target_block = Some(alias.clone());
             }
         }
+
+        // SafeTensors conversion writes target overrides as
+        // `language_model.model.layers.*`, which the shared parser reduces to
+        // the same bare `layers.*` namespace used by DFlash. Scope the target
+        // entries one wrapper deeper before adding companion profiles so target
+        // and draft layer 0 cannot overwrite each other. Main-GGUF conversion
+        // already emits this scoped form. Only a block that came from a target
+        // alias is rescoped: the companion's own keys are already in the draft
+        // namespace, and the profiles below restate them verbatim.
+        let mut quant = match target_block {
+            Some(mut block) => {
+                let target_keys = block
+                    .keys()
+                    .filter_map(|entry| {
+                        entry
+                            .strip_prefix("language_model.model.layers.")
+                            .map(|rest| (entry.clone(), rest.to_string()))
+                    })
+                    .collect::<Vec<_>>();
+                for (source, rest) in target_keys {
+                    let value = block.remove(&source).expect("collected quantization key");
+                    let target = format!("language_model.model.language_model.layers.{rest}");
+                    if block.insert(target.clone(), value).is_some() {
+                        return Err(Error::from_reason(format!(
+                            "Muse-Glimmer companion quantization collides with existing scoped target override '{target}'"
+                        )));
+                    }
+                }
+                block
+            }
+            None => companion_quantization
+                .as_object()
+                .cloned()
+                .expect("preserved_source_quantization builds a JSON object"),
+        };
+        for (prefix, profile) in &profiles {
+            quant.insert(prefix.clone(), profile.to_json());
+        }
+        let quant = serde_json::Value::Object(quant);
+        config["quantization"] = quant.clone();
+        config["quantization_config"] = quant;
     }
 
     if is_dflash {
@@ -5683,6 +5702,120 @@ mod tests {
             );
         }
         assert_eq!(config["dflash_config"]["block_size"], 16);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn companion_seed_does_not_rescope_draft_keys_into_the_target_namespace() {
+        use crate::models::muse_glimmer::persistence::{
+            muse_projection_quant, quant_lookup_prefix,
+        };
+        use crate::models::quant_dispatch::{
+            PerLayerMode, PerLayerQuant, load_quant_settings_from_disk,
+        };
+
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-companion-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        let primary = valid_muse_target_config();
+        assert!(
+            primary.get("quantization").is_none() && primary.get("quantization_config").is_none(),
+            "ANTI-VACUITY: the fixture must carry NEITHER alias, or the companion never seeds \
+             the block and nothing below is exercised"
+        );
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&primary).expect("serialize dense target config"),
+        )
+        .expect("write dense target config");
+
+        let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("prepare K-quant DFlash with dense target")
+            .expect("companion config update");
+        let config: serde_json::Value =
+            serde_json::from_str(&prepared).expect("parse companion config");
+
+        assert_eq!(
+            config["quantization"], config["quantization_config"],
+            "aliases must agree or the loader refuses the checkpoint"
+        );
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                config[block]["language_model.model.layers.0.self_attn.q_proj"]["mode"], "q4k",
+                "the draft's own override must survive in '{block}'"
+            );
+            assert!(
+                config[block]
+                    .get("language_model.model.language_model.layers.0.self_attn.q_proj")
+                    .is_none(),
+                "'{block}' rescoped the draft's own key into the target's namespace: {}",
+                config[block]
+            );
+        }
+
+        fs::write(&config_path, &prepared).expect("write prepared config");
+        let (bits, group_size, top_mode, overrides) =
+            load_quant_settings_from_disk(&root, 4, 64).expect("load prepared quant settings");
+        let default = PerLayerQuant {
+            bits,
+            group_size,
+            mode: top_mode.unwrap_or(PerLayerMode::Affine),
+            input_amax: None,
+        };
+        assert_eq!(
+            muse_projection_quant("layers.0.self_attn.q_proj", &overrides, default).mode,
+            PerLayerMode::Q4K,
+            "the draft projection must still resolve to its own K-quant geometry"
+        );
+        // Spelling-independent: the loader normalizes every config key, so a
+        // companion entry under ANY spelling that reduces to a target
+        // projection's scoped key silently retypes that projection.
+        let layers = config["text_config"]["num_hidden_layers"]
+            .as_u64()
+            .expect("fixture states the target layer count");
+        let mut target_prefixes = vec!["model.language_model.embed_tokens".to_string()];
+        for index in 0..layers {
+            for projection in [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "self_attn.gate_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                target_prefixes.push(format!("model.language_model.layers.{index}.{projection}"));
+            }
+        }
+        for prefix in target_prefixes {
+            let scoped = quant_lookup_prefix(&prefix);
+            assert!(
+                !overrides.contains_key(&scoped),
+                "a companion profile resolved onto target projection '{prefix}' as '{scoped}'"
+            );
+        }
         fs::remove_dir_all(root).ok();
     }
 

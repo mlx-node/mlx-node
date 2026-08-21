@@ -42,11 +42,11 @@ fn required<'a>(params: &'a HashMap<String, MxArray>, key: &str) -> Result<&'a M
         .ok_or_else(|| Error::from_reason(format!("Muse-Glimmer checkpoint is missing '{key}'")))
 }
 
-fn quant_lookup_prefix(prefix: &str) -> String {
+pub(crate) fn quant_lookup_prefix(prefix: &str) -> String {
     normalize_per_layer_key(&crate::utils::normalize_override_key(prefix))
 }
 
-fn muse_projection_quant(
+pub(crate) fn muse_projection_quant(
     prefix: &str,
     overrides: &HashMap<String, PerLayerQuant>,
     default: PerLayerQuant,
