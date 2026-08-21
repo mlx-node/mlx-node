@@ -20,7 +20,10 @@ use crate::engine::backend::{
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
 };
-use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, HybridSchedulerCommand};
+use crate::engine::hybrid_scheduler::{
+    HybridSchedulerBackend, HybridSchedulerCommand, pool_tokens_after_recurrent,
+    scheduled_turn_context, scheduler_per_seq_context_override,
+};
 use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
@@ -584,6 +587,27 @@ mod paged_context_capacity_tests {
         let mut params = make_params(10);
         constrain_paged_context_params("test", 48, 64, &mut params).unwrap();
         assert_eq!(params.max_new_tokens, 10);
+    }
+
+    #[test]
+    fn scheduler_usable_window_is_stricter_than_trained_min_pool_when_recurrent_is_nonzero() {
+        use crate::engine::hybrid_scheduler::{
+            pool_tokens_after_recurrent, scheduled_turn_context,
+        };
+        let trained = 1_048_576;
+        let pool = 1_048_576;
+        let rec = 48 * 1024 * 1024;
+        let usable = pool_tokens_after_recurrent(pool, 16, 1024, rec);
+        let old = trained.min(pool);
+        let effective = scheduled_turn_context(trained, usable, None);
+        assert!(rec > 0);
+        assert!(usable < pool);
+        assert!(effective < old);
+        assert_eq!(effective, usable);
+        assert_eq!(
+            scheduled_turn_context(trained, usable, Some(32_768)),
+            32_768
+        );
     }
 }
 
@@ -1810,9 +1834,16 @@ impl Qwen35Inner {
         };
         let blocks = adapter.block_capacity();
         let block_size = adapter.block_size();
+        let bytes_per_block = adapter.bytes_per_block().unwrap_or(0);
+        let usable = pool_tokens_after_recurrent(
+            adapter.max_capacity_tokens(),
+            block_size,
+            bytes_per_block,
+            self.config.recurrent_state_bytes(),
+        );
         (
             trained,
-            trained.min(adapter.max_capacity_tokens()),
+            scheduled_turn_context(trained, usable, scheduler_per_seq_context_override()),
             blocks,
             block_size,
         )
@@ -1823,12 +1854,12 @@ impl Qwen35Inner {
         prompt_tokens: usize,
         params: &mut engine::ChatParams,
     ) -> Result<()> {
-        let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
-            Error::from_reason("context_length_exceeded: paged cache is not initialized")
-        })?;
-        let capacity = adapter
-            .max_capacity_tokens()
-            .min(self.config.max_position_embeddings.max(0) as u32);
+        if self.paged_adapter.is_none() {
+            return Err(Error::from_reason(
+                "context_length_exceeded: paged cache is not initialized",
+            ));
+        }
+        let (_, capacity, _, _) = self.paged_context_limits();
         constrain_paged_context_params("Qwen3.5", prompt_tokens, capacity, params)
     }
 
@@ -14795,6 +14826,87 @@ mod paged_construction_tests {
         cfg.linear_value_head_dim = 32;
         cfg.paged_cache_memory_mb = Some(256);
         cfg
+    }
+
+    fn expected_scheduler_window(inner: &Qwen35Inner) -> (u32, u32, u32) {
+        use crate::engine::hybrid_scheduler::{
+            pool_tokens_after_recurrent, scheduled_turn_context, scheduler_per_seq_context_override,
+        };
+        let trained = inner.config.max_position_embeddings.max(0) as u32;
+        let adapter = inner
+            .paged_adapter
+            .as_ref()
+            .expect("test adapter must be installed");
+        let pool = adapter.max_capacity_tokens();
+        let usable = pool_tokens_after_recurrent(
+            pool,
+            adapter.block_size(),
+            adapter.bytes_per_block().unwrap_or(0),
+            inner.config.recurrent_state_bytes(),
+        );
+        (
+            trained,
+            scheduled_turn_context(trained, usable, scheduler_per_seq_context_override()),
+            pool,
+        )
+    }
+
+    #[test]
+    fn tiny_hybrid_recurrent_bytes_make_usable_window_stricter_than_raw_pool() {
+        use crate::engine::hybrid_scheduler::{
+            pool_tokens_after_recurrent, scheduled_turn_context,
+        };
+        let inner = Qwen35Inner::new(tiny_cfg(false)).expect("construct tiny dense model");
+        let rec = inner.config.recurrent_state_bytes();
+        assert!(rec > 0, "tiny hybrid config must have GDN state");
+        let trained = 1_048_576;
+        let pool = 349_520;
+        let usable = pool_tokens_after_recurrent(pool, 16, 1024, rec);
+        assert!(usable < pool);
+        assert_ne!(
+            scheduled_turn_context(trained, usable, None),
+            trained.min(pool)
+        );
+        assert_eq!(
+            scheduled_turn_context(trained, usable, Some(32_768)),
+            32_768
+        );
+    }
+
+    #[test]
+    fn paged_context_limits_and_preflight_use_scheduler_usable_window() {
+        let Some(inner) = dense_inner_with_test_adapter_or_skip(
+            "paged_context_limits_and_preflight_use_scheduler_usable_window",
+        ) else {
+            return;
+        };
+        assert!(inner.config.recurrent_state_bytes() > 0);
+        let (trained, expected, pool) = expected_scheduler_window(&inner);
+        let (published_trained, effective, _, _) = inner.paged_context_limits();
+        assert_eq!(published_trained, trained);
+        assert_eq!(effective, expected);
+        assert!(
+            effective < pool,
+            "recurrent charge must shrink the published window below raw pool tokens"
+        );
+        assert_ne!(effective, trained.min(pool));
+
+        let mut params = extract_chat_params(&crate::engine::types::ChatConfig {
+            max_new_tokens: Some(32),
+            ..crate::engine::types::ChatConfig::default()
+        });
+        inner
+            .preflight_paged_context(effective as usize, &mut params)
+            .expect("prompt at the scheduler window must pass");
+        let err = inner
+            .preflight_paged_context(pool as usize, &mut params)
+            .expect_err("prompt at raw pool tokens must fail after recurrent charge");
+        assert!(
+            err.reason
+                .starts_with("context_length_exceeded: rendered prompt has"),
+            "{}",
+            err.reason
+        );
     }
 
     #[test]
