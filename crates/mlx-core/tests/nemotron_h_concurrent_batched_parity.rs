@@ -1,36 +1,13 @@
 //! Real-NemotronH continuous-batching token parity and occupancy gate.
 //!
-//! The serial oracle deliberately runs through the scheduler one request at a
-//! time. Its decode therefore carries the incremental mamba state produced by
-//! each preceding token (the batched lane stacks those states into [N, ...]
-//! rows). Every request is text-only plain autoregressive decode; MTP-capable
-//! checkpoints are valid fixtures but the test explicitly disables MTP so the
-//! ordered-barrier path cannot mask the scheduled lane.
+//! The serial oracle runs through the scheduler one request at a time, so its
+//! decode carries the same incremental mamba state the batched lane stacks into
+//! [N, ...] rows. MTP is explicitly disabled so the ordered-barrier path cannot
+//! mask the scheduled lane.
 //!
-//! ## Env var
-//!
-//! This gate reads the family-specific **`MLX_TEST_NEMOTRON_H_MODEL_PATH`**
-//! (see `model_path` below), the same variable
-//! `nemotron_h_mtp_midcycle_state.rs` reads. `nemotron_h_paged_vs_flat_parity.rs`
-//! deliberately reads the GENERIC `MLX_TEST_MODEL_PATH` instead — set BOTH to
-//! the same checkpoint when running the whole nemotron gate set, or one of
-//! them silently skips.
-//!
-//! ## Cases
-//!
-//! Two of them, because they exercise different scheduler paths:
-//!   * short prompts — single-step prefill per row, then a long shared decode
-//!     window (the batched-decode occupancy gate);
-//!   * long prompts — a PAIR that cannot fit the scheduler's 2048-token
-//!     per-step budget (`MLX_SCHED_MAX_BATCHED_TOKENS`,
-//!     `engine/hybrid_scheduler.rs:316`), so admission has to split the
-//!     prefill across steps and the multi-row / chunk-aligned prefill path
-//!     actually runs. The short case never reaches that budget and therefore
-//!     never covered it.
-//!
-//! Run with:
-//! `MLX_TEST_NEMOTRON_H_MODEL_PATH=/abs/nemotron-h cargo test -p mlx-core \
-//!   --test nemotron_h_concurrent_batched_parity -- --ignored --nocapture`
+//! Reads `MLX_TEST_NEMOTRON_H_MODEL_PATH`; the sibling
+//! `nemotron_h_paged_vs_flat_parity.rs` reads the generic `MLX_TEST_MODEL_PATH`
+//! instead, so set both or one silently skips.
 
 use std::path::PathBuf;
 
@@ -100,14 +77,9 @@ fn assert_same(expected: &ChatResult, actual: &ChatResult, prompt: &str) {
     );
 }
 
-/// Minimum number of decode steps that must have carried >= 2 live rows.
-///
-/// Each request decodes `max_new_tokens = 24` tokens, and both are dispatched
-/// together, so on a working batched lane nearly every decode step is an N=2
-/// step. The previous gate only asked for `max_batch_occupancy >= 2`, which
-/// ONE lucky step satisfies — a scheduler that serialized 23 of 24 steps and
-/// happened to overlap a single one passed it. A third of the window is the
-/// smallest threshold that cannot be met by incidental overlap.
+/// Minimum number of decode steps that must have carried >= 2 live rows. A
+/// peak-occupancy check would pass on ONE lucky overlapping step; a third of
+/// the window is the smallest threshold incidental overlap cannot reach.
 const MIN_BATCHED_DECODE_STEPS: f64 = 8.0;
 
 /// Steps recorded at occupancy >= 2 in the cumulative decode histogram.
@@ -144,10 +116,8 @@ async fn load_model_or_skip() -> Option<NemotronHModel> {
     Some(model)
 }
 
-/// Shared body: run every prompt serially (cold, one at a time, resetting in
-/// between) to build the oracle, then run the same prompts concurrently and
-/// require token-identical results plus a genuinely batched decode window.
-/// Returns the serial results so a caller can assert prompt-scale properties.
+/// Build the serial oracle, then require the concurrent run to be
+/// token-identical and to have a genuinely batched decode window.
 async fn serial_then_batched_parity(
     model: &NemotronHModel,
     prompts: &[String],
@@ -203,11 +173,9 @@ async fn serial_then_batched_parity(
     serial
 }
 
-/// Deterministic long prompt: ~20 tokens per line, so `lines = 120` renders
-/// well past 1024 tokens and a PAIR of them cannot fit the scheduler's
-/// 2048-token per-step budget. Every line is distinct (no n-gram cutoff
-/// interaction) and the two topics differ, so the two rows are not degenerate
-/// copies of each other.
+/// Deterministic long prompt sized so a PAIR cannot fit the scheduler's
+/// per-step token budget. Lines are all distinct (no n-gram cutoff
+/// interaction) and the two topics differ, so the rows are not copies.
 fn long_prompt(topic: &str, lines: usize) -> String {
     let mut s = String::with_capacity(lines * 96);
     s.push_str("Read the following instrument log, then answer the question at the end.\n\n");
@@ -238,16 +206,10 @@ async fn carried_state_serial_and_n2_batch_are_token_identical() {
     serial_then_batched_parity(&model, &prompts, "short").await;
 }
 
-/// Long-prompt case: the pair exceeds the scheduler's per-step token budget,
-/// so admission must split the prefill across steps and the multi-row /
-/// chunk-aligned prefill path runs. The short case above never reaches that
-/// budget, so without this test the entire multi-row prefill lane was
-/// uncovered by the real-weights gate.
-///
-/// MUTATION this catches: a chunk-aligned prefill split that mis-slices a
-/// Mamba-2 chunk across a step boundary changes the recurrence's reduction
-/// order for the batched leg only, flipping tokens against the serial oracle.
-/// The short prompts never split, so they cannot see it.
+/// Long-prompt case: the pair exceeds the scheduler's per-step token budget, so
+/// admission must split the prefill and the chunk-aligned multi-row path runs.
+/// The short case never reaches that budget, so it cannot see a split that
+/// mis-slices a Mamba-2 chunk across a step boundary.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs MLX_TEST_NEMOTRON_H_MODEL_PATH pointing to a real NemotronH checkpoint"]
 async fn long_prompt_multi_row_prefill_serial_and_n2_batch_are_token_identical() {
@@ -259,8 +221,8 @@ async fn long_prompt_multi_row_prefill_serial_and_n2_batch_are_token_identical()
     let prompts = [long_prompt("alpha", 120), long_prompt("bravo", 120)];
     let serial = serial_then_batched_parity(&model, &prompts, "long").await;
 
-    // Anti-vacuity: if the prompts render short, this test is just a slower
-    // copy of the short case and covers nothing new.
+    // ANTI-VACUITY: if the prompts render short, no prefill split happens and
+    // this is just a slower copy of the short case.
     let total: u32 = serial.iter().map(|r| r.prompt_tokens).sum();
     for (index, result) in serial.iter().enumerate() {
         assert!(

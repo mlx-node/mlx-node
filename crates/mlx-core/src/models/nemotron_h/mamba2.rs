@@ -1,20 +1,10 @@
-//! NemotronH Mamba-2 SSM mixer.
+//! NemotronH Mamba-2 SSM mixer: in_proj (gate | xBC | dt), depthwise causal
+//! conv1d, the SSM itself (chunk scan on prefill, recurrent update on decode),
+//! a Zamba2 gated RMSNorm, then out_proj.
 //!
-//! Port of the HuggingFace NemotronHMamba2Mixer plus the mamba_ssm
-//! mamba2_chunk_scan torch fallback (the math shown just above the mixer
-//! class in modeling_nemotron_h.py) to MLX ops.
-//!
-//! Architecture per layer:
-//!   * in_proj [d_inner + conv_dim + num_heads, hidden] -> split into
-//!     gate [d_inner] | xBC [conv_dim] | dt [num_heads]
-//!   * depthwise causal conv1d over xBC (kernel conv_kernel, groups =
-//!     conv_dim, explicit conv state [B, conv_kernel-1, conv_dim])
-//!   * xBC split into x [d_inner] | B [n_groups*state] | C [n_groups*state]
-//!   * Mamba-2 SSM: chunk scan (prefill) or per-token recurrent update
-//!     (decode), state [B, num_heads, head_dim, state_size] f32
-//!   * Zamba2 gated RMSNorm: (scan * silu(gate)) normalized per 512-wide
-//!     group, times the mixer norm weight [d_inner]
-//!   * out_proj [hidden, d_inner]
+//! The conv state, dt, A and the scan are kept in f32 while the references
+//! carry them in the model dtype, so `gated_rmsnorm` has to restore the mixer's
+//! entry dtype at the exit boundary.
 
 use crate::array::{DType, MxArray};
 use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
@@ -33,9 +23,8 @@ pub struct Mamba2State {
 }
 
 impl Mamba2State {
-    /// Stack per-request rows along the batch axis into one batched state.
-    /// All rows must share the same non-batch shape (conv [K-1, conv_dim]
-    /// and SSM [num_heads, head_dim, state_size]).
+    /// Stack per-request rows along the batch axis. All rows must share the
+    /// same non-batch shape.
     pub(crate) fn stack_rows(rows: &[&Mamba2State]) -> Result<Mamba2State> {
         if rows.is_empty() {
             return Err(Error::from_reason(
@@ -62,9 +51,8 @@ impl Mamba2State {
     }
 }
 
-/// The Mamba-2 mixer: in_proj, depthwise conv, SSM, Zamba2 gated norm,
-/// out_proj. A_log/D/dt_bias and the gated-norm weight are kept as plain
-/// tensors (never quantized).
+/// The Mamba-2 mixer. A_log/D/dt_bias and the gated-norm weight are kept as
+/// plain tensors, never quantized.
 pub struct NemotronHMamba2Mixer {
     pub(crate) in_proj: LinearProj,
     pub(crate) conv1d: Conv1d,
@@ -82,15 +70,12 @@ pub struct NemotronHMamba2Mixer {
     pub(crate) chunk_size: i32,
     /// `(min, max)` bounds applied to `softplus(dt + dt_bias)`, from
     /// `NemotronHConfig::time_step_limit_pair()`. Defaults to the unbounded
-    /// `(0.0, +inf)`, matching mamba_ssm's `dt_limit` default, vLLM's
-    /// hardcoded `(0.0, inf)` and mlx-lm's `time_step_limit`. NOT derived
-    /// from `time_step_min`.
+    /// `(0.0, +inf)` as every served reference does, and is NOT derived from
+    /// `time_step_min`.
     pub(crate) dt_limit: (f64, f64),
     /// Epsilon for the Zamba2 gated RMSNorm, from
-    /// `NemotronHConfig::layer_norm_epsilon` — the same value the decoder
-    /// layer's pre-norm uses. Was hardcoded to 1e-5; both are 1e-5 on the
-    /// released checkpoint, so no token changes here, but a sibling
-    /// checkpoint may declare a different one.
+    /// `NemotronHConfig::layer_norm_epsilon` — never a hardcoded literal, or a
+    /// sibling checkpoint declaring a different one is normalized wrongly.
     pub(crate) norm_eps: f64,
 }
 
@@ -144,12 +129,10 @@ impl NemotronHMamba2Mixer {
         self.d_inner + 2 * self.n_groups * self.ssm_state_size
     }
 
-    /// Whether any projection holds a quantized backend.
     pub fn is_quantized(&self) -> bool {
         self.in_proj.is_quantized() || self.out_proj.is_quantized()
     }
 
-    /// Create the zero-initialized per-request state.
     pub fn fresh_state(&self, batch: i64) -> Result<Mamba2State> {
         let conv_dim = self.conv1d.get_weight().shape_at(0)?;
         Ok(Mamba2State {
@@ -169,24 +152,19 @@ impl NemotronHMamba2Mixer {
         })
     }
 
-    /// Forward through the full mixer: in_proj -> conv -> SSM -> gated norm
-    /// -> out_proj. State present + T == 1 takes the recurrent decode path;
-    /// otherwise the chunk-scan prefill path (a present state seeds the
-    /// initial SSM state for continuation prefills).
+    /// State present + T == 1 takes the recurrent decode path; otherwise the
+    /// chunk scan, seeded from any present state for a continuation prefill.
     pub fn forward(&self, x: &MxArray, state: Option<&mut Mamba2State>) -> Result<MxArray> {
         let shape = x.shape()?;
         let batch = shape[0];
         let seq = shape[1];
-        // The mixer is dtype-transparent in every reference: mlx-lm casts the
-        // scan output back with `y.astype(x.dtype)` (ssm.py:190) and HF/vLLM
-        // run the whole mixer in the module dtype. This port deliberately
-        // keeps the conv state, dt, A and the SSM scan in f32, so the
-        // reference's "input dtype" has to be captured HERE, at the mixer
-        // boundary, and re-applied by `gated_rmsnorm`.
+        // The mixer is dtype-transparent in every reference, but this port
+        // keeps the conv state, dt, A and the scan in f32 — so capture the
+        // entry dtype HERE for `gated_rmsnorm` to re-apply on the way out.
         let io_dtype = x.dtype()?;
         let projected = self.in_proj.forward(x)?;
-        // Split by explicit sizes (14 = 4 + 8 + 2 is not evenly divisible
-        // into 3 sections): gate [d_inner] | xBC [conv_dim] | dt [num_heads].
+        // Split by explicit sizes — the three sections are unequal:
+        // gate [d_inner] | xBC [conv_dim] | dt [num_heads].
         let d_inner = self.d_inner as i64;
         let conv_dim = (self.conv_dim()) as i64;
         let gate = projected.slice_axis(2, 0, d_inner)?;
@@ -204,7 +182,6 @@ impl NemotronHMamba2Mixer {
         let d_inner = self.d_inner as i64;
         let group_state = (self.n_groups * self.ssm_state_size) as i64;
         let x_inner = conv_out.slice_axis(2, 0, d_inner)?;
-        // Reshape the group projections to [B, T, n_groups, ssm_state_size].
         let b_groups = conv_out
             .slice_axis(2, d_inner, d_inner + group_state)?
             .reshape(&[batch, seq, self.n_groups as i64, self.ssm_state_size as i64])?;
@@ -212,10 +189,8 @@ impl NemotronHMamba2Mixer {
             .slice_axis(2, d_inner + group_state, d_inner + 2 * group_state)?
             .reshape(&[batch, seq, self.n_groups as i64, self.ssm_state_size as i64])?;
 
-        // dt = clip(softplus(dt + dt_bias), time_step_limit). The default
-        // limit is (0.0, +inf) - i.e. no clamp - so this matches mlx-lm's
-        // `compute_dt` and mamba_ssm's `dt_limit` default. `time_step_min`
-        // is deliberately not consulted (see NemotronHConfig::time_step_min).
+        // dt = clip(softplus(dt + dt_bias), time_step_limit), which defaults to
+        // no clamp. `time_step_min` is deliberately not consulted.
         let dt = Activations::softplus(
             &dt_raw
                 .astype(DType::Float32)?
@@ -223,7 +198,6 @@ impl NemotronHMamba2Mixer {
         )?
         .clip(Some(self.dt_limit.0), Some(self.dt_limit.1))?;
 
-        // A = -exp(A_log)
         let a = self.a_log.astype(DType::Float32)?.exp()?.mul_scalar(-1.0)?;
 
         let x_reshaped =
@@ -288,13 +262,9 @@ impl NemotronHMamba2Mixer {
         let keep = (self.conv_kernel - 1) as i64;
         let next_state = padded.slice_axis(1, total_len - keep, total_len)?;
         let conv_out = self.conv1d.forward(&padded)?;
-        // HF's `causal_conv1d_update` applies the mixer activation (SiLU for
-        // this family) to the conv output BEFORE the SSM split into x/B/C
-        // (`modeling_nemotron_h.py`: `causal_conv1d_update(..., self.activation)`
-        // in the decode path and `activation=self.activation` in the fused
-        // `mamba_split_conv1d_scan_combined` kernel). Without it, negative
-        // pre-activation values flow into the SSM input x and B/C, the recurrent
-        // state accumulates unbounded and the residual stream diverges.
+        // The mixer activation (SiLU) belongs on the conv output BEFORE the SSM
+        // split into x/B/C. Without it, negative pre-activation values reach the
+        // SSM, the recurrent state accumulates unbounded and output diverges.
         let conv_out = Activations::silu(&conv_out)?;
         let out = if is_decode {
             let t = conv_out.shape_at(1)?;
@@ -305,11 +275,8 @@ impl NemotronHMamba2Mixer {
         Ok((out, next_state))
     }
 
-    /// Recurrent decode: one token, per-head update.
-    ///
-    /// x is [B, 1, num_heads, head_dim] f32, dt [B, 1, num_heads] f32
-    /// (already softplus + clamped), a [num_heads] f32 (= -exp(A_log)),
-    /// B/C in group form [B, 1, n_groups, state].
+    /// Recurrent decode: one token, per-head update. All inputs are f32, with
+    /// `dt` already softplus'd and clamped and B/C still in group form.
     fn decode_step(
         &self,
         x: &MxArray,
@@ -337,7 +304,6 @@ impl NemotronHMamba2Mixer {
             self.ssm_state_size as i64,
         ])?;
 
-        // dB = dt * B; dBx = dB * x[..., None]
         let dt3 = dt4.broadcast_to(&[batch, self.num_heads as i64, self.head_dim as i64, 1])?;
         let b4 = b_head.reshape(&[batch, self.num_heads as i64, 1, self.ssm_state_size as i64])?;
         let db = dt3.mul(&b4)?;
@@ -407,22 +373,14 @@ fn segment_sum(x: &MxArray, chunk: i64) -> Result<MxArray> {
 /// Zamba2 gated RMSNorm: (x * silu(gate)) reshaped [..., groups, gs],
 /// normalized per group (mean of squares + eps), rescaled by weight.
 ///
-/// `out_dtype` is the MIXER's I/O dtype, NOT `x`'s: `x` is the SSM scan
-/// output, which this port keeps in f32 while every reference carries it in
-/// the model dtype. All three references end the norm with a cast back to
-/// that dtype — vLLM `mamba_mixer2.py:148` `return self.weight *
-/// x.to(input_dtype)`, HF `modeling_zamba2.py:69` the same, mlx-lm never
-/// leaves bf16 at all (`mx.fast.rms_norm` on a bf16 input). This is where
-/// the f32 accumulation is closed. Without it the f32 escapes into
-/// `out_proj`, `decoder_layer.rs`'s `x.add(&mixer_out)` promotes the whole
-/// residual stream on layer 0 (the released checkpoint's layer 0 is a Mamba
-/// layer), the FLAT KV cache ends up f32 while the paged pool is a 2-byte
-/// pool, and the two lanes run different attention arithmetic.
+/// `out_dtype` is the MIXER's I/O dtype, NOT `x`'s — `x` is the f32 SSM scan
+/// output. This is where the f32 accumulation is closed; let it escape and
+/// `out_proj` inherits it, the residual stream promotes at the first Mamba
+/// layer, and the flat KV cache ends up f32 against a 2-byte paged pool.
 ///
-/// `weight` is cast too: `persistence.rs:539` upcasts the checkpoint's BF16
-/// `mixer.norm.weight` to f32, and an f32 weight would re-promote the
-/// product. bf16 -> f32 -> bf16 is lossless, so the cast recovers the
-/// checkpoint bytes exactly and matches vLLM's bf16 parameter bit for bit.
+/// `weight` is cast too, since the loader upcasts the checkpoint's BF16
+/// `mixer.norm.weight` and an f32 weight would re-promote the product
+/// (bf16 -> f32 -> bf16 is lossless, so this recovers the checkpoint bytes).
 fn gated_rmsnorm(
     x: &MxArray,
     gate: &MxArray,
@@ -467,16 +425,8 @@ fn pad_time(v: &MxArray, pad_size: i64, ndim: i64) -> Result<MxArray> {
     v.pad(&width, 0.0)
 }
 
-/// Mamba-2 chunk scan (the mamba_ssm mamba2_chunk_scan torch fallback
-/// ported to MLX). All inputs are f32.
-///
-/// * x [B, S, H, D] - SSM input (already x * dt applied by the caller)
-/// * dt [B, S, H] - discretized time steps
-/// * a [H] - A = -exp(A_log)
-/// * b / c [B, S, G, NS] - group-form projections
-/// * d [H] - per-head D
-/// * initial_states [B, H, D, NS] f32 or None
-///
+/// Mamba-2 chunk scan, the mamba_ssm torch fallback ported to MLX. All inputs
+/// are f32; `b`/`c` arrive in group form and `a` is already `-exp(A_log)`.
 /// Returns (output [B, S, H, D], final_state [B, H, D, NS]).
 pub fn chunk_scan(
     x: &MxArray,
@@ -505,18 +455,15 @@ pub fn chunk_scan(
     let c = c.astype(DType::Float32)?;
     let d = d.astype(DType::Float32)?;
 
-    // Expand B/C from groups to heads.
     let b_head = expand_groups(&b, heads_per_group)?; // [B,S,H,NS]
     let c_head = expand_groups(&c, heads_per_group)?;
 
-    // D residual: D[..., None] * x (original, un-scaled)
     let d_residual = d.reshape(&[1, 1, num_heads, 1])?.mul(&x)?; // [B,S,H,D]
 
     let pad_size = (chunk_size - seq % chunk_size) % chunk_size;
     let padded_seq = seq + pad_size;
 
-    // Discretize: x = x * dt; A = A * dt (on the unpadded tensors, then
-    // pad to a chunk multiple so every chunk is full).
+    // Discretize on the unpadded tensors, then pad to a full chunk multiple.
     let x = x.mul(&dt.reshape(&[batch, seq, num_heads, 1])?)?;
     let a = a.reshape(&[1, 1, num_heads])?.mul(&dt)?; // [B,S,H]
 
@@ -525,14 +472,12 @@ pub fn chunk_scan(
     let b_head = pad_time(&b_head, pad_size, 4)?;
     let c_head = pad_time(&c_head, pad_size, 4)?;
 
-    // Reshape into chunks.
     let n_chunks = padded_seq / chunk_size;
     let x_chunks = x.reshape(&[batch, n_chunks, chunk_size, num_heads, head_dim])?;
     let a_chunks = a.reshape(&[batch, n_chunks, chunk_size, num_heads])?;
     let b_chunks = b_head.reshape(&[batch, n_chunks, chunk_size, num_heads, state_size])?;
     let c_chunks = c_head.reshape(&[batch, n_chunks, chunk_size, num_heads, state_size])?;
 
-    // A [B,H,N,C]; A_cumsum over the chunk positions.
     let a_perm = a_chunks.transpose(Some(&[0, 3, 1, 2]))?;
     let a_cumsum = a_perm.cumsum(-1)?;
 
@@ -589,7 +534,6 @@ pub fn chunk_scan(
         chunk_size,
         head_dim,
     ])?;
-    // states[s,d] = sum_c B_decay[c,s]*x[c,d] = (B^T @ X)[s,d]
     let states = bd_mm
         .transpose(Some(&[0, 2, 1]))?
         .matmul(&x2_mm)?
@@ -669,8 +613,7 @@ mod tests {
     use super::*;
     use crate::models::nemotron_h::config::NemotronHConfig;
 
-    /// Tiny mixer config: hidden 8, 2 SSM heads x 2 dim, 1 group, state 2,
-    /// conv kernel 4, chunk 3.
+    /// Tiny mixer config for the unit tests.
     fn tiny_cfg() -> NemotronHConfig {
         NemotronHConfig {
             vocab_size: 32,
@@ -681,7 +624,6 @@ mod tests {
             head_dim: 4,
             max_position_embeddings: 64,
             layer_norm_epsilon: 1e-5,
-            rope_theta: 10000.0,
             layers_block_type: vec!["linear_attention".into(), "moe".into()],
             mamba_num_heads: 2,
             mamba_head_dim: 2,
@@ -694,16 +636,10 @@ mod tests {
             n_routed_experts: 2,
             num_experts_per_tok: 1,
             routed_scaling_factor: 1.0,
-            n_group: 1,
-            topk_group: 1,
             norm_topk_prob: true,
             intermediate_size: 8,
             moe_shared_expert_intermediate_size: 8,
-            tie_word_embeddings: false,
-            bos_token_id: 1,
             eos_token_ids: vec![2],
-            pad_token_id: 0,
-            num_logits_to_keep: 1,
             mtp_layers_block_type: Vec::new(),
             n_mtp_layers: 0,
             paged_cache_memory_mb: None,
@@ -713,15 +649,11 @@ mod tests {
     }
 
     /// The reference default time-step limit: `(0.0, +inf)`, i.e. no clamp.
-    /// mamba_ssm's `dt_limit` default, vLLM's hardcoded pair, and mlx-lm's
-    /// `ModelArgs.__post_init__` fallback all agree on it.
     const NO_DT_LIMIT: (f64, f64) = (0.0, f64::INFINITY);
 
-    /// Input amplitude for the dt-clamp regression tests. The SSM term
-    /// `dt * B * x * C` is cubic in the input while the `D * x` skip is
-    /// linear, so a larger input widens the gap a clamped dt opens up -
-    /// without it the whole difference hides under the 5e-3 parity
-    /// tolerance and the regression assertions would be vacuous.
+    /// Input amplitude for the dt-clamp regression tests. The SSM term is cubic
+    /// in the input while the `D * x` skip is linear, so a small input hides a
+    /// clamped dt under the parity tolerance and the assertions go vacuous.
     const SIGNAL: f32 = 4.0;
 
     fn softplus(v: f32) -> f32 {
@@ -729,12 +661,9 @@ mod tests {
         v.max(0.0) + (-v.abs()).exp().ln_1p()
     }
 
-    /// Apply a `time_step_limit` pair to a raw `softplus(dt + dt_bias)`,
-    /// exactly as `NemotronHMamba2Mixer::forward` does.
-    ///
-    /// These oracles used to hardcode `.max(0.001)` - the same clamp the
-    /// mixer wrongly derived from `time_step_min` - so no parity assertion
-    /// could see the clamp at all. They now take the limit as data.
+    /// Apply a `time_step_limit` pair to a raw `softplus(dt + dt_bias)`, as
+    /// `NemotronHMamba2Mixer::forward` does. The oracles must take the limit as
+    /// DATA — hardcode a clamp here and no parity assertion can see one.
     fn apply_dt_limit(v: f32, limit: (f64, f64)) -> f32 {
         v.clamp(limit.0 as f32, limit.1 as f32)
     }
@@ -789,7 +718,6 @@ mod tests {
         let d: Vec<f32> = vec![0.5, -0.3];
         let dt_bias: Vec<f32> = vec![0.1, -0.2];
 
-        // Reference with discretization applied INSIDE the scan (x*dt, A*dt).
         let (ref_out, ref_state) = {
             let mut state = vec![0.0f32; h * d_dim * ns];
             let mut out = vec![0.0f32; t * h * d_dim];
@@ -814,8 +742,7 @@ mod tests {
             (out, state)
         };
 
-        // The chunk scan receives PRE-PROCESSED dt (the mixer forward applies
-        // softplus(dt + dt_bias) + the time-step clamp before calling it).
+        // The chunk scan receives PRE-PROCESSED dt.
         let dt_proc: Vec<f32> = (0..t * h)
             .map(|i| apply_dt_limit(softplus(dt[i] + dt_bias[i % h]), NO_DT_LIMIT))
             .collect();
@@ -833,8 +760,7 @@ mod tests {
         let got_out = got_out.to_float32().unwrap().to_vec();
         let got_state = got_state.to_float32().unwrap().to_vec();
 
-        // The reference above discretizes exactly as the chunk scan does:
-        // x*dt and A*dt inside, D*x residual on the original x.
+        // The reference discretizes exactly as the chunk scan does.
         assert_close(&got_out, &ref_out, "chunk scan output vs sequential", 2e-3);
         assert_close(
             &got_state,
@@ -844,10 +770,9 @@ mod tests {
         );
     }
 
-    /// Full-mixer continuity: prefill over all tokens, then prefill-over-
-    /// prefix + decode, must leave the same SSM state and the decode output
-    /// must match a pure-Rust reference through the whole mixer (in_proj,
-    /// conv, SSM, gated norm, out_proj).
+    /// Full-mixer continuity: prefill-all and prefix-prefill + decode must
+    /// leave the same SSM state, and the decode output must match a pure-Rust
+    /// reference through the whole mixer.
     #[test]
     fn prefill_decode_state_continuity() {
         let cfg = tiny_cfg();
@@ -860,10 +785,8 @@ mod tests {
             .collect();
         let mx_x = MxArray::from_float32(&x, &[1, t as i64, h as i64]).unwrap();
 
-        // Reference: full mixer math in pure Rust.
         let (ref_out, ref_state) = mixer_reference(&mixer, &x, t, 1, mixer.dt_limit);
 
-        // Full prefill.
         let mut state = mixer.fresh_state(1).expect("fresh state");
         let full_out = mixer
             .forward(&mx_x, Some(&mut state))
@@ -878,7 +801,6 @@ mod tests {
             5e-3,
         );
 
-        // Prefix prefill (t-1 tokens) + decode (last token).
         let mx_prefix =
             MxArray::from_float32(&x[..(t - 1) * h], &[1, (t - 1) as i64, h as i64]).unwrap();
         let mx_last = MxArray::from_float32(&x[(t - 1) * h..], &[1, 1, h as i64]).unwrap();
@@ -892,15 +814,13 @@ mod tests {
         let decode_out = decode_out.to_float32().unwrap().to_vec();
         let decode_state = state2.ssm.to_float32().unwrap().to_vec();
 
-        // Decode output must equal the reference's LAST token output.
         assert_close(
             &decode_out,
             &ref_out[(t - 1) * h..],
             "decode output vs reference last token",
             5e-3,
         );
-        // State continuity: prefill-all and prefix+decode converge to the
-        // same final SSM state.
+        // Prefill-all and prefix+decode converge to the same SSM state.
         assert_close(&decode_state, &ref_state, "decode state vs reference", 5e-3);
     }
 
@@ -926,9 +846,8 @@ mod tests {
         let w_in = mixer.in_proj.get_weight().to_float32().unwrap().to_vec(); // [in_rows, hidden]
         let w_out = mixer.out_proj.get_weight().to_float32().unwrap().to_vec();
         let w_conv = mixer.conv1d.get_weight().to_float32().unwrap().to_vec(); // [conv_dim, K, 1]
-        // Read the conv bias by forwarding a zero input through the conv
-        // (output == bias for zero input) - avoids reaching into Conv1d's
-        // private bias field from this module.
+        // Read the conv bias by forwarding a zero input (output == bias),
+        // avoiding Conv1d's private field.
         let conv_bias = {
             // Use a kernel-length input so the conv output length stays >= 1.
             let zero = MxArray::zeros(&[1, 4, conv_dim as i64], Some(DType::Float32)).unwrap();
@@ -948,7 +867,6 @@ mod tests {
         let norm_w = mixer.norm_weight.to_float32().unwrap().to_vec();
         let k = mixer.conv_kernel as usize;
 
-        // in_proj
         let mut proj = vec![0.0f32; t * in_rows];
         for tt in 0..t {
             for o in 0..in_rows {
@@ -973,7 +891,6 @@ mod tests {
                 dt[tt * num_heads + o] = proj[tt * in_rows + d_inner + conv_dim + o];
             }
         }
-        // causal conv over xbc with 3 left zeros
         let mut xbc_pad = vec![0.0f32; t * conv_dim + (k - 1) * conv_dim];
         for tt in 0..t {
             for cc in 0..conv_dim {
@@ -990,8 +907,7 @@ mod tests {
                 if let Some(b) = &conv_bias {
                     acc += b[cc];
                 }
-                // HF applies the mixer activation (SiLU) to the conv output
-                // before the SSM split (causal_conv1d_update's activation arg).
+                // SiLU on the conv output, before the SSM split.
                 conv_out[tt * conv_dim + cc] = silu(acc);
             }
         }
@@ -1009,7 +925,6 @@ mod tests {
             }
         }
 
-        // SSM sequential reference
         let a: Vec<f32> = a_log.iter().map(|v| -v.exp()).collect();
         let mut state = vec![0.0f32; num_heads * head_dim * ns];
         let mut scan = vec![0.0f32; t * num_heads * head_dim];
@@ -1035,7 +950,6 @@ mod tests {
             }
         }
 
-        // Gated RMSNorm: (scan * silu(gate)) grouped, normalized per group.
         let group_size = d_inner / n_groups;
         let mut normed = vec![0.0f32; t * d_inner];
         for tt in 0..t {
@@ -1055,7 +969,6 @@ mod tests {
             }
         }
 
-        // out_proj
         let mut out = vec![0.0f32; t * hidden];
         for tt in 0..t {
             for o in 0..hidden {
@@ -1074,18 +987,15 @@ mod tests {
         v / (1.0 + (-v).exp())
     }
 
-    /// Build a tiny mixer with an explicit per-head `dt_bias` and a non-zero
-    /// `D` skip. The `D` skip matters: with `D == 0` the SSM output is
-    /// (near-)proportional to `dt`, and the gated RMSNorm that follows
-    /// divides that common factor straight back out - a clamp on `dt` would
-    /// be invisible at the mixer output. A non-zero `D` anchors the scale.
+    /// Tiny mixer with an explicit per-head `dt_bias` and a NON-ZERO `D` skip.
+    /// `D` matters: at `D == 0` the SSM output is near-proportional to `dt` and
+    /// the following RMSNorm divides that factor out, hiding a dt clamp.
     fn mixer_with_dt_bias(cfg: &NemotronHConfig, dt_bias: &[f32]) -> NemotronHMamba2Mixer {
         mixer_with_dt_bias_dtype(cfg, dt_bias, DType::Float32)
     }
 
-    /// Cast a fixture weight into the mixer's working dtype. `Float32` is the
-    /// historical path and returns the array untouched, so every pre-existing
-    /// f32 fixture stays byte-identical.
+    /// Cast a fixture weight into the mixer's working dtype (`Float32` is a
+    /// no-op, so f32 fixtures stay byte-identical).
     fn as_dtype(v: MxArray, dtype: DType) -> MxArray {
         if dtype == DType::Float32 {
             v
@@ -1094,17 +1004,13 @@ mod tests {
         }
     }
 
-    /// `mixer_with_dt_bias`, with the DENSE weights (in_proj, out_proj, conv)
-    /// carried in `dtype`. Production's `in_proj`/`out_proj` are MXFP8 and
-    /// restore the activation dtype at the projection boundary
-    /// (`quantized_linear.rs`), but a dense `Linear` is a bare
-    /// `input.matmul(&weight_t)` and MLX promotes `bf16 x f32 -> f32`, so a
-    /// bf16 stream can only be reproduced here with bf16 dense weights.
+    /// `mixer_with_dt_bias`, with the DENSE weights carried in `dtype`. A dense
+    /// `Linear` is a bare matmul and MLX promotes `bf16 x f32 -> f32`, so only
+    /// bf16 dense weights reproduce a bf16 stream here.
     ///
-    /// `norm_weight` deliberately stays FLOAT32 in every case: that is what
-    /// `persistence.rs:539` (`m.norm_weight = w.astype(DType::Float32)`)
-    /// installs from a BF16 checkpoint tensor, and it is the second half of
-    /// the promotion `gated_rmsnorm` has to close.
+    /// `norm_weight` deliberately stays FLOAT32 in every case — that is what
+    /// the loader installs from the BF16 checkpoint tensor, and it is the
+    /// second half of the promotion `gated_rmsnorm` has to close.
     fn mixer_with_dt_bias_dtype(
         cfg: &NemotronHConfig,
         dt_bias: &[f32],
@@ -1114,13 +1020,10 @@ mod tests {
         let heads = cfg.mamba_num_heads as i64;
         assert_eq!(dt_bias.len() as i64, heads, "dt_bias must be per-head");
 
-        // Every projection is overwritten with deterministic values.
-        // `new_mamba_mixer` seeds them from MLX's PROCESS-GLOBAL RNG, so
-        // under `cargo test`'s parallel harness the draw depends on which
-        // other tests happened to run first - and the "a clamp would change
-        // the output by more than X" assertions below are weight-dependent.
-        // Random weights made these tests pass alone and fail in a full-module
-        // run.
+        // Every projection MUST be overwritten deterministically:
+        // `new_mamba_mixer` seeds from MLX's PROCESS-GLOBAL RNG, so under the
+        // parallel harness the draw depends on what ran first — and the
+        // magnitude assertions below are weight-dependent.
         let hidden = cfg.hidden_size as i64;
         let in_rows = cfg.mamba_in_proj_size() as i64;
         let d_inner = cfg.mamba_intermediate_size() as i64;
@@ -1186,20 +1089,12 @@ mod tests {
             .collect()
     }
 
-    /// REGRESSION: `time_step_min` must never bind the runtime clamp.
+    /// REGRESSION: `time_step_min` must never bind the runtime clamp. No served
+    /// reference does that — only HF's torch fallback.
     ///
-    /// The mixer used to compute `softplus(dt + dt_bias).clip(time_step_min,
-    /// None)`. No production reference does that: the HF fused path keys off
-    /// `time_step_limit` (absent in the released config, so mamba_ssm's
-    /// `dt_limit=(0.0, inf)` applies), vLLM hardcodes `(0.0, inf)`, and
-    /// mlx-lm clips to a `time_step_limit` that defaults to `(0.0, inf)`.
-    /// Only the HF torch *fallback* clamps to `time_step_min`.
-    ///
-    /// Mutation caught: restoring `.clip(Some(self.time_step_min), None)` (or
-    /// any bound derived from `time_step_min`) in `forward`. `time_step_min`
-    /// is set to 0.5 here so a revived clamp is unmistakable; on the released
-    /// checkpoint (`time_step_min = 1e-3`) ~9% of the 1472 SSM heads have
-    /// `softplus(dt_bias) < 1e-3`, so the clamp was live in production too.
+    /// Mutation caught: `.clip(Some(self.time_step_min), None)`, or any bound
+    /// derived from `time_step_min`, in `forward`. The fixture exaggerates
+    /// `time_step_min` to 0.5 so a revived clamp is unmistakable.
     #[test]
     fn time_step_min_does_not_clamp_dt() {
         let mut cfg = tiny_cfg();
@@ -1235,8 +1130,7 @@ mod tests {
         let (ref_unclamped, _) = mixer_reference(&mixer, &x, t, 1, NO_DT_LIMIT);
         assert_close(&got, &ref_unclamped, "mixer vs UNCLAMPED reference", 5e-3);
 
-        // Teeth: the old, wrong clamp produces a materially different output,
-        // so the assertion above is not vacuous.
+        // Anti-vacuity: the wrong clamp does move the output materially.
         let (ref_clamped, _) =
             mixer_reference(&mixer, &x, t, 1, (cfg.time_step_min, f64::INFINITY));
         let drift = max_abs_diff(&got, &ref_clamped);
@@ -1287,12 +1181,8 @@ mod tests {
         );
     }
 
-    /// The same regression on the single-token recurrent decode path, which
-    /// computes dt through the same `forward` prologue but runs
-    /// `decode_step` instead of the chunk scan.
-    ///
-    /// Mutation caught: same as `time_step_min_does_not_clamp_dt`, but proves
-    /// the decode branch is covered too.
+    /// The same regression on the recurrent decode path: same `forward`
+    /// prologue, `decode_step` instead of the chunk scan.
     #[test]
     fn decode_step_does_not_clamp_dt_to_time_step_min() {
         let mut cfg = tiny_cfg();
@@ -1305,8 +1195,7 @@ mod tests {
             .map(|i| SIGNAL * ((((i as f32) * 0.91) % 2.0) - 1.0))
             .collect();
 
-        // Prefill t-1 tokens, then take the last one through decode_step so
-        // the recurrent update runs against a real (non-zero) SSM state.
+        // Prefill first, so decode_step runs against a non-zero SSM state.
         let mx_prefix =
             MxArray::from_float32(&x[..(t - 1) * h], &[1, (t - 1) as i64, h as i64]).unwrap();
         let mx_last = MxArray::from_float32(&x[(t - 1) * h..], &[1, 1, h as i64]).unwrap();
@@ -1349,25 +1238,14 @@ mod tests {
         assert_close(&got, &ref_out, "single-token decode vs reference", 5e-3);
     }
 
-    /// PINS THE DTYPE CONTRACT at the mixer's exit boundary.
+    /// PINS THE DTYPE CONTRACT at the mixer's exit boundary: `gated_rmsnorm`
+    /// must return `out_dtype` whatever its operands are. BOTH fight that — the
+    /// scan output is f32 by design and the norm weight is f32 from the
+    /// loader's upcast — and MLX promotes, so either one left uncast
+    /// re-promotes the product and the f32 escapes into the residual stream.
     ///
-    /// `gated_rmsnorm` must return `out_dtype` - the dtype the MIXER was
-    /// entered with - no matter what its own operands are. Both operands fight
-    /// that: `x` is the SSM scan output, which this port deliberately keeps in
-    /// f32 (`chunk_scan` / `decode_step` are f32 throughout), and `weight` is
-    /// f32 because `persistence.rs:539` upcasts the checkpoint's BF16
-    /// `mixer.norm.weight`. MLX promotes on mixed dtypes, so EITHER operand
-    /// left uncast re-promotes the product back to f32.
-    ///
-    /// Mutations caught, each on its own:
-    ///   * dropping `.astype(out_dtype)` on `normed` -> `bf16 weight * f32` = f32
-    ///   * dropping `weight.astype(out_dtype)`       -> `f32 * bf16 normed` = f32
-    ///
-    /// An f32 return here is not a local wart: `out_proj` inherits it,
-    /// `decoder_layer.rs`'s `x.add(&mixer_out)` promotes the residual stream
-    /// from layer 0 (the released checkpoint's layer 0 is a Mamba layer), and
-    /// the FLAT KV cache then stores f32 while the paged pool is a 2-byte pool
-    /// - the two attention lanes end up running different arithmetic.
+    /// Mutations caught, each on its own: dropping `.astype(out_dtype)` on
+    /// `normed`, or dropping `weight.astype(out_dtype)`.
     #[test]
     fn gated_rmsnorm_returns_the_requested_io_dtype() {
         let d_inner = 8i64;
@@ -1404,8 +1282,7 @@ mod tests {
              of the scan output or of the upcast norm weight"
         );
 
-        // Only the boundary moved - the norm itself still accumulates in f32 -
-        // so the two runs agree to bf16 rounding.
+        // Only the boundary moved, so the two runs agree to bf16 rounding.
         let a = f32_out.to_float32().unwrap().to_vec();
         let b = bf16_out.to_float32().unwrap().to_vec();
         let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
@@ -1416,18 +1293,12 @@ mod tests {
         assert_close(&b, &a, "bf16 gated norm vs f32 gated norm", 3e-2 * scale);
     }
 
-    /// The whole mixer must be dtype-transparent: bf16 in -> bf16 out.
+    /// The whole mixer must be dtype-transparent: bf16 in -> bf16 out. The only
+    /// thing between that reference invariant and an f32 residual stream is the
+    /// cast `gated_rmsnorm` applies. The fixture reproduces both production
+    /// hazards: an f32 SSM scan and an f32 `norm_weight`.
     ///
-    /// This is the reference invariant (mlx-lm `y.astype(x.dtype)` ssm.py:190;
-    /// vLLM `mamba_mixer2.py:148`; HF `modeling_zamba2.py:69`), and the only
-    /// thing standing between it and an f32 residual stream is the cast
-    /// `gated_rmsnorm` applies. The fixture reproduces the two production
-    /// dtype hazards at once: an f32 SSM scan (this port's design) and an f32
-    /// `norm_weight` (persistence.rs:539's upcast of a BF16 checkpoint
-    /// tensor).
-    ///
-    /// Mutation caught: passing `scan_flat.dtype()` (or dropping either cast)
-    /// makes the bf16 arm return Float32.
+    /// Mutation caught: passing `scan_flat.dtype()`, or dropping either cast.
     #[test]
     fn mamba_mixer_is_dtype_transparent() {
         let cfg = tiny_cfg();
@@ -1482,13 +1353,10 @@ mod tests {
         );
     }
 
-    /// The gated-norm epsilon must come from `layer_norm_epsilon`, not from a
-    /// hardcoded `1e-5`. Both are 1e-5 on the released checkpoint, so this
-    /// changes no production token - but a sibling checkpoint declaring a
-    /// different epsilon would silently be normalized with the wrong one.
+    /// The gated-norm epsilon must come from `layer_norm_epsilon`: a sibling
+    /// checkpoint declaring a different one would silently normalize wrongly.
     ///
-    /// Mutation caught: restoring the literal `1e-5` at the `gated_rmsnorm`
-    /// call site.
+    /// Mutation caught: a literal `1e-5` at the `gated_rmsnorm` call site.
     #[test]
     fn gated_norm_eps_comes_from_the_config() {
         let mut big_eps = tiny_cfg();

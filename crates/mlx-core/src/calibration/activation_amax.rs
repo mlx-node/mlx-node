@@ -191,13 +191,10 @@ pub(crate) fn is_activation_fp8_site(normalized_key: &str) -> bool {
 /// entry with no collected amax (mxfp4 FFN, affine gates, in_proj_a/b, lm_head)
 /// are left untouched. Every other field of the config is preserved.
 ///
-/// Converted nvidia configs write the per-layer block under BOTH the
-/// `quantization` and `quantization_config` aliases as equal clones
-/// (`convert.rs`: `output_config["quantization"] = quant_obj.clone();
-/// output_config["quantization_config"] = quant_obj;`). Calibrating only one
-/// would leave the mirror stale and internally inconsistent, so we apply the
-/// per-entry amax to EVERY present object-valued alias. If neither alias exists
-/// the function is a no-op; a single alias is fine (updates just that one).
+/// Our converter emits only `quantization`, but an HF-sourced config can carry
+/// the legacy `quantization_config` alias as well, and the loader rejects a
+/// config whose two aliases disagree. So the per-entry amax is applied to EVERY
+/// present object-valued alias. If neither exists the function is a no-op.
 pub(crate) fn write_amax_into_config(
     config_path: &Path,
     amax: &HashMap<String, f32>,
@@ -207,26 +204,15 @@ pub(crate) fn write_amax_into_config(
     let mut config: serde_json::Value = serde_json::from_str(&data)
         .map_err(|e| Error::from_reason(format!("parse {}: {e}", config_path.display())))?;
 
-    // The nvidia recipe writes the per-layer block under `quantization`; HF
-    // exports (and our own converter) also mirror it into the
-    // `quantization_config` alias. We update EVERY present object-valued alias so
-    // the two never drift out of sync, but the SUCCESS decision mirrors the loader
-    // exactly: calibration counts as REAL only when the loader-preferred alias
-    // materializes an `input_amax` for EVERY collected activation-fp8 key.
-    //
-    // Loader alias selection (`load_quant_settings_from_disk`, quant_dispatch.rs:291):
-    // it reads `quantization` whenever that KEY is present — even if the value is
-    // non-object, in which case it materializes NOTHING and does NOT fall back —
-    // and only uses `quantization_config` when `quantization` is absent. So
-    // completeness is judged on the loader-preferred alias by key PRESENCE (not
-    // object-ness): a uniform `--q-mode mxfp8` checkpoint (no per-layer objects), a
-    // partially drifted config, a present-but-non-object preferred alias, or one
-    // where only the fallback alias homes all resolve to `homed < expected` and
-    // fail loudly. `apply_amax_to_block` only homes entries the loader would
-    // materialize (a parseable `bits`, per `parse_quant_block`), and dedups the
-    // SOURCE keys (the qkv/z fanout to one merged source counts once). Non-finite
-    // collected maxima never home, so completeness is measured against the FINITE
-    // collected count.
+    // Every present object-valued alias is updated so the two can never drift,
+    // but success is judged on the LOADER-preferred alias alone: the loader reads
+    // `quantization` whenever that KEY is present — even when its value is not an
+    // object, in which case it materializes nothing and does NOT fall back — and
+    // uses `quantization_config` only when `quantization` is absent. Judging on
+    // key presence rather than object-ness is what makes a drifted or non-object
+    // preferred alias fail loudly instead of silently calibrating the mirror.
+    // Non-finite maxima never home, so completeness is measured against the
+    // FINITE collected count.
     let expected = amax.values().filter(|v| v.is_finite()).count();
     let preferred_name = if config.get("quantization").is_some() {
         "quantization"
@@ -644,12 +630,9 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Converted nvidia configs mirror the per-layer block into BOTH the
-    /// `quantization` and `quantization_config` aliases as equal clones.
-    /// `write_amax_into_config` must calibrate BOTH so the two never drift out
-    /// of sync (a single stale alias is an internally-inconsistent config).
-    /// Wrapped keys are mapped and the merged `in_proj_qkvz` amax fans out to
-    /// both split entries in EACH alias.
+    /// An HF-sourced config can carry both aliases as equal clones, and the
+    /// loader rejects a config whose two disagree, so `write_amax_into_config`
+    /// must calibrate BOTH.
     #[test]
     fn write_amax_into_config_updates_both_aliases() {
         let path = std::env::temp_dir().join(format!(
@@ -661,8 +644,6 @@ mod tests {
                 .as_nanos()
         ));
 
-        // BOTH aliases present with IDENTICAL content, exactly as the converter
-        // writes them (`quantization` == `quantization_config` clone).
         let block = serde_json::json!({
             "mode": "mxfp8",
             "group_size": 32,

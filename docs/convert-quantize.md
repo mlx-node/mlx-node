@@ -1271,7 +1271,10 @@ what v1 cannot use:
   (`reject_legacy_mxfp8_mamba` / `require_affine_sidecars`) rather than silently running 6% off,
   because the `.weight` bytes are identical between the two encodings and only the declared mode
   can tell them apart. Both gates are exercised end to end through `load_inner` by
-  `load_inner_rejects_a_pre_affine_checkpoint_end_to_end`.
+  `load_inner_rejects_a_pre_affine_checkpoint_end_to_end`. Every stale-format rejection in this
+  family's loader — mxfp8 mamba, a missing affine sidecar, a missing or malformed
+  `.global_scale`, a BF16 router bias — ends in one shared `REGENERATE_HINT` sentence naming
+  `mlx convert -m nemotron_h`.
 - **`k_scale` / `v_scale`** (attention FP8 KV-cache scales, F32 `[1]`) — **dropped**. v1 keeps a
   bf16 KV cache, so the FP8 KV scales have no consumer and are discarded, not carried.
 - **`mtp.*`** — already bf16 in the source; retained bf16 verbatim.
@@ -1285,23 +1288,30 @@ decision engine would double-quantize them.
 
 ## Provenance: `config.json` and the loader contract
 
-### The two aliases
+### The quantization block
 
-Every quantizing converter writes the same object into two keys as byte-identical clones:
+The SafeTensors converter writes **one** key, `quantization`, and deletes any
+`quantization_config` the source carried:
 
 ```rust
-output_config["quantization"]        = quant_obj.clone();
-output_config["quantization_config"] = quant_obj;
+output_config["quantization"] = quant_obj;
 ```
+
+That delete is load-bearing. `quantization_config` is NVIDIA modelopt's and gemma-QAT's name for
+the *input* encoding, so leaving it beside the block just written gives the loader two aliases that
+disagree — which `select_quantization_block` rejects outright.
+
+The **reader** still accepts `quantization_config`; dropping it would make an NVIDIA source
+un-ingestable. The GGUF converter still writes both keys.
 
 | writer                                       | site                                        | `skip_mtp` |
 | -------------------------------------------- | ------------------------------------------- | ---------- |
-| SafeTensors convert                          | `crates/mlx-core/src/convert.rs:3131`       | `true`     |
-| GGUF → SafeTensors with `--quantize`         | `crates/mlx-core/src/utils/gguf.rs:3155`    | `false`    |
-| GGUF → SafeTensors, source-preserved         | `crates/mlx-core/src/utils/gguf.rs:3166`    | n/a        |
+| SafeTensors convert                          | `crates/mlx-core/src/convert.rs`            | `true`     |
+| GGUF → SafeTensors with `--quantize`         | `crates/mlx-core/src/utils/gguf.rs`         | `false`    |
+| GGUF → SafeTensors, source-preserved         | `crates/mlx-core/src/utils/gguf.rs`         | n/a        |
 
-Built by one function so the aliases and frontends cannot diverge
-(`build_quantization_object`, `crates/mlx-core/src/convert.rs:6726`):
+Built by one function so the frontends cannot diverge
+(`build_quantization_object`, `crates/mlx-core/src/convert.rs`):
 
 ```json
 { "group_size": <int|null>, "bits": <int>, "mode": "<str>",

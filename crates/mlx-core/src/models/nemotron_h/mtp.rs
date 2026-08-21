@@ -1,37 +1,22 @@
 //! NemotronH Multi-Token Prediction (MTP) head.
 //!
-//! Single-step predictor matching the vLLM NemotronH-MTP math
-//! (vllm/model_executor/models/nemotron_h_mtp.py):
+//! Single-step predictor matching the vLLM NemotronH-MTP math:
 //!
 //!   x0 = eh_proj(concat(enorm(emb(t_{p+1})), hnorm(h_p)))
-//!   layer 0 (attention): h = x0 + attention(norm(x0))  over the HEAD's OWN
-//!                          K/V history (its own k_proj/v_proj, its own
-//!                          causal cache)
-//!   layer 1 (moe):        h = h + moe(norm(h))          (dense bf16 experts)
-//!   h = final_layernorm(h)
-//!   logits = shared lm_head(h)   (the main model's untied lm_head)
+//!   layer 0 (attention): h = x0 + attention(norm(x0))  over the HEAD's OWN K/V
+//!   layer 1 (moe):       h = h + moe(norm(h))          (dense bf16 experts)
+//!   logits = shared lm_head(final_layernorm(h))
 //!
-//! The head is a real decoder layer with its OWN KV cache group, exactly as
-//! vLLM builds it: `NemotronHMTPAttentionDecoderLayer(NemotronHAttentionDecoderLayer)`
-//! (nemotron_h_mtp.py:40) whose `mixer` is a full `NemotronHAttention`
-//! (nemotron_h.py:497) holding its own `Attention(...)` (nemotron_h.py:457).
-//! It is therefore STATEFUL across cycles: [`NemotronHMtpModule::forward`]
-//! WRITES K/V into the caller-owned per-layer caches, which the stepper
-//! rewinds by cursor `trim` on rejection and extends on commit.
+//! The head is a real decoder layer with its OWN KV cache group, so it is STATEFUL
+//! across cycles: [`NemotronHMtpModule::forward`] WRITES K/V into the caller-owned
+//! caches, which the stepper rewinds by cursor `trim` and extends on commit.
 //!
-//! Slot convention (vLLM `llm_base_proposer.py:845-867`, the EAGLE
-//! `not needs_extra_input_slots` branch this head takes): drafter slot `p`
-//! holds `fused(enorm(emb(t_{p+1})), hnorm(h_p))` — token ids shifted LEFT
-//! by one against the target hiddens, with the newly sampled token in the
-//! final prompt slot. The prompt seed
-//! ([`NemotronHInner::chunked_prefill_seeding_mtp`](super::model)) and
-//! `commit_mtp` both write that pairing.
+//! Slot convention (vLLM EAGLE): drafter slot `p` holds
+//! `fused(enorm(emb(t_{p+1})), hnorm(h_p))` — ids shifted LEFT by one against the
+//! target hiddens, with the newly sampled token in the final prompt slot.
 //!
-//! NemotronH attention is NoPE, so no positions are threaded anywhere;
-//! causality comes from the cache offset plus the "causal" SDPA mask, which
-//! is bottom-right aligned when `q_len < k_len` (proved by
-//! `causal_attention_matches_explicit_offset_mask_when_kv_is_longer` in
-//! `array/attention.rs`). mtp.* weights are all dense bf16.
+//! Attention is NoPE: no positions are threaded anywhere, and causality comes from
+//! the cache offset plus the bottom-right-aligned "causal" SDPA mask.
 
 use crate::array::MxArray;
 use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
@@ -115,13 +100,10 @@ impl NemotronHMtpModule {
         })
     }
 
-    /// Build a fresh per-layer cache slot for every MTP layer.
-    ///
-    /// One slot per entry of `config.mtp_layers_block_type`, in order:
-    /// `full_attention` gets a flat [`KVCache`](crate::transformer::KVCache),
-    /// `moe` is stateless. Mirrors `Qwen3_5MoeMTPModule::fresh_caches`
-    /// (qwen3_5_moe/mtp.rs:221). The stepper owns these for the whole turn
-    /// and rewinds them by `trim`, never by snapshot.
+    /// Build a fresh per-layer cache slot for every MTP layer: one per entry of
+    /// `config.mtp_layers_block_type`, in order — `full_attention` gets a flat
+    /// [`KVCache`](crate::transformer::KVCache), `moe` is stateless. The stepper owns
+    /// these for the whole turn and rewinds them by `trim`, never by snapshot.
     pub fn fresh_caches(config: &NemotronHConfig) -> Vec<NemotronHLayerCache> {
         config
             .mtp_layers_block_type
@@ -136,20 +118,11 @@ impl NemotronHMtpModule {
             .collect()
     }
 
-    /// One MTP forward over `[1, L, hidden]` inputs, writing the head's OWN
-    /// K/V into `caches`.
-    ///
-    /// `prev_hidden` holds the target's post-final-norm hiddens `h_p ..
-    /// h_{p+L-1}`; `prev_emb` holds the embeddings of the tokens ONE
-    /// POSITION LATER (`emb(t_{p+1}) .. emb(t_{p+L})`) — the vLLM EAGLE
-    /// left-shift. Returns the draft hidden `[1, L, hidden]`; the caller
-    /// applies the shared lm_head for logits.
-    ///
-    /// `L` is 1 for a draft step and up to the prefill chunk size for the
-    /// prompt seed / commit. Causality inside a multi-token call comes from
-    /// the "causal" SDPA mode; causality against earlier calls comes from
-    /// the cache offset. NemotronH attention is NoPE, so no position is
-    /// threaded in.
+    /// One MTP forward over `[1, L, hidden]` inputs, writing the head's OWN K/V into
+    /// `caches`. `prev_hidden` holds the target's post-final-norm hiddens `h_p ..`,
+    /// `prev_emb` the embeddings of the tokens ONE POSITION LATER — the vLLM EAGLE
+    /// left-shift. Returns the draft hidden; the caller applies the shared lm_head.
+    /// Attention is NoPE, so no position is threaded in.
     pub fn forward(
         &self,
         prev_hidden: &MxArray,
@@ -169,11 +142,9 @@ impl NemotronHMtpModule {
         let mut h = self.eh_proj.forward(&concat)?;
 
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
-            // Pre-norm residual: the skip connection carries the PRE-norm
-            // hidden (NemotronHBlock: residual = h; h = norm(h); h =
-            // mixer(h); return residual + h). Adding the normed value here
-            // would replace the residual stream with its normalized self
-            // and corrupt the draft logits.
+            // Pre-norm residual: the skip connection carries the PRE-norm hidden.
+            // Adding the normed value here would replace the residual stream with
+            // its normalized self and corrupt the draft logits.
             let normed = layer.norm.forward(&h)?;
             let out = match &layer.mixer {
                 NemotronHMtpMixer::Attention(attn) => {
@@ -209,7 +180,6 @@ mod tests {
             head_dim: 4,
             max_position_embeddings: 64,
             layer_norm_epsilon: 1e-5,
-            rope_theta: 10000.0,
             layers_block_type: vec!["full_attention".into()],
             mamba_num_heads: 2,
             mamba_head_dim: 2,
@@ -222,16 +192,10 @@ mod tests {
             n_routed_experts: 2,
             num_experts_per_tok: 1,
             routed_scaling_factor: 1.0,
-            n_group: 1,
-            topk_group: 1,
             norm_topk_prob: true,
             intermediate_size: 8,
             moe_shared_expert_intermediate_size: 8,
-            tie_word_embeddings: false,
-            bos_token_id: 1,
             eos_token_ids: vec![2],
-            pad_token_id: 0,
-            num_logits_to_keep: 1,
             mtp_layers_block_type: vec!["full_attention".into(), "moe".into()],
             n_mtp_layers: 1,
             paged_cache_memory_mb: None,
@@ -259,9 +223,8 @@ mod tests {
             .get_offset()
     }
 
-    /// The MTP draft runs end-to-end on a tiny fixture: draft a token's
-    /// hidden from its OWN cache and apply the shared lm_head to get draft
-    /// logits.
+    /// The MTP draft runs end-to-end on a tiny fixture: draft a token's hidden from
+    /// its OWN cache and apply the shared lm_head to get draft logits.
     #[test]
     fn mtp_draft_produces_logits_from_shared_head() {
         let cfg = tiny_cfg();
@@ -289,12 +252,10 @@ mod tests {
         assert!(logits_v.iter().all(|v| v.is_finite()));
     }
 
-    /// T1: the head WRITES its own K/V. Two L=1 forwards must advance the
-    /// attention slot's offset 0 -> 1 -> 2, and a multi-token forward must
-    /// advance it by L.
+    /// T1: the head WRITES its own K/V — two L=1 forwards advance the attention
+    /// slot's offset 0 -> 1 -> 2, and a multi-token forward advances it by L.
     ///
-    /// MUTATION: the pre-port read-only head (`forward_read_only` over the
-    /// backbone KV) never wrote K/V, so the offset stayed at 0 forever.
+    /// MUTATION: the pre-port read-only head never wrote K/V, so the offset stayed 0.
     #[test]
     fn mtp_draft_writes_its_own_kv() {
         let cfg = tiny_cfg();
@@ -317,14 +278,9 @@ mod tests {
         assert_eq!(attn_offset(&caches), 5, "L=3 seed writes three slots");
     }
 
-    /// T2: the head READS its own history. The same input produces a
-    /// different output when a different token precedes it in the drafter
-    /// cache.
-    ///
-    /// MUTATION: dropping the cache argument, attending only to the current
-    /// token, or reverting to the backbone KV all make out_a == out_b
-    /// bit-for-bit. It also dies if k_proj/v_proj are never read (constant
-    /// K/V), which is exactly the defect this port fixes.
+    /// T2: the head READS its own history — the same input produces a different output
+    /// when a different token precedes it in the drafter cache. MUTATION: dropping the
+    /// cache argument, attending only to the current token, or reverting to backbone KV.
     #[test]
     fn mtp_draft_reads_its_own_history() {
         let cfg = tiny_cfg();
@@ -362,12 +318,9 @@ mod tests {
         );
     }
 
-    /// The head's K/V really come from its OWN k_proj/v_proj: perturbing
-    /// those two projections must change the draft output.
-    ///
-    /// MUTATION: the pre-port head loaded `mtp.*.k_proj` / `v_proj` at
-    /// persistence.rs:626-633 and NEVER read them — this test is the one the
-    /// old suite could not write.
+    /// The head's K/V really come from its OWN k_proj/v_proj: perturbing those two
+    /// projections must change the draft output. The pre-port head loaded
+    /// `mtp.*.k_proj` / `v_proj` and never read them.
     #[test]
     fn mtp_kv_projections_change_the_draft() {
         let cfg = tiny_cfg();
@@ -378,9 +331,9 @@ mod tests {
 
         let run = |scale: f32| -> Vec<f32> {
             let mtp = NemotronHMtpModule::new(&cfg).expect("mtp builds");
-            // Pin both KV projections to a deterministic weight so the two
-            // runs differ ONLY in k_proj/v_proj (every other weight comes
-            // from the process-global RNG and would otherwise differ).
+            // Pin both KV projections to a deterministic weight so the two runs
+            // differ ONLY in k_proj/v_proj (every other weight comes from the
+            // process-global RNG and would otherwise differ).
             let w: Vec<f32> = (0..kv_dim * h)
                 .map(|i| (((i * 37) % 23) as f32 * 0.011 - 0.12) * scale)
                 .collect();
@@ -397,8 +350,7 @@ mod tests {
                 _ => panic!("layer 0 is attention"),
             }
             let mut caches = NemotronHMtpModule::fresh_caches(&cfg);
-            // Two tokens: the second query attends over the first token's
-            // K/V, so a k_proj/v_proj change must move the output.
+            // Two tokens: the second query attends over the first token's K/V.
             mtp.forward(&seq_input(h, 1, 21.0), &seq_input(h, 1, 31.0), &mut caches)
                 .expect("history token");
             mtp.forward(&x_hidden, &x_emb, &mut caches)
@@ -422,9 +374,8 @@ mod tests {
         );
     }
 
-    /// `fresh_caches` must lay out one slot per declared MTP block, in
-    /// order, or `forward`'s zip would silently drive the MoE layer with the
-    /// attention cache.
+    /// `fresh_caches` must lay out one slot per declared MTP block, in order, or
+    /// `forward`'s zip would drive the MoE layer with the attention cache.
     #[test]
     fn fresh_caches_match_the_declared_block_types() {
         let cfg = tiny_cfg();
@@ -498,7 +449,6 @@ mod mtp_turn_tests {
             head_dim: 4,
             max_position_embeddings: 64,
             layer_norm_epsilon: 1e-5,
-            rope_theta: 10000.0,
             layers_block_type: vec![
                 "linear_attention".into(),
                 "moe".into(),
@@ -515,30 +465,21 @@ mod mtp_turn_tests {
             n_routed_experts: 2,
             num_experts_per_tok: 1,
             routed_scaling_factor: 1.0,
-            n_group: 1,
-            topk_group: 1,
             norm_topk_prob: true,
             intermediate_size: 8,
             moe_shared_expert_intermediate_size: 8,
-            tie_word_embeddings: false,
-            bos_token_id: 1,
             eos_token_ids: vec![2],
-            pad_token_id: 0,
-            num_logits_to_keep: 1,
             mtp_layers_block_type: vec!["full_attention".into(), "moe".into()],
             n_mtp_layers: 1,
             paged_cache_memory_mb: None,
             paged_block_size: None,
-            // Flat-only fixture: use_block_paged_cache None defaults the
-            // adapter ON (head_dim 4 is below the pool minimum), so pin it
-            // OFF here; tiny_mtp_paged_config opts back in with a valid
-            // pool head_dim.
+            // Flat-only fixture: `use_block_paged_cache: None` defaults the adapter
+            // ON (head_dim 4 is below the pool minimum), so pin it OFF here.
             use_block_paged_cache: Some(false),
         }
     }
 
-    /// Same shape as the scheduler tests' paged fixture (hidden 256, head_dim
-    /// 128 - the generic batched paged route) but with the MTP head on, so
+    /// Same shape as the scheduler tests' paged fixture but with the MTP head on, so
     /// the routing test exercises the paged-adapter-present case.
     fn tiny_mtp_paged_config() -> NemotronHConfig {
         NemotronHConfig {
@@ -550,7 +491,6 @@ mod mtp_turn_tests {
             head_dim: 128,
             max_position_embeddings: 512,
             layer_norm_epsilon: 1e-5,
-            rope_theta: 10000.0,
             layers_block_type: vec![
                 "linear_attention".into(),
                 "moe".into(),
@@ -567,16 +507,10 @@ mod mtp_turn_tests {
             n_routed_experts: 4,
             num_experts_per_tok: 1,
             routed_scaling_factor: 1.0,
-            n_group: 1,
-            topk_group: 1,
             norm_topk_prob: true,
             intermediate_size: 6,
             moe_shared_expert_intermediate_size: 8,
-            tie_word_embeddings: false,
-            bos_token_id: 1,
             eos_token_ids: vec![2],
-            pad_token_id: 0,
-            num_logits_to_keep: 1,
             mtp_layers_block_type: vec!["full_attention".into(), "moe".into()],
             n_mtp_layers: 1,
             paged_cache_memory_mb: Some(256),
@@ -585,23 +519,10 @@ mod mtp_turn_tests {
         }
     }
 
-    /// Greedy pick with PRODUCTION tie-break semantics: the FIRST maximal
-    /// index.
-    ///
-    /// Do NOT reach for `Iterator::max_by` here. It is documented to return
-    /// the LAST maximal element, while every lane this helper is an oracle
-    /// for returns the FIRST one:
-    ///   - `mx::argmax` — `ArgMax::reduce` in mlx's `arg_reduce.metal` breaks
-    ///     ties on `best.index > current.index`, i.e. keeps the smaller index;
-    ///   - the compiled production sampler — at `temperature <=
-    ///     GREEDY_TEMPERATURE_EPS` `mlx_compiled_sample_full` short-circuits to
-    ///     `mlx::core::argmax(logits, -1)`;
-    ///   - the MTP accept gate — `p_target_f32.argmax(0, None)` in
-    ///     `sampling::rs`.
-    ///
-    /// A two-way tie with bit-identical f32 logits does occur on the real
-    /// 30B-A3B-NVFP4 checkpoint, so `max_by` made this oracle disagree with a
-    /// real AR turn and reported a phantom AR-vs-MTP divergence.
+    /// Greedy pick with PRODUCTION tie-break semantics: the FIRST maximal index.
+    /// NOT `Iterator::max_by`, which returns the LAST — every lane this is an oracle
+    /// for (`mx::argmax`, the compiled greedy sampler, the MTP accept gate) keeps the
+    /// smaller index, and real ties made `max_by` report a phantom divergence.
     fn argmax(vec: &[f32]) -> usize {
         let mut best = 0usize;
         for (i, v) in vec.iter().enumerate() {
@@ -635,13 +556,8 @@ mod mtp_turn_tests {
     }
 
     /// Prefill the prompt AND seed the MTP drafter over it, exactly as
-    /// `run_mtp_whole_turn` does: chunked hidden-emitting prefill feeding the
-    /// shifted (hidden, emb) pairs into a fresh drafter cache, sample `y`,
-    /// seed the final slot with it, install `pending_mtp_draft_seed`.
-    /// Returns the sampled `y` (as `run_mtp_turn` wants it).
-    ///
-    /// Every MTP turn test must go through this: `begin_mtp_decode` now
-    /// hard-errors on an unseeded drafter.
+    /// `run_mtp_whole_turn` does, and return the sampled `y`. Every MTP turn test
+    /// must go through this: `begin_mtp_decode` hard-errors on an unseeded drafter.
     fn prefill_and_seed_mtp(
         inner: &mut NemotronHInner,
         prompt: &[u32],
@@ -702,23 +618,17 @@ mod mtp_turn_tests {
         Ok(out)
     }
 
-    /// The engine-owned run_mtp_turn loop driving the real
-    /// NemotronHMtpStepper must propose (draft_step) and verify
-    /// (verify_step) at least one cycle on a synthetic MTP-capable inner -
-    /// proving the draft head, the read-only backbone-KV attention, the
-    /// shared-lm_head projection, and the snapshot/rollback path are all
-    /// exercised - and the committed output must stay T=0-identical to a
-    /// plain greedy AR decode of the same inner.
+    /// The engine-owned run_mtp_turn loop driving the real NemotronHMtpStepper must
+    /// run at least one draft/verify cycle on a synthetic MTP-capable inner, and the
+    /// committed output must stay T=0-identical to a plain greedy AR decode.
     #[test]
     fn mtp_turn_runs_draft_verify_cycles() {
         if !compiled_forward_backend_available() {
             eprintln!("skipping (no Metal backend)");
             return;
         }
-        // The fixture's weights are random per construction; a greedy run
-        // can land on EOS (token 2) before the first MTP cycle, which is a
-        // valid zero-cycle exit. Retry with a fresh random inner so the test
-        // is robust while still exercising the draft+verify cycle.
+        // The fixture's weights are random per construction; a greedy run can land on
+        // EOS before the first MTP cycle, so retry with a fresh random inner.
         let prompt: Vec<u32> = vec![1, 5, 9, 3];
         let mut attempts = 0;
         loop {
@@ -792,41 +702,24 @@ mod mtp_turn_tests {
             )
             .expect("run_mtp_turn");
 
-            // Random-weights EOS exits can land before the first cycle:
-            // mtp_acceptance_summary() is None then (no cycle recorded), which
-            // is a valid zero-cycle exit — retry fresh rather than panicking.
+            // A zero-cycle EOS exit leaves `mtp_acceptance_summary()` None — retry
+            // fresh rather than panicking.
             let Some(summary) = profiler.mtp_acceptance_summary() else {
                 continue;
             };
             if summary.2 < 1 || generated.is_empty() {
                 continue;
             }
-            // The outcome is CONSUMED, not discarded (it used to be
-            // `let _ = outcome;`): the desync latch and the unemitted
-            // remainder must agree, because the latch is the ONLY signal
-            // that tells the engine the caches sit ahead of the saved
-            // history.
+            // The outcome is CONSUMED: the latch is the ONLY signal telling the
+            // engine the caches sit ahead of the saved history.
             assert_eq!(
                 outcome.desynced,
                 outcome.rollback_unemitted > 1,
                 "the latch must fire only when a FORWARDED accepted draft was dropped"
             );
-            // Scoped to THIS turn's pinned config (`depth: 1`,
-            // `mtp_adaptive_depth` unset => false): a depth-1 cycle emits at
-            // least one token (the near-tail guard needs `remaining >= 2`, so
-            // the emit loop's top-of-iteration budget check cannot fire at
-            // `cycle_emitted == 0`) and `outcome.tokens.len() <= 2`, so at
+            // Scoped to THIS turn's pinned config (depth 1, adaptive off): a depth-1
+            // cycle emits at least one token and `outcome.tokens.len() <= 2`, so at
             // most the never-forwarded bonus can go unemitted.
-            //
-            // Production gets the same shape because `run_mtp_whole_turn`
-            // pins `mtp_adaptive_depth = false` as well as seeding
-            // `p.mtp_depth.min(1)` — without that pin `run_mtp_cycle` would
-            // re-pick `cycle_depth` from `AdaptiveDepthPolicy::pick_depth()`,
-            // which sweeps 1..=5 regardless of the seed. This is a bound on
-            // the CURRENT policy, not on the stepper: the `> 1` latch arm
-            // stays correct at any depth and
-            // `mtp_rollback_unemitted_latches_when_a_forwarded_token_is_dropped`
-            // pins it directly.
             assert!(
                 outcome.rollback_unemitted <= 1,
                 "a depth-1, adaptive-off cycle can strand at most the \
@@ -868,11 +761,9 @@ mod mtp_turn_tests {
                 ChatBackend::verify_cache_prefix(&inner, &next_turn, true) > 0,
                 "the next flat turn must find a reusable prefix"
             );
-            // STRICTNESS contract at T=0, verified against the plain AR
-            // oracle of the same inner: every committed token must equal the
-            // target greedy token. An accepted draft therefore equals
-            // argmax(target logits) and a rejected draft is replaced by that
-            // argmax - otherwise generated would diverge from oracle.
+            // STRICTNESS contract at T=0 against the plain AR oracle of the same
+            // inner: an accepted draft equals argmax(target logits) and a rejected
+            // one is replaced by that argmax, so `generated` cannot diverge.
             assert!(
                 generated.len() <= oracle.len(),
                 "MTP emitted more tokens than AR: {} vs {}",
@@ -887,21 +778,10 @@ mod mtp_turn_tests {
         }
     }
 
-    /// The desync latch must reach the engine through the ChatBackend trait,
-    /// and the engine's heal must clear it: cache recovery resets +
-    /// re-prefills only when `flat_caches_desynced()` reports the flat caches
-    /// are ahead of the saved history (the qwen3_5/qwen3_5_moe contract).
-    ///
-    /// This pins the WIRING ONLY — set the field, read it through the trait,
-    /// clear it. It deliberately says nothing about what sets the field,
-    /// because "a mid-cycle stop sets the latch" is FALSE on this family: a
-    /// cycle's last outcome token (bonus or residual) is never forwarded
-    /// through the layers, so a depth-1 mid-cycle stop strands nothing and
-    /// `rollback_unemitted` (which latches only at `unemitted > 1`) leaves
-    /// this clear. `mtp_rollback_unemitted_needs_no_snapshot` (clear on a
-    /// bonus drop) and
-    /// `mtp_rollback_unemitted_latches_when_a_forwarded_token_is_dropped`
-    /// (set when a forwarded token is dropped) own the predicate itself.
+    /// The desync latch must reach the engine through the ChatBackend trait, and the
+    /// engine's heal must clear it. WIRING ONLY: it deliberately says nothing about
+    /// what SETS the field, because "a mid-cycle stop sets the latch" is FALSE here —
+    /// a cycle's last outcome token is never forwarded, so it strands nothing.
     #[test]
     fn flat_cache_desync_latch_reaches_the_backend_trait() {
         let cfg = tiny_mtp_config();
@@ -923,14 +803,10 @@ mod mtp_turn_tests {
         );
     }
 
-    /// On the paged path, prefix reuse must require the sequence's recurrent
-    /// (Mamba) state to have SURVIVED, not merely that its tokens match.
-    ///
-    /// A preempted sequence releases its recurrent state while its KV blocks
-    /// and owner history stay reusable, so a token-only predicate would
-    /// resume with attention KV at the prefix boundary but Mamba state back
-    /// at position zero. `activate_paged_seq` reporting survival honestly is
-    /// what lets the eligibility predicates force a COLD prefill instead.
+    /// On the paged path, prefix reuse must require the sequence's recurrent (Mamba)
+    /// state to have SURVIVED, not merely that its tokens match: a preempted sequence
+    /// releases its state while its KV blocks stay reusable, so a token-only predicate
+    /// would resume with KV at the prefix boundary but Mamba state at position zero.
     #[test]
     fn recurrent_state_survival_gates_prefix_reuse() {
         let cfg = tiny_mtp_paged_config();
@@ -960,8 +836,6 @@ mod mtp_turn_tests {
             "preemption-released state must force a COLD prefill"
         );
     }
-
-    // ===================== drafter-own-KV gates =====================
 
     /// An MTP-capable tiny inner: dense backbone MoE + a real lm_head + the
     /// MTP head armed.
@@ -1016,13 +890,9 @@ mod mtp_turn_tests {
     }
 
     /// T3 — THE shift gate. The prompt seed must pair drafter slot `p` with
-    /// `(h_p, emb(t_{p+1}))` and put the newly sampled `y` in the final slot
-    /// (vLLM `llm_base_proposer.py:845-867`). Compared against a single
-    /// reference `forward` over the whole prompt built with the ids shifted
-    /// by hand; the UNSHIFTED pairing must be measurably different.
-    ///
-    /// MUTATION: no shift, shift by two, or forgetting to substitute `y` in
-    /// the last slot. Fails on HEAD, where no seed exists at all.
+    /// `(h_p, emb(t_{p+1}))` and put the newly sampled `y` in the final slot, compared
+    /// against a hand-shifted reference; the UNSHIFTED pairing must differ measurably.
+    /// MUTATION: no shift, shift by two, or forgetting to substitute `y`.
     #[test]
     fn mtp_prompt_seed_shifts_ids_by_one() {
         if !compiled_forward_backend_available() {
@@ -1093,9 +963,6 @@ mod mtp_turn_tests {
 
         let d_ok = max_abs_diff(&got, &want);
         let d_bad = max_abs_diff(&got, &wrong);
-        // Measured on the random-weight fixture over repeated runs:
-        // d_ok 2.6e-5 .. 1.4e-3, d_bad 0.43 .. 1.02 — a ~500x separation.
-        // The gates sit an order of magnitude inside both.
         assert!(
             d_ok <= 1e-2,
             "chunked seed must equal the hand-shifted reference: max |diff| = {d_ok}"
@@ -1106,13 +973,10 @@ mod mtp_turn_tests {
         );
     }
 
-    /// T4 — the seed must not depend on where the prefill chunk boundaries
-    /// fall.
+    /// T4 — the seed must not depend on where the prefill chunk boundaries fall.
     ///
-    /// MUTATION: an off-by-one in the per-chunk id window
-    /// `tokens[s+1 .. s+1+L']`, or a wrong `L' = min(e-s, T-1-s)` clamp on
-    /// the final chunk (which silently drops or duplicates a pair only when
-    /// the prompt spans more than one chunk).
+    /// MUTATION: an off-by-one in the per-chunk id window `tokens[s+1 .. s+1+L']`, or
+    /// a wrong `L' = min(e-s, T-1-s)` clamp on the final chunk.
     #[test]
     fn mtp_seed_is_chunk_boundary_invariant() {
         if !compiled_forward_backend_available() {
@@ -1164,17 +1028,13 @@ mod mtp_turn_tests {
         let a = probe(mtp, &mut one_chunk, h);
         let b = probe(mtp, &mut many_chunks, h);
         let d = max_abs_diff(&a, &b);
-        // Measured 7.8e-5 .. 7.6e-4 on the random-weight fixture. A real
-        // window off-by-one either slices out of range (hard error) or moves
-        // the output by ~0.5.
         assert!(d <= 1e-2, "seed is chunk-dependent: max |diff| = {d}");
     }
 
-    /// T8 — `begin_mtp_decode` must REFUSE to run without a seeded drafter
-    /// rather than drafting from an empty history.
+    /// T8 — `begin_mtp_decode` must REFUSE to run without a seeded drafter rather
+    /// than drafting from an empty history.
     ///
-    /// MUTATION: a silent `unwrap_or_default()` / `fresh_caches()` fallback,
-    /// which is exactly the no-history bug this port removes.
+    /// MUTATION: a silent `unwrap_or_default()` / `fresh_caches()` fallback.
     #[test]
     fn begin_mtp_decode_refuses_an_unseeded_drafter() {
         let mut inner = mtp_ready_inner();
@@ -1196,12 +1056,8 @@ mod mtp_turn_tests {
         );
     }
 
-    /// A cache reset must drop the pending seed: it describes a token stream
-    /// that no longer exists.
-    ///
-    /// MUTATION: leaving `pending_mtp_draft_seed` alive across
-    /// `reset_caches_internal`, so the next turn drafts against the previous
-    /// turn's history.
+    /// A cache reset must drop the pending seed: it describes a token stream that no
+    /// longer exists, and keeping it would draft against the previous turn's history.
     #[test]
     fn reset_clears_the_pending_draft_seed() {
         let mut inner = mtp_ready_inner();
@@ -1213,15 +1069,10 @@ mod mtp_turn_tests {
         );
     }
 
-    /// T5 + the rejection rewind: the drafter's speculative K/V must be
-    /// OVERWRITTEN by the commit, never appended past, and a new cycle must
-    /// rewind the previous cycle's draft tail.
-    ///
-    /// MUTATION: dropping the `trim(committed_len)` in `commit_mtp` (or the
-    /// trim in `begin_cycle`) — the rejected draft's K/V survives in the
-    /// head's history and every later draft conditions on a token that was
-    /// never emitted. The offsets catch it structurally; the probe
-    /// comparison catches it numerically.
+    /// T5 + the rejection rewind: the drafter's speculative K/V must be OVERWRITTEN by
+    /// the commit, never appended past, and a new cycle must rewind the previous
+    /// cycle's draft tail. MUTATION: dropping the `trim(committed_len)` in `commit_mtp`
+    /// or in `begin_cycle` — later drafts then condition on a never-emitted token.
     #[test]
     fn mtp_commit_overwrites_the_rejected_draft_slot() {
         if !compiled_forward_backend_available() {
@@ -1235,9 +1086,8 @@ mod mtp_turn_tests {
         let stream = Stream::new(DeviceType::Gpu);
         let committed_ids: Vec<u32> = vec![13, 21];
 
-        // Same inner (same weights) run twice: once WITH a rejected draft
-        // before the commit, once without. The committed history — and so
-        // the next draft — must be identical.
+        // Same inner run twice, once WITH a rejected draft before the commit and once
+        // without: the committed history — and so the next draft — must be identical.
         let mut run = |with_draft: bool| -> Vec<f32> {
             inner.reset_caches_internal();
             let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
@@ -1311,16 +1161,11 @@ mod mtp_turn_tests {
         );
     }
 
-    /// The drafter cache rewinds WITH the main caches on rejection: a new
-    /// cycle re-anchors at the committed cursor, dropping the previous
-    /// cycle's speculative tail. Chained cycles anchor one slot lower,
-    /// because their draft pair `(h_{p+K}, emb(t_{p+K+1}))` targets the slot
-    /// the previous commit already wrote.
-    ///
-    /// MUTATION: a no-op `begin_cycle` (the pre-port stateless drafter), or
-    /// one that resets to a FRESH cache instead of trimming, or one that
-    /// ignores `chained_anchor`. `commit_mtp`'s own trim hides all three from
-    /// the commit-side test, so this is the gate that sees them.
+    /// The drafter cache rewinds WITH the main caches on rejection: a new cycle
+    /// re-anchors at the committed cursor, and chained cycles anchor one slot lower
+    /// because their draft pair targets the slot the previous commit already wrote.
+    /// MUTATION: a no-op `begin_cycle`, one that resets to a FRESH cache, or one that
+    /// ignores `chained_anchor` — `commit_mtp`'s own trim hides all three elsewhere.
     #[test]
     fn mtp_begin_cycle_rewinds_the_draft_tail() {
         if !compiled_forward_backend_available() {
@@ -1360,12 +1205,8 @@ mod mtp_turn_tests {
         );
         assert_eq!(step.committed_len(), t, "trim must not move committed_len");
 
-        // Chained cycles re-anchor one slot lower and overwrite the last
-        // committed pair with the identical pair. This is verbatim the
-        // engine's call (mtp_turn.rs:1778): `committed_history_active()`
-        // returning `false` (its pre-port value) would anchor a chained
-        // cycle at `committed_len` and drift the drafter cursor +1 per
-        // cycle, on top of re-committing the anchor at mtp_turn.rs:1826.
+        // Verbatim the engine's call: `committed_history_active()` returning `false`
+        // would anchor a chained cycle at `committed_len` and drift the cursor +1/cycle.
         let chained_anchor = true && step.committed_history_active();
         assert!(
             chained_anchor,
@@ -1380,13 +1221,10 @@ mod mtp_turn_tests {
         assert_eq!(step.committed_len(), t);
     }
 
-    /// T6 — `rollback_unemitted` rewinds the drafter by CURSOR, with no
-    /// snapshot, on the one path where a snapshot is guaranteed to be gone.
-    ///
-    /// MUTATION: any implementation that reaches for `self.snap` — `rollback`
-    /// nulls it on the `accepted_drafts == depth` branch, so every
-    /// full-accept cycle (the only strandable shape at the seeded depth of 1)
-    /// arrives here with no snapshot to undo from.
+    /// T6 — `rollback_unemitted` rewinds the drafter by CURSOR, with no snapshot, on
+    /// the one path where a snapshot is guaranteed to be gone: `rollback` nulls
+    /// `self.snap` on the `accepted_drafts == depth` branch, the only strandable
+    /// depth-1 shape. MUTATION: any implementation that reaches for `self.snap`.
     #[test]
     fn mtp_rollback_unemitted_needs_no_snapshot() {
         if !compiled_forward_backend_available() {
@@ -1442,45 +1280,24 @@ mod mtp_turn_tests {
             before - 1,
             "the drafter KV must follow the committed cursor"
         );
-        // The dropped token is the cycle's never-forwarded BONUS: the backbone
-        // caches hold `tokens[..len - 1]`, which is exactly the saved history.
-        // Latching here would make the NEXT flat AR turn discard its entire
-        // prefix cache (`run_flat_ar_turn` forces `hit = 0` on the latch) on
-        // every EOS-terminated MTP turn.
+        // The dropped token is the cycle's never-forwarded BONUS, so the backbone caches
+        // already hold exactly the saved history and the latch must stay clear.
         assert!(
             !step.into_desynced(),
             "a depth-1 bonus drop leaves the backbone aligned with the saved history"
         );
     }
 
-    /// WHY `run_mtp_whole_turn` PINS `mtp_adaptive_depth = false`.
-    ///
-    /// `depth: p.mtp_depth.min(1)` at the `run_mtp_turn` call site is NOT the
-    /// last word on cycle depth. `run_mtp_cycle` computes
-    ///
-    /// ```text
-    /// cycle_depth = if p.mtp_adaptive_depth { policy.pick_depth() } else { depth }
-    /// ```
-    ///
-    /// and `AdaptiveDepthPolicy::new(seed)` uses `seed` only to set
-    /// `current_depth` — it starts in `Explore`, whose `pick_depth()` returns
-    /// `explore_depth`, a cursor that walks `MIN_DEPTH..=MAX_DEPTH`
-    /// independent of the seed. `mtp_adaptive_depth` is a plain ChatConfig
-    /// knob (`config.mtp_adaptive_depth.unwrap_or(false)`) with no family
-    /// gate, and `Throughput` is the default mode, so `mtpAdaptiveDepth:
-    /// true` USED TO run NemotronH at depth 2..5 on a path this family never
-    /// validated.
-    ///
-    /// This test proves the bypass at the policy level. It is the reason the
-    /// family-level pin exists — delete the pin and depth > 1 comes straight
-    /// back — and the reason the `unemitted > 1` arm in `rollback_unemitted`
-    /// stays even though the pin makes it unreachable today.
+    /// WHY `run_mtp_whole_turn` PINS `mtp_adaptive_depth = false`: the
+    /// `p.mtp_depth.min(1)` at the call site is NOT the last word on cycle depth.
+    /// `run_mtp_cycle` takes `cycle_depth` from `AdaptiveDepthPolicy::pick_depth()`
+    /// whenever the knob is set, and that policy starts in `Explore` and walks
+    /// `MIN_DEPTH..=MAX_DEPTH` independent of the seed.
     #[test]
     fn adaptive_depth_policy_escapes_a_depth_1_seed() {
         use crate::models::qwen3_5::adaptive_depth::{AdaptiveDepthPolicy, CycleStats};
 
-        // Seeded exactly the way the NemotronH call site seeds it: with the
-        // already-clamped `p.mtp_depth.min(1)`.
+        // Seeded the way the NemotronH call site does: the already-clamped depth.
         let mut policy = AdaptiveDepthPolicy::new(1);
         assert_eq!(policy.pick_depth(), 1, "Explore starts at MIN_DEPTH");
 
@@ -1503,40 +1320,11 @@ mod mtp_turn_tests {
         );
     }
 
-    /// The other half of the same rule: dropping a token the backbone DID
-    /// forward must still latch. The cycle shape below is a DEPTH-2 one —
-    /// `commit_mtp` of three tokens (anchor + two accepted drafts) followed by
-    /// `rollback_unemitted(2)`, i.e. the emit loop stopped after the first
-    /// draft, leaving one forwarded draft plus the never-forwarded bonus
-    /// outstanding. The caches hold that second draft; the saved history does
-    /// not; `unemitted - 1 == 1` forwarded token was stranded, so the latch
-    /// must fire.
-    ///
-    /// WHY THE ARM IS KEPT even though production cannot reach depth 2 today.
-    /// `run_mtp_whole_turn` pins BOTH `depth: p.mtp_depth.min(1)` and
-    /// `mtp_adaptive_depth = false`; without that second pin `run_mtp_cycle`
-    /// takes `cycle_depth` from `AdaptiveDepthPolicy::pick_depth()`, which
-    /// sweeps 1..=5 regardless of the seed (see
-    /// `adaptive_depth_policy_escapes_a_depth_1_seed`) — the shape below is
-    /// exactly what that produced. The pin is a POLICY choice in one
-    /// function; this test is the correctness net under it, and `> 1` is the
-    /// right predicate at every depth because `unemitted - 1` is the
-    /// stranded-forwarded count at every depth.
-    ///
-    /// At a pinned depth of 1 the shape below cannot occur:
-    /// `outcome.tokens.len() <= 2` there, and the near-tail cap
-    /// (`cycle_depth.min(remaining - 1)` plus the `cycle_depth < 1 =>
-    /// continue`) forces `remaining >= 2` before a cycle runs, so the emit
-    /// loop's top-of-iteration budget check cannot fire at
-    /// `cycle_emitted == 0` and `unemitted` cannot exceed 1. An earlier
-    /// revision of this doc claimed the depth-1 emit loop could break at its
-    /// first iteration with both tokens outstanding — it cannot, and pinning
-    /// the latch on that unreachable trigger is what made the predicate look
-    /// dead.
-    ///
-    /// MUTATION: narrowing the latch to `unemitted > 2`, or dropping it
-    /// entirely — the caches would silently stay ahead of the saved history
-    /// and the next turn would decode from a poisoned prefix.
+    /// The other half of the same rule: dropping a token the backbone DID forward must
+    /// still latch. The shape below is a DEPTH-2 one — commit three tokens, then
+    /// `rollback_unemitted(2)` — so `unemitted - 1 == 1` forwarded token is stranded.
+    /// A pinned depth of 1 cannot reach it; the arm is kept because `> 1` is the right
+    /// predicate at EVERY depth. MUTATION: narrowing it to `> 2`, or dropping it.
     #[test]
     fn mtp_rollback_unemitted_latches_when_a_forwarded_token_is_dropped() {
         if !compiled_forward_backend_available() {
@@ -1667,15 +1455,10 @@ mod mtp_turn_tests {
         );
     }
 
-    /// Real-checkpoint T=0 lossless gate (env-gated: set
-    /// MLX_TEST_NEMOTRON_H_MODEL_PATH). Runs plain greedy AR and the MTP
-    /// loop from the same prompt and asserts the committed token sequences
-    /// are IDENTICAL. Set MLX_MTP_TRACE_ACCEPTANCE=1 to also see the
-    /// per-slot accept trace (draft_id / target_argmax / accepted).
-    ///
-    /// `#[ignore]` is load-bearing: without it this test early-returns on an
-    /// unset env var and reports "ok", so a skip reads as a pass in the
-    /// headline `cargo test -p mlx-core --lib` count.
+    /// Real-checkpoint T=0 lossless gate (env-gated:
+    /// MLX_TEST_NEMOTRON_H_MODEL_PATH): greedy AR and the MTP loop from the same prompt
+    /// must commit identical token sequences. `#[ignore]` is load-bearing — without it
+    /// the unset-env early return reports "ok", so a skip reads as a pass.
     #[ignore = "needs MLX_TEST_NEMOTRON_H_MODEL_PATH pointing to a real NemotronH checkpoint WITH an MTP head"]
     #[test]
     fn real_mtp_t0_lossless_gate() {
@@ -1695,9 +1478,8 @@ mod mtp_turn_tests {
         }
         let eos = inner.config.eos_token_ids.first().copied().unwrap_or(2);
         let n = 60;
-        // A real tokenized prompt (the model dir ships tokenizer.json) so the
-        // draft head sees in-distribution context and the acceptance rate is
-        // meaningful; the token ids are still opaque to the forward itself.
+        // A real tokenized prompt so the draft head sees in-distribution context and the
+        // acceptance rate is meaningful.
         let prompt: Vec<u32> = crate::tokenizer::Qwen3Tokenizer::from_file(
             &std::path::Path::new(&model_path).join("tokenizer.json"),
         )
@@ -1793,13 +1575,9 @@ mod mtp_turn_tests {
             first_div.map(|i| ar[i]).unwrap_or(0),
         );
 
-        // DRAFT QUALITY. Structure can be wired correctly and still draft
-        // from the wrong history (wrong shift direction, seed skipped, the
-        // head attending someone else's KV) — every such bug passes the
-        // lossless gate above, because a rejected draft is simply replaced
-        // by the target argmax. Only acceptance can see it. Measured with
-        // the pre-port read-only head: ~0.4/cycle, BELOW the 0.6 break-even
-        // where drafting stops paying for itself.
+        // DRAFT QUALITY. Structure can be wired right and still draft from the wrong
+        // history — every such bug passes the lossless gate above, because a rejected
+        // draft is simply replaced by the target argmax. Only acceptance can see it.
         let (mean, _, cycles) = profiler
             .mtp_acceptance_summary()
             .expect("the real-checkpoint gate must run at least one MTP cycle");

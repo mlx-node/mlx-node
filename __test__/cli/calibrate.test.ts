@@ -53,8 +53,8 @@ vi.mock('@mlx-node/core', async () => {
  *   - BOTH split GDN input projections `*.linear_attn.in_proj_qkv` /
  *     `*.linear_attn.in_proj_z` (the merged `in_proj_qkvz` amax fans out to both)
  *   - `*.linear_attn.out_proj`
- * and must NOT gain it on the mxfp4 FFN (`*.mlp.gate_proj`). The write mirrors
- * into BOTH the `quantization` and `quantization_config` aliases.
+ * and must NOT gain it on the mxfp4 FFN (`*.mlp.gate_proj`). Convert emits only
+ * the `quantization` block, so that is the only alias to calibrate here.
  *
  * Presence-gated + heavy: runs only when the base 0.8B checkpoint and the
  * calibration JSONL are on disk, so CI without the weights auto-skips. It
@@ -142,20 +142,20 @@ describe.skipIf(!canRun)('mlx calibrate (0.8B nvidia)', () => {
     if (scratch) rmSync(scratch, { recursive: true, force: true });
   });
 
-  it('writes input_amax onto attn/GDN keys in BOTH aliases', () => {
+  it('writes input_amax onto attn/GDN keys in the single quantization block', () => {
     const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-    for (const alias of ['quantization', 'quantization_config']) {
-      const block = config[alias] as Record<string, unknown>;
-      expect(block, `${alias} block must exist`).toBeTruthy();
+    expect(config.quantization_config, 'convert must not emit the legacy alias').toBeUndefined();
 
-      // self_attn.q_proj is an activation-fp8 site → must gain input_amax.
-      const qKeys = keysEndingWith(block, '.self_attn.q_proj');
-      expect(qKeys.length, `${alias}: at least one q_proj entry`).toBeGreaterThan(0);
-      for (const k of qKeys) {
-        expect(hasInputAmax(block, k), `${alias}: ${k} must have input_amax`).toBe(true);
-        const amax = (block[k] as Record<string, number>).input_amax;
-        expect(amax, `${alias}: ${k} input_amax finite positive`).toBeGreaterThan(0);
-      }
+    const block = config.quantization as Record<string, unknown>;
+    expect(block, 'quantization block must exist').toBeTruthy();
+
+    // self_attn.q_proj is an activation-fp8 site → must gain input_amax.
+    const qKeys = keysEndingWith(block, '.self_attn.q_proj');
+    expect(qKeys.length, 'at least one q_proj entry').toBeGreaterThan(0);
+    for (const k of qKeys) {
+      expect(hasInputAmax(block, k), `${k} must have input_amax`).toBe(true);
+      const amax = (block[k] as Record<string, number>).input_amax;
+      expect(amax, `${k} input_amax finite positive`).toBeGreaterThan(0);
     }
   });
 

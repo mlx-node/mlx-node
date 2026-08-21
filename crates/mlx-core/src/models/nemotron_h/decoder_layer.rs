@@ -1,9 +1,7 @@
 //! NemotronH decoder layer: pre-RMSNorm + ONE mixer + residual.
 //!
-//! The mixer kind comes from the config layers_block_type (remapped):
-//! "linear_attention" (Mamba-2 SSM), "full_attention" (GQA), or "moe"
-//! (pure MoE-FFN). Each layer has exactly ONE norm (unlike the classic
-//! attention+FFN two-norm transformer block).
+//! Each layer has exactly ONE norm and one mixer — not the classic
+//! attention+FFN two-norm block.
 
 use crate::array::MxArray;
 use crate::nn::RMSNorm;
@@ -90,13 +88,8 @@ impl NemotronHDecoderLayer {
     }
 
     /// Install the pre-mixer RMSNorm weight (the persistence loader's only
-    /// write path for it).
-    ///
-    /// There is deliberately no matching reader. The qwen3_5 GDN layer this
-    /// was adapted from needs one because its compiled forward re-uploads
-    /// the norm weight into a captured graph; NemotronH has no compiled
-    /// forward, so a getter here would be a write-only accessor pair with
-    /// nothing on the read side.
+    /// write path for it). No matching reader: unlike qwen3_5's GDN layer,
+    /// NemotronH has no compiled forward to re-upload it into.
     pub fn set_norm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.norm.set_weight(w)
     }

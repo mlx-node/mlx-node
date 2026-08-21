@@ -6,34 +6,9 @@ use crate::array::mask::create_causal_mask;
 use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
 use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
+use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::bindgen_prelude::*;
-
-/// When enabled (default), paged decode writes K/V into the pool with the
-/// graph-native, lazily-scheduled `update_keys_values_native` so the write
-/// feeds the same-step attention read through MLX graph dependencies — no
-/// per-layer host sync. When disabled, the synchronous `update_keys_values`
-/// (a raw Metal write outside the graph scheduler) is used instead. The sync
-/// path is also taken automatically when the native write fails.
-pub(crate) fn native_kv_write_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled_or_default("MLX_LFM2_NATIVE_KV_WRITE", true)
-    })
-}
-
-/// When enabled (default), paged decode gathers historical K/V with the
-/// graph-native `gather_kv_for_decode_graph`, which consumes the lazy pool
-/// arrays via graph dependencies (no per-layer host eval). When disabled, the
-/// synchronous `gather_kv_for_decode` (which forces a pending-write eval and
-/// reads the pool outside the graph) is used. The sync path is also taken
-/// automatically when the graph gather is unavailable for the inputs.
-pub(crate) fn graph_decode_gather_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled_or_default("MLX_LFM2_GRAPH_DECODE_GATHER", true)
-    })
-}
 
 /// When enabled (opt-in; default OFF), cache-hit prefill (`cached_prefix_len > 0`,
 /// i.e. every multi-turn chat continuation) first tries the MLX graph-native

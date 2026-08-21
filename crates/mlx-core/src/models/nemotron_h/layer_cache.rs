@@ -1,14 +1,6 @@
-//! Per-layer cache for NemotronH decoder layers.
-//!
-//! Three layer kinds with three cache shapes:
-//!   * Mamba  - Mamba2State (conv state [B, K-1, conv_dim] + SSM state
-//!     [B, num_heads, head_dim, state_size] f32)
-//!   * Attention - flat KVCache (append tensors)
-//!   * MoE    - stateless
-//!
-//! The MTP stepper snapshots and restores these caches around each
-//! propose/verify cycle; the snapshot clones the refcounted array handles
-//! (cheap) plus the KV offsets.
+//! Per-layer cache for NemotronH decoder layers: Mamba2State, a flat KVCache,
+//! or nothing (MoE). The MTP stepper snapshots and restores these around each
+//! propose/verify cycle.
 
 use crate::array::MxArray;
 use crate::transformer::KVCache;
@@ -64,15 +56,10 @@ impl NemotronHLayerCache {
         }
     }
 
-    /// Shared read-only view of the attention slot, for assertions only.
-    ///
-    /// Every caller is a cursor/offset probe: the MTP unit tests and the
-    /// `NemotronHMtpStepper::draft_kv_offset` test seam. The production
-    /// forward and rollback paths all mutate and go through
-    /// [`Self::as_kv_cache_mut`] instead. Gated so it cannot silently
-    /// acquire a production caller and so it stays available to
-    /// debug-build assertions (`debug_assert!` on the drafter cursor),
-    /// which compile outside `cfg(test)`.
+    /// Shared read-only view of the attention slot, for cursor/offset probes
+    /// only. Gated so it cannot pick up a production caller, but wider than
+    /// `cfg(test)` so `debug_assert!`s can still use it; production paths
+    /// mutate through [`Self::as_kv_cache_mut`].
     #[cfg(any(test, debug_assertions))]
     pub fn as_kv_cache(&self) -> Option<&KVCache> {
         match self {

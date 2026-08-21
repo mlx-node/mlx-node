@@ -12,7 +12,7 @@
  * The fork-time-only set, as of this writing: `MLX_PAGED_PREFILL_CHUNK_SIZE`,
  * `MLX_PAGED_PREFILL_EVAL_INTERVAL`, `MLX_PAGED_DECODE_CACHE_CLEAR_INTERVAL`,
  * `MLX_PAGED_GROUPED_{QWEN35,GEMMA4}`, `MLX_GEMMA4_PAGED_{DECODE,PREFILL}_ROUTE`,
- * `MLX_{QWEN35_,}NATIVE_KV_WRITE`, `MLX_INFERENCE_TRACE[_FILE]`, and roughly
+ * `MLX_PAGED_{NATIVE_KV_WRITE,GRAPH_DECODE_GATHER}`, `MLX_INFERENCE_TRACE[_FILE]`, and roughly
  * twenty MTP/sampling knobs. They are fork parameters, not settings.
  */
 

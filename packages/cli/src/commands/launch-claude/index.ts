@@ -64,8 +64,13 @@ Options:
                                   _DECODE_CLEAR_CACHE_INTERVAL_TOKENS).
     MLX_PAGED_CACHE_MEMORY_MB      Paged KV cache memory budget override for
                                   paged-aware Qwen3.5 launch.
-    MLX_GEMMA4_NATIVE_KV_WRITE    Set to 0/false/off to disable graph-native
-                                  Gemma4 global KV writes.
+    MLX_PAGED_NATIVE_KV_WRITE     Set to 0/false/off to disable graph-native
+                                  paged KV writes for every paged family.
+                                  Batched decode hard-errors when off.
+    MLX_PAGED_GRAPH_DECODE_GATHER
+                                  Set to 0/false/off to disable the
+                                  graph-native paged decode gather for every
+                                  paged family.
     MLX_GEMMA4_SLIDING_CHECKPOINT_LIMIT
                                   Override retained Gemma4 sliding-cache
                                   checkpoints. Defaults dynamically from the

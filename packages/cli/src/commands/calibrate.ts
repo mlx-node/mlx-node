@@ -66,9 +66,9 @@ function readCalibTexts(datasetPath: string, count: number): string[] {
  * reset between rows.
  *
  * On success it ATOMICALLY writes `input_amax` into `<input>/config.json`
- * (temp file + rename) under BOTH the `quantization` and `quantization_config`
- * aliases. On ANY error before the final write, `config.json` is left
- * UNTOUCHED — a failed calibration never mutates the live model in place.
+ * (temp file + rename) under every quantization block the config carries. On
+ * ANY error before the final write, `config.json` is left UNTOUCHED — a failed
+ * calibration never mutates the live model in place.
  */
 export async function calibrate(opts: CalibrateOptions): Promise<CalibrateResult> {
   const modelPath = resolve(opts.input);
@@ -117,11 +117,12 @@ What it does:
   template, no generated token) with the activation collector armed, recording
   each attention/GDN mxfp8 projection's per-tensor max|activation| (modelopt
   MaxCalibrator semantics). The collected input_amax is written ATOMICALLY into
-  the model's config.json IN PLACE (both the "quantization" and
-  "quantization_config" blocks) so a later inference run fake-quantizes those
-  activations to E4M3 for W8A8 numeric parity with NVIDIA modelopt. Only the
-  mxfp8 attn/GDN sites are calibrated; the mxfp4 FFN keeps bf16 activations.
-  A failed run leaves config.json untouched.
+  the model's config.json IN PLACE (the "quantization" block, plus the legacy
+  "quantization_config" alias when a source config carries one) so a later
+  inference run fake-quantizes those activations to E4M3 for W8A8 numeric
+  parity with NVIDIA modelopt. Only the mxfp8 attn/GDN sites are calibrated;
+  the mxfp4 FFN keeps bf16 activations. A failed run leaves config.json
+  untouched.
 
 Example:
   mlx calibrate -i ./qwen3.6-27b-nvidia-mxfp4-mlx \\

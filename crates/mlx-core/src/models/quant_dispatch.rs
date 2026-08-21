@@ -614,9 +614,8 @@ fn quant_object(quant_cfg: Option<&Value>) -> Result<Option<&serde_json::Map<Str
 }
 
 /// Select the modern or legacy quantization block without silent alias
-/// shadowing. Generated checkpoints duplicate both aliases byte-for-byte; a
-/// null/non-object alias or divergent pair is malformed and must fail before
-/// any dtype-based legacy mode heuristic runs.
+/// shadowing. A null/non-object alias or a divergent pair is malformed and must
+/// fail before any dtype-based legacy mode heuristic runs.
 pub fn select_quantization_block(raw: &Value) -> Result<Option<&Value>> {
     let modern = raw.get("quantization");
     let legacy = raw.get("quantization_config");
@@ -703,34 +702,15 @@ fn parse_group_size(value: &Value, mode: Option<PerLayerMode>, context: &str) ->
     Ok(group_size)
 }
 
-/// Does this `(mode, bits, group_size)` triple describe a projection that
-/// carries a calibrated static per-tensor FP8 (E4M3) ACTIVATION scale?
+/// The only two weight shapes carrying a calibrated static per-tensor FP8
+/// (E4M3) activation scale: mxfp8 8/32 (qwen3_5 nvidia recipe attn/GDN) and
+/// affine 8/32 (nemotron_h mamba `mixer.{in,out}_proj`, which avoids mxfp8
+/// because MLX's E8M0 block exponent rounds to nearest, not ceil).
 ///
-/// The two members are the only 8-bit group-32 packings this repo produces
-/// from a modelopt W8A8_FP8 source:
-///   * mxfp8 8/32  — the qwen3_5 nvidia recipe's attn/GDN projections;
-///   * affine 8/32 — nemotron_h's mamba `mixer.{in,out}_proj`, which moved off
-///     mxfp8 because MLX's E8M0 block exponent rounds to NEAREST rather than
-///     ceil (6.1% vs 0.64% relative RMS against the E4M3 source).
-///
-/// Everything else (mxfp4, nvfp4, sym8, fp8_e4m3, the K-quants, and affine at
-/// any other width or group size) is excluded, so a stale or hand-edited
-/// config can never fake-quant a projection that was never calibrated for it.
-///
-/// This is the single definition behind three gates that must not drift: the
-/// config parser below, the modelopt-schema parser in
-/// `nemotron_h::persistence`, and `QuantizedLinear`'s forward-time
-/// fake-quant/tap in `qwen3_5::quantized_linear`.
-///
-/// Widening from the earlier bare `mode == Mxfp8` test cannot change any
-/// EXISTING checkpoint, in either direction:
-///   * it cannot narrow mxfp8 — every `QuantizedLinear` that stores mode
-///     `"mxfp8"` is constructed with `MXFP8_BITS` / `MXFP8_GROUP_SIZE`, so the
-///     two new equalities are tautologies there;
-///   * it cannot widen an already-loadable checkpoint into a fake-quant —
-///     `parse_input_amax` USED to reject every non-mxfp8 `input_amax` outright,
-///     and every caller propagates that error (no loader swallows it), so no
-///     config carrying `affine` + `input_amax` was ever loadable to begin with.
+/// Fail-closed: everything else with an `input_amax` is a stale or hand-edited
+/// config. Shared by the config parser below, the modelopt-schema parser in
+/// `nemotron_h::persistence`, and the forward-time fake-quant gate in
+/// `qwen3_5::quantized_linear` — the three must not drift.
 pub fn admits_static_fp8_activation(mode: PerLayerMode, bits: i32, group_size: i32) -> bool {
     matches!(mode, PerLayerMode::Mxfp8 | PerLayerMode::Affine) && bits == 8 && group_size == 32
 }
@@ -1629,15 +1609,9 @@ mod tests {
         assert_eq!(overrides["layers.0.mlp.gate_proj"].group_size, 64);
     }
 
-    /// `input_amax` is admitted on EXACTLY the two static-FP8 weight shapes
-    /// this repo produces from a modelopt W8A8_FP8 source — mxfp8 8/32 and
-    /// affine 8/32 — and rejected everywhere else.
-    ///
-    /// The affine 8/32 arm is load-bearing: nemotron_h's converter writes
-    /// `"mode": "affine", "bits": 8, "group_size": 32` WITH `input_amax` for
-    /// the mamba `mixer.{in,out}_proj`. Before the predicate replaced the bare
-    /// `mode != Mxfp8` test, that config.json could not be parsed at all and
-    /// the whole model failed to load.
+    /// `input_amax` is admitted on exactly mxfp8 8/32 and affine 8/32, rejected
+    /// everywhere else. The affine arm is load-bearing: nemotron_h's converter
+    /// emits it for the mamba `mixer.{in,out}_proj`.
     #[test]
     fn input_amax_requires_positive_finite_f32_on_a_static_fp8_override() {
         let valid = serde_json::json!({
@@ -1677,7 +1651,7 @@ mod tests {
             assert!(parse_quant_settings(Some(&raw), 4, 64).is_err());
         }
 
-        // affine 8/32 — nemotron_h's mamba projections. ADMITTED.
+        // affine 8/32 — nemotron_h's mamba projections: admitted.
         let affine_8_32 = serde_json::json!({
             "mode": "affine",
             "bits": 8,
@@ -1696,8 +1670,7 @@ mod tests {
             "affine 8/32 is a static-FP8 weight shape and must carry its amax"
         );
 
-        // Right mode, wrong group size — a static per-tensor activation scale
-        // is only meaningful on the 8/32 packing, so 8/64 is still rejected.
+        // Right mode, wrong group size: 8/64 is still rejected.
         let affine_8_64 = serde_json::json!({
             "mode": "affine",
             "bits": 8,
@@ -1724,7 +1697,7 @@ mod tests {
         });
         assert!(parse_quant_settings(Some(&wrong_mode), 4, 64).is_err());
 
-        // nvfp4 8/32 is not a thing the recipes produce; reject it too.
+        // nvfp4 is not a static-FP8 shape; reject it too.
         let nvfp4_amax = serde_json::json!({
             "mode": "nvfp4",
             "bits": 4,

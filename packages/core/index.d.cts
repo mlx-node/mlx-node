@@ -1009,13 +1009,9 @@ export declare class NativeRewardRegistry {
 }
 
 /**
- * NVIDIA Nemotron 3.5 Lightning language model.
- *
- * Hybrid MoE architecture (Mamba-2 SSM + GQA + pure MoE-FFN layers) with
- * an optional in-checkpoint MTP head. All model state lives on a
- * dedicated OS thread; NAPI methods dispatch commands via channels. When
- * the block-paged adapter is active the thread runs the engine-owned
- * `HybridSchedulerState` continuous-batching loop.
+ * NVIDIA Nemotron 3.5 Lightning language model: hybrid Mamba-2 SSM + GQA + MoE-FFN
+ * with an optional in-checkpoint MTP head. All model state lives on a dedicated OS
+ * thread; NAPI methods dispatch commands via channels.
  */
 export declare class NemotronHModel {
   /**
@@ -1029,29 +1025,10 @@ export declare class NemotronHModel {
    */
   hasMtpWeights(): boolean;
   /**
-   * Whether `ChatSession` should turn MTP ON when the caller sets nothing.
-   *
-   * FALSE for this family, deliberately, even though `hasMtpWeights()` is
-   * true on every shipped checkpoint. Two reasons, both about SCHEDULING,
-   * not about speed:
-   *   * `enable_mtp == Some(true)` forces the chat-requires-barrier
-   *     predicate in the hybrid scheduler, which puts the turn in the
-   *     EXCLUSIVE lane and removes it from continuous batching entirely;
-   *   * streaming MTP turns fall back to paged AR
-   *     (`mtp_flat_routing_required`) for zero speculation AND zero
-   *     batching.
-   *
-   * The throughput argument that used to sit here is RETRACTED. MTP
-   * measured 0.56x AR only while the residual stream ran f32, which forced
-   * every dense projection through an f32 copy each forward (the bf16
-   * `lm_head` worst of all). With that seam closed at its source MTP is a
-   * wash -- 89.91 vs 89.51 tok/s against flat AR, 0.994x against paged AR,
-   * acceptance 0.9539 of a depth-1 maximum of 1.0. So enabling it per
-   * session now costs nothing; only the batching loss argues against
-   * making it the default.
-   *
-   * `enableMtp: true` still works for anyone who wants to A/B it;
-   * `MLX_NEMOTRON_MTP_DEFAULT=1` flips the auto-default fleet-wide.
+   * Whether `ChatSession` should turn MTP ON when the caller sets nothing. FALSE
+   * deliberately, about SCHEDULING not speed: `enable_mtp == Some(true)` forces the
+   * chat-requires-barrier predicate, putting the turn in the EXCLUSIVE lane and out
+   * of continuous batching. `MLX_NEMOTRON_MTP_DEFAULT=1` flips it.
    */
   mtpAutoEnabled(): boolean;
   /**
@@ -1060,10 +1037,8 @@ export declare class NemotronHModel {
    */
   hasBlockPagedCache(): boolean;
   /**
-   * Physical/trained context limits captured at load: the ChatSession
-   * preflight compacts or rejects against effective_window_tokens instead
-   * of the trained 1M-token window, so long conversations fail the
-   * preflight rather than inside paged-cache allocation.
+   * Physical/trained context limits captured at load, so the ChatSession preflight
+   * rejects long conversations instead of failing inside paged-cache allocation.
    */
   contextLimits(): NemotronHContextLimits;
   /** Get the model configuration. */
@@ -4272,139 +4247,60 @@ export interface MuseGlimmerContextLimits {
 /**
  * NVIDIA Nemotron 3.5 Lightning ("nemotron_h") model configuration.
  *
- * Hybrid MoE architecture: 52 layers alternating between three mixer kinds
- * (`layers_block_type`): `mamba` (Mamba-2 SSM), `moe` (pure MoE-FFN), and
- * `attention` (GQA). Each layer is a single pre-RMSNorm + ONE mixer + a
- * residual connection; the final `norm_f` + a separate untied `lm_head`
- * complete the stack.
- *
- * Parsed fail-closed from the checkpoint `config.json`; unknown layer block
- * types, missing mandatory fields, and unsupported optional features
- * (e.g. `moe_latent_size`) are rejected at load time rather than silently
- * mis-decoded.
+ * Hybrid MoE: every layer is one pre-RMSNorm + ONE mixer + a residual, closed
+ * by `norm_f` and an untied `lm_head`. Parsed fail-closed — unknown block
+ * types, missing fields and unsupported features are rejected at load.
  */
 export interface NemotronHConfig {
-  /** Vocabulary size (131072 for the 30B Lightning checkpoint). */
   vocabSize: number;
-  /** Hidden dimension (2688). */
   hiddenSize: number;
-  /** Total number of decoder layers (52). */
   numHiddenLayers: number;
-  /** Number of query heads in the GQA attention layers (32). */
   numAttentionHeads: number;
-  /** Number of KV heads in the GQA attention layers (2). */
   numKeyValueHeads: number;
-  /** Per-head attention dimension (128). */
   headDim: number;
-  /** Maximum position embeddings (context length). */
   maxPositionEmbeddings: number;
-  /** RMSNorm epsilon for every norm in the model (1e-5). */
   layerNormEpsilon: number;
   /**
-   * RoPE base frequency carried in some checkpoint `config.json` files.
-   *
-   * UNUSED BY THE RUNTIME: NemotronH attention is NoPE. No reference
-   * implementation declares or consumes `rope_theta` (HF
-   * `NemotronHConfig` has no such field, vLLM's attention takes no
-   * positions, mlx-lm never rotates), and neither does this family's
-   * attention module - wiring it into a rotation would change every
-   * token the model emits. Parsed leniently with a 10000.0 default so a
-   * spec-conformant checkpoint that omits it still loads, and echoed
-   * back through `getConfig()` as checkpoint metadata only.
-   */
-  ropeTheta: number;
-  /**
    * Per-layer mixer kind, remapped from the checkpoint's
-   * `layers_block_type`: "mamba" -> "linear_attention", "attention" ->
-   * "full_attention", "moe" -> "moe" (the HF `MIXER_TYPES` names).
+   * `layers_block_type` to the HF `MIXER_TYPES` names.
    */
   layersBlockType: Array<string>;
-  /** Number of SSM heads (64). */
   mambaNumHeads: number;
-  /** SSM head dimension (64). */
   mambaHeadDim: number;
-  /** SSM state size per head per group (128). */
+  /** SSM state size, per head per group. */
   ssmStateSize: number;
-  /** Number of SSM groups (8); each head belongs to group h / (H / G). */
+  /** Number of SSM groups; head `h` belongs to group `h / (H / G)`. */
   nGroups: number;
-  /** Depthwise causal conv1d kernel size (4). */
+  /** Depthwise causal conv1d kernel size. */
   convKernel: number;
-  /** Mamba-2 chunk-scan chunk size (128). */
   chunkSize: number;
   /**
-   * Declared minimum discretized time step (1e-3 in the released
-   * checkpoint).
+   * Declared minimum discretized time step.
    *
-   * UNUSED BY THE RUNTIME. No production reference clamps dt to it: the
-   * HF fused path builds `dt_limit_kwargs` from `time_step_limit` only
-   * (modeling_nemotron_h.py:281) and the released config declares no
-   * `time_step_limit`, so mamba_ssm's `dt_limit=(0.0, inf)` applies;
-   * vLLM hardcodes `dt_limit=(0.0, inf)` (mamba_mixer2.py:672, :890);
-   * mlx-lm defaults `time_step_limit` to `(0.0, inf)` and clips to that
-   * (nemotron_h.py:56-65 + ssm.py:8-11). Only the HF *torch fallback*
-   * (:417-418, :465-466) clamps to `time_step_min`, and that path is not
-   * what the checkpoint was trained/served with. Parsed leniently and
-   * echoed back through `getConfig()` as checkpoint metadata only. Use
-   * `time_step_limit_pair()` for the clamp the mixer actually applies.
+   * UNUSED BY THE RUNTIME. No served reference clamps dt to it - only HF's
+   * torch fallback does. `time_step_limit_pair()` is the real clamp.
    */
   timeStepMin: number;
   /**
-   * Optional `[min, max]` bounds for the discretized time step, matching
-   * mlx-lm's `ModelArgs.time_step_limit`. Absent (`None`) means the
-   * mamba_ssm/vLLM/mlx-lm default `(0.0, +inf)`, i.e. no clamp; the
-   * released 30B checkpoint declares no `time_step_limit`.
+   * Optional `[min, max]` bounds for the discretized time step. `None` is
+   * the reference default `(0.0, +inf)`, i.e. no clamp.
    */
   timeStepLimit?: number[];
-  /** Total routed experts (128). */
   nRoutedExperts: number;
-  /** Experts selected per token (6). */
   numExpertsPerTok: number;
-  /** Post-normalization routing weight scale (2.5). */
+  /** Routing weight scale, applied after normalization. */
   routedScalingFactor: number;
-  /** Number of expert groups (1 - grouping degenerates to a flat top-k). */
-  nGroup: number;
-  /** Number of top groups selected (1). */
-  topkGroup: number;
   /** Renormalize the gathered top-k weights to sum to 1 before scaling. */
   normTopkProb: boolean;
-  /** Per-expert MLP intermediate size (1856; non-gated up->relu2->down). */
+  /** Per-expert MLP intermediate size (non-gated up -> relu2 -> down). */
   intermediateSize: number;
-  /** Shared-expert MLP intermediate size (3712), applied on ALL tokens. */
+  /** Shared-expert MLP intermediate size; it runs on ALL tokens. */
   moeSharedExpertIntermediateSize: number;
-  /**
-   * Tie the lm_head to the embedding table.
-   *
-   * ALWAYS `false` here: `parse_config` rejects a `true` checkpoint at
-   * load time. The weight loader has no tied-head path - it requires an
-   * explicit `lm_head.weight` tensor - so accepting `true` would parse
-   * cleanly and then die much later with "Checkpoint missing
-   * lm_head.weight", which reads like a corrupt download rather than an
-   * unsupported variant.
-   */
-  tieWordEmbeddings: boolean;
-  bosTokenId: number;
-  /** EOS token ids (config.json scalar; generation_config carries {2, 11}). */
+  /** EOS token ids, from the config.json scalar or array. */
   eosTokenIds: number[];
-  padTokenId: number;
-  /**
-   * Declared `num_logits_to_keep` (1 on the released checkpoint).
-   *
-   * UNUSED BY THE RUNTIME. In HF it is a generation-time slicing hint:
-   * `prepare_inputs_for_generation` forwards it as `logits_to_keep`
-   * and the head is applied to `hidden_states[:, -N:, :]`
-   * (modeling_nemotron_h.py:1171-1172). mlx-lm and vLLM declare no such
-   * field at all. This runtime does not honour it either - every
-   * prefill path applies `lm_head` over the whole `[1, T, hidden]`
-   * block and slices the last position afterwards - so it is parsed
-   * leniently (default 1) and echoed back through `getConfig()` as
-   * checkpoint metadata only. Honouring it would be a real prefill
-   * saving on this 131072-wide head, but that is a change to the
-   * forward paths, not to this field.
-   */
-  numLogitsToKeep: number;
-  /** MTP layer kinds, remapped like `layers_block_type` (["attention","moe"]). */
+  /** MTP layer kinds, remapped like `layers_block_type`. */
   mtpLayersBlockType: string[];
-  /** Number of MTP predictor steps (`num_nextn_predict_layers`; 1). */
+  /** Number of MTP predictor steps (`num_nextn_predict_layers`). */
   nMtpLayers: number;
   /**
    * Optional block-paged KV cache memory cap in MiB. None resolves to the
@@ -4414,19 +4310,16 @@ export interface NemotronHConfig {
   /** Optional paged block size in tokens (default 16). */
   pagedBlockSize?: number;
   /**
-   * Opt in/out of the block-paged KV adapter. None (the default) enables
-   * the paged pool and the continuous-batching scheduler lane; explicit
-   * `Some(false)` reverts to the flat-cache whole-turn path.
+   * Opt in/out of the block-paged KV adapter. `None` enables the paged pool
+   * and the continuous-batching lane; `Some(false)` reverts to whole-turn.
    */
   useBlockPagedCache?: boolean;
 }
 
 /**
- * Physical and trained context limits captured at load time, surfaced
- * through `context_limits()` so the ChatSession preflight can compact or
- * reject against the paged pool's ACTUAL capacity instead of the trained
- * window (the 2 GiB default pool is far below the checkpoint's 1M-token
- * claim).
+ * Physical and trained context limits captured at load time, surfaced through
+ * `context_limits()` so the ChatSession preflight can compact or reject against
+ * the paged pool's ACTUAL capacity instead of the trained window.
  */
 export interface NemotronHContextLimits {
   trainedWindowTokens: number;

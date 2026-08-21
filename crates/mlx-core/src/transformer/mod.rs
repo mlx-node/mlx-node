@@ -17,6 +17,7 @@ pub mod mlp;
 #[cfg(test)]
 mod mlp_test;
 pub mod paged_attention_inputs;
+pub(crate) mod paged_flags;
 pub mod paged_kv_cache_adapter;
 pub mod rotating_kv_cache;
 

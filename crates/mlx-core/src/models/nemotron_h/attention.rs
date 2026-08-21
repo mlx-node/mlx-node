@@ -1,50 +1,33 @@
-//! NemotronH GQA attention mixer.
+//! NemotronH GQA attention mixer: bias-free projections, no Q/K RMSNorm, no
+//! softcap.
 //!
-//! Port of the HuggingFace NemotronHAttention: GQA (32 query / 2 KV heads,
-//! head_dim 128), bias-free projections, BF16. No Q/K RMSNorm and no
-//! softcap for this family.
+//! NoPE - no positional rotation anywhere. HF, vLLM and mlx-lm all agree
+//! (`apply_rotary_pos_emb` is defined in the HF module but never called from
+//! this class); position reaches the model through the Mamba-2 mixers.
 //!
-//! NemotronH attention is NoPE - no positional rotation is applied
-//! anywhere. All three references agree: HF `NemotronHAttention.forward`
-//! projects Q/K/V, updates the cache and calls the attention interface
-//! (`apply_rotary_pos_emb` is defined in that module but never called from
-//! this class), vLLM's `NemotronHAttention.forward(self, hidden_states,
-//! **kwargs)` takes no `positions` at all, and mlx-lm's `__call__` goes
-//! straight from the projections to SDPA. Position information reaches the
-//! model through the Mamba-2 mixers instead.
-//!
-//! The same layer serves both the backbone attention blocks and the MTP
-//! head's attention layer. The MTP head is a real decoder layer with its
-//! OWN KV cache group (vLLM `NemotronHMTPAttentionDecoderLayer` ->
-//! `NemotronHAttention` -> its own `Attention(...)`), so it drives the very
-//! same `forward` as the backbone, with its own per-layer cache.
+//! The MTP head is a real decoder layer with its own KV cache group, so it
+//! drives this same `forward` with its own per-layer cache.
 
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
 use crate::array::{DType, MxArray};
 use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
 use crate::nn::Linear;
 use crate::transformer::KVCache;
+use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::bindgen_prelude::*;
 
 use super::config::NemotronHConfig;
 
-/// The dtype the block-paged KV pool stores, and therefore the dtype the
-/// flat `KVCache` has to end up holding for the two lanes to run the same
-/// attention arithmetic.
+/// The dtype the block-paged KV pool stores, and therefore the dtype the flat
+/// `KVCache` must end up holding for the two lanes to run the same attention
+/// arithmetic. Hard constraint: `PagedKVCacheAdapter` rejects anything but
+/// half-precision and the pool is byte-allocated for 2-byte elements, while
+/// the flat cache has no dtype of its own — it stores whatever the residual
+/// stream hands the K/V projections (see `gated_rmsnorm` in `mamba2.rs`).
 ///
-/// This is a hard constraint on the paged side, not a preference:
-/// `PagedKVCacheAdapter` rejects anything but Float16/BFloat16 at every K/V
-/// boundary ("kernel io_type is half-precision") and the pool is
-/// byte-allocated for 2-byte elements. The FLAT cache has no dtype of its
-/// own - `KVCache::update_and_fetch` allocates its buffer with
-/// `keys.dtype()` - so it holds whatever the residual stream hands the K/V
-/// projections. Keeping that stream in the model dtype (bf16) is what keeps
-/// the lanes aligned; see `gated_rmsnorm` in `mamba2.rs`.
-/// `pub(crate)` so the end-to-end loader seam gate in `persistence.rs` can
-/// assert the FLAT cache against the paged writer's OWN constant rather than
-/// re-typing the literal — otherwise a future change to the pool dtype would
-/// leave that assertion quietly checking the old value.
+/// `pub(crate)` so the loader seam gate in `persistence.rs` asserts against
+/// this constant instead of re-typing the literal.
 pub(crate) const PAGED_KV_IO_DTYPE: DType = DType::BFloat16;
 
 pub struct NemotronHAttention {
@@ -139,22 +122,20 @@ impl NemotronHAttention {
         self.o_proj.forward(&output)
     }
 
-    /// Whether any projection holds a quantized backend.
     pub fn is_quantized(&self) -> bool {
         self.q_proj.is_quantized()
             || self.k_proj.is_quantized()
             || self.v_proj.is_quantized()
             || self.o_proj.is_quantized()
     }
+
     /// Block-paged forward driven by the PagedKVCacheAdapter.
     ///
-    /// Mirrors the LFM2 forward_paged contract: x is already pre-normalized,
-    /// attn_layer_idx is the ATTENTION-LAYER ORDINAL into the adapter's
-    /// LayerKVPool (0..6, NOT the absolute decoder index), and the caller must
-    /// have recorded the suffix in the adapter BEFORE this call so the
-    /// update_keys_values alignment passes. K/V are written into the shared
-    /// pool; attention reads the pool through the graph-native gather/prefill
-    /// bridges (with the synchronous fallbacks).
+    /// Mirrors the LFM2 forward_paged contract: `x` is already pre-normalized,
+    /// `attn_layer_idx` is the ATTENTION-LAYER ORDINAL into the adapter's
+    /// LayerKVPool (NOT the absolute decoder index), and the caller must have
+    /// recorded the suffix in the adapter BEFORE this call or the
+    /// `update_keys_values` alignment check fails.
     #[allow(clippy::too_many_arguments)]
     pub fn forward_paged(
         &self,
@@ -190,8 +171,7 @@ impl NemotronHAttention {
         ])?;
         let values_bhtd = values.transpose(Some(&[0, 2, 1, 3]))?;
 
-        // Paged layout [num_tokens, n_kv_heads, head_dim] (batch == 1 on the
-        // single-row prefill path).
+        // Paged layout [num_tokens, n_kv_heads, head_dim].
         let keys_paged = keys_bhtd.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
             batch * seq_len,
             self.num_kv_heads as i64,
@@ -203,12 +183,11 @@ impl NemotronHAttention {
             self.head_dim as i64,
         ])?;
 
-        // The KV pool stores 2-byte elements (bf16); cast at the write
-        // boundary so an f32 upstream stream (unit-test fixtures) is accepted
-        // and a production bf16 stream is an identity no-op.
+        // Cast at the write boundary: a production bf16 stream is a no-op, an
+        // f32 one (unit-test fixtures) is accepted.
         let keys_paged = keys_paged.astype(PAGED_KV_IO_DTYPE)?;
         let values_paged = values_paged.astype(PAGED_KV_IO_DTYPE)?;
-        let native_written = crate::models::lfm2::attention::native_kv_write_enabled()
+        let native_written = native_kv_write_enabled()
             && adapter
                 .update_keys_values_native(
                     attn_layer_idx,
@@ -294,14 +273,12 @@ impl NemotronHAttention {
                 }
             }
         } else {
-            // Decode: gather full historical K/V via the paged kernel (the
-            // kernels are half-precision; production bf16 streams pass through
-            // this cast unchanged).
+            // Decode: gather full historical K/V via the paged kernel.
             let queries_3d = queries_bhtd
                 .squeeze(Some(&[2]))?
                 .reshape(&[1, self.num_heads as i64, self.head_dim as i64])?
                 .astype(PAGED_KV_IO_DTYPE)?;
-            let attn_3d = if crate::models::lfm2::attention::graph_decode_gather_enabled() {
+            let attn_3d = if graph_decode_gather_enabled() {
                 match adapter.gather_kv_for_decode_graph(
                     attn_layer_idx,
                     &queries_3d,
@@ -340,11 +317,10 @@ impl NemotronHAttention {
 
     /// Uniform batched paged decode for the continuous-batching lane.
     ///
-    /// One token per row: queries [N, H, D], K/V [N, kvH, D], one batched
-    /// native K/V write and one graph-native batched attention gather. No
-    /// serial fallback - a genuine N-row wave must share the weight stream.
-    /// `rows` carries the per-row (seq id, logical position) pairs the
-    /// adapter needs for slot mapping; no rotation is applied to them.
+    /// One token per row, one batched native K/V write and one batched gather.
+    /// No serial fallback - a genuine N-row wave must share the weight stream.
+    /// `rows` carries the (seq id, logical position) pairs the adapter needs
+    /// for slot mapping; being NoPE, nothing rotates them.
     pub(crate) fn forward_paged_batched(
         &self,
         x: &MxArray,
@@ -364,9 +340,7 @@ impl NemotronHAttention {
                 shape.as_ref()
             )));
         }
-        if !crate::models::lfm2::attention::native_kv_write_enabled()
-            || !crate::models::lfm2::attention::graph_decode_gather_enabled()
-        {
+        if !native_kv_write_enabled() || !graph_decode_gather_enabled() {
             return Err(Error::from_reason(
                 "NemotronH batched decode requires native K/V writes and graph decode gather",
             ));
@@ -428,7 +402,6 @@ mod tests {
             head_dim: 4,
             max_position_embeddings: 64,
             layer_norm_epsilon: 1e-5,
-            rope_theta: 10000.0,
             layers_block_type: vec!["full_attention".into()],
             mamba_num_heads: 2,
             mamba_head_dim: 2,
@@ -441,16 +414,10 @@ mod tests {
             n_routed_experts: 2,
             num_experts_per_tok: 1,
             routed_scaling_factor: 1.0,
-            n_group: 1,
-            topk_group: 1,
             norm_topk_prob: true,
             intermediate_size: 8,
             moe_shared_expert_intermediate_size: 8,
-            tie_word_embeddings: false,
-            bos_token_id: 1,
             eos_token_ids: vec![2],
-            pad_token_id: 0,
-            num_logits_to_keep: 1,
             mtp_layers_block_type: Vec::new(),
             n_mtp_layers: 0,
             paged_cache_memory_mb: None,
@@ -459,9 +426,8 @@ mod tests {
         }
     }
 
-    /// Attention with a fresh cache over a 3-token sequence must produce
-    /// per-position outputs, and a cached decode at the 4th position must
-    /// equal the same forward computed from the full 4-token sequence.
+    /// A cached decode at position 4 must equal the same forward computed
+    /// from the full 4-token sequence.
     #[test]
     fn attention_kv_cache_continuity() {
         let cfg = tiny_cfg();
@@ -515,13 +481,9 @@ mod tests {
         let _ = out3;
     }
 
-    /// Regression: NemotronH attention is NoPE (HF `NemotronHAttention.forward`
-    /// never calls `apply_rotary_pos_emb`; vLLM's takes no `positions`; mlx-lm
-    /// goes straight from the projections to SDPA). Without a positional
-    /// rotation the decode output depends only on the SET of cached (K, V)
-    /// pairs, so feeding the same two-token history in the opposite ORDER must
-    /// give a bit-comparable result. With RoPE the two histories rotate K by
-    /// swapped offsets and the outputs diverge.
+    /// Regression: attention is NoPE, so the decode output depends only on the
+    /// SET of cached (K, V) pairs — the same two-token history in the opposite
+    /// ORDER must be bit-comparable. With RoPE the two would diverge.
     #[test]
     fn attention_has_no_positional_rotation() {
         let cfg = tiny_cfg();
@@ -564,8 +526,7 @@ mod tests {
         );
     }
 
-    /// Attention with dense BF16 projections, matching the released
-    /// checkpoint (q/k/v/o carry no `.scales` key there).
+    /// Attention with dense BF16 projections, as the checkpoint ships.
     fn bf16_attention(cfg: &NemotronHConfig) -> NemotronHAttention {
         let mut attn = NemotronHAttention::new(cfg).expect("attention builds");
         let h = cfg.hidden_size as i64;
@@ -588,22 +549,14 @@ mod tests {
         attn
     }
 
-    /// PINS THE FLAT/PAGED KV DTYPE SEAM.
+    /// Pins the flat/paged KV dtype seam: the flat cache stores whatever
+    /// `k_proj` produced while the paged lane always casts to
+    /// `PAGED_KV_IO_DTYPE`, so an upstream f32 promotion makes the two lanes
+    /// silently run different attention arithmetic.
     ///
-    /// The flat `KVCache` has no dtype of its own: `update_and_fetch`
-    /// allocates its buffer with `keys.dtype()`, so it stores exactly what
-    /// `k_proj` produced - i.e. the residual stream's dtype. The paged lane
-    /// has no such freedom: `forward_paged` casts every K/V write to
-    /// `PAGED_KV_IO_DTYPE` because the pool is byte-allocated for 2-byte
-    /// elements and the kernels are half-precision. So the moment anything
-    /// upstream promotes the residual to f32, the two lanes silently run
-    /// different attention arithmetic - flat over f32 K/V, paged over bf16.
-    ///
-    /// Mutation caught: any `astype(Float32)` introduced into this forward,
-    /// or a paged pool dtype that stops matching what the flat lane stores.
-    /// The UPSTREAM promotion (an f32 mixer output) is guarded in `mamba2.rs`
-    /// by `mamba_mixer_is_dtype_transparent`; the second half of this test
-    /// shows why that guard has to live there and not here.
+    /// Mutation caught: any `astype(Float32)` in this forward, or a pool dtype
+    /// that stops matching what the flat lane stores. The upstream promotion
+    /// is guarded separately by `mamba_mixer_is_dtype_transparent`.
     #[test]
     fn flat_kv_cache_stores_the_paged_pool_dtype() {
         let cfg = tiny_cfg();
@@ -644,12 +597,9 @@ mod tests {
             "the flat KV cache must hold the same dtype the paged pool stores"
         );
 
-        // Teeth, and the reason no cast is added at the flat write: the flat
-        // cache mirrors whatever the residual stream is. Run the very same
-        // forward on an f32 stream and it stores f32 - the exact divergence
-        // this test exists to catch. Casting here would paper over it while
-        // leaving `out_proj`, the MoE and `lm_head` in f32, so the fix belongs
-        // upstream at the mixer boundary.
+        // Teeth: the same forward on an f32 stream stores f32. Do NOT "fix"
+        // that with a cast at the flat write — it would leave `out_proj`, the
+        // MoE and `lm_head` in f32; the fix belongs at the mixer boundary.
         let attn_f32 = NemotronHAttention::new(&cfg).expect("attention builds");
         let x32 = MxArray::from_float32(&xs, &[1, 3, h]).unwrap();
         let mut cache_f32 = KVCache::new();

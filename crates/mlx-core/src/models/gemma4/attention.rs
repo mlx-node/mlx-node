@@ -6,6 +6,7 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::nn::{Linear, RMSNorm, RoPE};
+use crate::transformer::paged_flags::native_kv_write_enabled;
 use crate::transformer::paged_kv_cache_adapter::{
     DenseAttentionWindow, PagedAttentionV2Layout, PagedDecodeRouteHint, PagedKVCacheAdapter,
     PagedPrefillMemorySnapshot, SeqId, paged_attention_v2_aux_fits,
@@ -895,13 +896,6 @@ fn select_cache_hit_prefill_plan(
         estimated_varlen_bytes,
         live_headroom_bytes,
     }
-}
-
-fn native_kv_write_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled_or_default("MLX_GEMMA4_NATIVE_KV_WRITE", true)
-    })
 }
 
 /// Trim mask to match K/V sequence length (e.g. after RotatingKVCache eviction).

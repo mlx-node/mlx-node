@@ -1806,28 +1806,17 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             );
             continue;
         }
-        // Re-anchor the MTP cache to the main path's CURRENT offset
-        // before launching this cycle's drafts. On the Step-A path
-        // the main offset has
-        // advanced by 1 (Step A's forward) + the prior cycle's
-        // verify advancement. On the chained path the main offset
-        // has only advanced by the prior cycle's verify (Step A
-        // was skipped). EITHER way, this resets the MTP K/V and
-        // sets the MTP offset = current main offset, which is
-        // exactly the contract `begin_cycle` is documented to
-        // honour. Without it the MTP draft RoPE positions diverge
-        // and drafts produce gibberish.
-        // The `begin_cycle` hook emits its own
-        // `mlx_core::mtp` trace (old/new MTP offset) — it is the
-        // only site that knows the dense-vs-MoE offset getters.
+        // Re-anchor the MTP cache to the main path's CURRENT offset before this cycle's
+        // drafts: reset the MTP K/V and set the MTP offset to the current main offset,
+        // the contract `begin_cycle` is documented to honour. Without it the MTP draft
+        // RoPE positions diverge and drafts produce gibberish.
         //
-        // MUST stay BELOW the near-tail `continue` above. A chained anchor
-        // trims the drafter to `committed_len - 1`, and `KVCache::trim`
-        // cannot grow back, so anchoring on a cycle that then skips without
-        // drafting or committing strands the drafter one slot low for the
-        // rest of the turn — the next cycle's draft would overwrite the last
-        // COMMITTED pair. Nothing between the two positions reads drafter
-        // state: the intervening code only computes `cycle_depth`.
+        // MUST stay BELOW the near-tail `continue` above: a chained anchor trims the
+        // drafter to `committed_len - 1` and `KVCache::trim` cannot grow back, so
+        // anchoring on a cycle that then skips without drafting or committing strands
+        // the drafter one slot low for the rest of the turn and the next cycle's draft
+        // overwrites the last COMMITTED pair. Nothing between the two positions reads
+        // drafter state.
         step.begin_cycle(cycle_seed_was_chained && step.committed_history_active());
         profiler.begin("mtp_cycle");
         let cycle_started_at = std::time::Instant::now();
@@ -4734,33 +4723,15 @@ mod tests {
         assert_eq!((accepted, attempted), (2, 3));
     }
 
-    /// R2 — `begin_cycle` must never fire on a cycle that then SKIPS.
+    /// R2 — `begin_cycle` must never fire on a cycle that then SKIPS. It trims the
+    /// drafter cache and `KVCache::trim` cannot grow back, so a cycle that anchors
+    /// and then hits the near-tail `cycle_depth < 1` `continue` strands the drafter
+    /// one slot low and the NEXT cycle's draft overwrites the last COMMITTED pair.
     ///
-    /// `begin_cycle` is the drafter's re-anchor: on a chained cycle it trims
-    /// the drafter cache to `committed_len - 1`, and `KVCache::trim` cannot
-    /// grow back. A cycle that anchors and then hits the near-tail
-    /// `cycle_depth < 1` `continue` without drafting or committing therefore
-    /// strands the drafter one slot low for the rest of the turn, and the
-    /// NEXT cycle's draft overwrites the last COMMITTED pair.
+    /// The invariant: `BeginCycle` count == `VerifyStep` count. Family-independent —
+    /// qwen3_5 and qwen3_5_moe share this loop.
     ///
-    /// The invariant asserted here is exactly "one anchor per cycle that
-    /// really runs": `BeginCycle` count == `VerifyStep` count. It is
-    /// family-independent — the same ordering fix applies to qwen3_5 and
-    /// qwen3_5_moe, which share this loop.
-    ///
-    /// Budget arithmetic (depth 1, chained OFF so Step A runs every outer
-    /// iteration, full-accept cycles emitting 2 tokens):
-    ///   gen: [3]                 seed emit                       len 1
-    ///   iter0 Step A -> 7                                        len 2
-    ///   iter0 cycle: remaining 4 -> depth 1 -> full accept 4,5   len 4
-    ///   iter1 Step A -> 8                                        len 5
-    ///   iter1 cycle: remaining 1 -> cycle_depth 0 -> SKIP        len 5
-    ///   iter2 Step A -> 9 -> post-emit len 6 >= 6 -> "length"    len 6
-    /// So exactly ONE cycle drafts while THREE outer iterations run, and the
-    /// second iteration is the one that reaches the near-tail `continue`.
-    ///
-    /// MUTATION: moving `step.begin_cycle(...)` back above the near-tail
-    /// guard — `BeginCycle` becomes 2 against 1 `VerifyStep`.
+    /// MUTATION: moving `step.begin_cycle(...)` back above the near-tail guard.
     #[test]
     fn near_tail_skipped_cycle_does_not_anchor_the_drafter() {
         let _chained_off = force_chained_off();

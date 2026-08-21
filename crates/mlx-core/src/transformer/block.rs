@@ -7,31 +7,12 @@ use crate::nn::RMSNorm;
 use crate::transformer::attention::Attention;
 use crate::transformer::kv_cache::KVCache;
 use crate::transformer::mlp::MLP;
+use crate::transformer::paged_flags::native_kv_write_enabled;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRaggedRow, SeqId};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use std::ptr;
-use std::sync::OnceLock;
 use std::time::Instant;
-
-/// When enabled (default), Qwen3's paged decode path writes K/V into the
-/// pool with the graph-native, lazily-scheduled `update_keys_values_native`
-/// (see [`PagedKVCacheAdapter::update_keys_values_native`]) so the write
-/// feeds the same-step attention read through MLX graph dependencies
-/// instead of forcing a blocking `mlx_metal_synchronize()` + command-buffer
-/// host wait on every layer/token (see
-/// [`PagedKVCacheAdapter::update_keys_values`] /
-/// `LayerKVPool::write_kv`). Falls back to the synchronous
-/// `update_keys_values` automatically when disabled (via
-/// `MLX_QWEN3_NATIVE_KV_WRITE=0`) or when the native write errors. Mirrors
-/// the default-on migration already shipped for Gemma4 / Qwen3.5 / LFM2
-/// (PR #56).
-fn native_kv_write_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled_or_default("MLX_QWEN3_NATIVE_KV_WRITE", true)
-    })
-}
 
 /// Transformer block combining self-attention and MLP with pre-normalization.
 ///
@@ -267,11 +248,9 @@ impl TransformerBlock {
     ///   prefers `update_keys_values_native` and the decode read prefers
     ///   `gather_kv_for_decode_graph`, both falling back to their
     ///   synchronous counterparts on error or when disabled via
-    ///   `MLX_QWEN3_NATIVE_KV_WRITE=0`. This removes the per-layer,
+    ///   `MLX_PAGED_NATIVE_KV_WRITE=0`. This removes the per-layer,
     ///   per-decode-token blocking `mlx_metal_synchronize()` +
-    ///   command-buffer host wait that the synchronous path forces,
-    ///   mirroring the default-on migration already shipped for Gemma4 /
-    ///   Qwen3.5 / LFM2 (PR #56).
+    ///   command-buffer host wait that the synchronous path forces.
     /// - **Decode output dtype.** The decode gather returns the query/pool
     ///   dtype (BF16 for Qwen3's non-FP8 cache). We `astype` it back to
     ///   `x`'s dtype defensively before output projection / residual so the
@@ -322,7 +301,7 @@ impl TransformerBlock {
         //    on every layer/token (see
         //    `PagedKVCacheAdapter::update_keys_values`). Falls back to the
         //    synchronous write automatically when
-        //    `MLX_QWEN3_NATIVE_KV_WRITE=0` or when the native write errors.
+        //    `MLX_PAGED_NATIVE_KV_WRITE=0` or when the native write errors.
         let trace_enabled = inference_trace_enabled();
         let write_trace_start = trace_enabled.then(Instant::now);
         let write_path = if native_kv_write_enabled() {
@@ -439,7 +418,7 @@ impl TransformerBlock {
             // back to the synchronous `gather_kv_for_decode` kernel only if
             // the graph gather errors. When the write landed on the legacy
             // branch (flag off or native-write error), use the synchronous
-            // `gather_kv_for_decode` directly so `MLX_QWEN3_NATIVE_KV_WRITE=0`
+            // `gather_kv_for_decode` directly so `MLX_PAGED_NATIVE_KV_WRITE=0`
             // fully reverts BOTH the write and the decode read.
             //
             // Both kernels return the query/io dtype. Cast back to x's dtype
@@ -561,7 +540,7 @@ impl TransformerBlock {
         }
         if !native_kv_write_enabled() {
             return Err(Error::from_reason(
-                "forward_paged_adapter_batched requires MLX_QWEN3_NATIVE_KV_WRITE=1",
+                "forward_paged_adapter_batched requires MLX_PAGED_NATIVE_KV_WRITE=1",
             ));
         }
 
@@ -630,7 +609,7 @@ impl TransformerBlock {
         }
         if !native_kv_write_enabled() {
             return Err(Error::from_reason(
-                "forward_paged_adapter_ragged requires MLX_QWEN3_NATIVE_KV_WRITE=1",
+                "forward_paged_adapter_ragged requires MLX_PAGED_NATIVE_KV_WRITE=1",
             ));
         }
 

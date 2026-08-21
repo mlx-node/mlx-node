@@ -4,140 +4,67 @@ use serde_json::Value;
 
 /// NVIDIA Nemotron 3.5 Lightning ("nemotron_h") model configuration.
 ///
-/// Hybrid MoE architecture: 52 layers alternating between three mixer kinds
-/// (`layers_block_type`): `mamba` (Mamba-2 SSM), `moe` (pure MoE-FFN), and
-/// `attention` (GQA). Each layer is a single pre-RMSNorm + ONE mixer + a
-/// residual connection; the final `norm_f` + a separate untied `lm_head`
-/// complete the stack.
-///
-/// Parsed fail-closed from the checkpoint `config.json`; unknown layer block
-/// types, missing mandatory fields, and unsupported optional features
-/// (e.g. `moe_latent_size`) are rejected at load time rather than silently
-/// mis-decoded.
+/// Hybrid MoE: every layer is one pre-RMSNorm + ONE mixer + a residual, closed
+/// by `norm_f` and an untied `lm_head`. Parsed fail-closed — unknown block
+/// types, missing fields and unsupported features are rejected at load.
 #[napi(object)]
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct NemotronHConfig {
-    /// Vocabulary size (131072 for the 30B Lightning checkpoint).
     pub vocab_size: i32,
-    /// Hidden dimension (2688).
     pub hidden_size: i32,
-    /// Total number of decoder layers (52).
     pub num_hidden_layers: i32,
-    /// Number of query heads in the GQA attention layers (32).
     pub num_attention_heads: i32,
-    /// Number of KV heads in the GQA attention layers (2).
     pub num_key_value_heads: i32,
-    /// Per-head attention dimension (128).
     pub head_dim: i32,
-    /// Maximum position embeddings (context length).
     pub max_position_embeddings: i32,
-    /// RMSNorm epsilon for every norm in the model (1e-5).
     pub layer_norm_epsilon: f64,
-    /// RoPE base frequency carried in some checkpoint `config.json` files.
-    ///
-    /// UNUSED BY THE RUNTIME: NemotronH attention is NoPE. No reference
-    /// implementation declares or consumes `rope_theta` (HF
-    /// `NemotronHConfig` has no such field, vLLM's attention takes no
-    /// positions, mlx-lm never rotates), and neither does this family's
-    /// attention module - wiring it into a rotation would change every
-    /// token the model emits. Parsed leniently with a 10000.0 default so a
-    /// spec-conformant checkpoint that omits it still loads, and echoed
-    /// back through `getConfig()` as checkpoint metadata only.
-    pub rope_theta: f64,
     /// Per-layer mixer kind, remapped from the checkpoint's
-    /// `layers_block_type`: "mamba" -> "linear_attention", "attention" ->
-    /// "full_attention", "moe" -> "moe" (the HF `MIXER_TYPES` names).
+    /// `layers_block_type` to the HF `MIXER_TYPES` names.
     pub layers_block_type: Vec<String>,
 
     // --- Mamba-2 mixer ---
-    /// Number of SSM heads (64).
     pub mamba_num_heads: i32,
-    /// SSM head dimension (64).
     pub mamba_head_dim: i32,
-    /// SSM state size per head per group (128).
+    /// SSM state size, per head per group.
     pub ssm_state_size: i32,
-    /// Number of SSM groups (8); each head belongs to group h / (H / G).
+    /// Number of SSM groups; head `h` belongs to group `h / (H / G)`.
     pub n_groups: i32,
-    /// Depthwise causal conv1d kernel size (4).
+    /// Depthwise causal conv1d kernel size.
     pub conv_kernel: i32,
-    /// Mamba-2 chunk-scan chunk size (128).
     pub chunk_size: i32,
-    /// Declared minimum discretized time step (1e-3 in the released
-    /// checkpoint).
+    /// Declared minimum discretized time step.
     ///
-    /// UNUSED BY THE RUNTIME. No production reference clamps dt to it: the
-    /// HF fused path builds `dt_limit_kwargs` from `time_step_limit` only
-    /// (modeling_nemotron_h.py:281) and the released config declares no
-    /// `time_step_limit`, so mamba_ssm's `dt_limit=(0.0, inf)` applies;
-    /// vLLM hardcodes `dt_limit=(0.0, inf)` (mamba_mixer2.py:672, :890);
-    /// mlx-lm defaults `time_step_limit` to `(0.0, inf)` and clips to that
-    /// (nemotron_h.py:56-65 + ssm.py:8-11). Only the HF *torch fallback*
-    /// (:417-418, :465-466) clamps to `time_step_min`, and that path is not
-    /// what the checkpoint was trained/served with. Parsed leniently and
-    /// echoed back through `getConfig()` as checkpoint metadata only. Use
-    /// `time_step_limit_pair()` for the clamp the mixer actually applies.
+    /// UNUSED BY THE RUNTIME. No served reference clamps dt to it - only HF's
+    /// torch fallback does. `time_step_limit_pair()` is the real clamp.
     pub time_step_min: f64,
-    /// Optional `[min, max]` bounds for the discretized time step, matching
-    /// mlx-lm's `ModelArgs.time_step_limit`. Absent (`None`) means the
-    /// mamba_ssm/vLLM/mlx-lm default `(0.0, +inf)`, i.e. no clamp; the
-    /// released 30B checkpoint declares no `time_step_limit`.
+    /// Optional `[min, max]` bounds for the discretized time step. `None` is
+    /// the reference default `(0.0, +inf)`, i.e. no clamp.
     #[napi(ts_type = "number[]")]
     pub time_step_limit: Option<Vec<f64>>,
 
     // --- MoE mixer ---
-    /// Total routed experts (128).
     pub n_routed_experts: i32,
-    /// Experts selected per token (6).
     pub num_experts_per_tok: i32,
-    /// Post-normalization routing weight scale (2.5).
+    /// Routing weight scale, applied after normalization.
     pub routed_scaling_factor: f64,
-    /// Number of expert groups (1 - grouping degenerates to a flat top-k).
-    pub n_group: i32,
-    /// Number of top groups selected (1).
-    pub topk_group: i32,
     /// Renormalize the gathered top-k weights to sum to 1 before scaling.
     pub norm_topk_prob: bool,
-    /// Per-expert MLP intermediate size (1856; non-gated up->relu2->down).
+    /// Per-expert MLP intermediate size (non-gated up -> relu2 -> down).
     pub intermediate_size: i32,
-    /// Shared-expert MLP intermediate size (3712), applied on ALL tokens.
+    /// Shared-expert MLP intermediate size; it runs on ALL tokens.
     pub moe_shared_expert_intermediate_size: i32,
 
-    // --- Token ids / heads ---
-    /// Tie the lm_head to the embedding table.
-    ///
-    /// ALWAYS `false` here: `parse_config` rejects a `true` checkpoint at
-    /// load time. The weight loader has no tied-head path - it requires an
-    /// explicit `lm_head.weight` tensor - so accepting `true` would parse
-    /// cleanly and then die much later with "Checkpoint missing
-    /// lm_head.weight", which reads like a corrupt download rather than an
-    /// unsupported variant.
-    pub tie_word_embeddings: bool,
-    pub bos_token_id: i32,
-    /// EOS token ids (config.json scalar; generation_config carries {2, 11}).
+    // --- Token ids ---
+    /// EOS token ids, from the config.json scalar or array.
     #[napi(ts_type = "number[]")]
     pub eos_token_ids: Vec<i32>,
-    pub pad_token_id: i32,
-    /// Declared `num_logits_to_keep` (1 on the released checkpoint).
-    ///
-    /// UNUSED BY THE RUNTIME. In HF it is a generation-time slicing hint:
-    /// `prepare_inputs_for_generation` forwards it as `logits_to_keep`
-    /// and the head is applied to `hidden_states[:, -N:, :]`
-    /// (modeling_nemotron_h.py:1171-1172). mlx-lm and vLLM declare no such
-    /// field at all. This runtime does not honour it either - every
-    /// prefill path applies `lm_head` over the whole `[1, T, hidden]`
-    /// block and slices the last position afterwards - so it is parsed
-    /// leniently (default 1) and echoed back through `getConfig()` as
-    /// checkpoint metadata only. Honouring it would be a real prefill
-    /// saving on this 131072-wide head, but that is a change to the
-    /// forward paths, not to this field.
-    pub num_logits_to_keep: i32,
 
     // --- MTP head ---
-    /// MTP layer kinds, remapped like `layers_block_type` (["attention","moe"]).
+    /// MTP layer kinds, remapped like `layers_block_type`.
     #[serde(default)]
     #[napi(ts_type = "string[]")]
     pub mtp_layers_block_type: Vec<String>,
-    /// Number of MTP predictor steps (`num_nextn_predict_layers`; 1).
+    /// Number of MTP predictor steps (`num_nextn_predict_layers`).
     #[serde(default)]
     pub n_mtp_layers: i32,
 
@@ -149,18 +76,16 @@ pub struct NemotronHConfig {
     /// Optional paged block size in tokens (default 16).
     #[serde(default)]
     pub paged_block_size: Option<u32>,
-    /// Opt in/out of the block-paged KV adapter. None (the default) enables
-    /// the paged pool and the continuous-batching scheduler lane; explicit
-    /// `Some(false)` reverts to the flat-cache whole-turn path.
+    /// Opt in/out of the block-paged KV adapter. `None` enables the paged pool
+    /// and the continuous-batching lane; `Some(false)` reverts to whole-turn.
     #[serde(default)]
     pub use_block_paged_cache: Option<bool>,
 }
 
 impl NemotronHConfig {
-    /// The `(min, max)` bounds the Mamba-2 mixer clips `softplus(dt +
-    /// dt_bias)` to. Defaults to `(0.0, +inf)` - no clamp - exactly as
-    /// mlx-lm's `ModelArgs.__post_init__` does. `time_step_min` is
-    /// deliberately NOT consulted; see its doc comment.
+    /// The `(min, max)` bounds the Mamba-2 mixer clips `softplus(dt + dt_bias)`
+    /// to. Defaults to `(0.0, +inf)` - no clamp - as mlx-lm does.
+    /// `time_step_min` is deliberately NOT consulted; see its doc comment.
     pub fn time_step_limit_pair(&self) -> (f64, f64) {
         match self.time_step_limit.as_deref() {
             Some([lo, hi]) => (*lo, *hi),
@@ -180,35 +105,27 @@ impl NemotronHConfig {
 
     /// in_proj output size: intermediate + conv_dim + num_heads (gate | xBC | dt).
     ///
-    /// TEST-ONLY. Production does not call this: `new_mamba_mixer`
-    /// (`mamba2.rs`) inlines the same `d_inner + conv_dim + num_heads` sum
-    /// when it sizes the `in_proj` `Linear`, and the persistence loader
-    /// reads the row count off the checkpoint tensor. The helper survives
-    /// as the fixture-building expression for the mamba2 and config unit
-    /// tests, gated so it cannot quietly become a second, drifting
-    /// definition of the projection width.
+    /// TEST-ONLY, and gated so it stays that way: `new_mamba_mixer` inlines
+    /// the same sum, and two definitions of it would drift.
     #[cfg(test)]
     pub fn mamba_in_proj_size(&self) -> i32 {
         self.mamba_intermediate_size() + self.mamba_conv_dim() + self.mamba_num_heads
     }
 
-    /// Whether layer `idx` uses the Mamba-2 SSM mixer.
     pub fn is_mamba_layer(&self, idx: usize) -> bool {
         self.layer_kind(idx) == "linear_attention"
     }
 
-    /// Whether layer `idx` uses the GQA attention mixer.
     pub fn is_attention_layer(&self, idx: usize) -> bool {
         self.layer_kind(idx) == "full_attention"
     }
 
-    /// Whether layer `idx` uses the pure MoE-FFN mixer.
     pub fn is_moe_layer(&self, idx: usize) -> bool {
         self.layer_kind(idx) == "moe"
     }
 
-    /// The remapped block type of layer `idx`. Panics on an out-of-range
-    /// index - the layer count is validated at parse time.
+    /// The remapped block type of layer `idx`; panics out of range, which the
+    /// parse-time layer-count check rules out.
     pub fn layer_kind(&self, idx: usize) -> &str {
         &self.layers_block_type[idx]
     }
@@ -220,8 +137,7 @@ impl NemotronHConfig {
             .collect()
     }
 
-    /// Rough resident-memory estimate in bytes (bf16 weights + packed
-    /// quantized approximations), used for the wired-limit context.
+    /// Rough resident-memory estimate for the wired-limit context.
     pub fn estimate_memory_bytes(&self) -> u64 {
         let h = self.hidden_size as u64;
         let v = self.vocab_size as u64;
@@ -250,8 +166,7 @@ impl NemotronHConfig {
     }
 }
 
-/// Remap a checkpoint `layers_block_type` entry to the internal HF
-/// `MIXER_TYPES` name. Fails closed on unknown kinds.
+/// Remap a `layers_block_type` entry to the HF `MIXER_TYPES` name.
 fn remap_block_type(kind: &str, ctx: &str) -> Result<String> {
     match kind {
         "mamba" => Ok("linear_attention".to_string()),
@@ -285,18 +200,13 @@ fn req_f64(raw: &Value, key: &str) -> Result<f64> {
     })
 }
 
-/// Parse an optional f64 config field, falling back to `default` when the key
-/// is absent or not a number.
+/// Parse an optional f64 config field, falling back to `default`.
 fn opt_f64(raw: &Value, key: &str, default: f64) -> f64 {
     raw.get(key).and_then(Value::as_f64).unwrap_or(default)
 }
 
-/// Parse the optional `time_step_limit` as a `[min, max]` pair.
-///
-/// Absent or `null` yields `None`, which `time_step_limit_pair()` resolves to
-/// the reference default `(0.0, +inf)`. Anything present but not a two-element
-/// numeric array with `min <= max` is rejected rather than silently ignored -
-/// a mis-shaped limit would otherwise change every SSM time step.
+/// Parse the optional `time_step_limit`. Absent is `None` (no clamp); anything
+/// mis-shaped is rejected, since ignoring it changes every SSM time step.
 fn parse_time_step_limit(raw: &Value) -> Result<Option<Vec<f64>>> {
     let Some(v) = raw.get("time_step_limit") else {
         return Ok(None);
@@ -313,8 +223,7 @@ fn parse_time_step_limit(raw: &Value) -> Result<Option<Vec<f64>>> {
             "config.json time_step_limit must be a [min, max] pair of numbers, got {v}"
         )));
     }
-    // `partial_cmp` rather than `!(a <= b)` so a NaN bound is rejected
-    // explicitly instead of by comparison fallthrough.
+    // `partial_cmp` rather than `!(a <= b)` so a NaN bound is rejected.
     let ordered = matches!(
         pair[0].partial_cmp(&pair[1]),
         Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
@@ -336,8 +245,7 @@ fn req_bool(raw: &Value, key: &str) -> Result<bool> {
     })
 }
 
-/// Parse the optional `eos_token_id` as a scalar or array, returning the
-/// flattened id list. Empty when absent.
+/// Parse the optional `eos_token_id`, scalar or array, into a flat id list.
 fn parse_eos_ids(raw: &Value) -> Result<Vec<i32>> {
     match raw.get("eos_token_id") {
         None => Ok(Vec::new()),
@@ -361,22 +269,14 @@ fn parse_eos_ids(raw: &Value) -> Result<Vec<i32>> {
     }
 }
 
-/// Parse a `NemotronHConfig` from a parsed checkpoint `config.json` value.
-///
-/// Fail-closed contract: every field the model math depends on is required
-/// and validated; the `model_type` must be `nemotron_h`, `layers_block_type`
-/// entries must be known mixer kinds, the layer count must equal the block
-/// list length, and unsupported optional features (`moe_latent_size`) are
-/// rejected.
+/// Parse a `NemotronHConfig` from a checkpoint `config.json`. Fail-closed:
+/// every field the model math depends on is required and validated.
 pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
-    // The architecture is authoritative, matching the TypeScript registry's
-    // architecture probe and the native gemma4 loader: a config that
-    // declares NemotronHForCausalLM is this family even when model_type is
-    // absent or malformed. Without the architecture, model_type must match.
+    // The architecture is authoritative, matching the TS registry probe: a
+    // config declaring NemotronHForCausalLM is this family regardless.
     let model_type = raw.get("model_type").and_then(Value::as_str).unwrap_or("");
-    // Accept BOTH registry-blessed forms: the array and the bare string
-    // (the TS normalizeConfig contract explicitly converts the string form
-    // into a single-element architecture set, so this parser must agree).
+    // Both forms: TS `normalizeConfig` converts a bare string into a
+    // single-element architecture set, so this parser must accept it too.
     let architectures_declare_nemotron = match raw.get("architectures") {
         Some(serde_json::Value::Array(values)) => values
             .iter()
@@ -525,14 +425,10 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
         )));
     }
 
-    // Fail closed on a tied head. `persistence.rs` builds the lm_head from
-    // an explicit `lm_head.weight` tensor and has no embedding-tied path, so
-    // a `true` checkpoint would parse cleanly here and then fail deep in
-    // weight loading with "Checkpoint missing lm_head.weight" - a message
-    // that reads like a corrupt download rather than an unsupported model
-    // variant. Reject it where the reason is still legible.
-    let tie_word_embeddings = req_bool(raw, "tie_word_embeddings")?;
-    if tie_word_embeddings {
+    // Fail closed on a tied head: the loader has no embedding-tied path, so
+    // accepting it only defers the failure to a missing-tensor error deep in
+    // weight loading. Reject it where the reason is still legible.
+    if req_bool(raw, "tie_word_embeddings")? {
         return Err(Error::from_reason(
             "config.json tie_word_embeddings=true: this family supports only an UNTIED lm_head. \
              The weight loader requires an explicit 'lm_head.weight' tensor and has no \
@@ -556,10 +452,6 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
         head_dim,
         max_position_embeddings: req_i32(raw, "max_position_embeddings")?,
         layer_norm_epsilon: req_f64(raw, "layer_norm_epsilon")?,
-        // Optional: no reference config class declares `rope_theta` and
-        // nothing reads it (NemotronH attention is NoPE). Requiring it
-        // would reject a spec-conformant checkpoint.
-        rope_theta: opt_f64(raw, "rope_theta", 10_000.0),
         layers_block_type,
         mamba_num_heads,
         mamba_head_dim,
@@ -567,10 +459,9 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
         n_groups,
         conv_kernel: req_i32(raw, "conv_kernel")?,
         chunk_size: {
-            // Fail-closed: the Mamba-2 chunk scan divides by chunk_size, so a
-            // zero (or negative) value from checkpoint metadata would panic
-            // the model thread on the first multi-token forward instead of
-            // failing the load.
+            // Fail-closed: the chunk scan divides by chunk_size, so a
+            // non-positive value would panic the model thread on the first
+            // multi-token forward instead of failing the load.
             let chunk_size = req_i32(raw, "chunk_size")?;
             if chunk_size <= 0 {
                 return Err(Error::from_reason(format!(
@@ -579,28 +470,17 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
             }
             chunk_size
         },
-        // Optional: mlx-lm declares `time_step_min` as `Optional[float] =
-        // None` and never clips to it. Parsed leniently so a config that
-        // omits it still loads; the runtime clamp comes from
-        // `time_step_limit` alone.
+        // Optional: nothing clips to it, so a config that omits it must still
+        // load. The runtime clamp comes from `time_step_limit` alone.
         time_step_min: opt_f64(raw, "time_step_min", 0.001),
         time_step_limit: parse_time_step_limit(raw)?,
         n_routed_experts,
         num_experts_per_tok,
         routed_scaling_factor: req_f64(raw, "routed_scaling_factor")?,
-        n_group,
-        topk_group,
         norm_topk_prob: req_bool(raw, "norm_topk_prob")?,
         intermediate_size: req_i32(raw, "intermediate_size")?,
         moe_shared_expert_intermediate_size: req_i32(raw, "moe_shared_expert_intermediate_size")?,
-        tie_word_embeddings,
-        bos_token_id: raw.get("bos_token_id").and_then(Value::as_i64).unwrap_or(0) as i32,
         eos_token_ids,
-        pad_token_id: raw.get("pad_token_id").and_then(Value::as_i64).unwrap_or(0) as i32,
-        num_logits_to_keep: raw
-            .get("num_logits_to_keep")
-            .and_then(Value::as_i64)
-            .unwrap_or(1) as i32,
         mtp_layers_block_type,
         n_mtp_layers,
         paged_cache_memory_mb: raw
@@ -641,7 +521,6 @@ mod tests {
             "head_dim": 128,
             "max_position_embeddings": 1048576,
             "layer_norm_epsilon": 1e-5,
-            "rope_theta": 10000.0,
             "layers_block_type": block,
             "mamba_num_heads": 64,
             "mamba_head_dim": 64,
@@ -659,22 +538,16 @@ mod tests {
             "intermediate_size": 1856,
             "moe_shared_expert_intermediate_size": 3712,
             "tie_word_embeddings": false,
-            "bos_token_id": 1,
             "eos_token_id": 2,
-            "pad_token_id": 0,
-            "num_logits_to_keep": 1,
             "mtp_layers_block_type": ["attention", "moe"],
             "num_nextn_predict_layers": 1,
         })
     }
 
-    /// The released 30B checkpoint declares `time_step_min`/`time_step_max`/
-    /// `time_step_floor` but NO `time_step_limit`, so the runtime clamp must
-    /// resolve to the reference default `(0.0, +inf)` - i.e. no clamp.
+    /// An absent `time_step_limit` must resolve to `(0.0, +inf)`.
     ///
-    /// Mutation caught: resolving an absent `time_step_limit` to anything
-    /// derived from `time_step_min` (the shipped bug clamped to `(1e-3,
-    /// inf)`, which bound ~9% of the checkpoint's 1472 SSM heads).
+    /// Mutation caught: deriving it from `time_step_min`, which silently
+    /// bounds real SSM heads.
     #[test]
     fn absent_time_step_limit_is_unbounded() {
         let raw = lightning_json();
@@ -688,8 +561,7 @@ mod tests {
         assert_eq!(cfg.time_step_limit_pair(), (0.0, f64::INFINITY));
     }
 
-    /// A declared `time_step_limit` pair is honoured verbatim, matching
-    /// mlx-lm's `ModelArgs.time_step_limit` / mamba_ssm's `dt_limit`.
+    /// A declared `time_step_limit` pair is honoured verbatim.
     #[test]
     fn declared_time_step_limit_is_parsed() {
         let mut raw = lightning_json();
@@ -701,8 +573,7 @@ mod tests {
         assert_eq!(cfg.time_step_limit_pair(), (0.0, 0.1));
     }
 
-    /// A mis-shaped `time_step_limit` must fail the load rather than be
-    /// silently ignored - ignoring it would change every SSM time step.
+    /// A mis-shaped `time_step_limit` must fail the load, not be ignored.
     #[test]
     fn malformed_time_step_limit_is_rejected() {
         for bad in [
@@ -728,9 +599,8 @@ mod tests {
         assert!(parse_config(&raw).is_err(), "min > max must be rejected");
     }
 
-    /// mlx-lm declares `time_step_min` as `Optional[float] = None`; a
-    /// checkpoint that omits it must still load now that nothing reads it.
-    /// Regression against parsing it with `req_f64`.
+    /// Nothing reads `time_step_min`, so a checkpoint that omits it must still
+    /// load. Regression against parsing it with `req_f64`.
     #[test]
     fn time_step_min_is_optional() {
         let mut raw = lightning_json();
@@ -738,19 +608,6 @@ mod tests {
         let cfg = parse_config(&raw).expect("config without time_step_min parses");
         assert_eq!(cfg.time_step_min, 0.001);
         assert_eq!(cfg.time_step_limit_pair(), (0.0, f64::INFINITY));
-    }
-
-    /// `rope_theta` is declared by no reference config class (HF, vLLM and
-    /// mlx-lm all describe NemotronH attention without a rotation), so a
-    /// checkpoint that omits it must still load. Regression against parsing
-    /// it with `req_f64`.
-    #[test]
-    fn rope_theta_is_optional_and_defaults() {
-        let mut raw = lightning_json();
-        assert!(raw.get("rope_theta").is_some());
-        raw.as_object_mut().unwrap().remove("rope_theta");
-        let cfg = parse_config(&raw).expect("config without rope_theta parses");
-        assert_eq!(cfg.rope_theta, 10_000.0);
     }
 
     #[test]
@@ -765,7 +622,6 @@ mod tests {
         assert_eq!(cfg.eos_token_ids, vec![2]);
         assert_eq!(cfg.n_mtp_layers, 1);
         assert_eq!(cfg.mtp_layers_block_type, vec!["full_attention", "moe"]);
-        // Layer classification: 23 mamba + 23 moe + 6 attention.
         assert_eq!(cfg.layers_block_type.len(), 52);
         assert_eq!(
             cfg.layers_block_type
@@ -804,9 +660,8 @@ mod tests {
 
     #[test]
     fn architecture_is_authoritative_over_wrong_model_type() {
-        // Wrong model_type WITH the architecture present is accepted (the
-        // registry's architecture probe selects this family for the same
-        // config, so the native loader must agree).
+        // The TS registry's architecture probe selects this family for such a
+        // config, so the native loader must agree.
         let mut v = lightning_json();
         v["model_type"] = json!("qwen3");
         assert!(parse_config(&v).is_ok());
@@ -814,9 +669,8 @@ mod tests {
 
     #[test]
     fn accepts_bare_string_architecture_form() {
-        // The TS registry's normalizeConfig blesses the bare-string
-        // architectures form as a single-element set; the native parser must
-        // agree or detectModelType() would select a family load() rejects.
+        // TS `normalizeConfig` blesses this form, so the native parser must
+        // agree or `detectModelType()` picks a family `load()` rejects.
         let mut v = lightning_json();
         v.as_object_mut().unwrap().remove("model_type");
         v["architectures"] = json!("NemotronHForCausalLM");
@@ -881,13 +735,10 @@ mod tests {
         assert!(err.reason.contains("moe_latent_size"), "{}", err.reason);
     }
 
-    /// A tied-head checkpoint must be rejected AT PARSE TIME. The loader has
-    /// no embedding-tied path, so accepting it here only defers the failure
-    /// to `persistence.rs`, where it surfaces as "Checkpoint missing
-    /// lm_head.weight" - indistinguishable from a truncated download.
+    /// A tied-head checkpoint must be rejected AT PARSE TIME, or the failure
+    /// only defers to a missing-tensor error that reads like a bad download.
     ///
-    /// Mutation caught: dropping the guard and going back to a bare
-    /// `req_bool` - the config would parse and the assert below would fail.
+    /// Mutation caught: dropping the guard for a bare `req_bool`.
     #[test]
     fn rejects_tied_word_embeddings() {
         let mut v = lightning_json();
@@ -903,8 +754,7 @@ mod tests {
             "the message must name the tensor the loader would have failed on: {}",
             err.reason
         );
-        // ...and the field is still REQUIRED: an absent key is a different
-        // failure, not a silent `false`.
+        // ...and the field is still REQUIRED, not a silent `false`.
         let mut missing = lightning_json();
         missing
             .as_object_mut()

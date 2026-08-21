@@ -1,10 +1,8 @@
 //! NemotronH model: NemotronHInner + ChatBackend/MtpBackend + NAPI class.
 //!
-//! Flat-cache backend: Mamba-2 SSM states and attention K/V live in
-//! per-layer NemotronHLayerCache slots owned by the model thread. No
-//! paged/scheduler hooks yet (a follow-up agent adds concurrency); the
-//! speculative MTP head runs the engine's flat run_mtp_turn loop with a
-//! depth-1 drafter reading the backbone's final attention layer KV.
+//! Mamba-2 SSM states and attention K/V live in per-layer NemotronHLayerCache
+//! slots owned by the model thread; the speculative MTP head runs the engine's
+//! flat run_mtp_turn loop with a depth-1 drafter that owns its own KV.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -45,20 +43,22 @@ use super::mtp::NemotronHMtpModule;
 /// Chunk size for the chunked prefill (tokens per chunk).
 pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 
+/// The distinguished error a chunk-boundary cancel poll aborts a prefill
+/// with. Shared by the producers (every chunked prefill in this file) and
+/// the one consumer that must tell a cancellation apart from a genuine
+/// failure (`mtp_seed_aborted`), so the two cannot drift.
+pub(crate) const PREFILL_CANCELLED: &str = "prefill cancelled";
+
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum NemotronHCmd {
     Chat(Box<ChatCmd>),
     SchedulerStats {
         reply: ResponseTx<engine::SchedulerStatsJs>,
     },
-    /// Test-only: snapshot the flat-MTP seam between turns as
-    /// `(cached_token_history.len(), attention kv_offset,
-    /// flat_mtp_caches_desynced, flat_mtp_last_rollback_unemitted)`.
-    ///
-    /// The first two are the seam's REAL invariant: the flat trunk must never
-    /// sit ahead of the token history that keys it. The last two let a test
-    /// pin the latch PREDICATE (`desynced == rollback_unemitted > 1`) instead
-    /// of merely observing that the latch fired.
+    /// Test-only: `(cached_token_history.len(), attention kv_offset,
+    /// flat_mtp_caches_desynced, flat_mtp_last_rollback_unemitted)`. The first two
+    /// are the seam invariant: the flat trunk must never sit ahead of the token
+    /// history that keys it.
     #[doc(hidden)]
     MtpFlatStateForTest {
         reply: ResponseTx<(usize, i32, bool, usize)>,
@@ -106,9 +106,8 @@ pub(crate) fn handle_nemotron_h_cmd(inner: &mut NemotronHInner, cmd: NemotronHCm
         }
         NemotronHCmd::MtpFlatStateForTest { reply } => {
             // `as_kv_cache_mut`, not `as_kv_cache`: the shared accessor is
-            // `#[cfg(any(test, debug_assertions))]`, so it vanishes from a
-            // release build of the library and an integration test (which
-            // links the library WITHOUT `cfg(test)`) could not call it.
+            // `#[cfg(any(test, debug_assertions))]` and is gone from a release
+            // build, which an integration test links WITHOUT `cfg(test)`.
             let kv_offset = inner
                 .caches
                 .iter_mut()
@@ -142,25 +141,17 @@ pub(crate) struct NemotronHInner {
     pub(crate) mtp: Option<NemotronHMtpModule>,
     /// Set true by the loader only after the MTP weight set is COMPLETE.
     pub(crate) mtp_weights_loaded: bool,
-    /// Handover slot for the turn's seeded MTP drafter cache: the per-layer
-    /// caches the prompt seed wrote (see `chunked_prefill_seeding_mtp`) plus
-    /// their committed length (== the prompt length). Produced by
-    /// `run_mtp_whole_turn` BEFORE the engine builds the stepper and
-    /// `take()`n by `begin_mtp_decode`, which hard-errors when it is `None`
-    /// rather than drafting from an empty history. Per-turn only: the flat
-    /// MTP path resets and re-prefills the whole stream every turn, so a
-    /// surviving seed would describe the previous turn.
+    /// Handover slot for the turn's seeded MTP drafter cache plus its committed
+    /// length. `begin_mtp_decode` hard-errors on `None` rather than drafting from an
+    /// empty history. Per-turn only: a surviving seed would describe the last turn.
     pub(crate) pending_mtp_draft_seed: Option<(Vec<NemotronHLayerCache>, i32)>,
     /// Flat MTP mid-cycle-stop desync latch: forces a full re-prefill on the
     /// next AR turn.
     pub(crate) flat_mtp_caches_desynced: bool,
-    /// The `rollback_unemitted` the engine computed for the most recent flat
-    /// MTP turn (0 when it ended on a clean cycle boundary). Diagnostic and
-    /// test seam ONLY — nothing in the decode path reads it. It is the
-    /// latch-INDEPENDENT way to ask "did that turn stop mid-cycle?", which is
-    /// what `nemotron_h_mtp_midcycle_state.rs` needs: keying that question off
-    /// `flat_mtp_caches_desynced` would make the gate a probe of its own
-    /// guard, unable to tell a correct latch predicate from a wrong one.
+    /// The `rollback_unemitted` of the most recent flat MTP turn (0 when it ended on
+    /// a clean cycle boundary). Diagnostic and test seam ONLY: it is the
+    /// latch-INDEPENDENT way to ask "did that turn stop mid-cycle?", so a gate keyed
+    /// off it is not a probe of its own guard.
     pub(crate) flat_mtp_last_rollback_unemitted: usize,
     /// Parsed generation_config.json sampling/stop defaults.
     pub(crate) gen_defaults: crate::engine::ModelGenerationDefaults,
@@ -170,31 +161,22 @@ pub(crate) struct NemotronHInner {
     /// and moe layers keep their own per-request state / stateless forward.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
     /// Per-request recurrent state for the scheduler lane: one full
-    /// `Vec<NemotronHLayerCache>` per live sequence, so the mamba SSM/conv
-    /// states are swapped into `caches` for serial prefill/finalize and
-    /// stacked into `[N, ...]` rows for batched decode (lfm2 ShortConv
-    /// pattern).
+    /// `Vec<NemotronHLayerCache>` per live sequence, swapped into `caches` for serial
+    /// prefill and stacked into `[N, ...]` rows for batched decode.
     pub(crate) scheduled_caches: HashMap<SeqId, Vec<NemotronHLayerCache>>,
     /// The sequence whose per-request caches currently sit in `caches`.
     pub(crate) active_scheduled_seq: Option<SeqId>,
-    /// Whether the most recent `prime_prefix_state_for` decided the live
-    /// mamba states already reflected the incoming prompt's cached prefix, so
-    /// the turn only had to prefill the suffix. Read by
-    /// `paged_perf_prefill_tokens` so telemetry reports the suffix-scale
-    /// numerator instead of the full-prompt one.
+    /// Whether the most recent `prime_prefix_state_for` decided the live mamba states
+    /// already reflected the prompt's cached prefix, so the turn only prefilled the
+    /// suffix. Read by `paged_perf_prefill_tokens` for the telemetry numerator.
     pub(crate) last_paged_prefill_reused_mamba_state: bool,
     /// Whether the currently active scheduled sequence's recurrent (Mamba)
     /// state was RESTORED from parked caches (true) or freshly
     /// zero-initialized (false — e.g. after preemption released it).
     pub(crate) active_seq_recurrent_survived: bool,
-    /// Quantized checkpoints (NVFP4/MXFP8) dispatch different matmul kernels
-    /// for M=1 vs M>=2 rows, so a batched `[N,1]` projection differs from the
-    /// single-row decode by a few ULP. NemotronH's 23 mamba layers amplify
-    /// that into token flips by step ~8, so the batched lane runs the
-    /// quantized projections per row (M=1, bit-identical to the scalar path)
-    /// while attention stays batched (its projections are dense bf16, which
-    /// the kernels compute bit-exactly for any M). Mirrors Qwen3.5 MoE's
-    /// `preserve_singleton_projection_graphs` contract.
+    /// Quantized kernels dispatch differently for M=1 vs M>=2, and the 23 mamba layers
+    /// amplify those few ULP into token flips by step ~8. When set, the batched lane
+    /// runs the quantized projections per row (M=1, bit-identical to the scalar path).
     pub(crate) row_exact_decode_projections: bool,
 }
 
@@ -328,44 +310,13 @@ fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAd
     Ok(Some(adapter))
 }
 
-/// Whether the live mamba states (held in `caches` / `scheduled_caches` for
-/// the sequence) are already at the `cached_prefix_len` boundary for this
-/// exact token prefix: the turn strictly extends the immediately-preceding
-/// saved history byte-for-byte, so the parked per-request states reflect the
-/// prefix. Any mismatch (first turn, aborted-since-last-save, foreign/partial
-/// prefix hit) must DROP the cached prefix and cold-prefill the whole plan:
-/// there is no reconstruction path any more.
-/// [`NemotronHInner::run_paged_prefill_chunk`] hard-errors on a nonzero
-/// `cached_prefix_len` that arrives without a live mamba state, so
-/// `prime_prefix_state_for` is obliged to drive `cached_prefix_len` to 0
-/// rather than hand the prefix down. The mamba recurrent state is
-/// non-invertible, so this is the only legal fast path (lfm2
-/// `conv_state_reusable` mirror).
-/// Whether the flat MTP core must drop its final generated token when saving
-/// the session history.
+/// Whether the flat MTP core must drop its final generated token when saving the
+/// session history, so it ends exactly where the physical caches end.
 ///
-/// The saved history has to end exactly where the physical caches end. The
-/// speculative loop reports two facts about its exit and BOTH are needed —
-/// `finish_reason` alone is ambiguous because the engine leaves
-/// `last_in_cache` at its initial `true` on every length exit:
-///
-/// * `last_in_cache == false` — the loop stopped on a token it had sampled
-///   but never forwarded (Step-A EOS / cancel / repetition, or the emit
-///   loop stopping on the cycle's unforwarded bonus token). Always drop.
-/// * `finish_reason == "length"` with `rollback_unemitted == 0` — the
-///   ORDINARY length exit: the budget tripped right after Step A committed a
-///   freshly sampled token (`mtp_turn.rs:1671`) or at the top of the loop on
-///   a cycle's unforwarded bonus (`:1518`). The token is not in the caches,
-///   so it must still be dropped.
-/// * `finish_reason == "length"` with `rollback_unemitted > 0` — the
-///   MID-CYCLE length exit: the emit loop broke at the top of an iteration
-///   with accepted tokens left over (`mtp_turn.rs:1900`), so the last EMITTED
-///   token is NOT the bonus — verify already wrote its K/V and advanced the
-///   mamba state through the same forward. Dropping it would leave the saved
-///   history one token BEHIND the physical caches.
-///
-/// Every non-length reason already rides on `last_in_cache`, which the engine
-/// sets honestly at each of those break sites.
+/// `finish_reason` alone is ambiguous: the engine leaves `last_in_cache` at `true`
+/// on EVERY length exit. `rollback_unemitted` separates them — 0 is a token sampled
+/// but never forwarded (drop), nonzero is a mid-cycle break where verify already
+/// wrote that token's K/V (keep).
 fn mtp_history_drop_last(
     last_in_cache: bool,
     finish_reason: &str,
@@ -374,6 +325,11 @@ fn mtp_history_drop_last(
     !last_in_cache || (finish_reason == "length" && rollback_unemitted == 0)
 }
 
+/// Whether the live mamba states already sit at the `cached_prefix_len` boundary.
+/// The Mamba-2 recurrent state is NON-INVERTIBLE, so only a strict byte-for-byte
+/// extension of the saved history may reuse a cached K/V prefix; every other hit
+/// must drive `cached_prefix_len` to 0 (there is no reconstruction path, and
+/// `run_paged_prefill_chunk` hard-errors on the mismatch).
 fn mamba_state_reusable(
     plan: &[u32],
     cached_token_history: &[u32],
@@ -400,11 +356,10 @@ impl NemotronHInner {
         self.mtp.is_some() && self.mtp_weights_loaded
     }
 
-    /// MTP-routing predicate for the whole-turn executors: an MTP-requested
-    /// turn runs the FLAT speculative core (never the generic paged
-    /// executor) exactly when the request opted in, a complete MTP head is
-    /// loaded, and the turn is not streaming (the flat MTP core has no
-    /// streaming arm; streaming MTP turns keep the paged AR fallback).
+    /// MTP-routing predicate for the whole-turn executors: run the FLAT speculative
+    /// core exactly when the request opted in, a complete MTP head is loaded, and the
+    /// turn is not streaming (the flat core has no streaming arm, so streaming MTP
+    /// turns keep the paged AR fallback).
     pub(crate) fn mtp_flat_routing_required(
         &self,
         params: &crate::engine::params::ChatParams,
@@ -413,8 +368,7 @@ impl NemotronHInner {
         let requested = params.enable_mtp && self.has_mtp_weights();
         if requested && streaming {
             // Process-wide one-shot: a streaming server would otherwise emit
-            // one line per turn. Both call sites pass `args.sink.is_some()`,
-            // so this covers the paged AR fallback and the flat AR fallback.
+            // one line per turn.
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
                 tracing::warn!(
@@ -478,9 +432,7 @@ impl NemotronHInner {
         self.caches = fresh_caches(&self.config, &self.layers).expect("fresh caches rebuild");
         self.cached_token_history.clear();
         self.flat_mtp_caches_desynced = false;
-        // The drafter seed describes the backbone history that just went
-        // away; keeping it would let a later `begin_mtp_decode` draft from a
-        // cache anchored to a dead token stream.
+        // The seed describes a backbone history that just went away.
         self.pending_mtp_draft_seed = None;
     }
 
@@ -494,14 +446,8 @@ impl NemotronHInner {
     }
 
     /// Save the session history, aligning it with the physical cache length.
-    ///
-    /// `drop_last` is the CALLER's decision, never re-derived here from the
-    /// finish reason. The AR/paged callers pass `true` unconditionally (the
-    /// shared decode loop never forwards the final committed token, and the
-    /// Mamba recurrent state is non-invertible, so the boundary token can
-    /// never be replayed into the caches); the MTP caller passes
-    /// [`mtp_history_drop_last`], which separates the two length exits the
-    /// speculative loop can take.
+    /// `drop_last` is the CALLER's decision, never re-derived here: AR/paged callers
+    /// pass `true` unconditionally, the MTP caller passes [`mtp_history_drop_last`].
     fn save_cache_state_internal(
         &mut self,
         reuse_cache: bool,
@@ -532,12 +478,9 @@ impl NemotronHInner {
         generation_stream: Stream,
     ) -> Result<MxArray> {
         let total_len = prompt.shape_at(1)?;
-        // Chunk-aligned slices: the Mamba-2 chunk scan pads the LAST chunk of
-        // each forward, so every intermediate boundary must land on the
-        // configured chunk grid — a fixed 2048 step would split chunks when
-        // chunk_size does not divide 2048, changing the recurrence's reduction
-        // grouping relative to an unsplit cold forward (same invariant as the
-        // paged prefill path).
+        // Chunk-aligned slices: the Mamba-2 chunk scan pads the LAST chunk of each
+        // forward, so every intermediate boundary must land on the configured chunk
+        // grid or the recurrence's reduction grouping changes.
         let slices = chunk_aligned_prefill_slices(
             0,
             total_len as u32,
@@ -552,7 +495,7 @@ impl NemotronHInner {
                 .as_ref()
                 .is_some_and(|f| f.load(Ordering::Relaxed))
             {
-                return Err(Error::from_reason("prefill cancelled"));
+                return Err(Error::from_reason(PREFILL_CANCELLED));
             }
             let chunk = prompt.slice_axis(1, s as i64, e as i64)?;
             {
@@ -567,24 +510,11 @@ impl NemotronHInner {
         last.ok_or_else(|| Error::from_reason("chunked_prefill produced no chunks"))
     }
 
-    /// Chunked prefill that ALSO seeds the MTP drafter's own KV cache.
-    ///
-    /// Sibling of [`chunked_prefill`](Self::chunked_prefill) — identical
-    /// chunk grid (the Mamba-2 chunk-alignment invariant is copied, not
-    /// re-derived) — used only by the flat MTP whole-turn core. Per chunk it
-    /// runs the hidden-emitting forward and feeds the drafter the vLLM
-    /// EAGLE-shifted pairs
-    ///
-    ///   drafter slot p  <-  ( h_p , emb(tokens[p + 1]) )   for p < T-1
-    ///
-    /// so the head arrives at decode time with the same causal history the
-    /// backbone has. Slot `T-1` is NOT written here: its embedding is the
-    /// first sampled token `y`, which does not exist until the caller
-    /// samples it — see [`seed_mtp_final_slot`](Self::seed_mtp_final_slot).
-    ///
-    /// Returns `(final chunk logits [1, L_last, vocab], h_{T-1} as
-    /// [1, 1, hidden])`. Never materializes `[1, T, hidden]` for the whole
-    /// prompt: the drafter is fed chunk by chunk.
+    /// Chunked prefill that ALSO seeds the MTP drafter's own KV cache, feeding it the
+    /// vLLM EAGLE-shifted pairs `drafter slot p <- (h_p, emb(tokens[p + 1]))` for
+    /// `p < T-1`. Slot `T-1` is NOT written here: its embedding is the first sampled
+    /// token `y` — see [`seed_mtp_final_slot`](Self::seed_mtp_final_slot). Returns the
+    /// final chunk's logits plus `h_{T-1}`.
     pub(crate) fn chunked_prefill_seeding_mtp(
         &mut self,
         prompt: &MxArray,
@@ -601,10 +531,9 @@ impl NemotronHInner {
         )
     }
 
-    /// [`chunked_prefill_seeding_mtp`](Self::chunked_prefill_seeding_mtp)
-    /// with an explicit chunk step, so a test can force the multi-chunk path
-    /// without a 2048-token prompt. The seed must be invariant to where the
-    /// chunk boundaries fall.
+    /// [`chunked_prefill_seeding_mtp`](Self::chunked_prefill_seeding_mtp) with an
+    /// explicit chunk step, so a test can force the multi-chunk path. The seed must
+    /// be invariant to where the chunk boundaries fall.
     pub(crate) fn chunked_prefill_seeding_mtp_stepped(
         &mut self,
         prompt: &MxArray,
@@ -634,7 +563,7 @@ impl NemotronHInner {
                 .as_ref()
                 .is_some_and(|f| f.load(Ordering::Relaxed))
             {
-                return Err(Error::from_reason("prefill cancelled"));
+                return Err(Error::from_reason(PREFILL_CANCELLED));
             }
             let chunk = prompt.slice_axis(1, s as i64, e as i64)?;
             let (logits, hidden) = {
@@ -664,9 +593,8 @@ impl NemotronHInner {
                 out = Some((logits, h_last));
             } else {
                 self.eval_caches_internal()?;
-                // The drafter cache is lazy too: without this the next
-                // `clear_cache()` strands its graph and peak memory grows
-                // with the prompt instead of with the chunk.
+                // The drafter cache is lazy too: without this eval the next
+                // `clear_cache()` strands its graph and peak memory grows.
                 let mut refs = Vec::new();
                 for c in mtp_caches.iter() {
                     c.collect_arrays(&mut refs);
@@ -678,11 +606,9 @@ impl NemotronHInner {
         out.ok_or_else(|| Error::from_reason("chunked_prefill_seeding_mtp produced no chunks"))
     }
 
-    /// Write the FINAL prompt slot of the drafter cache: `(h_{T-1},
-    /// emb(y))`, where `y` is the token sampled from the prefill logits.
-    ///
-    /// Completes the seed to `committed_len == T` so the first decode
-    /// cycle's `begin_cycle` trims to exactly the prompt boundary.
+    /// Write the FINAL prompt slot of the drafter cache: `(h_{T-1}, emb(y))`, where
+    /// `y` is the token sampled from the prefill logits. Completes the seed to
+    /// `committed_len == T`.
     pub(crate) fn seed_mtp_final_slot(
         &mut self,
         h_last: &MxArray,
@@ -705,8 +631,6 @@ impl NemotronHInner {
 }
 
 impl NemotronHInner {
-    // ===================== Paged / scheduler recurrent state =====================
-
     /// f32 bytes of one request's mamba recurrent state (conv + SSM per mamba
     /// layer), used by the scheduler's unified-memory watermark.
     pub(crate) fn recurrent_state_bytes_per_seq(&self) -> u64 {
@@ -733,13 +657,9 @@ impl NemotronHInner {
         self.active_scheduled_seq == Some(seq_id) || self.scheduled_caches.contains_key(&seq_id)
     }
 
-    /// Whether `activate_paged_seq(seq_id)` will land on state that SURVIVED
-    /// (as opposed to fresh zero-state caches). Mirrors `activate_paged_seq`
-    /// exactly: an already-live sequence keeps whatever the activation that
-    /// made it live decided; any other sequence survives iff its caches are
-    /// parked. Read BEFORE the activation, so the eligibility predicates can
-    /// consult it while `active_seq_recurrent_survived` still describes the
-    /// PREVIOUS sequence.
+    /// Whether `activate_paged_seq(seq_id)` will land on state that SURVIVED (as
+    /// opposed to fresh zero-state caches). Read BEFORE the activation, while
+    /// `active_seq_recurrent_survived` still describes the PREVIOUS sequence.
     pub(crate) fn scheduled_recurrent_state_live(&self, seq_id: SeqId) -> bool {
         if self.active_scheduled_seq == Some(seq_id) {
             self.active_seq_recurrent_survived
@@ -784,28 +704,16 @@ impl NemotronHInner {
             .activate_request(seq_id)
             .map_err(Error::from_reason)?;
         if self.active_scheduled_seq == Some(seq_id) {
-            // Already live: `caches` still holds exactly the state the
-            // activation that made this sequence live installed, so nothing
-            // about its survival changed here — LEAVE THE FLAG ALONE.
-            //
-            // Re-asserting `true` here made the flag dead on the scheduled
-            // lane: the scheduler activates a sequence
-            // (`hybrid_scheduler.rs:1654`, and `:2069` on resume) and then
-            // immediately activates it AGAIN through
-            // `prepare_scheduled_prefix` -> `prime_prefix_state_for`
-            // (`:1677` / `:2073`), whose first statement is this function. A
-            // preempted sequence's honest `had_state = false` was overwritten
-            // one call before `prime_prefix_state_for` read it, collapsing
-            // `reused_state` to the token-only predicate its own comment
-            // forbids — a resumed sequence could then decode with the mamba
+            // Already live: LEAVE THE FLAG ALONE. The scheduler activates a
+            // sequence and then activates it AGAIN through `prime_prefix_state_for`;
+            // re-asserting `true` here would overwrite a preempted sequence's honest
+            // `had_state = false` before that function reads it, resuming with mamba
             // state at zero against a full cached KV prefix.
             return Ok(());
         }
-        // Capture BEFORE the remove: a preempted sequence's recurrent state
-        // was released, so the remove below falls back to FRESH zero-state
-        // caches. The reuse predicate must know the state did not survive —
-        // otherwise a cached KV prefix matching the saved history would be
-        // kept and the turn would resume with Mamba state at zero.
+        // Capture BEFORE the remove: a preempted sequence's recurrent state was
+        // released, so the remove falls back to FRESH zero-state caches and the reuse
+        // predicate must know the state did not survive.
         let had_state = self.scheduled_caches.contains_key(&seq_id);
         self.park_active_scheduled_caches();
         self.caches = self
@@ -902,16 +810,10 @@ impl NemotronHInner {
         Ok(())
     }
 
-    // ===================== Paged prefill =====================
-
-    /// One paged prefill slice: record the suffix in the adapter and forward
-    /// it through all layers (attention via the paged pool). Returns the
-    /// last-token logits `[vocab]`.
-    ///
-    /// A nonzero `cached_prefix_len` is only ever legal here when the live
-    /// mamba state already sits on that boundary — `prime_prefix_state_for`
-    /// enforces that invariant, and `skip_reconstruction` records it for
-    /// this slice.
+    /// One paged prefill slice: record the suffix in the adapter and forward it
+    /// through all layers. Returns the last-token logits `[vocab]`. A nonzero
+    /// `cached_prefix_len` is legal only when the live mamba state already sits on
+    /// that boundary, which `skip_reconstruction` records.
     fn run_paged_prefill_chunk(
         &mut self,
         full_tokens: &[u32],
@@ -926,11 +828,10 @@ impl NemotronHInner {
         }
         let suffix_len = suffix_tokens.len() as u32;
 
-        // Assertion, not a fallback. `prime_prefix_state_for` guarantees that a
-        // nonzero `cached_prefix_len` always comes with a live mamba state at
-        // that boundary; reaching here means that guarantee was broken and the
-        // only alternatives are a silently-wrong recurrent state or a
-        // full-prefix reconstruction with neither slicing nor a cancel point.
+        // Assertion, not a fallback. `prime_prefix_state_for` guarantees that a nonzero
+        // `cached_prefix_len` always comes with a live mamba state at that boundary;
+        // reaching here means that guarantee broke, and there is no reconstruction path
+        // to fall back to.
         if cached_prefix_len > 0 && !skip_reconstruction {
             let planned = full_tokens.len();
             return Err(Error::from_reason(format!(
@@ -1023,14 +924,11 @@ impl NemotronHInner {
         self.run_paged_decode_forward(token_id, first_logical_position)
     }
 
-    /// Forward half of one paged decode step, for a token whose blocks are
-    /// ALREADY reserved and whose adapter cursor has ALREADY advanced.
-    ///
-    /// `first_logical_position` is the position the token occupies, i.e. the
-    /// cursor value captured BEFORE the record. Splitting the step this way
-    /// lets the row-exact batched wave reserve every row's blocks up front
-    /// (the only step that can fail on an allocator squeeze) before any row's
-    /// non-invertible mamba state is touched.
+    /// Forward half of one paged decode step, for a token whose blocks are ALREADY
+    /// reserved and whose cursor has ALREADY advanced; `first_logical_position` is the
+    /// cursor captured BEFORE the record. The split lets the row-exact wave reserve
+    /// every row's blocks (the only failable step) before any row's non-invertible
+    /// mamba state is touched.
     fn run_paged_decode_forward(
         &mut self,
         token_id: u32,
@@ -1079,14 +977,9 @@ impl NemotronHInner {
         }
     }
 
-    /// Roll back one recorded decode token per sequence, newest first.
-    ///
-    /// Restores the adapter cursor / block-table token count of rows that
-    /// already recorded before a peer's record failed, so an allocator squeeze
-    /// leaves the whole wave exactly where it started. Blocks lazily allocated
-    /// by the successful records stay owned by their request (the same
-    /// contract [`PagedKVCacheAdapter::rollback_last_tokens`] documents) —
-    /// the retry writes into them.
+    /// Roll back one recorded decode token per sequence, newest first, so an allocator
+    /// squeeze leaves the wave where it started. Blocks the successful records
+    /// allocated stay owned by their request — the retry writes into them.
     fn unwind_recorded_decode_rows(&mut self, recorded: &[SeqId]) -> Result<()> {
         for &recorded_seq in recorded.iter().rev() {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
@@ -1104,35 +997,18 @@ impl NemotronHInner {
         Ok(())
     }
 
-    /// Row-exact batched decode: N single-row decodes stacked into `[N, 1,
-    /// vocab]`, bit-identical to N scalar decodes, committed ALL-OR-NOTHING.
+    /// Row-exact batched decode: N single-row decodes stacked into `[N, 1, vocab]`,
+    /// bit-identical to N scalar decodes, committed ALL-OR-NOTHING.
     ///
-    /// Ordering is the whole point. Phase 1 records every row (the only step
-    /// that reserves blocks and so the only step an allocator squeeze can
-    /// fail), unwinding every already-recorded peer in reverse on failure.
-    /// Only then does phase 2 run the per-row forwards, which write K/V and
-    /// fold each row's token into its non-invertible mamba state.
-    ///
-    /// The naive shape — activate + `run_paged_decode_step` per row — records
-    /// and forwards row `k` before row `k+1` is even asked for blocks. When
-    /// row `k+1` then failed with a `paged decode could not reserve` error the
-    /// scheduler treated the WHOLE wave as blocked
-    /// (`engine/scheduler.rs:468`, `engine/hybrid_scheduler.rs:963`), popped
-    /// every row's generated token, and re-fed the same token on the next
-    /// step: survivors recorded it twice and folded it into their mamba state
-    /// twice, which no rollback can undo. A KV-only unwind would not have
-    /// helped — `rollback_last_tokens` moves the cursor, not the recurrent
-    /// state — so the fix is to reserve first and touch state second rather
-    /// than to snapshot and restore 23 mamba states per wave.
-    ///
-    /// Phase 2 can still fail (an MLX error, a missing per-request cache), and
-    /// such a failure does leave earlier rows advanced. That is terminal, not
-    /// retried: none of those messages carry the allocation-blocked marker, so
-    /// the scheduler fails every row of the wave instead of re-feeding it.
+    /// Ordering is the whole point: phase 1 records every row (the only step that
+    /// reserves blocks, so the only one an allocator squeeze can fail) and unwinds its
+    /// peers on failure, and only then does phase 2 fold each token into its
+    /// non-invertible mamba state. Row-by-row instead lets the scheduler's
+    /// blocked-wave retry re-feed a token a survivor already folded in.
     fn run_row_exact_decode_wave(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
-        // Pre-pass BEFORE any mutation: reject a duplicated sequence (two rows
-        // of one wave would record two tokens against one cursor) and resolve
-        // every row's write position while the cursors are still untouched.
+        // Pre-pass BEFORE any mutation: reject a duplicated sequence (two rows of one
+        // wave would record two tokens against one cursor) and resolve every row's
+        // write position while the cursors are still untouched.
         let mut seen = HashSet::with_capacity(rows.len());
         let mut positions = Vec::with_capacity(rows.len());
         {
@@ -1173,9 +1049,8 @@ impl NemotronHInner {
             recorded.push(seq_id);
         }
 
-        // Phase 2: per-row scalar forwards. `activate_paged_seq` re-points the
-        // adapter at each row (phase 1 left it on the last row) and swaps that
-        // row's per-request caches into `self.caches`.
+        // Phase 2: per-row scalar forwards. `activate_paged_seq` re-points the adapter
+        // at each row and swaps in that row's per-request caches.
         let mut logits = Vec::with_capacity(rows.len());
         for (index, &(seq_id, token_id)) in rows.iter().enumerate() {
             self.activate_paged_seq(seq_id)?;
@@ -1194,20 +1069,15 @@ impl NemotronHInner {
                 "run_paged_decode_step_batched requires at least one row",
             ));
         }
-        // Preserve the scalar decode graph for a one-row wave (quantized
-        // matrix kernels can round differently when a singleton is forced
-        // through a batched graph).
+        // Preserve the scalar decode graph for a one-row wave (quantized kernels can
+        // round differently when a singleton goes through a batched graph).
         if let [(seq_id, token_id)] = rows {
             self.activate_paged_seq(*seq_id)?;
             return self.run_paged_decode_step(*token_id);
         }
-        // Quantized checkpoints: the batched [N,1] projections (mamba MXFP8,
-        // MoE NVFP4, lm_head NVFP4) AND the batched paged-attention kernels
-        // round differently from the single-row decode; the 23 mamba layers
-        // amplify a few ULP into token flips. Run the full per-row scalar
-        // decode (each row records its own token, writes K/V, and advances its
-        // mamba state with M=1 kernels), so the batch output is bit-identical
-        // to N single-row decodes. Dense checkpoints keep the fused path.
+        // Quantized checkpoints: the batched [N,1] projections AND the batched
+        // paged-attention kernels round differently from the single-row decode, and the
+        // 23 mamba layers amplify a few ULP into token flips. Dense keeps the fused path.
         if self.row_exact_decode_projections {
             return self.run_row_exact_decode_wave(rows);
         }
@@ -1333,11 +1203,10 @@ impl ChatBackend for NemotronHInner {
     }
 
     fn extra_eos_ids(&self) -> Vec<u32> {
-        // UNION of the checkpoint config's EOS set and `generation_config.json`
-        // (the engine contract: `eos_token_ids` is a union, never an override —
-        // see ChatParams::extra_eos_ids). The released Nemotron checkpoint adds
-        // a generation-config EOS absent from config.json; without this every
-        // chat path would decode past it.
+        // UNION of the checkpoint config's EOS set and `generation_config.json` (the
+        // engine contract: `eos_token_ids` is a union, never an override). The released
+        // checkpoint adds a generation-config EOS absent from config.json; without this
+        // every chat path would decode past it.
         let mut ids: Vec<u32> = self
             .config
             .eos_token_ids
@@ -1348,24 +1217,11 @@ impl ChatBackend for NemotronHInner {
         ids
     }
 
-    /// True when the physical flat caches hold tokens the saved history does
-    /// NOT, so cache recovery must reset + re-prefill instead of reusing the
-    /// advanced recurrent state (the qwen3_5/qwen3_5_moe contract).
-    ///
-    /// NOT "a mid-cycle MTP stop happened". `rollback_unemitted` sets the
-    /// latch only at `unemitted > 1`, i.e. only when a token the backbone
-    /// actually FORWARDED is dropped. A cycle's LAST outcome token — the
-    /// bonus on a full accept, the residual on a rejection — is never fed
-    /// through the layers: the bonus is read off a verify row that already
-    /// exists, and the residual is sampled after `rollback` restored the
-    /// pre-verify snapshot. So a stop that strands only that token
-    /// (`unemitted == 1`, the shape EVERY depth-1 mid-cycle stop takes)
-    /// leaves the flat KV and all Mamba-2 states exactly aligned with the
-    /// saved history, and this must report `false`. Measured on
-    /// nemotron-3.5-lightning-30b-a3b-nvfp4: `attention kv_offset -
-    /// cached_token_history.len() == 0` on every mid-cycle stop observed.
-    /// Latching there would force the next flat turn to `hit = 0` and
-    /// re-prefill the whole prompt for nothing.
+    /// True when the physical flat caches hold tokens the saved history does NOT, so
+    /// cache recovery must reset + re-prefill. NOT "a mid-cycle MTP stop happened":
+    /// `rollback_unemitted` latches only when a token the backbone actually FORWARDED
+    /// is dropped, and a cycle's LAST outcome token (bonus or residual) never goes
+    /// through the layers, so a depth-1 mid-cycle stop must report `false`.
     fn flat_caches_desynced(&self) -> bool {
         self.flat_mtp_caches_desynced
     }
@@ -1388,11 +1244,10 @@ impl ChatBackend for NemotronHInner {
         self.reset_caches_internal();
         self.scheduled_caches.clear();
         self.active_scheduled_seq = None;
-        // The EXPLICIT command reset must restore a fully cold state:
-        // release the live request AND purge the allocator prefix cache so a
-        // reset-then-rerun of the same prompt replays the cold prefill
-        // (lfm2 rationale: the bf16 reduction order of a partial-prefix hit
-        // differs from the cold full prefill).
+        // The EXPLICIT command reset must restore a fully cold state: release the live
+        // request AND purge the allocator prefix cache, so a reset-then-rerun of the
+        // same prompt replays the cold prefill (a partial-prefix hit has a different
+        // bf16 reduction order).
         if scope == ResetScope::Command
             && let Some(adapter) = self.paged_adapter.as_mut()
         {
@@ -1463,12 +1318,9 @@ impl ChatBackend for NemotronHInner {
                 kind: SpeculativeKind::NativeMtp,
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
-                // Native MTP is flat-cache only for this family (the draft
-                // head reads the FLAT KV). The plan keeps the paged adapter
-                // exposed so plain AR turns stay on the paged lane; a sync
-                // MTP-requested turn is re-routed to the flat speculative
-                // core inside run_paged_turn (the engine also keeps
-                // enable_mtp turns off the batched lane).
+                // Native MTP is flat-cache only here (the draft head reads the
+                // FLAT KV); the plan keeps the paged adapter exposed for plain AR
+                // turns, and run_paged_turn re-routes sync MTP turns to the flat core.
                 supports_paged_attention: false,
             }),
         }
@@ -1479,15 +1331,10 @@ impl ChatBackend for NemotronHInner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Native MTP is flat-cache only (the draft head reads the FLAT KV),
-        // but a paged adapter still resolves every fresh turn to this path
-        // (TurnPlan gives paged attention precedence over the speculative
-        // decoder, and this family's SpeculativePlan truthfully declares
-        // supports_paged_attention: false). Route sync MTP-requested turns
-        // to the flat speculative core so the draft+verify cycle actually
-        // runs; streaming MTP turns keep the generic paged AR fallback (the
-        // flat core has no streaming arm and would trip
-        // whole_turn_outcome's Complete-on-streaming guard).
+        // Native MTP is flat-cache only, but a paged adapter still resolves every fresh
+        // turn to this path. Route sync MTP-requested turns to the flat speculative core;
+        // streaming MTP turns keep the paged AR fallback (the flat core has no streaming
+        // arm).
         if self.mtp_flat_routing_required(args.params, args.sink.is_some()) {
             return self.run_mtp_whole_turn(args);
         }
@@ -1495,16 +1342,10 @@ impl ChatBackend for NemotronHInner {
     }
 
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Same gate `run_paged_turn` applies. This path is reached when the
-        // plan chose the flat speculative handler, i.e. on a model with MTP
-        // weights and NO paged adapter (`use_block_paged_cache: false`, or a
-        // build where `compiled_forward_backend_available()` is false) — the
-        // one family route where the engine cannot fall back for us. The flat
-        // MTP core has no streaming arm and never reads `args.sink`, so
-        // returning its `TurnOutput::Complete` on a sink-bearing turn is
-        // rejected outright by `whole_turn_outcome`
-        // (`engine/session.rs:451`): a streaming MTP request would hard-error
-        // instead of generating. Route those turns to plain AR streaming.
+        // Same gate `run_paged_turn` applies. Reached on a model with MTP weights and NO
+        // paged adapter — the one route where the engine cannot fall back for us. The
+        // flat core returns `TurnOutput::Complete`, which `whole_turn_outcome` rejects
+        // outright on a sink-bearing turn, so streaming goes to plain AR.
         if !self.mtp_flat_routing_required(args.params, args.sink.is_some()) {
             return self.run_flat_ar_turn(args);
         }
@@ -1523,9 +1364,8 @@ impl NemotronHInner {
     }
 }
 
-/// Paged decode stepper for the exclusive/whole-turn lane (the paged analog
-/// of NemotronHDecode). Drives the engine-owned run_paged_turn decode
-/// loop through PagedBackend.
+/// Paged decode stepper for the exclusive/whole-turn lane, driving the
+/// engine-owned run_paged_turn decode loop through PagedBackend.
 pub(crate) struct NemotronHPagedDecode<'a> {
     inner: &'a mut NemotronHInner,
 }
@@ -1561,11 +1401,10 @@ impl DecodeStep for NemotronHPagedDecode<'_> {
     }
 }
 
-/// NemotronH paged prefix state: the effective prefix/suffix split the
-/// adapter resolved, PLUS the full prompt tokens (which the engine never
-/// hands to `paged_prefill`). `run_paged_prefill_chunk` now uses the full
-/// tokens only to report the planned length in its fail-closed error; it no
-/// longer rebuilds mamba state over `full_tokens[..cached_prefix_len]`.
+/// NemotronH paged prefix state: the effective prefix/suffix split the adapter
+/// resolved, PLUS the full prompt tokens (which the engine never hands to
+/// `paged_prefill`). The full tokens are used only to report the planned length
+/// in `run_paged_prefill_chunk`'s fail-closed error.
 pub(crate) struct NemotronHPrefixState {
     pub(crate) effective_cached_prefix_len: usize,
     pub(crate) suffix_len: usize,
@@ -1599,35 +1438,15 @@ impl PagedBackend for NemotronHInner {
     ) -> Result<Self::PrefixState> {
         debug_assert!(extra_keys.is_empty(), "nemotron_h is text-only");
         let owner_history = self.cached_token_history.clone();
-        // The Mamba-2 recurrent state is non-invertible: a cached K/V prefix can
-        // only be continued when the mamba state for it is already live in these
-        // caches — i.e. when `plan` is a strict token-extension of the history
-        // the previous turn left behind. Any other prefix hit (a different
-        // owner's shared template head, a same-owner reset) would require
-        // reconstructing the prefix mamba state from scratch, and the
-        // flat-vs-paged attention reconstruction is not bit-identical to the
-        // cold full prefill — the tiny residual differences accumulate through
-        // the recurrent decode and flip greedy argmaxes mid-turn (observed as
-        // confused rambling on every second session of a model). Force a cold
-        // prefill (skip_lookup) in that case: always correct, at the cost of
-        // forgoing prefix reuse across owners.
+        // The Mamba-2 recurrent state is non-invertible: a cached K/V prefix is
+        // continuable only when `plan` strictly extends the previous turn's history AND
+        // this sequence's recurrent row is still live (preemption, abort and
+        // finalize-without-reuse all release it). Reconstruction is not bit-identical to
+        // the cold prefill and the residual flips greedy argmaxes mid-turn.
         //
-        // The token predicate is necessary but NOT sufficient: the Mamba-2
-        // state is non-invertible, so a cached K/V prefix is only continuable
-        // when the recurrent state that produced it is still live for this
-        // sequence. When it is not (finalize with reuse_cache=false, abort,
-        // preemption), keeping the prefix would force a full-prefix
-        // reconstruction that is neither bit-identical to the cold prefill nor
-        // bounded. Force the cold prefill.
-        //
-        // This liveness term is a FAST PATH, not the enforcement: the backstop
-        // in `prime_prefix_state_for` catches the same condition (and the two
-        // adapter routes that ignore `skip_lookup` entirely), so removing this
-        // term changes no observable outcome. It earns its place by keeping
-        // the common preempted-resume off the backstop's
-        // allocate -> free -> reallocate re-prepare, which can fail on a
-        // near-full block pool where the single-phase prepare would have
-        // succeeded. Do not delete it as dead weight.
+        // FAST PATH, not enforcement: `prime_prefix_state_for`'s backstop covers the same
+        // condition, but this keeps the common preempted-resume off that backstop's
+        // reallocating re-prepare, which can fail on a near-full pool.
         let continuation_eligible = !owner_history.is_empty()
             && plan.len() > owner_history.len()
             && plan[..owner_history.len()] == owner_history[..]
@@ -1656,18 +1475,15 @@ impl PagedBackend for NemotronHInner {
         );
         let mut last = None;
         for (s, e) in slices {
-            // Cancellation point. `chunked_prefill` and
-            // `chunked_prefill_seeding_mtp` already poll here; the paged slice
-            // loop did not, so a long cold prefill on the single-session lane
-            // (the engine calls `paged_prefill` ONCE with the whole suffix)
-            // had no cancellation point at all and stalled the model thread
-            // for every peer session.
+            // Cancellation point: the engine calls `paged_prefill` ONCE with the
+            // whole suffix on the single-session lane, so without this a long cold
+            // prefill stalls the model thread for every peer session.
             if self
                 .turn_cancel
                 .as_ref()
                 .is_some_and(|f| f.load(Ordering::Relaxed))
             {
-                return Err(Error::from_reason("prefill cancelled"));
+                return Err(Error::from_reason(PREFILL_CANCELLED));
             }
             let skip = prefix.mamba_state_reusable || s > cached;
             let local = (s - cached) as usize;
@@ -1718,10 +1534,8 @@ impl PagedBackend for NemotronHInner {
         _keep_all: bool,
         reuse_cache: bool,
     ) -> Result<()> {
-        // NemotronH paged ALWAYS drops the last token: the decode loop never
-        // forwards the final sampled token (the terminal forward is skipped),
-        // so it is absent from the adapter and the mamba states. Mirror the
-        // flat path's drop-last-always contract.
+        // NemotronH paged ALWAYS drops the last token: the decode loop never forwards
+        // the final sampled token, so it is in neither the adapter nor the mamba states.
         self.save_cache_state_internal(
             reuse_cache,
             save_tokens,
@@ -1732,9 +1546,8 @@ impl PagedBackend for NemotronHInner {
     }
 
     fn paged_perf_prefill_tokens(&self, prompt_token_count: usize, suffix_len: usize) -> usize {
-        // A foreign/partial prefix hit is forced to a COLD prefill of the
-        // whole plan, so ttft measures full-prompt work; the exact-owner
-        // carried-state path prefills only the suffix.
+        // A foreign/partial prefix hit is forced to a COLD prefill of the whole plan, so
+        // ttft measures full-prompt work; the carried-state path prefills the suffix.
         if self.last_paged_prefill_reused_mamba_state {
             suffix_len
         } else {
@@ -1778,24 +1591,13 @@ impl HybridSchedulerBackend for NemotronHInner {
         self.has_scheduled_caches_for(seq_id)
     }
 
-    /// Residency cap on parked recurrent rows.
-    ///
-    /// Without this override the trait default (`true`) makes
-    /// `HybridSchedulerState::ensure_recurrent_slot`'s idle-victim body dead
-    /// code and lets `scheduled_caches` grow one row per owner forever. The
-    /// cap is `scheduler_max_num_seqs_for(32)` — the SAME number
-    /// `max_concurrent_sequences()` advertises — not the GDN families'
-    /// `HYBRID_LIVE_STATE_UNITS = 2`: a NemotronH row is conv + SSM over 23
-    /// mamba layers (~47.6 MiB on the released checkpoint) rather than a full
-    /// GDN row store, and a cap of 2 would cut this family's batching from 8
-    /// rows to 2.
-    ///
-    /// Deliberately NOT mirroring qwen3_5's hard error inside
-    /// `activate_scheduled_recurrent`: this family routes both
-    /// `activate_scheduled_recurrent` and `activate_paged_seq` to the same
-    /// function, and `finish_completed` calls the latter WITHOUT an
-    /// `ensure_recurrent_slot` gate — erroring there would fail completed
-    /// turns. The scheduler already gates admission and resume.
+    /// Residency cap on parked recurrent rows. Without this override the trait default
+    /// (`true`) makes `ensure_recurrent_slot`'s idle-victim body dead code and
+    /// `scheduled_caches` grows one row per owner forever. The cap matches
+    /// `max_concurrent_sequences()`, not `HYBRID_LIVE_STATE_UNITS = 2`, which would
+    /// cut batching from 8 rows to 2. Deliberately not qwen3_5's hard error inside
+    /// `activate_scheduled_recurrent`: `finish_completed` reaches the same function
+    /// with no `ensure_recurrent_slot` gate, so erroring there would fail live turns.
     fn can_activate_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
         self.has_scheduled_recurrent(seq_id)
             || self.scheduled_recurrent_units() < scheduler_max_num_seqs_for(32)
@@ -1859,19 +1661,11 @@ impl HybridSchedulerBackend for NemotronHInner {
         cache_salt: u64,
         _block_size: u32,
     ) -> Result<ScheduledPrefixAdmission<Self::PrefixState, Self::RestoreTicket>> {
-        // Same cold-prefill rule as the single-session lane: only a strict
-        // token-extension of the live history may reuse a cached K/V prefix
-        // (see `prime_prefix_state`); anything else forces skip_lookup.
-        //
-        // Plus the fact that makes it correct on the scheduled lane: a
-        // PREEMPTED sequence keeps its owner history and its registered K/V
-        // blocks but loses its recurrent row (`handle_preempted` calls
-        // `release_scheduled_recurrent_for`), and `ensure_recurrent_slot` can
-        // evict an idle row the same way. `activate_scheduled_recurrent`
-        // already ran for this seq_id before this call, so the liveness answer
-        // here is the honest one. Like the single-session lane's copy, this
-        // term is the fast path; `prime_prefix_state_for`'s backstop is the
-        // enforcement.
+        // Same cold-prefill rule as the single-session lane (see `prime_prefix_state`),
+        // plus the fact that makes it correct here: a PREEMPTED sequence keeps its owner
+        // history and K/V blocks but loses its recurrent row (as can an idle row
+        // `ensure_recurrent_slot` evicts), and `activate_scheduled_recurrent` already ran
+        // for this seq_id, so the liveness answer is honest.
         let continuation_eligible = !owner_history.is_empty()
             && tokens.len() > owner_history.len()
             && tokens[..owner_history.len()] == owner_history[..]
@@ -1897,11 +1691,9 @@ impl HybridSchedulerBackend for NemotronHInner {
         first_chunk: bool,
     ) -> Result<Option<MxArray>> {
         self.activate_paged_seq(seq_id)?;
-        // The engine's pinned break-set is a 2048-token grid from the
-        // effective prefix; re-split every slice at the CONFIGURED Mamba-2
-        // chunk-size boundaries so no executed prefill forward splits a
-        // chunk (a hard-coded 128 would misalign checkpoints that declare a
-        // different chunk_size and change the recurrence's reduction order).
+        // The engine's pinned break-set is a 2048-token grid; re-split every slice at
+        // the CONFIGURED Mamba-2 chunk boundaries so no executed prefill forward splits
+        // a chunk (a hard-coded 128 would misalign other checkpoints).
         let slices = chunk_aligned_prefill_slices(
             start as u32,
             end as u32,
@@ -1980,28 +1772,15 @@ impl NemotronHInner {
             )
             .map_err(Error::from_reason)?;
         let mut cached_prefix_len = turn_plan.cached_prefix_len as usize;
-        // Reuse requires BOTH a token-exact prefix match AND the sequence's
-        // recurrent (Mamba) state actually surviving at that boundary. A
-        // preempted sequence releases its recurrent state while its history
-        // and KV blocks remain reusable: a token-only match would then keep
-        // the prefix and continue with KV at the prefix boundary but Mamba
-        // state at position zero.
+        // Reuse requires BOTH a token-exact prefix match AND the sequence's recurrent
+        // (Mamba) state surviving at that boundary: a preempted sequence releases its
+        // state while its history and KV blocks stay reusable.
         let mut reused_state = self.active_seq_recurrent_survived
             && mamba_state_reusable(plan, owner_history, cached_prefix_len);
-        // INVARIANT (enforced, not assumed): a kept K/V prefix ALWAYS has a
-        // live mamba state at exactly its boundary. The callers' `skip_lookup`
-        // predicate closes the hash-lookup route, but two adapter routes
-        // ignore `skip_lookup` entirely:
-        //   * `ContinuedLivePrefix` — the adapter's `can_continue` never
-        //     consults `skip_lookup`, so a row whose recurrent state
-        //     `ensure_recurrent_slot` evicted while its request stayed live
-        //     would still be handed its whole prior prefix;
-        //   * `ContinueFailedReset` — a block-rounded hash hit BELOW
-        //     `owner_history.len()`, which `mamba_state_reusable` rejects.
-        // Both used to fall through to an unsliced, uncancellable
-        // reconstruction of the whole prefix whose arithmetic is not
-        // bit-identical to the cold prefill. Drop the prefix and re-prepare
-        // cold instead: same FLOPs, exact numerics, ordinary slicing.
+        // INVARIANT (enforced, not assumed): a kept K/V prefix ALWAYS has a live mamba
+        // state at exactly its boundary. `skip_lookup` closes the hash-lookup route, but
+        // `ContinuedLivePrefix` and `ContinueFailedReset` ignore it entirely. Drop the
+        // prefix and re-prepare cold: same FLOPs, exact numerics.
         if !reused_state && cached_prefix_len > 0 {
             tracing::debug!(
                 target: "mlx_core::nemotron_h",
@@ -2034,33 +1813,15 @@ impl NemotronHInner {
             reused_state = false;
         }
         self.last_paged_prefill_reused_mamba_state = reused_state;
-        // From here this turn's prefill brings the live recurrent state to the
-        // plan boundary. There is no two-pass reconstruction any more
-        // (`run_mamba_only_prefill` is gone and `run_paged_prefill_chunk`
-        // hard-errors on a prefix with no live state): when `reused_state` is
-        // false the block above has already forced `cached_prefix_len` to 0,
-        // so the single prefill pass runs COLD over the whole plan from the
-        // zeroed state; when it is true the single pass covers the suffix
-        // alone on top of the surviving state. Either way the sequence's state
-        // is at its boundary by the end of the turn, so the NEXT activation of
-        // this still-live sequence may treat it as survived — that is what
-        // keeps a warm continuation on the fast path now that a re-activation
-        // no longer asserts survival itself.
-        // A turn that fails after this point does not leak the claim: every
-        // failure route releases the sequence (`abort_paged_turn`,
-        // `release_scheduled_recurrent_for`, preemption at
-        // `hybrid_scheduler.rs:1993`), and `release_scheduled_caches_for`
-        // clears `active_scheduled_seq`, so the next activation takes the
-        // honest `had_state` path again.
+        // From here this turn's prefill brings the live recurrent state to the plan
+        // boundary either way, so the NEXT activation of this still-live sequence may
+        // treat it as survived. A turn that fails after this point does not leak the
+        // claim: every failure route releases the sequence.
         self.active_seq_recurrent_survived = true;
-        // A turn that is NOT a live continuation of the currently live request
-        // (fresh owner, or a same-owner continue that had to reset) cannot
-        // inherit the previous request's token history. The decode loop applies
-        // penalties over this history and labels positions from it, so a stale
-        // cross-owner history shifts the penalty context and position
-        // accounting — observed as every second session on one model generating
-        // confused rambling. Same-owner live continuations
-        // (`ContinuedLivePrefix`) keep the history.
+        // A turn that is NOT a live continuation of the currently live request (fresh
+        // owner, or a same-owner continue that had to reset) cannot inherit the previous
+        // request's token history: the decode loop applies penalties over it and labels
+        // positions from it, so a stale cross-owner history shifts both.
         if turn_plan.reason != PagedTurnPlanReason::ContinuedLivePrefix {
             self.cached_token_history.clear();
         }
@@ -2076,13 +1837,10 @@ impl NemotronHInner {
     }
 }
 
-/// Split the absolute token range [start, end) into sub-slices of at most
-/// slice_tokens tokens whose internal boundaries are all multiples of the
-/// Mamba-2 chunk_size (taken from the checkpoint config; 128 for the
-/// released model). The first sub-slice starts at start (the effective
-/// cached-prefix boundary, possibly unaligned); every later boundary is a
-/// chunk multiple, so no executed prefill forward splits a chunk relative
-/// to the model's chunk-scan arithmetic.
+/// Split [start, end) into sub-slices of at most `slice_tokens` tokens whose
+/// internal boundaries are all multiples of the Mamba-2 `chunk_size`, so no
+/// executed prefill forward splits a chunk relative to the chunk-scan arithmetic.
+/// The first sub-slice starts at `start`, which may be unaligned.
 pub(crate) fn chunk_aligned_prefill_slices(
     start: u32,
     end: u32,
@@ -2101,10 +1859,9 @@ pub(crate) fn chunk_aligned_prefill_slices(
     while s < end {
         let candidate = (s + slice_tokens).min(end);
         let e = if candidate < end {
-            // NONTERMINAL boundary: round DOWN to a chunk multiple so the
-            // next slice starts exactly on the chunk grid. (slice_tokens
-            // itself need not divide the chunk size — 2048 vs 192 leaves
-            // 2048 = 10*192 + 128, which would otherwise end mid-chunk.)
+            // NONTERMINAL boundary: round DOWN to a chunk multiple. (`slice_tokens`
+            // need not divide the chunk size: 2048 = 10*192 + 128 would otherwise
+            // end mid-chunk.)
             let snapped = (candidate / chunk_size) * chunk_size;
             if snapped > s {
                 snapped
@@ -2113,8 +1870,7 @@ pub(crate) fn chunk_aligned_prefill_slices(
                 (s + chunk_size).min(end)
             }
         } else {
-            // FINAL boundary: reach the range end exactly; the chunk scan
-            // pads the last chunk of each slice internally.
+            // FINAL boundary: reach the range end exactly.
             end
         };
         slices.push((s, e));
@@ -2125,21 +1881,11 @@ pub(crate) fn chunk_aligned_prefill_slices(
 
 /// Flat MTP propose/verify stepper for the engine-owned run_mtp_turn loop.
 ///
-/// The drafter is STATEFUL: the MTP head is a real decoder layer with its
-/// own K/V (vLLM `NemotronHMTPAttentionDecoderLayer`), so this stepper owns
-/// the head's per-layer caches for the whole turn. They arrive already
-/// seeded over the prompt through
-/// [`NemotronHInner::pending_mtp_draft_seed`]; `committed_len` tracks how
-/// many of their slots hold TRULY COMMITTED pairs.
-///
-/// Two different rewinds, deliberately:
-///   * the BACKBONE caches roll back from the pre-verify snapshot (`snap`)
-///     and `restore_and_replay_main` re-forwards the accepted prefix;
-///   * the DRAFTER cache never uses a snapshot — it rewinds by cursor
-///     `trim` (`begin_cycle` / `commit_mtp`), the vLLM model of overwriting
-///     rejected slots in place.
-///
-/// The single-step head clamps the requested depth to 1.
+/// The drafter is STATEFUL: the MTP head is a real decoder layer with its own K/V,
+/// so this stepper owns the head's per-layer caches for the whole turn, seeded over
+/// the prompt via [`NemotronHInner::pending_mtp_draft_seed`]. Two rewinds,
+/// deliberately: the BACKBONE rolls back from the pre-verify snapshot (`snap`); the
+/// DRAFTER never uses one, rewinding by cursor `trim`.
 pub(crate) struct NemotronHMtpStepper<'a> {
     inner: &'a mut NemotronHInner,
     embedding: Embedding,
@@ -2167,9 +1913,8 @@ impl NemotronHMtpStepper<'_> {
         }
     }
 
-    /// Test seam AND debug-build invariant seam: the drafter attention slot's
-    /// live offset. Compiled in every debug build so `begin_cycle`'s
-    /// cursor-alignment `debug_assert!` can read it.
+    /// The drafter attention slot's live offset. Compiled in every debug build so
+    /// `begin_cycle`'s cursor-alignment `debug_assert!` can read it.
     #[cfg(any(test, debug_assertions))]
     pub(crate) fn draft_kv_offset(&self) -> i32 {
         self.mtp_caches
@@ -2186,9 +1931,8 @@ impl NemotronHMtpStepper<'_> {
         self.committed_len
     }
 
-    /// Bound the drafter's lazy graph alongside the backbone caches: the
-    /// head writes K/V every draft AND every commit, so without this the
-    /// graph grows without bound across cycles.
+    /// Bound the drafter's lazy graph alongside the backbone caches: the head writes
+    /// K/V every draft AND every commit.
     fn async_eval_draft_caches(&self) {
         let mut refs = Vec::new();
         for c in self.mtp_caches.iter() {
@@ -2206,11 +1950,9 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
     }
 
     fn committed_history_active(&self) -> bool {
-        // The drafter now carries a persistent, prompt-seeded committed
-        // history. This gates `SkipAlreadyCommittedAnchor` (mtp_turn.rs:1826)
-        // and `begin_cycle(chained && active)` (mtp_turn.rs:1778): left at
-        // `false`, every chained cycle would re-commit its anchor and drift
-        // the drafter cursor by +1 per cycle.
+        // The drafter carries a persistent, prompt-seeded committed history. Left at
+        // `false`, every chained cycle would re-commit its anchor and drift the drafter
+        // cursor by +1 per cycle.
         true
     }
 
@@ -2219,11 +1961,9 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         ids: &MxArray,
         embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)> {
-        // Step A contract (qwen3_5_moe convention): the engine seeds the
-        // next cycle with hidden.shape_at(1) as the HIDDEN size, so the
-        // returned hidden must be [1, hidden] (time dim 1 squeezed away).
-        // The verify step uses forward_with_hidden_3d directly and keeps
-        // [1, T, hidden] for its MtpVerifyOutput contract.
+        // Step A contract: the engine seeds the next cycle with `hidden.shape_at(1)` as
+        // the HIDDEN size, so the returned hidden must be [1, hidden]. Verify uses
+        // forward_with_hidden_3d directly and keeps [1, T, hidden].
         let (logits, hidden) = self.inner.forward_with_hidden_3d(ids, embedding)?;
         let hidden = hidden.squeeze(Some(&[1]))?;
         Ok((logits, hidden, true))
@@ -2239,9 +1979,8 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
                 "NemotronH MTP draft_step: inner.mtp is None despite has_mtp_weights() gate",
             )
         })?;
-        // The draft writes its own K/V at the slot `begin_cycle` just
-        // trimmed to. It reads the head's OWN causal history — never the
-        // backbone's KV.
+        // The draft writes its own K/V at the slot `begin_cycle` just trimmed to, and
+        // reads the head's OWN causal history — never the backbone's KV.
         let h_next = mtp.forward(prev_hidden, prev_emb, &mut self.mtp_caches)?;
         let head = self
             .inner
@@ -2259,13 +1998,10 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         embedding: &Embedding,
         depth: usize,
     ) -> Result<crate::models::qwen3_5::mtp_decode::MtpVerifyOutput> {
-        // Fail closed on the depth-1 invariant rather than verify a shape
-        // this family never validated. `run_mtp_whole_turn` pins
+        // Fail closed on the depth-1 invariant. `run_mtp_whole_turn` pins
         // `mtp_adaptive_depth = false` and seeds `p.mtp_depth.min(1)`, and
-        // `run_mtp_cycle` only ever SHORTENS a cycle's depth (the near-tail
-        // budget cap and the EV gate), so exactly 1 arrives here. Anything
-        // else means a new engine route bypassed that clamp, and with it the
-        // `unemitted <= 1` shape `rollback_unemitted` is reasoned against.
+        // `run_mtp_cycle` only ever SHORTENS a cycle's depth, so exactly 1 arrives here;
+        // anything else means a new engine route bypassed that clamp.
         if depth != 1 {
             return Err(Error::from_reason(format!(
                 "NemotronH MTP verify_step: cycle depth {depth} but this family is \
@@ -2289,17 +2025,10 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
             )));
         }
         let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
-        // Verify one token at a time through the AR DECODE path. A batched
-        // [1, depth+1] forward routes every stateful mamba layer through the
-        // chunk-scan, whose padded-chunk arithmetic differs from the
-        // recurrent decode_step in f32 rounding (measured up to ~1.5 logits
-        // on the real checkpoint). Over accepted cycles that state drift
-        // flips near-tie argmaxes, so the committed token stops being the
-        // true AR greedy token at T=0 - a lossless-contract violation that
-        // also derails the continuation into loops. Sequential 1-token
-        // forwards are bit-identical to the AR path: the anchor's forward
-        // equals the AR decode that committed it, and each accepted draft's
-        // forward equals the AR decode of that draft.
+        // Verify one token at a time through the AR DECODE path. A batched [1, depth+1]
+        // forward routes every stateful mamba layer through the chunk-scan, whose
+        // padded-chunk arithmetic differs from the recurrent decode_step in f32 rounding;
+        // the drift flips near-tie argmaxes and breaks the T=0 lossless contract.
         let mut logits_rows: Vec<MxArray> = Vec::with_capacity(depth + 1);
         let mut hidden_rows: Vec<MxArray> = Vec::with_capacity(depth + 1);
         for &tok in &id_slice {
@@ -2369,22 +2098,12 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         Ok(())
     }
 
-    /// Append the cycle's TRULY COMMITTED pairs to the drafter's history.
-    ///
-    /// Ported from `MoeMtpStepper::commit_mtp` (qwen3_5_moe/model.rs:9175).
-    /// The slot rule is the same everywhere: slot `p` holds
-    /// `(h_p, emb(t_{p+1}))`, so the hidden run starts one position BEFORE
-    /// the committed ids.
-    ///   * `IncludeAnchor` (Step-A cycles): the anchor token was sampled by
-    ///     Step A and is not in the drafter cache yet, so the hidden run is
-    ///     `seed_hidden ++ verify_hiddens[:, 0..M-1, :]`.
-    ///   * `SkipAlreadyCommittedAnchor` (chained cycles): the anchor was
-    ///     already committed by the previous cycle, so the run is
-    ///     `verify_hiddens[:, 0..M, :]`.
-    ///
-    /// The `trim` first is load-bearing: this cycle's draft steps wrote
-    /// speculative K/V past `committed_len`, and a rejected draft's K/V must
-    /// be overwritten, not appended past.
+    /// Append the cycle's TRULY COMMITTED pairs to the drafter's history. Slot `p`
+    /// holds `(h_p, emb(t_{p+1}))`, so the hidden run starts one position BEFORE the
+    /// committed ids: `seed_hidden ++ verify_hiddens[..M-1]` for `IncludeAnchor`,
+    /// `verify_hiddens[..M]` for `SkipAlreadyCommittedAnchor`. The `trim` first is
+    /// load-bearing: this cycle's drafts wrote speculative K/V past `committed_len`,
+    /// and a rejected draft's K/V must be overwritten.
     fn commit_mtp(
         &mut self,
         anchor: crate::models::qwen3_5::mtp_decode::MtpCommitAnchor,
@@ -2426,38 +2145,19 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         Ok(())
     }
 
-    /// Re-anchor the drafter cache before this cycle's draft steps.
-    ///
-    /// Mirrors `MoeMtpStepper::begin_cycle` (qwen3_5_moe/model.rs:9240). The
-    /// cache is PERSISTENT, so this truncates the previous cycle's draft
-    /// tail instead of rebuilding. A chained cycle's draft pair is
-    /// `(h_{p+K}, emb(t_{p+K+1}))`, whose slot is one BELOW the committed
-    /// cursor (the previous commit already wrote that same pair there), so
-    /// it anchors at `committed_len - 1`; Step-A cycles anchor at
-    /// `committed_len`.
+    /// Re-anchor the drafter cache before this cycle's draft steps: PERSISTENT, so
+    /// this truncates the previous cycle's draft tail. A chained cycle's draft pair
+    /// targets the slot the previous commit already wrote, so it anchors at
+    /// `committed_len - 1`; Step-A cycles anchor at `committed_len`.
     fn begin_cycle(&mut self, chained_anchor: bool) {
-        // The drafter must never enter a cycle BELOW the committed cursor.
-        // `KVCache::trim` cannot GROW (`kv_cache.rs`), so a cycle that
-        // anchored the drafter at `committed_len - 1` and then bailed out
-        // without drafting or committing would leave the cursor one slot low
-        // for good, and the next cycle's draft would overwrite the last
-        // COMMITTED pair instead of appending past it. The engine's near-tail
-        // `continue` used to sit between the anchor and the draft; this
-        // assertion is what catches a re-introduction of that ordering.
+        // The drafter must never enter a cycle BELOW the committed cursor:
+        // `KVCache::trim` cannot GROW, so a cycle that anchored at `committed_len - 1`
+        // and bailed without drafting would leave the cursor low for good and the next
+        // draft would overwrite the last COMMITTED pair. `>=` not `==`: an all-rejected
+        // cycle legitimately sits ABOVE `committed_len`.
         //
-        // `>=` and not `==` deliberately: a cycle whose drafts were all
-        // rejected legitimately leaves the cursor ABOVE `committed_len`
-        // (`commit_mtp` is a no-op at m == 0), and the trim below is exactly
-        // what rewinds it. Only a cursor BELOW the committed cursor is
-        // unrecoverable.
-        //
-        // `#[cfg(debug_assertions)]` on a BLOCK, not a bare `debug_assert!`:
-        // the latter expands to `if cfg!(debug_assertions) { .. }`, a RUNTIME
-        // bool whose body is still type-checked in release — and
-        // `draft_kv_offset` / `as_kv_cache` are themselves
-        // `#[cfg(any(test, debug_assertions))]`, so the bare form fails
-        // `cargo build --release` (and therefore `yarn build:native`) with
-        // E0599. The `#[cfg]` attribute removes the block outright instead.
+        // `#[cfg(debug_assertions)]` on a BLOCK, not a bare `debug_assert!`: the latter
+        // still TYPE-CHECKS its body in release, where `draft_kv_offset` does not exist.
         #[cfg(debug_assertions)]
         {
             let cursor = self.draft_kv_offset();
@@ -2495,57 +2195,19 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         if unemitted == 0 {
             return;
         }
-        // Latch ONLY when a FORWARDED token is dropped. `unemitted - 1` is
-        // the exact count of those, at EVERY depth:
-        //
-        //   forwarded this cycle : anchor ++ accepted drafts
-        //   saved this cycle     : anchor (Step A pushed it) ++ emitted drafts
-        //   never forwarded      : the LAST outcome token
-        //
-        // The last outcome token is the bonus (full accept) or the residual
-        // (rejection). Neither is ever fed to `forward_with_hidden_3d`: the
-        // bonus is `argmax` of a verify row that already exists, and the
-        // residual is sampled after `rollback` has restored the pre-verify
-        // snapshot. The engine states the same rule in its own units —
-        // `last_in_cache = cycle_emitted < outcome.tokens.len()`
-        // (`engine/mtp_turn.rs`) — and `mtp_history_drop_last` keeps every
-        // EMITTED token in the saved history on a mid-cycle stop
-        // (`!last_in_cache || (reason == "length" && unemitted == 0)` is
-        // false there). So the caches sit ahead of the saved history by
-        // exactly `unemitted - 1` tokens, and `unemitted == 1` is a cycle
-        // that stranded only the never-forwarded boundary token: the flat KV
-        // and all 23 Mamba-2 states are EXACTLY aligned with the history and
-        // latching would discard the next flat turn's whole prefix cache
-        // (`run_flat_ar_turn` forces `hit = 0` on the latch) for nothing.
-        //
-        // MEASURED on nemotron-3.5-lightning-30b-a3b-nvfp4-mlx: over 42
-        // depth-1 turns, `attention kv_offset - cached_token_history.len()`
-        // was 0 on every one, including the 3 that stopped mid-cycle with
-        // `unemitted == 1`; a deliberately injected one-token skew moved the
-        // live-vs-cold Mamba-2 state distance by 35-150x, so the zero is a
-        // real measurement and not an insensitive probe.
-        //
-        // The `> 1` arm is unreachable TODAY and kept deliberately. Two
-        // separate clamps in `run_mtp_whole_turn` hold depth at 1 — the
-        // `p.mtp_depth.min(1)` seed AND the `mtp_adaptive_depth = false` pin
-        // that stops `run_mtp_cycle` re-picking a deeper `cycle_depth` from
-        // `AdaptiveDepthPolicy::pick_depth()` (`Explore` sweeps 1..=5
-        // regardless of the seed; see
-        // `mtp::adaptive_depth_policy_escapes_a_depth_1_seed`). Before that
-        // pin, `mtpAdaptiveDepth: true` reached depth 2..5 here. The arm is
-        // the correct predicate at EVERY depth — `unemitted - 1` is the
-        // stranded-forwarded count at all of them — so it is what keeps this
-        // function right if the depth-1 pin is ever lifted. Do not delete it
-        // on the strength of the clamps; delete the clamps first, with the
-        // deeper path validated.
+        // Latch ONLY when a FORWARDED token is dropped; `unemitted - 1` is that count at
+        // every depth. A cycle's LAST outcome token is never fed through the backbone
+        // (the bonus is argmax of an existing verify row; the residual is sampled after
+        // `rollback` restored the snapshot), so `unemitted == 1` — every depth-1
+        // mid-cycle stop — leaves the caches aligned with the saved history and must NOT
+        // latch. The `> 1` arm is unreachable while depth is pinned to 1, and is kept
+        // because it is the correct predicate at every depth.
         if unemitted > 1 {
             self.mtp_desynced = true;
         }
-        // Cursor rewind ONLY — deliberately reads no snapshot. On the
-        // one strandable path at depth 1 (`accepted_drafts == depth`)
-        // `rollback` has already nulled `self.snap`, so a snapshot-based
-        // undo here would silently no-op. Trimming is enough: the
-        // trimmed slots are overwritten in place by the next write.
+        // Cursor rewind ONLY, deliberately snapshot-free: on the one strandable depth-1
+        // path (`accepted_drafts == depth`) `rollback` has already nulled `self.snap`,
+        // so a snapshot-based undo here would silently no-op.
         self.committed_len = (self.committed_len - unemitted as i32).max(0);
         let target = self.committed_len;
         self.trim_draft_caches(target);
@@ -2561,18 +2223,10 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
 }
 
 impl NemotronHInner {
-    /// Plain autoregressive whole-turn core over the FLAT caches, handling
-    /// both the sync and the streaming arm.
-    ///
-    /// Only `run_speculative_turn` calls this, and only when the flat MTP gate
-    /// declines the turn. The engine's own generic AR flow
-    /// (`TurnPath::Generic`) is unreachable from inside a specialized handler:
-    /// the plan resolves the path once, before the sink is known, and a
-    /// specialized handler must return a `TurnOutput` rather than fall
-    /// through. Structure mirrors that generic flow one for one — prefix
-    /// verify, prefill, first-token sample, `run_decode_loop`,
-    /// materialize-final on a length exit, save, finalize — so the two cannot
-    /// drift in behaviour.
+    /// Plain autoregressive whole-turn core over the FLAT caches, sync and streaming.
+    /// Only `run_speculative_turn` calls it, when the flat MTP gate declines: the
+    /// engine's generic AR flow is unreachable from inside a specialized handler.
+    /// Structure mirrors that generic flow one for one so the two cannot drift.
     fn run_flat_ar_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         if args.tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
@@ -2591,9 +2245,8 @@ impl NemotronHInner {
         let generation_start = report_perf.then(std::time::Instant::now);
         let mut first_token_instant: Option<std::time::Instant> = None;
 
-        // A prior mid-cycle MTP stop left the flat trunk ahead of the saved
-        // history; the mamba state cannot rewind, so heal by re-prefilling
-        // (the generic flow's `desynced` rule).
+        // A prior mid-cycle MTP stop left the flat trunk ahead of the saved history; the
+        // mamba state cannot rewind, so heal by re-prefilling.
         let desynced = self.flat_mtp_caches_desynced;
         let hit = if desynced {
             0
@@ -2691,10 +2344,9 @@ impl NemotronHInner {
             step.end_decode()?;
         }
 
-        // `NemotronHDecode` inherits the default no-op `materialize_final`:
-        // the mamba recurrent state cannot re-run a forward for the final
-        // token, so this family drops-last on EVERY exit (the same contract
-        // `save_cache_state` states).
+        // `NemotronHDecode` inherits the default no-op `materialize_final`: the mamba
+        // state cannot re-run a forward for the final token, so this family drops-last
+        // on EVERY exit.
         ChatBackend::save_cache_state(
             self,
             SaveStateArgs {
@@ -2766,14 +2418,10 @@ impl NemotronHInner {
         }
     }
 
-    /// FAIL-CLOSED handling for a drafter seed that could not be built.
-    ///
-    /// The MTP head has its own KV history; a half-seeded or unseeded cache
-    /// would draft from the wrong state, so the head is disarmed for the
-    /// whole model (`mtp_weights_loaded = false` kills `has_mtp_weights()`,
-    /// hence the `SpeculativePlan` and `mtp_flat_routing_required` for every
-    /// later turn) and THIS turn is retried on the plain AR lane. No
-    /// recursion is possible: the routing predicate is already false.
+    /// FAIL-CLOSED handling for a drafter seed that could not be built. A half-seeded
+    /// cache would draft from the wrong state, so the head is disarmed for the whole
+    /// model (`mtp_weights_loaded = false`) and THIS turn is retried on the plain AR
+    /// lane. No recursion is possible: the routing predicate is already false.
     fn mtp_seed_failed_fallback(
         &mut self,
         args: &mut WholeTurnArgs<'_>,
@@ -2796,58 +2444,40 @@ impl NemotronHInner {
         }
     }
 
-    /// Whole-turn speculative MTP core (fresh and delta turns).
-    ///
-    /// Prefills the FULL token stream (re-prefilling the cached history on
-    /// warm deltas - correct and simple for the flat path) while seeding the
-    /// MTP head's own KV cache over the same stream, samples the first
-    /// token, seeds the final drafter slot with it, then drives the
-    /// engine-owned run_mtp_turn loop with the depth-1 NemotronHMtpStepper.
-    ///
-    /// Returns `TurnOutput` rather than `ChatResult` so the fail-closed seed
-    /// fallback ([`mtp_seed_failed_fallback`](Self::mtp_seed_failed_fallback))
-    /// can hand back the AR lane's own output — both call sites
-    /// (`run_paged_turn`, `run_speculative_turn`) return `TurnOutput`, so
-    /// nothing is unwrapped or re-wrapped on the way out.
+    /// Route a drafter seed that did not complete. A cooperative CANCELLATION is not
+    /// a seeding failure, and disarming on it would be permanent: nothing outside the
+    /// loader sets `mtp_weights_loaded` back to `true`, and all sessions share one
+    /// inner, so clean the caches the partial seed advanced and propagate the
+    /// distinguished error. Anything else takes the fail-closed
+    /// [`mtp_seed_failed_fallback`](Self::mtp_seed_failed_fallback).
+    fn mtp_seed_aborted(&mut self, args: &mut WholeTurnArgs<'_>, err: Error) -> Result<TurnOutput> {
+        if err.reason == PREFILL_CANCELLED {
+            self.pending_mtp_draft_seed = None;
+            self.reset_caches_internal();
+            return Err(err);
+        }
+        self.mtp_seed_failed_fallback(args, &err)
+    }
+
+    /// Whole-turn speculative MTP core (fresh and delta turns). Prefills the FULL
+    /// token stream (re-prefilling the cached history on warm deltas) while seeding the
+    /// MTP head's own KV over the same stream, then drives run_mtp_turn at depth 1.
+    /// Returns `TurnOutput` so the fail-closed seed fallback can hand back the AR
+    /// lane's own output unchanged.
     fn run_mtp_whole_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         if args.tokens.is_empty() {
             return Err(Error::from_reason("Empty prompt"));
         }
-        // The shared parameter resolver leaves `extra_eos_ids` empty for the
-        // executor to populate (see ChatParams::extra_eos_ids). Union in the
-        // checkpoint's full EOS set (config eos_token_ids: 2 and 11) so MTP
-        // turns stop on the alternate terminators, matching the paged
-        // executor (paged_turn.rs `backend.extra_eos_ids()`).
+        // The shared parameter resolver leaves `extra_eos_ids` empty for the executor to
+        // populate; union in the checkpoint's full EOS set so MTP turns stop on the
+        // alternate terminators, matching the paged executor.
         let mut p = args.params.clone();
         p.extra_eos_ids = self.extra_eos_ids();
-        // GUARD for the depth-1 invariant this family's flat MTP core rests
-        // on. `depth: p.mtp_depth.min(1)` at the `run_mtp_turn` call site
-        // below only SEEDS the turn; `run_mtp_cycle` recomputes the depth
-        // every cycle as
-        //
-        //     cycle_depth = if p.mtp_adaptive_depth { policy.pick_depth() }
-        //                   else { depth }
-        //
-        // and `AdaptiveDepthPolicy::new(seed)` starts in `Explore`, whose
-        // `pick_depth()` walks `MIN_DEPTH..=MAX_DEPTH` independent of the
-        // seed (pinned by `mtp::adaptive_depth_policy_escapes_a_depth_1_seed`).
-        // `mtp_adaptive_depth` is a plain ChatConfig knob
-        // (`config.mtp_adaptive_depth.unwrap_or(false)`, `engine/params.rs`)
-        // with no family gate, so before this clamp `mtpAdaptiveDepth: true`
-        // silently ran NemotronH at depth 2..5 — a path this change set never
-        // validated, and the one thing that makes the `unemitted > 1` latch
-        // arm in `rollback_unemitted` load-bearing rather than defensive.
-        //
-        // Pinned here rather than asserted: the clamp degrades to the
-        // validated depth-1 lane instead of failing the turn. Deleting it
-        // re-opens depth > 1 for this family, so validate the deeper path
-        // (and re-read `rollback_unemitted`) before doing so.
-        //
-        // NOTE this also un-exempts these turns from the engine's MTP
-        // acceptance gate (`mtp_turn.rs`, `!p.mtp_adaptive_depth &&
-        // p.mtp_depth == 1`), which is correct — they ARE fixed depth-1
-        // turns now — and inert either way: NemotronH does not override
-        // `record_turn_mtp_acceptance`, so the default no-op runs.
+        // GUARD for the depth-1 invariant this family's flat MTP core rests on. The
+        // `p.mtp_depth.min(1)` at the call site below only SEEDS the turn: `run_mtp_cycle`
+        // re-picks the depth from `AdaptiveDepthPolicy::pick_depth()` whenever
+        // `mtp_adaptive_depth` is set, and that policy sweeps 1..=5 regardless of the
+        // seed. The two pins are ONE guard.
         if p.mtp_adaptive_depth {
             static WARNED: std::sync::Once = std::sync::Once::new();
             WARNED.call_once(|| {
@@ -2875,14 +2505,11 @@ impl NemotronHInner {
             None
         };
         let mut generated_tokens: Vec<u32> = Vec::new();
-        // Penalty history must start from the FULL rendered prompt (same as the
-        // flat/paged executors' `args.tokens` seeding); `cached_token_history`
-        // is empty on fresh turns and only holds the prior boundary on
-        // continuations, so repetition/presence/frequency/consecutive/ngram
-        // controls would otherwise ignore the prompt.
+        // Penalty history must start from the FULL rendered prompt:
+        // `cached_token_history` is empty on fresh turns, so the repetition, presence,
+        // frequency and ngram controls would otherwise ignore the prompt.
         let mut token_history = tokens.clone();
-        // Initialize as "length" like the other decode paths; run_mtp_turn only
-        // overrides it on an actual EOS stop.
+        // "length" like the other decode paths; run_mtp_turn overrides it on EOS.
         let mut finish_reason = String::from("length");
         let mut first_token_instant: Option<std::time::Instant> = None;
 
@@ -2891,13 +2518,10 @@ impl NemotronHInner {
         let wired_ctx =
             crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-        // The flat MTP head reads the backbone KV, so the caches must hold
-        // the FULL token stream. Reset + prefill (re-prefills the history
-        // on warm deltas - the flat path's simple correctness tradeoff).
-        // On a paged model (run_paged_turn routes sync MTP turns here) the
-        // flat core takes over self.caches wholesale, so park any
-        // adapter-owned scheduled sequence FIRST so its per-request mamba
-        // and attention state survives for a later paged turn.
+        // The flat MTP head reads the backbone KV, so the caches must hold the FULL
+        // token stream: reset + prefill. On a paged model the flat core takes over
+        // `self.caches` wholesale, so park any adapter-owned scheduled sequence FIRST or
+        // its per-request state is lost to a later paged turn.
         if self.active_scheduled_seq.is_some() {
             self.park_active_scheduled_caches();
         }
@@ -2912,9 +2536,8 @@ impl NemotronHInner {
         profiler.begin_prefill();
         let turn_cancel = self.turn_cancel.clone();
         let prompt = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
-        // The drafter's own KV history is seeded from the SAME chunked pass
-        // that fills the backbone caches (no second prompt forward, and the
-        // [1, T, hidden] tensor is never materialized whole).
+        // The drafter's own KV history is seeded from the SAME chunked pass that fills
+        // the backbone caches (no second prompt forward).
         let mut mtp_caches = super::mtp::NemotronHMtpModule::fresh_caches(&self.config);
         let mut committed_len = 0i32;
         let (prefill_logits, h_last) = match self.chunked_prefill_seeding_mtp(
@@ -2926,7 +2549,7 @@ impl NemotronHInner {
             Ok(v) => v,
             Err(e) => {
                 drop(wired_ctx);
-                return self.mtp_seed_failed_fallback(args, &e);
+                return self.mtp_seed_aborted(args, e);
             }
         };
         let seq_len = prefill_logits.shape_at(1)?;
@@ -2937,44 +2560,29 @@ impl NemotronHInner {
 
         last_logits = crate::engine::apply_all_penalties(last_logits, &token_history, p)?;
         let y = crate::sampling::sample(&last_logits, p.sampling_config)?;
-        // `run_mtp_turn` evals `y` again at turn entry; eval is idempotent,
-        // so reading the id here changes nothing downstream.
         y.eval();
         let y_id = y.item_at_int32(0)? as u32;
-        // Final prompt slot: (h_{T-1}, emb(y)) — the vLLM
-        // `input_ids[token_indices_to_sample] = next_token_ids` half of the
-        // shift. committed_len reaches T here.
+        // Final prompt slot: (h_{T-1}, emb(y)). committed_len reaches T here.
         if let Err(e) = self.seed_mtp_final_slot(&h_last, y_id, &mut mtp_caches, &mut committed_len)
         {
             drop(wired_ctx);
-            return self.mtp_seed_failed_fallback(args, &e);
+            return self.mtp_seed_aborted(args, e);
         }
         debug_assert_eq!(committed_len as usize, tokens.len());
         self.pending_mtp_draft_seed = Some((mtp_caches, committed_len));
 
         let mut reasoning_tracker =
             crate::engine::ReasoningTracker::from_setup(&thinking, think_end_id);
-        // last_in_cache is set from the run_mtp_turn outcome.
-
         let mut rng = rand::rng();
         let outcome = crate::engine::mtp_turn::run_mtp_turn(
             self,
             &mut rng,
             crate::engine::mtp_turn::MtpTurnArgs {
                 y: y.clone(),
-                // Depth is clamped to 1 by POLICY, not by architecture. The
-                // head now owns a real KV cache, so depth > 1 is reachable
-                // the way vLLM does it (loop the single MTP layer,
-                // llm_base_proposer.py:676) — deliberately OUT OF SCOPE for
-                // this change, which lands the head's own history first.
-                //
-                // This clamp only SEEDS the turn — `run_mtp_cycle` re-picks
-                // the depth every cycle and would escape it whenever
-                // `p.mtp_adaptive_depth` is true. It is a real ceiling only
-                // because `p.mtp_adaptive_depth` was pinned to `false` at the
-                // top of this function; the two are ONE guard and must move
-                // together. `verify_step` fails closed on any depth that
-                // reaches it anyway.
+                // Depth is clamped to 1 by POLICY, not by architecture. This
+                // clamp only SEEDS the turn; it is a real ceiling only because
+                // `p.mtp_adaptive_depth` was pinned false at the top of this
+                // function — the two are ONE guard and must move together.
                 depth: p.mtp_depth.min(1),
                 params: p,
                 reasoning_tracker: &mut reasoning_tracker,
@@ -3044,11 +2652,9 @@ impl MtpBackend for NemotronHInner {
 
     fn begin_mtp_decode(&mut self, _setup: &MtpTurnSetup<'_>) -> Result<Self::MtpDecode<'_>> {
         let embedding = self.embedding.clone();
-        // FAIL-CLOSED: the drafter has its own KV history and MUST have been
-        // seeded over the prompt by `run_mtp_whole_turn`. Defaulting to an
-        // empty cache here would silently reintroduce the no-history bug
-        // this port exists to fix (drafts conditioned on nothing, acceptance
-        // ~0.4/cycle, below the 0.6 break-even).
+        // FAIL-CLOSED: the drafter owns a KV history and MUST have been seeded over the
+        // prompt by `run_mtp_whole_turn`. Defaulting to an empty cache would silently
+        // reintroduce the no-history bug this port exists to fix.
         let (mtp_caches, committed_len) = self.pending_mtp_draft_seed.take().ok_or_else(|| {
             Error::from_reason(
                 "NemotronH MTP decode started without a seeded drafter cache: \
@@ -3068,11 +2674,9 @@ impl MtpBackend for NemotronHInner {
     }
 }
 
-/// Physical and trained context limits captured at load time, surfaced
-/// through `context_limits()` so the ChatSession preflight can compact or
-/// reject against the paged pool's ACTUAL capacity instead of the trained
-/// window (the 2 GiB default pool is far below the checkpoint's 1M-token
-/// claim).
+/// Physical and trained context limits captured at load time, surfaced through
+/// `context_limits()` so the ChatSession preflight can compact or reject against
+/// the paged pool's ACTUAL capacity instead of the trained window.
 #[napi(object)]
 #[derive(Clone, Copy)]
 pub struct NemotronHContextLimits {
@@ -3093,13 +2697,9 @@ impl NemotronHContextLimits {
     }
 }
 
-/// NVIDIA Nemotron 3.5 Lightning language model.
-///
-/// Hybrid MoE architecture (Mamba-2 SSM + GQA + pure MoE-FFN layers) with
-/// an optional in-checkpoint MTP head. All model state lives on a
-/// dedicated OS thread; NAPI methods dispatch commands via channels. When
-/// the block-paged adapter is active the thread runs the engine-owned
-/// `HybridSchedulerState` continuous-batching loop.
+/// NVIDIA Nemotron 3.5 Lightning language model: hybrid Mamba-2 SSM + GQA + MoE-FFN
+/// with an optional in-checkpoint MTP head. All model state lives on a dedicated OS
+/// thread; NAPI methods dispatch commands via channels.
 #[napi]
 pub struct NemotronHModel {
     /// Dedicated model thread owning `NemotronHSchedulerState`.
@@ -3135,29 +2735,10 @@ impl NemotronHModel {
         self.mtp_active
     }
 
-    /// Whether `ChatSession` should turn MTP ON when the caller sets nothing.
-    ///
-    /// FALSE for this family, deliberately, even though `hasMtpWeights()` is
-    /// true on every shipped checkpoint. Two reasons, both about SCHEDULING,
-    /// not about speed:
-    ///   * `enable_mtp == Some(true)` forces the chat-requires-barrier
-    ///     predicate in the hybrid scheduler, which puts the turn in the
-    ///     EXCLUSIVE lane and removes it from continuous batching entirely;
-    ///   * streaming MTP turns fall back to paged AR
-    ///     (`mtp_flat_routing_required`) for zero speculation AND zero
-    ///     batching.
-    ///
-    /// The throughput argument that used to sit here is RETRACTED. MTP
-    /// measured 0.56x AR only while the residual stream ran f32, which forced
-    /// every dense projection through an f32 copy each forward (the bf16
-    /// `lm_head` worst of all). With that seam closed at its source MTP is a
-    /// wash -- 89.91 vs 89.51 tok/s against flat AR, 0.994x against paged AR,
-    /// acceptance 0.9539 of a depth-1 maximum of 1.0. So enabling it per
-    /// session now costs nothing; only the batching loss argues against
-    /// making it the default.
-    ///
-    /// `enableMtp: true` still works for anyone who wants to A/B it;
-    /// `MLX_NEMOTRON_MTP_DEFAULT=1` flips the auto-default fleet-wide.
+    /// Whether `ChatSession` should turn MTP ON when the caller sets nothing. FALSE
+    /// deliberately, about SCHEDULING not speed: `enable_mtp == Some(true)` forces the
+    /// chat-requires-barrier predicate, putting the turn in the EXCLUSIVE lane and out
+    /// of continuous batching. `MLX_NEMOTRON_MTP_DEFAULT=1` flips it.
     #[napi]
     pub fn mtp_auto_enabled(&self) -> bool {
         static OPT_IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -3172,10 +2753,8 @@ impl NemotronHModel {
         self.paged_active
     }
 
-    /// Physical/trained context limits captured at load: the ChatSession
-    /// preflight compacts or rejects against effective_window_tokens instead
-    /// of the trained 1M-token window, so long conversations fail the
-    /// preflight rather than inside paged-cache allocation.
+    /// Physical/trained context limits captured at load, so the ChatSession preflight
+    /// rejects long conversations instead of failing inside paged-cache allocation.
     #[napi]
     pub fn context_limits(&self) -> NemotronHContextLimits {
         self.context_limits
@@ -3207,14 +2786,8 @@ impl NemotronHModel {
 
     /// Test-only flat-MTP seam snapshot:
     /// `(history_len, attn_kv_offset, desynced, rollback_unemitted)`.
-    ///
-    /// `history_len` vs `attn_kv_offset` is the seam's actual contract — the
-    /// flat trunk must never sit ahead of the token history that keys it.
-    /// `rollback_unemitted` says whether the preceding turn stopped
-    /// mid-cycle WITHOUT consulting the latch, so a test can find the
-    /// drafted-EOS scenario even when the latch (correctly) stays clear.
-    /// Serialized behind the model thread, so it observes the fully-finalized
-    /// preceding turn.
+    /// `rollback_unemitted` says whether the preceding turn stopped mid-cycle WITHOUT
+    /// consulting the latch. Serialized behind the model thread.
     #[doc(hidden)]
     pub async fn mtp_flat_state_for_test(&self) -> Result<(usize, i32, bool, usize)> {
         send_and_await(&self.thread, |reply| NemotronHCmd::MtpFlatStateForTest {
@@ -3294,7 +2867,6 @@ mod scheduler_tests {
             head_dim: 128,
             max_position_embeddings: 512,
             layer_norm_epsilon: 1e-5,
-            rope_theta: 10000.0,
             layers_block_type: vec![
                 "linear_attention".into(),
                 "moe".into(),
@@ -3311,16 +2883,10 @@ mod scheduler_tests {
             n_routed_experts: 4,
             num_experts_per_tok: 1,
             routed_scaling_factor: 1.0,
-            n_group: 1,
-            topk_group: 1,
             norm_topk_prob: true,
             intermediate_size: 6,
             moe_shared_expert_intermediate_size: 8,
-            tie_word_embeddings: false,
-            bos_token_id: 1,
             eos_token_ids: vec![2],
-            pad_token_id: 0,
-            num_logits_to_keep: 1,
             mtp_layers_block_type: Vec::new(),
             n_mtp_layers: 0,
             paged_cache_memory_mb: Some(256),
@@ -3329,23 +2895,10 @@ mod scheduler_tests {
         }
     }
 
-    /// Greedy pick with PRODUCTION tie-break semantics: the FIRST maximal
-    /// index.
-    ///
-    /// Do NOT reach for `Iterator::max_by` here. It is documented to return
-    /// the LAST maximal element, while every lane this helper is an oracle
-    /// for returns the FIRST one:
-    ///   - `mx::argmax` — `ArgMax::reduce` in mlx's `arg_reduce.metal` breaks
-    ///     ties on `best.index > current.index`, i.e. keeps the smaller index;
-    ///   - the compiled production sampler — at `temperature <=
-    ///     GREEDY_TEMPERATURE_EPS` `mlx_compiled_sample_full` short-circuits to
-    ///     `mlx::core::argmax(logits, -1)`;
-    ///   - the MTP accept gate — `p_target_f32.argmax(0, None)` in
-    ///     `sampling::rs`.
-    ///
-    /// A two-way tie with bit-identical f32 logits does occur on the real
-    /// 30B-A3B-NVFP4 checkpoint, so `max_by` made this oracle disagree with a
-    /// real AR turn and reported a phantom AR-vs-MTP divergence.
+    /// Greedy pick with PRODUCTION tie-break semantics: the FIRST maximal index.
+    /// NOT `Iterator::max_by`, which returns the LAST — every lane this is an oracle
+    /// for (`mx::argmax`, the compiled greedy sampler, the MTP accept gate) keeps the
+    /// smaller index, and real ties made `max_by` report a phantom divergence.
     fn argmax(vec: &[f32]) -> usize {
         let mut best = 0usize;
         for (i, v) in vec.iter().enumerate() {
@@ -3356,9 +2909,8 @@ mod scheduler_tests {
         best
     }
 
-    /// The tiny fixture's MoE layer is constructed with quantized (uint8)
-    /// expert backends; install deterministic dense bf16 stacks so the
-    /// gather kernels run (mirrors the loader's set_experts).
+    /// The tiny fixture's MoE layer is built with quantized (uint8) expert backends;
+    /// install deterministic dense bf16 stacks so the gather kernels run.
     fn install_dense_moe(inner: &mut NemotronHInner) -> Result<()> {
         let h = inner.config.hidden_size as i64;
         let e = inner.config.n_routed_experts as i64;
@@ -3378,15 +2930,12 @@ mod scheduler_tests {
             .ok_or_else(|| Error::from_reason("fixture layer 1 must be MoE"))?;
         moe.experts.set_dense(&up_w, &down_w)
     }
-    /// Pure-function gate on the prefill break-set: the executor's slice
-    /// splitter must never produce an internal boundary inside a Mamba-2
-    /// chunk (every boundary except the range start is a multiple of the
-    /// chunk size), and every slice is at most `slice_tokens` long.
+    /// Pure-function gate on the prefill break-set: no internal boundary inside a
+    /// Mamba-2 chunk, and every slice at most `slice_tokens` long.
     #[test]
     fn chunk_aligned_prefill_slices_never_split_a_chunk() {
         let cases: &[(u32, u32, u32, u32)] = &[
-            // Cold start (the common parity case): the 2048 grid from 0
-            // lands exactly on chunk multiples.
+            // Cold start: the 2048 grid from 0 lands on chunk multiples.
             (0, 3000, 2048, 128),
             // Warm partial-prefix hit at a non-chunk-multiple boundary.
             (112, 2160, 2048, 128),
@@ -3396,13 +2945,11 @@ mod scheduler_tests {
             (112, 140, 2048, 128),
             // Exact multiples.
             (128, 1280, 2048, 128),
-            // A valid checkpoint may declare a different chunk_size (e.g.
-            // 256): the boundaries must follow it, not a hard-coded 128.
+            // A valid checkpoint may declare a different chunk_size.
             (0, 3000, 2048, 256),
             (112, 2160, 2048, 256),
             (256, 1280, 2048, 256),
-            // chunk_size that does NOT divide the slice grid: every
-            // nonterminal end must round down to a chunk multiple.
+            // chunk_size that does NOT divide the slice grid.
             (0, 3000, 2048, 192),
             (192, 2240, 2048, 192),
         ];
@@ -3421,9 +2968,8 @@ mod scheduler_tests {
                     "slice {i} of {start}..{end} exceeds the token budget: {} > {slice_tokens}",
                     e - s
                 );
-                // Every boundary EXCEPT the very first start (the effective
-                // cached-prefix boundary, which the family cannot move) must
-                // be a chunk multiple: no break inside a chunk.
+                // Every boundary except the very first start (which the family
+                // cannot move) must be a chunk multiple.
                 if i > 0 || s % chunk_size == 0 {
                     assert!(
                         s % chunk_size == 0,
@@ -3487,13 +3033,9 @@ mod scheduler_tests {
             s2.ssm.to_float32().unwrap().to_vec()
         );
     }
-    /// Batched N=2 decode is T=0-identical to two serial decodes: prefill
-    /// both requests cold (distinct cache salts), decode one token per
-    /// request serially, reset both, re-prefill cold, then decode the same
-    /// two tokens through `run_paged_decode_step_batched`, and compare the
-    /// greedy (argmax) tokens row by row. This is the batched==serial
-    /// equivalence gate for the mamba stack/scatter, the batched paged
-    /// attention kernels, and the MoE routing over [N,1,H].
+    /// Batched N=2 decode is T=0-identical to two serial decodes. The batched==serial
+    /// equivalence gate for the mamba stack/scatter, the batched paged attention
+    /// kernels, and the MoE routing over [N,1,H].
     #[test]
     fn batched_decode_equals_serial_t0() {
         if !compiled_forward_backend_available() {
@@ -3648,9 +3190,7 @@ mod scheduler_tests {
     }
 
     /// The row-exact batched branch (quantized checkpoints) must also be
-    /// T=0-identical to serial: it runs the per-row scalar decode and stacks
-    /// the logits, so the assertion is structural (exercises the branch) plus
-    /// token-level.
+    /// T=0-identical to serial.
     #[test]
     fn row_exact_batched_decode_equals_serial_t0() {
         if !compiled_forward_backend_available() {
@@ -3739,25 +3279,10 @@ mod scheduler_tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // FIX 4: the MTP history drop-last decision.
-    // ------------------------------------------------------------------
-
-    /// `finish_reason == "length"` is NOT a drop signal by itself. The
-    /// engine leaves `last_in_cache` at its initial `true` on every length
-    /// exit, so the two flavours are told apart by `rollback_unemitted`:
-    ///
-    ///   * ORDINARY length exit (`rollback_unemitted == 0`) — the budget
-    ///     tripped on a token Step A had just sampled and never forwarded
-    ///     (`mtp_turn.rs:1671`) or on a cycle's unforwarded bonus
-    ///     (`:1518`). Still drop it.
-    ///   * MID-CYCLE length exit (`rollback_unemitted > 0`) — the emit loop
-    ///     broke with accepted tokens left over (`mtp_turn.rs:1900`), so the
-    ///     last EMITTED token was written by verify. Keep it.
-    ///
-    /// Mutation this catches: restoring the old
-    /// `drop_last_always || finish_reason == "length"` rule (which cannot
-    /// see `rollback_unemitted`) flips the mid-cycle case to `true`.
+    /// `finish_reason == "length"` is NOT a drop signal by itself: the engine leaves
+    /// `last_in_cache` at `true` on every length exit, so `rollback_unemitted` tells
+    /// the two apart — 0 is the never-forwarded token (drop), nonzero is the mid-cycle
+    /// exit where verify already wrote it (keep).
     #[test]
     fn mtp_history_drop_last_separates_the_two_length_exits() {
         // Ordinary length exits still drop the never-forwarded final token.
@@ -3781,10 +3306,9 @@ mod scheduler_tests {
         assert!(!mtp_history_drop_last(true, "cancelled", 0));
     }
 
-    /// End of the same rule at the save boundary: after a mid-cycle length
-    /// stop the saved history must be exactly as long as the token stream
-    /// the caches actually forwarded (prompt + every emitted token), while
-    /// the ordinary length stop still ends one token short.
+    /// After a mid-cycle length stop the saved history must be exactly as long as the
+    /// token stream the caches forwarded, while the ordinary length stop still ends
+    /// one token short.
     #[test]
     fn mid_cycle_length_stop_saves_a_history_matching_the_caches() {
         if !compiled_forward_backend_available() {
@@ -3795,8 +3319,7 @@ mod scheduler_tests {
         let prompt = [1u32, 5, 9, 3];
         let generated = [11u32, 12, 13];
 
-        // Mid-cycle length stop: the emit loop broke with 2 accepted tokens
-        // unemitted, so all 3 emitted tokens were forwarded by verify.
+        // Mid-cycle length stop: all 3 emitted tokens were forwarded by verify.
         inner.save_cache_state_internal(
             true,
             &prompt,
@@ -3810,8 +3333,7 @@ mod scheduler_tests {
         );
         assert_eq!(inner.cached_token_history.last(), generated.last());
 
-        // Ordinary length stop: the final token was sampled by Step A and
-        // never forwarded; it must still be dropped.
+        // Ordinary length stop: the final token was never forwarded.
         inner.save_cache_state_internal(
             true,
             &prompt,
@@ -3825,22 +3347,11 @@ mod scheduler_tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // FIX 2: the recurrent-survival fact must survive re-activation.
-    // ------------------------------------------------------------------
-
-    /// The scheduler activates a sequence and then activates it AGAIN one
-    /// call later inside `prepare_scheduled_prefix` ->
-    /// `prime_prefix_state_for` (`hybrid_scheduler.rs:1654` then `:1677`;
-    /// `:2069` then `:2073` on a preempted resume). The second activation
-    /// takes the already-live early return, which must leave the survival
-    /// fact exactly as the first activation reported it.
+    /// The scheduler activates a sequence and then activates it AGAIN one call later
+    /// inside `prepare_scheduled_prefix`. The second activation takes the already-live
+    /// early return, which must leave the survival fact untouched.
     ///
-    /// Mutation this catches: re-adding
-    /// `self.active_seq_recurrent_survived = true;` to the early return —
-    /// the fresh/preempted `false` is overwritten before
-    /// `prime_prefix_state_for` reads it, and `reused_state` collapses to
-    /// its token-only half (KV at the prefix boundary, mamba at zero).
+    /// MUTATION: re-adding `active_seq_recurrent_survived = true` to that return.
     #[test]
     fn recurrent_survival_survives_a_second_activation() {
         if !compiled_forward_backend_available() {
@@ -3850,8 +3361,7 @@ mod scheduler_tests {
         let mut inner = NemotronHInner::new(tiny_paged_config()).expect("inner builds");
         assert!(inner.paged_adapter.is_some(), "gate requires the adapter");
 
-        // Fresh sequence (the shape a preemption-released one also takes):
-        // zero-initialized caches, state did NOT survive.
+        // Fresh sequence (the shape a preemption-released one also takes).
         inner.activate_paged_seq(4).expect("activate fresh");
         assert!(
             !inner.active_seq_recurrent_survived,
@@ -3863,8 +3373,7 @@ mod scheduler_tests {
             "re-activating the SAME live sequence must not manufacture survival"
         );
 
-        // A genuinely restored state stays survived across re-activation, so
-        // warm continuations keep the fast path.
+        // A genuinely restored state stays survived across re-activation.
         inner.park_active_scheduled_caches();
         inner.activate_paged_seq(4).expect("activate parked");
         assert!(inner.active_seq_recurrent_survived, "parked state survives");
@@ -3874,10 +3383,6 @@ mod scheduler_tests {
             "re-activation must not erase a real survival either"
         );
     }
-
-    // ------------------------------------------------------------------
-    // FIX 1: the row-exact batched wave is all-or-nothing.
-    // ------------------------------------------------------------------
 
     /// Adapter over a deliberately tiny block pool so the allocator can be
     /// drained in a handful of calls.
@@ -3907,9 +3412,8 @@ mod scheduler_tests {
         PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).expect("tiny adapter")
     }
 
-    /// Flatten one sequence's mamba conv + SSM state into comparable f32s.
-    /// Parks first so the state is reachable through `scheduled_caches`
-    /// whether or not the sequence is the live one.
+    /// Flatten one sequence's mamba conv + SSM state into comparable f32s. Parks
+    /// first so the state is reachable whether or not the sequence is the live one.
     fn mamba_fingerprint(inner: &mut NemotronHInner, seq_id: SeqId) -> Vec<f32> {
         inner.park_active_scheduled_caches();
         let caches = inner
@@ -3927,19 +3431,11 @@ mod scheduler_tests {
         out
     }
 
-    /// A mid-batch allocator squeeze must leave EVERY surviving row exactly
-    /// where it was — cursor and mamba state both.
-    ///
-    /// The scheduler treats a `paged decode could not reserve` error as
-    /// "blocked" for the whole wave: it pops the generated token of every
-    /// row (`engine/hybrid_scheduler.rs:963`) and re-feeds the same token on
-    /// the next step. Any row that already committed would then record that
-    /// token twice and fold it into its non-invertible mamba state twice.
-    ///
-    /// Mutation this catches: restoring the per-row
-    /// `activate_paged_seq(seq); run_paged_decode_step(token)` loop, which
-    /// records AND forwards row 0 before row 1 is asked for blocks — the
-    /// cursor assertion and the mamba-state assertion both fail.
+    /// A mid-batch allocator squeeze must leave EVERY surviving row exactly where it
+    /// was — cursor and mamba state both. The scheduler treats the error as "blocked"
+    /// for the whole wave and re-feeds the same token, so a row that already committed
+    /// would fold it into its non-invertible mamba state twice. MUTATION: restoring
+    /// the per-row activate + `run_paged_decode_step` loop.
     #[test]
     fn row_exact_batched_decode_unwinds_a_mid_batch_allocator_squeeze() {
         if !compiled_forward_backend_available() {
@@ -4044,9 +3540,8 @@ mod scheduler_tests {
         );
     }
 
-    /// Two rows of one wave naming the same sequence would record two tokens
-    /// against one cursor; the row-exact branch rejects it before mutating
-    /// anything, exactly as the fused branch does.
+    /// Two rows of one wave naming the same sequence would record two tokens against
+    /// one cursor; the row-exact branch rejects it before mutating anything.
     #[test]
     fn row_exact_batched_decode_rejects_a_duplicate_sequence() {
         if !compiled_forward_backend_available() {
@@ -4090,10 +3585,6 @@ mod scheduler_tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // FIX 3: streaming MTP must fall back to AR streaming, not error.
-    // ------------------------------------------------------------------
-
     #[derive(Default)]
     struct CollectSink {
         chunks: Mutex<Vec<ChatStreamChunk>>,
@@ -4109,20 +3600,17 @@ mod scheduler_tests {
         }
     }
 
-    /// Adapter-less fixture WITH an MTP head: exactly the shape that routes
-    /// a `enable_mtp` turn to `run_speculative_turn`
-    /// (`use_block_paged_cache: false` closes the paged plan, so
-    /// `TurnPlan::path()` picks `Speculative`).
+    /// Adapter-less fixture WITH an MTP head: the shape that routes an `enable_mtp`
+    /// turn to `run_speculative_turn`.
     fn tiny_flat_mtp_config() -> NemotronHConfig {
         NemotronHConfig {
             mtp_layers_block_type: vec!["full_attention".into(), "moe".into()],
             n_mtp_layers: 1,
             use_block_paged_cache: Some(false),
-            // No stop ids: the fixture's weights are random, and a greedy run
-            // over a 32-token vocab lands on a real EOS often enough to make
-            // a budget assertion flaky. `extra_eos_ids()` unions this list,
-            // so emptying it leaves the unreachable `u32::MAX` session EOS as
-            // the only stop and the turn always walks the full budget.
+            // No stop ids: random fixture weights hit a real EOS often enough to
+            // make a budget assertion flaky. `extra_eos_ids()` unions this list,
+            // so emptying it leaves the unreachable `u32::MAX` session EOS as the
+            // only stop and the turn always walks the full budget.
             eos_token_ids: Vec::new(),
             ..tiny_paged_config()
         }
@@ -4161,14 +3649,9 @@ mod scheduler_tests {
         Arc::new(tok)
     }
 
-    /// A STREAMING MTP request on an adapter-less model must generate
-    /// through the AR fallback. The flat MTP core never reads `args.sink`
-    /// and returns `TurnOutput::Complete`, which `whole_turn_outcome`
-    /// (`engine/session.rs:451`) rejects outright on a sink-bearing turn.
-    ///
-    /// Mutation this catches: dropping the `mtp_flat_routing_required`
-    /// guard from `run_speculative_turn` — the turn returns `Complete` and
-    /// the assertions on `Streamed` + a terminal chunk both fail.
+    /// A STREAMING MTP request on an adapter-less model must generate through the AR
+    /// fallback: the flat MTP core returns `TurnOutput::Complete`, which
+    /// `whole_turn_outcome` rejects on a sink-bearing turn.
     #[test]
     fn streaming_mtp_request_falls_back_to_ar_streaming() {
         if !compiled_forward_backend_available() {
@@ -4249,20 +3732,11 @@ mod scheduler_tests {
         );
     }
 
-    /// FAIL-CLOSED: a drafter seed that cannot be built must DISARM the MTP
-    /// head for good and finish the turn autoregressively — never draft from
-    /// a half-built or empty history, and never leave MTP armed for the next
-    /// turn.
+    /// FAIL-CLOSED: a drafter seed that cannot be built must DISARM the MTP head for
+    /// good and finish the turn autoregressively. The forced failure is real: the
+    /// config declares one MTP block while the built module has two.
     ///
-    /// The forced failure is a real error path: the config declares one MTP
-    /// block while the built module has two layers, so
-    /// `NemotronHMtpModule::forward` rejects the cache-length mismatch inside
-    /// the seeding prefill.
-    ///
-    /// Mutation this catches: propagating the seed error (`return Err(e)`)
-    /// instead of falling back, or falling back WITHOUT clearing
-    /// `mtp_weights_loaded` — the next turn would route to MTP again and
-    /// fail again, or worse, `begin_mtp_decode` would draft from nothing.
+    /// MUTATION: propagating the error, or falling back without clearing the flag.
     #[test]
     fn mtp_seed_failure_disables_the_head_and_falls_back_to_ar() {
         if !compiled_forward_backend_available() {
@@ -4353,20 +3827,116 @@ mod scheduler_tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // C1: a kept K/V prefix ALWAYS has a live mamba state at its boundary.
-    // ------------------------------------------------------------------
+    /// A turn CANCELLED mid-prefill is NOT a seeding failure: the distinguished
+    /// `PREFILL_CANCELLED` error must propagate with the MTP head STILL ARMED.
+    /// Nothing outside the loader ever sets `mtp_weights_loaded` back to `true`, and
+    /// every session on this loaded model shares one inner, so disarming here would
+    /// strip speculative MTP for the life of the process.
+    ///
+    /// MUTATION: routing the cancellation into `mtp_seed_failed_fallback` — the reply
+    /// still rejects, so ONLY the still-armed assertions fail.
+    #[test]
+    fn cancelled_prefill_seed_propagates_without_disarming_the_mtp_head() {
+        if !compiled_forward_backend_available() {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        }
+        let mut inner = NemotronHInner::new(tiny_flat_mtp_config()).expect("inner builds");
+        install_dense_moe(&mut inner).expect("install dense experts");
+        inner.mtp_weights_loaded = true;
+        assert!(
+            inner.execution_plan().speculative.is_some(),
+            "the head starts armed"
+        );
 
-    /// A 40-token prompt: 2 full 16-token blocks (registerable, so a hash
-    /// lookup CAN hit) plus a partial tail.
+        // What `session_start` does before handing the turn to the executor: install the
+        // turn's cancel flag, pre-flipped so the first chunk-boundary poll aborts the seed.
+        let cancelled = Arc::new(AtomicBool::new(true));
+        ChatBackend::set_turn_cancel_flag(&mut inner, Some(Arc::clone(&cancelled)));
+
+        let tokenizer = tiny_tokenizer();
+        let config = ChatConfig {
+            temperature: Some(0.0),
+            max_new_tokens: Some(4),
+            max_consecutive_tokens: Some(0),
+            max_ngram_repeats: Some(0),
+            enable_mtp: Some(true),
+            ..Default::default()
+        };
+        let mut params = crate::engine::params::extract_chat_params(&config);
+        params.enable_mtp = true;
+        assert!(
+            inner.mtp_flat_routing_required(&params, /* streaming */ false),
+            "a sync MTP turn must route to the flat MTP core"
+        );
+
+        let tokens = vec![1u32, 5, 9, 3];
+        let plan = TurnPlan {
+            is_delta: false,
+            input_media: crate::engine::plan::MediaCapabilities::NONE,
+            context_media: crate::engine::plan::MediaCapabilities::NONE,
+            use_paged_attention: false,
+            decoder: DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+        };
+        let mut args = WholeTurnArgs {
+            tokens: &tokens,
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &params,
+            thinking: ThinkingSetup {
+                enabled: false,
+                budget: None,
+            },
+            plan,
+            sink: None,
+            cancelled: Some(cancelled.as_ref()),
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+
+        let err = ChatBackend::run_speculative_turn(&mut inner, &mut args)
+            .err()
+            .expect("a cancelled turn must not produce a result");
+        assert_eq!(
+            err.reason, PREFILL_CANCELLED,
+            "the cancellation must reach the session layer unmasked"
+        );
+
+        ChatBackend::set_turn_cancel_flag(&mut inner, None);
+        assert!(
+            inner.mtp_weights_loaded,
+            "a cancelled turn must NOT disarm the head - nothing ever re-arms it"
+        );
+        assert!(inner.has_mtp_weights());
+        assert!(
+            inner.execution_plan().speculative.is_some(),
+            "later turns on this model must still see the speculative plan"
+        );
+        assert!(
+            inner.mtp_flat_routing_required(&params, false),
+            "later MTP requests must still route into the MTP core"
+        );
+        assert!(
+            inner.pending_mtp_draft_seed.is_none(),
+            "no half-built seed may survive the cancellation"
+        );
+        assert!(
+            inner.cached_token_history.is_empty(),
+            "the aborted prefill must leave no committed history behind"
+        );
+    }
+
+    /// A 40-token prompt: 2 registerable 16-token blocks plus a partial tail.
     fn c1_prompt() -> Vec<u32> {
         (0..40u32).map(|i| (i % 30) + 1).collect()
     }
 
-    /// Cold-prefill `tokens` on `seq_id` with the hash lookup forced OFF and
-    /// return the resulting mamba fingerprint. The reference every C1 case
-    /// compares against, computed on the SAME inner (the fixture's weights are
-    /// random per construction, so a second inner is not comparable).
+    /// Cold-prefill `tokens` on `seq_id` with the hash lookup forced OFF. Computed on
+    /// the SAME inner — the fixture's weights are random per construction, so a
+    /// second inner is not comparable.
     fn cold_prefill_fingerprint(
         inner: &mut NemotronHInner,
         seq_id: SeqId,
@@ -4388,30 +3958,11 @@ mod scheduler_tests {
         mamba_fingerprint(inner, seq_id)
     }
 
-    /// THE C1 gate. A preempted sequence keeps its owner history AND its
-    /// registered K/V blocks, but `handle_preempted` releases its recurrent
-    /// row. The resume must therefore drop the prefix and cold-prefill, and
-    /// the recurrent state it lands on must be BIT-IDENTICAL to a never-
-    /// preempted cold prefill of the same token stream.
-    ///
-    /// MUTATIONS, verified by running them:
-    ///   * reverting the `continuation_eligible` edits AND the
-    ///     `prime_prefix_state_for` backstop (i.e. the pre-fix code) — the
-    ///     prefix-length assert fails with 32 (two registered 16-token
-    ///     blocks) against 0.
-    ///   * additionally restoring `run_mamba_only_prefill` at the
-    ///     `run_paged_prefill_chunk` call site — the fingerprint assert
-    ///     fails. MEASURED on this fixture: the reconstruction is NOT
-    ///     bit-identical to the cold prefill (max_abs_diff 5.5e-8 over the
-    ///     conv+SSM state). That residual is what accumulates through the
-    ///     non-invertible recurrent decode and flips greedy argmaxes on the
-    ///     real 23-mamba-layer checkpoint, so the gate is exact equality.
-    ///
-    /// NOT caught here (measured): reverting ONLY the `continuation_eligible`
-    /// edits. The backstop absorbs that on its own, so the predicates are a
-    /// fast path, not the enforcement — see
-    /// `evicted_recurrent_row_with_a_live_adapter_request_reprepares_cold`
-    /// for the backstop's own gate.
+    /// THE C1 gate. A preempted sequence keeps its owner history AND its registered
+    /// K/V blocks, but `handle_preempted` releases its recurrent row, so the resume
+    /// must drop the prefix and cold-prefill onto a recurrent state BIT-IDENTICAL to a
+    /// never-preempted cold prefill — a reconstruction is not, and that residual flips
+    /// greedy argmaxes on the real checkpoint.
     #[test]
     fn preempted_resume_prefills_cold_and_matches_a_fresh_cold_prefill() {
         if !compiled_forward_backend_available() {
@@ -4484,21 +4035,11 @@ mod scheduler_tests {
         );
     }
 
-    /// The non-regression gate the C1 fix must NOT break: a warm continuation
-    /// whose recurrent state really did survive still keeps its whole K/V
-    /// prefix and prefills only the suffix.
+    /// The non-regression gate the C1 fix must NOT break: a warm continuation whose
+    /// recurrent state really did survive still keeps its whole K/V prefix.
     ///
-    /// Mutation this catches (verified by running it): over-tightening
-    /// `reused_state` to always-false — the new backstop then discards EVERY
-    /// warm prefix and this assert fails with 0 against 40, i.e. every warm
-    /// turn silently re-prefills its whole history.
-    ///
-    /// NOT caught here (measured): forcing `scheduled_recurrent_state_live` to
-    /// always-false. The adapter's `can_continue` / `ContinuedLivePrefix`
-    /// route ignores `skip_lookup` entirely, so a genuinely live request keeps
-    /// its prefix regardless of the eligibility predicate. That independence
-    /// is exactly why the backstop has to exist — see
-    /// `evicted_recurrent_row_with_a_live_adapter_request_reprepares_cold`.
+    /// NOT caught here: forcing `scheduled_recurrent_state_live` to always-false — the
+    /// adapter's `ContinuedLivePrefix` route ignores `skip_lookup` entirely.
     #[test]
     fn warm_continuation_keeps_its_kv_prefix_when_the_mamba_state_survived() {
         if !compiled_forward_backend_available() {
@@ -4561,18 +4102,10 @@ mod scheduler_tests {
         );
     }
 
-    /// The BACKSTOP gate. `ensure_recurrent_slot` evicts an idle recurrent row
-    /// WITHOUT releasing that row's adapter request, so the next turn arrives
-    /// with state=gone but request=live+already_registered. The adapter's
-    /// `can_continue` never consults `skip_lookup`, so the predicate edits
-    /// alone cannot stop it handing back the whole prior prefix.
-    ///
-    /// Mutation this catches (verified by running it): shipping the
-    /// `continuation_eligible` edits WITHOUT the `prime_prefix_state_for`
-    /// backstop — the adapter returns `ContinuedLivePrefix` with the full
-    /// 40-token prefix and this assert fails with 40 against 0. This is the
-    /// gate that proves the backstop, not the predicates, is the enforcement
-    /// layer.
+    /// The BACKSTOP gate. `ensure_recurrent_slot` evicts an idle recurrent row WITHOUT
+    /// releasing that row's adapter request, so the next turn arrives with state=gone
+    /// but request=live+already_registered. The adapter's `can_continue` never consults
+    /// `skip_lookup`, so the predicate edits alone cannot stop it.
     #[test]
     fn evicted_recurrent_row_with_a_live_adapter_request_reprepares_cold() {
         if !compiled_forward_backend_available() {
@@ -4629,12 +4162,9 @@ mod scheduler_tests {
         assert_eq!(after_eviction.suffix_len, tokens.len());
     }
 
-    /// The invariant is fail-closed at the point of use, not merely upstream:
-    /// a nonzero cached prefix with no live mamba state is a hard error, never
-    /// a silent full-prefix reconstruction.
-    ///
-    /// Mutation this catches: reintroducing `run_mamba_only_prefill` (or any
-    /// other unbounded, uncancellable reconstruction) at that call site.
+    /// The invariant is fail-closed at the point of use, not merely upstream: a
+    /// nonzero cached prefix with no live mamba state is a hard error, never a silent
+    /// full-prefix reconstruction.
     #[test]
     fn paged_prefill_refuses_a_prefix_without_a_live_mamba_state() {
         if !compiled_forward_backend_available() {
@@ -4654,23 +4184,10 @@ mod scheduler_tests {
         );
     }
 
-    // ------------------------------------------------------------------
-    // C3: parked recurrent rows are capped, so eviction is reachable.
-    // ------------------------------------------------------------------
-
-    /// `can_activate_scheduled_recurrent` must actually refuse past the cap —
-    /// that refusal is the ONLY thing that makes
-    /// `HybridSchedulerState::ensure_recurrent_slot`'s idle-victim body run.
-    /// Without the override the inherited default is `true` forever and
-    /// `scheduled_caches` grows one ~47.6 MiB row per owner.
-    ///
-    /// The expectation is DERIVED from `scheduler_max_num_seqs_for(32)`, not
-    /// hard-coded: it reads `MLX_SCHED_MAX_NUM_SEQS` through a process-wide
-    /// `OnceLock` that an earlier test in the same binary may already have
-    /// forced.
-    ///
-    /// Mutation this catches: deleting the override — the negative assert
-    /// fails immediately.
+    /// `can_activate_scheduled_recurrent` must actually refuse past the cap — that
+    /// refusal is the ONLY thing that makes `ensure_recurrent_slot`'s idle-victim body
+    /// run. The expectation is DERIVED from `scheduler_max_num_seqs_for(32)`, never
+    /// hard-coded: it reads a process-wide `OnceLock` an earlier test may have forced.
     #[test]
     fn recurrent_slot_cap_refuses_a_new_row_at_capacity() {
         if !compiled_forward_backend_available() {
@@ -4707,8 +4224,7 @@ mod scheduler_tests {
             "a resident row must stay admissible at the cap"
         );
 
-        // Evicting one idle row (what `ensure_recurrent_slot` does) reopens
-        // the slot.
+        // Evicting one idle row (what `ensure_recurrent_slot` does) reopens a slot.
         inner.release_scheduled_caches_for(0);
         assert_eq!(inner.scheduled_recurrent_units(), cap - 1);
         assert!(
@@ -4740,8 +4256,8 @@ mod scheduler_tests {
         assert_eq!(inner.scheduled_recurrent_units(), 2, "no-op re-activation");
     }
 
-    /// `scheduled_recurrent_state_live` must answer for the sequence being
-    /// asked about, BEFORE its activation — that is the only point at which
+    /// `scheduled_recurrent_state_live` must answer for the sequence being asked
+    /// about, BEFORE its activation — the only point at which
     /// `active_seq_recurrent_survived` still describes the PREVIOUS sequence.
     #[test]
     fn scheduled_recurrent_state_live_reads_the_pre_activation_truth() {

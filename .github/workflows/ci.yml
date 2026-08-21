@@ -250,9 +250,8 @@ jobs:
   # QAT (wNa8o8) leg (~2.9GB) runs on PR opt-in but is SKIPPED on the push/release
   # gate (its run step early-exits) until CI's HUGGINGFACE_TOKEN is confirmed to
   # reach the gated google/gemma-4-E2B-it-qat-mobile-transformers repo — otherwise
-  # a download failure would block releases. The nemotron_h leg is PR-opt-in for
-  # the same "must not block a release" reason, but because of SIZE: the only
-  # published checkpoint is the 30B-A3B NVFP4 one (~17GB source, similar output).
+  # a download failure would block releases. nemotron_h is PR-opt-in for the same
+  # reason, but because of size: its only published checkpoint is the 30B-A3B.
   model-test:
     name: e2e ${{ matrix.name }}
     needs: build
@@ -356,67 +355,25 @@ jobs:
             stage1_ts: ''
             stage2_rust: ''
             tests: __test__/models/gemma4-qat-e2e.test.ts
-          # nemotron_h: modelopt NVFP4 INGEST, not a bf16 recipe run. The
-          # shared convert line still passes `-d bf16`, which is a no-op here:
-          # NemotronHRecipe::owns_dtype_cast() is true, so
-          # `dtype_cast_owned_by_sanitizer` sets `has_custom_sanitizer` and
-          # convert.rs passes every tensor through uncast (all in
-          # crates/mlx-core/src/convert.rs; cited by function name, not line,
-          # because that file drifts).
-          # `-q`/`--q-recipe`/`--q-mxfp`/`--imatrix-path`/`--q-mtp` ARE rejected
-          # on this source, both in the CLI (the `modelType === 'nemotron_h'`
-          # guard in packages/cli/src/commands/convert.ts) and natively
-          # (`validate_nemotron_h_ingest_options`), so none of them may be
-          # added to this leg.
+          # nemotron_h ingests a modelopt NVFP4 source; it is not a recipe run.
+          # The shared convert line's `-d bf16` is a no-op here because the
+          # recipe owns the dtype cast. `-q`, `--q-recipe`, `--q-mxfp`,
+          # `--imatrix-path` and `--q-mtp` are rejected on this source and must
+          # not be added to this leg.
           #
           # The `-mlx-bf16` suffix the shared script appends to `out` is a
-          # misnomer for this family — the output is NVFP4 experts /
-          # shared_experts (E2M1 codes + verbatim E4M3 group scales + a separate
-          # F32 `.global_scale`), affine 8-bit group-32 Mamba-2 in/out
-          # projections, and a bf16 `lm_head`. NOT mxfp8: the quantization-
-          # accuracy pass moved the Mamba projections off mxfp8, and a
-          # pre-pass checkpoint is now a HARD LOAD ERROR. It is only a
-          # directory name; do not "fix" it by special-casing the script.
+          # misnomer: the output is NVFP4 experts, affine-8 Mamba projections
+          # and a bf16 lm_head. It is only a directory name — do not
+          # special-case the script to "fix" it.
           #
-          # Two env vars, deliberately: nemotron_h_paged_vs_flat_parity.rs
-          # (`resolve_source_model`) reads MLX_TEST_MODEL_PATH, while BOTH
-          # nemotron_h_concurrent_batched_parity.rs (`model_path`) and
-          # nemotron_h_mtp_midcycle_state.rs (`resolve_source_model`) read
-          # MLX_TEST_NEMOTRON_H_MODEL_PATH. Wiring only one silently self-skips
-          # the other gates — they early-return and libtest counts them as
-          # passed. Cited by function name, not line: these files drift.
+          # BOTH env vars are required. The three test files are split across
+          # them; wiring only one makes the others early-return, which libtest
+          # counts as PASSED.
           #
-          # ****  THIS LEG HAS NEVER RUN. "Listed" is not "exercised."  ****
-          # Three independent gates keep it off, and only the middle one is a
-          # nemotron decision:
-          #   1. the whole `model-test` job is label-gated (`if:` on the job,
-          #      above): on a PR it runs only while the PR carries `model-e2e`;
-          #   2. this leg's run step additionally `exit 0`s on `push` and
-          #      `workflow_dispatch`, so no release path reaches it;
-          #   3. it has never been observed green on any runner.
-          # Removing (1) is a repo-wide policy call and is deliberately NOT made
-          # here. Until this leg goes green once on hardware that fits it,
-          # LOCAL runs are this family's only real evidence — do not read the
-          # presence of these gates in the matrix as CI coverage.
-          #
-          # RESOURCE BILL — disk is NOT the only extra cost.
-          #   DISK ~38 GB: the modelopt source is ~17 GB and the converted
-          #   output is ~21 GB, both live at once (convert reads the source and
-          #   writes the output side by side, and neither can be deleted before
-          #   the tests run). The flat/paged clones are cheap on top of that:
-          #   `clone_model_dir` in nemotron_h_paged_vs_flat_parity.rs symlinks
-          #   every weight file and real-copies only config.json, so the two
-          #   clones add kilobytes, not gigabytes.
-          #   MEMORY ~42 GB: nemotron_h_paged_vs_flat_greedy_parity (and the
-          #   two-turn variant) `load`s the flat clone AND the paged clone and
-          #   holds BOTH resident for the whole comparison. On unified memory
-          #   that is two full ~21 GB weight sets at once. A hosted macos-26
-          #   runner does not have that, so expect this leg to swap or die
-          #   there even if the disk fits.
-          # If it fails on ENOSPC or on memory the fix is a self-hosted runner
-          # (or a smaller published checkpoint, of which there is none today),
-          # NOT dropping the gates. Keeping it off the release gate means such a
-          # failure cannot block publish, exactly as for the gemma4 leg.
+          # THIS LEG HAS NEVER RUN GREEN, so its presence in the matrix is not
+          # coverage. It needs ~38 GB disk and ~42 GB memory (two full weight
+          # sets resident), which no hosted runner has. The fix is a self-hosted
+          # runner, not dropping the gates.
           - name: nemotron_h
             model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
             slug: nvidia-nemotron-3.5-lightning-30b-a3b-nvfp4
@@ -431,13 +388,8 @@ jobs:
               --test nemotron_h_paged_vs_flat_parity
               --test nemotron_h_concurrent_batched_parity
               --test nemotron_h_mtp_midcycle_state
-            # The real-checkpoint T=0 lossless gate is a `--lib` UNIT test, not
-            # an integration target, so it cannot ride `tests:` above — see the
-            # qwen3_5-dense leg's comment on this key for the full rationale.
-            # It reads MLX_TEST_NEMOTRON_H_MODEL_PATH, which `env:` already
-            # exports, and it self-skips (loudly — the run step greps for
-            # `skipping `) when the backend is missing or the converted
-            # checkpoint carries no MTP head.
+            # A `--lib` unit test cannot ride `tests:` above. Self-skips loudly
+            # when the backend or the MTP head is missing.
             lib_tests: >-
               models::nemotron_h::mtp::mtp_turn_tests::real_mtp_t0_lossless_gate
     steps:
@@ -498,10 +450,7 @@ jobs:
             echo "::notice::Skipping gemma4 QAT leg on ${{ github.event_name }} (PR opt-in only; gated HF repo)."
             exit 0
           fi
-          # nemotron_h needs ~38 GB free (a ~17 GB modelopt source plus a ~21 GB
-          # converted output, both live at once). Same treatment as the gemma4
-          # leg: PR opt-in only, so a download/disk failure cannot block a
-          # release. See the matrix entry's comment for the ENOSPC caveat.
+          # PR opt-in only: a ~38 GB download must not be able to block a release.
           if [ "${{ matrix.name }}" = "nemotron_h" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "::notice::Skipping nemotron_h leg on ${{ github.event_name }} (PR opt-in only; 30B checkpoint)."
             exit 0

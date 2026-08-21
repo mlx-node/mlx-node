@@ -328,8 +328,9 @@ attention/GDN projections).
 bf16 until calibrated. This command runs the model over the NVIDIA calibration
 mix, records each attention/GDN mxfp8 projection's running `max|activation|`
 (modelopt `MaxCalibrator` semantics), and writes `input_amax` into the model's
-`config.json` **in place** — under both the `quantization` and
-`quantization_config` blocks. At load time each of those projections then
+`config.json` **in place** — under the `quantization` block (plus the legacy
+`quantization_config` alias when a source config carries one). At load time each
+of those projections then
 fake-quantizes its input to E4M3 (`from_fp8(to_fp8(x·448/amax))·amax/448`) before
 the matmul. Only the mxfp8 attn/GDN sites (`self_attn.{q,k,v,o}_proj`, GDN
 `in_proj_qkv`/`in_proj_z`/`out_proj`) are calibrated; the mxfp4 FFN keeps bf16

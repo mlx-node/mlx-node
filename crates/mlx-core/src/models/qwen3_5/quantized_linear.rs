@@ -801,18 +801,13 @@ impl QuantizedLinear {
         Ok(result)
     }
 
-    /// Does this projection carry a calibrated static per-tensor FP8 (E4M3)
-    /// ACTIVATION scale? Mirrors
-    /// [`crate::models::quant_dispatch::admits_static_fp8_activation`], which
-    /// is the parser-side gate on `input_amax` — the two must agree, or a
-    /// config that parses cleanly would silently skip the fake-quant.
+    /// String-mode mirror of
+    /// [`crate::models::quant_dispatch::admits_static_fp8_activation`] (the
+    /// parser-side gate on `input_amax`); the two must agree or a config that
+    /// parses cleanly would silently skip the fake-quant.
     ///
-    /// Expressed on the string `mode` because that is what `QuantizedLinear`
-    /// stores; `DEFAULT_QUANT_MODE` is the "affine" spelling. nemotron_h's
-    /// mamba `mixer.{in,out}_proj` are affine 8/32 and DO carry an amax.
-    ///
-    /// Gates the fake-quant ONLY. The calibration tap in `forward` is
-    /// deliberately narrower (mxfp8) — see the comment there.
+    /// Gates the fake-quant ONLY — the calibration tap in `forward` is
+    /// deliberately narrower.
     fn admits_static_fp8_activation(&self) -> bool {
         (self.mode == MXFP8_MODE || self.mode == DEFAULT_QUANT_MODE)
             && self.bits == 8
@@ -829,41 +824,19 @@ impl QuantizedLinear {
         let calibrating =
             crate::calibration::activation_amax::ActivationAmaxCollector::is_calibrating();
 
-        // Activation-amax calibration tap (modelopt MaxCalibrator): while this
-        // thread is calibrating, record this projection's raw bf16 activation
-        // `max|x|` BEFORE any fake-quant. TWO independent gates: `mode ==
-        // MXFP8_MODE`, AND an `amax_key` threaded by the loader.
+        // Activation-amax calibration tap (modelopt MaxCalibrator): record the
+        // raw bf16 `max|x|` BEFORE any fake-quant (which is suppressed while
+        // calibrating, below, so a re-calibration stays at raw-bf16 parity).
         //
-        // The tap is deliberately NARROWER than the fake-quant gate below, and
-        // must stay that way. The tap PRODUCES an `input_amax`; the fake-quant
-        // CONSUMES one. `admits_static_fp8_activation()` also admits affine
-        // 8/32 (nemotron_h's mamba `mixer.{in,out}_proj`), but widening the tap
-        // to match would change behaviour for the only families that can reach
-        // it:
-        //   * nemotron_h cannot reach it at all — its loader never calls
-        //     `with_amax_key`, and `calibrate_activation_amax_raw`
-        //     (calibration/napi.rs) dispatches `qwen3_5` / `qwen3_5_moe` only,
-        //     rejecting every other `model_type`. It consumes a converted
-        //     `input_amax`; it never produces one.
-        //   * qwen3_5 / qwen3_5_moe CAN — their loaders set `amax_key` on every
-        //     `is_activation_fp8_site` attn/GDN projection regardless of quant
-        //     mode. Those sites are not always mxfp8: `--q-recipe unsloth
-        //     --q-bits 6 --q-group-size 32` snaps `self_attn.q/k/v_proj` and
-        //     `linear_attn.in_proj_qkv/z` to 8-bit affine at the requested
-        //     group size, i.e. affine 8/32, and emits a per-layer override
-        //     object for each. On such a checkpoint a widened tap would record
-        //     every site and rewrite `config.json` with `input_amax`, where
-        //     today `mlx calibrate` records nothing and leaves the file
-        //     byte-untouched (napi.rs `persist_amax_if_any` reads an EMPTY map
-        //     as "not an nvidia-recipe checkpoint"). The rewritten config then
-        //     parses cleanly and fake-quants on every later load. This mxfp8
-        //     check IS that nvidia-recipe test — it is the only one there is.
-        //
-        // The recorded value is the clean bf16 input — the fake-quant is
-        // suppressed while calibrating (below), so an already-calibrated model
-        // re-calibrates at raw-bf16 MaxCalibrator parity. When not calibrating
-        // this is a single thread-local load then skip, so forward is
-        // behaviorally unchanged for normal inference.
+        // The tap PRODUCES an `input_amax`; the fake-quant below CONSUMES one,
+        // so this `mode == MXFP8_MODE` gate is deliberately NARROWER than
+        // `admits_static_fp8_activation()` and must stay that way. It is the
+        // only nvidia-recipe test there is: the qwen3_5 loaders attach an
+        // `amax_key` to every attn/GDN site whatever its quant mode, and
+        // `--q-recipe unsloth --q-bits 6 --q-group-size 32` packs those sites
+        // as affine 8/32. Widening the tap would make `mlx calibrate` rewrite
+        // such a checkpoint's config.json with `input_amax` — switching on FP8
+        // activation fake-quant for a model that was never a W8A8_FP8 source.
         if calibrating
             && self.mode == MXFP8_MODE
             && let Some(key) = &self.amax_key
@@ -879,17 +852,10 @@ impl QuantizedLinear {
         // MaxCalibrator parity on a re-calibration).
         //
         // Otherwise the gate requires BOTH a positive `input_amax` AND
-        // `self.admits_static_fp8_activation()`: mxfp8 8/32 and affine 8/32 are
-        // EXACTLY the two weight shapes this repo produces from a modelopt
-        // W8A8_FP8 source that reach THIS type (qwen3.5 attn+GDN, and
-        // nemotron_h's mamba `mixer.{in,out}_proj`; gemma4 has its own
-        // `QuantizedLinear` and threads no amax at all), so the check enforces
-        // the invariant at the point of use rather than trusting the loaders.
-        // Even if a stale, malformed, or hand-edited config erroneously threads
-        // `input_amax` onto a projection outside that set (mxfp4 FFN, affine
-        // 4-bit gates/in_proj_ba, lm_head, nvfp4, sym8), `x` stays the original
-        // bf16 reference there and that forward is byte-identical to before.
-        // Apple GPUs have no fp8 matmul hardware — numeric parity, not speed.
+        // `admits_static_fp8_activation()`, so a stale or hand-edited config
+        // cannot fake-quant a projection that was never calibrated — the
+        // invariant is enforced here rather than trusted from the loaders.
+        // Apple GPUs have no fp8 matmul hardware: numeric parity, not speed.
         let xq_owned;
         let x = if calibrating {
             x
@@ -1712,18 +1678,11 @@ mod fp8_activation_tests {
         );
     }
 
-    /// Invariant guard: a projection OUTSIDE the static-FP8 weight shapes that
-    /// erroneously carries a positive `input_amax` (stale / malformed /
-    /// hand-edited config) must NOT fake-quant its activations — its forward is
-    /// byte-identical to the same projection with `input_amax == None`. Only
-    /// `admits_static_fp8_activation()` (mxfp8 8/32 = the nvidia recipe's
-    /// attn/GDN sites, affine 8/32 = nemotron_h's mamba `mixer.{in,out}_proj`)
-    /// gets FP8 activations; mxfp4 FFN, affine 4-bit gates / affine 8/64
-    /// in_proj_a/b, lm_head, nvfp4, and sym8 stay bf16.
+    /// Invariant guard: a projection outside the static-FP8 weight shapes that
+    /// erroneously carries a positive `input_amax` must NOT fake-quant — its
+    /// forward is byte-identical to `input_amax == None`.
     ///
-    /// RED on the unfixed gate (before the `&& admits_static_fp8_activation()`
-    /// guard): this mxfp4 linear WOULD fake-quant `x` and diverge from the
-    /// baseline, so the bit-identical assert fails.
+    /// RED without the `&& admits_static_fp8_activation()` guard.
     #[test]
     fn forward_ignores_input_amax_on_non_mxfp8() {
         let (n, k) = (32i64, 64i64); // k % MXFP4_GROUP_SIZE == 0
@@ -1838,9 +1797,7 @@ mod fp8_activation_tests {
         ActivationAmaxCollector::disarm_current_thread();
     }
 
-    /// Affine-quantize a 2D bf16 weight at 8 bits / group_size 32 — the shape
-    /// nemotron_h's mamba `mixer.{in,out}_proj` carry, and the one
-    /// `admits_static_fp8_activation()` admits alongside mxfp8 — returning
+    /// Affine-quantize a 2D bf16 weight at 8 bits / group 32, returning
     /// `(packed_weight, scales, biases)`.
     fn quantize_affine_8_32(weight: &MxArray) -> (MxArray, MxArray, MxArray) {
         let mut out_q: *mut sys::mlx_array = std::ptr::null_mut();
@@ -1865,8 +1822,8 @@ mod fp8_activation_tests {
         )
     }
 
-    /// A fresh affine 8/32 `QuantizedLinear` over shared (cloned) packed
-    /// operands (`with_input_amax` consumes `self`).
+    /// A fresh affine 8/32 `QuantizedLinear` per call, since the `with_*`
+    /// builders consume `self`.
     fn make_affine_8_32_linear(
         w_q: &MxArray,
         scales: &MxArray,
@@ -1883,24 +1840,13 @@ mod fp8_activation_tests {
         )
     }
 
-    /// The calibration tap must stay NARROWER than the fake-quant gate. An
-    /// affine 8/32 projection is a static-FP8 CONSUMER — it fake-quants, since
-    /// `admits_static_fp8_activation()` is true for it — but it must never
-    /// PRODUCE an amax through the tap.
+    /// The calibration tap must stay NARROWER than the fake-quant gate: an
+    /// affine 8/32 projection CONSUMES an amax (it fake-quants) but must never
+    /// PRODUCE one through the tap, or `mlx calibrate` would start rewriting
+    /// config.json for unsloth-recipe qwen3_5 checkpoints.
     ///
-    /// Why the two gates differ: the qwen3_5 / qwen3_5_moe loaders attach an
-    /// `amax_key` to EVERY `is_activation_fp8_site` attn/GDN projection
-    /// regardless of quant mode, and `--q-recipe unsloth --q-bits 6
-    /// --q-group-size 32` packs exactly those sites as affine 8/32. Were the
-    /// tap to use `admits_static_fp8_activation()`, `mlx calibrate` on such a
-    /// checkpoint would go from "records nothing, leaves config.json
-    /// byte-untouched" to "records every site and rewrites config.json with
-    /// input_amax" — switching on FP8 activation fake-quant for a model that
-    /// was never a modelopt W8A8_FP8 source. The mxfp8 test in the tap IS the
-    /// nvidia-recipe test.
-    ///
-    /// MUTATION CAUGHT: replacing the tap's `self.mode == MXFP8_MODE` with
-    /// `self.admits_static_fp8_activation()`.
+    /// MUTATION CAUGHT: the tap using `admits_static_fp8_activation()` instead
+    /// of `self.mode == MXFP8_MODE`.
     #[test]
     fn forward_tap_ignores_affine_8_32_site() {
         use crate::calibration::activation_amax::{ActivationAmaxCollector, CALIB_TEST_LOCK};
@@ -1928,8 +1874,8 @@ mod fp8_activation_tests {
             .astype(DType::BFloat16)
             .unwrap();
 
-        // An `is_activation_fp8_site` key — exactly what the qwen3_5 loader
-        // threads onto an attn projection, whatever its quant mode.
+        // An `is_activation_fp8_site` key, as the qwen3_5 loader threads onto
+        // an attn projection whatever its quant mode.
         let lin = make_affine_8_32_linear(&w_q, &scales, &biases)
             .with_amax_key(Some("layers.0.self_attn.q_proj".to_string()));
         ActivationAmaxCollector::arm_current_thread();
@@ -1941,9 +1887,8 @@ mod fp8_activation_tests {
             "an affine 8/32 site must not be tapped; got {recorded:?}"
         );
 
-        // Anti-vacuity: this very fixture DOES satisfy the (wider) fake-quant
-        // gate, so the empty map above is the tap's mxfp8 test doing the work —
-        // not a shape that `admits_static_fp8_activation()` would reject anyway.
+        // Anti-vacuity: this fixture DOES satisfy the wider fake-quant gate, so
+        // the empty map above is the tap's mxfp8 test doing the work.
         let base = make_affine_8_32_linear(&w_q, &scales, &biases)
             .forward(&x)
             .unwrap();
