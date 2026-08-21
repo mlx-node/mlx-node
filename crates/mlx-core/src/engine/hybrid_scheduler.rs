@@ -402,6 +402,37 @@ pub(crate) fn reservation_fits_empty_pool(
     need <= cap
 }
 
+/// Keep-live blocks already allocated for `seq_id` that a continuation
+/// will reuse. Subtracted from `reservation_blocks` at admit so the
+/// full-prompt ISL is not charged on top of KV that is neither free nor
+/// reclaimable. Mismatch or `!reuse` credits 0 — prefix prepare rebuilds.
+fn reusable_keep_live_blocks(
+    adapter: Option<&PagedKVCacheAdapter>,
+    seq_id: SeqId,
+    prompt: &[u32],
+    reuse: bool,
+) -> u32 {
+    if !reuse {
+        return 0;
+    }
+    let Some(adapter) = adapter else {
+        return 0;
+    };
+    if !adapter.is_live_for_continue_for(seq_id) {
+        return 0;
+    }
+    let Some(held) = adapter.request_tokens_for(seq_id) else {
+        return 0;
+    };
+    if !prompt.starts_with(held) {
+        return 0;
+    }
+    adapter
+        .block_table_for(seq_id)
+        .map(|table| table.num_blocks() as u32)
+        .unwrap_or(0)
+}
+
 fn scheduler_watermark_fraction() -> f64 {
     static VALUE: OnceLock<f64> = OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -1653,8 +1684,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     }
 
     /// Idle parked recurrent row that is not the candidate and is not in the
-    /// scheduler's running/waiting set. Shared by the unit-cap path and
-    /// memory-denial reclaim so the two policies cannot drift.
+    /// scheduler's running/waiting set. Unit-cap eviction only.
     fn idle_recurrent_victim(&self, seq_id: SeqId) -> Option<SeqId> {
         self.owner_sequences
             .values()
@@ -1663,6 +1693,25 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 candidate != seq_id
                     && self.inner.has_scheduled_recurrent(candidate)
                     && !self.scheduler.contains_seq(candidate)
+            })
+            .min()
+    }
+
+    /// Idle owner that holds a recurrent row or a keep-live/cache table.
+    /// Used by memory-denial reclaim only; unit-cap stays rec-only.
+    fn idle_memory_victim(&self, seq_id: SeqId) -> Option<SeqId> {
+        self.owner_sequences
+            .values()
+            .copied()
+            .filter(|&candidate| {
+                candidate != seq_id
+                    && !self.scheduler.contains_seq(candidate)
+                    && (self.inner.has_scheduled_recurrent(candidate)
+                        || self.inner.scheduler_materialized_blocks(candidate) > 0
+                        || self
+                            .inner
+                            .paged_adapter()
+                            .is_some_and(|adapter| adapter.block_table_for(candidate).is_some()))
             })
             .min()
     }
@@ -1682,10 +1731,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.inner.can_activate_scheduled_recurrent(seq_id)
     }
 
-    /// Drop one idle parked recurrent row and unpin its keep-live KV so
+    /// Drop one idle parked recurrent row and/or unpin its keep-live KV so
     /// published full blocks drop to prefix-cache `ref_count == 1` (evictable).
     fn reclaim_one_idle_scheduled(&mut self, seq_id: SeqId) -> bool {
-        let Some(victim) = self.idle_recurrent_victim(seq_id) else {
+        let Some(victim) = self.idle_memory_victim(seq_id) else {
             return false;
         };
         self.inner.release_scheduled_recurrent_for(victim);
@@ -1793,9 +1842,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return Err(prepared);
         }
         if let Some(snapshot) = cache_snapshot {
+            let reuse = prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache;
+            let charge = prepared
+                .reservation_blocks
+                .saturating_sub(reusable_keep_live_blocks(
+                    self.inner.paged_adapter(),
+                    prepared.seq_id,
+                    &prepared.admitted.tokens,
+                    reuse,
+                ));
             match self.try_reserve_reclaiming_idle(
                 prepared.seq_id,
-                prepared.reservation_blocks,
+                charge,
                 candidate_state_bytes,
                 snapshot,
             ) {
@@ -2215,9 +2273,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return;
         }
         if let Some(snapshot) = cache_snapshot {
+            let materialized = self.inner.scheduler_materialized_blocks(turn.seq_id);
+            let charge = if materialized > 0 {
+                turn.block_reservation_total.saturating_sub(materialized)
+            } else {
+                turn.block_reservation_total
+            };
             match self.try_reserve_reclaiming_idle(
                 turn.seq_id,
-                turn.block_reservation_total,
+                charge,
                 turn.recurrent_state_bytes,
                 snapshot,
             ) {
@@ -2727,6 +2791,44 @@ mod tests {
         }
     }
 
+    fn tiny_nemotron_paged_config() -> NemotronHConfig {
+        NemotronHConfig {
+            vocab_size: 32,
+            hidden_size: 256,
+            num_hidden_layers: 3,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 128,
+            max_position_embeddings: 512,
+            layer_norm_epsilon: 1e-5,
+            layers_block_type: vec![
+                "linear_attention".into(),
+                "moe".into(),
+                "full_attention".into(),
+            ],
+            mamba_num_heads: 2,
+            mamba_head_dim: 2,
+            ssm_state_size: 2,
+            n_groups: 1,
+            conv_kernel: 4,
+            chunk_size: 4,
+            time_step_min: 0.001,
+            time_step_limit: None,
+            n_routed_experts: 4,
+            num_experts_per_tok: 1,
+            routed_scaling_factor: 1.0,
+            norm_topk_prob: true,
+            intermediate_size: 6,
+            moe_shared_expert_intermediate_size: 8,
+            eos_token_ids: vec![2],
+            mtp_layers_block_type: Vec::new(),
+            n_mtp_layers: 0,
+            paged_cache_memory_mb: Some(256),
+            paged_block_size: Some(16),
+            use_block_paged_cache: Some(true),
+        }
+    }
+
     #[test]
     fn dense_and_moe_construct_the_same_engine_scheduler() {
         let dense = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
@@ -3154,6 +3256,175 @@ mod tests {
         assert!(
             matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 100 }),
             "idle scheduler must hard-error, not spin in prepared_waiting: {outcome:?}"
+        );
+    }
+
+    #[test]
+    fn continuation_credits_keep_live_blocks_against_reservation() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        assert!(state.idle_recurrent_victim(2).is_none());
+        assert!(state.idle_memory_victim(2).is_none());
+        assert!(!state.scheduler.has_live_turns());
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 100,
+                free_blocks: 40,
+                reclaimable_blocks: 0,
+                allocated_blocks: 60,
+            },
+            bytes_per_block: 4096,
+        };
+        let reservation_blocks = 70u32;
+        let already_materialized = 60u32;
+        assert!(reservation_fits_empty_pool(
+            reservation_blocks,
+            snapshot.blocks.total_blocks,
+            snapshot.bytes_per_block,
+            0,
+        ));
+        let without_credit = state
+            .try_reserve_reclaiming_idle(2, reservation_blocks, 0, snapshot)
+            .expect("no snapshot refresh");
+        assert!(
+            matches!(
+                without_credit,
+                MemoryReserveOutcome::Reject { total_blocks: 100 }
+            ),
+            "70 vs free 40 without keep-live credit must Reject: {without_credit:?}"
+        );
+        let charge = reservation_blocks.saturating_sub(already_materialized);
+        assert_eq!(charge, 10);
+        let with_credit = state
+            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .expect("no snapshot refresh");
+        assert!(
+            matches!(with_credit, MemoryReserveOutcome::Admitted),
+            "charge 10 vs free 40 must admit: {with_credit:?}"
+        );
+    }
+
+    #[test]
+    fn reusable_keep_live_credits_prefix_match_not_mismatch() {
+        assert_eq!(
+            reusable_keep_live_blocks(None, 1, &[1, 2, 3], true),
+            0,
+            "no adapter credits 0"
+        );
+        let inner = match NemotronHInner::new(tiny_nemotron_paged_config()) {
+            Ok(inner) => inner,
+            Err(_) => {
+                eprintln!(
+                    "skipping reusable_keep_live_credits_prefix_match_not_mismatch: inner failed"
+                );
+                return;
+            }
+        };
+        let mut state = HybridSchedulerState::new(inner).expect("construct nemotron scheduler");
+        let Some(adapter) = state.inner.paged_adapter_mut() else {
+            eprintln!(
+                "skipping reusable_keep_live_credits_prefix_match_not_mismatch: Metal unavailable"
+            );
+            return;
+        };
+        let held: Vec<u32> = (1..33).collect();
+        adapter.begin_request(1).expect("begin keep-live request");
+        let _ = adapter
+            .find_cached_prefix(&[], &[], 0, false)
+            .expect("prefix lookup");
+        adapter
+            .allocate_suffix_blocks(held.len() as u32)
+            .expect("allocate held blocks");
+        adapter.record_tokens(&held).expect("record held tokens");
+        adapter
+            .finalize_turn_keep_live(&[], 0)
+            .expect("keep-live finalize");
+        let num_blocks = adapter
+            .block_table_for(1)
+            .expect("keep-live table")
+            .num_blocks() as u32;
+        assert!(num_blocks > 0, "held tokens must occupy blocks");
+        let mut continued = held.clone();
+        continued.extend_from_slice(&[99, 100]);
+        let mut mismatch = held.clone();
+        mismatch[0] = 0;
+        mismatch.extend_from_slice(&[99, 100]);
+        let adapter = state.inner.paged_adapter();
+        assert_eq!(
+            reusable_keep_live_blocks(adapter, 1, &continued, true),
+            num_blocks,
+            "prompt starting with held credits num_blocks"
+        );
+        assert_eq!(
+            reusable_keep_live_blocks(adapter, 1, &mismatch, true),
+            0,
+            "mismatch credits 0; prefix will rebuild"
+        );
+        assert_eq!(
+            reusable_keep_live_blocks(adapter, 1, &continued, false),
+            0,
+            "!reuse credits 0"
+        );
+    }
+
+    #[test]
+    fn cache_only_idle_owner_is_memory_victim_not_unit_cap_victim() {
+        let inner = match NemotronHInner::new(tiny_nemotron_paged_config()) {
+            Ok(inner) => inner,
+            Err(_) => {
+                eprintln!(
+                    "skipping cache_only_idle_owner_is_memory_victim_not_unit_cap_victim: inner failed"
+                );
+                return;
+            }
+        };
+        if inner.paged_adapter().is_none() {
+            eprintln!(
+                "skipping cache_only_idle_owner_is_memory_victim_not_unit_cap_victim: Metal unavailable"
+            );
+            return;
+        }
+        let mut state = HybridSchedulerState::new(inner).expect("construct nemotron scheduler");
+        state.owner_sequences.insert("cache-only".into(), 1);
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .begin_request(1)
+            .expect("begin cache-only request");
+        state.inner.release_scheduled_recurrent_for(1);
+        assert!(
+            !state.inner.has_scheduled_recurrent(1),
+            "recurrent row is gone"
+        );
+        assert!(
+            state
+                .inner
+                .paged_adapter()
+                .and_then(|adapter| adapter.block_table_for(1))
+                .is_some(),
+            "block table remains after rec release"
+        );
+        assert!(
+            state.idle_recurrent_victim(2).is_none(),
+            "cache-only owner is not a unit-cap victim"
+        );
+        assert_eq!(
+            state.idle_memory_victim(2),
+            Some(1),
+            "cache-only keep-live table is a memory victim"
+        );
+        assert!(
+            state.reclaim_one_idle_scheduled(2),
+            "memory-denial reclaim must unpin the cache-only table"
+        );
+        assert!(
+            state
+                .inner
+                .paged_adapter()
+                .and_then(|adapter| adapter.block_table_for(1))
+                .is_none(),
+            "reclaim unpins the keep-live table"
         );
     }
 
