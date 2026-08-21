@@ -15,7 +15,8 @@ use crate::array::MxArray;
 use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
     ChatBackend, DecodeStep, FinalizeArgs, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
-    PagedPrefix, ResetScope, SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
+    PagedPrefix, ResetScope, SaveStateArgs, SpecFrontier, StreamEmitter, TurnOutput, TurnSetup,
+    WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, FromChatCmd, handle_chat_cmd};
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
@@ -1913,6 +1914,19 @@ impl NemotronHMtpStepper<'_> {
         }
     }
 
+    /// The BACKBONE attention side's ground-truth frontier: the first
+    /// attention layer's offset, in absolute consumed tokens. The flat twin of
+    /// the qwen3_5 / MoE `attention_frontier` — this family's native MTP is
+    /// flat-cache only (`execution_plan` publishes
+    /// `supports_paged_attention: false`), so there is no paged branch to pick.
+    fn attention_frontier(&self) -> Option<u64> {
+        self.inner
+            .caches
+            .iter()
+            .find_map(|c| c.attention_offset())
+            .map(|offset| offset.max(0) as u64)
+    }
+
     /// The drafter attention slot's live offset. Compiled in every debug build so
     /// `begin_cycle`'s cursor-alignment `debug_assert!` can read it.
     #[cfg(any(test, debug_assertions))]
@@ -2041,12 +2055,7 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         let hiddens = MxArray::concatenate_many(hidden_rows.iter().collect::<Vec<_>>(), Some(1))?;
         // The engine slices verify_hiddens[:, K, :], so hiddens must stay
         // [1, depth+1, hidden] (each row is the raw 3D per-token hidden).
-        Ok(crate::models::qwen3_5::mtp_decode::MtpVerifyOutput {
-            logits: Some(logits),
-            hiddens,
-            target_argmax: None,
-            target_sparse: None,
-        })
+        Ok(crate::models::qwen3_5::mtp_decode::MtpVerifyOutput::logits_only(logits, hiddens))
     }
 
     fn snapshot_main_linear(&mut self) {
@@ -2211,6 +2220,26 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         self.committed_len = (self.committed_len - unemitted as i32).max(0);
         let target = self.committed_len;
         self.trim_draft_caches(target);
+    }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        // Hybrid stack, but the recurrent count is NOT nameable here, so it is
+        // reported as unknown rather than fabricated: `Mamba2State` is a conv
+        // tensor plus an ssm tensor with no consumed-token counter, and this
+        // family rewinds the recurrent side by whole-snapshot RESTORE
+        // (`rollback` restores every layer, Mamba and attention alike, from one
+        // `snapshot_main_linear`) instead of replaying a step count, so there is
+        // no bookkeeping to publish. Echoing `attn_tokens` back would turn the
+        // I4 tripwire into a comparison of a value with itself.
+        //
+        // The tripwire is inert for the other reason too: `rollback_unemitted`
+        // rewinds only the DRAFTER caches and never touches `inner.caches`, so
+        // this family heals a mid-cycle stop through the `mtp_desynced` latch,
+        // not by moving one side of the backbone.
+        Some(SpecFrontier {
+            attn_tokens: self.attention_frontier()?,
+            recurrent_tokens: None,
+        })
     }
 
     fn take_replay_error(&mut self) -> Option<Error> {
@@ -2597,7 +2626,6 @@ impl NemotronHInner {
                 generation_stream,
                 prompt_hidden: None,
                 prompt_hidden_ids: None,
-                prompt_hidden_position_base: 0,
                 cancel_flag: turn_cancel.as_deref(),
             },
             None,

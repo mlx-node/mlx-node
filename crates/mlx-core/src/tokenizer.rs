@@ -4195,6 +4195,10 @@ mod tests {
             RenderContextOptions {
                 current_date: Some(PROBE_DATE.to_string()),
                 reasoning_strength: None,
+                // The one-shot default. The Nemotron gate this test pins reads
+                // `truncate_history_thinking`, not `preserve_thinking`, so the
+                // pin has to hold for a caller that opts into nothing.
+                preserve_thinking: false,
             },
         )
         .expect("Nemotron template should render");

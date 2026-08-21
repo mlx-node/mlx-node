@@ -423,7 +423,7 @@ mod mtp_turn_tests {
     use crate::engine::backend::{
         ChatBackend, MtpBackend, MtpStepper, MtpTurnSetup, ThinkingSetup,
     };
-    use crate::engine::mtp_turn::{MtpTurnArgs, run_mtp_turn};
+    use crate::engine::mtp_turn::{MtpTurnArgs, run_mtp_turn, turn_lookahead_rows};
     use crate::engine::params::extract_chat_params;
     use crate::engine::penalties::ReasoningTracker;
     use crate::engine::persistence::compiled_forward_backend_available;
@@ -695,7 +695,6 @@ mod mtp_turn_tests {
                     generation_stream: stream,
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
-                    prompt_hidden_position_base: 0,
                     cancel_flag: None,
                 },
                 None,
@@ -850,6 +849,25 @@ mod mtp_turn_tests {
         inner.mtp_weights_loaded = true;
         assert!(inner.has_mtp_weights());
         inner
+    }
+
+    /// `MtpTurnSetup` for the flat drafter tests, with `lookahead_rows` read
+    /// off the model's own `SpeculativePlan` exactly as `run_mtp_turn` reads it
+    /// (I1 — no reserver re-derives `depth + 1` locally). NemotronH's
+    /// `begin_mtp_decode` ignores the margin, because its native MTP is
+    /// flat-cache only and has no paged region to reserve; taking it off the
+    /// plan anyway keeps these tests from pinning a value production never
+    /// sends.
+    fn flat_mtp_setup(inner: &NemotronHInner, first_sampled_token: u32) -> MtpTurnSetup<'static> {
+        MtpTurnSetup {
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
+            first_sampled_token,
+            lookahead_rows: inner
+                .execution_plan()
+                .speculative
+                .map_or(0, |plan| turn_lookahead_rows(plan, &greedy_params())),
+        }
     }
 
     fn greedy_params() -> crate::engine::params::ChatParams {
@@ -1039,12 +1057,7 @@ mod mtp_turn_tests {
     fn begin_mtp_decode_refuses_an_unseeded_drafter() {
         let mut inner = mtp_ready_inner();
         assert!(inner.pending_mtp_draft_seed.is_none());
-        let setup = MtpTurnSetup {
-            prompt_hidden: None,
-            prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
-            first_sampled_token: 5,
-        };
+        let setup = flat_mtp_setup(&inner, 5);
         let err = inner
             .begin_mtp_decode(&setup)
             .err()
@@ -1091,12 +1104,7 @@ mod mtp_turn_tests {
         let mut run = |with_draft: bool| -> Vec<f32> {
             inner.reset_caches_internal();
             let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
-            let setup = MtpTurnSetup {
-                prompt_hidden: None,
-                prompt_hidden_ids: None,
-                prompt_hidden_position_base: 0,
-                first_sampled_token: 7,
-            };
+            let setup = flat_mtp_setup(&inner, 7);
             let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
             assert_eq!(step.committed_len(), prompt.len() as i32);
             assert_eq!(step.draft_kv_offset(), prompt.len() as i32);
@@ -1181,12 +1189,7 @@ mod mtp_turn_tests {
 
         inner.reset_caches_internal();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
-        let setup = MtpTurnSetup {
-            prompt_hidden: None,
-            prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
-            first_sampled_token: 7,
-        };
+        let setup = flat_mtp_setup(&inner, 7);
         let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
         assert_eq!(step.draft_kv_offset(), t);
 
@@ -1239,12 +1242,7 @@ mod mtp_turn_tests {
 
         inner.reset_caches_internal();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
-        let setup = MtpTurnSetup {
-            prompt_hidden: None,
-            prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
-            first_sampled_token: 7,
-        };
+        let setup = flat_mtp_setup(&inner, 7);
         let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
 
         // One full cycle: draft, then commit two tokens.
@@ -1339,12 +1337,7 @@ mod mtp_turn_tests {
 
         inner.reset_caches_internal();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
-        let setup = MtpTurnSetup {
-            prompt_hidden: None,
-            prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
-            first_sampled_token: 7,
-        };
+        let setup = flat_mtp_setup(&inner, 7);
         let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
 
         step.begin_cycle(false);
@@ -1536,7 +1529,6 @@ mod mtp_turn_tests {
                 generation_stream: stream,
                 prompt_hidden: None,
                 prompt_hidden_ids: None,
-                prompt_hidden_position_base: 0,
                 cancel_flag: None,
             },
             None,
