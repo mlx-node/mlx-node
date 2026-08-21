@@ -2781,6 +2781,21 @@ fn prepare_muse_secondary_config(
         Error::from_reason(format!("Failed to parse {}: {e}", config_path.display()))
     })?;
 
+    // This function is the only writer of `dflash_config` into an output
+    // config, so the key's presence proves a previous DFlash pass already
+    // merged its draft profiles into the quantization block. Those entries are
+    // spelled exactly like the SafeTensors target's own overrides and nothing
+    // on disk records which provenance a key has, so the rescope below can no
+    // longer tell them apart.
+    if is_dflash && config.get("dflash_config").is_some() {
+        return Err(Error::from_reason(format!(
+            "{} already carries a merged DFlash companion: a second companion pass cannot \
+             tell the previous draft's per-layer quantization entries from the target's own \
+             overrides. Convert into a fresh output directory.",
+            config_path.display()
+        )));
+    }
+
     if !profiles.is_empty() {
         let companion_quantization = preserved_source_quantization(gguf, import_k_quants)?
             .ok_or_else(|| {
@@ -5816,6 +5831,76 @@ mod tests {
                 "a companion profile resolved onto target projection '{prefix}' as '{scoped}'"
             );
         }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_second_companion_pass_over_a_merged_config_is_refused() {
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-repeat-companion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&valid_muse_target_config()).expect("serialize dense target config"),
+        )
+        .expect("write dense target config");
+
+        let first = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("first companion pass")
+            .expect("companion config update");
+        let merged: serde_json::Value =
+            serde_json::from_str(&first).expect("parse merged companion config");
+        assert!(
+            merged.get("dflash_config").is_some(),
+            "ANTI-VACUITY: pass 1 must write the marker the guard keys on"
+        );
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                merged[block]["language_model.model.layers.0.self_attn.q_proj"]["mode"], "q4k",
+                "ANTI-VACUITY: pass 1 must record the draft profile in '{block}', or the \
+                 phantom check below passes on an empty block"
+            );
+            assert!(
+                merged[block]
+                    .get("language_model.model.language_model.layers.0.self_attn.q_proj")
+                    .is_none(),
+                "ANTI-VACUITY: pass 1 already produced the phantom, so a refused pass 2 \
+                 would prove nothing: {}",
+                merged[block]
+            );
+        }
+
+        fs::write(&config_path, &first).expect("feed pass 1 output back as the target config");
+        let error = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect_err("a repeated companion merge must be refused");
+        assert!(
+            error
+                .reason
+                .contains("already carries a merged DFlash companion"),
+            "unexpected error: {}",
+            error.reason
+        );
         fs::remove_dir_all(root).ok();
     }
 
