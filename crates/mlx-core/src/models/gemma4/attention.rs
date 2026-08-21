@@ -201,13 +201,10 @@ fn parse_grouped_d512_selector(value: Option<&str>) -> &'static str {
 fn grouped_d512_diagnostic_config() -> (&'static str, Option<u32>) {
     static CONFIG: OnceLock<(String, Option<u32>)> = OnceLock::new();
     let config = CONFIG.get_or_init(|| {
-        let selector_env = std::env::var("MLX_PAGED_GROUPED_D512")
-            .ok()
-            .or_else(|| std::env::var("MLX_PAGED_GROUPED_GEMMA4").ok());
+        let selector_env = std::env::var("MLX_PAGED_GROUPED_D512").ok();
         let selector = parse_grouped_d512_selector(selector_env.as_deref());
         let stripes = std::env::var("MLX_PAGED_GROUPED_D512_STRIPES")
             .ok()
-            .or_else(|| std::env::var("MLX_PAGED_GROUPED_GEMMA4_STRIPES").ok())
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|value| matches!(value, 4 | 8 | 16 | 32 | 64 | 128 | 256));
         (selector.to_string(), stripes)
@@ -340,9 +337,7 @@ fn paged_decode_mode() -> PagedDecodeMode {
     static MODE: OnceLock<PagedDecodeMode> = OnceLock::new();
     *MODE.get_or_init(|| {
         let route = std::env::var("MLX_GEMMA4_PAGED_DECODE_ROUTE").ok();
-        let grouped = std::env::var("MLX_PAGED_GROUPED_D512")
-            .ok()
-            .or_else(|| std::env::var("MLX_PAGED_GROUPED_GEMMA4").ok());
+        let grouped = std::env::var("MLX_PAGED_GROUPED_D512").ok();
         resolve_paged_decode_mode(route.as_deref(), grouped.as_deref())
     })
 }
@@ -517,29 +512,15 @@ fn select_paged_decode_plan(input: PagedDecodePolicyInput) -> PagedDecodePlan {
     }
 }
 
-fn parse_cache_hit_prefill_mode(
-    route: Option<&str>,
-    legacy_paged_attention: Option<&str>,
-) -> CacheHitPrefillMode {
-    if let Some(route) = route.map(str::trim) {
-        return match route.to_ascii_lowercase().as_str() {
-            "" | "auto" => CacheHitPrefillMode::Auto,
-            "sdpa" | "paged_pool_sdpa" => CacheHitPrefillMode::ForceSdpa,
-            "varlen" | "paged_varlen" => CacheHitPrefillMode::ForceVarlen,
-            "legacy" | "paged_legacy" => CacheHitPrefillMode::ForceLegacy,
-            "host" | "host_read" => CacheHitPrefillMode::ForceHostRead,
-            _ => CacheHitPrefillMode::Auto,
-        };
-    }
-
-    // Backward compatibility: this switch previously selected between the
-    // duplicated-row paged bridge and host materialization. Disabling it must
-    // continue to force the diagnostic host-read path; enabled/unset now opts
-    // into the faster adaptive paged-storage policy.
-    match legacy_paged_attention {
-        Some(value) if !crate::inference_trace::env_flag_value_enabled(value) => {
-            CacheHitPrefillMode::ForceHostRead
-        }
+fn parse_cache_hit_prefill_mode(route: Option<&str>) -> CacheHitPrefillMode {
+    let Some(route) = route.map(str::trim) else {
+        return CacheHitPrefillMode::Auto;
+    };
+    match route.to_ascii_lowercase().as_str() {
+        "sdpa" | "paged_pool_sdpa" => CacheHitPrefillMode::ForceSdpa,
+        "varlen" | "paged_varlen" => CacheHitPrefillMode::ForceVarlen,
+        "legacy" | "paged_legacy" => CacheHitPrefillMode::ForceLegacy,
+        "host" | "host_read" => CacheHitPrefillMode::ForceHostRead,
         _ => CacheHitPrefillMode::Auto,
     }
 }
@@ -548,8 +529,7 @@ fn cache_hit_prefill_mode() -> CacheHitPrefillMode {
     static MODE: OnceLock<CacheHitPrefillMode> = OnceLock::new();
     *MODE.get_or_init(|| {
         let route = std::env::var("MLX_GEMMA4_PAGED_PREFILL_ROUTE").ok();
-        let legacy = std::env::var("MLX_GEMMA4_PAGED_PREFILL_PAGED_ATTENTION").ok();
-        parse_cache_hit_prefill_mode(route.as_deref(), legacy.as_deref())
+        parse_cache_hit_prefill_mode(route.as_deref())
     })
 }
 
@@ -2903,19 +2883,15 @@ mod tests {
     }
 
     #[test]
-    fn cache_hit_prefill_mode_preserves_compatibility_and_explicit_routes() {
+    fn cache_hit_prefill_mode_resolves_explicit_routes() {
         assert_eq!(
-            parse_cache_hit_prefill_mode(None, None),
+            parse_cache_hit_prefill_mode(None),
             CacheHitPrefillMode::Auto
         );
         assert_eq!(
-            parse_cache_hit_prefill_mode(None, Some("0")),
-            CacheHitPrefillMode::ForceHostRead,
-            "the former disable switch must retain its host-read diagnostic semantics"
-        );
-        assert_eq!(
-            parse_cache_hit_prefill_mode(None, Some("1")),
-            CacheHitPrefillMode::Auto
+            parse_cache_hit_prefill_mode(Some("nonsense")),
+            CacheHitPrefillMode::Auto,
+            "an unrecognized route must fall back to Auto, never to a silent mode switch"
         );
         for (route, expected) in [
             ("auto", CacheHitPrefillMode::Auto),
@@ -2924,11 +2900,7 @@ mod tests {
             ("legacy", CacheHitPrefillMode::ForceLegacy),
             ("host", CacheHitPrefillMode::ForceHostRead),
         ] {
-            assert_eq!(
-                parse_cache_hit_prefill_mode(Some(route), Some("0")),
-                expected,
-                "the explicit route must take precedence over the compatibility switch"
-            );
+            assert_eq!(parse_cache_hit_prefill_mode(Some(route)), expected);
         }
         assert_eq!(
             gemma4_paged_prefill_route_policy_for_mode(CacheHitPrefillMode::ForceSdpa),

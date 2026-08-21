@@ -14,12 +14,9 @@ use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup};
 use crate::engine::params::ChatParams;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
 use crate::models::qwen3_5::mtp_decode::{
-    MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput, mtp_batch_target_arrays_enabled,
-    mtp_defer_verify_hidden_eval, mtp_draft_sampling_config, mtp_greedy_argmax_only_verify_enabled,
-    mtp_native_sparse_verify_enabled, mtp_target_distribution_first_enabled, mtp_trace_acceptance,
-    mtp_verify_async_eval, mtp_verify_top1_check_enabled, sparse_accept_gate,
-    trace_acceptance_dense, trace_acceptance_emit, trace_acceptance_greedy,
-    trace_acceptance_sparse,
+    MtpCommitAnchor, MtpCycleOutcome, MtpVerifyOutput, mtp_draft_sampling_config,
+    mtp_trace_acceptance, sparse_accept_gate, trace_acceptance_dense, trace_acceptance_emit,
+    trace_acceptance_greedy, trace_acceptance_sparse,
 };
 use crate::nn::Embedding;
 use crate::sampling;
@@ -69,29 +66,10 @@ fn debug_assert_one_frontier<S: MtpStepper>(step: &S, site: &str) {
     }
 }
 
-/// One MTP draft+verify cycle, generic over [`MtpStepper`] — a VERBATIM,
-/// mechanical relocation of
-/// [`crate::models::qwen3_5::mtp_decode::run_mtp_cycle_inner`], calling
-/// `step.*` where the original calls `ops.*`. Every surrounding line
-/// (sampling, accept-branch selection, async_eval scheduling, K arithmetic,
-/// commit-anchor handling, profiler begin/end, the `verify_hiddens[:, K, :]`
-/// return slice, adaptive/EV-depth orchestration) is byte-for-byte identical
-/// in logic and ORDER.
-///
-/// Translated `ops.*` → `step.*` swap sites (the ONLY substantive change
-/// vs the original body):
-///   * `(ops.draft_step)(a, b)` → `step.draft_step(a, b)`
-///   * `(ops.snapshot_main_linear)()` → `step.snapshot_main_linear()`
-///   * the verify dispatch: `ops.verify_step_argmax_only` /
-///     `ops.verify_step_sparse` boxed-`Option` fields →
-///     `step.verify_step_argmax_only(..)` / `step.verify_step_sparse(..)`
-///     (each returns `Option<Result<..>>`: `Some` = use it, `None` = fall
-///     back to `step.verify_step(..)`); `(ops.verify_step)(..)` →
-///     `step.verify_step(..)`
-///   * `(ops.commit_mtp)(..)` → `step.commit_mtp(..)`
-///   * `(ops.rollback)(k, d)` → `step.rollback(k, d)`
-///   * `(ops.restore_and_replay_main)(ids, emb)` →
-///     `step.restore_and_replay_main(ids, emb)`
+/// One MTP draft+verify cycle, generic over [`MtpStepper`]: draft `depth`
+/// tokens, verify them in one batched forward, accept a prefix, commit it,
+/// and roll the drafter back to that prefix. Returns the accepted tokens
+/// plus `verify_hiddens[:, K, :]` — the seed the next cycle chains from.
 pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     step: &mut S,
     prev_hidden_in: MxArray,
@@ -140,8 +118,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         && params.frequency_penalty == 0.0;
     let use_sparse_accept =
         sparse_accept_gate() && sampling::is_greedy_temperature(temperature) && penalties_no_op;
-    let use_sparse_stochastic_accept = mtp_batch_target_arrays_enabled()
-        && !sampling::is_greedy_temperature(temperature)
+    let use_sparse_stochastic_accept = !sampling::is_greedy_temperature(temperature)
         && penalties_no_op
         && sampling::sparse_distribution_supported(&sampling_cfg)
         && sampling::sparse_distribution_supported(&draft_sampling_cfg);
@@ -197,7 +174,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
             // temperature/top_p case) and both parity modes.
             //
             // NOTE: at T=0 the non-sparse `else` accept branch is only reached
-            // when `MLX_MTP_SPARSE_ACCEPT` is disabled; in that case
+            // when a test forces the gate off; in that case
             // `accept_with_residual` takes its argmax-only shortcut and never
             // reads `q`. `sampling_distribution` at T=0 returns the (valid,
             // 1D `[vocab]`) one-hot argmax distribution — it does NOT error,
@@ -349,41 +326,12 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     // available to algorithmic work.
     let verify_only_t0 = std::time::Instant::now();
     profiler.begin("mtp_verify_dispatch");
-    let trace_logits = mtp_trace_logits();
     let trace_acceptance = mtp_trace_acceptance();
-    let use_native_sparse_verify = use_sparse_stochastic_accept
-        && mtp_native_sparse_verify_enabled()
-        && sampling::sampler_parity_is_mtplx()
-        && !trace_logits;
-    let use_greedy_argmax_only_verify = use_sparse_accept
-        && mtp_greedy_argmax_only_verify_enabled()
-        && !trace_logits
-        && !trace_acceptance
-        && !mtp_verify_top1_check_enabled();
-    let verify_step_res = if let Some(res) = use_greedy_argmax_only_verify
-        .then(|| {
-            profiler.begin("mtp_verify_dispatch_argmax_only");
-            let res = step.verify_step_argmax_only(&verify_in, embedding, effective_depth);
-            profiler.end();
-            res
-        })
-        .flatten()
-    {
-        res
-    } else if let Some(res) = use_native_sparse_verify
-        .then(|| step.verify_step_sparse(&verify_in, embedding, effective_depth, &sampling_cfg))
-        .flatten()
-    {
-        res
-    } else {
-        step.verify_step(&verify_in, embedding, effective_depth)
-    };
+    let verify_step_res = step.verify_step(&verify_in, embedding, effective_depth);
     profiler.end();
     let MtpVerifyOutput {
         logits: verify_logits,
         hiddens: verify_hiddens,
-        target_argmax: verify_target_argmax,
-        target_sparse: verify_target_sparse,
     } = verify_step_res?;
     tracing::debug!(
         target: "mlx_core::mtp",
@@ -408,10 +356,6 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     // `verify_hiddens[:, K, :]` slice is actually realised on-device
     // by the chained-cycle path; for the default Step-A path the
     // batch eval is still cheap (one extra command-buffer entry).
-    //
-    // `MLX_MTP_VERIFY_ASYNC_EVAL=0` reverts to the synchronous
-    // `verify_logits.eval()` barrier — byte-identical for
-    // parity-debugging or hardware where the overlap budget is negligible.
     // Fast-path acceptance. When eligible, collapse the D+1 per-position
     // softmax materializations into ONE batched
     // `argmax(verify_logits, axis=-1)` op + one `.eval()` reading
@@ -430,95 +374,17 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     // When ineligible (T>0, or any penalty non-default), fall through to
     // the per-position path below.
 
-    let sparse_verify_argmax = if use_sparse_accept {
-        verify_target_argmax.as_ref()
-    } else {
-        None
-    };
-    let verify_logits_ref = verify_logits.as_ref();
-
     profiler.begin("mtp_verify_eval");
-    let defer_hidden = mtp_defer_verify_hidden_eval();
-    let target_distribution_first = use_sparse_stochastic_accept
-        && defer_hidden
-        && mtp_target_distribution_first_enabled()
-        && verify_logits_ref.is_some()
-        && !trace_logits;
-    if target_distribution_first {
-        tracing::debug!(
-            target: "mlx_core::mtp::verify_async_eval",
-            depth = effective_depth,
-            requested_depth = depth,
-            "W6.23 target-distribution-first verify scheduling"
-        );
-    } else if mtp_verify_async_eval() {
-        tracing::debug!(
-            target: "mlx_core::mtp::verify_async_eval",
-            depth = effective_depth,
-            requested_depth = depth,
-            defer_hidden,
-            "W6.9 async_eval verify outputs"
-        );
-        if let Some(argmax_arr) = sparse_verify_argmax {
-            let mut eval_arrays: Vec<&MxArray> =
-                Vec::with_capacity(1 + usize::from(trace_logits) + usize::from(!defer_hidden));
-            eval_arrays.push(argmax_arr);
-            if trace_logits && let Some(verify_logits) = verify_logits_ref {
-                eval_arrays.push(verify_logits);
-            }
-            if !defer_hidden {
-                eval_arrays.push(&verify_hiddens);
-            }
-            MxArray::async_eval_arrays(&eval_arrays);
-        } else if let Some(verify_logits) = verify_logits_ref {
-            if defer_hidden {
-                MxArray::async_eval_arrays(&[verify_logits]);
-            } else {
-                MxArray::async_eval_arrays(&[verify_logits, &verify_hiddens]);
-            }
-        } else if !defer_hidden {
-            MxArray::async_eval_arrays(&[&verify_hiddens]);
-        }
-    } else {
-        // We materialize logits now so per-position slicing reads
-        // from a CPU-resident buffer for penalty application. The
-        // hiddens ride on the same lazy graph; we only eval the
-        // K-th slice below.
-        //
-        // Note: the sparse-accept path also benefits from this eager
-        // eval — folding verify materialization into the accept-loop
-        // argmax op (one combined sync) measured ~10% slower than two
-        // separate syncs. The eager eval here lets MLX's scheduler
-        // pipeline the verify command buffer with the subsequent argmax
-        // dispatch build, which the combined-eval variant defeats. Kept
-        // unconditional.
-        if let Some(argmax_arr) = sparse_verify_argmax {
-            argmax_arr.eval();
-            if trace_logits && let Some(verify_logits) = verify_logits_ref {
-                verify_logits.eval();
-            }
-        } else if let Some(verify_logits) = verify_logits_ref {
-            verify_logits.eval();
-        } else if !defer_hidden {
-            verify_hiddens.eval();
-        }
-        tracing::debug!(
-            target: "mlx_core::mtp::verify_async_eval",
-            depth = effective_depth,
-            requested_depth = depth,
-            sparse_argmax = sparse_verify_argmax.is_some(),
-            "verify eval (synchronous; async-eval disabled)"
-        );
-    }
+    MxArray::async_eval_arrays(&[&verify_logits]);
+    tracing::debug!(
+        target: "mlx_core::mtp::verify_async_eval",
+        depth = effective_depth,
+        requested_depth = depth,
+        "async_eval verify logits; the hidden slice rides the lazy graph"
+    );
     profiler.end();
     profiler.record_duration("mtp_verify_floor", verify_only_t0.elapsed());
-    let vocab = if let Some(verify_logits) = verify_logits_ref {
-        verify_logits.shape_at(2)?
-    } else if let Some(target_sparse) = verify_target_sparse.as_ref() {
-        target_sparse.vocab_size() as i64
-    } else {
-        embedding.num_embeddings() as i64
-    };
+    let vocab = verify_logits.shape_at(2)?;
 
     // Step 3: per-position accept/reject. Build extended history as
     // we accept; rejecting at position i halts the loop.
@@ -532,24 +398,12 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         // about per-position argmax — no full-vocab softmax
         // materialization needed.
         //
-        // `verify_logits` may still be lazy from the verify dispatch
-        // (especially under `MLX_MTP_VERIFY_ASYNC_EVAL=1`). The
-        // `.eval()` below is the SINGLE sync point for the accept
-        // loop — vs the D × per-position `p_target.eval()`
+        // `verify_logits` is still lazy from the verify dispatch's
+        // `async_eval`. The `.eval()` below is the SINGLE sync point for
+        // the accept loop — vs the D × per-position `p_target.eval()`
         // path that forces D full-vocab softmaxes through Metal.
         profiler.begin("mtp_accept_argmax");
-        let fallback_argmax;
-        let argmax_arr = if let Some(argmax_arr) = sparse_verify_argmax {
-            argmax_arr
-        } else {
-            let verify_logits = verify_logits_ref.ok_or_else(|| {
-                Error::from_reason(
-                    "MTP greedy sparse accept requires verifier logits or precomputed target argmax",
-                )
-            })?;
-            fallback_argmax = verify_logits.argmax(-1, None)?;
-            &fallback_argmax
-        };
+        let argmax_arr = verify_logits.argmax(-1, None)?;
         argmax_arr.eval();
 
         // Extract D+1 int32s into a CPU buffer. `verify_logits` was
@@ -558,21 +412,6 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         let mut target_argmax: Vec<i32> = Vec::with_capacity(effective_depth + 1);
         for i in 0..=effective_depth {
             target_argmax.push(argmax_arr.item_at_int32(i)?);
-        }
-        if sparse_verify_argmax.is_some() && mtp_verify_top1_check_enabled() {
-            let verify_logits = verify_logits_ref.ok_or_else(|| {
-                Error::from_reason("MTP verifier top1 check requires verifier logits")
-            })?;
-            let fallback_argmax = verify_logits.argmax(-1, None)?;
-            fallback_argmax.eval();
-            for (i, &compiled_id) in target_argmax.iter().enumerate() {
-                let fallback_id = fallback_argmax.item_at_int32(i)?;
-                if compiled_id != fallback_id {
-                    return Err(Error::from_reason(format!(
-                        "MTP verifier top1 mismatch at slot {i}: compiled={compiled_id}, fallback={fallback_id}"
-                    )));
-                }
-            }
         }
         profiler.end();
 
@@ -586,13 +425,11 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
             let target_id = target_argmax[i];
             let accept = target_id == draft_ids[i];
             if trace_acceptance {
-                let top2 = verify_logits_ref.and_then(|verify_logits| {
-                    verify_logits
-                        .slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])
-                        .and_then(|s| s.squeeze(Some(&[0, 1])))
-                        .and_then(|v1d| trace_top2(&v1d, vocab))
-                        .ok()
-                });
+                let top2 = verify_logits
+                    .slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])
+                    .and_then(|s| s.squeeze(Some(&[0, 1])))
+                    .and_then(|v1d| trace_top2(&v1d, vocab))
+                    .ok();
                 trace_acceptance_greedy(
                     effective_depth,
                     i,
@@ -636,25 +473,13 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         profiler.end();
     } else if use_sparse_stochastic_accept {
         profiler.begin("mtp_accept_sparse_probs");
-        let target_sparse_from_logits;
-        let target_sparse = if let Some(rows) = verify_target_sparse.as_ref() {
-            rows.validate_for_accept(effective_depth + 1, vocab as usize, &sampling_cfg)?;
-            rows
-        } else {
-            let verify_logits = verify_logits_ref.ok_or_else(|| {
-                Error::from_reason(
-                    "MTP sparse stochastic target path requires verifier logits or precomputed sparse rows",
-                )
-            })?;
-            target_sparse_from_logits =
-                sampling::sparse_distributions_from_logits(verify_logits, &sampling_cfg)?
-                    .ok_or_else(|| {
-                        Error::from_reason(
-                            "MTP sparse stochastic target path became ineligible after gating",
-                        )
-                    })?;
-            &target_sparse_from_logits
-        };
+        let target_sparse = sampling::sparse_distributions_from_logits(
+            &verify_logits,
+            &sampling_cfg,
+        )?
+        .ok_or_else(|| {
+            Error::from_reason("MTP sparse stochastic target path became ineligible after gating")
+        })?;
         profiler.end();
 
         // Exact stochastic accept loop over tiny CPU-side top-k distributions.
@@ -722,8 +547,6 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         }
         profiler.end();
     } else {
-        let verify_logits = verify_logits_ref
-            .ok_or_else(|| Error::from_reason("MTP legacy accept requires verifier logits"))?;
         let mut hist_extended: Vec<u32> = token_history.to_vec();
         // Per-position path. Used for T>0 (where residual
         // sampling needs the full target distribution) and for
@@ -845,8 +668,6 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     // Position label `token_history.len() + j` aligns with the AR
     // loop's `$hist.len() + 1` numbering (same prompt base).
     if mtp_trace_logits() {
-        let verify_logits = verify_logits_ref
-            .ok_or_else(|| Error::from_reason("MTP_TRACE_LOGITS requires verifier logits"))?;
         for (j, &committed_id) in accepted_tokens.iter().enumerate() {
             let slot = j as i64;
             let source = if all_accepted && j + 1 == accepted_tokens.len() {
@@ -1041,9 +862,9 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     // alive as long as any other handle still holds them.
 
     // Pick the position-K slice of `verify_hiddens` and return it so the
-    // caller (the `decode_loop_mtp!` macro) can chain cycles: the NEXT
-    // cycle's first MTP draft uses this hidden as `prev_hidden`,
-    // eliminating the per-cycle main-model "Step A" forward.
+    // caller can chain cycles: the NEXT cycle's first MTP draft uses this
+    // hidden as `prev_hidden`, eliminating the per-cycle main-model
+    // "Step A" forward.
     //
     // Semantics: `verify_hiddens[K]` is the post-final-norm hidden at
     // verify position K — the prediction context for the committed
@@ -1077,15 +898,13 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
 }
 
 /// Required arguments of [`run_mtp_turn`] — the MTP analog of
-/// [`crate::engine::decode::DecodeLoopArgs`]. Every field is the macro
-/// parameter of the SAME name in `decode_loop_mtp!`; the turn-constant
-/// `embedding_weight` + the per-cycle scratch live on the
-/// [`MtpStepper`] (captured at `begin_mtp_decode`), so they are NOT here.
-///
+/// [`crate::engine::decode::DecodeLoopArgs`]. The turn-constant
+/// `embedding_weight` + the per-cycle scratch live on the [`MtpStepper`]
+/// (captured at `begin_mtp_decode`), so they are NOT here.
 pub(crate) struct MtpTurnArgs<'a> {
     /// First generated token (sampled from the prefill logits BEFORE the
     /// turn). The loop takes ownership; its final reassignment is not
-    /// observed by callers (== the macro's `y`).
+    /// observed by callers.
     pub y: MxArray,
     /// Requested draft depth for this turn (`params.mtp_depth`) — the
     /// macro's `mtp_depth`. The stepper still applies its intra-cycle
@@ -1102,15 +921,12 @@ pub(crate) struct MtpTurnArgs<'a> {
     pub first_token_instant: &'a mut Option<Instant>,
     pub report_perf: bool,
     pub generation_stream: Stream,
-    /// Prompt-prefix MTP seed inputs, forwarded verbatim into
-    /// [`MtpTurnSetup`] so [`MtpBackend::begin_mtp_decode`] can commit the
-    /// prompt prefix into the drafter's committed-history cache before the
-    /// loop. == the `prompt_hidden` / `prompt_hidden_ids` /
-    /// `prompt_hidden_position_base` fields of `ChatDecodeInputs` the eager
-    /// block read. `None` / `0` ⇒ no prompt seed (cycle-history v1).
+    /// Prompt-prefix MTP seed inputs, forwarded into [`MtpTurnSetup`] so
+    /// [`MtpBackend::begin_mtp_decode`] can commit the prompt prefix into the
+    /// drafter's committed-history cache before the loop. `None` ⇒ no prompt
+    /// seed, and the drafter builds cycle history from decode tokens alone.
     pub prompt_hidden: Option<MxArray>,
     pub prompt_hidden_ids: Option<Vec<u32>>,
-    pub prompt_hidden_position_base: usize,
     /// Per-turn cooperative cancel flag (H2) — the family core's clone of
     /// the backend-installed `turn_cancel`. Polled at every per-step /
     /// per-cycle snapshot point the STREAMING path already polls, so a
@@ -1219,51 +1035,23 @@ impl DecodeProgressTrace {
     }
 }
 
-/// Engine-owned MTP propose/verify whole-turn loop — the relocated SYNC
-/// (non-streaming) body of `decode_loop_mtp!`, generic over
-/// [`MtpBackend`]. The MTP analog of
+/// Engine-owned MTP propose/verify whole-turn loop, generic over
+/// [`MtpBackend`] — the MTP analog of
 /// [`crate::engine::decode::run_decode_loop`].
 ///
 /// Calls [`MtpBackend::begin_mtp_decode`] to build the per-turn stepper,
-/// then drives the relocated outer loop: the initial-`y` emit, Step A vs.
+/// then drives the outer loop: the initial-`y` emit, Step A vs.
 /// chained-hidden routing, [`run_mtp_cycle`] per cycle, the per-token emit
 /// loop, and the mid-cycle-stop `rollback_unemitted`. Returns the
 /// [`MtpTurnOutcome`] (`last_in_cache` + `desynced`) AND surfaces any
 /// full-accept GDN tape-replay error stashed by the infallible
 /// [`MtpStepper::rollback`] via [`MtpStepper::take_replay_error`] after the
-/// loop — the two side-channels the family code reads after the macro
-/// today.
+/// loop.
 ///
-/// VERBATIM, mechanical relocation of the macro's SYNC arm: every
-/// surrounding line (the initial-`y` emit, the `max_as_usize` negative
-/// clamp, all stop checks, the `do_step_a` routing, the chained_hidden
-/// stash/drain, the adaptive/EV depth pick + near-tail cap, the per-token
-/// emit loop with `observe`/force-end + every-256-token cache clear, the
-/// `last_in_cache` bookkeeping at the 3 break sites, and the
-/// `eval_step_with_chained_hidden` fused chained eval at the iteration
-/// boundary) is byte-for-byte identical in logic and ORDER, swapping the
-/// macro's `$mtp.<closure>` for `step.<method>` and
-/// `run_mtp_cycle_inner(&mut $mtp, ..)` for `run_mtp_cycle(step, ..)`.
-///
-/// The macro→method swaps (the ONLY substantive change vs the original
-/// body):
-///   * `($mtp.forward_with_hidden)(ids, emb)` → `step.forward_with_hidden(ids, emb)`
-///   * `($mtp.eval_step)(t, l, b)` → `step.eval_step(t, l, b)`
-///   * `($mtp.begin_cycle)(c)` → `step.begin_cycle(c)`
-///   * `$mtp.committed_history_active` (field) → `step.committed_history_active()`
-///   * `($mtp.eval_step_with_chained_hidden)(y, h)` → `step.eval_step_with_chained_hidden(y, h)`
-///   * `($mtp.rollback_unemitted)(u)` → `step.rollback_unemitted(u)`
-///   * `run_mtp_cycle_inner(&mut $mtp, ..)` → `run_mtp_cycle(step, ..)`
-///
-/// The post-loop `replay_err_cell` / `mtp_desynced` reads become the
-/// engine-owned `step.take_replay_error()?` / `step.into_desynced()` outs.
-///
-/// The optional `streaming` arm is the engine-owned analog of
-/// `decode_loop_mtp!`'s `$(, streaming: {...})?`: the relocated
-/// per-token streaming emit points at the SAME three sites the sync path
-/// pushes (the initial-`y` push, Step A's sampled token, and the cycle
-/// emit loop) plus the pre-loop cancellation break, routed through the
-/// shared [`StreamingCtx`] / [`crate::engine::backend::StreamEmitter`] /
+/// The optional `streaming` arm emits at the SAME three sites the sync path
+/// pushes (the initial-`y` push, Step A's sampled token, and the cycle emit
+/// loop) plus the pre-loop cancellation break, routed through the shared
+/// [`StreamingCtx`] / [`crate::engine::backend::StreamEmitter`] /
 /// [`crate::engine::backend::ChunkSink`] abstraction — the SAME emitter
 /// type / incremental detokenization (`step_decode_stream`) /
 /// reasoning-suppression gate `run_decode_loop` uses. `None` ⇒ the SYNC
@@ -1293,7 +1081,6 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         generation_stream,
         prompt_hidden,
         prompt_hidden_ids,
-        prompt_hidden_position_base,
         cancel_flag,
     } = args;
     // One closure for every cancel snapshot point below — sync turns poll
@@ -1329,7 +1116,6 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     let setup = MtpTurnSetup {
         prompt_hidden: prompt_hidden.as_ref(),
         prompt_hidden_ids: prompt_hidden_ids.as_deref(),
-        prompt_hidden_position_base,
         first_sampled_token,
         lookahead_rows,
     };
@@ -1340,7 +1126,6 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             event = "mtp_stepper_ready",
             depth,
             prompt_hidden_tokens = setup.prompt_hidden_ids.map_or(0, |ids| ids.len()),
-            position_base = prompt_hidden_position_base,
             elapsed_ms = decode_progress.turn_start.elapsed().as_secs_f64() * 1000.0,
             "MTP stepper ready"
         );
@@ -1484,8 +1269,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         hist.push(initial_token_id);
         profiler.step();
         let _is_reasoning = tracker.observe_token(initial_token_id);
-        // Streaming-only — relocated VERBATIM from `decode_loop_mtp!`'s
-        // initial-`$y` arm. The initial seed's cancel-check just SKIPS the
+        // Streaming-only. The initial seed's cancel-check just SKIPS the
         // detok+emit (NO break, unlike Step A / the emit loop): a cancel
         // before the first forward leaves the seed committed but unstreamed.
         // Detokenize + length-advance stay OUTSIDE the emitter's gate so
@@ -1549,9 +1333,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             last_in_cache = false;
             break;
         }
-        // Pre-loop cancel check — relocated VERBATIM from
-        // `decode_loop_mtp!` (it sits between the EOS pre-check and the
-        // repetition pre-check). A cancel observed at the iteration top
+        // Pre-loop cancel check, between the EOS pre-check and the
+        // repetition pre-check. A cancel observed at the iteration top
         // exits "cancelled" before any forward; the last emitted token is
         // the unforwarded seed/boundary, so it is not yet in the cache.
         // H2: `turn_cancelled()` extends the SAME poll to sync turns
@@ -1599,8 +1382,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // `MLX_MTP_CHAINED_CYCLES=0`): always Step A, byte-exact with
         // the non-chained path. On M1–M4 the chained path still
         // regresses depth-3 acceptance (a lazy-slice eval-scheduling
-        // stall), see the comment block at the top of
-        // `decode_loop_mtp!` for details.
+        // stall).
         //
         // On the chained path the prior cycle's verify already
         // committed all accepted tokens' K/V, and the next cycle's
@@ -1670,9 +1452,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             profiler.step();
             let _is_reasoning = tracker.observe_token(token_id);
 
-            // Relocated VERBATIM from `decode_loop_mtp!`'s Step A arm. It
-            // runs AFTER `observe_token` and BEFORE the EOS check (the
-            // macro's order): a cancel observed here breaks "cancelled"
+            // Runs AFTER `observe_token` and BEFORE the EOS check: a
+            // cancel observed here breaks "cancelled"
             // (the just-committed token is unforwarded, so
             // `last_in_cache = false`); otherwise detokenize +
             // length-advance (outside the emitter's gate) then emit
@@ -1992,9 +1773,8 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
             // only the prefix that was really pushed.
             profiler.step();
             let _is_reasoning = tracker.observe_token(tok_id);
-            // Relocated VERBATIM from `decode_loop_mtp!`'s emit-loop arm.
-            // It runs AFTER `observe_token` and BEFORE the EOS check (the
-            // macro's order). A cancel here breaks "cancelled": the last
+            // Runs AFTER `observe_token` and BEFORE the EOS check.
+            // A cancel here breaks "cancelled": the last
             // outcome token is the unforwarded boundary (bonus/residual),
             // so keep an earlier emitted token (verify wrote its K/V) but
             // drop the boundary —
@@ -2222,8 +2002,6 @@ mod tests {
         ForwardWithHidden,
         DraftStep,
         VerifyStep { depth: usize },
-        VerifyStepArgmaxOnly { depth: usize },
-        VerifyStepSparse { depth: usize },
         SnapshotMainLinear,
         Rollback { accepted: usize, depth: usize },
         RestoreAndReplayMain { accepted: usize },
@@ -2258,11 +2036,6 @@ mod tests {
     /// [`MtpStepper::into_desynced`] terminal value (paged MUST be false);
     /// `replay_error` lets a test script a stashed rollback error the
     /// engine would surface via [`MtpStepper::take_replay_error`].
-    ///
-    /// `has_argmax_only` / `has_sparse` gate the optional verify fast paths
-    /// (default-`None` on every eager family today) so a test can prove
-    /// both the "fast path present" and "fall back to verify_step" arms
-    /// compile and dispatch.
     struct MockMtpStepper {
         ledger: RefCell<Vec<Call>>,
         embedding: Embedding,
@@ -2270,8 +2043,6 @@ mod tests {
         relabel: Option<&'static str>,
         desynced: bool,
         replay_error: RefCell<Option<Error>>,
-        has_argmax_only: bool,
-        has_sparse: bool,
         // ---- canned-array driving (the `run_mtp_cycle` integration path) ----
         // When `Some`, `draft_step` / `verify_step` return REAL shaped MLX
         // arrays so `run_mtp_cycle` executes its T=0 sparse-accept branch with
@@ -2402,8 +2173,6 @@ mod tests {
                 relabel: None,
                 desynced: false,
                 replay_error: RefCell::new(None),
-                has_argmax_only: false,
-                has_sparse: false,
                 cycle: None,
                 turn: None,
                 shared_ledger: None,
@@ -2689,41 +2458,6 @@ mod tests {
             }
         }
 
-        fn verify_step_argmax_only(
-            &mut self,
-            _ids: &MxArray,
-            _embedding: &Embedding,
-            depth: usize,
-        ) -> Option<Result<MtpVerifyOutput>> {
-            self.record(Call::VerifyStepArgmaxOnly { depth });
-            if self.has_argmax_only {
-                Some(Ok(MtpVerifyOutput::logits_only(
-                    lazy_scalar(0.0),
-                    lazy_scalar(0.0),
-                )))
-            } else {
-                None
-            }
-        }
-
-        fn verify_step_sparse(
-            &mut self,
-            _ids: &MxArray,
-            _embedding: &Embedding,
-            depth: usize,
-            _cfg: &SamplingConfig,
-        ) -> Option<Result<MtpVerifyOutput>> {
-            self.record(Call::VerifyStepSparse { depth });
-            if self.has_sparse {
-                Some(Ok(MtpVerifyOutput::logits_only(
-                    lazy_scalar(0.0),
-                    lazy_scalar(0.0),
-                )))
-            } else {
-                None
-            }
-        }
-
         fn snapshot_main_linear(&mut self) {
             self.record(Call::SnapshotMainLinear);
             self.snap_pos.set(self.state_pos.get());
@@ -2879,9 +2613,7 @@ mod tests {
             prev_emb = lazy_scalar(0.0);
         }
 
-        // Snapshot → verify (fast-path probe falls through to verify_step).
         step.snapshot_main_linear();
-        let _argmax = step.verify_step_argmax_only(&lazy_scalar(0.0), &emb, depth);
         let _verify = step
             .verify_step(&lazy_scalar(0.0), &emb, depth)
             .expect("mock verify never fails");
@@ -2936,7 +2668,6 @@ mod tests {
                 Call::DraftStep,
                 Call::DraftStep,
                 Call::SnapshotMainLinear,
-                Call::VerifyStepArgmaxOnly { depth: 3 },
                 Call::VerifyStep { depth: 3 },
                 Call::CommitMtp {
                     anchor: MtpCommitAnchor::IncludeAnchor,
@@ -2980,37 +2711,6 @@ mod tests {
                 depth: 2,
             }),
             "full accept still calls rollback(accepted=depth, depth) for GDN normalization"
-        );
-    }
-
-    #[test]
-    fn mtp_stepper_verify_fast_paths_dispatch() {
-        let embedding = MockMtpStepper::new().embedding;
-        // argmax-only fast path present → returns Some, engine uses it.
-        let mut argmax = MockMtpStepper::new();
-        argmax.has_argmax_only = true;
-        let r = argmax.verify_step_argmax_only(&lazy_scalar(0.0), &embedding, 4);
-        assert!(r.is_some(), "argmax-only present must return Some");
-        assert!(r.expect("present").is_ok());
-
-        // sparse fast path present → Some; absent default → None (fall back
-        // to verify_step, the eager-family shape).
-        let mut sparse = MockMtpStepper::new();
-        sparse.has_sparse = true;
-        let cfg = SamplingConfig::default();
-        let s = sparse.verify_step_sparse(&lazy_scalar(0.0), &embedding, 4, &cfg);
-        assert!(s.is_some(), "sparse present must return Some");
-
-        let mut none = MockMtpStepper::new();
-        assert!(
-            none.verify_step_argmax_only(&lazy_scalar(0.0), &embedding, 4)
-                .is_none(),
-            "absent argmax-only default is None"
-        );
-        assert!(
-            none.verify_step_sparse(&lazy_scalar(0.0), &embedding, 4, &cfg)
-                .is_none(),
-            "absent sparse default is None"
         );
     }
 
@@ -3132,8 +2832,8 @@ mod tests {
 
     /// Run one scripted `run_mtp_cycle` over the canned mock with an explicit
     /// EV depth policy and commit anchor. Forces the sparse-accept gate ON so
-    /// the deterministic T=0 branch runs regardless of `MLX_MTP_SPARSE_ACCEPT`,
-    /// and enables the profiler so `ran_sparse` can fail-closed.
+    /// the deterministic T=0 branch runs, and enables the profiler so
+    /// `ran_sparse` can fail-closed.
     fn run_scripted_cycle_full(
         vocab: i64,
         hidden: i64,
@@ -4318,7 +4018,6 @@ mod tests {
                 generation_stream,
                 prompt_hidden: None,
                 prompt_hidden_ids: None,
-                prompt_hidden_position_base: 0,
                 cancel_flag,
             },
             // The whole-turn mock tests drive the SYNC path.
@@ -4968,7 +4667,6 @@ mod tests {
                 generation_stream,
                 prompt_hidden: None,
                 prompt_hidden_ids: None,
-                prompt_hidden_position_base: 0,
                 cancel_flag: None,
             },
             None,

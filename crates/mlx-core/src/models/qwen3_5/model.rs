@@ -1500,10 +1500,6 @@ pub(crate) struct ChatDecodeInputs {
     /// forwarded. `prompt_hidden.shape(1) == prompt_hidden_ids.len()`.
     /// `Some` iff `prompt_hidden` is `Some`.
     pub prompt_hidden_ids: Option<Vec<u32>>,
-    /// Absolute committed-history position of `prompt_hidden_ids[0]`'s hidden
-    /// row. Zero for full committed history; non-zero for last-window prompt
-    /// seeding.
-    pub prompt_hidden_position_base: usize,
 }
 
 // ========== Qwen35Inner implementation ==========
@@ -4033,20 +4029,13 @@ impl Qwen35Inner {
         // logits-only prefill — they do not feed the dense MTP
         // committed-history path.
         //
-        // `MLX_MTP_NO_PROMPT_PREFILL=1` opts OUT — the prefill stays
-        // logits-only and the MTP committed-history starts empty.
-        //
         // Cache-reuse turns: when `cached_prefix_len > 0` the prefill
         // only processes the uncached SUFFIX, so the captured hidden
         // tensor would cover the suffix — not the full prompt. The
         // prompt-prefill seed REQUIRES the full prompt's hiddens, so it
         // is skipped on cache-reuse turns; committed-history still runs
         // (it starts empty and builds from decode tokens — correct).
-        let want_prompt_hidden = p.enable_mtp
-            && self.has_mtp_weights()
-            && !mtp_decode::mtp_no_prompt_prefill()
-            && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(prefill_tokens.len());
+        let want_prompt_hidden = p.enable_mtp && self.has_mtp_weights() && cached_prefix_len == 0;
 
         // === Text prefill ===
         profiler.begin_prefill();
@@ -4063,7 +4052,7 @@ impl Qwen35Inner {
                     &self.final_norm,
                     &self.lm_head,
                     generation_stream,
-                    Some(mtp_prompt_history.keep_tokens),
+                    Some(prefill_tokens.len()),
                     turn_cancel.as_deref(),
                 )
                 .map(|(logits, ph)| {
@@ -4135,18 +4124,9 @@ impl Qwen35Inner {
             embedding,
             generation_stream,
             params: p,
-            // `prompt_hidden` is `Some` iff the hidden-emitting prefill ran;
-            // pair it with the exact prompt tail whose hiddens it holds.
-            prompt_hidden_ids: prompt_hidden.as_ref().map(|_| {
-                let start = mtp_prompt_history
-                    .hidden_start_token_index()
-                    .min(prefill_tokens.len());
-                prefill_tokens[start..].to_vec()
-            }),
-            prompt_hidden_position_base: prompt_hidden
-                .as_ref()
-                .map(|_| mtp_prompt_history.position_base)
-                .unwrap_or(0),
+            // `prompt_hidden` is `Some` iff the hidden-emitting prefill ran,
+            // and that prefill always covers the whole prompt.
+            prompt_hidden_ids: prompt_hidden.as_ref().map(|_| prefill_tokens.clone()),
             prompt_hidden,
         })
     }
@@ -4358,7 +4338,6 @@ impl Qwen35Inner {
             // MTP committed-history cache.
             prompt_hidden: None,
             prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
         })
     }
 
@@ -4404,7 +4383,6 @@ impl Qwen35Inner {
             params: p,
             prompt_hidden,
             prompt_hidden_ids,
-            prompt_hidden_position_base,
         } = inputs;
 
         // Pure-Rust ("eager") dense MTP. Gated on the same per-request /
@@ -4510,7 +4488,6 @@ impl Qwen35Inner {
                     generation_stream,
                     prompt_hidden,
                     prompt_hidden_ids,
-                    prompt_hidden_position_base,
                     // H2: sync turns cancel through the engine loop's
                     // ungated polls (this site has no StreamingCtx).
                     cancel_flag: turn_cancel.as_deref(),
@@ -4693,7 +4670,6 @@ impl Qwen35Inner {
         generation_stream: Stream,
         prompt_hidden: Option<MxArray>,
         prompt_hidden_ids: Option<Vec<u32>>,
-        prompt_hidden_position_base: usize,
         last_in_cache: &mut bool,
     ) -> Result<()> {
         // The turn profiler relabel ("mtp_eager") now moves into
@@ -4739,7 +4715,6 @@ impl Qwen35Inner {
                 generation_stream,
                 prompt_hidden,
                 prompt_hidden_ids,
-                prompt_hidden_position_base,
                 // H2: the same flag StreamingCtx carries — the engine's
                 // ungated polls and the streaming reads are idempotent.
                 cancel_flag: Some(cancelled),
@@ -5194,9 +5169,7 @@ impl Qwen35Inner {
         // the suffix-only prefill cannot produce the full prompt's hidden
         // tensor.
         let eager_mtp_paged = p.enable_mtp && self.has_mtp_weights();
-        let want_prompt_hidden =
-            eager_mtp_paged && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
+        let want_prompt_hidden = eager_mtp_paged && cached_prefix_len == 0;
         let mut mtp_profiler = begin_paged_mtp_profiler(eager_mtp_paged, suffix_len);
 
         // === PREFILL ===
@@ -5205,7 +5178,7 @@ impl Qwen35Inner {
             suffix,
             cached_prefix_len,
             gdn_prefix_already_primed,
-            want_prompt_hidden.then_some(mtp_prompt_history.keep_tokens),
+            want_prompt_hidden.then_some(tokens.len()),
             &layer_kinds,
             "paged_turn_sync_core_inner",
         )?;
@@ -5276,17 +5249,11 @@ impl Qwen35Inner {
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-            // Prompt-tail ids + position base for the committed-history seed.
-            // `prompt_hidden` is only `Some` when `want_prompt_hidden` held,
-            // which already requires `cached_prefix_len == 0` (=> position_base
-            // is 0 on those turns), so committed-history v2 is correct.
-            let prompt_hidden_position_base = mtp_prompt_history.position_base;
-            let prompt_hidden_ids: Vec<u32> = {
-                let start = mtp_prompt_history
-                    .hidden_start_token_index()
-                    .min(tokens.len());
-                tokens[start..].to_vec()
-            };
+            // Prompt-tail ids for the committed-history seed. `prompt_hidden`
+            // is only `Some` when `want_prompt_hidden` held, which already
+            // requires `cached_prefix_len == 0`, so the captured hiddens cover
+            // the whole prompt.
+            let prompt_hidden_ids: Vec<u32> = tokens.to_vec();
 
             let mut rng = rand::rng();
 
@@ -5319,7 +5286,6 @@ impl Qwen35Inner {
                     generation_stream,
                     prompt_hidden,
                     prompt_hidden_ids: Some(prompt_hidden_ids),
-                    prompt_hidden_position_base,
                     // H2: sync paged MTP cancels through the engine loop's
                     // ungated polls (no StreamingCtx on this site).
                     cancel_flag: turn_cancel.as_deref(),
@@ -6810,9 +6776,7 @@ impl Qwen35Inner {
         // committed-history v2 seed, same as the sync core. Only capture it
         // when the eager paged MTP arm will actually run.
         let eager_mtp_paged = p.enable_mtp && self.has_mtp_weights();
-        let want_prompt_hidden =
-            eager_mtp_paged && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
+        let want_prompt_hidden = eager_mtp_paged && cached_prefix_len == 0;
         let inference_info_enabled =
             tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
         let prefill_trace_start = inference_info_enabled.then(std::time::Instant::now);
@@ -6824,11 +6788,7 @@ impl Qwen35Inner {
                 suffix_tokens = suffix_len,
                 cached_prefix_tokens = cached_prefix_len,
                 mtp = eager_mtp_paged,
-                keep_prompt_hidden_tokens = if want_prompt_hidden {
-                    mtp_prompt_history.keep_tokens
-                } else {
-                    0
-                },
+                keep_prompt_hidden_tokens = if want_prompt_hidden { tokens.len() } else { 0 },
                 "prefill started"
             );
         }
@@ -6839,7 +6799,7 @@ impl Qwen35Inner {
             suffix,
             cached_prefix_len,
             gdn_prefix_already_primed,
-            want_prompt_hidden.then_some(mtp_prompt_history.keep_tokens),
+            want_prompt_hidden.then_some(tokens.len()),
             &layer_kinds,
             "paged_turn_stream_core_inner",
         )?;
@@ -6913,13 +6873,7 @@ impl Qwen35Inner {
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-            let prompt_hidden_position_base = mtp_prompt_history.position_base;
-            let prompt_hidden_ids: Vec<u32> = {
-                let start = mtp_prompt_history
-                    .hidden_start_token_index()
-                    .min(tokens.len());
-                tokens[start..].to_vec()
-            };
+            let prompt_hidden_ids: Vec<u32> = tokens.to_vec();
 
             let mut rng = rand::rng();
 
@@ -6930,7 +6884,6 @@ impl Qwen35Inner {
                     turn_id = trace_turn_id,
                     depth = p.mtp_depth,
                     prompt_hidden_tokens = prompt_hidden_ids.len(),
-                    position_base = prompt_hidden_position_base,
                     elapsed_ms = turn_trace_start.map(elapsed_ms).unwrap_or(0.0),
                     "MTP decode started"
                 );
@@ -6975,7 +6928,6 @@ impl Qwen35Inner {
                     generation_stream,
                     prompt_hidden,
                     prompt_hidden_ids: Some(prompt_hidden_ids),
-                    prompt_hidden_position_base,
                     // H2: the same flag StreamingCtx carries — the engine's
                     // ungated polls and the streaming reads are idempotent.
                     cancel_flag: Some(cancelled),
@@ -7380,7 +7332,6 @@ impl Qwen35Inner {
                 generation_stream,
                 None,
                 None,
-                0,
                 &mut last_in_cache,
             )?;
         } else {
@@ -7807,9 +7758,7 @@ impl Qwen35Inner {
         // only the hidden-emitting prefill produces. Skip on cache-reuse turns
         // (the captured hidden would cover the SUFFIX, not the full prompt) —
         // committed-history still runs (it builds from decode tokens).
-        let want_prompt_hidden =
-            eager_mtp && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(prefill_tokens.len());
+        let want_prompt_hidden = eager_mtp && cached_prefix_len == 0;
         let mut prompt_hidden: Option<MxArray> = None;
 
         // Text prefill
@@ -7826,7 +7775,7 @@ impl Qwen35Inner {
                     &self.final_norm,
                     &self.lm_head,
                     generation_stream,
-                    Some(mtp_prompt_history.keep_tokens),
+                    Some(prefill_tokens.len()),
                     turn_cancel.as_deref(),
                 )
                 .map(|(logits, ph)| {
@@ -7886,18 +7835,10 @@ impl Qwen35Inner {
         let mut last_is_reasoning = starts_in_thinking;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
-        // Pair the captured prompt hidden with the exact prompt tail whose
-        // hiddens it holds (mirrors the non-stream caller at 1708-1717).
-        let prompt_hidden_ids: Option<Vec<u32>> = prompt_hidden.as_ref().map(|_| {
-            let start = mtp_prompt_history
-                .hidden_start_token_index()
-                .min(prefill_tokens.len());
-            prefill_tokens[start..].to_vec()
-        });
-        let prompt_hidden_position_base = prompt_hidden
-            .as_ref()
-            .map(|_| mtp_prompt_history.position_base)
-            .unwrap_or(0);
+        // The hidden-emitting prefill always covers the whole prompt, so the
+        // captured hidden pairs with every prefill token.
+        let prompt_hidden_ids: Option<Vec<u32>> =
+            prompt_hidden.as_ref().map(|_| prefill_tokens.clone());
 
         // Whether the final committed token reached the physical KV/GDN cache;
         // written by the decode driver so the save below drops it when it was
@@ -7925,7 +7866,6 @@ impl Qwen35Inner {
                 generation_stream,
                 prompt_hidden,
                 prompt_hidden_ids,
-                prompt_hidden_position_base,
                 &mut last_in_cache,
             )?;
         } else {
@@ -11399,18 +11339,13 @@ impl MtpBackend for Qwen35Inner {
         let embedding = self.embedding.clone();
         let config = self.config.clone();
 
-        // Committed-history is only correct when the prompt tail's hiddens
-        // start at absolute position 0 (the eager drafter derives RoPE purely
-        // from the local cache offset) AND the matching prompt seed is
-        // actually present. Cache-reuse continuations do not capture
-        // full-prompt hiddens; their default position base is still zero, so
-        // checking the base alone would falsely advertise an empty drafter
-        // cache as prompt-committed. Chained cycles would then skip the
-        // main-model anchor against that nonexistent history and could
-        // diverge from the full-reprefill heal. Seedless turns fall back to
-        // v1 cycle-history.
-        let has_prompt_seed = setup.prompt_hidden_position_base == 0
-            && setup.prompt_hidden.is_some()
+        // Committed history needs the prompt seed itself, not just a prompt.
+        // Cache-reuse continuations do not capture full-prompt hiddens;
+        // advertising an empty drafter cache as prompt-committed would let
+        // chained cycles skip the main-model anchor against a nonexistent
+        // history and diverge from the full-reprefill heal. Seedless turns
+        // fall back to cycle history.
+        let has_prompt_seed = setup.prompt_hidden.is_some()
             && setup.prompt_hidden_ids.is_some_and(|ids| !ids.is_empty());
         let use_committed = has_prompt_seed;
 
@@ -11546,7 +11481,6 @@ impl MtpBackend for Qwen35Inner {
                 seed_tokens,
                 chunks = seed_chunks,
                 max_chunk_tokens = 7,
-                position_base = setup.prompt_hidden_position_base,
                 setup_elapsed_ms = seed_trace_start.map(elapsed_ms).unwrap_or(0.0),
                 "MTP prompt seed completed"
             );
@@ -17295,7 +17229,6 @@ mod paged_construction_tests {
         let setup = MtpTurnSetup {
             prompt_hidden: None,
             prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
             first_sampled_token: 21,
             lookahead_rows: lookahead,
         };
@@ -17653,7 +17586,6 @@ mod paged_construction_tests {
         let setup = MtpTurnSetup {
             prompt_hidden: None,
             prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
             first_sampled_token: 21,
             lookahead_rows: lookahead,
         };

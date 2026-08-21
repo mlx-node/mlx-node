@@ -2896,7 +2896,6 @@ impl Qwen35MoeInner {
                     generation_stream,
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
-                    prompt_hidden_position_base: 0,
                     // H2: sync turns cancel through the engine loop's
                     // ungated polls (this site has no StreamingCtx).
                     cancel_flag: turn_cancel.as_deref(),
@@ -5195,7 +5194,6 @@ impl Qwen35MoeInner {
                     generation_stream,
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
-                    prompt_hidden_position_base: 0,
                     // H2: the same flag StreamingCtx carries — the engine's
                     // ungated polls and the streaming reads are idempotent.
                     cancel_flag: Some(cancelled),
@@ -5603,7 +5601,6 @@ impl Qwen35MoeInner {
                     generation_stream,
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
-                    prompt_hidden_position_base: 0,
                     // H2: sync turns cancel through the engine loop's
                     // ungated polls (this site has no StreamingCtx).
                     cancel_flag: turn_cancel.as_deref(),
@@ -5907,7 +5904,6 @@ impl Qwen35MoeInner {
                     generation_stream,
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
-                    prompt_hidden_position_base: 0,
                     // H2: the same flag StreamingCtx carries — the engine's
                     // ungated polls and the streaming reads are idempotent.
                     cancel_flag: Some(cancelled),
@@ -8909,8 +8905,7 @@ fn moe_mtp_committed_history_enabled() -> bool {
 /// fresh cache) and [`Self::commit_mtp`] appends each cycle's newly committed
 /// tokens' exact K/V, so the drafter's cache persists across cycles within a
 /// turn. `use_committed` is opt-in: it requires the
-/// `MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY` flag AND
-/// `setup.prompt_hidden_position_base == 0`. With the flag off (the default)
+/// `MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY` flag. With the flag off (the default)
 /// `use_committed` is `false`, so this stepper falls back to CYCLE-HISTORY v1
 /// (fresh drafter cache each cycle, no-op commit) — byte-for-byte the prior
 /// behavior. The prompt-prefix seed in [`MtpBackend::begin_mtp_decode`]
@@ -9351,16 +9346,9 @@ impl MtpBackend for Qwen35MoeInner {
         let config = self.config.clone();
         let fa_idx = self.fa_idx;
 
-        // Committed-history is opt-in (default off) and only correct when the
-        // prompt tail's hiddens start at absolute position 0 (the eager
-        // drafter derives RoPE purely from the local cache offset) — mirrors
-        // `DenseMtpStepper::begin_mtp_decode`'s gate, plus the
-        // `MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY` flag. No MoE call site
-        // populates a real `prompt_hidden_position_base` yet (see the struct
-        // doc), so the position gate is always satisfied today; the flag is
-        // what makes this `true`.
-        let use_committed =
-            moe_mtp_committed_history_enabled() && setup.prompt_hidden_position_base == 0;
+        // Committed history is opt-in (default off) behind the
+        // `MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY` flag.
+        let use_committed = moe_mtp_committed_history_enabled();
 
         let mut stepper = MoeMtpStepper {
             inner: self,

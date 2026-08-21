@@ -193,14 +193,22 @@ pub(crate) struct SpeculativePlan {
 impl SpeculativePlan {
     /// The one Barrier-vs-Scheduled decision every admission gate consults.
     ///
-    /// Always [`SpeculativeLane::Barrier`] today. Flipping any configuration
-    /// to `Scheduled` (planned behind `MLX_MTP_SCHEDULED=1`) requires the
-    /// scheduler to reserve [`Self::lookahead_rows`] slots per verify cycle,
-    /// roll back rejected rows per sequence, and key drafter state by owner;
-    /// none of that machinery exists yet. The gemma4/muse `execute_barrier`
-    /// flat-lane owner installs are cache-layout decisions (which cache
-    /// representation a live owner occupies), not lane decisions, and remain
-    /// family-owned regardless of this value.
+    /// Always [`SpeculativeLane::Barrier`] today, and it must stay that way
+    /// until four things exist, none of which does:
+    ///   * a scheduler step contract wider than one token per decode row
+    ///     (`engine::scheduler` hard-codes `StepKind::Decode => 1` and one
+    ///     `generated_token` per row);
+    ///   * a batched ragged verify — every [`crate::engine::backend::MtpStepper`]
+    ///     signature bakes in batch 1;
+    ///   * per-owner speculative state, so two speculative rows cannot
+    ///     clobber one model-level drafter cache / tape / snapshot;
+    ///   * re-entrant speculative drivers — `run_mtp_turn` / `run_dspark_turn`
+    ///     own the whole turn plus `&mut model`.
+    ///
+    /// The gemma4/muse `execute_barrier` flat-lane owner installs are
+    /// cache-layout decisions (which cache representation a live owner
+    /// occupies), not lane decisions, and remain family-owned regardless of
+    /// this value.
     pub const fn lane(self) -> SpeculativeLane {
         SpeculativeLane::Barrier
     }

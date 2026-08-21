@@ -148,7 +148,6 @@ fn grouped_d512_stripe_override() -> Option<u32> {
         grouped_d512_stripe_override_value(
             std::env::var("MLX_PAGED_GROUPED_D512_STRIPES")
                 .ok()
-                .or_else(|| std::env::var("MLX_PAGED_GROUPED_GEMMA4_STRIPES").ok())
                 .as_deref(),
         )
     })
@@ -242,12 +241,7 @@ fn grouped_d512_paged_attention_mode() -> GroupedD512Mode {
     // Gemma-specific variable remains a compatibility alias.
     static MODE: OnceLock<GroupedD512Mode> = OnceLock::new();
     *MODE.get_or_init(|| {
-        grouped_d512_env_mode_value(
-            std::env::var("MLX_PAGED_GROUPED_D512")
-                .ok()
-                .or_else(|| std::env::var("MLX_PAGED_GROUPED_GEMMA4").ok())
-                .as_deref(),
-        )
+        grouped_d512_env_mode_value(std::env::var("MLX_PAGED_GROUPED_D512").ok().as_deref())
     })
 }
 

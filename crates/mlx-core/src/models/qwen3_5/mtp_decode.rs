@@ -1,13 +1,12 @@
 //! Qwen3.5 MTP (Multi-Token Prediction) speculative-decode machinery.
 //!
-//! Family-specific in refactor phase 1: the cached MTP env-flag readers,
-//! draft/verify helpers, history-policy resolution, and the shared cycle
-//! data types (`MtpCommitAnchor` / `MtpCycleOutcome` / `MtpVerifyOutput`)
-//! that only the MTP path consumes. The engine-owned propose/verify loop
-//! (`crate::engine::mtp_turn::run_mtp_turn` / `run_mtp_cycle`) drives them.
-//! The model-neutral AR decode infrastructure lives in
-//! [`crate::engine`]; shared items needed by both the AR and MTP paths
-//! (`apply_all_penalties`, the `mtp_trace_logits` / `trace_top2` trace
+//! Holds the cached MTP env-flag readers, the draft/verify helpers, and the
+//! shared cycle data types (`MtpCommitAnchor` / `MtpCycleOutcome` /
+//! `MtpVerifyOutput`) that only the MTP path consumes. The engine-owned
+//! propose/verify loop (`crate::engine::mtp_turn::run_mtp_turn` /
+//! `run_mtp_cycle`) drives them. The model-neutral AR decode infrastructure
+//! lives in [`crate::engine`]; shared items needed by both the AR and MTP
+//! paths (`apply_all_penalties`, the `mtp_trace_logits` / `trace_top2` trace
 //! helpers) are imported from there.
 
 use std::sync::OnceLock;
@@ -17,7 +16,7 @@ use napi::bindgen_prelude::*;
 use crate::array::MxArray;
 use crate::engine::decode::Top2;
 use crate::nn::Embedding;
-use crate::sampling::{self, SamplingConfig};
+use crate::sampling::SamplingConfig;
 
 // ---------------------------------------------------------------------------
 // MTP runtime flag inventory
@@ -32,15 +31,9 @@ use crate::sampling::{self, SamplingConfig};
 //
 // | Knob                          | Default | Opt direction |
 // |-------------------------------|---------|---------------|
-// | `MLX_MTP_USE_TAPE_REPLAY`     | ON      | opt-OUT       |
 // | `mtpAdaptiveDepth` (TS field) | OFF*    | per-session   |
 // | `MLX_MTP_ADAPTIVE_DEPTH_MODE` | throughput | opt-IN EV  |
 // | `MLX_MTP_CHAINED_CYCLES`      | M5+ ON, M1–M4 OFF | gen-gated |
-// | `MLX_MTP_VERIFY_ASYNC_EVAL`   | ON      | opt-OUT       |
-// | `MLX_MTP_DEFER_VERIFY_HIDDEN` | ON      | opt-OUT       |
-// | `MLX_MTP_HISTORY_POLICY`      | committed | opt-IN window |
-// | `MLX_MTP_SPARSE_ACCEPT`       | ON      | opt-OUT       |
-// | `MLX_MTP_BATCH_TARGET_ARRAYS` | ON      | opt-OUT       |
 // | `MLX_MTP_TRACE_ACCEPTANCE`    | OFF     | opt-IN        |
 //
 // * adaptive depth is opt-in. When unset, MTP pins depth 1 because current
@@ -53,8 +46,6 @@ use crate::sampling::{self, SamplingConfig};
 //   `MLX_MTP_EV_ALLOW_DEEPEN=0` to pin the base depth.
 //
 // Interaction notes:
-//   - `MLX_MTP_USE_TAPE_REPLAY=0` falls back to the K+1 replay path; safe to
-//     combine with all other flags.
 //   - `MLX_MTP_CHAINED_CYCLES` is GPU-generation-gated: default ON on M5+
 //     (arch gen >= 17), default OFF on M1–M4 (gen 13–16). Force OFF with
 //     `MLX_MTP_CHAINED_CYCLES=0` (even on M5+) or ON with `=1` (even on
@@ -68,55 +59,6 @@ use crate::sampling::{self, SamplingConfig};
 //     (affine +16%, nvfp4 byte-identical to AR). On M1–M4 it helps only at
 //     depth 1 and REGRESSES depth-3 acceptance (a lazy-slice eval-scheduling
 //     stall), so it stays OFF there pending that fix.
-//   - `MLX_MTP_VERIFY_ASYNC_EVAL=1` overlaps verify dispatch with the
-//     accept loop's CPU-side graph construction; composes cleanly with
-//     all other flags.
-
-// Async verify-eval pipeline.
-//
-// Replaces the synchronous `verify_logits.eval()` at the end of
-// the MTP cycle's verify step with a single batched
-// `mlx::core::async_eval` over `(verify_logits, verify_hiddens)`. The
-// dispatch is non-blocking, so CPU control flow continues into the
-// accept loop's penalty / softmax / slice graph construction while the
-// GPU is still running the verify command buffer. The first downstream
-// `eval()` (the accept loop's `p_target.eval()`) then implicitly
-// synchronizes. Semantic equivalent of MTPLX's `LAZY_VERIFY_LOGITS`
-// (`MTPLX/mtplx/generation.py:49, 3894`) — both defer the verify-logits
-// sync until the accept loop's first downstream `.eval()`.
-//
-// Opt-out: `MLX_MTP_VERIFY_ASYNC_EVAL=0` (or `false` / `off`) reverts
-// to the synchronous `verify_logits.eval()` barrier (byte-identical
-// acceptance). Default ON. The env var is read once per process and cached.
-pub(crate) fn mtp_verify_async_eval() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_VERIFY_ASYNC_EVAL") {
-        Ok(v) => {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        }
-        Err(_) => true, // default ON — overlaps verify dispatch with accept-loop graph construction
-    })
-}
-
-// Defer verify hidden materialization.
-//
-// The T=0 sparse-accept path needs verifier logits for one batched
-// argmax, but it does not need the full `[1, D+1, hidden]` tensor
-// eagerly. The commit graph consumes only the accepted prefix, and the
-// chained path consumes only the K-th hidden slice. Default ON to match
-// MTPLX's "logits first, accepted hidden slice later" policy; opt out
-// for bisecting lazy-graph scheduling issues.
-pub(crate) fn mtp_defer_verify_hidden_eval() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_DEFER_VERIFY_HIDDEN") {
-        Ok(v) => {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        }
-        Err(_) => true,
-    })
-}
 
 /// Break-even first-draft acceptance rate for the MTP acceptance gate.
 ///
@@ -243,31 +185,6 @@ pub(crate) fn mtp_accept_gate_blocks(accepted: u64, attempted: u64) -> bool {
     cdf < 0.05
 }
 
-// MTPLX-style stochastic verify scheduling.
-//
-// In the T>0 sparse-accept path, target top-k distributions are the first
-// consumer of verifier logits. Evaluating the full `[D+1, vocab]` logits tensor
-// before that duplicates the synchronization MTPLX avoids with
-// `MTPLX_DEFER_VERIFY_HIDDEN_EVAL=1`: it builds/evals the target distribution
-// directly from lazy verifier logits, then materializes only the accepted hidden
-// prefix later during commit/chaining.
-//
-// Opt-in only: on this MLX native path the lazy sparse-distribution graph can be
-// more expensive than the explicit verify eval plus top-k pass. Keep it as a
-// measurement knob rather than a default.
-pub(crate) fn mtp_target_distribution_first_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(
-        || match std::env::var("MLX_MTP_TARGET_DISTRIBUTION_FIRST") {
-            Ok(v) => {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-            }
-            Err(_) => false,
-        },
-    )
-}
-
 /// Minimum GPU architecture generation for chained MTP cycles to default ON.
 /// M5+ (gen >= 17): chained is measured net-positive (affine +16%, nvfp4 byte-
 /// identical to AR). On M1–M4 (gen 13–16) a lazy-slice eval-scheduling stall makes
@@ -309,139 +226,6 @@ pub(crate) fn mtp_chained_cycles_enabled() -> bool {
     })
 }
 
-// Prompt-prefix MTP prefill opt-OUT.
-//
-// `MLX_MTP_NO_PROMPT_PREFILL=1` (or `true` / `on`) disables committing
-// the prompt prefix into the MTP committed-history cache: the prefill
-// stays logits-only and the MTP heads build history only from
-// decode-produced tokens (the pre-prompt-prefill behaviour). Default
-// OFF (prompt-prefill enabled). Read once per process and cached.
-pub(crate) fn mtp_no_prompt_prefill() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_NO_PROMPT_PREFILL") {
-        Ok(v) => {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-        }
-        Err(_) => false, // default OFF — prompt-prefill enabled
-    })
-}
-
-// MTPLX-style committed MTP history policy.
-//
-// The committed-history cache remains active. This policy only decides how
-// much prompt-side history is seeded before decode:
-//   - committed: seed the full `[prompt[1..], first_sample]` run.
-//   - last_window: seed only the tail of that run and carry an absolute
-//     position base so RoPE positions stay aligned with the real sequence.
-//   - auto: use last_window once the prompt crosses a threshold.
-//
-// Decode-time appends continue from the seeded tail. This mirrors MTPLX's
-// normal decode path; their window is re-applied when the serving engine
-// explicitly rebases/restores prompt state.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum MtpHistoryPolicy {
-    Committed,
-    LastWindow,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct MtpPromptHistorySelection {
-    pub policy: MtpHistoryPolicy,
-    pub keep_tokens: usize,
-    pub position_base: usize,
-}
-
-impl MtpPromptHistorySelection {
-    pub(crate) fn hidden_start_token_index(self) -> usize {
-        self.position_base
-    }
-}
-
-fn parse_env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|raw| {
-        let raw = raw.trim();
-        if raw.is_empty() {
-            None
-        } else {
-            raw.parse::<usize>().ok()
-        }
-    })
-}
-
-fn normalize_mtp_history_policy(raw: &str) -> Option<&'static str> {
-    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "" => None,
-        "auto" => Some("auto"),
-        "committed" | "full" => Some("committed"),
-        "last_window" | "lastwindow" | "window" => Some("last_window"),
-        // Keep MTPLX's opt-out spelling as an alias for the existing explicit
-        // `MLX_MTP_NO_PROMPT_PREFILL` escape hatch, not as a silent mode switch.
-        "cycle" | "none" | "off" => Some("committed"),
-        _ => None,
-    }
-}
-
-pub(crate) fn resolve_mtp_prompt_history_selection(
-    requested_policy: &str,
-    prompt_len: usize,
-    window_tokens: usize,
-    threshold_tokens: usize,
-) -> MtpPromptHistorySelection {
-    let normalized = normalize_mtp_history_policy(requested_policy).unwrap_or("committed");
-    let policy = match normalized {
-        "last_window" => MtpHistoryPolicy::LastWindow,
-        "auto" if prompt_len >= threshold_tokens.max(1) => MtpHistoryPolicy::LastWindow,
-        _ => MtpHistoryPolicy::Committed,
-    };
-    match policy {
-        MtpHistoryPolicy::Committed => MtpPromptHistorySelection {
-            policy,
-            keep_tokens: prompt_len,
-            position_base: 0,
-        },
-        MtpHistoryPolicy::LastWindow => {
-            let keep_tokens = prompt_len.min(window_tokens.max(1));
-            MtpPromptHistorySelection {
-                policy,
-                keep_tokens,
-                position_base: prompt_len.saturating_sub(keep_tokens),
-            }
-        }
-    }
-}
-
-pub(crate) fn mtp_prompt_history_selection(prompt_len: usize) -> MtpPromptHistorySelection {
-    static POLICY: OnceLock<String> = OnceLock::new();
-    static WINDOW: OnceLock<usize> = OnceLock::new();
-    static THRESHOLD: OnceLock<usize> = OnceLock::new();
-
-    let policy = POLICY.get_or_init(|| match std::env::var("MLX_MTP_HISTORY_POLICY") {
-        Ok(raw) if normalize_mtp_history_policy(&raw).is_some() => raw,
-        Ok(raw) => {
-            tracing::warn!(
-                target: "mlx_core::mtp",
-                value = %raw,
-                "Ignoring invalid MLX_MTP_HISTORY_POLICY; using committed"
-            );
-            "committed".to_string()
-        }
-        Err(_) => "committed".to_string(),
-    });
-    let window = *WINDOW.get_or_init(|| {
-        parse_env_usize("MLX_MTP_HISTORY_LAST_WINDOW")
-            .filter(|v| *v > 0)
-            .unwrap_or(8192)
-    });
-    let threshold = *THRESHOLD.get_or_init(|| {
-        parse_env_usize("MLX_MTP_HISTORY_LAST_WINDOW_THRESHOLD")
-            .filter(|v| *v > 0)
-            .unwrap_or(16384)
-    });
-
-    resolve_mtp_prompt_history_selection(policy, prompt_len, window, threshold)
-}
-
 // Accept-loop sync collapse via on-device sparse top-K / batched
 // argmax (MTPLX-style).
 //
@@ -463,40 +247,19 @@ pub(crate) fn mtp_prompt_history_selection(prompt_len: usize) -> MtpPromptHistor
 //     argmax in one shot without re-applying the penalty per
 //     position.
 //
-// Default ON for the deterministic fast path. At T=0 with default
-// penalties, acceptance only needs verifier argmax IDs, so this avoids
-// D per-position full-vocab softmax materializations. Set
-// `MLX_MTP_SPARSE_ACCEPT=0` / `false` / `off` to force the per-position
-// path for parity debugging or A/B measurements. The env
-// var is read once per process and cached.
-pub(crate) fn mtp_sparse_accept_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_SPARSE_ACCEPT") {
-        Ok(v) => {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        }
-        Err(_) => true,
-    })
-}
-
-// Indirection over the sparse-accept gate so tests can drive the
-// production `use_sparse_accept` commit path hermetically — independent
-// of the process-wide `MLX_MTP_SPARSE_ACCEPT` env var / OnceLock cache.
-// In non-test builds this is a zero-cost `#[inline]` passthrough, so the
-// decode path's behavior and codegen are identical to calling
-// `mtp_sparse_accept_enabled()` directly.
+// The gate is unconditional on the deterministic path; tests override it
+// per-thread so they can drive the per-position accept loop instead.
 #[cfg(not(test))]
 #[inline]
 pub(crate) fn sparse_accept_gate() -> bool {
-    mtp_sparse_accept_enabled()
+    true
 }
 
 #[cfg(test)]
 thread_local! {
-    /// Test-only override for [`sparse_accept_gate`]. `None` defers to the
-    /// real env-backed [`mtp_sparse_accept_enabled`]; `Some(b)` forces the
-    /// gate so a test deterministically exercises the intended accept path.
+    /// Test-only override for [`sparse_accept_gate`]. `None` keeps the
+    /// production answer; `Some(b)` forces the gate so a test
+    /// deterministically exercises the intended accept path.
     static TEST_FORCE_SPARSE_ACCEPT: std::cell::Cell<Option<bool>> =
         const { std::cell::Cell::new(None) };
 }
@@ -505,13 +268,12 @@ thread_local! {
 pub(crate) fn sparse_accept_gate() -> bool {
     TEST_FORCE_SPARSE_ACCEPT
         .with(std::cell::Cell::get)
-        .unwrap_or_else(mtp_sparse_accept_enabled)
+        .unwrap_or(true)
 }
 
 /// RAII guard that forces [`sparse_accept_gate`] for the current thread and
-/// restores the prior value on drop (panic-safe). Used by the C2 T=0 safety
-/// test to guarantee it drives the production sparse-accept commit path
-/// regardless of `MLX_MTP_SPARSE_ACCEPT`.
+/// restores the prior value on drop (panic-safe). Used by the T=0 safety
+/// test to guarantee it drives the production sparse-accept commit path.
 #[cfg(test)]
 pub(crate) struct ForceSparseAcceptGuard(Option<bool>);
 
@@ -528,67 +290,6 @@ impl Drop for ForceSparseAcceptGuard {
     fn drop(&mut self) {
         TEST_FORCE_SPARSE_ACCEPT.with(|c| c.set(self.0));
     }
-}
-
-// MTPLX-style stochastic accept fast path.
-//
-// At T>0 with default penalties and a bounded top-k sampler, exact
-// probability-ratio acceptance does not need dense `[vocab]` CPU copies. We
-// keep `top_k` token IDs/probabilities per verifier row, copy only that tiny
-// `[D+1, top_k]` table, and run accept/residual/bonus sampling on CPU. This
-// mirrors MTPLX's `MTPLX_BATCH_TARGET_ARRAYS=1` path while preserving this
-// runtime's compiled sampler semantics. Opt out with
-// `MLX_MTP_BATCH_TARGET_ARRAYS=0` / `false` / `off`.
-pub(crate) fn mtp_batch_target_arrays_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_BATCH_TARGET_ARRAYS") {
-        Ok(v) => {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        }
-        Err(_) => true,
-    })
-}
-
-// Native stochastic verifier sparse-target output.
-//
-// This is an opt-out gate for the native sparse-verify fast path
-// (`MtpStepper::verify_step_sparse`). When the sampler is in MTPLX parity
-// mode, such a verifier can return compact `[depth+1, top_k]` target
-// ids/probabilities directly from the native graph instead of surfacing full
-// `[1, depth+1, vocab]` logits and rebuilding the same sparse rows on the
-// Rust side. No eager stepper implements `verify_step_sparse` today, so the
-// gate is currently inert; kept for a future native sparse verifier.
-pub(crate) fn mtp_native_sparse_verify_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_NATIVE_SPARSE_VERIFY") {
-        Ok(v) => {
-            let v = v.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-        }
-        Err(_) => true,
-    })
-}
-
-// Greedy verifier output fast path.
-//
-// At T=0 with default penalties, accept/reject only needs target top-1 ids.
-// This opt-in gate allows the dense verifier to return `[1, depth+1]` argmax
-// ids plus hiddens without surfacing full `[1, depth+1, vocab]` logits.
-// Diagnostics that need logits disable this path at the call site. It is
-// disabled by default because the current MLX graph evaluates this form slower
-// than the full-logits verifier on M5 Max.
-pub(crate) fn mtp_greedy_argmax_only_verify_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(
-        || match std::env::var("MLX_MTP_GREEDY_ARGMAX_ONLY_VERIFY") {
-            Ok(v) => {
-                let v = v.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-            }
-            Err(_) => false,
-        },
-    )
 }
 
 fn parse_env_f64(name: &str) -> Option<f64> {
@@ -658,17 +359,6 @@ pub(crate) fn mtp_draft_sampling_config(
         draft.top_k = Some(top_k);
     }
     draft
-}
-
-pub(crate) fn mtp_verify_top1_check_enabled() -> bool {
-    static CACHE: OnceLock<bool> = OnceLock::new();
-    *CACHE.get_or_init(|| match std::env::var("MLX_MTP_VERIFY_TOP1_CHECK") {
-        Ok(v) => {
-            let v = v.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on")
-        }
-        Err(_) => false,
-    })
 }
 
 pub(crate) fn mtp_trace_acceptance() -> bool {
@@ -1159,70 +849,23 @@ pub(crate) struct MtpCycleOutcome {
     pub effective_depth: usize,
 }
 
+/// Dense verify logits `[1, depth+1, vocab]` plus per-position hiddens
+/// `[1, depth+1, hidden]`. The accept loop derives its argmax / sparse
+/// target from the logits.
 pub(crate) struct MtpVerifyOutput {
-    pub logits: Option<MxArray>,
+    pub logits: MxArray,
     pub hiddens: MxArray,
-    pub target_argmax: Option<MxArray>,
-    pub target_sparse: Option<sampling::SparseDistributionRows>,
 }
 
 impl MtpVerifyOutput {
-    /// Verify produced dense logits only, with no precomputed target. The
-    /// eager dense and MoE verify paths build only this variant; the
-    /// per-position accept loop derives any argmax/sparse target from the
-    /// dense logits.
     pub(crate) fn logits_only(logits: MxArray, hiddens: MxArray) -> Self {
-        Self {
-            logits: Some(logits),
-            hiddens,
-            target_argmax: None,
-            target_sparse: None,
-        }
+        Self { logits, hiddens }
     }
 }
 
 #[cfg(test)]
-mod mtp_history_policy_tests {
-    use super::{
-        MTP_ACCEPT_GATE_HISTORY_CAP, MtpHistoryPolicy, MtpPromptHistorySelection,
-        mtp_accept_gate_blocks, mtp_bound_gate_history, resolve_mtp_prompt_history_selection,
-    };
-
-    #[test]
-    fn committed_keeps_full_prompt_run() {
-        assert_eq!(
-            resolve_mtp_prompt_history_selection("committed", 4096, 8192, 16384),
-            MtpPromptHistorySelection {
-                policy: MtpHistoryPolicy::Committed,
-                keep_tokens: 4096,
-                position_base: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn auto_switches_to_last_window_at_threshold() {
-        assert_eq!(
-            resolve_mtp_prompt_history_selection("auto", 20000, 8192, 16384),
-            MtpPromptHistorySelection {
-                policy: MtpHistoryPolicy::LastWindow,
-                keep_tokens: 8192,
-                position_base: 11808,
-            }
-        );
-    }
-
-    #[test]
-    fn last_window_caps_prompt_tail() {
-        assert_eq!(
-            resolve_mtp_prompt_history_selection("last-window", 10, 4, 100),
-            MtpPromptHistorySelection {
-                policy: MtpHistoryPolicy::LastWindow,
-                keep_tokens: 4,
-                position_base: 6,
-            }
-        );
-    }
+mod mtp_accept_gate_tests {
+    use super::{MTP_ACCEPT_GATE_HISTORY_CAP, mtp_accept_gate_blocks, mtp_bound_gate_history};
 
     #[test]
     fn confidence_gate_ignores_undersampled_and_marginal_rates() {

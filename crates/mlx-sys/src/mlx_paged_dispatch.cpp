@@ -362,10 +362,6 @@ uint32_t grouped_d512_stripe_override() {
   static const uint32_t stripes = []() {
     const char* value = std::getenv("MLX_PAGED_GROUPED_D512_STRIPES");
     if (value == nullptr) {
-      // Compatibility alias retained for existing Gemma 4 A/B scripts.
-      value = std::getenv("MLX_PAGED_GROUPED_GEMMA4_STRIPES");
-    }
-    if (value == nullptr) {
       return uint32_t{0};
     }
     char* end = nullptr;
@@ -475,10 +471,6 @@ GroupedD512Mode grouped_d512_paged_attention_mode() {
   // Cache once because this runs on every global layer and decode token.
   static const GroupedD512Mode mode = []() {
     const char* value = std::getenv("MLX_PAGED_GROUPED_D512");
-    if (value == nullptr) {
-      // Compatibility alias retained for existing Gemma 4 deployments.
-      value = std::getenv("MLX_PAGED_GROUPED_GEMMA4");
-    }
     if (value == nullptr) {
       return GroupedD512Mode::Disabled;
     }
@@ -840,9 +832,6 @@ std::atomic<uint64_t>& grouped_d512_test_probe_counter() {
 bool grouped_d512_test_probe_enabled() {
   static const bool enabled = []() {
     const char* value = std::getenv("MLX_PAGED_GROUPED_D512_TEST_PROBE");
-    if (value == nullptr) {
-      value = std::getenv("MLX_PAGED_GROUPED_GEMMA4_TEST_PROBE");
-    }
     return value != nullptr && std::string(value) == "1";
   }();
   return enabled;

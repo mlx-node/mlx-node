@@ -25,7 +25,6 @@ use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
 use crate::nn::Embedding;
 use crate::profiling::PerformanceMetrics;
-use crate::sampling::SamplingConfig;
 use crate::stream::Stream;
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 
@@ -1450,10 +1449,6 @@ pub(crate) struct MtpTurnSetup<'a> {
     /// `prompt_hidden.shape(1) == prompt_hidden_ids.len()`. `Some` iff
     /// `prompt_hidden` is `Some`.
     pub prompt_hidden_ids: Option<&'a [u32]>,
-    /// Absolute committed-history position of `prompt_hidden_ids[0]`'s hidden
-    /// row. Zero for full committed history; non-zero for last-window prompt
-    /// seeding (which disables the v2 committed-history prompt seed).
-    pub prompt_hidden_position_base: usize,
     /// The first generated token (sampled from the prefill logits BEFORE the
     /// turn). Already materialized — the prompt seed appends it to the
     /// committed run `[prompt_ids[1..], y]`. == the eager block's
@@ -1471,9 +1466,7 @@ pub(crate) struct MtpTurnSetup<'a> {
 }
 
 /// Sub-trait of [`ChatBackend`] for families whose MTP speculative-decode
-/// whole-turn flows through the engine-owned propose/verify loop instead
-/// of the former family-local `decode_loop_mtp!` macro + `MtpOps` closure
-/// bundle (now removed).
+/// whole turn flows through the engine-owned propose/verify loop.
 ///
 /// Split out of [`ChatBackend`] for the SAME reason as [`PagedBackend`]:
 /// the GAT (`type MtpDecode<'a>`) has no stable trait-level default, so
@@ -1483,13 +1476,10 @@ pub(crate) struct MtpTurnSetup<'a> {
 /// `run_mtp_turn(self, args)`; MTP-less families do not implement
 /// it.
 ///
-/// The engine-owned loop (`run_mtp_turn`) is the relocated
-/// `decode_loop_mtp!` outer body + `run_mtp_cycle_inner` (both now
-/// removed), calling the [`MtpStepper`] methods where those called `ops.*`. The stepper
-/// borrows `&mut self` for the whole turn (the analog of
+/// The engine-owned loop (`run_mtp_turn`) calls the [`MtpStepper`] methods.
+/// The stepper borrows `&mut self` for the whole turn (the analog of
 /// [`PagedBackend::PagedDecode`] / [`ChatBackend::Decode`]) and holds the
 /// per-cycle snapshot/tape/replay-error as its own fields.
-///
 pub(crate) trait MtpBackend: ChatBackend {
     /// Per-turn MTP propose/verify stepper. Borrows `&mut self` for the
     /// whole decode loop. The per-cycle GDN tape / linear-cache snapshot /
@@ -1532,22 +1522,19 @@ pub(crate) struct SpecFrontier {
     pub recurrent_tokens: Option<u64>,
 }
 
-/// Per-turn MTP stepper the engine-owned propose/verify loop drives — the
-/// 11 closures of the former `MtpOps` bundle (now removed) as trait
-/// methods, plus the macro-level orchestration hooks the engine takes
-/// over (`profiler_relabel` / `embedding_weight` /
-/// `committed_history_active` / `take_replay_error` / `into_desynced`).
-/// The `== MtpOps::*` notes on each method below map it to its origin
-/// closure for historical reference.
+/// Per-turn MTP stepper the engine-owned propose/verify loop drives:
+/// the forward/draft/verify/commit/rollback primitives plus the
+/// orchestration hooks the engine reads (`profiler_relabel` /
+/// `embedding` / `committed_history_active` / `take_replay_error` /
+/// `into_desynced`).
 ///
 /// The `&mut self` borrow model is strictly sequential: the engine calls
 /// exactly one method at a time, threading the lazy [`MxArray`] outputs of
 /// one call into the next. `eval_step` / `eval_step_with_chained_hidden`
 /// are `&self` (they only SCHEDULE async eval — no state mutation), every
 /// other forward/draft/verify/rollback/commit method is `&mut self`. The
-/// GDN tape + linear snapshot are private stepper fields (`Scratch`), so
-/// they never cross the trait — exactly as the former `run_mtp_cycle_inner`
-/// kept them inside the `MtpOps` closures' captured environment.
+/// GDN tape + linear snapshot are private stepper fields, so they never
+/// cross the trait.
 ///
 /// # Invariants the engine must preserve (each gated byte-identical)
 ///   * async_eval batching — every `async_eval` stays INSIDE a method;
@@ -1575,7 +1562,6 @@ pub(crate) trait MtpStepper {
     /// [`Self::begin_cycle`]. Both the dense and MoE eager steppers
     /// report this whenever their flag-gated `use_committed` gate holds;
     /// steppers with no committed-history support return `false`.
-    /// == `MtpOps::committed_history_active`.
     fn committed_history_active(&self) -> bool;
 
     /// Whether this turn may reuse the previous verify hidden to skip the
@@ -1597,9 +1583,8 @@ pub(crate) trait MtpStepper {
     }
 
     /// Single main-path forward returning `(logits, hidden, needs_squeeze)`
-    /// — `hidden` is `[1, hidden_size]` bf16. == `MtpOps::forward_with_hidden`
-    /// (the `F` closure). Step A's forward + the per-accepted-draft replay
-    /// forwards both go through here.
+    /// — `hidden` is `[1, hidden_size]` bf16. Step A's forward + the
+    /// per-accepted-draft replay forwards both go through here.
     fn forward_with_hidden(
         &mut self,
         ids: &MxArray,
@@ -1607,12 +1592,12 @@ pub(crate) trait MtpStepper {
     ) -> Result<(MxArray, MxArray, bool)>;
 
     /// One MTP draft step returning `(h_next [1,1,hidden], draft_logits
-    /// [1,vocab])`. == `MtpOps::draft_step` (the `D` closure).
+    /// [1,vocab])`.
     fn draft_step(&mut self, prev_h: &MxArray, prev_emb: &MxArray) -> Result<(MxArray, MxArray)>;
 
     /// MTP verify step returning verify logits `[1, depth+1, vocab]` +
     /// hiddens `[1, depth+1, hidden]`. RECORDS the GDN tape (consumed by
-    /// [`Self::rollback`]). == `MtpOps::verify_step` (the `V` closure).
+    /// [`Self::rollback`]).
     fn verify_step(
         &mut self,
         ids: &MxArray,
@@ -1620,51 +1605,21 @@ pub(crate) trait MtpStepper {
         depth: usize,
     ) -> Result<MtpVerifyOutput>;
 
-    /// Greedy argmax-only verify fast path (T=0, penalties no-op,
-    /// no tracing). `None` = this stepper has no such fast path and the
-    /// engine falls back to [`Self::verify_step`]. == the
-    /// `MtpOps::verify_step_argmax_only` `Option<Box<dyn FnMut>>` field
-    /// (None on every eager path today).
-    fn verify_step_argmax_only(
-        &mut self,
-        _ids: &MxArray,
-        _embedding: &Embedding,
-        _depth: usize,
-    ) -> Option<Result<MtpVerifyOutput>> {
-        None
-    }
-
-    /// Native-sparse verify fast path. `None` = unavailable, fall back to
-    /// [`Self::verify_step`]. == the `MtpOps::verify_step_sparse`
-    /// `Option<Box<dyn FnMut>>` field (None on every eager path today).
-    fn verify_step_sparse(
-        &mut self,
-        _ids: &MxArray,
-        _embedding: &Embedding,
-        _depth: usize,
-        _cfg: &SamplingConfig,
-    ) -> Option<Result<MtpVerifyOutput>> {
-        None
-    }
-
     /// Snapshot the main path's K/V + GDN linear caches + decode offset
-    /// before verify. == `MtpOps::snapshot_main_linear` (the `S` closure).
-    /// Stores into the stepper's own scratch fields.
+    /// before verify. Stores into the stepper's own scratch fields.
     fn snapshot_main_linear(&mut self);
 
     /// Rewind the MTP draft state to the accepted prefix and REPLAY the
     /// GDN tape from the snapshot. Infallible at the call boundary (any
-    /// replay error is STASHED and surfaced by [`Self::take_replay_error`]
-    /// — see the `R` closure `MtpOps::rollback`, which is `FnMut(usize,
-    /// usize)` with no `Result`). `accepted_drafts` / `depth` match the
-    /// cycle's accept count and effective depth.
+    /// replay error is STASHED and surfaced by [`Self::take_replay_error`]).
+    /// `accepted_drafts` / `depth` match the cycle's accept count and
+    /// effective depth.
     fn rollback(&mut self, accepted_drafts: usize, depth: usize);
 
     /// On rejection: restore the linear caches + main offset to the
     /// snapshot point, then run ONE eager `forward_with_hidden` per
     /// accepted draft so the main linear state catches up. `accepted` is
-    /// the accepted-draft prefix (NOT the residual). ==
-    /// `MtpOps::restore_and_replay_main` (the `RR` closure).
+    /// the accepted-draft prefix (NOT the residual).
     fn restore_and_replay_main(&mut self, accepted: &[u32], embedding: &Embedding) -> Result<()>;
 
     /// Committed-history commit. Appends `K+2` exact committed K/V slots
@@ -1672,9 +1627,6 @@ pub(crate) trait MtpStepper {
     /// payload policy (engine-chosen [`MtpCommitAnchor`]); the model
     /// consumes it. A no-op impl keeps the cycle-history policy (tests, or
     /// dense/MoE steppers whose flag-gated `use_committed` gate is off).
-    /// == `MtpOps::commit_mtp` (the `CM` closure) — `(anchor,
-    /// prev_hidden [1,1,hidden], verify_hiddens [1,D+1,hidden],
-    /// committed_ids [K+2], k_accepted, embedding_weight)`.
     fn commit_mtp(
         &mut self,
         anchor: MtpCommitAnchor,
@@ -1688,7 +1640,7 @@ pub(crate) trait MtpStepper {
     /// Re-anchor the MTP draft caches/offset to the main path's current
     /// position, once per outer iteration AFTER Step A. `chained_anchor`
     /// is `cycle_seed_was_chained && committed_history_active` — the same
-    /// arg the engine loop passes. == `MtpOps::begin_cycle` (the `B` closure).
+    /// arg the engine loop passes.
     fn begin_cycle(&mut self, chained_anchor: bool);
 
     /// Reserve the speculative lookahead region for the cycle about to run,
@@ -1706,22 +1658,19 @@ pub(crate) trait MtpStepper {
     }
 
     /// Schedule async eval for an emitted token (+ logits on the
-    /// budget-forced path). `&self` — schedules only, no mutation. ==
-    /// `MtpOps::eval_step` (the `E` closure, which is `Fn`).
+    /// budget-forced path). `&self` — schedules only, no mutation.
     fn eval_step(&self, token: &MxArray, logits: &MxArray, budget_forced: bool);
 
     /// Fused chained-hidden eval — folds `verify_hiddens[:, K, :]` into the
     /// SAME `async_eval` batch as the just-set token. `&self` — schedules
     /// only. MUST be called at the iteration boundary EXACTLY where the
-    /// engine loop calls it; do NOT reorder. == `MtpOps::eval_step_with_chained_hidden`
-    /// (the `EX` closure, which is `Fn`).
+    /// engine loop calls it; do NOT reorder.
     fn eval_step_with_chained_hidden(&self, token: &MxArray, chained_h: &MxArray);
 
     /// On a mid-cycle stop (EOS / cancel / length / repetition cutoff)
     /// after some-but-not-all of the cycle's tokens were emitted: receives
     /// the count of accepted-but-unemitted tokens. The paged path
-    /// truncates the live adapter; dense / MoE pass a no-op. ==
-    /// `MtpOps::rollback_unemitted` (the `RU` closure).
+    /// truncates the live adapter; dense / MoE pass a no-op.
     fn rollback_unemitted(&mut self, unemitted: usize);
 
     /// The stepper's CURRENT target-state frontier ([`SpecFrontier`]), or
