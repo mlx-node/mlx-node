@@ -5905,6 +5905,80 @@ mod tests {
     }
 
     #[test]
+    fn a_quantized_mmproj_companion_is_not_refused_by_the_dflash_guard() {
+        // Only a DFlash pass writes entries the rescope cannot attribute. The
+        // vision namespace never reaches that loop, so a merged sidecar must
+        // not stop a mixed-quant mmproj from recording its own modes.
+        let tensors = vec![
+            GgufTensorInfo {
+                name: "v.blk.0.attn_q.weight".to_string(),
+                n_dims: 2,
+                dims: vec![1536, 1536],
+                tensor_type: GgufTensorType::Q4K,
+                offset: 0,
+            },
+            GgufTensorInfo {
+                name: "v.blk.0.attn_out.weight".to_string(),
+                n_dims: 2,
+                dims: vec![1536, 1536],
+                tensor_type: GgufTensorType::Q6K,
+                offset: 0,
+            },
+        ];
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: muse_glimmer_mmproj_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-mmproj-after-dflash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        let mut primary = valid_muse_target_config();
+        primary["dflash_config"] = serde_json::json!({"block_size": 16});
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&primary).expect("serialize merged target config"),
+        )
+        .expect("write merged target config");
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).expect("read back target config"))
+                .expect("parse target config");
+        assert!(
+            on_disk.get("dflash_config").is_some(),
+            "ANTI-VACUITY: the config this pass reads must carry the marker, or the guard is \
+             never reached and the 'is_dflash' conjunct goes unobserved"
+        );
+
+        let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("a vision companion writes no draft profiles and must not be refused")
+            .expect("companion config update");
+        let config: serde_json::Value =
+            serde_json::from_str(&prepared).expect("parse companion config");
+        fs::remove_dir_all(root).ok();
+
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                config[block]["language_model.model.vision_tower.layers.0.attn.q_proj"]["mode"],
+                "q4k"
+            );
+            assert_eq!(
+                config[block]["language_model.model.vision_tower.layers.0.attn.proj"]["mode"],
+                "q6k"
+            );
+        }
+    }
+
+    #[test]
     fn companion_quantization_keeps_target_and_dflash_layers_distinct() {
         let mut tensors = complete_muse_glimmer_dflash_tensors();
         tensors
