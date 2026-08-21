@@ -467,9 +467,10 @@ pub(crate) fn commit_after_verify(
 /// the active offsets disagree with each other — a frontier violation the
 /// caller reports as "unknown" rather than picking a side.
 ///
-/// Reachable today only through `DsparkStepper::frontier` (itself consumed
-/// by the `SpecPagedCache` facade's debug contract) and this file's unit
-/// test, so the lib target sees it as dead until that facade lands.
+/// Reachable only through `DsparkStepper::frontier`, which nothing calls —
+/// the `SpecPagedCache` facade's `frontier` is the cache-side, `seq_id`-keyed
+/// method and never routes through that hook — so the lib target sees this
+/// whole chain as dead and only this file's unit test exercises it.
 #[allow(dead_code)]
 pub(crate) fn active_cache_frontier(
     caches: &[Gemma4LayerCache],

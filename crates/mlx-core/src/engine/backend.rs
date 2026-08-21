@@ -1166,8 +1166,10 @@ pub(crate) trait ChatBackend {
     // contract documented above.
 
     /// Execute a turn whose eligible attention layers use the paged adapter.
-    /// The plan may also select speculative decoding; dense Qwen3.5 handles
-    /// that supported composition inside this executor.
+    /// The plan may also select speculative decoding; every family whose
+    /// [`crate::engine::plan::SpeculativePlan`] declares
+    /// `supports_paged_attention` — Qwen3.5 dense and MoE native MTP, gemma4
+    /// DSpark — handles that composition inside this executor.
     fn run_paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         Err(Error::from_reason(format!(
             "{} execution plan selected paged attention but the backend has no paged executor",
@@ -1971,10 +1973,11 @@ pub(crate) trait DsparkStepper {
     /// the common offset every ACTIVE target cache sits at — the same
     /// per-cache totals `gemma4::layer_cache::commit_after_verify`
     /// validates on every commit. REQUIRED for the same reason as
-    /// [`MtpStepper::frontier`]. No engine call site consumes it yet — the
-    /// `SpecPagedCache` facade's `frontier()` debug contract does; until
-    /// then it exists so every stepper answers the same question the
-    /// `run_mtp_turn` asserts already put to [`MtpStepper`].
+    /// [`MtpStepper::frontier`], but unlike it nothing calls this one: the
+    /// [`crate::engine::spec_paged::SpecPagedCache`] facade's `frontier` is
+    /// the CACHE-side, `seq_id`-keyed method and never routes through this
+    /// hook. It stays required so every stepper can answer the question
+    /// `run_mtp_turn`'s debug asserts put to [`MtpStepper`].
     #[allow(dead_code)]
     fn frontier(&self) -> Option<SpecFrontier>;
 }
