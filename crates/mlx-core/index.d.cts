@@ -1026,9 +1026,11 @@ export declare class NemotronHModel {
   hasMtpWeights(): boolean;
   /**
    * Whether `ChatSession` should turn MTP ON when the caller sets nothing. FALSE
-   * deliberately, about SCHEDULING not speed: `enable_mtp == Some(true)` forces the
-   * chat-requires-barrier predicate, putting the turn in the EXCLUSIVE lane and out
-   * of continuous batching. `MLX_NEMOTRON_MTP_DEFAULT=1` flips it.
+   * deliberately, about SCHEDULING not speed: this family's flat MTP core has no
+   * streaming arm, so `enable_mtp == Some(true)` costs a SYNC turn its scheduled
+   * slot — `chat_requires_barrier` routes it to the EXCLUSIVE lane and out of
+   * continuous batching. A streaming turn plans plain autoregressive and keeps its
+   * slot. `MLX_NEMOTRON_MTP_DEFAULT=1` flips the default.
    */
   mtpAutoEnabled(): boolean;
   /**
