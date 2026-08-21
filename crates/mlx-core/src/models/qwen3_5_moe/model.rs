@@ -9248,8 +9248,8 @@ pub(crate) struct MoeMtpStepper<'a> {
     /// verify core's own row write, consumed by [`MtpStepper::rollback`]'s
     /// facade commit — the one place the adapter's speculative rows are
     /// retracted, so the commit arithmetic cannot drift from the conformance
-    /// surface. `None` in flat mode, between cycles, and when the adapter
-    /// names no active sequence.
+    /// surface. `None` in flat mode and between cycles; a paged cycle that
+    /// cannot be opened refuses the verify rather than writing without one.
     open_cycle: Option<crate::engine::spec_paged::VerifyTicket>,
     /// Absolute tokens the GDN recurrent state has consumed, reported by
     /// [`MtpStepper::frontier`] against the ATTENTION side's ground truth
@@ -9408,7 +9408,7 @@ impl MoeMtpStepper<'_> {
         let owner = self
             .owner
             .expect("paged_verify_step is only reached on a paged turn");
-        self.open_verify_cycle(owner, depth + 1);
+        self.open_verify_cycle(owner, depth + 1)?;
         let inner = &mut *self.inner;
         let adapter = owner
             .resolve(&mut inner.paged_adapter, "eager paged MoE MTP verify_step")
@@ -9437,27 +9437,32 @@ impl MoeMtpStepper<'_> {
 
     /// Mint the cycle ticket the verify core's own row write belongs to.
     ///
-    /// Failure is not fatal and not silent: the only way to reach it is an
-    /// adapter that no longer answers to this turn's owner, whose
-    /// `record_tokens` fails the verify a few lines later.
-    fn open_verify_cycle(&mut self, owner: SpecOwner, rows: usize) {
+    /// A mint that fails REFUSES the verify. The only way to reach it is an
+    /// adapter that no longer answers to this turn's owner — whose row write
+    /// would fail a few lines later anyway — and proceeding without a ticket
+    /// would leave the retraction to something other than
+    /// [`crate::engine::spec_paged::SpecPagedCache::commit_cycle`], which is
+    /// where the commit arithmetic lives.
+    fn open_verify_cycle(&mut self, owner: SpecOwner, rows: usize) -> Result<()> {
         self.close_abandoned_cycle();
         let seq_id = owner.seq_id();
-        match crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq_id, rows) {
-            Ok(ticket) => self.open_cycle = Some(ticket),
-            Err(e) => tracing::warn!(
-                target: "mlx_core::qwen3_5_moe::paged",
-                "eager MoE MTP-paged verify cycle ({rows} rows) could not be opened \
-                 (the rollback falls back to a direct adapter retraction): {e}",
-            ),
-        }
+        let ticket =
+            crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq_id, rows)
+                .map_err(|e| {
+                    Error::from_reason(format!(
+                        "eager MoE MTP-paged verify cycle ({rows} rows) on sequence \
+                         {seq_id} could not be opened: {e}"
+                    ))
+                })?;
+        self.open_cycle = Some(ticket);
+        Ok(())
     }
 
     /// Close a cycle abandoned between its verify write and its rollback.
-    /// Keeping every written row is what the un-ticketed path did — they stay
-    /// recorded past the emitted frontier and the epilogue's frontier check
-    /// refuses to persist the turn — so a full keep retracts nothing and this
-    /// consumes the ticket instead of letting its abandoned-cycle guard fire.
+    /// Keeping every written row is the fail-closed answer: they stay recorded
+    /// past the emitted frontier and the epilogue's frontier check refuses to
+    /// persist the turn, so a full keep retracts nothing and this consumes the
+    /// ticket instead of letting its abandoned-cycle guard fire.
     fn close_abandoned_cycle(&mut self) {
         let Some(ticket) = self.open_cycle.take() else {
             return;
@@ -9645,11 +9650,10 @@ impl MtpStepper for MoeMtpStepper<'_> {
             return;
         }
         // The paged path rewinds the full-attention K/V (which lives in the
-        // paged pool, not `inner.caches`) by `rejected` tokens before the
-        // shared GDN tape replay. The retraction goes through the cycle
-        // `verify_step` opened, so the adapter half of this rollback and the
-        // facade's conformance surface are the same arithmetic: the commit
-        // derives its rollback as `rows - keep` =
+        // paged pool, not `inner.caches`) before the shared GDN tape replay,
+        // and only through the cycle `verify_step` opened — so the adapter
+        // half of this rollback and the facade's conformance surface are the
+        // same arithmetic: the commit derives its rollback as `rows - keep` =
         // `(depth + 1) - (accepted_drafts + 1)`.
         if let Some(owner) = self.owner {
             match self.open_cycle.take() {
@@ -9672,27 +9676,18 @@ impl MtpStepper for MoeMtpStepper<'_> {
                     }
                 }
                 None => {
-                    // No cycle to close: `verify_step` could not open one,
-                    // which also fails the verify itself, so production never
-                    // lands here. Retract directly rather than leave rejected
-                    // rows recorded.
-                    let rejected = depth.saturating_sub(accepted_drafts);
-                    if rejected > 0
-                        && let Err(e) = owner
-                            .resolve(&mut self.inner.paged_adapter, MOE_PAGED_MTP)
-                            .map_err(Error::from_reason)
-                            .and_then(|adapter| {
-                                adapter.rollback_last_tokens(rejected as u32).map_err(|e| {
-                                    Error::from_reason(format!("adapter rollback: {e}"))
-                                })
-                            })
-                    {
-                        tracing::warn!(
-                            target: "mlx_core::qwen3_5_moe::paged",
-                            "eager MoE MTP-paged rollback_last_tokens({rejected}) outside a \
-                             verify cycle failed (ignored): {e}",
-                        );
-                    }
+                    // `verify_step` refuses to write rows it could not open a
+                    // cycle for, so the rows this would retract cannot exist.
+                    // A stepper that lands here disagrees with its own cache:
+                    // fail the turn closed rather than retract by hand, which
+                    // would be a second copy of the arithmetic `commit_cycle`
+                    // is here to single-source.
+                    self.replay_err = Some(Error::from_reason(format!(
+                        "eager MoE MTP-paged rollback on sequence {} found no open verify \
+                         cycle ({accepted_drafts} of {depth} drafts accepted); refusing to \
+                         retract the adapter outside the facade",
+                        owner.seq_id()
+                    )));
                 }
             }
         }
@@ -9706,7 +9701,9 @@ impl MtpStepper for MoeMtpStepper<'_> {
             }
             Err(e) => {
                 self.recurrent_frontier = None;
-                self.replay_err = Some(e);
+                // A refusal stashed above is the root cause; a replay that
+                // also fails on top of it must not shadow it.
+                self.replay_err.get_or_insert(e);
             }
         }
     }
@@ -11454,6 +11451,104 @@ mod paged_construction_tests {
             .allocate_suffix_blocks(prompt.len() as u32)
             .expect("allocate suffix blocks");
         adapter.record_tokens(prompt).expect("record tokens");
+    }
+
+    fn paged_mtp_turn_setup() -> MtpTurnSetup<'static> {
+        MtpTurnSetup {
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
+            first_sampled_token: 0,
+            lookahead_rows: 0,
+        }
+    }
+
+    /// A verify cycle the facade cannot mint REFUSES the verify. The rows
+    /// the core is about to write are the rows `commit_cycle` retracts, so a
+    /// write with no ticket would have to be retracted by something else —
+    /// which is the second copy of the commit arithmetic the facade exists
+    /// to prevent.
+    ///
+    /// Mutation this catches: swallowing the failed mint with a warning and
+    /// letting the verify proceed un-ticketed.
+    #[test]
+    fn moe_paged_verify_refuses_a_cycle_it_cannot_open() {
+        let Some(mut inner) =
+            moe_inner_with_test_adapter_or_skip("moe_paged_verify_refuses_a_cycle_it_cannot_open")
+        else {
+            return;
+        };
+        let prompt: Vec<u32> = (0u32..16).collect();
+        record_whole_moe_paged_request(&mut inner, &prompt);
+
+        let setup = paged_mtp_turn_setup();
+        let mut stepper = inner.begin_mtp_decode(&setup).expect("paged MTP stepper");
+        let owner = stepper.owner.expect("a paged turn claims an owner");
+        // A sequence the turn never claimed: the stepper's `frontier` refuses
+        // to name one for it, so the mint fails exactly as it does when the
+        // adapter has been re-pointed mid-turn.
+        let stranger =
+            SpecOwner::claim(Some(owner.seq_id() + 1), "test stranger").expect("claim stranger");
+        let error = stepper
+            .open_verify_cycle(stranger, 3)
+            .expect_err("a cycle the facade cannot mint must refuse the verify");
+        assert!(
+            error.reason.contains("could not be opened"),
+            "the refusal must name the failed mint: {}",
+            error.reason
+        );
+        assert!(
+            stepper.open_cycle.is_none(),
+            "a refused mint must leave no cycle open"
+        );
+    }
+
+    /// The paged rollback retracts ONLY through the cycle `verify_step`
+    /// opened. With no cycle the stepper and its cache disagree about
+    /// whether any speculative row exists, so the rollback fails the turn
+    /// closed and leaves the adapter alone.
+    ///
+    /// Mutation this catches: restoring a direct
+    /// `adapter.rollback_last_tokens(depth - accepted_drafts)` fallback —
+    /// the adapter loses rows here, and the commit arithmetic has a second
+    /// home.
+    #[test]
+    fn moe_paged_rollback_without_a_cycle_refuses_instead_of_retracting() {
+        let Some(mut inner) = moe_inner_with_test_adapter_or_skip(
+            "moe_paged_rollback_without_a_cycle_refuses_instead_of_retracting",
+        ) else {
+            return;
+        };
+        let prompt: Vec<u32> = (0u32..16).collect();
+        record_whole_moe_paged_request(&mut inner, &prompt);
+
+        let setup = paged_mtp_turn_setup();
+        {
+            let mut stepper = inner.begin_mtp_decode(&setup).expect("paged MTP stepper");
+            assert!(
+                stepper.open_cycle.is_none(),
+                "a fresh stepper opens no cycle"
+            );
+            MtpStepper::rollback(&mut stepper, 1, 3);
+            let error = stepper
+                .take_replay_error()
+                .expect("a rollback with no cycle must fail the turn closed");
+            assert!(
+                error.reason.contains("no open verify cycle"),
+                "the refusal must name the missing cycle, not a downstream replay \
+                 failure: {}",
+                error.reason
+            );
+        }
+        assert_eq!(
+            inner
+                .paged_adapter
+                .as_ref()
+                .expect("adapter")
+                .request_tokens()
+                .len(),
+            prompt.len(),
+            "the refusal must leave the adapter untouched — no hand retraction"
+        );
     }
 
     /// MoE mirror of the dense case: the hand-written cores finalize through

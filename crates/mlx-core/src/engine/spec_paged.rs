@@ -48,12 +48,31 @@ pub(crate) fn abandoned_spec_turn_epilogues() -> u64 {
 
 /// The obligation to run the family turn epilogue, as a value (L-EPILOGUE).
 ///
-/// Minted once at a paged speculative dispatch and moved into the driver, so
-/// removing the mint is a compile error rather than a silent policy change.
+/// Minted once at a paged speculative dispatch and moved into the driver.
 /// The only successful discharge is [`Self::finish`], whose body IS
 /// `engine::paged_turn::finish_paged_turn`; [`Self::abort`] is the error
-/// exit, where no epilogue may run because nothing may be published. Not
+/// exit, where no epilogue may run because nothing may be published. A
+/// driver that writes its own reconcile/finalize/save leaves the token to
+/// [`Drop`], which counts the abandonment and trips a debug assertion. Not
 /// `Clone`: one turn, one epilogue.
+///
+/// # Scope: this observes the drivers that TAKE a token
+///
+/// `finish_paged_turn` is `pub(crate)` and is reached directly by
+/// `engine::paged_turn::run_paged_turn` and by the continuous-batching
+/// scheduler's per-row epilogue, so holding a token is opt-in rather than a
+/// type-system seal: a driver that mints none still compiles and stays
+/// green. `engine::dspark_turn::run_paged_dspark_turn` is the one driver
+/// that opts in; qwen3.5-MoE paged MTP reaches the same epilogue through
+/// `run_paged_turn`, which satisfies I11 but is not observed here.
+///
+/// One fork is live and unobserved: qwen3.5 DENSE paged MTP runs its own
+/// `paged_turn_sync_core` / `paged_turn_stream_core`
+/// (`models::qwen3_5::model`), which never calls `finish_paged_turn` at all
+/// — it finalizes, saves the history and checkpoints GDN inline. Sealing the
+/// epilogue behind this token would not catch that, because there is no call
+/// to seal; closing it means routing the dense cores onto the generic paged
+/// driver, which is a change to those cores, not to this type.
 #[must_use = "a paged speculative turn must exit through SpecTurnEpilogue::{finish, abort}"]
 #[derive(Debug)]
 pub(crate) struct SpecTurnEpilogue {
@@ -293,13 +312,15 @@ impl Drop for VerifyTicket {
 /// implementation of this trait nor a caller may fork a private epilogue —
 /// forking one re-opens the GDN-seam bug class Stage A closed.
 ///
-/// [`SpecTurnEpilogue`] is the executable form: a paged speculative driver
-/// is handed one at dispatch and can discharge it only by calling
+/// [`SpecTurnEpilogue`] is the executable form for the drivers that TAKE a
+/// token: one handed the token at dispatch can discharge it only by
 /// [`SpecTurnEpilogue::finish`], which IS `finish_paged_turn`, or
 /// [`SpecTurnEpilogue::abort`], which releases the request and runs no
-/// epilogue at all. A driver that writes its own reconcile/finalize/save
-/// inline leaves the token to [`Drop`], which counts the abandonment and
-/// trips a debug assertion.
+/// epilogue at all, and forking an epilogue instead leaves the token to
+/// `Drop`, which counts the abandonment and trips a debug assertion. It
+/// does not seal the law against a driver that mints none — the scope note
+/// on [`SpecTurnEpilogue`] names which paths are observed and which fork is
+/// still live.
 #[allow(dead_code)]
 pub(crate) trait SpecPagedCache {
     /// Reserve block capacity for `rows` rows past `seq_id`'s current

@@ -20,8 +20,8 @@ use napi::bindgen_prelude::*;
 use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
-    DsparkBackend, DsparkProposal, DsparkStepper, PagedBackend, PagedPrefix, StreamEmitter,
-    TurnOutput, TurnTokenObserver, WholeTurnArgs,
+    DecodeStep, DsparkBackend, DsparkProposal, DsparkStepper, PagedBackend, PagedPrefix,
+    StreamEmitter, TurnOutput, TurnTokenObserver, WholeTurnArgs,
 };
 use crate::engine::decode::StreamingCtx;
 use crate::engine::paged_turn::FinishPagedTurnArgs;
@@ -36,7 +36,7 @@ use crate::stream::{DeviceType, Stream};
 /// [`crate::engine::mtp_turn::MtpTurnArgs`], minus the MTP-only
 /// prompt-hidden seed fields (the DSpark stepper owns its draft-context
 /// seeding) and plus the draft `block_size`. Constructed in production by
-/// gemma4's `draft_chat_turn`.
+/// [`run_paged_dspark_turn`] and by gemma4's `flat_draft_chat_turn`.
 pub(crate) struct DsparkTurnArgs<'a> {
     /// First generated token (sampled from the prefill logits BEFORE the
     /// turn). The loop takes ownership and emits it first (guarded by the
@@ -268,8 +268,9 @@ impl DsparkBreakEvenPolicy {
 /// where the AR reference would) → emit → cache-clear cadence → stop or
 /// `anchor = boundary; eval_boundary`.
 ///
-/// Driven in production by gemma4's `mtp_turn` override
-/// (`draft_chat_turn`); the module's mock tests pin the loop contract.
+/// Driven in production by [`run_paged_dspark_turn`] on the paged lane and
+/// by gemma4's `flat_draft_chat_turn` on the flat one; the module's mock
+/// tests pin the loop contract.
 pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     backend: &mut B,
     rng: &mut R,
@@ -953,11 +954,6 @@ pub(crate) trait PagedDsparkBackend: PagedBackend + DsparkBackend {
         stream: Stream,
     ) -> Result<MxArray>;
 
-    /// Record + forward the final emitted token so the paged cursor equals
-    /// the keep-all history the save publishes. Called on a LENGTH exit
-    /// only, and only when the loop reports the token has no K/V yet.
-    fn materialize_final_paged(&mut self, token_id: u32) -> Result<()>;
-
     /// The per-cycle drafted-block cap (the drafter's own block width), and
     /// the quantity the turn's lookahead reservation is sized from.
     fn dspark_block_size(&self) -> Result<usize>;
@@ -971,10 +967,14 @@ pub(crate) trait PagedDsparkBackend: PagedBackend + DsparkBackend {
 ///
 /// MIRRORS [`crate::engine::paged_turn::run_paged_turn`] hook for hook —
 /// prime → prefill → first-token sample → decode → materialize-final →
-/// epilogue — substituting the tapped prefill and [`run_dspark_turn`] for
-/// the plain prefill and `run_decode_loop`. The epilogue is not called
-/// directly: [`SpecTurnEpilogue`] is minted here and is the only way to
-/// reach it (L-EPILOGUE).
+/// end-decode → epilogue — substituting the tapped prefill and
+/// [`run_dspark_turn`] for the plain prefill and `run_decode_loop`. The
+/// turn tail is literally the autoregressive one: the same
+/// [`DecodeStep::materialize_final`] and [`DecodeStep::end_decode`] calls
+/// on the same [`PagedBackend::begin_paged_decode`] stepper, so a
+/// speculative turn cannot end on a frontier the autoregressive turn would
+/// have settled. The epilogue is not called directly: [`SpecTurnEpilogue`]
+/// is minted here and is the only way to reach it (L-EPILOGUE).
 pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
     backend: &mut B,
     args: &mut WholeTurnArgs<'_>,
@@ -1124,14 +1124,24 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
         }
     };
 
-    // LENGTH exits keep every token, so the last one's K/V must exist for
-    // the adapter cursor to equal the saved history. A kept accepted draft
-    // already has it; a cycle boundary never does.
-    if finish_reason == "length"
-        && !outcome.last_in_cache
-        && let Some(&final_token) = generated_tokens.last()
-        && let Err(error) = backend.materialize_final_paged(final_token)
-    {
+    // The autoregressive lane's turn tail, unchanged. LENGTH exits keep
+    // every token, so the last one's K/V must exist for the adapter cursor
+    // to equal the saved history — a kept accepted draft already has it, a
+    // cycle boundary never does. `end_decode` then settles the frontier that
+    // row moved: the per-cycle settles inside `run_dspark_turn` stop at the
+    // last COMMIT, so without this the sliding prune and the cold-rung walk
+    // would never see the final token.
+    let tail: Result<()> = (|| {
+        let mut step = backend.begin_paged_decode()?;
+        if finish_reason == "length"
+            && !outcome.last_in_cache
+            && let Some(&final_token) = generated_tokens.last()
+        {
+            step.materialize_final(final_token)?;
+        }
+        step.end_decode()
+    })();
+    if let Err(error) = tail {
         epilogue.abort(backend);
         return Err(error);
     }
@@ -2656,8 +2666,8 @@ mod tests {
                 report_perf: false,
                 generation_stream,
                 // The streaming drive exercises the StreamingCtx polls in
-                // isolation — production (gemma4 `draft_chat_turn`) also
-                // wires the same flag here.
+                // isolation — production (`run_paged_dspark_turn`, gemma4
+                // `flat_draft_chat_turn`) also wires the same flag here.
                 cancel_flag: None,
                 turn_token_observer,
             },

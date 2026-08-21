@@ -387,7 +387,7 @@ impl Gemma4Inner {
                     // Cooperative-cancel checkpoint (H1b) at every chunk
                     // boundary after the first chunk (a one-chunk prefill is
                     // the single-shot case and stays uncancellable). The Err
-                    // rides `draft_chat_turn`'s `draft_fail_closed` arm.
+                    // rides `flat_draft_chat_turn`'s `draft_fail_closed` arm.
                     if offset > 0
                         && inner
                             .turn_cancel
@@ -777,7 +777,7 @@ mod tests {
     // ── fail-closed error path (whole-turn core) ───────────────────────
 
     /// FAIL-CLOSED regression on the ASSISTANT variant (the port of the
-    /// DSpark `dspark_turn_error_fails_closed_then_cold_turn_recovers`
+    /// DSpark `dspark_paged_turn_error_fails_closed_then_cold_turn_recovers`
     /// test): a REAL (unmocked) stepper error AFTER prefill has advanced
     /// the target caches must drop the entire warm session, and the very
     /// next turn must succeed via the cold path.
@@ -868,7 +868,7 @@ mod tests {
 
     // ── streaming cancellation (whole-turn) ────────────────────────────
 
-    /// WHOLE-TURN streaming cancellation through `draft_chat_turn` on the
+    /// WHOLE-TURN streaming cancellation through `flat_draft_chat_turn` on the
     /// ASSISTANT variant (mechanical port of the DSpark
     /// `dspark_streaming_cancel_whole_turn_state_consistent` test): a
     /// cancel raised from the chunk sink must terminate the stream promptly

@@ -720,12 +720,6 @@ impl PagedDsparkBackend for Gemma4Inner {
         Ok(last_logits)
     }
 
-    fn materialize_final_paged(&mut self, token_id: u32) -> Result<()> {
-        let seq_id = self.active_paged_seq;
-        let _logits = self.run_paged_decode_step_for(seq_id, token_id)?;
-        Ok(())
-    }
-
     fn dspark_block_size(&self) -> Result<usize> {
         Ok(self
             .dspark_draft()
@@ -1584,6 +1578,97 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    /// A LENGTH exit materializes one final row AFTER the last cycle's
+    /// commit, and that row can be the one whose committed cutoff
+    /// (`committed - window`) crosses a block boundary. The turn tail must
+    /// settle it: the per-cycle settles inside `run_dspark_turn` stop at the
+    /// last COMMIT, so a tail without `end_decode` leaves the retired
+    /// sliding block held for the rest of the session and skips the
+    /// cold-rung walk at the turn's real frontier.
+    ///
+    /// The fixture's discriminating property is asserted, not assumed: the
+    /// same autoregressive turn one token shorter leaves a DIFFERENT sliding
+    /// free-block count, which is what makes the final token the one that
+    /// retires the block.
+    ///
+    /// Mutation this catches: dropping `end_decode` from
+    /// `run_paged_dspark_turn`'s tail — the speculative lane then holds one
+    /// sliding block the autoregressive lane returned.
+    #[test]
+    fn paged_dspark_length_exit_settles_the_materialized_final_row() {
+        const SEED: u64 = 0x0D1_9A7E_0001;
+        const PROMPT_LEN: usize = 4;
+        // `PROMPT_LEN + BUDGET == 16 == 2 * paged_block_size`, and the tiny
+        // config's sliding window is one block wide, so the final row is
+        // exactly the token that moves the committed cutoff onto block 1.
+        const BUDGET: i32 = 12;
+
+        let Some(_probe) = seeded_tiny_paged_inner_with_draft(SEED) else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
+        };
+        let tokenizer = tiny_qwen_tokenizer();
+        let tokens: Vec<u32> = (0..PROMPT_LEN as u32).map(|i| i % 16).collect();
+
+        let ar_blocks_at = |budget: i32| {
+            let mut inner = seeded_tiny_paged_inner_with_draft(SEED).expect("seeded AR fixture");
+            let result = run_tiny_paged_ar_turn(
+                &mut inner,
+                &tokenizer,
+                &tokens,
+                &tiny_turn_config(None, budget),
+            )
+            .expect("paged AR turn");
+            (result, paged_free_blocks(&inner))
+        };
+        let (_, ar_short_blocks) = ar_blocks_at(BUDGET - 1);
+        let (ar, ar_blocks) = ar_blocks_at(BUDGET);
+        assert_eq!(
+            ar.finish_reason, "length",
+            "the fixture must exit on length"
+        );
+        assert_ne!(
+            ar_short_blocks, ar_blocks,
+            "the fixture is only discriminating if the LAST token is the one that \
+             retires a sliding block — one token shorter must leave a different \
+             free-block count"
+        );
+
+        let mut spec_inner =
+            seeded_tiny_paged_inner_with_draft(SEED).expect("seeded speculative fixture");
+        let spec_seq = spec_inner.active_paged_seq;
+        let spec = run_tiny_paged_draft_turn(
+            &mut spec_inner,
+            &tokenizer,
+            &tokens,
+            &tiny_turn_config(None, BUDGET),
+        )
+        .expect("paged DSpark turn");
+
+        assert_eq!(spec.raw_text, ar.raw_text, "raw_text");
+        assert_eq!(spec.finish_reason, ar.finish_reason, "finish_reason");
+        assert_eq!(spec.num_tokens, ar.num_tokens, "token count");
+        assert_eq!(
+            committed_paged_tokens(&spec_inner, spec_seq).map(|rows| rows.len()),
+            Some(PROMPT_LEN + spec.num_tokens as usize),
+            "a length exit keeps every token, so the final row must be materialized"
+        );
+        assert!(
+            spec.performance
+                .as_ref()
+                .and_then(|p| p.mtp_cycles)
+                .unwrap_or(0)
+                > 0,
+            "the speculative lane must actually run cycles (silent AR fallback?)"
+        );
+        assert_eq!(
+            paged_free_blocks(&spec_inner),
+            ar_blocks,
+            "the turn tail must settle the materialized final row: the speculative \
+             lane is holding a sliding block the autoregressive lane returned"
+        );
     }
 
     /// A stop INSIDE a speculative block registers only the tokens the turn
