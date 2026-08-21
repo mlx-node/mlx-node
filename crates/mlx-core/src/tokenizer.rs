@@ -8359,8 +8359,18 @@ mod tests {
     }
 
     /// Blast-radius gate for detection, mirroring the ternary transform's: load every
-    /// installed tokenizer and assert only Muse-Glimmer's vocabulary enables the
-    /// sanitizer. Opt in with `MLX_TEST_MODEL_CACHE_DIR`.
+    /// installed tokenizer and assert the set whose vocabulary enables the sanitizer
+    /// is EXACTLY the set of Muse-Glimmer checkpoints. Opt in with
+    /// `MLX_TEST_MODEL_CACHE_DIR`.
+    ///
+    /// The oracle is the checkpoint's directory name, which is filesystem identity
+    /// and not derived from the code under test, and the comparison is a
+    /// biconditional over every loadable tokenizer in the cache, so all three ways
+    /// of breaking detection go red here: firing for one extra family, firing for
+    /// every family, and firing for none. It is stated as that property rather than
+    /// as a literal list of cache directories because converting another
+    /// Muse-Glimmer quant is not a regression, and a gate that goes red for one
+    /// teaches the next reader to relax it.
     #[test]
     #[ignore = "requires a local model cache; set MLX_TEST_MODEL_CACHE_DIR and run with --ignored"]
     fn only_muse_glimmer_vocabularies_enable_the_marker_sanitizer() {
@@ -8369,8 +8379,16 @@ mod tests {
         };
         let entries = std::fs::read_dir(&root).unwrap_or_else(|e| panic!("read_dir {root}: {e}"));
 
+        /// Directory-name oracle for "this checkpoint IS a Muse-Glimmer", used
+        /// only to name the expected partition — detection itself reads the
+        /// vocabulary, so the two sides of the comparison stay independent.
+        fn is_muse_glimmer(dir_name: &str) -> bool {
+            dir_name.to_ascii_lowercase().contains("muse-glimmer")
+        }
+
         let mut seen = 0usize;
         let mut enabled: Vec<String> = Vec::new();
+        let mut muse_glimmer: Vec<String> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path().join("tokenizer.json");
             if !path.exists() {
@@ -8380,19 +8398,38 @@ mod tests {
                 continue;
             };
             seen += 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_muse_glimmer(&name) {
+                muse_glimmer.push(name.clone());
+            }
             if !Qwen3Tokenizer::detect_control_markers(&tokenizer).is_empty() {
-                enabled.push(entry.file_name().to_string_lossy().into_owned());
+                enabled.push(name);
             }
         }
+        enabled.sort();
+        muse_glimmer.sort();
 
         assert!(
             seen >= 2,
             "only {seen} tokenizer(s) loaded from {root} — this gate needs the real cache",
         );
+        // Non-vacuity, both directions. Without a Muse-Glimmer checkpoint the
+        // comparison below would pass on a detector that never fires; without a
+        // non-Muse-Glimmer one it would pass on a detector that always fires.
+        assert!(
+            !muse_glimmer.is_empty(),
+            "no Muse-Glimmer checkpoint in {root} — this gate cannot prove the \
+             sanitizer ever turns ON",
+        );
+        assert!(
+            muse_glimmer.len() < seen,
+            "all {seen} checkpoints in {root} are Muse-Glimmer — this gate cannot \
+             prove the sanitizer ever stays OFF",
+        );
         assert_eq!(
-            enabled,
-            vec!["muse-glimmer-30b".to_string()],
-            "exactly one installed checkpoint may enable the marker sanitizer",
+            enabled, muse_glimmer,
+            "the marker sanitizer must be enabled for every Muse-Glimmer \
+             checkpoint and for no other ({seen} tokenizers loaded from {root})",
         );
         eprintln!("loaded {seen} tokenizers, sanitizer enabled for {enabled:?}");
     }
