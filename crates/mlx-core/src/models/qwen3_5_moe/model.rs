@@ -8914,8 +8914,7 @@ fn moe_mtp_committed_history_enabled() -> bool {
 /// hidden-emitting prefill), so even with the flag on, cycle 1 of every turn
 /// still starts the drafter from an empty cache — only cycles 2+ within the
 /// SAME turn benefit today. FLAT-ONLY: the main forward, verify, and rollback
-/// all act on `inner.caches`; there is no paged routing, adapter, or
-/// `MtpStepMode` here.
+/// all act on `inner.caches`; there is no paged routing or adapter here.
 pub(crate) struct MoeMtpStepper<'a> {
     /// The model — owns layers / caches / mtp / final_norm / lm_head and the
     /// `flat_mtp_caches_desynced` latch.

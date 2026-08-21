@@ -26,6 +26,7 @@ use crate::engine::plan::{
     SpeculativePlan,
 };
 use crate::engine::recurrent_state::{HYBRID_LIVE_STATE_UNITS, RecurrentStateTable};
+use crate::engine::spec_owner::SpecOwner;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -4454,10 +4455,9 @@ impl Qwen35Inner {
             // engine-owned (`engine::run_mtp_turn`) and drives the
             // `DenseMtpStepper` (`MtpBackend::begin_mtp_decode`). The stepper
             // captures the embedding table + config and runs the prompt-prefix
-            // seed before the loop; the 11 former `MtpOps` closures are its
-            // `MtpStepper` methods. The `profiler.set_label("mtp_eager")` relabel
-            // moved into `DenseMtpStepper::profiler_relabel` (applied once at
-            // turn entry by the engine).
+            // seed before the loop. The `profiler.set_label("mtp_eager")`
+            // relabel lives in `DenseMtpStepper::profiler_relabel` (applied
+            // once at turn entry by the engine).
             let mut rng = rand::rng();
 
             // Preserve the eager block's initial `async_eval_arrays(&[&y])`
@@ -5259,11 +5259,10 @@ impl Qwen35Inner {
 
             // The propose/verify whole-turn loop is engine-owned
             // (`run_mtp_turn`) and drives the `DenseMtpStepper` in its PAGED
-            // mode: `begin_mtp_decode` moves `self.paged_adapter` into the
-            // stepper for the turn, runs the committed-history prompt seed, and
-            // routes the Step-A / verify forwards through the adapter; the
-            // stepper's `Drop` restores the adapter into `self.paged_adapter`
-            // before this call returns, so the paged-history save below finds
+            // mode: `begin_mtp_decode` claims the adapter's active sequence as
+            // the turn's owner, runs the committed-history prompt seed, and
+            // routes the Step-A / verify forwards through the adapter, which
+            // stays on `self` throughout so the paged-history save below finds
             // it. The paged path commits cache state through its own
             // paged-history save; the turn outcome's rewind tail is consumed
             // below (`last_in_cache` stays inert — dense paged is drop-last).
@@ -10333,29 +10332,26 @@ impl DecodeStep for Qwen35Decode<'_> {
 }
 
 /// Per-turn pure-Rust ("eager") dense MTP stepper the engine-owned
-/// [`crate::engine::mtp_turn::run_mtp_turn`] drives.
-///
-/// The 11 `MtpOps` closures of the old `chat_with_caches_inner` eager-MTP
-/// block become [`MtpStepper`] methods; the per-cycle scratch the closures
-/// captured in `RefCell`/`Cell` (the GDN tape, the pre-verify snapshot, the
-/// stashed replay error, the desync latch, the committed-history bookkeeping)
-/// becomes PLAIN struct fields — the engine calls the methods strictly
-/// sequentially and non-nested, so the interior mutability the closures needed
-/// to share `&mut self` is gone.
+/// [`crate::engine::mtp_turn::run_mtp_turn`] drives. The per-cycle scratch
+/// (the GDN tape, the pre-verify snapshot, the stashed replay error, the
+/// desync latch, the committed-history bookkeeping) are plain fields: the
+/// engine calls the methods strictly sequentially and non-nested.
 ///
 /// Drives BOTH the FLAT and the block-PAGED dense MTP turn, selected by
-/// [`MtpStepMode`]: the flat mode runs the eager pre-norm forwards against
-/// `inner.caches`; the paged mode routes the main Step-A / verify forwards
-/// through the captured [`PagedKVCacheAdapter`]
+/// [`Self::owner`]: with no owner the eager pre-norm forwards run against
+/// `inner.caches`; with one, the main Step-A / verify forwards route through
+/// `inner.paged_adapter`
 /// ([`super::paged_forward::run_paged_step_with_hidden`] /
 /// [`super::paged_forward::run_paged_verify_step`]) while the GDN recurrent
 /// state stays FLAT in `inner.caches` Linear slots. Only four methods
 /// (`forward_with_hidden`, `verify_step`, `rollback`, `rollback_unemitted`)
-/// branch on the mode; every other method is mode-identical (the drafter and
-/// the committed-history commit are paged-agnostic). The paged adapter is moved
-/// into the stepper at [`MtpBackend::begin_mtp_decode`] and restored into
-/// `inner.paged_adapter` by [`Drop`] so the post-turn paged-history save finds
-/// it, on EVERY exit path of `run_mtp_turn`.
+/// branch on it; every other method is path-identical (the drafter and the
+/// committed-history commit are paged-agnostic).
+///
+/// The adapter stays ON THE MODEL for the whole turn (I6): each paged touch
+/// borrows it back through [`SpecOwner::resolve`], which refuses once the
+/// adapter's active request is no longer this turn's. That refusal is what
+/// makes the borrow-back sound, so nothing has to be moved out and restored.
 pub(crate) struct DenseMtpStepper<'a> {
     /// The model — owns layers / caches / mtp / final_norm / lm_head and the
     /// `flat_mtp_caches_desynced` latch. == the closures'
@@ -10421,41 +10417,23 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// Config clone for the per-cycle drafter cache reset/fresh build. == the
     /// closures' captured `config`.
     config: Qwen3_5Config,
-    /// Flat vs. paged main-forward routing. `Paged` owns the turn's
-    /// [`PagedKVCacheAdapter`] (moved in at `begin_mtp_decode`, restored into
-    /// `inner.paged_adapter` by [`Drop`]).
-    mode: MtpStepMode,
+    /// The sequence this turn's paged main-forwards belong to, claimed at
+    /// `begin_mtp_decode`. `None` runs the flat main path.
+    owner: Option<SpecOwner>,
     /// Per-layer attention/linear classification consumed by the paged
     /// forwards. Empty on the flat path (unused there).
     layer_kinds: Vec<super::decoder_layer::Qwen3_5LayerKind>,
-}
-
-/// Main-forward routing for [`DenseMtpStepper`]: `Flat` runs the eager
-/// pre-norm forwards against `inner.caches`; `Paged` routes full-attention
-/// K/V through the owned adapter while GDN state stays flat. The adapter is
-/// boxed so the unit `Flat` variant does not pad out to the adapter's size.
-enum MtpStepMode {
-    Flat,
-    Paged(Box<PagedKVCacheAdapter>),
 }
 
 impl Drop for DenseMtpStepper<'_> {
     fn drop(&mut self) {
         // A turn that failed between the verify write and its rollback (any
         // `?` in the engine's accept path) leaves the cycle open; close it
-        // before the adapter moves back out of `mode`, or the ticket's
-        // abandoned-cycle guard turns that error return into a debug-build
-        // panic.
-        self.close_abandoned_cycle();
-        // Restore the paged adapter into the model so the post-turn
-        // paged-history save (which runs AFTER `run_mtp_turn` returns) finds
-        // `inner.paged_adapter == Some`. Firing in `Drop` covers EVERY exit
+        // here so the ticket's abandoned-cycle guard does not turn that error
+        // return into a debug-build panic. Firing in `Drop` covers EVERY exit
         // path of `run_mtp_turn` — the `Ok` tail, the `take_replay_error`
-        // early return, and any mid-loop `?` propagation. Idempotent: the
-        // adapter is taken out of `mode` here, so a second drop is a no-op.
-        if let MtpStepMode::Paged(adapter) = std::mem::replace(&mut self.mode, MtpStepMode::Flat) {
-            self.inner.paged_adapter = Some(*adapter);
-        }
+        // early return, and any mid-loop `?` propagation.
+        self.close_abandoned_cycle();
     }
 }
 
@@ -10469,7 +10447,7 @@ impl DenseMtpStepper<'_> {
     /// on the paged path their K/V lives in the pool (rewound by the adapter)
     /// and the flat shells are skipped.
     fn replay_main_linear_to(&mut self, steps: usize) -> Result<()> {
-        let paged = matches!(self.mode, MtpStepMode::Paged(_));
+        let paged = self.owner.is_some();
         let snap = match self.snap.as_ref() {
             Some(Ok(s)) => s,
             Some(Err(e)) => {
@@ -10566,9 +10544,15 @@ impl DenseMtpStepper<'_> {
     /// The attention side's ground-truth frontier: the paged adapter's
     /// recorded rows, or the first flat FullAttention cache's offset.
     fn attention_frontier(&self) -> Option<u64> {
-        match &self.mode {
-            MtpStepMode::Paged(adapter) => Some(adapter.request_tokens().len() as u64),
-            MtpStepMode::Flat => {
+        match self.owner {
+            Some(owner) => Some(
+                owner
+                    .resolve_ref(&self.inner.paged_adapter, DENSE_PAGED_MTP)
+                    .ok()?
+                    .request_tokens()
+                    .len() as u64,
+            ),
+            None => {
                 let caches = self.inner.caches.as_ref()?;
                 caches
                     .iter()
@@ -10579,26 +10563,19 @@ impl DenseMtpStepper<'_> {
     }
 
     /// The paged speculative cache the facade (`engine::spec_paged`)
-    /// addresses: the turn's owned adapter, iff `seq_id` names the turn's
-    /// single active sequence. Any other id is refused — a facade call must
-    /// never re-activate a different request mid-turn — and the flat mode
-    /// has no paged cache to hand out.
+    /// addresses: the model's adapter, borrowed back through the turn's
+    /// owner, iff `seq_id` is that owner. Any other id is refused — a facade
+    /// call must never re-activate a different request mid-turn — and a flat
+    /// turn has no paged cache to hand out.
     fn paged_cache_for(
         &mut self,
         seq_id: u32,
     ) -> std::result::Result<&mut PagedKVCacheAdapter, String> {
-        match &mut self.mode {
-            MtpStepMode::Paged(adapter) => match adapter.active_seq_id() {
-                Some(active) if active == seq_id => Ok(adapter),
-                active => Err(format!(
-                    "dense paged MTP facade: sequence {seq_id} is not the turn's \
-                     active sequence ({active:?})"
-                )),
-            },
-            MtpStepMode::Flat => Err("dense paged MTP facade: the flat stepper mode has no \
-                 paged speculative cache"
-                .to_string()),
-        }
+        let owner = self.owner.ok_or_else(|| {
+            format!("{DENSE_PAGED_MTP}: a flat turn has no paged speculative cache")
+        })?;
+        owner.accepts(seq_id, DENSE_PAGED_MTP)?;
+        owner.resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
     }
 
     /// The paged half of [`MtpStepper::verify_step`]: slice `ids` to exactly
@@ -10635,11 +10612,14 @@ impl DenseMtpStepper<'_> {
         }
         let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
         let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
-        self.open_verify_cycle(depth + 1);
-        let MtpStepMode::Paged(adapter) = &mut self.mode else {
-            unreachable!("paged_verify_step is only reached in paged mode");
-        };
+        let owner = self
+            .owner
+            .expect("paged_verify_step is only reached on a paged turn");
+        self.open_verify_cycle(owner, depth + 1);
         let inner = &mut *self.inner;
+        let adapter = owner
+            .resolve(&mut inner.paged_adapter, "eager paged MTP verify_step")
+            .map_err(Error::from_reason)?;
         // Cross-turn M-RoPE delta carried by a text turn that warm-
         // continues an image prefill; 0 for pure-text sessions.
         let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
@@ -10665,23 +10645,12 @@ impl DenseMtpStepper<'_> {
     /// Mint the cycle ticket the verify core's own row write belongs to.
     ///
     /// Failure is not fatal and not silent: the only way to reach it is an
-    /// adapter with no active request, whose `record_tokens` fails the
-    /// verify a few lines later with the message it always did, so the
-    /// pre-facade error semantics stand.
-    fn open_verify_cycle(&mut self, rows: usize) {
+    /// adapter that no longer answers to this turn's owner, whose
+    /// `record_tokens` fails the verify a few lines later, so the pre-facade
+    /// error semantics stand.
+    fn open_verify_cycle(&mut self, owner: SpecOwner, rows: usize) {
         self.close_abandoned_cycle();
-        let seq_id = match &self.mode {
-            MtpStepMode::Paged(adapter) => adapter.active_seq_id(),
-            MtpStepMode::Flat => None,
-        };
-        let Some(seq_id) = seq_id else {
-            tracing::warn!(
-                target: "mlx_core::qwen3_5::paged",
-                "eager MTP-paged verify cycle left unopened: the adapter names no \
-                 active sequence",
-            );
-            return;
-        };
+        let seq_id = owner.seq_id();
         match crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq_id, rows) {
             Ok(ticket) => self.open_cycle = Some(ticket),
             Err(e) => tracing::warn!(
@@ -10698,6 +10667,25 @@ impl DenseMtpStepper<'_> {
     /// length-agreement check refuses to persist the turn — so a full keep
     /// retracts nothing and this consumes the ticket instead of letting its
     /// abandoned-cycle guard fire.
+    /// The turn's paged adapter, borrowed back through the owner. Tests
+    /// assert on adapter state across a whole turn; production reaches it
+    /// through `paged_cache_for` or an inline `owner.resolve`.
+    #[cfg(test)]
+    fn owned_adapter(&self) -> &PagedKVCacheAdapter {
+        self.owner
+            .expect("the turn must be paged")
+            .resolve_ref(&self.inner.paged_adapter, DENSE_PAGED_MTP)
+            .expect("the paged adapter must still answer to the turn's owner")
+    }
+
+    #[cfg(test)]
+    fn owned_adapter_mut(&mut self) -> &mut PagedKVCacheAdapter {
+        self.owner
+            .expect("the turn must be paged")
+            .resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
+            .expect("the paged adapter must still answer to the turn's owner")
+    }
+
     fn close_abandoned_cycle(&mut self) {
         let Some(ticket) = self.open_cycle.take() else {
             return;
@@ -10744,8 +10732,8 @@ impl MtpStepper for DenseMtpStepper<'_> {
         ids: &MxArray,
         embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)> {
-        let output = match &mut self.mode {
-            MtpStepMode::Flat => {
+        let output = match self.owner {
+            None => {
                 let inner = &mut *self.inner;
                 let pre =
                     forward_pre_norm_inner(ids, embedding, &mut inner.layers, &mut inner.caches)?;
@@ -10754,10 +10742,16 @@ impl MtpStepper for DenseMtpStepper<'_> {
                 let hidden = h3.squeeze(Some(&[1]))?;
                 Ok((logits, hidden, true))
             }
-            MtpStepMode::Paged(adapter) => {
+            Some(owner) => {
                 ids.eval();
                 let token_id = ids.item_at_int32(0)? as u32;
                 let inner = &mut *self.inner;
+                let adapter = owner
+                    .resolve(
+                        &mut inner.paged_adapter,
+                        "eager paged MTP forward_with_hidden",
+                    )
+                    .map_err(Error::from_reason)?;
                 // Cross-turn M-RoPE delta carried by a text turn that warm-
                 // continues an image prefill; 0 for pure-text sessions.
                 let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
@@ -10819,7 +10813,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
         embedding: &Embedding,
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
-        let output = if matches!(self.mode, MtpStepMode::Paged(_)) {
+        let output = if self.owner.is_some() {
             self.paged_verify_step(ids, depth)
         } else {
             let inner = &mut *self.inner;
@@ -10857,7 +10851,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
         // paged-aware so we capture only the GDN (Linear) state and skip the
         // shells — `rollback` rewinds those via the adapter and never reads
         // their snapshot.
-        let paged = matches!(self.mode, MtpStepMode::Paged(_));
+        let paged = self.owner.is_some();
         let inner = &*self.inner;
         let snap = match inner.caches.as_ref() {
             Some(caches) => super::layer_cache::snapshot_all_mtp(caches, paged),
@@ -10887,7 +10881,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
         // are the same arithmetic: the commit derives its rollback as
         // `rows - keep` = `(depth + 1) - (accepted_drafts + 1)`, which is the
         // `depth - accepted_drafts` this path always applied.
-        if matches!(self.mode, MtpStepMode::Paged(_)) {
+        if let Some(owner) = self.owner {
             match self.open_cycle.take() {
                 Some(ticket) => {
                     let seq_id = ticket.seq_id();
@@ -10910,14 +10904,20 @@ impl MtpStepper for DenseMtpStepper<'_> {
                     }
                 }
                 None => {
-                    // No cycle to close: `verify_step` could not name the
-                    // turn's sequence, which also fails the verify itself, so
-                    // production never lands here. Retract directly rather
-                    // than leave rejected rows recorded.
+                    // No cycle to close: `verify_step` could not open one,
+                    // which also fails the verify itself, so production never
+                    // lands here. Retract directly rather than leave rejected
+                    // rows recorded.
                     let rejected = depth.saturating_sub(accepted_drafts);
-                    if let MtpStepMode::Paged(adapter) = &mut self.mode
-                        && rejected > 0
-                        && let Err(e) = adapter.rollback_last_tokens(rejected as u32)
+                    if rejected > 0
+                        && let Err(e) = owner
+                            .resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
+                            .map_err(Error::from_reason)
+                            .and_then(|adapter| {
+                                adapter.rollback_last_tokens(rejected as u32).map_err(|e| {
+                                    Error::from_reason(format!("adapter rollback: {e}"))
+                                })
+                            })
                     {
                         tracing::warn!(
                             target: "mlx_core::qwen3_5::paged",
@@ -11064,15 +11064,10 @@ impl MtpStepper for DenseMtpStepper<'_> {
     // fallback with untouched adapter state; the flat mode has no
     // reservation semantics and is always covered.
     fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
-        let seq_id = match &self.mode {
-            MtpStepMode::Flat => return Ok(true),
-            MtpStepMode::Paged(adapter) => adapter.active_seq_id().ok_or_else(|| {
-                Error::from_reason(
-                    "eager paged MTP per-cycle lookahead reservation: the \
-                     adapter has no active request",
-                )
-            })?,
+        let Some(owner) = self.owner else {
+            return Ok(true);
         };
+        let seq_id = owner.seq_id();
         crate::engine::spec_paged::SpecPagedCache::reserve_lookahead(self, seq_id, rows).map_err(
             |e| {
                 Error::from_reason(format!(
@@ -11101,27 +11096,31 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     fn rollback_unemitted(&mut self, unemitted: usize) {
-        match &mut self.mode {
-            MtpStepMode::Flat => {
-                if unemitted > 0 {
-                    self.mtp_desynced = true;
-                }
-                return;
+        let Some(owner) = self.owner else {
+            if unemitted > 0 {
+                self.mtp_desynced = true;
             }
-            MtpStepMode::Paged(adapter) => {
-                // Truncate the live paged adapter by the accepted-but-unemitted
-                // tokens; the paged path never sets the FLAT desync latch. An
-                // adapter truncate failure is not fatal here: the epilogue's
-                // frontier check sees the skew and refuses to persist.
-                if let Err(e) = adapter.rollback_last_tokens(unemitted as u32) {
-                    tracing::warn!(
-                        target: "mlx_core::qwen3_5::paged",
-                        "eager MTP-paged rollback_unemitted({unemitted}) adapter \
-                         truncate failed (epilogue frontier check refuses to \
-                         persist): {e}",
-                    );
-                }
-            }
+            return;
+        };
+        // Truncate the live paged adapter by the accepted-but-unemitted
+        // tokens; the paged path never sets the FLAT desync latch. An adapter
+        // truncate failure is not fatal here: the epilogue's frontier check
+        // sees the skew and refuses to persist.
+        if let Err(e) = owner
+            .resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
+            .map_err(Error::from_reason)
+            .and_then(|adapter| {
+                adapter
+                    .rollback_last_tokens(unemitted as u32)
+                    .map_err(|e| Error::from_reason(format!("adapter rollback: {e}")))
+            })
+        {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                "eager MTP-paged rollback_unemitted({unemitted}) adapter \
+                 truncate failed (epilogue frontier check refuses to \
+                 persist): {e}",
+            );
         }
         // Paged GDN rewind twin of the adapter truncate above: replay the
         // retained snapshot + tape to `last_cycle_steps - unemitted` steps so
@@ -11182,16 +11181,16 @@ impl MtpStepper for DenseMtpStepper<'_> {
         // tape replay — so every paged target-state kind already sits at the
         // drop-last-of-emitted frontier and reporting `false` is honest; it
         // never touches the FLAT desync latch. A rewind failure routes through
-        // `take_replay_error` → session invalidation instead. The adapter is
-        // restored into `inner.paged_adapter` by the `Drop` impl that runs as
-        // `self` falls out of scope here. (`self` is consumed by value rather
-        // than destructured because the `Drop` impl forbids moving fields out.)
-        match self.mode {
-            MtpStepMode::Flat => self.mtp_desynced,
-            MtpStepMode::Paged(_) => false,
-        }
+        // `take_replay_error` → session invalidation instead. (`self` is
+        // consumed by value rather than destructured because the `Drop` impl
+        // forbids moving fields out.)
+        self.owner.is_none() && self.mtp_desynced
     }
 }
+
+/// Context prefix for every owner-addressed refusal on this family's paged
+/// speculative path.
+const DENSE_PAGED_MTP: &str = "dense paged MTP facade";
 
 /// The refusal both facade writers return for this family; see the
 /// `SpecPagedCache` impl docs below.
@@ -11204,9 +11203,8 @@ fn dense_core_writes_its_own_rows(seq_id: u32) -> String {
 }
 
 /// Facade conformance for the dense paged MTP turn (`engine::spec_paged`):
-/// the cache is the [`MtpStepMode::Paged`] adapter, addressed by the turn's
-/// single active sequence ([`DenseMtpStepper::paged_cache_for`] refuses any
-/// other id).
+/// the cache is the model's paged adapter, borrowed back through the turn's
+/// [`SpecOwner`] ([`DenseMtpStepper::paged_cache_for`] refuses any other id).
 ///
 /// # What production routes through here, and what it does not
 ///
@@ -11313,12 +11311,9 @@ impl crate::engine::spec_paged::SpecPagedCache for DenseMtpStepper<'_> {
     }
 
     fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
-        match &self.mode {
-            MtpStepMode::Paged(adapter) if adapter.active_seq_id() == Some(seq_id) => {
-                MtpStepper::frontier(self)
-            }
-            _ => None,
-        }
+        self.owner
+            .filter(|owner| owner.seq_id() == seq_id)
+            .and_then(|_| MtpStepper::frontier(self))
     }
 }
 
@@ -11350,11 +11345,14 @@ impl MtpBackend for Qwen35Inner {
         let use_committed = has_prompt_seed;
 
         // Auto-select the main-forward routing: the paged cores leave a paged
-        // adapter on `self`, so `take()` moves it into the stepper for the turn
-        // (restored by `Drop`); the flat cores have none and run flat. The
-        // paged forwards need the per-layer kind classification (unused flat).
-        let (mode, layer_kinds) = match self.paged_adapter.take() {
-            Some(mut adapter) => {
+        // adapter on `self`, so the turn claims its active sequence as the
+        // owner and borrows the adapter back per touch; the flat cores have
+        // none and run flat. The paged forwards need the per-layer kind
+        // classification (unused flat).
+        let (owner, layer_kinds) = match self.paged_adapter.as_mut() {
+            Some(adapter) => {
+                let owner = SpecOwner::claim(adapter.active_seq_id(), "eager paged MTP turn entry")
+                    .map_err(Error::from_reason)?;
                 // Reserve the speculative lookahead region before any cycle
                 // writes (I1: `setup.lookahead_rows` comes from the
                 // `SpeculativePlan` property — never a local `depth + 1`).
@@ -11366,21 +11364,17 @@ impl MtpBackend for Qwen35Inner {
                 // `reserve_cycle_lookahead` call on the stepper.
                 if setup.lookahead_rows > 0 {
                     let rows = u32::try_from(setup.lookahead_rows).unwrap_or(u32::MAX);
-                    if let Err(e) = adapter.reserve_rows(rows) {
-                        // `mode` does not exist yet, so `Drop` cannot restore
-                        // the adapter — put it back before erroring out.
-                        self.paged_adapter = Some(adapter);
-                        return Err(Error::from_reason(format!(
+                    adapter.reserve_rows(rows).map_err(|e| {
+                        Error::from_reason(format!(
                             "eager paged MTP lookahead reservation ({rows} rows): {e}"
-                        )));
-                    }
+                        ))
+                    })?;
                 }
                 // Cached once at construction (see the field rustdoc); clone is
                 // a copy of the turn-constant classification.
-                let layer_kinds = self.layer_kinds.clone();
-                (MtpStepMode::Paged(Box::new(adapter)), layer_kinds)
+                (Some(owner), self.layer_kinds.clone())
             }
-            None => (MtpStepMode::Flat, Vec::new()),
+            None => (None, Vec::new()),
         };
 
         let mut stepper = DenseMtpStepper {
@@ -11399,7 +11393,7 @@ impl MtpBackend for Qwen35Inner {
             mtp_desynced: false,
             embedding,
             config,
-            mode,
+            owner,
             layer_kinds,
         };
         // The GDN recurrent state is aligned with the attention state at turn
@@ -17052,6 +17046,120 @@ mod paged_construction_tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// I6 gate: a paged speculative turn ADDRESSES the model's adapter, it
+    /// does not take it. Three things follow, and each is one assertion here:
+    ///
+    ///   * the adapter stays reachable through `inner.paged_adapter` for the
+    ///     whole turn, and the turn's writes land on THAT adapter — a stepper
+    ///     that moved a copy out would leave the model's cursor at the prompt;
+    ///   * a facade write addressed to any other sequence is refused, so a
+    ///     turn can never drive a cache that has moved to another request;
+    ///   * a paged turn whose adapter names no active request is refused AT
+    ///     ENTRY with the adapter untouched, instead of running Step A against
+    ///     it and failing at the verify write.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn paged_mtp_turn_addresses_the_model_adapter_instead_of_taking_it() {
+        use crate::engine::spec_paged::SpecPagedCache;
+
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.n_mtp_layers = 1;
+        let Some((mut inner, _cfg)) = paged_inner_with_cfg_or_skip(
+            "paged_mtp_turn_addresses_the_model_adapter_instead_of_taking_it",
+            cfg,
+        ) else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        inner.mtp_weights_loaded = true;
+
+        let prompt: Vec<u32> = (0..24u32).map(|i| (i * 5 + 7) % 257).collect();
+        reset_paged_request(&mut inner, &prompt);
+        run_dense_paged_prefill_with_size(&mut inner, &prompt, &prompt, 0, 2048)
+            .expect("dense paged prefill")
+            .eval();
+
+        let depth = 2usize;
+        let lookahead = inner
+            .execution_plan()
+            .speculative
+            .expect("dense MTP checkpoint must publish a speculative plan")
+            .lookahead_rows(depth);
+        let setup = MtpTurnSetup {
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
+            first_sampled_token: 21,
+            lookahead_rows: lookahead,
+        };
+
+        let seq_id = {
+            let mut step = inner.begin_mtp_decode(&setup).expect("begin_mtp_decode");
+            let seq_id = step
+                .owned_adapter()
+                .active_seq_id()
+                .expect("active request");
+
+            // A facade WRITE addressed to a foreign sequence is refused. The
+            // frontier read is already gated elsewhere; this is the write half,
+            // and it is what stops a re-pointed cache from being driven.
+            let err = SpecPagedCache::reserve_lookahead(&mut step, seq_id + 1, lookahead)
+                .expect_err("a foreign sequence must be refused by the facade");
+            assert!(
+                err.contains("not this turn's owner"),
+                "the refusal must name the owner mismatch, got: {err}"
+            );
+
+            // One real Step-A forward, so the turn actually writes a row.
+            let ids = MxArray::from_int32(&[21], &[1, 1]).expect("step-A ids");
+            let embedding = step.embedding().clone();
+            let (logits, _hidden, _squeeze) = step
+                .forward_with_hidden(&ids, &embedding)
+                .expect("Step-A forward on the model's adapter");
+            logits.eval();
+            seq_id
+        };
+
+        // The write landed on the MODEL's adapter, not on a copy the stepper
+        // owned and handed back.
+        let adapter = inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter stays on model");
+        assert_eq!(adapter.active_seq_id(), Some(seq_id));
+        assert_eq!(
+            adapter.current_token_count(),
+            prompt.len() as u32 + 1,
+            "the turn's Step-A row must be visible on the model's own adapter"
+        );
+
+        // Entry refusal: no active request means no addressable sequence, so
+        // the turn never starts and the adapter is left exactly as it was.
+        let blocks_before = adapter.num_allocated_blocks();
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .release_request()
+            .expect("release_request");
+        let err = inner
+            .begin_mtp_decode(&setup)
+            .err()
+            .expect("a paged turn with no active request must be refused at entry");
+        assert!(
+            err.reason.contains("no active request"),
+            "the entry refusal must name the missing request, got: {}",
+            err.reason
+        );
+        let adapter = inner
+            .paged_adapter
+            .as_ref()
+            .expect("the refused turn must not consume the adapter");
+        assert!(
+            adapter.num_allocated_blocks() <= blocks_before,
+            "a refused turn must not reserve lookahead blocks"
+        );
+    }
+
     /// Cross-module gate for the reserve→verify seam (T1/T2/T3 wiring) and
     /// for the facade cycle the dense paged commit is routed through
     /// (`engine::spec_paged`). Every cycle here is a REAL verify forward, so
@@ -17084,9 +17192,7 @@ mod paged_construction_tests {
 
         /// `(allocated blocks, recorded rows)` of the turn's paged adapter.
         fn adapter_stats(step: &DenseMtpStepper<'_>) -> (usize, u32) {
-            let MtpStepMode::Paged(adapter) = &step.mode else {
-                panic!("mode must stay paged for the whole turn");
-            };
+            let adapter = step.owned_adapter();
             (
                 adapter.num_allocated_blocks(),
                 adapter.current_token_count(),
@@ -17252,12 +17358,10 @@ mod paged_construction_tests {
             "the reservation must not advance the cursor"
         );
 
-        let seq_id = {
-            let MtpStepMode::Paged(adapter) = &step.mode else {
-                panic!("paged model must take the paged stepper mode");
-            };
-            adapter.active_seq_id().expect("active request")
-        };
+        let seq_id = step
+            .owned_adapter()
+            .active_seq_id()
+            .expect("active request");
         assert_eq!(
             SpecPagedCache::frontier(&step, seq_id),
             MtpStepper::frontier(&step),
@@ -17344,14 +17448,11 @@ mod paged_construction_tests {
         let ticket = cache
             .open_core_write_cycle(seq_id, kv_rows.len())
             .expect("open the cycle around the core write");
-        {
-            let MtpStepMode::Paged(adapter) = &mut cache.inner_mut().mode else {
-                panic!("mode must stay paged for the whole turn");
-            };
-            adapter
-                .record_tokens(&kv_rows)
-                .expect("the core write the cycle was opened around");
-        }
+        cache
+            .inner_mut()
+            .owned_adapter_mut()
+            .record_tokens(&kv_rows)
+            .expect("the core write the cycle was opened around");
         assert_eq!(
             adapter_stats(cache.inner()),
             (kv_blocks, committed_cursor + kv_rows.len() as u32),
@@ -17426,7 +17527,7 @@ mod paged_construction_tests {
         drop(step);
         assert!(
             inner.paged_adapter.is_some(),
-            "the stepper Drop must restore the adapter"
+            "the adapter stays on the model for the whole speculative turn"
         );
     }
 
@@ -17606,9 +17707,7 @@ mod paged_construction_tests {
             "cycle-1 replay must succeed"
         );
         let (blocks_after_cycle1, cursor_after_cycle1) = {
-            let MtpStepMode::Paged(adapter) = &step.mode else {
-                panic!("paged model must take the paged stepper mode");
-            };
+            let adapter = step.owned_adapter();
             (
                 adapter.num_allocated_blocks(),
                 adapter.current_token_count(),
@@ -17628,9 +17727,7 @@ mod paged_construction_tests {
             "a reservation the pool can hold must admit cycle 2"
         );
         let reserved_blocks = {
-            let MtpStepMode::Paged(adapter) = &step.mode else {
-                panic!("mode must stay paged across the reservation");
-            };
+            let adapter = step.owned_adapter();
             assert_eq!(
                 adapter.current_token_count(),
                 cursor_after_cycle1,
@@ -17658,9 +17755,7 @@ mod paged_construction_tests {
             .hiddens
             .eval();
         {
-            let MtpStepMode::Paged(adapter) = &step.mode else {
-                panic!("mode must stay paged across the cycle");
-            };
+            let adapter = step.owned_adapter();
             assert_eq!(
                 adapter.num_allocated_blocks(),
                 reserved_blocks,
@@ -17675,9 +17770,7 @@ mod paged_construction_tests {
 
         // (b) A reservation the pool cannot hold: AR fallback, state untouched.
         let (blocks_before, cursor_before, over_capacity) = {
-            let MtpStepMode::Paged(adapter) = &step.mode else {
-                panic!("mode must stay paged across the rollback");
-            };
+            let adapter = step.owned_adapter();
             (
                 adapter.num_allocated_blocks(),
                 adapter.current_token_count(),
@@ -17692,9 +17785,7 @@ mod paged_construction_tests {
             "an over-capacity per-cycle reservation must signal AR fallback"
         );
         {
-            let MtpStepMode::Paged(adapter) = &step.mode else {
-                panic!("mode must stay paged across the failed reservation");
-            };
+            let adapter = step.owned_adapter();
             assert_eq!(adapter.num_allocated_blocks(), blocks_before);
             assert_eq!(adapter.current_token_count(), cursor_before);
         }
@@ -17707,9 +17798,7 @@ mod paged_construction_tests {
             .expect("AR forward after fallback");
         logits.eval();
         {
-            let MtpStepMode::Paged(adapter) = &step.mode else {
-                panic!("mode must stay paged across the AR forward");
-            };
+            let adapter = step.owned_adapter();
             assert_eq!(
                 adapter.current_token_count(),
                 cursor_before + 1,
@@ -17720,7 +17809,7 @@ mod paged_construction_tests {
         drop(step);
         assert!(
             inner.paged_adapter.is_some(),
-            "the stepper Drop must restore the adapter"
+            "the adapter stays on the model for the whole speculative turn"
         );
     }
 }
