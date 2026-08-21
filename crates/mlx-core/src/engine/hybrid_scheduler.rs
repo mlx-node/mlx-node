@@ -1520,7 +1520,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let trained_context = u32::try_from(self.inner.max_position_embeddings())
             .unwrap_or(1)
             .max(1);
-        let context = trained_context.min(scheduler_per_seq_context());
+        let pool_tokens = self
+            .inner
+            .paged_adapter()
+            .map(crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::max_capacity_tokens)
+            .unwrap_or(trained_context);
+        let context = scheduled_turn_context(
+            trained_context,
+            pool_tokens,
+            scheduler_per_seq_context_override(),
+        );
         let max_new_tokens = match engine::scheduler::clamp_scheduled_output_tokens(
             prompt_tokens,
             requested_max_new_tokens,
@@ -3080,5 +3089,14 @@ mod scheduled_context_tests {
         // Some(0) is treated as unset; None means no extra clip beyond min(trained, pool).
         assert_eq!(scheduled_turn_context(64, 64, Some(0)), 64);
         assert_eq!(scheduled_turn_context(1_048_576, 349_520, None), 349_520);
+    }
+
+    #[test]
+    fn incident_prompt_fits_nemotron_pool() {
+        let trained = 1_048_576;
+        let pool = 349_520;
+        let cap = scheduled_turn_context(trained, pool, None);
+        // Output still clamped to remaining window; prompt accepted against the pool.
+        assert!(crate::engine::scheduler::clamp_scheduled_output_tokens(33_611, 1024, cap).is_ok());
     }
 }
