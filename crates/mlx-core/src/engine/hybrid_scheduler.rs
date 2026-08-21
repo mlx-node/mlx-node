@@ -1733,13 +1733,32 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
 
     /// Drop one idle parked recurrent row and/or unpin its keep-live KV so
     /// published full blocks drop to prefix-cache `ref_count == 1` (evictable).
-    fn reclaim_one_idle_scheduled(&mut self, seq_id: SeqId) -> bool {
+    /// `Ok(false)` means no victim or the same victim is still eligible.
+    fn reclaim_one_idle_scheduled(&mut self, seq_id: SeqId) -> Result<bool> {
+        self.reclaim_one_idle_scheduled_with(seq_id, B::release_scheduled_cache)
+    }
+
+    fn reclaim_one_idle_scheduled_with<F>(
+        &mut self,
+        seq_id: SeqId,
+        release_cache: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce(&mut B, SeqId) -> Result<()>,
+    {
         let Some(victim) = self.idle_memory_victim(seq_id) else {
-            return false;
+            return Ok(false);
         };
         self.inner.release_scheduled_recurrent_for(victim);
-        let _ = self.inner.release_scheduled_cache(victim);
-        true
+        release_cache(&mut self.inner, victim)?;
+        if !self.idle_reclaim_made_progress(seq_id, victim) {
+            return Ok(false);
+        }
+        Ok(true)
+    }
+
+    fn idle_reclaim_made_progress(&self, seq_id: SeqId, victim: SeqId) -> bool {
+        self.idle_memory_victim(seq_id) != Some(victim)
     }
 
     fn try_reserve_reclaiming_idle(
@@ -1747,8 +1766,28 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         seq_id: SeqId,
         reservation_blocks: u32,
         candidate_state_bytes: u64,
-        mut snapshot: SchedulerCacheSnapshot,
+        snapshot: SchedulerCacheSnapshot,
     ) -> Result<MemoryReserveOutcome> {
+        self.try_reserve_reclaiming_idle_with(
+            seq_id,
+            reservation_blocks,
+            candidate_state_bytes,
+            snapshot,
+            B::release_scheduled_cache,
+        )
+    }
+
+    fn try_reserve_reclaiming_idle_with<F>(
+        &mut self,
+        seq_id: SeqId,
+        reservation_blocks: u32,
+        candidate_state_bytes: u64,
+        mut snapshot: SchedulerCacheSnapshot,
+        mut release_cache: F,
+    ) -> Result<MemoryReserveOutcome>
+    where
+        F: FnMut(&mut B, SeqId) -> Result<()>,
+    {
         loop {
             let decision = self.scheduler.try_reserve_memory(
                 engine::scheduler::MemoryTelemetry {
@@ -1768,7 +1807,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             if decision.admitted {
                 return Ok(MemoryReserveOutcome::Admitted);
             }
-            if !self.reclaim_one_idle_scheduled(seq_id) {
+            if !self.reclaim_one_idle_scheduled_with(seq_id, &mut release_cache)? {
                 if self.scheduler.has_live_turns() {
                     return Ok(MemoryReserveOutcome::Defer);
                 }
@@ -3127,7 +3166,7 @@ mod tests {
         );
 
         assert!(
-            state.reclaim_one_idle_scheduled(2),
+            state.reclaim_one_idle_scheduled(2).expect("cache release"),
             "memory-denial reclaim must evict the idle parked row"
         );
         assert!(
@@ -3257,6 +3296,99 @@ mod tests {
             matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 100 }),
             "idle scheduler must hard-error, not spin in prepared_waiting: {outcome:?}"
         );
+    }
+
+    #[test]
+    fn reclaim_without_idle_victim_returns_ok_false() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        assert!(state.idle_memory_victim(2).is_none());
+        let progress = state
+            .reclaim_one_idle_scheduled(2)
+            .expect("no victim does not release cache");
+        assert!(!progress, "no idle victim is not reclaim progress");
+    }
+
+    #[test]
+    fn idle_reclaim_makes_no_progress_while_same_victim_eligible() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        state.owner_sequences.insert("parked".into(), 1);
+        state
+            .inner
+            .activate_scheduled_recurrent(1)
+            .expect("activate parked owner");
+        state
+            .inner
+            .park_active_scheduled_recurrent()
+            .expect("park seq 1");
+        assert_eq!(state.idle_memory_victim(2), Some(1));
+        assert!(
+            !state.idle_reclaim_made_progress(2, 1),
+            "same victim still eligible is no progress"
+        );
+        state.inner.release_scheduled_recurrent_for(1);
+        assert!(
+            state.idle_memory_victim(2).is_none(),
+            "rec release drops the Qwen3.5 victim"
+        );
+        assert!(
+            state.idle_reclaim_made_progress(2, 1),
+            "cleared victim is progress"
+        );
+    }
+
+    #[test]
+    fn reclaim_propagates_cache_release_error() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        state.owner_sequences.insert("parked".into(), 1);
+        state
+            .inner
+            .activate_scheduled_recurrent(1)
+            .expect("activate parked owner");
+        state
+            .inner
+            .park_active_scheduled_recurrent()
+            .expect("park seq 1");
+        let error = state
+            .reclaim_one_idle_scheduled_with(2, |_inner, victim| {
+                assert_eq!(victim, 1);
+                Err(Error::from_reason("injected cache release failure"))
+            })
+            .expect_err("cache release Err must propagate");
+        assert_eq!(error.reason, "injected cache release failure");
+    }
+
+    #[test]
+    fn try_reserve_propagates_cache_release_error() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        state.owner_sequences.insert("parked".into(), 1);
+        state
+            .inner
+            .activate_scheduled_recurrent(1)
+            .expect("activate parked owner");
+        state
+            .inner
+            .park_active_scheduled_recurrent()
+            .expect("park seq 1");
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 100,
+                free_blocks: 0,
+                reclaimable_blocks: 0,
+                allocated_blocks: 100,
+            },
+            bytes_per_block: 4096,
+        };
+        let error = state
+            .try_reserve_reclaiming_idle_with(2, 10, 1, snapshot, |_inner, victim| {
+                assert_eq!(victim, 1);
+                Err(Error::from_reason("injected cache release failure"))
+            })
+            .expect_err("deny + failed unpin must not spin");
+        assert_eq!(error.reason, "injected cache release failure");
     }
 
     #[test]
@@ -3415,7 +3547,7 @@ mod tests {
             "cache-only keep-live table is a memory victim"
         );
         assert!(
-            state.reclaim_one_idle_scheduled(2),
+            state.reclaim_one_idle_scheduled(2).expect("cache release"),
             "memory-denial reclaim must unpin the cache-only table"
         );
         assert!(
@@ -3426,6 +3558,112 @@ mod tests {
                 .is_none(),
             "reclaim unpins the keep-live table"
         );
+        assert!(
+            state.idle_memory_victim(2).is_none(),
+            "successful cache-only reclaim must drop the victim"
+        );
+    }
+
+    #[test]
+    fn cache_only_unpin_that_leaves_victim_is_not_progress() {
+        let inner = match NemotronHInner::new(tiny_nemotron_paged_config()) {
+            Ok(inner) => inner,
+            Err(_) => {
+                eprintln!(
+                    "skipping cache_only_unpin_that_leaves_victim_is_not_progress: inner failed"
+                );
+                return;
+            }
+        };
+        if inner.paged_adapter().is_none() {
+            eprintln!(
+                "skipping cache_only_unpin_that_leaves_victim_is_not_progress: Metal unavailable"
+            );
+            return;
+        }
+        let mut state = HybridSchedulerState::new(inner).expect("construct nemotron scheduler");
+        state.owner_sequences.insert("cache-only".into(), 1);
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .begin_request(1)
+            .expect("begin cache-only request");
+        state.inner.release_scheduled_recurrent_for(1);
+        assert_eq!(state.idle_memory_victim(2), Some(1));
+        let mut unpin_calls = 0u32;
+        let progress = state
+            .reclaim_one_idle_scheduled_with(2, |_inner, victim| {
+                unpin_calls += 1;
+                assert_eq!(victim, 1);
+                Ok(())
+            })
+            .expect("noop unpin is Ok");
+        assert_eq!(unpin_calls, 1);
+        assert!(
+            !progress,
+            "same idle victim after a no-op unpin is not progress"
+        );
+        assert_eq!(state.idle_memory_victim(2), Some(1));
+    }
+
+    #[test]
+    fn try_reserve_rejects_when_cache_only_unpin_makes_no_progress() {
+        let inner = match NemotronHInner::new(tiny_nemotron_paged_config()) {
+            Ok(inner) => inner,
+            Err(_) => {
+                eprintln!(
+                    "skipping try_reserve_rejects_when_cache_only_unpin_makes_no_progress: inner failed"
+                );
+                return;
+            }
+        };
+        if inner.paged_adapter().is_none() {
+            eprintln!(
+                "skipping try_reserve_rejects_when_cache_only_unpin_makes_no_progress: Metal unavailable"
+            );
+            return;
+        }
+        let mut state = HybridSchedulerState::new(inner).expect("construct nemotron scheduler");
+        state.owner_sequences.insert("cache-only".into(), 1);
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .begin_request(1)
+            .expect("begin cache-only request");
+        state.inner.release_scheduled_recurrent_for(1);
+        assert_eq!(state.idle_memory_victim(2), Some(1));
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 100,
+                free_blocks: 0,
+                reclaimable_blocks: 0,
+                allocated_blocks: 100,
+            },
+            bytes_per_block: 4096,
+        };
+        let mut unpin_calls = 0u32;
+        let outcome = state
+            .try_reserve_reclaiming_idle_with(2, 10, 0, snapshot, |_inner, victim| {
+                unpin_calls += 1;
+                assert!(
+                    unpin_calls <= 2,
+                    "reclaim loop must stop when the victim remains"
+                );
+                assert_eq!(victim, 1);
+                Ok(())
+            })
+            .expect("noop unpin is Ok");
+        assert_eq!(
+            unpin_calls, 1,
+            "no-progress reclaim must not retry the same victim"
+        );
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 100 }),
+            "no-progress reclaim must Reject, not spin: {outcome:?}"
+        );
+        assert_eq!(state.idle_memory_victim(2), Some(1));
     }
 
     #[test]
