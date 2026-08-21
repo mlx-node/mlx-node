@@ -8393,6 +8393,7 @@ impl Qwen35Inner {
                 Some(true),
                 tools.as_deref(),
                 enable_thinking,
+                false,
             )?;
 
             let prompt_array =

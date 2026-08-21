@@ -54,7 +54,7 @@ const CHANNEL_CLOSE: &str = "<channel|>";
 /// The session continuation verifier normalizes template-owned whitespace
 /// around exactly this tag; `</think>` never appears in a Gemma4 render, so a
 /// wrong answer here silently ends every reasoning session.
-pub(crate) fn reasoning_close_tag() -> &'static str {
+pub(crate) const fn reasoning_close_tag() -> &'static str {
     CHANNEL_CLOSE
 }
 const TOOL_CALL_OPEN: &str = "<|tool_call>";

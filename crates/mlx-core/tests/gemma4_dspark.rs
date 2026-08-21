@@ -36,23 +36,29 @@
 //! chosen to be tie-free: constrained generations (counting, single-word
 //! answers, recipes) whose greedy top-2 gaps are far above kernel noise.
 //!
-//! The constrained-generation rule covers the WHOLE decode, not just the
-//! visible answer. A Gemma4 turn opens with a free-form `<|channel>thought`
-//! block that no fixture can constrain, and a tie inside it is enough to
-//! spend the budget differently and truncate the visible tail — that is what
-//! `decode_wrap` hit (exact tie at `27.500` between ids 623 and 98936, the
-//! T=8 verify row resolving to the lower id where the T=1 AR decode read a
-//! 1-ULP gap). Fixtures whose thought is not itself constrained therefore
-//! suppress it with `reasoning_effort: "none"`, which makes the template
-//! emit `<|channel>thought\n<channel|>` in the PROMPT.
+//! Screening is empirical, not structural: every fixture below was RUN and
+//! observed byte-equal AR-vs-DSpark on this checkpoint. MLX runs are
+//! deterministic, so green is stable per machine + MLX pin.
 //!
-//! Every fixture below was screened to be byte-equal AR-vs-DSpark on this
-//! checkpoint; MLX runs are deterministic, so green is stable per
-//! machine + MLX pin. If one of these tests diverges after an MLX bump,
-//! check whether the divergence point is a near-tie (top-2 gap <= ~2 bf16
-//! ULP → re-screen the fixture) before suspecting the DSpark wiring; a
-//! REAL bookkeeping bug (positions, rollback offsets, masks) diverges
-//! grossly and immediately, not at a single near-tied token.
+//! One caveat the constrained-answer wording hides: a Gemma4 turn opens with a
+//! free-form `<|channel>thought` block that no prompt can constrain, and a tie
+//! inside it is enough to spend the budget differently and truncate the visible
+//! tail. `decode_wrap` hit exactly that (exact tie at `27.500` between ids 623
+//! and 98936, the T=8 verify row resolving to the lower id where the T=1 AR
+//! decode read a 1-ULP gap), so THAT fixture — and only that one, because it is
+//! the only place a divergence was ever observed — suppresses the thought with
+//! `reasoning_effort: "none"`, which makes the template emit
+//! `<|channel>thought\n<channel|>` in the PROMPT. The other fixtures keep their
+//! free-form thought and stand on the empirical screening alone; the sibling
+//! `gemma4_assistant.rs` runs this same decode-wrap prompt unsuppressed for the
+//! same reason. Re-screening is the remedy when one of them starts to diverge —
+//! suppression is not a rule they are all expected to follow.
+//!
+//! If one of these tests diverges after an MLX bump, check whether the
+//! divergence point is a near-tie (top-2 gap <= ~2 bf16 ULP → re-screen the
+//! fixture) before suspecting the DSpark wiring; a REAL bookkeeping bug
+//! (positions, rollback offsets, masks) diverges grossly and immediately, not
+//! at a single near-tied token.
 //!
 //! Env (both required; unset → skip-with-message):
 //!   MLX_TEST_GEMMA4_MODEL_PATH   — bf16 unified 48L Gemma-4-12B-IT checkout
@@ -396,12 +402,17 @@ async fn dspark_greedy_matches_ar_across_sliding_wrap() {
         )
         .await
         .expect("AR (decode wrap) failed");
-    assert!(
-        !ar_a.raw_text.contains("<channel|>"),
-        "decode-wrap fixture must decode only constrained text; a closed reasoning \
-         channel means the thought was generated after all: {:?}",
-        ar_a.raw_text.chars().take(200).collect::<String>(),
-    );
+    // The OPEN tag is the load-bearing half: a thought that opens and never
+    // closes before the budget runs out is exactly as unscreened as one that
+    // completes, and a close-only check waves it through.
+    for tag in ["<|channel>", "<channel|>"] {
+        assert!(
+            !ar_a.raw_text.contains(tag),
+            "decode-wrap fixture must decode only constrained text; the generated \
+             text carries {tag}, so a free-form thought was decoded after all: {:?}",
+            ar_a.raw_text.chars().take(200).collect::<String>(),
+        );
+    }
     assert!(
         ar_a.prompt_tokens < 1024,
         "decode-wrap fixture must START below the sliding window, got {} prompt tokens",
@@ -523,6 +534,15 @@ async fn dspark_stop_mid_block_then_delta_turn() {
         sp2.cached_tokens > 0,
         "turn 2 must warm-continue on the saved session (cached_tokens > 0), got {}",
         sp2.cached_tokens
+    );
+    // The AR baseline carries the same assertion, and must: a continuation
+    // regression breaks BOTH lanes, and two lanes that agree on being broken
+    // still satisfy every parity assertion below. Only this reads the baseline
+    // as a result rather than as a reference.
+    assert!(
+        ar2.cached_tokens > 0,
+        "the AR baseline must warm-continue too (cached_tokens > 0), got {}",
+        ar2.cached_tokens
     );
 
     // 2-turn transcript parity vs the AR baseline.

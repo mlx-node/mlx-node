@@ -2000,7 +2000,8 @@ impl Qwen3Inner {
             .ok_or_else(|| napi::Error::from_reason("Tokenizer not available."))?
             .clone();
 
-        let token_ids = tokenizer.apply_chat_template_sync(&messages, Some(true), None, None)?;
+        let token_ids =
+            tokenizer.apply_chat_template_sync(&messages, Some(true), None, None, false)?;
         let input_ids = MxArray::from_uint32(&token_ids, &[1, token_ids.len() as i64])?;
 
         // Use generate_for_training_sync on the NAPI model (which uses Arc<RwLock<>>)
@@ -2686,6 +2687,7 @@ impl Qwen3Inner {
                 Some(true),
                 tools.as_deref(),
                 enable_thinking,
+                false,
             )?;
 
             let prompt_array =

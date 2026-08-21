@@ -6611,6 +6611,7 @@ impl Qwen35MoeInner {
                 Some(true),
                 tools.as_deref(),
                 enable_thinking,
+                false,
             )?;
 
             let prompt_array =

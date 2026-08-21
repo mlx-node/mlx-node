@@ -30,7 +30,7 @@ use crate::stream::Stream;
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
 
 /// The reasoning-close tag used by every family whose template writes
-/// `</think>`; [`ChatBackend::reasoning_close_tag`] overrides it per family.
+/// `</think>`; [`ChatBackend::REASONING_CLOSE_TAG`] overrides it per family.
 pub(crate) const REASONING_CLOSE_TAG_DEFAULT: &str = "</think>";
 
 /// Per-step decode operations for one generation turn.
@@ -741,17 +741,26 @@ pub(crate) trait ChatBackend {
     /// (`apply_chat_template_sync` with `add_generation_prompt = true`,
     /// the request tools, and `resolve_enable_thinking`). Missing templates
     /// fail closed; model wire formats are never reconstructed in Rust.
+    ///
+    /// `preserve_thinking` is the turn's answer to
+    /// [`crate::tokenizer::RenderContextOptions::preserve_thinking`] and the
+    /// caller owns it. An implementation must forward the value it was given:
+    /// the continuation verifier re-renders the same conversation several ways
+    /// and compares the results, so a render that answers differently from its
+    /// siblings silently ends the session's prefix reuse.
     fn render_prompt(
         &self,
         tok: &Qwen3Tokenizer,
         messages: &[ChatMessage],
         config: &ChatConfig,
+        preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
         tok.apply_chat_template_sync(
             messages,
             Some(true),
             config.tools.as_deref(),
             resolve_enable_thinking(config),
+            preserve_thinking,
         )
     }
 
@@ -1131,9 +1140,11 @@ pub(crate) trait ChatBackend {
     /// exactly this tag, so a family whose reasoning channel closes with
     /// anything else must say so here or every reasoning turn ends its live
     /// session. Gemma4 closes with `<channel|>`.
-    fn reasoning_close_tag(&self) -> &'static str {
-        REASONING_CLOSE_TAG_DEFAULT
-    }
+    ///
+    /// An associated const rather than a method: the answer depends only on
+    /// the family, and a test can then read a family's answer
+    /// (`<Family as ChatBackend>::REASONING_CLOSE_TAG`) without a loaded model.
+    const REASONING_CLOSE_TAG: &'static str = REASONING_CLOSE_TAG_DEFAULT;
 
     /// Convert a live cached-history token stream to the logical form emitted
     /// by the checkpoint chat template for comparison only.

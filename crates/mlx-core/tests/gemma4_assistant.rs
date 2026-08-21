@@ -32,7 +32,13 @@
 //! The fixtures are inherited from the DSpark suite (`gemma4_dspark.rs`),
 //! which screened them on this exact bf16 12B target checkpoint, and were
 //! re-validated byte-equal AR-vs-assistant here; MLX runs are
-//! deterministic, so green is stable per machine + MLX pin. If one of
+//! deterministic, so green is stable per machine + MLX pin. One fixture is no
+//! longer identical to its DSpark twin: `decode_wrap` there suppresses the
+//! free-form `<|channel>thought` with `reasoning_effort: "none"`, after a bf16
+//! tie inside the thought was observed on that lane. The same prompt runs
+//! UNSUPPRESSED here, because the divergence was never observed on this lane
+//! and the screening is empirical — suppression is a re-screening remedy, not a
+//! rule every fixture follows. If one of
 //! these tests diverges after an MLX bump, check whether the divergence
 //! point is a near-tie (top-2 gap <= ~2 bf16 ULP → re-screen the fixture)
 //! before suspecting the assistant wiring; a REAL bookkeeping bug
@@ -411,6 +417,15 @@ async fn assistant_stop_mid_block_then_delta_turn() {
         sp2.cached_tokens > 0,
         "turn 2 must warm-continue on the saved session (cached_tokens > 0), got {}",
         sp2.cached_tokens
+    );
+    // The AR baseline carries the same assertion, and must: a continuation
+    // regression breaks BOTH lanes, and two lanes that agree on being broken
+    // still satisfy every parity assertion below. Only this reads the baseline
+    // as a result rather than as a reference.
+    assert!(
+        ar2.cached_tokens > 0,
+        "the AR baseline must warm-continue too (cached_tokens > 0), got {}",
+        ar2.cached_tokens
     );
 
     // 2-turn transcript parity vs the AR baseline.

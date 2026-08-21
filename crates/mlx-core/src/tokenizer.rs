@@ -524,8 +524,8 @@ impl Qwen3Tokenizer {
         )
     }
 
-    /// Teach Gemma4 templates to honor the replay-only `preserve_thinking`
-    /// context flag on assistant turns that carry no tool call.
+    /// Teach Gemma4 templates to honor the `preserve_thinking` context flag on
+    /// assistant turns that carry no tool call.
     ///
     /// Gemma4 gates historical reasoning on `loop.index0 >
     /// ns_turn.last_user_idx` and grants `preserve_thinking` only to tool-call
@@ -533,27 +533,28 @@ impl Qwen3Tokenizer {
     /// `<|channel>thought` block of every plain assistant answer. The live KV
     /// still holds those tokens, so the next turn's render is not an extension
     /// of the committed prefix and a warm session can never continue — it cold-
-    /// replays the whole conversation instead.
+    /// replays the whole conversation instead. See
+    /// [`RenderContextOptions::preserve_thinking`] for who pays that and who
+    /// opts in.
     ///
     /// The rewrite is deliberately narrow:
     /// - only the two published Gemma4 gate spellings are extended, and each
     ///   is widened by a leading `preserve_thinking or`, so the flag being
-    ///   false reproduces upstream exactly;
+    ///   false reproduces upstream exactly — byte for byte;
     /// - the parentheses are load-bearing on the second spelling, whose gate
     ///   sits inside an `{%- if thinking_text and … -%}` conjunction;
-    /// - ordinary renders still behave exactly like upstream because the
-    ///   compatibility flag is supplied only by our chat-template context.
+    /// - both spellings are folded over rather than returned on first match,
+    ///   so a template that ever carried both gates keeps neither un-widened.
     fn enable_gemma4_preserve_thinking(template: &str) -> String {
         const GEMMA4_GATES: [&str; 2] = [
             "(loop.index0 > ns_turn.last_user_idx) or (preserve_thinking and message.get('tool_calls'))",
             "loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')",
         ];
-        for gate in GEMMA4_GATES {
-            if template.contains(gate) {
-                return template.replace(gate, &format!("(preserve_thinking or ({gate}))"));
-            }
-        }
-        template.to_string()
+        GEMMA4_GATES
+            .iter()
+            .fold(template.to_string(), |rewritten, gate| {
+                rewritten.replace(gate, &format!("(preserve_thinking or ({gate}))"))
+            })
     }
 
     /// Parenthesize a call keyword argument whose value is a bare conditional
@@ -2391,22 +2392,21 @@ impl Qwen3Tokenizer {
         // Setting to false adds empty <think></think> tags which DISABLES thinking.
         // bos_token/eos_token: used by Gemma4 and other templates ({{ bos_token }}).
         //
-        // `preserve_thinking=true` keeps `reasoning_content` rendered on
-        // EVERY prior assistant turn, not just on the most recent one after
-        // the last user query. Qwen3.5/3.6's template gate is
-        //   `preserve_thinking or loop.index0 > ns.last_query_index`
-        // which means when a NEW user message arrives mid-session,
-        // `last_query_index` jumps forward and all earlier assistant turns
-        // silently drop their `<think>…</think>` blocks on re-render. That
-        // flips the token prefix at the first reasoning boundary, so the
-        // server's tier-2 KV cache misses entirely and the next turn cold-
-        // prefills the full conversation. Pinning `preserve_thinking=true`
-        // keeps the rendered prompt byte-stable turn over turn so
-        // `verify_cache_prefix_direct` can reuse the prior cached prefix.
+        // `preserve_thinking` decides whether prior assistant turns keep their
+        // reasoning block on re-render; it is opt-in and only a stateful session
+        // turns it on. See [`RenderContextOptions::preserve_thinking`] for what
+        // each answer costs.
         //
-        // Templates that don't read `preserve_thinking` (e.g. Qwen3
-        // non-thinking, LFM2, Gemma4) ignore the extra key — minijinja
-        // treats unknown variables in `context!` as a no-op on access.
+        // It stays an EXPLICIT key rather than moving into the merge layer for
+        // two reasons: the gates read it unguarded (`preserve_thinking or …`),
+        // so it must always be defined; and `context!` resolves an explicit key
+        // ahead of every `..` layer, so no future merge source can quietly
+        // shadow the caller's answer.
+        //
+        // Templates that don't read `preserve_thinking` (Qwen3 non-thinking,
+        // LFM2.5-1.2B-Thinking, Muse-Glimmer) ignore the extra key — minijinja
+        // treats unknown variables in `context!` as a no-op on access. Gemma4
+        // does read it, via `Self::enable_gemma4_preserve_thinking`.
         //
         // `..build_render_context(...)` merges the caller's optional globals in as
         // a fallback layer (precedence is left to right, so nothing above can be
@@ -2443,7 +2443,7 @@ impl Qwen3Tokenizer {
         );
         ctx_map.insert(
             "preserve_thinking".to_string(),
-            minijinja::Value::from(true),
+            minijinja::Value::from(render_ctx.preserve_thinking),
         );
         // LFM2.5-1.2B-Thinking predates the shared
         // `preserve_thinking` name and uses this equivalent flag.
@@ -2661,12 +2661,19 @@ impl Qwen3Tokenizer {
     /// Apply chat template synchronously (for internal use by chat())
     ///
     /// This is a synchronous version of apply_chat_template for use in blocking tasks.
+    ///
+    /// `preserve_thinking` is stated by every caller rather than defaulted, so
+    /// the answer a render used is readable at its call site: the continuation
+    /// verifier compares several renders of one conversation and they only line
+    /// up when all of them answered the same way. See
+    /// [`RenderContextOptions::preserve_thinking`].
     pub(crate) fn apply_chat_template_sync(
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: Option<bool>,
         tools: Option<&[ToolDefinition]>,
         enable_thinking: Option<bool>,
+        preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
         self.apply_chat_template_sync_with_content_order(
             messages,
@@ -2675,6 +2682,7 @@ impl Qwen3Tokenizer {
             enable_thinking,
             MultimodalContentOrder::TextThenMedia,
             None,
+            preserve_thinking,
         )
     }
 
@@ -2693,6 +2701,7 @@ impl Qwen3Tokenizer {
         enable_thinking: Option<bool>,
         content_order: MultimodalContentOrder,
         existing_image_placeholder: Option<&str>,
+        preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
         let formatted = self.render_chat_template_sync_with_content_order(
             messages,
@@ -2701,7 +2710,10 @@ impl Qwen3Tokenizer {
             enable_thinking,
             content_order,
             existing_image_placeholder,
-            RenderContextOptions::default(),
+            RenderContextOptions {
+                preserve_thinking,
+                ..RenderContextOptions::default()
+            },
         )?;
 
         // Encode the formatted text (don't add extra special tokens)
@@ -2720,6 +2732,7 @@ impl Qwen3Tokenizer {
         add_generation_prompt: Option<bool>,
         tools: Option<&[ToolDefinition]>,
         enable_thinking: Option<bool>,
+        preserve_thinking: bool,
     ) -> Result<String> {
         self.render_chat_template_sync_with_content_order(
             messages,
@@ -2728,7 +2741,10 @@ impl Qwen3Tokenizer {
             enable_thinking,
             MultimodalContentOrder::TextThenMedia,
             None,
-            RenderContextOptions::default(),
+            RenderContextOptions {
+                preserve_thinking,
+                ..RenderContextOptions::default()
+            },
         )
     }
 
@@ -2882,9 +2898,9 @@ pub enum MultimodalContentOrder {
 
 /// Caller-supplied template globals that no template can derive on its own.
 ///
-/// Both keys are `Option` and an unset one is left **out** of the render context
-/// entirely rather than passed as an empty string, because the templates that
-/// read them branch on definedness.
+/// The two `Option` keys are left **out** of the render context entirely when
+/// unset, rather than passed as an empty string, because the templates that
+/// read them branch on definedness. `preserve_thinking` is always defined.
 ///
 /// # Neither value is neutralised, because neither is caller text
 ///
@@ -2920,6 +2936,42 @@ pub(crate) struct RenderContextOptions {
     /// substitutes `high` when this is undefined or empty, so leaving it `None` is
     /// not the same as sending `high` textually — it just lets the template decide.
     pub reasoning_strength: Option<String>,
+    /// Keep the `reasoning_content` of assistant turns that precede the last
+    /// user message. **Default `false`: this is opt-in, and only a stateful
+    /// session opts in.**
+    ///
+    /// # What `true` costs
+    ///
+    /// It overrides the checkpoint's own gate. Gemma4 scopes
+    /// `preserve_thinking` to assistant turns that carry a `tool_calls` field;
+    /// the Qwen3.6 and LFM2.5 gates spell it as `preserve_thinking or
+    /// loop.index0 > <index of the last user turn>`. Setting it therefore does
+    /// not back-fill a flag the template was waiting for — it widens a scope the
+    /// template author chose.
+    /// A Gemma4 multi-turn prompt then carries EVERY prior chain of thought and
+    /// grows without a cap: measured over three turns on `gemma-4-12b-it`,
+    /// 0 → 2 rendered thought blocks and 66 → 104 prompt tokens.
+    ///
+    /// # Why a stateful session sets it anyway
+    ///
+    /// The live KV cache physically holds the tokens of the thought the model
+    /// just generated. A re-render that deletes them stops being an extension of
+    /// the committed prefix, so `verify_cache_prefix` misses and every
+    /// continuation cold-replays the whole conversation
+    /// (`cached_tokens = 0`). A [`crate::engine::session`] turn owns both the
+    /// transcript and that cache, so it opts in and keeps the prefix reusable.
+    ///
+    /// # Why every other caller leaves it `false`
+    ///
+    /// transformers 5.5.0, mlx-lm, mlx-vlm and vLLM all render these templates
+    /// AS SHIPPED and none of them sets the flag, so they drop prior thoughts.
+    /// A one-shot render (`/v1/chat/completions`, the NAPI
+    /// `applyChatTemplate`, a GRPO rollout) has no cache to protect and must
+    /// stay byte-identical to those four. Both mlx-lm and vLLM do let a
+    /// *client* pass the flag, and vLLM additionally ships a vendored Gemma4
+    /// template already spelling the widened gate
+    /// (`examples/tool_chat_template_gemma4.jinja:236`).
+    pub preserve_thinking: bool,
 }
 
 /// Python `json.dumps` default separators: `", "` between items and `": "` after
@@ -3369,7 +3421,7 @@ mod tests {
         }];
 
         let error = tokenizer
-            .apply_chat_template_sync(&messages, Some(true), None, None)
+            .apply_chat_template_sync(&messages, Some(true), None, None, false)
             .unwrap_err();
         assert!(
             error.to_string().contains(MISSING_CHAT_TEMPLATE_ERROR),
@@ -3982,12 +4034,18 @@ mod tests {
             },
         ];
 
-        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+        let session_render = render_as_session_turn(template, &messages, true, None)
+            .expect("legacy Qwen template should render");
+        assert_eq!(session_render, "<think>private chain</think>answer");
+
+        // The same opt-in the Gemma4 gate gets: a one-shot render keeps the
+        // upstream scope, which drops a thought that precedes the last user
+        // message.
+        let default_render = Qwen3Tokenizer::render_chat_template_jinja2(
             template, &messages, None, true, None, "<bos>", "<eos>",
         )
         .expect("legacy Qwen template should render");
-
-        assert_eq!(rendered, "<think>private chain</think>answer");
+        assert_eq!(default_render, "answer");
     }
 
     #[test]
@@ -4722,6 +4780,7 @@ mod tests {
             RenderContextOptions {
                 current_date: Some(PROBE_DATE.to_string()),
                 reasoning_strength: None,
+                preserve_thinking: false,
             },
         )
     }
@@ -5768,6 +5827,35 @@ mod tests {
         "loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')",
     ];
 
+    /// Render the way a stateful [`crate::engine::session`] turn renders —
+    /// `preserve_thinking` on, read from the session's own constant so a test
+    /// cannot drift from the value production uses.
+    ///
+    /// Every other render in this file goes through the default path, which is
+    /// what a one-shot caller gets.
+    fn render_as_session_turn(
+        template: &str,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        enable_thinking: Option<bool>,
+    ) -> std::result::Result<String, String> {
+        Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+            template,
+            messages,
+            None,
+            add_generation_prompt,
+            enable_thinking,
+            "<bos>",
+            "<eos>",
+            MultimodalContentOrder::TextThenMedia,
+            None,
+            RenderContextOptions {
+                preserve_thinking: crate::engine::session::SESSION_PRESERVE_THINKING,
+                ..RenderContextOptions::default()
+            },
+        )
+    }
+
     /// Minimal stand-in for the Gemma4 reasoning channel: the same
     /// `last_user_idx` scan, the same `{gate}` conjunction shape, and the same
     /// emitted block, with everything else stripped.
@@ -5786,35 +5874,33 @@ mod tests {
         )
     }
 
+    /// Three-message transcript whose middle assistant turn carries a chain of
+    /// thought: the shape a warm continuation re-renders.
+    fn gemma4_thinking_history() -> [ChatMessage; 3] {
+        let mut assistant = user_msg("Paris", 0);
+        assistant.role = "assistant".to_string();
+        assistant.reasoning_content = Some("The capital of France is Paris.".to_string());
+        [
+            user_msg("What is the capital of France?", 0),
+            assistant,
+            user_msg("And of Italy?", 0),
+        ]
+    }
+
     /// A Gemma4 session commits the `<|channel>thought` block it generated into
     /// the KV cache, so a re-render that drops it on the next user turn is not
     /// an extension of the committed prefix and the warm session cold-replays
     /// (`cached_tokens = 0` on every continuation). Both shipped gate spellings
-    /// must therefore honor the `preserve_thinking` flag our render context
-    /// pins, exactly as the legacy Qwen gate does.
+    /// must therefore honor the `preserve_thinking` flag a session render sets,
+    /// exactly as the legacy Qwen gate does.
     #[test]
     fn gemma4_history_gate_honors_preserve_thinking() {
-        let mut assistant = user_msg("Paris", 0);
-        assistant.role = "assistant".to_string();
-        assistant.reasoning_content = Some("The capital of France is Paris.".to_string());
-        let history = [
-            user_msg("What is the capital of France?", 0),
-            assistant,
-            user_msg("And of Italy?", 0),
-        ];
+        let history = gemma4_thinking_history();
 
         for gate in GEMMA4_THINKING_GATES {
             let template = gemma4_thinking_channel_template(gate);
-            let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
-                &template,
-                &history,
-                None,
-                false,
-                Some(true),
-                "<bos>",
-                "<eos>",
-            )
-            .unwrap_or_else(|e| panic!("render failed for gate {gate}: {e}"));
+            let rendered = render_as_session_turn(&template, &history, false, Some(true))
+                .unwrap_or_else(|e| panic!("render failed for gate {gate}: {e}"));
             assert_eq!(
                 rendered,
                 "What is the capital of France?\
@@ -5831,19 +5917,53 @@ mod tests {
             calling.role = "assistant".to_string();
             calling.tool_calls = Some(vec![tool_call(Some("call_1"), "do_thing")]);
             let no_reasoning = [user_msg("Do it.", 0), calling];
-            let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+            let rendered = render_as_session_turn(&template, &no_reasoning, false, Some(true))
+                .unwrap_or_else(|e| panic!("render failed for gate {gate}: {e}"));
+            assert_eq!(
+                rendered, "Do it.",
+                "gate {gate} rendered a channel block for a message with no reasoning",
+            );
+        }
+    }
+
+    /// `preserve_thinking` is OPT-IN, and only a stateful session opts in.
+    ///
+    /// A one-shot render — `/v1/chat/completions`, the NAPI
+    /// `applyChatTemplate`, a GRPO rollout — owns no KV cache, so it has
+    /// nothing to protect and must stay byte-identical to transformers,
+    /// mlx-lm, mlx-vlm and vLLM, all of which render these templates as shipped
+    /// and drop a prior assistant turn's thought. Driven through
+    /// [`Qwen3Tokenizer::render_chat_template_jinja2`], the entry point the
+    /// NAPI one-shot render actually uses, so this pins the DEFAULT and not
+    /// merely the struct field.
+    #[test]
+    fn gemma4_history_reasoning_is_off_in_a_default_render() {
+        let history = gemma4_thinking_history();
+
+        for gate in GEMMA4_THINKING_GATES {
+            let template = gemma4_thinking_channel_template(gate);
+            let default_render = Qwen3Tokenizer::render_chat_template_jinja2(
                 &template,
-                &no_reasoning,
+                &history,
                 None,
                 false,
                 Some(true),
                 "<bos>",
                 "<eos>",
             )
-            .unwrap_or_else(|e| panic!("render failed for gate {gate}: {e}"));
+            .unwrap_or_else(|e| panic!("default render failed for gate {gate}: {e}"));
             assert_eq!(
-                rendered, "Do it.",
-                "gate {gate} rendered a channel block for a message with no reasoning",
+                default_render, "What is the capital of France?ParisAnd of Italy?",
+                "gate {gate}: a default render must drop the prior turn's thought",
+            );
+
+            let session_render = render_as_session_turn(&template, &history, false, Some(true))
+                .unwrap_or_else(|e| panic!("session render failed for gate {gate}: {e}"));
+            assert!(
+                session_render
+                    .contains("<|channel>thought\nThe capital of France is Paris.\n<channel|>"),
+                "gate {gate}: a session render must keep the prior turn's thought:\n\
+                 {session_render}",
             );
         }
     }
@@ -5870,6 +5990,23 @@ mod tests {
             assert_eq!(
                 Qwen3Tokenizer::enable_gemma4_preserve_thinking(gate),
                 format!("(preserve_thinking or ({gate}))"),
+            );
+        }
+
+        // A template carrying both spellings must come back with both widened.
+        // Stopping at the first match would leave the second gate on the
+        // upstream scope while the first honors the flag, so one assistant turn
+        // in the render would keep its thought and another would drop it.
+        let both = format!(
+            "{{%- if thinking_text and {} -%}}a{{%- endif -%}}\
+             {{%- if thinking_text and {} -%}}b{{%- endif -%}}",
+            GEMMA4_THINKING_GATES[0], GEMMA4_THINKING_GATES[1],
+        );
+        let rewritten = Qwen3Tokenizer::enable_gemma4_preserve_thinking(&both);
+        for gate in GEMMA4_THINKING_GATES {
+            assert!(
+                rewritten.contains(&format!("(preserve_thinking or ({gate}))")),
+                "gate {gate} left un-widened in a template carrying both:\n{rewritten}",
             );
         }
     }
@@ -5905,16 +6042,8 @@ mod tests {
             user_msg("And of Italy?", 0),
         ];
         let render = |messages: &[ChatMessage], generation_prompt: bool| {
-            Qwen3Tokenizer::render_chat_template_jinja2(
-                &tmpl,
-                messages,
-                None,
-                generation_prompt,
-                Some(true),
-                "<bos>",
-                "<eos>",
-            )
-            .unwrap_or_else(|e| panic!("Gemma4 thinking-history render failed: {e}"))
+            render_as_session_turn(&tmpl, messages, generation_prompt, Some(true))
+                .unwrap_or_else(|e| panic!("Gemma4 thinking-history render failed: {e}"))
         };
 
         let completed_render = render(&completed, false);
@@ -6347,7 +6476,7 @@ mod tests {
     /// that is exactly how a dead sanitizer shipped before.
     fn render_user_through(tokenizer: &Qwen3Tokenizer, content: &str) -> String {
         tokenizer
-            .render_chat_template_sync(&[user_msg(content, 0)], Some(false), None, None)
+            .render_chat_template_sync(&[user_msg(content, 0)], Some(false), None, None, false)
             .expect("echo template renders")
     }
 
@@ -6519,7 +6648,13 @@ mod tests {
         );
         // Through the checkpoint's OWN template, not an echo stub.
         let rendered = tokenizer
-            .render_chat_template_sync(&[user_msg(HOSTILE_USER_CONTENT, 0)], Some(true), None, None)
+            .render_chat_template_sync(
+                &[user_msg(HOSTILE_USER_CONTENT, 0)],
+                Some(true),
+                None,
+                None,
+                false,
+            )
             .expect("the checkpoint's own chat template must render");
         // The template's own structural markers are of course present, so count
         // instead: exactly one user turn, one generation prompt, and no forged turn.
@@ -6652,6 +6787,7 @@ mod tests {
                     Some(true),
                     None,
                     None,
+                    false,
                 )
                 .expect("the checkpoint's own chat template must render")
         };
@@ -6793,6 +6929,7 @@ mod tests {
                     Some(true),
                     None,
                     None,
+                    false,
                 )
                 .expect("the checkpoint's own chat template must render")
         };
@@ -6843,6 +6980,7 @@ mod tests {
                     Some(true),
                     None,
                     None,
+                    false,
                 )
                 .expect("the checkpoint's own chat template must render")
         };
@@ -6856,6 +6994,7 @@ mod tests {
                 Some(true),
                 None,
                 None,
+                false,
             )
             .expect_err("a marker inside tool_call_id must fail the render")
             .to_string();
@@ -6931,6 +7070,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect_err("colliding ids must fail the render, not be silently merged")
             .to_string();
@@ -6987,7 +7127,7 @@ mod tests {
         // And it still renders, with both calls intact.
         let (_dir, tokenizer) = muse_field_fixture("muse-id-duplicate");
         let rendered = tokenizer
-            .render_chat_template_sync(&messages, Some(false), None, None)
+            .render_chat_template_sync(&messages, Some(false), None, None, false)
             .expect("a duplicate id carries no marker, so nothing may refuse it");
         assert!(
             rendered.contains("[tool=18C, clear][tcid=call_1]"),
@@ -7021,7 +7161,7 @@ mod tests {
             ),
         ] {
             let error = tokenizer
-                .render_chat_template_sync(&messages, Some(false), None, None)
+                .render_chat_template_sync(&messages, Some(false), None, None, false)
                 .expect_err(label)
                 .to_string();
             assert!(
@@ -7040,7 +7180,7 @@ mod tests {
             vec![tool_result_answering("call_9")],
         ] {
             tokenizer
-                .render_chat_template_sync(&messages, Some(false), None, None)
+                .render_chat_template_sync(&messages, Some(false), None, None, false)
                 .expect("a clean id must render");
         }
     }
@@ -7074,6 +7214,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect_err("a manufactured key collision must fail the render")
             .to_string();
@@ -7101,6 +7242,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect_err("the collision must be refused whichever key carries the marker")
             .to_string();
@@ -7125,6 +7267,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect_err("a nested key collision must fail the render")
             .to_string();
@@ -7145,7 +7288,13 @@ mod tests {
                 Some(r#"{"city<|eot|>": {"type": "string"}, "city ": {"type": "string"}}"#.into());
         }
         let error = tokenizer
-            .render_chat_template_sync(&[user_msg("hi", 0)], Some(false), Some(&[tool]), None)
+            .render_chat_template_sync(
+                &[user_msg("hi", 0)],
+                Some(false),
+                Some(&[tool]),
+                None,
+                false,
+            )
             .expect_err("a schema key collision must fail the render")
             .to_string();
         assert!(
@@ -7169,6 +7318,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect("a key with no collision must still render");
         assert!(
@@ -7248,6 +7398,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect("a non-Muse family must not be refused for a marker in an id or a key");
         for expected in [
@@ -7277,6 +7428,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_with(field, key)]),
                     None,
+                    false,
                 )
                 .expect("the checkpoint's own chat template must render")
         };
@@ -7328,6 +7480,7 @@ mod tests {
                 Some(true),
                 None,
                 None,
+                false,
             )
             .expect_err("a marker inside a tool name must fail the render, not be rewritten");
         let error = error.to_string();
@@ -7345,6 +7498,7 @@ mod tests {
                 Some(true),
                 None,
                 None,
+                false,
             )
             .expect("a clean tool name must still render");
     }
@@ -7356,7 +7510,13 @@ mod tests {
         let mut tool = tool_with(BENIGN_FIELD, BENIGN_KEY);
         tool.function.name = "wx<|message|>.forecast".to_string();
         let error = tokenizer
-            .render_chat_template_sync(&[user_msg("weather?", 0)], Some(true), Some(&[tool]), None)
+            .render_chat_template_sync(
+                &[user_msg("weather?", 0)],
+                Some(true),
+                Some(&[tool]),
+                None,
+                false,
+            )
             .expect_err("a marker inside a tool-definition name must fail the render");
         let error = error.to_string();
         assert!(
@@ -7372,6 +7532,7 @@ mod tests {
                 Some(true),
                 Some(&[tool_with(BENIGN_FIELD, BENIGN_KEY)]),
                 None,
+                false,
             )
             .expect("a clean tool name must still render");
         assert!(
@@ -7468,6 +7629,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_named(name)]),
                     None,
+                    false,
                 )
                 .map(|rendered| format!("RENDERED: {rendered}"))
                 .expect_err(&format!("tool name {name:?} must fail the render"))
@@ -7496,6 +7658,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_named(name)]),
                     None,
+                    false,
                 )
                 .unwrap_or_else(|e| panic!("tool name {name:?} is legal but was refused: {e}"));
             assert!(
@@ -7547,6 +7710,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_named(name)]),
                     None,
+                    false,
                 )
                 .unwrap_or_else(|e| {
                     panic!(
@@ -7619,6 +7783,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_named(name)]),
                     None,
+                    false,
                 )
                 .map(|rendered| format!("RENDERED: {rendered}"))
                 .expect_err(&format!("tool name {name:?} must fail the real render"))
@@ -7635,6 +7800,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_named(name)]),
                     None,
+                    false,
                 )
                 .unwrap_or_else(|e| panic!("tool name {name:?} is legal but was refused: {e}"));
             assert!(
@@ -7738,6 +7904,7 @@ mod tests {
                         Some(true),
                         Some(&[tool_named(name)]),
                         None,
+                        false,
                     )
                     .unwrap_or_else(|e| panic!("{family} refused the legal name {name:?}: {e}"));
                 // Both families JSON-encode it, so the escaped spelling is what to
@@ -7826,7 +7993,7 @@ mod tests {
             // hostile one would abort before the other ten sites could be measured.
             let (messages, tools) = every_hostile_field(&field, &field, "call_1");
             let rendered = tokenizer
-                .render_chat_template_sync(&messages, Some(false), Some(&tools), None)
+                .render_chat_template_sync(&messages, Some(false), Some(&tools), None, false)
                 .expect("the field template must render");
             assert_eq!(
                 encoded_control_ids(&tokenizer, &rendered),
@@ -7886,6 +8053,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect("the field template must render");
         assert_eq!(
@@ -7927,7 +8095,7 @@ mod tests {
         tools[0].function.name = format!("wx{HOSTILE_KEY}.forecast");
 
         let rendered = tokenizer
-            .render_chat_template_sync(&named, Some(false), Some(&tools), None)
+            .render_chat_template_sync(&named, Some(false), Some(&tools), None, false)
             .expect("a non-Muse family's prompt must still render, markers and all");
 
         // Each site, named, so a failure says which field was touched. `content` is
@@ -8166,6 +8334,7 @@ mod tests {
         let ctx = super::Qwen3Tokenizer::build_render_context(super::RenderContextOptions {
             current_date: Some("2026-08-10".to_string()),
             reasoning_strength: Some("low".to_string()),
+            preserve_thinking: false,
         });
         assert_eq!(
             env.get_template("t").unwrap().render(&ctx).unwrap(),
@@ -8187,6 +8356,7 @@ mod tests {
         let ctx = super::Qwen3Tokenizer::build_render_context(super::RenderContextOptions {
             current_date: None,
             reasoning_strength: None,
+            preserve_thinking: false,
         });
         assert_eq!(
             env.get_template("t").unwrap().render(&ctx).unwrap(),
@@ -8226,6 +8396,7 @@ mod tests {
             super::RenderContextOptions {
                 current_date: Some("2026-08-10".to_string()),
                 reasoning_strength: Some("low".to_string()),
+                preserve_thinking: false,
             },
         )
         .expect("template renders");

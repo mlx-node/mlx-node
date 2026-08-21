@@ -704,6 +704,7 @@ mod mock_backend_tests {
             tok: &Qwen3Tokenizer,
             messages: &[ChatMessage],
             config: &ChatConfig,
+            preserve_thinking: bool,
         ) -> Result<Vec<u32>> {
             // Counting renderer: same body as the trait default, plus the
             // invocation counter the pre-render image-guard tests assert
@@ -720,6 +721,7 @@ mod mock_backend_tests {
                 Some(true),
                 config.tools.as_deref(),
                 resolve_enable_thinking(config),
+                preserve_thinking,
             )
         }
 
@@ -1723,7 +1725,13 @@ mod mock_backend_tests {
         // template.)
         let probe = backend
             .tokenizer
-            .apply_chat_template_sync(&user_messages("hello world again"), Some(true), None, None)
+            .apply_chat_template_sync(
+                &user_messages("hello world again"),
+                Some(true),
+                None,
+                None,
+                crate::engine::session::SESSION_PRESERVE_THINKING,
+            )
             .unwrap_or_else(|e| panic!("probe render failed: {}", e.reason));
         assert!(probe.len() > 4);
         backend.history = probe[..probe.len() - 3].to_vec();
@@ -1776,7 +1784,13 @@ mod mock_backend_tests {
         let retry_messages = user_messages("hello world again");
         let retry_prompt = backend
             .tokenizer
-            .apply_chat_template_sync(&retry_messages, Some(true), None, None)
+            .apply_chat_template_sync(
+                &retry_messages,
+                Some(true),
+                None,
+                None,
+                crate::engine::session::SESSION_PRESERVE_THINKING,
+            )
             .unwrap_or_else(|e| panic!("retry probe render failed: {}", e.reason));
         assert!(retry_prompt.len() > 4);
 

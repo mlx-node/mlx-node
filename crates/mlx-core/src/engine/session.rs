@@ -533,6 +533,27 @@ pub(super) fn live_history_media_matches<B: ChatBackend>(
     backend.session_media_matches_payloads(&images, &audio)
 }
 
+/// Whether a session turn keeps prior assistant turns' reasoning when it
+/// re-renders the transcript.
+///
+/// `true`, and this is the only place in the crate that answers `true` —
+/// every one-shot render leaves
+/// [`crate::tokenizer::RenderContextOptions::preserve_thinking`] at its `false`
+/// default and stays byte-identical to transformers / mlx-lm / mlx-vlm / vLLM.
+/// A session may answer differently because it owns what they do not: a live KV
+/// cache holding the tokens of the thought the model just generated. Drop those
+/// on re-render and the prompt stops being an extension of the committed
+/// prefix, `verify_cache_prefix` misses, and every continuation cold-replays
+/// the whole conversation.
+///
+/// It is a constant rather than a request field because it must be the same
+/// across the four renders [`render_live_continuation`] compares — the full
+/// re-render from [`ChatBackend::render_prompt`], the completed-history render,
+/// its provenance shadow, and the completed-history token render. Two of them
+/// disagreeing would reproduce the `cached_tokens = 0` this fixes, in a shape
+/// no template rewrite could bridge.
+pub(crate) const SESSION_PRESERVE_THINKING: bool = true;
+
 #[derive(Debug, PartialEq, Eq)]
 struct StructuredReasoningBoundary {
     ordinal: usize,
@@ -579,12 +600,14 @@ fn structured_reasoning_boundary_ordinals(
     completed_history: &[ChatMessage],
     config: &ChatConfig,
     close_tag: &str,
+    preserve_thinking: bool,
 ) -> Result<Option<Vec<StructuredReasoningBoundary>>> {
     let completed_template = tokenizer.render_chat_template_sync(
         completed_history,
         Some(false),
         config.tools.as_deref(),
         crate::engine::params::resolve_enable_thinking(config),
+        preserve_thinking,
     )?;
     let salt = (0usize..)
         .find(|salt| !completed_template.contains(&format!("__MLX_REASONING_PROVENANCE_{salt}_")))
@@ -618,6 +641,7 @@ fn structured_reasoning_boundary_ordinals(
         Some(false),
         config.tools.as_deref(),
         crate::engine::params::resolve_enable_thinking(config),
+        preserve_thinking,
     )?;
     let mut rendered_replacements = Vec::new();
     for replacement in replacements {
@@ -763,7 +787,7 @@ fn cached_structured_reasoning_matches(
 /// same reasoning boundary but are not prefix-equal. Literal tags in user or
 /// ordinary assistant content are never selected.
 ///
-/// `close_tag` is the family's own tag ([`ChatBackend::reasoning_close_tag`]);
+/// `close_tag` is the family's own tag ([`ChatBackend::REASONING_CLOSE_TAG`]);
 /// Gemma4 closes with `<channel|>` and its template always writes the newline
 /// before it that the model may not have generated.
 fn normalize_reasoning_boundaries(
@@ -843,6 +867,7 @@ fn render_live_continuation<B: ChatBackend>(
     messages: &[ChatMessage],
     config: &ChatConfig,
     full_tokens: &[u32],
+    preserve_thinking: bool,
 ) -> Result<Option<Vec<u32>>> {
     let Some((_pending, completed_history)) = messages.split_last() else {
         return Ok(None);
@@ -860,14 +885,20 @@ fn render_live_continuation<B: ChatBackend>(
         Some(false),
         config.tools.as_deref(),
         crate::engine::params::resolve_enable_thinking(config),
+        preserve_thinking,
     )?;
     let cached_comparison_tokens = backend.template_history_comparison_tokens(cached_tokens);
     let cached_text = tokenizer.decode_sync(&cached_comparison_tokens, false)?;
     let completed_text = tokenizer.decode_sync(&completed_tokens, false)?;
     let full_text = tokenizer.decode_sync(full_tokens, false)?;
-    let close_tag = backend.reasoning_close_tag();
-    let Some(reasoning_boundaries) =
-        structured_reasoning_boundary_ordinals(tokenizer, completed_history, config, close_tag)?
+    let close_tag = B::REASONING_CLOSE_TAG;
+    let Some(reasoning_boundaries) = structured_reasoning_boundary_ordinals(
+        tokenizer,
+        completed_history,
+        config,
+        close_tag,
+        preserve_thinking,
+    )?
     else {
         return Ok(None);
     };
@@ -985,9 +1016,17 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
         )));
     }
 
-    let full_tokens = backend.render_prompt(&tokenizer, &messages, &config)?;
+    let full_tokens =
+        backend.render_prompt(&tokenizer, &messages, &config, SESSION_PRESERVE_THINKING)?;
     let live_continuation = if turn_kind == TurnKind::Continue {
-        render_live_continuation(backend, &tokenizer, &messages, &config, &full_tokens)?
+        render_live_continuation(
+            backend,
+            &tokenizer,
+            &messages,
+            &config,
+            &full_tokens,
+            SESSION_PRESERVE_THINKING,
+        )?
     } else {
         None
     };
