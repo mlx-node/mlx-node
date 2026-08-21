@@ -80,7 +80,7 @@ same-binary uniform/ragged validation with separate model instances:
 | `MLX_SCHED_WATERMARK_FRACTION`  | `0.05`  | Free-block headroom retained while work is already live.                                                   |
 | `MLX_SCHED_RESERVE_FULL_ISL`    | `1`     | Reserve each admitted request's remaining prompt growth in the must-fit test.                              |
 | `MLX_SCHED_RAGGED_STEP`         | `0`     | Use one packed varlen Qwen3 forward for mixed prefill/decode slices.                                       |
-| `MLX_PAGED_PER_SEQ_CTX`         | `unset` | Optional per-sequence **admit** cap and Qwen3/LFM2 pool-budget clip. Unset → admit `min(trained, live pool)`. Default 32768 applies only to the Qwen3/LFM2 **pool request** formula, not to Nemotron/Qwen3.5 admit. |
+| `MLX_PAGED_PER_SEQ_CTX`         | `unset` | Optional per-sequence **admit** cap and Qwen3/LFM2 pool-budget clip. Unset → admit `min(trained, live pool minus recurrent KV-equivalent)`. When set, Muse/Nemotron `contextLimits()` also publish that cap. Default 32768 applies only to the Qwen3/LFM2 **pool request** formula. |
 | `MLX_CONTINUOUS_BATCHING`       | `0`     | Opt default-off compatible checkpoints into the shared scheduled lane (currently Qwen3.5 dense and MoE).   |
 | `MLX_SERVE_FORCE_SERIAL`        | `0`     | Route eligible Qwen3/LFM2/Qwen3.5/Gemma4/NemotronH turns through the whole-turn path for A/B and rollback. |
 

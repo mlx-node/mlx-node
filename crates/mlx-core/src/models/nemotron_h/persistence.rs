@@ -970,6 +970,7 @@ pub(crate) fn load_inner(model_path: &str) -> Result<(NemotronHInner, u64)> {
 
     let weight_refs: Vec<&MxArray> = params.values().collect();
     crate::array::memory::materialize_weights(&weight_refs)?;
+    inner.size_paged_pool_after_weight_load()?;
 
     let tokenizer_path = path.join("tokenizer.json");
     if tokenizer_path.exists() {

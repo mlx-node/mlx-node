@@ -360,6 +360,40 @@ pub(crate) fn scheduled_turn_context(
     cap
 }
 
+/// Tokens one sequence can actually use after charging recurrent state
+/// (Mamba/GDN) against the same unified-memory pool as paged KV blocks.
+pub(crate) fn pool_tokens_after_recurrent(
+    pool_tokens: u32,
+    block_size: u32,
+    bytes_per_block: u64,
+    recurrent_state_bytes: u64,
+) -> u32 {
+    if bytes_per_block == 0 || block_size == 0 {
+        return pool_tokens.max(1);
+    }
+    let rec_blocks = recurrent_state_bytes
+        .div_ceil(bytes_per_block)
+        .min(u64::from(u32::MAX)) as u32;
+    let rec_tokens = rec_blocks.saturating_mul(block_size);
+    pool_tokens.saturating_sub(rec_tokens).max(1)
+}
+
+/// Whether a reservation plus one row of recurrent state can ever fit in an
+/// empty pool. If not, admission must error — not defer — or the row wedges
+/// `prepared_waiting` forever.
+pub(crate) fn reservation_fits_empty_pool(
+    reservation_blocks: u32,
+    total_blocks: u32,
+    bytes_per_block: u64,
+    recurrent_state_bytes: u64,
+) -> bool {
+    let need = u64::from(reservation_blocks)
+        .saturating_mul(bytes_per_block)
+        .saturating_add(recurrent_state_bytes);
+    let cap = u64::from(total_blocks).saturating_mul(bytes_per_block);
+    need <= cap
+}
+
 fn scheduler_watermark_fraction() -> f64 {
     static VALUE: OnceLock<f64> = OnceLock::new();
     *VALUE.get_or_init(|| {
@@ -1520,34 +1554,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let trained_context = u32::try_from(self.inner.max_position_embeddings())
             .unwrap_or(1)
             .max(1);
-        let pool_tokens = self
-            .inner
-            .paged_adapter()
-            .map(crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::max_capacity_tokens)
-            .unwrap_or(trained_context);
-        let context = scheduled_turn_context(
-            trained_context,
-            pool_tokens,
-            scheduler_per_seq_context_override(),
-        );
-        let max_new_tokens = match engine::scheduler::clamp_scheduled_output_tokens(
-            prompt_tokens,
-            requested_max_new_tokens,
-            context,
-        ) {
-            Ok(max_new_tokens) => max_new_tokens,
-            Err(error) => {
-                if newly_assigned {
-                    self.owner_sequences.remove(&owner_id);
-                    self.owner_states.remove(&owner_id);
-                }
-                response.send_error(Error::from_reason(error), cancelled.as_ref());
-                return None;
-            }
-        };
-        admitted.params.max_new_tokens = max_new_tokens as i32;
-        let requested_tokens =
-            engine::scheduler::scheduled_materialized_tokens(prompt_tokens, max_new_tokens);
         if !self.inner.scheduler_cache_available() {
             if newly_assigned {
                 self.owner_sequences.remove(&owner_id);
@@ -1573,6 +1579,42 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 return None;
             }
         };
+        let adapter = self.inner.paged_adapter();
+        let pool_tokens = adapter
+            .map(crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::max_capacity_tokens)
+            .unwrap_or(trained_context);
+        let bytes_per_block = adapter
+            .map(|adapter| adapter.bytes_per_block().unwrap_or(0))
+            .unwrap_or(0);
+        let usable_pool = pool_tokens_after_recurrent(
+            pool_tokens,
+            block_size,
+            bytes_per_block,
+            self.inner.recurrent_state_bytes(),
+        );
+        let context = scheduled_turn_context(
+            trained_context,
+            usable_pool,
+            scheduler_per_seq_context_override(),
+        );
+        let max_new_tokens = match engine::scheduler::clamp_scheduled_output_tokens(
+            prompt_tokens,
+            requested_max_new_tokens,
+            context,
+        ) {
+            Ok(max_new_tokens) => max_new_tokens,
+            Err(error) => {
+                if newly_assigned {
+                    self.owner_sequences.remove(&owner_id);
+                    self.owner_states.remove(&owner_id);
+                }
+                response.send_error(Error::from_reason(error), cancelled.as_ref());
+                return None;
+            }
+        };
+        admitted.params.max_new_tokens = max_new_tokens as i32;
+        let requested_tokens =
+            engine::scheduler::scheduled_materialized_tokens(prompt_tokens, max_new_tokens);
         let full_blocks = requested_tokens.div_ceil(block_size);
         let reservation_blocks = if scheduler_reserve_full_isl() {
             full_blocks
@@ -1655,9 +1697,19 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 return Ok(None);
             }
         };
-        if cache_snapshot
-            .is_some_and(|snapshot| prepared.reservation_blocks > snapshot.blocks.total_blocks)
-        {
+        let candidate_state_bytes = if self.inner.has_scheduled_recurrent(prepared.seq_id) {
+            0
+        } else {
+            self.inner.recurrent_state_bytes()
+        };
+        if cache_snapshot.is_some_and(|snapshot| {
+            !reservation_fits_empty_pool(
+                prepared.reservation_blocks,
+                snapshot.blocks.total_blocks,
+                snapshot.bytes_per_block,
+                candidate_state_bytes,
+            )
+        }) {
             self.cleanup_rejected_prepared(&prepared);
             let total_blocks = cache_snapshot.map_or(0, |snapshot| snapshot.blocks.total_blocks);
             prepared.response.send_error(
@@ -1672,11 +1724,6 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if !self.ensure_recurrent_slot(prepared.seq_id) {
             return Err(prepared);
         }
-        let candidate_state_bytes = if self.inner.has_scheduled_recurrent(prepared.seq_id) {
-            0
-        } else {
-            self.inner.recurrent_state_bytes()
-        };
         if let Some(snapshot) = cache_snapshot {
             let decision = self.scheduler.try_reserve_memory(
                 engine::scheduler::MemoryTelemetry {
@@ -3058,7 +3105,7 @@ mod tests {
 
 #[cfg(test)]
 mod scheduled_context_tests {
-    use super::scheduled_turn_context;
+    use super::{pool_tokens_after_recurrent, reservation_fits_empty_pool, scheduled_turn_context};
 
     #[test]
     fn admit_uses_pool_when_env_unset() {
@@ -3098,5 +3145,23 @@ mod scheduled_context_tests {
         let cap = scheduled_turn_context(trained, pool, None);
         // Output still clamped to remaining window; prompt accepted against the pool.
         assert!(crate::engine::scheduler::clamp_scheduled_output_tokens(33_611, 1024, cap).is_ok());
+    }
+
+    #[test]
+    fn recurrent_bytes_leave_kv_headroom() {
+        // 16-token blocks, 1024 bytes/block: 48 MiB recurrent → 49152 blocks → 786432 tokens.
+        let pool = 1_048_576;
+        let usable = pool_tokens_after_recurrent(pool, 16, 1024, 48 * 1024 * 1024);
+        assert_eq!(usable, 1_048_576 - 786_432);
+        assert!(usable < pool);
+    }
+
+    #[test]
+    fn filling_the_pool_with_nonzero_recurrent_cannot_fit() {
+        // Equality used to skip `reservation_blocks > total_blocks` and then
+        // defer forever once recurrent bytes were charged.
+        assert!(reservation_fits_empty_pool(100, 100, 4096, 0));
+        assert!(!reservation_fits_empty_pool(100, 100, 4096, 1));
+        assert!(!reservation_fits_empty_pool(101, 100, 4096, 0));
     }
 }

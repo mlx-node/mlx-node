@@ -127,18 +127,30 @@ pub struct MuseGlimmerContextLimits {
 }
 
 impl MuseGlimmerContextLimits {
-    fn from_parts(trained_window_tokens: u32, paged: Option<(u32, u32, u32)>) -> Self {
+    fn from_parts(
+        trained_window_tokens: u32,
+        paged: Option<(u32, u32, u32)>,
+        override_cap: Option<u32>,
+    ) -> Self {
         let Some((paged_window_tokens, paged_block_capacity, paged_block_size)) = paged else {
             return Self {
                 trained_window_tokens,
-                effective_window_tokens: trained_window_tokens,
+                effective_window_tokens: crate::engine::hybrid_scheduler::scheduled_turn_context(
+                    trained_window_tokens,
+                    trained_window_tokens,
+                    override_cap,
+                ),
                 paged_block_capacity: 0,
                 paged_block_size: 0,
             };
         };
         Self {
             trained_window_tokens,
-            effective_window_tokens: trained_window_tokens.min(paged_window_tokens),
+            effective_window_tokens: crate::engine::hybrid_scheduler::scheduled_turn_context(
+                trained_window_tokens,
+                paged_window_tokens,
+                override_cap,
+            ),
             paged_block_capacity,
             paged_block_size,
         }
@@ -155,7 +167,11 @@ impl MuseGlimmerContextLimits {
                 adapter.block_size(),
             )
         });
-        Self::from_parts(trained, paged)
+        Self::from_parts(
+            trained,
+            paged,
+            crate::engine::hybrid_scheduler::scheduler_per_seq_context_override(),
+        )
     }
 }
 
@@ -165,7 +181,8 @@ mod context_limit_tests {
 
     #[test]
     fn paged_effective_window_is_min_trained_and_pool() {
-        let limits = MuseGlimmerContextLimits::from_parts(131_072, Some((131_072, 8_192, 16)));
+        let limits =
+            MuseGlimmerContextLimits::from_parts(131_072, Some((131_072, 8_192, 16)), None);
         assert_eq!(limits.trained_window_tokens, 131_072);
         assert_eq!(limits.effective_window_tokens, 131_072);
         assert_eq!(limits.paged_block_capacity, 8_192);
@@ -174,7 +191,7 @@ mod context_limit_tests {
 
     #[test]
     fn paged_effective_window_follows_a_smaller_pool() {
-        let limits = MuseGlimmerContextLimits::from_parts(131_072, Some((32_768, 2_048, 16)));
+        let limits = MuseGlimmerContextLimits::from_parts(131_072, Some((32_768, 2_048, 16)), None);
         assert_eq!(limits.effective_window_tokens, 32_768);
         assert_eq!(limits.paged_block_capacity, 2_048);
         assert_eq!(limits.paged_block_size, 16);
@@ -182,10 +199,19 @@ mod context_limit_tests {
 
     #[test]
     fn a_flat_only_runtime_publishes_the_trained_window() {
-        let limits = MuseGlimmerContextLimits::from_parts(131_072, None);
+        let limits = MuseGlimmerContextLimits::from_parts(131_072, None, None);
         assert_eq!(limits.effective_window_tokens, 131_072);
         assert_eq!(limits.paged_block_capacity, 0);
         assert_eq!(limits.paged_block_size, 0);
+    }
+
+    #[test]
+    fn explicit_env_cap_is_published_unset_does_not_impose_32k() {
+        let capped =
+            MuseGlimmerContextLimits::from_parts(131_072, Some((131_072, 8_192, 16)), Some(32_768));
+        assert_eq!(capped.effective_window_tokens, 32_768);
+        let unset = MuseGlimmerContextLimits::from_parts(131_072, Some((131_072, 8_192, 16)), None);
+        assert_eq!(unset.effective_window_tokens, 131_072);
     }
 }
 
