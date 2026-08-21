@@ -23,6 +23,7 @@ export const AGENT_PAGED_MODEL_TYPES = [
   'muse_glimmer',
   'lfm2',
   'lfm2_moe',
+  'nemotron_h',
 ] as const;
 
 /** Families historically forced paged by `mlx launch claude`. */

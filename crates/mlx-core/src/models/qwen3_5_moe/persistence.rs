@@ -592,8 +592,10 @@ fn apply_weights_moe_inner_with_residency(
         let amax_key = is_site.then_some(nk);
         // Gate the CONSUMED activation amax under the SAME predicate as the
         // recorded `amax_key` — mirrors the dense qwen3_5 loader.
-        // `QuantizedLinear::forward` fake-quants whenever `input_amax > 0 &&
-        // mode == MXFP8_MODE`, so a stale / hand-edited / future-recipe config
+        // `QuantizedLinear::forward` fake-quants whenever `input_amax > 0` AND
+        // the weight shape is static-FP8 (mxfp8 8/32 or affine 8/32 — see
+        // `quant_dispatch::admits_static_fp8_activation`), so a stale /
+        // hand-edited / future-recipe config
         // with `input_amax` on a NON-attn/GDN mxfp8 projection must NOT thread
         // it — else it would fake-quant a non-site's activations, violating
         // "activation FP8 only on attn/GDN sites".

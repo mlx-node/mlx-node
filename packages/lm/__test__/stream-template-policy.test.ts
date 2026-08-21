@@ -12,6 +12,7 @@ vi.mock('@mlx-node/core', () => {
     Gemma4Model: UnusedNativeModel,
     Lfm2Model: UnusedNativeModel,
     MuseGlimmerModel: UnusedNativeModel,
+    NemotronHModel: UnusedNativeModel,
     Qwen3Model: UnusedNativeModel,
     Qwen35Model: UnusedNativeModel,
     Qwen35MoeModel: UnusedNativeModel,

@@ -55,7 +55,13 @@ interface FamilyTraits {
    * `max_position_embeddings` at either nesting level. Values are the
    * trained windows of the reference checkpoints: Qwen3 40960,
    * Qwen3.5 (+MoE) 262144, Gemma4 131072, LFM2.5 (dense + MoE) 128000
-   * (`LFM2_CONFIGS[*].maxPositionEmbeddings` in `packages/lm`).
+   * (`LFM2_CONFIGS[*].maxPositionEmbeddings` in `packages/lm`),
+   * Nemotron 3.5 Lightning 1048576
+   * (`crates/mlx-core/src/models/nemotron_h/config.rs`).
+   *
+   * A family's VOCAB size is never the right value here — the two are
+   * unrelated numbers that happen to collide on some checkpoints
+   * (nemotron_h is 131072 vocab / 1048576 context).
    */
   fallbackContextWindow: number;
 }
@@ -91,6 +97,10 @@ const FAMILY_TRAITS: Record<string, FamilyTraits> = {
   },
   lfm2: { reasoning: true, fallbackContextWindow: 128000 },
   lfm2_moe: { reasoning: true, fallbackContextWindow: 128000 },
+  nemotron_h: {
+    reasoning: true,
+    fallbackContextWindow: 1048576,
+  },
 };
 
 function positiveInteger(value: unknown): number | undefined {
@@ -194,7 +204,11 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     }
 
     const name = basename(full);
-    const { contextWindow, supportsImages } = await readDiscoveryMetadata(full, modelType, traits.fallbackContextWindow);
+    const { contextWindow, supportsImages } = await readDiscoveryMetadata(
+      full,
+      modelType,
+      traits.fallbackContextWindow,
+    );
     out.push({
       discovered: { name, path: full, modelType },
       piModel: {

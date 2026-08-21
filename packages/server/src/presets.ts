@@ -89,6 +89,16 @@ export const MUSE_GLIMMER_SAMPLING_DEFAULTS: ChatConfig = {
   repetitionPenalty: 1.0,
 };
 
+/** Sampling defaults from NVIDIA's Nemotron 3.5 Lightning release recipe. */
+export const NEMOTRON_SAMPLING_DEFAULTS: ChatConfig = {
+  temperature: 1.0,
+  topP: 0.95,
+  topK: 20,
+  minP: 0.0,
+  presencePenalty: 0.0,
+  repetitionPenalty: 1.0,
+};
+
 /** Sampling defaults for LFM2.5 Thinking. */
 export const LFM2_SAMPLING_DEFAULTS: ChatConfig = {
   temperature: 0.05,
@@ -134,5 +144,9 @@ export const LAUNCH_PRESETS: Record<string, LaunchPreset> = {
   lfm2: {
     sampling: LFM2_SAMPLING_DEFAULTS,
     maxOutputTokens: 8192,
+  },
+  nemotron_h: {
+    sampling: NEMOTRON_SAMPLING_DEFAULTS,
+    maxOutputTokens: 32768,
   },
 };

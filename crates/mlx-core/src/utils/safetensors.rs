@@ -291,16 +291,20 @@ impl SafeTensorsFile {
 /// Convert bytes to f32 array (little-endian)
 fn bytes_to_f32(bytes: &[u8]) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
         .collect()
 }
 
 /// Convert bytes to i32 array (little-endian)
 fn bytes_to_i32(bytes: &[u8]) -> Vec<i32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| i32::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -308,8 +312,10 @@ fn bytes_to_i32(bytes: &[u8]) -> Vec<i32> {
 /// Used for packed quantized weight loading
 fn bytes_to_u32(bytes: &[u8]) -> Vec<u32> {
     bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect()
 }
 
@@ -317,8 +323,10 @@ fn bytes_to_u32(bytes: &[u8]) -> Vec<u32> {
 /// Used for direct bf16/f16 loading without f32 conversion
 fn bytes_to_u16(bytes: &[u8]) -> Vec<u16> {
     bytes
-        .chunks_exact(2)
-        .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect()
 }
 

@@ -135,7 +135,9 @@ fn image_token_counts(grid_thw: Option<&MxArray>, spatial_merge_size: i32) -> Re
         .ok_or_else(|| Error::new(Status::InvalidArg, "invalid spatial_merge_size"))?;
 
     grid_data
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|grid| {
             let tokens = grid[0]
                 .checked_mul(grid[1])

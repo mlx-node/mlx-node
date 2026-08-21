@@ -4,6 +4,7 @@ import {
   Gemma4Model as Gemma4ModelNative,
   Lfm2Model as Lfm2ModelNative,
   MuseGlimmerModel as MuseGlimmerModelNative,
+  NemotronHModel as NemotronHModelNative,
   Qwen3Tokenizer,
   Qwen3Model as Qwen3ModelNative,
   Qwen35Model as Qwen35ModelNative,
@@ -844,6 +845,11 @@ export class Lfm2Model extends makeStreamingModel(Lfm2ModelNative, {
   replayAssistantRawText: true,
 }) {}
 
+/** Nemotron 3.5 Lightning (text-only) — see {@link Qwen35Model} for the wrapper shape. */
+export class NemotronHModel extends makeStreamingModel(NemotronHModelNative, {
+  recordModelPath: true,
+}) {}
+
 /** Gemma4 model (text-only) — see {@link Qwen35Model} for the wrapper shape. */
 export class Gemma4Model extends makeStreamingModel(Gemma4ModelNative, {
   recordModelPath: true,
@@ -882,12 +888,14 @@ function _assertSessionCapable(): void {
   const _gemma4: SessionCapableModel = null as unknown as Gemma4Model;
   const _museGlimmer: SessionCapableModel = null as unknown as MuseGlimmerModel;
   const _qwen3: SessionCapableModel = null as unknown as Qwen3Model;
+  const _nemotronH: SessionCapableModel = null as unknown as NemotronHModel;
   void _qwen35;
   void _moe;
   void _lfm2;
   void _gemma4;
   void _museGlimmer;
   void _qwen3;
+  void _nemotronH;
 }
 void _assertSessionCapable;
 
@@ -931,11 +939,14 @@ function _assertPreservedNativeSurfaces(): void {
     null as unknown as Gemma4Model;
   const _museGlimmer: PreservedNativeSurface<typeof MuseGlimmerModelNative> =
     null as unknown as MuseGlimmerModel;
+  const _nemotronH: PreservedNativeSurface<typeof NemotronHModelNative> =
+    null as unknown as NemotronHModel;
   void _qwen3;
   void _qwen35;
   void _moe;
   void _lfm2;
   void _gemma4;
   void _museGlimmer;
+  void _nemotronH;
 }
 void _assertPreservedNativeSurfaces;

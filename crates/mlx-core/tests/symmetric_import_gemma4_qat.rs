@@ -138,8 +138,10 @@ fn historical_bias_bits(scale_bits: u16) -> u16 {
 
 fn u16_le(bytes: &[u8]) -> Vec<u16> {
     bytes
-        .chunks_exact(2)
-        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|c| u16::from_le_bytes(*c))
         .collect()
 }
 
@@ -359,8 +361,10 @@ fn the_decode_is_unchanged_with_the_rebuilt_bias() {
 
         let w_bytes = f.new.read(&format!("{base}.weight"));
         let words: Vec<u32> = w_bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
             .collect();
         let weight = MxArray::from_uint32(&words, &w_shape).expect("weight array");
         let scales =

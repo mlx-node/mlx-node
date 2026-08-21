@@ -113,6 +113,12 @@ PROBE_CONTEXT = {
     "enable_thinking": True,
     "preserve_thinking": True,
     "keep_past_thinking": True,
+    # Nemotron-H's spelling of the same knob, inverted: its template defaults it
+    # to True and strips the `<think>` body of every assistant turn older than
+    # the last user message. Inert for THIS probe (its only user message is at
+    # index 0, so no assistant turn is older) — present because the context keys
+    # here must mirror `tokenizer.rs`'s `ctx_map`, not because it moves bytes.
+    "truncate_history_thinking": False,
     "bos_token": BOS_PROBE,
     "eos_token": EOS_PROBE,
     # `build_render_context`: present only when `RenderContextOptions` set it.

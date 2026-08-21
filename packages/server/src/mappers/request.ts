@@ -136,8 +136,16 @@ export interface MappedRequest {
  *   * `generation_mode: "mtp"` → `enableMtp = true`
  *   * `generation_mode: "ar"`  → `enableMtp = false`
  *   * any other / absent value → `enableMtp` untouched, so the
- *     downstream `ChatSession.mergeConfig` auto-default (true when
- *     the model ships an MTP head) applies.
+ *     downstream `ChatSession.mergeConfig` auto-default applies.
+ *     That default is two-part, not just "has a head": the model
+ *     must report `hasMtpWeights()` AND opt in through
+ *     `ChatSession#mtpAutoDefaultAllowed`, which prefers the native
+ *     `mtpAutoEnabled()` getter when present and otherwise falls
+ *     back to the `MTP_AUTO_DEFAULT_SUPPRESSED_MODELS` class-name
+ *     list (both in `packages/lm/src/chat-session.ts`). NemotronH
+ *     is currently suppressed — its head is a measured throughput
+ *     loss — so `generation_mode: "mtp"` (or an explicit
+ *     `enableMtp: true`) is the only way to speculate on it here.
  *
  *   * `mtp_depth: <positive int ≤ 64>` → `mtpDepth = value`
  *   * non-integer, out-of-range, or absent → `mtpDepth` untouched.

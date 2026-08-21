@@ -788,46 +788,56 @@ fn bytes_to_mxarray(data: &[u8], shape: &[i64], dtype: &str, name: &str) -> Resu
     match dtype {
         "f32" => {
             let floats: Vec<f32> = data
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             MxArray::from_float32(&floats, shape)
         }
         "f64" => {
             // Downcast f64 to f32
             let floats: Vec<f32> = data
-                .chunks_exact(8)
-                .map(|c| {
-                    f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]) as f32
-                })
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c) as f32)
                 .collect();
             MxArray::from_float32(&floats, shape)
         }
         "f16" => {
             let u16s: Vec<u16> = data
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             MxArray::from_float16(&u16s, shape)
         }
         "bf16" => {
             let u16s: Vec<u16> = data
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             MxArray::from_bfloat16(&u16s, shape)
         }
         "i32" => {
             let ints: Vec<i32> = data
-                .chunks_exact(4)
-                .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| i32::from_le_bytes(*c))
                 .collect();
             MxArray::from_int32(&ints, shape)
         }
         "i64" => {
             let ints: Vec<i64> = data
-                .chunks_exact(8)
-                .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| i64::from_le_bytes(*c))
                 .collect();
             MxArray::from_int64(&ints, shape)
         }

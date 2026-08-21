@@ -614,9 +614,8 @@ fn quant_object(quant_cfg: Option<&Value>) -> Result<Option<&serde_json::Map<Str
 }
 
 /// Select the modern or legacy quantization block without silent alias
-/// shadowing. Generated checkpoints duplicate both aliases byte-for-byte; a
-/// null/non-object alias or divergent pair is malformed and must fail before
-/// any dtype-based legacy mode heuristic runs.
+/// shadowing. A null/non-object alias or a divergent pair is malformed and must
+/// fail before any dtype-based legacy mode heuristic runs.
 pub fn select_quantization_block(raw: &Value) -> Result<Option<&Value>> {
     let modern = raw.get("quantization");
     let legacy = raw.get("quantization_config");
@@ -703,17 +702,33 @@ fn parse_group_size(value: &Value, mode: Option<PerLayerMode>, context: &str) ->
     Ok(group_size)
 }
 
+/// The only two weight shapes carrying a calibrated static per-tensor FP8
+/// (E4M3) activation scale: mxfp8 8/32 (qwen3_5 nvidia recipe attn/GDN) and
+/// affine 8/32 (nemotron_h mamba `mixer.{in,out}_proj`, which avoids mxfp8
+/// because MLX's E8M0 block exponent rounds to nearest, not ceil).
+///
+/// Fail-closed: everything else with an `input_amax` is a stale or hand-edited
+/// config. Shared by the config parser below, the modelopt-schema parser in
+/// `nemotron_h::persistence`, and the forward-time fake-quant gate in
+/// `qwen3_5::quantized_linear` — the three must not drift.
+pub fn admits_static_fp8_activation(mode: PerLayerMode, bits: i32, group_size: i32) -> bool {
+    matches!(mode, PerLayerMode::Mxfp8 | PerLayerMode::Affine) && bits == 8 && group_size == 32
+}
+
 fn parse_input_amax(
     value: Option<&Value>,
     mode: PerLayerMode,
+    bits: i32,
+    group_size: i32,
     context: &str,
 ) -> Result<Option<f32>> {
     let Some(value) = value else {
         return Ok(None);
     };
-    if mode != PerLayerMode::Mxfp8 {
+    if !admits_static_fp8_activation(mode, bits, group_size) {
         return Err(Error::from_reason(format!(
-            "Invalid {context}: input_amax is supported only for mxfp8 activation calibration, got mode {mode:?}"
+            "Invalid {context}: input_amax is supported only on static-FP8 layers (mxfp8 8/32 or \
+             affine 8/32), got mode {mode:?} at {bits} bits / group_size {group_size}"
         )));
     }
     let raw = value.as_f64().ok_or_else(|| {
@@ -913,6 +928,8 @@ fn parse_per_layer_entries(
         let input_amax = parse_input_amax(
             child.get("input_amax"),
             mode,
+            bits,
+            group_size,
             &format!("{context}.input_amax"),
         )?;
         let zero_point = parse_symmetric_zero_point(
@@ -963,7 +980,8 @@ pub fn parse_quant_block(
     }
     if obj.is_some_and(|q| q.contains_key("input_amax")) {
         return Err(Error::from_reason(
-            "Invalid top-level quantization.input_amax: activation calibration is supported only on per-layer mxfp8 overrides"
+            "Invalid top-level quantization.input_amax: activation calibration is supported only \
+             on per-layer static-FP8 overrides (mxfp8 8/32 or affine 8/32)"
                 .to_string(),
         ));
     }
@@ -1003,7 +1021,8 @@ pub fn parse_quant_settings(
     };
     if obj.is_some_and(|q| q.contains_key("input_amax")) {
         return Err(Error::from_reason(
-            "Invalid top-level quantization.input_amax: activation calibration is supported only on per-layer mxfp8 overrides"
+            "Invalid top-level quantization.input_amax: activation calibration is supported only \
+             on per-layer static-FP8 overrides (mxfp8 8/32 or affine 8/32)"
                 .to_string(),
         ));
     }
@@ -1590,8 +1609,11 @@ mod tests {
         assert_eq!(overrides["layers.0.mlp.gate_proj"].group_size, 64);
     }
 
+    /// `input_amax` is admitted on exactly mxfp8 8/32 and affine 8/32, rejected
+    /// everywhere else. The affine arm is load-bearing: nemotron_h's converter
+    /// emits it for the mamba `mixer.{in,out}_proj`.
     #[test]
-    fn input_amax_requires_positive_finite_f32_mxfp8_override() {
+    fn input_amax_requires_positive_finite_f32_on_a_static_fp8_override() {
         let valid = serde_json::json!({
             "mode": "mxfp8",
             "bits": 8,
@@ -1629,6 +1651,39 @@ mod tests {
             assert!(parse_quant_settings(Some(&raw), 4, 64).is_err());
         }
 
+        // affine 8/32 — nemotron_h's mamba projections: admitted.
+        let affine_8_32 = serde_json::json!({
+            "mode": "affine",
+            "bits": 8,
+            "group_size": 32,
+            "layers.0.mixer.in_proj": {
+                "mode": "affine",
+                "bits": 8,
+                "group_size": 32,
+                "input_amax": 6.25
+            }
+        });
+        let (_, _, _, affine_overrides) = parse_quant_settings(Some(&affine_8_32), 4, 64).unwrap();
+        assert_eq!(
+            affine_overrides["layers.0.mixer.in_proj"].input_amax,
+            Some(6.25),
+            "affine 8/32 is a static-FP8 weight shape and must carry its amax"
+        );
+
+        // Right mode, wrong group size: 8/64 is still rejected.
+        let affine_8_64 = serde_json::json!({
+            "mode": "affine",
+            "bits": 8,
+            "group_size": 64,
+            "layers.0.mixer.in_proj": {
+                "mode": "affine",
+                "bits": 8,
+                "group_size": 64,
+                "input_amax": 1.0
+            }
+        });
+        assert!(parse_quant_settings(Some(&affine_8_64), 4, 64).is_err());
+
         let wrong_mode = serde_json::json!({
             "mode": "affine",
             "bits": 4,
@@ -1641,6 +1696,20 @@ mod tests {
             }
         });
         assert!(parse_quant_settings(Some(&wrong_mode), 4, 64).is_err());
+
+        // nvfp4 is not a static-FP8 shape; reject it too.
+        let nvfp4_amax = serde_json::json!({
+            "mode": "nvfp4",
+            "bits": 4,
+            "group_size": 16,
+            "layers.0.self_attn.q_proj": {
+                "mode": "nvfp4",
+                "bits": 4,
+                "group_size": 16,
+                "input_amax": 1.0
+            }
+        });
+        assert!(parse_quant_settings(Some(&nvfp4_amax), 4, 64).is_err());
 
         let top_level = serde_json::json!({
             "mode": "mxfp8",

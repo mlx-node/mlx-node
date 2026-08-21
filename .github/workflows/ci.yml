@@ -250,7 +250,8 @@ jobs:
   # QAT (wNa8o8) leg (~2.9GB) runs on PR opt-in but is SKIPPED on the push/release
   # gate (its run step early-exits) until CI's HUGGINGFACE_TOKEN is confirmed to
   # reach the gated google/gemma-4-E2B-it-qat-mobile-transformers repo — otherwise
-  # a download failure would block releases.
+  # a download failure would block releases. nemotron_h is PR-opt-in for the same
+  # reason, but because of size: its only published checkpoint is the 30B-A3B.
   model-test:
     name: e2e ${{ matrix.name }}
     needs: build
@@ -354,6 +355,44 @@ jobs:
             stage1_ts: ''
             stage2_rust: ''
             tests: __test__/models/gemma4-qat-e2e.test.ts
+          # nemotron_h ingests a modelopt NVFP4 source; it is not a recipe run.
+          # The shared convert line's `-d bf16` is a no-op here because the
+          # recipe owns the dtype cast. `-q`, `--q-recipe`, `--q-mxfp`,
+          # `--imatrix-path` and `--q-mtp` are rejected on this source and must
+          # not be added to this leg.
+          #
+          # The `-mlx-bf16` suffix the shared script appends to `out` is a
+          # misnomer: the output is NVFP4 experts, affine-8 Mamba projections
+          # and a bf16 lm_head. It is only a directory name — do not
+          # special-case the script to "fix" it.
+          #
+          # BOTH env vars are required. The three test files are split across
+          # them; wiring only one makes the others early-return, which libtest
+          # counts as PASSED.
+          #
+          # THIS LEG NEVER RUNS: the run step skips it on every event, because it
+          # needs ~38 GB disk and ~42 GB memory (two full weight sets resident)
+          # and no hosted runner has that. It is wiring kept ready for a
+          # self-hosted runner — not coverage. Local runs are this family's only
+          # evidence today.
+          - name: nemotron_h
+            model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
+            slug: nvidia-nemotron-3.5-lightning-30b-a3b-nvfp4
+            mtype: nemotron_h
+            kind: cargo
+            env: MLX_TEST_MODEL_PATH MLX_TEST_NEMOTRON_H_MODEL_PATH
+            stage0_ts: ''
+            stage1_rust: ''
+            stage1_ts: ''
+            stage2_rust: ''
+            tests: >-
+              --test nemotron_h_paged_vs_flat_parity
+              --test nemotron_h_concurrent_batched_parity
+              --test nemotron_h_mtp_midcycle_state
+            # A `--lib` unit test cannot ride `tests:` above. Self-skips loudly
+            # when the backend or the MTP head is missing.
+            lib_tests: >-
+              models::nemotron_h::mtp::mtp_turn_tests::real_mtp_t0_lossless_gate
     steps:
       - uses: actions/checkout@v6
         with:
@@ -410,6 +449,15 @@ jobs:
           # block releases.
           if [ "${{ matrix.name }}" = "gemma4" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
             echo "::notice::Skipping gemma4 QAT leg on ${{ github.event_name }} (PR opt-in only; gated HF repo)."
+            exit 0
+          fi
+          # Skipped on EVERY event until a self-hosted runner exists. macos-26 has
+          # neither the ~38 GB disk nor the ~42 GB memory this leg needs, so it would
+          # fail rather than cover anything — and the `model-e2e` label runs the whole
+          # matrix, so that failure would land on every other family's PR too. Flip
+          # this guard when a runner that fits it exists.
+          if [ "${{ matrix.name }}" = "nemotron_h" ]; then
+            echo "::notice::Skipping nemotron_h leg: needs a self-hosted runner (~38 GB disk / ~42 GB memory)."
             exit 0
           fi
           # Same reason as the `test` job: `yarn mlx` needs @mlx-node/server's

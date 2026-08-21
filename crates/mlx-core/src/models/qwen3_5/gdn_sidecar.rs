@@ -405,8 +405,10 @@ fn decode_array(
     let array = match dtype {
         DType::BFloat16 | DType::Float16 => {
             let raw: Vec<u16> = bytes
-                .chunks_exact(std::mem::size_of::<u16>())
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .as_chunks::<{ std::mem::size_of::<u16>() }>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
                 .collect();
             if raw.len() != elements {
                 return Ok(None);
@@ -419,8 +421,10 @@ fn decode_array(
         }
         DType::Float32 => {
             let raw: Vec<f32> = bytes
-                .chunks_exact(std::mem::size_of::<f32>())
-                .map(|quad| f32::from_le_bytes([quad[0], quad[1], quad[2], quad[3]]))
+                .as_chunks::<{ std::mem::size_of::<f32>() }>()
+                .0
+                .iter()
+                .map(|quad| f32::from_le_bytes(*quad))
                 .collect();
             if raw.len() != elements {
                 return Ok(None);

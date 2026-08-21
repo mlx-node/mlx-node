@@ -596,22 +596,28 @@ fn load_unquantized_tensor(
     match tensor.tensor_type {
         GgufTensorType::F32 => {
             let data: Vec<f32> = buf
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             MxArray::from_float32(&data, &shape)
         }
         GgufTensorType::F16 => {
             let data: Vec<u16> = buf
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             MxArray::from_float16(&data, &shape)
         }
         GgufTensorType::BF16 => {
             let data: Vec<u16> = buf
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             MxArray::from_bfloat16(&data, &shape)
         }
@@ -2782,9 +2788,18 @@ fn prepare_muse_secondary_config(
                     "Muse-Glimmer companion has quantized profiles but no quantization metadata",
                 )
             })?;
+        // A target config may carry only one alias. Seed the missing one from its
+        // SIBLING, not from the companion block: seeding from the companion gives
+        // the two aliases different top-level geometry and different overrides, and
+        // the loader rejects a config whose aliases disagree.
+        let seed = config
+            .get("quantization")
+            .or_else(|| config.get("quantization_config"))
+            .cloned()
+            .unwrap_or_else(|| companion_quantization.clone());
         for key in ["quantization", "quantization_config"] {
             if config.get(key).is_none() {
-                config[key] = companion_quantization.clone();
+                config[key] = seed.clone();
             }
             let quant = config
                 .get_mut(key)
@@ -5723,6 +5738,83 @@ mod tests {
         let config: serde_json::Value =
             serde_json::from_str(&prepared).expect("parse companion config");
         for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                config[block]["language_model.model.language_model.layers.0.self_attn.q_proj"]["mode"],
+                "q6k"
+            );
+            assert_eq!(
+                config[block]["language_model.model.layers.0.self_attn.q_proj"]["mode"],
+                "q4k"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn single_alias_target_does_not_produce_disagreeing_companion_aliases() {
+        // convert emits only `quantization`. Seeding the absent alias from the
+        // companion block instead of the sibling made the two disagree, and
+        // `select_quantization_block` rejects that outright — the model would
+        // not load at all.
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-single-alias-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        let mut primary = valid_muse_target_config();
+        primary["quantization"] = serde_json::json!({
+            "bits": 6,
+            "group_size": 16,
+            "mode": "q6k",
+            "language_model.model.layers.0.self_attn.q_proj": {
+                "bits": 6, "group_size": 16, "mode": "q6k"
+            },
+        });
+        assert!(
+            primary.get("quantization_config").is_none(),
+            "ANTI-VACUITY: the fixture must carry exactly ONE alias, or this \
+             test cannot observe the divergence"
+        );
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&primary).expect("serialize primary config"),
+        )
+        .expect("write primary config");
+
+        let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("prepare companion quantization")
+            .expect("companion config update");
+        let config: serde_json::Value =
+            serde_json::from_str(&prepared).expect("parse companion config");
+
+        assert_eq!(
+            config["quantization"], config["quantization_config"],
+            "aliases must agree or the loader refuses the checkpoint"
+        );
+        // The seed came from the sibling, so the target's own geometry and its
+        // rescoped override survive in both.
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(config[block]["mode"], "q6k");
             assert_eq!(
                 config[block]["language_model.model.language_model.layers.0.self_attn.q_proj"]["mode"],
                 "q6k"

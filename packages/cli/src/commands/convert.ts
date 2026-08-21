@@ -104,7 +104,7 @@ Optional Arguments:
   --model-type, -m      Model type (auto-detected if not specified)
                         Options: paddleocr-vl, pp-lcnet-ori, uvdoc, qwen3_asr,
                         qwen3_5, qwen3_5_moe, lfm2_moe, lfm2, qianfan-ocr,
-                        privacy-filter, muse_glimmer
+                        privacy-filter, muse_glimmer, nemotron_h
   --verbose, -v         Enable verbose logging
   --help, -h            Show this help message
 
@@ -234,6 +234,19 @@ Model Types:
   pp-lcnet-ori          PP-LCNet orientation classifier (Paddle -> SafeTensors)
   uvdoc                 UVDoc unwarping model (Paddle/PyTorch -> SafeTensors)
   qianfan-ocr           Qianfan-OCR InternVL model (key renaming, conv2d transposition)
+  nemotron_h            NVIDIA Nemotron 3.5 Lightning (modelopt NVFP4/FP8
+                        ingest, not a re-quantization). Experts, shared experts:
+                        NVFP4 codes and their per-group E4M3 scales repacked
+                        byte-for-byte into the MLX nvfp4 layout, with
+                        weight_scale_2 carried out-of-band as a separate F32
+                        .global_scale (so the output is not plain mlx-lm nvfp4).
+                        lm_head: dequantized to bf16 using the exact scale.
+                        Mamba-2 in_proj/out_proj: the FP8 weights are
+                        RE-QUANTIZED to affine 8-bit group-32, which costs
+                        ~0.7% relative RMS — this half is a repack, not a
+                        lossless one. --quantize/--q-recipe/--q-mxfp/
+                        --imatrix-path/--q-mtp are rejected — ingest is the
+                        only mode.
 
 GGUF Support:
   When --input points to a .gguf file, the converter automatically parses the
@@ -782,7 +795,14 @@ export async function run(argv: string[]) {
     try {
       const configPath = resolve(inputPath, 'config.json');
       const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-      if (config.model_type === 'paddleocr_vl') {
+      if (Array.isArray(config.architectures) && config.architectures.includes('NemotronHForCausalLM')) {
+        // The Nemotron architecture is authoritative (native parser +
+        // runtime registry probe): check it BEFORE the model_type branches
+        // so a stale-but-recognized model_type (e.g. qwen3_5) cannot route
+        // a Nemotron checkpoint to another family's sanitizer.
+        modelType = 'nemotron_h';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'paddleocr_vl') {
         modelType = 'paddleocr-vl';
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       } else if (config.model_type === 'internvl_chat' || config.model_type === 'qianfan-ocr') {
@@ -836,10 +856,26 @@ export async function run(argv: string[]) {
       } else if (config.model_type === 'muse_glimmer') {
         modelType = config.model_type;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
+      } else if (config.model_type === 'nemotron_h') {
+        // The architecture-only arm is handled FIRST in this chain (the
+        // architecture is authoritative); this arm covers checkpoints that
+        // declare the plain model_type.
+        modelType = 'nemotron_h';
+        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
     } catch {
       // config.json not found or invalid
     }
+  }
+
+  if (
+    modelType === 'nemotron_h' &&
+    (args.quantize || quantRecipe !== undefined || args['q-mxfp'] || imatrixPath !== undefined || quantMtp !== 'off')
+  ) {
+    console.error(
+      'Error: Nemotron-H (nemotron_h) checkpoints are already quantized by NVIDIA (NVFP4 experts/shared_experts/lm_head, FP8 mamba projections) and convert in INGEST mode only: omit --quantize, --q-recipe, --q-mxfp, --imatrix-path, and --q-mtp. Ingest repacks the NVFP4 codes and their per-group E4M3 scales byte-for-byte into the MLX nvfp4 layout (weight_scale_2 carried separately as a F32 .global_scale) and dequantizes lm_head to bf16, but it RE-QUANTIZES the FP8 Mamba-2 projections to affine 8-bit group-32 at ~0.7% relative RMS, so that half is a repack, not a lossless one.',
+    );
+    process.exit(1);
   }
 
   if (modelType === 'muse_glimmer' && args.quantize && quantRecipe === 'unsloth' && quantMode === 'nvfp4') {

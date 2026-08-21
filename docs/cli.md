@@ -160,6 +160,36 @@ mlx convert -m qwen3_5_moe -q --q-recipe nvidia \
   -i ./qwen3.6-35b-a3b -o ./qwen3.6-35b-a3b-nvidia-mxfp4-mlx
 ```
 
+### modelopt NVFP4 ingest (nemotron_h)
+
+`nemotron_h` is an ingest, not a recipe run: the source is NVIDIA's modelopt
+checkpoint `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4`, which is
+**already quantized** (experts, shared experts, and `lm_head` in NVFP4; the
+Mamba-2 `in_proj`/`out_proj` in FP8). Ingest preserves NVFP4 byte-for-byte — the
+fp4 E2M1 codes and the per-group E4M3 `weight_scale` bytes are both carried
+verbatim, and the checkpoint's `weight_scale_2` is carried **separately** as a
+Float32 `.global_scale` key (an `[E]` vector for the stacked experts, since it
+varies per expert) applied as a scalar on the projection output at runtime.
+Folding it into the E4M3 group scales, as an earlier revision did, cost ~8% mean
+relative error because the product lands in E4M3's subnormal band; **checkpoints
+converted before this change must be regenerated** — the loader rejects one that
+has no `.global_scale`. Ingest also re-quantizes the FP8 Mamba-2 projections to
+**affine 8-bit group-32** with the checkpoint's static `input_scale` threaded as
+`input_amax`. (These were mxfp8 8/32 until the quantization-accuracy pass: MLX
+rounds the E8M0 block exponent to NEAREST rather than ceil, which costs 6.1%
+relative RMS against a per-tensor-E4M3 source versus 0.64% for affine 8/32 —
+a 9.6x error reduction on the whole sequence-mixing backbone. Checkpoints
+converted before that pass are rejected at load with a regenerate hint.) No
+re-quantization flags apply (`-q`/`--q-recipe` are rejected on this
+already-quantized source); the convert is a format/repack pass, not a recipe.
+One consequence: the output is no longer loadable by mlx-lm as plain nvfp4.
+
+```bash
+mlx convert -m nemotron_h \
+  -i .cache/models/nvidia-nemotron-3.5-lightning-30b-a3b-nvfp4 \
+  -o .cache/models/nemotron-3.5-lightning-30b-a3b-nvfp4-mlx
+```
+
 ### Qwen MTP quantization conversion
 
 ```bash
@@ -298,8 +328,9 @@ attention/GDN projections).
 bf16 until calibrated. This command runs the model over the NVIDIA calibration
 mix, records each attention/GDN mxfp8 projection's running `max|activation|`
 (modelopt `MaxCalibrator` semantics), and writes `input_amax` into the model's
-`config.json` **in place** — under both the `quantization` and
-`quantization_config` blocks. At load time each of those projections then
+`config.json` **in place** — under the `quantization` block (plus the legacy
+`quantization_config` alias when a source config carries one). At load time each
+of those projections then
 fake-quantizes its input to E4M3 (`from_fp8(to_fp8(x·448/amax))·amax/448`) before
 the matmul. Only the mxfp8 attn/GDN sites (`self_attn.{q,k,v,o}_proj`, GDN
 `in_proj_qkv`/`in_proj_z`/`out_proj`) are calibrated; the mxfp4 FFN keeps bf16

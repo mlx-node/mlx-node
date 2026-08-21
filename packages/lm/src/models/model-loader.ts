@@ -12,6 +12,7 @@ import {
   HarrierModel,
   Lfm2Model as NativeLfm2Model,
   MuseGlimmerModel as NativeMuseGlimmerModel,
+  NemotronHModel as NativeNemotronHModel,
   QianfanOCRModel,
   Qwen3Model as NativeQwen3Model,
   Qwen35Model as NativeQwen35Model,
@@ -19,7 +20,7 @@ import {
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
-import { Gemma4Model, Lfm2Model, MuseGlimmerModel, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
+import { Gemma4Model, Lfm2Model, MuseGlimmerModel, NemotronHModel, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
 
 /** Optional settings for {@link loadModel} / {@link loadSession}. */
 export interface LoadModelOptions {
@@ -174,6 +175,16 @@ const MODEL_FAMILY_REGISTRY = [
     match: { rawModelTypes: ['lfm2_moe'] },
     load: (modelPath: string) => Lfm2Model.load(modelPath),
     nativeModelClass: NativeLfm2Model,
+  },
+  {
+    modelType: 'nemotron_h',
+    kind: 'loadable',
+    match: {
+      rawModelTypes: ['nemotron_h'],
+      architectureProbe: ({ architectures }) => architectures.has('NemotronHForCausalLM'),
+    },
+    load: (modelPath: string) => NemotronHModel.load(modelPath),
+    nativeModelClass: NativeNemotronHModel,
   },
   {
     modelType: 'internvl_chat',
@@ -384,8 +395,12 @@ export async function loadModel(modelPath: string, options?: LoadModelOptions): 
  * speculative decoding — gemma4 only; any other detected family rejects it.
  * Without the option, Gemma4 loads `<modelPath>/draft/` automatically when
  * that embedded checkpoint is present.
- * The resulting session auto-enables the speculative path (the model
- * reports `hasMtpWeights()`); pass `enableMtp: false` per call to opt out.
+ * The resulting session auto-enables the speculative path when the model
+ * reports `hasMtpWeights()` AND does not opt out of the auto-default; pass
+ * `enableMtp: false` per call to suppress it, or `enableMtp: true` to force
+ * it on a family that opts out. NemotronH opts out (`mtpAutoEnabled()`
+ * returns false) because forcing MTP moves the turn into the exclusive lane
+ * and out of continuous batching; see `ChatSession.mtpAutoDefaultAllowed`.
  */
 export async function loadSession(
   modelPath: string,

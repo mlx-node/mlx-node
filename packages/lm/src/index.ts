@@ -35,6 +35,16 @@ export { LFM2_CONFIGS, getLfm2Config } from './models/lfm2-configs.js';
 export { Qwen35MoeModel } from './stream.js';
 export type { Qwen35MoeConfig } from '@mlx-node/core';
 
+// Nemotron H models
+//
+// The config/limits types ship alongside the class for the same reason
+// Qwen3.5's do: `NemotronHModel` exposes both `getConfig()` and
+// `contextLimits()`, and without these exports a consumer cannot name
+// either return type. (`MuseGlimmerModel` above deliberately exports no
+// config type — that wrapper has no `getConfig()` at all.)
+export { NemotronHModel } from './stream.js';
+export type { NemotronHConfig, NemotronHContextLimits } from '@mlx-node/core';
+
 // Memory hygiene: most management is automatic — the decode loop
 // inside `@mlx-node/core` calls `mlx_clear_cache()` every 256 generated
 // tokens to prevent unbounded free-pool growth during long

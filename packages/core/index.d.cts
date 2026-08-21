@@ -1009,6 +1009,129 @@ export declare class NativeRewardRegistry {
 }
 
 /**
+ * NVIDIA Nemotron 3.5 Lightning language model: hybrid Mamba-2 SSM + GQA + MoE-FFN
+ * with an optional in-checkpoint MTP head. All model state lives on a dedicated OS
+ * thread; NAPI methods dispatch commands via channels.
+ */
+export declare class NemotronHModel {
+  /**
+   * Load a NemotronH model from a directory containing safetensors and
+   * config.json.
+   */
+  static load(modelPath: string): Promise<NemotronHModel>;
+  /**
+   * Whether this checkpoint shipped a complete MTP head (speculative
+   * decoding is available when enableMtp is set on the request).
+   */
+  hasMtpWeights(): boolean;
+  /**
+   * Whether `ChatSession` should turn MTP ON when the caller sets nothing. FALSE
+   * deliberately, about SCHEDULING not speed: `enable_mtp == Some(true)` forces the
+   * chat-requires-barrier predicate, putting the turn in the EXCLUSIVE lane and out
+   * of continuous batching. `MLX_NEMOTRON_MTP_DEFAULT=1` flips it.
+   */
+  mtpAutoEnabled(): boolean;
+  /**
+   * Whether the block-paged KV cache adapter is active on this model
+   * instance (default-on unless `use_block_paged_cache: false`).
+   */
+  hasBlockPagedCache(): boolean;
+  /**
+   * Physical/trained context limits captured at load, so the ChatSession preflight
+   * rejects long conversations instead of failing inside paged-cache allocation.
+   */
+  contextLimits(): NemotronHContextLimits;
+  /** Get the model configuration. */
+  getConfig(): NemotronHConfig;
+  /**
+   * Native admission capacity for the server's per-model semaphore.
+   * Paged models advertise the scheduler lane (up to 8 default); flat
+   * models and forced-serial processes report 1.
+   */
+  maxConcurrentSequences(): number;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
+  /** Estimated number of model parameters. */
+  numParameters(): number;
+  /**
+   * Reset all caches and clear cached token history. Async so a reset
+   * queued behind an in-flight turn parks a tokio future, never the
+   * Node event loop (H1: a dead prefill used to freeze all HTTP traffic).
+   */
+  resetCaches(): Promise<void>;
+  /**
+   * Release scheduler-owned KV/history state for one logical
+   * session owner without purging content-addressed prefix blocks.
+   */
+  releaseCacheOwner(ownerId: string): Promise<void>;
+  /**
+   * Start a new chat session.
+   *
+   * Renders the complete conversation through the loaded chat
+   * template, decodes until the family's session stop token, and
+   * preserves the resulting KV state for exact-prefix reuse.
+   */
+  chatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionStart` (H2). Resolves
+   * IMMEDIATELY with a `ChatSessionCall` whose `cancel()`
+   * can cancel the queued/running turn; the reply arrives via
+   * `call.result()`. A cancelled turn rejects `result()` with
+   * the exact string `"chat session cancelled"`. The LM wrapper
+   * keeps this two-phase operation private and exposes cancellation
+   * through the ordinary method's `AbortSignal` argument.
+   */
+  beginChatSessionStart(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from the complete
+   * structured conversation. The loaded model template is the
+   * sole authority for the rendered suffix; native cache reuse
+   * occurs only after the completed structured history is verified
+   * against the saved token history.
+   */
+  chatSessionContinue(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinue` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinue(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /**
+   * Continue an existing chat session from a complete
+   * structured conversation ending in a tool-role message.
+   */
+  chatSessionContinueTool(messages: Array<ChatMessage>, config?: ChatConfig | undefined | null): Promise<ChatResult>;
+  /**
+   * Internal operation bridge for `chatSessionContinueTool` (H2). Same
+   * contract as `beginChatSessionStart`.
+   */
+  beginChatSessionContinueTool(
+    messages: Array<ChatMessage>,
+    config?: ChatConfig | undefined | null,
+  ): Promise<ChatSessionCall>;
+  /** Streaming variant of `chatSessionStart`. */
+  chatStreamSessionStart(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinue`. */
+  chatStreamSessionContinue(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+  /** Streaming variant of `chatSessionContinueTool`. */
+  chatStreamSessionContinueTool(
+    messages: ChatMessage[],
+    config: ChatConfig | null,
+    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
+  ): Promise<ChatStreamHandle>;
+}
+
+/**
  * OutputStore - Persistence layer for training outputs
  *
  * Stores all model outputs during GRPO training for debugging and research.
@@ -4115,6 +4238,90 @@ export declare const enum MultimodalContentOrder {
  * per request and fall back to the paged AR scheduler.
  */
 export interface MuseGlimmerContextLimits {
+  trainedWindowTokens: number;
+  effectiveWindowTokens: number;
+  pagedBlockCapacity: number;
+  pagedBlockSize: number;
+}
+
+/**
+ * NVIDIA Nemotron 3.5 Lightning ("nemotron_h") model configuration.
+ *
+ * Hybrid MoE: every layer is one pre-RMSNorm + ONE mixer + a residual, closed
+ * by `norm_f` and an untied `lm_head`. Parsed fail-closed — unknown block
+ * types, missing fields and unsupported features are rejected at load.
+ */
+export interface NemotronHConfig {
+  vocabSize: number;
+  hiddenSize: number;
+  numHiddenLayers: number;
+  numAttentionHeads: number;
+  numKeyValueHeads: number;
+  headDim: number;
+  maxPositionEmbeddings: number;
+  layerNormEpsilon: number;
+  /**
+   * Per-layer mixer kind, remapped from the checkpoint's
+   * `layers_block_type` to the HF `MIXER_TYPES` names.
+   */
+  layersBlockType: Array<string>;
+  mambaNumHeads: number;
+  mambaHeadDim: number;
+  /** SSM state size, per head per group. */
+  ssmStateSize: number;
+  /** Number of SSM groups; head `h` belongs to group `h / (H / G)`. */
+  nGroups: number;
+  /** Depthwise causal conv1d kernel size. */
+  convKernel: number;
+  chunkSize: number;
+  /**
+   * Declared minimum discretized time step.
+   *
+   * UNUSED BY THE RUNTIME. No served reference clamps dt to it - only HF's
+   * torch fallback does. `time_step_limit_pair()` is the real clamp.
+   */
+  timeStepMin: number;
+  /**
+   * Optional `[min, max]` bounds for the discretized time step. `None` is
+   * the reference default `(0.0, +inf)`, i.e. no clamp.
+   */
+  timeStepLimit?: number[];
+  nRoutedExperts: number;
+  numExpertsPerTok: number;
+  /** Routing weight scale, applied after normalization. */
+  routedScalingFactor: number;
+  /** Renormalize the gathered top-k weights to sum to 1 before scaling. */
+  normTopkProb: boolean;
+  /** Per-expert MLP intermediate size (non-gated up -> relu2 -> down). */
+  intermediateSize: number;
+  /** Shared-expert MLP intermediate size; it runs on ALL tokens. */
+  moeSharedExpertIntermediateSize: number;
+  /** EOS token ids, from the config.json scalar or array. */
+  eosTokenIds: number[];
+  /** MTP layer kinds, remapped like `layers_block_type`. */
+  mtpLayersBlockType: string[];
+  /** Number of MTP predictor steps (`num_nextn_predict_layers`). */
+  nMtpLayers: number;
+  /**
+   * Optional block-paged KV cache memory cap in MiB. None resolves to the
+   * default 2048 MiB pool; explicit values are honored.
+   */
+  pagedCacheMemoryMb?: number;
+  /** Optional paged block size in tokens (default 16). */
+  pagedBlockSize?: number;
+  /**
+   * Opt in/out of the block-paged KV adapter. `None` enables the paged pool
+   * and the continuous-batching lane; `Some(false)` reverts to whole-turn.
+   */
+  useBlockPagedCache?: boolean;
+}
+
+/**
+ * Physical and trained context limits captured at load time, surfaced through
+ * `context_limits()` so the ChatSession preflight can compact or reject against
+ * the paged pool's ACTUAL capacity instead of the trained window.
+ */
+export interface NemotronHContextLimits {
   trainedWindowTokens: number;
   effectiveWindowTokens: number;
   pagedBlockCapacity: number;

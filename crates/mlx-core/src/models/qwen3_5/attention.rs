@@ -13,6 +13,7 @@ use crate::models::paddleocr_vl::language::{
 };
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
+use crate::transformer::paged_flags::native_kv_write_enabled;
 use crate::transformer::paged_kv_cache_adapter::{
     PagedAttentionV2Layout, PagedKVCacheAdapter, PagedPrefillMemorySnapshot, SeqId,
     paged_attention_v2_aux_fits, paged_attention_v2_partition_upper_bound,
@@ -455,16 +456,6 @@ fn live_prefill_headroom(snapshot: PagedPrefillMemorySnapshot) -> LivePrefillHea
         metal_current_allocated_bytes: snapshot.metal_current_allocated_bytes,
         paged_pool_allocated_bytes: snapshot.paged_pool_allocated_bytes,
     }
-}
-
-fn native_kv_write_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        std::env::var("MLX_QWEN35_NATIVE_KV_WRITE")
-            .or_else(|_| std::env::var("MLX_NATIVE_KV_WRITE"))
-            .map(|value| crate::inference_trace::env_flag_value_enabled(&value))
-            .unwrap_or(true)
-    })
 }
 
 impl Qwen3_5Attention {
