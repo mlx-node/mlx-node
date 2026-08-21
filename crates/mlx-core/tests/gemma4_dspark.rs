@@ -5,11 +5,11 @@
 //! SAME instance with `enableMtp: false` (the draft never touches the target
 //! weights, and only one ~24 GB target is resident at a time).
 //!
-//! `enableMtp` also picks the cache lane — `enable_mtp == Some(true)` claims
-//! the FLAT lane, so the AR oracle runs paged while DSpark runs on a
-//! RotatingKVCache. That is NOT what separates them numerically: a depth-1
-//! DSpark run byte-matches the paged AR run over 600 tokens. What separates
-//! them is the verify block's row count, below.
+//! Both lanes run on the SAME paged pools: DSpark verifies its block against
+//! the target's block-paged KV through
+//! `crate::engine::spec_paged::SpecPagedCache`, so `enableMtp` selects the
+//! decoder only, never the cache layout. What separates the two runs
+//! numerically is the verify block's row count, below.
 //!
 //! PRIMARY ORACLE: speculative decoding must be LOSSLESS at T=0 — the
 //! DSpark turn's text/raw_text/finish_reason must byte-match the AR run.
@@ -437,6 +437,11 @@ async fn dspark_greedy_matches_ar_across_sliding_wrap() {
     // (b) >1100-token prompt + 300-token budget: the window wraps DURING
     // PREFILL, so the tapped chunked prefill and every verify block run on
     // already-rotated sliding caches.
+    //
+    // Reasoning is suppressed here for the same reason the fixtures are
+    // screened: a free-form thought is not tie-free, and a near-tie inside it
+    // moves where the shared token budget runs out, truncating the visible
+    // count at a different number on each lane.
     let mut long_prompt = String::new();
     for _ in 0..60 {
         long_prompt.push_str(paragraph);
@@ -448,7 +453,7 @@ async fn dspark_greedy_matches_ar_across_sliding_wrap() {
     let ar_b = model
         .chat_session_start(
             vec![user_message(&long_prompt)],
-            Some(chat_config(300, false)),
+            Some(chat_config_no_reasoning(300, false)),
         )
         .await
         .expect("AR (prefill wrap) failed");
@@ -460,7 +465,7 @@ async fn dspark_greedy_matches_ar_across_sliding_wrap() {
     let dspark_b = model
         .chat_session_start(
             vec![user_message(&long_prompt)],
-            Some(chat_config(300, true)),
+            Some(chat_config_no_reasoning(300, true)),
         )
         .await
         .expect("DSpark (prefill wrap) failed");

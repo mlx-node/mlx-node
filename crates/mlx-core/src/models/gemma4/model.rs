@@ -47,7 +47,7 @@ use super::attention::{
 };
 use super::config::Gemma4Config;
 use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
-use super::dspark::DsparkTap;
+use super::dspark::{DsparkContextCache, DsparkTap};
 use super::layer_cache::Gemma4LayerCache;
 use super::sliding_sidecar;
 use crate::engine;
@@ -671,7 +671,7 @@ impl Gemma4KVCacheCoordinator {
     ///
     /// Pure-attention family: the adapters' recorded rows are the whole
     /// per-token state, so `recurrent_tokens` is structurally `None`.
-    fn spec_frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
+    pub(crate) fn spec_frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
         self.request_token_count_all(seq_id)
             .ok()
             .map(|attn_tokens| SpecFrontier {
@@ -1186,7 +1186,7 @@ pub(crate) struct Gemma4Inner {
     pub(crate) kv_cache_coordinator: Option<Gemma4KVCacheCoordinator>,
     /// Sequence selected by the scheduler while model-neutral paged and media
     /// hooks run. Ownerless legacy turns use sequence zero.
-    active_paged_seq: u32,
+    pub(crate) active_paged_seq: u32,
     /// Draft model for speculative decoding (`Gemma4LoadOptions::
     /// draft_model_path`), either [`Gemma4Draft`] variant. Draft target caches
     /// use a per-owner flat lane while ordinary text/media owners continue to
@@ -2704,12 +2704,6 @@ impl Gemma4Inner {
             Some(Gemma4Draft::Assistant(draft)) => Some(draft),
             _ => None,
         }
-    }
-
-    /// Whether ANY draft variant is loaded (the speculative whole-turn
-    /// gate; see `mtp_turn`).
-    pub(crate) fn has_draft(&self) -> bool {
-        self.draft.is_some()
     }
 
     pub(crate) fn set_active_paged_owner(&mut self, seq_id: u32) {
@@ -5166,7 +5160,11 @@ impl Gemma4Inner {
     /// projection tail of the paged forwards. `last_only == true` is the
     /// prefill tails' last-token projection; `last_only == false` is the
     /// all-rows verify shape.
-    fn project_paged_hidden(&self, hidden_states: &MxArray, last_only: bool) -> Result<MxArray> {
+    pub(crate) fn project_paged_hidden(
+        &self,
+        hidden_states: &MxArray,
+        last_only: bool,
+    ) -> Result<MxArray> {
         project_paged_hidden_rows(
             hidden_states,
             &self.final_norm,
@@ -5176,6 +5174,24 @@ impl Gemma4Inner {
             &self.config,
             last_only,
         )
+    }
+
+    /// Fuse one tapped chunk's residual hiddens and append one draft
+    /// context row per token at `position_base`.
+    fn append_dspark_prefill_rows(
+        &self,
+        draft_tap: Option<&mut Gemma4DsparkPrefillTap<'_>>,
+        captured: &[MxArray],
+        position_base: i32,
+    ) -> Result<()> {
+        let Some(draft_tap) = draft_tap else {
+            return Ok(());
+        };
+        let draft = self.dspark_draft().ok_or_else(|| {
+            Error::from_reason("Gemma4 tapped paged prefill: no DSpark draft model loaded")
+        })?;
+        let fused = draft.fuse_context(captured)?;
+        draft_tap.ctx.append(draft, &fused, position_base)
     }
 
     /// Run a paged-attention prefill over the full prompt, dispatching
@@ -5210,13 +5226,21 @@ impl Gemma4Inner {
     /// `<turn|>` stop signal to be missed and the decoder to fall into
     /// the all-zero-input cycle (`mean(V)` attention output → `id+1`
     /// counting cascade).
-    fn run_paged_prefill_chunk(
+    ///
+    /// `draft_tap` is `Some` on a DSpark speculative turn: each chunk's
+    /// residual hiddens are cloned, fused, and appended to the draft's
+    /// context before the chunk's graph is dropped, so the full prompt's
+    /// tapped hiddens are never held at once. The target-side walk is the
+    /// same either way — the tap only clones — which is what makes a
+    /// speculative turn's prompt K/V bit-identical to the plain paged turn's.
+    pub(crate) fn run_paged_prefill_chunk(
         &mut self,
         full_tokens: &[u32],
         suffix_tokens: &[u32],
         cached_prefix_len: u32,
         sliding_primed_prefix_len: u32,
         _cache_salt: u64,
+        mut draft_tap: Option<&mut Gemma4DsparkPrefillTap<'_>>,
     ) -> Result<MxArray> {
         if suffix_tokens.is_empty() {
             return Err(Error::from_reason(
@@ -5257,13 +5281,23 @@ impl Gemma4Inner {
                 .record_tokens_all(self.active_paged_seq, chunk)
                 .map_err(Error::from_reason)?;
             let absolute_position = suffix_start.saturating_add(position);
+            let mut tap = draft_tap
+                .as_deref()
+                .map(|draft_tap| DsparkTap::new(draft_tap.layer_ids));
             let hidden = self.run_paged_prefill_layer_loop(
                 chunk,
                 absolute_position as u32,
                 absolute_position as u32,
                 &layer_kinds,
-                None,
+                tap.as_mut(),
             )?;
+            if let Some(tap) = tap {
+                self.append_dspark_prefill_rows(
+                    draft_tap.as_deref_mut(),
+                    &tap.captured,
+                    absolute_position as i32,
+                )?;
+            }
             hidden.eval();
             let coordinator = self
                 .kv_cache_coordinator
@@ -5291,13 +5325,19 @@ impl Gemma4Inner {
             .record_tokens_all(self.active_paged_seq, final_token)
             .map_err(Error::from_reason)?;
         let final_position = suffix_start.saturating_add(final_index);
+        let mut tap = draft_tap
+            .as_deref()
+            .map(|draft_tap| DsparkTap::new(draft_tap.layer_ids));
         let hidden_states = self.run_paged_prefill_layer_loop(
             final_token,
             final_position as u32,
             final_position as u32,
             &layer_kinds,
-            None,
+            tap.as_mut(),
         )?;
+        if let Some(tap) = tap {
+            self.append_dspark_prefill_rows(draft_tap, &tap.captured, final_position as i32)?;
+        }
         self.kv_cache_coordinator
             .as_mut()
             .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
@@ -5419,7 +5459,7 @@ impl Gemma4Inner {
     /// on the paged adapter so `update_keys_values`'s alignment check
     /// (`first_logical_position == current_token_count - chunk.len()`)
     /// passes.
-    fn run_paged_prefill_layer_loop(
+    pub(crate) fn run_paged_prefill_layer_loop(
         &mut self,
         chunk_tokens: &[u32],
         first_logical_position: u32,
@@ -6057,7 +6097,11 @@ impl Gemma4Inner {
     }
 
     /// Run one paged decode step for a scheduler-owned sequence.
-    fn run_paged_decode_step_for(&mut self, seq_id: u32, token_id: u32) -> Result<MxArray> {
+    pub(crate) fn run_paged_decode_step_for(
+        &mut self,
+        seq_id: u32,
+        token_id: u32,
+    ) -> Result<MxArray> {
         let first_logical_position = {
             let coordinator = self.kv_cache_coordinator.as_mut().ok_or_else(|| {
                 Error::from_reason("run_paged_decode_step: paged_adapter is None")
@@ -6586,7 +6630,6 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
-            None,
         )?;
         // `true` requests the engine's `squeeze(Some(&[1]))`: the eager
         // forward returns `[1, 1, vocab]`.
@@ -6622,7 +6665,6 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
-            None,
         )?;
         Ok(())
     }
@@ -6720,11 +6762,11 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
 /// `full_tokens` retains the prompt so `run_paged_prefill_chunk` can verify that
 /// the supplied suffix starts exactly at the common absolute cursor.
 pub(crate) struct Gemma4PrefixState {
-    effective_cached_prefix_len: usize,
+    pub(crate) effective_cached_prefix_len: usize,
     suffix_len: usize,
-    sliding_primed_prefix_len: u32,
-    cache_salt: u64,
-    full_tokens: Vec<u32>,
+    pub(crate) sliding_primed_prefix_len: u32,
+    pub(crate) cache_salt: u64,
+    pub(crate) full_tokens: Vec<u32>,
 }
 
 impl PagedPrefix for Gemma4PrefixState {
@@ -6799,6 +6841,7 @@ impl PagedBackend for Gemma4Inner {
             prefix.effective_cached_prefix_len as u32,
             prefix.sliding_primed_prefix_len,
             prefix.cache_salt,
+            None,
         )
     }
 
@@ -7287,7 +7330,6 @@ impl ChatBackend for Gemma4Inner {
                 &self.final_norm,
                 self.ple.as_ref(),
                 &self.config,
-                None,
                 self.turn_cancel.as_deref(),
             )?;
         }
@@ -7317,7 +7359,6 @@ impl ChatBackend for Gemma4Inner {
                 self.embed_weight_t.as_ref(),
                 self.ple.as_ref(),
                 &self.config,
-                None,
             )?
         };
         logits.squeeze(Some(&[1]))
@@ -7377,12 +7418,34 @@ impl ChatBackend for Gemma4Inner {
 
     fn execution_plan(&self) -> ExecutionPlan {
         // The scheduler selects one physical cache lane before entering the
-        // model-neutral planner. A speculative command temporarily installs
-        // flat target caches, so hide the resident paged pools for that
-        // command; ordinary AR/media commands expose them as usual.
+        // model-neutral planner. An ASSISTANT-draft command temporarily
+        // installs flat target caches, so the resident paged pools are hidden
+        // for that command; every other command exposes them as usual.
         let paged_available = self.kv_cache_coordinator.is_some() && !self.active_flat_session;
         let image_components_loaded = self.image_path_loaded();
         let audio_embedder_loaded = self.embed_audio.is_some();
+        let speculative = match self.draft.as_ref() {
+            // DSpark proposes over tapped residual hiddens and verifies as a
+            // block against the target's PAGED pools; there is no flat lane
+            // for it, so it is offered only where those pools are visible.
+            Some(Gemma4Draft::Dspark(_)) => paged_available.then_some(SpeculativePlan {
+                kind: SpeculativeKind::DraftModel,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::NONE,
+                supports_paged_attention: true,
+            }),
+            // The assistant drafter reads the target's flat `Gemma4LayerCache`
+            // K/V arrays directly for its Q-only attention, which the pools
+            // cannot hand it — so it declares no paged support and the planner
+            // routes it to the flat speculative handler.
+            Some(Gemma4Draft::Assistant(_)) => Some(SpeculativePlan {
+                kind: SpeculativeKind::DraftModel,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::NONE,
+                supports_paged_attention: false,
+            }),
+            None => None,
+        };
         ExecutionPlan {
             media: gemma4_media_plan(
                 image_components_loaded,
@@ -7392,17 +7455,7 @@ impl ChatBackend for Gemma4Inner {
             paged_attention: paged_available.then_some(PagedAttentionPlan {
                 supports_delta: true,
             }),
-            speculative: self.has_draft().then_some(SpeculativePlan {
-                kind: SpeculativeKind::DraftModel,
-                supported_input_media: MediaCapabilities::NONE,
-                supported_context_media: MediaCapabilities::NONE,
-                // Proposal/verification uses the request's flat target cache
-                // lane. `execution_plan` hides the resident paged pools while
-                // that lane is installed, so the planner reaches the
-                // speculative whole-turn core without claiming paged draft
-                // support that does not exist.
-                supports_paged_attention: false,
-            }),
+            speculative,
         }
     }
 
@@ -7485,33 +7538,36 @@ impl ChatBackend for Gemma4Inner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        if matches!(args.plan.decoder, DecoderPlan::Speculative(_)) {
-            debug_assert!(args.media.is_empty());
-            return self.draft_chat_turn(args);
-        }
         // The execution plan admits every text turn shape (fresh + delta,
-        // sync + streaming) when the adapter is loaded. The generic paged
-        // engine drives the lifecycle via [`PagedBackend`].
+        // sync + streaming) when the adapter is loaded. Both decoders drive
+        // the SAME paged lifecycle (prime → prefill → … → epilogue); they
+        // differ only in what runs between the first sample and the epilogue.
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.kv_cache_coordinator.is_some());
-        debug_assert!(matches!(args.plan.decoder, DecoderPlan::Autoregressive));
         debug_assert!(self.paged_text_turn_context.is_empty());
         self.paged_text_turn_context = args.plan.context_media;
-        let result = crate::engine::paged_turn::run_paged_turn(self, args);
+        let result = match args.plan.decoder {
+            DecoderPlan::Speculative(_) => {
+                debug_assert!(args.media.is_empty());
+                crate::engine::dspark_turn::run_paged_dspark_turn(self, args)
+            }
+            DecoderPlan::Autoregressive => crate::engine::paged_turn::run_paged_turn(self, args),
+        };
         self.paged_text_turn_context = MediaCapabilities::NONE;
         result
     }
 
-    /// Draft speculative-decode whole-turn path (either [`Gemma4Draft`]
-    /// variant). The execution plan admits this handler only after request
-    /// opt-in, with a loaded draft, flat KV, and text-only input.
+    /// FLAT-lane draft speculative-decode whole-turn path. The execution
+    /// plan admits this handler only after request opt-in, with the loaded
+    /// draft the flat lane serves (the assistant), flat KV, and text-only
+    /// input; DSpark declares paged support and reaches `run_paged_turn`.
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         debug_assert!(args.media.is_empty());
         debug_assert!(matches!(
             args.plan.decoder,
             DecoderPlan::Speculative(SpeculativeKind::DraftModel)
         ));
-        self.draft_chat_turn(args)
+        self.flat_draft_chat_turn(args)
     }
 
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
@@ -7880,8 +7936,6 @@ fn is_greedy_sampling(config: Option<SamplingConfig>) -> bool {
 /// When `inputs_embeds` is provided, uses it directly (skipping embedding lookup).
 /// When `per_layer_inputs` is provided, uses it directly (skipping PLE computation).
 ///
-/// When `tap` is provided, the residual-stream hidden of each tapped layer
-/// (post residual add, PRE final-norm) is pushed onto `tap.captured` in
 /// `layer_ids` order; the compute graph is otherwise unchanged.
 pub(crate) fn forward_body(
     input_ids: Option<&MxArray>,
@@ -7893,22 +7947,7 @@ pub(crate) fn forward_body(
     ple: Option<&PleComponents>,
     per_layer_inputs: Option<&MxArray>,
     config: &Gemma4Config,
-    mut tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
-    if let Some(t) = tap.as_deref() {
-        let mut previous: Option<usize> = None;
-        for &id in t.layer_ids {
-            if id >= layers.len() || previous.is_some_and(|prev| id <= prev) {
-                return Err(Error::from_reason(format!(
-                    "forward_body: tap layer_ids {:?} must be strictly ascending decoder indices below {}",
-                    t.layer_ids,
-                    layers.len()
-                )));
-            }
-            previous = Some(id);
-        }
-    }
-
     // Step 1: Embedding (or use pre-computed embeddings)
     let mut h = if let Some(embeds) = inputs_embeds {
         embeds
@@ -8059,15 +8098,6 @@ pub(crate) fn forward_body(
                 shared_kv.insert(i, (keys, values));
             }
         }
-
-        // Residual-stream hidden of layer i (post residual add, pre
-        // final-norm — HF `hidden_states[i + 1]`), captured for both the
-        // regular and the KV-shared branch.
-        if let Some(t) = tap.as_deref_mut()
-            && t.layer_ids.contains(&i)
-        {
-            t.captured.push(h.clone());
-        }
     }
 
     // Final norm
@@ -8087,7 +8117,6 @@ pub(crate) fn forward_inner(
     embed_weight_t: Option<&MxArray>,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
-    tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
     let h = forward_body(
         Some(input_ids),
@@ -8099,7 +8128,6 @@ pub(crate) fn forward_inner(
         ple,
         None,
         config,
-        tap,
     )?;
     lm_head_logits(&h, embedding, lm_head, embed_weight_t, config)
 }
@@ -8147,6 +8175,16 @@ pub(crate) fn lm_head_logits(
         crate::models::gemma4::diagnostic::dump_logits("post_softcap", &logits);
         Ok(logits)
     }
+}
+
+/// Draft-side accumulator a TAPPED paged prefill fills.
+///
+/// `layer_ids` are the drafter's target decoder indices (strictly ascending);
+/// `ctx` is the drafter's fused-context cache, which gains one row per
+/// prefilled token at its absolute sequence position.
+pub(crate) struct Gemma4DsparkPrefillTap<'a> {
+    pub(crate) layer_ids: &'a [usize],
+    pub(crate) ctx: &'a mut DsparkContextCache,
 }
 
 /// Final-norm + LM-head + softcap projection over a paged residual
@@ -8199,52 +8237,12 @@ fn validate_paged_tap_layer_ids(tap: Option<&DsparkTap<'_>>, num_layers: usize) 
     Ok(())
 }
 
-/// Run the target over a `[1, T]` verify block at the current cache offset,
-/// capturing the tapped hidden states, and return the `[1, T, vocab]` logits.
-///
-/// This is exactly the existing T>1-at-offset forward (`forward_inner`, with
-/// the same masks/rope the chunked prefill uses). It does not sample and
-/// touches no history bookkeeping; caches advance by T. Callers pair it with
-/// `snapshot_before_verify` / `commit_after_verify` for rollback.
-pub(crate) fn dspark_verify_forward(
-    block_ids: &MxArray,
-    embedding: &Embedding,
-    layers: &[Gemma4DecoderLayer],
-    caches: &mut [Gemma4LayerCache],
-    final_norm: &RMSNorm,
-    lm_head: &Option<LinearProj>,
-    embed_weight_t: Option<&MxArray>,
-    ple: Option<&PleComponents>,
-    config: &Gemma4Config,
-    tap: &mut DsparkTap<'_>,
-) -> Result<MxArray> {
-    if block_ids.ndim()? != 2 || block_ids.shape_at(0)? != 1 || block_ids.shape_at(1)? < 1 {
-        return Err(Error::from_reason(format!(
-            "dspark_verify_forward expects block_ids shaped [1, T] with T >= 1, got {:?}",
-            block_ids.shape()?.as_ref()
-        )));
-    }
-    forward_inner(
-        block_ids,
-        embedding,
-        layers,
-        caches,
-        final_norm,
-        lm_head,
-        embed_weight_t,
-        ple,
-        config,
-        Some(tap),
-    )
-}
-
 /// Run the target over a `[1, T]` verify block at the current cache offset
 /// and return the `[1, T, vocab]` softcapped logits together with the
 /// `[1, T, hidden]` post-final-norm hidden state (the assistant draft chains
 /// its next round's `h_prev` from the hidden at the last kept slot).
 ///
-/// Same forward as [`dspark_verify_forward`] minus the residual-stream tap:
-/// it does not sample and touches no history bookkeeping; caches advance by
+/// It does not sample and touches no history bookkeeping; caches advance by
 /// T. Callers pair it with `snapshot_before_verify` / `commit_after_verify`
 /// for rollback.
 pub(crate) fn assistant_verify_forward(
@@ -8274,7 +8272,6 @@ pub(crate) fn assistant_verify_forward(
         ple,
         None,
         config,
-        None,
     )?;
     let logits = lm_head_logits(&hidden, embedding, lm_head, embed_weight_t, config)?;
     Ok((logits, hidden))
@@ -9873,7 +9870,6 @@ fn prefill_body_gemma4(
     final_norm: &RMSNorm,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
-    mut tap: Option<&mut DsparkTap<'_>>,
     turn_cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     let total_len = prompt.shape_at(1)?;
@@ -9928,7 +9924,6 @@ fn prefill_body_gemma4(
             ple,
             chunk_ple.as_ref(),
             config,
-            tap.as_deref_mut(),
         )?;
         eval_gemma4_caches(caches)?;
         crate::array::clear_cache();
@@ -9961,7 +9956,6 @@ fn prefill_body_gemma4(
             ple,
             remaining_ple.as_ref(),
             config,
-            tap,
         )?;
     }
 
@@ -10095,7 +10089,7 @@ fn prompt_holds_media_placeholders(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::engine::plan::{TurnPath, TurnPlan, TurnRequest};
     use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
@@ -11942,7 +11936,7 @@ mod tests {
     /// Production text of this file: everything above the unit-test module.
     fn production_source() -> &'static str {
         include_str!("model.rs")
-            .split_once("#[cfg(test)]\nmod tests {")
+            .split_once("#[cfg(test)]\npub(crate) mod tests {")
             .expect("model.rs must contain its unit-test module")
             .0
     }
@@ -12137,75 +12131,133 @@ mod tests {
         }
     }
 
-    /// A speculative / native-MTP gemma4 turn publishes no sliding
-    /// decode-boundary checkpoint — not a rung, not even a cadence entry. That
-    /// is harmless only because a draft turn has no paged adapter, and so no
-    /// cold tier for a rung to serve:
+    /// The FLAT draft lane still publishes no sliding decode-boundary
+    /// checkpoint, and that stays harmless only while it owns no paged state:
+    /// `capture_gemma4_sliding_cold_sidecar` needs a `PagedKVCacheAdapter`,
+    /// and an assistant turn runs on `Gemma4LayerCache` arrays with the pools
+    /// hidden. `assistant_decode.rs` must therefore never reach for the
+    /// adapter — the day it does, the publisher has to be wired in, and NOT
+    /// as a copy of the AR call: speculative decode accepts a variable number
+    /// of tokens per cycle, so the cursor can step from below a rung to above
+    /// it without ever landing on it.
     ///
-    /// ```text
-    ///   load_from_dir sees a draft  ->  use_block_paged_cache = Some(false)
-    ///                               ->  Gemma4Inner::new builds no adapter
-    ///                               ->  build_cold_tier_context returns None
-    ///                               ->  capture_gemma4_sliding_cold_sidecar returns at line 1
-    /// ```
-    ///
-    /// Load-time coexistence is pinned by the corresponding persistence tests;
-    /// this test keeps the draft core itself isolated from paged KV mutation.
-    /// This is the other half, and the tripwire: the day a draft turn gains a
-    /// paged adapter, the sliding decode publisher has to be wired into the
-    /// accept loop — and that is NOT a copy of the AR call, because speculative
-    /// decode accepts a variable number of tokens per cycle, so the cursor can
-    /// step from below a rung to above it without ever landing on it. The
-    /// predicate would have to be "a boundary lies in `(previous, current]`",
-    /// the same `gemma4_sliding_checkpoint_boundaries_crossed` shape the prefill
-    /// chunk walk uses, and the snapshot would have to be sliced back to that
-    /// boundary rather than taken at the cursor.
+    /// The paged DSpark lane already answers this. Its post-commit settle
+    /// (`Gemma4DsparkStepper::settle_at_committed_frontier` ->
+    /// `settle_grouped_kv_step_at`) walks `gemma4_cold_rung_candidates`, whose
+    /// predicate is `boundary <= frontier` rather than `boundary == frontier`,
+    /// so a jumped rung is still captured — pinned end to end by
+    /// `family_settle_at_the_committed_frontier_captures_the_cold_rung`.
     #[test]
-    fn gemma4_draft_decode_paths_never_touch_the_paged_adapter() {
-        for (label, source) in [
-            ("dspark_decode.rs", include_str!("dspark_decode.rs")),
-            ("assistant_decode.rs", include_str!("assistant_decode.rs")),
-        ] {
-            // Comments name the field to explain why it is absent; code must not.
-            let code = source
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                !code.contains("paged_adapter"),
-                "{label} mentions `paged_adapter`. A draft turn used to be flat by \
-                 construction, which is the only reason it is safe for the draft decode \
-                 loops not to publish a sliding decode-boundary checkpoint. If that has \
-                 changed, wire the publisher in — with a crossed-boundary predicate, not \
-                 a landed-on-boundary one: a variable accept count can jump the cursor \
-                 straight over a rung"
-            );
-        }
+    fn the_flat_draft_decode_path_never_touches_the_paged_adapter() {
+        let source = include_str!("assistant_decode.rs");
+        // Comments name the field to explain why it is absent; code must not.
+        let code = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("paged_adapter") && !code.contains("kv_cache_coordinator"),
+            "assistant_decode.rs reaches for paged state. The flat lane owning no paged \
+             state is the only reason it is safe for it not to publish a sliding \
+             decode-boundary checkpoint. If that has changed, wire the publisher in — \
+             with a crossed-boundary predicate, not a landed-on-boundary one: a variable \
+             accept count can jump the cursor straight over a rung"
+        );
     }
 
-    /// A draft turn's real, production-derived plan: no paged adapter, so the
-    /// turn reaches the speculative handler.
+    /// A DSpark turn's real, production-derived plan: the paged pools are
+    /// visible, so the plan advertises paged draft support and the turn
+    /// reaches the PAGED handler, where `run_paged_turn`'s speculative branch
+    /// drives `run_paged_dspark_turn`.
     ///
-    /// `tiny_inner_with_draft` is the in-crate stand-in for the flat lane a
-    /// loaded target scheduler installs for one speculative command.
+    /// This is the positive control for the two edits that enable D1 — the
+    /// `supports_paged_attention` flip and the scheduler's narrowed flat-lane
+    /// predicate. Either one alone is not enough: with the pools hidden
+    /// (`install_flat_owner_caches`) a DSpark request advertises no
+    /// speculative plan at all and downgrades to AR, which the second half of
+    /// this test pins.
     #[test]
-    fn gemma4_flat_draft_plan_routes_to_the_speculative_handler() {
-        let inner = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
+    fn gemma4_paged_dspark_plan_routes_to_the_paged_handler() {
+        let Some(inner) =
+            crate::models::gemma4::dspark_decode::tests::tiny_paged_inner_with_draft()
+        else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
+        };
+        let execution = inner.execution_plan();
+        assert!(
+            execution.paged_attention.is_some(),
+            "a DSpark command runs on the paged lane, so the pools stay visible"
+        );
+        let speculative = match execution.speculative {
+            Some(s) => s,
+            None => panic!("a loaded DSpark draft must be advertised on the paged lane"),
+        };
+        assert!(
+            speculative.supports_paged_attention,
+            "DSpark proposal/verification is implemented against the paged pools"
+        );
+
+        let request = TurnRequest {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            speculative_requested: true,
+        };
+        let plan = TurnPlan::resolve(execution, request);
+        assert_eq!(
+            plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            "paged + DSpark + opt-in must select the draft decoder"
+        );
+        assert_eq!(
+            plan.path(),
+            TurnPath::Paged,
+            "`path()` checks paged first; `run_paged_turn`'s speculative branch \
+             owns the turn from there"
+        );
+
+        // Hiding the pools does not silently downgrade to a flat DSpark turn —
+        // there is none. The plan drops speculation entirely and says so.
+        let mut hidden = inner;
+        hidden.install_flat_owner_caches(None);
+        let hidden_execution = hidden.execution_plan();
+        assert!(
+            hidden_execution.speculative.is_none(),
+            "with the pools hidden a DSpark draft has no lane, so none is offered"
+        );
+        assert_eq!(
+            TurnPlan::resolve(hidden_execution, request).decoder,
+            DecoderPlan::Autoregressive,
+            "a laneless DSpark request downgrades to exact AR rather than dropping"
+        );
+        assert!(
+            hidden.kv_cache_coordinator.is_some(),
+            "hiding the pools must not destroy them"
+        );
+    }
+
+    /// The ASSISTANT drafter keeps the flat lane: its Q-only attention reads
+    /// the target's flat `Gemma4LayerCache` K/V directly, so its plan declares
+    /// no paged support and the turn reaches the flat speculative handler.
+    #[test]
+    fn gemma4_assistant_draft_plan_routes_to_the_flat_speculative_handler() {
+        let inner = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_assistant_draft();
         let execution = inner.execution_plan();
 
         assert!(
             execution.paged_attention.is_none(),
-            "the flat draft lane must hide paged attention from the turn planner"
+            "the flat assistant lane must hide paged attention from the turn planner"
         );
         let speculative = match execution.speculative {
             Some(s) => s,
-            None => panic!("tiny_inner_with_draft carries a draft; the plan must advertise it"),
+            None => panic!("tiny_inner_with_assistant_draft carries a draft; advertise it"),
         };
         assert!(
             !speculative.supports_paged_attention,
-            "gemma4 draft proposal/verification is implemented against flat KV only"
+            "the assistant drafter has no paged proposal/verification path"
         );
 
         let plan = TurnPlan::resolve(
@@ -12220,112 +12272,104 @@ mod tests {
         assert_eq!(
             plan.decoder,
             DecoderPlan::Speculative(SpeculativeKind::DraftModel),
-            "flat + draft + opt-in must select the draft decoder"
+            "flat + assistant draft + opt-in must select the draft decoder"
         );
         assert_eq!(
             plan.path(),
             TurnPath::Speculative,
-            "the draft decoder only runs when `path()` also lands on the speculative \
-             handler; `run_paged_turn` has no speculative branch to fall back on"
+            "the assistant decoder runs through `run_speculative_turn`"
         );
     }
 
-    /// The model-neutral planner cannot execute the flat draft while paged
-    /// attention is exposed for the same command. This negative control makes
-    /// the scheduler's dynamic lane selection mutation-sensitive: speculative
-    /// commands must hide the resident paged pools before planning.
+    /// One PAGED owner serves media turns and speculative turns in the same
+    /// session, and the media state decides which decoder it gets: while the
+    /// live prefix carries media the speculative plan does not cover it and
+    /// the turn downgrades to exact AR on the SAME owner; once a fresh
+    /// text turn replaces that context, speculation is admitted again — no
+    /// lane switch, no second owner, and the coordinator is never rebuilt.
     ///
-    /// ```text
-    ///   paged ON + supports_paged_attention:false  -> decoder downgraded to AR
-    ///   paged ON + supports_paged_attention:TRUE   -> decoder Speculative, but
-    ///                                                 path() tests paged FIRST
-    ///   ...both land on TurnPath::Paged -> engine::paged_turn, which never
-    ///      reads `plan.decoder` (the only mentions in that file are its own
-    ///      test fixture and a JSON key). The `debug_assert!` in
-    ///      `run_paged_turn` is compiled out of release.
-    /// ```
-    ///
-    /// The second row is the point. It is the shape a future change produces
-    /// when someone reads "draft turns are flat by construction", decides to
-    /// lift the restriction, and flips `supports_paged_attention` to `true`
-    /// here without touching the load path — and it still does not run. Paged
-    /// speculative decode needs a branch inside `engine::paged_turn`, not a
-    /// flag flip.
+    /// Mutation this catches: widening the DSpark plan's
+    /// `supported_context_media`, which would run speculation over a media
+    /// prefix the drafter's tapped context never saw.
     #[test]
-    fn gemma4_paged_planner_requires_the_scheduler_selected_flat_lane() {
-        let inner = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
-        let flat = inner.execution_plan();
-        let speculative = match flat.speculative {
-            Some(s) => s,
-            None => panic!("tiny_inner_with_draft carries a draft; the plan must advertise it"),
+    fn gemma4_paged_owner_serves_media_then_speculative_turns() {
+        let Some(mut inner) =
+            crate::models::gemma4::dspark_decode::tests::tiny_paged_inner_with_draft()
+        else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
         };
+        inner.set_active_paged_owner(21);
+        let coordinator_groups = inner
+            .kv_cache_coordinator
+            .as_ref()
+            .map(|coordinator| coordinator.routes().len());
 
-        // Exactly what dropping the load-path forcing produces: the same draft
-        // plan, plus the paged adapter `unwrap_or(true)` would have built.
-        let paged_and_draft = ExecutionPlan {
-            paged_attention: Some(PagedAttentionPlan {
-                supports_delta: true,
-            }),
-            ..flat
-        };
-
-        let request = TurnRequest {
-            is_delta: false,
-            input_media: MediaCapabilities::NONE,
-            context_media: MediaCapabilities::NONE,
-            speculative_requested: true,
-        };
-
-        let plan = TurnPlan::resolve(paged_and_draft, request);
+        // A live media prefix: speculation is offered but does not cover the
+        // context, so the planner downgrades this turn only.
+        inner.media_session_context = MediaCapabilities::IMAGES;
+        let continued = TurnPlan::resolve(
+            inner.execution_plan(),
+            TurnRequest {
+                is_delta: true,
+                input_media: MediaCapabilities::NONE,
+                context_media: inner.media_session_context,
+                speculative_requested: true,
+            },
+        );
         assert_eq!(
-            plan.decoder,
+            continued.decoder,
             DecoderPlan::Autoregressive,
-            "paged ON + a paged-incapable proposer must downgrade to plain AR — the draft \
-             is loaded and resident, and not one draft forward runs"
+            "a speculative request over a media prefix must downgrade, not run"
         );
         assert_eq!(
-            plan.path(),
+            continued.path(),
             TurnPath::Paged,
-            "`path()` checks paged BEFORE speculative, so the turn goes to \
-             `engine::paged_turn`, which never reads `plan.decoder`. Silent loss of the \
-             measured draft speedup — the exact outcome the explicit-`true` config is \
-             hard-errored for. Keep the load path forcing paged OFF whenever a draft \
-             resolves"
+            "the downgraded turn stays on the same paged owner"
         );
 
-        // Flipping the capability flag alone does NOT fix it.
-        let flag_flipped = ExecutionPlan {
-            speculative: Some(SpeculativePlan {
-                supports_paged_attention: true,
-                ..speculative
-            }),
-            ..paged_and_draft
-        };
-        let flipped_plan = TurnPlan::resolve(flag_flipped, request);
-        assert_eq!(
-            flipped_plan.decoder,
-            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
-            "with the flag set, resolve() no longer downgrades the decoder"
+        // A fresh text turn replaces the media context; the same owner now
+        // takes the speculative decoder.
+        inner.media_session_context = MediaCapabilities::NONE;
+        let fresh = TurnPlan::resolve(
+            inner.execution_plan(),
+            TurnRequest {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                speculative_requested: true,
+            },
         );
         assert_eq!(
-            flipped_plan.path(),
-            TurnPath::Paged,
-            "...and the turn STILL routes to `engine::paged_turn`, which has no \
-             speculative branch, so the draft is still never stepped — now without even \
-             the AR downgrade to make the plan honest. Setting \
-             `supports_paged_attention: true` is not the missing piece; a speculative \
-             branch inside `engine::paged_turn` (plus a CROSSED-boundary sliding \
-             checkpoint predicate, since a variable accept count jumps rungs) is"
+            fresh.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            "a text-only prefix on the same owner admits speculation"
+        );
+        assert_eq!(fresh.path(), TurnPath::Paged);
+        assert_eq!(
+            inner.active_paged_seq, 21,
+            "both turns run on the one owner the scheduler selected"
+        );
+        assert_eq!(
+            inner
+                .kv_cache_coordinator
+                .as_ref()
+                .map(|coordinator| coordinator.routes().len()),
+            coordinator_groups,
+            "neither turn may rebuild the grouped coordinator"
         );
     }
 
+    /// The one lane that still installs flat caches — the ASSISTANT drafter —
+    /// must HIDE the resident paged pools for its command, not destroy them:
+    /// the very next AR command on the same loaded model runs paged.
     #[test]
-    fn gemma4_resident_paged_pools_are_hidden_only_for_the_flat_draft_lane() {
+    fn gemma4_resident_paged_pools_are_hidden_only_for_the_assistant_lane() {
         if !crate::engine::persistence::compiled_forward_backend_available() {
             return;
         }
         let mut draft_fixture =
-            crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
+            crate::models::gemma4::dspark_decode::tests::tiny_inner_with_assistant_draft();
         let mut inner = Gemma4Inner::new(paged_tiny_config(Some(true)))
             .expect("construct tiny paged Gemma4 target");
         inner.draft = draft_fixture.draft.take();
@@ -13719,7 +13763,7 @@ mod tests {
     }
 
     #[cfg(test)]
-    fn cast_paged_tiny_weights_to_bf16(inner: &mut super::Gemma4Inner) {
+    pub(crate) fn cast_paged_tiny_weights_to_bf16(inner: &mut super::Gemma4Inner) {
         use crate::array::{DType, MxArray};
         let cast = |array: &MxArray| -> MxArray {
             array.astype(DType::BFloat16).expect("astype BFloat16")
@@ -13830,7 +13874,7 @@ mod tests {
             return;
         }
 
-        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, 0, 0) {
+        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, 0, 0, None) {
             Ok(l) => l,
             Err(e) => {
                 let msg = e.reason.to_string();
@@ -14849,16 +14893,13 @@ mod prefix_cache_decision_tests {
 }
 
 #[cfg(test)]
-mod dspark_tap_tests {
-    //! Tap purity: threading a `DsparkTap` through the Gemma4 forward
-    //! paths must leave the compute graph byte-identical to a tap-less
-    //! run, while capturing the residual-stream hiddens of the tapped
-    //! layers. Runs a tiny random-weight Gemma4 (4 layers, hybrid
-    //! sliding/global types, one KV-shared layer) through the REAL
-    //! `forward_body` / `forward_inner` / `dspark_verify_forward` paths.
+mod flat_verify_tests {
+    //! The FLAT verify seam on a tiny random-weight Gemma4 (4 layers, hybrid
+    //! sliding/global types, one KV-shared layer): the real `forward_body` /
+    //! `assistant_verify_forward` paths plus the snapshot/commit rollback the
+    //! assistant drafter runs around every block.
 
     use super::*;
-    use crate::models::gemma4::dspark::DsparkTap;
 
     fn tiny_config() -> Gemma4Config {
         serde_json::from_value(serde_json::json!({
@@ -14920,206 +14961,81 @@ mod dspark_tap_tests {
         assert_eq!(a_bits, b_bits, "{ctx}: bits");
     }
 
+    /// The flat verify seam on a real tiny model: snapshot -> T>1 block
+    /// forward at offset -> partial-keep commit.
+    ///
+    /// The 3-token block runs at offset 6 and crosses the sliding window
+    /// (6+3 > 8), so the windowed-mask path is exercised; the KV-shared
+    /// layer reads its anchor's cache and its own vec entry must stay
+    /// untouched through both the write and the rollback.
     #[test]
-    fn dspark_tap_purity_and_verify_forward() {
+    fn flat_verify_snapshot_and_partial_commit() {
         let config = tiny_config();
         let (embedding, layers, final_norm) = tiny_model(&config);
 
-        // 6-token prefill then a 3-token verify block: the block runs
-        // T>1 at offset 6, which also crosses the sliding window (6+3 > 8)
-        // so the windowed-mask path is exercised.
         let prefill_ids = MxArray::from_int32(&[3, 9, 17, 25, 33, 41], &[1, 6]).unwrap();
         let block_ids = MxArray::from_int32(&[7, 11, 13], &[1, 3]).unwrap();
-
-        // Pass A: no tap.
-        let mut caches_a = init_caches_for_config(&config);
-        let hidden_a = forward_body(
-            Some(&prefill_ids),
-            None,
-            &embedding,
-            &layers,
-            &mut caches_a,
-            &final_norm,
-            None,
-            None,
-            &config,
-            None,
-        )
-        .unwrap();
-        let logits_a = forward_inner(
-            &block_ids,
-            &embedding,
-            &layers,
-            &mut caches_a,
-            &final_norm,
-            &None,
-            None,
-            None,
-            &config,
-            None,
-        )
-        .unwrap();
-
-        // Pass B: tapped, including the KV-shared layer 3 (anchor = layer 1),
-        // with the real snapshot → verify → commit flow around the verify.
-        let layer_ids = [0usize, 2, 3];
         let shared_slots = dspark_shared_slot_mask(&config);
         assert_eq!(
             shared_slots,
             vec![false, false, false, true],
             "config-derived shared-slot mask"
         );
-        let mut caches_b = init_caches_for_config(&config);
-        let mut prefill_tap = DsparkTap::new(&layer_ids);
-        let hidden_b = forward_body(
+
+        let mut caches = init_caches_for_config(&config);
+        forward_body(
             Some(&prefill_ids),
             None,
             &embedding,
             &layers,
-            &mut caches_b,
+            &mut caches,
             &final_norm,
             None,
             None,
             &config,
-            Some(&mut prefill_tap),
         )
         .unwrap();
         let rollback = super::super::layer_cache::snapshot_before_verify(
-            &caches_b,
+            &caches,
             block_ids.shape_at(1).unwrap() as usize,
             &shared_slots,
         )
         .unwrap();
-        let mut verify_tap = DsparkTap::new(&layer_ids);
-        let logits_b = dspark_verify_forward(
+        let (logits, _hidden) = assistant_verify_forward(
             &block_ids,
             &embedding,
             &layers,
-            &mut caches_b,
+            &mut caches,
             &final_norm,
             &None,
             None,
             None,
             &config,
-            &mut verify_tap,
         )
         .unwrap();
+        assert_eq!(logits.shape().unwrap().to_vec(), vec![1, 3, 64]);
 
-        // Tap must not perturb the compute graph.
-        assert_bitwise_eq(&hidden_a, &hidden_b, "prefill hidden");
-        assert_bitwise_eq(&logits_a, &logits_b, "verify logits");
-        assert_eq!(logits_b.shape().unwrap().to_vec(), vec![1, 3, 64]);
-
-        // One [B, T, hidden] capture per tapped layer, per forward call.
-        assert_eq!(prefill_tap.captured.len(), layer_ids.len());
-        for arr in &prefill_tap.captured {
-            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 6, 32]);
-        }
-        assert_eq!(verify_tap.captured.len(), layer_ids.len());
-        for arr in &verify_tap.captured {
-            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 3, 32]);
-        }
-
-        // Different layers must yield different hiddens (real per-layer
-        // captures, not one array pushed repeatedly).
-        let first = verify_tap.captured[0].to_float32().unwrap().to_vec();
-        let second = verify_tap.captured[1].to_float32().unwrap().to_vec();
-        assert_ne!(first, second, "captures must differ across layers");
-
-        // Caches advance by T on both passes; the KV-shared layer's own
-        // vec entry is never written (it reads its anchor's cache).
-        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+        // Caches advance by T; the KV-shared layer's own vec entry is never
+        // written (it reads its anchor's cache).
+        for (idx, cache) in caches.iter().enumerate().take(3) {
             assert_eq!(cache.get_offset(), 9, "cache {idx} offset");
-            assert_eq!(caches_a[idx].get_offset(), 9, "cache {idx} tapless offset");
         }
         assert_eq!(
-            caches_b[3].get_offset(),
+            caches[3].get_offset(),
             0,
             "KV-shared layer's cache entry must stay untouched"
         );
 
         // Partial-keep commit on the real model: active caches land at
         // prefill + keep, the shared slot stays untouched.
-        super::super::layer_cache::commit_after_verify(&mut caches_b, &rollback, 1).unwrap();
-        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+        super::super::layer_cache::commit_after_verify(&mut caches, &rollback, 1).unwrap();
+        for (idx, cache) in caches.iter().enumerate().take(3) {
             assert_eq!(cache.get_offset(), 7, "cache {idx} post-commit offset");
         }
         assert_eq!(
-            caches_b[3].get_offset(),
+            caches[3].get_offset(),
             0,
             "KV-shared layer's cache entry must stay untouched after commit"
-        );
-    }
-
-    #[test]
-    fn dspark_tap_rejects_unsorted_or_out_of_range_layer_ids() {
-        let config = tiny_config();
-        let (embedding, layers, final_norm) = tiny_model(&config);
-        let ids = MxArray::from_int32(&[3, 9], &[1, 2]).unwrap();
-
-        for bad in [vec![2usize, 0], vec![1, 1], vec![7]] {
-            let mut caches = init_caches_for_config(&config);
-            let mut tap = DsparkTap::new(&bad);
-            let result = forward_body(
-                Some(&ids),
-                None,
-                &embedding,
-                &layers,
-                &mut caches,
-                &final_norm,
-                None,
-                None,
-                &config,
-                Some(&mut tap),
-            );
-            assert!(result.is_err(), "layer_ids {bad:?} must be rejected");
-        }
-    }
-
-    #[test]
-    fn dspark_verify_forward_rejects_bad_block_shape() {
-        let config = tiny_config();
-        let (embedding, layers, final_norm) = tiny_model(&config);
-        let layer_ids = [0usize];
-
-        // Batch > 1 is rejected.
-        let batch2 = MxArray::from_int32(&[1, 2], &[2, 1]).unwrap();
-        let mut caches = init_caches_for_config(&config);
-        let mut tap = DsparkTap::new(&layer_ids);
-        assert!(
-            dspark_verify_forward(
-                &batch2,
-                &embedding,
-                &layers,
-                &mut caches,
-                &final_norm,
-                &None,
-                None,
-                None,
-                &config,
-                &mut tap,
-            )
-            .is_err()
-        );
-
-        // 1-D input is rejected.
-        let flat = MxArray::from_int32(&[1, 2], &[2]).unwrap();
-        let mut caches = init_caches_for_config(&config);
-        let mut tap = DsparkTap::new(&layer_ids);
-        assert!(
-            dspark_verify_forward(
-                &flat,
-                &embedding,
-                &layers,
-                &mut caches,
-                &final_norm,
-                &None,
-                None,
-                None,
-                &config,
-                &mut tap,
-            )
-            .is_err()
         );
     }
 }
@@ -15130,7 +15046,7 @@ mod spec_paged_substrate_tests {
     //! cross-group reservation, the all-rows projection, and the paged-loop
     //! tap — every one behavior-neutral for the autoregressive lane.
 
-    use super::dspark_tap_tests::assert_bitwise_eq;
+    use super::flat_verify_tests::assert_bitwise_eq;
     use super::*;
     use crate::engine::spec_paged::SpecPagedCache;
 
@@ -16656,9 +16572,8 @@ mod assistant_seam_tests {
     //! random-weight Gemma4 (4 hybrid layers, one KV-shared) through the
     //! REAL forward paths.
 
-    use super::dspark_tap_tests::{assert_bitwise_eq, tiny_model};
+    use super::flat_verify_tests::{assert_bitwise_eq, tiny_model};
     use super::*;
-    use crate::models::gemma4::dspark::DsparkTap;
 
     /// Tiny flat-path Gemma4 config (mirrors the DSpark decode tests):
     /// 4 hybrid layers, one KV-shared.
@@ -16858,7 +16773,6 @@ mod assistant_seam_tests {
                 None,
                 None,
                 config,
-                None,
             )
             .unwrap();
 
@@ -16873,7 +16787,6 @@ mod assistant_seam_tests {
                 None,
                 None,
                 config,
-                None,
             )
             .unwrap();
             let logits_b = lm_head_logits(&hidden, &embedding, &None, None, config).unwrap();
@@ -16888,10 +16801,9 @@ mod assistant_seam_tests {
 
     // ── assistant verify forward ───────────────────────────────────────
 
-    /// Same forward as `dspark_verify_forward` (bitwise-equal logits against
-    /// an empty-tap run on equivalent fresh caches), plus the post-final-norm
-    /// hidden as the second tuple element; caches advance by T and bad block
-    /// shapes are rejected.
+    /// Same forward as `forward_inner` (bitwise-equal logits on equivalent
+    /// fresh caches), plus the post-final-norm hidden as the second tuple
+    /// element; caches advance by T and bad block shapes are rejected.
     #[test]
     fn assistant_verify_forward_returns_hidden_and_logits() {
         let config = tiny_target_config();
@@ -16912,16 +16824,14 @@ mod assistant_seam_tests {
                 None,
                 None,
                 &config,
-                None,
             )
             .unwrap()
         };
 
-        // Reference: dspark_verify_forward with an EMPTY tap.
+        // Reference: the plain block forward the assistant seam wraps.
         let mut caches_a = init_caches_for_config(&config);
         prefill(&mut caches_a);
-        let mut tap = DsparkTap::new(&[]);
-        let logits_a = dspark_verify_forward(
+        let logits_a = forward_inner(
             &block_ids,
             &embedding,
             &layers,
@@ -16931,10 +16841,8 @@ mod assistant_seam_tests {
             None,
             None,
             &config,
-            &mut tap,
         )
         .unwrap();
-        assert!(tap.captured.is_empty(), "empty tap must capture nothing");
 
         // Assistant seam on equivalent fresh caches.
         let mut caches_b = init_caches_for_config(&config);
@@ -16969,7 +16877,6 @@ mod assistant_seam_tests {
             None,
             None,
             &config,
-            None,
         )
         .unwrap();
         assert_bitwise_eq(&hidden_ref, &hidden, "post-final-norm hidden");

@@ -418,7 +418,6 @@ impl Gemma4Inner {
                         inner.ple.as_ref(),
                         chunk_ple.as_ref(),
                         &inner.config,
-                        None,
                     )?;
                     // Eval cadence mirrors `prefill_body_gemma4`: full
                     // chunks eval+clear between iterations; the remainder
@@ -451,7 +450,6 @@ impl Gemma4Inner {
                 inner.ple.as_ref(),
                 None,
                 &inner.config,
-                None,
             )?;
             let logits = lm_head_logits(
                 &hidden,
@@ -487,7 +485,7 @@ mod tests {
     use crate::models::gemma4::assistant::AssistantDraftModel;
     use crate::models::gemma4::dspark::DsparkContextCache;
     use crate::models::gemma4::dspark_decode::tests::{
-        CancelAfterSink, run_tiny_draft_turn, tiny_assistant_config,
+        CancelAfterSink, run_tiny_flat_draft_turn, tiny_assistant_config,
         tiny_inner_with_assistant_draft, tiny_inner_with_draft, tiny_qwen_tokenizer,
         tiny_target_config, tiny_target_config_with_window, tiny_turn_config,
     };
@@ -804,8 +802,9 @@ mod tests {
 
         // Turn 1: unset depth resolves to ASSISTANT_DEFAULT_DEPTH (3) →
         // 1+3 verify rows over a 2-token window → hard error mid-turn.
-        let err = run_tiny_draft_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 8))
-            .expect_err("a depth-3 verify block must violate the window-2 rollback invariant");
+        let err =
+            run_tiny_flat_draft_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 8))
+                .expect_err("a depth-3 verify block must violate the window-2 rollback invariant");
         assert!(
             err.reason.contains("sliding window") && err.reason.contains("verify block"),
             "expected the snapshot_before_verify window guard, got: {}",
@@ -833,7 +832,7 @@ mod tests {
 
         // Turn 2: depth 1 → verify blocks of <= 2 rows fit the window; the
         // turn must run cold end-to-end and land fully consistent.
-        let res = run_tiny_draft_turn(
+        let res = run_tiny_flat_draft_turn(
             &mut inner,
             &tokenizer,
             &tokens,
@@ -929,7 +928,7 @@ mod tests {
             },
         };
         let out = inner
-            .draft_chat_turn(&mut args)
+            .flat_draft_chat_turn(&mut args)
             .expect("streaming cancelled turn must complete cleanly");
         assert!(
             matches!(out, TurnOutput::Streamed),
@@ -984,7 +983,7 @@ mod tests {
 
         // The next turn runs normally (fresh prompt: the longer saved
         // history is a prefix-miss, so it takes the cold path).
-        let res = run_tiny_draft_turn(
+        let res = run_tiny_flat_draft_turn(
             &mut inner,
             &tokenizer,
             &tokens,
