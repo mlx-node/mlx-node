@@ -136,7 +136,8 @@ Everything here is a gap we intend to close. Ordered.
 | **D3** | muse DFlash on paged. Needs `DecoderPlan::Speculative`, settle-as-parameter (landed in D0), and an admission cap at `min(prefix_hit, context.logical_len())`. | > paged AR |
 | **D4** | gemma4 assistant Q-only over target KV — vLLM's `kv_sharing_target_layer_name` shape, zero drafter KV. | Pool-kernel Q-only, or a clean 4K/16K/32K A/B. **NO-GO acceptable** |
 | **LCP-flat** | Longest-common-prefix reuse on the **flat** lane for pure-attention families. Today it returns 0 or everything; vLLM always keeps the common prefix. Sanctioned in `engine/cache.rs` for families without recurrent state. | Surfaced by the gemma4 continuation bug. D1 makes it moot for gemma4 speculation, but the flat lane remains the fallback and the env lever |
-| **B1/B3** | `dense_gdn_consumed_tokens` audit stored in the checkpoint; `SpecOwnerState` to kill the adapter move + Drop restore. B3 is a soft prereq of D3 and a hard one of C2. | — |
+| **B1** | `dense_gdn_consumed_tokens` audit stored in the checkpoint. | — |
+| ~~**B3**~~ | **Landed.** `engine::spec_owner::SpecOwner` addresses the paged adapter by the sequence a turn claimed at entry, so `DenseMtpStepper` no longer moves it out of the model and restores it in `Drop`. Was a soft prereq of D3 and a hard one of C2. | — |
 | **C2** | Scheduled-lane speculation — drafts as ordinary scheduled tokens instead of a barrier turn. **The largest remaining structural gap.** | LOOM Stage-1 + B3. Measure first: the depth-1 MTP ceiling is 1.1–1.15×, so this may stay default-off |
 | **C3** | Drafter KV resident in the pool (full I8): DSpark private KV, DFlash retained context, MoE drafter cache. EAGLE tail-drop ships in the **same PR**, never before. | C2 paying off first |
 
