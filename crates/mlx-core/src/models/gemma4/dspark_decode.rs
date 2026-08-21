@@ -1128,6 +1128,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::engine::backend::{PagedBackend, PagedPrefix};
     use crate::engine::plan::{
         DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
     };
@@ -1489,6 +1490,52 @@ pub(crate) mod tests {
         assert!(
             inner.draft_turn_state.is_none(),
             "the per-turn stash must be consumed by begin_dspark_decode"
+        );
+    }
+
+    /// The paged lane stashes the drafter's whole-prompt context inside
+    /// `paged_prefill_with_draft_state`, i.e. BEFORE the anchor sample the
+    /// turn driver runs next — so `abort_paged_turn`, the only error exit
+    /// from that window, must drop it. `begin_dspark_decode` is its one
+    /// consumer and is unreachable without a fresh write, so what survives
+    /// is unreachable residency: one `KVCache` per draft layer over the
+    /// whole prefilled suffix, freed only by the next paged DSpark turn's
+    /// own prefill or by unload (`reset_caches_sync` routes to
+    /// `clear_reuse_state`, which does not cover the field).
+    ///
+    /// Driven through the REAL production write, not a hand-set field. The
+    /// `is_some` control is load-bearing: the fail-closed regression below
+    /// asserts the same `is_none` and passes today only because its
+    /// injected error fires inside `run_paged_prefill_chunk`, upstream of
+    /// the stash.
+    #[test]
+    fn abort_paged_turn_drops_the_draft_stash() {
+        let Some(mut inner) = seeded_tiny_paged_inner_with_draft(0xD1_FA11_0002) else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
+        };
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+        let prefix = PagedBackend::prime_prefix_state(&mut inner, &tokens, false, 0, &[], 0)
+            .expect("paged prime must succeed on the tiny fixture");
+        let suffix = &tokens[prefix.effective_cached_prefix_len()..];
+        let _ = PagedDsparkBackend::paged_prefill_with_draft_state(
+            &mut inner,
+            suffix,
+            &prefix,
+            Stream::new(DeviceType::Gpu),
+        )
+        .expect("tapped paged prefill must succeed");
+        assert!(
+            inner.draft_turn_state.is_some(),
+            "ANTI-VACUITY: the paged prefill must have stashed, or the assert below is free"
+        );
+
+        PagedBackend::abort_paged_turn(&mut inner);
+
+        assert!(
+            inner.draft_turn_state.is_none(),
+            "abort_paged_turn is the paged speculative turn's only error exit; a stash it \
+             leaves behind is unreachable and unfreeable until the next turn's own prefill"
         );
     }
 

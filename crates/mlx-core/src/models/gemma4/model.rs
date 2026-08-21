@@ -6913,6 +6913,10 @@ impl PagedBackend for Gemma4Inner {
             let _ = coordinator.release_request_all(self.active_paged_seq);
         }
         self.caches = None;
+        // The paged speculative prefill stashes the drafter's whole-prompt
+        // context BEFORE the anchor sample, so an abort raised in that
+        // window inherits a stash nothing downstream can consume.
+        self.draft_turn_state = None;
         self.clear_reuse_state();
     }
 
