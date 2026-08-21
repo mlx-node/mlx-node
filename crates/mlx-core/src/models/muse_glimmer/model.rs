@@ -115,9 +115,8 @@ pub(crate) enum MusePagedSettle {
 }
 
 /// Trained and physically available active-context limits for one loaded
-/// Muse-Glimmer model. The effective window is conservative across both
-/// execution modes: DFlash may use the flat cache, but callers can disable it
-/// per request and fall back to the paged AR scheduler.
+/// Muse-Glimmer model. Values are snapshots because the physical pool is fixed
+/// for the lifetime of the resident model.
 #[napi(object)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuseGlimmerContextLimits {
@@ -128,11 +127,7 @@ pub struct MuseGlimmerContextLimits {
 }
 
 impl MuseGlimmerContextLimits {
-    fn from_parts(
-        trained_window_tokens: u32,
-        scheduler_window_tokens: u32,
-        paged: Option<(u32, u32, u32)>,
-    ) -> Self {
+    fn from_parts(trained_window_tokens: u32, paged: Option<(u32, u32, u32)>) -> Self {
         let Some((paged_window_tokens, paged_block_capacity, paged_block_size)) = paged else {
             return Self {
                 trained_window_tokens,
@@ -143,9 +138,7 @@ impl MuseGlimmerContextLimits {
         };
         Self {
             trained_window_tokens,
-            effective_window_tokens: trained_window_tokens
-                .min(scheduler_window_tokens)
-                .min(paged_window_tokens),
+            effective_window_tokens: trained_window_tokens.min(paged_window_tokens),
             paged_block_capacity,
             paged_block_size,
         }
@@ -162,11 +155,7 @@ impl MuseGlimmerContextLimits {
                 adapter.block_size(),
             )
         });
-        Self::from_parts(
-            trained,
-            crate::engine::hybrid_scheduler::scheduler_per_seq_context(),
-            paged,
-        )
+        Self::from_parts(trained, paged)
     }
 }
 
@@ -175,18 +164,25 @@ mod context_limit_tests {
     use super::MuseGlimmerContextLimits;
 
     #[test]
-    fn paged_ar_limit_is_published_even_when_dflash_can_use_the_trained_window() {
-        let limits =
-            MuseGlimmerContextLimits::from_parts(131_072, 32_768, Some((131_072, 8_192, 16)));
+    fn paged_effective_window_is_min_trained_and_pool() {
+        let limits = MuseGlimmerContextLimits::from_parts(131_072, Some((131_072, 8_192, 16)));
         assert_eq!(limits.trained_window_tokens, 131_072);
-        assert_eq!(limits.effective_window_tokens, 32_768);
+        assert_eq!(limits.effective_window_tokens, 131_072);
         assert_eq!(limits.paged_block_capacity, 8_192);
         assert_eq!(limits.paged_block_size, 16);
     }
 
     #[test]
+    fn paged_effective_window_follows_a_smaller_pool() {
+        let limits = MuseGlimmerContextLimits::from_parts(131_072, Some((32_768, 2_048, 16)));
+        assert_eq!(limits.effective_window_tokens, 32_768);
+        assert_eq!(limits.paged_block_capacity, 2_048);
+        assert_eq!(limits.paged_block_size, 16);
+    }
+
+    #[test]
     fn a_flat_only_runtime_publishes_the_trained_window() {
-        let limits = MuseGlimmerContextLimits::from_parts(131_072, 32_768, None);
+        let limits = MuseGlimmerContextLimits::from_parts(131_072, None);
         assert_eq!(limits.effective_window_tokens, 131_072);
         assert_eq!(limits.paged_block_capacity, 0);
         assert_eq!(limits.paged_block_size, 0);
@@ -1677,9 +1673,8 @@ impl MuseGlimmerModel {
         }
     }
 
-    /// Conservative model-wide context snapshot used by higher layers for
-    /// compaction. It includes the paged AR limit even when DFlash is present,
-    /// because DFlash is opt-in per request and can be disabled by the caller.
+    /// Model-wide context snapshot used by higher layers for compaction.
+    /// `effective_window_tokens` is min(trained, live pool).
     #[napi]
     pub fn context_limits(&self) -> MuseGlimmerContextLimits {
         self.context_limits.clone()
