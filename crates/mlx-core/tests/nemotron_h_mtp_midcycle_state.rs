@@ -16,70 +16,87 @@
 //!     -- --ignored --nocapture
 //! ```
 //!
-//! ## The bug class
+//! ## The seam
 //!
-//! A Nemotron-H MTP cycle at depth 1 commits up to two tokens (the
-//! always-verified target token plus the accepted draft). When the emit loop
-//! stops *inside* a cycle — a drafted-and-accepted EOS landing on the first
-//! of the two — the backbone forward has already advanced the flat caches
-//! and the 23 Mamba-2 recurrent states over the whole cycle, while only a
-//! prefix of it reaches the saved token history. The Mamba-2 recurrence is
-//! non-invertible: nothing can rewind that state. The family's guard is the
-//! `flat_mtp_caches_desynced` latch set from
-//! `NemotronHMtpStepper::rollback_unemitted` (`model.rs:2260`), which the
-//! generic flat flow (`engine/session.rs:1138`) turns into a forced
-//! `hit = 0` re-prefill on the next turn. Lose the latch and the next warm
-//! continue decodes against recurrent state that is AHEAD of its own token
-//! key.
+//! A Nemotron-H MTP cycle commits up to `depth + 1` tokens. The emit loop can
+//! stop *inside* a cycle — a drafted-and-accepted EOS landing before the last
+//! of them — and the Mamba-2 recurrence is non-invertible, so nothing can
+//! rewind the 23 recurrent states. The contract this file gates is therefore
+//! a state-vs-history one:
+//!
+//! ```text
+//! forwarded this cycle : anchor ++ accepted drafts
+//! saved this cycle     : anchor ++ EMITTED drafts
+//! never forwarded      : the LAST outcome token (bonus | residual)
+//! ```
+//!
+//! The anchor is pushed to the history by Step A and fed to the backbone by
+//! verify; each accepted draft is forwarded by verify and pushed by the emit
+//! loop; the cycle's final token is sampled from a logits row that already
+//! exists and is fed to the backbone only by the NEXT cycle's Step A.
+//! `mtp_history_drop_last` keeps every emitted token on a mid-cycle stop. So
+//! after a stop the flat trunk sits ahead of the saved history by exactly
+//! `rollback_unemitted - 1` tokens, and the `flat_mtp_caches_desynced` latch
+//! (`NemotronHMtpStepper::rollback_unemitted`) fires on `unemitted > 1`. The
+//! generic flat flow (`engine/session.rs`) turns the latch into a forced
+//! `hit = 0` re-prefill on the next turn.
+//!
+//! At a pinned depth of 1 `unemitted` never exceeds 1, so the latch correctly
+//! stays CLEAR on a drafted-EOS stop and the next turn keeps its prefix cache.
+//! That is the behaviour under test, not a bug.
+//!
+//! ## Why this file no longer classifies by the latch
+//!
+//! It used to. `LatchVerdict::classify(cached_tokens)` called
+//! `cached_tokens == 0` "Stranded", and `cached_tokens` is 0 exactly when the
+//! latch forced `hit = 0`. That made the trigger detector a probe of the
+//! guard: it could see *that the latch fired*, never *that a cycle stopped
+//! mid-cycle*. The two are different questions, and a detector that cannot
+//! separate them cannot tell a correct latch predicate from a wrong one —
+//! when the predicate was corrected to `> 1`, this file failed with "the
+//! drafted-EOS trigger was NOT exercised" on turns that had, in fact,
+//! stopped mid-cycle.
+//!
+//! The trigger now comes from `NemotronHModel::mtp_flat_state_for_test()`,
+//! which reports the engine-computed `rollback_unemitted` alongside the
+//! saved history length and the live attention KV offset. A turn stopped
+//! mid-cycle iff `rollback_unemitted > 0`, latch or no latch.
 //!
 //! ## Oracles
 //!
-//! Three orthogonal ones, all expressible through the public napi surface:
+//! 1. **Cache-vs-history invariant (PRIMARY).** `attn_kv_offset ==
+//!    cached_token_history.len()` after every MTP turn. This is the seam's
+//!    real contract, it holds whether or not any latch exists, and it is
+//!    what the old file only ever checked by proxy.
+//! 2. **Latch predicate.** `desynced == (rollback_unemitted > 1)` — pins the
+//!    rule, not the firing.
+//! 3. **Warm-reuse arm is live.** After a mid-cycle stop the following AR
+//!    turn must actually take the reuse arm (`cached_tokens ==
+//!    history_len`). Under the old predicate this was 0, which silently
+//!    turned oracle 4 into a comparison of two cold prefills.
+//! 4. **Mamba-2 state oracle (behavioural).** The warm continuation must
+//!    byte-match a fresh `reset_caches()` recompute of the identical
+//!    transcript.
 //!
-//! 1. **Latch probe (counter oracle).** On a FLAT clone the latch is
-//!    directly observable: `ChatResult::cached_tokens` on the following AR
-//!    turn is `0` exactly when the latch fired, and the full saved history
-//!    length when it did not. An AR->AR control turn proves the reuse arm is
-//!    alive at all, so `cached_tokens == 0` is a signal and not the
-//!    universal answer.
-//! 2. **Mamba-2 state oracle (centrepiece, L2).** After the stranded turn,
-//!    the warm continuation is compared byte-for-byte against a *fresh
-//!    recompute of the identical transcript* — `reset_caches()` (which
-//!    zeroes every conv/SSM state, clears `cached_token_history`, and purges
-//!    the paged prefix cache: `model.rs:1318`) followed by a single cold
-//!    turn over the same three messages. That is exactly "recompute the
-//!    recurrent state over `cached_token_history` from a fresh state and
-//!    compare against the live persisted state", read out through the one
-//!    function of that state the public API exposes: the tokens it produces.
-//!    Any surviving mid-cycle skew flips a greedy argmax within a handful of
-//!    recurrent steps.
-//!
-//!    LIMITATION, stated plainly: this is an *output-equivalence* oracle,
-//!    not the bit-level state compare the task asks for. `NemotronHInner` —
-//!    which owns `caches` and `cached_token_history` — is `pub(crate)`
-//!    (`model.rs:99`) and NemotronH ships no `*_for_test` accessor, so an
-//!    integration test cannot read the conv/SSM tensors at all. The
-//!    bit-level variant needs a small hook on `NemotronHModel` (e.g.
-//!    `mamba_state_for_test() -> (Vec<u32> /* cached_token_history */,
-//!    Vec<Vec<f32>> /* per-mamba-layer conv ++ ssm */)`) which lives outside
-//!    this file set.
-//! 3. **Behavioural twin (L1).** At T=0 MTP is output-invariant, so the MTP
-//!    turn must byte-match a pure-AR turn on the same prompt; both sessions
-//!    then warm-continue with speculation OFF over the identical transcript,
-//!    so any turn-2 divergence isolates carried state. Guarded by a
-//!    warm-vs-cold calibration, because the AR twin's turn 2 takes the
-//!    *reuse* arm (incremental Mamba-2 recurrence) while the stranded
-//!    session's turn 2 takes the *heal* arm (chunked prefill): a checkpoint
-//!    where those two kernel paths are not bit-identical would fail the twin
-//!    for a reason the seam does not own.
+//!    SENSITIVITY, stated plainly: this output-equivalence oracle was
+//!    MEASURED to be blind at 1-token granularity on
+//!    `nemotron-3.5-lightning-30b-a3b-nvfp4-mlx`. Injecting a genuine
+//!    one-token skew (popping a token off the saved history so the trunk
+//!    really is ahead) still left `warm.raw_text == cold.raw_text` on all
+//!    three strand prompts. It is kept because it catches gross divergence
+//!    cheaply, but it must NOT be this file's only oracle — that is why
+//!    oracle 1 is numeric and primary.
+//! 5. **Behavioural twin (L1).** At T=0 MTP is output-invariant, so the MTP
+//!    turn must byte-match a pure-AR turn on the same prompt. Guarded by a
+//!    warm-vs-cold calibration (see the inline note).
 //!
 //! ## Anti-vacuity (L4)
 //!
 //! Every trigger panics if it never fires: the strand sweep panics when no
-//! prompt strands, the AR control panics when warm reuse never happens, and
-//! every MTP turn asserts a positive accepted-draft count so a dead drafter
-//! (which can only ever produce 1-token cycles, and therefore can never
-//! strand) cannot pass this file green.
+//! prompt stops mid-cycle, the AR control panics when warm reuse never
+//! happens, and every MTP turn asserts a positive accepted-draft count so a
+//! dead drafter (which can only ever produce 1-token cycles, and therefore
+//! can never strand) cannot pass this file green.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -112,21 +129,26 @@ const FOLLOWUP: &str = "Repeat back exactly what you just wrote.";
 // Latch verdict (pure logic — the one checkpoint-free test in this file)
 // ---------------------------------------------------------------------------
 
-/// What the following AR turn's `cached_tokens` says about the MTP turn that
-/// preceded it on a FLAT model.
+/// Whether an MTP turn stopped INSIDE a cycle, read from the engine's own
+/// `rollback_unemitted` rather than from the desync latch.
+///
+/// This deliberately does NOT look at `cached_tokens`. `cached_tokens == 0`
+/// on the next turn means "the latch fired", which is a fact about the guard,
+/// not about the cycle: at a pinned depth of 1 a mid-cycle stop strands only
+/// the never-forwarded boundary token, so the latch correctly stays clear and
+/// a latch-keyed detector reports "no strand" on a turn that plainly stranded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LatchVerdict {
-    /// `cached_tokens == 0`: the desync latch forced `hit = 0`, so the MTP
-    /// turn stopped mid-cycle and rolled back an unemitted tail.
+enum MidCycleVerdict {
+    /// `rollback_unemitted > 0`: the emit loop broke before the cycle's last
+    /// outcome token, so the cycle's tail was rolled back off the drafter.
     Stranded,
-    /// `cached_tokens > 0`: no latch, so the MTP turn ended on a clean cycle
-    /// boundary and the saved history matched the physical trunk.
+    /// `rollback_unemitted == 0`: the turn ended on a clean cycle boundary.
     Clean,
 }
 
-impl LatchVerdict {
-    fn classify(cached_tokens_on_next_ar_turn: u32) -> Self {
-        if cached_tokens_on_next_ar_turn == 0 {
+impl MidCycleVerdict {
+    fn classify(rollback_unemitted: usize) -> Self {
+        if rollback_unemitted > 0 {
             Self::Stranded
         } else {
             Self::Clean
@@ -134,15 +156,41 @@ impl LatchVerdict {
     }
 }
 
-/// MUTATION this catches: inverting the probe (treating a *positive*
-/// `cached_tokens` as the strand signal) would make the sweep below classify
-/// every clean turn as a strand and pass green without ever exercising the
-/// seam.
+/// MUTATION this catches: inverting the probe (treating a zero
+/// `rollback_unemitted` as the strand signal) would make the sweep below
+/// classify every clean turn as a strand and pass green without ever
+/// exercising the seam.
 #[test]
-fn latch_verdict_reads_zero_reuse_as_the_strand_signal() {
-    assert_eq!(LatchVerdict::classify(0), LatchVerdict::Stranded);
-    assert_eq!(LatchVerdict::classify(1), LatchVerdict::Clean);
-    assert_eq!(LatchVerdict::classify(4096), LatchVerdict::Clean);
+fn midcycle_verdict_reads_unemitted_tail_as_the_strand_signal() {
+    assert_eq!(MidCycleVerdict::classify(0), MidCycleVerdict::Clean);
+    assert_eq!(MidCycleVerdict::classify(1), MidCycleVerdict::Stranded);
+    assert_eq!(MidCycleVerdict::classify(3), MidCycleVerdict::Stranded);
+}
+
+/// The latch predicate, isolated as pure logic so it is pinned even without a
+/// checkpoint: the trunk sits ahead of the saved history by
+/// `rollback_unemitted - 1` tokens (the cycle's last outcome token was never
+/// forwarded), so the desync latch must fire iff that count is positive.
+fn expected_desync(rollback_unemitted: usize) -> bool {
+    rollback_unemitted > 1
+}
+
+#[test]
+fn desync_is_expected_only_when_a_forwarded_token_was_dropped() {
+    assert!(
+        !expected_desync(0),
+        "a clean cycle boundary strands nothing"
+    );
+    assert!(
+        !expected_desync(1),
+        "one outstanding token is the never-forwarded bonus/residual, so the \
+         caches are exactly aligned with the saved history"
+    );
+    assert!(
+        expected_desync(2),
+        "two outstanding tokens means one FORWARDED accepted draft never \
+         reached the saved history"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -357,29 +405,39 @@ async fn fresh_recompute(
 }
 
 // ---------------------------------------------------------------------------
-// L1 + L2 + L4 — flat lane (the only lane where the latch is observable)
+// Flat lane: cache/history invariant, latch predicate, warm-continue oracle
 // ---------------------------------------------------------------------------
 
 /// Drafted-EOS mid-cycle stop on the FLAT lane, then a warm continuation.
 ///
 /// Legs, in order:
-///  * AR->AR control: proves the warm-reuse arm is alive (anti-vacuity for
-///    the counter oracle — without it `cached_tokens == 0` proves nothing).
-///  * Strand sweep: MTP turn 1 per prompt, classify by the following AR
-///    turn's `cached_tokens`. Panics when no prompt strands.
-///  * L2 Mamba-2 state oracle: the stranded session's warm continuation must
-///    byte-match a fresh recompute of the identical transcript.
-///  * L1 behavioural twin: MTP turn 1 must byte-match its AR twin at T=0,
-///    and both sessions' turn 2 must agree (calibrated — see the module
-///    docs).
+///  * AR->AR control: proves the warm-reuse arm is alive at all (anti-vacuity
+///    for oracle 3 — without it `cached_tokens == hist_len` proves nothing).
+///  * Strand sweep: one MTP turn per prompt, classified by the engine's own
+///    `rollback_unemitted` via `mtp_flat_state_for_test()`. EVERY swept turn
+///    is held to oracle 1 (`kv_offset == hist_len`) and oracle 2
+///    (`desynced == unemitted > 1`). Panics when no prompt stops mid-cycle.
+///  * Oracle 3: the continuation after the mid-cycle stop takes the WARM arm.
+///  * Oracle 4: that warm continuation byte-matches a fresh cold recompute of
+///    the identical transcript.
+///  * L1 behavioural twin: MTP turn 1 must byte-match its AR twin at T=0, and
+///    both sessions' turn 2 must agree (calibrated — see the module docs).
 ///
-/// MUTATION this catches: deleting `self.mtp_desynced = true` from
-/// `NemotronHMtpStepper::rollback_unemitted` (`model.rs:2262`), or dropping
-/// the `desynced` short-circuit in `engine/session.rs:1138`. Either lets the
-/// next turn reuse a trunk whose 23 Mamba-2 states are `unemitted` tokens
-/// ahead of the saved history; `cached_tokens` goes positive (killing the
-/// counter oracle) and the reply diverges from the fresh recompute (killing
-/// the state oracle).
+/// MUTATIONS this catches:
+///  * Widening the latch back to `unemitted > 0` — oracle 2 fails on the
+///    stranded turn (`desynced=true` with `unemitted=1`), and oracle 3 fails
+///    with `cached_tokens=0`, which is the prefix-cache discard the predicate
+///    exists to avoid.
+///  * Widening it to `unemitted > 2`, or deleting `self.mtp_desynced = true`
+///    outright — oracle 2 fails as soon as a depth > 1 cycle strands a
+///    forwarded draft (reachable via `mtpAdaptiveDepth: true`; see
+///    `nemotron_h::mtp`'s `adaptive_depth_policy_escapes_a_depth_1_seed`).
+///  * Anything that leaves the trunk ahead of the saved history — e.g.
+///    routing the MTP save through the generic `ChatBackend::save_cache_state`
+///    (which passes `drop_last: true` unconditionally) instead of
+///    `mtp_history_drop_last` — oracle 1 fails with `kv_offset == hist_len + 1`
+///    on every mid-cycle turn. Oracle 1 is the one that catches this; oracle 4
+///    was MEASURED not to (see the module docs' sensitivity note).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs MLX_TEST_NEMOTRON_H_MODEL_PATH pointing to a real NemotronH checkpoint WITH an MTP head"]
 async fn flat_mtp_midcycle_stop_warm_continue_matches_fresh_mamba_recompute() {
@@ -421,14 +479,21 @@ async fn flat_mtp_midcycle_stop_warm_continue_matches_fresh_mamba_recompute() {
         .expect("AR control turn 2");
     assert!(
         c2.cached_tokens > 0,
-        "AR->AR warm reuse never happened (cached_tokens=0), so the latch \
-         probe below cannot distinguish 'the latch fired' from 'this \
-         checkpoint never reuses a prefix'. The whole file would be vacuous."
+        "AR->AR warm reuse never happened (cached_tokens=0), so the \
+         reuse-arm assertion below cannot distinguish 'the mid-cycle turn \
+         kept its prefix' from 'this checkpoint never reuses a prefix'. The \
+         whole file would be vacuous."
     );
     println!("control: AR->AR reuse = {} tokens", c2.cached_tokens);
 
     // ---- strand sweep ----
-    let mut stranded: Option<(&str, ChatResult, ChatResult)> = None;
+    //
+    // Classified by the engine's own `rollback_unemitted`, read from the
+    // model thread AFTER turn 1 finalizes and BEFORE turn 2 mutates the
+    // state. Every swept turn — stranded or clean — is held to the seam's
+    // real invariant and to the latch predicate; only the FIRST stranded one
+    // is carried forward to the behavioural oracles.
+    let mut stranded: Option<(&str, ChatResult, ChatResult, usize)> = None;
     let mut clean_turns = 0usize;
     for prompt in STRAND_PROMPTS.iter() {
         model.reset_caches().await.expect("reset before MTP turn");
@@ -440,8 +505,50 @@ async fn flat_mtp_midcycle_stop_warm_continue_matches_fresh_mamba_recompute() {
         assert_eq!(
             m1.cached_tokens, 0,
             "the flat MTP core re-prefills the whole stream every turn and \
-             reports cached_tokens = 0 by construction (model.rs:2705)"
+             reports cached_tokens = 0 by construction"
         );
+
+        let (hist_len, kv_offset, desynced, unemitted) = model
+            .mtp_flat_state_for_test()
+            .await
+            .expect("flat MTP seam snapshot after turn 1");
+        let verdict = MidCycleVerdict::classify(unemitted);
+        println!(
+            "strand sweep {prompt:?}: finish={} hist_len={hist_len} \
+             kv_offset={kv_offset} unemitted={unemitted} desynced={desynced} \
+             -> {verdict:?}",
+            m1.finish_reason
+        );
+
+        // ---- ORACLE 1 (PRIMARY): the trunk must never sit ahead of the
+        // token history that keys it. Holds on EVERY turn, latch or no latch,
+        // and is the assertion the old file only made by proxy.
+        assert!(
+            kv_offset >= 0,
+            "{prompt:?}: no flat attention cache to probe (kv_offset=-1); the \
+             seam snapshot cannot see the trunk at all"
+        );
+        assert_eq!(
+            kv_offset as usize, hist_len,
+            "{prompt:?}: CACHE/HISTORY SKEW. The flat attention trunk is at \
+             offset {kv_offset} but the saved token history holds {hist_len} \
+             tokens (rollback_unemitted={unemitted}). The 23 Mamba-2 states \
+             advance through the same `forward_with_hidden_3d` calls as this \
+             offset, so a nonzero delta means the recurrent state is ahead of \
+             its own token key and no warm continuation from here is sound."
+        );
+
+        // ---- ORACLE 2: the latch predicate, not merely "the latch fired".
+        assert_eq!(
+            desynced,
+            expected_desync(unemitted),
+            "{prompt:?}: latch predicate violated. desynced={desynced} but \
+             rollback_unemitted={unemitted}. The trunk sits ahead of the saved \
+             history by exactly `unemitted - 1` tokens (the cycle's last \
+             outcome token is never forwarded), so the latch must fire iff \
+             `unemitted > 1`."
+        );
+
         let m2 = model
             .chat_session_continue(
                 vec![
@@ -453,37 +560,57 @@ async fn flat_mtp_midcycle_stop_warm_continue_matches_fresh_mamba_recompute() {
             )
             .await
             .expect("warm AR turn 2 after the MTP turn");
-        let verdict = LatchVerdict::classify(m2.cached_tokens);
-        println!(
-            "strand sweep {prompt:?}: finish={} cached_tokens={} -> {verdict:?}",
-            m1.finish_reason, m2.cached_tokens
-        );
+
         match verdict {
-            LatchVerdict::Stranded => {
-                stranded = Some((prompt, m1, m2));
-                break;
+            MidCycleVerdict::Stranded if stranded.is_none() => {
+                stranded = Some((prompt, m1, m2, hist_len));
             }
-            LatchVerdict::Clean => clean_turns += 1,
+            MidCycleVerdict::Stranded => {}
+            MidCycleVerdict::Clean => clean_turns += 1,
         }
     }
-    let Some((prompt, m1, m2)) = stranded else {
+    let Some((prompt, m1, m2, hist_len)) = stranded else {
         panic!(
             "no prompt in STRAND_PROMPTS stopped MID-CYCLE on this checkpoint \
-             (every following AR turn reused a prefix, so the desync latch \
-             never fired) — the drafted-EOS trigger was NOT exercised. Extend \
+             (every MTP turn reported rollback_unemitted = 0, i.e. every turn \
+             ended on a clean cycle boundary) — the drafted-EOS trigger was \
+             NOT exercised and the oracles below prove nothing. Extend \
              STRAND_PROMPTS for this checkpoint rather than accepting green."
         );
     };
     if clean_turns == 0 {
         eprintln!(
-            "note: every swept prompt stranded; the probe's specificity rests \
+            "note: every swept prompt stranded; the sweep's specificity rests \
              on the AR->AR control alone. A clean-boundary MTP prompt would \
              strengthen it."
         );
     }
-    println!("stranded on {prompt:?} (clean turns before it: {clean_turns})");
+    println!("stranded on {prompt:?} (clean turns in sweep: {clean_turns})");
 
-    // ---- L2: Mamba-2 state oracle ----
+    // ---- ORACLE 3: the reuse arm is LIVE across the mid-cycle seam ----
+    //
+    // This is what makes oracle 4 an oracle. A depth-1 mid-cycle stop strands
+    // only the never-forwarded boundary token, so the latch stays clear and
+    // the continuation must take the WARM arm. When the latch over-fired
+    // (`unemitted > 0`) this was 0 and the warm-vs-cold comparison below
+    // degenerated into comparing two runs of the same cold-prefill path —
+    // green, and meaningless.
+    assert_eq!(
+        m2.cached_tokens as usize, hist_len,
+        "the AR continuation after the mid-cycle stop reused \
+         {} of {hist_len} saved tokens. A 0 means the desync latch discarded \
+         the whole prefix cache on a turn whose caches were exactly aligned \
+         with its history (the seam assertions above just proved that), which \
+         is the performance bug this predicate exists to avoid AND collapses \
+         the state oracle below into two cold prefills.",
+        m2.cached_tokens
+    );
+
+    // ---- ORACLE 4: Mamba-2 state oracle (behavioural, secondary) ----
+    //
+    // Kept as a cheap gross-divergence check. It is NOT sufficient on its
+    // own: an injected one-token skew was measured to leave the reply
+    // byte-identical on this checkpoint. Oracle 1 above is the sensitive one.
     let cold = fresh_recompute(
         &model,
         vec![

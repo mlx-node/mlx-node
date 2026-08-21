@@ -29,6 +29,24 @@ use napi::bindgen_prelude::*;
 
 use super::config::NemotronHConfig;
 
+/// The dtype the block-paged KV pool stores, and therefore the dtype the
+/// flat `KVCache` has to end up holding for the two lanes to run the same
+/// attention arithmetic.
+///
+/// This is a hard constraint on the paged side, not a preference:
+/// `PagedKVCacheAdapter` rejects anything but Float16/BFloat16 at every K/V
+/// boundary ("kernel io_type is half-precision") and the pool is
+/// byte-allocated for 2-byte elements. The FLAT cache has no dtype of its
+/// own - `KVCache::update_and_fetch` allocates its buffer with
+/// `keys.dtype()` - so it holds whatever the residual stream hands the K/V
+/// projections. Keeping that stream in the model dtype (bf16) is what keeps
+/// the lanes aligned; see `gated_rmsnorm` in `mamba2.rs`.
+/// `pub(crate)` so the end-to-end loader seam gate in `persistence.rs` can
+/// assert the FLAT cache against the paged writer's OWN constant rather than
+/// re-typing the literal — otherwise a future change to the pool dtype would
+/// leave that assertion quietly checking the old value.
+pub(crate) const PAGED_KV_IO_DTYPE: DType = DType::BFloat16;
+
 pub struct NemotronHAttention {
     pub(crate) q_proj: LinearProj,
     pub(crate) k_proj: LinearProj,
@@ -188,8 +206,8 @@ impl NemotronHAttention {
         // The KV pool stores 2-byte elements (bf16); cast at the write
         // boundary so an f32 upstream stream (unit-test fixtures) is accepted
         // and a production bf16 stream is an identity no-op.
-        let keys_paged = keys_paged.astype(DType::BFloat16)?;
-        let values_paged = values_paged.astype(DType::BFloat16)?;
+        let keys_paged = keys_paged.astype(PAGED_KV_IO_DTYPE)?;
+        let values_paged = values_paged.astype(PAGED_KV_IO_DTYPE)?;
         let native_written = crate::models::lfm2::attention::native_kv_write_enabled()
             && adapter
                 .update_keys_values_native(
@@ -282,7 +300,7 @@ impl NemotronHAttention {
             let queries_3d = queries_bhtd
                 .squeeze(Some(&[2]))?
                 .reshape(&[1, self.num_heads as i64, self.head_dim as i64])?
-                .astype(DType::BFloat16)?;
+                .astype(PAGED_KV_IO_DTYPE)?;
             let attn_3d = if crate::models::lfm2::attention::graph_decode_gather_enabled() {
                 match adapter.gather_kv_for_decode_graph(
                     attn_layer_idx,
@@ -373,9 +391,9 @@ impl NemotronHAttention {
             .reshape(&[batch, 1, self.num_kv_heads as i64, self.head_dim as i64])?
             .transpose(Some(&[0, 2, 1, 3]))?;
 
-        let queries = queries.squeeze(Some(&[2]))?.astype(DType::BFloat16)?;
-        let keys = keys.squeeze(Some(&[2]))?.astype(DType::BFloat16)?;
-        let values = values.squeeze(Some(&[2]))?.astype(DType::BFloat16)?;
+        let queries = queries.squeeze(Some(&[2]))?.astype(PAGED_KV_IO_DTYPE)?;
+        let keys = keys.squeeze(Some(&[2]))?.astype(PAGED_KV_IO_DTYPE)?;
+        let values = values.squeeze(Some(&[2]))?.astype(PAGED_KV_IO_DTYPE)?;
         adapter
             .update_keys_values_native_batched(attn_layer_idx, &keys, &values, rows)
             .map_err(Error::from_reason)?;
@@ -543,6 +561,108 @@ mod tests {
         assert!(
             max_d <= 1e-5,
             "attention is order-sensitive, i.e. a positional rotation is applied: max |diff| = {max_d}"
+        );
+    }
+
+    /// Attention with dense BF16 projections, matching the released
+    /// checkpoint (q/k/v/o carry no `.scales` key there).
+    fn bf16_attention(cfg: &NemotronHConfig) -> NemotronHAttention {
+        let mut attn = NemotronHAttention::new(cfg).expect("attention builds");
+        let h = cfg.hidden_size as i64;
+        let q_dim = (cfg.num_attention_heads * cfg.head_dim) as i64;
+        let kv_dim = (cfg.num_key_value_heads * cfg.head_dim) as i64;
+        let mk = |rows: i64, cols: i64, seed: f32| -> LinearProj {
+            let w: Vec<f32> = (0..rows * cols)
+                .map(|i| ((i as f32 + seed) * 0.13) % 1.0 - 0.5)
+                .collect();
+            let w = MxArray::from_float32(&w, &[rows, cols])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            LinearProj::Standard(Linear::from_weights(&w, None).unwrap())
+        };
+        attn.q_proj = mk(q_dim, h, 0.0);
+        attn.k_proj = mk(kv_dim, h, 5.0);
+        attn.v_proj = mk(kv_dim, h, 11.0);
+        attn.o_proj = mk(h, q_dim, 17.0);
+        attn
+    }
+
+    /// PINS THE FLAT/PAGED KV DTYPE SEAM.
+    ///
+    /// The flat `KVCache` has no dtype of its own: `update_and_fetch`
+    /// allocates its buffer with `keys.dtype()`, so it stores exactly what
+    /// `k_proj` produced - i.e. the residual stream's dtype. The paged lane
+    /// has no such freedom: `forward_paged` casts every K/V write to
+    /// `PAGED_KV_IO_DTYPE` because the pool is byte-allocated for 2-byte
+    /// elements and the kernels are half-precision. So the moment anything
+    /// upstream promotes the residual to f32, the two lanes silently run
+    /// different attention arithmetic - flat over f32 K/V, paged over bf16.
+    ///
+    /// Mutation caught: any `astype(Float32)` introduced into this forward,
+    /// or a paged pool dtype that stops matching what the flat lane stores.
+    /// The UPSTREAM promotion (an f32 mixer output) is guarded in `mamba2.rs`
+    /// by `mamba_mixer_is_dtype_transparent`; the second half of this test
+    /// shows why that guard has to live there and not here.
+    #[test]
+    fn flat_kv_cache_stores_the_paged_pool_dtype() {
+        let cfg = tiny_cfg();
+        let h = cfg.hidden_size as i64;
+        let xs: Vec<f32> = (0..3 * h)
+            .map(|i| ((i as f32) * 0.57) % 1.0 - 0.5)
+            .collect();
+
+        let attn = bf16_attention(&cfg);
+        let x = MxArray::from_float32(&xs, &[1, 3, h])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let mut cache = KVCache::new();
+        let out = attn.forward(&x, None, Some(&mut cache)).unwrap();
+
+        assert_eq!(
+            out.dtype().unwrap(),
+            DType::BFloat16,
+            "attention must be dtype-transparent: a bf16 stream in, a bf16 stream out"
+        );
+        assert_eq!(
+            cache
+                .keys_ref()
+                .expect("the forward must populate the cache")
+                .dtype()
+                .unwrap(),
+            PAGED_KV_IO_DTYPE,
+            "the flat KV cache must hold the same dtype the paged pool stores"
+        );
+        assert_eq!(
+            cache
+                .values_ref()
+                .expect("the forward must populate the cache")
+                .dtype()
+                .unwrap(),
+            PAGED_KV_IO_DTYPE,
+            "the flat KV cache must hold the same dtype the paged pool stores"
+        );
+
+        // Teeth, and the reason no cast is added at the flat write: the flat
+        // cache mirrors whatever the residual stream is. Run the very same
+        // forward on an f32 stream and it stores f32 - the exact divergence
+        // this test exists to catch. Casting here would paper over it while
+        // leaving `out_proj`, the MoE and `lm_head` in f32, so the fix belongs
+        // upstream at the mixer boundary.
+        let attn_f32 = NemotronHAttention::new(&cfg).expect("attention builds");
+        let x32 = MxArray::from_float32(&xs, &[1, 3, h]).unwrap();
+        let mut cache_f32 = KVCache::new();
+        let _ = attn_f32.forward(&x32, None, Some(&mut cache_f32)).unwrap();
+        assert_eq!(
+            cache_f32
+                .keys_ref()
+                .expect("the forward must populate the cache")
+                .dtype()
+                .unwrap(),
+            DType::Float32,
+            "the flat cache adopts the projection dtype, so the bf16 assertion \
+             above is not vacuous"
         );
     }
 }

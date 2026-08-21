@@ -35,12 +35,14 @@ pub struct NemotronHConfig {
     pub layer_norm_epsilon: f64,
     /// RoPE base frequency carried in some checkpoint `config.json` files.
     ///
-    /// UNUSED: NemotronH attention is NoPE. No reference implementation
-    /// declares or consumes `rope_theta` (HF `NemotronHConfig` has no such
-    /// field, vLLM's attention takes no positions, mlx-lm never rotates), so
-    /// it is parsed leniently with a 10000.0 default and never read. The
-    /// field is retained only so the napi object shape - and the two
-    /// hand-synced `index.d.cts` artifacts - stay stable.
+    /// UNUSED BY THE RUNTIME: NemotronH attention is NoPE. No reference
+    /// implementation declares or consumes `rope_theta` (HF
+    /// `NemotronHConfig` has no such field, vLLM's attention takes no
+    /// positions, mlx-lm never rotates), and neither does this family's
+    /// attention module - wiring it into a rotation would change every
+    /// token the model emits. Parsed leniently with a 10000.0 default so a
+    /// spec-conformant checkpoint that omits it still loads, and echoed
+    /// back through `getConfig()` as checkpoint metadata only.
     pub rope_theta: f64,
     /// Per-layer mixer kind, remapped from the checkpoint's
     /// `layers_block_type`: "mamba" -> "linear_attention", "attention" ->
@@ -72,9 +74,8 @@ pub struct NemotronHConfig {
     /// (nemotron_h.py:56-65 + ssm.py:8-11). Only the HF *torch fallback*
     /// (:417-418, :465-466) clamps to `time_step_min`, and that path is not
     /// what the checkpoint was trained/served with. Parsed leniently and
-    /// retained only so the napi object shape - and the two hand-synced
-    /// `index.d.cts` artifacts - stay stable. Use `time_step_limit_pair()`
-    /// for the clamp the mixer actually applies.
+    /// echoed back through `getConfig()` as checkpoint metadata only. Use
+    /// `time_step_limit_pair()` for the clamp the mixer actually applies.
     pub time_step_min: f64,
     /// Optional `[min, max]` bounds for the discretized time step, matching
     /// mlx-lm's `ModelArgs.time_step_limit`. Absent (`None`) means the
@@ -102,14 +103,33 @@ pub struct NemotronHConfig {
     pub moe_shared_expert_intermediate_size: i32,
 
     // --- Token ids / heads ---
-    /// Tie the lm_head to the embedding table. False for Nemotron.
+    /// Tie the lm_head to the embedding table.
+    ///
+    /// ALWAYS `false` here: `parse_config` rejects a `true` checkpoint at
+    /// load time. The weight loader has no tied-head path - it requires an
+    /// explicit `lm_head.weight` tensor - so accepting `true` would parse
+    /// cleanly and then die much later with "Checkpoint missing
+    /// lm_head.weight", which reads like a corrupt download rather than an
+    /// unsupported variant.
     pub tie_word_embeddings: bool,
     pub bos_token_id: i32,
     /// EOS token ids (config.json scalar; generation_config carries {2, 11}).
     #[napi(ts_type = "number[]")]
     pub eos_token_ids: Vec<i32>,
     pub pad_token_id: i32,
-    /// Compute only the last `num_logits_to_keep` logits (1).
+    /// Declared `num_logits_to_keep` (1 on the released checkpoint).
+    ///
+    /// UNUSED BY THE RUNTIME. In HF it is a generation-time slicing hint:
+    /// `prepare_inputs_for_generation` forwards it as `logits_to_keep`
+    /// and the head is applied to `hidden_states[:, -N:, :]`
+    /// (modeling_nemotron_h.py:1171-1172). mlx-lm and vLLM declare no such
+    /// field at all. This runtime does not honour it either - every
+    /// prefill path applies `lm_head` over the whole `[1, T, hidden]`
+    /// block and slices the last position afterwards - so it is parsed
+    /// leniently (default 1) and echoed back through `getConfig()` as
+    /// checkpoint metadata only. Honouring it would be a real prefill
+    /// saving on this 131072-wide head, but that is a change to the
+    /// forward paths, not to this field.
     pub num_logits_to_keep: i32,
 
     // --- MTP head ---
@@ -159,6 +179,15 @@ impl NemotronHConfig {
     }
 
     /// in_proj output size: intermediate + conv_dim + num_heads (gate | xBC | dt).
+    ///
+    /// TEST-ONLY. Production does not call this: `new_mamba_mixer`
+    /// (`mamba2.rs`) inlines the same `d_inner + conv_dim + num_heads` sum
+    /// when it sizes the `in_proj` `Linear`, and the persistence loader
+    /// reads the row count off the checkpoint tensor. The helper survives
+    /// as the fixture-building expression for the mamba2 and config unit
+    /// tests, gated so it cannot quietly become a second, drifting
+    /// definition of the projection width.
+    #[cfg(test)]
     pub fn mamba_in_proj_size(&self) -> i32 {
         self.mamba_intermediate_size() + self.mamba_conv_dim() + self.mamba_num_heads
     }
@@ -189,12 +218,6 @@ impl NemotronHConfig {
         (0..self.num_hidden_layers as usize)
             .filter(|&i| self.is_attention_layer(i))
             .collect()
-    }
-
-    /// The LAST attention layer index - the backbone attention layer whose
-    /// flat K/V cache the MTP head's attention reads as "target KV".
-    pub fn last_attention_idx(&self) -> Option<usize> {
-        self.attention_layer_idxs().pop()
     }
 
     /// Rough resident-memory estimate in bytes (bf16 weights + packed
@@ -502,6 +525,21 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
         )));
     }
 
+    // Fail closed on a tied head. `persistence.rs` builds the lm_head from
+    // an explicit `lm_head.weight` tensor and has no embedding-tied path, so
+    // a `true` checkpoint would parse cleanly here and then fail deep in
+    // weight loading with "Checkpoint missing lm_head.weight" - a message
+    // that reads like a corrupt download rather than an unsupported model
+    // variant. Reject it where the reason is still legible.
+    let tie_word_embeddings = req_bool(raw, "tie_word_embeddings")?;
+    if tie_word_embeddings {
+        return Err(Error::from_reason(
+            "config.json tie_word_embeddings=true: this family supports only an UNTIED lm_head. \
+             The weight loader requires an explicit 'lm_head.weight' tensor and has no \
+             embedding-tied path.",
+        ));
+    }
+
     let eos_token_ids = parse_eos_ids(raw)?;
     if eos_token_ids.is_empty() {
         return Err(Error::from_reason(
@@ -555,7 +593,7 @@ pub fn parse_config(raw: &Value) -> Result<NemotronHConfig> {
         norm_topk_prob: req_bool(raw, "norm_topk_prob")?,
         intermediate_size: req_i32(raw, "intermediate_size")?,
         moe_shared_expert_intermediate_size: req_i32(raw, "moe_shared_expert_intermediate_size")?,
-        tie_word_embeddings: req_bool(raw, "tie_word_embeddings")?,
+        tie_word_embeddings,
         bos_token_id: raw.get("bos_token_id").and_then(Value::as_i64).unwrap_or(0) as i32,
         eos_token_ids,
         pad_token_id: raw.get("pad_token_id").and_then(Value::as_i64).unwrap_or(0) as i32,
@@ -754,7 +792,6 @@ mod tests {
         assert!(cfg.is_moe_layer(1));
         assert!(cfg.is_attention_layer(5));
         assert_eq!(cfg.attention_layer_idxs(), vec![5, 12, 19, 26, 33, 42]);
-        assert_eq!(cfg.last_attention_idx(), Some(42));
     }
 
     #[test]
@@ -842,6 +879,39 @@ mod tests {
         v["moe_latent_size"] = json!(512);
         let err = parse_config(&v).unwrap_err();
         assert!(err.reason.contains("moe_latent_size"), "{}", err.reason);
+    }
+
+    /// A tied-head checkpoint must be rejected AT PARSE TIME. The loader has
+    /// no embedding-tied path, so accepting it here only defers the failure
+    /// to `persistence.rs`, where it surfaces as "Checkpoint missing
+    /// lm_head.weight" - indistinguishable from a truncated download.
+    ///
+    /// Mutation caught: dropping the guard and going back to a bare
+    /// `req_bool` - the config would parse and the assert below would fail.
+    #[test]
+    fn rejects_tied_word_embeddings() {
+        let mut v = lightning_json();
+        v["tie_word_embeddings"] = json!(true);
+        let err = parse_config(&v).unwrap_err();
+        assert!(
+            err.reason.contains("tie_word_embeddings"),
+            "the message must name the field: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("lm_head.weight"),
+            "the message must name the tensor the loader would have failed on: {}",
+            err.reason
+        );
+        // ...and the field is still REQUIRED: an absent key is a different
+        // failure, not a silent `false`.
+        let mut missing = lightning_json();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("tie_word_embeddings");
+        let err = parse_config(&missing).unwrap_err();
+        assert!(err.reason.contains("tie_word_embeddings"), "{}", err.reason);
     }
 
     #[test]

@@ -234,10 +234,19 @@ Model Types:
   pp-lcnet-ori          PP-LCNet orientation classifier (Paddle -> SafeTensors)
   uvdoc                 UVDoc unwarping model (Paddle/PyTorch -> SafeTensors)
   qianfan-ocr           Qianfan-OCR InternVL model (key renaming, conv2d transposition)
-  nemotron_h            NVIDIA Nemotron 3.5 Lightning (NVFP4/FP8 ingest: repacks
-                        the shipped quantized codes into MLX nvfp4/mxfp8 layouts;
-                        --quantize/--q-recipe/--q-mxfp/--imatrix-path/--q-mtp are
-                        rejected — ingest is the only mode)
+  nemotron_h            NVIDIA Nemotron 3.5 Lightning (modelopt NVFP4/FP8
+                        ingest, not a re-quantization). Experts, shared experts:
+                        NVFP4 codes and their per-group E4M3 scales repacked
+                        byte-for-byte into the MLX nvfp4 layout, with
+                        weight_scale_2 carried out-of-band as a separate F32
+                        .global_scale (so the output is not plain mlx-lm nvfp4).
+                        lm_head: dequantized to bf16 using the exact scale.
+                        Mamba-2 in_proj/out_proj: the FP8 weights are
+                        RE-QUANTIZED to affine 8-bit group-32, which costs
+                        ~0.7% relative RMS — this half is a repack, not a
+                        lossless one. --quantize/--q-recipe/--q-mxfp/
+                        --imatrix-path/--q-mtp are rejected — ingest is the
+                        only mode.
 
 GGUF Support:
   When --input points to a .gguf file, the converter automatically parses the
@@ -786,10 +795,7 @@ export async function run(argv: string[]) {
     try {
       const configPath = resolve(inputPath, 'config.json');
       const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-      if (
-        Array.isArray(config.architectures) &&
-        config.architectures.includes('NemotronHForCausalLM')
-      ) {
+      if (Array.isArray(config.architectures) && config.architectures.includes('NemotronHForCausalLM')) {
         // The Nemotron architecture is authoritative (native parser +
         // runtime registry probe): check it BEFORE the model_type branches
         // so a stale-but-recognized model_type (e.g. qwen3_5) cannot route
@@ -867,7 +873,7 @@ export async function run(argv: string[]) {
     (args.quantize || quantRecipe !== undefined || args['q-mxfp'] || imatrixPath !== undefined || quantMtp !== 'off')
   ) {
     console.error(
-      'Error: Nemotron-H (nemotron_h) checkpoints are already quantized by NVIDIA (NVFP4 experts/shared_experts/lm_head, FP8 mamba projections) and convert in INGEST mode only: omit --quantize, --q-recipe, --q-mxfp, --imatrix-path, and --q-mtp. The NVFP4/FP8 codes are repacked losslessly into the MLX nvfp4/mxfp8 layouts.',
+      'Error: Nemotron-H (nemotron_h) checkpoints are already quantized by NVIDIA (NVFP4 experts/shared_experts/lm_head, FP8 mamba projections) and convert in INGEST mode only: omit --quantize, --q-recipe, --q-mxfp, --imatrix-path, and --q-mtp. Ingest repacks the NVFP4 codes and their per-group E4M3 scales byte-for-byte into the MLX nvfp4 layout (weight_scale_2 carried separately as a F32 .global_scale) and dequantizes lm_head to bf16, but it RE-QUANTIZES the FP8 Mamba-2 projections to affine 8-bit group-32 at ~0.7% relative RMS, so that half is a repack, not a lossless one.',
     );
     process.exit(1);
   }

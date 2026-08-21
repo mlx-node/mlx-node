@@ -355,6 +355,30 @@ describe('DownloadManager', () => {
     expect(job.receivedBytes).toBe(312);
   });
 
+  it('refuses a hidden catalog entry up front instead of failing mid-download', () => {
+    // A `hidden` entry is an UNPUBLISHED repo: it stays in MODEL_CATALOG so a
+    // locally converted checkpoint at the canonical slug is still recognized as
+    // Installed, but Hugging Face answers 401 for it. Membership alone is
+    // therefore not a sufficient allowlist. No UI offers one (the Models page
+    // filters `!item.hidden`), so the reachable route is a direct API POST.
+    const hidden = MODEL_CATALOG.find((entry) => entry.hidden);
+    expect(hidden, 'catalog must still carry a hidden entry for this gate to mean anything').toBeDefined();
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+
+    expect(() => manager.start(hidden!.hfRepo)).toThrow(/not in the model catalog/);
+    // Rejected BEFORE any job is allocated — otherwise the SPA renders a job
+    // that marches to a 401 instead of an immediate, actionable error.
+    expect(manager.jobs()).toEqual([]);
+
+    // Non-hidden entries are unaffected.
+    expect(() => manager.start(REPO)).not.toThrow();
+  });
+
   it('pins one resolved commit sha and threads it into every list/download call', async () => {
     hub.sha = SHA_A;
     const manager = new DownloadManager({

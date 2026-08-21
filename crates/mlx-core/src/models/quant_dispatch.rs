@@ -703,17 +703,52 @@ fn parse_group_size(value: &Value, mode: Option<PerLayerMode>, context: &str) ->
     Ok(group_size)
 }
 
+/// Does this `(mode, bits, group_size)` triple describe a projection that
+/// carries a calibrated static per-tensor FP8 (E4M3) ACTIVATION scale?
+///
+/// The two members are the only 8-bit group-32 packings this repo produces
+/// from a modelopt W8A8_FP8 source:
+///   * mxfp8 8/32  — the qwen3_5 nvidia recipe's attn/GDN projections;
+///   * affine 8/32 — nemotron_h's mamba `mixer.{in,out}_proj`, which moved off
+///     mxfp8 because MLX's E8M0 block exponent rounds to NEAREST rather than
+///     ceil (6.1% vs 0.64% relative RMS against the E4M3 source).
+///
+/// Everything else (mxfp4, nvfp4, sym8, fp8_e4m3, the K-quants, and affine at
+/// any other width or group size) is excluded, so a stale or hand-edited
+/// config can never fake-quant a projection that was never calibrated for it.
+///
+/// This is the single definition behind three gates that must not drift: the
+/// config parser below, the modelopt-schema parser in
+/// `nemotron_h::persistence`, and `QuantizedLinear`'s forward-time
+/// fake-quant/tap in `qwen3_5::quantized_linear`.
+///
+/// Widening from the earlier bare `mode == Mxfp8` test cannot change any
+/// EXISTING checkpoint, in either direction:
+///   * it cannot narrow mxfp8 — every `QuantizedLinear` that stores mode
+///     `"mxfp8"` is constructed with `MXFP8_BITS` / `MXFP8_GROUP_SIZE`, so the
+///     two new equalities are tautologies there;
+///   * it cannot widen an already-loadable checkpoint into a fake-quant —
+///     `parse_input_amax` USED to reject every non-mxfp8 `input_amax` outright,
+///     and every caller propagates that error (no loader swallows it), so no
+///     config carrying `affine` + `input_amax` was ever loadable to begin with.
+pub fn admits_static_fp8_activation(mode: PerLayerMode, bits: i32, group_size: i32) -> bool {
+    matches!(mode, PerLayerMode::Mxfp8 | PerLayerMode::Affine) && bits == 8 && group_size == 32
+}
+
 fn parse_input_amax(
     value: Option<&Value>,
     mode: PerLayerMode,
+    bits: i32,
+    group_size: i32,
     context: &str,
 ) -> Result<Option<f32>> {
     let Some(value) = value else {
         return Ok(None);
     };
-    if mode != PerLayerMode::Mxfp8 {
+    if !admits_static_fp8_activation(mode, bits, group_size) {
         return Err(Error::from_reason(format!(
-            "Invalid {context}: input_amax is supported only for mxfp8 activation calibration, got mode {mode:?}"
+            "Invalid {context}: input_amax is supported only on static-FP8 layers (mxfp8 8/32 or \
+             affine 8/32), got mode {mode:?} at {bits} bits / group_size {group_size}"
         )));
     }
     let raw = value.as_f64().ok_or_else(|| {
@@ -913,6 +948,8 @@ fn parse_per_layer_entries(
         let input_amax = parse_input_amax(
             child.get("input_amax"),
             mode,
+            bits,
+            group_size,
             &format!("{context}.input_amax"),
         )?;
         let zero_point = parse_symmetric_zero_point(
@@ -963,7 +1000,8 @@ pub fn parse_quant_block(
     }
     if obj.is_some_and(|q| q.contains_key("input_amax")) {
         return Err(Error::from_reason(
-            "Invalid top-level quantization.input_amax: activation calibration is supported only on per-layer mxfp8 overrides"
+            "Invalid top-level quantization.input_amax: activation calibration is supported only \
+             on per-layer static-FP8 overrides (mxfp8 8/32 or affine 8/32)"
                 .to_string(),
         ));
     }
@@ -1003,7 +1041,8 @@ pub fn parse_quant_settings(
     };
     if obj.is_some_and(|q| q.contains_key("input_amax")) {
         return Err(Error::from_reason(
-            "Invalid top-level quantization.input_amax: activation calibration is supported only on per-layer mxfp8 overrides"
+            "Invalid top-level quantization.input_amax: activation calibration is supported only \
+             on per-layer static-FP8 overrides (mxfp8 8/32 or affine 8/32)"
                 .to_string(),
         ));
     }
@@ -1590,8 +1629,17 @@ mod tests {
         assert_eq!(overrides["layers.0.mlp.gate_proj"].group_size, 64);
     }
 
+    /// `input_amax` is admitted on EXACTLY the two static-FP8 weight shapes
+    /// this repo produces from a modelopt W8A8_FP8 source — mxfp8 8/32 and
+    /// affine 8/32 — and rejected everywhere else.
+    ///
+    /// The affine 8/32 arm is load-bearing: nemotron_h's converter writes
+    /// `"mode": "affine", "bits": 8, "group_size": 32` WITH `input_amax` for
+    /// the mamba `mixer.{in,out}_proj`. Before the predicate replaced the bare
+    /// `mode != Mxfp8` test, that config.json could not be parsed at all and
+    /// the whole model failed to load.
     #[test]
-    fn input_amax_requires_positive_finite_f32_mxfp8_override() {
+    fn input_amax_requires_positive_finite_f32_on_a_static_fp8_override() {
         let valid = serde_json::json!({
             "mode": "mxfp8",
             "bits": 8,
@@ -1629,6 +1677,40 @@ mod tests {
             assert!(parse_quant_settings(Some(&raw), 4, 64).is_err());
         }
 
+        // affine 8/32 — nemotron_h's mamba projections. ADMITTED.
+        let affine_8_32 = serde_json::json!({
+            "mode": "affine",
+            "bits": 8,
+            "group_size": 32,
+            "layers.0.mixer.in_proj": {
+                "mode": "affine",
+                "bits": 8,
+                "group_size": 32,
+                "input_amax": 6.25
+            }
+        });
+        let (_, _, _, affine_overrides) = parse_quant_settings(Some(&affine_8_32), 4, 64).unwrap();
+        assert_eq!(
+            affine_overrides["layers.0.mixer.in_proj"].input_amax,
+            Some(6.25),
+            "affine 8/32 is a static-FP8 weight shape and must carry its amax"
+        );
+
+        // Right mode, wrong group size — a static per-tensor activation scale
+        // is only meaningful on the 8/32 packing, so 8/64 is still rejected.
+        let affine_8_64 = serde_json::json!({
+            "mode": "affine",
+            "bits": 8,
+            "group_size": 64,
+            "layers.0.mixer.in_proj": {
+                "mode": "affine",
+                "bits": 8,
+                "group_size": 64,
+                "input_amax": 1.0
+            }
+        });
+        assert!(parse_quant_settings(Some(&affine_8_64), 4, 64).is_err());
+
         let wrong_mode = serde_json::json!({
             "mode": "affine",
             "bits": 4,
@@ -1641,6 +1723,20 @@ mod tests {
             }
         });
         assert!(parse_quant_settings(Some(&wrong_mode), 4, 64).is_err());
+
+        // nvfp4 8/32 is not a thing the recipes produce; reject it too.
+        let nvfp4_amax = serde_json::json!({
+            "mode": "nvfp4",
+            "bits": 4,
+            "group_size": 16,
+            "layers.0.self_attn.q_proj": {
+                "mode": "nvfp4",
+                "bits": 4,
+                "group_size": 16,
+                "input_amax": 1.0
+            }
+        });
+        assert!(parse_quant_settings(Some(&nvfp4_amax), 4, 64).is_err());
 
         let top_level = serde_json::json!({
             "mode": "mxfp8",

@@ -856,23 +856,23 @@ becomes `log(-x)` because GGUF stores `-exp(A_log)` (`:1626`).
 ### dtype policy
 
 `GgufConversionOptions.dtype` accepts `float32|f32`, `float16|f16`, `bfloat16|bf16`
-(`crates/mlx-core/src/utils/gguf.rs:2805`). The napi doc says *"default: keep original"* (`:2404`) —
+(`crates/mlx-core/src/utils/gguf.rs:3363`). The napi doc says *"default: keep original"* (`:2904`) —
 but the CLI never passes `None`: `const dtype = args.dtype || 'bfloat16'`
-(`packages/cli/src/commands/convert.ts:512`).
+(`packages/cli/src/commands/convert.ts:625`, the GGUF branch).
 
-The cast loop (`:2817`) skips a key if any of four tests hit:
+The cast loop (`:3376`) skips a key if any of four tests hit:
 
 | # | test                                | line   | covers                                                  |
 | - | ----------------------------------- | ------ | -------------------------------------------------------- |
-| 1 | `preserve_dtype_keys.contains(key)` | `2819` | every K-quant-sourced output, named explicitly            |
-| 2 | `key.ends_with(".scales")`          | `2823` | affine f16 scales, K-quant int8/uint8 sub-scales          |
-| 3 | `key.ends_with(".biases")`          | `2823` | Q4_1 f16 minima, K-quant f16 `d`/`dmin`                   |
-| 4 | `arr.dtype() == DType::Uint32`      | `2827` | every packed weight plane                                 |
+| 1 | `preserve_dtype_keys.contains(key)` | `3377` | every K-quant-sourced output, named explicitly            |
+| 2 | `key.ends_with(".scales")`          | `3381` | affine f16 scales, K-quant int8/uint8 sub-scales          |
+| 3 | `key.ends_with(".biases")`          | `3381` | Q4_1 f16 minima, K-quant f16 `d`/`dmin`                   |
+| 4 | `arr.dtype() == DType::Uint32`      | `3386` | every packed weight plane                                 |
 
-`preserve_dtype_keys` (`:2761`) is built from the source tensor list mapped through the **same**
+`preserve_dtype_keys` (`:3319`) is built from the source tensor list mapped through the **same**
 `gguf_name_to_hf_for_metadata` that `remap_keys` uses, then expanded by `k_quant_output_keys`
 (`:947`). Tests 2-4 only *happen* to cover those keys today, which is why the producer and the
-do-not-cast set are named through one helper and cannot drift (`:2749`).
+do-not-cast set are named through one helper and cannot drift (`:3307`).
 
 ## SafeTensors inputs, families, foreign formats
 
@@ -911,11 +911,11 @@ config.json ──▶ TS auto-detect ──▶ modelType: string | undefined
                                           ├─ pp-lcnet-ori | uvdoc → convert_foreign_weights()
                                           │
                                           └─ convertModel({modelType, …})
-                                                 recipe_for(model_type)     convert.rs:1760
+                                                 recipe_for(model_type)     convert.rs:2783
                                                    Some(recipe)  → recipe.sanitize(...)
-                                                   None + Some(mt) → Err "Unknown model type"  :2688
+                                                   None + Some(mt) → Err "Unknown model type"  :4007
                                                    None (mt ABSENT) → tensors pass through
-                                                                       UNSANITIZED, no error   :2699
+                                                                       UNSANITIZED, no error   :4012
 ```
 
 TS auto-detect arms (`packages/cli/src/commands/convert.ts:602-651`):
@@ -930,33 +930,40 @@ TS auto-detect arms (`packages/cli/src/commands/convert.ts:602-651`):
 string `"gemma4"` (`crates/mlx-core/src/convert.rs:2266`), so collapsing would route an
 audio-carrying unified QAT into an importer that drops audio.
 
-Native registry: 9 `model_type` strings → 6 recipe impls (`crates/mlx-core/src/convert.rs:1745`).
+Native registry: 12 `model_type` strings → 9 recipe impls (`recipe_for`,
+`crates/mlx-core/src/convert.rs:2783`).
 
 | `model_type`               | impl                            | struct line |
 | -------------------------- | ------------------------------- | ----------- |
-| `qwen3_5`, `qwen3_5_moe`   | `Qwen35Recipe { is_moe }`       | `219`       |
-| `lfm2`, `lfm2_moe`         | `Lfm2Recipe`                    | `1189`      |
-| `paddleocr-vl`             | `PaddleOcrVlRecipe`             | `1520`      |
-| `qianfan-ocr`              | `QianfanOcrRecipe`              | `1540`      |
-| `privacy-filter`           | `PrivacyFilterRecipe`           | `1562`      |
-| `gemma4`, `gemma4_unified` | `Gemma4Recipe`                  | `1593`      |
+| `qwen3_asr`                | `Qwen3AsrRecipe`                | `1727`      |
+| `qwen3_5`, `qwen3_5_moe`   | `Qwen35Recipe { is_moe }`       | `226`       |
+| `lfm2`, `lfm2_moe`         | `Lfm2Recipe`                    | `1340`      |
+| `paddleocr-vl`             | `PaddleOcrVlRecipe`             | `1671`      |
+| `qianfan-ocr`              | `QianfanOcrRecipe`              | `1695`      |
+| `privacy-filter`           | `PrivacyFilterRecipe`           | `1800`      |
+| `muse_glimmer`             | `MuseGlimmerRecipe`             | `1832`      |
+| `gemma4`, `gemma4_unified` | `Gemma4Recipe`                  | `1912`      |
+| `nemotron_h`               | `NemotronHRecipe`               | `2720`      |
 
 ### Recipe asymmetry flags
 
 Five behaviour flags on the trait (`crates/mlx-core/src/convert.rs:153`), all defaulting to the
 conservative value:
 
-| flag (default)                     | qwen3_5 | qwen3_5_moe | lfm2 / lfm2_moe | paddleocr-vl | qianfan-ocr | privacy-filter | gemma4\* |
-| ---------------------------------- | ------- | ----------- | --------------- | ------------ | ----------- | -------------- | -------- |
-| `owns_dtype_cast` (false)          | **true** (`1166`) | **true** | **true** (`1505`) | false  | false       | false          | false    |
-| `embed_quantizable` (false)        | false   | false       | **true** (`1509`) | false      | false       | false          | false    |
-| `sym8_supported` (false)           | **true** (`1170`) | **true** | **true** (`1513`) | false  | false       | false          | **true** (`1736`) |
-| `quant_managed_by_sanitizer` (false) | false | false       | false           | false        | false       | **true** (`1584`) | false  |
-| `has_mtp` (None)                   | **Sidecar** (`1179`) | **Inline** | None      | None         | None        | None           | None     |
+| flag (default)                       | qwen3_asr | qwen3_5 | qwen3_5_moe | lfm2 / lfm2_moe | paddleocr-vl | qianfan-ocr | privacy-filter | muse_glimmer | gemma4\* | nemotron_h |
+| ------------------------------------ | --------- | ------- | ----------- | --------------- | ------------ | ----------- | -------------- | ------------ | -------- | ---------- |
+| `owns_dtype_cast` (false)            | false     | **true** (`1317`) | **true** | **true** (`1656`) | false | false  | false          | false        | false    | **true** (`2727`) |
+| `embed_quantizable` (false)          | **true** (`1792`) | false | false   | **true** (`1660`) | false | false  | false          | false        | false    | false      |
+| `sym8_supported` (false)             | false     | **true** (`1321`) | **true** | **true** (`1664`) | false | false  | false          | false        | **true** (`2055`) | false |
+| `quant_managed_by_sanitizer` (false) | false     | false   | false       | false           | false        | false       | **true** (`1822`) | false     | false    | false      |
+| `has_mtp` (None)                     | None      | **Sidecar** (`1330`) | **Inline** | None     | None         | None        | None           | None         | None     | None       |
 
-`owns_dtype_cast = true` bypasses the generic dtype loop entirely (`:2585`), so the hard
-`Err("Unsupported target dtype")` at `:2669` is **unreachable** for qwen3_5 / qwen3_5_moe / lfm2 /
-lfm2_moe — those families only `warn!` and default to bfloat16 (`:507`, `:1208`).
+`owns_dtype_cast = true` bypasses the generic dtype loop entirely (`:3878`), so the hard
+`Err("Unsupported target dtype")` at `:3966` is **unreachable** for qwen3_5 / qwen3_5_moe / lfm2 /
+lfm2_moe / nemotron_h. qwen3_5 and lfm2 still `warn!` and default to bfloat16 in their own arms
+(`:686`, `:1360`); **nemotron_h does neither** — its `sanitize` takes `_target_dtype_str` and
+ignores it outright (`:2731`), because the ingest reproduces the source's NVFP4/FP8 layout rather
+than casting to a requested float dtype. `--dtype` is therefore a no-op on that family, silently.
 
 `fn model_types()` (`:161`) is `#[allow(dead_code)]` — it exists only for the registry-consistency
 test.
@@ -1246,12 +1253,25 @@ what v1 cannot use:
   scale: dequantize with the unmodified `weight_scale` into F32, multiply by `weight_scale_2`,
   then cast to bf16. It therefore needs no runtime hook and emits no `.global_scale` key.
 - **FP8 Mamba-2 projections** (`mixer.in_proj` / `mixer.out_proj`) — source `weight` is raw E4M3
-  `[N,K]` with an F32 scalar `weight_scale` and a static `input_scale` `[1]`. Ingest maps them to
-  **mxfp8 8/32** and threads the checkpoint's `input_scale` as a **static `input_amax`** on each
-  mxfp8 per-layer override, so at load the projection fake-quantizes its activation
+  `[N,K]` with an F32 scalar `weight_scale` and a static `input_scale` `[1]`. Ingest re-quantizes
+  them to **affine 8-bit group-32** (`fp8_to_affine8`: reconstruct `from_fp8(w) * weight_scale`,
+  cast to BF16, then `mlx_quantize("affine", 32, 8)`, emitting the mandatory `.biases` sidecar)
+  and threads the checkpoint's `input_scale` as a **static `input_amax`** on each
+  per-layer override, so at load the projection fake-quantizes its activation
   (`from_fp8(to_fp8(x·448/amax))·amax/448`). Divergence: modelopt's runtime scales activations
   **per-token dynamically**, while the exported `input_scale` is a fixed value — v1 keeps it as a
   static amax (same mechanics as `mlx calibrate`'s sites, minus the calibration pass).
+  These were **mxfp8 8/32** until the quantization-accuracy pass. MLX's `fp8.h` rounds the E8M0
+  block exponent to **nearest** rather than ceil, so a per-tensor-E4M3 source loses 6.1191%
+  relative RMS (20.96% max/amax) through mxfp8 versus **0.6366%** (0.87% max/amax) through
+  affine 8/32 — 9.6x better, measured on a seeded Gaussian `[256, 2688]` fixture in
+  `nemotron_fp8_to_affine8_requant_error_within_tolerance`. The on-disk consequences:
+  `.scales` U8 -> BF16, a NEW BF16 `.biases`, `.weight` unchanged, and the per-layer mode string
+  `"mxfp8"` -> `"affine"`. A pre-pass checkpoint is rejected at load with a regenerate hint
+  (`reject_legacy_mxfp8_mamba` / `require_affine_sidecars`) rather than silently running 6% off,
+  because the `.weight` bytes are identical between the two encodings and only the declared mode
+  can tell them apart. Both gates are exercised end to end through `load_inner` by
+  `load_inner_rejects_a_pre_affine_checkpoint_end_to_end`.
 - **`k_scale` / `v_scale`** (attention FP8 KV-cache scales, F32 `[1]`) — **dropped**. v1 keeps a
   bf16 KV cache, so the FP8 KV scales have no consumer and are discarded, not carried.
 - **`mtp.*`** — already bf16 in the source; retained bf16 verbatim.
@@ -1351,7 +1371,7 @@ load_with_thread(path)                              crates/mlx-core/src/engine/p
 ```
 
 Bias expansion must precede the sidecar join (`:113`): `SymmetricZeroPoints::for_key` falls back to
-the top-level default for any key with no entry (`quant_dispatch.rs:725`), so a Q4_0 main model paired
+the top-level default for any key with no entry (`quant_dispatch.rs:806`), so a Q4_0 main model paired
 with a Q8_0 mmproj would otherwise derive every vision bias at the wrong offset. "Running afterwards
 turns a loud missing-`.biases` failure into silent corruption."
 
@@ -1624,7 +1644,7 @@ The highest-value section. Everything here is confirmed in code.
 | 37 | **The affine GGUF repack performs no divisibility validation**, unlike the K-quant path which rejects a last dim that is not a positive multiple of `QK_K`. `load_quantized_tensor` uses integer division throughout; a 2-row tensor with last dim 48 indexes `scales[2]` out of bounds — a panic across the napi boundary, not a named error. | `crates/mlx-core/src/utils/gguf.rs:776`, `:978`                             |
 | 38 | **`Vec::with_capacity` on `tensor_count` and `n_dims` is not covered by `MAX_GGUF_ALLOC`.** The 256 MiB cap applies to string lengths and array element *counts* only (256 M `String` headers ≈ 6 GB). A malformed header can abort the process before a single tensor is parsed. | `crates/mlx-core/src/utils/gguf.rs:511`, `:517`, `:362`                     |
 | 39 | **The gemma-QAT "already quantized" reject is narrower than it looks.** It is gated on `is_gemma_qat_family` = `nvidia_recipe_family(model_type) == Some("gemma4") && is_gemma_qat_source`, so a gemma-QAT source converted with a mismatched `-m` (e.g. `-m qwen3_5 -q`) escapes it entirely and falls through to the generic quantizer, which would re-quantize already-quantized weights. Only the *unified* reject hangs off bare `is_gemma_qat_source`. | `crates/mlx-core/src/convert.rs:2264`, `:2267`, `:2284`                     |
-| 40 | **`--dtype` is validated inconsistently by family.** For `owns_dtype_cast` families the generic loop is bypassed, so `Err("Unsupported target dtype")` is unreachable and a `warn!` is the only handler. `mlx convert -m qwen3_5 -d float64` prints `Dtype: float64`, writes bf16, exits 0. The same flag on `-m gemma4` hard-errors. | `crates/mlx-core/src/convert.rs:507`, `:2585`, `:2669`                      |
+| 40 | **`--dtype` is validated inconsistently by family.** For `owns_dtype_cast` families the generic loop is bypassed, so `Err("Unsupported target dtype")` is unreachable and a `warn!` is the only handler. `mlx convert -m qwen3_5 -d float64` prints `Dtype: float64`, writes bf16, exits 0. The same flag on `-m gemma4` hard-errors. **`-m nemotron_h` is a third behaviour**: its sanitize binds the parameter as `_target_dtype_str` and never reads it, so `--dtype` is a silent no-op with not even a warning — correct for a format-preserving ingest, indistinguishable from a working flag at the CLI. | `crates/mlx-core/src/convert.rs:686`, `:3878`, `:3966`, `:2731`             |
 | 42 | **`verify_override_coverage` — the set-difference audit — exists ONLY for the gemma-prequant import.** Its doc explains why: the generic paths' override maps are intentionally sparse, so a `.scales` tensor without an override is normal there. No automated guard will catch a coverage hole on any other path. | `crates/mlx-core/src/convert_gemma_import.rs:262`                           |
 | 43 | **A sym8 checkpoint refuses to load on any GPU below Apple gen 17 (M5).** `try_build_sym8_quantized_linear` hard-errors with "sym8 checkpoints require an M5+ GPU". `sym8_eligible` deliberately OMITS this check because it is a runtime property, so conversion succeeds on an M1–M4 box and produces a checkpoint that same box cannot load. Neither `docs/cli.md:144` nor the `--q-mode` help mentions it. | `crates/mlx-core/src/models/qwen3_5/quantized_linear.rs:389`, `crates/mlx-core/src/convert.rs:5546` |
 
@@ -1672,7 +1692,7 @@ Two consequences worth naming:
 | # | Trap                                                                                                                                                                                                                        | Where                                                                       |
 | - | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------- |
 | 50 | **`.biases` on a K-quant holds ggml's `d` (and `dmin`) — a SCALE, not an additive bias.** Any code assuming it is additive (a bias-folding pass, a dtype-following cast rule, a re-quantizer) silently corrupts K-quant tensors. Its dtype must stay exactly `float16`. This is why the converter needs a dedicated content-keyed exemption rather than the ordinary "float follows `--dtype`" rule. | `crates/mlx-core/src/utils/gguf_kquant.rs:22`, `crates/mlx-core/src/models/quant_dispatch.rs:455`, `crates/mlx-core/src/convert.rs:5455` |
-| 51 | **`kquant_biases_to_preserve` is skipped entirely when the family owns its own dtype cast** (`let kquant_biases_keys = if has_custom_sanitizer { HashSet::new() } else { … }`). `owns_dtype_cast()` is true for qwen3_5, qwen3_5_moe, lfm2, lfm2_moe. Latent today (the GGUF K-quant import writes its own output and re-quantization is refused), but it is a whole-family opt-out, not a per-tensor one. | `crates/mlx-core/src/convert.rs:2546`, `:1166`                              |
+| 51 | **`kquant_biases_to_preserve` is skipped entirely when the family owns its own dtype cast** (`let kquant_biases_keys = if has_custom_sanitizer { HashSet::new() } else { … }`). `owns_dtype_cast()` is true for qwen3_5, qwen3_5_moe, lfm2, lfm2_moe **and nemotron_h** — the flag's membership grows with every family that takes over its own dtype cast, so this list is the thing to re-derive rather than trust. Latent today (the GGUF K-quant import writes its own output, re-quantization is refused, and the nemotron_h ingest reads modelopt NVFP4/FP8 rather than GGUF), but it is a whole-family opt-out, not a per-tensor one. | `crates/mlx-core/src/convert.rs:3833`, `:1317`, `:2727`                     |
 | 52 | **`nn::Linear`'s quantized backend hardcodes `mode = "affine"`** at both the forward (`mlx_quantized_matmul`) and the load-time dequant. There is no mode parameter on `Linear::load_quantized`. This is the concrete reason `is_affine_only_key` exists — emitting mxfp4/mxfp8/nvfp4 at lm_head / router.proj / embed_tokens\* / embedding_projection would be silently mis-dequantized as affine, no error, just wrong numbers. | `crates/mlx-core/src/nn/linear.rs:62`, `:149`, `crates/mlx-core/src/convert.rs:3865` |
 | 53 | **`is_affine_only_key` short-circuits `is_router_gate` inside both upgrade wrappers, and the two disagree.** For `.router.proj`, `apply_mxfp_upgrade` returns the inner decision unchanged (including a bare `Default`, which resolves to the global affine default), whereas `apply_nvfp4_upgrade` rewrites a `Default` into an explicit `Custom{8, 64, affine}`. Latent — no shipped recipe returns `Default` there. | `crates/mlx-core/src/convert.rs:4820` vs `:5153`                            |
 | 54 | **PaddleOCR-VL's key transform uses `String::replace`, which rewrites ALL occurrences**: `result.replace("model.", "language_model.model.")` guarded only by `!result.contains("visual")`. Any key containing `model.` more than once is rewritten at every position, and `transform_key` is the identity for unmatched keys, so the damage is silent. | `crates/mlx-core/src/models/paddleocr_vl/persistence.rs:31`                  |

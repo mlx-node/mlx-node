@@ -180,8 +180,16 @@ pub struct NemotronHSharedExpert {
     /// NVFP4 per-tensor global scale (`weight_scale_2`) for each projection,
     /// applied on that projection's OUTPUT. `None` for dense bf16 projections
     /// (the MTP head), which have no global scale at all.
-    pub(crate) up_global_scale: Option<f64>,
-    pub(crate) down_global_scale: Option<f64>,
+    ///
+    /// Held as a 1-element FLOAT32 `MxArray`, not an `f64`: `mul_scalar`
+    /// builds its scalar in the ARRAY's dtype when the array is floating
+    /// (mlx-sys/src/mlx_array_ops.cpp:357-362 `array scalar(value, dt)` with
+    /// `dt = arr->dtype()`), so a bf16 activation would truncate the
+    /// ~1.7e-4..5.9e-4 scale by up to 0.26% — which relu2 then SQUARES to
+    /// 0.52% on the up branch. `mul` with an f32 array promotes instead,
+    /// exactly as the routed arm does at `forward_proj`.
+    pub(crate) up_global_scale: Option<MxArray>,
+    pub(crate) down_global_scale: Option<MxArray>,
 }
 
 impl NemotronHSharedExpert {
@@ -200,13 +208,25 @@ impl NemotronHSharedExpert {
         let mut up = self.up_proj.forward(x)?;
         // relu2 is homogeneous of degree 2, so the up-projection's global
         // scale MUST land before it — applying it afterwards would square it.
-        if let Some(g) = self.up_global_scale {
-            up = up.mul_scalar(g)?;
+        // The f32 scale array promotes the bf16 activation (an f64 scalar
+        // would be built in bf16 and truncate the scale); restore the
+        // projection's dtype at this boundary, mirroring
+        // `NemotronHExperts::forward_proj`.
+        if let Some(g) = &self.up_global_scale {
+            let dtype = up.dtype()?;
+            up = up.mul(g)?;
+            if up.dtype()? != dtype {
+                up = up.astype(dtype)?;
+            }
         }
         let activated = relu2(&up)?;
         let mut out = self.down_proj.forward(&activated)?;
-        if let Some(g) = self.down_global_scale {
-            out = out.mul_scalar(g)?;
+        if let Some(g) = &self.down_global_scale {
+            let dtype = out.dtype()?;
+            out = out.mul(g)?;
+            if out.dtype()? != dtype {
+                out = out.astype(dtype)?;
+            }
         }
         Ok(out)
     }
@@ -303,6 +323,11 @@ impl NemotronHMoE {
     /// [B, T, hidden]; output [B, T, hidden].
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
         let shape = x.shape()?;
+        // The dtype this block must hand back to the residual stream. The
+        // router below deliberately runs in f32, and MLX promotes, so without
+        // an explicit restore the routed-expert sum would widen the residual
+        // and every downstream layer with it. See the cast on `expert_out`.
+        let io_dtype = x.dtype()?;
         let batch = shape[0];
         let seq = shape[1];
         let hidden = shape[2];
@@ -332,7 +357,26 @@ impl NemotronHMoE {
         let activated = relu2(&up)?;
         let down = self.experts.forward_down(&activated, &topk_indices)?;
         let weighted = down.mul(&topk_weights.reshape(&[ne, k, 1])?)?;
-        let expert_out = weighted.sum(Some(&[1]), None)?;
+        // `topk_weights` descends from the f32 router, so this product and the
+        // sum over `k` are f32 REGARDLESS of the activation dtype. Restore the
+        // block's input dtype here, before the shared expert is added.
+        //
+        // Placement is not arbitrary — it mirrors the reference exactly.
+        // HF `modeling_nemotron_h.py` ends `NemotronHExperts.forward` with
+        // `return final_hidden_states.to(hidden_states.dtype)` (its
+        // accumulator is explicitly allocated in `top_k_weights.dtype`), and
+        // only THEN does `NemotronHMoE.forward` do
+        // `hidden_states + self.shared_experts(residuals)`. mlx-lm closes the
+        // same seam with `.astype(y.dtype)` on the weighted sum.
+        //
+        // Without this the residual promotes to f32 at the FIRST MoE layer
+        // (`layers_block_type[1] == "moe"` on the released checkpoint) — ahead
+        // of the first attention layer at index 5 — which silently widens the
+        // flat KV cache, the MTP head's K/V and the lm_head logits, and makes
+        // the flat lane run different arithmetic from the bf16 paged pool.
+        // `NemotronHMamba2Mixer::gated_rmsnorm`'s matching restore is a no-op
+        // while this one is missing.
+        let expert_out = weighted.sum(Some(&[1]), None)?.astype(io_dtype)?;
 
         let shared = self.shared_experts.forward(&x_flat)?;
         let out = expert_out.add(&shared)?;
@@ -703,6 +747,228 @@ mod tests {
         );
     }
 
+    /// Round an f32 through BF16 exactly as MLX would, so the fixture below
+    /// can assert its own precondition instead of trusting a hand-computed
+    /// neighbour.
+    fn bf16_round(v: f32) -> f32 {
+        MxArray::from_float32(&[v], &[1])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec()[0]
+    }
+
+    /// The shared expert's global scale must reach the activation at FULL f32
+    /// precision.
+    ///
+    /// MUTATION CAUGHT: `up.mul_scalar(g: f64)`. `mlx_array_mul_scalar`
+    /// (mlx-sys/src/mlx_array_ops.cpp:357-362) builds the scalar in the
+    /// ARRAY's dtype when the array is floating, so a bf16 `up` silently
+    /// rounds the global scale — 0.12% mean / 0.26% max over the 46 real
+    /// shared-expert scales, which relu2 then SQUARES to 0.52%. The shipped
+    /// straddle test cannot see it: it uses f32 weights and scales 3.0/0.5,
+    /// both exact in bf16.
+    ///
+    /// Tolerance-free by construction: `G_LO` and `G_HI` are two distinct f32
+    /// scales that share the SAME bf16 image. Rounding the scale to bf16 makes
+    /// the two forwards BIT-IDENTICAL; applying the f32 scale makes them
+    /// differ. The scale is on the UP side so relu2 squares the 0.195% gap
+    /// into 0.39%, at one bf16 ULP.
+    #[test]
+    fn shared_expert_global_scale_is_not_rounded_to_bf16() {
+        // The exact bf16 neighbour of the canonical weight_scale_2 8.646647e-5.
+        const B: f32 = 8.630_752_6e-5;
+        assert_eq!(bf16_round(B), B, "B must itself be a bf16 value");
+        // Both within half a bf16 ULP (relative 1/512) of B, so both round to B.
+        let g_lo = B * (1.0 - 1.0 / 1024.0);
+        let g_hi = B * (1.0 + 1.0 / 1024.0);
+        assert_eq!(
+            bf16_round(g_lo),
+            bf16_round(g_hi),
+            "fixture rot: the two scales no longer share a bf16 image"
+        );
+        assert_ne!(g_lo, g_hi, "the two scales must be distinct in f32");
+
+        // BF16 weights and BF16 x — the real dtype at this call site (the
+        // NVFP4 up_proj emits bf16). An f32 fixture makes mul_scalar exact and
+        // hides the bug.
+        const HIDDEN: i64 = 64;
+        const INTER: i64 = 128;
+        const TOKENS: i64 = 32;
+        let mut cfg = tiny_cfg();
+        cfg.hidden_size = HIDDEN as i32;
+        cfg.moe_shared_expert_intermediate_size = INTER as i32;
+        let mut sh = NemotronHSharedExpert::new(&cfg).expect("shared expert builds");
+
+        let bf16_of = |vals: &[f32], shape: &[i64]| {
+            MxArray::from_float32(vals, shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap()
+        };
+        let up_w: Vec<f32> = (0..(INTER * HIDDEN) as usize)
+            .map(|i| ((i as f32) * 0.037).sin() * 0.5)
+            .collect();
+        let down_w: Vec<f32> = (0..(HIDDEN * INTER) as usize)
+            .map(|i| ((i as f32) * 0.019).cos() * 0.5)
+            .collect();
+        sh.up_proj
+            .set_weight(&bf16_of(&up_w, &[INTER, HIDDEN]), "up")
+            .unwrap();
+        sh.down_proj
+            .set_weight(&bf16_of(&down_w, &[HIDDEN, INTER]), "down")
+            .unwrap();
+        let xv: Vec<f32> = (0..(TOKENS * HIDDEN) as usize)
+            .map(|i| ((i as f32) * 0.011).sin())
+            .collect();
+        let x = bf16_of(&xv, &[TOKENS, HIDDEN]);
+
+        sh.up_global_scale = Some(MxArray::from_float32(&[g_lo], &[1]).unwrap());
+        let lo: Vec<f32> = sh.forward(&x).unwrap().to_float32().unwrap().to_vec();
+        sh.up_global_scale = Some(MxArray::from_float32(&[g_hi], &[1]).unwrap());
+        let hi: Vec<f32> = sh.forward(&x).unwrap().to_float32().unwrap().to_vec();
+
+        assert_eq!(lo.len(), (TOKENS * HIDDEN) as usize);
+        let nonzero = lo.iter().filter(|v| **v != 0.0).count();
+        assert!(
+            nonzero * 2 >= lo.len(),
+            "fixture is degenerate: only {nonzero} of {} outputs are non-zero",
+            lo.len()
+        );
+        let differing = lo.iter().zip(&hi).filter(|(a, b)| a != b).count();
+        assert!(
+            differing > 0,
+            "two f32 global scales sharing a bf16 image produced bit-identical output \
+             (0 of {} elements differ) — the scale is being rounded to bf16",
+            lo.len()
+        );
+    }
+
+    /// `NemotronHSharedExpert::forward` must be dtype-transparent: the
+    /// activation dtype that goes in comes back out.
+    ///
+    /// Both global scales are f32 `MxArray`s — they have to be, or `mul_scalar`
+    /// would round them (see the field doc) — so `mul` PROMOTES a bf16
+    /// activation, and the two `astype` restores are the only thing stopping
+    /// that promotion from escaping. The shared expert is added to every
+    /// backbone MoE layer's output, so one escape widens the residual stream
+    /// for the whole 52-layer stack, the flat KV cache, and the lm_head matmul.
+    ///
+    /// Neither shipped fixture can see this:
+    ///   * `shared_expert_global_scales_straddle_relu2` uses f32 weights and an
+    ///     f32 `x`, so `mul` never promotes and neither `astype` is reached;
+    ///   * `shared_expert_global_scale_is_not_rounded_to_bf16` does run bf16,
+    ///     but asserts only that two scales give DIFFERENT values — which stays
+    ///     true with the restores deleted, since MLX just keeps promoting.
+    ///
+    /// A value-only assertion can never catch this: promotion is silent and
+    /// only ever ADDS precision.
+    ///
+    /// MUTATION CAUGHT: deleting either `astype` — the up arm and the down arm
+    /// are isolated by leaving the other scale `None`, and each shows up in the
+    /// bf16 pass. Hardcoding `BFloat16` in place of the restore is caught here
+    /// on the DOWN arm (the f32 pass sees a narrowed output); the same mutation
+    /// on the UP arm is invisible to a dtype assertion, because the f32 down
+    /// projection re-promotes it — `shared_expert_global_scales_straddle_relu2`
+    /// catches that one on values.
+    #[test]
+    fn shared_expert_forward_preserves_activation_dtype() {
+        const HIDDEN: i64 = 8;
+        const INTER: i64 = 16;
+        const TOKENS: i64 = 3;
+        let mut cfg = tiny_cfg();
+        cfg.hidden_size = HIDDEN as i32;
+        cfg.moe_shared_expert_intermediate_size = INTER as i32;
+
+        let up_w: Vec<f32> = (0..(INTER * HIDDEN) as usize)
+            .map(|i| ((i as f32) * 0.037).sin() * 0.5)
+            .collect();
+        let down_w: Vec<f32> = (0..(HIDDEN * INTER) as usize)
+            .map(|i| ((i as f32) * 0.019).cos() * 0.5)
+            .collect();
+        let xv: Vec<f32> = (0..(TOKENS * HIDDEN) as usize)
+            .map(|i| ((i as f32) * 0.11).sin())
+            .collect();
+
+        // The canonical NVFP4 `weight_scale_2` magnitude, so the fixture drives
+        // the same f32 promotion the real checkpoint does.
+        let scale = || Some(MxArray::from_float32(&[8.646_647e-5], &[1]).unwrap());
+
+        for dtype in [DType::BFloat16, DType::Float32] {
+            let cast = |vals: &[f32], shape: &[i64]| {
+                MxArray::from_float32(vals, shape)
+                    .unwrap()
+                    .astype(dtype)
+                    .unwrap()
+            };
+            let build = || {
+                let mut sh = NemotronHSharedExpert::new(&cfg).expect("shared expert builds");
+                sh.up_proj
+                    .set_weight(&cast(&up_w, &[INTER, HIDDEN]), "up")
+                    .unwrap();
+                sh.down_proj
+                    .set_weight(&cast(&down_w, &[HIDDEN, INTER]), "down")
+                    .unwrap();
+                sh
+            };
+            let x = cast(&xv, &[TOKENS, HIDDEN]);
+
+            // No scale at all (the dense MTP head): the projections alone are
+            // already transparent, so this is the control.
+            assert_eq!(
+                build().forward(&x).unwrap().dtype().unwrap(),
+                dtype,
+                "{dtype:?}: the unscaled shared expert must not change dtype"
+            );
+
+            // UP scale only — isolates the restore inside the `up` branch. Its
+            // promotion also survives relu2 and the down projection, so the
+            // output dtype reports it.
+            let mut up_only = build();
+            up_only.up_global_scale = scale();
+            assert_eq!(
+                up_only.forward(&x).unwrap().dtype().unwrap(),
+                dtype,
+                "{dtype:?}: the up-branch global scale must leave the output at the \
+                 input dtype, not the f32 dtype of the scale"
+            );
+
+            // DOWN scale only — isolates the restore inside the `out` branch.
+            let mut down_only = build();
+            down_only.down_global_scale = scale();
+            assert_eq!(
+                down_only.forward(&x).unwrap().dtype().unwrap(),
+                dtype,
+                "{dtype:?}: the down-branch global scale must leave the output at the \
+                 input dtype, not the f32 dtype of the scale"
+            );
+
+            // Both, as the real NVFP4 checkpoint carries them.
+            let mut both = build();
+            both.up_global_scale = scale();
+            both.down_global_scale = scale();
+            let out = both.forward(&x).unwrap();
+            assert_eq!(
+                out.dtype().unwrap(),
+                dtype,
+                "{dtype:?}: the shared expert must hand the residual stream its own dtype"
+            );
+
+            // Guard the fixture: an all-zero output would satisfy every dtype
+            // assertion above without any arithmetic having happened.
+            let vals: Vec<f32> = out.to_float32().unwrap().to_vec();
+            assert_eq!(vals.len(), (TOKENS * HIDDEN) as usize);
+            let nonzero = vals.iter().filter(|v| **v != 0.0).count();
+            assert!(
+                nonzero * 2 >= vals.len(),
+                "{dtype:?}: fixture is degenerate — only {nonzero} of {} outputs are non-zero",
+                vals.len()
+            );
+        }
+    }
+
     /// The shared expert's global scales must straddle relu2 correctly:
     /// `g_d * down(relu2(g_u * up(x)))`. relu2 is homogeneous of degree 2, so
     /// applying `g_u` AFTER relu2 scales that term by `g_u` instead of
@@ -726,8 +992,8 @@ mod tests {
 
         let g_u = 3.0f32;
         let g_d = 0.5f32;
-        sh.up_global_scale = Some(g_u as f64);
-        sh.down_global_scale = Some(g_d as f64);
+        sh.up_global_scale = Some(MxArray::from_float32(&[g_u], &[1]).unwrap());
+        sh.down_global_scale = Some(MxArray::from_float32(&[g_d], &[1]).unwrap());
 
         let xrow = [0.5f32, -1.0, 0.25, 0.75];
         let x = MxArray::from_float32(&xrow, &[1, 4]).unwrap();

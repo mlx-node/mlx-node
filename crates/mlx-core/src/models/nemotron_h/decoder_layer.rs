@@ -89,12 +89,16 @@ impl NemotronHDecoderLayer {
         x.add(&mixer_out)
     }
 
+    /// Install the pre-mixer RMSNorm weight (the persistence loader's only
+    /// write path for it).
+    ///
+    /// There is deliberately no matching reader. The qwen3_5 GDN layer this
+    /// was adapted from needs one because its compiled forward re-uploads
+    /// the norm weight into a captured graph; NemotronH has no compiled
+    /// forward, so a getter here would be a write-only accessor pair with
+    /// nothing on the read side.
     pub fn set_norm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.norm.set_weight(w)
-    }
-
-    pub fn get_norm_weight(&self) -> MxArray {
-        self.norm.get_weight()
     }
 
     /// Mutable accessors for the persistence layer.

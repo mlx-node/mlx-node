@@ -9,16 +9,29 @@
 //!
 //! Quantization dispatch (per-layer, resolved from config.json):
 //!   * NVFP4 - experts via try_build_nvfp4_quantized_switch_linear,
-//!     shared_experts + lm_head via try_build_nvfp4_quantized_linear. Every
-//!     NVFP4 prefix additionally REQUIRES a Float32 `.global_scale` sidecar
-//!     (`[n_routed_experts]` on the stacked experts, a scalar on the shared
-//!     experts): convert emits NVIDIA's per-group E4M3 `weight_scale` bytes
-//!     verbatim and carries `weight_scale_2` here instead of folding it. The
-//!     lookup is FAIL-CLOSED — a missing/mis-typed/mis-shaped one is a hard
-//!     error, because defaulting it to 1.0 would leave the projection
-//!     ~1/weight_scale_2 (~1.15e4x) too large with no diagnostic.
-//!   * MXFP8 - mamba in_proj/out_proj via try_build_mxfp8_quantized_linear
-//!     with the layer's input_amax threaded for W8A8 numeric parity
+//!     shared_experts via try_build_nvfp4_quantized_linear. lm_head is NOT
+//!     nvfp4 at runtime: it inherits the top-level nvfp4 mode from config but
+//!     convert dequantizes it to dense BF16 (see
+//!     `convert::dequant_nvfp4_to_bf16_exact`), so the builder finds no
+//!     `.scales` and it takes the dense path. Every NVFP4 prefix additionally
+//!     REQUIRES a Float32 `.global_scale` sidecar (`[n_routed_experts]` on the
+//!     stacked experts, a scalar on the shared experts): convert emits
+//!     NVIDIA's per-group E4M3 `weight_scale` bytes verbatim and carries
+//!     `weight_scale_2` here instead of folding it. The lookup is FAIL-CLOSED
+//!     — a missing/mis-typed/mis-shaped one is a hard error, because
+//!     defaulting it to 1.0 would leave the projection ~1/weight_scale_2
+//!     (~1.15e4x) too large with no diagnostic.
+//!   * AFFINE 8-bit group-32 - mamba in_proj/out_proj via
+//!     try_build_quantized_linear, with the layer's input_amax threaded for
+//!     W8A8 numeric parity. NOT mxfp8: MLX's E8M0 block scale rounds
+//!     log2(amax/448) to NEAREST and clips ~50% of 32-element groups, costing
+//!     5-7% relative RMS on the sequence-mixing backbone (see
+//!     convert::recipe::fp8_to_affine8). A projection that still declares
+//!     mxfp8 is a pre-fix checkpoint and is REJECTED at load.
+//!   * the MoE router pair (mixer.gate.weight,
+//!     mixer.gate.e_score_correction_bias) stays at the source F32 - see
+//!     convert::recipe::NemotronAction::Router. A BF16 bias there collapses
+//!     all 128 experts onto one value and is rejected.
 //!   * everything else dense bf16 (attention, conv1d, norms, A_log/D/
 //!     dt_bias, embeddings, all mtp.*)
 
@@ -36,12 +49,12 @@ use crate::engine::persistence::{
     load_all_safetensors, parse_generation_defaults, prewarm_checkpoint_pages,
 };
 use crate::models::quant_dispatch::{
-    PerLayerMode, PerLayerQuant, default_per_layer_quant, effective_plq_for, parse_quant_block,
-    select_quantization_block,
+    PerLayerMode, PerLayerQuant, admits_static_fp8_activation, default_per_layer_quant,
+    effective_plq_for, parse_quant_block, select_quantization_block,
 };
 use crate::models::qwen3_5::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, is_quantized_checkpoint,
-    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
+    try_build_nvfp4_quantized_linear, try_build_quantized_linear,
 };
 use crate::models::qwen3_5_moe::quantized_linear::{
     LinearProj, QuantizedLinear, QuantizedSwitchLinear, try_build_nvfp4_quantized_switch_linear,
@@ -180,6 +193,14 @@ fn sanitize_weights(
 /// the superseded folding ingest.
 const REGENERATE_HINT: &str = "This checkpoint predates the NVFP4 global-scale split (convert used to fold weight_scale_2 into the per-group E4M3 scales, which costs ~8% relative error). Re-run `mlx convert -m nemotron_h` against the NVIDIA source to regenerate it.";
 
+/// Regeneration hint for the quantization-accuracy pass: the mamba
+/// `mixer.{in,out}_proj` moved off MLX's mxfp8 grid onto affine 8-bit
+/// group-32 (mxfp8's E8M0 block scale rounds to NEAREST and clips ~50% of
+/// groups, costing 5-7% relative RMS), and the MoE router pair is now retained
+/// at the source F32 instead of being rounded to BF16 (which collapsed all 128
+/// `e_score_correction_bias` entries onto one value).
+const REQUANT_REGENERATE_HINT: &str = "This checkpoint predates the Nemotron-H quantization-accuracy pass (mamba in_proj/out_proj mxfp8 -> affine 8-bit group-32, and F32 MoE router retention). Re-run `mlx convert -m nemotron_h` against the NVIDIA source to regenerate it.";
+
 /// Fetch the MANDATORY `[E]` Float32 NVFP4 global scale for a stacked expert
 /// projection.
 ///
@@ -218,7 +239,13 @@ fn require_expert_global_scale(
 
 /// Fetch the MANDATORY per-tensor NVFP4 global scale for a 2-D projection
 /// (the shared experts). Same fail-closed contract as the stacked variant.
-fn require_scalar_global_scale(params: &HashMap<String, MxArray>, prefix: &str) -> Result<f64> {
+/// Returns the validated 1-element Float32 TENSOR, not an `f64`: the runtime
+/// must multiply by an f32 ARRAY so MLX promotes `bf16 * f32 -> f32`. An `f64`
+/// scalar would go through `mlx_array_mul_scalar`, which builds the scalar in
+/// the ARRAY's dtype (mlx-sys/src/mlx_array_ops.cpp:357-362) and truncates the
+/// ~8.6e-5 scale to bf16 — the exact error this function's dtype check
+/// rejects on disk.
+fn require_scalar_global_scale(params: &HashMap<String, MxArray>, prefix: &str) -> Result<MxArray> {
     let key = format!("{prefix}.global_scale");
     let gs = params.get(&key).ok_or_else(|| {
         Error::from_reason(format!(
@@ -245,7 +272,33 @@ fn require_scalar_global_scale(params: &HashMap<String, MxArray>, prefix: &str) 
             "'{key}' must be finite and positive, got {v}. {REGENERATE_HINT}"
         )));
     }
-    Ok(v)
+    gs.reshape(&[1])
+}
+
+/// Does the RUNTIME have somewhere to apply a 2-D NVFP4 projection's
+/// per-tensor `.global_scale`?
+///
+/// Only the shared experts do: `SparseMoeBlock::shared_experts` owns
+/// `{up,down}_global_scale` and multiplies each projection's output by it
+/// (sparse_moe.rs). `QuantizedLinear` itself has NO global-scale field, so any
+/// OTHER prefix that reaches the nvfp4 arm of `try_build_ql` would build a
+/// perfectly valid-looking projection whose weights are `1/weight_scale_2`
+/// (~1.15e4x) too large, with no diagnostic — the exact failure the
+/// `require_*_global_scale` guards exist to prevent.
+///
+/// That is not hypothetical. `lm_head` inherits the top-level `nvfp4` mode on
+/// every converted checkpoint and enters that arm on every load; it only
+/// declines to build because convert dequantizes it to BF16 and leaves no
+/// `.scales`. And the mamba `mixer.{in,out}_proj` reached it for real once —
+/// see `canonicalize_nemotron_per_layer`, written because their per-layer
+/// affine overrides mis-normalized and fell back to the top-level nvfp4
+/// default. Convert's own NVFP4 emit arm is not shared-expert-specific either
+/// ("shared_experts (and any other non-expert NVFP4 group)"), so it will
+/// happily write `.weight` + `.scales` + `.global_scale` for a future source
+/// that quantizes some other 2-D projection.
+fn nvfp4_global_scale_is_applied(prefix: &str) -> bool {
+    prefix.ends_with(".mixer.shared_experts.up_proj")
+        || prefix.ends_with(".mixer.shared_experts.down_proj")
 }
 
 /// Map a modelopt quant_algo string to a PerLayerMode (with fixed bits).
@@ -257,10 +310,12 @@ fn modelopt_mode(algo: &str, key: &str) -> Result<PerLayerQuant> {
             mode: PerLayerMode::Nvfp4,
             input_amax: None,
         }),
+        // NVIDIA's per-tensor E4M3 weights are ingested as affine 8-bit
+        // group-32, not MLX mxfp8 — see convert::recipe::fp8_to_affine8.
         "FP8" | "W8A8_FP8" => Ok(PerLayerQuant {
             bits: 8,
             group_size: 32,
-            mode: PerLayerMode::Mxfp8,
+            mode: PerLayerMode::Affine,
             input_amax: None,
         }),
         "MIXED_PRECISION" => Err(Error::from_reason(format!(
@@ -313,9 +368,9 @@ fn parse_nemotron_quant_settings(
         let mut plq = modelopt_mode(algo, key)?;
         // Optional converted input_amax (activation calibration).
         if let Some(amax) = value.get("input_amax").and_then(Value::as_f64) {
-            if plq.mode != PerLayerMode::Mxfp8 {
+            if !admits_static_fp8_activation(plq.mode, plq.bits, plq.group_size) {
                 return Err(Error::from_reason(format!(
-                    "quantization override '{key}': input_amax is only valid for FP8 layers"
+                    "quantization override '{key}': input_amax is only valid on static-FP8 layers (mxfp8 8/32 or affine 8/32)"
                 )));
             }
             plq.input_amax = Some(amax as f32);
@@ -363,6 +418,71 @@ fn canonicalize_nemotron_per_layer(
     )
 }
 
+/// A Nemotron-H mamba projection declared `mxfp8` is a pre-affine checkpoint.
+///
+/// It would still LOAD and RUN — silently 5-7% relative RMS off on the whole
+/// 890M-param sequence-mixing backbone, feeding a NON-INVERTIBLE Mamba-2
+/// recurrence — because the mxfp8 payload is structurally valid for the old
+/// builder. Reject it here, from the CONFIG, before a single tensor is read:
+/// the on-disk `.weight` is byte-identical between the two modes, so the
+/// payload alone is ambiguous and only the declared mode can tell them apart.
+fn reject_legacy_mxfp8_mamba(per_layer: &HashMap<String, PerLayerQuant>) -> Result<()> {
+    for (key, plq) in per_layer {
+        if plq.mode == PerLayerMode::Mxfp8
+            && (key.ends_with(".mixer.in_proj") || key.ends_with(".mixer.out_proj"))
+        {
+            return Err(Error::from_reason(format!(
+                "Nemotron-H projection '{key}' is declared mxfp8. {REQUANT_REGENERATE_HINT}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The affine-8/32 mamba projections carry floating `.scales` AND a
+/// same-shaped floating `.biases`. An mxfp8-era payload has Uint8 `.scales`
+/// and no `.biases` at all, and `try_build_quantized_linear` accepts it
+/// happily — MLX only rejects it at FORWARD time ("Biases must be provided for
+/// affine quantization" / "scales.dtype() == uint8"), deep in the first decode
+/// and with no regenerate hint. Catch it at load instead.
+fn require_affine_sidecars(params: &HashMap<String, MxArray>, prefix: &str) -> Result<()> {
+    let scales = params.get(&format!("{prefix}.scales")).ok_or_else(|| {
+        Error::from_reason(format!(
+            "affine projection '{prefix}' is missing '.scales'. {REQUANT_REGENERATE_HINT}"
+        ))
+    })?;
+    let scales_dtype = scales.dtype()?;
+    if !matches!(
+        scales_dtype,
+        DType::BFloat16 | DType::Float16 | DType::Float32
+    ) {
+        return Err(Error::from_reason(format!(
+            "affine projection '{prefix}': '.scales' is {scales_dtype:?}, expected a floating \
+             dtype — Uint8 scales are the superseded mxfp8 payload. {REQUANT_REGENERATE_HINT}"
+        )));
+    }
+    let biases = params.get(&format!("{prefix}.biases")).ok_or_else(|| {
+        Error::from_reason(format!(
+            "affine projection '{prefix}' is missing the mandatory '.biases' sidecar. \
+             {REQUANT_REGENERATE_HINT}"
+        ))
+    })?;
+    let biases_dtype = biases.dtype()?;
+    let biases_shape = biases.shape()?.to_vec();
+    let scales_shape = scales.shape()?.to_vec();
+    if !matches!(
+        biases_dtype,
+        DType::BFloat16 | DType::Float16 | DType::Float32
+    ) || biases_shape != scales_shape
+    {
+        return Err(Error::from_reason(format!(
+            "affine projection '{prefix}': '.biases' {biases_dtype:?}{biases_shape:?} must match \
+             '.scales' {scales_dtype:?}{scales_shape:?}. {REQUANT_REGENERATE_HINT}"
+        )));
+    }
+    Ok(())
+}
+
 /// Load quant settings from disk: read the quantization block from
 /// config.json, returning the parsed per-layer overrides. Absent block =
 /// empty overrides (dense checkpoint).
@@ -405,23 +525,52 @@ fn apply_weights(
 
     // Mode-aware linear builder (2-D weights: shared experts, lm_head,
     // mamba in_proj/out_proj, MTP-free 2-D projections).
-    let try_build_ql =
-        |params: &HashMap<String, MxArray>, prefix: &str| -> Option<QuantizedLinear> {
-            let plq = plq_for(prefix);
-            match plq.mode {
-                PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-                PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix)
-                    .map(|ql| ql.with_input_amax(plq.input_amax)),
-                PerLayerMode::Affine => {
-                    try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+    let try_build_ql = |params: &HashMap<String, MxArray>,
+                        prefix: &str|
+     -> Result<Option<QuantizedLinear>> {
+        let plq = plq_for(prefix);
+        Ok(match plq.mode {
+            PerLayerMode::Nvfp4 => {
+                let built = try_build_nvfp4_quantized_linear(params, prefix);
+                // FAIL-CLOSED, symmetric with the Affine/Mxfp8 arms below.
+                // `try_build_nvfp4_quantized_linear` reads only `.weight` and
+                // `.scales`; the per-tensor `.global_scale` is applied by the
+                // CALLER, and only the shared-expert caller has a slot for it
+                // (see `nvfp4_global_scale_is_applied`). Building here for any
+                // other prefix would drop `weight_scale_2` silently.
+                if built.is_some() && !nvfp4_global_scale_is_applied(prefix) {
+                    return Err(Error::from_reason(format!(
+                        "NVFP4 projection '{prefix}' is packed nvfp4 (.weight + .scales), but \
+                         only the shared experts apply the per-tensor '.global_scale' at \
+                         runtime — loading it here would drop weight_scale_2 and run the \
+                         projection ~1/weight_scale_2 (~1.15e4x) too large. {REGENERATE_HINT}"
+                    )));
                 }
-                other => {
-                    // Fp8E4m3 / sym8 / k-quants are not produced for this family.
-                    let _ = other;
-                    None
-                }
+                built
             }
-        };
+            PerLayerMode::Affine => {
+                let built = try_build_quantized_linear(params, prefix, plq.group_size, plq.bits);
+                if built.is_some() {
+                    require_affine_sidecars(params, prefix)?;
+                }
+                // The mamba projections are W8A8: the static E4M3
+                // activation scale rides with the affine weights now, so
+                // thread it here as the mxfp8 arm used to.
+                built.map(|ql| ql.with_input_amax(plq.input_amax))
+            }
+            PerLayerMode::Mxfp8 => {
+                return Err(Error::from_reason(format!(
+                    "Nemotron-H projection '{prefix}' resolves to mxfp8. \
+                         {REQUANT_REGENERATE_HINT}"
+                )));
+            }
+            other => {
+                // Fp8E4m3 / sym8 / k-quants are not produced for this family.
+                let _ = other;
+                None
+            }
+        })
+    };
     // Stacked-expert builder (3-D [E,N,K]). An NVFP4 stack is only usable
     // together with its [E] global scale, so the two are built as one unit
     // and a missing sidecar is a hard error, not a dense fallback.
@@ -457,7 +606,7 @@ fn apply_weights(
     // otherwise. The model has an UNTIED lm_head (tie_word_embeddings
     // false), so it is always present.
     if is_quantized {
-        if let Some(ql) = try_build_ql(params, "lm_head") {
+        if let Some(ql) = try_build_ql(params, "lm_head")? {
             inner.lm_head = Some(LinearProj::Quantized(ql));
         } else if let Some(w) = params.get("lm_head.weight") {
             crate::models::quant_dispatch::ensure_dense_weight_floating("lm_head.weight", w)?;
@@ -491,7 +640,7 @@ fn apply_weights(
 
         if let Some(m) = layer.mamba_mut() {
             let in_key = format!("{prefix}.mixer.in_proj");
-            if let Some(ql) = try_build_ql(params, &in_key) {
+            if let Some(ql) = try_build_ql(params, &in_key)? {
                 m.in_proj.set_quantized(ql);
             } else if let Some(w) = params.get(&format!("{in_key}.weight")) {
                 crate::models::quant_dispatch::ensure_dense_weight_floating(
@@ -505,7 +654,7 @@ fn apply_weights(
                 )));
             }
             let out_key = format!("{prefix}.mixer.out_proj");
-            if let Some(ql) = try_build_ql(params, &out_key) {
+            if let Some(ql) = try_build_ql(params, &out_key)? {
                 m.out_proj.set_quantized(ql);
             } else if let Some(w) = params.get(&format!("{out_key}.weight")) {
                 crate::models::quant_dispatch::ensure_dense_weight_floating(
@@ -573,6 +722,20 @@ fn apply_weights(
                     "MoE layer {i}: missing required tensor '{bias_key}'"
                 ))
             })?;
+            // The router bias is ~40.7 with a spread of only ~0.1 across the
+            // 128 experts; BF16's ULP there is 0.25, so a BF16 copy collapses
+            // every entry onto one value and DELETES the load-balancing
+            // correction (measured on the pre-fix checkpoint: 1 unique value
+            // of 128). Convert now retains the source F32, so a BF16 tensor
+            // here is a pre-fix checkpoint. Every shipped Nemotron-H source
+            // ships this bias as F32 (verified: 46/46 backbone router tensors
+            // in 30B-A3B); a future NVIDIA variant shipping BF16 would be
+            // rejected spuriously, but loudly and with a one-line fix.
+            if bias_w.dtype()? == DType::BFloat16 {
+                return Err(Error::from_reason(format!(
+                    "MoE layer {i}: '{bias_key}' is BF16. {REQUANT_REGENERATE_HINT}"
+                )));
+            }
             m.e_score_correction_bias = bias_w.astype(DType::Float32)?;
             // Stacked experts (NVFP4 quantized or dense fallback) — both
             // sides are required for a usable expert layer.
@@ -589,7 +752,7 @@ fn apply_weights(
             // sides are required.
             for proj in ["up_proj", "down_proj"] {
                 let key = format!("{prefix}.mixer.shared_experts.{proj}");
-                if let Some(ql) = try_build_ql(params, &key) {
+                if let Some(ql) = try_build_ql(params, &key)? {
                     // NVFP4 shared experts carry a per-tensor global scale;
                     // any other quantized mode (none is produced for this
                     // family today) has none. Fail closed on a missing one.
@@ -728,6 +891,47 @@ fn apply_mtp_weights(inner: &mut NemotronHInner, params: &HashMap<String, MxArra
         }
     }
 
+    // The four MoE-body tensors are installed VERBATIM as dense bf16 — there
+    // is no dequant path on the MTP ingest. A packed (U8/U32) or mis-shaped
+    // tensor would only surface as garbage logits or a matmul failure deep
+    // inside the first draft, so validate dtype AND shape here and take the
+    // same fail-closed branch as a missing key. Convert refuses to PRODUCE a
+    // quantized MTP head (classify_nemotron_key); this refuses to CONSUME one.
+    let n_experts = inner.config.n_routed_experts as i64;
+    let inter = inner.config.intermediate_size as i64;
+    let shared_inter = inner.config.moe_shared_expert_intermediate_size as i64;
+    for (key, want) in [
+        (
+            "mtp.layers.1.mixer.experts.up_proj.weight",
+            vec![n_experts, inter, hidden],
+        ),
+        (
+            "mtp.layers.1.mixer.experts.down_proj.weight",
+            vec![n_experts, hidden, inter],
+        ),
+        (
+            "mtp.layers.1.mixer.shared_experts.up_proj.weight",
+            vec![shared_inter, hidden],
+        ),
+        (
+            "mtp.layers.1.mixer.shared_experts.down_proj.weight",
+            vec![hidden, shared_inter],
+        ),
+    ] {
+        let w = params.get(key).unwrap();
+        let dtype = w.dtype()?;
+        let shape = w.shape()?.to_vec();
+        if !matches!(dtype, DType::Float32 | DType::Float16 | DType::BFloat16) || shape != want {
+            inner.mtp_weights_loaded = false;
+            warn!(
+                "NemotronH MTP weight {} is {:?}{:?}, expected a floating {:?} (the MTP ingest \
+                 has no dequant path); disabling speculative MTP",
+                key, dtype, shape, want
+            );
+            return Ok(());
+        }
+    }
+
     mtp.enorm
         .set_weight(params.get("mtp.layers.0.enorm.weight").unwrap())?;
     mtp.hnorm
@@ -859,6 +1063,7 @@ pub(crate) fn load_inner(model_path: &str) -> Result<(NemotronHInner, u64)> {
 
     // Quantization settings from config.json (mlx or modelopt schema).
     let (top_level_mode, per_layer_quant) = load_quant_settings(path)?;
+    reject_legacy_mxfp8_mamba(&per_layer_quant)?;
     if top_level_mode.is_some() || !per_layer_quant.is_empty() {
         info!(
             "NemotronH quantization: {} per-layer overrides",
@@ -956,6 +1161,98 @@ mod tests {
     use super::*;
     use crate::utils::safetensors::save_safetensors;
 
+    /// Write the BF16 tensor set for the 3-layer (mamba, moe, attention)
+    /// synthetic checkpoint into `dir`. Shared so the happy-path load and the
+    /// legacy-format rejection gate below differ ONLY in `config.json` — which
+    /// is the whole point of the latter, since the on-disk `.weight` bytes are
+    /// identical between the mxfp8 and affine encodings.
+    fn write_synthetic_bf16_tensors(dir: &std::path::Path) {
+        write_synthetic_bf16_tensors_with(dir, Vec::new());
+    }
+
+    /// As above, but `extra` is inserted LAST so it can add sidecars or
+    /// replace a dense `.weight` with a quantized payload.
+    fn write_synthetic_bf16_tensors_with(dir: &std::path::Path, extra: Vec<(String, MxArray)>) {
+        let mut tensors: HashMap<String, MxArray> = HashMap::new();
+
+        let put = |name: &str, shape: &[i64], tensors: &mut HashMap<String, MxArray>| {
+            let n: usize = shape.iter().map(|&s| s as usize).product();
+            let vals: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013) % 1.0 - 0.5).collect();
+            let arr = MxArray::from_float32(&vals, shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            tensors.insert(name.to_string(), arr);
+        };
+
+        put("embedding.weight", &[32, 8], &mut tensors);
+        put("final_norm.weight", &[8], &mut tensors);
+        put("lm_head.weight", &[32, 8], &mut tensors);
+        // layer 0: mamba
+        put("layers.0.norm.weight", &[8], &mut tensors);
+        put("layers.0.mixer.in_proj.weight", &[14, 8], &mut tensors);
+        put("layers.0.mixer.conv1d.weight", &[8, 4, 1], &mut tensors);
+        put("layers.0.mixer.conv1d.bias", &[8], &mut tensors);
+        put("layers.0.mixer.dt_bias", &[2], &mut tensors);
+        put("layers.0.mixer.A_log", &[2], &mut tensors);
+        put("layers.0.mixer.D", &[2], &mut tensors);
+        put("layers.0.mixer.norm.weight", &[4], &mut tensors);
+        put("layers.0.mixer.out_proj.weight", &[8, 4], &mut tensors);
+        // layer 1: moe (2 experts, stacked by the loader)
+        put("layers.1.norm.weight", &[8], &mut tensors);
+        put("layers.1.mixer.gate.weight", &[2, 8], &mut tensors);
+        put(
+            "layers.1.mixer.experts.0.up_proj.weight",
+            &[6, 8],
+            &mut tensors,
+        );
+        put(
+            "layers.1.mixer.experts.0.down_proj.weight",
+            &[8, 6],
+            &mut tensors,
+        );
+        put(
+            "layers.1.mixer.experts.1.up_proj.weight",
+            &[6, 8],
+            &mut tensors,
+        );
+        put(
+            "layers.1.mixer.experts.1.down_proj.weight",
+            &[8, 6],
+            &mut tensors,
+        );
+        put(
+            "layers.1.mixer.shared_experts.up_proj.weight",
+            &[8, 8],
+            &mut tensors,
+        );
+        put(
+            "layers.1.mixer.shared_experts.down_proj.weight",
+            &[8, 8],
+            &mut tensors,
+        );
+        // layer 2: attention
+        put("layers.2.norm.weight", &[8], &mut tensors);
+        put("layers.2.mixer.q_proj.weight", &[8, 8], &mut tensors);
+        put("layers.2.mixer.k_proj.weight", &[4, 8], &mut tensors);
+        put("layers.2.mixer.v_proj.weight", &[4, 8], &mut tensors);
+        put("layers.2.mixer.o_proj.weight", &[8, 8], &mut tensors);
+        // The router bias is retained at F32 by convert (BF16's ULP at the
+        // real bias magnitude ~40.7 exceeds the whole 0.06-0.20 inter-expert
+        // spread); the loader rejects a BF16 one.
+        tensors.insert(
+            "layers.1.mixer.gate.e_score_correction_bias".to_string(),
+            MxArray::from_float32(&[0.25, -0.5], &[2]).unwrap(),
+        );
+
+        for (name, arr) in extra {
+            tensors.insert(name, arr);
+        }
+
+        save_safetensors(dir.join("model.safetensors"), &mut tensors, None)
+            .expect("write safetensors");
+    }
+
     /// Build a tiny synthetic BF16 checkpoint (3 layers: mamba, moe,
     /// attention) in a temp dir, load it with load_inner, and run one flat
     /// forward.
@@ -1002,51 +1299,7 @@ mod tests {
             "use_block_paged_cache": false
         }"#;
         fs::write(dir.join("config.json"), config_json).expect("write config");
-
-        // ---- safetensors: all tensors BF16, deterministic values ----
-        let mut tensors: HashMap<String, MxArray> = HashMap::new();
-        let mut put = |name: &str, shape: &[i64]| {
-            let n: usize = shape.iter().map(|&s| s as usize).product();
-            let vals: Vec<f32> = (0..n).map(|i| ((i as f32) * 0.013) % 1.0 - 0.5).collect();
-            let arr = MxArray::from_float32(&vals, shape)
-                .unwrap()
-                .astype(DType::BFloat16)
-                .unwrap();
-            tensors.insert(name.to_string(), arr);
-        };
-
-        put("embedding.weight", &[32, 8]);
-        put("final_norm.weight", &[8]);
-        put("lm_head.weight", &[32, 8]);
-        // layer 0: mamba
-        put("layers.0.norm.weight", &[8]);
-        put("layers.0.mixer.in_proj.weight", &[14, 8]);
-        put("layers.0.mixer.conv1d.weight", &[8, 4, 1]);
-        put("layers.0.mixer.conv1d.bias", &[8]);
-        put("layers.0.mixer.dt_bias", &[2]);
-        put("layers.0.mixer.A_log", &[2]);
-        put("layers.0.mixer.D", &[2]);
-        put("layers.0.mixer.norm.weight", &[4]);
-        put("layers.0.mixer.out_proj.weight", &[8, 4]);
-        // layer 1: moe (2 experts, stacked by the loader)
-        put("layers.1.norm.weight", &[8]);
-        put("layers.1.mixer.gate.weight", &[2, 8]);
-        put("layers.1.mixer.gate.e_score_correction_bias", &[2]);
-        put("layers.1.mixer.experts.0.up_proj.weight", &[6, 8]);
-        put("layers.1.mixer.experts.0.down_proj.weight", &[8, 6]);
-        put("layers.1.mixer.experts.1.up_proj.weight", &[6, 8]);
-        put("layers.1.mixer.experts.1.down_proj.weight", &[8, 6]);
-        put("layers.1.mixer.shared_experts.up_proj.weight", &[8, 8]);
-        put("layers.1.mixer.shared_experts.down_proj.weight", &[8, 8]);
-        // layer 2: attention
-        put("layers.2.norm.weight", &[8]);
-        put("layers.2.mixer.q_proj.weight", &[8, 8]);
-        put("layers.2.mixer.k_proj.weight", &[4, 8]);
-        put("layers.2.mixer.v_proj.weight", &[4, 8]);
-        put("layers.2.mixer.o_proj.weight", &[8, 8]);
-
-        save_safetensors(dir.join("model.safetensors"), &mut tensors, None)
-            .expect("write safetensors");
+        write_synthetic_bf16_tensors(&dir);
 
         let (mut inner, weight_bytes) = load_inner(dir.to_str().unwrap()).expect("load_inner");
         assert!(weight_bytes > 0);
@@ -1058,12 +1311,230 @@ mod tests {
         let shape = logits.shape().unwrap().to_vec();
         assert_eq!(shape, vec![1, 3, 32]);
 
+        // ---- CROSS-MODULE SEAM GATE: the flat lane must stay in the paged
+        // lane's dtype end to end. ----
+        //
+        // This fixture's `layers_block_type` is EXACTLY the promotion chain:
+        // mamba (layer 0) -> moe (layer 1) -> attention (layer 2), with every
+        // weight BF16, so the residual enters layer 2 in whatever the first
+        // two mixers hand it. Three separate f32 escapes feed this one
+        // observable, and each lives in a different file:
+        //   * `mamba2.rs::gated_rmsnorm` — f32 scan output x f32 norm weight;
+        //   * `sparse_moe.rs::NemotronHMoE::forward` — the f32 router's
+        //     `topk_weights` promoting the routed-expert sum;
+        //   * `sparse_moe.rs::NemotronHSharedExpert::forward` — the f32 NVFP4
+        //     `global_scale` arrays.
+        // No single module's unit test can see the composition, which is
+        // precisely why this assertion belongs here: `mamba2.rs`'s mixer tests
+        // pass with the MoE escape wide open, and vice versa.
+        //
+        // Why it matters beyond tidiness: `KVCache::update_and_fetch`
+        // allocates its buffer with `keys.dtype()`, so the FLAT cache has no
+        // dtype of its own — it stores whatever the residual hands `k_proj`.
+        // The PAGED pool is byte-allocated for 2-byte elements and hard-casts
+        // to `PAGED_KV_IO_DTYPE`. If the residual promotes, the two lanes hold
+        // different precision for the same tokens and stop being comparable.
+        let kv = inner.caches[2]
+            .as_kv_cache()
+            .expect("layers_block_type[2] == \"attention\"");
+        assert_eq!(
+            kv.keys_ref().expect("prefill wrote keys").dtype().unwrap(),
+            crate::models::nemotron_h::attention::PAGED_KV_IO_DTYPE,
+            "flat KV keys must hold the dtype the paged pool writes; an f32 \
+             here means a mixer promoted the residual stream"
+        );
+        assert_eq!(
+            kv.values_ref()
+                .expect("prefill wrote values")
+                .dtype()
+                .unwrap(),
+            crate::models::nemotron_h::attention::PAGED_KV_IO_DTYPE,
+            "flat KV values must hold the dtype the paged pool writes"
+        );
+        assert_eq!(
+            logits.dtype().unwrap(),
+            crate::models::nemotron_h::attention::PAGED_KV_IO_DTYPE,
+            "an all-BF16 checkpoint must produce BF16 logits; f32 here means \
+             the residual widened somewhere upstream of lm_head"
+        );
+
         // Second forward (decode-style single token) reuses the caches.
         let ids2 = MxArray::from_uint32(&[17], &[1, 1]).unwrap();
         let logits2 = inner.forward(&ids2).expect("forward decode");
         assert_eq!(logits2.shape().unwrap().to_vec(), vec![1, 1, 32]);
+        // Decode appends into the SAME buffer; a promotion that only showed up
+        // on the single-token path would silently reallocate it.
+        let kv2 = inner.caches[2].as_kv_cache().expect("attention slot");
+        assert_eq!(
+            kv2.keys_ref().unwrap().dtype().unwrap(),
+            crate::models::nemotron_h::attention::PAGED_KV_IO_DTYPE,
+            "decode must not widen the flat KV cache either"
+        );
+        assert_eq!(
+            logits2.dtype().unwrap(),
+            crate::models::nemotron_h::attention::PAGED_KV_IO_DTYPE,
+            "decode logits must stay BF16 too"
+        );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// END-TO-END format gate: a pre-affine checkpoint must be rejected by
+    /// `load_inner` itself, loudly, with the regenerate hint.
+    ///
+    /// The unit tests above call `reject_legacy_mxfp8_mamba` and
+    /// `require_affine_sidecars` DIRECTLY, which proves the predicates but not
+    /// that anything reaches them. This drives a real directory through the
+    /// real loader, so a refactor that drops either call site — leaving a
+    /// superseded checkpoint to load and silently run 5-7% relative RMS off
+    /// across the whole 890M-param sequence-mixing backbone — fails here.
+    ///
+    /// Both arms reuse `write_synthetic_bf16_tensors`, so the ONLY thing that
+    /// varies is `config.json`. That is the crux: the on-disk `.weight` bytes
+    /// are byte-identical between the mxfp8 and affine encodings, so the
+    /// declared mode is the only thing that can tell them apart.
+    #[test]
+    fn load_inner_rejects_a_pre_affine_checkpoint_end_to_end() {
+        let base_cfg = |quant: &str| {
+            format!(
+                r#"{{
+            "model_type": "nemotron_h",
+            "architectures": ["NemotronHForCausalLM"],
+            "vocab_size": 32,
+            "hidden_size": 8,
+            "num_hidden_layers": 3,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "max_position_embeddings": 64,
+            "layer_norm_epsilon": 1e-5,
+            "rope_theta": 10000.0,
+            "layers_block_type": ["mamba", "moe", "attention"],
+            "mamba_num_heads": 2,
+            "mamba_head_dim": 2,
+            "ssm_state_size": 2,
+            "n_groups": 1,
+            "conv_kernel": 4,
+            "chunk_size": 4,
+            "time_step_min": 0.001,
+            "n_routed_experts": 2,
+            "num_experts_per_tok": 1,
+            "routed_scaling_factor": 1.0,
+            "n_group": 1,
+            "topk_group": 1,
+            "norm_topk_prob": true,
+            "intermediate_size": 6,
+            "moe_shared_expert_intermediate_size": 8,
+            "tie_word_embeddings": false,
+            "bos_token_id": 1,
+            "eos_token_id": 2,
+            "pad_token_id": 0,
+            "num_logits_to_keep": 1,
+            "use_block_paged_cache": false,
+            "quantization": {quant}
+        }}"#
+            )
+        };
+
+        // The superseded on-disk payload for the two mamba projections:
+        // packed uint32 `.weight` + Uint8 E8M0 `.scales`, and NO `.biases`.
+        // Identical bytes under both configs below — only the declared mode
+        // differs, which is exactly why the mode has to be load-bearing.
+        let legacy_mxfp8_payload = || -> Vec<(String, MxArray)> {
+            let mut v = Vec::new();
+            for (prefix, n) in [
+                ("layers.0.mixer.in_proj", 14i64),
+                ("layers.0.mixer.out_proj", 8),
+            ] {
+                v.push((
+                    format!("{prefix}.weight"),
+                    MxArray::from_uint32(&vec![0u32; (n * 2) as usize], &[n, 2]).unwrap(),
+                ));
+                v.push((
+                    format!("{prefix}.scales"),
+                    MxArray::from_uint8(&vec![0x38u8; n as usize], &[n, 1]).unwrap(),
+                ));
+            }
+            v
+        };
+
+        let run = |tag: &str, quant: &str, extra: Vec<(String, MxArray)>| -> String {
+            let dir = std::env::temp_dir().join(format!(
+                "nemotron_h_fmt_{}_{}_{}",
+                std::process::id(),
+                tag,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create temp dir");
+            fs::write(dir.join("config.json"), base_cfg(quant)).expect("write config");
+            write_synthetic_bf16_tensors_with(&dir, extra);
+            let err = load_inner(dir.to_str().unwrap())
+                .err()
+                .unwrap_or_else(|| panic!("{tag}: load_inner must FAIL on this checkpoint"))
+                .reason;
+            let _ = fs::remove_dir_all(&dir);
+            err
+        };
+
+        // ---- Guard 1: the dangerous direction. A mamba projection declared
+        // mxfp8 is the superseded encoding, and it would otherwise load and
+        // run cleanly. Must be refused from the CONFIG, before any tensor is
+        // read.
+        let legacy = run(
+            "mxfp8",
+            r#"{
+                "bits": 8, "group_size": 32, "mode": "affine",
+                "layers.0.mixer.in_proj": {"bits": 8, "group_size": 32, "mode": "mxfp8"},
+                "layers.0.mixer.out_proj": {"bits": 8, "group_size": 32, "mode": "mxfp8"}
+            }"#,
+            legacy_mxfp8_payload(),
+        );
+        assert!(
+            legacy.contains("mxfp8"),
+            "Guard 1 must name the superseded mode; got: {legacy}"
+        );
+        assert!(
+            legacy.contains("mixer.in_proj") || legacy.contains("mixer.out_proj"),
+            "Guard 1 must name the offending projection; got: {legacy}"
+        );
+        assert!(
+            legacy.contains("mlx convert -m nemotron_h"),
+            "a fail-closed format error is only actionable with the regenerate \
+             command; got: {legacy}"
+        );
+
+        // ---- Guard 2: the same checkpoint re-declared as affine 8/32 gets
+        // PAST guard 1 (so guard 1 is mode-specific, not a blanket refusal of
+        // every quantized mamba config) and is then caught by the sidecar
+        // check, because an mxfp8-era payload carries no `.biases`.
+        //
+        // Without this, MLX only complains at the FIRST DECODE, deep inside a
+        // forward and with no hint about what to do.
+        let missing_sidecars = run(
+            "affine",
+            r#"{
+                "bits": 8, "group_size": 32, "mode": "affine",
+                "layers.0.mixer.in_proj": {"bits": 8, "group_size": 32, "mode": "affine"},
+                "layers.0.mixer.out_proj": {"bits": 8, "group_size": 32, "mode": "affine"}
+            }"#,
+            legacy_mxfp8_payload(),
+        );
+        assert!(
+            !missing_sidecars.contains("is declared mxfp8"),
+            "Guard 1 must not fire on the affine replacement; got: {missing_sidecars}"
+        );
+        assert!(
+            missing_sidecars.contains(".scales") || missing_sidecars.contains(".biases"),
+            "Guard 2 must name the missing sidecar; got: {missing_sidecars}"
+        );
+        assert!(
+            missing_sidecars.contains("mlx convert -m nemotron_h"),
+            "Guard 2 must carry the regenerate hint too; got: {missing_sidecars}"
+        );
     }
 
     /// A full, correctly shaped MTP weight set for the tiny config below.
@@ -1216,10 +1687,15 @@ mod tests {
         let quant_cfg = select_quantization_block(&raw).unwrap();
         let (top, per_layer) = parse_nemotron_quant_settings(quant_cfg).unwrap();
         assert_eq!(top, None);
-        assert_eq!(
-            per_layer["layers.0.mixer.in_proj"].mode,
-            PerLayerMode::Mxfp8
-        );
+        // NVIDIA's per-tensor E4M3 mamba projections are ingested as affine
+        // 8-bit group-32, NOT mxfp8 (whose E8M0 block scale clips ~50% of
+        // groups). 8/32 also keeps them inside the input_amax allowlist.
+        for proj in ["in_proj", "out_proj"] {
+            let plq = per_layer[&format!("layers.0.mixer.{proj}")];
+            assert_eq!(plq.mode, PerLayerMode::Affine, "{proj}");
+            assert_eq!(plq.bits, 8, "{proj}");
+            assert_eq!(plq.group_size, 32, "{proj}");
+        }
         assert_eq!(
             per_layer["layers.1.mixer.experts.up_proj"].mode,
             PerLayerMode::Nvfp4
@@ -1301,10 +1777,11 @@ mod tests {
         put_bf16("lm_head.weight", &[32, H], &mut params);
         put_bf16("layers.0.norm.weight", &[H], &mut params);
         put_bf16("layers.0.mixer.gate.weight", &[E, H], &mut params);
-        put_bf16(
-            "layers.0.mixer.gate.e_score_correction_bias",
-            &[E],
-            &mut params,
+        // F32 by construction: convert retains the router pair at source
+        // precision and `apply_weights` rejects a BF16 bias.
+        params.insert(
+            "layers.0.mixer.gate.e_score_correction_bias".to_string(),
+            MxArray::from_float32(&[0.25, -0.5, 0.125], &[E]).unwrap(),
         );
 
         // Stacked experts: [E, N=16, K=16] -> u32 [E,16,2] + u8 [E,16,1].
@@ -1389,6 +1866,55 @@ mod tests {
                 "error must tell the user to regenerate the checkpoint: {msg}"
             );
         }
+    }
+
+    /// The `try_build_ql` NVFP4 arm is FAIL-CLOSED outside the shared
+    /// experts. `try_build_nvfp4_quantized_linear` reads only `.weight` and
+    /// `.scales`, and `QuantizedLinear` has no field to hold a per-tensor
+    /// `.global_scale` — only `SparseMoeBlock::shared_experts` does. So a
+    /// packed nvfp4 `lm_head` (which inherits the top-level nvfp4 mode on
+    /// every converted checkpoint and enters this arm on every load) must be
+    /// REJECTED, not built with weight_scale_2 dropped.
+    ///
+    /// MUTATION CAUGHT: restoring the bare
+    /// `PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix)`
+    /// arm — the checkpoint below then loads clean and runs ~1.15e4x hot.
+    #[test]
+    fn nemotron_nvfp4_outside_the_shared_experts_is_rejected() {
+        // The shipped shape: lm_head is the dense BF16 tensor convert emits,
+        // so the same nvfp4 mode resolution is harmless.
+        apply_nvfp4(&nvfp4_moe_params()).expect("a dense bf16 lm_head must still load");
+
+        // Repack lm_head [32,16] as an nvfp4 pair: u32 [32,2] + u8 E4M3 [32,1],
+        // plus the sidecar convert writes for every non-expert NVFP4 group.
+        let mut params = nvfp4_moe_params();
+        let words: Vec<u32> = (0..64u32).map(|i| i.wrapping_mul(0x0104_0301)).collect();
+        params.insert(
+            "lm_head.weight".to_string(),
+            MxArray::from_uint32(&words, &[32, 2]).unwrap(),
+        );
+        let scale_bytes: Vec<u8> = (0..32).map(|i| 0x38u8 + (i % 8) as u8).collect();
+        params.insert(
+            "lm_head.scales".to_string(),
+            MxArray::from_uint8(&scale_bytes, &[32, 1]).unwrap(),
+        );
+        params.insert(
+            "lm_head.global_scale".to_string(),
+            MxArray::from_float32(&[8.646647e-5], &[1]).unwrap(),
+        );
+
+        let err = apply_nvfp4(&params)
+            .expect_err("a packed nvfp4 lm_head has nowhere to apply its global scale");
+        let msg = err.reason.clone();
+        assert!(msg.contains("lm_head"), "error must name the prefix: {msg}");
+        assert!(
+            msg.contains("global_scale"),
+            "error must name the dropped sidecar: {msg}"
+        );
+        assert!(
+            msg.contains("mlx convert"),
+            "error must carry the regenerate hint: {msg}"
+        );
     }
 
     /// `.global_scale` must be Float32 — bf16 rounds weight_scale_2 (~8.6e-5)
@@ -1479,5 +2005,184 @@ mod tests {
         );
         assert!(!out.keys().any(|k| k.ends_with(".weight_scale")));
         assert!(!out.keys().any(|k| k.ends_with(".weight_scale_2")));
+    }
+
+    /// GUARD 1: a pre-affine checkpoint is detected from its CONFIG, before a
+    /// single tensor is read. The mxfp8 and affine payloads share the same
+    /// `.weight` bytes, so the declared mode is the only thing that tells them
+    /// apart — and the old payload would otherwise load and run 5-7% off.
+    #[test]
+    fn legacy_mxfp8_mamba_override_is_rejected_with_regenerate_hint() {
+        let mxfp8 = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Mxfp8,
+            input_amax: Some(1.0),
+        };
+        for proj in ["in_proj", "out_proj"] {
+            let mut per_layer = HashMap::new();
+            per_layer.insert(format!("layers.7.mixer.{proj}"), mxfp8);
+            let err = reject_legacy_mxfp8_mamba(&per_layer)
+                .expect_err("an mxfp8 mamba projection must be rejected");
+            let msg = err.reason;
+            assert!(msg.contains(&format!("layers.7.mixer.{proj}")), "{msg}");
+            assert!(msg.contains("mxfp8"), "{msg}");
+            assert!(msg.contains("mlx convert -m nemotron_h"), "{msg}");
+        }
+
+        // The affine replacement, and an mxfp8 override on a NON-mamba key,
+        // both pass — the guard must not fire on the qwen/gemma shape or on a
+        // correctly regenerated checkpoint.
+        let mut ok = HashMap::new();
+        ok.insert(
+            "layers.7.mixer.in_proj".to_string(),
+            PerLayerQuant {
+                mode: PerLayerMode::Affine,
+                ..mxfp8
+            },
+        );
+        ok.insert("layers.9.mixer.q_proj".to_string(), mxfp8);
+        reject_legacy_mxfp8_mamba(&ok).expect("affine mamba + non-mamba mxfp8 must pass");
+    }
+
+    /// GUARD 2: an mxfp8-era PAYLOAD under an affine config (hand-edited or
+    /// copied) is caught at LOAD with the regenerate hint, not at the first
+    /// forward with an opaque MLX throw.
+    #[test]
+    fn affine_mamba_projection_requires_floating_scales_and_biases() {
+        let prefix = "layers.0.mixer.in_proj";
+        let packed = MxArray::from_uint32(&[0u32; 8], &[4, 2]).unwrap();
+        let f_scales = MxArray::from_float32(&[0.5f32; 4], &[4, 1])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let biases = MxArray::from_float32(&[-1.0f32; 4], &[4, 1])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        // Well-formed affine payload.
+        let mut ok: HashMap<String, MxArray> = HashMap::new();
+        ok.insert(format!("{prefix}.weight"), packed.clone());
+        ok.insert(format!("{prefix}.scales"), f_scales.clone());
+        ok.insert(format!("{prefix}.biases"), biases.clone());
+        require_affine_sidecars(&ok, prefix).expect("bf16 scales + bf16 biases must pass");
+
+        // The superseded mxfp8 payload: U8 E8M0 scales, no biases at all.
+        let mut legacy: HashMap<String, MxArray> = HashMap::new();
+        legacy.insert(format!("{prefix}.weight"), packed.clone());
+        legacy.insert(
+            format!("{prefix}.scales"),
+            MxArray::from_uint8(&[0x38u8; 4], &[4, 1]).unwrap(),
+        );
+        let msg = require_affine_sidecars(&legacy, prefix)
+            .expect_err("Uint8 scales are the mxfp8 payload")
+            .reason;
+        assert!(msg.contains("Uint8"), "{msg}");
+        assert!(msg.contains("mlx convert -m nemotron_h"), "{msg}");
+
+        // Floating scales but the mandatory .biases missing.
+        let mut no_biases: HashMap<String, MxArray> = HashMap::new();
+        no_biases.insert(format!("{prefix}.weight"), packed.clone());
+        no_biases.insert(format!("{prefix}.scales"), f_scales.clone());
+        let msg = require_affine_sidecars(&no_biases, prefix)
+            .expect_err("a missing .biases sidecar must be rejected")
+            .reason;
+        assert!(msg.contains(".biases"), "{msg}");
+        assert!(msg.contains("mlx convert -m nemotron_h"), "{msg}");
+
+        // .biases present but shaped differently from .scales.
+        let mut skewed: HashMap<String, MxArray> = HashMap::new();
+        skewed.insert(format!("{prefix}.weight"), packed);
+        skewed.insert(format!("{prefix}.scales"), f_scales);
+        skewed.insert(
+            format!("{prefix}.biases"),
+            MxArray::from_float32(&[-1.0f32; 2], &[2, 1])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap(),
+        );
+        let msg = require_affine_sidecars(&skewed, prefix)
+            .expect_err("a shape-skewed .biases must be rejected")
+            .reason;
+        assert!(msg.contains("must match"), "{msg}");
+    }
+
+    /// GUARD 3: a BF16 router bias is a pre-fix checkpoint. BF16's ULP at the
+    /// real bias magnitude (~40.7) is 0.25, larger than the entire 0.06-0.20
+    /// inter-expert spread, so the copy collapses all 128 entries onto one
+    /// value and DELETES the load-balancing correction.
+    #[test]
+    fn bf16_router_correction_bias_is_rejected() {
+        let mut params = nvfp4_moe_params();
+        // Sanity: the fixture is F32, and F32 loads.
+        assert_eq!(
+            params["layers.0.mixer.gate.e_score_correction_bias"]
+                .dtype()
+                .unwrap(),
+            DType::Float32
+        );
+        apply_nvfp4(&params).expect("an F32 router bias loads");
+
+        let bf16 = params["layers.0.mixer.gate.e_score_correction_bias"]
+            .astype(DType::BFloat16)
+            .unwrap();
+        params.insert(
+            "layers.0.mixer.gate.e_score_correction_bias".to_string(),
+            bf16,
+        );
+        let msg = apply_nvfp4(&params)
+            .expect_err("a BF16 router bias must be rejected")
+            .reason;
+        assert!(msg.contains("e_score_correction_bias"), "{msg}");
+        assert!(msg.contains("BF16"), "{msg}");
+        assert!(msg.contains("mlx convert -m nemotron_h"), "{msg}");
+    }
+
+    /// The modelopt schema's `input_amax` rides on the affine-8/32 mamba
+    /// projections now that FP8 maps to `Affine`. It must still be REJECTED on
+    /// every other shape — a stale or hand-edited config cannot fake-quant an
+    /// uncalibrated projection.
+    #[test]
+    fn modelopt_input_amax_rides_affine_8_32_and_nothing_else() {
+        use serde_json::json;
+        let raw = json!({
+            "quantization_config": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "backbone.layers.0.mixer.in_proj": {"quant_algo": "FP8", "input_amax": 112.0}
+                }
+            }
+        });
+        let quant_cfg = select_quantization_block(&raw).unwrap();
+        let (_, per_layer) = parse_nemotron_quant_settings(quant_cfg).unwrap();
+        let plq = per_layer["layers.0.mixer.in_proj"];
+        assert_eq!(plq.mode, PerLayerMode::Affine);
+        assert_eq!(plq.bits, 8);
+        assert_eq!(plq.group_size, 32);
+        assert_eq!(plq.input_amax, Some(112.0));
+
+        // NVFP4 (4/16) carries no static activation scale.
+        let raw = json!({
+            "quantization_config": {
+                "quant_algo": "MIXED_PRECISION",
+                "quantized_layers": {
+                    "lm_head": {"quant_algo": "W4A16_NVFP4", "input_amax": 112.0}
+                }
+            }
+        });
+        let quant_cfg = select_quantization_block(&raw).unwrap();
+        let msg = parse_nemotron_quant_settings(quant_cfg)
+            .expect_err("input_amax on nvfp4 must be rejected")
+            .reason;
+        assert!(msg.contains("input_amax"), "{msg}");
+
+        // And the allowlist's exact boundary, checked directly.
+        assert!(admits_static_fp8_activation(PerLayerMode::Affine, 8, 32));
+        assert!(admits_static_fp8_activation(PerLayerMode::Mxfp8, 8, 32));
+        assert!(!admits_static_fp8_activation(PerLayerMode::Affine, 8, 64));
+        assert!(!admits_static_fp8_activation(PerLayerMode::Affine, 4, 32));
+        assert!(!admits_static_fp8_activation(PerLayerMode::Nvfp4, 8, 32));
+        assert!(!admits_static_fp8_activation(PerLayerMode::Sym8, 8, 32));
     }
 }

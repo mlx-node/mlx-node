@@ -86,6 +86,12 @@ pub struct NemotronHMamba2Mixer {
     /// hardcoded `(0.0, inf)` and mlx-lm's `time_step_limit`. NOT derived
     /// from `time_step_min`.
     pub(crate) dt_limit: (f64, f64),
+    /// Epsilon for the Zamba2 gated RMSNorm, from
+    /// `NemotronHConfig::layer_norm_epsilon` — the same value the decoder
+    /// layer's pre-norm uses. Was hardcoded to 1e-5; both are 1e-5 on the
+    /// released checkpoint, so no token changes here, but a sibling
+    /// checkpoint may declare a different one.
+    pub(crate) norm_eps: f64,
 }
 
 /// Build a fresh (random-initialized) Mamba mixer sized from config.
@@ -128,6 +134,7 @@ pub fn new_mamba_mixer(config: &NemotronHConfig) -> Result<NemotronHMamba2Mixer>
         conv_kernel: config.conv_kernel,
         chunk_size: config.chunk_size,
         dt_limit: config.time_step_limit_pair(),
+        norm_eps: config.layer_norm_epsilon,
     })
 }
 
@@ -170,6 +177,13 @@ impl NemotronHMamba2Mixer {
         let shape = x.shape()?;
         let batch = shape[0];
         let seq = shape[1];
+        // The mixer is dtype-transparent in every reference: mlx-lm casts the
+        // scan output back with `y.astype(x.dtype)` (ssm.py:190) and HF/vLLM
+        // run the whole mixer in the module dtype. This port deliberately
+        // keeps the conv state, dt, A and the SSM scan in f32, so the
+        // reference's "input dtype" has to be captured HERE, at the mixer
+        // boundary, and re-applied by `gated_rmsnorm`.
+        let io_dtype = x.dtype()?;
         let projected = self.in_proj.forward(x)?;
         // Split by explicit sizes (14 = 4 + 8 + 2 is not evenly divisible
         // into 3 sections): gate [d_inner] | xBC [conv_dim] | dt [num_heads].
@@ -241,8 +255,9 @@ impl NemotronHMamba2Mixer {
             &scan_flat,
             &gate,
             &self.norm_weight,
-            1e-5,
+            self.norm_eps,
             (self.d_inner / self.n_groups) as i64,
+            io_dtype,
         )?;
         let out = self.out_proj.forward(&normed)?;
 
@@ -391,12 +406,30 @@ fn segment_sum(x: &MxArray, chunk: i64) -> Result<MxArray> {
 
 /// Zamba2 gated RMSNorm: (x * silu(gate)) reshaped [..., groups, gs],
 /// normalized per group (mean of squares + eps), rescaled by weight.
+///
+/// `out_dtype` is the MIXER's I/O dtype, NOT `x`'s: `x` is the SSM scan
+/// output, which this port keeps in f32 while every reference carries it in
+/// the model dtype. All three references end the norm with a cast back to
+/// that dtype — vLLM `mamba_mixer2.py:148` `return self.weight *
+/// x.to(input_dtype)`, HF `modeling_zamba2.py:69` the same, mlx-lm never
+/// leaves bf16 at all (`mx.fast.rms_norm` on a bf16 input). This is where
+/// the f32 accumulation is closed. Without it the f32 escapes into
+/// `out_proj`, `decoder_layer.rs`'s `x.add(&mixer_out)` promotes the whole
+/// residual stream on layer 0 (the released checkpoint's layer 0 is a Mamba
+/// layer), the FLAT KV cache ends up f32 while the paged pool is a 2-byte
+/// pool, and the two lanes run different attention arithmetic.
+///
+/// `weight` is cast too: `persistence.rs:539` upcasts the checkpoint's BF16
+/// `mixer.norm.weight` to f32, and an f32 weight would re-promote the
+/// product. bf16 -> f32 -> bf16 is lossless, so the cast recovers the
+/// checkpoint bytes exactly and matches vLLM's bf16 parameter bit for bit.
 fn gated_rmsnorm(
     x: &MxArray,
     gate: &MxArray,
     weight: &MxArray,
     eps: f64,
     group_size: i64,
+    out_dtype: DType,
 ) -> Result<MxArray> {
     let shape = x.shape()?;
     let nd = shape.len();
@@ -412,8 +445,8 @@ fn gated_rmsnorm(
     let var = hg.square()?.mean(Some(&[-1]), Some(true))?;
     let denom = MxArray::scalar_float(eps)?.add(&var)?;
     let rstd = MxArray::scalar_float(1.0)?.div(&denom.sqrt()?)?;
-    let normed = hg.mul(&rstd)?.reshape(&shape)?;
-    weight.mul(&normed)
+    let normed = hg.mul(&rstd)?.reshape(&shape)?.astype(out_dtype)?;
+    weight.astype(out_dtype)?.mul(&normed)
 }
 
 /// Left-pad a tensor along the time axis (axis 1) with pad_size zeros.
@@ -1047,6 +1080,36 @@ mod tests {
     /// divides that common factor straight back out - a clamp on `dt` would
     /// be invisible at the mixer output. A non-zero `D` anchors the scale.
     fn mixer_with_dt_bias(cfg: &NemotronHConfig, dt_bias: &[f32]) -> NemotronHMamba2Mixer {
+        mixer_with_dt_bias_dtype(cfg, dt_bias, DType::Float32)
+    }
+
+    /// Cast a fixture weight into the mixer's working dtype. `Float32` is the
+    /// historical path and returns the array untouched, so every pre-existing
+    /// f32 fixture stays byte-identical.
+    fn as_dtype(v: MxArray, dtype: DType) -> MxArray {
+        if dtype == DType::Float32 {
+            v
+        } else {
+            v.astype(dtype).expect("cast fixture weight")
+        }
+    }
+
+    /// `mixer_with_dt_bias`, with the DENSE weights (in_proj, out_proj, conv)
+    /// carried in `dtype`. Production's `in_proj`/`out_proj` are MXFP8 and
+    /// restore the activation dtype at the projection boundary
+    /// (`quantized_linear.rs`), but a dense `Linear` is a bare
+    /// `input.matmul(&weight_t)` and MLX promotes `bf16 x f32 -> f32`, so a
+    /// bf16 stream can only be reproduced here with bf16 dense weights.
+    ///
+    /// `norm_weight` deliberately stays FLOAT32 in every case: that is what
+    /// `persistence.rs:539` (`m.norm_weight = w.astype(DType::Float32)`)
+    /// installs from a BF16 checkpoint tensor, and it is the second half of
+    /// the promotion `gated_rmsnorm` has to close.
+    fn mixer_with_dt_bias_dtype(
+        cfg: &NemotronHConfig,
+        dt_bias: &[f32],
+        dtype: DType,
+    ) -> NemotronHMamba2Mixer {
         let mut mixer = new_mamba_mixer(cfg).expect("mixer builds");
         let heads = cfg.mamba_num_heads as i64;
         assert_eq!(dt_bias.len() as i64, heads, "dt_bias must be per-head");
@@ -1067,7 +1130,10 @@ mod tests {
         let w_in = det_weights(0, (in_rows * hidden) as usize, 0.5);
         mixer.in_proj = LinearProj::Standard(
             crate::nn::Linear::from_weights(
-                &MxArray::from_float32(&w_in, &[in_rows, hidden]).unwrap(),
+                &as_dtype(
+                    MxArray::from_float32(&w_in, &[in_rows, hidden]).unwrap(),
+                    dtype,
+                ),
                 None,
             )
             .unwrap(),
@@ -1075,7 +1141,10 @@ mod tests {
         let w_out = det_weights(1, (hidden * d_inner) as usize, 0.5);
         mixer.out_proj = LinearProj::Standard(
             crate::nn::Linear::from_weights(
-                &MxArray::from_float32(&w_out, &[hidden, d_inner]).unwrap(),
+                &as_dtype(
+                    MxArray::from_float32(&w_out, &[hidden, d_inner]).unwrap(),
+                    dtype,
+                ),
                 None,
             )
             .unwrap(),
@@ -1083,8 +1152,14 @@ mod tests {
         let w_conv = det_weights(2, (conv_dim * k) as usize, 0.6);
         let b_conv = det_weights(3, conv_dim as usize, 0.2);
         mixer.conv1d = Conv1d::from_weights(
-            &MxArray::from_float32(&w_conv, &[conv_dim, k, 1]).unwrap(),
-            Some(&MxArray::from_float32(&b_conv, &[conv_dim]).unwrap()),
+            &as_dtype(
+                MxArray::from_float32(&w_conv, &[conv_dim, k, 1]).unwrap(),
+                dtype,
+            ),
+            Some(&as_dtype(
+                MxArray::from_float32(&b_conv, &[conv_dim]).unwrap(),
+                dtype,
+            )),
             None,
             None,
             None,
@@ -1272,5 +1347,180 @@ mod tests {
         let got = out.to_float32().unwrap().to_vec();
         let (ref_out, _) = mixer_reference(&mixer, &x, 1, 1, mixer.dt_limit);
         assert_close(&got, &ref_out, "single-token decode vs reference", 5e-3);
+    }
+
+    /// PINS THE DTYPE CONTRACT at the mixer's exit boundary.
+    ///
+    /// `gated_rmsnorm` must return `out_dtype` - the dtype the MIXER was
+    /// entered with - no matter what its own operands are. Both operands fight
+    /// that: `x` is the SSM scan output, which this port deliberately keeps in
+    /// f32 (`chunk_scan` / `decode_step` are f32 throughout), and `weight` is
+    /// f32 because `persistence.rs:539` upcasts the checkpoint's BF16
+    /// `mixer.norm.weight`. MLX promotes on mixed dtypes, so EITHER operand
+    /// left uncast re-promotes the product back to f32.
+    ///
+    /// Mutations caught, each on its own:
+    ///   * dropping `.astype(out_dtype)` on `normed` -> `bf16 weight * f32` = f32
+    ///   * dropping `weight.astype(out_dtype)`       -> `f32 * bf16 normed` = f32
+    ///
+    /// An f32 return here is not a local wart: `out_proj` inherits it,
+    /// `decoder_layer.rs`'s `x.add(&mixer_out)` promotes the residual stream
+    /// from layer 0 (the released checkpoint's layer 0 is a Mamba layer), and
+    /// the FLAT KV cache then stores f32 while the paged pool is a 2-byte pool
+    /// - the two attention lanes end up running different arithmetic.
+    #[test]
+    fn gated_rmsnorm_returns_the_requested_io_dtype() {
+        let d_inner = 8i64;
+        let t = 3i64;
+        let xs: Vec<f32> = (0..(t * d_inner))
+            .map(|i| ((i as f32) * 0.41) % 2.0 - 1.0)
+            .collect();
+        let gs: Vec<f32> = (0..(t * d_inner))
+            .map(|i| ((i as f32) * 0.73) % 2.0 - 1.0)
+            .collect();
+        let ws: Vec<f32> = (0..d_inner)
+            .map(|i| 0.5 + ((i as f32) * 0.11) % 1.0)
+            .collect();
+
+        // Exactly the production dtypes: f32 scan output, f32 norm weight.
+        let x = MxArray::from_float32(&xs, &[1, t, d_inner]).unwrap();
+        let gate = MxArray::from_float32(&gs, &[1, t, d_inner]).unwrap();
+        let weight = MxArray::from_float32(&ws, &[d_inner]).unwrap();
+        assert_eq!(x.dtype().unwrap(), DType::Float32);
+        assert_eq!(weight.dtype().unwrap(), DType::Float32);
+
+        let f32_out = gated_rmsnorm(&x, &gate, &weight, 1e-5, d_inner, DType::Float32).unwrap();
+        assert_eq!(
+            f32_out.dtype().unwrap(),
+            DType::Float32,
+            "an f32 mixer must stay f32 (the cast is a graph no-op there)"
+        );
+
+        let bf16_out = gated_rmsnorm(&x, &gate, &weight, 1e-5, d_inner, DType::BFloat16).unwrap();
+        assert_eq!(
+            bf16_out.dtype().unwrap(),
+            DType::BFloat16,
+            "the gated norm must return the MIXER's I/O dtype, not the f32 dtype \
+             of the scan output or of the upcast norm weight"
+        );
+
+        // Only the boundary moved - the norm itself still accumulates in f32 -
+        // so the two runs agree to bf16 rounding.
+        let a = f32_out.to_float32().unwrap().to_vec();
+        let b = bf16_out.to_float32().unwrap().to_vec();
+        let scale = a.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(
+            scale > 0.1,
+            "fixture must produce a non-trivial output (scale {scale})"
+        );
+        assert_close(&b, &a, "bf16 gated norm vs f32 gated norm", 3e-2 * scale);
+    }
+
+    /// The whole mixer must be dtype-transparent: bf16 in -> bf16 out.
+    ///
+    /// This is the reference invariant (mlx-lm `y.astype(x.dtype)` ssm.py:190;
+    /// vLLM `mamba_mixer2.py:148`; HF `modeling_zamba2.py:69`), and the only
+    /// thing standing between it and an f32 residual stream is the cast
+    /// `gated_rmsnorm` applies. The fixture reproduces the two production
+    /// dtype hazards at once: an f32 SSM scan (this port's design) and an f32
+    /// `norm_weight` (persistence.rs:539's upcast of a BF16 checkpoint
+    /// tensor).
+    ///
+    /// Mutation caught: passing `scan_flat.dtype()` (or dropping either cast)
+    /// makes the bf16 arm return Float32.
+    #[test]
+    fn mamba_mixer_is_dtype_transparent() {
+        let cfg = tiny_cfg();
+        let h = cfg.hidden_size as usize;
+        let t = 4usize;
+        let xs: Vec<f32> = (0..t * h)
+            .map(|i| (((i as f32) * 0.91) % 2.0) - 1.0)
+            .collect();
+
+        let run = |dtype: DType| -> (DType, Vec<f32>) {
+            let mixer = mixer_with_dt_bias_dtype(&cfg, &[0.0, 0.0], dtype);
+            assert_eq!(
+                mixer.norm_weight.dtype().unwrap(),
+                DType::Float32,
+                "the fixture must reproduce persistence.rs:539's f32 norm weight, \
+                 otherwise the weight half of the promotion is untested"
+            );
+            let x = as_dtype(
+                MxArray::from_float32(&xs, &[1, t as i64, h as i64]).unwrap(),
+                dtype,
+            );
+            let mut state = mixer.fresh_state(1).expect("fresh state");
+            let out = mixer.forward(&x, Some(&mut state)).expect("prefill runs");
+            (out.dtype().unwrap(), out.to_float32().unwrap().to_vec())
+        };
+
+        let (f32_dtype, f32_out) = run(DType::Float32);
+        assert_eq!(
+            f32_dtype,
+            DType::Float32,
+            "an f32 stream must stay f32 - the cast must not force half precision"
+        );
+
+        let (bf16_dtype, bf16_out) = run(DType::BFloat16);
+        assert_eq!(
+            bf16_dtype,
+            DType::BFloat16,
+            "a bf16 stream must leave the mixer in bf16; an f32 return promotes \
+             the residual for all 52 layers and forks the flat/paged KV dtypes"
+        );
+
+        // Same math, different precision: the two arms must still agree.
+        let scale = f32_out.iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(
+            scale > 1e-3,
+            "fixture must produce a non-trivial output (scale {scale})"
+        );
+        let drift = max_abs_diff(&bf16_out, &f32_out);
+        assert!(
+            drift <= 5e-2 * scale,
+            "bf16 mixer diverges from the f32 mixer: max |diff| = {drift} (scale {scale})"
+        );
+    }
+
+    /// The gated-norm epsilon must come from `layer_norm_epsilon`, not from a
+    /// hardcoded `1e-5`. Both are 1e-5 on the released checkpoint, so this
+    /// changes no production token - but a sibling checkpoint declaring a
+    /// different epsilon would silently be normalized with the wrong one.
+    ///
+    /// Mutation caught: restoring the literal `1e-5` at the `gated_rmsnorm`
+    /// call site.
+    #[test]
+    fn gated_norm_eps_comes_from_the_config() {
+        let mut big_eps = tiny_cfg();
+        big_eps.layer_norm_epsilon = 4.0;
+        let baseline = tiny_cfg();
+        assert_eq!(baseline.layer_norm_epsilon, 1e-5);
+
+        let h = baseline.hidden_size as usize;
+        let t = 3usize;
+        let xs: Vec<f32> = (0..t * h)
+            .map(|i| SIGNAL * ((((i as f32) * 0.57) % 2.0) - 1.0))
+            .collect();
+        let mx = MxArray::from_float32(&xs, &[1, t as i64, h as i64]).unwrap();
+
+        let run = |cfg: &NemotronHConfig| -> Vec<f32> {
+            let mixer = mixer_with_dt_bias(cfg, &[0.0, 0.0]);
+            assert_eq!(mixer.norm_eps, cfg.layer_norm_epsilon);
+            let mut state = mixer.fresh_state(1).expect("fresh state");
+            mixer
+                .forward(&mx, Some(&mut state))
+                .expect("prefill runs")
+                .to_float32()
+                .unwrap()
+                .to_vec()
+        };
+
+        let small = run(&baseline);
+        let large = run(&big_eps);
+        let drift = max_abs_diff(&small, &large);
+        assert!(
+            drift > 1e-3,
+            "a 4.0 epsilon must visibly damp the gated norm (drift {drift})"
+        );
     }
 }

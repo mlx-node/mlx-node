@@ -64,6 +64,16 @@ impl NemotronHLayerCache {
         }
     }
 
+    /// Shared read-only view of the attention slot, for assertions only.
+    ///
+    /// Every caller is a cursor/offset probe: the MTP unit tests and the
+    /// `NemotronHMtpStepper::draft_kv_offset` test seam. The production
+    /// forward and rollback paths all mutate and go through
+    /// [`Self::as_kv_cache_mut`] instead. Gated so it cannot silently
+    /// acquire a production caller and so it stays available to
+    /// debug-build assertions (`debug_assert!` on the drafter cursor),
+    /// which compile outside `cfg(test)`.
+    #[cfg(any(test, debug_assertions))]
     pub fn as_kv_cache(&self) -> Option<&KVCache> {
         match self {
             NemotronHLayerCache::Attention(c) => Some(c),

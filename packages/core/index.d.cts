@@ -1009,6 +1009,9 @@ export declare class NativeRewardRegistry {
 }
 
 /**
+ * NVIDIA Nemotron 3.5 Lightning language model.
+ *
+ * Hybrid MoE architecture (Mamba-2 SSM + GQA + pure MoE-FFN layers) with
  * an optional in-checkpoint MTP head. All model state lives on a
  * dedicated OS thread; NAPI methods dispatch commands via channels. When
  * the block-paged adapter is active the thread runs the engine-owned
@@ -1025,6 +1028,32 @@ export declare class NemotronHModel {
    * decoding is available when enableMtp is set on the request).
    */
   hasMtpWeights(): boolean;
+  /**
+   * Whether `ChatSession` should turn MTP ON when the caller sets nothing.
+   *
+   * FALSE for this family, deliberately, even though `hasMtpWeights()` is
+   * true on every shipped checkpoint. Two reasons, both about SCHEDULING,
+   * not about speed:
+   *   * `enable_mtp == Some(true)` forces the chat-requires-barrier
+   *     predicate in the hybrid scheduler, which puts the turn in the
+   *     EXCLUSIVE lane and removes it from continuous batching entirely;
+   *   * streaming MTP turns fall back to paged AR
+   *     (`mtp_flat_routing_required`) for zero speculation AND zero
+   *     batching.
+   *
+   * The throughput argument that used to sit here is RETRACTED. MTP
+   * measured 0.56x AR only while the residual stream ran f32, which forced
+   * every dense projection through an f32 copy each forward (the bf16
+   * `lm_head` worst of all). With that seam closed at its source MTP is a
+   * wash -- 89.91 vs 89.51 tok/s against flat AR, 0.994x against paged AR,
+   * acceptance 0.9539 of a depth-1 maximum of 1.0. So enabling it per
+   * session now costs nothing; only the batching loss argues against
+   * making it the default.
+   *
+   * `enableMtp: true` still works for anyone who wants to A/B it;
+   * `MLX_NEMOTRON_MTP_DEFAULT=1` flips the auto-default fleet-wide.
+   */
+  mtpAutoEnabled(): boolean;
   /**
    * Whether the block-paged KV cache adapter is active on this model
    * instance (default-on unless `use_block_paged_cache: false`).
@@ -4274,12 +4303,14 @@ export interface NemotronHConfig {
   /**
    * RoPE base frequency carried in some checkpoint `config.json` files.
    *
-   * UNUSED: NemotronH attention is NoPE. No reference implementation
-   * declares or consumes `rope_theta` (HF `NemotronHConfig` has no such
-   * field, vLLM's attention takes no positions, mlx-lm never rotates), so
-   * it is parsed leniently with a 10000.0 default and never read. The
-   * field is retained only so the napi object shape - and the two
-   * hand-synced `index.d.cts` artifacts - stay stable.
+   * UNUSED BY THE RUNTIME: NemotronH attention is NoPE. No reference
+   * implementation declares or consumes `rope_theta` (HF
+   * `NemotronHConfig` has no such field, vLLM's attention takes no
+   * positions, mlx-lm never rotates), and neither does this family's
+   * attention module - wiring it into a rotation would change every
+   * token the model emits. Parsed leniently with a 10000.0 default so a
+   * spec-conformant checkpoint that omits it still loads, and echoed
+   * back through `getConfig()` as checkpoint metadata only.
    */
   ropeTheta: number;
   /**
@@ -4313,9 +4344,8 @@ export interface NemotronHConfig {
    * (nemotron_h.py:56-65 + ssm.py:8-11). Only the HF *torch fallback*
    * (:417-418, :465-466) clamps to `time_step_min`, and that path is not
    * what the checkpoint was trained/served with. Parsed leniently and
-   * retained only so the napi object shape - and the two hand-synced
-   * `index.d.cts` artifacts - stay stable. Use `time_step_limit_pair()`
-   * for the clamp the mixer actually applies.
+   * echoed back through `getConfig()` as checkpoint metadata only. Use
+   * `time_step_limit_pair()` for the clamp the mixer actually applies.
    */
   timeStepMin: number;
   /**
@@ -4341,13 +4371,36 @@ export interface NemotronHConfig {
   intermediateSize: number;
   /** Shared-expert MLP intermediate size (3712), applied on ALL tokens. */
   moeSharedExpertIntermediateSize: number;
-  /** Tie the lm_head to the embedding table. False for Nemotron. */
+  /**
+   * Tie the lm_head to the embedding table.
+   *
+   * ALWAYS `false` here: `parse_config` rejects a `true` checkpoint at
+   * load time. The weight loader has no tied-head path - it requires an
+   * explicit `lm_head.weight` tensor - so accepting `true` would parse
+   * cleanly and then die much later with "Checkpoint missing
+   * lm_head.weight", which reads like a corrupt download rather than an
+   * unsupported variant.
+   */
   tieWordEmbeddings: boolean;
   bosTokenId: number;
   /** EOS token ids (config.json scalar; generation_config carries {2, 11}). */
   eosTokenIds: number[];
   padTokenId: number;
-  /** Compute only the last `num_logits_to_keep` logits (1). */
+  /**
+   * Declared `num_logits_to_keep` (1 on the released checkpoint).
+   *
+   * UNUSED BY THE RUNTIME. In HF it is a generation-time slicing hint:
+   * `prepare_inputs_for_generation` forwards it as `logits_to_keep`
+   * and the head is applied to `hidden_states[:, -N:, :]`
+   * (modeling_nemotron_h.py:1171-1172). mlx-lm and vLLM declare no such
+   * field at all. This runtime does not honour it either - every
+   * prefill path applies `lm_head` over the whole `[1, T, hidden]`
+   * block and slices the last position afterwards - so it is parsed
+   * leniently (default 1) and echoed back through `getConfig()` as
+   * checkpoint metadata only. Honouring it would be a real prefill
+   * saving on this 131072-wide head, but that is a change to the
+   * forward paths, not to this field.
+   */
   numLogitsToKeep: number;
   /** MTP layer kinds, remapped like `layers_block_type` (["attention","moe"]). */
   mtpLayersBlockType: string[];
@@ -4369,9 +4422,6 @@ export interface NemotronHConfig {
 }
 
 /**
- * NVIDIA Nemotron 3.5 Lightning language model.
- *
- * Hybrid MoE architecture (Mamba-2 SSM + GQA + pure MoE-FFN layers) with
  * Physical and trained context limits captured at load time, surfaced
  * through `context_limits()` so the ChatSession preflight can compact or
  * reject against the paged pool's ACTUAL capacity instead of the trained

@@ -396,7 +396,13 @@ export class DownloadManager {
    */
   start(repo: string, opts?: { overwrite?: boolean }): string {
     if (this.closed) throw new DownloadsClosedError();
-    if (!MODEL_CATALOG.some((entry) => entry.hfRepo === repo)) {
+    // `hidden` entries are unpublished repos. They stay in MODEL_CATALOG so a
+    // locally converted checkpoint at the canonical slug is still recognized as
+    // Installed, but they are NOT downloadable: the remote does not exist yet,
+    // so admitting one here allocates a job that fails mid-download with a 401
+    // instead of being refused up front. No UI reaches this for a hidden entry
+    // (the Models page filters `!item.hidden`); a direct API POST does.
+    if (!MODEL_CATALOG.some((entry) => !entry.hidden && entry.hfRepo === repo)) {
       throw new Error(`Repo "${repo}" is not in the model catalog`);
     }
     const active = this.activeJobFor(repo);

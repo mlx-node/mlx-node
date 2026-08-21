@@ -116,6 +116,39 @@ const IMAGE_CHANGE_RESTART_PREFIX = 'IMAGE_CHANGE_REQUIRES_SESSION_RESTART:';
 const NATIVE_DEFAULT_MAX_NEW_TOKENS = 2048;
 
 /**
+ * Model wrapper class names whose in-checkpoint MTP head must NOT be
+ * auto-enabled, used only while the native wrapper does not yet answer
+ * {@link SessionCapableModel.mtpAutoEnabled}.
+ *
+ * The native getter is the real signal — it is per-instance, it can consult
+ * the loaded head's dtype, and it is what `mtpAutoEnabled()` exists for.
+ * This list is the fallback that keeps the policy correct on a binding that
+ * predates the getter, and {@link ChatSession#mtpAutoDefaultAllowed} always
+ * prefers the getter when it is present, in BOTH directions (a family on
+ * this list that answers `true` is auto-enabled).
+ *
+ * NemotronH — `nemotron-3.5-lightning-30b-a3b`: the shipped checkpoint always
+ * carries a complete MTP head, so `hasMtpWeights()` is unconditionally
+ * `true` and the historical auto-default fired on every session. That is a
+ * measured net loss on this family, for two independent reasons:
+ *   - `enable_mtp === true` forces the turn into the exclusive/barrier
+ *     scheduler lane (`engine/hybrid_scheduler.rs`), which takes the session
+ *     OUT of continuous batching entirely — so concurrent sessions serialize;
+ *   - a streaming MTP turn has no flat-core streaming arm at all and falls
+ *     back to paged AR — zero speculation AND zero batching.
+ * The throughput half of this argument is RETRACTED. MTP measured 0.56× plain
+ * AR only while the residual stream ran f32, which pushed every dense
+ * projection through an f32 copy each forward (the bf16 `lm_head` worst of
+ * all). With that seam closed at its source MTP is a wash: 89.91 vs 89.51
+ * tok/s against flat AR, 0.994× against paged AR, acceptance 0.9539 of a
+ * depth-1 maximum of 1.0. So the BARRIER, not the head's BF16 width, is why
+ * this stays off by default — and enabling it per session now costs nothing.
+ * Removing it from this set is the switch to flip once an MTP turn can share
+ * the continuous-batching lane instead of forcing the exclusive one.
+ */
+const MTP_AUTO_DEFAULT_SUPPRESSED_MODELS: ReadonlySet<string> = new Set(['NemotronHModel']);
+
+/**
  * Stable, provider-neutral error raised before native inference when a
  * rendered prompt cannot fit in the model's physically available hot KV
  * window. The marker is intentionally the canonical string recognized by
@@ -501,6 +534,12 @@ export interface SessionCapableModel {
    * `enableMtp: false` in their `ChatConfig` overlay. When `false`
    * (or the method is missing), `enableMtp` is left untouched.
    *
+   * This is a pure CAPABILITY query: `true` means "speculative decoding
+   * is available", not "speculative decoding is a win here". A family
+   * that ships a complete but unprofitable head suppresses the
+   * auto-default through {@link SessionCapableModel.mtpAutoEnabled}
+   * while still reporting `true` here.
+   *
    * Synchronous on every supporting wrapper so the auto-default check
    * doesn't need a model-thread roundtrip per call — the value is
    * captured at load time and never changes for a given model
@@ -573,6 +612,33 @@ export interface SessionCapableModel {
    * native-MTP semantics above are unchanged.
    */
   hasMtpWeights?(): boolean;
+  /**
+   * Whether {@link ChatSession#mergeConfig} should turn `enableMtp` ON for
+   * this model when the caller sets nothing.
+   *
+   * Separate from {@link SessionCapableModel.hasMtpWeights}, which stays a
+   * pure capability query. Shipping an MTP head and *profiting* from it are
+   * different facts, and only the native side knows the second one: a head
+   * whose weights are a wider dtype than the backbone, or whose family
+   * routes `enableMtp` turns into an exclusive scheduler lane and out of
+   * continuous batching, can be a net throughput LOSS at the default
+   * settings.
+   *
+   * Contract:
+   *   - method absent   → historical behavior, auto-default whenever
+   *     `hasMtpWeights()` is `true`. Every family that predates this
+   *     method (Qwen3.5 dense/MoE native heads, Gemma4 external drafts)
+   *     is byte-identical.
+   *   - returns `true`  → auto-default, same as absent.
+   *   - returns `false` → do NOT auto-default. `enableMtp` stays
+   *     `undefined` and the native side falls back to plain AR.
+   *
+   * This is a DEFAULT, not a ban: an explicit `enableMtp: true` from
+   * `defaultConfig` or a per-call overlay still enables speculation, so
+   * A/B benchmarking a "not on by default" head needs no env var and no
+   * rebuild.
+   */
+  mtpAutoEnabled?(): boolean;
 }
 
 /** Per-call options for {@link ChatSession#send} / `sendStream`. */
@@ -1836,13 +1902,20 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    *
    * MTP auto-default: if neither `defaultConfig` nor `overlay`
    * sets `enableMtp` AND the underlying model exposes
-   * `hasMtpWeights()` returning `true`, set `enableMtp = true` so the
-   * speculative-decode path runs out of the box on MTP-capable
-   * checkpoints. An explicit `false` from either source wins (the
-   * undefined-check below preserves it). This duck-typed check also
-   * covers Gemma4 with an external draft attached — DSpark or Google
-   * assistant (`hasMtpWeights()` reports the external draft there,
-   * not in-checkpoint MTP heads).
+   * `hasMtpWeights()` returning `true` AND
+   * {@link ChatSession#mtpAutoDefaultAllowed} agrees, set
+   * `enableMtp = true` so the speculative-decode path runs out of the
+   * box on MTP-capable checkpoints. An explicit `false` from either
+   * source wins (the undefined-check below preserves it). This
+   * duck-typed check also covers Gemma4 with an external draft
+   * attached — DSpark or Google assistant (`hasMtpWeights()` reports
+   * the external draft there, not in-checkpoint MTP heads).
+   *
+   * The second gate exists because "has a head" and "is faster with the
+   * head" are different facts. A family whose head is a measured net
+   * loss at default settings opts out of the DEFAULT only — an explicit
+   * `enableMtp: true` still runs speculation. See
+   * {@link SessionCapableModel.mtpAutoEnabled}.
    */
   private mergeConfig(overlay: ChatConfig | undefined, establishCacheOwner = true): ChatConfig {
     if (this.disposed) {
@@ -1879,11 +1952,47 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     if (
       merged.enableMtp === undefined &&
       typeof this.model.hasMtpWeights === 'function' &&
-      this.model.hasMtpWeights()
+      this.model.hasMtpWeights() &&
+      this.mtpAutoDefaultAllowed()
     ) {
       merged.enableMtp = true;
     }
     return merged;
+  }
+
+  /**
+   * Whether an MTP-capable model wants `enableMtp` turned on for a caller
+   * who set nothing.
+   *
+   * Two sources, in priority order:
+   *   1. `mtpAutoEnabled()` on the model — authoritative in both
+   *      directions when present, so a native opt-in (e.g. an env-var
+   *      override baked into the wrapper) beats the static list below.
+   *   2. {@link MTP_AUTO_DEFAULT_SUPPRESSED_MODELS}, matched against the
+   *      class names along the instance's prototype chain. The chain walk
+   *      rather than a bare `constructor.name` check is what makes this
+   *      work for both the raw native class and the `makeStreamingModel`
+   *      wrapper subclass that `@mlx-node/lm` actually hands to
+   *      `ChatSession`, and it keeps matching if a caller subclasses one.
+   *
+   * A model that supplies neither is auto-enabled, preserving the
+   * pre-existing behavior for every other family.
+   */
+  private mtpAutoDefaultAllowed(): boolean {
+    if (typeof this.model.mtpAutoEnabled === 'function') {
+      return this.model.mtpAutoEnabled();
+    }
+    for (
+      let proto: object | null = Object.getPrototypeOf(this.model) as object | null;
+      proto !== null;
+      proto = Object.getPrototypeOf(proto) as object | null
+    ) {
+      const name = (proto as { constructor?: { name?: string } }).constructor?.name;
+      if (name !== undefined && MTP_AUTO_DEFAULT_SUPPRESSED_MODELS.has(name)) {
+        return false;
+      }
+    }
+    return true;
   }
 
   /**

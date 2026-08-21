@@ -51,6 +51,18 @@ pub(crate) enum NemotronHCmd {
     SchedulerStats {
         reply: ResponseTx<engine::SchedulerStatsJs>,
     },
+    /// Test-only: snapshot the flat-MTP seam between turns as
+    /// `(cached_token_history.len(), attention kv_offset,
+    /// flat_mtp_caches_desynced, flat_mtp_last_rollback_unemitted)`.
+    ///
+    /// The first two are the seam's REAL invariant: the flat trunk must never
+    /// sit ahead of the token history that keys it. The last two let a test
+    /// pin the latch PREDICATE (`desynced == rollback_unemitted > 1`) instead
+    /// of merely observing that the latch fired.
+    #[doc(hidden)]
+    MtpFlatStateForTest {
+        reply: ResponseTx<(usize, i32, bool, usize)>,
+    },
 }
 
 impl FromChatCmd for NemotronHCmd {
@@ -64,7 +76,7 @@ impl HybridSchedulerCommand for NemotronHCmd {
     fn as_chat(&self) -> Option<&ChatCmd> {
         match self {
             Self::Chat(chat) => Some(chat),
-            Self::SchedulerStats { .. } => None,
+            Self::SchedulerStats { .. } | Self::MtpFlatStateForTest { .. } => None,
         }
     }
 
@@ -91,6 +103,24 @@ pub(crate) fn handle_nemotron_h_cmd(inner: &mut NemotronHInner, cmd: NemotronHCm
         NemotronHCmd::Chat(chat) => handle_chat_cmd(inner, *chat),
         NemotronHCmd::SchedulerStats { reply } => {
             let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
+        }
+        NemotronHCmd::MtpFlatStateForTest { reply } => {
+            // `as_kv_cache_mut`, not `as_kv_cache`: the shared accessor is
+            // `#[cfg(any(test, debug_assertions))]`, so it vanishes from a
+            // release build of the library and an integration test (which
+            // links the library WITHOUT `cfg(test)`) could not call it.
+            let kv_offset = inner
+                .caches
+                .iter_mut()
+                .find_map(|c| c.as_kv_cache_mut())
+                .map(|kv| kv.get_offset())
+                .unwrap_or(-1);
+            let _ = reply.send(Ok((
+                inner.cached_token_history.len(),
+                kv_offset,
+                inner.flat_mtp_caches_desynced,
+                inner.flat_mtp_last_rollback_unemitted,
+            )));
         }
     }
 }
@@ -124,6 +154,14 @@ pub(crate) struct NemotronHInner {
     /// Flat MTP mid-cycle-stop desync latch: forces a full re-prefill on the
     /// next AR turn.
     pub(crate) flat_mtp_caches_desynced: bool,
+    /// The `rollback_unemitted` the engine computed for the most recent flat
+    /// MTP turn (0 when it ended on a clean cycle boundary). Diagnostic and
+    /// test seam ONLY — nothing in the decode path reads it. It is the
+    /// latch-INDEPENDENT way to ask "did that turn stop mid-cycle?", which is
+    /// what `nemotron_h_mtp_midcycle_state.rs` needs: keying that question off
+    /// `flat_mtp_caches_desynced` would make the gate a probe of its own
+    /// guard, unable to tell a correct latch predicate from a wrong one.
+    pub(crate) flat_mtp_last_rollback_unemitted: usize,
     /// Parsed generation_config.json sampling/stop defaults.
     pub(crate) gen_defaults: crate::engine::ModelGenerationDefaults,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) covering
@@ -140,9 +178,10 @@ pub(crate) struct NemotronHInner {
     /// The sequence whose per-request caches currently sit in `caches`.
     pub(crate) active_scheduled_seq: Option<SeqId>,
     /// Whether the most recent `prime_prefix_state_for` decided the live
-    /// mamba states already reflected the incoming prompt's cached prefix
-    /// (Pass 1 skipped). Read by `paged_perf_prefill_tokens` so telemetry
-    /// reports the suffix-scale numerator when Pass 1 did not run.
+    /// mamba states already reflected the incoming prompt's cached prefix, so
+    /// the turn only had to prefill the suffix. Read by
+    /// `paged_perf_prefill_tokens` so telemetry reports the suffix-scale
+    /// numerator instead of the full-prompt one.
     pub(crate) last_paged_prefill_reused_mamba_state: bool,
     /// Whether the currently active scheduled sequence's recurrent (Mamba)
     /// state was RESTORED from parked caches (true) or freshly
@@ -196,6 +235,7 @@ impl NemotronHInner {
             mtp_weights_loaded: false,
             pending_mtp_draft_seed: None,
             flat_mtp_caches_desynced: false,
+            flat_mtp_last_rollback_unemitted: 0,
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
             paged_adapter,
             scheduled_caches: HashMap::new(),
@@ -293,8 +333,12 @@ fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAd
 /// exact token prefix: the turn strictly extends the immediately-preceding
 /// saved history byte-for-byte, so the parked per-request states reflect the
 /// prefix. Any mismatch (first turn, aborted-since-last-save, foreign/partial
-/// prefix hit) falls through to the Pass-1 reconstruction in
-/// [`NemotronHInner::run_paged_prefill_chunk`]. The mamba recurrent state is
+/// prefix hit) must DROP the cached prefix and cold-prefill the whole plan:
+/// there is no reconstruction path any more.
+/// [`NemotronHInner::run_paged_prefill_chunk`] hard-errors on a nonzero
+/// `cached_prefix_len` that arrives without a live mamba state, so
+/// `prime_prefix_state_for` is obliged to drive `cached_prefix_len` to 0
+/// rather than hand the prefix down. The mamba recurrent state is
 /// non-invertible, so this is the only legal fast path (lfm2
 /// `conv_state_reusable` mirror).
 /// Whether the flat MTP core must drop its final generated token when saving
@@ -366,7 +410,22 @@ impl NemotronHInner {
         params: &crate::engine::params::ChatParams,
         streaming: bool,
     ) -> bool {
-        !streaming && params.enable_mtp && self.has_mtp_weights()
+        let requested = params.enable_mtp && self.has_mtp_weights();
+        if requested && streaming {
+            // Process-wide one-shot: a streaming server would otherwise emit
+            // one line per turn. Both call sites pass `args.sink.is_some()`,
+            // so this covers the paged AR fallback and the flat AR fallback.
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    target: "mlx_core::nemotron_h",
+                    "enableMtp is set on a STREAMING NemotronH turn: the flat MTP core \
+                     has no streaming arm, so this turn decodes plain autoregressively \
+                     with no speculation. Use a non-streaming turn for MTP."
+                );
+            });
+        }
+        !streaming && requested
     }
 
     /// Full forward over input_ids [1, T]: returns [1, T, vocab] logits.
@@ -674,6 +733,28 @@ impl NemotronHInner {
         self.active_scheduled_seq == Some(seq_id) || self.scheduled_caches.contains_key(&seq_id)
     }
 
+    /// Whether `activate_paged_seq(seq_id)` will land on state that SURVIVED
+    /// (as opposed to fresh zero-state caches). Mirrors `activate_paged_seq`
+    /// exactly: an already-live sequence keeps whatever the activation that
+    /// made it live decided; any other sequence survives iff its caches are
+    /// parked. Read BEFORE the activation, so the eligibility predicates can
+    /// consult it while `active_seq_recurrent_survived` still describes the
+    /// PREVIOUS sequence.
+    pub(crate) fn scheduled_recurrent_state_live(&self, seq_id: SeqId) -> bool {
+        if self.active_scheduled_seq == Some(seq_id) {
+            self.active_seq_recurrent_survived
+        } else {
+            self.scheduled_caches.contains_key(&seq_id)
+        }
+    }
+
+    /// Live recurrent rows resident in `caches` + `scheduled_caches`.
+    /// `activate_paged_seq` removes from the map before setting the active
+    /// slot, so no sequence is counted twice.
+    pub(crate) fn scheduled_recurrent_units(&self) -> usize {
+        self.scheduled_caches.len() + usize::from(self.active_scheduled_seq.is_some())
+    }
+
     /// Physical vs trained context limits (qwen3_5/qwen3_5_moe contract):
     /// (trained window, effective window capped by the paged pool's token
     /// capacity, block capacity, block size). Without an adapter the flat
@@ -723,8 +804,8 @@ impl NemotronHInner {
         // Capture BEFORE the remove: a preempted sequence's recurrent state
         // was released, so the remove below falls back to FRESH zero-state
         // caches. The reuse predicate must know the state did not survive —
-        // otherwise a cached KV prefix matching the saved history would skip
-        // the Pass-1 reconstruction and resume with Mamba state at zero.
+        // otherwise a cached KV prefix matching the saved history would be
+        // kept and the turn would resume with Mamba state at zero.
         let had_state = self.scheduled_caches.contains_key(&seq_id);
         self.park_active_scheduled_caches();
         self.caches = self
@@ -823,51 +904,14 @@ impl NemotronHInner {
 
     // ===================== Paged prefill =====================
 
-    /// Forward the cached prefix through ALL layers with attention run as a
-    /// FLAT causal self-prefill whose K/V are discarded (the prefix K/V already
-    /// live in the paged pool). Rebuilds the exact inter-layer residual stream
-    /// so every mamba layer's conv/SSM state lands on the `cached_prefix_len`
-    /// boundary before the suffix forward continues from it (lfm2 Pass-1
-    /// pattern; the mamba state is non-invertible so it must be re-derived from
-    /// scratch whenever the live caches are not already known to hold it).
-    fn run_mamba_only_prefill(&mut self, prefix_tokens: &[u32]) -> Result<()> {
-        if prefix_tokens.is_empty() {
-            return Ok(());
-        }
-        let input_ids = MxArray::from_uint32(prefix_tokens, &[1, prefix_tokens.len() as i64])?;
-        let mut hidden = self.embedding.forward(&input_ids)?;
-        let num_layers = self.layers.len();
-        #[allow(clippy::needless_range_loop)]
-        for layer_idx in 0..num_layers {
-            let layer: &NemotronHDecoderLayer = unsafe { &*self.layers.as_ptr().add(layer_idx) };
-            let normed = layer.norm.forward(&hidden)?;
-            let out = match &layer.mixer {
-                NemotronHMixer::Mamba(m) => {
-                    let cache: &mut NemotronHLayerCache =
-                        unsafe { &mut *self.caches.as_mut_ptr().add(layer_idx) };
-                    let state = cache.as_mamba_state_mut().ok_or_else(|| {
-                        Error::from_reason("run_mamba_only_prefill: mamba cache missing")
-                    })?;
-                    m.forward(&normed, Some(state))?
-                }
-                NemotronHMixer::Attention(a) => {
-                    // EXACT prefix reconstruction: run attention as a flat
-                    // causal self-prefill with NO paged-pool I/O so the
-                    // residual feeding downstream mamba layers is identical
-                    // to the cold full-prefill arithmetic.
-                    a.forward(&normed, None, None)?
-                }
-                NemotronHMixer::MoE(m) => m.forward(&normed)?,
-            };
-            hidden = hidden.add(&out)?;
-        }
-        Ok(())
-    }
-
-    /// One paged prefill slice: bring the mamba state to `cached_prefix_len`
-    /// (Pass 1 unless already established), record the suffix in the adapter,
-    /// and forward the suffix through all layers (attention via the paged
-    /// pool). Returns the last-token logits `[vocab]`.
+    /// One paged prefill slice: record the suffix in the adapter and forward
+    /// it through all layers (attention via the paged pool). Returns the
+    /// last-token logits `[vocab]`.
+    ///
+    /// A nonzero `cached_prefix_len` is only ever legal here when the live
+    /// mamba state already sits on that boundary — `prime_prefix_state_for`
+    /// enforces that invariant, and `skip_reconstruction` records it for
+    /// this slice.
     fn run_paged_prefill_chunk(
         &mut self,
         full_tokens: &[u32],
@@ -882,9 +926,18 @@ impl NemotronHInner {
         }
         let suffix_len = suffix_tokens.len() as u32;
 
+        // Assertion, not a fallback. `prime_prefix_state_for` guarantees that a
+        // nonzero `cached_prefix_len` always comes with a live mamba state at
+        // that boundary; reaching here means that guarantee was broken and the
+        // only alternatives are a silently-wrong recurrent state or a
+        // full-prefix reconstruction with neither slicing nor a cancel point.
         if cached_prefix_len > 0 && !skip_reconstruction {
-            let prefix = &full_tokens[..(cached_prefix_len as usize)];
-            self.run_mamba_only_prefill(prefix)?;
+            let planned = full_tokens.len();
+            return Err(Error::from_reason(format!(
+                "nemotron_h: paged prefill reached a {cached_prefix_len}-token cached prefix \
+                 without a live mamba state (plan {planned} tokens); prime_prefix_state_for \
+                 must force a cold prefill"
+            )));
         }
 
         {
@@ -1295,10 +1348,24 @@ impl ChatBackend for NemotronHInner {
         ids
     }
 
-    /// Mid-cycle MTP stops (EOS/cancel/repetition cutoff) leave the physical
-    /// flat caches ahead of the saved token history; the engine must see that
-    /// latch so cache recovery resets + re-prefills instead of reusing the
+    /// True when the physical flat caches hold tokens the saved history does
+    /// NOT, so cache recovery must reset + re-prefill instead of reusing the
     /// advanced recurrent state (the qwen3_5/qwen3_5_moe contract).
+    ///
+    /// NOT "a mid-cycle MTP stop happened". `rollback_unemitted` sets the
+    /// latch only at `unemitted > 1`, i.e. only when a token the backbone
+    /// actually FORWARDED is dropped. A cycle's LAST outcome token — the
+    /// bonus on a full accept, the residual on a rejection — is never fed
+    /// through the layers: the bonus is read off a verify row that already
+    /// exists, and the residual is sampled after `rollback` restored the
+    /// pre-verify snapshot. So a stop that strands only that token
+    /// (`unemitted == 1`, the shape EVERY depth-1 mid-cycle stop takes)
+    /// leaves the flat KV and all Mamba-2 states exactly aligned with the
+    /// saved history, and this must report `false`. Measured on
+    /// nemotron-3.5-lightning-30b-a3b-nvfp4: `attention kv_offset -
+    /// cached_token_history.len() == 0` on every mid-cycle stop observed.
+    /// Latching there would force the next flat turn to `hit = 0` and
+    /// re-prefill the whole prompt for nothing.
     fn flat_caches_desynced(&self) -> bool {
         self.flat_mtp_caches_desynced
     }
@@ -1495,9 +1562,10 @@ impl DecodeStep for NemotronHPagedDecode<'_> {
 }
 
 /// NemotronH paged prefix state: the effective prefix/suffix split the
-/// adapter resolved, PLUS the full prompt tokens (the mamba Pass-1 rebuild
-/// needs full_tokens[..cached_prefix_len], which the engine never hands to
-/// paged_prefill).
+/// adapter resolved, PLUS the full prompt tokens (which the engine never
+/// hands to `paged_prefill`). `run_paged_prefill_chunk` now uses the full
+/// tokens only to report the planned length in its fail-closed error; it no
+/// longer rebuilds mamba state over `full_tokens[..cached_prefix_len]`.
 pub(crate) struct NemotronHPrefixState {
     pub(crate) effective_cached_prefix_len: usize,
     pub(crate) suffix_len: usize,
@@ -1543,9 +1611,27 @@ impl PagedBackend for NemotronHInner {
         // confused rambling on every second session of a model). Force a cold
         // prefill (skip_lookup) in that case: always correct, at the cost of
         // forgoing prefix reuse across owners.
+        //
+        // The token predicate is necessary but NOT sufficient: the Mamba-2
+        // state is non-invertible, so a cached K/V prefix is only continuable
+        // when the recurrent state that produced it is still live for this
+        // sequence. When it is not (finalize with reuse_cache=false, abort,
+        // preemption), keeping the prefix would force a full-prefix
+        // reconstruction that is neither bit-identical to the cold prefill nor
+        // bounded. Force the cold prefill.
+        //
+        // This liveness term is a FAST PATH, not the enforcement: the backstop
+        // in `prime_prefix_state_for` catches the same condition (and the two
+        // adapter routes that ignore `skip_lookup` entirely), so removing this
+        // term changes no observable outcome. It earns its place by keeping
+        // the common preempted-resume off the backstop's
+        // allocate -> free -> reallocate re-prepare, which can fail on a
+        // near-full block pool where the single-phase prepare would have
+        // succeeded. Do not delete it as dead weight.
         let continuation_eligible = !owner_history.is_empty()
             && plan.len() > owner_history.len()
-            && plan[..owner_history.len()] == owner_history[..];
+            && plan[..owner_history.len()] == owner_history[..]
+            && self.scheduled_recurrent_state_live(0);
         self.prime_prefix_state_for(0, plan, &owner_history, cache_salt, !continuation_eligible)
     }
 
@@ -1570,6 +1656,19 @@ impl PagedBackend for NemotronHInner {
         );
         let mut last = None;
         for (s, e) in slices {
+            // Cancellation point. `chunked_prefill` and
+            // `chunked_prefill_seeding_mtp` already poll here; the paged slice
+            // loop did not, so a long cold prefill on the single-session lane
+            // (the engine calls `paged_prefill` ONCE with the whole suffix)
+            // had no cancellation point at all and stalled the model thread
+            // for every peer session.
+            if self
+                .turn_cancel
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Relaxed))
+            {
+                return Err(Error::from_reason("prefill cancelled"));
+            }
             let skip = prefix.mamba_state_reusable || s > cached;
             let local = (s - cached) as usize;
             let local_end = (e - cached) as usize;
@@ -1633,9 +1732,9 @@ impl PagedBackend for NemotronHInner {
     }
 
     fn paged_perf_prefill_tokens(&self, prompt_token_count: usize, suffix_len: usize) -> usize {
-        // A foreign/partial prefix hit re-derives the mamba state over the
-        // FULL prompt (Pass 1), so ttft measures full-prompt work; the
-        // exact-owner carried-state path prefills only the suffix.
+        // A foreign/partial prefix hit is forced to a COLD prefill of the
+        // whole plan, so ttft measures full-prompt work; the exact-owner
+        // carried-state path prefills only the suffix.
         if self.last_paged_prefill_reused_mamba_state {
             suffix_len
         } else {
@@ -1677,6 +1776,29 @@ impl HybridSchedulerBackend for NemotronHInner {
 
     fn has_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
         self.has_scheduled_caches_for(seq_id)
+    }
+
+    /// Residency cap on parked recurrent rows.
+    ///
+    /// Without this override the trait default (`true`) makes
+    /// `HybridSchedulerState::ensure_recurrent_slot`'s idle-victim body dead
+    /// code and lets `scheduled_caches` grow one row per owner forever. The
+    /// cap is `scheduler_max_num_seqs_for(32)` — the SAME number
+    /// `max_concurrent_sequences()` advertises — not the GDN families'
+    /// `HYBRID_LIVE_STATE_UNITS = 2`: a NemotronH row is conv + SSM over 23
+    /// mamba layers (~47.6 MiB on the released checkpoint) rather than a full
+    /// GDN row store, and a cap of 2 would cut this family's batching from 8
+    /// rows to 2.
+    ///
+    /// Deliberately NOT mirroring qwen3_5's hard error inside
+    /// `activate_scheduled_recurrent`: this family routes both
+    /// `activate_scheduled_recurrent` and `activate_paged_seq` to the same
+    /// function, and `finish_completed` calls the latter WITHOUT an
+    /// `ensure_recurrent_slot` gate — erroring there would fail completed
+    /// turns. The scheduler already gates admission and resume.
+    fn can_activate_scheduled_recurrent(&self, seq_id: SeqId) -> bool {
+        self.has_scheduled_recurrent(seq_id)
+            || self.scheduled_recurrent_units() < scheduler_max_num_seqs_for(32)
     }
 
     fn activate_scheduled_recurrent(&mut self, seq_id: SeqId) -> Result<()> {
@@ -1740,9 +1862,20 @@ impl HybridSchedulerBackend for NemotronHInner {
         // Same cold-prefill rule as the single-session lane: only a strict
         // token-extension of the live history may reuse a cached K/V prefix
         // (see `prime_prefix_state`); anything else forces skip_lookup.
+        //
+        // Plus the fact that makes it correct on the scheduled lane: a
+        // PREEMPTED sequence keeps its owner history and its registered K/V
+        // blocks but loses its recurrent row (`handle_preempted` calls
+        // `release_scheduled_recurrent_for`), and `ensure_recurrent_slot` can
+        // evict an idle row the same way. `activate_scheduled_recurrent`
+        // already ran for this seq_id before this call, so the liveness answer
+        // here is the honest one. Like the single-session lane's copy, this
+        // term is the fast path; `prime_prefix_state_for`'s backstop is the
+        // enforcement.
         let continuation_eligible = !owner_history.is_empty()
             && tokens.len() > owner_history.len()
-            && tokens[..owner_history.len()] == owner_history[..];
+            && tokens[..owner_history.len()] == owner_history[..]
+            && self.scheduled_recurrent_state_live(seq_id);
         self.prime_prefix_state_for(
             seq_id,
             tokens,
@@ -1829,7 +1962,7 @@ impl NemotronHInner {
         self.activate_paged_seq(seq_id)?;
         let total_budget = plan.len() as u32;
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
-        let turn_plan = self
+        let mut turn_plan = self
             .paged_adapter
             .as_mut()
             .ok_or_else(|| {
@@ -1846,23 +1979,73 @@ impl NemotronHInner {
                 max_cache_hit_tokens,
             )
             .map_err(Error::from_reason)?;
-        let cached_prefix_len = turn_plan.cached_prefix_len as usize;
+        let mut cached_prefix_len = turn_plan.cached_prefix_len as usize;
         // Reuse requires BOTH a token-exact prefix match AND the sequence's
         // recurrent (Mamba) state actually surviving at that boundary. A
         // preempted sequence releases its recurrent state while its history
-        // and KV blocks remain reusable: a token-only match would then skip
-        // Pass-1 reconstruction and continue with KV at the prefix boundary
-        // but Mamba state at position zero.
-        let reused_state = self.active_seq_recurrent_survived
+        // and KV blocks remain reusable: a token-only match would then keep
+        // the prefix and continue with KV at the prefix boundary but Mamba
+        // state at position zero.
+        let mut reused_state = self.active_seq_recurrent_survived
             && mamba_state_reusable(plan, owner_history, cached_prefix_len);
+        // INVARIANT (enforced, not assumed): a kept K/V prefix ALWAYS has a
+        // live mamba state at exactly its boundary. The callers' `skip_lookup`
+        // predicate closes the hash-lookup route, but two adapter routes
+        // ignore `skip_lookup` entirely:
+        //   * `ContinuedLivePrefix` — the adapter's `can_continue` never
+        //     consults `skip_lookup`, so a row whose recurrent state
+        //     `ensure_recurrent_slot` evicted while its request stayed live
+        //     would still be handed its whole prior prefix;
+        //   * `ContinueFailedReset` — a block-rounded hash hit BELOW
+        //     `owner_history.len()`, which `mamba_state_reusable` rejects.
+        // Both used to fall through to an unsliced, uncancellable
+        // reconstruction of the whole prefix whose arithmetic is not
+        // bit-identical to the cold prefill. Drop the prefix and re-prepare
+        // cold instead: same FLOPs, exact numerics, ordinary slicing.
+        if !reused_state && cached_prefix_len > 0 {
+            tracing::debug!(
+                target: "mlx_core::nemotron_h",
+                seq_id,
+                cached_prefix_len,
+                reason = ?turn_plan.reason,
+                "nemotron_h: K/V prefix has no live mamba state; re-preparing cold"
+            );
+            let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+                Error::from_reason("nemotron_h prime_prefix_state: paged adapter is None")
+            })?;
+            adapter.release_request().map_err(Error::from_reason)?;
+            turn_plan = adapter
+                .prepare_turn_with_max_cache_hit_tokens(
+                    seq_id,
+                    plan,
+                    total_budget,
+                    true,
+                    &[],
+                    cache_salt,
+                    /* skip_lookup */ true,
+                    max_cache_hit_tokens,
+                )
+                .map_err(Error::from_reason)?;
+            cached_prefix_len = turn_plan.cached_prefix_len as usize;
+            debug_assert_eq!(
+                cached_prefix_len, 0,
+                "skip_lookup must force a 0-token cold prefill"
+            );
+            reused_state = false;
+        }
         self.last_paged_prefill_reused_mamba_state = reused_state;
         // From here this turn's prefill brings the live recurrent state to the
-        // plan boundary: Pass 1 + suffix when `reused_state` is false (the
-        // reset below zeroes it first), the suffix alone when it is true.
-        // Either way the sequence's state is at its boundary by the end of the
-        // turn, so the NEXT activation of this still-live sequence may treat
-        // it as survived — that is what keeps a warm continuation on the fast
-        // path now that a re-activation no longer asserts survival itself.
+        // plan boundary. There is no two-pass reconstruction any more
+        // (`run_mamba_only_prefill` is gone and `run_paged_prefill_chunk`
+        // hard-errors on a prefix with no live state): when `reused_state` is
+        // false the block above has already forced `cached_prefix_len` to 0,
+        // so the single prefill pass runs COLD over the whole plan from the
+        // zeroed state; when it is true the single pass covers the suffix
+        // alone on top of the surviving state. Either way the sequence's state
+        // is at its boundary by the end of the turn, so the NEXT activation of
+        // this still-live sequence may treat it as survived — that is what
+        // keeps a warm continuation on the fast path now that a re-activation
+        // no longer asserts survival itself.
         // A turn that fails after this point does not leak the claim: every
         // failure route releases the sequence (`abort_paged_turn`,
         // `release_scheduled_recurrent_for`, preemption at
@@ -1984,8 +2167,10 @@ impl NemotronHMtpStepper<'_> {
         }
     }
 
-    /// Test seam: the drafter attention slot's live offset.
-    #[cfg(test)]
+    /// Test seam AND debug-build invariant seam: the drafter attention slot's
+    /// live offset. Compiled in every debug build so `begin_cycle`'s
+    /// cursor-alignment `debug_assert!` can read it.
+    #[cfg(any(test, debug_assertions))]
     pub(crate) fn draft_kv_offset(&self) -> i32 {
         self.mtp_caches
             .iter()
@@ -1994,7 +2179,8 @@ impl NemotronHMtpStepper<'_> {
             .unwrap_or(-1)
     }
 
-    /// Test seam: the drafter's committed length.
+    /// Test seam: the drafter's committed length. Stays `#[cfg(test)]` —
+    /// `begin_cycle`'s debug assertion reads the FIELD, not this accessor.
     #[cfg(test)]
     pub(crate) fn committed_len(&self) -> i32 {
         self.committed_len
@@ -2073,6 +2259,22 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         embedding: &Embedding,
         depth: usize,
     ) -> Result<crate::models::qwen3_5::mtp_decode::MtpVerifyOutput> {
+        // Fail closed on the depth-1 invariant rather than verify a shape
+        // this family never validated. `run_mtp_whole_turn` pins
+        // `mtp_adaptive_depth = false` and seeds `p.mtp_depth.min(1)`, and
+        // `run_mtp_cycle` only ever SHORTENS a cycle's depth (the near-tail
+        // budget cap and the EV gate), so exactly 1 arrives here. Anything
+        // else means a new engine route bypassed that clamp, and with it the
+        // `unemitted <= 1` shape `rollback_unemitted` is reasoned against.
+        if depth != 1 {
+            return Err(Error::from_reason(format!(
+                "NemotronH MTP verify_step: cycle depth {depth} but this family is \
+                 pinned to depth 1 (run_mtp_whole_turn clamps mtp_adaptive_depth \
+                 off and seeds mtp_depth.min(1)); validate the deeper draft path \
+                 and re-check NemotronHMtpStepper::rollback_unemitted before \
+                 relaxing this"
+            )));
+        }
         let id_window = ids.to_int32().map_err(|e| {
             Error::from_reason(format!(
                 "NemotronH MTP verify_step: ids to_int32: {}",
@@ -2234,6 +2436,38 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
     /// it anchors at `committed_len - 1`; Step-A cycles anchor at
     /// `committed_len`.
     fn begin_cycle(&mut self, chained_anchor: bool) {
+        // The drafter must never enter a cycle BELOW the committed cursor.
+        // `KVCache::trim` cannot GROW (`kv_cache.rs`), so a cycle that
+        // anchored the drafter at `committed_len - 1` and then bailed out
+        // without drafting or committing would leave the cursor one slot low
+        // for good, and the next cycle's draft would overwrite the last
+        // COMMITTED pair instead of appending past it. The engine's near-tail
+        // `continue` used to sit between the anchor and the draft; this
+        // assertion is what catches a re-introduction of that ordering.
+        //
+        // `>=` and not `==` deliberately: a cycle whose drafts were all
+        // rejected legitimately leaves the cursor ABOVE `committed_len`
+        // (`commit_mtp` is a no-op at m == 0), and the trim below is exactly
+        // what rewinds it. Only a cursor BELOW the committed cursor is
+        // unrecoverable.
+        //
+        // `#[cfg(debug_assertions)]` on a BLOCK, not a bare `debug_assert!`:
+        // the latter expands to `if cfg!(debug_assertions) { .. }`, a RUNTIME
+        // bool whose body is still type-checked in release — and
+        // `draft_kv_offset` / `as_kv_cache` are themselves
+        // `#[cfg(any(test, debug_assertions))]`, so the bare form fails
+        // `cargo build --release` (and therefore `yarn build:native`) with
+        // E0599. The `#[cfg]` attribute removes the block outright instead.
+        #[cfg(debug_assertions)]
+        {
+            let cursor = self.draft_kv_offset();
+            debug_assert!(
+                cursor >= self.committed_len,
+                "drafter cursor {} fell below committed_len {} at cycle entry",
+                cursor,
+                self.committed_len
+            );
+        }
         let target = if chained_anchor {
             (self.committed_len - 1).max(0)
         } else {
@@ -2258,17 +2492,63 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
     }
 
     fn rollback_unemitted(&mut self, unemitted: usize) {
-        if unemitted > 0 {
-            self.mtp_desynced = true;
-            // Cursor rewind ONLY — deliberately reads no snapshot. On the
-            // one strandable path at depth 1 (`accepted_drafts == depth`)
-            // `rollback` has already nulled `self.snap`, so a snapshot-based
-            // undo here would silently no-op. Trimming is enough: the
-            // trimmed slots are overwritten in place by the next write.
-            self.committed_len = (self.committed_len - unemitted as i32).max(0);
-            let target = self.committed_len;
-            self.trim_draft_caches(target);
+        if unemitted == 0 {
+            return;
         }
+        // Latch ONLY when a FORWARDED token is dropped. `unemitted - 1` is
+        // the exact count of those, at EVERY depth:
+        //
+        //   forwarded this cycle : anchor ++ accepted drafts
+        //   saved this cycle     : anchor (Step A pushed it) ++ emitted drafts
+        //   never forwarded      : the LAST outcome token
+        //
+        // The last outcome token is the bonus (full accept) or the residual
+        // (rejection). Neither is ever fed to `forward_with_hidden_3d`: the
+        // bonus is `argmax` of a verify row that already exists, and the
+        // residual is sampled after `rollback` has restored the pre-verify
+        // snapshot. The engine states the same rule in its own units —
+        // `last_in_cache = cycle_emitted < outcome.tokens.len()`
+        // (`engine/mtp_turn.rs`) — and `mtp_history_drop_last` keeps every
+        // EMITTED token in the saved history on a mid-cycle stop
+        // (`!last_in_cache || (reason == "length" && unemitted == 0)` is
+        // false there). So the caches sit ahead of the saved history by
+        // exactly `unemitted - 1` tokens, and `unemitted == 1` is a cycle
+        // that stranded only the never-forwarded boundary token: the flat KV
+        // and all 23 Mamba-2 states are EXACTLY aligned with the history and
+        // latching would discard the next flat turn's whole prefix cache
+        // (`run_flat_ar_turn` forces `hit = 0` on the latch) for nothing.
+        //
+        // MEASURED on nemotron-3.5-lightning-30b-a3b-nvfp4-mlx: over 42
+        // depth-1 turns, `attention kv_offset - cached_token_history.len()`
+        // was 0 on every one, including the 3 that stopped mid-cycle with
+        // `unemitted == 1`; a deliberately injected one-token skew moved the
+        // live-vs-cold Mamba-2 state distance by 35-150x, so the zero is a
+        // real measurement and not an insensitive probe.
+        //
+        // The `> 1` arm is unreachable TODAY and kept deliberately. Two
+        // separate clamps in `run_mtp_whole_turn` hold depth at 1 — the
+        // `p.mtp_depth.min(1)` seed AND the `mtp_adaptive_depth = false` pin
+        // that stops `run_mtp_cycle` re-picking a deeper `cycle_depth` from
+        // `AdaptiveDepthPolicy::pick_depth()` (`Explore` sweeps 1..=5
+        // regardless of the seed; see
+        // `mtp::adaptive_depth_policy_escapes_a_depth_1_seed`). Before that
+        // pin, `mtpAdaptiveDepth: true` reached depth 2..5 here. The arm is
+        // the correct predicate at EVERY depth — `unemitted - 1` is the
+        // stranded-forwarded count at all of them — so it is what keeps this
+        // function right if the depth-1 pin is ever lifted. Do not delete it
+        // on the strength of the clamps; delete the clamps first, with the
+        // deeper path validated.
+        if unemitted > 1 {
+            self.mtp_desynced = true;
+        }
+        // Cursor rewind ONLY — deliberately reads no snapshot. On the
+        // one strandable path at depth 1 (`accepted_drafts == depth`)
+        // `rollback` has already nulled `self.snap`, so a snapshot-based
+        // undo here would silently no-op. Trimming is enough: the
+        // trimmed slots are overwritten in place by the next write.
+        self.committed_len = (self.committed_len - unemitted as i32).max(0);
+        let target = self.committed_len;
+        self.trim_draft_caches(target);
     }
 
     fn take_replay_error(&mut self) -> Option<Error> {
@@ -2540,6 +2820,46 @@ impl NemotronHInner {
         // executor (paged_turn.rs `backend.extra_eos_ids()`).
         let mut p = args.params.clone();
         p.extra_eos_ids = self.extra_eos_ids();
+        // GUARD for the depth-1 invariant this family's flat MTP core rests
+        // on. `depth: p.mtp_depth.min(1)` at the `run_mtp_turn` call site
+        // below only SEEDS the turn; `run_mtp_cycle` recomputes the depth
+        // every cycle as
+        //
+        //     cycle_depth = if p.mtp_adaptive_depth { policy.pick_depth() }
+        //                   else { depth }
+        //
+        // and `AdaptiveDepthPolicy::new(seed)` starts in `Explore`, whose
+        // `pick_depth()` walks `MIN_DEPTH..=MAX_DEPTH` independent of the
+        // seed (pinned by `mtp::adaptive_depth_policy_escapes_a_depth_1_seed`).
+        // `mtp_adaptive_depth` is a plain ChatConfig knob
+        // (`config.mtp_adaptive_depth.unwrap_or(false)`, `engine/params.rs`)
+        // with no family gate, so before this clamp `mtpAdaptiveDepth: true`
+        // silently ran NemotronH at depth 2..5 — a path this change set never
+        // validated, and the one thing that makes the `unemitted > 1` latch
+        // arm in `rollback_unemitted` load-bearing rather than defensive.
+        //
+        // Pinned here rather than asserted: the clamp degrades to the
+        // validated depth-1 lane instead of failing the turn. Deleting it
+        // re-opens depth > 1 for this family, so validate the deeper path
+        // (and re-read `rollback_unemitted`) before doing so.
+        //
+        // NOTE this also un-exempts these turns from the engine's MTP
+        // acceptance gate (`mtp_turn.rs`, `!p.mtp_adaptive_depth &&
+        // p.mtp_depth == 1`), which is correct — they ARE fixed depth-1
+        // turns now — and inert either way: NemotronH does not override
+        // `record_turn_mtp_acceptance`, so the default no-op runs.
+        if p.mtp_adaptive_depth {
+            static WARNED: std::sync::Once = std::sync::Once::new();
+            WARNED.call_once(|| {
+                tracing::warn!(
+                    target: "mlx_core::nemotron_h",
+                    "mtpAdaptiveDepth is set on a NemotronH MTP turn: the flat MTP core \
+                     is validated at draft depth 1 only, so the adaptive policy is \
+                     disabled and every cycle runs at depth 1."
+                );
+            });
+            p.mtp_adaptive_depth = false;
+        }
         let p = &p;
         let eos_id = args.eos_id;
         let thinking = args.thinking;
@@ -2647,6 +2967,14 @@ impl NemotronHInner {
                 // the way vLLM does it (loop the single MTP layer,
                 // llm_base_proposer.py:676) — deliberately OUT OF SCOPE for
                 // this change, which lands the head's own history first.
+                //
+                // This clamp only SEEDS the turn — `run_mtp_cycle` re-picks
+                // the depth every cycle and would escape it whenever
+                // `p.mtp_adaptive_depth` is true. It is a real ceiling only
+                // because `p.mtp_adaptive_depth` was pinned to `false` at the
+                // top of this function; the two are ONE guard and must move
+                // together. `verify_step` fails closed on any depth that
+                // reaches it anyway.
                 depth: p.mtp_depth.min(1),
                 params: p,
                 reasoning_tracker: &mut reasoning_tracker,
@@ -2667,6 +2995,7 @@ impl NemotronHInner {
             None,
         )?;
         let last_in_cache = outcome.last_in_cache;
+        self.flat_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
         if outcome.desynced {
             self.flat_mtp_caches_desynced = true;
         }
@@ -2739,9 +3068,6 @@ impl MtpBackend for NemotronHInner {
     }
 }
 
-/// NVIDIA Nemotron 3.5 Lightning language model.
-///
-/// Hybrid MoE architecture (Mamba-2 SSM + GQA + pure MoE-FFN layers) with
 /// Physical and trained context limits captured at load time, surfaced
 /// through `context_limits()` so the ChatSession preflight can compact or
 /// reject against the paged pool's ACTUAL capacity instead of the trained
@@ -2767,6 +3093,9 @@ impl NemotronHContextLimits {
     }
 }
 
+/// NVIDIA Nemotron 3.5 Lightning language model.
+///
+/// Hybrid MoE architecture (Mamba-2 SSM + GQA + pure MoE-FFN layers) with
 /// an optional in-checkpoint MTP head. All model state lives on a
 /// dedicated OS thread; NAPI methods dispatch commands via channels. When
 /// the block-paged adapter is active the thread runs the engine-owned
@@ -2804,6 +3133,36 @@ impl NemotronHModel {
     #[napi]
     pub fn has_mtp_weights(&self) -> bool {
         self.mtp_active
+    }
+
+    /// Whether `ChatSession` should turn MTP ON when the caller sets nothing.
+    ///
+    /// FALSE for this family, deliberately, even though `hasMtpWeights()` is
+    /// true on every shipped checkpoint. Two reasons, both about SCHEDULING,
+    /// not about speed:
+    ///   * `enable_mtp == Some(true)` forces the chat-requires-barrier
+    ///     predicate in the hybrid scheduler, which puts the turn in the
+    ///     EXCLUSIVE lane and removes it from continuous batching entirely;
+    ///   * streaming MTP turns fall back to paged AR
+    ///     (`mtp_flat_routing_required`) for zero speculation AND zero
+    ///     batching.
+    ///
+    /// The throughput argument that used to sit here is RETRACTED. MTP
+    /// measured 0.56x AR only while the residual stream ran f32, which forced
+    /// every dense projection through an f32 copy each forward (the bf16
+    /// `lm_head` worst of all). With that seam closed at its source MTP is a
+    /// wash -- 89.91 vs 89.51 tok/s against flat AR, 0.994x against paged AR,
+    /// acceptance 0.9539 of a depth-1 maximum of 1.0. So enabling it per
+    /// session now costs nothing; only the batching loss argues against
+    /// making it the default.
+    ///
+    /// `enableMtp: true` still works for anyone who wants to A/B it;
+    /// `MLX_NEMOTRON_MTP_DEFAULT=1` flips the auto-default fleet-wide.
+    #[napi]
+    pub fn mtp_auto_enabled(&self) -> bool {
+        static OPT_IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *OPT_IN.get_or_init(|| std::env::var("MLX_NEMOTRON_MTP_DEFAULT").is_ok_and(|v| v == "1"))
+            && self.mtp_active
     }
 
     /// Whether the block-paged KV cache adapter is active on this model
@@ -2844,6 +3203,24 @@ impl NemotronHModel {
     #[napi]
     pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
         send_and_await(&self.thread, |reply| NemotronHCmd::SchedulerStats { reply }).await
+    }
+
+    /// Test-only flat-MTP seam snapshot:
+    /// `(history_len, attn_kv_offset, desynced, rollback_unemitted)`.
+    ///
+    /// `history_len` vs `attn_kv_offset` is the seam's actual contract — the
+    /// flat trunk must never sit ahead of the token history that keys it.
+    /// `rollback_unemitted` says whether the preceding turn stopped
+    /// mid-cycle WITHOUT consulting the latch, so a test can find the
+    /// drafted-EOS scenario even when the latch (correctly) stays clear.
+    /// Serialized behind the model thread, so it observes the fully-finalized
+    /// preceding turn.
+    #[doc(hidden)]
+    pub async fn mtp_flat_state_for_test(&self) -> Result<(usize, i32, bool, usize)> {
+        send_and_await(&self.thread, |reply| NemotronHCmd::MtpFlatStateForTest {
+            reply,
+        })
+        .await
     }
 }
 
@@ -2952,12 +3329,31 @@ mod scheduler_tests {
         }
     }
 
+    /// Greedy pick with PRODUCTION tie-break semantics: the FIRST maximal
+    /// index.
+    ///
+    /// Do NOT reach for `Iterator::max_by` here. It is documented to return
+    /// the LAST maximal element, while every lane this helper is an oracle
+    /// for returns the FIRST one:
+    ///   - `mx::argmax` — `ArgMax::reduce` in mlx's `arg_reduce.metal` breaks
+    ///     ties on `best.index > current.index`, i.e. keeps the smaller index;
+    ///   - the compiled production sampler — at `temperature <=
+    ///     GREEDY_TEMPERATURE_EPS` `mlx_compiled_sample_full` short-circuits to
+    ///     `mlx::core::argmax(logits, -1)`;
+    ///   - the MTP accept gate — `p_target_f32.argmax(0, None)` in
+    ///     `sampling::rs`.
+    ///
+    /// A two-way tie with bit-identical f32 logits does occur on the real
+    /// 30B-A3B-NVFP4 checkpoint, so `max_by` made this oracle disagree with a
+    /// real AR turn and reported a phantom AR-vs-MTP divergence.
     fn argmax(vec: &[f32]) -> usize {
-        vec.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i)
-            .unwrap()
+        let mut best = 0usize;
+        for (i, v) in vec.iter().enumerate() {
+            if *v > vec[best] {
+                best = i;
+            }
+        }
+        best
     }
 
     /// The tiny fixture's MoE layer is constructed with quantized (uint8)
@@ -3954,6 +4350,434 @@ mod scheduler_tests {
         assert!(
             !inner.mtp_flat_routing_required(&params, false),
             "later turns must not route back into the MTP core"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // C1: a kept K/V prefix ALWAYS has a live mamba state at its boundary.
+    // ------------------------------------------------------------------
+
+    /// A 40-token prompt: 2 full 16-token blocks (registerable, so a hash
+    /// lookup CAN hit) plus a partial tail.
+    fn c1_prompt() -> Vec<u32> {
+        (0..40u32).map(|i| (i % 30) + 1).collect()
+    }
+
+    /// Cold-prefill `tokens` on `seq_id` with the hash lookup forced OFF and
+    /// return the resulting mamba fingerprint. The reference every C1 case
+    /// compares against, computed on the SAME inner (the fixture's weights are
+    /// random per construction, so a second inner is not comparable).
+    fn cold_prefill_fingerprint(
+        inner: &mut NemotronHInner,
+        seq_id: SeqId,
+        tokens: &[u32],
+        cache_salt: u64,
+    ) -> Vec<f32> {
+        let stream = Stream::default(DeviceType::Gpu);
+        let prefix = inner
+            .prime_prefix_state_for(seq_id, tokens, &[], cache_salt, /* skip_lookup */ true)
+            .expect("cold prime");
+        assert_eq!(
+            prefix.effective_cached_prefix_len, 0,
+            "skip_lookup must force a 0-token prefix"
+        );
+        inner.activate_paged_seq(seq_id).expect("activate");
+        let _ = inner
+            .paged_prefill(tokens, &prefix, stream)
+            .expect("cold prefill");
+        mamba_fingerprint(inner, seq_id)
+    }
+
+    /// THE C1 gate. A preempted sequence keeps its owner history AND its
+    /// registered K/V blocks, but `handle_preempted` releases its recurrent
+    /// row. The resume must therefore drop the prefix and cold-prefill, and
+    /// the recurrent state it lands on must be BIT-IDENTICAL to a never-
+    /// preempted cold prefill of the same token stream.
+    ///
+    /// MUTATIONS, verified by running them:
+    ///   * reverting the `continuation_eligible` edits AND the
+    ///     `prime_prefix_state_for` backstop (i.e. the pre-fix code) — the
+    ///     prefix-length assert fails with 32 (two registered 16-token
+    ///     blocks) against 0.
+    ///   * additionally restoring `run_mamba_only_prefill` at the
+    ///     `run_paged_prefill_chunk` call site — the fingerprint assert
+    ///     fails. MEASURED on this fixture: the reconstruction is NOT
+    ///     bit-identical to the cold prefill (max_abs_diff 5.5e-8 over the
+    ///     conv+SSM state). That residual is what accumulates through the
+    ///     non-invertible recurrent decode and flips greedy argmaxes on the
+    ///     real 23-mamba-layer checkpoint, so the gate is exact equality.
+    ///
+    /// NOT caught here (measured): reverting ONLY the `continuation_eligible`
+    /// edits. The backstop absorbs that on its own, so the predicates are a
+    /// fast path, not the enforcement — see
+    /// `evicted_recurrent_row_with_a_live_adapter_request_reprepares_cold`
+    /// for the backstop's own gate.
+    #[test]
+    fn preempted_resume_prefills_cold_and_matches_a_fresh_cold_prefill() {
+        if !compiled_forward_backend_available() {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        }
+        let mut inner = NemotronHInner::new(tiny_paged_config()).expect("inner builds");
+        install_dense_moe(&mut inner).expect("install dense experts");
+        let stream = Stream::default(DeviceType::Gpu);
+        let salt = 77u64;
+        let prompt = c1_prompt();
+        let replay: Vec<u32> = prompt.iter().copied().chain([7u32, 9u32]).collect();
+
+        // Reference: the same token stream, cold, on an unrelated sequence.
+        let cold_reference = cold_prefill_fingerprint(&mut inner, 2, &replay, 5001);
+
+        // Turn 1 on seq 1.
+        let prefix = inner
+            .prime_prefix_state_for(1, &prompt, &[], salt, false)
+            .expect("prime turn 1");
+        assert_eq!(prefix.effective_cached_prefix_len, 0, "turn 1 is cold");
+        inner.activate_paged_seq(1).expect("activate turn 1");
+        let _ = inner
+            .paged_prefill(&prompt, &prefix, stream)
+            .expect("prefill turn 1");
+
+        // Preempt EXACTLY as `handle_preempted` does: publish the full blocks
+        // for reuse, release the adapter request, then drop the recurrent row.
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("adapter");
+            adapter
+                .register_full_blocks_for_reuse_for(1, &[], salt, false)
+                .expect("register blocks for reuse");
+            adapter.release_request_for(1).expect("release request");
+        }
+        inner.release_scheduled_caches_for(1);
+
+        // Resume, in the scheduler's order: activate the recurrent row FIRST,
+        // then prepare the prefix.
+        inner.activate_paged_seq(1).expect("activate on resume");
+        assert!(
+            !inner.active_seq_recurrent_survived,
+            "a preempted row must re-activate as NOT survived"
+        );
+        let admission = HybridSchedulerBackend::prepare_scheduled_prefix(
+            &mut inner, 1, &replay, &prompt, true, salt, 16,
+        )
+        .expect("prepare on resume");
+        // `NoRestoreTicket` makes `Waiting` uninhabited, so this is
+        // irrefutable: nemotron_h always admits Ready.
+        let ScheduledPrefixAdmission::Ready(resumed) = admission;
+        assert_eq!(
+            resumed.effective_cached_prefix_len, 0,
+            "a resume without a live mamba state must drop the K/V prefix"
+        );
+        assert!(
+            !resumed.mamba_state_reusable,
+            "the cold path must not claim a reusable mamba state"
+        );
+        assert_eq!(resumed.suffix_len, replay.len(), "the whole stream re-runs");
+
+        inner.activate_paged_seq(1).expect("activate for prefill");
+        let _ = inner
+            .paged_prefill(&replay, &resumed, stream)
+            .expect("resume prefill");
+        assert_eq!(
+            mamba_fingerprint(&mut inner, 1),
+            cold_reference,
+            "the resumed recurrent state must be bit-identical to a cold prefill"
+        );
+    }
+
+    /// The non-regression gate the C1 fix must NOT break: a warm continuation
+    /// whose recurrent state really did survive still keeps its whole K/V
+    /// prefix and prefills only the suffix.
+    ///
+    /// Mutation this catches (verified by running it): over-tightening
+    /// `reused_state` to always-false — the new backstop then discards EVERY
+    /// warm prefix and this assert fails with 0 against 40, i.e. every warm
+    /// turn silently re-prefills its whole history.
+    ///
+    /// NOT caught here (measured): forcing `scheduled_recurrent_state_live` to
+    /// always-false. The adapter's `can_continue` / `ContinuedLivePrefix`
+    /// route ignores `skip_lookup` entirely, so a genuinely live request keeps
+    /// its prefix regardless of the eligibility predicate. That independence
+    /// is exactly why the backstop has to exist — see
+    /// `evicted_recurrent_row_with_a_live_adapter_request_reprepares_cold`.
+    #[test]
+    fn warm_continuation_keeps_its_kv_prefix_when_the_mamba_state_survived() {
+        if !compiled_forward_backend_available() {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        }
+        let mut inner = NemotronHInner::new(tiny_paged_config()).expect("inner builds");
+        install_dense_moe(&mut inner).expect("install dense experts");
+        let stream = Stream::default(DeviceType::Gpu);
+        let salt = 88u64;
+        let prompt = c1_prompt();
+        let suffix: Vec<u32> = vec![7, 9, 11];
+        let tokens: Vec<u32> = prompt
+            .iter()
+            .copied()
+            .chain(suffix.iter().copied())
+            .collect();
+
+        let prefix = inner
+            .prime_prefix_state_for(1, &prompt, &[], salt, false)
+            .expect("prime turn 1");
+        inner.activate_paged_seq(1).expect("activate turn 1");
+        let _ = inner
+            .paged_prefill(&prompt, &prefix, stream)
+            .expect("prefill turn 1");
+        // The scheduler's success path: keep the request live, park the row.
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .finalize_turn_keep_live(&[], salt)
+            .expect("finalize keep-live");
+        inner.park_active_scheduled_caches();
+
+        inner.activate_paged_seq(1).expect("activate turn 2");
+        assert!(
+            inner.active_seq_recurrent_survived,
+            "a parked row must re-activate as survived"
+        );
+        let admission = HybridSchedulerBackend::prepare_scheduled_prefix(
+            &mut inner, 1, &tokens, &prompt, true, salt, 16,
+        )
+        .expect("prepare turn 2");
+        // `NoRestoreTicket` makes `Waiting` uninhabited, so this is
+        // irrefutable: nemotron_h always admits Ready.
+        let ScheduledPrefixAdmission::Ready(warm) = admission;
+        assert_eq!(
+            warm.effective_cached_prefix_len,
+            prompt.len(),
+            "a live-state continuation must keep its whole K/V prefix"
+        );
+        assert!(
+            warm.mamba_state_reusable,
+            "the surviving mamba state sits exactly on the prefix boundary"
+        );
+        assert_eq!(warm.suffix_len, suffix.len(), "only the suffix re-runs");
+        assert!(
+            inner.last_paged_prefill_reused_mamba_state,
+            "the perf accounting must report a suffix-only prefill"
+        );
+    }
+
+    /// The BACKSTOP gate. `ensure_recurrent_slot` evicts an idle recurrent row
+    /// WITHOUT releasing that row's adapter request, so the next turn arrives
+    /// with state=gone but request=live+already_registered. The adapter's
+    /// `can_continue` never consults `skip_lookup`, so the predicate edits
+    /// alone cannot stop it handing back the whole prior prefix.
+    ///
+    /// Mutation this catches (verified by running it): shipping the
+    /// `continuation_eligible` edits WITHOUT the `prime_prefix_state_for`
+    /// backstop — the adapter returns `ContinuedLivePrefix` with the full
+    /// 40-token prefix and this assert fails with 40 against 0. This is the
+    /// gate that proves the backstop, not the predicates, is the enforcement
+    /// layer.
+    #[test]
+    fn evicted_recurrent_row_with_a_live_adapter_request_reprepares_cold() {
+        if !compiled_forward_backend_available() {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        }
+        let mut inner = NemotronHInner::new(tiny_paged_config()).expect("inner builds");
+        install_dense_moe(&mut inner).expect("install dense experts");
+        let stream = Stream::default(DeviceType::Gpu);
+        let salt = 99u64;
+        let prompt = c1_prompt();
+        let tokens: Vec<u32> = prompt.iter().copied().chain([7u32, 9, 11]).collect();
+
+        let prefix = inner
+            .prime_prefix_state_for(1, &prompt, &[], salt, false)
+            .expect("prime turn 1");
+        inner.activate_paged_seq(1).expect("activate turn 1");
+        let _ = inner
+            .paged_prefill(&prompt, &prefix, stream)
+            .expect("prefill turn 1");
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .finalize_turn_keep_live(&[], salt)
+            .expect("finalize keep-live");
+        assert!(
+            inner
+                .paged_adapter
+                .as_ref()
+                .expect("adapter")
+                .is_live_for_continue(),
+            "the fixture needs a LIVE, already-registered request"
+        );
+        inner.park_active_scheduled_caches();
+
+        // EXACTLY what `ensure_recurrent_slot` does to an idle victim: drop
+        // the recurrent row and nothing else.
+        inner.release_scheduled_caches_for(1);
+
+        inner.activate_paged_seq(1).expect("activate turn 2");
+        let admission = HybridSchedulerBackend::prepare_scheduled_prefix(
+            &mut inner, 1, &tokens, &prompt, true, salt, 16,
+        )
+        .expect("prepare turn 2");
+        // `NoRestoreTicket` makes `Waiting` uninhabited, so this is
+        // irrefutable: nemotron_h always admits Ready.
+        let ScheduledPrefixAdmission::Ready(after_eviction) = admission;
+        assert_eq!(
+            after_eviction.effective_cached_prefix_len, 0,
+            "an evicted recurrent row must re-prepare cold even on a LIVE request"
+        );
+        assert!(!after_eviction.mamba_state_reusable);
+        assert_eq!(after_eviction.suffix_len, tokens.len());
+    }
+
+    /// The invariant is fail-closed at the point of use, not merely upstream:
+    /// a nonzero cached prefix with no live mamba state is a hard error, never
+    /// a silent full-prefix reconstruction.
+    ///
+    /// Mutation this catches: reintroducing `run_mamba_only_prefill` (or any
+    /// other unbounded, uncancellable reconstruction) at that call site.
+    #[test]
+    fn paged_prefill_refuses_a_prefix_without_a_live_mamba_state() {
+        if !compiled_forward_backend_available() {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        }
+        let mut inner = NemotronHInner::new(tiny_paged_config()).expect("inner builds");
+        let full = c1_prompt();
+        let err = inner
+            .run_paged_prefill_chunk(&full, &full[8..], 8, /* skip_reconstruction */ false)
+            .err()
+            .expect("a prefix without live state must be refused");
+        assert!(
+            err.reason.contains("without a live mamba state"),
+            "unexpected error: {}",
+            err.reason
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // C3: parked recurrent rows are capped, so eviction is reachable.
+    // ------------------------------------------------------------------
+
+    /// `can_activate_scheduled_recurrent` must actually refuse past the cap —
+    /// that refusal is the ONLY thing that makes
+    /// `HybridSchedulerState::ensure_recurrent_slot`'s idle-victim body run.
+    /// Without the override the inherited default is `true` forever and
+    /// `scheduled_caches` grows one ~47.6 MiB row per owner.
+    ///
+    /// The expectation is DERIVED from `scheduler_max_num_seqs_for(32)`, not
+    /// hard-coded: it reads `MLX_SCHED_MAX_NUM_SEQS` through a process-wide
+    /// `OnceLock` that an earlier test in the same binary may already have
+    /// forced.
+    ///
+    /// Mutation this catches: deleting the override — the negative assert
+    /// fails immediately.
+    #[test]
+    fn recurrent_slot_cap_refuses_a_new_row_at_capacity() {
+        if !compiled_forward_backend_available() {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        }
+        let mut inner = NemotronHInner::new(tiny_paged_config()).expect("inner builds");
+        let cap = scheduler_max_num_seqs_for(32);
+        assert!(cap >= 2, "the cap must leave room for real batching");
+
+        for seq_id in 0..cap as SeqId {
+            assert!(
+                HybridSchedulerBackend::can_activate_scheduled_recurrent(&inner, seq_id),
+                "seq {seq_id} is below the cap and must be admissible"
+            );
+            inner.activate_paged_seq(seq_id).expect("activate");
+        }
+        inner.park_active_scheduled_caches();
+        assert_eq!(
+            inner.scheduled_recurrent_units(),
+            cap,
+            "every admitted row must be resident"
+        );
+
+        let newcomer = cap as SeqId;
+        assert!(
+            !HybridSchedulerBackend::can_activate_scheduled_recurrent(&inner, newcomer),
+            "a new sequence past the cap must be refused so the scheduler evicts"
+        );
+        // An ALREADY-resident sequence is always admissible, cap or not —
+        // otherwise a running turn could not be re-activated.
+        assert!(
+            HybridSchedulerBackend::can_activate_scheduled_recurrent(&inner, 0),
+            "a resident row must stay admissible at the cap"
+        );
+
+        // Evicting one idle row (what `ensure_recurrent_slot` does) reopens
+        // the slot.
+        inner.release_scheduled_caches_for(0);
+        assert_eq!(inner.scheduled_recurrent_units(), cap - 1);
+        assert!(
+            HybridSchedulerBackend::can_activate_scheduled_recurrent(&inner, newcomer),
+            "evicting one idle row must admit the newcomer"
+        );
+    }
+
+    /// `scheduled_recurrent_units` must count the ACTIVE row exactly once.
+    /// Double-counting it would silently shrink the effective cap by one.
+    #[test]
+    fn scheduled_recurrent_units_counts_the_active_row_once() {
+        if !compiled_forward_backend_available() {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        }
+        let mut inner = NemotronHInner::new(tiny_paged_config()).expect("inner builds");
+        assert_eq!(inner.scheduled_recurrent_units(), 0, "fresh model has none");
+        inner.activate_paged_seq(1).expect("activate 1");
+        assert_eq!(inner.scheduled_recurrent_units(), 1);
+        inner.park_active_scheduled_caches();
+        assert_eq!(inner.scheduled_recurrent_units(), 1, "parked still counts");
+        inner.activate_paged_seq(2).expect("activate 2");
+        assert_eq!(inner.scheduled_recurrent_units(), 2);
+        // Re-activating an already-parked row must MOVE it, not duplicate it.
+        inner.activate_paged_seq(1).expect("re-activate 1");
+        assert_eq!(inner.scheduled_recurrent_units(), 2);
+        inner.activate_paged_seq(1).expect("re-activate live 1");
+        assert_eq!(inner.scheduled_recurrent_units(), 2, "no-op re-activation");
+    }
+
+    /// `scheduled_recurrent_state_live` must answer for the sequence being
+    /// asked about, BEFORE its activation — that is the only point at which
+    /// `active_seq_recurrent_survived` still describes the PREVIOUS sequence.
+    #[test]
+    fn scheduled_recurrent_state_live_reads_the_pre_activation_truth() {
+        if !compiled_forward_backend_available() {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        }
+        let mut inner = NemotronHInner::new(tiny_paged_config()).expect("inner builds");
+        assert!(
+            !inner.scheduled_recurrent_state_live(1),
+            "an unknown sequence has no live state"
+        );
+        inner.activate_paged_seq(1).expect("activate 1");
+        assert!(
+            !inner.scheduled_recurrent_state_live(1),
+            "a FRESH activation is zero-state, not survived"
+        );
+        inner.park_active_scheduled_caches();
+        assert!(
+            inner.scheduled_recurrent_state_live(1),
+            "a parked row IS live for its owner"
+        );
+        inner.activate_paged_seq(1).expect("re-activate 1");
+        assert!(
+            inner.scheduled_recurrent_state_live(1),
+            "the live sequence keeps the survival its activation decided"
+        );
+        // A different sequence's liveness must not read the active flag.
+        assert!(
+            !inner.scheduled_recurrent_state_live(2),
+            "an unrelated sequence must not inherit the active row's survival"
+        );
+        inner.release_scheduled_caches_for(1);
+        assert!(
+            !inner.scheduled_recurrent_state_live(1),
+            "a released row is not live"
         );
     }
 }

@@ -18,7 +18,21 @@ export interface CatalogEntry {
   description: string;
   /** Exactly one entry carries this. */
   isDefault?: boolean;
-  /** Not offered by the wizard (repo not yet published). */
+  /**
+   * The repo is not published yet, so no UI may offer it as a download.
+   *
+   * Two consumers honour this: the agent wizard via {@link visibleCatalog},
+   * and the dashboard Models page, which filters `!item.hidden` before
+   * rendering cards (`packages/dashboard/ui/src/pages/models.tsx`).
+   * `catalogWithState()` deliberately keeps hidden entries so the UI, not the
+   * dashboard core, decides.
+   *
+   * Also honoured by the download allowlist: `DownloadManager.start`
+   * (`packages/dashboard/src/download.ts`) refuses a hidden repo up front
+   * rather than allocating a job that fails mid-download with a 401 from
+   * Hugging Face. No UI reaches that path for a hidden entry, but a direct
+   * API call does.
+   */
   hidden?: boolean;
 }
 
@@ -54,10 +68,23 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     hidden: true,
   },
   {
-    // Converted from the modelopt NVFP4 checkpoint via
-    // `mlx convert -m nemotron_h` (NVFP4 preserved; FP8 Mamba-2 projections
-    // mapped to mxfp8). Provisional slug — the user finalizes it on HF
-    // upload; entry stays hidden until the repo exists.
+    // NOT DOWNLOADABLE. This repo does not exist: the slug below is a
+    // placeholder the user has not uploaded to, and Hugging Face answers 401
+    // for it. Nothing may offer it as an install until the upload happens and
+    // `hidden` is dropped — and do not guess a substitute slug, because a
+    // wrong-but-live repo would install the wrong weights silently.
+    //
+    // The only route to this model today is local conversion from NVIDIA's
+    // modelopt checkpoint:
+    //   mlx convert -m nemotron_h \
+    //     -i <nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4> \
+    //     -o <models>/nemotron-3.5-lightning-30b-a3b-nvfp4-mlx
+    // (NVFP4 preserved byte-for-byte; the FP8 Mamba-2 projections are
+    // re-quantized. See docs/cli.md "modelopt NVFP4 ingest".)
+    //
+    // The entry is kept — rather than deleted — so the wizard, the dashboard
+    // catalog state, and `catalogSlug()` recognize a locally converted
+    // checkpoint sitting at the canonical slug.
     label: 'Nemotron-3.5-Lightning-30B-A3B',
     hfRepo: 'Brooooooklyn/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-nvfp4-mlx',
     sizeGb: 23,

@@ -173,8 +173,13 @@ varies per expert) applied as a scalar on the projection output at runtime.
 Folding it into the E4M3 group scales, as an earlier revision did, cost ~8% mean
 relative error because the product lands in E4M3's subnormal band; **checkpoints
 converted before this change must be regenerated** — the loader rejects one that
-has no `.global_scale`. Ingest also maps the FP8 Mamba-2 projections to mxfp8
-with the checkpoint's static `input_scale` threaded as `input_amax`. No
+has no `.global_scale`. Ingest also re-quantizes the FP8 Mamba-2 projections to
+**affine 8-bit group-32** with the checkpoint's static `input_scale` threaded as
+`input_amax`. (These were mxfp8 8/32 until the quantization-accuracy pass: MLX
+rounds the E8M0 block exponent to NEAREST rather than ceil, which costs 6.1%
+relative RMS against a per-tensor-E4M3 source versus 0.64% for affine 8/32 —
+a 9.6x error reduction on the whole sequence-mixing backbone. Checkpoints
+converted before that pass are rejected at load with a regenerate hint.) No
 re-quantization flags apply (`-q`/`--q-recipe` are rejected on this
 already-quantized source); the convert is a format/repack pass, not a recipe.
 One consequence: the output is no longer loadable by mlx-lm as plain nvfp4.

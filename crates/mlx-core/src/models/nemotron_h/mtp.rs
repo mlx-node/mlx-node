@@ -585,12 +585,31 @@ mod mtp_turn_tests {
         }
     }
 
+    /// Greedy pick with PRODUCTION tie-break semantics: the FIRST maximal
+    /// index.
+    ///
+    /// Do NOT reach for `Iterator::max_by` here. It is documented to return
+    /// the LAST maximal element, while every lane this helper is an oracle
+    /// for returns the FIRST one:
+    ///   - `mx::argmax` — `ArgMax::reduce` in mlx's `arg_reduce.metal` breaks
+    ///     ties on `best.index > current.index`, i.e. keeps the smaller index;
+    ///   - the compiled production sampler — at `temperature <=
+    ///     GREEDY_TEMPERATURE_EPS` `mlx_compiled_sample_full` short-circuits to
+    ///     `mlx::core::argmax(logits, -1)`;
+    ///   - the MTP accept gate — `p_target_f32.argmax(0, None)` in
+    ///     `sampling::rs`.
+    ///
+    /// A two-way tie with bit-identical f32 logits does occur on the real
+    /// 30B-A3B-NVFP4 checkpoint, so `max_by` made this oracle disagree with a
+    /// real AR turn and reported a phantom AR-vs-MTP divergence.
     fn argmax(vec: &[f32]) -> usize {
-        vec.iter()
-            .enumerate()
-            .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap())
-            .map(|(i, _)| i)
-            .unwrap()
+        let mut best = 0usize;
+        for (i, v) in vec.iter().enumerate() {
+            if *v > vec[best] {
+                best = i;
+            }
+        }
+        best
     }
 
     /// Deterministic dense bf16 expert stack for the backbone MoE layer
@@ -789,8 +808,65 @@ mod mtp_turn_tests {
             // history.
             assert_eq!(
                 outcome.desynced,
-                outcome.rollback_unemitted > 0,
-                "desync latch must fire exactly when a mid-cycle stop left tokens unemitted"
+                outcome.rollback_unemitted > 1,
+                "the latch must fire only when a FORWARDED accepted draft was dropped"
+            );
+            // Scoped to THIS turn's pinned config (`depth: 1`,
+            // `mtp_adaptive_depth` unset => false): a depth-1 cycle emits at
+            // least one token (the near-tail guard needs `remaining >= 2`, so
+            // the emit loop's top-of-iteration budget check cannot fire at
+            // `cycle_emitted == 0`) and `outcome.tokens.len() <= 2`, so at
+            // most the never-forwarded bonus can go unemitted.
+            //
+            // Production gets the same shape because `run_mtp_whole_turn`
+            // pins `mtp_adaptive_depth = false` as well as seeding
+            // `p.mtp_depth.min(1)` — without that pin `run_mtp_cycle` would
+            // re-pick `cycle_depth` from `AdaptiveDepthPolicy::pick_depth()`,
+            // which sweeps 1..=5 regardless of the seed. This is a bound on
+            // the CURRENT policy, not on the stepper: the `> 1` latch arm
+            // stays correct at any depth and
+            // `mtp_rollback_unemitted_latches_when_a_forwarded_token_is_dropped`
+            // pins it directly.
+            assert!(
+                outcome.rollback_unemitted <= 1,
+                "a depth-1, adaptive-off cycle can strand at most the \
+                 unforwarded bonus, got {}",
+                outcome.rollback_unemitted
+            );
+            assert!(
+                !outcome.desynced,
+                "a depth-1 turn never drops a FORWARDED token, so the next flat \
+                 turn must keep its prefix cache"
+            );
+            // The consumer seam: a clear latch is what lets the NEXT flat AR
+            // turn reuse its prefix instead of forcing ResetScope::PrefixMiss.
+            inner.flat_mtp_caches_desynced = outcome.desynced;
+            ChatBackend::save_cache_state(
+                &mut inner,
+                crate::engine::backend::SaveStateArgs {
+                    reuse_cache: true,
+                    is_delta: false,
+                    has_images: false,
+                    generated_tokens: &generated,
+                    finish_reason: &finish,
+                    save_tokens: &prompt,
+                    save_expanded_tokens: None,
+                    image_cache_key: 0,
+                },
+            );
+            let next_turn: Vec<u32> = inner
+                .cached_token_history
+                .iter()
+                .copied()
+                .chain([29u32])
+                .collect();
+            assert!(
+                !inner.flat_caches_desynced(),
+                "an EOS/mid-cycle-terminated depth-1 MTP turn must leave the latch clear"
+            );
+            assert!(
+                ChatBackend::verify_cache_prefix(&inner, &next_turn, true) > 0,
+                "the next flat turn must find a reusable prefix"
             );
             // STRICTNESS contract at T=0, verified against the plain AR
             // oracle of the same inner: every committed token must equal the
@@ -811,11 +887,21 @@ mod mtp_turn_tests {
         }
     }
 
-    /// The mid-cycle-stop desync latch must reach the engine through the
-    /// ChatBackend trait: the physical flat caches can be ahead of the saved
-    /// token history after a partial MTP cycle (EOS/cancel/repetition
-    /// cutoff), and cache recovery resets + re-prefills only when
-    /// flat_caches_desynced() reports it (the qwen3_5/qwen3_5_moe contract).
+    /// The desync latch must reach the engine through the ChatBackend trait,
+    /// and the engine's heal must clear it: cache recovery resets +
+    /// re-prefills only when `flat_caches_desynced()` reports the flat caches
+    /// are ahead of the saved history (the qwen3_5/qwen3_5_moe contract).
+    ///
+    /// This pins the WIRING ONLY — set the field, read it through the trait,
+    /// clear it. It deliberately says nothing about what sets the field,
+    /// because "a mid-cycle stop sets the latch" is FALSE on this family: a
+    /// cycle's last outcome token (bonus or residual) is never forwarded
+    /// through the layers, so a depth-1 mid-cycle stop strands nothing and
+    /// `rollback_unemitted` (which latches only at `unemitted > 1`) leaves
+    /// this clear. `mtp_rollback_unemitted_needs_no_snapshot` (clear on a
+    /// bonus drop) and
+    /// `mtp_rollback_unemitted_latches_when_a_forwarded_token_is_dropped`
+    /// (set when a forwarded token is dropped) own the predicate itself.
     #[test]
     fn flat_cache_desync_latch_reaches_the_backend_trait() {
         let cfg = tiny_mtp_config();
@@ -828,7 +914,7 @@ mod mtp_turn_tests {
         inner.flat_mtp_caches_desynced = true;
         assert!(
             inner.flat_caches_desynced(),
-            "a mid-cycle MTP stop must surface the latch to the engine"
+            "a set latch must surface to the engine through the trait"
         );
         inner.clear_flat_caches_desynced();
         assert!(
@@ -837,15 +923,14 @@ mod mtp_turn_tests {
         );
     }
 
-    /// On a paged model the engine still resolves an MTP-requested turn to
-    /// the Paged path (paged attention takes precedence and the family's
-    /// SpeculativePlan truthfully declares supports_paged_attention=false),
-    /// so run_paged_turn must re-route it to the flat speculative core -
-    /// Prefix reuse must require the sequence's recurrent (Mamba) state to
-    /// have SURVIVED: a preempted sequence releases its state while its KV
-    /// blocks and owner history remain reusable, so a token-only predicate
-    /// would skip the Pass-1 reconstruction and resume with KV at the prefix
-    /// boundary but Mamba state at position zero.
+    /// On the paged path, prefix reuse must require the sequence's recurrent
+    /// (Mamba) state to have SURVIVED, not merely that its tokens match.
+    ///
+    /// A preempted sequence releases its recurrent state while its KV blocks
+    /// and owner history stay reusable, so a token-only predicate would
+    /// resume with attention KV at the prefix boundary but Mamba state back
+    /// at position zero. `activate_paged_seq` reporting survival honestly is
+    /// what lets the eligibility predicates force a COLD prefill instead.
     #[test]
     fn recurrent_state_survival_gates_prefix_reuse() {
         let cfg = tiny_mtp_paged_config();
@@ -872,7 +957,7 @@ mod mtp_turn_tests {
             .expect("reactivate after preemption");
         assert!(
             !inner.active_seq_recurrent_survived,
-            "preemption-released state must force Pass-1 reconstruction"
+            "preemption-released state must force a COLD prefill"
         );
     }
 
@@ -1299,8 +1384,9 @@ mod mtp_turn_tests {
     /// snapshot, on the one path where a snapshot is guaranteed to be gone.
     ///
     /// MUTATION: any implementation that reaches for `self.snap` — `rollback`
-    /// nulls it on the `accepted_drafts == depth` branch, and depth is
-    /// clamped to 1, so EVERY strandable cycle is a full-accept cycle.
+    /// nulls it on the `accepted_drafts == depth` branch, so every
+    /// full-accept cycle (the only strandable shape at the seeded depth of 1)
+    /// arrives here with no snapshot to undo from.
     #[test]
     fn mtp_rollback_unemitted_needs_no_snapshot() {
         if !compiled_forward_backend_available() {
@@ -1356,7 +1442,151 @@ mod mtp_turn_tests {
             before - 1,
             "the drafter KV must follow the committed cursor"
         );
-        assert!(step.into_desynced(), "the desync latch must be set");
+        // The dropped token is the cycle's never-forwarded BONUS: the backbone
+        // caches hold `tokens[..len - 1]`, which is exactly the saved history.
+        // Latching here would make the NEXT flat AR turn discard its entire
+        // prefix cache (`run_flat_ar_turn` forces `hit = 0` on the latch) on
+        // every EOS-terminated MTP turn.
+        assert!(
+            !step.into_desynced(),
+            "a depth-1 bonus drop leaves the backbone aligned with the saved history"
+        );
+    }
+
+    /// WHY `run_mtp_whole_turn` PINS `mtp_adaptive_depth = false`.
+    ///
+    /// `depth: p.mtp_depth.min(1)` at the `run_mtp_turn` call site is NOT the
+    /// last word on cycle depth. `run_mtp_cycle` computes
+    ///
+    /// ```text
+    /// cycle_depth = if p.mtp_adaptive_depth { policy.pick_depth() } else { depth }
+    /// ```
+    ///
+    /// and `AdaptiveDepthPolicy::new(seed)` uses `seed` only to set
+    /// `current_depth` — it starts in `Explore`, whose `pick_depth()` returns
+    /// `explore_depth`, a cursor that walks `MIN_DEPTH..=MAX_DEPTH`
+    /// independent of the seed. `mtp_adaptive_depth` is a plain ChatConfig
+    /// knob (`config.mtp_adaptive_depth.unwrap_or(false)`) with no family
+    /// gate, and `Throughput` is the default mode, so `mtpAdaptiveDepth:
+    /// true` USED TO run NemotronH at depth 2..5 on a path this family never
+    /// validated.
+    ///
+    /// This test proves the bypass at the policy level. It is the reason the
+    /// family-level pin exists — delete the pin and depth > 1 comes straight
+    /// back — and the reason the `unemitted > 1` arm in `rollback_unemitted`
+    /// stays even though the pin makes it unreachable today.
+    #[test]
+    fn adaptive_depth_policy_escapes_a_depth_1_seed() {
+        use crate::models::qwen3_5::adaptive_depth::{AdaptiveDepthPolicy, CycleStats};
+
+        // Seeded exactly the way the NemotronH call site seeds it: with the
+        // already-clamped `p.mtp_depth.min(1)`.
+        let mut policy = AdaptiveDepthPolicy::new(1);
+        assert_eq!(policy.pick_depth(), 1, "Explore starts at MIN_DEPTH");
+
+        let mut seen_above_1 = false;
+        for _ in 0..64 {
+            let d = policy.pick_depth();
+            if d > 1 {
+                seen_above_1 = true;
+                break;
+            }
+            policy.record_cycle(CycleStats {
+                depth: d,
+                committed: u32::from(d) + 1,
+                wall_ns: 1_000_000,
+            });
+        }
+        assert!(
+            seen_above_1,
+            "a depth-1-seeded adaptive policy must still explore depth > 1 —              if this ever stops being true, the `unemitted > 1` latch arm in              NemotronHMtpStepper::rollback_unemitted really is dead and the              comment there should be revisited"
+        );
+    }
+
+    /// The other half of the same rule: dropping a token the backbone DID
+    /// forward must still latch. The cycle shape below is a DEPTH-2 one —
+    /// `commit_mtp` of three tokens (anchor + two accepted drafts) followed by
+    /// `rollback_unemitted(2)`, i.e. the emit loop stopped after the first
+    /// draft, leaving one forwarded draft plus the never-forwarded bonus
+    /// outstanding. The caches hold that second draft; the saved history does
+    /// not; `unemitted - 1 == 1` forwarded token was stranded, so the latch
+    /// must fire.
+    ///
+    /// WHY THE ARM IS KEPT even though production cannot reach depth 2 today.
+    /// `run_mtp_whole_turn` pins BOTH `depth: p.mtp_depth.min(1)` and
+    /// `mtp_adaptive_depth = false`; without that second pin `run_mtp_cycle`
+    /// takes `cycle_depth` from `AdaptiveDepthPolicy::pick_depth()`, which
+    /// sweeps 1..=5 regardless of the seed (see
+    /// `adaptive_depth_policy_escapes_a_depth_1_seed`) — the shape below is
+    /// exactly what that produced. The pin is a POLICY choice in one
+    /// function; this test is the correctness net under it, and `> 1` is the
+    /// right predicate at every depth because `unemitted - 1` is the
+    /// stranded-forwarded count at every depth.
+    ///
+    /// At a pinned depth of 1 the shape below cannot occur:
+    /// `outcome.tokens.len() <= 2` there, and the near-tail cap
+    /// (`cycle_depth.min(remaining - 1)` plus the `cycle_depth < 1 =>
+    /// continue`) forces `remaining >= 2` before a cycle runs, so the emit
+    /// loop's top-of-iteration budget check cannot fire at
+    /// `cycle_emitted == 0` and `unemitted` cannot exceed 1. An earlier
+    /// revision of this doc claimed the depth-1 emit loop could break at its
+    /// first iteration with both tokens outstanding — it cannot, and pinning
+    /// the latch on that unreachable trigger is what made the predicate look
+    /// dead.
+    ///
+    /// MUTATION: narrowing the latch to `unemitted > 2`, or dropping it
+    /// entirely — the caches would silently stay ahead of the saved history
+    /// and the next turn would decode from a poisoned prefix.
+    #[test]
+    fn mtp_rollback_unemitted_latches_when_a_forwarded_token_is_dropped() {
+        if !compiled_forward_backend_available() {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        }
+        let mut inner = mtp_ready_inner();
+        let h = inner.config.hidden_size as usize;
+        let prompt: Vec<u32> = vec![1, 5, 9, 3];
+        let p = greedy_params();
+        let stream = Stream::new(DeviceType::Gpu);
+
+        inner.reset_caches_internal();
+        let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
+        let setup = MtpTurnSetup {
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
+            prompt_hidden_position_base: 0,
+            first_sampled_token: 7,
+        };
+        let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
+
+        step.begin_cycle(false);
+        let seed_h = det_rows(h, 1, 5.0);
+        step.draft_step(&seed_h, &det_rows(h, 1, 17.0))
+            .expect("draft");
+        let emb = step.embedding().clone();
+        step.commit_mtp(
+            crate::models::qwen3_5::mtp_decode::MtpCommitAnchor::IncludeAnchor,
+            &seed_h,
+            &det_rows(h, 3, 33.0),
+            &[13u32, 21u32, 34u32],
+            1,
+            &emb,
+        )
+        .expect("commit");
+        let before = step.committed_len();
+        assert_eq!(before, prompt.len() as i32 + 3);
+
+        step.rollback_unemitted(2);
+        assert_eq!(
+            step.committed_len(),
+            before - 2,
+            "the cursor rewinds by the full unemitted count"
+        );
+        assert_eq!(step.draft_kv_offset(), before - 2);
+        assert!(
+            step.into_desynced(),
+            "dropping a FORWARDED token must latch the desync"
+        );
     }
 
     /// A zero (or out-of-set) paged block size must fail the load with a
@@ -1532,8 +1762,8 @@ mod mtp_turn_tests {
         .expect("run_mtp_turn");
         assert_eq!(
             outcome.desynced,
-            outcome.rollback_unemitted > 0,
-            "desync latch must fire exactly when a mid-cycle stop left tokens unemitted"
+            outcome.rollback_unemitted > 1,
+            "the latch must fire only when a FORWARDED accepted draft was dropped"
         );
 
         let mut first_div = None;

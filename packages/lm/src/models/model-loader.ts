@@ -395,8 +395,12 @@ export async function loadModel(modelPath: string, options?: LoadModelOptions): 
  * speculative decoding — gemma4 only; any other detected family rejects it.
  * Without the option, Gemma4 loads `<modelPath>/draft/` automatically when
  * that embedded checkpoint is present.
- * The resulting session auto-enables the speculative path (the model
- * reports `hasMtpWeights()`); pass `enableMtp: false` per call to opt out.
+ * The resulting session auto-enables the speculative path when the model
+ * reports `hasMtpWeights()` AND does not opt out of the auto-default; pass
+ * `enableMtp: false` per call to suppress it, or `enableMtp: true` to force
+ * it on a family that opts out. NemotronH opts out (`mtpAutoEnabled()`
+ * returns false) because forcing MTP moves the turn into the exclusive lane
+ * and out of continuous batching; see `ChatSession.mtpAutoDefaultAllowed`.
  */
 export async function loadSession(
   modelPath: string,
