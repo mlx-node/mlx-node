@@ -2802,9 +2802,10 @@ mod tests {
 
     /// T=1.0 `ChatParams` — drives `run_mtp_cycle` down the DENSE stochastic
     /// `accept_with_residual` branch: `temperature == 1.0` is not greedy
-    /// (`use_sparse_accept == false`) and the batched-target-array env is
-    /// off by default (`use_sparse_stochastic_accept == false`), so neither
-    /// sparse fast path applies. All penalties stay at their no-op defaults.
+    /// (`use_sparse_accept == false`) and `top_k == 0` fails
+    /// `sparse_distribution_supported` (`use_sparse_stochastic_accept ==
+    /// false`), so neither sparse fast path applies. All penalties stay at
+    /// their no-op defaults.
     fn dense_params() -> ChatParams {
         ChatParams {
             sampling_config: Some(SamplingConfig {

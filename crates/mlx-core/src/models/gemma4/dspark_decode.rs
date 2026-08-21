@@ -66,8 +66,8 @@ pub(crate) enum Gemma4DraftTurnState {
 }
 
 /// DSpark's [`Gemma4DraftTurnState`] payload: the draft's fused-context
-/// cache built by the whole-turn core's tapped prefill
-/// (`dspark_prefill_with_tap`).
+/// cache built by `paged_prefill_with_draft_state`, which taps the target's
+/// paged prefill walk.
 pub(crate) struct DsparkTurnState {
     /// The draft's fused-context K/V cache, holding one row per freshly
     /// prefilled prompt token (absolute positions

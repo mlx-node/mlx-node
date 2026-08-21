@@ -335,11 +335,9 @@ impl Gemma4Inner {
     /// byte-identical to the AR path, plus the LAST prompt token's
     /// post-final-norm hidden.
     ///
-    /// Mirrors `dspark_prefill_with_tap` MINUS all tap/fuse/context work
-    /// (same upfront embedding/PLE, same 512-token chunking, same eval
-    /// cadence and `clear_cache`, same last-token split) — the last token
-    /// runs `forward_body` with the hidden kept, then the `lm_head_logits`
-    /// tail, which composes to exactly `forward_inner`.
+    /// The last token runs `forward_body` with the hidden kept, then the
+    /// `lm_head_logits` tail, which composes to exactly `forward_inner` —
+    /// that split is what keeps the target compute byte-identical to AR.
     ///
     /// Returns the sampling-ready last-token logits `[1, vocab]` plus the
     /// turn's [`AssistantTurnState`].
