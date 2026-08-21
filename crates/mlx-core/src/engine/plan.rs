@@ -727,9 +727,11 @@ mod tests {
 
     /// A decoder that DOES stream is unaffected by the request fact.
     ///
-    /// MUTATION: invert `admits_streaming` to `!self.supports_streaming ||
-    /// !streaming` — the streaming assertion here fails while the sync-only
-    /// test above still passes, so the two pin the predicate from both sides.
+    /// MUTATION: reduce `admits_streaming` to `!streaming` — the `streaming =
+    /// true` leg here fails while the sync-only test above still passes, so
+    /// the two pin the predicate from both sides. A full inversion
+    /// (`!self.supports_streaming || !streaming`) is NOT that mutation: it
+    /// flips the sync-only decoder's answer too and fails both tests.
     #[test]
     fn a_streaming_capable_decoder_is_admitted_on_both_turn_shapes() {
         let execution = ExecutionPlan {

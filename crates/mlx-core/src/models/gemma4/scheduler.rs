@@ -389,7 +389,7 @@ impl HybridSchedulerBackend for Gemma4Inner {
                     state.is_some_and(|state| state.flat_caches.is_some())
                 };
                 let message = if conflicting {
-                    "Gemma4 cannot switch a live cache owner between autoregressive/media and MTP/DSpark cache layouts; start a new session"
+                    "Gemma4 cannot switch a live cache owner between autoregressive/media and assistant-draft cache layouts; start a new session"
                 } else {
                     "chat session continuation requires an initialized cache owner (call chatSessionStart first)"
                 };

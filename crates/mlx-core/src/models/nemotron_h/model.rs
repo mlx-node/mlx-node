@@ -2230,8 +2230,8 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
 
 impl NemotronHInner {
     /// Plain autoregressive whole-turn core over the FLAT caches, sync and streaming.
-    /// Only `run_speculative_turn` calls it, when the flat MTP gate declines: the
-    /// engine's generic AR flow is unreachable from inside a specialized handler.
+    /// Reached only from `mtp_seed_failed_fallback` on a model with no paged adapter:
+    /// the engine's generic AR flow is unreachable from inside a specialized handler.
     /// Structure mirrors that generic flow one for one so the two cannot drift.
     fn run_flat_ar_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         if args.tokens.is_empty() {
@@ -2426,11 +2426,17 @@ impl NemotronHInner {
 
     /// FAIL-CLOSED handling for a drafter seed that could not be built. A half-seeded
     /// cache would draft from the wrong state, so the seed is dropped and THIS turn is
-    /// retried on the plain AR lane. The head stays ARMED: the only failure that reaches
-    /// here is a recoverable MLX eval failure, which is a transient allocation
-    /// condition, and one inner is shared by every session on this loaded model, so a
-    /// permanent disarm would trade one memory-pressure episode for the loaded model's
-    /// remaining life.
+    /// retried on the plain AR lane.
+    ///
+    /// Every non-cancellation error out of `chunked_prefill_seeding_mtp` /
+    /// `seed_mtp_final_slot` arrives here, transient (an MLX allocation or eval failure)
+    /// and permanent (a config/module mismatch: `NemotronHMtpModule::fresh_caches` sizes
+    /// the cache vector from `config.mtp_layers_block_type`, and the head's `forward`
+    /// checks that length against its built layers) alike. The degrade is per-TURN so
+    /// the two need no telling apart: a permanent condition simply re-fails and
+    /// re-degrades on every later turn, while disarming the head would spend one
+    /// transient episode on the whole loaded model, since one inner serves every session
+    /// on it.
     fn mtp_seed_failed_fallback(
         &mut self,
         args: &mut WholeTurnArgs<'_>,
@@ -2751,9 +2757,11 @@ impl NemotronHModel {
     }
 
     /// Whether `ChatSession` should turn MTP ON when the caller sets nothing. FALSE
-    /// deliberately, about SCHEDULING not speed: `enable_mtp == Some(true)` forces the
-    /// chat-requires-barrier predicate, putting the turn in the EXCLUSIVE lane and out
-    /// of continuous batching. `MLX_NEMOTRON_MTP_DEFAULT=1` flips it.
+    /// deliberately, about SCHEDULING not speed: this family's flat MTP core has no
+    /// streaming arm, so `enable_mtp == Some(true)` costs a SYNC turn its scheduled
+    /// slot — `chat_requires_barrier` routes it to the EXCLUSIVE lane and out of
+    /// continuous batching. A streaming turn plans plain autoregressive and keeps its
+    /// slot. `MLX_NEMOTRON_MTP_DEFAULT=1` flips the default.
     #[napi]
     pub fn mtp_auto_enabled(&self) -> bool {
         static OPT_IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

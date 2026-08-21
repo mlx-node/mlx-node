@@ -1143,12 +1143,14 @@ pub(crate) struct Gemma4Inner {
     /// defensively inside [`ChatBackend::prefill`] / the vision cores).
     /// Shared across turns by the session API.
     pub(crate) caches: Option<Vec<Gemma4LayerCache>>,
-    /// Selects the request-local flat target cache lane used by MTP/DSpark.
+    /// Selects the request-local flat target cache lane used by the ASSISTANT
+    /// drafter.
     ///
     /// A loaded draft may coexist with the resident paged pools. The
     /// scheduler installs exactly one owner's flat caches here while an
-    /// exclusive speculative command runs, then parks them again. Ordinary
-    /// AR/media commands leave this false and use `active_paged_seq`.
+    /// exclusive assistant-draft command runs, then parks them again. Every
+    /// other command — AR, media, and DSpark — leaves this false and uses
+    /// `active_paged_seq`.
     active_flat_session: bool,
     /// Tokens (post image-expansion) whose KV state is currently live in
     /// `caches`. Maintained in parallel with `caches` for prefix-reuse
@@ -1188,9 +1190,9 @@ pub(crate) struct Gemma4Inner {
     /// hooks run. Ownerless legacy turns use sequence zero.
     pub(crate) active_paged_seq: u32,
     /// Draft model for speculative decoding (`Gemma4LoadOptions::
-    /// draft_model_path`), either [`Gemma4Draft`] variant. Draft target caches
-    /// use a per-owner flat lane while ordinary text/media owners continue to
-    /// use the resident grouped paged pools.
+    /// draft_model_path`), either [`Gemma4Draft`] variant. An assistant draft's
+    /// target caches use a per-owner flat lane; DSpark verifies against the
+    /// resident grouped paged pools, like every ordinary text/media owner.
     pub(crate) draft: Option<Gemma4Draft>,
     /// Per-turn draft handoff: the whole-turn core builds the variant's
     /// prefill-derived state (DSpark fused-context cache / assistant
@@ -6754,7 +6756,6 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         let _logits = self.inner.run_paged_decode_step(token_id)?;
         Ok(())
     }
-    // end_decode → default Ok(()).
 }
 
 /// Gemma4 paged prefix state: the common boundary owned by every physical

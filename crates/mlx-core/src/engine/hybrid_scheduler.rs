@@ -2693,12 +2693,16 @@ mod tests {
     /// admitted for sync turns and refused for streaming ones — the one
     /// family where the two answers can differ.
     ///
-    /// MUTATIONS, each verified to fail exactly this test:
+    /// MUTATIONS:
     ///   * barrier on `config.enable_mtp` alone (drop the
-    ///     `speculation_requires_exclusive_lane` conjunct) — the streaming and
-    ///     no-head legs report a barrier the planner does not need;
+    ///     `speculation_requires_exclusive_lane` conjunct) — the streaming leg
+    ///     here reports a barrier the planner does not need. This one kills
+    ///     BOTH this test and
+    ///     `enable_mtp_without_a_loaded_decoder_keeps_the_scheduled_lane`,
+    ///     whose fixture carries no head at all;
     ///   * drop `admits_streaming` from `speculation_requires_exclusive_lane`
-    ///     — the streaming leg barriers while the plan says autoregressive.
+    ///     — fails exactly this test: the streaming leg barriers while the
+    ///     plan says autoregressive.
     #[test]
     fn the_barrier_gate_never_declines_a_turn_the_planner_will_speculate_on() {
         let mut inner =
