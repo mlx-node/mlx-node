@@ -336,13 +336,28 @@ fn scheduler_long_prefill_tokens() -> u32 {
 
 pub(crate) fn scheduler_per_seq_context() -> u32 {
     static VALUE: OnceLock<u32> = OnceLock::new();
-    *VALUE.get_or_init(|| {
-        std::env::var("MLX_PAGED_PER_SEQ_CTX")
-            .ok()
-            .and_then(|value| value.parse::<u32>().ok())
-            .filter(|&value| value > 0)
-            .unwrap_or(32_768)
-    })
+    *VALUE.get_or_init(|| scheduler_per_seq_context_override().unwrap_or(32_768))
+}
+
+pub(crate) fn scheduler_per_seq_context_override() -> Option<u32> {
+    std::env::var("MLX_PAGED_PER_SEQ_CTX")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|&value| value > 0)
+}
+
+pub(crate) fn scheduled_turn_context(
+    trained_context: u32,
+    pool_tokens: u32,
+    override_cap: Option<u32>,
+) -> u32 {
+    let trained = trained_context.max(1);
+    let pool = pool_tokens.max(1);
+    let mut cap = trained.min(pool);
+    if let Some(limit) = override_cap.filter(|&value| value > 0) {
+        cap = cap.min(limit);
+    }
+    cap
 }
 
 fn scheduler_watermark_fraction() -> f64 {
@@ -3029,5 +3044,41 @@ mod tests {
             state.owner_states.get("continued-owner").map(Vec::as_slice),
             Some(&[7, 8][..])
         );
+    }
+}
+
+#[cfg(test)]
+mod scheduled_context_tests {
+    use super::scheduled_turn_context;
+
+    #[test]
+    fn admit_uses_pool_when_env_unset() {
+        // Incident numbers: 33611 prompt, 32768 old cap, ~349520 pool, 1M trained.
+        let cap = scheduled_turn_context(1_048_576, 349_520, None);
+        assert_eq!(cap, 349_520);
+        assert!(crate::engine::scheduler::clamp_scheduled_output_tokens(33_611, 1024, cap).is_ok());
+        assert!(
+            crate::engine::scheduler::clamp_scheduled_output_tokens(33_611, 1024, 32_768).is_err()
+        );
+    }
+
+    #[test]
+    fn admit_never_exceeds_trained() {
+        assert_eq!(scheduled_turn_context(40_960, 262_144, None), 40_960);
+    }
+
+    #[test]
+    fn explicit_env_cap_still_clips() {
+        assert_eq!(
+            scheduled_turn_context(1_048_576, 349_520, Some(32_768)),
+            32_768
+        );
+    }
+
+    #[test]
+    fn zero_or_missing_override_is_ignored() {
+        // Some(0) is treated as unset; None means no extra clip beyond min(trained, pool).
+        assert_eq!(scheduled_turn_context(64, 64, Some(0)), 64);
+        assert_eq!(scheduled_turn_context(1_048_576, 349_520, None), 349_520);
     }
 }
