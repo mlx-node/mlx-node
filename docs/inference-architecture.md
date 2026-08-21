@@ -139,9 +139,11 @@ the committed length, never by a snapshot restore (the same rewind-and-overwrite
 model the KV cache uses everywhere else). Attention is **NoPE** throughout;
 causality comes from the cache offset plus the causal mask. Depth stays clamped
 to 1: vLLM reaches depth > 1 by looping the single MTP layer, which is
-architecturally available here but out of scope. A seed failure is fail-closed —
-it disarms the head for the rest of the model's life and the turn retries on the
-AR lane.
+architecturally available here but out of scope. A seed failure is fail-closed for
+the TURN, not for the model: the half-built seed is dropped, the turn retries on the
+AR lane, and the head stays armed for the next turn. The only seeding failure that
+arrives as a recoverable error is an MLX eval/allocation failure, which is transient,
+and one inner is shared by every session on the loaded model.
 
 ## Extension boundary
 

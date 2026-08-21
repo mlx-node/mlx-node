@@ -140,7 +140,10 @@ pub(crate) struct NemotronHInner {
     pub(crate) cached_token_history: Vec<u32>,
     /// Multi-Token Prediction head - Some when config.n_mtp_layers > 0.
     pub(crate) mtp: Option<NemotronHMtpModule>,
-    /// Set true by the loader only after the MTP weight set is COMPLETE.
+    /// Set true by the loader only after the MTP weight set is COMPLETE, and never
+    /// written again: `NemotronHModel::mtp_active` is a load-time snapshot of
+    /// `has_mtp_weights()`, so a runtime writer here would make the `hasMtpWeights()`
+    /// NAPI getter lie.
     pub(crate) mtp_weights_loaded: bool,
     /// Handover slot for the turn's seeded MTP drafter cache plus its committed
     /// length. `begin_mtp_decode` hard-errors on `None` rather than drafting from an
@@ -154,6 +157,12 @@ pub(crate) struct NemotronHInner {
     /// latch-INDEPENDENT way to ask "did that turn stop mid-cycle?", so a gate keyed
     /// off it is not a probe of its own guard.
     pub(crate) flat_mtp_last_rollback_unemitted: usize,
+    /// Lifetime count of drafter seeds that failed and degraded their turn to plain AR.
+    /// A cancellation is not a failure and never increments it. Diagnostic and test
+    /// seam ONLY: it is the observable that separates the cancel arm of
+    /// `mtp_seed_aborted` from the fallback arm, which are otherwise
+    /// post-condition-identical.
+    pub(crate) mtp_seed_failures: u32,
     /// Parsed generation_config.json sampling/stop defaults.
     pub(crate) gen_defaults: crate::engine::ModelGenerationDefaults,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) covering
@@ -219,6 +228,7 @@ impl NemotronHInner {
             pending_mtp_draft_seed: None,
             flat_mtp_caches_desynced: false,
             flat_mtp_last_rollback_unemitted: 0,
+            mtp_seed_failures: 0,
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
             paged_adapter,
             scheduled_caches: HashMap::new(),
@@ -2415,29 +2425,33 @@ impl NemotronHInner {
     }
 
     /// FAIL-CLOSED handling for a drafter seed that could not be built. A half-seeded
-    /// cache would draft from the wrong state, so the head is disarmed for the whole
-    /// model (`mtp_weights_loaded = false`) and THIS turn is retried on the plain AR
-    /// lane. No recursion is possible: the routing predicate is already false.
+    /// cache would draft from the wrong state, so the seed is dropped and THIS turn is
+    /// retried on the plain AR lane. The head stays ARMED: the only failure that reaches
+    /// here is a recoverable MLX eval failure, which is a transient allocation
+    /// condition, and one inner is shared by every session on this loaded model, so a
+    /// permanent disarm would trade one memory-pressure episode for the loaded model's
+    /// remaining life.
     fn mtp_seed_failed_fallback(
         &mut self,
         args: &mut WholeTurnArgs<'_>,
         err: &Error,
     ) -> Result<TurnOutput> {
+        self.mtp_seed_failures = self.mtp_seed_failures.saturating_add(1);
         tracing::warn!(
-            "NemotronH MTP drafter seed failed ({}); disabling speculative MTP for this \
-             model and running this turn autoregressively",
+            target: "mlx_core::nemotron_h",
+            seed_failures = self.mtp_seed_failures,
+            "NemotronH MTP drafter seed failed ({}); running this turn autoregressively \
+             and retrying the head on the next turn",
             err.reason
         );
-        self.mtp_weights_loaded = false;
         self.pending_mtp_draft_seed = None;
         // The partial seed left the backbone caches mid-prompt; the AR lane
         // must start from a clean slate.
         self.reset_caches_internal();
-        // The head is disarmed, so `execution_plan` no longer offers a
-        // speculative decoder: re-state the turn's plan as the planner would
-        // now resolve it. The paged core reads `plan.decoder` to decide
-        // whether to admit a verify cycle, and a stale `Speculative` here
-        // would send the fallback straight back into speculation.
+        // THIS turn, and only this turn, leaves the speculative lane. The paged
+        // core reads `plan.decoder` to decide whether to admit a verify cycle, and
+        // a stale `Speculative` here would send the fallback straight back into
+        // speculation.
         args.plan.decoder = DecoderPlan::Autoregressive;
         args.plan.use_paged_attention = self.paged_adapter.is_some();
         if args.plan.use_paged_attention {
@@ -2447,10 +2461,9 @@ impl NemotronHInner {
         }
     }
 
-    /// Route a drafter seed that did not complete. A cooperative CANCELLATION is not
-    /// a seeding failure, and disarming on it would be permanent: nothing outside the
-    /// loader sets `mtp_weights_loaded` back to `true`, and all sessions share one
-    /// inner, so clean the caches the partial seed advanced and propagate the
+    /// Route a drafter seed that did not complete. A cooperative CANCELLATION must
+    /// reach the caller as an ERROR, never be silently converted into a completed AR
+    /// turn, so it cleans the caches the partial seed advanced and propagates the
     /// distinguished error. Anything else takes the fail-closed
     /// [`mtp_seed_failed_fallback`](Self::mtp_seed_failed_fallback).
     fn mtp_seed_aborted(&mut self, args: &mut WholeTurnArgs<'_>, err: Error) -> Result<TurnOutput> {
@@ -3766,13 +3779,19 @@ mod scheduler_tests {
         );
     }
 
-    /// FAIL-CLOSED: a drafter seed that cannot be built must DISARM the MTP head for
-    /// good and finish the turn autoregressively. The forced failure is real: the
-    /// config declares one MTP block while the built module has two.
+    /// FAIL-CLOSED for the TURN, not for the model: a drafter seed that cannot be
+    /// built drops the seed and finishes THIS turn autoregressively, leaving the head
+    /// armed so the next turn retries it. The forced failure is real — the config
+    /// declares one MTP block while the built module has two — and the mutation
+    /// stands, so the SECOND turn proves the retry by reaching the drafter and failing
+    /// the same way.
     ///
-    /// MUTATION: propagating the error, or falling back without clearing the flag.
+    /// MUTATION A: re-add `self.mtp_weights_loaded = false` to
+    /// `mtp_seed_failed_fallback` — turn 1's still-armed assertions fail.
+    /// MUTATION B: drop the `mtp_seed_failures` increment — the count assertions fail.
+    /// MUTATION C: propagate the error instead of falling back — the unwrap panics.
     #[test]
-    fn mtp_seed_failure_disables_the_head_and_falls_back_to_ar() {
+    fn a_failed_seed_degrades_only_its_own_turn_and_leaves_the_head_armed() {
         if !compiled_forward_backend_available() {
             eprintln!("skipping (no Metal backend)");
             return;
@@ -3815,62 +3834,73 @@ mod scheduler_tests {
             use_paged_attention: false,
             decoder: DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
         };
-        let mut args = WholeTurnArgs {
-            tokens: &tokens,
-            tokenizer: &tokenizer,
-            eos_id: u32::MAX,
-            config: &config,
-            params: &params,
-            thinking: ThinkingSetup {
-                enabled: false,
-                budget: None,
-            },
-            plan,
-            sink: None,
-            cancelled: None,
-            media: MediaInputs {
-                images: &[],
-                audio: &[],
-            },
-        };
 
-        let out = ChatBackend::run_speculative_turn(&mut inner, &mut args)
-            .unwrap_or_else(|e| panic!("the seed failure must NOT propagate: {}", e.reason));
-        match out {
-            TurnOutput::Complete(result) => assert_eq!(
-                result.num_tokens, 4,
-                "the AR fallback must generate the full budget"
-            ),
-            _ => panic!("expected a completed sync turn"),
+        for turn in 1..=2u32 {
+            let mut args = WholeTurnArgs {
+                tokens: &tokens,
+                tokenizer: &tokenizer,
+                eos_id: u32::MAX,
+                config: &config,
+                params: &params,
+                thinking: ThinkingSetup {
+                    enabled: false,
+                    budget: None,
+                },
+                plan,
+                sink: None,
+                cancelled: None,
+                media: MediaInputs {
+                    images: &[],
+                    audio: &[],
+                },
+            };
+
+            let out =
+                ChatBackend::run_speculative_turn(&mut inner, &mut args).unwrap_or_else(|e| {
+                    panic!(
+                        "turn {turn}: the seed failure must NOT propagate: {}",
+                        e.reason
+                    )
+                });
+            match out {
+                TurnOutput::Complete(result) => assert_eq!(
+                    result.num_tokens, 4,
+                    "turn {turn}: the AR fallback must generate the full budget"
+                ),
+                _ => panic!("turn {turn}: expected a completed sync turn"),
+            }
+            assert_eq!(
+                inner.mtp_seed_failures, turn,
+                "turn {turn}: the fallback arm must count every failed seed"
+            );
+            assert!(
+                inner.mtp_weights_loaded && inner.has_mtp_weights(),
+                "turn {turn}: a failed seed must NOT disarm the head"
+            );
+            assert!(
+                inner.pending_mtp_draft_seed.is_none(),
+                "turn {turn}: no half-built seed may survive"
+            );
+            assert!(
+                inner.execution_plan().speculative.is_some(),
+                "turn {turn}: the speculative plan must stay on offer"
+            );
+            assert_eq!(
+                planned_turn(&inner, true, false).decoder,
+                DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+                "turn {turn}: the next MTP request must plan back into the drafter"
+            );
         }
-        assert!(
-            !inner.mtp_weights_loaded,
-            "a failed seed must disarm the head"
-        );
-        assert!(!inner.has_mtp_weights());
-        assert!(
-            inner.pending_mtp_draft_seed.is_none(),
-            "no half-built seed may survive"
-        );
-        assert!(
-            inner.execution_plan().speculative.is_none(),
-            "the speculative plan must go dark for every later turn"
-        );
-        assert_eq!(
-            planned_turn(&inner, true, false).decoder,
-            DecoderPlan::Autoregressive,
-            "later turns must not plan back into the MTP core"
-        );
     }
 
     /// A turn CANCELLED mid-prefill is NOT a seeding failure: the distinguished
-    /// `PREFILL_CANCELLED` error must propagate with the MTP head STILL ARMED.
-    /// Nothing outside the loader ever sets `mtp_weights_loaded` back to `true`, and
-    /// every session on this loaded model shares one inner, so disarming here would
-    /// strip speculative MTP for the life of the process.
+    /// `PREFILL_CANCELLED` error must propagate instead of being masked as a completed
+    /// AR turn. Both arms of `mtp_seed_aborted` leave the head armed and the caches
+    /// clean, so `mtp_seed_failures` is the only thing that tells them apart.
     ///
-    /// MUTATION: routing the cancellation into `mtp_seed_failed_fallback` — the reply
-    /// still rejects, so ONLY the still-armed assertions fail.
+    /// MUTATION: routing the cancellation into `mtp_seed_failed_fallback` — the AR
+    /// fallback re-polls the same flag in its own prefill and still rejects, so ONLY
+    /// the `mtp_seed_failures` assertion fails.
     #[test]
     fn cancelled_prefill_seed_propagates_without_disarming_the_mtp_head() {
         if !compiled_forward_backend_available() {
@@ -3942,10 +3972,15 @@ mod scheduler_tests {
             "the cancellation must reach the session layer unmasked"
         );
 
+        assert_eq!(
+            inner.mtp_seed_failures, 0,
+            "a cancellation must never be counted as a seeding failure"
+        );
+
         ChatBackend::set_turn_cancel_flag(&mut inner, None);
         assert!(
             inner.mtp_weights_loaded,
-            "a cancelled turn must NOT disarm the head - nothing ever re-arms it"
+            "a cancelled turn must leave the head armed"
         );
         assert!(inner.has_mtp_weights());
         assert!(
