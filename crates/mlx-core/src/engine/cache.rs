@@ -37,8 +37,8 @@ impl ImageCacheDigest {
 
     fn extra_key_words(self) -> [u64; 4] {
         let mut words = [0u64; 4];
-        for (word, bytes) in words.iter_mut().zip(self.0.chunks_exact(8)) {
-            *word = u64::from_le_bytes(bytes.try_into().expect("SHA-256 word is 8 bytes"));
+        for (word, bytes) in words.iter_mut().zip(self.0.as_chunks::<8>().0) {
+            *word = u64::from_le_bytes(*bytes);
         }
         words
     }
@@ -792,13 +792,17 @@ mod image_cache_identity_tests {
         );
         assert_eq!(extra_at_one[0].len(), 2 + 4 * 2);
         let carried_digest = extra_at_one[0][2..]
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .flat_map(|pair| pair[0].to_le_bytes())
             .collect::<Vec<_>>();
         assert_eq!(carried_digest.as_slice(), digests[0].as_bytes());
         assert!(
             extra_at_one[0][2..]
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .all(|pair| pair[1] == 1),
             "every digest word must be bound to the placeholder position",
         );

@@ -1215,8 +1215,10 @@ mod tests {
         let weight =
             MxArray::from_uint8(&w_bytes, &[w_shape[0] as i64, w_shape[1] as i64]).unwrap();
         let scales_f32: Vec<f32> = s_bytes
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         let scale = MxArray::from_float32(&scales_f32, &[s_shape[0] as i64, 1]).unwrap();
 

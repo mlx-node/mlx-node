@@ -16817,7 +16817,7 @@ mod compute_per_block_image_extra_keys_tests {
         // Block 1: no image tokens → empty.
         assert!(per_block[1].is_empty());
         // Verify pair structure: alternating (hash, pos_within_block).
-        for (i, pair) in per_block[0].chunks_exact(2).enumerate() {
+        for (i, pair) in per_block[0].as_chunks::<2>().0.iter().enumerate() {
             assert_eq!(pair[0], 0xABCD, "image hash at pair {i}");
             assert_eq!(pair[1], (5 + i) as u64, "pos_within_block at pair {i}");
         }
@@ -16840,17 +16840,17 @@ mod compute_per_block_image_extra_keys_tests {
         assert_eq!(per_block[1].len(), 16 * 2);
         assert_eq!(per_block[2].len(), 8 * 2);
         // Block 0: pos_within_block runs 10..16.
-        for (i, pair) in per_block[0].chunks_exact(2).enumerate() {
+        for (i, pair) in per_block[0].as_chunks::<2>().0.iter().enumerate() {
             assert_eq!(pair[0], 0xCAFE);
             assert_eq!(pair[1], (10 + i) as u64);
         }
         // Block 1: pos_within_block runs 0..16 (modulo block_size).
-        for (i, pair) in per_block[1].chunks_exact(2).enumerate() {
+        for (i, pair) in per_block[1].as_chunks::<2>().0.iter().enumerate() {
             assert_eq!(pair[0], 0xCAFE);
             assert_eq!(pair[1], i as u64);
         }
         // Block 2: pos_within_block runs 0..8 (token 32 → pos 0; token 39 → pos 7).
-        for (i, pair) in per_block[2].chunks_exact(2).enumerate() {
+        for (i, pair) in per_block[2].as_chunks::<2>().0.iter().enumerate() {
             assert_eq!(pair[0], 0xCAFE);
             assert_eq!(pair[1], i as u64);
         }

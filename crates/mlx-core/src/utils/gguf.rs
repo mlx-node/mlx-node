@@ -596,22 +596,28 @@ fn load_unquantized_tensor(
     match tensor.tensor_type {
         GgufTensorType::F32 => {
             let data: Vec<f32> = buf
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             MxArray::from_float32(&data, &shape)
         }
         GgufTensorType::F16 => {
             let data: Vec<u16> = buf
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             MxArray::from_float16(&data, &shape)
         }
         GgufTensorType::BF16 => {
             let data: Vec<u16> = buf
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             MxArray::from_bfloat16(&data, &shape)
         }

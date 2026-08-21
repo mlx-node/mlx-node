@@ -220,8 +220,10 @@ fn read_f32_tensor(path: &Path, data_offset: u64, tensor_offset: u64, n: usize) 
     let mut bytes = vec![0u8; n * 4];
     f.read_exact(&mut bytes).expect("read tensor payload");
     bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

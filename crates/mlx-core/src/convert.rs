@@ -2207,8 +2207,8 @@ pub(crate) mod recipe {
         }
         let bytes = weight.to_uint8()?;
         let mut words = Vec::with_capacity(bytes.len() / 4);
-        for chunk in bytes.chunks_exact(4) {
-            words.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        for chunk in bytes.as_chunks::<4>().0 {
+            words.push(u32::from_le_bytes(*chunk));
         }
         MxArray::from_uint32(&words, &[rows, bytes_per_row / 4])
     }

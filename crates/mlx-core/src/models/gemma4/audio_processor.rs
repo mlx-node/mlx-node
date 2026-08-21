@@ -119,8 +119,10 @@ pub fn decode_wav_to_pcm(bytes: &[u8]) -> Result<Vec<f32>> {
                     "decode_wav_to_pcm: PCM16 data length is not a multiple of 2 bytes",
                 ));
             }
-            data.chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
+            data.as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
                 .collect()
         }
         // IEEE float32.
@@ -130,8 +132,10 @@ pub fn decode_wav_to_pcm(bytes: &[u8]) -> Result<Vec<f32>> {
                     "decode_wav_to_pcm: float32 data length is not a multiple of 4 bytes",
                 ));
             }
-            data.chunks_exact(4)
-                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            data.as_chunks::<4>()
+                .0
+                .iter()
+                .map(|b| f32::from_le_bytes(*b))
                 .collect()
         }
         (fmt, bits) => {

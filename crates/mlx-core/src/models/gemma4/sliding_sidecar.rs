@@ -322,15 +322,17 @@ pub(crate) fn decode_layer_kv(
         geo.head_dim as i64,
     ];
     let mut layer_kv = Vec::with_capacity(geo.physical_layers as usize);
-    for pair in tensors.chunks_exact(TENSORS_PER_LAYER as usize) {
+    for pair in tensors.as_chunks::<{ TENSORS_PER_LAYER as usize }>().0 {
         let mut arrays = Vec::with_capacity(TENSORS_PER_LAYER as usize);
         for bytes in pair {
             if bytes.len() != elements * std::mem::size_of::<u16>() {
                 return Ok(None);
             }
             let raw = bytes
-                .chunks_exact(2)
-                .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|bytes| u16::from_le_bytes(*bytes))
                 .collect::<Vec<_>>();
             arrays.push(MxArray::from_bfloat16(&raw, &shape)?);
         }
@@ -515,8 +517,10 @@ pub(crate) fn decode_snapshots(
                 return Ok(None);
             }
             let raw: Vec<u16> = bytes
-                .chunks_exact(std::mem::size_of::<u16>())
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+                .as_chunks::<{ std::mem::size_of::<u16>() }>()
+                .0
+                .iter()
+                .map(|pair| u16::from_le_bytes(*pair))
                 .collect();
             arrays.push(MxArray::from_bfloat16(&raw, &shape)?);
         }

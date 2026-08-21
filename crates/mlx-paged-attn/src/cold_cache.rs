@@ -2528,8 +2528,10 @@ fn decode_block(
         return Err("cold-cache tokens have invalid byte length".to_string());
     }
     let tokens = token_bytes
-        .chunks_exact(4)
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().expect("four-byte chunk")))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect();
     // `num_layers` comes from untrusted metadata; a valid block has exactly
     // `1 + 2*num_layers` tensors (`tokens` plus each layer's key/value).
@@ -2842,7 +2844,7 @@ fn hex_decode_32(value: &str) -> Option<[u8; 32]> {
         }
     }
     let mut output = [0u8; 32];
-    for (i, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+    for (i, pair) in value.as_bytes().as_chunks::<2>().0.iter().enumerate() {
         output[i] = nibble(pair[0])? << 4 | nibble(pair[1])?;
     }
     Some(output)
