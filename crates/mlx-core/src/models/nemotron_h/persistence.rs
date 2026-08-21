@@ -998,7 +998,16 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
             let (inner, weight_bytes) = load_inner(&model_path)?;
+            let pool_bytes = inner
+                .paged_adapter
+                .as_ref()
+                .map(crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::pool_allocated_bytes)
+                .transpose()
+                .map_err(Error::from_reason)?
+                .unwrap_or(0);
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+            let pool_cache_limit_guard = (pool_bytes != 0)
+                .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
             let mtp_active = inner.has_mtp_weights();
             let paged_active = inner.paged_adapter.is_some();
             let context_limits =
@@ -1010,6 +1019,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
                 (
                     config,
                     cache_limit_guard,
+                    pool_cache_limit_guard,
                     mtp_active,
                     paged_active,
                     context_limits,
@@ -1019,7 +1029,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
         |state, receiver| state.drive(receiver),
     );
 
-    let (config, cache_limit_guard, mtp_active, paged_active, context_limits) = init_rx
+    let (
+        config,
+        cache_limit_guard,
+        pool_cache_limit_guard,
+        mtp_active,
+        paged_active,
+        context_limits,
+    ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
@@ -1030,6 +1047,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
         paged_active,
         context_limits,
         _cache_limit_guard: cache_limit_guard,
+        _pool_cache_limit_guard: pool_cache_limit_guard,
     })
 }
 

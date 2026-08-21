@@ -2837,6 +2837,9 @@ pub struct NemotronHModel {
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
+    /// RAII: unregisters this model's private paged KV pool from the
+    /// cache-limit coordinator on drop. `None` when paged cache is off.
+    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
 }
 
 #[napi]
@@ -3052,6 +3055,23 @@ mod scheduler_tests {
             .ok_or_else(|| Error::from_reason("fixture layer 1 must be MoE"))?;
         moe.experts.set_dense(&up_w, &down_w)
     }
+
+    #[test]
+    fn tiny_paged_pool_reports_nonzero_allocated_bytes() {
+        let inner = NemotronHInner::new(tiny_paged_config()).expect("inner builds");
+        let Some(adapter) = inner.paged_adapter.as_ref() else {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        };
+        let pool_bytes = adapter
+            .pool_allocated_bytes()
+            .expect("paged pool byte accounting");
+        assert!(
+            pool_bytes > 0,
+            "paged pool must report its private Metal bytes so load_with_thread can register_pool"
+        );
+    }
+
     /// Pure-function gate on the prefill break-set: no internal boundary inside a
     /// Mamba-2 chunk, and every slice at most `slice_tokens` long.
     #[test]
