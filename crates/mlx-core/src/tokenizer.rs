@@ -2407,6 +2407,9 @@ impl Qwen3Tokenizer {
         // LFM2.5-1.2B-Thinking, Muse-Glimmer) ignore the extra key — minijinja
         // treats unknown variables in `context!` as a no-op on access. Gemma4
         // does read it, via `Self::enable_gemma4_preserve_thinking`.
+        // LFM2.5-1.2B-Thinking ignoring it does NOT mean it renders as shipped:
+        // it reads the sibling `keep_past_thinking` key, which is pinned ON
+        // below regardless of `render_ctx`. See that key's comment.
         //
         // `..build_render_context(...)` merges the caller's optional globals in as
         // a fallback layer (precedence is left to right, so nothing above can be
@@ -2445,8 +2448,25 @@ impl Qwen3Tokenizer {
             "preserve_thinking".to_string(),
             minijinja::Value::from(render_ctx.preserve_thinking),
         );
-        // LFM2.5-1.2B-Thinking predates the shared
-        // `preserve_thinking` name and uses this equivalent flag.
+        // LFM2.5-1.2B-Thinking predates the shared `preserve_thinking`
+        // name and spells the same idea as `keep_past_thinking`.
+        //
+        // KNOWN DIVERGENCE, deliberately NOT wired to `render_ctx`. This key is
+        // pinned ON for every caller, one-shot renders included, so an
+        // lfm2-style thinking template keeps every prior assistant thought
+        // where upstream drops it: the shipped template defaults the flag to
+        // false (`lfm2.5-1.2b-thinking/chat_template.jinja:2`) and gates the
+        // `</think>`-split on it (:36), and transformers, mlx-lm and vLLM all
+        // render it as shipped. The byte-identical-to-upstream property claimed
+        // for `preserve_thinking` at
+        // [`RenderContextOptions::preserve_thinking`] therefore does NOT hold
+        // for this family — nor for Nemotron-H, whose `truncate_history_thinking`
+        // below is pinned the same way for the same reason.
+        //
+        // Pinned since `4fef3b33` (PR #109). Making it opt-in the same way
+        // changes what every LFM2.5-thinking prompt renders, for a family with
+        // its own cache-reuse story, so it is tracked as its own product
+        // decision rather than settled here.
         ctx_map.insert(
             "keep_past_thinking".to_string(),
             minijinja::Value::from(true),
@@ -2971,6 +2991,19 @@ pub(crate) struct RenderContextOptions {
     /// *client* pass the flag, and vLLM additionally ships a vendored Gemma4
     /// template already spelling the widened gate
     /// (`examples/tool_chat_template_gemma4.jinja:236`).
+    ///
+    /// # The scope of that last claim
+    ///
+    /// It is about THIS flag. It is not a crate-wide invariant, because the
+    /// render context also pins a sibling key ON unconditionally:
+    /// `keep_past_thinking => true`, the pre-`preserve_thinking` spelling that
+    /// lfm2-style thinking templates read. Those templates default it to
+    /// `false` and gate the `</think>` split on it
+    /// (`lfm2.5-1.2b-thinking/chat_template.jinja:2` and `:36`), so on that
+    /// family a one-shot render keeps prior thoughts and is NOT byte-identical
+    /// to upstream. Known and tracked divergence, pinned since `4fef3b33`
+    /// (PR #109); see the comment on that key in
+    /// [`Qwen3Tokenizer::render_chat_template_jinja2_with_content_order`].
     pub preserve_thinking: bool,
 }
 
@@ -6009,6 +6042,102 @@ mod tests {
                 "gate {gate} left un-widened in a template carrying both:\n{rewritten}",
             );
         }
+    }
+
+    /// The two gate rewrites are ORDER-DEPENDENT, and neither function says so
+    /// on its own.
+    ///
+    /// [`Qwen3Tokenizer::enable_legacy_preserve_thinking`] bails out and returns
+    /// the template untouched the moment it contains the substring
+    /// `preserve_thinking`, and
+    /// [`Qwen3Tokenizer::enable_gemma4_preserve_thinking`] INSERTS that exact
+    /// substring when it widens the gate spelling that does not already carry
+    /// it. Legacy therefore has to run first. Swapping the two calls in
+    /// [`Qwen3Tokenizer::render_chat_template_jinja2_with_content_order`]
+    /// silently disables the legacy rewrite — no compile error, and nothing
+    /// else in this file notices, because no shipped checkpoint carries both
+    /// gate families at once.
+    ///
+    /// Driven through the full render entry point rather than by calling the
+    /// two helpers by hand: the ordering is the thing under test, and a test
+    /// that picks its own order cannot see the production one.
+    #[test]
+    fn legacy_gate_rewrite_runs_before_the_gemma4_one() {
+        const LEGACY_GATE: &str = "loop.index0 > ns.last_query_index";
+        // Spelling 1 already contains `preserve_thinking`, so it would suppress
+        // the legacy rewrite from the raw source text alone and prove nothing
+        // about the call order. The hazard lives on spelling 2.
+        let gemma4_gate = GEMMA4_THINKING_GATES[1];
+        assert!(
+            !gemma4_gate.contains("preserve_thinking"),
+            "this fixture only bites on the gate spelling that lacks the flag",
+        );
+
+        // `L` marks the legacy gate firing, `G` the Gemma4 one. Two messages,
+        // `[user, assistant]`, so the last-user index is 0 and message 0 fails
+        // BOTH gates on their upstream scope — it can only emit if the widened
+        // `preserve_thinking or` disjunct is present.
+        let template = format!(
+            "{{%- set ns = namespace(last_query_index=0) -%}}\
+             {{%- set ns_turn = namespace(last_user_idx=0) -%}}\
+             {{%- for i in range(messages | length) -%}}\
+             {{%- if messages[i]['role'] == 'user' -%}}\
+             {{%- set ns.last_query_index = i -%}}\
+             {{%- set ns_turn.last_user_idx = i -%}}\
+             {{%- endif -%}}{{%- endfor -%}}\
+             {{%- for message in messages -%}}\
+             {{%- if {LEGACY_GATE} -%}}L{{%- endif -%}}\
+             {{%- if {gemma4_gate} -%}}G{{%- endif -%}}\
+             {{%- endfor -%}}"
+        );
+        assert!(
+            !template.contains("preserve_thinking"),
+            "the fixture must start out unaware of the flag:\n{template}",
+        );
+
+        let mut assistant = user_msg("", 0);
+        assistant.role = "assistant".to_string();
+        let messages = [user_msg("What is the capital of France?", 0), assistant];
+
+        let render = |preserve_thinking: bool| {
+            Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+                &template,
+                &messages,
+                None,
+                false,
+                None,
+                "<bos>",
+                "<eos>",
+                MultimodalContentOrder::TextThenMedia,
+                None,
+                RenderContextOptions {
+                    preserve_thinking,
+                    ..RenderContextOptions::default()
+                },
+            )
+            .unwrap_or_else(|e| {
+                panic!("render failed (preserve_thinking={preserve_thinking}): {e}")
+            })
+        };
+
+        // Flag ON: both gates must be widened, so every message emits both
+        // marks. Run the Gemma4 rewrite first and the legacy one is skipped,
+        // message 0 loses its `L`, and this reads `GLG`.
+        assert_eq!(
+            render(true),
+            "LGLG",
+            "a gate was left un-widened — `enable_legacy_preserve_thinking` must \
+             run BEFORE `enable_gemma4_preserve_thinking`",
+        );
+
+        // Flag OFF: the widening is a pure disjunct, so both gates fall back to
+        // their upstream scope. This also proves the fixture is not emitting
+        // `L`/`G` unconditionally.
+        assert_eq!(
+            render(false),
+            "L",
+            "a widened gate changed behaviour with the flag off",
+        );
     }
 
     /// Guard the inline copies above against checkpoint drift, and prove the

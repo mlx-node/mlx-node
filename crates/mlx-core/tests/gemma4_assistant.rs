@@ -388,6 +388,17 @@ async fn assistant_stop_mid_block_then_delta_turn() {
         )
         .await
         .expect("AR turn 2 (continue) failed");
+    // Checked HERE, before the assistant lane runs at all. A continuation
+    // regression breaks BOTH lanes, and two lanes that agree on being broken
+    // still satisfy every parity assertion below — so the baseline has to be
+    // read as a result, not only as a reference. First in the file as well as
+    // first in the diagnosis: if the control lane is the broken one, saying so
+    // is more useful than reporting the feature lane.
+    assert!(
+        ar2.cached_tokens > 0,
+        "the AR baseline must warm-continue too (cached_tokens > 0), got {}",
+        ar2.cached_tokens
+    );
 
     // Assistant: same 2-turn shape on the same instance (the fresh start's
     // prefix verification resets the AR session's caches).
@@ -417,15 +428,6 @@ async fn assistant_stop_mid_block_then_delta_turn() {
         sp2.cached_tokens > 0,
         "turn 2 must warm-continue on the saved session (cached_tokens > 0), got {}",
         sp2.cached_tokens
-    );
-    // The AR baseline carries the same assertion, and must: a continuation
-    // regression breaks BOTH lanes, and two lanes that agree on being broken
-    // still satisfy every parity assertion below. Only this reads the baseline
-    // as a result rather than as a reference.
-    assert!(
-        ar2.cached_tokens > 0,
-        "the AR baseline must warm-continue too (cached_tokens > 0), got {}",
-        ar2.cached_tokens
     );
 
     // 2-turn transcript parity vs the AR baseline.
