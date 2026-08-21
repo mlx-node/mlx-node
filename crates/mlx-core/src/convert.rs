@@ -2466,6 +2466,19 @@ pub(crate) mod recipe {
                                 "Nemotron-H FP8 group '{base}' is missing .weight_scale"
                             ))
                         })?;
+                    // The affine-8/32 override for this projection is derived from the
+                    // `.input_scale` sidecar. Without it the emitted payload is affine
+                    // but the config keeps the top-level nvfp4 mode, and the loader
+                    // rejects it. Refuse here, where the reason is still legible.
+                    if !weights.contains_key(&format!("{base}.input_scale")) {
+                        return Err(Error::from_reason(format!(
+                            "Nemotron-H FP8 group '{base}' has .weight_scale but no \
+                             .input_scale. The affine-8/32 config override is derived \
+                             from that sidecar, so converting would emit a checkpoint \
+                             whose payload is affine but whose declared mode is nvfp4, \
+                             and it would be rejected at load."
+                        )));
+                    }
                     groups.insert(base.clone(), (weight, weight_scale, None));
                     consumed.insert(format!("{base}.weight"));
                     consumed.insert(format!("{base}.weight_scale"));
@@ -18411,6 +18424,66 @@ mod tests {
                     .is_some_and(|i| !i.is_empty() && i.chars().all(|c| c.is_ascii_digit()))
             }
         }));
+    }
+
+    /// An FP8 group's affine-8/32 config override is derived from `.input_scale`.
+    /// Without the sidecar the payload is affine but the declared mode stays
+    /// nvfp4, so the checkpoint converts cleanly and then fails to load.
+    #[test]
+    fn nemotron_h_fp8_group_without_input_scale_is_rejected_at_ingest() {
+        use crate::convert::recipe::ConversionRecipe;
+        use crate::convert::recipe::NemotronHRecipe;
+
+        fn fixture(with_input_scale: bool) -> HashMap<String, MxArray> {
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+            let base = "backbone.layers.0.mixer.in_proj";
+            let f32v: Vec<f32> = (0..4 * 64).map(|i| ((i as f32) - 128.0) * 0.02).collect();
+            weights.insert(
+                format!("{base}.weight"),
+                MxArray::from_float32(&f32v, &[4, 64])
+                    .unwrap()
+                    .to_fp8()
+                    .unwrap(),
+            );
+            weights.insert(
+                format!("{base}.weight_scale"),
+                MxArray::from_float32(&[0.5], &[1]).unwrap(),
+            );
+            if with_input_scale {
+                weights.insert(
+                    format!("{base}.input_scale"),
+                    MxArray::from_float32(&[0.0625], &[1]).unwrap(),
+                );
+            }
+            weights
+        }
+
+        let config = serde_json::json!({
+            "layers_block_type": ["mamba"],
+            "n_routed_experts": 2,
+        });
+
+        // ANTI-VACUITY: the same fixture WITH the sidecar must ingest cleanly,
+        // or the rejection below could be any unrelated fixture gap.
+        NemotronHRecipe
+            .sanitize(fixture(true), &config, "bfloat16", false, false)
+            .expect("the fixture must ingest when .input_scale is present");
+
+        let err = match NemotronHRecipe.sanitize(fixture(false), &config, "bfloat16", false, false)
+        {
+            Ok(_) => panic!("an FP8 group without .input_scale must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("input_scale"),
+            "the error must name the missing sidecar, got: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("backbone.layers.0.mixer.in_proj"),
+            "the error must name the offending group, got: {}",
+            err.reason
+        );
     }
 
     /// The ingest guard rejects every quantize-time flag, keyed on either the
