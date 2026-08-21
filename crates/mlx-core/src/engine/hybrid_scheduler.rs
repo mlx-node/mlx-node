@@ -56,6 +56,14 @@ pub(crate) struct SchedulerCacheSnapshot {
     pub bytes_per_block: u64,
 }
 
+/// Result of unified-memory reservation after reclaiming idle parked rows.
+#[derive(Debug)]
+enum MemoryReserveOutcome {
+    Admitted,
+    Defer,
+    Reject { total_blocks: u32 },
+}
+
 pub(crate) struct SchedulerOwnerContext<'a, S> {
     pub owner_sequences: &'a mut HashMap<String, SeqId>,
     pub owner_states: &'a mut HashMap<String, S>,
@@ -1644,6 +1652,21 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
+    /// Idle parked recurrent row that is not the candidate and is not in the
+    /// scheduler's running/waiting set. Shared by the unit-cap path and
+    /// memory-denial reclaim so the two policies cannot drift.
+    fn idle_recurrent_victim(&self, seq_id: SeqId) -> Option<SeqId> {
+        self.owner_sequences
+            .values()
+            .copied()
+            .filter(|&candidate| {
+                candidate != seq_id
+                    && self.inner.has_scheduled_recurrent(candidate)
+                    && !self.scheduler.contains_seq(candidate)
+            })
+            .min()
+    }
+
     /// Keep the two-unit residency cap as a queueing boundary. An idle warm
     /// row may be discarded because its owner history can rebuild the exact
     /// GDN state through the ordinary prefix-prime path; a scheduler-owned row
@@ -1652,21 +1675,69 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if self.inner.can_activate_scheduled_recurrent(seq_id) {
             return true;
         }
-        let idle_victim = self
-            .owner_sequences
-            .values()
-            .copied()
-            .filter(|&candidate| {
-                candidate != seq_id
-                    && self.inner.has_scheduled_recurrent(candidate)
-                    && !self.scheduler.contains_seq(candidate)
-            })
-            .min();
-        let Some(victim) = idle_victim else {
+        let Some(victim) = self.idle_recurrent_victim(seq_id) else {
             return false;
         };
         self.inner.release_scheduled_recurrent_for(victim);
         self.inner.can_activate_scheduled_recurrent(seq_id)
+    }
+
+    /// Drop one idle parked recurrent row and unpin its keep-live KV so
+    /// published full blocks drop to prefix-cache `ref_count == 1` (evictable).
+    fn reclaim_one_idle_scheduled(&mut self, seq_id: SeqId) -> bool {
+        let Some(victim) = self.idle_recurrent_victim(seq_id) else {
+            return false;
+        };
+        self.inner.release_scheduled_recurrent_for(victim);
+        let _ = self.inner.release_scheduled_cache(victim);
+        true
+    }
+
+    fn try_reserve_reclaiming_idle(
+        &mut self,
+        seq_id: SeqId,
+        reservation_blocks: u32,
+        candidate_state_bytes: u64,
+        mut snapshot: SchedulerCacheSnapshot,
+    ) -> Result<MemoryReserveOutcome> {
+        loop {
+            let decision = self.scheduler.try_reserve_memory(
+                engine::scheduler::MemoryTelemetry {
+                    capacity_bytes: u64::from(snapshot.blocks.total_blocks)
+                        .saturating_mul(snapshot.bytes_per_block),
+                    free_bytes: u64::from(snapshot.blocks.free_blocks)
+                        .saturating_mul(snapshot.bytes_per_block),
+                    reclaimable_bytes: u64::from(snapshot.blocks.reclaimable_blocks)
+                        .saturating_mul(snapshot.bytes_per_block),
+                },
+                reservation_blocks,
+                snapshot.bytes_per_block,
+                self.inner.scheduled_recurrent_bytes(),
+                candidate_state_bytes,
+                scheduler_watermark_fraction(),
+            );
+            if decision.admitted {
+                return Ok(MemoryReserveOutcome::Admitted);
+            }
+            if !self.reclaim_one_idle_scheduled(seq_id) {
+                if self.scheduler.has_live_turns() {
+                    return Ok(MemoryReserveOutcome::Defer);
+                }
+                return Ok(MemoryReserveOutcome::Reject {
+                    total_blocks: snapshot.blocks.total_blocks,
+                });
+            }
+            if let Some(updated) = self.inner.scheduler_cache_snapshot()? {
+                snapshot = updated;
+            }
+        }
+    }
+
+    fn context_length_exceeded(reservation_blocks: u32, total_blocks: u32) -> Error {
+        Error::from_reason(format!(
+            "context_length_exceeded: request requires {} paged blocks but the pool has {}",
+            reservation_blocks, total_blocks
+        ))
     }
 
     fn admit_prepared(
@@ -1713,10 +1784,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.cleanup_rejected_prepared(&prepared);
             let total_blocks = cache_snapshot.map_or(0, |snapshot| snapshot.blocks.total_blocks);
             prepared.response.send_error(
-                Error::from_reason(format!(
-                    "context_length_exceeded: request requires {} paged blocks but the pool has {}",
-                    prepared.reservation_blocks, total_blocks
-                )),
+                Self::context_length_exceeded(prepared.reservation_blocks, total_blocks),
                 prepared.cancelled.as_ref(),
             );
             return Ok(None);
@@ -1725,23 +1793,29 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return Err(prepared);
         }
         if let Some(snapshot) = cache_snapshot {
-            let decision = self.scheduler.try_reserve_memory(
-                engine::scheduler::MemoryTelemetry {
-                    capacity_bytes: u64::from(snapshot.blocks.total_blocks)
-                        .saturating_mul(snapshot.bytes_per_block),
-                    free_bytes: u64::from(snapshot.blocks.free_blocks)
-                        .saturating_mul(snapshot.bytes_per_block),
-                    reclaimable_bytes: u64::from(snapshot.blocks.reclaimable_blocks)
-                        .saturating_mul(snapshot.bytes_per_block),
-                },
+            match self.try_reserve_reclaiming_idle(
+                prepared.seq_id,
                 prepared.reservation_blocks,
-                snapshot.bytes_per_block,
-                self.inner.scheduled_recurrent_bytes(),
                 candidate_state_bytes,
-                scheduler_watermark_fraction(),
-            );
-            if !decision.admitted {
-                return Err(prepared);
+                snapshot,
+            ) {
+                Ok(MemoryReserveOutcome::Admitted) => {}
+                Ok(MemoryReserveOutcome::Defer) => return Err(prepared),
+                Ok(MemoryReserveOutcome::Reject { total_blocks }) => {
+                    self.cleanup_rejected_prepared(&prepared);
+                    prepared.response.send_error(
+                        Self::context_length_exceeded(prepared.reservation_blocks, total_blocks),
+                        prepared.cancelled.as_ref(),
+                    );
+                    return Ok(None);
+                }
+                Err(error) => {
+                    self.cleanup_rejected_prepared(&prepared);
+                    prepared
+                        .response
+                        .send_error(error, prepared.cancelled.as_ref());
+                    return Ok(None);
+                }
             }
         }
 
@@ -2141,24 +2215,29 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return;
         }
         if let Some(snapshot) = cache_snapshot {
-            let decision = self.scheduler.try_reserve_memory(
-                engine::scheduler::MemoryTelemetry {
-                    capacity_bytes: u64::from(snapshot.blocks.total_blocks)
-                        .saturating_mul(snapshot.bytes_per_block),
-                    free_bytes: u64::from(snapshot.blocks.free_blocks)
-                        .saturating_mul(snapshot.bytes_per_block),
-                    reclaimable_bytes: u64::from(snapshot.blocks.reclaimable_blocks)
-                        .saturating_mul(snapshot.bytes_per_block),
-                },
+            match self.try_reserve_reclaiming_idle(
+                turn.seq_id,
                 turn.block_reservation_total,
-                snapshot.bytes_per_block,
-                self.inner.scheduled_recurrent_bytes(),
                 turn.recurrent_state_bytes,
-                scheduler_watermark_fraction(),
-            );
-            if !decision.admitted {
-                self.scheduler.prepend_preempted(turn);
-                return;
+                snapshot,
+            ) {
+                Ok(MemoryReserveOutcome::Admitted) => {}
+                Ok(MemoryReserveOutcome::Defer) => {
+                    self.scheduler.prepend_preempted(turn);
+                    return;
+                }
+                Ok(MemoryReserveOutcome::Reject { total_blocks }) => {
+                    let reservation_blocks = turn.block_reservation_total;
+                    self.fail_preempted(
+                        turn,
+                        Self::context_length_exceeded(reservation_blocks, total_blocks).reason,
+                    );
+                    return;
+                }
+                Err(error) => {
+                    self.fail_preempted(turn, error.reason.clone());
+                    return;
+                }
             }
         }
         let Some(replay) = turn.payload.preemption_replay.as_ref() else {
@@ -2909,6 +2988,176 @@ mod tests {
     }
 
     #[test]
+    fn memory_denial_reclaims_idle_parked_row_unit_cap_would_keep() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        state.owner_sequences.insert("history-only".into(), 3);
+        state.owner_sequences.insert("parked".into(), 1);
+        state
+            .inner
+            .activate_scheduled_recurrent(1)
+            .expect("activate parked owner");
+        state
+            .inner
+            .park_active_scheduled_recurrent()
+            .expect("park seq 1");
+        if let Some(adapter) = state.inner.paged_adapter_mut() {
+            adapter
+                .begin_request(1)
+                .expect("parked owner can hold a keep-live request slot");
+            assert!(adapter.block_table_for(1).is_some());
+        }
+
+        assert!(state.inner.has_scheduled_recurrent(1));
+        assert!(
+            state.ensure_recurrent_slot(2),
+            "one parked idle row does not fill the two-unit cap"
+        );
+        assert!(
+            state.inner.has_scheduled_recurrent(1),
+            "unit-cap eviction must not fire with a single parked owner"
+        );
+        assert_eq!(state.idle_recurrent_victim(2), Some(1));
+        assert_ne!(
+            state.idle_recurrent_victim(2),
+            Some(3),
+            "history-only owners are not reclaim victims"
+        );
+
+        assert!(
+            state.reclaim_one_idle_scheduled(2),
+            "memory-denial reclaim must evict the idle parked row"
+        );
+        assert!(
+            !state.inner.has_scheduled_recurrent(1),
+            "reclaim drops the parked GDN/Mamba row"
+        );
+        assert!(
+            state
+                .inner
+                .paged_adapter()
+                .and_then(|adapter| adapter.block_table_for(1))
+                .is_none(),
+            "reclaim unpins keep-live KV so published full blocks become evictable"
+        );
+        assert!(state.inner.can_activate_scheduled_recurrent(2));
+        assert!(!state.inner.has_scheduled_recurrent(3));
+    }
+
+    #[test]
+    fn reclaiming_parked_recurrent_admits_usable_pool_reservation() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        state.owner_sequences.insert("parked".into(), 1);
+        state
+            .inner
+            .activate_scheduled_recurrent(1)
+            .expect("activate parked owner");
+        state
+            .inner
+            .park_active_scheduled_recurrent()
+            .expect("park seq 1");
+
+        let rec = state.inner.recurrent_state_bytes();
+        assert!(rec > 0, "tiny Qwen3.5 fixture must have GDN state");
+        assert_eq!(state.inner.scheduled_recurrent_bytes(), rec);
+        // Qwen3.5 unit constructors leave the paged adapter unbuilt; size a
+        // synthetic pool the same way admit does: KV at usable tokens after
+        // one recurrent row.
+        let block_size = 16u32;
+        let bytes_per_block = 1024u64;
+        let rec_tokens = rec
+            .div_ceil(bytes_per_block)
+            .saturating_mul(u64::from(block_size))
+            .min(u64::from(u32::MAX)) as u32;
+        let pool_tokens = rec_tokens.saturating_add(256);
+        let usable = pool_tokens_after_recurrent(pool_tokens, block_size, bytes_per_block, rec);
+        let reservation_blocks = usable.div_ceil(block_size);
+        let total_blocks = pool_tokens / block_size;
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks,
+                free_blocks: total_blocks,
+                reclaimable_blocks: 0,
+                allocated_blocks: 0,
+            },
+            bytes_per_block,
+        };
+        assert!(reservation_fits_empty_pool(
+            reservation_blocks,
+            total_blocks,
+            bytes_per_block,
+            rec,
+        ));
+
+        let telemetry = engine::scheduler::MemoryTelemetry {
+            capacity_bytes: u64::from(total_blocks).saturating_mul(bytes_per_block),
+            free_bytes: u64::from(total_blocks).saturating_mul(bytes_per_block),
+            reclaimable_bytes: 0,
+        };
+        assert!(
+            !engine::scheduler::memory_admission_decision(
+                telemetry,
+                0,
+                reservation_blocks,
+                bytes_per_block,
+                rec,
+                rec,
+                false,
+                0.0,
+            )
+            .admitted,
+            "parked row plus candidate overflows a usable-pool KV reservation"
+        );
+
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, reservation_blocks, rec, snapshot)
+            .expect("reserve after reclaim");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "idle reclaim must admit, not defer: {outcome:?}"
+        );
+        assert!(!state.inner.has_scheduled_recurrent(1));
+        assert!(
+            engine::scheduler::memory_admission_decision(
+                telemetry,
+                0,
+                reservation_blocks,
+                bytes_per_block,
+                state.inner.scheduled_recurrent_bytes(),
+                rec,
+                false,
+                0.0,
+            )
+            .admitted
+        );
+    }
+
+    #[test]
+    fn idle_memory_denial_without_idle_victims_rejects() {
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        assert!(state.idle_recurrent_victim(2).is_none());
+        assert!(!state.scheduler.has_live_turns());
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 100,
+                free_blocks: 0,
+                reclaimable_blocks: 0,
+                allocated_blocks: 100,
+            },
+            bytes_per_block: 4096,
+        };
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, 10, 1, snapshot)
+            .expect("no snapshot refresh");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 100 }),
+            "idle scheduler must hard-error, not spin in prepared_waiting: {outcome:?}"
+        );
+    }
+
+    #[test]
     fn cache_owner_release_drops_history_sequence_and_recurrent_state() {
         let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
         let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
@@ -3163,5 +3412,58 @@ mod scheduled_context_tests {
         assert!(reservation_fits_empty_pool(100, 100, 4096, 0));
         assert!(!reservation_fits_empty_pool(100, 100, 4096, 1));
         assert!(!reservation_fits_empty_pool(101, 100, 4096, 0));
+    }
+
+    #[test]
+    fn one_recurrent_row_fits_usable_pool_two_do_not() {
+        // KV sized to `pool_tokens_after_recurrent` (one row). Empty-pool + that
+        // row fits; parked row + candidate row does not.
+        let pool_tokens = 1_048_576;
+        let block_size = 16;
+        let bytes_per_block = 1024;
+        let rec_bytes = 48 * 1024 * 1024;
+        let usable =
+            pool_tokens_after_recurrent(pool_tokens, block_size, bytes_per_block, rec_bytes);
+        let total_blocks = pool_tokens / block_size;
+        let reservation_blocks = usable.div_ceil(block_size);
+
+        assert!(reservation_fits_empty_pool(
+            reservation_blocks,
+            total_blocks,
+            bytes_per_block,
+            rec_bytes,
+        ));
+
+        let telemetry = crate::engine::scheduler::MemoryTelemetry {
+            capacity_bytes: u64::from(total_blocks).saturating_mul(bytes_per_block),
+            free_bytes: u64::from(total_blocks).saturating_mul(bytes_per_block),
+            reclaimable_bytes: 0,
+        };
+        let two_rows = crate::engine::scheduler::memory_admission_decision(
+            telemetry,
+            0,
+            reservation_blocks,
+            bytes_per_block,
+            rec_bytes,
+            rec_bytes,
+            false,
+            0.0,
+        );
+        assert!(
+            !two_rows.admitted,
+            "parked + candidate recurrent rows must overflow usable-pool KV"
+        );
+
+        let one_row = crate::engine::scheduler::memory_admission_decision(
+            telemetry,
+            0,
+            reservation_blocks,
+            bytes_per_block,
+            0,
+            rec_bytes,
+            false,
+            0.0,
+        );
+        assert!(one_row.admitted);
     }
 }
