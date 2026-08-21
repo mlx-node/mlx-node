@@ -10220,6 +10220,12 @@ impl Qwen35Inner {
         {
             planned_mtp = false;
             config.enable_mtp = Some(false);
+            // THIS turn leaves the speculative lane. The generic paged driver
+            // below dispatches on `plan.decoder`, and dense implements no
+            // paged speculative core (its MTP lives in the forked cores
+            // above), so a stale `Speculative` would fail the turn on the
+            // erroring default hook instead of decoding it autoregressively.
+            args.plan.decoder = DecoderPlan::Autoregressive;
         }
         debug_assert!(!planned_mtp || self.has_mtp_weights());
         let mut p = extract_chat_params(&config);
@@ -17942,11 +17948,13 @@ mod paged_gdn_frontier_tests {
 
 #[cfg(test)]
 mod mtp_gate_state_tests {
-    //! Cheap construction-only tests for the MTP acceptance-gate state on
-    //! `Qwen35Inner` (no Metal: `new` defers the paged pool, and
-    //! `reset_caches_sync` on a fresh inner touches no GPU state).
+    //! Cheap tests for the MTP acceptance-gate state on `Qwen35Inner` and
+    //! for what a gated turn does to its plan (no Metal: `new` defers the
+    //! paged pool, `reset_caches_sync` on a fresh inner touches no GPU state,
+    //! and an adapter-less paged turn stops at the preflight).
 
     use super::*;
+    use crate::engine::plan::{MediaInputs, TurnPlan};
     use crate::models::qwen3_5::config::Qwen3_5Config;
 
     fn tiny_cfg() -> Qwen3_5Config {
@@ -17979,6 +17987,126 @@ mod mtp_gate_state_tests {
             persist_paged_cache: None,
             n_mtp_layers: 0,
         }
+    }
+
+    /// A minimal real tokenizer so `WholeTurnArgs` can be built without a
+    /// checkpoint (mirrors `engine::paged_turn`'s fixture).
+    fn tiny_tokenizer() -> Arc<Qwen3Tokenizer> {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "a": 0, "b": 1, "c": 2, "<unk>": 3 },
+                "unk_token": "<unk>"
+            }
+        }"#;
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-gate-plan-tok-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("fixture dir: {e}"));
+        let path = dir.join("tokenizer.json");
+        std::fs::write(&path, json).unwrap_or_else(|e| panic!("fixture write: {e}"));
+        let tok =
+            Qwen3Tokenizer::from_file(&path).unwrap_or_else(|e| panic!("fixture tokenizer: {e}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(tok)
+    }
+
+    /// Dense forks its own paged MTP core, so the acceptance gate runs in
+    /// `paged_whole_turn` instead of in `admit_paged_speculative_decode` the
+    /// way MoE's does. A gated turn falls through to the generic paged driver,
+    /// which dispatches on `plan.decoder` — so the gate has to restate the
+    /// plan, or the fall-through lands on the erroring default hook and fails
+    /// the turn it was supposed to decode autoregressively.
+    ///
+    /// MUTATION: drop the `args.plan.decoder = DecoderPlan::Autoregressive`
+    /// restatement — the final assertion fails.
+    #[test]
+    fn a_gated_paged_mtp_turn_leaves_the_speculative_lane() {
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
+
+        // Dense implements no paged speculative core, so the generic driver's
+        // speculative branch is a turn FAILURE, not an autoregressive
+        // fallback. That is what the restatement below has to avoid.
+        let probe = extract_chat_params(&ChatConfig::default());
+        let refusal =
+            <Qwen35Inner as PagedBackend>::admit_paged_speculative_decode(&mut inner, &probe)
+                .expect_err("dense must inherit the erroring default hook");
+        assert!(
+            refusal
+                .reason
+                .contains("implements no paged speculative core"),
+            "unexpected refusal: {}",
+            refusal.reason
+        );
+
+        // 0-of-5 accepted first drafts: confidently below break-even.
+        assert!(
+            mtp_decode::mtp_accept_gate_blocks(0, 5),
+            "fixture counts must block the gate"
+        );
+        inner.mtp_draft_accepted = 0;
+        inner.mtp_draft_attempted = 5;
+
+        let tokenizer = tiny_tokenizer();
+        let config = ChatConfig {
+            enable_mtp: Some(true),
+            max_new_tokens: Some(4),
+            ..ChatConfig::default()
+        };
+        let params = extract_chat_params(&config);
+        let tokens = [1u32, 2, 3];
+        let mut args = WholeTurnArgs {
+            tokens: &tokens,
+            tokenizer: &tokenizer,
+            eos_id: 0,
+            config: &config,
+            params: &params,
+            thinking: ThinkingSetup {
+                enabled: false,
+                budget: None,
+            },
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: true,
+                decoder: DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            },
+            sink: None,
+            cancelled: None,
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+
+        // The adapter-less fixture stops the turn at the paged preflight,
+        // which runs AFTER the gate — far enough to observe the restated plan
+        // without a GPU.
+        let err = match inner.paged_whole_turn(&mut args) {
+            Ok(_) => panic!("an adapter-less fixture cannot pass the paged preflight"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("paged cache is not initialized"),
+            "expected the preflight refusal, got: {}",
+            err.reason
+        );
+        assert_eq!(
+            args.plan.decoder,
+            DecoderPlan::Autoregressive,
+            "a gated turn must leave the speculative lane before the generic \
+             paged driver reads plan.decoder"
+        );
     }
 
     #[test]
