@@ -19,12 +19,18 @@ use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
-use crate::engine::backend::{DsparkBackend, DsparkProposal, DsparkStepper, TurnTokenObserver};
+use crate::engine::backend::{
+    DsparkBackend, DsparkProposal, DsparkStepper, PagedBackend, PagedPrefix, StreamEmitter,
+    TurnOutput, TurnTokenObserver, WholeTurnArgs,
+};
 use crate::engine::decode::StreamingCtx;
-use crate::engine::params::ChatParams;
+use crate::engine::paged_turn::FinishPagedTurnArgs;
+use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
+use crate::engine::plan::SpeculativeDraftWidth;
+use crate::engine::spec_paged::SpecTurnEpilogue;
 use crate::sampling;
-use crate::stream::Stream;
+use crate::stream::{DeviceType, Stream};
 
 /// Required arguments of [`run_dspark_turn`] — the DSpark analog of
 /// [`crate::engine::mtp_turn::MtpTurnArgs`], minus the MTP-only
@@ -292,6 +298,14 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     // single ungated read covers both paths byte-identically.
     let turn_cancelled = || cancel_flag.is_some_and(|flag| flag.load(Ordering::Relaxed));
 
+    // I1: the speculative slot margin one cycle needs is the backend's
+    // `SpeculativePlan` property, read once at turn entry. `0` ⇒ the backend
+    // declares no speculative plan, so no margin is defined and the per-cycle
+    // reservation below is inert (the flat steppers' shape).
+    let lookahead_rows = backend.execution_plan().speculative.map_or(0, |plan| {
+        plan.lookahead_rows_for(SpeculativeDraftWidth::DraftBlockSize(block_size))
+    });
+
     let mut step = backend.begin_dspark_decode(block_size)?;
 
     // Materialize the prefill-sampled seed once; it is the first anchor.
@@ -465,7 +479,26 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // budget slot: a cycle emits at most `L + 1` tokens.
         let remaining: usize = max_as_usize.saturating_sub(generated.len());
         let normal_l_cap: usize = block_size.min(p.mtp_depth).min(remaining.saturating_sub(1));
-        let (l_cap, measurement_cycle) = break_even.plan_cycle(normal_l_cap);
+        let (mut l_cap, mut measurement_cycle) = break_even.plan_cycle(normal_l_cap);
+
+        // Per-cycle speculative admission: every committed token moves the
+        // frontier, so the lookahead region is re-reserved for THIS cycle (a
+        // covered no-op while the previous reservation still holds).
+        // Exhaustion drops the draft block rather than erroring the turn —
+        // the cycle degenerates to one AR step through verify, whose single
+        // row the ordinary decode allocation path still covers. A
+        // calibration cycle already planned at `l_cap == 0` writes one row
+        // too and is left alone.
+        if l_cap >= 1 && lookahead_rows > 0 && !step.reserve_cycle_lookahead(lookahead_rows)? {
+            tracing::debug!(
+                target: "mlx_core::mtp",
+                lookahead_rows,
+                "DSpark cycle drafted nothing: speculative lookahead reservation \
+                 exhausted; AR-decoding instead"
+            );
+            l_cap = 0;
+            measurement_cycle = DsparkMeasurementCycle::None;
+        }
 
         // `L_cap == 0` (remaining == 1): skip propose entirely — the cycle
         // degenerates to a single AR step THROUGH verify (verify_ids =
@@ -898,6 +931,239 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     Ok(DsparkTurnOutcome { last_in_cache })
 }
 
+/// Sub-trait for a family whose DSpark speculative turn runs against the
+/// target's PAGED KV state: [`PagedBackend`]'s turn lifecycle (prime →
+/// prefill → reconcile → finalize → save) with [`DsparkBackend`]'s
+/// propose/verify stepper in place of the autoregressive decode loop.
+///
+/// Production implementation: gemma4 (`models::gemma4::dspark_decode`).
+pub(crate) trait PagedDsparkBackend: PagedBackend + DsparkBackend {
+    /// [`PagedBackend::paged_prefill`] with the draft's per-turn state built
+    /// alongside it, stashed for [`DsparkBackend::begin_dspark_decode`] to
+    /// take.
+    ///
+    /// Target-side compute must be byte-identical to the plain paged
+    /// prefill — the T=0 oracle compares the speculative and autoregressive
+    /// lanes on the same prompt — so the draft side rides the SAME chunk
+    /// walk rather than a second one.
+    fn paged_prefill_with_draft_state(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        stream: Stream,
+    ) -> Result<MxArray>;
+
+    /// Record + forward the final emitted token so the paged cursor equals
+    /// the keep-all history the save publishes. Called on a LENGTH exit
+    /// only, and only when the loop reports the token has no K/V yet.
+    fn materialize_final_paged(&mut self, token_id: u32) -> Result<()>;
+
+    /// The per-cycle drafted-block cap (the drafter's own block width), and
+    /// the quantity the turn's lookahead reservation is sized from.
+    fn dspark_block_size(&self) -> Result<usize>;
+
+    /// The paged sequence this turn owns. Diagnostic only: it names the
+    /// sequence in the abandoned-epilogue report.
+    fn paged_spec_seq_id(&self) -> u32;
+}
+
+/// Drive one PAGED DSpark speculative whole turn.
+///
+/// MIRRORS [`crate::engine::paged_turn::run_paged_turn`] hook for hook —
+/// prime → prefill → first-token sample → decode → materialize-final →
+/// epilogue — substituting the tapped prefill and [`run_dspark_turn`] for
+/// the plain prefill and `run_decode_loop`. The epilogue is not called
+/// directly: [`SpecTurnEpilogue`] is minted here and is the only way to
+/// reach it (L-EPILOGUE).
+pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
+    backend: &mut B,
+    args: &mut WholeTurnArgs<'_>,
+) -> Result<TurnOutput> {
+    let tokenizer = args.tokenizer.clone();
+    let eos_id = args.eos_id;
+    let thinking = args.thinking;
+    let is_delta = args.plan.is_delta;
+    let is_streaming = args.sink.is_some();
+    let think_end_id = tokenizer.think_end_id();
+
+    // Owned params: re-resolved from the request config (deterministic —
+    // identical to what the session core handed us in `args.params`), then
+    // populated with the stop-set `run_dspark_turn` reads from
+    // `ChatParams::extra_eos_ids` (the autoregressive loops thread it as a
+    // separate argument instead).
+    let mut p = backend.resolve_params(args.config);
+    p.extra_eos_ids = backend.extra_eos_ids();
+    let report_perf = p.report_performance;
+    let max_new_tokens = p.max_new_tokens;
+    let reuse_cache = if is_delta { true } else { p.reuse_cache };
+    let block_size = backend.dspark_block_size()?;
+
+    let generation_start = report_perf.then(Instant::now);
+    let mut first_token_instant: Option<Instant> = None;
+
+    // L-EPILOGUE: from here the turn owes exactly one epilogue, and this
+    // token is the only handle to it.
+    let epilogue = SpecTurnEpilogue::begin(backend.paged_spec_seq_id());
+
+    let prefix = match backend.prime_prefix_state(args.tokens, reuse_cache, 0, &[], p.cache_salt) {
+        Ok(prefix) => prefix,
+        Err(error) => {
+            epilogue.abort(backend);
+            return Err(error);
+        }
+    };
+    let effective_cached_prefix_len = prefix.effective_cached_prefix_len();
+    let suffix_len = prefix.suffix_len();
+    if suffix_len == 0 {
+        epilogue.abort(backend);
+        return Err(Error::from_reason(
+            "run_paged_dspark_turn: empty prefill suffix (prime_prefix_state must cap cached \
+             prefix at len-1)",
+        ));
+    }
+    let suffix = &args.tokens[effective_cached_prefix_len..];
+
+    let mut token_history: Vec<u32> = args.tokens.to_vec();
+    let mut generated_tokens: Vec<u32> =
+        Vec::with_capacity(generated_capacity_hint(max_new_tokens));
+    let mut finish_reason = String::from("length");
+
+    let generation_stream = Stream::new(DeviceType::Gpu);
+    let _wired_ctx = backend
+        .wired_limit_bytes()
+        .map(|bytes| crate::stream::WiredLimitContext::new(bytes, vec![generation_stream]));
+
+    let mut profiler = DecodeProfiler::new(
+        backend.profiler_label(is_delta, is_streaming),
+        backend.family_name(),
+    );
+    profiler.set_prompt_tokens(suffix_len as u32);
+    profiler.snapshot_memory_before();
+
+    let mut reasoning_tracker = ReasoningTracker::from_setup(&thinking, think_end_id);
+    let stream_skip_special = backend.stream_skip_special_tokens();
+    let mut decode_stream = tokenizer.inner().decode_stream(stream_skip_special);
+    let mut streamed_text_len = 0usize;
+    let mut last_is_reasoning = thinking.enabled;
+    let mut emitter: Option<Box<dyn StreamEmitter>> = args.sink.map(|_| backend.stream_emitter());
+    let turn_token_observer = backend.turn_token_observer();
+
+    profiler.begin_prefill();
+    let last_logits =
+        match backend.paged_prefill_with_draft_state(suffix, &prefix, generation_stream) {
+            Ok(logits) => logits,
+            Err(error) => {
+                epilogue.abort(backend);
+                return Err(error);
+            }
+        };
+    profiler.end_prefill();
+
+    let last_logits = match apply_all_penalties(last_logits, &token_history, &p) {
+        Ok(logits) => logits,
+        Err(error) => {
+            epilogue.abort(backend);
+            return Err(error);
+        }
+    };
+    let y = match sampling::sample(&last_logits, p.sampling_config) {
+        Ok(y) => y,
+        Err(error) => {
+            epilogue.abort(backend);
+            return Err(error);
+        }
+    };
+    y.eval();
+    if report_perf {
+        first_token_instant = Some(Instant::now());
+    }
+    crate::array::synchronize_and_clear_cache();
+
+    let mut rng = rand::rng();
+    let outcome = {
+        let streaming_ctx = match (args.sink, args.cancelled, emitter.as_mut()) {
+            (Some(sink), Some(cancelled), Some(em)) => Some(StreamingCtx {
+                callback: sink,
+                cancelled,
+                decode_stream: &mut decode_stream,
+                tokenizer: tokenizer.inner(),
+                streamed_text_len: &mut streamed_text_len,
+                last_is_reasoning: &mut last_is_reasoning,
+                emitter: em.as_mut(),
+            }),
+            _ => None,
+        };
+        run_dspark_turn(
+            backend,
+            &mut rng,
+            DsparkTurnArgs {
+                y,
+                block_size,
+                params: &p,
+                reasoning_tracker: &mut reasoning_tracker,
+                profiler: &mut profiler,
+                max_new_tokens,
+                eos_id,
+                generated_tokens: &mut generated_tokens,
+                token_history: &mut token_history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_token_instant,
+                report_perf,
+                generation_stream,
+                cancel_flag: args.cancelled,
+                turn_token_observer,
+            },
+            streaming_ctx,
+        )
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            epilogue.abort(backend);
+            return Err(error);
+        }
+    };
+
+    // LENGTH exits keep every token, so the last one's K/V must exist for
+    // the adapter cursor to equal the saved history. A kept accepted draft
+    // already has it; a cycle boundary never does.
+    if finish_reason == "length"
+        && !outcome.last_in_cache
+        && let Some(&final_token) = generated_tokens.last()
+        && let Err(error) = backend.materialize_final_paged(final_token)
+    {
+        epilogue.abort(backend);
+        return Err(error);
+    }
+
+    epilogue.finish(
+        backend,
+        FinishPagedTurnArgs {
+            tokenizer: &tokenizer,
+            params: &p,
+            config: args.config,
+            thinking,
+            is_delta,
+            reuse_cache,
+            prompt_tokens: args.tokens,
+            effective_cached_prefix_len,
+            suffix_len,
+            generated_tokens: &generated_tokens,
+            finish_reason,
+            retain_final_length_token: true,
+            generation_start,
+            first_token_instant,
+            reasoning_tokens: reasoning_tracker.reasoning_token_count(),
+            profiler: &profiler,
+            stream_skip_special,
+            streamed_text_len,
+            last_is_reasoning,
+            sink: args.sink,
+            emitter,
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     //! `run_dspark_turn` tests over a scripted [`MockDsparkStepper`] — NO
@@ -1009,6 +1275,7 @@ mod tests {
     /// handed it so tests assert the exact per-cycle sequencing.
     #[derive(Clone, Debug, PartialEq, Eq)]
     enum Call {
+        Reserve { rows: usize, granted: bool },
         Propose { anchor: u32, max_len: usize },
         VerifyArProbe { anchor: u32 },
         Verify { ids: Vec<u32> },
@@ -1094,6 +1361,10 @@ mod tests {
         /// Synthetic target graph construction/dispatch inside the dedicated
         /// probe. Calibration must include this delay.
         ar_probe_target_build_delay: Option<Duration>,
+        /// 0-based cycle from which `reserve_cycle_lookahead` reports pool
+        /// exhaustion — the paged steppers' `Ok(false)`.
+        reserve_exhausted_from: Option<usize>,
+        reserve_calls: Cell<usize>,
         ledger: Rc<RefCell<Vec<Call>>>,
     }
 
@@ -1132,6 +1403,18 @@ mod tests {
     impl DsparkStepper for MockDsparkStepper {
         fn supports_adaptive_ar_fallback(&self) -> bool {
             self.adaptive_ar_fallback
+        }
+
+        fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
+            let call = self.reserve_calls.get();
+            self.reserve_calls.set(call + 1);
+            let granted = self
+                .reserve_exhausted_from
+                .is_none_or(|exhausted_from| call < exhausted_from);
+            self.ledger
+                .borrow_mut()
+                .push(Call::Reserve { rows, granted });
+            Ok(granted)
         }
 
         fn enter_ar_fallback(&mut self) -> Result<()> {
@@ -1246,6 +1529,10 @@ mod tests {
         adaptive_ar_fallback: bool,
         propose_delay: Option<Duration>,
         ar_probe_target_build_delay: Option<Duration>,
+        reserve_exhausted_from: Option<usize>,
+        /// Drafted block width the plan sizes the lookahead reservation
+        /// from; `None` advertises no speculative plan at all.
+        draft_block_size: Option<usize>,
         ledger: Rc<RefCell<Vec<Call>>>,
         begin_calls: Cell<usize>,
         /// `block_size` observed by `begin_dspark_decode` (setup plumbing).
@@ -1262,6 +1549,8 @@ mod tests {
                 adaptive_ar_fallback: false,
                 propose_delay: None,
                 ar_probe_target_build_delay: None,
+                reserve_exhausted_from: None,
+                draft_block_size: None,
                 ledger: Rc::new(RefCell::new(Vec::new())),
                 begin_calls: Cell::new(0),
                 seen_block_size: Cell::new(usize::MAX),
@@ -1274,6 +1563,18 @@ mod tests {
             let mut b = Self::greedy(vocab, cycles);
             b.neg_fill = -1.0e30;
             b
+        }
+
+        /// Advertise a draft-model speculative plan of `block_size` and
+        /// exhaust the pool from the `exhausted_from`-th cycle on.
+        fn with_lookahead_exhausted_from(
+            mut self,
+            block_size: usize,
+            exhausted_from: usize,
+        ) -> Self {
+            self.draft_block_size = Some(block_size);
+            self.reserve_exhausted_from = Some(exhausted_from);
+            self
         }
 
         fn with_slow_adaptive_fallback(mut self) -> Self {
@@ -1342,6 +1643,20 @@ mod tests {
                 "MockDsparkBackend::finalize_turn must not run",
             ))
         }
+
+        fn execution_plan(&self) -> crate::engine::plan::ExecutionPlan {
+            crate::engine::plan::ExecutionPlan {
+                speculative: self
+                    .draft_block_size
+                    .map(|_| crate::engine::plan::SpeculativePlan {
+                        kind: crate::engine::plan::SpeculativeKind::DraftModel,
+                        supported_input_media: crate::engine::plan::MediaCapabilities::NONE,
+                        supported_context_media: crate::engine::plan::MediaCapabilities::NONE,
+                        supports_paged_attention: true,
+                    }),
+                ..crate::engine::plan::ExecutionPlan::TEXT_ONLY
+            }
+        }
     }
 
     impl DsparkBackend for MockDsparkBackend {
@@ -1364,6 +1679,8 @@ mod tests {
                 ar_fallback: false,
                 propose_delay: self.propose_delay,
                 ar_probe_target_build_delay: self.ar_probe_target_build_delay,
+                reserve_exhausted_from: self.reserve_exhausted_from,
+                reserve_calls: Cell::new(0),
                 ledger: Rc::clone(&self.ledger),
             })
         }
@@ -1726,6 +2043,96 @@ mod tests {
     }
 
     // ---- 1. emission order + per-cycle commit ledger ---------------------
+
+    /// Pool exhaustion mid-turn drops the DRAFT BLOCK, not the turn: the
+    /// exhausted cycle skips `propose` entirely and takes ONE autoregressive
+    /// step through `verify` (a 1-token block, `commit(1, 1)`), so the turn
+    /// still finishes on budget.
+    ///
+    /// The reservation is sized from the backend's `SpeculativePlan`
+    /// (`lookahead_rows_for(DraftBlockSize(block_size))` = `block_size + 1`),
+    /// never a local `depth + 1` (I1).
+    ///
+    /// Mutation this catches: ignoring `reserve_cycle_lookahead`'s `false`
+    /// (the cycle then proposes and verifies a full block against an
+    /// unreserved region), or erroring the turn instead of degrading.
+    #[test]
+    fn dspark_turn_lookahead_exhaustion_degrades_to_one_ar_step() {
+        // Cycle 0 drafts 2 and both are accepted. Later cycles carry a
+        // 1-token script the engine may never reach: the pool is exhausted
+        // from cycle 1 on, so those cycles must skip `propose` outright.
+        let backend = MockDsparkBackend::greedy(
+            16,
+            vec![
+                CycleScript::greedy(vec![5, 6], vec![5, 6, 7]),
+                CycleScript::greedy(vec![8], vec![8, 9]),
+                CycleScript::greedy(vec![11], vec![11, 12]),
+            ],
+        )
+        .with_lookahead_exhausted_from(2, 1);
+        let mut backend = backend;
+        let mut params = greedy_params();
+        params.max_new_tokens = 6;
+        params.mtp_depth = 2;
+        let out = drive_turn(&mut backend, params, 6, 999, 2);
+
+        let reserves: Vec<(usize, bool)> = out
+            .ledger
+            .iter()
+            .filter_map(|call| match call {
+                Call::Reserve { rows, granted } => Some((*rows, *granted)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            reserves.iter().all(|&(rows, _)| rows == 3),
+            "every cycle must reserve anchor + block_size rows from the plan, got {reserves:?}"
+        );
+        assert_eq!(
+            reserves.first().copied(),
+            Some((3, true)),
+            "the first cycle must be admitted"
+        );
+        assert!(
+            reserves.len() >= 2 && reserves[1..].iter().all(|&(_, granted)| !granted),
+            "cycles from the second on must see the pool exhausted, got {reserves:?}"
+        );
+
+        let proposes = count(&out.ledger, |c| matches!(c, Call::Propose { .. }));
+        assert_eq!(
+            proposes, 1,
+            "only the admitted cycle may draft a block; an exhausted cycle skips propose"
+        );
+        let verify_widths: Vec<usize> = out
+            .ledger
+            .iter()
+            .filter_map(|call| match call {
+                Call::Verify { ids } => Some(ids.len()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            verify_widths.first().copied(),
+            Some(3),
+            "the admitted cycle verifies anchor + 2 drafts"
+        );
+        assert!(
+            verify_widths[1..].iter().all(|&width| width == 1),
+            "every exhausted cycle must verify a single anchor row, got {verify_widths:?}"
+        );
+        assert!(
+            commits(&out.ledger)[1..]
+                .iter()
+                .all(|&(keep, total)| keep == 1 && total == 1),
+            "an exhausted cycle commits exactly its one AR row, got {:?}",
+            commits(&out.ledger)
+        );
+        assert_eq!(
+            out.finish_reason, "length",
+            "exhaustion must degrade the cycle, never fail the turn"
+        );
+        assert_eq!(out.generated.len(), 6, "the turn still fills its budget");
+    }
 
     #[test]
     fn dspark_turn_multi_cycle_greedy_emission_and_commit_ledger() {

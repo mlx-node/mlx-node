@@ -28,7 +28,84 @@
 //! through the coordinator internally — no out-of-band per-group view ever
 //! exists that could go stale or need capturing.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::engine::backend::{PagedBackend, TurnOutput};
+use crate::engine::paged_turn::{FinishPagedTurnArgs, finish_paged_turn};
+
 use crate::engine::backend::SpecFrontier;
+
+/// Paged speculative turns that ended without running the family epilogue.
+static ABANDONED_SPEC_TURN_EPILOGUES: AtomicU64 = AtomicU64::new(0);
+
+/// Observation hook for [`ABANDONED_SPEC_TURN_EPILOGUES`] — the counter a
+/// forked epilogue bumps, so L-EPILOGUE has a reader that does not depend on
+/// `debug_assertions`.
+#[cfg(test)]
+pub(crate) fn abandoned_spec_turn_epilogues() -> u64 {
+    ABANDONED_SPEC_TURN_EPILOGUES.load(Ordering::Relaxed)
+}
+
+/// The obligation to run the family turn epilogue, as a value (L-EPILOGUE).
+///
+/// Minted once at a paged speculative dispatch and moved into the driver, so
+/// removing the mint is a compile error rather than a silent policy change.
+/// The only successful discharge is [`Self::finish`], whose body IS
+/// `engine::paged_turn::finish_paged_turn`; [`Self::abort`] is the error
+/// exit, where no epilogue may run because nothing may be published. Not
+/// `Clone`: one turn, one epilogue.
+#[must_use = "a paged speculative turn must exit through SpecTurnEpilogue::{finish, abort}"]
+#[derive(Debug)]
+pub(crate) struct SpecTurnEpilogue {
+    seq_id: u32,
+    discharged: bool,
+}
+
+impl SpecTurnEpilogue {
+    pub(crate) fn begin(seq_id: u32) -> Self {
+        Self {
+            seq_id,
+            discharged: false,
+        }
+    }
+
+    /// Reconcile -> finalize -> save, for a turn that completed.
+    pub(crate) fn finish<B: PagedBackend>(
+        mut self,
+        backend: &mut B,
+        args: FinishPagedTurnArgs<'_>,
+    ) -> napi::Result<TurnOutput> {
+        self.discharged = true;
+        finish_paged_turn(backend, args)
+    }
+
+    /// Error exit: release the live request instead of publishing anything.
+    pub(crate) fn abort<B: PagedBackend>(mut self, backend: &mut B) {
+        self.discharged = true;
+        backend.abort_paged_turn();
+    }
+}
+
+impl Drop for SpecTurnEpilogue {
+    fn drop(&mut self) {
+        // Firing while the thread already unwinds would abort the process
+        // and bury the original panic.
+        if self.discharged || std::thread::panicking() {
+            return;
+        }
+        ABANDONED_SPEC_TURN_EPILOGUES.fetch_add(1, Ordering::Relaxed);
+        let seq_id = self.seq_id;
+        tracing::error!(
+            target: "mlx_core::engine::spec_paged",
+            seq_id,
+            "a paged speculative turn exited without the family epilogue"
+        );
+        debug_assert!(
+            false,
+            "sequence {seq_id} forked its own paged speculative turn epilogue"
+        );
+    }
+}
 
 /// An OPEN speculative verify cycle for one sequence.
 ///
@@ -216,11 +293,13 @@ impl Drop for VerifyTicket {
 /// implementation of this trait nor a caller may fork a private epilogue —
 /// forking one re-opens the GDN-seam bug class Stage A closed.
 ///
-/// This law has NO executable enforcement here: nothing in this module can
-/// observe a turn epilogue, so it is a documented obligation on the driver.
-/// The first driver that will execute it is Stage D1 (gemma4 DSpark paged),
-/// with Stage D2 (dense/MoE native MTP) next; whichever lands first owns
-/// making it checkable.
+/// [`SpecTurnEpilogue`] is the executable form: a paged speculative driver
+/// is handed one at dispatch and can discharge it only by calling
+/// [`SpecTurnEpilogue::finish`], which IS `finish_paged_turn`, or
+/// [`SpecTurnEpilogue::abort`], which releases the request and runs no
+/// epilogue at all. A driver that writes its own reconcile/finalize/save
+/// inline leaves the token to [`Drop`], which counts the abandonment and
+/// trips a debug assertion.
 #[allow(dead_code)]
 pub(crate) trait SpecPagedCache {
     /// Reserve block capacity for `rows` rows past `seq_id`'s current
@@ -682,6 +761,39 @@ mod tests {
                 attn_tokens,
                 recurrent_tokens: None,
             })
+        }
+    }
+
+    /// L-EPILOGUE, executable half: a paged speculative turn that exits
+    /// without discharging its [`SpecTurnEpilogue`] — the shape a forked
+    /// reconcile/finalize/save takes — is COUNTED and trips the debug
+    /// assertion. The positive half (a real driver discharging it through
+    /// `finish` / `abort`) is asserted on the production driver by
+    /// `models::gemma4::dspark_decode`'s paged turn gates, which read this
+    /// same counter across a turn.
+    ///
+    /// Mutation this catches: dropping the `Drop` impl, or discharging the
+    /// token anywhere other than `finish`/`abort`.
+    #[test]
+    fn an_abandoned_turn_epilogue_is_counted() {
+        let before = abandoned_spec_turn_epilogues();
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let outcome = std::panic::catch_unwind(|| {
+            let _epilogue = SpecTurnEpilogue::begin(41);
+        });
+        std::panic::set_hook(previous_hook);
+
+        assert_eq!(
+            abandoned_spec_turn_epilogues(),
+            before + 1,
+            "a turn epilogue dropped without finish/abort must be counted"
+        );
+        if cfg!(debug_assertions) {
+            assert!(
+                outcome.is_err(),
+                "a debug build must also trip the abandoned-epilogue assertion"
+            );
         }
     }
 

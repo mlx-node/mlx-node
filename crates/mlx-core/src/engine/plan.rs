@@ -246,11 +246,10 @@ impl SpeculativePlan {
     /// target's verify rows only. vLLM's harmless over-reserve for its
     /// read-only gemma4_mtp drafter is likewise not copied.
     ///
-    /// No production reserver consumes it yet — the external-draft paged
-    /// steppers (`SpecPagedCache::reserve_lookahead` callers) do; until
-    /// then it exists so their reservations are sized by the plan property
-    /// rather than a re-derived local formula (I1).
-    #[allow(dead_code)]
+    /// `engine::dspark_turn::run_paged_dspark_turn` sizes its per-cycle
+    /// `SpecPagedCache::reserve_lookahead` from this, so the reservation
+    /// comes from the plan property rather than a re-derived local formula
+    /// (I1).
     pub const fn lookahead_rows_for(self, width: SpeculativeDraftWidth) -> usize {
         match (self.kind, width) {
             (SpeculativeKind::NativeMtp, SpeculativeDraftWidth::Depth(depth)) => depth + 1,
