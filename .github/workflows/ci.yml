@@ -370,10 +370,11 @@ jobs:
           # them; wiring only one makes the others early-return, which libtest
           # counts as PASSED.
           #
-          # THIS LEG HAS NEVER RUN GREEN, so its presence in the matrix is not
-          # coverage. It needs ~38 GB disk and ~42 GB memory (two full weight
-          # sets resident), which no hosted runner has. The fix is a self-hosted
-          # runner, not dropping the gates.
+          # THIS LEG NEVER RUNS: the run step skips it on every event, because it
+          # needs ~38 GB disk and ~42 GB memory (two full weight sets resident)
+          # and no hosted runner has that. It is wiring kept ready for a
+          # self-hosted runner — not coverage. Local runs are this family's only
+          # evidence today.
           - name: nemotron_h
             model: nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4
             slug: nvidia-nemotron-3.5-lightning-30b-a3b-nvfp4
@@ -450,9 +451,13 @@ jobs:
             echo "::notice::Skipping gemma4 QAT leg on ${{ github.event_name }} (PR opt-in only; gated HF repo)."
             exit 0
           fi
-          # PR opt-in only: a ~38 GB download must not be able to block a release.
-          if [ "${{ matrix.name }}" = "nemotron_h" ] && [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "::notice::Skipping nemotron_h leg on ${{ github.event_name }} (PR opt-in only; 30B checkpoint)."
+          # Skipped on EVERY event until a self-hosted runner exists. macos-26 has
+          # neither the ~38 GB disk nor the ~42 GB memory this leg needs, so it would
+          # fail rather than cover anything — and the `model-e2e` label runs the whole
+          # matrix, so that failure would land on every other family's PR too. Flip
+          # this guard when a runner that fits it exists.
+          if [ "${{ matrix.name }}" = "nemotron_h" ]; then
+            echo "::notice::Skipping nemotron_h leg: needs a self-hosted runner (~38 GB disk / ~42 GB memory)."
             exit 0
           fi
           # Same reason as the `test` job: `yarn mlx` needs @mlx-node/server's
