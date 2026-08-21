@@ -730,7 +730,7 @@ fn dense_paged_frontier_skew(adapter_recorded_len: usize, history_len: usize) ->
 /// else round-trips through f32 and compares `to_bits`, so `-0.0 != 0.0` and
 /// differing NaN payloads count as differences — exactly what a
 /// state-equals-its-key audit needs.
-fn arrays_bits_equal_for_test(a: &MxArray, b: &MxArray) -> Result<bool> {
+pub(crate) fn arrays_bits_equal_for_test(a: &MxArray, b: &MxArray) -> Result<bool> {
     a.eval();
     b.eval();
     let (da, db) = (a.dtype()?, b.dtype()?);
@@ -10469,76 +10469,14 @@ impl DenseMtpStepper<'_> {
             .caches
             .as_mut()
             .ok_or_else(|| Error::from_reason("eager MTP replay: inner.caches is None"))?;
-        if caches.len() != snap.len() || caches.len() != tape.len() {
-            return Err(Error::from_reason(format!(
-                "eager MTP replay: length mismatch (caches {}, snapshot {}, \
-                 tape {})",
-                caches.len(),
-                snap.len(),
-                tape.len(),
-            )));
-        }
-        for (idx, cache) in caches.iter_mut().enumerate() {
-            let Some(layer_tape) = tape[idx].as_ref() else {
-                if paged {
-                    // Full-attention layer on the paged path: K/V lives in
-                    // the paged pool and is rewound through the adapter. The
-                    // `inner.caches` FullAttention slot is unused on the
-                    // paged path, so skip it.
-                    continue;
-                }
-                // Full-attention layer: rewind the offset to
-                // `snapshot_offset + steps` so the next forward
-                // overwrites the discarded rows. No-op on full accept.
-                match &snap[idx] {
-                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset } => {
-                        let kv = cache.as_kv_cache_mut().ok_or_else(|| {
-                            Error::from_reason(format!(
-                                "eager MTP replay: layer {idx} has a \
-                                 FullAttention snapshot but its cache slot is \
-                                 not FullAttention",
-                            ))
-                        })?;
-                        let target = *offset + steps as i32;
-                        kv.trim(target);
-                    }
-                    super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
-                        return Err(Error::from_reason(format!(
-                            "eager MTP replay: layer {idx} has no GDN tape \
-                             but a Linear snapshot",
-                        )));
-                    }
-                }
-                continue;
-            };
-            let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
-                Error::from_reason(format!(
-                    "eager MTP replay: layer {idx} has a GDN tape but its \
-                     cache slot is not Linear",
-                ))
-            })?;
-            let (snap_conv, snap_rec) = match &snap[idx] {
-                super::layer_cache::Qwen3_5LayerSnapshot::Linear {
-                    conv_state,
-                    recurrent_state,
-                } => (conv_state.as_ref(), recurrent_state.as_ref()),
-                super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { .. } => {
-                    return Err(Error::from_reason(format!(
-                        "eager MTP replay: layer {idx} GDN tape but \
-                         FullAttention snapshot",
-                    )));
-                }
-            };
-            let window = layer_tape.kernel.window_len()? as usize;
-            if steps > window {
-                return Err(Error::from_reason(format!(
-                    "eager MTP replay: target steps {steps} \
-                     exceeds recorded window {window} at layer {idx}",
-                )));
-            }
-            layer_tape.replay_into(arrays, snap_conv, snap_rec, steps)?;
-        }
-        Ok(())
+        super::layer_cache::replay_mtp_snapshot_to(
+            caches,
+            snap,
+            tape,
+            steps,
+            paged,
+            "eager MTP replay",
+        )
     }
 
     /// The attention side's ground-truth frontier: the paged adapter's

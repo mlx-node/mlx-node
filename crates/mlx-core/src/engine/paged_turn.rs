@@ -8,8 +8,8 @@ use std::time::Instant;
 use napi::bindgen_prelude::*;
 
 use crate::engine::backend::{
-    ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, StreamEmitter, ThinkingSetup,
-    TurnOutput, WholeTurnArgs,
+    ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, PagedSpeculativeArgs,
+    StreamEmitter, ThinkingSetup, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
 use crate::engine::finalize::compute_performance_metrics;
@@ -312,11 +312,24 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
     // before the closure borrows `&mut backend` via `begin_paged_decode`
     // (this hook only needs `&self`).
     let decode_generation_stream = backend.paged_decode_stream(generation_stream);
-    let decode_result: Result<()> = (|| {
-        let mut step = backend.begin_paged_decode()?;
-        if let Some(label) = step.profiler_relabel() {
-            profiler.set_label(label);
+    // Speculative admission runs BEFORE the decode scope opens, while the
+    // autoregressive fallback is still reachable: the family reserves its
+    // pre-cycle lookahead here, and exhaustion degrades this turn to AR
+    // instead of erroring inside a verify. A plan that selected no speculative
+    // decoder never asks.
+    let speculative_admitted = match args.plan.decoder {
+        crate::engine::plan::DecoderPlan::Speculative(_) => {
+            match backend.admit_paged_speculative_decode(p) {
+                Ok(admitted) => admitted,
+                Err(e) => {
+                    backend.abort_paged_turn();
+                    return Err(e);
+                }
+            }
         }
+        crate::engine::plan::DecoderPlan::Autoregressive => false,
+    };
+    let decode_result: Result<()> = (|| {
         let streaming_ctx = match (args.sink, args.cancelled, emitter.as_mut()) {
             (Some(sink), Some(cancelled), Some(em)) => Some(StreamingCtx {
                 callback: sink,
@@ -329,6 +342,35 @@ pub(crate) fn run_paged_turn<B: PagedBackend>(
             }),
             _ => None,
         };
+        if speculative_admitted {
+            // The speculative stepper records every emitted token's K/V inside
+            // its own forwards and rewinds a mid-cycle stop itself, so neither
+            // `materialize_final` nor the compiled-export latch below applies:
+            // the adapter already sits at the drop-last frontier the epilogue
+            // reconciles against.
+            backend.run_paged_speculative_decode(PagedSpeculativeArgs {
+                y,
+                prompt_len: args.tokens.len(),
+                params: p,
+                reasoning_tracker: &mut reasoning_tracker,
+                profiler: &mut profiler,
+                max_new_tokens,
+                eos_id,
+                generated_tokens: &mut generated_tokens,
+                token_history: &mut token_history,
+                finish_reason: &mut finish_reason,
+                first_token_instant: &mut first_token_instant,
+                report_perf,
+                generation_stream: decode_generation_stream,
+                cancel_flag: args.cancelled,
+                streaming: streaming_ctx,
+            })?;
+            return Ok(());
+        }
+        let mut step = backend.begin_paged_decode()?;
+        if let Some(label) = step.profiler_relabel() {
+            profiler.set_label(label);
+        }
         run_decode_loop(
             &mut step,
             DecodeLoopArgs {
@@ -442,11 +484,14 @@ mod tests {
     use super::{FinishPagedTurnArgs, finish_paged_turn, run_paged_turn};
     use crate::array::MxArray;
     use crate::decode_profiler::DecodeProfiler;
+    use crate::engine::backend::PagedSpeculativeArgs;
     use crate::engine::backend::{
         ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
         SaveStateArgs, ThinkingSetup, TurnOutput, TurnSetup, WholeTurnArgs,
     };
-    use crate::engine::plan::{DecoderPlan, MediaCapabilities, MediaInputs, TurnPlan};
+    use crate::engine::plan::{
+        DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
+    };
     use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
     use crate::profiling::PerformanceMetrics;
     use crate::stream::Stream;
@@ -638,6 +683,14 @@ mod tests {
         /// on every other test → the stepper never touches cancellation.
         cancel: Option<Arc<AtomicBool>>,
         flip_on_forward: Option<usize>,
+        /// What `admit_paged_speculative_decode` answers. `Some(true)` runs
+        /// the scripted speculative core, `Some(false)` declines to the
+        /// autoregressive loop, and `None` reproduces the trait default — the
+        /// "published the flag without a core" family — by calling the SAME
+        /// refusal the default calls.
+        spec_admit: Option<bool>,
+        /// Tokens the scripted speculative core emits in one go.
+        spec_tokens: Vec<u32>,
     }
 
     impl ChatBackend for MockBackend {
@@ -787,6 +840,41 @@ mod tests {
             })
         }
 
+        fn admit_paged_speculative_decode(
+            &mut self,
+            _params: &crate::engine::params::ChatParams,
+        ) -> Result<bool> {
+            self.ledger.push("admit_paged_speculative_decode");
+            match self.spec_admit {
+                Some(admit) => Ok(admit),
+                None => crate::engine::backend::paged_speculative_core_missing(),
+            }
+        }
+
+        fn run_paged_speculative_decode(
+            &mut self,
+            args: PagedSpeculativeArgs<'_, '_, '_>,
+        ) -> Result<()> {
+            self.ledger.push("run_paged_speculative_decode");
+            let tokens = self.spec_tokens.clone();
+            for token in &tokens {
+                args.generated_tokens.push(*token);
+                args.token_history.push(*token);
+                // A real speculative stepper records every emitted token's
+                // K/V inside its own verify forward.
+                self.adapter_cursor.fetch_add(1, Ordering::Relaxed);
+            }
+            // ...and then rewinds the terminal token, which is emitted but
+            // never forwarded: the drop-last frontier the epilogue reconciles
+            // against. Modelling it is what lets the test assert the
+            // speculative path needs no `materialize_final`.
+            if !tokens.is_empty() {
+                self.adapter_cursor.fetch_sub(1, Ordering::Relaxed);
+            }
+            *args.finish_reason = String::from("stop");
+            Ok(())
+        }
+
         fn finalize_paged_turn(&mut self, _reuse_cache: bool, cache_salt: u64) {
             self.ledger.push("finalize_paged_turn");
             self.finalize_cache_salt
@@ -927,6 +1015,8 @@ mod tests {
             saved: Arc::new(std::sync::Mutex::new(None)),
             cancel: None,
             flip_on_forward: None,
+            spec_admit: None,
+            spec_tokens: Vec::new(),
         };
 
         // T=0 greedy params, profiling OFF, no cutoffs, budget MAX_NEW.
@@ -1091,6 +1181,8 @@ mod tests {
             cancel: Some(cancelled.clone()),
             // Flip during the 2nd decode forward == step_idx 1's forward.
             flip_on_forward: Some(2),
+            spec_admit: None,
+            spec_tokens: Vec::new(),
         };
 
         let config = ChatConfig {
@@ -1230,6 +1322,8 @@ mod tests {
             saved: Arc::new(std::sync::Mutex::new(None)),
             cancel: None,
             flip_on_forward: None,
+            spec_admit: None,
+            spec_tokens: Vec::new(),
         };
 
         let config = ChatConfig {
@@ -1493,6 +1587,8 @@ mod tests {
             saved: saved.clone(),
             cancel: None,
             flip_on_forward: None,
+            spec_admit: None,
+            spec_tokens: Vec::new(),
         };
 
         let config = ChatConfig {
@@ -1655,6 +1751,8 @@ mod tests {
             saved: saved.clone(),
             cancel: None,
             flip_on_forward: None,
+            spec_admit: None,
+            spec_tokens: Vec::new(),
         };
         let config = ChatConfig {
             temperature: Some(0.0),
@@ -1763,5 +1861,253 @@ mod tests {
             "reconcile must roll the over-recorded EOS off the adapter cursor \
              so it matches the dropped-EOS history (warm-continue parity)"
         );
+    }
+
+    /// Outcome of one speculative-dispatch turn: the lifecycle call sequence
+    /// (minus per-step noise), the number of autoregressive decode forwards,
+    /// what the epilogue persisted, and the final simulated adapter cursor.
+    struct SpecDispatchOutcome {
+        seq: Vec<&'static str>,
+        forward_count: usize,
+        saved: Option<SavedHistory>,
+        final_cursor: usize,
+        result: Result<()>,
+    }
+
+    /// Drive one paged turn whose plan selects `decoder`, with the mock's
+    /// speculative core scripted by `spec_admit` / `spec_tokens`.
+    fn run_spec_dispatch_turn(
+        decoder: DecoderPlan,
+        spec_admit: Option<bool>,
+        spec_tokens: Vec<u32>,
+        max_new: i32,
+    ) -> SpecDispatchOutcome {
+        const PROMPT: [u32; 3] = [0, 1, 2];
+        let ledger = Arc::new(Ledger::default());
+        let forward_count = Arc::new(AtomicUsize::new(0));
+        let adapter_cursor = Arc::new(AtomicUsize::new(0));
+        let saved = Arc::new(std::sync::Mutex::new(None));
+        let tokenizer = tiny_qwen3_tokenizer();
+
+        let mut backend = MockBackend {
+            ledger: ledger.clone(),
+            forward_count: forward_count.clone(),
+            tokenizer: tokenizer.clone(),
+            vocab: 4,
+            target: 1,
+            decode_target: 1, // never the u32::MAX session EOS → walks the budget
+            fail_prime: false,
+            fail_prefill: false,
+            fail_forward_on: None,
+            fail_save: false,
+            adapter_cursor: adapter_cursor.clone(),
+            prime_cache_salt: Arc::new(AtomicU64::new(0)),
+            finalize_cache_salt: Arc::new(AtomicU64::new(0)),
+            saved: saved.clone(),
+            cancel: None,
+            flip_on_forward: None,
+            spec_admit,
+            spec_tokens,
+        };
+
+        let config = ChatConfig {
+            cache_salt: None,
+            cache_owner_id: None,
+            cache_root_owner_id: None,
+            temperature: Some(0.0),
+            max_new_tokens: Some(max_new),
+            max_consecutive_tokens: Some(0),
+            max_ngram_repeats: Some(0),
+            reuse_cache: Some(true),
+            ..Default::default()
+        };
+        let p = crate::engine::params::extract_chat_params(&config);
+        let thinking = ThinkingSetup {
+            enabled: false,
+            budget: None,
+        };
+        let prompt = PROMPT.to_vec();
+        let mut plan = paged_test_plan();
+        plan.decoder = decoder;
+        let mut args = WholeTurnArgs {
+            tokens: &prompt,
+            tokenizer: &tokenizer,
+            eos_id: u32::MAX,
+            config: &config,
+            params: &p,
+            thinking,
+            plan,
+            sink: None,
+            cancelled: None,
+            media: no_media(),
+        };
+
+        let result = run_paged_turn(&mut backend, &mut args).map(|_| ());
+        SpecDispatchOutcome {
+            seq: ledger
+                .snapshot()
+                .into_iter()
+                .filter(|e| *e != "maintain_cache")
+                .collect(),
+            forward_count: forward_count.load(Ordering::Relaxed),
+            saved: saved.lock().expect("saved poisoned").clone(),
+            final_cursor: adapter_cursor.load(Ordering::Relaxed),
+            result,
+        }
+    }
+
+    /// The paged driver's speculative branch: a plan that selected a
+    /// speculative decoder runs the FAMILY's speculative core in place of the
+    /// generic autoregressive loop, and still exits through the one shared
+    /// epilogue (reconcile → finalize → save → finalize_turn). That shared
+    /// exit is L-EPILOGUE (I11) made structural: a speculative turn has no
+    /// private epilogue to fork.
+    ///
+    /// Also pins the two things the speculative branch must NOT do: open the
+    /// autoregressive stepper (`begin_paged_decode`) and run
+    /// `materialize_final` — the speculative core records every emitted
+    /// token's K/V in its own forwards and leaves the cursor on the drop-last
+    /// frontier, so the reconcile finds no surplus.
+    ///
+    /// Catches, verified by mutation: deleting the `if speculative_admitted`
+    /// dispatch in `run_paged_turn` — `begin_paged_decode` then appears in the
+    /// sequence and `run_paged_speculative_decode` does not.
+    #[test]
+    fn a_speculative_plan_runs_the_family_core_and_the_shared_epilogue() {
+        let out = run_spec_dispatch_turn(
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            Some(true),
+            vec![1, 1, 1, 1],
+            16,
+        );
+        out.result
+            .unwrap_or_else(|e| panic!("speculative turn failed: {}", e.reason));
+        assert_eq!(
+            out.seq,
+            vec![
+                "prime_prefix_state",
+                "paged_prefill",
+                "admit_paged_speculative_decode",
+                "run_paged_speculative_decode",
+                "finalize_paged_turn",
+                "save_paged_history",
+                "finalize_turn",
+            ],
+            "a speculative paged turn replaces only the decode block"
+        );
+        assert_eq!(
+            out.forward_count, 0,
+            "the autoregressive decode loop must not run"
+        );
+        let saved = out.saved.expect("reuse_cache turn must persist history");
+        // 3 prompt tokens + 4 emitted, drop-last → 6.
+        assert_eq!(saved.persisted_history.len(), 6);
+        assert_eq!(
+            out.final_cursor,
+            saved.persisted_history.len(),
+            "the speculative core leaves the adapter ON the drop-last frontier, so \
+             the reconcile has no surplus to roll back"
+        );
+    }
+
+    /// Admission is checked while the autoregressive fallback is still
+    /// reachable: a family that declines this turn (its pre-cycle lookahead
+    /// reservation exhausted the pool) decodes autoregressively instead of
+    /// erroring, through the same driver.
+    ///
+    /// Catches, verified by mutation: treating admission as unconditional
+    /// (`let speculative_admitted = matches!(decoder, Speculative(_))`) — the
+    /// declined turn then runs `run_paged_speculative_decode` and emits the
+    /// scripted tokens instead of the budget.
+    #[test]
+    fn a_declined_speculative_admission_falls_back_to_the_autoregressive_loop() {
+        const MAX_NEW: i32 = 5;
+        let out = run_spec_dispatch_turn(
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            Some(false),
+            vec![1, 1, 1, 1],
+            MAX_NEW,
+        );
+        out.result
+            .unwrap_or_else(|e| panic!("declined speculative turn failed: {}", e.reason));
+        assert_eq!(
+            out.seq,
+            vec![
+                "prime_prefix_state",
+                "paged_prefill",
+                "admit_paged_speculative_decode",
+                "begin_paged_decode",
+                "materialize_final",
+                "finalize_paged_turn",
+                "save_paged_history",
+                "finalize_turn",
+            ],
+            "a declined admission runs the generic autoregressive decode"
+        );
+        assert_eq!(
+            out.forward_count,
+            (MAX_NEW - 1) as usize,
+            "the pipelined autoregressive loop runs max_new-1 forwards"
+        );
+    }
+
+    /// An autoregressive plan never asks about speculative admission — the
+    /// hook is reachable only through a plan the family itself published
+    /// `supports_paged_attention` for.
+    ///
+    /// Catches, verified by mutation: calling `admit_paged_speculative_decode`
+    /// unconditionally instead of matching on `args.plan.decoder`.
+    #[test]
+    fn an_autoregressive_plan_never_asks_for_speculative_admission() {
+        let out = run_spec_dispatch_turn(DecoderPlan::Autoregressive, Some(true), vec![1, 1], 5);
+        out.result
+            .unwrap_or_else(|e| panic!("autoregressive turn failed: {}", e.reason));
+        assert!(
+            !out.seq.contains(&"admit_paged_speculative_decode"),
+            "an autoregressive plan must not consult the speculative hooks: {:?}",
+            out.seq
+        );
+        assert!(out.seq.contains(&"begin_paged_decode"));
+    }
+
+    /// The flag-without-a-core shape: a family whose speculative plan
+    /// publishes `supports_paged_attention: true` while it implements no paged
+    /// speculative core inherits the trait default, and the turn FAILS closed
+    /// — releasing the live request — instead of degrading to a permanent,
+    /// invisible autoregressive fallback nobody would ever notice.
+    ///
+    /// The mock reaches that refusal through the same
+    /// `paged_speculative_core_missing()` the trait default calls.
+    ///
+    /// Catches, verified by mutation: making the driver swallow an admission
+    /// error (`.unwrap_or(false)`) — the turn then completes autoregressively
+    /// and neither the error nor `abort_paged_turn` appears.
+    #[test]
+    fn publishing_the_flag_without_a_core_fails_the_turn_closed() {
+        let out = run_spec_dispatch_turn(
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            None,
+            Vec::new(),
+            5,
+        );
+        let err = out
+            .result
+            .expect_err("a missing speculative core must fail the turn");
+        assert!(
+            err.reason.contains("implements no paged speculative core"),
+            "{}",
+            err.reason
+        );
+        assert_eq!(
+            out.seq,
+            vec![
+                "prime_prefix_state",
+                "paged_prefill",
+                "admit_paged_speculative_decode",
+                "abort_paged_turn",
+            ],
+            "the live paged request is released and nothing is persisted"
+        );
+        assert!(out.saved.is_none(), "nothing may be persisted");
     }
 }

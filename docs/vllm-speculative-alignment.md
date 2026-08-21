@@ -113,6 +113,11 @@ that a thresholded one would have absorbed. The cost is that fixtures must be sc
 that screening must cover the model's **reasoning block**, not only the visible answer, since a tie inside the
 thought spends the shared token budget and truncates the answer. See `bf16-tie-screening`.
 
+Screening is a real cost, paid per fixture. On the 35B-A3B MoE checkpoint an unscreened free-form prompt
+diverges between paged MTP and paged AR — and equally between *flat* MTP and *flat* AR, and even between paged
+AR and flat AR with no speculation involved — while every screened fixture is byte-identical across all three.
+A `D*` gate written on an unscreened prompt therefore measures kernel rounding, and reads as a correctness bug.
+
 **Reopens if:** screening cost ever exceeds the bugs it catches.
 
 ### X9. `preserve_thinking` is opt-in, not on
@@ -132,7 +137,7 @@ Everything here is a gap we intend to close. Ordered.
 | Stage | What | Gate |
 |---|---|---|
 | **D1** | gemma4 DSpark on paged KV. First driver through the `SpecPagedCache` facade; makes L-EPILOGUE executable instead of a documented obligation. | ≥ flat DSpark's 1.4–1.5× vs paged AR; T=0 parity incl. a sliding-wrap leg |
-| **D2** | qwen3.5 MoE paged MTP. Recovers the ~1.25× flat-MTP win currently lost to silent paged-AR fallback. Runs parallel to D1 (disjoint files). | ≥1.15× vs paged AR |
+| ~~**D2**~~ | **Landed.** qwen3.5 MoE paged MTP. The MoE speculative plan publishes `supports_paged_attention`, and the generic paged driver runs the family's speculative core in place of the autoregressive loop (`PagedBackend::admit_paged_speculative_decode` + `run_paged_speculative_decode`), so both paged decoders share one epilogue. History is CYCLE history — dense's committed-history mode is gated on a prompt-hidden seed no MoE prefill can produce, so the flag and its inert seed were deleted rather than left as an unsatisfiable option. | **Met.** 1.28× at depth 2 and 1.23× at depth 1 vs paged AR (35B-A3B MXFP8-MTP, 400-token decode, release, alternating A/B in one binary); 1.15×/1.14× at depth 3/4. T=0 three-way parity paged-MTP == paged-AR == flat-MTP over screened fixtures |
 | **D3** | muse DFlash on paged. Needs `DecoderPlan::Speculative`, settle-as-parameter (landed in D0), and an admission cap at `min(prefix_hit, context.logical_len())`. | > paged AR |
 | **D4** | gemma4 assistant Q-only over target KV — vLLM's `kv_sharing_target_layer_name` shape, zero drafter KV. | Pool-kernel Q-only, or a clean 4K/16K/32K A/B. **NO-GO acceptable** |
 | **LCP-flat** | Longest-common-prefix reuse on the **flat** lane for pure-attention families. Today it returns 0 or everything; vLLM always keeps the common prefix. Sanctioned in `engine/cache.rs` for families without recurrent state. | Surfaced by the gemma4 continuation bug. D1 makes it moot for gemma4 speculation, but the flat lane remains the fallback and the env lever |

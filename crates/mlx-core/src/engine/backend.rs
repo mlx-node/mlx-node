@@ -1210,6 +1210,50 @@ pub(crate) trait ChatBackend {
 /// [`crate::engine::decode::run_decode_loop`] — the GAT stepper owning
 /// `&mut self` dissolves the `&mut paged_adapter` + `&layers`
 /// double-borrow that forced the per-family inlined paged loops.
+/// Everything a family's paged SPECULATIVE decode needs from the generic
+/// paged turn driver, handed over in place of the autoregressive decode loop.
+///
+/// The driver builds these from the same locals it would have fed
+/// [`crate::engine::decode::run_decode_loop`], so a speculative decode and an
+/// autoregressive one land on the SAME turn prologue (prime → prefill → first
+/// sample) and the SAME epilogue (reconcile → finalize → save). That is what
+/// keeps L-EPILOGUE (I11) structural rather than a convention each family
+/// re-derives.
+/// The refusal both [`PagedBackend`] speculative hooks default to.
+///
+/// Reached only when a family's [`ChatBackend::execution_plan`] published
+/// `supports_paged_attention: true` for its speculative plan while the family
+/// implements no paged speculative core, so it fails the turn instead of
+/// degrading: a silent decline would ship the flag as a permanent, invisible
+/// autoregressive fallback that no test could see.
+pub(crate) fn paged_speculative_core_missing<T>() -> Result<T> {
+    Err(Error::from_reason(
+        "paged speculative decode: this family's speculative plan publishes \
+         supports_paged_attention but it implements no paged speculative core",
+    ))
+}
+
+pub(crate) struct PagedSpeculativeArgs<'a, 'b, 'c> {
+    /// First generated token, already sampled from the prefill logits.
+    pub y: MxArray,
+    /// Prompt length, so the family can compare its own post-decode frontier
+    /// against the drop-last history the epilogue is about to persist.
+    pub prompt_len: usize,
+    pub params: &'a ChatParams,
+    pub reasoning_tracker: &'a mut crate::engine::penalties::ReasoningTracker,
+    pub profiler: &'a mut DecodeProfiler,
+    pub max_new_tokens: i32,
+    pub eos_id: u32,
+    pub generated_tokens: &'a mut Vec<u32>,
+    pub token_history: &'a mut Vec<u32>,
+    pub finish_reason: &'a mut String,
+    pub first_token_instant: &'a mut Option<std::time::Instant>,
+    pub report_perf: bool,
+    pub generation_stream: Stream,
+    pub cancel_flag: Option<&'a AtomicBool>,
+    pub streaming: Option<crate::engine::decode::StreamingCtx<'b, 'c>>,
+}
+
 pub(crate) trait PagedBackend: ChatBackend {
     /// Per-step paged decode stepper. Borrows `&mut self` for the whole
     /// decode loop (the analog of [`ChatBackend::Decode`]). Pure-eager
@@ -1272,6 +1316,39 @@ pub(crate) trait PagedBackend: ChatBackend {
     /// positions array; gemma4 adds a diagnostic step counter), then drives
     /// [`crate::engine::decode::run_decode_loop`].
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>>;
+
+    /// Whether this turn's paged SPECULATIVE decode is admitted, checked
+    /// while the autoregressive fallback is still available.
+    ///
+    /// Called once, after prefill and the first sample, ONLY when the resolved
+    /// plan selected a speculative decoder. The family reserves whatever
+    /// pre-cycle capacity its speculative lane needs here (I1: the lookahead
+    /// region), so exhaustion degrades to autoregressive decode with untouched
+    /// state instead of erroring mid-verify. `Ok(false)` runs the generic
+    /// autoregressive loop.
+    ///
+    /// The default is an ERROR, not a decline: this hook is reached only when
+    /// the family's own [`ChatBackend::execution_plan`] published
+    /// `supports_paged_attention: true` for its speculative plan, so inheriting
+    /// the default means the flag was flipped without a core. Failing loudly
+    /// keeps those two edits one change — a silent decline would ship as a
+    /// permanent, invisible autoregressive fallback.
+    fn admit_paged_speculative_decode(&mut self, _params: &ChatParams) -> Result<bool> {
+        paged_speculative_core_missing()
+    }
+
+    /// Run the whole paged speculative decode, in place of
+    /// [`crate::engine::decode::run_decode_loop`].
+    ///
+    /// Reached only when [`Self::admit_paged_speculative_decode`] returned
+    /// `true`, so the default is unreachable and refuses loudly rather than
+    /// silently emitting nothing.
+    fn run_paged_speculative_decode(
+        &mut self,
+        _args: PagedSpeculativeArgs<'_, '_, '_>,
+    ) -> Result<()> {
+        paged_speculative_core_missing()
+    }
 
     /// Post-turn adapter lifecycle, run by the engine AFTER the decode
     /// scope drops the stepper and BEFORE [`Self::save_paged_history`].
@@ -1559,9 +1636,10 @@ pub(crate) trait MtpStepper {
     /// the chained-cycle commit anchor
     /// (`MtpCommitAnchor::SkipAlreadyCommittedAnchor` instead of
     /// `IncludeAnchor`) and the `chained_anchor` argument of
-    /// [`Self::begin_cycle`]. Both the dense and MoE eager steppers
-    /// report this whenever their flag-gated `use_committed` gate holds;
-    /// steppers with no committed-history support return `false`.
+    /// [`Self::begin_cycle`]. The dense eager stepper reports this whenever
+    /// its prompt-seed gate holds; steppers with no committed-history support
+    /// return `false` — including the MoE stepper, which has no
+    /// hidden-emitting prefill to seed one from.
     fn committed_history_active(&self) -> bool;
 
     /// Whether this turn may reuse the previous verify hidden to skip the
@@ -1625,8 +1703,8 @@ pub(crate) trait MtpStepper {
     /// Committed-history commit. Appends `K+2` exact committed K/V slots
     /// to the persistent MTP cache. The `anchor` selects the commit
     /// payload policy (engine-chosen [`MtpCommitAnchor`]); the model
-    /// consumes it. A no-op impl keeps the cycle-history policy (tests, or
-    /// dense/MoE steppers whose flag-gated `use_committed` gate is off).
+    /// consumes it. A no-op impl keeps the cycle-history policy (tests, the
+    /// MoE stepper, or the dense stepper on a turn with no prompt seed).
     fn commit_mtp(
         &mut self,
         anchor: MtpCommitAnchor,
@@ -1814,6 +1892,20 @@ pub(crate) trait DsparkStepper {
         Err(Error::from_reason(
             "DSpark stepper does not support a target-only AR probe commit",
         ))
+    }
+
+    /// Reserve the speculative lookahead region for the cycle about to run,
+    /// measured past the stepper's CURRENT committed frontier. The engine
+    /// calls this once per cycle, right before the cycle's propose/verify:
+    /// every committed token moves the frontier, so a turn-entry reservation
+    /// would cover only the first cycle. `Ok(true)` = the coming verify write
+    /// is covered, or this stepper has no reservation semantics (the flat
+    /// default). `Ok(false)` = pool exhaustion with untouched state — the
+    /// engine drops this cycle's draft block and takes one autoregressive
+    /// step THROUGH verify instead of erroring the turn. Non-capacity
+    /// failures are `Err`.
+    fn reserve_cycle_lookahead(&mut self, _rows: usize) -> Result<bool> {
+        Ok(true)
     }
 
     /// Draft up to `max_len` tokens conditioned on `anchor_id` (the last

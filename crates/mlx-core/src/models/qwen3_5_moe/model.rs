@@ -41,8 +41,7 @@ use crate::models::qwen3_5::gdn_checkpoint_store::{
 use crate::models::qwen3_5::model::{
     IMAGE_TOKEN_ID, Qwen3_5ContextLimits, VisionCache, VisionCacheInner, async_eval_layer_caches,
     compute_image_token_counts_per_image, constrain_paged_context_params, eval_layer_caches,
-    inject_image_placeholders, partition_prefill_chunks, qwen35_expanded_prompt_token_count,
-    vlm_prepare_vision_features,
+    inject_image_placeholders, qwen35_expanded_prompt_token_count, vlm_prepare_vision_features,
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
@@ -60,6 +59,7 @@ use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::engine;
 use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup, SpecFrontier};
+use crate::engine::spec_owner::SpecOwner;
 use crate::engine::{
     apply_all_penalties, compute_performance_metrics, extract_chat_params, finalize_chat_result,
     save_cache_state_direct, verify_cache_prefix_direct,
@@ -294,6 +294,25 @@ pub(crate) struct Qwen35MoeInner {
     /// release the request. `save_paged_history` consumes this latch instead of
     /// republishing expanded image-placeholder history as a live session.
     paged_finalize_failed: bool,
+    /// Engine-computed accepted-but-unemitted tail of the most recent paged
+    /// MTP turn, recorded so a test can see a mid-cycle stop was acted on
+    /// rather than discarded.
+    pub(crate) paged_mtp_last_rollback_unemitted: usize,
+    /// Mid-cycle GDN rewinds this session performed. Pairs with
+    /// `paged_mtp_gdn_invalidations`: a rewind that fails increments the
+    /// latter instead.
+    paged_mtp_gdn_rewinds: u64,
+    /// Failed mid-cycle GDN rewinds plus every paged epilogue frontier
+    /// disagreement that armed `paged_gdn_state_dirty`.
+    paged_mtp_gdn_invalidations: u64,
+    /// Refuse-to-persist latch for the GDN half of a paged session: armed when
+    /// a paged epilogue found the adapter and the drop-last history at
+    /// different frontiers, so the live recurrent state cannot be keyed on that
+    /// history. Consumed by `remember_moe_gdn_history_checkpoint` (refuses and
+    /// drops the stale checkpoint) and `prepare_moe_gdn_prefix_state` (the
+    /// live / last-history fast arms are skipped, so the next turn recomputes).
+    /// GDN-only — the adapter's content-addressed K/V is unaffected.
+    paged_gdn_state_dirty: bool,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) for
     /// full-attention layers — same semantics as the dense model.
     /// Enabled by default for compatible checkpoints; explicit false retains
@@ -460,6 +479,42 @@ pub(crate) enum Qwen35MoeCmd {
     SchedulerStats {
         reply: ResponseTx<engine::SchedulerStatsJs>,
     },
+    /// Test-only: snapshot the paged-MTP GDN bookkeeping between turns — see
+    /// [`MoeMtpPagedGdnStateForTest`].
+    #[doc(hidden)]
+    MtpPagedGdnStateForTest {
+        reply: ResponseTx<MoeMtpPagedGdnStateForTest>,
+    },
+    /// Test-only state oracle: recompute GDN over the persisted history
+    /// checkpoint's own token key from FRESH caches and bit-compare the
+    /// conv/recurrent arrays against the checkpoint. `Ok(true)` iff every
+    /// linear layer matches exactly — i.e. the persisted state equals what its
+    /// key claims it is.
+    #[doc(hidden)]
+    GdnHistoryCheckpointOracleForTest { reply: ResponseTx<bool> },
+}
+
+/// Test-only between-turn snapshot of the MoE paged-MTP GDN bookkeeping, read
+/// via [`Qwen35MoeCmd::MtpPagedGdnStateForTest`]. Serialized behind the model
+/// thread, so it observes the fully-finalized preceding turn.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct MoeMtpPagedGdnStateForTest {
+    /// Whether the block-paged adapter is installed (the paged MTP lane).
+    pub paged_active: bool,
+    /// `cached_token_history.len()` — the committed drop-last history.
+    pub history_len: usize,
+    /// Engine-computed accepted-but-unemitted tail of the most recent paged
+    /// MTP turn.
+    pub last_rollback_unemitted: usize,
+    /// Mid-cycle GDN rewinds performed.
+    pub gdn_rewinds: u64,
+    /// GDN invalidations: failed rewinds + epilogue frontier disagreements.
+    pub gdn_invalidations: u64,
+    /// Whether the refuse-to-persist latch is currently armed.
+    pub state_dirty: bool,
+    /// Whether a GDN history checkpoint is currently stored.
+    pub has_history_checkpoint: bool,
 }
 
 impl FromChatCmd for Qwen35MoeCmd {
@@ -600,6 +655,20 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
         }
         Qwen35MoeCmd::SchedulerStats { reply } => {
             let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
+        }
+        Qwen35MoeCmd::MtpPagedGdnStateForTest { reply } => {
+            let _ = reply.send(Ok(MoeMtpPagedGdnStateForTest {
+                paged_active: inner.paged_adapter.is_some(),
+                history_len: inner.cached_token_history.len(),
+                last_rollback_unemitted: inner.paged_mtp_last_rollback_unemitted,
+                gdn_rewinds: inner.paged_mtp_gdn_rewinds,
+                gdn_invalidations: inner.paged_mtp_gdn_invalidations,
+                state_dirty: inner.paged_gdn_state_dirty,
+                has_history_checkpoint: inner.gdn_last_history_checkpoint.is_some(),
+            }));
+        }
+        Qwen35MoeCmd::GdnHistoryCheckpointOracleForTest { reply } => {
+            let _ = reply.send(inner.moe_gdn_history_checkpoint_recompute_matches_for_test());
         }
     }
 }
@@ -836,6 +905,10 @@ impl Qwen35MoeInner {
             gdn_prefix_checkpoints: VecDeque::new(),
             gdn_last_history_checkpoint: None,
             paged_finalize_failed: false,
+            paged_mtp_last_rollback_unemitted: 0,
+            paged_mtp_gdn_rewinds: 0,
+            paged_mtp_gdn_invalidations: 0,
+            paged_gdn_state_dirty: false,
             paged_adapter,
             row_exact_decode_projections: false,
             scheduled_recurrent: RecurrentStateTable::stage2(),
@@ -1568,6 +1641,91 @@ impl Qwen35MoeInner {
         self.flat_mtp_caches_desynced = false;
     }
 
+    /// I4 frontier agreement for a paged MoE epilogue: the adapter's recorded
+    /// tokens and the drop-last history about to be persisted must sit at ONE
+    /// frontier before any GDN state is keyed on that history. STRICT equality
+    /// — both sides drop the SAME unforwarded final token, so any tolerance
+    /// would either mask a real one-token skew or arm the latch forever.
+    ///
+    /// Disagreement arms the `paged_gdn_state_dirty` refuse-to-persist latch
+    /// consumed by [`Self::remember_moe_gdn_history_checkpoint`] (refuses and
+    /// drops the stale checkpoint) and `prepare_moe_gdn_prefix_state` (the next
+    /// turn recomputes instead of adopting the live state); the adapter K/V
+    /// itself stays — content-addressed prefix reuse is unaffected by a
+    /// GDN-side skew.
+    fn check_moe_paged_frontier(&mut self, history_len: usize, context: &str) {
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return;
+        };
+        let adapter_recorded_len = adapter.request_tokens().len();
+        if adapter_recorded_len == history_len {
+            return;
+        }
+        let skew = adapter_recorded_len as i64 - history_len as i64;
+        tracing::error!(
+            target: "mlx_core::qwen3_5_moe::paged",
+            "MoE paged epilogue frontier disagreement ({context}): adapter recorded \
+             {adapter_recorded_len} tokens, drop-last history has {history_len} \
+             (skew {skew}); refusing to persist GDN state",
+        );
+        self.paged_gdn_state_dirty = true;
+        self.paged_mtp_gdn_invalidations += 1;
+    }
+
+    /// Test-only state oracle: recompute the GDN recurrent state over the
+    /// persisted history checkpoint's OWN token key from fresh caches and
+    /// bit-compare it against what the checkpoint stored. `Ok(true)` iff every
+    /// linear layer matches exactly — i.e. the persisted state is what its key
+    /// claims it is, which is precisely what a mis-rewound speculative turn
+    /// breaks and a length-only assertion cannot see.
+    fn moe_gdn_history_checkpoint_recompute_matches_for_test(&mut self) -> Result<bool> {
+        let Some(checkpoint) = self.gdn_last_history_checkpoint.as_ref() else {
+            return Err(Error::from_reason(
+                "MoE GDN state oracle: no history checkpoint is stored",
+            ));
+        };
+        let tokens = checkpoint.tokens.clone();
+        let reference = clone_moe_linear_layer_caches(&self.config, &checkpoint.caches)
+            .ok_or_else(|| {
+                Error::from_reason("MoE GDN state oracle: checkpoint caches are not ready")
+            })?;
+        let mut recomputed = fresh_moe_layer_caches(&self.config);
+        let embed = self.embedding.clone();
+        super::paged_forward::run_gdn_only_prefill_materialized(
+            &tokens,
+            &embed,
+            &mut self.layers,
+            &mut recomputed,
+            None,
+        )?;
+        for layer_idx in 0..self.config.num_layers as usize {
+            if !self.config.is_linear_layer(layer_idx) {
+                continue;
+            }
+            let (
+                Qwen3_5LayerCache::Linear(checkpoint_arrays),
+                Qwen3_5LayerCache::Linear(recomputed_arrays),
+            ) = (&reference[layer_idx], &recomputed[layer_idx])
+            else {
+                return Err(Error::from_reason(format!(
+                    "MoE GDN state oracle: layer {layer_idx} is not Linear on both sides",
+                )));
+            };
+            for slot in 0..2 {
+                match (checkpoint_arrays.get(slot), recomputed_arrays.get(slot)) {
+                    (None, None) => {}
+                    (Some(a), Some(b)) => {
+                        if !crate::models::qwen3_5::model::arrays_bits_equal_for_test(a, b)? {
+                            return Ok(false);
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn invalidate_moe_paged_session(&mut self, context: &str) {
         tracing::warn!(
             target: "mlx_core::qwen3_5_moe::paged",
@@ -1654,6 +1812,29 @@ impl Qwen35MoeInner {
         if self.cached_token_history.is_empty() {
             self.gdn_last_history_checkpoint = None;
             return Ok(trace.finish(total_start));
+        }
+        if self.paged_gdn_state_dirty {
+            // Refuse-to-persist: this turn's epilogue found the adapter and the
+            // saved history disagreeing on the frontier, so the live GDN state
+            // cannot be keyed on `cached_token_history`. Drop the stale
+            // checkpoint too so no later lookup resurrects state that does not
+            // match its token key. GDN-only — the adapter K/V stays.
+            self.gdn_last_history_checkpoint = None;
+            return Ok(trace.finish(total_start));
+        }
+        // L-KEY (I4): the state cloned below is keyed on
+        // `cached_token_history`, and a paged session's GDN state sits at the
+        // adapter's recorded frontier (the paged forwards and rollbacks move
+        // both together). A caller that publishes without first running
+        // `check_moe_paged_frontier` (which arms the latch consumed above)
+        // trips this in debug builds instead of storing state != its key.
+        #[cfg(debug_assertions)]
+        if let Some(adapter) = self.paged_adapter.as_ref() {
+            debug_assert_eq!(
+                adapter.request_tokens().len(),
+                self.cached_token_history.len(),
+                "GDN history checkpoint key disagrees with the paged frontier",
+            );
         }
 
         let eval_start = trace_enabled.then(std::time::Instant::now);
@@ -2270,7 +2451,14 @@ impl Qwen35MoeInner {
             );
             preparation
         };
-        let gdn_caches_ready = moe_paged_linear_caches_ready(&self.config, self.caches.as_deref());
+        // A prior epilogue that armed the refuse-to-persist latch left the
+        // LIVE recurrent state at a frontier the history does not describe, so
+        // the two arms that adopt it as-is are skipped and this turn recomputes
+        // from a checkpoint or a replay. The latch is one-shot per session:
+        // taking it here lets a clean recompute heal the session.
+        let gdn_state_dirty = std::mem::take(&mut self.paged_gdn_state_dirty);
+        let gdn_caches_ready =
+            !gdn_state_dirty && moe_paged_linear_caches_ready(&self.config, self.caches.as_deref());
         if gdn_caches_ready && continued_live_prefix {
             return Ok(finish("live", cached_prefix_len, 0));
         }
@@ -8350,6 +8538,122 @@ impl PagedBackend for Qwen35MoeInner {
         Ok(Qwen35MoePagedDecode { inner: self })
     }
 
+    fn admit_paged_speculative_decode(&mut self, p: &engine::ChatParams) -> Result<bool> {
+        // MTP acceptance gate: a previous turn whose draft head accepted below
+        // break-even decodes THIS turn plain AR. The flat lane applies the same
+        // policy from `moe_whole_turn`; here it runs after prefill, where the
+        // AR fallback below is still a plain loop rather than a failed turn.
+        if !p.mtp_adaptive_depth && !self.mtp_gate_allows(p.mtp_depth.max(1) as u32) {
+            return Ok(false);
+        }
+        let Some(plan) = self.execution_plan().speculative else {
+            // The plan is what selected a speculative decoder, so this is
+            // unreachable; declining only restores plain AR decode.
+            debug_assert!(
+                false,
+                "MoE paged speculative admission without a speculative plan"
+            );
+            return Ok(false);
+        };
+        // Pre-cycle lookahead reservation (I1) while AR fallback is still an
+        // option — allocator exhaustion inside the verify loop would instead
+        // surface as a turn error and invalidate the paged session.
+        let rows = u32::try_from(crate::engine::mtp_turn::turn_lookahead_rows(plan, p))
+            .unwrap_or(u32::MAX);
+        let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
+            Error::from_reason("MoE paged speculative admission: paged_adapter is None")
+        })?;
+        match adapter.reserve_rows(rows) {
+            Ok(_) => Ok(true),
+            Err(e) if e.starts_with("context_length_exceeded:") => {
+                tracing::warn!(
+                    target: "mlx_core::qwen3_5_moe::paged",
+                    lookahead_rows = rows,
+                    "MoE paged speculative lookahead reservation exhausted the paged \
+                     pool; falling back to autoregressive decode: {e}"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(Error::from_reason(format!(
+                "MoE paged speculative lookahead reservation: {e}"
+            ))),
+        }
+    }
+
+    fn run_paged_speculative_decode(
+        &mut self,
+        args: crate::engine::backend::PagedSpeculativeArgs<'_, '_, '_>,
+    ) -> Result<()> {
+        // Pure-Rust eager paged MoE MTP. The main Step-A / verify forwards
+        // route through the paged adapter (`run_paged_step_with_hidden` /
+        // `run_paged_verify_step`); the GDN recurrent state stays FLAT in
+        // `self.caches` Linear slots, so the tape replay (the rollback
+        // keystone) is IDENTICAL to the flat eager arm. Full-attention K/V
+        // lives in the paged pool, so the rollback rewinds it through the
+        // facade cycle, NOT a `self.caches` KV trim.
+        let crate::engine::backend::PagedSpeculativeArgs {
+            y,
+            prompt_len,
+            params,
+            reasoning_tracker,
+            profiler,
+            max_new_tokens,
+            eos_id,
+            generated_tokens,
+            token_history,
+            finish_reason,
+            first_token_instant,
+            report_perf,
+            generation_stream,
+            cancel_flag,
+            streaming,
+        } = args;
+        MxArray::async_eval_arrays(&[&y]);
+        let mut rng = rand::rng();
+        let outcome = crate::engine::mtp_turn::run_mtp_turn(
+            self,
+            &mut rng,
+            crate::engine::mtp_turn::MtpTurnArgs {
+                y,
+                depth: params.mtp_depth,
+                params,
+                reasoning_tracker,
+                profiler,
+                max_new_tokens,
+                eos_id,
+                // Reborrowed so the frontier check below can still read the
+                // emitted count once the loop returns.
+                generated_tokens: &mut *generated_tokens,
+                token_history,
+                finish_reason,
+                first_token_instant,
+                report_perf,
+                generation_stream,
+                // No MoE hidden-emitting prefill exists, so the drafter builds
+                // cycle history from decode tokens alone.
+                prompt_hidden: None,
+                prompt_hidden_ids: None,
+                cancel_flag,
+            },
+            streaming,
+        )?;
+        self.paged_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
+        debug_assert!(
+            !outcome.desynced,
+            "the paged MoE MTP stepper must rewind both state kinds itself and never \
+             arm the flat desync latch"
+        );
+        // I4 at the epilogue boundary: the adapter and the drop-last history
+        // the epilogue is about to persist must sit at ONE frontier before any
+        // GDN state is keyed on that history. Runs BEFORE `finish_paged_turn`
+        // reconciles, because reconcile would roll the adapter back to the
+        // history length without moving the recurrent state with it and hide
+        // exactly the skew this catches.
+        let expected_history_len = prompt_len + generated_tokens.len().saturating_sub(1);
+        self.check_moe_paged_frontier(expected_history_len, "paged MTP epilogue");
+        Ok(())
+    }
+
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
         // Terminal lifecycle block of a paged turn. Success: keep the request
         // live across turns when reuse is on, using PER-BLOCK extra keys (NOT
@@ -8776,14 +9080,7 @@ impl ChatBackend for Qwen35MoeInner {
             paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
                 supports_delta: true,
             }),
-            speculative: self.has_mtp_weights().then_some(SpeculativePlan {
-                kind: SpeculativeKind::NativeMtp,
-                supported_input_media: MediaCapabilities::NONE,
-                supported_context_media: MediaCapabilities::NONE,
-                // Existing MoE routing gives paged attention precedence;
-                // native MTP is flat-cache only for this family.
-                supports_paged_attention: false,
-            }),
+            speculative: self.has_mtp_weights().then(qwen35_moe_speculative_plan),
         }
     }
 
@@ -8836,13 +9133,17 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Unlike dense, the MoE execution plan does not admit speculative
-        // decoding with paged attention. The autoregressive text+paged path
-        // runs through the generic `run_paged_turn`, which drives the adapter
-        // lifecycle via [`PagedBackend`] and reuses the shared decode loop.
+        // BOTH paged decoders run through the generic `run_paged_turn`, which
+        // drives the adapter lifecycle via [`PagedBackend`]: autoregressive on
+        // the shared decode loop, native MTP on the speculative branch
+        // (`admit_paged_speculative_decode` + `run_paged_speculative_decode`).
+        // Sharing one driver is what keeps the two decoders on one epilogue.
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.paged_adapter.is_some());
-        debug_assert!(matches!(args.plan.decoder, DecoderPlan::Autoregressive));
+        debug_assert!(matches!(
+            args.plan.decoder,
+            DecoderPlan::Autoregressive | DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+        ));
         let mut constrained_params = args.params.clone();
         self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
         let mut constrained_args = WholeTurnArgs {
@@ -8879,79 +9180,92 @@ impl ChatBackend for Qwen35MoeInner {
     }
 }
 
-/// Opt-in gate for the MoE MTP committed-history v2 path. Default OFF: the
-/// drafter cache retention policy is an unvalidated perf change (v2 adds
-/// per-cycle commit work whose accept-rate payoff is unmeasured), so it ships
-/// behind this flag until a same-checkpoint A/B confirms the win. When off,
-/// `MoeMtpStepper::use_committed` is `false` at every site and the stepper is
-/// byte-for-byte the prior cycle-history v1. Read once on first call and
-/// cached; subsequent reads hit the `OnceLock` fast path.
-fn moe_mtp_committed_history_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        crate::inference_trace::env_flag_enabled_or_default(
-            "MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY",
-            false,
-        )
-    })
+/// The speculative plan this family publishes once its MTP head is loaded.
+///
+/// Named rather than inlined into [`ChatBackend::execution_plan`] so the
+/// routing gate can compose the REAL published plan with `TurnPlan::resolve`
+/// without standing up a 35B model — the flag and the core it promises then
+/// cannot drift apart unnoticed.
+///
+/// Native MTP runs on BOTH lanes: the paged lane through the generic driver's
+/// speculative branch (`PagedBackend::admit_paged_speculative_decode` +
+/// `run_paged_speculative_decode`), the flat lane through
+/// `ChatBackend::run_speculative_turn`. Media stays out of both — an
+/// image-bearing turn has no MoE hidden-emitting prefill to seed a drafter.
+fn qwen35_moe_speculative_plan() -> SpeculativePlan {
+    SpeculativePlan {
+        kind: SpeculativeKind::NativeMtp,
+        supported_input_media: MediaCapabilities::NONE,
+        supported_context_media: MediaCapabilities::NONE,
+        supports_paged_attention: true,
+    }
 }
 
-/// Per-turn MTP propose/verify stepper for the MoE family's FLAT eager path
-/// that [`crate::engine::mtp_turn::run_mtp_turn`] drives.
+/// Per-turn MTP propose/verify stepper for the MoE family, driving BOTH the
+/// FLAT and the block-PAGED lane of [`crate::engine::mtp_turn::run_mtp_turn`],
+/// selected by [`Self::owner`].
 ///
-/// COMMITTED-HISTORY v2 (mirrors dense's `DenseMtpStepper`): when
-/// `use_committed` holds, [`Self::begin_cycle`] only truncates the prior
-/// cycle's speculative draft tail back to `committed_len` (never rebuilding a
-/// fresh cache) and [`Self::commit_mtp`] appends each cycle's newly committed
-/// tokens' exact K/V, so the drafter's cache persists across cycles within a
-/// turn. `use_committed` is opt-in: it requires the
-/// `MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY` flag. With the flag off (the default)
-/// `use_committed` is `false`, so this stepper falls back to CYCLE-HISTORY v1
-/// (fresh drafter cache each cycle, no-op commit) — byte-for-byte the prior
-/// behavior. The prompt-prefix seed in [`MtpBackend::begin_mtp_decode`]
-/// mirrors dense's byte-for-byte but is currently INERT: no MoE call site
-/// populates a real `prompt_hidden`/`prompt_hidden_ids` yet (there is no MoE
-/// hidden-emitting prefill), so even with the flag on, cycle 1 of every turn
-/// still starts the drafter from an empty cache — only cycles 2+ within the
-/// SAME turn benefit today. FLAT-ONLY: the main forward, verify, and rollback
-/// all act on `inner.caches`; there is no paged routing or adapter here.
+/// With no owner the eager pre-norm forwards run against `inner.caches`; with
+/// one, the main Step-A / verify forwards route through `inner.paged_adapter`
+/// ([`super::paged_forward::run_paged_step_with_hidden`] /
+/// [`super::paged_forward::run_paged_verify_step`]) while the GDN recurrent
+/// state stays FLAT in `inner.caches` Linear slots. Only four methods
+/// (`forward_with_hidden`, `verify_step`, `rollback`, `rollback_unemitted`)
+/// branch on it.
+///
+/// The adapter stays ON THE MODEL for the whole turn (I6): each paged touch
+/// borrows it back through [`SpecOwner::resolve`], which refuses once the
+/// adapter's active request is no longer this turn's.
+///
+/// History policy is CYCLE history: [`Self::begin_cycle`] rebuilds a fresh
+/// drafter cache every cycle and [`Self::commit_mtp`] is a no-op. The dense
+/// family's committed-history mode is gated on a prompt-hidden seed
+/// (`MtpTurnSetup::prompt_hidden`), and no MoE call site can produce one —
+/// there is no MoE hidden-emitting prefill — so the mode's own precondition is
+/// unsatisfiable here.
 pub(crate) struct MoeMtpStepper<'a> {
     /// The model — owns layers / caches / mtp / final_norm / lm_head and the
     /// `flat_mtp_caches_desynced` latch.
     inner: &'a mut Qwen35MoeInner,
-    /// Drafter K/V caches. v2 committed-history mode (`use_committed`) holds
-    /// the persistent committed prefix; v1 cycle-history mode (the flag-off
-    /// default, or the `position_base != 0` fallback) is reset fresh by
-    /// [`Self::begin_cycle`].
+    /// Drafter K/V caches, rebuilt fresh by [`Self::begin_cycle`].
     mtp_caches: Vec<Qwen3_5LayerCache>,
-    /// Eager analogue of dense's committed-length cursor: committed tokens
-    /// whose exact K/V live in `mtp_caches`.
-    committed_len: i32,
-    /// Committed-history active iff the opt-in flag is on AND the prompt tail's
-    /// hiddens start at absolute position 0 — mirrors
-    /// `DenseMtpStepper::use_committed`.
-    use_committed: bool,
     /// Pre-verify snapshot of the main caches, taken in
-    /// [`Self::snapshot_main_linear`], consumed by [`Self::rollback`].
+    /// [`Self::snapshot_main_linear`], consumed by [`Self::rollback`] and the
+    /// paged [`Self::rollback_unemitted`].
     snap: Option<Result<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>>,
-    /// GDN tape recorded by [`Self::verify_step`], consumed by
-    /// [`Self::rollback`].
+    /// GDN tape recorded by [`Self::verify_step`], consumed by the same two
+    /// rewinds.
     tape: Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    /// Number of tape steps the retained snapshot + tape currently represent
+    /// as the cycle's committed GDN frontier: set to the recorded step count
+    /// (`depth + 1`) by `verify_step`, overwritten to `accepted_steps`
+    /// (`accepted_drafts + 1`) by `rollback`. `rollback_unemitted` subtracts
+    /// `unemitted` in these SAME units, so the mid-cycle rewind target
+    /// (`last_cycle_steps - unemitted`) is immune to tape-step-unit skew.
+    last_cycle_steps: usize,
+    /// The paged verify cycle [`MtpStepper::verify_step`] opened around the
+    /// verify core's own row write, consumed by [`MtpStepper::rollback`]'s
+    /// facade commit — the one place the adapter's speculative rows are
+    /// retracted, so the commit arithmetic cannot drift from the conformance
+    /// surface. `None` in flat mode, between cycles, and when the adapter
+    /// names no active sequence.
+    open_cycle: Option<crate::engine::spec_paged::VerifyTicket>,
     /// Absolute tokens the GDN recurrent state has consumed, reported by
-    /// [`MtpStepper::frontier`] against the flat full-attention offset.
-    /// Seeded from that offset at construction (the two sides are aligned at
-    /// turn entry) and moved only where the recurrent state actually moves:
-    /// `forward_with_hidden` +1, `verify_step` +depth+1, `rollback` to
-    /// `recurrent_snapshot_base + accepted_steps`. `None` after a failed
-    /// replay — the count is then unknown and the stashed error fail-closes
-    /// the turn. Mirrors `DenseMtpStepper`'s bookkeeping, flat-only.
+    /// [`MtpStepper::frontier`] against the ATTENTION side's ground truth
+    /// (adapter recorded rows / flat full-attention offset). Seeded from that
+    /// frontier at construction and moved ONLY where the recurrent state
+    /// actually moves: `forward_with_hidden` +1, `verify_step` +depth+1,
+    /// replay-driven rollbacks to `recurrent_snapshot_base + steps`. `None`
+    /// after a failed replay — the count is then unknown and the stashed error
+    /// fail-closes the turn.
     recurrent_frontier: Option<u64>,
-    /// [`Self::recurrent_frontier`] captured by `snapshot_main_linear`.
+    /// [`Self::recurrent_frontier`] captured by `snapshot_main_linear` — the
+    /// base the replay-driven rollbacks land relative to.
     recurrent_snapshot_base: Option<u64>,
     /// Error stashed by the infallible [`Self::rollback`] replay, surfaced by
     /// [`Self::take_replay_error`].
     replay_err: Option<Error>,
-    /// Mid-cycle-stop desync latch (set by [`Self::rollback_unemitted`]),
+    /// Mid-cycle-stop desync latch (set by the FLAT [`Self::rollback_unemitted`]),
     /// reported by [`Self::into_desynced`].
     mtp_desynced: bool,
     /// The model's embedding lookup and tied-head projection backend.
@@ -8959,8 +9273,205 @@ pub(crate) struct MoeMtpStepper<'a> {
     /// Config clone for the per-cycle drafter cache reset.
     config: Qwen3_5MoeConfig,
     /// Index of the first full-attention layer, threaded into the MoE eager
-    /// forwards.
+    /// flat forwards.
     fa_idx: usize,
+    /// The sequence this turn's paged main-forwards belong to, claimed at
+    /// `begin_mtp_decode`. `None` runs the flat main path.
+    owner: Option<SpecOwner>,
+    /// Per-layer attention/linear classification consumed by the paged
+    /// forwards. Empty on the flat path (unused there).
+    layer_kinds: Vec<crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind>,
+}
+
+impl Drop for MoeMtpStepper<'_> {
+    fn drop(&mut self) {
+        // A turn that failed between the verify write and its rollback (any
+        // `?` in the engine's accept path) leaves the cycle open; close it here
+        // so the ticket's abandoned-cycle guard does not turn that error return
+        // into a debug-build panic.
+        self.close_abandoned_cycle();
+    }
+}
+
+/// Context prefix for every owner-addressed refusal on this family's paged
+/// speculative path.
+const MOE_PAGED_MTP: &str = "MoE paged MTP facade";
+
+/// The refusal both facade writers return for this family; see the
+/// `SpecPagedCache` impl docs below.
+fn moe_core_writes_its_own_rows(seq_id: u32) -> String {
+    format!(
+        "MoE paged MTP facade: the verify core records sequence {seq_id}'s rows \
+         itself — open the cycle with open_core_write_cycle around that write \
+         instead of record_verify/record_rows"
+    )
+}
+
+impl MoeMtpStepper<'_> {
+    /// Restore the pre-verify snapshot and replay the first `steps` recorded
+    /// tape steps into the live main caches — the shared GDN replay both
+    /// `rollback` (to `accepted_steps`) and the paged `rollback_unemitted`
+    /// (to `last_cycle_steps - unemitted`) drive.
+    fn replay_main_linear_to(&mut self, steps: usize) -> Result<()> {
+        let paged = self.owner.is_some();
+        let snap = match self.snap.as_ref() {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                return Err(Error::from_reason(format!(
+                    "eager MoE MTP replay: snapshot failed: {}",
+                    e.reason
+                )));
+            }
+            None => {
+                return Err(Error::from_reason(
+                    "eager MoE MTP replay: snapshot missing (snapshot_main_linear \
+                     did not run)",
+                ));
+            }
+        };
+        let tape = &self.tape;
+        let inner = &mut *self.inner;
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("eager MoE MTP replay: inner.caches is None"))?;
+        super::layer_cache::replay_mtp_snapshot_to(
+            caches,
+            snap,
+            tape,
+            steps,
+            paged,
+            "eager MoE MTP replay",
+        )
+    }
+
+    /// The attention side's ground-truth frontier: the paged adapter's
+    /// recorded rows, or the flat full-attention cache's offset.
+    fn attention_frontier(&self) -> Option<u64> {
+        match self.owner {
+            Some(owner) => Some(
+                owner
+                    .resolve_ref(&self.inner.paged_adapter, MOE_PAGED_MTP)
+                    .ok()?
+                    .request_tokens()
+                    .len() as u64,
+            ),
+            None => self
+                .inner
+                .caches
+                .as_ref()?
+                .get(self.fa_idx)
+                .map(|cache| cache.offset().max(0) as u64),
+        }
+    }
+
+    /// The paged speculative cache the facade (`engine::spec_paged`)
+    /// addresses: the model's adapter, borrowed back through the turn's
+    /// owner, iff `seq_id` is that owner.
+    fn paged_cache_for(
+        &mut self,
+        seq_id: u32,
+    ) -> std::result::Result<&mut PagedKVCacheAdapter, String> {
+        let owner = self.owner.ok_or_else(|| {
+            format!("{MOE_PAGED_MTP}: a flat turn has no paged speculative cache")
+        })?;
+        owner.accepts(seq_id, MOE_PAGED_MTP)?;
+        owner.resolve(&mut self.inner.paged_adapter, MOE_PAGED_MTP)
+    }
+
+    /// The paged half of [`MtpStepper::verify_step`]: slice `ids` to exactly
+    /// the `depth + 1` rows the core records, OPEN the facade cycle around
+    /// that write, then run it. The cycle is opened AFTER the fallible id work
+    /// so a malformed `ids` never mints a ticket, and BEFORE the write so the
+    /// ticket's basis is the pre-write cursor.
+    fn paged_verify_step(
+        &mut self,
+        ids: &MxArray,
+        depth: usize,
+    ) -> Result<mtp_decode::MtpVerifyOutput> {
+        let id_window = ids.to_int32().map_err(|e| {
+            Error::from_reason(format!(
+                "eager paged MoE MTP verify_step: ids to_int32: {}",
+                e.reason
+            ))
+        })?;
+        if id_window.len() < depth + 1 {
+            return Err(Error::from_reason(format!(
+                "eager paged MoE MTP verify_step: ids has {} elements, need {}",
+                id_window.len(),
+                depth + 1
+            )));
+        }
+        let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
+        let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
+        let owner = self
+            .owner
+            .expect("paged_verify_step is only reached on a paged turn");
+        self.open_verify_cycle(owner, depth + 1);
+        let inner = &mut *self.inner;
+        let adapter = owner
+            .resolve(&mut inner.paged_adapter, "eager paged MoE MTP verify_step")
+            .map_err(Error::from_reason)?;
+        // Cross-turn M-RoPE delta carried by a text turn that warm-continues an
+        // image prefill; 0 for pure-text sessions.
+        let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("eager paged MoE MTP verify_step: caches is None"))?;
+        let tape = &mut self.tape;
+        super::paged_forward::run_paged_verify_step(
+            &verify_in,
+            &inner.embedding,
+            &mut inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &self.layer_kinds,
+            adapter,
+            tape,
+            rope_deltas,
+        )
+    }
+
+    /// Mint the cycle ticket the verify core's own row write belongs to.
+    ///
+    /// Failure is not fatal and not silent: the only way to reach it is an
+    /// adapter that no longer answers to this turn's owner, whose
+    /// `record_tokens` fails the verify a few lines later.
+    fn open_verify_cycle(&mut self, owner: SpecOwner, rows: usize) {
+        self.close_abandoned_cycle();
+        let seq_id = owner.seq_id();
+        match crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq_id, rows) {
+            Ok(ticket) => self.open_cycle = Some(ticket),
+            Err(e) => tracing::warn!(
+                target: "mlx_core::qwen3_5_moe::paged",
+                "eager MoE MTP-paged verify cycle ({rows} rows) could not be opened \
+                 (the rollback falls back to a direct adapter retraction): {e}",
+            ),
+        }
+    }
+
+    /// Close a cycle abandoned between its verify write and its rollback.
+    /// Keeping every written row is what the un-ticketed path did — they stay
+    /// recorded past the emitted frontier and the epilogue's frontier check
+    /// refuses to persist the turn — so a full keep retracts nothing and this
+    /// consumes the ticket instead of letting its abandoned-cycle guard fire.
+    fn close_abandoned_cycle(&mut self) {
+        let Some(ticket) = self.open_cycle.take() else {
+            return;
+        };
+        let (seq_id, rows) = (ticket.seq_id(), ticket.rows());
+        if let Err(e) =
+            crate::engine::spec_paged::SpecPagedCache::commit_cycle(self, seq_id, ticket, rows)
+        {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5_moe::paged",
+                "eager MoE MTP-paged abandoned verify cycle on sequence {seq_id} \
+                 ({rows} rows) could not be closed cleanly (ignored): {e}",
+            );
+        }
+    }
 }
 
 impl MtpStepper for MoeMtpStepper<'_> {
@@ -8969,7 +9480,9 @@ impl MtpStepper for MoeMtpStepper<'_> {
     }
 
     fn committed_history_active(&self) -> bool {
-        self.use_committed
+        // Cycle history: the drafter cache is rebuilt every cycle and
+        // `commit_mtp` is a no-op (see the struct doc).
+        false
     }
 
     fn profiler_relabel(&self) -> Option<&'static str> {
@@ -8987,22 +9500,58 @@ impl MtpStepper for MoeMtpStepper<'_> {
         ids: &MxArray,
         embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)> {
-        let inner = &mut *self.inner;
-        let pre = forward_pre_norm_inner(
-            ids,
-            embedding,
-            &mut inner.layers,
-            &mut inner.caches,
-            self.fa_idx,
-        )?;
-        let h3 = inner.final_norm.forward(&pre)?;
-        let logits = project_logits_from_hidden(&h3, &inner.lm_head, embedding)?;
-        let hidden = h3.squeeze(Some(&[1]))?;
-        if let Some(frontier) = self.recurrent_frontier.as_mut() {
+        let output = match self.owner {
+            None => {
+                let inner = &mut *self.inner;
+                let pre = forward_pre_norm_inner(
+                    ids,
+                    embedding,
+                    &mut inner.layers,
+                    &mut inner.caches,
+                    self.fa_idx,
+                )?;
+                let h3 = inner.final_norm.forward(&pre)?;
+                let logits = project_logits_from_hidden(&h3, &inner.lm_head, embedding)?;
+                let hidden = h3.squeeze(Some(&[1]))?;
+                Ok((logits, hidden, true))
+            }
+            Some(owner) => {
+                ids.eval();
+                let token_id = ids.item_at_int32(0)? as u32;
+                let inner = &mut *self.inner;
+                let adapter = owner
+                    .resolve(
+                        &mut inner.paged_adapter,
+                        "eager paged MoE MTP forward_with_hidden",
+                    )
+                    .map_err(Error::from_reason)?;
+                // Cross-turn M-RoPE delta carried by a text turn that warm-
+                // continues an image prefill; 0 for pure-text sessions.
+                let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
+                let caches = inner.caches.as_mut().ok_or_else(|| {
+                    Error::from_reason("eager paged MoE MTP forward_with_hidden: caches is None")
+                })?;
+                let (logits, hidden) = super::paged_forward::run_paged_step_with_hidden(
+                    token_id,
+                    &inner.embedding,
+                    &mut inner.layers,
+                    caches,
+                    &inner.final_norm,
+                    &inner.lm_head,
+                    &self.layer_kinds,
+                    adapter,
+                    rope_deltas,
+                )?;
+                Ok((logits, hidden, true))
+            }
+        };
+        if output.is_ok()
+            && let Some(frontier) = self.recurrent_frontier.as_mut()
+        {
             // The main forward consumed one token on the GDN side.
             *frontier += 1;
         }
-        Ok((logits, hidden, true))
+        output
     }
 
     // One MTP draft step on the eager drafter. `h_next` is `[1, 1, hidden]`;
@@ -9028,30 +9577,39 @@ impl MtpStepper for MoeMtpStepper<'_> {
     }
 
     // Batched verify: run the K+1 verify ids through the main stack,
-    // advancing `inner.caches` by K+1, recording the GDN tape.
+    // advancing the caches by K+1, recording the GDN tape. The paged half
+    // also opens the facade cycle its core write belongs to
+    // ([`MoeMtpStepper::paged_verify_step`]); `rollback` closes it.
     fn verify_step(
         &mut self,
         ids: &MxArray,
         embedding: &Embedding,
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
-        let inner = &mut *self.inner;
-        let tape = &mut self.tape;
-        let output = eager_verify_step(
-            &mut inner.layers,
-            &mut inner.caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            self.fa_idx,
-            ids,
-            embedding,
-            Some(tape),
-        );
-        if output.is_ok()
-            && let Some(frontier) = self.recurrent_frontier.as_mut()
-        {
-            // Verify consumed the anchor plus D drafts on the GDN side.
-            *frontier += depth as u64 + 1;
+        let output = if self.owner.is_some() {
+            self.paged_verify_step(ids, depth)
+        } else {
+            let inner = &mut *self.inner;
+            let tape = &mut self.tape;
+            eager_verify_step(
+                &mut inner.layers,
+                &mut inner.caches,
+                &inner.final_norm,
+                &inner.lm_head,
+                self.fa_idx,
+                ids,
+                embedding,
+                Some(tape),
+            )
+        };
+        if output.is_ok() {
+            // The recorded tape step count for this cycle: the anchor plus D
+            // drafts. `rollback` overwrites it with the accepted count.
+            self.last_cycle_steps = depth + 1;
+            if let Some(frontier) = self.recurrent_frontier.as_mut() {
+                // Verify consumed the anchor plus D drafts on the GDN side.
+                *frontier += depth as u64 + 1;
+            }
         }
         output
     }
@@ -9062,9 +9620,14 @@ impl MtpStepper for MoeMtpStepper<'_> {
     // Snapshot the main caches before verify mutates them. Stash the fallible
     // result; surfaced in `rollback` / `restore_and_replay_main`.
     fn snapshot_main_linear(&mut self) {
+        // On the paged backend the FullAttention K/V lives in the paged pool,
+        // not `inner.caches`, so its flat slot is an empty shell. Snapshot
+        // paged-aware so we capture only the GDN (Linear) state and skip the
+        // shells — `rollback` rewinds those via the adapter.
+        let paged = self.owner.is_some();
         let inner = &*self.inner;
         let snap = match inner.caches.as_ref() {
-            Some(caches) => super::layer_cache::snapshot_all(caches),
+            Some(caches) => super::layer_cache::snapshot_all_mtp(caches, paged),
             None => Err(Error::from_reason(
                 "eager MoE MTP snapshot_main_linear: inner.caches is None",
             )),
@@ -9075,99 +9638,66 @@ impl MtpStepper for MoeMtpStepper<'_> {
 
     // Pure-Rust GDN tape replay — fires on BOTH full and partial accept.
     // Infallible signature: any error is stashed in `self.replay_err` and
-    // surfaced later. Full-attention layers rewind their K/V offset to
-    // `snapshot_offset + accepted_steps`; GDN layers replay the recorded tape.
-    fn rollback(&mut self, accepted_drafts: usize, _depth: usize) {
+    // surfaced later.
+    fn rollback(&mut self, accepted_drafts: usize, depth: usize) {
         if self.replay_err.is_some() {
             return;
         }
-        let accepted_steps = accepted_drafts + 1;
-        let result: Result<()> = (|| {
-            let snap = match self.snap.as_ref() {
-                Some(Ok(s)) => s,
-                Some(Err(e)) => {
-                    return Err(Error::from_reason(format!(
-                        "eager MoE MTP rollback: snapshot failed: {}",
-                        e.reason
-                    )));
+        // The paged path rewinds the full-attention K/V (which lives in the
+        // paged pool, not `inner.caches`) by `rejected` tokens before the
+        // shared GDN tape replay. The retraction goes through the cycle
+        // `verify_step` opened, so the adapter half of this rollback and the
+        // facade's conformance surface are the same arithmetic: the commit
+        // derives its rollback as `rows - keep` =
+        // `(depth + 1) - (accepted_drafts + 1)`.
+        if let Some(owner) = self.owner {
+            match self.open_cycle.take() {
+                Some(ticket) => {
+                    let seq_id = ticket.seq_id();
+                    // `keep` is CLAMPED to the rows the cycle wrote.
+                    // `accepted_drafts <= depth` is an engine invariant; were
+                    // it ever broken, the clamp keeps this on the commit's
+                    // checked path — retracting zero rows — instead of leaving
+                    // through an Err and a log line.
+                    let keep = (accepted_drafts + 1).min(ticket.rows());
+                    if let Err(e) = crate::engine::spec_paged::SpecPagedCache::commit_cycle(
+                        self, seq_id, ticket, keep,
+                    ) {
+                        tracing::warn!(
+                            target: "mlx_core::qwen3_5_moe::paged",
+                            "eager MoE MTP-paged verify commit (keep {keep} of the cycle's \
+                             rows) failed (ignored): {e}",
+                        );
+                    }
                 }
                 None => {
-                    return Err(Error::from_reason(
-                        "eager MoE MTP rollback: snapshot missing (snapshot_main_linear \
-                         did not run)",
-                    ));
-                }
-            };
-            let tape = &self.tape;
-            let inner = &mut *self.inner;
-            let caches = inner.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("eager MoE MTP rollback: inner.caches is None")
-            })?;
-            if caches.len() != snap.len() || caches.len() != tape.len() {
-                return Err(Error::from_reason(format!(
-                    "eager MoE MTP rollback: length mismatch (caches {}, snapshot {}, \
-                     tape {})",
-                    caches.len(),
-                    snap.len(),
-                    tape.len(),
-                )));
-            }
-            for (idx, cache) in caches.iter_mut().enumerate() {
-                let Some(layer_tape) = tape[idx].as_ref() else {
-                    // Full-attention layer: rewind the offset to
-                    // `snapshot_offset + accepted_steps` so the next forward
-                    // overwrites the rejected drafts. No-op on full accept.
-                    match &snap[idx] {
-                        super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset } => {
-                            let kv = cache.as_kv_cache_mut().ok_or_else(|| {
-                                Error::from_reason(format!(
-                                    "eager MoE MTP rollback: layer {idx} has a \
-                                     FullAttention snapshot but its cache slot is \
-                                     not FullAttention",
-                                ))
-                            })?;
-                            let target = *offset + accepted_steps as i32;
-                            kv.trim(target);
-                        }
-                        super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
-                            return Err(Error::from_reason(format!(
-                                "eager MoE MTP rollback: layer {idx} has no GDN tape \
-                                 but a Linear snapshot",
-                            )));
-                        }
+                    // No cycle to close: `verify_step` could not open one,
+                    // which also fails the verify itself, so production never
+                    // lands here. Retract directly rather than leave rejected
+                    // rows recorded.
+                    let rejected = depth.saturating_sub(accepted_drafts);
+                    if rejected > 0
+                        && let Err(e) = owner
+                            .resolve(&mut self.inner.paged_adapter, MOE_PAGED_MTP)
+                            .map_err(Error::from_reason)
+                            .and_then(|adapter| {
+                                adapter.rollback_last_tokens(rejected as u32).map_err(|e| {
+                                    Error::from_reason(format!("adapter rollback: {e}"))
+                                })
+                            })
+                    {
+                        tracing::warn!(
+                            target: "mlx_core::qwen3_5_moe::paged",
+                            "eager MoE MTP-paged rollback_last_tokens({rejected}) outside a \
+                             verify cycle failed (ignored): {e}",
+                        );
                     }
-                    continue;
-                };
-                let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "eager MoE MTP rollback: layer {idx} has a GDN tape but its \
-                         cache slot is not Linear",
-                    ))
-                })?;
-                let (snap_conv, snap_rec) = match &snap[idx] {
-                    super::layer_cache::Qwen3_5LayerSnapshot::Linear {
-                        conv_state,
-                        recurrent_state,
-                    } => (conv_state.as_ref(), recurrent_state.as_ref()),
-                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { .. } => {
-                        return Err(Error::from_reason(format!(
-                            "eager MoE MTP rollback: layer {idx} GDN tape but \
-                             FullAttention snapshot",
-                        )));
-                    }
-                };
-                let window = layer_tape.kernel.window_len()? as usize;
-                if accepted_steps > window {
-                    return Err(Error::from_reason(format!(
-                        "eager MoE MTP rollback: accepted_steps {accepted_steps} \
-                         exceeds recorded window {window} at layer {idx}",
-                    )));
                 }
-                layer_tape.replay_into(arrays, snap_conv, snap_rec, accepted_steps)?;
             }
-            Ok(())
-        })();
-        match result {
+        }
+        let accepted_steps = accepted_drafts + 1;
+        self.last_cycle_steps = accepted_steps;
+        match self.replay_main_linear_to(accepted_steps) {
             Ok(()) => {
                 self.recurrent_frontier = self
                     .recurrent_snapshot_base
@@ -9182,106 +9712,58 @@ impl MtpStepper for MoeMtpStepper<'_> {
 
     // On rejection (partial accept): the GDN tape replay in `rollback` already
     // reconstructed the AR-exact main cache state, so no re-forward loop is
-    // needed. This only surfaces a stashed replay error and clears the
-    // per-cycle snapshot + tape.
+    // needed. This only surfaces a stashed replay error.
+    //
+    // The per-cycle snapshot + tape are deliberately RETAINED: both are
+    // re-armed by the next cycle anyway (`snapshot_main_linear` overwrites
+    // `snap`; the verify cores clear + re-record `tape` at record time), and a
+    // mid-cycle stop after THIS cycle still needs them — the paged
+    // `rollback_unemitted` replays the GDN state back to the emitted frontier
+    // from exactly this snapshot + tape.
     fn restore_and_replay_main(&mut self, _accepted: &[u32], _embedding: &Embedding) -> Result<()> {
-        self.snap = None;
-        self.tape.clear();
         if let Some(e) = self.replay_err.take() {
             return Err(e);
         }
         Ok(())
     }
 
-    // Committed-history commit. Mirrors `DenseMtpStepper::commit_mtp`.
-    //
-    // v1 (`!use_committed`): no-op.
-    //
-    // v2 (`use_committed`): append the M newly committed tokens' EXACT K/V to
-    // the persistent MTP cache via one multi-token drafter forward.
+    // Cycle history: nothing to commit into the drafter cache.
     fn commit_mtp(
         &mut self,
-        anchor: mtp_decode::MtpCommitAnchor,
-        seed_hidden: &MxArray,
-        verify_hiddens: &MxArray,
-        committed_ids: &[u32],
+        _anchor: mtp_decode::MtpCommitAnchor,
+        _seed_hidden: &MxArray,
+        _verify_hiddens: &MxArray,
+        _committed_ids: &[u32],
         _k_accepted: usize,
-        embedding: &Embedding,
+        _embedding: &Embedding,
     ) -> Result<()> {
-        if !self.use_committed {
-            return Ok(());
-        }
-        let m = committed_ids.len();
-        if m == 0 {
-            return Ok(());
-        }
-        let hidden_dim = verify_hiddens.shape_at(2)?;
-
-        // Assemble hidden_seq [1, M, hidden] per anchor.
-        let hidden_seq = match anchor {
-            mtp_decode::MtpCommitAnchor::IncludeAnchor => {
-                // seed_hidden ++ verify_hiddens[:, 0..M-1, :].
-                let vh_prefix =
-                    verify_hiddens.slice(&[0, 0, 0], &[1, (m - 1) as i64, hidden_dim])?;
-                MxArray::concatenate(seed_hidden, &vh_prefix, 1)?
-            }
-            mtp_decode::MtpCommitAnchor::SkipAlreadyCommittedAnchor => {
-                // verify_hiddens[:, 0..M, :].
-                verify_hiddens.slice(&[0, 0, 0], &[1, m as i64, hidden_dim])?
-            }
-        };
-
-        // Gather the M committed-token input embeddings → [1, M, hidden].
-        let ids_i32: Vec<i32> = committed_ids.iter().map(|&v| v as i32).collect();
-        let ids_arr = MxArray::from_int32(&ids_i32, &[m as i64])?;
-        let gathered = embedding.forward(&ids_arr)?;
-        let emb_seq = gathered.reshape(&[1, m as i64, hidden_dim])?;
-
-        // Drop this cycle's draft K/V (written past committed_len by the draft
-        // steps), then write the exact committed K/V via one multi-token
-        // forward.
-        let inner = &mut *self.inner;
-        let mtp = inner.mtp.as_mut().ok_or_else(|| {
-            Error::from_reason(
-                "eager MoE MTP commit_mtp: inner.mtp is None despite \
-                 has_mtp_weights() gate",
-            )
-        })?;
-        let caches = &mut self.mtp_caches;
-        for c in caches.iter_mut() {
-            if let Some(kv) = c.as_kv_cache_mut() {
-                kv.trim(self.committed_len);
-            }
-        }
-        let _ = mtp.forward(&hidden_seq, &emb_seq, Some(caches))?;
-        self.committed_len += m as i32;
         Ok(())
     }
 
-    // Re-anchor the drafter cache at the start of each cycle. Mirrors
-    // `DenseMtpStepper::begin_cycle`.
-    //
-    // v1 (`!use_committed`): reset to a fresh cache.
-    //
-    // v2 (`use_committed`): the cache is PERSISTENT; truncate the prior
-    // cycle's draft tail back to the re-anchor target. `chained_anchor`
-    // cycles anchor one slot earlier (`committed_len - 1`); Step-A cycles at
-    // `committed_len`.
-    fn begin_cycle(&mut self, chained_anchor: bool) {
-        if !self.use_committed {
-            self.mtp_caches = Qwen3_5MoeMTPModule::fresh_caches(&self.config);
-            return;
-        }
-        let target = if chained_anchor {
-            (self.committed_len - 1).max(0)
-        } else {
-            self.committed_len
+    // Re-anchor the drafter cache at the start of each cycle: a fresh cache.
+    fn begin_cycle(&mut self, _chained_anchor: bool) {
+        self.mtp_caches = Qwen3_5MoeMTPModule::fresh_caches(&self.config);
+    }
+
+    // Per-cycle paged twin of the turn-entry lookahead reservation: re-reserve
+    // the lookahead region past the adapter's CURRENT cursor so this cycle's
+    // verify writes land in pre-allocated blocks. The mechanism lives once, in
+    // the stepper's `SpecPagedCache::reserve_lookahead`; this hook only names
+    // the turn's active sequence for it. Exhaustion reports AR fallback with
+    // untouched adapter state; the flat mode has no reservation semantics and
+    // is always covered.
+    fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
+        let Some(owner) = self.owner else {
+            return Ok(true);
         };
-        for c in self.mtp_caches.iter_mut() {
-            if let Some(kv) = c.as_kv_cache_mut() {
-                kv.trim(target);
-            }
-        }
+        let seq_id = owner.seq_id();
+        crate::engine::spec_paged::SpecPagedCache::reserve_lookahead(self, seq_id, rows).map_err(
+            |e| {
+                Error::from_reason(format!(
+                    "eager paged MoE MTP per-cycle lookahead reservation ({rows} rows): {e}"
+                ))
+            },
+        )
     }
 
     // Bound the lazy graph: materialize the token plus the main GDN/full-attn
@@ -9303,24 +9785,73 @@ impl MtpStepper for MoeMtpStepper<'_> {
     }
 
     fn rollback_unemitted(&mut self, unemitted: usize) {
-        if unemitted > 0 {
-            self.mtp_desynced = true;
+        let Some(owner) = self.owner else {
+            if unemitted > 0 {
+                self.mtp_desynced = true;
+            }
+            return;
+        };
+        // Truncate the live paged adapter by the accepted-but-unemitted
+        // tokens; the paged path never sets the FLAT desync latch. An adapter
+        // truncate failure is not fatal here: the epilogue's frontier check
+        // sees the skew and refuses to persist.
+        if let Err(e) = owner
+            .resolve(&mut self.inner.paged_adapter, MOE_PAGED_MTP)
+            .map_err(Error::from_reason)
+            .and_then(|adapter| {
+                adapter
+                    .rollback_last_tokens(unemitted as u32)
+                    .map_err(|e| Error::from_reason(format!("adapter rollback: {e}")))
+            })
+        {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5_moe::paged",
+                "eager MoE MTP-paged rollback_unemitted({unemitted}) adapter \
+                 truncate failed (epilogue frontier check refuses to persist): {e}",
+            );
+        }
+        // Paged GDN rewind twin of the adapter truncate above: replay the
+        // retained snapshot + tape to `last_cycle_steps - unemitted` steps so
+        // the recurrent state lands on the SAME drop-last-of-emitted frontier
+        // as the adapter and the to-be-saved history. `unemitted ==
+        // last_cycle_steps` degenerates to a pure snapshot restore (a stop
+        // before any cycle token was emitted). A replay failure is stashed in
+        // `replay_err` — the engine polls `take_replay_error` right after this
+        // hook and fail-closes the turn.
+        if self.replay_err.is_some() {
+            // The turn is already failing; the stashed error aborts it, so a
+            // second (snapshot-less) replay attempt would only shadow the root
+            // cause.
+            return;
+        }
+        let Some(target) = self.last_cycle_steps.checked_sub(unemitted) else {
+            self.inner.paged_mtp_gdn_invalidations += 1;
+            self.recurrent_frontier = None;
+            self.replay_err = Some(Error::from_reason(format!(
+                "eager MoE MTP-paged rollback_unemitted: unemitted {unemitted} exceeds \
+                 the cycle's committed steps {}",
+                self.last_cycle_steps
+            )));
+            return;
+        };
+        match self.replay_main_linear_to(target) {
+            Ok(()) => {
+                self.recurrent_frontier = self
+                    .recurrent_snapshot_base
+                    .map(|base| base + target as u64);
+                self.inner.paged_mtp_gdn_rewinds += 1;
+            }
+            Err(e) => {
+                self.recurrent_frontier = None;
+                self.inner.paged_mtp_gdn_invalidations += 1;
+                self.replay_err = Some(e);
+            }
         }
     }
 
     fn frontier(&self) -> Option<SpecFrontier> {
-        // Flat-only: the full-attention offset is the attention side's
-        // ground truth. A flat mid-cycle stop leaves BOTH sides ahead of the
-        // emitted frontier together (the desync latch heals that), so the
-        // two counts stay equal at every post-rollback point.
-        let attn_tokens = self
-            .inner
-            .caches
-            .as_ref()?
-            .get(self.fa_idx)
-            .map(|cache| cache.offset().max(0) as u64)?;
         Some(SpecFrontier {
-            attn_tokens,
+            attn_tokens: self.attention_frontier()?,
             recurrent_tokens: self.recurrent_frontier,
         })
     }
@@ -9330,7 +9861,111 @@ impl MtpStepper for MoeMtpStepper<'_> {
     }
 
     fn into_desynced(self) -> bool {
-        self.mtp_desynced
+        // Paged rewinds BOTH sides of a mid-cycle stop in `rollback_unemitted`
+        // — the adapter cursor by truncation and the GDN recurrent state by
+        // tape replay — so every paged target-state kind already sits at the
+        // drop-last-of-emitted frontier and reporting `false` is honest. A
+        // rewind failure routes through `take_replay_error` → session
+        // invalidation instead. (`self` is consumed by value rather than
+        // destructured because the `Drop` impl forbids moving fields out.)
+        self.owner.is_none() && self.mtp_desynced
+    }
+}
+
+/// Facade conformance for the MoE paged MTP turn (`engine::spec_paged`): the
+/// cache is the model's paged adapter, borrowed back through the turn's
+/// [`SpecOwner`] ([`MoeMtpStepper::paged_cache_for`] refuses any other id).
+///
+/// PRODUCTION-ROUTED — these are the turn's only path, so conformance and
+/// production cannot drift:
+///
+/// * `reserve_lookahead` — [`MtpStepper::reserve_cycle_lookahead`] delegates
+///   here for the mechanism ([`PagedKVCacheAdapter::reserve_rows`] plus the
+///   capacity-exhaustion mapping) and only names the active sequence.
+/// * `open_core_write_cycle` + `commit_cycle` — the MoE verify core records
+///   its `[anchor, drafts..]` slice as part of the forward, so
+///   [`MtpStepper::verify_step`] opens the cycle AROUND that write and
+///   [`MtpStepper::rollback`] closes it.
+///
+/// REFUSED — the verify core writes this family's rows:
+///
+/// * `record_verify` and the `record_rows` primitive under it would write rows
+///   the verify forward never wrote. Paired with `verify_step` they record the
+///   cycle's rows twice; on their own, every row a commit KEEPS advances the
+///   adapter while the recurrent state stands still, and the two frontiers
+///   desync.
+///
+/// NOT production-routed — conformance surface only:
+///
+/// * `settle_committed` / `settle_captures_durable_state`. Settle is the
+///   IDENTITY for this family, by construction: the MoE adapter is
+///   full-attention-only (`sliding_window == 0`, so no per-step prune exists),
+///   and every durable surface — GDN history checkpoints, cold sidecars, the
+///   paged-history save, prefix registration — runs in the turn epilogue at
+///   the committed frontier (I3), never per step. Conformance tests for this
+///   family therefore MUST NOT gate on settle side effects.
+impl crate::engine::spec_paged::SpecPagedCache for MoeMtpStepper<'_> {
+    fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> std::result::Result<bool, String> {
+        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+        match self.paged_cache_for(seq_id)?.reserve_rows(rows) {
+            Ok(_) => Ok(true),
+            Err(e) if e.starts_with("context_length_exceeded:") => {
+                tracing::warn!(
+                    target: "mlx_core::qwen3_5_moe::paged",
+                    lookahead_rows = rows,
+                    "MoE paged MTP lookahead reservation exhausted the paged pool; \
+                     the cycle degrades to autoregressive decode: {e}"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn record_rows(&mut self, seq_id: u32, _tokens: &[u32]) -> std::result::Result<(), String> {
+        Err(moe_core_writes_its_own_rows(seq_id))
+    }
+
+    fn record_verify(
+        &mut self,
+        seq_id: u32,
+        _tokens: &[u32],
+    ) -> std::result::Result<crate::engine::spec_paged::VerifyTicket, String> {
+        Err(moe_core_writes_its_own_rows(seq_id))
+    }
+
+    fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
+        let rows = u32::try_from(rows).map_err(|_| {
+            format!("MoE paged MTP commit rollback of {rows} rows does not fit u32")
+        })?;
+        self.paged_cache_for(seq_id)?.rollback_last_tokens(rows)
+    }
+
+    fn settle_committed(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: u64,
+    ) -> std::result::Result<(), String> {
+        // The identity (see the impl docs): validate only, touch nothing.
+        let recorded = self.paged_cache_for(seq_id)?.request_tokens().len() as u64;
+        if committed_tokens > recorded {
+            return Err(format!(
+                "MoE paged MTP settle_committed: committed frontier {committed_tokens} \
+                 exceeds recorded token count {recorded}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn settle_captures_durable_state(&self) -> bool {
+        // The identity settle (see the impl docs) touches nothing at all.
+        false
+    }
+
+    fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
+        self.owner
+            .filter(|owner| owner.seq_id() == seq_id)
+            .and_then(|_| MtpStepper::frontier(self))
     }
 }
 
@@ -9345,17 +9980,45 @@ impl MtpBackend for Qwen35MoeInner {
         let config = self.config.clone();
         let fa_idx = self.fa_idx;
 
-        // Committed history is opt-in (default off) behind the
-        // `MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY` flag.
-        let use_committed = moe_mtp_committed_history_enabled();
+        // Auto-select the main-forward routing: the paged cores leave a paged
+        // adapter on `self`, so the turn claims its active sequence as the
+        // owner and borrows the adapter back per touch; the flat cores have
+        // none and run flat. The paged forwards need the per-layer kind
+        // classification (unused flat).
+        let (owner, layer_kinds) = match self.paged_adapter.as_mut() {
+            Some(adapter) => {
+                let owner =
+                    SpecOwner::claim(adapter.active_seq_id(), "eager paged MoE MTP turn entry")
+                        .map_err(Error::from_reason)?;
+                // Reserve the speculative lookahead region before any cycle
+                // writes (I1: `setup.lookahead_rows` comes from the
+                // `SpeculativePlan` property — never a local `depth + 1`). The
+                // paged core reserved this same margin at its AR-fallback
+                // gate, so this normally takes the covered no-op branch; a
+                // caller that skips that gate still fails HERE, pre-cycle with
+                // untouched state, instead of mid-verify. Later cycles are
+                // covered by the engine loop's per-cycle
+                // `reserve_cycle_lookahead` call on the stepper.
+                if setup.lookahead_rows > 0 {
+                    let rows = u32::try_from(setup.lookahead_rows).unwrap_or(u32::MAX);
+                    adapter.reserve_rows(rows).map_err(|e| {
+                        Error::from_reason(format!(
+                            "eager paged MoE MTP lookahead reservation ({rows} rows): {e}"
+                        ))
+                    })?;
+                }
+                (Some(owner), self.layer_kinds.clone())
+            }
+            None => (None, Vec::new()),
+        };
 
         let mut stepper = MoeMtpStepper {
             inner: self,
             mtp_caches: Qwen3_5MoeMTPModule::fresh_caches(&config),
-            committed_len: 0,
-            use_committed,
             snap: None,
             tape: Vec::new(),
+            last_cycle_steps: 0,
+            open_cycle: None,
             recurrent_frontier: None,
             recurrent_snapshot_base: None,
             replay_err: None,
@@ -9363,72 +10026,13 @@ impl MtpBackend for Qwen35MoeInner {
             embedding,
             config,
             fa_idx,
+            owner,
+            layer_kinds,
         };
         // The GDN recurrent state is aligned with the attention state at turn
-        // entry (both consumed exactly the prefilled history), so the
-        // recurrent bookkeeping seeds from the attention side's ground truth.
-        stepper.recurrent_frontier = stepper
-            .inner
-            .caches
-            .as_ref()
-            .and_then(|caches| caches.get(stepper.fa_idx))
-            .map(|cache| cache.offset().max(0) as u64);
-
-        // Prompt-prefix seed (v2 committed-history only). Mirrors
-        // `DenseMtpStepper::begin_mtp_decode`'s prompt-prefix seed block
-        // byte-for-byte. Currently INERT: no MoE call site populates
-        // `setup.prompt_hidden` / `setup.prompt_hidden_ids` yet (there is no
-        // MoE hidden-emitting prefill), so this block never runs until a
-        // follow-up wires that capture through — see the struct doc on
-        // [`MoeMtpStepper`].
-        if use_committed
-            && let (Some(ph), Some(ph_ids)) = (setup.prompt_hidden, setup.prompt_hidden_ids)
-            && !ph_ids.is_empty()
-        {
-            let prompt_len = ph_ids.len();
-            let hidden_dim = ph.shape_at(2)?;
-            let hidden_len = ph.shape_at(1)? as usize;
-            if hidden_len != prompt_len {
-                return Err(Error::from_reason(format!(
-                    "eager MoE MTP prompt-seed: prompt_hidden length {hidden_len} \
-                     does not match prompt_hidden_ids length {prompt_len}"
-                )));
-            }
-            // The first sampled token `y` is supplied by the engine via the
-            // setup so the prompt seed can commit `[prompt_ids[1..], y]`.
-            let y_id = setup.first_sampled_token;
-
-            // Committed run = [prompt_ids[1..prompt_len], y] (length P).
-            let mut committed_ids: Vec<i32> = Vec::with_capacity(prompt_len);
-            committed_ids.extend(ph_ids[1..prompt_len].iter().map(|&v| v as i32));
-            committed_ids.push(y_id as i32);
-
-            let chunk_sizes = partition_prefill_chunks(prompt_len);
-            let mut cursor: usize = 0;
-            for &chunk in &chunk_sizes {
-                let chunk_i64 = chunk as i64;
-                let start = cursor as i64;
-                // hidden_seq = prompt_hidden[:, cursor..cursor+chunk, :].
-                let hidden_seq = ph.slice(&[0, start, 0], &[1, start + chunk_i64, hidden_dim])?;
-                // emb_seq = gather embedding rows for the chunk's ids.
-                let ids_arr =
-                    MxArray::from_int32(&committed_ids[cursor..cursor + chunk], &[chunk_i64])?;
-                let gathered = stepper.embedding.forward(&ids_arr)?;
-                let emb_seq = gathered.reshape(&[1, chunk_i64, hidden_dim])?;
-
-                let inner = &mut *stepper.inner;
-                let mtp = inner.mtp.as_mut().ok_or_else(|| {
-                    Error::from_reason(
-                        "eager MoE MTP prompt-seed: inner.mtp is None despite \
-                         has_mtp_weights() gate",
-                    )
-                })?;
-                let caches = &mut stepper.mtp_caches;
-                let _ = mtp.forward(&hidden_seq, &emb_seq, Some(caches))?;
-                stepper.committed_len += chunk as i32;
-                cursor += chunk;
-            }
-        }
+        // entry (both consumed exactly the prefilled history), so the recurrent
+        // bookkeeping seeds from the attention side's ground truth.
+        stepper.recurrent_frontier = stepper.attention_frontier();
 
         Ok(stepper)
     }
@@ -9550,6 +10154,26 @@ impl Qwen3_5MoeModel {
     #[napi]
     pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
         send_and_await(&self.thread, |reply| Qwen35MoeCmd::SchedulerStats { reply }).await
+    }
+
+    /// Test-only: snapshot the paged-MTP GDN bookkeeping between turns.
+    #[doc(hidden)]
+    pub async fn mtp_paged_gdn_state_for_test(&self) -> Result<MoeMtpPagedGdnStateForTest> {
+        send_and_await(&self.thread, |reply| {
+            Qwen35MoeCmd::MtpPagedGdnStateForTest { reply }
+        })
+        .await
+    }
+
+    /// Test-only state oracle: recompute GDN over the persisted history
+    /// checkpoint's own token key from fresh caches and bit-compare against the
+    /// checkpoint. `Ok(true)` iff the persisted state equals what its key says.
+    #[doc(hidden)]
+    pub async fn gdn_history_checkpoint_oracle_for_test(&self) -> Result<bool> {
+        send_and_await(&self.thread, |reply| {
+            Qwen35MoeCmd::GdnHistoryCheckpointOracleForTest { reply }
+        })
+        .await
     }
 
     /// Whether this checkpoint shipped an MTP head (module loaded by
@@ -11641,6 +12265,113 @@ mod calibration_cmd_tests {
                 assert_eq!(calib_seq, 128);
             }
             _ => panic!("expected CalibratePrefillRaw variant"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod paged_speculative_routing_tests {
+    //! Routing gate for the MoE paged native-MTP lane.
+    //!
+    //! Composes the plan this family actually publishes
+    //! (`qwen35_moe_speculative_plan`) with the engine's resolver, so the gate
+    //! fails if either half of the flip is missing: the published
+    //! `supports_paged_attention` flag, or the paged core the generic driver
+    //! dispatches into.
+    //!
+    //! The core half is not asserted here — it lives with the driver
+    //! (`engine::paged_turn`'s
+    //! `a_speculative_plan_runs_the_family_core_and_the_shared_epilogue` and
+    //! `publishing_the_flag_without_a_core_fails_the_turn_closed`). What THIS
+    //! module pins is that MoE reaches that dispatch at all, and that the flat
+    //! lane still exists for adapter-less checkpoints.
+
+    use super::{qwen35_moe_media_plan, qwen35_moe_speculative_plan};
+    use crate::engine::plan::{
+        DecoderPlan, ExecutionPlan, MediaCapabilities, PagedAttentionPlan, SpeculativeKind,
+        TurnPath, TurnPlan, TurnRequest,
+    };
+
+    /// The execution plan a fully loaded vision-capable MoE checkpoint
+    /// publishes, assembled from the same two helpers `execution_plan` uses.
+    fn execution(paged: bool, has_mtp: bool) -> ExecutionPlan {
+        ExecutionPlan {
+            media: qwen35_moe_media_plan(true, true, paged),
+            paged_attention: paged.then_some(PagedAttentionPlan {
+                supports_delta: true,
+            }),
+            speculative: has_mtp.then(qwen35_moe_speculative_plan),
+        }
+    }
+
+    fn text_mtp_request(is_delta: bool) -> TurnRequest {
+        TurnRequest {
+            is_delta,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            speculative_requested: true,
+        }
+    }
+
+    /// A paged text turn that asked for MTP resolves to NATIVE MTP on the
+    /// PAGED handler — not the silent autoregressive downgrade this family
+    /// took while `supports_paged_attention` was false.
+    ///
+    /// Catches, verified by mutation: setting `supports_paged_attention: false`
+    /// back in `qwen35_moe_speculative_plan` — the decoder then resolves to
+    /// `Autoregressive` and the turn decodes with the MTP head loaded but
+    /// never engaged.
+    #[test]
+    fn a_paged_text_turn_that_requested_mtp_plans_native_mtp_not_a_downgrade() {
+        for is_delta in [false, true] {
+            let plan = TurnPlan::resolve(execution(true, true), text_mtp_request(is_delta));
+            assert!(plan.use_paged_attention, "is_delta={is_delta}");
+            assert_eq!(
+                plan.decoder,
+                DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+                "a paged MoE text turn must keep native MTP (is_delta={is_delta})"
+            );
+            assert_eq!(
+                plan.path(),
+                TurnPath::Paged,
+                "paged speculation runs on the paged handler (is_delta={is_delta})"
+            );
+        }
+    }
+
+    /// The FLAT lane survives the flip: an adapter-less MoE checkpoint (sym8,
+    /// or `use_block_paged_cache: false`) still plans native MTP and still
+    /// routes to the flat speculative handler.
+    ///
+    /// Catches, verified by mutation: deleting the flat MTP arm's plan by
+    /// gating `speculative` on the adapter — the flat checkpoint then plans
+    /// `Autoregressive` and loses MTP entirely.
+    #[test]
+    fn an_adapter_less_checkpoint_still_plans_flat_native_mtp() {
+        let plan = TurnPlan::resolve(execution(false, true), text_mtp_request(false));
+        assert!(!plan.use_paged_attention);
+        assert_eq!(
+            plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+        );
+        assert_eq!(plan.path(), TurnPath::Speculative);
+    }
+
+    /// An image-bearing turn keeps the autoregressive decoder on both lanes:
+    /// there is no MoE hidden-emitting prefill to seed a drafter from image
+    /// features.
+    #[test]
+    fn an_image_turn_never_plans_speculative_decode() {
+        let request = TurnRequest {
+            is_delta: false,
+            input_media: MediaCapabilities::IMAGES,
+            context_media: MediaCapabilities::NONE,
+            speculative_requested: true,
+        };
+        for paged in [false, true] {
+            let plan = TurnPlan::resolve(execution(paged, true), request);
+            assert_eq!(plan.decoder, DecoderPlan::Autoregressive, "paged={paged}");
+            assert_eq!(plan.path(), TurnPath::Multimodal, "paged={paged}");
         }
     }
 }

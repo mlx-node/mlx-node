@@ -306,7 +306,91 @@ pub(crate) enum Qwen3_5LayerSnapshot {
     },
 }
 
-/// Snapshot every layer's cache in one shot.
+/// Restore `snap` into `caches` and replay the first `steps` recorded tape
+/// steps — the eager-MTP GDN rewind both the dense and the MoE stepper drive
+/// from their `rollback` and paged `rollback_unemitted` hooks.
+///
+/// Pure over `(snap, tape, steps)`: `steps == 0` degenerates to a bare
+/// snapshot restore. On the FLAT path a full-attention layer (no tape) rewinds
+/// its K/V offset to `snapshot_offset + steps`; on the PAGED path that K/V
+/// lives in the pool and is rewound through the adapter, so the vestigial flat
+/// shell is skipped. `context` prefixes every error so the caller's family and
+/// hook stay identifiable.
+pub(crate) fn replay_mtp_snapshot_to(
+    caches: &mut [Qwen3_5LayerCache],
+    snap: &[Qwen3_5LayerSnapshot],
+    tape: &[Option<super::gated_delta_net::GdnLayerTape>],
+    steps: usize,
+    paged: bool,
+    context: &str,
+) -> Result<()> {
+    if caches.len() != snap.len() || caches.len() != tape.len() {
+        return Err(Error::from_reason(format!(
+            "{context}: length mismatch (caches {}, snapshot {}, tape {})",
+            caches.len(),
+            snap.len(),
+            tape.len(),
+        )));
+    }
+    for (idx, cache) in caches.iter_mut().enumerate() {
+        let Some(layer_tape) = tape[idx].as_ref() else {
+            if paged {
+                // Full-attention layer on the paged path: K/V lives in the
+                // paged pool and is rewound through the adapter. The
+                // `FullAttention` slot is unused there, so skip it.
+                continue;
+            }
+            match &snap[idx] {
+                Qwen3_5LayerSnapshot::FullAttention { offset } => {
+                    let kv = cache.as_kv_cache_mut().ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "{context}: layer {idx} has a FullAttention snapshot but its \
+                             cache slot is not FullAttention",
+                        ))
+                    })?;
+                    let target = *offset + steps as i32;
+                    kv.trim(target);
+                }
+                Qwen3_5LayerSnapshot::Linear { .. } => {
+                    return Err(Error::from_reason(format!(
+                        "{context}: layer {idx} has no GDN tape but a Linear snapshot",
+                    )));
+                }
+            }
+            continue;
+        };
+        let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
+            Error::from_reason(format!(
+                "{context}: layer {idx} has a GDN tape but its cache slot is not Linear",
+            ))
+        })?;
+        let (snap_conv, snap_rec) = match &snap[idx] {
+            Qwen3_5LayerSnapshot::Linear {
+                conv_state,
+                recurrent_state,
+            } => (conv_state.as_ref(), recurrent_state.as_ref()),
+            Qwen3_5LayerSnapshot::FullAttention { .. } => {
+                return Err(Error::from_reason(format!(
+                    "{context}: layer {idx} GDN tape but FullAttention snapshot",
+                )));
+            }
+        };
+        let window = layer_tape.kernel.window_len()? as usize;
+        if steps > window {
+            return Err(Error::from_reason(format!(
+                "{context}: target steps {steps} exceeds recorded window {window} at \
+                 layer {idx}",
+            )));
+        }
+        layer_tape.replay_into(arrays, snap_conv, snap_rec, steps)?;
+    }
+    Ok(())
+}
+
+/// Snapshot every layer's cache in one shot. Production snapshots go through
+/// [`snapshot_all_mtp`], which is paged-aware; this stays as the round-trip
+/// oracle `restore_all` is paired with.
+#[cfg(test)]
 pub(crate) fn snapshot_all(caches: &[Qwen3_5LayerCache]) -> Result<Vec<Qwen3_5LayerSnapshot>> {
     caches.iter().map(|c| c.snapshot()).collect()
 }
@@ -799,5 +883,67 @@ mod tests {
         } else {
             unreachable!();
         }
+    }
+    /// The extracted eager-MTP GDN rewind is BACKEND-AWARE at exactly one
+    /// place: a tape-less (full-attention) layer. On the FLAT lane its K/V
+    /// lives here and is trimmed to `snapshot_offset + steps`; on the PAGED
+    /// lane it lives in the adapter pool and the vestigial shell must be left
+    /// alone — trimming a shell whose offset is 0 to `0 + steps` would invent
+    /// a frontier for rows this cache never held.
+    ///
+    /// Catches, verified by mutation: dropping the `if paged { continue }` arm
+    /// in `replay_mtp_snapshot_to`. The paged leg then errors on the shell's
+    /// mismatched snapshot instead of skipping it.
+    #[test]
+    fn replay_skips_the_full_attention_shell_on_paged_and_trims_it_on_flat() {
+        let mut caches = vec![Qwen3_5LayerCache::new_full_attention()];
+        let k = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]).unwrap();
+        let v = MxArray::from_float32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]).unwrap();
+        if !try_eval_or_skip(&k, "replay_skips_the_full_attention_shell::prime") {
+            return;
+        }
+        {
+            let kv = caches[0].as_kv_cache_mut().unwrap();
+            kv.update_and_fetch(&k, &v).unwrap();
+            assert_eq!(kv.get_offset(), 4);
+        }
+        // A snapshot taken two tokens back, i.e. a cycle that wrote 2 rows.
+        let snap = vec![Qwen3_5LayerSnapshot::FullAttention { offset: 2 }];
+        let tape: Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>> = vec![None];
+
+        // PAGED: the pool owns the K/V, so this cache is untouched.
+        replay_mtp_snapshot_to(&mut caches, &snap, &tape, 1, true, "paged replay")
+            .expect("the paged replay must skip the shell, not fail on it");
+        assert_eq!(
+            caches[0].offset(),
+            4,
+            "a paged replay must not move the vestigial full-attention shell"
+        );
+
+        // FLAT: the same call rewinds to snapshot_offset + steps.
+        replay_mtp_snapshot_to(&mut caches, &snap, &tape, 1, false, "flat replay")
+            .expect("flat replay");
+        assert_eq!(
+            caches[0].offset(),
+            3,
+            "a flat replay rewinds full-attention K/V to snapshot_offset + steps"
+        );
+    }
+
+    /// Length disagreement between the three parallel slices is reported with
+    /// all three counts rather than panicking on an index — the shape a
+    /// mismatched layer_kinds/tape wiring takes.
+    #[test]
+    fn replay_reports_a_length_mismatch_instead_of_indexing_past_the_tape() {
+        let mut caches = vec![Qwen3_5LayerCache::new_linear()];
+        let snap = vec![Qwen3_5LayerSnapshot::Linear {
+            conv_state: None,
+            recurrent_state: None,
+        }];
+        let tape: Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>> = Vec::new();
+        let err = replay_mtp_snapshot_to(&mut caches, &snap, &tape, 0, false, "ctx")
+            .expect_err("a short tape must be refused");
+        assert!(err.reason.contains("length mismatch"), "{}", err.reason);
+        assert!(err.reason.contains("ctx"), "{}", err.reason);
     }
 }

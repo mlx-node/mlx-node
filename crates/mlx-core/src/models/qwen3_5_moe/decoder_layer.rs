@@ -249,6 +249,87 @@ impl DecoderLayer {
         }
     }
 
+    /// Tape-recording twin of [`DecoderLayer::forward_paged_or_flat`] for the
+    /// MoE eager paged MTP verify forward.
+    ///
+    /// `Linear` layers stay on the flat `Qwen3_5LayerCache::Linear` path and
+    /// record their per-step recurrence inputs into `tape_sink` (the replay
+    /// keystone the rollback consumes); `FullAttentionPaged` layers route
+    /// through the adapter and clear their tape slot. Sparse expert routing
+    /// already flattens `[B, T, H]`, so the `[1, K+1, H]` verify block runs
+    /// the same expert tail as a prefill chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_paged_or_flat_with_tape(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        first_logical_position: u32,
+        cached_prefix_len: u32,
+        is_prefill: bool,
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+        rope_position_offset: i32,
+    ) -> Result<MxArray> {
+        match kind {
+            Qwen3_5LayerKind::Linear => {
+                let _ = adapter;
+                let _ = first_logical_position;
+                let _ = cached_prefix_len;
+                let _ = is_prefill;
+                let _ = rope_position_offset;
+                if !matches!(self.attn, AttentionType::Linear(_)) {
+                    return Err(Error::from_reason(
+                        "Qwen3_5MoeDecoderLayer::forward_paged_or_flat_with_tape: kind=Linear \
+                         applied to a FullAttention operator",
+                    ));
+                }
+                self.forward_with_tape(x, None, flat_cache, None, true, tape_sink)
+            }
+            Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                let _ = flat_cache; // adapter owns K/V for paged layers
+                // Full-attention layers do not record a GDN tape.
+                if let Some(slot) = tape_sink {
+                    *slot = None;
+                }
+                let attn = match &self.attn {
+                    AttentionType::Full(a) => a,
+                    AttentionType::Linear(_) => {
+                        return Err(Error::from_reason(
+                            "Qwen3_5MoeDecoderLayer::forward_paged_or_flat_with_tape: \
+                             kind=FullAttentionPaged applied to a Linear (GDN) operator",
+                        ));
+                    }
+                };
+                let normed = self.input_layernorm.forward(x)?;
+                // MTP tape forwards always carry M-RoPE positions as `None`
+                // (the K+1 verify ids are re-embedded tokens, not image
+                // features), so RoPE takes the scalar-offset path.
+                // `rope_position_offset` still carries any cross-turn delta: a
+                // text turn that warm-continues an image prefill runs paged MTP
+                // and must rotate at the compressed position.
+                let attn_out = attn.forward_paged(
+                    &normed,
+                    adapter,
+                    paged_idx,
+                    first_logical_position,
+                    cached_prefix_len,
+                    is_prefill,
+                    None,
+                    rope_position_offset,
+                    &mut None,
+                )?;
+                let h = x.add(&attn_out)?;
+                let normed = self.post_attention_layernorm.forward(&h)?;
+                let mlp_out = match &self.mlp {
+                    MLPType::Dense(mlp) => mlp.forward(&normed)?,
+                    MLPType::MoE(moe) => moe.forward(&normed)?,
+                };
+                h.add(&mlp_out)
+            }
+        }
+    }
+
     /// One text decode forward over independent paged/GDN request rows.
     /// Sparse expert routing already flattens `[B,T,H]`, so the MoE tail uses
     /// the same batched tensor as attention without a serial fallback.
