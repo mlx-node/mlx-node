@@ -351,8 +351,14 @@ impl HybridSchedulerBackend for Gemma4Inner {
             return;
         }
         let command = *command;
+        // Only the ASSISTANT drafter needs the flat target-cache lane (its
+        // Q-only attention reads `Gemma4LayerCache` K/V arrays directly).
+        // DSpark verifies against the paged pools, so a DSpark command stays
+        // on the paged lane — installing flat caches there would hide the
+        // pools from the planner and silently downgrade the turn to AR.
         let flat_lane = gemma4_chat_parts(&command).is_some_and(|(_, config)| {
-            config.enable_mtp == Some(true) || self.kv_cache_coordinator.is_none()
+            (config.enable_mtp == Some(true) && self.assistant_draft().is_some())
+                || self.kv_cache_coordinator.is_none()
         });
         let Some(owner_id) = gemma4_owner_id(&command).map(str::to_owned) else {
             self.select_ownerless_lane(flat_lane);
@@ -472,7 +478,13 @@ mod tests {
         if !crate::engine::persistence::compiled_forward_backend_available() {
             return;
         }
-        let inner = tiny_paged_inner();
+        let mut inner = tiny_paged_inner();
+        // The flat lane is the ASSISTANT drafter's; without one loaded an
+        // `enable_mtp` command has no flat layout to switch INTO.
+        inner.draft =
+            crate::models::gemma4::dspark_decode::tests::tiny_inner_with_assistant_draft()
+                .draft
+                .take();
         assert!(
             crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(
                 inner
@@ -483,6 +495,7 @@ mod tests {
             ) > 1,
             "shared full-attention blocks must not statically partition one max context per slot"
         );
+        let inner = inner;
         let mut state =
             Gemma4SchedulerState::new(inner).expect("construct generic Gemma4 scheduler");
         state.owner_sequences.insert("session-a".to_string(), 7);
@@ -521,6 +534,69 @@ mod tests {
                 .owner_states
                 .get("session-a")
                 .is_some_and(|owner| owner.flat_caches.is_none())
+        );
+    }
+
+    /// A DSpark command keeps the PAGED lane. `enable_mtp` alone must not
+    /// claim the flat cache layout any more — DSpark verifies against the
+    /// paged pools, and installing flat caches for its command would hide
+    /// those pools from the planner and silently downgrade the turn to AR.
+    ///
+    /// Mutation this catches: restoring the old
+    /// `config.enable_mtp == Some(true)` predicate, which sends a live paged
+    /// owner into the flat-layout conflict below.
+    #[test]
+    fn a_dspark_command_stays_on_the_live_paged_owner() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let mut inner = tiny_paged_inner();
+        inner.draft = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft()
+            .draft
+            .take();
+        let mut state =
+            Gemma4SchedulerState::new(inner).expect("construct generic Gemma4 scheduler");
+        state.owner_sequences.insert("session-a".to_string(), 7);
+        state.owner_states.insert(
+            "session-a".to_string(),
+            Gemma4SchedulerOwnerState::default(),
+        );
+        let config = ChatConfig {
+            cache_owner_id: Some("session-a".to_string()),
+            enable_mtp: Some(true),
+            ..ChatConfig::default()
+        };
+        let (reply, result) = tokio::sync::oneshot::channel();
+        <Gemma4Inner as HybridSchedulerBackend>::execute_barrier(
+            &mut state.inner,
+            Gemma4Cmd::Chat(Box::new(ChatCmd::SessionContinue {
+                messages: Vec::new(),
+                config,
+                reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            })),
+            SchedulerOwnerContext {
+                owner_sequences: &mut state.owner_sequences,
+                owner_states: &mut state.owner_states,
+                next_seq_id: &mut 8,
+            },
+        );
+        // The empty-message continuation still fails downstream; what matters
+        // is that it was ADMITTED to the paged lane instead of refused as a
+        // cache-layout switch.
+        if let Err(error) = result.blocking_recv().expect("lane reply") {
+            assert!(
+                !error.reason.contains("cannot switch a live cache owner"),
+                "a DSpark command must not be treated as a flat-layout owner: {}",
+                error.reason
+            );
+        }
+        assert!(
+            state
+                .owner_states
+                .get("session-a")
+                .is_none_or(|owner| owner.flat_caches.is_none()),
+            "no flat cache layout may be installed for a DSpark command"
         );
     }
 
