@@ -133,13 +133,11 @@ impl MuseGlimmerContextLimits {
         override_cap: Option<u32>,
     ) -> Self {
         let Some((paged_window_tokens, paged_block_capacity, paged_block_size)) = paged else {
+            // Flat-only runtimes never enter the paged scheduler, so the
+            // MLX_PAGED_PER_SEQ_CTX operator cap does not apply.
             return Self {
                 trained_window_tokens,
-                effective_window_tokens: crate::engine::hybrid_scheduler::scheduled_turn_context(
-                    trained_window_tokens,
-                    trained_window_tokens,
-                    override_cap,
-                ),
+                effective_window_tokens: trained_window_tokens,
                 paged_block_capacity: 0,
                 paged_block_size: 0,
             };
@@ -200,6 +198,14 @@ mod context_limit_tests {
     #[test]
     fn a_flat_only_runtime_publishes_the_trained_window() {
         let limits = MuseGlimmerContextLimits::from_parts(131_072, None, None);
+        assert_eq!(limits.effective_window_tokens, 131_072);
+        assert_eq!(limits.paged_block_capacity, 0);
+        assert_eq!(limits.paged_block_size, 0);
+    }
+
+    #[test]
+    fn a_flat_only_runtime_ignores_the_paged_env_cap() {
+        let limits = MuseGlimmerContextLimits::from_parts(131_072, None, Some(32_768));
         assert_eq!(limits.effective_window_tokens, 131_072);
         assert_eq!(limits.paged_block_capacity, 0);
         assert_eq!(limits.paged_block_size, 0);
