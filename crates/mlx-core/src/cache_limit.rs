@@ -640,6 +640,9 @@ mod tests {
     /// never observes another's `MLX_GPU_HEADROOM_GB` setting.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Serializes tests that mutate the process-wide pool registry.
+    static POOL_LOCK: Mutex<()> = Mutex::new(());
+
     /// RAII guard that unsets the env var on drop. Any test that calls
     /// `std::env::set_var(GPU_HEADROOM_ENV, ...)` should wrap the call
     /// in one of these so a panic cannot leak the variable into the
@@ -775,6 +778,7 @@ mod tests {
 
     #[test]
     fn registered_pool_bytes_tracks_live_guards() {
+        let _lock = POOL_LOCK.lock().unwrap();
         let before = coordinator().registered_pool_bytes();
         let _g1 = coordinator().register_pool(3 * GB);
         let _g2 = coordinator().register_pool(5 * GB);
@@ -786,6 +790,7 @@ mod tests {
 
     #[test]
     fn try_register_pool_if_total_eq_rejects_stale_snapshot() {
+        let _lock = POOL_LOCK.lock().unwrap();
         let before = coordinator().registered_pool_bytes();
         let _occupant = coordinator().register_pool(GB);
         assert!(
