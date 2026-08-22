@@ -2834,11 +2834,13 @@ fn prepare_muse_secondary_config(
         // are the draft's. Rescoping those would invent a target override, and
         // the spelling alone cannot distinguish them. The marker by itself does
         // not prove this: `--config-dir` at an already converted directory
-        // copies it into a staged output whose block the primary pass rebuilt
-        // in the target namespace. Both conditions together do. This binds the
-        // block rather than the running companion — the loop below walks the
-        // target block, so a vision pass over the same config invents the same
-        // phantom.
+        // copies it forward beside a block a quantizing or source-preserving
+        // primary rebuilt one wrapper deeper. That primary rebuilds neither
+        // alias when its GGUF is dense and no quantization was asked for, so
+        // the copied block reaches this merge verbatim, describing another
+        // checkpoint's weights. This binds the block rather than the running
+        // companion — the loop below walks the target block, so a vision pass
+        // over the same config invents the same phantom.
         if carries_merged_dflash
             && let Some(stale) = target_block.as_ref().and_then(|block| {
                 block
@@ -6072,6 +6074,131 @@ mod tests {
                 "the target's regenerated override must survive in '{block}'"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_dense_primary_keeps_the_copied_block_so_the_draft_pass_is_refused() {
+        // The sibling test above covers a primary that rebuilds the block. A
+        // primary whose GGUF carries no quantized tensor and that is not asked
+        // to quantize writes neither alias, so the previous run's block reaches
+        // the staged output verbatim — draft overrides included, in the
+        // namespace a target override also uses.
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let draft = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-dense-primary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let source = root.join("converted");
+        let output = root.join("output");
+        fs::create_dir_all(&source).expect("create converted source directory");
+
+        let seed = source.join("config.json");
+        fs::write(
+            &seed,
+            serde_json::to_vec(&valid_muse_target_config()).expect("serialize dense target config"),
+        )
+        .expect("write dense target config");
+        let previous = prepare_muse_secondary_config(&seed, &draft, true)
+            .expect("previous companion pass")
+            .expect("companion config update");
+        fs::write(&seed, &previous).expect("install the previous run's merged config");
+        let previous: serde_json::Value =
+            serde_json::from_str(&previous).expect("parse the previous merged config");
+        assert!(
+            previous.get("dflash_config").is_some()
+                && previous["quantization"]
+                    .get("language_model.model.layers.0.self_attn.q_proj")
+                    .is_some(),
+            "ANTI-VACUITY: the copied directory must carry both the marker and the previous \
+             draft's own override, or nothing below is exercised: {previous}"
+        );
+
+        let f16_weight = vec![0u8; 32 * 2];
+        let gguf_data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("muse-glimmer".to_string()),
+            )],
+            &[(
+                "blk.0.attn_q.weight",
+                &[32, 1],
+                GgufTensorType::F16,
+                &f16_weight,
+            )],
+        );
+        let input = root.join("model.gguf");
+        fs::write(&input, gguf_data).expect("write Muse main GGUF");
+
+        let primary =
+            parse_gguf(input.to_string_lossy().into_owned()).expect("parse Muse main GGUF");
+        assert!(
+            preserved_source_quantization(&primary, true)
+                .expect("primary source quantization")
+                .is_none(),
+            "ANTI-VACUITY: the primary GGUF must be entirely dense, or the conversion takes \
+             the rebuilding arm the sibling test already covers"
+        );
+
+        convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: Some(source.to_string_lossy().into_owned()),
+            dtype: None,
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(false),
+        })
+        .await
+        .expect("primary Muse conversion");
+
+        let staged_path = output.join("config.json");
+        let staged: serde_json::Value =
+            serde_json::from_slice(&fs::read(&staged_path).expect("read staged config"))
+                .expect("parse staged config");
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                staged[block], previous[block],
+                "a dense primary must leave '{block}' exactly as --config-dir wrote it"
+            );
+        }
+
+        let error = prepare_muse_secondary_config(&staged_path, &draft, true)
+            .expect_err("a copied draft override must refuse the draft pass");
+        fs::remove_dir_all(root).ok();
+        assert!(
+            error.reason.contains("carries a merged DFlash companion")
+                && error
+                    .reason
+                    .contains("language_model.model.layers.0.self_attn.q_proj"),
+            "unexpected error: {}",
+            error.reason
+        );
     }
 
     #[test]
