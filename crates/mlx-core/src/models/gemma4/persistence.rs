@@ -524,10 +524,11 @@ fn validate_required_weights(
         let attn = format!("{}.self_attn", prefix);
         let mlp = format!("{}.mlp", prefix);
 
-        // Attention projections always required
+        // Q/O projections are always required. KV-shared layers reuse both K
+        // and V from an earlier anchor and legitimately omit their own
+        // projections from the checkpoint.
         let attn_keys = [
             format!("{}.q_proj.weight", attn),
-            format!("{}.k_proj.weight", attn),
             format!("{}.o_proj.weight", attn),
         ];
         for key in &attn_keys {
@@ -539,9 +540,21 @@ fn validate_required_weights(
             }
         }
 
-        // v_proj required when this layer does not use k_eq_v
+        let is_kv_shared = config.is_kv_shared_layer(i);
+        if !is_kv_shared {
+            let key = format!("{}.k_proj.weight", attn);
+            if !has(&key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {}",
+                    key
+                )));
+            }
+        }
+
+        // v_proj is required only when the layer owns its KV and does not use
+        // K=V sharing within the attention projection itself.
         let layer_k_eq_v = config.attention_k_eq_v && config.is_global_layer(i);
-        if !layer_k_eq_v {
+        if !is_kv_shared && !layer_k_eq_v {
             let key = format!("{}.v_proj.weight", attn);
             if !has(&key) {
                 return Err(Error::from_reason(format!(
@@ -4437,6 +4450,85 @@ mod tests {
             format!("{err}").contains("layers.0.mlp.gate_proj.weight"),
             "error must name the missing .weight, got: {err}"
         );
+    }
+
+    /// Gemma 4 E2B checkpoints store K/V projections only on the physical
+    /// (non-shared) prefix of the decoder. Trailing KV-shared layers retain
+    /// their own Q/O projections but reuse K/V from an earlier same-kind
+    /// anchor, so their absent k_proj/v_proj weights are valid.
+    #[test]
+    fn validate_required_weights_accepts_kv_shared_projection_omissions() {
+        let config: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 64,
+            "layer_types": ["sliding_attention", "sliding_attention"],
+            "num_kv_shared_layers": 1,
+            "attention_k_eq_v": false
+        }))
+        .expect("minimal KV-shared Gemma4Config");
+        assert_eq!(config.first_kv_shared_layer(), 1);
+
+        let dummy = || MxArray::from_float32(&[0.0], &[1]).expect("dummy");
+        let full = || -> HashMap<String, MxArray> {
+            let mut params = HashMap::new();
+            for key in ["embed_tokens.weight", "norm.weight"] {
+                params.insert(key.to_string(), dummy());
+            }
+            for layer in 0..2 {
+                for suffix in [
+                    "self_attn.q_proj.weight",
+                    "self_attn.o_proj.weight",
+                    "self_attn.q_norm.weight",
+                    "layer_scalar",
+                    "mlp.gate_proj.weight",
+                    "mlp.up_proj.weight",
+                    "mlp.down_proj.weight",
+                    "input_layernorm.weight",
+                    "post_attention_layernorm.weight",
+                    "pre_feedforward_layernorm.weight",
+                    "post_feedforward_layernorm.weight",
+                ] {
+                    params.insert(format!("layers.{layer}.{suffix}"), dummy());
+                }
+            }
+            for suffix in [
+                "self_attn.k_proj.weight",
+                "self_attn.v_proj.weight",
+                "self_attn.k_norm.weight",
+            ] {
+                params.insert(format!("layers.0.{suffix}"), dummy());
+            }
+            params
+        };
+
+        let params = full();
+        assert!(!params.contains_key("layers.1.self_attn.k_proj.weight"));
+        assert!(!params.contains_key("layers.1.self_attn.v_proj.weight"));
+        validate_required_weights(&params, &config)
+            .expect("a KV-shared layer may omit its own K/V projections");
+
+        for missing in [
+            "layers.0.self_attn.k_proj.weight",
+            "layers.0.self_attn.v_proj.weight",
+            "layers.1.self_attn.q_proj.weight",
+        ] {
+            let mut params = full();
+            params.remove(missing);
+            let err = validate_required_weights(&params, &config)
+                .expect_err("owned K/V and every layer's Q projection remain mandatory");
+            assert!(
+                format!("{err}").contains(missing),
+                "error must name {missing}, got: {err}"
+            );
+        }
     }
 
     /// An untied Gemma4 checkpoint that carries `lm_head.scales` (and
