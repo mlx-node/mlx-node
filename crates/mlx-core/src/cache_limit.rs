@@ -228,6 +228,18 @@ impl CacheLimitCoordinator {
         CacheLimitGuard { id }
     }
 
+    /// Sum of every live private paged-KV pool registered with this
+    /// coordinator. Used by load-time pool sizers so a second model does
+    /// not treat another model's Metal buffers as free headroom.
+    pub fn registered_pool_bytes(&self) -> u64 {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .pools
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add)
+    }
+
     /// Register a private paged-KV pool so the MLX freelist ceiling is
     /// debited by memory that MLX's own allocator counters cannot see.
     pub fn register_pool(&self, pool_bytes: u64) -> PoolCacheLimitGuard {
@@ -730,6 +742,17 @@ mod tests {
         let with_pool = compute_cache_limit(36 * GB, 8 * GB, 96 * GB);
         assert_eq!(without_pool.saturating_sub(with_pool), 8 * GB);
         approx_eq_gb(with_pool, 37.6);
+    }
+
+    #[test]
+    fn registered_pool_bytes_tracks_live_guards() {
+        let before = coordinator().registered_pool_bytes();
+        let _g1 = coordinator().register_pool(3 * GB);
+        let _g2 = coordinator().register_pool(5 * GB);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            8 * GB
+        );
     }
 
     // ── env override: MLX_GPU_HEADROOM_GB ─────────────────────────

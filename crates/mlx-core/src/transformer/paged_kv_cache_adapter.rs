@@ -2513,6 +2513,17 @@ impl PagedKVCacheAdapter {
         self.requests.len() + usize::from(self.active_seq.is_some())
     }
 
+    /// Active request plus parked keep-live tables, including exclusive seq 0
+    /// which is never entered in `owner_sequences`.
+    pub fn live_seq_ids(&self) -> Vec<SeqId> {
+        let mut ids = Vec::with_capacity(self.requests.len().saturating_add(1));
+        if let Some(seq_id) = self.active_seq {
+            ids.push(seq_id);
+        }
+        ids.extend(self.requests.keys().copied());
+        ids
+    }
+
     pub fn current_token_count_for(&self, seq_id: SeqId) -> Option<u32> {
         if self.active_seq == Some(seq_id) {
             return Some(self.request_tokens.len() as u32);

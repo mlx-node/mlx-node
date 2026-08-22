@@ -758,11 +758,23 @@ impl NemotronHInner {
                  pool request: {error}"
             ))
         })?;
-        let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
+        let selected_blocks = Self::selected_blocks_after_sibling_pools(
             sizing.selected_blocks,
+            sizing.selected_bytes,
+            sizing.bytes_per_block,
+            crate::cache_limit::coordinator().registered_pool_bytes(),
+        )
+        .ok_or_else(|| {
+            Error::from_reason(
+                "NemotronH adaptive paged cache sizing failed safely; sibling private pools \
+                 leave no room for one block",
+            )
+        })?;
+        let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            selected_blocks,
             block_size,
         )));
-        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, sizing.selected_blocks, cache_dtype)
+        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, selected_blocks, cache_dtype)
             .map_err(|e| {
                 Error::from_reason(format!(
                     "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
@@ -776,6 +788,25 @@ impl NemotronHInner {
             })?,
         );
         Ok(())
+    }
+
+    /// Shrink a load-time pool selection by sibling models' already-registered
+    /// private Metal pools. `None` means those pools leave no room for a block.
+    pub(crate) fn selected_blocks_after_sibling_pools(
+        selected_blocks: u32,
+        selected_bytes: u64,
+        bytes_per_block: u64,
+        sibling_pool_bytes: u64,
+    ) -> Option<u32> {
+        if sibling_pool_bytes == 0 || bytes_per_block == 0 {
+            return Some(selected_blocks);
+        }
+        let room = selected_bytes.saturating_sub(sibling_pool_bytes);
+        let blocks = (room / bytes_per_block).min(u64::from(u32::MAX)) as u32;
+        if blocks == 0 {
+            return None;
+        }
+        Some(blocks.min(selected_blocks))
     }
 
     /// Activate the adapter request and swap the sequence's per-request caches
@@ -3069,6 +3100,22 @@ mod scheduler_tests {
         assert!(
             pool_bytes > 0,
             "paged pool must report its private Metal bytes so load_with_thread can register_pool"
+        );
+    }
+
+    #[test]
+    fn sibling_private_pools_shrink_adaptive_block_count() {
+        assert_eq!(
+            NemotronHInner::selected_blocks_after_sibling_pools(100, 100_000, 1000, 0),
+            Some(100)
+        );
+        assert_eq!(
+            NemotronHInner::selected_blocks_after_sibling_pools(100, 100_000, 1000, 40_000),
+            Some(60)
+        );
+        assert_eq!(
+            NemotronHInner::selected_blocks_after_sibling_pools(100, 100_000, 1000, 100_000),
+            None
         );
     }
 

@@ -1700,20 +1700,22 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// Idle owner that holds a recurrent row or a keep-live/cache table.
     /// Used by memory-denial reclaim only; unit-cap stays rec-only.
     fn idle_memory_victim(&self, seq_id: SeqId) -> Option<SeqId> {
-        self.owner_sequences
-            .values()
-            .copied()
-            .filter(|&candidate| {
-                candidate != seq_id
-                    && !self.scheduler.contains_seq(candidate)
-                    && (self.inner.has_scheduled_recurrent(candidate)
-                        || self.inner.scheduler_materialized_blocks(candidate) > 0
-                        || self
-                            .inner
-                            .paged_adapter()
-                            .is_some_and(|adapter| adapter.block_table_for(candidate).is_some()))
-            })
-            .min()
+        let mut candidates: Vec<SeqId> = self.owner_sequences.values().copied().collect();
+        if let Some(adapter) = self.inner.paged_adapter() {
+            candidates.extend(adapter.live_seq_ids());
+        }
+        candidates.sort_unstable();
+        candidates.dedup();
+        candidates.into_iter().find(|&candidate| {
+            candidate != seq_id
+                && !self.scheduler.contains_seq(candidate)
+                && (self.inner.has_scheduled_recurrent(candidate)
+                    || self.inner.scheduler_materialized_blocks(candidate) > 0
+                    || self
+                        .inner
+                        .paged_adapter()
+                        .is_some_and(|adapter| adapter.block_table_for(candidate).is_some()))
+        })
     }
 
     /// Keep the two-unit residency cap as a queueing boundary. An idle warm
@@ -1734,6 +1736,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// Drop one idle parked recurrent row and/or unpin its keep-live KV so
     /// published full blocks drop to prefix-cache `ref_count == 1` (evictable).
     /// `Ok(false)` means no victim or the same victim is still eligible.
+    /// Production admit uses [`Self::reclaim_one_idle_scheduled_with`] so tests
+    /// can inject a failing unpin; this wrapper is test-only.
+    #[cfg(test)]
     fn reclaim_one_idle_scheduled(&mut self, seq_id: SeqId) -> Result<bool> {
         self.reclaim_one_idle_scheduled_with(seq_id, B::release_scheduled_cache)
     }
@@ -3561,6 +3566,55 @@ mod tests {
         assert!(
             state.idle_memory_victim(2).is_none(),
             "successful cache-only reclaim must drop the victim"
+        );
+    }
+
+    #[test]
+    fn exclusive_seq_zero_keep_live_is_a_memory_victim() {
+        let inner = match NemotronHInner::new(tiny_nemotron_paged_config()) {
+            Ok(inner) => inner,
+            Err(_) => {
+                eprintln!("skipping exclusive_seq_zero_keep_live_is_a_memory_victim: inner failed");
+                return;
+            }
+        };
+        if inner.paged_adapter().is_none() {
+            eprintln!(
+                "skipping exclusive_seq_zero_keep_live_is_a_memory_victim: Metal unavailable"
+            );
+            return;
+        }
+        let mut state = HybridSchedulerState::new(inner).expect("construct nemotron scheduler");
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .begin_request(0)
+            .expect("exclusive lane keep-live");
+        assert!(
+            state.owner_sequences.is_empty(),
+            "seq 0 is not entered in owner_sequences"
+        );
+        assert!(
+            state.idle_recurrent_victim(1).is_none(),
+            "seq 0 without rec is not a unit-cap victim"
+        );
+        assert_eq!(
+            state.idle_memory_victim(1),
+            Some(0),
+            "exclusive keep-live table must be reclaimable"
+        );
+        assert!(
+            state.reclaim_one_idle_scheduled(1).expect("unpin seq 0"),
+            "memory-denial reclaim must unpin sequence 0"
+        );
+        assert!(
+            state
+                .inner
+                .paged_adapter()
+                .and_then(|adapter| adapter.block_table_for(0))
+                .is_none(),
+            "seq 0 table is gone after reclaim"
         );
     }
 
