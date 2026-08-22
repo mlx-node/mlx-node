@@ -503,6 +503,7 @@ pub fn compute_load_time_pool_sizing(
     util: f64,
     safety_margin_bytes: u64,
     bytes_per_block: u64,
+    extra_reserved_bytes: u64,
 ) -> Result<LoadTimePoolSizing, ProfileError> {
     if requested_blocks == 0 || bytes_per_block == 0 {
         return Err(ProfileError::InvalidShape(format!(
@@ -519,10 +520,12 @@ pub fn compute_load_time_pool_sizing(
             .saturating_sub(safety_margin_bytes)
     };
 
-    // Total-memory and Metal ceilings are absolute, so subtract current MLX
-    // active allocation from both.
-    let total_budget = budget(total_memory_bytes, metal_active_bytes);
-    let metal_budget = metal_working_set_bytes.map(|ws| budget(ws, metal_active_bytes));
+    // Total-memory and Metal ceilings are absolute. Subtract MLX active
+    // memory and any extra reserved bytes (sibling private Metal pools that
+    // those counters cannot see) before taking min(requested, safe).
+    let used = metal_active_bytes.saturating_add(extra_reserved_bytes);
+    let total_budget = budget(total_memory_bytes, used);
+    let metal_budget = metal_working_set_bytes.map(|ws| budget(ws, used));
 
     // Total physical memory is the mandatory safety ceiling. Optional live
     // probes may only tighten it; their absence must never restore the full
@@ -566,6 +569,29 @@ pub fn load_time_pool_sizing(
     block_size: u32,
     dtype: MetalDtype,
 ) -> Result<LoadTimePoolSizing, ProfileError> {
+    load_time_pool_sizing_with_reserved(
+        requested_blocks,
+        num_layers,
+        num_kv_heads,
+        head_size,
+        block_size,
+        dtype,
+        0,
+    )
+}
+
+/// Same as [`load_time_pool_sizing`], but `extra_reserved_bytes` (sibling
+/// private Metal pools) is subtracted from the safe budget *before*
+/// `min(requested, safe)`.
+pub fn load_time_pool_sizing_with_reserved(
+    requested_blocks: u32,
+    num_layers: u32,
+    num_kv_heads: u32,
+    head_size: u32,
+    block_size: u32,
+    dtype: MetalDtype,
+    extra_reserved_bytes: u64,
+) -> Result<LoadTimePoolSizing, ProfileError> {
     let total = read_total_memory_bytes()?;
     let util = read_util_env()?;
     let safety = read_safety_margin_env()?;
@@ -589,12 +615,20 @@ pub fn load_time_pool_sizing(
             util,
             safety,
             bpb,
+            extra_reserved_bytes,
         )
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (requested_blocks, total, util, safety, bpb);
+        let _ = (
+            requested_blocks,
+            total,
+            util,
+            safety,
+            bpb,
+            extra_reserved_bytes,
+        );
         Err(ProfileError::TotalMemoryUnavailable)
     }
 }
@@ -845,12 +879,61 @@ mod tests {
     fn load_time_sizing_treats_requested_pool_as_maximum() {
         let gib = 1024u64 * 1024 * 1024;
         let bpb = 1024 * 1024;
-        let sizing =
-            compute_load_time_pool_sizing(2048, 64 * gib, Some(48 * gib), 20 * gib, 0.85, gib, bpb)
-                .unwrap();
+        let sizing = compute_load_time_pool_sizing(
+            2048,
+            64 * gib,
+            Some(48 * gib),
+            20 * gib,
+            0.85,
+            gib,
+            bpb,
+            0,
+        )
+        .unwrap();
         assert_eq!(sizing.requested_blocks, 2048);
         assert_eq!(sizing.selected_blocks, 2048);
         assert_eq!(sizing.selected_bytes, 2 * gib);
+    }
+
+    #[test]
+    fn extra_reserved_debits_safe_budget_not_the_request_cap() {
+        let gib = 1024u64 * 1024 * 1024;
+        let bpb = 1024 * 1024;
+        // Same machine as the request-cap test: 2 GiB request, ~20 GiB safe.
+        let sibling_2g = compute_load_time_pool_sizing(
+            2048,
+            64 * gib,
+            Some(48 * gib),
+            20 * gib,
+            0.85,
+            gib,
+            bpb,
+            2 * gib,
+        )
+        .unwrap();
+        assert_eq!(
+            sibling_2g.selected_blocks, 2048,
+            "ample headroom must still grant the full 2 GiB request"
+        );
+
+        let sibling_tight = compute_load_time_pool_sizing(
+            2048,
+            64 * gib,
+            Some(48 * gib),
+            20 * gib,
+            0.85,
+            gib,
+            bpb,
+            18 * gib,
+        )
+        .unwrap();
+        // metal safe = 48*0.85 - 20 - 18 - 1 = 1.8 GiB < 2 GiB request
+        let expected = ((48f64 * gib as f64 * 0.85) as u64)
+            .saturating_sub(20 * gib)
+            .saturating_sub(18 * gib)
+            .saturating_sub(gib);
+        assert_eq!(sibling_tight.selected_bytes, expected / bpb * bpb);
+        assert!(sibling_tight.selected_blocks < 2048);
     }
 
     #[test]
@@ -867,6 +950,7 @@ mod tests {
             0.85,
             gib,
             bpb,
+            0,
         )
         .unwrap();
         let expected_bytes = ((32f64 * gib as f64 * 0.85) as u64)
@@ -888,6 +972,7 @@ mod tests {
             0.85,
             gib,
             16 * 1024 * 1024,
+            0,
         )
         .unwrap_err();
         assert!(matches!(err, ProfileError::NotEnoughBlocks { .. }));
@@ -898,7 +983,7 @@ mod tests {
         let gib = 1024u64 * 1024 * 1024;
         let bpb = 1024 * 1024;
         let sizing =
-            compute_load_time_pool_sizing(u32::MAX, 16 * gib, None, 4 * gib, 0.85, gib, bpb)
+            compute_load_time_pool_sizing(u32::MAX, 16 * gib, None, 4 * gib, 0.85, gib, bpb, 0)
                 .unwrap();
         let expected_budget = ((16f64 * gib as f64 * 0.85) as u64)
             .saturating_sub(4 * gib)
@@ -913,7 +998,7 @@ mod tests {
         let gib = 1024u64 * 1024 * 1024;
         let bpb = 1024 * 1024;
         let without_working_set =
-            compute_load_time_pool_sizing(u32::MAX, 64 * gib, None, 20 * gib, 0.85, gib, bpb)
+            compute_load_time_pool_sizing(u32::MAX, 64 * gib, None, 20 * gib, 0.85, gib, bpb, 0)
                 .unwrap();
         let with_tight_working_set = compute_load_time_pool_sizing(
             u32::MAX,
@@ -923,6 +1008,7 @@ mod tests {
             0.85,
             gib,
             bpb,
+            0,
         )
         .unwrap();
         assert!(with_tight_working_set.selected_blocks < without_working_set.selected_blocks);
