@@ -171,8 +171,9 @@ pub(crate) struct NemotronHInner {
     /// through the adapter (indexed by attention-layer ordinal 0..6); mamba
     /// and moe layers keep their own per-request state / stateless forward.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
-    /// Registered when the adaptive pool is reserved, before Metal alloc, so a
-    /// concurrent load cannot reuse the same headroom. Taken by `load_with_thread`.
+    /// Registered before Metal alloc (configured pools at `load_inner`, adaptive
+    /// pools in `size_paged_pool_after_weight_load`) so a concurrent load cannot
+    /// reuse the same headroom. Taken by `load_with_thread`.
     pub(crate) pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
     /// Per-request recurrent state for the scheduler lane: one full
     /// `Vec<NemotronHLayerCache>` per live sequence, swapped into `caches` for serial
@@ -269,11 +270,18 @@ fn fresh_caches(
     Ok(caches)
 }
 
-/// Construct the block-paged KV adapter covering only the GQA attention
-/// layers (pool indexed by attention-layer ordinal). Gated on
-/// `use_block_paged_cache` (default-on when None) and Metal availability;
-/// returns `None` when either gate is closed.
-fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAdapter>> {
+struct ConfiguredPagedPoolPlan {
+    pa_config: mlx_paged_attn::PagedAttentionConfig,
+    num_blocks: u32,
+    block_size: u32,
+    cache_dtype: mlx_paged_attn::metal::MetalDtype,
+    pool_bytes: u64,
+}
+
+/// Shared gates + byte math for a configured (`paged_cache_memory_mb`) pool.
+/// Uncapped configs return `None` so `size_paged_pool_after_weight_load` can
+/// apply `load_time_pool_sizing`.
+fn configured_paged_pool_plan(config: &NemotronHConfig) -> Result<Option<ConfiguredPagedPoolPlan>> {
     if config.use_block_paged_cache == Some(false)
         || !crate::engine::persistence::compiled_forward_backend_available()
     {
@@ -289,8 +297,6 @@ fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAd
             "NemotronH block-paged adapter: invalid paged_block_size {block_size} (must be 8, 16, or 32)"
         )));
     }
-    // Uncapped configs defer allocation until after weights so
-    // `size_paged_pool_after_weight_load` can apply `load_time_pool_sizing`.
     let Some(gpu_memory_mb) = config.paged_cache_memory_mb else {
         return Ok(None);
     };
@@ -312,21 +318,67 @@ fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAd
             config.head_dim, config.num_key_value_heads
         )));
     }
-    let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
-        num_blocks, block_size,
-    )));
     let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-    let pool =
-        mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype).map_err(|e| {
+    let pool_bytes = mlx_paged_attn::profile::bytes_per_block(
+        attn_layer_count,
+        config.num_key_value_heads as u32,
+        config.head_dim as u32,
+        block_size,
+        cache_dtype,
+    )
+    .map_err(|error| {
+        Error::from_reason(format!(
+            "NemotronH configured paged pool byte accounting failed: {error}"
+        ))
+    })?
+    .saturating_mul(u64::from(num_blocks));
+    Ok(Some(ConfiguredPagedPoolPlan {
+        pa_config,
+        num_blocks,
+        block_size,
+        cache_dtype,
+        pool_bytes,
+    }))
+}
+
+/// Register a configured pool with the coordinator before `NemotronHInner::new`
+/// allocates it, so a concurrent uncapped Nemotron load cannot treat those
+/// private Metal bytes as free headroom.
+pub(crate) fn reserve_configured_paged_pool(
+    config: &NemotronHConfig,
+) -> Result<Option<crate::cache_limit::PoolCacheLimitGuard>> {
+    let Some(plan) = configured_paged_pool_plan(config)? else {
+        return Ok(None);
+    };
+    Ok(Some(
+        crate::cache_limit::coordinator().register_pool(plan.pool_bytes),
+    ))
+}
+
+/// Construct the block-paged KV adapter covering only the GQA attention
+/// layers (pool indexed by attention-layer ordinal). Gated on
+/// `use_block_paged_cache` (default-on when None) and Metal availability;
+/// returns `None` when either gate is closed.
+fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAdapter>> {
+    let Some(plan) = configured_paged_pool_plan(config)? else {
+        return Ok(None);
+    };
+    let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
+        plan.num_blocks,
+        plan.block_size,
+    )));
+    let pool = mlx_paged_attn::LayerKVPool::new(plan.pa_config, plan.num_blocks, plan.cache_dtype)
+        .map_err(|e| {
             Error::from_reason(format!(
                 "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
             ))
         })?;
-    let adapter = PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
-        Error::from_reason(format!(
-            "Failed to construct NemotronH PagedKVCacheAdapter: {e}"
-        ))
-    })?;
+    let adapter =
+        PagedKVCacheAdapter::new(allocator, Arc::new(pool), plan.block_size).map_err(|e| {
+            Error::from_reason(format!(
+                "Failed to construct NemotronH PagedKVCacheAdapter: {e}"
+            ))
+        })?;
     Ok(Some(adapter))
 }
 
@@ -3095,6 +3147,54 @@ mod scheduler_tests {
             pool_bytes > 0,
             "paged pool must report its private Metal bytes so load_with_thread can register_pool"
         );
+    }
+
+    #[test]
+    fn uncapped_config_does_not_reserve_a_configured_pool() {
+        let mut config = tiny_paged_config();
+        config.paged_cache_memory_mb = None;
+        let before = crate::cache_limit::coordinator().registered_pool_bytes();
+        let guard = reserve_configured_paged_pool(&config).expect("uncapped plan");
+        assert!(
+            guard.is_none(),
+            "uncapped loads must leave reservation to the adaptive CAS path"
+        );
+        assert_eq!(
+            crate::cache_limit::coordinator().registered_pool_bytes(),
+            before
+        );
+    }
+
+    #[test]
+    fn configured_pool_is_reserved_before_metal_alloc() {
+        let config = tiny_paged_config();
+        let Some(plan) = configured_paged_pool_plan(&config).expect("plan") else {
+            eprintln!("skipping (no Metal backend or paged gated off)");
+            return;
+        };
+        let before = crate::cache_limit::coordinator().registered_pool_bytes();
+        let guard = reserve_configured_paged_pool(&config)
+            .expect("reserve")
+            .expect("configured pool must register");
+        assert_eq!(
+            crate::cache_limit::coordinator()
+                .registered_pool_bytes()
+                .saturating_sub(before),
+            plan.pool_bytes,
+            "configured reservation must be visible before Inner::new allocates"
+        );
+        let inner = NemotronHInner::new(config).expect("inner builds");
+        let adapter = inner
+            .paged_adapter
+            .as_ref()
+            .expect("configured plan existed so the adapter must build");
+        assert_eq!(
+            adapter
+                .pool_allocated_bytes()
+                .expect("paged pool byte accounting"),
+            plan.pool_bytes
+        );
+        drop(guard);
     }
 
     /// Pure-function gate on the prefill break-set: no internal boundary inside a

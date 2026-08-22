@@ -42,7 +42,7 @@ use crate::models::qwen3_5_moe::quantized_linear::{
 use crate::tokenizer::Qwen3Tokenizer;
 
 use super::config::{NemotronHConfig, parse_config};
-use super::model::{NemotronHInner, NemotronHModel};
+use super::model::{NemotronHInner, NemotronHModel, reserve_configured_paged_pool};
 use super::sparse_moe::ExpertProj;
 
 /// Strip the HF backbone. model wrapper from a tensor or quant key.
@@ -959,7 +959,13 @@ pub(crate) fn load_inner(model_path: &str) -> Result<(NemotronHInner, u64)> {
     let params = sanitize_weights(std::mem::take(&mut raw_params), &config)?;
     info!("NemotronH sanitized to {} tensors", params.len());
 
+    // Configured pools allocate inside `new`. Reserve first so a concurrent
+    // uncapped Nemotron load's adaptive sizer sees the bytes before Metal
+    // alloc; the CAS path in `size_paged_pool_after_weight_load` does not
+    // cover this branch.
+    let configured_pool_guard = reserve_configured_paged_pool(&config)?;
     let mut inner = NemotronHInner::new(config.clone())?;
+    inner.pool_cache_limit_guard = configured_pool_guard;
     inner.set_gen_defaults(parse_generation_defaults(path));
     // Quantized projections dispatch different matmul kernels for M=1 vs M>=2
     // rows, so the batched decode lane must run them per row to stay
