@@ -36,7 +36,7 @@ const CHUNK_THRESHOLD: i64 = 64;
 enum GdnKernel {
     /// Measured-best default: per-step on every arch.
     Auto,
-    /// Force the per-step recurrence (also the `MLX_GDN_FORCE_PERSTEP=1` legacy toggle).
+    /// Force the per-step recurrence.
     ForcePerStep,
     /// Force the chunked prefill kernel (A/B only — changes output by 1–2 bf16 ULP).
     ForceChunked,
@@ -47,36 +47,24 @@ enum GdnKernel {
     ForceChunkedOps,
 }
 
-/// Read the `MLX_GDN_KERNEL` override fresh per call (`perstep` | `chunked`); also honors the
-/// legacy `MLX_GDN_FORCE_PERSTEP=1`. Anything else (incl. unset) → [`GdnKernel::Auto`].
+/// Read the `MLX_GDN_KERNEL` override fresh per call (`perstep` | `chunked` | `chunked_ops`).
+/// Anything else (incl. unset) → [`GdnKernel::Auto`].
 fn gdn_kernel_override() -> GdnKernel {
-    parse_gdn_kernel(
-        std::env::var("MLX_GDN_KERNEL").ok().as_deref(),
-        std::env::var("MLX_GDN_FORCE_PERSTEP").ok().as_deref(),
-    )
+    parse_gdn_kernel(std::env::var("MLX_GDN_KERNEL").ok().as_deref())
 }
 
-/// Pure parse of the GDN-kernel env overrides (kept env-free for race-free testing).
-/// `MLX_GDN_KERNEL` takes precedence; the legacy `MLX_GDN_FORCE_PERSTEP=1/true/on` is a
-/// per-step-only fallback. Unrecognized / both-unset → [`GdnKernel::Auto`].
-fn parse_gdn_kernel(mlx_gdn_kernel: Option<&str>, legacy_force_perstep: Option<&str>) -> GdnKernel {
-    if let Some(v) = mlx_gdn_kernel {
-        match v.trim().to_ascii_lowercase().as_str() {
-            "perstep" | "per_step" | "per-step" | "step" => return GdnKernel::ForcePerStep,
-            "chunked_ops" | "chunkedops" | "chunked-ops" | "ops" => {
-                return GdnKernel::ForceChunkedOps;
-            }
-            "chunked" | "chunk" => return GdnKernel::ForceChunked,
-            _ => {}
-        }
+/// Pure parse of the GDN-kernel env override (kept env-free for race-free testing).
+/// Unrecognized / unset → [`GdnKernel::Auto`].
+fn parse_gdn_kernel(mlx_gdn_kernel: Option<&str>) -> GdnKernel {
+    let Some(v) = mlx_gdn_kernel else {
+        return GdnKernel::Auto;
+    };
+    match v.trim().to_ascii_lowercase().as_str() {
+        "perstep" | "per_step" | "per-step" | "step" => GdnKernel::ForcePerStep,
+        "chunked_ops" | "chunkedops" | "chunked-ops" | "ops" => GdnKernel::ForceChunkedOps,
+        "chunked" | "chunk" => GdnKernel::ForceChunked,
+        _ => GdnKernel::Auto,
     }
-    if matches!(
-        legacy_force_perstep.map(str::trim),
-        Some("1") | Some("true") | Some("on")
-    ) {
-        return GdnKernel::ForcePerStep;
-    }
-    GdnKernel::Auto
 }
 
 /// Pure routing predicate: should this GDN call take the chunked prefill kernel?
@@ -941,56 +929,25 @@ mod tests {
     #[test]
     fn parse_gdn_kernel_override_semantics() {
         // Default: nothing set.
-        assert_eq!(parse_gdn_kernel(None, None), GdnKernel::Auto);
+        assert_eq!(parse_gdn_kernel(None), GdnKernel::Auto);
         // MLX_GDN_KERNEL=chunked / perstep (case-insensitive, trimmed, aliases).
-        assert_eq!(
-            parse_gdn_kernel(Some("chunked"), None),
-            GdnKernel::ForceChunked
-        );
-        assert_eq!(
-            parse_gdn_kernel(Some("  CHUNK "), None),
-            GdnKernel::ForceChunked
-        );
+        assert_eq!(parse_gdn_kernel(Some("chunked")), GdnKernel::ForceChunked);
+        assert_eq!(parse_gdn_kernel(Some("  CHUNK ")), GdnKernel::ForceChunked);
         // MLX_GDN_KERNEL=chunked_ops selects the device-agnostic ops path (CUDA default).
         assert_eq!(
-            parse_gdn_kernel(Some("chunked_ops"), None),
+            parse_gdn_kernel(Some("chunked_ops")),
             GdnKernel::ForceChunkedOps
         );
         assert_eq!(
-            parse_gdn_kernel(Some("CHUNKED-OPS"), None),
+            parse_gdn_kernel(Some("CHUNKED-OPS")),
             GdnKernel::ForceChunkedOps
         );
-        assert_eq!(
-            parse_gdn_kernel(Some("perstep"), None),
-            GdnKernel::ForcePerStep
-        );
-        assert_eq!(
-            parse_gdn_kernel(Some("per-step"), None),
-            GdnKernel::ForcePerStep
-        );
-        assert_eq!(
-            parse_gdn_kernel(Some("Step"), None),
-            GdnKernel::ForcePerStep
-        );
-        // MLX_GDN_KERNEL wins over the legacy toggle when it is a known value.
-        assert_eq!(
-            parse_gdn_kernel(Some("chunked"), Some("1")),
-            GdnKernel::ForceChunked
-        );
-        // Unknown MLX_GDN_KERNEL falls through to the legacy toggle, then to Auto.
-        assert_eq!(
-            parse_gdn_kernel(Some("garbage"), Some("1")),
-            GdnKernel::ForcePerStep
-        );
-        assert_eq!(parse_gdn_kernel(Some("garbage"), None), GdnKernel::Auto);
-        // Legacy MLX_GDN_FORCE_PERSTEP truthy values only.
-        assert_eq!(
-            parse_gdn_kernel(None, Some("true")),
-            GdnKernel::ForcePerStep
-        );
-        assert_eq!(parse_gdn_kernel(None, Some("on")), GdnKernel::ForcePerStep);
-        assert_eq!(parse_gdn_kernel(None, Some("0")), GdnKernel::Auto);
-        assert_eq!(parse_gdn_kernel(None, Some("")), GdnKernel::Auto);
+        assert_eq!(parse_gdn_kernel(Some("perstep")), GdnKernel::ForcePerStep);
+        assert_eq!(parse_gdn_kernel(Some("per-step")), GdnKernel::ForcePerStep);
+        assert_eq!(parse_gdn_kernel(Some("Step")), GdnKernel::ForcePerStep);
+        // An unrecognized value is Auto, never a silent mode switch.
+        assert_eq!(parse_gdn_kernel(Some("garbage")), GdnKernel::Auto);
+        assert_eq!(parse_gdn_kernel(Some("")), GdnKernel::Auto);
     }
 
     use crate::array::DType;

@@ -15,7 +15,8 @@ use crate::array::MxArray;
 use crate::engine::ThinkingPolicy;
 use crate::engine::backend::{
     ChatBackend, DecodeStep, FinalizeArgs, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
-    PagedPrefix, ResetScope, SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
+    PagedPrefix, ResetScope, SaveStateArgs, SpecFrontier, StreamEmitter, TurnOutput, TurnSetup,
+    WholeTurnArgs,
 };
 use crate::engine::cmd::{ChatCmd, FromChatCmd, handle_chat_cmd};
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
@@ -24,7 +25,7 @@ use crate::engine::hybrid_scheduler::{
     NoRestoreTicket, ScheduledPrefixAdmission, scheduler_max_num_seqs_for,
 };
 use crate::engine::plan::{
-    ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
+    DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
 };
 use crate::engine::{self};
@@ -139,7 +140,10 @@ pub(crate) struct NemotronHInner {
     pub(crate) cached_token_history: Vec<u32>,
     /// Multi-Token Prediction head - Some when config.n_mtp_layers > 0.
     pub(crate) mtp: Option<NemotronHMtpModule>,
-    /// Set true by the loader only after the MTP weight set is COMPLETE.
+    /// Set true by the loader only after the MTP weight set is COMPLETE, and never
+    /// written again: `NemotronHModel::mtp_active` is a load-time snapshot of
+    /// `has_mtp_weights()`, so a runtime writer here would make the `hasMtpWeights()`
+    /// NAPI getter lie.
     pub(crate) mtp_weights_loaded: bool,
     /// Handover slot for the turn's seeded MTP drafter cache plus its committed
     /// length. `begin_mtp_decode` hard-errors on `None` rather than drafting from an
@@ -153,6 +157,12 @@ pub(crate) struct NemotronHInner {
     /// latch-INDEPENDENT way to ask "did that turn stop mid-cycle?", so a gate keyed
     /// off it is not a probe of its own guard.
     pub(crate) flat_mtp_last_rollback_unemitted: usize,
+    /// Lifetime count of drafter seeds that failed and degraded their turn to plain AR.
+    /// A cancellation is not a failure and never increments it. Diagnostic and test
+    /// seam ONLY: it is the observable that separates the cancel arm of
+    /// `mtp_seed_aborted` from the fallback arm, which are otherwise
+    /// post-condition-identical.
+    pub(crate) mtp_seed_failures: u32,
     /// Parsed generation_config.json sampling/stop defaults.
     pub(crate) gen_defaults: crate::engine::ModelGenerationDefaults,
     /// Block-paged KV adapter (vLLM-style refcounted prefix cache) covering
@@ -218,6 +228,7 @@ impl NemotronHInner {
             pending_mtp_draft_seed: None,
             flat_mtp_caches_desynced: false,
             flat_mtp_last_rollback_unemitted: 0,
+            mtp_seed_failures: 0,
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
             paged_adapter,
             scheduled_caches: HashMap::new(),
@@ -354,32 +365,6 @@ impl NemotronHInner {
     /// Whether a complete MTP head was loaded.
     pub(crate) fn has_mtp_weights(&self) -> bool {
         self.mtp.is_some() && self.mtp_weights_loaded
-    }
-
-    /// MTP-routing predicate for the whole-turn executors: run the FLAT speculative
-    /// core exactly when the request opted in, a complete MTP head is loaded, and the
-    /// turn is not streaming (the flat core has no streaming arm, so streaming MTP
-    /// turns keep the paged AR fallback).
-    pub(crate) fn mtp_flat_routing_required(
-        &self,
-        params: &crate::engine::params::ChatParams,
-        streaming: bool,
-    ) -> bool {
-        let requested = params.enable_mtp && self.has_mtp_weights();
-        if requested && streaming {
-            // Process-wide one-shot: a streaming server would otherwise emit
-            // one line per turn.
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                tracing::warn!(
-                    target: "mlx_core::nemotron_h",
-                    "enableMtp is set on a STREAMING NemotronH turn: the flat MTP core \
-                     has no streaming arm, so this turn decodes plain autoregressively \
-                     with no speculation. Use a non-streaming turn for MTP."
-                );
-            });
-        }
-        !streaming && requested
     }
 
     /// Full forward over input_ids [1, T]: returns [1, T, vocab] logits.
@@ -1318,10 +1303,12 @@ impl ChatBackend for NemotronHInner {
                 kind: SpeculativeKind::NativeMtp,
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
-                // Native MTP is flat-cache only here (the draft head reads the
-                // FLAT KV); the plan keeps the paged adapter exposed for plain AR
-                // turns, and run_paged_turn re-routes sync MTP turns to the flat core.
+                // Native MTP is flat-cache only here: the draft head reads the
+                // FLAT KV, so an admitted MTP turn takes the flat lane with its
+                // target and the paged adapter serves the autoregressive turns.
                 supports_paged_attention: false,
+                // `run_mtp_whole_turn` only ever returns `TurnOutput::Complete`.
+                supports_streaming: false,
             }),
         }
     }
@@ -1331,24 +1318,15 @@ impl ChatBackend for NemotronHInner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Native MTP is flat-cache only, but a paged adapter still resolves every fresh
-        // turn to this path. Route sync MTP-requested turns to the flat speculative core;
-        // streaming MTP turns keep the paged AR fallback (the flat core has no streaming
-        // arm).
-        if self.mtp_flat_routing_required(args.params, args.sink.is_some()) {
-            return self.run_mtp_whole_turn(args);
-        }
+        debug_assert!(matches!(args.plan.decoder, DecoderPlan::Autoregressive));
         crate::engine::paged_turn::run_paged_turn(self, args)
     }
 
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // Same gate `run_paged_turn` applies. Reached on a model with MTP weights and NO
-        // paged adapter — the one route where the engine cannot fall back for us. The
-        // flat core returns `TurnOutput::Complete`, which `whole_turn_outcome` rejects
-        // outright on a sink-bearing turn, so streaming goes to plain AR.
-        if !self.mtp_flat_routing_required(args.params, args.sink.is_some()) {
-            return self.run_flat_ar_turn(args);
-        }
+        debug_assert!(
+            args.sink.is_none(),
+            "the flat MTP core has no streaming arm"
+        );
         self.run_mtp_whole_turn(args)
     }
 }
@@ -1913,6 +1891,19 @@ impl NemotronHMtpStepper<'_> {
         }
     }
 
+    /// The BACKBONE attention side's ground-truth frontier: the first
+    /// attention layer's offset, in absolute consumed tokens. The flat twin of
+    /// the qwen3_5 / MoE `attention_frontier` — this family's native MTP is
+    /// flat-cache only (`execution_plan` publishes
+    /// `supports_paged_attention: false`), so there is no paged branch to pick.
+    fn attention_frontier(&self) -> Option<u64> {
+        self.inner
+            .caches
+            .iter()
+            .find_map(|c| c.attention_offset())
+            .map(|offset| offset.max(0) as u64)
+    }
+
     /// The drafter attention slot's live offset. Compiled in every debug build so
     /// `begin_cycle`'s cursor-alignment `debug_assert!` can read it.
     #[cfg(any(test, debug_assertions))]
@@ -2041,12 +2032,7 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         let hiddens = MxArray::concatenate_many(hidden_rows.iter().collect::<Vec<_>>(), Some(1))?;
         // The engine slices verify_hiddens[:, K, :], so hiddens must stay
         // [1, depth+1, hidden] (each row is the raw 3D per-token hidden).
-        Ok(crate::models::qwen3_5::mtp_decode::MtpVerifyOutput {
-            logits: Some(logits),
-            hiddens,
-            target_argmax: None,
-            target_sparse: None,
-        })
+        Ok(crate::models::qwen3_5::mtp_decode::MtpVerifyOutput::logits_only(logits, hiddens))
     }
 
     fn snapshot_main_linear(&mut self) {
@@ -2213,6 +2199,26 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
         self.trim_draft_caches(target);
     }
 
+    fn frontier(&self) -> Option<SpecFrontier> {
+        // Hybrid stack, but the recurrent count is NOT nameable here, so it is
+        // reported as unknown rather than fabricated: `Mamba2State` is a conv
+        // tensor plus an ssm tensor with no consumed-token counter, and this
+        // family rewinds the recurrent side by whole-snapshot RESTORE
+        // (`rollback` restores every layer, Mamba and attention alike, from one
+        // `snapshot_main_linear`) instead of replaying a step count, so there is
+        // no bookkeeping to publish. Echoing `attn_tokens` back would turn the
+        // I4 tripwire into a comparison of a value with itself.
+        //
+        // The tripwire is inert for the other reason too: `rollback_unemitted`
+        // rewinds only the DRAFTER caches and never touches `inner.caches`, so
+        // this family heals a mid-cycle stop through the `mtp_desynced` latch,
+        // not by moving one side of the backbone.
+        Some(SpecFrontier {
+            attn_tokens: self.attention_frontier()?,
+            recurrent_tokens: None,
+        })
+    }
+
     fn take_replay_error(&mut self) -> Option<Error> {
         self.replay_err.take()
     }
@@ -2224,8 +2230,8 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
 
 impl NemotronHInner {
     /// Plain autoregressive whole-turn core over the FLAT caches, sync and streaming.
-    /// Only `run_speculative_turn` calls it, when the flat MTP gate declines: the
-    /// engine's generic AR flow is unreachable from inside a specialized handler.
+    /// Reached only from `mtp_seed_failed_fallback` on a model with no paged adapter:
+    /// the engine's generic AR flow is unreachable from inside a specialized handler.
     /// Structure mirrors that generic flow one for one so the two cannot drift.
     fn run_flat_ar_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         if args.tokens.is_empty() {
@@ -2419,35 +2425,51 @@ impl NemotronHInner {
     }
 
     /// FAIL-CLOSED handling for a drafter seed that could not be built. A half-seeded
-    /// cache would draft from the wrong state, so the head is disarmed for the whole
-    /// model (`mtp_weights_loaded = false`) and THIS turn is retried on the plain AR
-    /// lane. No recursion is possible: the routing predicate is already false.
+    /// cache would draft from the wrong state, so the seed is dropped and THIS turn is
+    /// retried on the plain AR lane.
+    ///
+    /// Every non-cancellation error out of `chunked_prefill_seeding_mtp` /
+    /// `seed_mtp_final_slot` arrives here, transient (an MLX allocation or eval failure)
+    /// and permanent (a config/module mismatch: `NemotronHMtpModule::fresh_caches` sizes
+    /// the cache vector from `config.mtp_layers_block_type`, and the head's `forward`
+    /// checks that length against its built layers) alike. The degrade is per-TURN so
+    /// the two need no telling apart: a permanent condition simply re-fails and
+    /// re-degrades on every later turn, while disarming the head would spend one
+    /// transient episode on the whole loaded model, since one inner serves every session
+    /// on it.
     fn mtp_seed_failed_fallback(
         &mut self,
         args: &mut WholeTurnArgs<'_>,
         err: &Error,
     ) -> Result<TurnOutput> {
+        self.mtp_seed_failures = self.mtp_seed_failures.saturating_add(1);
         tracing::warn!(
-            "NemotronH MTP drafter seed failed ({}); disabling speculative MTP for this \
-             model and running this turn autoregressively",
+            target: "mlx_core::nemotron_h",
+            seed_failures = self.mtp_seed_failures,
+            "NemotronH MTP drafter seed failed ({}); running this turn autoregressively \
+             and retrying the head on the next turn",
             err.reason
         );
-        self.mtp_weights_loaded = false;
         self.pending_mtp_draft_seed = None;
         // The partial seed left the backbone caches mid-prompt; the AR lane
         // must start from a clean slate.
         self.reset_caches_internal();
-        if self.paged_adapter.is_some() {
+        // THIS turn, and only this turn, leaves the speculative lane. The paged
+        // core reads `plan.decoder` to decide whether to admit a verify cycle, and
+        // a stale `Speculative` here would send the fallback straight back into
+        // speculation.
+        args.plan.decoder = DecoderPlan::Autoregressive;
+        args.plan.use_paged_attention = self.paged_adapter.is_some();
+        if args.plan.use_paged_attention {
             crate::engine::paged_turn::run_paged_turn(self, args)
         } else {
             self.run_flat_ar_turn(args)
         }
     }
 
-    /// Route a drafter seed that did not complete. A cooperative CANCELLATION is not
-    /// a seeding failure, and disarming on it would be permanent: nothing outside the
-    /// loader sets `mtp_weights_loaded` back to `true`, and all sessions share one
-    /// inner, so clean the caches the partial seed advanced and propagate the
+    /// Route a drafter seed that did not complete. A cooperative CANCELLATION must
+    /// reach the caller as an ERROR, never be silently converted into a completed AR
+    /// turn, so it cleans the caches the partial seed advanced and propagates the
     /// distinguished error. Anything else takes the fail-closed
     /// [`mtp_seed_failed_fallback`](Self::mtp_seed_failed_fallback).
     fn mtp_seed_aborted(&mut self, args: &mut WholeTurnArgs<'_>, err: Error) -> Result<TurnOutput> {
@@ -2597,7 +2619,6 @@ impl NemotronHInner {
                 generation_stream,
                 prompt_hidden: None,
                 prompt_hidden_ids: None,
-                prompt_hidden_position_base: 0,
                 cancel_flag: turn_cancel.as_deref(),
             },
             None,
@@ -2736,9 +2757,11 @@ impl NemotronHModel {
     }
 
     /// Whether `ChatSession` should turn MTP ON when the caller sets nothing. FALSE
-    /// deliberately, about SCHEDULING not speed: `enable_mtp == Some(true)` forces the
-    /// chat-requires-barrier predicate, putting the turn in the EXCLUSIVE lane and out
-    /// of continuous batching. `MLX_NEMOTRON_MTP_DEFAULT=1` flips it.
+    /// deliberately, about SCHEDULING not speed: this family's flat MTP core has no
+    /// streaming arm, so `enable_mtp == Some(true)` costs a SYNC turn its scheduled
+    /// slot — `chat_requires_barrier` routes it to the EXCLUSIVE lane and out of
+    /// continuous batching. A streaming turn plans plain autoregressive and keeps its
+    /// slot. `MLX_NEMOTRON_MTP_DEFAULT=1` flips the default.
     #[napi]
     pub fn mtp_auto_enabled(&self) -> bool {
         static OPT_IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2850,7 +2873,7 @@ mod scheduler_tests {
     use super::*;
     use crate::engine::backend::{ChunkSink, ThinkingSetup};
     use crate::engine::persistence::compiled_forward_backend_available;
-    use crate::engine::plan::{DecoderPlan, MediaInputs, TurnPlan};
+    use crate::engine::plan::{MediaInputs, TurnPath, TurnPlan, TurnRequest};
     use crate::engine::types::{ChatConfig, ChatStreamChunk};
 
     /// Tiny hybrid config: mamba(0) + moe(1) + attention(2), dense bf16
@@ -3649,11 +3672,35 @@ mod scheduler_tests {
         Arc::new(tok)
     }
 
-    /// A STREAMING MTP request on an adapter-less model must generate through the AR
-    /// fallback: the flat MTP core returns `TurnOutput::Complete`, which
-    /// `whole_turn_outcome` rejects on a sink-bearing turn.
+    /// The turn the engine planner resolves for a text-only request against
+    /// this inner's live execution plan. The family no longer holds a second
+    /// opinion, so every routing assertion below reads this one.
+    fn planned_turn(
+        inner: &NemotronHInner,
+        speculative_requested: bool,
+        streaming: bool,
+    ) -> TurnPlan {
+        TurnPlan::resolve(
+            ChatBackend::execution_plan(inner),
+            TurnRequest {
+                is_delta: false,
+                input_media: crate::engine::plan::MediaCapabilities::NONE,
+                context_media: crate::engine::plan::MediaCapabilities::NONE,
+                speculative_requested,
+                streaming,
+            },
+        )
+    }
+
+    /// A STREAMING MTP request must be refused by the PLANNER, not by the family
+    /// mid-turn: the flat MTP core has no streaming arm, so the plan names the
+    /// target's own autoregressive lane and that lane really streams the budget.
+    ///
+    /// MUTATION: flip `supports_streaming` to `true` in `execution_plan` — the
+    /// plan resolves `Speculative`/`TurnPath::Speculative` and the two planner
+    /// assertions fail.
     #[test]
-    fn streaming_mtp_request_falls_back_to_ar_streaming() {
+    fn a_streaming_mtp_request_plans_autoregressive_and_still_streams() {
         if !compiled_forward_backend_available() {
             eprintln!("skipping (no Metal backend)");
             return;
@@ -3678,21 +3725,28 @@ mod scheduler_tests {
         };
         let mut params = crate::engine::params::extract_chat_params(&config);
         params.enable_mtp = true;
-        assert!(
-            !inner.mtp_flat_routing_required(&params, /* streaming */ true),
-            "the flat MTP core must decline a streaming turn"
+        let plan = planned_turn(
+            &inner, /* speculative_requested */ true, /* streaming */ true,
+        );
+        assert_eq!(
+            plan.decoder,
+            DecoderPlan::Autoregressive,
+            "the flat MTP core must be declined on a sink-bearing turn"
+        );
+        assert_eq!(
+            plan.path(),
+            TurnPath::Generic,
+            "an adapter-less target serves the refused turn on its own AR lane"
+        );
+        // The same request without a sink still plans MTP.
+        assert_eq!(
+            planned_turn(&inner, true, false).decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
         );
 
         let sink = CollectSink::default();
         let cancelled = AtomicBool::new(false);
         let tokens = vec![1u32, 5, 9, 3];
-        let plan = TurnPlan {
-            is_delta: false,
-            input_media: crate::engine::plan::MediaCapabilities::NONE,
-            context_media: crate::engine::plan::MediaCapabilities::NONE,
-            use_paged_attention: false,
-            decoder: DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
-        };
         let mut args = WholeTurnArgs {
             tokens: &tokens,
             tokenizer: &tokenizer,
@@ -3713,8 +3767,9 @@ mod scheduler_tests {
             },
         };
 
-        let out = ChatBackend::run_speculative_turn(&mut inner, &mut args)
-            .unwrap_or_else(|e| panic!("streaming MTP turn errored: {}", e.reason));
+        let out = inner
+            .run_flat_ar_turn(&mut args)
+            .unwrap_or_else(|e| panic!("streaming AR turn errored: {}", e.reason));
         assert!(
             matches!(out, TurnOutput::Streamed),
             "a sink-bearing turn must report Streamed"
@@ -3732,13 +3787,19 @@ mod scheduler_tests {
         );
     }
 
-    /// FAIL-CLOSED: a drafter seed that cannot be built must DISARM the MTP head for
-    /// good and finish the turn autoregressively. The forced failure is real: the
-    /// config declares one MTP block while the built module has two.
+    /// FAIL-CLOSED for the TURN, not for the model: a drafter seed that cannot be
+    /// built drops the seed and finishes THIS turn autoregressively, leaving the head
+    /// armed so the next turn retries it. The forced failure is real — the config
+    /// declares one MTP block while the built module has two — and the mutation
+    /// stands, so the SECOND turn proves the retry by reaching the drafter and failing
+    /// the same way.
     ///
-    /// MUTATION: propagating the error, or falling back without clearing the flag.
+    /// MUTATION A: re-add `self.mtp_weights_loaded = false` to
+    /// `mtp_seed_failed_fallback` — turn 1's still-armed assertions fail.
+    /// MUTATION B: drop the `mtp_seed_failures` increment — the count assertions fail.
+    /// MUTATION C: propagate the error instead of falling back — the unwrap panics.
     #[test]
-    fn mtp_seed_failure_disables_the_head_and_falls_back_to_ar() {
+    fn a_failed_seed_degrades_only_its_own_turn_and_leaves_the_head_armed() {
         if !compiled_forward_backend_available() {
             eprintln!("skipping (no Metal backend)");
             return;
@@ -3767,9 +3828,10 @@ mod scheduler_tests {
         };
         let mut params = crate::engine::params::extract_chat_params(&config);
         params.enable_mtp = true;
-        assert!(
-            inner.mtp_flat_routing_required(&params, /* streaming */ false),
-            "a sync MTP turn must still route to the flat MTP core"
+        assert_eq!(
+            planned_turn(&inner, true, false).decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            "a sync MTP turn must still plan the flat MTP core"
         );
 
         let tokens = vec![1u32, 5, 9, 3];
@@ -3780,61 +3842,73 @@ mod scheduler_tests {
             use_paged_attention: false,
             decoder: DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
         };
-        let mut args = WholeTurnArgs {
-            tokens: &tokens,
-            tokenizer: &tokenizer,
-            eos_id: u32::MAX,
-            config: &config,
-            params: &params,
-            thinking: ThinkingSetup {
-                enabled: false,
-                budget: None,
-            },
-            plan,
-            sink: None,
-            cancelled: None,
-            media: MediaInputs {
-                images: &[],
-                audio: &[],
-            },
-        };
 
-        let out = ChatBackend::run_speculative_turn(&mut inner, &mut args)
-            .unwrap_or_else(|e| panic!("the seed failure must NOT propagate: {}", e.reason));
-        match out {
-            TurnOutput::Complete(result) => assert_eq!(
-                result.num_tokens, 4,
-                "the AR fallback must generate the full budget"
-            ),
-            _ => panic!("expected a completed sync turn"),
+        for turn in 1..=2u32 {
+            let mut args = WholeTurnArgs {
+                tokens: &tokens,
+                tokenizer: &tokenizer,
+                eos_id: u32::MAX,
+                config: &config,
+                params: &params,
+                thinking: ThinkingSetup {
+                    enabled: false,
+                    budget: None,
+                },
+                plan,
+                sink: None,
+                cancelled: None,
+                media: MediaInputs {
+                    images: &[],
+                    audio: &[],
+                },
+            };
+
+            let out =
+                ChatBackend::run_speculative_turn(&mut inner, &mut args).unwrap_or_else(|e| {
+                    panic!(
+                        "turn {turn}: the seed failure must NOT propagate: {}",
+                        e.reason
+                    )
+                });
+            match out {
+                TurnOutput::Complete(result) => assert_eq!(
+                    result.num_tokens, 4,
+                    "turn {turn}: the AR fallback must generate the full budget"
+                ),
+                _ => panic!("turn {turn}: expected a completed sync turn"),
+            }
+            assert_eq!(
+                inner.mtp_seed_failures, turn,
+                "turn {turn}: the fallback arm must count every failed seed"
+            );
+            assert!(
+                inner.mtp_weights_loaded && inner.has_mtp_weights(),
+                "turn {turn}: a failed seed must NOT disarm the head"
+            );
+            assert!(
+                inner.pending_mtp_draft_seed.is_none(),
+                "turn {turn}: no half-built seed may survive"
+            );
+            assert!(
+                inner.execution_plan().speculative.is_some(),
+                "turn {turn}: the speculative plan must stay on offer"
+            );
+            assert_eq!(
+                planned_turn(&inner, true, false).decoder,
+                DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+                "turn {turn}: the next MTP request must plan back into the drafter"
+            );
         }
-        assert!(
-            !inner.mtp_weights_loaded,
-            "a failed seed must disarm the head"
-        );
-        assert!(!inner.has_mtp_weights());
-        assert!(
-            inner.pending_mtp_draft_seed.is_none(),
-            "no half-built seed may survive"
-        );
-        assert!(
-            inner.execution_plan().speculative.is_none(),
-            "the speculative plan must go dark for every later turn"
-        );
-        assert!(
-            !inner.mtp_flat_routing_required(&params, false),
-            "later turns must not route back into the MTP core"
-        );
     }
 
     /// A turn CANCELLED mid-prefill is NOT a seeding failure: the distinguished
-    /// `PREFILL_CANCELLED` error must propagate with the MTP head STILL ARMED.
-    /// Nothing outside the loader ever sets `mtp_weights_loaded` back to `true`, and
-    /// every session on this loaded model shares one inner, so disarming here would
-    /// strip speculative MTP for the life of the process.
+    /// `PREFILL_CANCELLED` error must propagate instead of being masked as a completed
+    /// AR turn. Both arms of `mtp_seed_aborted` leave the head armed and the caches
+    /// clean, so `mtp_seed_failures` is the only thing that tells them apart.
     ///
-    /// MUTATION: routing the cancellation into `mtp_seed_failed_fallback` — the reply
-    /// still rejects, so ONLY the still-armed assertions fail.
+    /// MUTATION: routing the cancellation into `mtp_seed_failed_fallback` — the AR
+    /// fallback re-polls the same flag in its own prefill and still rejects, so ONLY
+    /// the `mtp_seed_failures` assertion fails.
     #[test]
     fn cancelled_prefill_seed_propagates_without_disarming_the_mtp_head() {
         if !compiled_forward_backend_available() {
@@ -3865,9 +3939,10 @@ mod scheduler_tests {
         };
         let mut params = crate::engine::params::extract_chat_params(&config);
         params.enable_mtp = true;
-        assert!(
-            inner.mtp_flat_routing_required(&params, /* streaming */ false),
-            "a sync MTP turn must route to the flat MTP core"
+        assert_eq!(
+            planned_turn(&inner, true, false).decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            "a sync MTP turn must plan the flat MTP core"
         );
 
         let tokens = vec![1u32, 5, 9, 3];
@@ -3905,19 +3980,25 @@ mod scheduler_tests {
             "the cancellation must reach the session layer unmasked"
         );
 
+        assert_eq!(
+            inner.mtp_seed_failures, 0,
+            "a cancellation must never be counted as a seeding failure"
+        );
+
         ChatBackend::set_turn_cancel_flag(&mut inner, None);
         assert!(
             inner.mtp_weights_loaded,
-            "a cancelled turn must NOT disarm the head - nothing ever re-arms it"
+            "a cancelled turn must leave the head armed"
         );
         assert!(inner.has_mtp_weights());
         assert!(
             inner.execution_plan().speculative.is_some(),
             "later turns on this model must still see the speculative plan"
         );
-        assert!(
-            inner.mtp_flat_routing_required(&params, false),
-            "later MTP requests must still route into the MTP core"
+        assert_eq!(
+            planned_turn(&inner, true, false).decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            "later MTP requests must still plan the MTP core"
         );
         assert!(
             inner.pending_mtp_draft_seed.is_none(),

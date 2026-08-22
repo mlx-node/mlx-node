@@ -111,6 +111,19 @@ fn send_error(command: ChatCmd, error: Error) {
     }
 }
 
+impl MuseGlimmerInner {
+    /// Which physical cache layout a command needs before the model-neutral
+    /// planner runs. Only a loaded DFlash drafter needs the flat target
+    /// caches; without one the request resolves to plain paged AR, and
+    /// installing flat caches for it would hide the pools from the planner
+    /// and strand the owner on a layout the next turn cannot continue.
+    pub(crate) fn requires_flat_lane(&self, command: &ChatCmd) -> bool {
+        self.paged.is_none()
+            || (self.dflash.is_some()
+                && chat_config(command).is_some_and(|config| config.enable_mtp == Some(true)))
+    }
+}
+
 impl HybridSchedulerBackend for MuseGlimmerInner {
     type Command = MuseGlimmerCmd;
     type RestoreTicket = NoRestoreTicket;
@@ -320,8 +333,7 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
             return;
         }
         let command = *command;
-        let flat_lane = chat_config(&command).is_some_and(|config| config.enable_mtp == Some(true))
-            || self.paged.is_none();
+        let flat_lane = self.requires_flat_lane(&command);
         let Some(owner) = owner_id(&command).map(str::to_owned) else {
             self.select_ownerless_lane(flat_lane);
             handle_chat_cmd(self, command);

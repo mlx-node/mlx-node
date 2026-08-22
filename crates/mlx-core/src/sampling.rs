@@ -83,9 +83,7 @@ impl SamplerParityMode {
 fn sampler_parity_mode() -> SamplerParityMode {
     static CACHE: OnceLock<SamplerParityMode> = OnceLock::new();
     *CACHE.get_or_init(|| {
-        let raw = std::env::var("MLX_MTP_SAMPLER_PARITY")
-            .or_else(|_| std::env::var("MLX_SAMPLER_PARITY"))
-            .unwrap_or_default();
+        let raw = std::env::var("MLX_MTP_SAMPLER_PARITY").unwrap_or_default();
         match raw.trim().to_ascii_lowercase().as_str() {
             "mtplx" | "mlx-lm" | "mlx_lm" | "temperature-first" | "temperature_first" => {
                 SamplerParityMode::Mtplx
@@ -93,10 +91,6 @@ fn sampler_parity_mode() -> SamplerParityMode {
             _ => SamplerParityMode::Current,
         }
     })
-}
-
-pub(crate) fn sampler_parity_is_mtplx() -> bool {
-    sampler_parity_mode() == SamplerParityMode::Mtplx
 }
 
 /// Owned sparse probability distribution used by stochastic MTP acceptance.
@@ -137,38 +131,6 @@ impl SparseDistribution {
 }
 
 impl SparseDistributionRows {
-    pub(crate) fn validate_for_accept(
-        &self,
-        expected_rows: usize,
-        expected_vocab_size: usize,
-        config: &SamplingConfig,
-    ) -> Result<()> {
-        let top_k = config.top_k.unwrap_or(0);
-        let expected_width = usize::min(top_k.max(0) as usize, expected_vocab_size);
-        if self.rows < expected_rows
-            || self.width != expected_width
-            || self.vocab_size != expected_vocab_size
-        {
-            return Err(Error::new(
-                Status::InvalidArg,
-                format!(
-                    "precomputed sparse target rows mismatch: rows={} width={} vocab={} expected rows>={} width={} vocab={}",
-                    self.rows,
-                    self.width,
-                    self.vocab_size,
-                    expected_rows,
-                    expected_width,
-                    expected_vocab_size
-                ),
-            ));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn vocab_size(&self) -> usize {
-        self.vocab_size
-    }
-
     pub(crate) fn row(&self, row: usize) -> Result<SparseDistributionRef<'_>> {
         if row >= self.rows {
             return Err(Error::new(

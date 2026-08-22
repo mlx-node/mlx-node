@@ -20,6 +20,7 @@ use crate::engine::plan::{
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::ModelThread;
 use crate::model_thread::ResponseTx;
+use crate::models::gemma4::dspark::DsparkTap;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::gemma4::model::Gemma4KVCacheCoordinator;
 use crate::models::gemma4::quantized_linear::LinearProj;
@@ -74,6 +75,43 @@ pub(crate) struct MusePagedRuntime {
     pub(crate) routes: Vec<LayerKVCacheRoute>,
     pub(crate) prefill_windows: Vec<PagedWindowSlot>,
     pub(crate) decode_windows: Vec<PagedWindowSlot>,
+}
+
+/// Settle basis for one [`MuseGlimmerInner::run_paged_layer_loop`] call. This
+/// family's per-step settle (pending-write eval, cold-checkpoint rung walk,
+/// sliding prune) is inlined at the tail of the unified loop rather than run
+/// by its callers, so the basis has to travel as a parameter.
+///
+/// Of the two durable halves, only one is unlawful while a speculative
+/// verify write is pending. The committed-basis PRUNE is safe by itself: its
+/// cutoff trails the committed frontier, so it can never null a block a
+/// rollback returns the live window into (L-SETTLE, `engine::spec_paged`).
+/// The rung walk is not — a captured cold checkpoint is durable and no
+/// rollback retracts it. Both run under [`Self::Committed`] here, so that
+/// basis is this family's POST-COMMIT settle, and a chunk written inside an
+/// open verify cycle takes [`Self::Suppressed`] instead (I9).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum MusePagedSettle {
+    /// Settle at the write cursor — every recorded token is committed (the
+    /// autoregressive shape; every existing caller).
+    Cursor,
+    /// Settle at the COMMITTED frontier: the rung walk refuses any anchor
+    /// past this length and the sliding prune routes through the
+    /// committed-cutoff variant. A frontier past the cursor is clamped by
+    /// the rung walk and refused by the prune — the committed frontier
+    /// trails the cursor by definition.
+    ///
+    /// Still carries the rung walk, so this is the settle a speculative
+    /// owner runs once the commit has landed, never inside its cycle.
+    #[allow(dead_code)]
+    Committed(u32),
+    /// No settle: pending pool writes are still evaluated (a compute flush,
+    /// not a durable action), but no rung is captured and nothing is pruned
+    /// — the shape of a verify write whose rows a commit may still retract;
+    /// the owner settles post-commit at the committed frontier. The only
+    /// mode lawful inside an open verify cycle.
+    #[allow(dead_code)]
+    Suppressed,
 }
 
 /// Trained and physically available active-context limits for one loaded
@@ -473,6 +511,23 @@ impl MuseGlimmerInner {
     }
 
     pub(crate) fn remember_sliding_cold_checkpoints(&mut self, seq_id: SeqId) -> Result<()> {
+        self.remember_sliding_cold_checkpoints_at_frontier(seq_id, None)
+    }
+
+    /// [`Self::remember_sliding_cold_checkpoints`] with the rung walk capped
+    /// at a COMMITTED frontier. `None` keeps the write-cursor basis (every
+    /// recorded token is committed — the autoregressive shape);
+    /// `Some(committed)` refuses any rung past the committed length so a
+    /// durable checkpoint can never capture rows a speculative rollback may
+    /// still retract (I3/I9). The comparison stays inclusive at the frontier
+    /// on both bases — a rung landing exactly on it is exactly the boundary a
+    /// settle is entitled to capture. A committed frontier past the cursor is
+    /// clamped to it — the committed frontier trails the cursor by definition.
+    fn remember_sliding_cold_checkpoints_at_frontier(
+        &mut self,
+        seq_id: SeqId,
+        committed_tokens: Option<u32>,
+    ) -> Result<()> {
         let candidates = {
             let Some(paged) = self.paged.as_ref() else {
                 return Ok(());
@@ -485,13 +540,14 @@ impl MuseGlimmerInner {
             let Some(recorded) = full.current_token_count_for(seq_id) else {
                 return Ok(());
             };
+            let frontier = committed_tokens.map_or(recorded, |committed| committed.min(recorded));
             let Some(tokens) = full.request_tokens_for(seq_id) else {
                 return Ok(());
             };
             anchors
                 .iter()
                 .copied()
-                .filter(|boundary| *boundary <= recorded)
+                .filter(|boundary| *boundary <= frontier)
                 .filter_map(|boundary| {
                     tokens
                         .get(..boundary as usize)
@@ -787,12 +843,15 @@ impl MuseGlimmerInner {
         tokens: &[u32],
         first_logical_position: u32,
         is_prefill: bool,
+        settle: MusePagedSettle,
+        mut tap: Option<&mut DsparkTap<'_>>,
     ) -> Result<MxArray> {
         if tokens.is_empty() {
             return Err(Error::from_reason(
                 "Muse-Glimmer paged forward requires at least one token",
             ));
         }
+        validate_paged_tap_layer_ids(tap.as_deref(), self.layers.len())?;
         self.paged
             .as_mut()
             .ok_or_else(|| Error::from_reason("Muse-Glimmer paged runtime is unavailable"))?
@@ -842,22 +901,47 @@ impl MuseGlimmerInner {
                 is_prefill,
                 window,
             )?;
+            // Residual-stream hidden of layer `index` (post residual add, pre
+            // final-norm) — the same capture point as `forward_with_taps_mode`;
+            // the compute graph is otherwise unchanged.
+            if let Some(t) = tap.as_deref_mut()
+                && t.layer_ids.contains(&index)
+            {
+                t.captured.push(hidden.clone());
+            }
             crate::array::maybe_eval_clear_for_paged_prefill_layer(index, &hidden)?;
         }
+        self.settle_paged_kv_step(self.active_paged_seq, settle)?;
+        Ok(hidden)
+    }
+
+    /// The per-step KV settle at the tail of [`Self::run_paged_layer_loop`]:
+    /// evaluate pending pool writes, then — unless suppressed — capture cold
+    /// checkpoint rungs and prune the sliding groups at the settle basis.
+    fn settle_paged_kv_step(&mut self, seq_id: SeqId, settle: MusePagedSettle) -> Result<()> {
         self.paged
             .as_mut()
-            .expect("checked Muse paged runtime")
+            .ok_or_else(|| Error::from_reason("Muse-Glimmer paged runtime is unavailable"))?
             .coordinator
             .eval_pending_pool_writes_all()
             .map_err(Error::from_reason)?;
-        self.remember_sliding_cold_checkpoints(self.active_paged_seq)?;
-        self.paged
+        let committed_tokens = match settle {
+            MusePagedSettle::Suppressed => return Ok(()),
+            MusePagedSettle::Cursor => None,
+            MusePagedSettle::Committed(tokens) => Some(tokens),
+        };
+        self.remember_sliding_cold_checkpoints_at_frontier(seq_id, committed_tokens)?;
+        let coordinator = &mut self
+            .paged
             .as_mut()
-            .expect("checked Muse paged runtime")
-            .coordinator
-            .prune_sliding_all(self.active_paged_seq)
-            .map_err(Error::from_reason)?;
-        Ok(hidden)
+            .ok_or_else(|| Error::from_reason("Muse-Glimmer paged runtime is unavailable"))?
+            .coordinator;
+        match committed_tokens {
+            None => coordinator.prune_sliding_all(seq_id),
+            Some(committed) => coordinator.prune_sliding_all_committed(seq_id, committed),
+        }
+        .map(|_| ())
+        .map_err(Error::from_reason)
     }
 
     fn run_paged_prefill_slice(
@@ -865,7 +949,13 @@ impl MuseGlimmerInner {
         tokens: &[u32],
         first_logical_position: u32,
     ) -> Result<MxArray> {
-        let hidden = self.run_paged_layer_loop(tokens, first_logical_position, true)?;
+        let hidden = self.run_paged_layer_loop(
+            tokens,
+            first_logical_position,
+            true,
+            MusePagedSettle::Cursor,
+            None,
+        )?;
         self.project_logits(&hidden, true)?.squeeze(Some(&[0, 1]))
     }
 
@@ -878,7 +968,8 @@ impl MuseGlimmerInner {
             .coordinator
             .request_token_count_all(seq_id)
             .map_err(Error::from_reason)?;
-        let hidden = self.run_paged_layer_loop(&[token], position, false)?;
+        let hidden =
+            self.run_paged_layer_loop(&[token], position, false, MusePagedSettle::Cursor, None)?;
         self.project_logits(&hidden, false)
     }
 
@@ -965,6 +1056,29 @@ impl MuseGlimmerInner {
             self.project_logits(&hidden, false)
         }
     }
+}
+
+/// The paged layer loop's twin of `forward_with_taps_mode`'s capture
+/// contract, validated up front: capture order is push-in-loop, so
+/// `layer_ids` must be strictly ascending decoder indices below the layer
+/// count. Runs before the loop records the chunk, so a bad tap changes no
+/// cache state.
+fn validate_paged_tap_layer_ids(tap: Option<&DsparkTap<'_>>, num_layers: usize) -> Result<()> {
+    let Some(t) = tap else {
+        return Ok(());
+    };
+    let mut previous: Option<usize> = None;
+    for &id in t.layer_ids {
+        if id >= num_layers || previous.is_some_and(|prev| id <= prev) {
+            return Err(Error::from_reason(format!(
+                "Muse-Glimmer paged layer loop: tap layer_ids {:?} must be strictly ascending \
+                 decoder indices below {num_layers}",
+                t.layer_ids
+            )));
+        }
+        previous = Some(id);
+    }
+    Ok(())
 }
 
 pub(crate) struct MusePagedDecode<'a> {
@@ -1495,6 +1609,7 @@ impl ChatBackend for MuseGlimmerInner {
                 supported_input_media: crate::engine::plan::MediaCapabilities::NONE,
                 supported_context_media: crate::engine::plan::MediaCapabilities::NONE,
                 supports_paged_attention: false,
+                supports_streaming: true,
             }),
         }
     }
@@ -1587,4 +1702,564 @@ crate::models::chat_napi::chat_napi_surface! {
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
     ts_stream_continue: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
     ts_stream_continue_tool: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+}
+
+#[cfg(test)]
+mod spec_paged_settle_tests {
+    //! T-D0.4 gating tests: the settle-basis parameter on the unified paged
+    //! layer loop and its tap surface — every one behavior-neutral for the
+    //! autoregressive lane, whose callers stay on `MusePagedSettle::Cursor`.
+
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use super::super::kv_cache::{compute_layer_kv_cache_groups, compute_layer_kv_cache_specs};
+    use super::super::output_parser::SPEC_JSON;
+    use super::*;
+    use crate::transformer::AttentionKind;
+    use crate::transformer::KVCacheDType;
+    use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
+
+    const BLOCK_SIZE: u32 = 8;
+
+    /// Tiny hybrid config the validator accepts: window 16 over block size 8
+    /// keeps prune activity inside a ~40-token schedule, and the sliding
+    /// layer count / kv geometry satisfy the sidecar policy so the rung walk
+    /// actually captures. Head size 32 is the pool minimum.
+    fn tiny_paged_config() -> MuseGlimmerConfig {
+        MuseGlimmerConfig::from_json_str(
+            r#"{"model_type":"muse_glimmer","image_token_id":60,
+                "video_token_id":61,"out_hidden_size":8,
+                "projector_hidden_size":8,"projector_hidden_act":"gelu",
+                "text_config":{
+                  "model_type":"muse_glimmer_text",
+                  "hidden_size":8,"intermediate_size":16,
+                  "num_hidden_layers":4,
+                  "num_attention_heads":2,"num_key_value_heads":1,"head_dim":32,
+                  "vocab_size":64,"sliding_window":16,
+                  "max_position_embeddings":256,
+                  "rms_norm_eps":1e-5,"post_norm_eps":1e-8,
+                  "qk_scale_factor":1.0,"output_multiplier":1.0,
+                  "final_logit_softcapping":20.0,
+                  "tie_word_embeddings":true,
+                  "layer_types":["sliding_attention","full_attention",
+                                 "sliding_attention","full_attention"],
+                  "layer_rope_theta":[500000.0,0,500000.0,0]},
+                "vision_config":{"model_type":"muse_glimmer_vision",
+                  "hidden_size":1536,"num_hidden_layers":50,
+                  "intermediate_size":8960,"num_attention_heads":16,
+                  "patch_size":14,"merge_size":2,"patch_temporal":2,
+                  "pos_emb_height":32,"pos_emb_width":32,
+                  "layer_norm_eps":1e-5}}"#,
+        )
+        .expect("tiny paged Muse-Glimmer config must validate")
+    }
+
+    /// Placeholder pool sized to the allocator, or `None` (skip) without a
+    /// Metal device — the `paged_kv_cache_adapter` test-shim pattern.
+    fn maybe_test_pool(num_blocks: u32) -> Option<Arc<mlx_paged_attn::LayerKVPool>> {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: BLOCK_SIZE,
+            num_kv_heads: 1,
+            head_size: 32,
+            num_layers: 2,
+            ..mlx_paged_attn::PagedAttentionConfig::default()
+        };
+        match mlx_paged_attn::LayerKVPool::new_for_test(
+            cfg,
+            num_blocks,
+            2,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(pool) => Some(Arc::new(pool)),
+            Err(error) if error.contains("No Metal device found") => None,
+            Err(error) => panic!("unexpected new_for_test failure: {error}"),
+        }
+    }
+
+    /// Real grouped runtime over the tiny config (group 0 full, group 1
+    /// sliding — the grouping contract). Returns `None` (skip) without Metal.
+    fn maybe_paged_runtime(config: &MuseGlimmerConfig) -> Option<MusePagedRuntime> {
+        let specs = compute_layer_kv_cache_specs(config, BLOCK_SIZE, KVCacheDType::BFloat16)
+            .expect("tiny specs must build");
+        let groups = compute_layer_kv_cache_groups(config, BLOCK_SIZE, KVCacheDType::BFloat16, 512)
+            .expect("tiny groups must build");
+        let mut adapters = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+                64, BLOCK_SIZE,
+            )));
+            let pool = maybe_test_pool(64)?;
+            let adapter = match group.attention_kind {
+                AttentionKind::Full => PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE),
+                AttentionKind::SlidingWindow { sliding_window } => {
+                    PagedKVCacheAdapter::new_sliding(
+                        allocator,
+                        pool,
+                        BLOCK_SIZE,
+                        sliding_window,
+                        256,
+                    )
+                }
+            }
+            .expect("tiny adapter must construct");
+            adapters.push(adapter);
+        }
+        let coordinator = Gemma4KVCacheCoordinator::new(&specs, groups, adapters, 4)
+            .expect("tiny coordinator must construct");
+        let routes = coordinator.routes().to_vec();
+        Some(MusePagedRuntime {
+            coordinator,
+            routes,
+            prefill_windows: Vec::new(),
+            decode_windows: Vec::new(),
+        })
+    }
+
+    /// Weightless inner whose settle path is fully real: the layer vec is
+    /// empty (the settle never runs a layer forward), everything the settle
+    /// consumes — coordinator, config geometry, checkpoint map — is the
+    /// production state.
+    fn maybe_tiny_inner() -> Option<MuseGlimmerInner> {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return None;
+        }
+        let config = tiny_paged_config();
+        let paged = maybe_paged_runtime(&config)?;
+        Some(MuseGlimmerInner {
+            embed_tokens: Embedding::new(
+                config.text_config.vocab_size as u32,
+                config.text_config.hidden_size as u32,
+            )
+            .expect("tiny embedding"),
+            final_norm: RMSNorm::new(
+                config.text_config.hidden_size as u32,
+                Some(config.text_config.rms_norm_eps as f64),
+            )
+            .expect("tiny final norm"),
+            config,
+            layers: Vec::new(),
+            lm_head: None,
+            caches: Vec::new(),
+            tokenizer: None,
+            response_template: Arc::new(
+                ResponseTemplate::from_tokenizer_config_str(SPEC_JSON)
+                    .expect("spec template must compile"),
+            ),
+            cached_token_history: Vec::new(),
+            turn_cancel: None,
+            gen_defaults: crate::engine::ModelGenerationDefaults::default(),
+            dflash: None,
+            dflash_turn_state: None,
+            dflash_context: None,
+            paged: Some(paged),
+            row_exact_decode_projections: false,
+            active_paged_seq: 0,
+            active_flat_session: false,
+            sliding_cold_checkpoints: HashMap::new(),
+        })
+    }
+
+    /// Cache-lane selection and the engine planner must agree about an
+    /// `enable_mtp` command on a checkpoint with NO DFlash drafter: the plan
+    /// is plain paged autoregressive, so the barrier must leave the pools
+    /// visible instead of installing flat caches the next turn cannot
+    /// continue from.
+    ///
+    /// MUTATION: drop the `self.dflash.is_some()` conjunct from
+    /// `requires_flat_lane` — the first assertion fails while the planner
+    /// still reports paged AR, which is exactly the split this pins shut.
+    #[test]
+    fn a_drafterless_enable_mtp_command_keeps_the_paged_cache_lane() {
+        let Some(inner) = maybe_tiny_inner() else {
+            eprintln!("skipping (no Metal backend)");
+            return;
+        };
+        assert!(
+            inner.dflash.is_none(),
+            "fixture must carry no DFlash drafter"
+        );
+        assert!(inner.paged.is_some(), "fixture must own the paged pools");
+
+        let (reply, _result) = tokio::sync::oneshot::channel();
+        let command = ChatCmd::SessionStart {
+            messages: Vec::new(),
+            config: ChatConfig {
+                enable_mtp: Some(true),
+                ..ChatConfig::default()
+            },
+            reply,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(
+            !inner.requires_flat_lane(&command),
+            "with no drafter loaded there is nothing the flat target caches would serve"
+        );
+
+        let plan = crate::engine::plan::TurnPlan::resolve(
+            ChatBackend::execution_plan(&inner),
+            crate::engine::plan::TurnRequest {
+                is_delta: false,
+                input_media: crate::engine::plan::MediaCapabilities::NONE,
+                context_media: crate::engine::plan::MediaCapabilities::NONE,
+                speculative_requested: true,
+                streaming: false,
+            },
+        );
+        assert_eq!(
+            plan.decoder,
+            crate::engine::plan::DecoderPlan::Autoregressive
+        );
+        assert_eq!(
+            plan.path(),
+            crate::engine::plan::TurnPath::Paged,
+            "the lane the barrier selects must be the lane the planner names"
+        );
+    }
+
+    /// A real sliding cold tier at a temp dir, so the rung walk actually
+    /// captures — an empty-ladder run would compare nothing.
+    fn attach_cold_tier(inner: &mut MuseGlimmerInner, root: &std::path::Path) {
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.to_path_buf())
+            .expect("temp-dir cold cache must open");
+        let policy = super::super::cold_sidecar::policy(&inner.config)
+            .expect("tiny geometry must yield a sliding sidecar policy");
+        inner
+            .paged
+            .as_mut()
+            .expect("tiny paged runtime")
+            .coordinator
+            .full_adapter_mut()
+            .set_cold_tier(ColdTierContext {
+                manager: Arc::new(manager),
+                fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                    b"muse-spec-paged-settle".as_slice(),
+                ]),
+                sidecar_policy: Some(policy),
+            });
+    }
+
+    fn group_count(inner: &MuseGlimmerInner) -> usize {
+        inner
+            .paged
+            .as_ref()
+            .expect("tiny paged runtime")
+            .routes
+            .iter()
+            .map(|route| route.group_id + 1)
+            .max()
+            .expect("tiny routes must be non-empty")
+    }
+
+    fn block_ids_per_group(inner: &MuseGlimmerInner, seq_id: SeqId) -> Vec<Vec<u32>> {
+        let coordinator = &inner
+            .paged
+            .as_ref()
+            .expect("tiny paged runtime")
+            .coordinator;
+        (0..group_count(inner))
+            .map(|group_id| {
+                coordinator
+                    .adapter(group_id)
+                    .expect("group adapter")
+                    .block_table_for(seq_id)
+                    .expect("block table")
+                    .blocks()
+                    .iter()
+                    .map(|block| block.block_id)
+                    .collect()
+            })
+            .collect()
+    }
+
+    fn captured_rungs(inner: &MuseGlimmerInner, seq_id: SeqId) -> Vec<(u32, Vec<u32>)> {
+        inner
+            .sliding_cold_checkpoints
+            .get(&seq_id)
+            .map(|checkpoints| {
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| (checkpoint.boundary, checkpoint.tokens.clone()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One sequence's full settle trace: per-settle block-id snapshots for
+    /// every group, the cursor at each settle, and the captured cold rungs.
+    struct SettleTrace {
+        step_block_ids: Vec<Vec<Vec<u32>>>,
+        cursors: Vec<u32>,
+        rungs: Vec<(u32, Vec<u32>)>,
+    }
+
+    /// Chunks of 3 keep the prune cutoff off block alignment; the final
+    /// 5-chunk lands the LAST settle exactly on the 32-token anchor rung, so
+    /// an exclusive frontier comparison has no later settle to hide behind.
+    const SCHEDULE: [u32; 10] = [3, 3, 3, 3, 3, 3, 3, 3, 3, 5];
+
+    fn drive_settles(
+        inner: &mut MuseGlimmerInner,
+        seq_id: SeqId,
+        committed_basis: bool,
+    ) -> SettleTrace {
+        inner
+            .paged
+            .as_mut()
+            .expect("tiny paged runtime")
+            .coordinator
+            .reset_scheduled_request(seq_id)
+            .expect("reset");
+        inner.set_active_paged_owner(seq_id);
+        let mut next_token = 0u32;
+        let mut step_block_ids = Vec::new();
+        let mut cursors = Vec::new();
+        for chunk_len in SCHEDULE {
+            let tokens: Vec<u32> = (next_token..next_token + chunk_len).collect();
+            let first_position = next_token;
+            next_token += chunk_len;
+            let settle = if committed_basis {
+                MusePagedSettle::Committed(next_token)
+            } else {
+                MusePagedSettle::Cursor
+            };
+            inner
+                .run_paged_layer_loop(&tokens, first_position, true, settle, None)
+                .expect("paged layer loop");
+            let cursor = inner
+                .paged
+                .as_ref()
+                .expect("tiny paged runtime")
+                .coordinator
+                .full_adapter()
+                .current_token_count_for(seq_id)
+                .expect("cursor");
+            cursors.push(cursor);
+            step_block_ids.push(block_ids_per_group(inner, seq_id));
+        }
+        let rungs = captured_rungs(inner, seq_id);
+        inner.release_paged_request(seq_id).expect("release");
+        SettleTrace {
+            step_block_ids,
+            cursors,
+            rungs,
+        }
+    }
+
+    /// Per-step nulled-position patterns for one trace: a position is nulled
+    /// iff its block id equals the trace-final id of position 0 (the shared
+    /// null sentinel once the window has passed block 0; the sentinel block
+    /// is adapter-owned and never freed, so no live block can alias it).
+    fn null_patterns(trace: &SettleTrace) -> Vec<Vec<Vec<bool>>> {
+        let final_step = trace.step_block_ids.last().expect("at least one settle");
+        let null_ids: Vec<u32> = final_step.iter().map(|ids| ids[0]).collect();
+        trace
+            .step_block_ids
+            .iter()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .zip(&null_ids)
+                    .map(|(ids, &null_id)| ids.iter().map(|&id| id == null_id).collect())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// When committed == cursor (every autoregressive step), the
+    /// committed-basis settle must be indistinguishable from the cursor-basis
+    /// settle: bit-equal nulled-block sets in every group at every step, and
+    /// identical captured checkpoint rungs — including the rung the last
+    /// settle lands on exactly. Mutation this catches: the loop's settle
+    /// parameterization changing autoregressive behavior (either basis arm
+    /// drifting by even one token moves a retirement boundary or drops the
+    /// on-frontier rung).
+    #[test]
+    fn settle_at_committed_equals_cursor_when_equal() {
+        let Some(mut inner) = maybe_tiny_inner() else {
+            eprintln!("skipping settle_at_committed_equals_cursor_when_equal: Metal unavailable");
+            return;
+        };
+        let root =
+            std::env::temp_dir().join(format!("mlx-muse-spec-paged-settle-{}", std::process::id()));
+        attach_cold_tier(&mut inner, &root);
+
+        let cursor_trace = drive_settles(&mut inner, 21, false);
+        let committed_trace = drive_settles(&mut inner, 22, true);
+
+        assert_eq!(cursor_trace.cursors, committed_trace.cursors);
+        assert_eq!(
+            null_patterns(&cursor_trace),
+            null_patterns(&committed_trace),
+            "committed == cursor must null bit-equal block sets in every group at every settle"
+        );
+
+        // Non-vacuity: the window actually retired blocks...
+        let final_patterns = null_patterns(&cursor_trace);
+        let final_step = final_patterns.last().expect("final settle");
+        assert!(
+            final_step
+                .iter()
+                .any(|pattern| pattern.iter().filter(|&&nulled| nulled).count() >= 2),
+            "the schedule must drive at least two blocks out of the sliding window"
+        );
+        // ...and both bases captured the same rung ladder, ending on the rung
+        // the final settle lands on exactly.
+        let expected_rungs = vec![
+            (8u32, (0..8).collect::<Vec<u32>>()),
+            (32u32, (0..32).collect::<Vec<u32>>()),
+        ];
+        assert_eq!(
+            cursor_trace.rungs, expected_rungs,
+            "the cursor-basis settle must capture the rung landing exactly on the frontier"
+        );
+        assert_eq!(
+            committed_trace.rungs, expected_rungs,
+            "the committed-basis settle must capture the same rungs at committed == cursor"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A suppressed settle must defer BOTH durable actions — no rung capture,
+    /// no sliding prune — until the owner settles at the committed frontier
+    /// (I9), at which point the deferred settle prunes and captures what is
+    /// still within the sliding read window. Mutation this catches: the
+    /// `Suppressed` arm falling through to either settling basis.
+    #[test]
+    fn suppressed_settle_defers_prune_and_checkpoints_to_the_committed_settle() {
+        let Some(mut inner) = maybe_tiny_inner() else {
+            eprintln!(
+                "skipping suppressed_settle_defers_prune_and_checkpoints_to_the_committed_settle: \
+                 Metal unavailable"
+            );
+            return;
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-muse-spec-paged-suppress-{}",
+            std::process::id()
+        ));
+        attach_cold_tier(&mut inner, &root);
+
+        let seq_id = 31;
+        inner
+            .paged
+            .as_mut()
+            .expect("tiny paged runtime")
+            .coordinator
+            .reset_scheduled_request(seq_id)
+            .expect("reset");
+        inner.set_active_paged_owner(seq_id);
+        let mut next_token = 0u32;
+        for chunk_len in SCHEDULE {
+            let tokens: Vec<u32> = (next_token..next_token + chunk_len).collect();
+            let first_position = next_token;
+            next_token += chunk_len;
+            inner
+                .run_paged_layer_loop(
+                    &tokens,
+                    first_position,
+                    true,
+                    MusePagedSettle::Suppressed,
+                    None,
+                )
+                .expect("suppressed paged layer loop");
+        }
+        assert_eq!(
+            captured_rungs(&inner, seq_id),
+            Vec::new(),
+            "a suppressed settle must capture no checkpoint rungs"
+        );
+        for (group_id, ids) in block_ids_per_group(&inner, seq_id).into_iter().enumerate() {
+            let mut unique = ids.clone();
+            unique.sort_unstable();
+            unique.dedup();
+            assert_eq!(
+                unique.len(),
+                ids.len(),
+                "a suppressed settle must prune nothing in group {group_id} (no null aliasing)"
+            );
+        }
+
+        // The deferred committed settle prunes and captures. The 8-token rung
+        // is past its sliding read window by now (deferring until commit
+        // forfeits it — acceptance-lossy, never correctness); the 32 rung is
+        // exactly the committed frontier and must be captured.
+        inner
+            .settle_paged_kv_step(seq_id, MusePagedSettle::Committed(next_token))
+            .expect("deferred committed settle");
+        assert_eq!(
+            captured_rungs(&inner, seq_id),
+            vec![(32u32, (0..32).collect::<Vec<u32>>())],
+            "the deferred settle must capture the on-frontier rung"
+        );
+        let sliding_ids = block_ids_per_group(&inner, seq_id)
+            .pop()
+            .expect("sliding group");
+        assert_eq!(
+            sliding_ids[0], sliding_ids[1],
+            "the deferred settle must null the blocks the window has passed"
+        );
+
+        inner.release_paged_request(seq_id).expect("release");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The tap contract is validated before the loop records the chunk, so a
+    /// bad tap changes no cache state. Mutation this catches: dropping the
+    /// validation call from the loop head.
+    #[test]
+    fn paged_loop_rejects_bad_tap_ids_before_recording() {
+        let Some(mut inner) = maybe_tiny_inner() else {
+            eprintln!(
+                "skipping paged_loop_rejects_bad_tap_ids_before_recording: Metal unavailable"
+            );
+            return;
+        };
+        let seq_id = 41;
+        inner
+            .paged
+            .as_mut()
+            .expect("tiny paged runtime")
+            .coordinator
+            .reset_scheduled_request(seq_id)
+            .expect("reset");
+        inner.set_active_paged_owner(seq_id);
+        let layer_ids = [0usize];
+        let mut tap = DsparkTap::new(&layer_ids);
+        assert!(
+            inner
+                .run_paged_layer_loop(&[1, 2], 0, true, MusePagedSettle::Cursor, Some(&mut tap))
+                .is_err(),
+            "tap ids at or past the layer count must be rejected"
+        );
+        assert_eq!(
+            inner
+                .paged
+                .as_ref()
+                .expect("tiny paged runtime")
+                .coordinator
+                .request_token_count_all(seq_id)
+                .expect("token count"),
+            0,
+            "a rejected tap must not record the chunk"
+        );
+        inner.release_paged_request(seq_id).expect("release");
+    }
+
+    /// The pure half of the tap contract: strictly ascending decoder indices
+    /// below the layer count, `None` always valid.
+    #[test]
+    fn paged_tap_layer_ids_must_be_strictly_ascending_and_in_range() {
+        let check = |ids: &[usize], num_layers: usize| {
+            let tap = DsparkTap::new(ids);
+            validate_paged_tap_layer_ids(Some(&tap), num_layers).is_ok()
+        };
+        assert!(validate_paged_tap_layer_ids(None, 0).is_ok());
+        assert!(check(&[], 0));
+        assert!(check(&[0, 2, 3], 4));
+        assert!(!check(&[2, 0], 4), "descending ids must be rejected");
+        assert!(!check(&[1, 1], 4), "duplicate ids must be rejected");
+        assert!(!check(&[4], 4), "an id at the layer count must be rejected");
+    }
 }

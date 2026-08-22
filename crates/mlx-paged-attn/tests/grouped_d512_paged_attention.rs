@@ -1036,9 +1036,7 @@ fn grouped_d512_hq16_hkv2_alternating_benchmark() {
     eprintln!(
         "D512 Hq16/Hkv2 raw benchmark: warmups={WARMUPS}, iterations={ITERATIONS}, \
          stripe_override={}",
-        std::env::var("MLX_PAGED_GROUPED_D512_STRIPES")
-            .or_else(|_| std::env::var("MLX_PAGED_GROUPED_GEMMA4_STRIPES"))
-            .unwrap_or_else(|_| "default".to_string())
+        std::env::var("MLX_PAGED_GROUPED_D512_STRIPES").unwrap_or_else(|_| "default".to_string())
     );
     for context_len in [4_096, 16_384, 32_768, 65_536, 91_765, 112_000] {
         let (grouped_ms, generic_ms) =

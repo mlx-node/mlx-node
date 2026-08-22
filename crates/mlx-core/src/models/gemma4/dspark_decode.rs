@@ -1,22 +1,28 @@
 //! Gemma4 draft speculative-decode wiring: the family-side
 //! [`DsparkStepper`]/[`DsparkBackend`] implementation the engine-owned
-//! [`crate::engine::dspark_turn::run_dspark_turn`] loop drives, plus the
-//! variant-generic whole-turn core (`draft_chat_turn`) behind gemma4's
-//! `ChatBackend::run_speculative_turn` executor.
+//! [`crate::engine::dspark_turn::run_dspark_turn`] loop drives.
+//!
+//! The two drafts run on DIFFERENT physical target caches. DSpark verifies a
+//! block against the target's PAGED pools through
+//! [`crate::engine::spec_paged::SpecPagedCache`], so its turns are driven by
+//! [`crate::engine::dspark_turn::run_paged_dspark_turn`] and share the paged
+//! epilogue. The assistant drafter's Q-only attention reads the target's flat
+//! [`super::layer_cache::Gemma4LayerCache`] K/V arrays directly, which the
+//! pools cannot hand it, so it keeps the flat whole-turn core
+//! (`flat_draft_chat_turn`) — the only remaining caller of that path.
 //!
 //! Split of responsibilities:
 //!   * the DSpark DRAFT model (5-layer cross-attending transformer, markov
 //!     head, confidence head, context K/V cache) lives in [`super::dspark`];
 //!     the assistant draft + its stepper live in [`super::assistant`] /
 //!     [`super::assistant_decode`];
-//!   * the TARGET-side primitives (hidden tap, verify forward,
-//!     snapshot/commit rollback, shared-slot mask) live in
-//!     [`super::model`] / [`super::layer_cache`];
+//!   * the TARGET-side primitives (hidden tap, verify forward, shared-slot
+//!     mask) live in [`super::model`] / [`super::layer_cache`];
 //!   * the model-agnostic propose → verify → accept → stop-clamp → commit
 //!     loop lives in [`crate::engine::dspark_turn`];
 //!   * THIS module glues them together for gemma4: the DSpark stepper, the
 //!     variant dispatch ([`Gemma4DraftTurnState`] / [`Gemma4DraftStepper`] /
-//!     `begin_dspark_decode`), and the whole-turn core.
+//!     `begin_dspark_decode`), and the flat whole-turn core.
 
 use std::time::Instant;
 
@@ -26,22 +32,22 @@ use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     ChatBackend, DsparkBackend, DsparkProposal, DsparkStepper, DsparkVerifyOutput, FinalizeArgs,
-    ResetScope, StreamEmitter, TurnOutput, WholeTurnArgs,
+    ResetScope, SpecFrontier, StreamEmitter, TurnOutput, WholeTurnArgs,
 };
 use crate::engine::decode::StreamingCtx;
-use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
+use crate::engine::dspark_turn::{DsparkTurnArgs, PagedDsparkBackend, run_dspark_turn};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
+use crate::engine::spec_paged::{SpecPagedCache, VerifyTicket};
 use crate::stream::{DeviceType, Stream, StreamContext};
 
 use super::assistant_decode::{AssistantTurnState, Gemma4AssistantStepper};
+use super::decoder_layer::Gemma4LayerKind;
 use super::dspark::{DsparkContextCache, DsparkTap, truncate_by_confidence};
-use super::layer_cache::{Gemma4VerifyRollback, commit_after_verify, snapshot_before_verify};
 use super::model::{
-    GEMMA4_PREFILL_STEP_SIZE, Gemma4Draft, Gemma4Inner, assistant_kv_source_indices, compute_ple,
-    dspark_shared_slot_mask, dspark_verify_forward, eval_gemma4_caches, forward_body,
-    forward_inner,
+    Gemma4Draft, Gemma4DsparkPrefillTap, Gemma4Inner, Gemma4SpecPagedCache,
+    assistant_kv_source_indices, dspark_shared_slot_mask, eval_gemma4_caches, forward_inner,
 };
 
 /// Per-turn draft handoff from the whole-turn core's prefill to
@@ -60,8 +66,8 @@ pub(crate) enum Gemma4DraftTurnState {
 }
 
 /// DSpark's [`Gemma4DraftTurnState`] payload: the draft's fused-context
-/// cache built by the whole-turn core's tapped prefill
-/// (`dspark_prefill_with_tap`).
+/// cache built by `paged_prefill_with_draft_state`, which taps the target's
+/// paged prefill walk.
 pub(crate) struct DsparkTurnState {
     /// The draft's fused-context K/V cache, holding one row per freshly
     /// prefilled prompt token (absolute positions
@@ -86,39 +92,51 @@ fn dspark_confidence_threshold_from_env() -> f32 {
 /// Per-turn gemma4 DSpark stepper ([`DsparkBackend::DsparkDecode`]).
 ///
 /// Owns the turn's draft context cache and position cursor; borrows the
-/// model for the whole decode loop. The tapped target hiddens and the
-/// verify rollback are stashed between `verify` and `commit` — they never
-/// cross the engine trait (see the invariant on [`DsparkStepper`]).
+/// model for the whole decode loop. Every TARGET-side touch goes through
+/// [`Gemma4SpecPagedCache`], so one cycle is that facade's checked
+/// transaction: reserve the lookahead region, `record_verify` the block,
+/// run the tapped layer loop over the rows it recorded, `commit_cycle` the
+/// accepted prefix, then settle at the COMMITTED frontier — never inside
+/// the open cycle and never at the write cursor (L-SETTLE).
+///
+/// The facade performs the verify WRITE (`record_verify`) rather than the
+/// core, because gemma4's paged layer loop requires its rows to be recorded
+/// first: `PagedKVCacheAdapter::update_keys_values` rejects a chunk whose
+/// `first_logical_position` is not `current_token_count - chunk_len`.
+///
+/// The tapped target hiddens and the open cycle's ticket are stashed
+/// between `verify` and `commit` — they never cross the engine trait (see
+/// the invariant on [`DsparkStepper`]).
 pub(crate) struct Gemma4DsparkStepper<'a> {
     inner: &'a mut Gemma4Inner,
+    /// Paged sequence this turn owns.
+    seq_id: u32,
     ctx: DsparkContextCache,
     /// Permanently use exact target-only AR for the rest of this turn after
     /// the measured break-even guard determines that speculation loses on
     /// the current hardware/context.
     ar_fallback: bool,
-    /// Absolute position of the next verify block's anchor (== the current
-    /// committed sequence length: prompt + anchor-exclusive generation).
+    /// Absolute position of the next verify block's anchor (== the committed
+    /// paged frontier: prompt + anchor-exclusive generation).
     next_pos: i32,
     /// Draft `target_layer_ids` as decoder indices (strictly ascending).
     layer_ids: Vec<usize>,
-    /// Config-derived KV-shared slot mask ([`dspark_shared_slot_mask`]),
-    /// passed to every `snapshot_before_verify`.
-    shared_slots: Vec<bool>,
+    /// Per-layer paged routing, resolved once for the turn.
+    layer_kinds: Vec<Gemma4LayerKind>,
     confidence_threshold: f32,
-    /// Pending rollback from the last `verify`, consumed by `commit`.
-    rollback: Option<Gemma4VerifyRollback>,
+    /// The cycle `verify` opened, consumed by `commit`.
+    open_cycle: Option<VerifyTicket>,
     /// Tapped `[1, 1+L, hidden]` hiddens from the last `verify` (one per
     /// `layer_ids` entry), consumed by `commit`.
     tapped: Option<Vec<MxArray>>,
-    /// A one-token adaptive AR probe wrote its anchor in full and therefore
-    /// has no rollback, but still owns `tapped` until `commit_ar_probe`
-    /// appends the hidden to the draft context.
+    /// A one-token adaptive AR probe keeps every row it wrote, but still
+    /// owns its cycle and its tap until `commit_ar_probe`.
     ar_probe_pending: bool,
 }
 
 impl Gemma4DsparkStepper<'_> {
     fn ensure_no_pending_verify(&self, op: &str) -> Result<()> {
-        if self.rollback.is_some() || self.tapped.is_some() || self.ar_probe_pending {
+        if self.open_cycle.is_some() || self.tapped.is_some() || self.ar_probe_pending {
             return Err(Error::from_reason(format!(
                 "gemma4 DSpark {op}: previous verify was never committed"
             )));
@@ -126,43 +144,77 @@ impl Gemma4DsparkStepper<'_> {
         Ok(())
     }
 
-    /// Build the ordinary tapped target graph. This helper performs no
-    /// rollback snapshot and does not mutate transaction fields; callers
-    /// choose whether the write is speculative (`verify`) or the full-keep
-    /// one-token AR calibration path (`verify_ar_probe`).
-    fn tapped_target_forward(
+    fn paged_cache(&mut self) -> Gemma4SpecPagedCache<'_> {
+        Gemma4SpecPagedCache::new(self.inner)
+    }
+
+    /// Close an open cycle that can no longer produce a valid row, keeping
+    /// nothing. The original error is what the caller sees unless the
+    /// retraction itself fails.
+    fn retract_cycle(&mut self, ticket: VerifyTicket, op: &str, error: Error) -> Error {
+        let seq_id = self.seq_id;
+        match self.paged_cache().commit_cycle(seq_id, ticket, 0) {
+            Ok(()) => error,
+            Err(rollback) => Error::from_reason(format!(
+                "gemma4 DSpark {op}: {error}; retracting the verify rows also failed: {rollback}"
+            )),
+        }
+    }
+
+    /// Record `verify_ids` at the committed frontier and run the tapped
+    /// target forward over exactly those rows.
+    ///
+    /// A verify block is bit-for-bit an ordinary paged prefill chunk at
+    /// those positions: same layer loop, same RoPE offset, same sliding
+    /// mask, same slot mapping. Speculation adds no attention math.
+    fn tapped_paged_verify(
         &mut self,
         verify_ids: &[u32],
         op: &str,
-    ) -> Result<(MxArray, Vec<MxArray>)> {
-        let ids_i32: Vec<i32> = verify_ids.iter().map(|&t| t as i32).collect();
-        let block = MxArray::from_int32(&ids_i32, &[1, verify_ids.len() as i64])?;
-        let inner = &mut *self.inner;
-        let caches = inner
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason(format!("gemma4 DSpark {op}: caches missing")))?;
-        let mut tap = DsparkTap::new(&self.layer_ids);
-        let logits = dspark_verify_forward(
-            &block,
-            &inner.embed_tokens,
-            &inner.layers,
-            caches,
-            &inner.final_norm,
-            &inner.lm_head,
-            inner.embed_weight_t.as_ref(),
-            inner.ple.as_ref(),
-            &inner.config,
-            &mut tap,
-        )?;
-        if tap.captured.len() != self.layer_ids.len() {
-            return Err(Error::from_reason(format!(
+    ) -> Result<(MxArray, Vec<MxArray>, VerifyTicket)> {
+        let seq_id = self.seq_id;
+        let first_position = u32::try_from(self.next_pos).map_err(|_| {
+            Error::from_reason(format!(
+                "gemma4 DSpark {op}: verify anchor sits at negative position {}",
+                self.next_pos
+            ))
+        })?;
+        let ticket = self
+            .paged_cache()
+            .record_verify(seq_id, verify_ids)
+            .map_err(Error::from_reason)?;
+
+        let captured: Vec<MxArray>;
+        let forward = {
+            let mut tap = DsparkTap::new(&self.layer_ids);
+            let forward = self.inner.run_paged_prefill_layer_loop(
+                verify_ids,
+                first_position,
+                first_position,
+                &self.layer_kinds,
+                Some(&mut tap),
+            );
+            captured = tap.captured;
+            forward
+        };
+        let hidden = match forward {
+            Ok(hidden) => hidden,
+            Err(error) => return Err(self.retract_cycle(ticket, op, error)),
+        };
+        if captured.len() != self.layer_ids.len() {
+            let error = Error::from_reason(format!(
                 "gemma4 DSpark {op}: tapped {} hiddens for {} configured target layers",
-                tap.captured.len(),
+                captured.len(),
                 self.layer_ids.len()
-            )));
+            ));
+            return Err(self.retract_cycle(ticket, op, error));
         }
-        Ok((logits, tap.captured))
+        // All-rows projection: row `i` is the target's distribution after
+        // `verify_ids[i]`.
+        match self.inner.project_paged_hidden(&hidden, false) {
+            Ok(logits) => Ok((logits, captured, ticket)),
+            Err(error) => Err(self.retract_cycle(ticket, op, error)),
+        }
     }
 
     fn append_tapped_prefix(&mut self, tapped: &[MxArray], keep: usize, op: &str) -> Result<()> {
@@ -179,6 +231,23 @@ impl Gemma4DsparkStepper<'_> {
         self.next_pos += keep as i32;
         Ok(())
     }
+
+    /// Post-commit settle at the frontier the commit landed on: pending-write
+    /// eval, the cold-checkpoint rung walk, and the committed-basis sliding
+    /// prune. Rungs are selected by `boundary <= frontier`, so a cycle whose
+    /// accept count steps the cursor straight over a rung still captures it.
+    fn settle_at_committed_frontier(&mut self, op: &str) -> Result<()> {
+        let seq_id = self.seq_id;
+        let mut cache = self.paged_cache();
+        let Some(frontier) = SpecPagedCache::frontier(&cache, seq_id) else {
+            return Err(Error::from_reason(format!(
+                "gemma4 DSpark {op}: the paged cache cannot name a frontier for sequence {seq_id}"
+            )));
+        };
+        cache
+            .settle_committed(seq_id, frontier.attn_tokens)
+            .map_err(Error::from_reason)
+    }
 }
 
 impl DsparkStepper for Gemma4DsparkStepper<'_> {
@@ -186,8 +255,20 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         true
     }
 
+    fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
+        if self.ar_fallback {
+            // Target-only AR writes one row through the ordinary decode
+            // path, which allocates for itself.
+            return Ok(true);
+        }
+        let seq_id = self.seq_id;
+        self.paged_cache()
+            .reserve_lookahead(seq_id, rows)
+            .map_err(Error::from_reason)
+    }
+
     fn enter_ar_fallback(&mut self) -> Result<()> {
-        if self.rollback.is_some() || self.tapped.is_some() || self.ar_probe_pending {
+        if self.open_cycle.is_some() || self.tapped.is_some() || self.ar_probe_pending {
             return Err(Error::from_reason(
                 "gemma4 DSpark AR fallback: cannot switch with an uncommitted verify",
             ));
@@ -216,12 +297,13 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         }
         self.ensure_no_pending_verify("AR probe")?;
 
-        // Full-keep one-token target write: unlike speculative verify this
-        // needs no snapshot/rollback. Keep the hidden tap because the next
-        // calibration cycle is speculative and must be conditioned on this
-        // anchor. The engine times this whole call, including target graph
-        // construction/dispatch; fusion happens in commit_ar_probe afterward.
-        let (logits, tapped) = self.tapped_target_forward(&[anchor_id], "AR probe")?;
+        // One-token verify: the cycle is opened exactly as a speculative one
+        // is, and its single row is kept in full. Keeping the hidden tap
+        // conditions the next (speculative) calibration cycle on this anchor.
+        // The engine times this whole call; fusion happens in
+        // `commit_ar_probe` afterward.
+        let (logits, tapped, ticket) = self.tapped_paged_verify(&[anchor_id], "AR probe")?;
+        self.open_cycle = Some(ticket);
         self.tapped = Some(tapped);
         self.ar_probe_pending = true;
         Ok(DsparkVerifyOutput { logits })
@@ -231,11 +313,6 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         if !self.ar_probe_pending {
             return Err(Error::from_reason(
                 "gemma4 DSpark AR probe commit: no pending probe",
-            ));
-        }
-        if self.rollback.is_some() {
-            return Err(Error::from_reason(
-                "gemma4 DSpark AR probe commit: unexpected rollback state",
             ));
         }
         let tapped = self.tapped.take().ok_or_else(|| {
@@ -249,9 +326,16 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
                 first.shape_at(1)?
             )));
         }
+        let ticket = self.open_cycle.take().ok_or_else(|| {
+            Error::from_reason("gemma4 DSpark AR probe commit: no pending verify cycle")
+        })?;
+        let seq_id = self.seq_id;
+        self.paged_cache()
+            .commit_cycle(seq_id, ticket, 1)
+            .map_err(Error::from_reason)?;
         self.append_tapped_prefix(&tapped, 1, "AR probe commit")?;
         self.ar_probe_pending = false;
-        Ok(())
+        self.settle_at_committed_frontier("AR probe commit")
     }
 
     fn propose(
@@ -325,8 +409,8 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
             ));
         }
         // Commit-exactly-once defense: a second verify before the previous
-        // cycle's commit would orphan its rollback (the caches would then
-        // hold TWO uncommitted verify blocks).
+        // cycle's commit would orphan its ticket (the cache would then hold
+        // TWO uncommitted verify blocks).
         self.ensure_no_pending_verify("verify")?;
 
         if self.ar_fallback {
@@ -336,37 +420,16 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
                     verify_ids.len()
                 )));
             }
-            let block = MxArray::from_int32(&[verify_ids[0] as i32], &[1, 1])?;
-            let inner = &mut *self.inner;
-            let caches = inner.caches.as_mut().ok_or_else(|| {
-                Error::from_reason("gemma4 DSpark AR fallback verify: caches missing")
-            })?;
-            let logits = forward_inner(
-                &block,
-                &inner.embed_tokens,
-                &inner.layers,
-                caches,
-                &inner.final_norm,
-                &inner.lm_head,
-                inner.embed_weight_t.as_ref(),
-                inner.ple.as_ref(),
-                &inner.config,
-                None,
-            )?;
+            // Exact target-only AR: the ordinary paged decode step, which
+            // records its own row and opens no cycle.
+            let logits = self
+                .inner
+                .run_paged_decode_step_for(self.seq_id, verify_ids[0])?;
             return Ok(DsparkVerifyOutput { logits });
         }
 
-        let rb = {
-            let caches = self
-                .inner
-                .caches
-                .as_ref()
-                .ok_or_else(|| Error::from_reason("gemma4 DSpark verify: caches missing"))?;
-            snapshot_before_verify(caches, verify_ids.len(), &self.shared_slots)?
-        };
-        let (logits, tapped) = self.tapped_target_forward(verify_ids, "verify")?;
-
-        self.rollback = Some(rb);
+        let (logits, tapped, ticket) = self.tapped_paged_verify(verify_ids, "verify")?;
+        self.open_cycle = Some(ticket);
         self.tapped = Some(tapped);
         Ok(DsparkVerifyOutput { logits })
     }
@@ -379,58 +442,71 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
                 )));
             }
             self.next_pos += 1;
-            return Ok(());
+            return self.settle_at_committed_frontier("AR fallback commit");
         }
         if self.ar_probe_pending {
             return Err(Error::from_reason(
                 "gemma4 DSpark commit: pending AR probe requires commit_ar_probe",
             ));
         }
-        let rb = self.rollback.take().ok_or_else(|| {
-            Error::from_reason("gemma4 DSpark commit: no pending verify rollback")
-        })?;
-        let tapped = self
-            .tapped
-            .take()
-            .ok_or_else(|| Error::from_reason("gemma4 DSpark commit: no stashed tapped hiddens"))?;
         if keep == 0 {
             return Err(Error::from_reason(
                 "gemma4 DSpark commit: engine contract violation (keep must be >= 1 — the anchor's slot is unconditionally kept)",
             ));
         }
-        if let Some(first) = tapped.first()
-            && first.shape_at(1)? != total_written as i64
         {
-            return Err(Error::from_reason(format!(
-                "gemma4 DSpark commit: stashed tapped hiddens cover {} positions but the engine reports a {}-token verify block",
-                first.shape_at(1)?,
-                total_written
-            )));
+            let tapped = self.tapped.as_ref().ok_or_else(|| {
+                Error::from_reason("gemma4 DSpark commit: no stashed tapped hiddens")
+            })?;
+            if let Some(first) = tapped.first()
+                && first.shape_at(1)? != total_written as i64
+            {
+                return Err(Error::from_reason(format!(
+                    "gemma4 DSpark commit: stashed tapped hiddens cover {} positions but the engine reports a {}-token verify block",
+                    first.shape_at(1)?,
+                    total_written
+                )));
+            }
         }
+        let ticket = self
+            .open_cycle
+            .take()
+            .ok_or_else(|| Error::from_reason("gemma4 DSpark commit: no pending verify cycle"))?;
+        let tapped = self
+            .tapped
+            .take()
+            .ok_or_else(|| Error::from_reason("gemma4 DSpark commit: no stashed tapped hiddens"))?;
 
-        // Target side: keep the first `keep` of the verify block's K/V
-        // slots, roll back the rest (validated against the shared-slot mask
-        // on every commit, full keep included).
-        {
-            let caches = self
-                .inner
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("gemma4 DSpark commit: caches missing"))?;
-            commit_after_verify(caches, &rb, keep)?;
-        }
+        // Target side: the facade keeps the first `keep` rows of the cycle
+        // and derives the rollback from its own ticket.
+        let seq_id = self.seq_id;
+        self.paged_cache()
+            .commit_cycle(seq_id, ticket, keep)
+            .map_err(Error::from_reason)?;
 
         // Draft side: fuse the kept prefix of the tapped hiddens and append
         // it to the persisted context at the block's base position, then
         // advance the cursor. The boundary token has no slot on either side
         // — it re-enters as the next cycle's verify anchor.
-        self.append_tapped_prefix(&tapped, keep, "commit")
+        self.append_tapped_prefix(&tapped, keep, "commit")?;
+
+        self.settle_at_committed_frontier("commit")
     }
 
     fn eval_boundary(&self, token: &MxArray) {
         // Schedule-only async eval of the next cycle's anchor (gemma4's
         // decode eval pattern: token only, never the logits).
         MxArray::async_eval_arrays(&[token]);
+    }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        // Pure-attention target: the frontier is the row count every KV
+        // group agrees on; the drafter's private context cache is not target
+        // state.
+        self.inner
+            .kv_cache_coordinator
+            .as_ref()?
+            .spec_frontier(self.seq_id)
     }
 }
 
@@ -450,6 +526,13 @@ impl DsparkStepper for Gemma4DraftStepper<'_> {
         match self {
             Self::Dspark(stepper) => stepper.supports_adaptive_ar_fallback(),
             Self::Assistant(stepper) => stepper.supports_adaptive_ar_fallback(),
+        }
+    }
+
+    fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
+        match self {
+            Self::Dspark(stepper) => stepper.reserve_cycle_lookahead(rows),
+            Self::Assistant(stepper) => stepper.reserve_cycle_lookahead(rows),
         }
     }
 
@@ -518,6 +601,13 @@ impl DsparkStepper for Gemma4DraftStepper<'_> {
             Self::Assistant(stepper) => stepper.eval_boundary(token),
         }
     }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        match self {
+            Self::Dspark(stepper) => stepper.frontier(),
+            Self::Assistant(stepper) => stepper.frontier(),
+        }
+    }
 }
 
 impl DsparkBackend for Gemma4Inner {
@@ -549,17 +639,19 @@ impl DsparkBackend for Gemma4Inner {
                         .map(|&id| id as usize)
                         .collect()
                 };
-                let shared_slots = dspark_shared_slot_mask(&self.config);
                 let confidence_threshold = dspark_confidence_threshold_from_env();
+                let layer_kinds = self.compute_layer_kinds()?;
+                let seq_id = self.active_paged_seq;
                 Ok(Gemma4DraftStepper::Dspark(Gemma4DsparkStepper {
                     inner: self,
+                    seq_id,
                     ctx: state.ctx,
                     ar_fallback: false,
                     next_pos: state.next_pos,
                     layer_ids,
-                    shared_slots,
+                    layer_kinds,
                     confidence_threshold,
-                    rollback: None,
+                    open_cycle: None,
                     tapped: None,
                     ar_probe_pending: false,
                 }))
@@ -581,18 +673,84 @@ impl DsparkBackend for Gemma4Inner {
     }
 }
 
+impl PagedDsparkBackend for Gemma4Inner {
+    fn paged_prefill_with_draft_state(
+        &mut self,
+        suffix_tokens: &[u32],
+        prefix: &Self::PrefixState,
+        _stream: Stream,
+    ) -> Result<MxArray> {
+        let (layer_ids, draft_layers) = {
+            let draft = self.dspark_draft().ok_or_else(|| {
+                Error::from_reason("gemma4 DSpark paged prefill: no DSpark draft model loaded")
+            })?;
+            let layer_ids: Vec<usize> = draft
+                .config
+                .target_layer_ids
+                .iter()
+                .map(|&id| id as usize)
+                .collect();
+            (layer_ids, draft.num_layers())
+        };
+        let mut ctx = DsparkContextCache::new(draft_layers);
+        // Diagnostic step -1 (prefill), matching `PagedBackend::paged_prefill`.
+        crate::models::gemma4::diagnostic::set_step(-1);
+        let last_logits = {
+            let mut draft_tap = Gemma4DsparkPrefillTap {
+                layer_ids: &layer_ids,
+                ctx: &mut ctx,
+            };
+            self.run_paged_prefill_chunk(
+                &prefix.full_tokens,
+                suffix_tokens,
+                prefix.effective_cached_prefix_len as u32,
+                prefix.sliding_primed_prefix_len,
+                prefix.cache_salt,
+                Some(&mut draft_tap),
+            )?
+        };
+        // Cached-prefix tokens have NO draft context rows: the drafter
+        // cross-attends over whatever rows exist, and verification always
+        // re-derives ground truth from the target, so a shorter context can
+        // only depress acceptance, never correctness.
+        self.draft_turn_state = Some(Gemma4DraftTurnState::Dspark(DsparkTurnState {
+            ctx,
+            next_pos: (prefix.effective_cached_prefix_len + suffix_tokens.len()) as i32,
+        }));
+        Ok(last_logits)
+    }
+
+    fn dspark_block_size(&self) -> Result<usize> {
+        Ok(self
+            .dspark_draft()
+            .ok_or_else(|| {
+                Error::from_reason("gemma4 paged draft turn: no DSpark draft model loaded")
+            })?
+            .config
+            .block_size)
+    }
+
+    fn paged_spec_seq_id(&self) -> u32 {
+        self.active_paged_seq
+    }
+}
+
 impl Gemma4Inner {
-    /// Draft whole-turn core (both [`Gemma4Draft`] variants) behind
-    /// gemma4's `ChatBackend::run_speculative_turn` executor — the draft analog of the
+    /// FLAT-lane draft whole-turn core behind gemma4's
+    /// `ChatBackend::run_speculative_turn` executor — the draft analog of the
     /// engine's generic `chat_turn_core` tail, sync AND streaming through
     /// the same body (`args.sink` presence selects the mode, mirroring
     /// `vision_chat_turn` / the MTP whole-turn cores).
     ///
+    /// The ASSISTANT drafter is the only one that runs here: its Q-only
+    /// attention reads the target's flat `Gemma4LayerCache` K/V arrays
+    /// directly, which the block-paged pools cannot hand it. DSpark verifies
+    /// against the paged pools and is routed to
+    /// `engine::dspark_turn::run_paged_dspark_turn` instead.
+    ///
     /// Flow: resolve params (+ `extra_eos_ids`) → prefix decision via the
-    /// existing cache-prefix machinery → the VARIANT's prefill (DSpark:
-    /// chunked prefill WITH the hidden tap, per-chunk capture → fuse →
-    /// context-append → drop; assistant: the same chunked prefill keeping
-    /// only the last token's post-final-norm hidden) → anchor sample
+    /// existing cache-prefix machinery → the assistant's chunked prefill
+    /// (keeping only the last token's post-final-norm hidden) → anchor sample
     /// (byte-identical to the generic flow) → `run_dspark_turn` → save
     /// (AR-parity: stop exits drop the final token, length exits
     /// materialize its K/V and keep all — post-turn history AND cache
@@ -600,7 +758,10 @@ impl Gemma4Inner {
     /// (+ default `augment_performance`, which fills the `mtp_*`
     /// acceptance fields). Every error between prefill start and the save
     /// fails CLOSED (`draft_fail_closed`).
-    pub(crate) fn draft_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+    pub(crate) fn flat_draft_chat_turn(
+        &mut self,
+        args: &mut WholeTurnArgs<'_>,
+    ) -> Result<TurnOutput> {
         let tokenizer = args.tokenizer.clone();
         let eos_id = args.eos_id;
         let thinking = args.thinking;
@@ -687,14 +848,6 @@ impl Gemma4Inner {
         // could warm-start corrupt K/V from.
         profiler.begin_prefill();
         let (last_logits, turn_state) = match self.draft.as_ref() {
-            Some(Gemma4Draft::Dspark(_)) => match self.dspark_prefill_with_tap(
-                &prefill_tokens,
-                cached_prefix_len as i32,
-                generation_stream,
-            ) {
-                Ok((logits, state)) => (logits, Gemma4DraftTurnState::Dspark(state)),
-                Err(e) => return Err(self.draft_fail_closed(e)),
-            },
             Some(Gemma4Draft::Assistant(_)) => match self.assistant_prefill_with_hidden(
                 &prefill_tokens,
                 cached_prefix_len as i32,
@@ -703,9 +856,9 @@ impl Gemma4Inner {
                 Ok((logits, state)) => (logits, Gemma4DraftTurnState::Assistant(state)),
                 Err(e) => return Err(self.draft_fail_closed(e)),
             },
-            None => {
+            _ => {
                 return Err(self.draft_fail_closed(Error::from_reason(
-                    "gemma4 draft turn: no draft model loaded",
+                    "gemma4 flat draft turn: the flat lane serves the assistant drafter only",
                 )));
             }
         };
@@ -727,18 +880,9 @@ impl Gemma4Inner {
             first_token_instant = Some(Instant::now());
         }
 
-        // Per-cycle draft cap: DSpark blocks are checkpoint-pinned; the
-        // assistant drafts by chained AR steps, so the resolved depth IS
-        // the cap.
-        let block_size = match self.draft.as_ref() {
-            Some(Gemma4Draft::Dspark(draft)) => draft.config.block_size,
-            Some(Gemma4Draft::Assistant(_)) => p.mtp_depth,
-            None => {
-                return Err(self.draft_fail_closed(Error::from_reason(
-                    "gemma4 draft turn: no draft model loaded",
-                )));
-            }
-        };
+        // Per-cycle draft cap: the assistant drafts by chained AR steps, so
+        // the resolved depth IS the cap.
+        let block_size = p.mtp_depth;
 
         // Hand the prefill-built draft state to the stepper (taken by
         // `begin_dspark_decode` inside the loop).
@@ -813,7 +957,7 @@ impl Gemma4Inner {
             && !last_in_cache
             && let Some(&final_token) = generated_tokens.last()
         {
-            if let Err(e) = self.dspark_materialize_final(final_token, generation_stream) {
+            if let Err(e) = self.flat_materialize_final(final_token, generation_stream) {
                 return Err(self.draft_fail_closed(e));
             }
             last_in_cache = true;
@@ -829,8 +973,8 @@ impl Gemma4Inner {
         new_history.extend_from_slice(history_tokens);
         self.cached_token_history = new_history;
         if !is_delta {
-            // Fresh text-only turn: clear any stale media keys (the DSpark
-            // path is text-only by its `mtp_turn` gate).
+            // Fresh text-only turn: clear any stale media keys (the draft
+            // path is text-only by its speculative-plan gate).
             self.cached_image_key = None;
             self.cached_audio_key = None;
         }
@@ -928,170 +1072,6 @@ impl Gemma4Inner {
         Ok(TurnOutput::Complete(Box::new(result)))
     }
 
-    /// Chunked prefill WITH the DSpark hidden tap.
-    ///
-    /// Target-side compute is byte-identical to the AR path
-    /// (`prefill_body_gemma4` + the last-token `forward_inner`): same
-    /// upfront embedding/PLE, same 512-token chunking, same eval cadence
-    /// and `clear_cache`, same last-token split — the tap only CLONES the
-    /// residual-stream hiddens (tap purity is pinned by
-    /// `dspark_tap_purity_and_verify_forward`).
-    ///
-    /// Per chunk: forward w/ a FRESH tap → `fuse_context` → context-append
-    /// at the chunk's absolute base → drop the tap. Full-prompt tapped
-    /// hiddens are never held. `position_base` is the cached-prefix length
-    /// (the absolute position of `prefill_tokens[0]`); cached-prefix tokens
-    /// have NO context rows — the draft cross-attends over whatever rows
-    /// exist, and verification always re-derives ground truth from the
-    /// target, so a shorter context can only depress acceptance, never
-    /// correctness.
-    ///
-    /// Returns the sampling-ready last-token logits `[1, vocab]` plus the
-    /// turn's [`DsparkTurnState`].
-    fn dspark_prefill_with_tap(
-        &mut self,
-        prefill_tokens: &[u32],
-        position_base: i32,
-        stream: Stream,
-    ) -> Result<(MxArray, DsparkTurnState)> {
-        if prefill_tokens.is_empty() {
-            return Err(Error::from_reason(
-                "gemma4 DSpark prefill: empty prefill token set",
-            ));
-        }
-        if self.caches.is_none() {
-            self.init_caches_sync()?;
-        }
-
-        let inner = &mut *self;
-        // Field-level borrow (not the whole-struct accessor) so the draft
-        // borrow stays disjoint from the `caches` borrow below.
-        let draft = match inner.draft.as_ref() {
-            Some(Gemma4Draft::Dspark(draft)) => draft,
-            _ => {
-                return Err(Error::from_reason(
-                    "gemma4 DSpark prefill: no DSpark draft model loaded",
-                ));
-            }
-        };
-        let caches = inner
-            .caches
-            .as_mut()
-            .ok_or_else(|| Error::from_reason("gemma4 DSpark prefill: caches missing"))?;
-        let layer_ids: Vec<usize> = draft
-            .config
-            .target_layer_ids
-            .iter()
-            .map(|&id| id as usize)
-            .collect();
-        let mut ctx = DsparkContextCache::new(draft.num_layers());
-
-        let n = prefill_tokens.len() as i64;
-        let ids_i32: Vec<i32> = prefill_tokens.iter().map(|&t| t as i32).collect();
-        let prompt = MxArray::from_int32(&ids_i32, &[1, n])?;
-
-        {
-            let _stream_ctx = StreamContext::new(stream);
-            if n > 1 {
-                // Body over tokens [0 .. n-1] — the last token is handled by
-                // the full forward below (`prefill_body_gemma4`'s split).
-                let prefill_len = n - 1;
-                let prefill_ids = prompt.slice_axis(1, 0, prefill_len)?;
-                let all_embeds = {
-                    let emb = inner.embed_tokens.forward(&prefill_ids)?;
-                    emb.mul_scalar((inner.config.hidden_size as f64).sqrt())?
-                };
-                let all_ple: Option<MxArray> = match inner.ple.as_ref() {
-                    Some(ple) => Some(compute_ple(&prefill_ids, &all_embeds, ple, prefill_len)?),
-                    None => None,
-                };
-                let mut offset: i64 = 0;
-                while offset < prefill_len {
-                    // Cooperative-cancel checkpoint (H1b) at every chunk
-                    // boundary after the first chunk (a one-chunk prefill is
-                    // the single-shot case and stays uncancellable). The Err
-                    // rides `draft_chat_turn`'s `draft_fail_closed` arm.
-                    if offset > 0
-                        && inner
-                            .turn_cancel
-                            .as_ref()
-                            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-                    {
-                        return Err(Error::from_reason("prefill cancelled"));
-                    }
-                    let end = if prefill_len - offset > GEMMA4_PREFILL_STEP_SIZE {
-                        offset + GEMMA4_PREFILL_STEP_SIZE
-                    } else {
-                        prefill_len
-                    };
-                    let chunk_embeds = all_embeds.slice_axis(1, offset, end)?;
-                    let chunk_ple = all_ple
-                        .as_ref()
-                        .map(|p| p.slice_axis(1, offset, end))
-                        .transpose()?;
-                    let mut tap = DsparkTap::new(&layer_ids);
-                    let _hidden = forward_body(
-                        None,
-                        Some(chunk_embeds),
-                        &inner.embed_tokens,
-                        &inner.layers,
-                        caches,
-                        &inner.final_norm,
-                        inner.ple.as_ref(),
-                        chunk_ple.as_ref(),
-                        &inner.config,
-                        Some(&mut tap),
-                    )?;
-                    // capture → fuse → append → drop, per chunk.
-                    let fused = draft.fuse_context(&tap.captured)?;
-                    ctx.append(draft, &fused, position_base + offset as i32)?;
-                    // Eval cadence mirrors `prefill_body_gemma4`: full
-                    // chunks eval+clear between iterations; the remainder
-                    // chunk is covered by the post-body eval below.
-                    if end < prefill_len {
-                        eval_gemma4_caches(caches)?;
-                        crate::array::clear_cache();
-                    }
-                    offset = end;
-                }
-            }
-        }
-        eval_gemma4_caches(caches)?;
-
-        // Last token: full forward (lm_head + softcap) with one more tapped
-        // context row, exactly the AR prefill's last-token split.
-        let last = prompt.slice_axis(1, n - 1, n)?;
-        let last_logits = {
-            let _stream_ctx = StreamContext::new(stream);
-            crate::models::gemma4::diagnostic::set_step(-1);
-            let mut tap = DsparkTap::new(&layer_ids);
-            let logits = forward_inner(
-                &last,
-                &inner.embed_tokens,
-                &inner.layers,
-                caches,
-                &inner.final_norm,
-                &inner.lm_head,
-                inner.embed_weight_t.as_ref(),
-                inner.ple.as_ref(),
-                &inner.config,
-                Some(&mut tap),
-            )?;
-            let fused = draft.fuse_context(&tap.captured)?;
-            ctx.append(draft, &fused, position_base + (n - 1) as i32)?;
-            logits
-        };
-        let last_logits = last_logits.squeeze(Some(&[1]))?;
-
-        Ok((
-            last_logits,
-            DsparkTurnState {
-                ctx,
-                next_pos: position_base + n as i32,
-            },
-        ))
-    }
-
     /// Fail CLOSED after a draft turn error that may have left the target
     /// caches advanced beyond `cached_token_history` (prefill and verify
     /// write K/V before the save records anything): drop the whole warm
@@ -1110,46 +1090,16 @@ impl Gemma4Inner {
         err
     }
 
-    /// LENGTH-exit only: run ONE more forward for the final emitted token
-    /// so its K/V lands in the live session caches, then DISCARD the
-    /// logits — the DSpark analog of `Gemma4Decode::materialize_final`
+    /// LENGTH-exit only: run ONE more flat forward for the final emitted
+    /// token so its K/V lands in the live session caches, then DISCARD the
+    /// logits — the flat-lane analog of `Gemma4Decode::materialize_final`
     /// (the AR flow keeps every token on length exits and materializes the
-    /// final one; the save's keep-all history then equals the physical
-    /// cache offsets). No sample / push / emit; like the AR steppers, this
-    /// deliberately does NOT fire a sliding decode-boundary checkpoint.
+    /// final one; the save's keep-all history then equals the physical cache
+    /// offsets). No sample / push / emit.
     ///
-    /// Nor does anything else on the draft path, and that is structural rather
-    /// than an omission. `maybe_remember_gemma4_sliding_decode_boundary_checkpoint`
-    /// exists to feed `capture_gemma4_sliding_cold_sidecar`, which needs a
-    /// `PagedKVCacheAdapter` — and a draft turn provably has none:
-    /// `persistence::resolve_gemma4_draft_paged_cache` forces
-    /// `use_block_paged_cache = Some(false)` the moment a draft is resolved (an
-    /// explicit `true` is a hard load error), so `Gemma4Inner::new` builds no
-    /// adapter, `build_cold_tier_context` returns `None` at its first line for
-    /// want of one, and neither this file nor `assistant_decode.rs` touches
-    /// `paged_adapter` at all. Publishing here would be dead code, not a fix.
-    ///
-    /// So the answer to "should draft/MTP turns publish sliding checkpoints?"
-    /// is no, and not because it would be wrong — because there is no paged
-    /// state on a draft turn for a rung to describe. Writing the crossed-
-    /// boundary machinery now would be machinery for a path that does not
-    /// exist. It becomes reachable only if `engine::paged_turn` grows a
-    /// speculative branch, and at that point it is required, not optional: a
-    /// variable accept count steps the cursor from below a rung to above it
-    /// without landing on it, so `rung == prefix_len` silently never fires.
-    /// The predicate has to be "a boundary lies in `(previous, current]`" —
-    /// the `gemma4_sliding_checkpoint_boundaries_crossed` shape the prefill
-    /// chunk walk already uses — and the snapshot has to be sliced back to
-    /// that boundary rather than taken at the cursor. Note also that on a
-    /// persistence-OFF turn publishing changes the retained set and therefore
-    /// the emitted tokens, so it must stay behind the same transparency gate
-    /// as the AR publisher.
-    ///
-    /// Pinned by `persistence::tests::{dspark,embedded}_draft_conflicts_with_explicit_paged_cache`
-    /// and `draft_paged_cache_resolution_covers_the_whole_truth_table` on the
-    /// load path; by `model::tests::gemma4_draft_decode_paths_never_touch_the_paged_adapter`
-    /// and `gemma4_paged_plus_draft_silently_drops_the_draft` on the plan path.
-    fn dspark_materialize_final(&mut self, token_id: u32, stream: Stream) -> Result<()> {
+    /// The flat lane carries no paged adapter, so there is no cold tier for a
+    /// sliding decode-boundary rung to describe and nothing to publish here.
+    fn flat_materialize_final(&mut self, token_id: u32, stream: Stream) -> Result<()> {
         let caches = self
             .caches
             .as_mut()
@@ -1167,7 +1117,6 @@ impl Gemma4Inner {
             self.embed_weight_t.as_ref(),
             self.ple.as_ref(),
             &self.config,
-            None,
         )?;
         eval_gemma4_caches(caches)?;
         Ok(())
@@ -1179,6 +1128,7 @@ pub(crate) mod tests {
     use std::sync::Arc;
 
     use super::*;
+    use crate::engine::backend::{PagedBackend, PagedPrefix};
     use crate::engine::plan::{
         DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
     };
@@ -1235,9 +1185,44 @@ pub(crate) mod tests {
         })
     }
 
+    /// [`tiny_target_config`] with the block-paged coordinator ON.
+    ///
+    /// The paged pools constrain geometry the flat fixture does not: head
+    /// size >= 32 and a block size of 8/16/32. `paged_cache_memory_mb` keeps
+    /// each group's Metal pool at ~8 MiB. The draft never reads target K/V
+    /// (it cross-attends over fused residual hiddens), so the wider head is
+    /// invisible to [`tiny_draft_config`].
+    pub(crate) fn tiny_paged_target_config() -> Gemma4Config {
+        let mut value = tiny_target_config_value();
+        value["head_dim"] = serde_json::json!(32);
+        value["use_block_paged_cache"] = serde_json::json!(true);
+        value["paged_block_size"] = serde_json::json!(8);
+        value["paged_cache_memory_mb"] = serde_json::json!(8);
+        serde_json::from_value(value).expect("tiny paged Gemma4 config must deserialize")
+    }
+
+    /// A tiny PAGED target with the DSpark draft attached, or `None` when
+    /// this build/host cannot back the paged pools (no Metal device) — the
+    /// caller skips.
+    pub(crate) fn tiny_paged_inner_with_draft() -> Option<Gemma4Inner> {
+        let mut inner = Gemma4Inner::new(tiny_paged_target_config()).ok()?;
+        inner.kv_cache_coordinator.as_ref()?;
+        // The paged pools store 2-byte K/V; random-init weights are f32, so
+        // the target must be cast before any row is written.
+        crate::models::gemma4::model::tests::cast_paged_tiny_weights_to_bf16(&mut inner);
+        let draft = DsparkDraftModel::new(tiny_draft_config()).ok()?;
+        inner.draft = Some(Gemma4Draft::Dspark(draft));
+        Some(inner)
+    }
+
     /// Tiny draft config geometry-matched to [`tiny_target_config`]
     /// (hidden 8, vocab 16, 4 target layers, block_size 3).
     fn tiny_draft_config() -> DsparkConfig {
+        serde_json::from_value(tiny_draft_config_value())
+            .expect("tiny draft config must deserialize")
+    }
+
+    fn tiny_draft_config_value() -> serde_json::Value {
         serde_json::from_str(
             r#"{
                 "architectures": ["Gemma4DSparkModel"],
@@ -1268,7 +1253,7 @@ pub(crate) mod tests {
                 }
             }"#,
         )
-        .expect("tiny draft config must deserialize")
+        .expect("tiny draft config JSON must parse")
     }
 
     pub(crate) fn tiny_inner_with_draft() -> Gemma4Inner {
@@ -1448,31 +1433,28 @@ pub(crate) mod tests {
 
     // ── begin_dspark_decode plumbing ───────────────────────────────────
 
-    /// The stepper derives the shared-slot mask from the target config
-    /// (`dspark_shared_slot_mask`) and the layer ids from the draft's
-    /// `target_layer_ids`; the per-turn context stash is TAKEN (single
-    /// use), and calling begin without a stash is a hard error.
+    /// The stepper derives its paged routing from the target config and its
+    /// layer ids from the draft's `target_layer_ids`, adopts the model's
+    /// active paged sequence, and starts with no open cycle; the per-turn
+    /// context stash is TAKEN (single use), and calling begin without a
+    /// stash is a hard error.
     #[test]
-    fn begin_dspark_decode_takes_stash_and_derives_mask() {
-        let mut inner = tiny_inner_with_draft();
+    fn begin_dspark_decode_takes_stash_and_derives_paged_state() {
+        let Some(mut inner) = tiny_paged_inner_with_draft() else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
+        };
         let num_draft_layers = inner
             .dspark_draft()
             .map(|d| d.num_layers())
             .expect("draft loaded");
-
-        // No stash → hard error naming the missing prefill.
-        let err = inner
-            .begin_dspark_decode(3)
-            .err()
-            .expect("begin without a stash must fail");
+        let num_target_layers = inner.config.num_hidden_layers as usize;
+        inner.set_active_paged_owner(5);
         assert!(
-            err.reason.contains("prepared draft context"),
-            "got: {}",
-            err.reason
+            inner.begin_dspark_decode(3).is_err(),
+            "begin without a prepared draft context must be a hard error"
         );
 
-        // Stash → stepper carries the config-derived mask + draft layer ids
-        // and the stash is consumed.
         inner.draft_turn_state = Some(Gemma4DraftTurnState::Dspark(DsparkTurnState {
             ctx: DsparkContextCache::new(num_draft_layers),
             next_pos: 7,
@@ -1487,16 +1469,22 @@ pub(crate) mod tests {
                     panic!("a DSpark draft must yield the DSpark stepper")
                 }
             };
-            assert_eq!(
-                stepper.shared_slots,
-                vec![false, false, false, true],
-                "mask must come from dspark_shared_slot_mask(config)"
-            );
             assert_eq!(stepper.layer_ids, vec![0, 2]);
+            assert_eq!(
+                stepper.layer_kinds.len(),
+                num_target_layers,
+                "the stepper resolves paged routing for every decoder layer once per turn"
+            );
+            assert_eq!(
+                stepper.seq_id, 5,
+                "the stepper must address the model's active paged sequence"
+            );
             assert_eq!(stepper.next_pos, 7);
             assert!(!stepper.ar_fallback);
             assert!(
-                stepper.rollback.is_none() && stepper.tapped.is_none() && !stepper.ar_probe_pending
+                stepper.open_cycle.is_none()
+                    && stepper.tapped.is_none()
+                    && !stepper.ar_probe_pending
             );
         }
         assert!(
@@ -1505,161 +1493,350 @@ pub(crate) mod tests {
         );
     }
 
+    /// The paged lane stashes the drafter's whole-prompt context inside
+    /// `paged_prefill_with_draft_state`, i.e. BEFORE the anchor sample the
+    /// turn driver runs next — so `abort_paged_turn`, the only error exit
+    /// from that window, must drop it. `begin_dspark_decode` is its one
+    /// consumer and is unreachable without a fresh write, so what survives
+    /// is unreachable residency: one `KVCache` per draft layer over the
+    /// whole prefilled suffix, freed only by the next paged DSpark turn's
+    /// own prefill or by unload (`reset_caches_sync` routes to
+    /// `clear_reuse_state`, which does not cover the field).
+    ///
+    /// Driven through the REAL production write, not a hand-set field. The
+    /// `is_some` control is load-bearing: the fail-closed regression below
+    /// asserts the same `is_none` and passes today only because its
+    /// injected error fires inside `run_paged_prefill_chunk`, upstream of
+    /// the stash.
     #[test]
-    fn dspark_stepper_ar_fallback_uses_single_token_target_forward() {
-        let mut inner = tiny_inner_with_draft();
-        inner
-            .init_caches_sync()
-            .expect("tiny target caches must initialize");
-        let num_draft_layers = inner.dspark_draft().expect("draft loaded").num_layers();
-        inner.draft_turn_state = Some(Gemma4DraftTurnState::Dspark(DsparkTurnState {
-            ctx: DsparkContextCache::new(num_draft_layers),
-            next_pos: 0,
-        }));
-
-        let mut stepper = match inner
-            .begin_dspark_decode(3)
-            .expect("prepared DSpark stepper")
-        {
-            Gemma4DraftStepper::Dspark(stepper) => stepper,
-            Gemma4DraftStepper::Assistant(_) => panic!("expected DSpark stepper"),
+    fn abort_paged_turn_drops_the_draft_stash() {
+        let Some(mut inner) = seeded_tiny_paged_inner_with_draft(0xD1_FA11_0002) else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
         };
-        assert!(stepper.supports_adaptive_ar_fallback());
-        stepper
-            .enter_ar_fallback()
-            .expect("clean stepper can enter AR fallback");
-        assert!(stepper.ar_fallback);
-        assert!(
-            stepper.ctx.is_empty(),
-            "unused draft context must be dropped"
-        );
-
-        let err = stepper
-            .verify(&[1, 2])
-            .err()
-            .expect("fallback must reject speculative verify blocks");
-        assert!(err.reason.contains("requires one anchor token"));
-
-        let out = stepper
-            .verify(&[1])
-            .expect("fallback must run one ordinary target forward");
-        assert_eq!(
-            out.logits.shape().expect("logit shape").as_ref(),
-            &[1, 1, 16]
-        );
-        out.logits.eval();
-        let fallback_logits = out
-            .logits
-            .to_float32()
-            .expect("fallback logits to f32")
-            .to_vec();
-        stepper
-            .commit(1, 1)
-            .expect("single-token target write is already committed");
-        assert_eq!(stepper.next_pos, 1);
-        assert!(
-            stepper.rollback.is_none() && stepper.tapped.is_none() && !stepper.ar_probe_pending
-        );
-        let fallback_offsets: Vec<i32> = stepper
-            .inner
-            .caches
-            .as_ref()
-            .expect("fallback target caches")
-            .iter()
-            .map(|cache| cache.get_offset())
-            .collect();
-        drop(stepper);
-
-        // Replay the identical token through the ordinary Gemma4 AR forward
-        // from fresh caches. Fallback deliberately calls this same primitive
-        // with `tap=None`; pin both logits and physical cache offsets exactly.
-        ChatBackend::reset_caches(&mut inner, ResetScope::PrefixMiss)
-            .expect("reset target caches for AR reference");
-        let block = MxArray::from_int32(&[1], &[1, 1]).expect("reference token");
-        let inner_ref = &mut inner;
-        let caches = inner_ref.caches.as_mut().expect("reference target caches");
-        let direct_logits = forward_inner(
-            &block,
-            &inner_ref.embed_tokens,
-            &inner_ref.layers,
-            caches,
-            &inner_ref.final_norm,
-            &inner_ref.lm_head,
-            inner_ref.embed_weight_t.as_ref(),
-            inner_ref.ple.as_ref(),
-            &inner_ref.config,
-            None,
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+        let prefix = PagedBackend::prime_prefix_state(&mut inner, &tokens, false, 0, &[], 0)
+            .expect("paged prime must succeed on the tiny fixture");
+        let suffix = &tokens[prefix.effective_cached_prefix_len()..];
+        let _ = PagedDsparkBackend::paged_prefill_with_draft_state(
+            &mut inner,
+            suffix,
+            &prefix,
+            Stream::new(DeviceType::Gpu),
         )
-        .expect("ordinary target AR forward");
-        direct_logits.eval();
-        assert_eq!(
-            fallback_logits,
-            direct_logits
-                .to_float32()
-                .expect("reference logits to f32")
-                .to_vec(),
-            "fallback logits must be byte-identical to ordinary target AR"
+        .expect("tapped paged prefill must succeed");
+        assert!(
+            inner.draft_turn_state.is_some(),
+            "ANTI-VACUITY: the paged prefill must have stashed, or the assert below is free"
         );
-        let direct_offsets: Vec<i32> = inner_ref
-            .caches
-            .as_ref()
-            .expect("reference target caches")
-            .iter()
-            .map(|cache| cache.get_offset())
-            .collect();
-        assert_eq!(
-            fallback_offsets, direct_offsets,
-            "fallback must advance exactly the same physical cache slots as AR"
+
+        PagedBackend::abort_paged_turn(&mut inner);
+
+        assert!(
+            inner.draft_turn_state.is_none(),
+            "abort_paged_turn is the paged speculative turn's only error exit; a stash it \
+             leaves behind is unreachable and unfreeable until the next turn's own prefill"
         );
     }
 
+    // ── paged speculative gates ────────────────────────────────────────
+
+    /// PRIMARY ORACLE: at T=0 the paged DSpark turn must produce exactly the
+    /// AR turn's tokens, and leave exactly the AR turn's paged rows.
+    ///
+    /// Both lanes run on identically seeded fixtures, so the only difference
+    /// is the decoder. The second leg starts with a prompt LONGER than the
+    /// sliding window, so every verify block lands on already-pruned sliding
+    /// groups and the committed-basis prune runs between cycles.
+    ///
+    /// Mutation this catches: committing the whole verify block instead of
+    /// the accepted prefix (`commit_cycle(.., ticket.rows())`), or settling
+    /// at the write cursor instead of the committed frontier.
     #[test]
-    fn dspark_ar_probe_avoids_rollback_and_consumes_tapped_state() {
-        let mut inner = tiny_inner_with_draft();
-        inner
-            .init_caches_sync()
-            .expect("tiny target caches must initialize");
-        let num_draft_layers = inner.dspark_draft().expect("draft loaded").num_layers();
-        inner.draft_turn_state = Some(Gemma4DraftTurnState::Dspark(DsparkTurnState {
-            ctx: DsparkContextCache::new(num_draft_layers),
-            next_pos: 0,
-        }));
-        let mut stepper = match inner
-            .begin_dspark_decode(3)
-            .expect("prepared DSpark stepper")
-        {
-            Gemma4DraftStepper::Dspark(stepper) => stepper,
-            Gemma4DraftStepper::Assistant(_) => panic!("expected DSpark stepper"),
+    fn paged_dspark_matches_paged_ar_at_greedy_temperature() {
+        const SEED: u64 = 0x0D1_9A7E_0001;
+        let Some(_probe) = seeded_tiny_paged_inner_with_draft(SEED) else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
         };
+        let tokenizer = tiny_qwen_tokenizer();
+        let window = 8usize;
+        let epilogues_abandoned_before = crate::engine::spec_paged::abandoned_spec_turn_epilogues();
 
-        // The dedicated calibration path writes exactly one fully-kept target
-        // slot and captures the hidden needed by the next speculative cycle,
-        // but deliberately creates no rollback snapshot.
-        let out = stepper
-            .verify_ar_probe(1)
-            .expect("one-token dedicated AR probe verify");
-        assert!(stepper.rollback.is_none());
-        assert!(stepper.tapped.is_some() && stepper.ar_probe_pending);
-        let sampled = out.logits.argmax(-1, None).expect("probe argmax");
-        sampled.eval();
-        let _ = sampled.item_at_int32(0).expect("force probe target graph");
+        for (label, prompt_len, budget) in [("sub_window", 4usize, 9i32), ("wrapped", 12, 24)] {
+            let tokens: Vec<u32> = (0..prompt_len as u32).map(|i| i % 16).collect();
+            let config = tiny_turn_config(None, budget);
 
-        // Commit/fusion happens outside the AR timer, but must leave no
-        // speculative transaction behind before the next probe cycle.
-        stepper
-            .commit_ar_probe()
-            .expect("commit full-keep probe anchor");
-        stepper
-            .materialize_adaptive_state()
-            .expect("materialize next-cycle draft context");
-        assert_eq!(stepper.next_pos, 1);
-        assert!(
-            stepper.rollback.is_none() && stepper.tapped.is_none() && !stepper.ar_probe_pending,
-            "AR calibration must not leak rollback/tapped state into the next cycle"
+            let mut ar_inner = seeded_tiny_paged_inner_with_draft(SEED).expect("seeded AR fixture");
+            let ar_seq = ar_inner.active_paged_seq;
+            let ar = run_tiny_paged_ar_turn(&mut ar_inner, &tokenizer, &tokens, &config)
+                .expect("paged AR turn");
+            let ar_rows = committed_paged_tokens(&ar_inner, ar_seq);
+
+            let mut spec_inner =
+                seeded_tiny_paged_inner_with_draft(SEED).expect("seeded speculative fixture");
+            let spec_seq = spec_inner.active_paged_seq;
+            let spec = run_tiny_paged_draft_turn(&mut spec_inner, &tokenizer, &tokens, &config)
+                .expect("paged DSpark turn");
+            let spec_rows = committed_paged_tokens(&spec_inner, spec_seq);
+
+            assert_eq!(spec.raw_text, ar.raw_text, "[{label}] raw_text");
+            assert_eq!(spec.num_tokens, ar.num_tokens, "[{label}] token count");
+            assert_eq!(
+                spec.finish_reason, ar.finish_reason,
+                "[{label}] finish_reason"
+            );
+            assert_eq!(
+                spec_inner.cached_token_history, ar_inner.cached_token_history,
+                "[{label}] saved history"
+            );
+            assert_eq!(spec_rows, ar_rows, "[{label}] committed paged rows");
+            assert_eq!(
+                paged_free_blocks(&spec_inner),
+                paged_free_blocks(&ar_inner),
+                "[{label}] the post-commit settle must reclaim exactly the blocks the AR \
+                 lane's per-step settle does"
+            );
+            assert_eq!(
+                spec_rows.as_deref(),
+                Some(spec_inner.cached_token_history.as_slice()),
+                "[{label}] no drafted row may outlive its cycle"
+            );
+
+            let cycles = spec
+                .performance
+                .as_ref()
+                .and_then(|p| p.mtp_cycles)
+                .unwrap_or(0);
+            assert!(
+                cycles > 0,
+                "[{label}] the speculative lane must actually run cycles (silent AR fallback?)"
+            );
+            assert_eq!(
+                crate::engine::spec_paged::abandoned_spec_turn_epilogues(),
+                epilogues_abandoned_before,
+                "[{label}] a completed speculative turn must discharge its epilogue \
+                 through SpecTurnEpilogue::finish (L-EPILOGUE)"
+            );
+            if label == "wrapped" {
+                assert!(
+                    prompt_len > window,
+                    "the wrapped leg must start past the {window}-token sliding window"
+                );
+            }
+        }
+    }
+
+    /// A LENGTH exit materializes one final row AFTER the last cycle's
+    /// commit, and that row can be the one whose committed cutoff
+    /// (`committed - window`) crosses a block boundary. The turn tail must
+    /// settle it: the per-cycle settles inside `run_dspark_turn` stop at the
+    /// last COMMIT, so a tail without `end_decode` leaves the retired
+    /// sliding block held for the rest of the session and skips the
+    /// cold-rung walk at the turn's real frontier.
+    ///
+    /// The fixture's discriminating property is asserted, not assumed: the
+    /// same autoregressive turn one token shorter leaves a DIFFERENT sliding
+    /// free-block count, which is what makes the final token the one that
+    /// retires the block.
+    ///
+    /// Mutation this catches: dropping `end_decode` from
+    /// `run_paged_dspark_turn`'s tail — the speculative lane then holds one
+    /// sliding block the autoregressive lane returned.
+    #[test]
+    fn paged_dspark_length_exit_settles_the_materialized_final_row() {
+        const SEED: u64 = 0x0D1_9A7E_0001;
+        const PROMPT_LEN: usize = 4;
+        // `PROMPT_LEN + BUDGET == 16 == 2 * paged_block_size`, and the tiny
+        // config's sliding window is one block wide, so the final row is
+        // exactly the token that moves the committed cutoff onto block 1.
+        const BUDGET: i32 = 12;
+
+        let Some(_probe) = seeded_tiny_paged_inner_with_draft(SEED) else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
+        };
+        let tokenizer = tiny_qwen_tokenizer();
+        let tokens: Vec<u32> = (0..PROMPT_LEN as u32).map(|i| i % 16).collect();
+
+        let ar_blocks_at = |budget: i32| {
+            let mut inner = seeded_tiny_paged_inner_with_draft(SEED).expect("seeded AR fixture");
+            let result = run_tiny_paged_ar_turn(
+                &mut inner,
+                &tokenizer,
+                &tokens,
+                &tiny_turn_config(None, budget),
+            )
+            .expect("paged AR turn");
+            (result, paged_free_blocks(&inner))
+        };
+        let (_, ar_short_blocks) = ar_blocks_at(BUDGET - 1);
+        let (ar, ar_blocks) = ar_blocks_at(BUDGET);
+        assert_eq!(
+            ar.finish_reason, "length",
+            "the fixture must exit on length"
+        );
+        assert_ne!(
+            ar_short_blocks, ar_blocks,
+            "the fixture is only discriminating if the LAST token is the one that \
+             retires a sliding block — one token shorter must leave a different \
+             free-block count"
+        );
+
+        let mut spec_inner =
+            seeded_tiny_paged_inner_with_draft(SEED).expect("seeded speculative fixture");
+        let spec_seq = spec_inner.active_paged_seq;
+        let spec = run_tiny_paged_draft_turn(
+            &mut spec_inner,
+            &tokenizer,
+            &tokens,
+            &tiny_turn_config(None, BUDGET),
+        )
+        .expect("paged DSpark turn");
+
+        assert_eq!(spec.raw_text, ar.raw_text, "raw_text");
+        assert_eq!(spec.finish_reason, ar.finish_reason, "finish_reason");
+        assert_eq!(spec.num_tokens, ar.num_tokens, "token count");
+        assert_eq!(
+            committed_paged_tokens(&spec_inner, spec_seq).map(|rows| rows.len()),
+            Some(PROMPT_LEN + spec.num_tokens as usize),
+            "a length exit keeps every token, so the final row must be materialized"
         );
         assert!(
-            !stepper.ctx.is_empty(),
-            "the kept probe hidden must seed the following speculative cycle"
+            spec.performance
+                .as_ref()
+                .and_then(|p| p.mtp_cycles)
+                .unwrap_or(0)
+                > 0,
+            "the speculative lane must actually run cycles (silent AR fallback?)"
+        );
+        assert_eq!(
+            paged_free_blocks(&spec_inner),
+            ar_blocks,
+            "the turn tail must settle the materialized final row: the speculative \
+             lane is holding a sliding block the autoregressive lane returned"
+        );
+    }
+
+    /// A stop INSIDE a speculative block registers only the tokens the turn
+    /// emitted: the saved history drops the stop token (AR parity) and the
+    /// paged rows equal that history exactly — the drafted rows past the cut
+    /// were retracted by the cycle's commit.
+    ///
+    /// Mutation this catches: keeping the whole verify block on a stop cut
+    /// (`keep = 1 + accepted_drafts_k` instead of the clamped count), which
+    /// leaves rows past the saved history.
+    #[test]
+    fn paged_dspark_mid_cycle_stop_registers_only_emitted_tokens() {
+        let Some(mut inner) = seeded_tiny_paged_inner_with_draft(0x5709_C107) else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
+        };
+        let tokenizer = tiny_qwen_tokenizer();
+        let tokens: Vec<u32> = vec![0, 1, 2, 3];
+        let seq_id = inner.active_paged_seq;
+
+        // Every id in the tiny vocab is a stop token, so the FIRST emitted
+        // token ends the turn — the earliest possible mid-block cut.
+        let mut config = tiny_turn_config(None, 12);
+        config.max_new_tokens = Some(12);
+        let out = run_tiny_paged_turn(
+            &mut inner, &tokenizer, &tokens, &config, true, 0, None, None,
+        )
+        .expect("stop-shaped speculative turn");
+        let res = match out {
+            TurnOutput::Complete(res) => *res,
+            TurnOutput::Streamed => panic!("sync turn returned Streamed"),
+        };
+        assert_eq!(res.finish_reason, "stop", "the fixture must stop early");
+
+        let history = inner.cached_token_history.clone();
+        assert_eq!(
+            history.len(),
+            tokens.len() + res.num_tokens as usize - 1,
+            "a stop exit drops the stop token from the saved history (AR parity)"
+        );
+        assert_eq!(
+            committed_paged_tokens(&inner, seq_id).as_deref(),
+            Some(history.as_slice()),
+            "the committed paged rows must be exactly the saved history — no drafted \
+             row past the stop may survive"
+        );
+    }
+
+    /// REJECT-ALL: a cycle whose drafted rows are all rejected must leave
+    /// the paged cache exactly as a cycle that drafted nothing does — same
+    /// committed rows, same blocks — so no drafted row can reach the
+    /// settle's cold-rung walk or the sliding prune.
+    ///
+    /// Both legs reserve the same lookahead, so the only difference is the
+    /// three rows leg A writes and rolls back.
+    ///
+    /// Mutation this catches: committing `total_written` instead of `keep`
+    /// (the rejected rows stay committed), or settling before the rollback
+    /// (the checkpoint walk sees the write cursor).
+    #[test]
+    fn paged_dspark_reject_all_leaves_no_drafted_row_behind() {
+        const SEED: u64 = 0x0D19_E7EC;
+        const RESERVE_ROWS: usize = 3;
+
+        fn cycle(verify_ids: &[u32]) -> Option<(Vec<u32>, Option<Vec<u32>>)> {
+            let mut inner = seeded_tiny_paged_inner_with_draft(SEED)?;
+            let tokenizer = tiny_qwen_tokenizer();
+            let tokens: Vec<u32> = vec![0, 1, 2, 3];
+            run_tiny_paged_draft_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 4))
+                .expect("warm the sequence with a real speculative turn");
+            let seq_id = inner.active_paged_seq;
+            let warm = committed_paged_tokens(&inner, seq_id).expect("warm rows");
+            let num_draft_layers = inner
+                .dspark_draft()
+                .map(DsparkDraftModel::num_layers)
+                .expect("draft loaded");
+            inner.draft_turn_state = Some(Gemma4DraftTurnState::Dspark(DsparkTurnState {
+                ctx: DsparkContextCache::new(num_draft_layers),
+                next_pos: i32::try_from(warm.len()).expect("warm rows fit i32"),
+            }));
+            {
+                let Gemma4DraftStepper::Dspark(mut stepper) = inner
+                    .begin_dspark_decode(2)
+                    .expect("begin a synthetic cycle")
+                else {
+                    panic!("a DSpark draft must yield the DSpark stepper")
+                };
+                assert!(
+                    stepper
+                        .reserve_cycle_lookahead(RESERVE_ROWS)
+                        .expect("reserve lookahead"),
+                    "the tiny pool must admit {RESERVE_ROWS} lookahead rows"
+                );
+                stepper.verify(verify_ids).expect("verify block");
+                // keep = 1: the anchor's own row only — every drafted row rejected.
+                stepper.commit(1, verify_ids.len()).expect("commit");
+            }
+            let mut expected = warm;
+            expected.push(verify_ids[0]);
+            let rows = committed_paged_tokens(&inner, seq_id).expect("rows after the cycle");
+            assert_eq!(
+                rows, expected,
+                "only the anchor's row may survive a cycle committed with keep = 1"
+            );
+            Some((rows, paged_free_blocks(&inner)))
+        }
+
+        const ANCHOR: u32 = 5;
+        let Some((no_draft_rows, no_draft_blocks)) = cycle(&[ANCHOR]) else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
+        };
+        let (reject_all_rows, reject_all_blocks) = cycle(&[ANCHOR, 6, 7]).expect("reject-all leg");
+
+        assert_eq!(
+            reject_all_rows, no_draft_rows,
+            "a reject-all cycle must commit exactly the rows a no-draft cycle commits"
+        );
+        assert_eq!(
+            reject_all_blocks, no_draft_blocks,
+            "a reject-all cycle must leave the same blocks a no-draft cycle does"
         );
     }
 
@@ -1741,9 +1918,54 @@ pub(crate) mod tests {
         }
     }
 
-    /// Drive `draft_chat_turn` directly (sync — no model thread), with an
+    /// Drive one PAGED tiny turn through the real `ChatBackend` dispatch
+    /// (sync unless a sink is supplied — no model thread), with an
     /// out-of-vocab `eos_id` so the tiny model can only exit "length".
-    pub(crate) fn run_tiny_draft_turn(
+    /// `speculative` picks the decoder the dispatch then routes on.
+    pub(crate) fn run_tiny_paged_turn(
+        inner: &mut Gemma4Inner,
+        tokenizer: &Arc<crate::tokenizer::Qwen3Tokenizer>,
+        tokens: &[u32],
+        config: &ChatConfig,
+        speculative: bool,
+        eos_id: u32,
+        sink: Option<&dyn crate::engine::backend::ChunkSink>,
+        cancelled: Option<&std::sync::atomic::AtomicBool>,
+    ) -> Result<TurnOutput> {
+        let p = ChatBackend::resolve_params(inner, config);
+        let thinking = ChatBackend::thinking_setup(inner, config);
+        let mut args = WholeTurnArgs {
+            tokens,
+            tokenizer,
+            eos_id,
+            config,
+            params: &p,
+            thinking,
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: true,
+                decoder: if speculative {
+                    DecoderPlan::Speculative(SpeculativeKind::DraftModel)
+                } else {
+                    DecoderPlan::Autoregressive
+                },
+            },
+            sink,
+            cancelled,
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+        ChatBackend::run_paged_turn(inner, &mut args)
+    }
+
+    /// Drive `flat_draft_chat_turn` directly (sync — no model thread) for
+    /// the FLAT lane the assistant drafter runs on, with an out-of-vocab
+    /// `eos_id` so the tiny model can only exit "length".
+    pub(crate) fn run_tiny_flat_draft_turn(
         inner: &mut Gemma4Inner,
         tokenizer: &Arc<crate::tokenizer::Qwen3Tokenizer>,
         tokens: &[u32],
@@ -1772,47 +1994,134 @@ pub(crate) mod tests {
                 audio: &[],
             },
         };
-        match inner.draft_chat_turn(&mut args)? {
+        match inner.flat_draft_chat_turn(&mut args)? {
             TurnOutput::Complete(r) => Ok(*r),
             TurnOutput::Streamed => panic!("sync draft turn returned TurnOutput::Streamed"),
         }
     }
 
-    /// FAIL-CLOSED regression: a REAL (unmocked) stepper error AFTER
-    /// prefill has advanced the target caches must drop the entire warm
-    /// session — caches, `cached_token_history`, per-turn stash — so no
-    /// later turn can prefix-match into K/V the history knows nothing
-    /// about; and the very next turn must succeed via the cold path.
+    /// [`run_tiny_paged_turn`] on the speculative lane, sync.
+    pub(crate) fn run_tiny_paged_draft_turn(
+        inner: &mut Gemma4Inner,
+        tokenizer: &Arc<crate::tokenizer::Qwen3Tokenizer>,
+        tokens: &[u32],
+        config: &ChatConfig,
+    ) -> Result<crate::engine::types::ChatResult> {
+        match run_tiny_paged_turn(inner, tokenizer, tokens, config, true, 999, None, None)? {
+            TurnOutput::Complete(r) => Ok(*r),
+            TurnOutput::Streamed => panic!("sync draft turn returned TurnOutput::Streamed"),
+        }
+    }
+
+    /// The same turn on the plain paged AR lane — the T=0 oracle the
+    /// speculative parity gates compare against.
+    pub(crate) fn run_tiny_paged_ar_turn(
+        inner: &mut Gemma4Inner,
+        tokenizer: &Arc<crate::tokenizer::Qwen3Tokenizer>,
+        tokens: &[u32],
+        config: &ChatConfig,
+    ) -> Result<crate::engine::types::ChatResult> {
+        match run_tiny_paged_turn(inner, tokenizer, tokens, config, false, 999, None, None)? {
+            TurnOutput::Complete(r) => Ok(*r),
+            TurnOutput::Streamed => panic!("sync AR turn returned TurnOutput::Streamed"),
+        }
+    }
+
+    /// Deterministic weights: MLX's global PRNG seeds `Linear::new`'s
+    /// Xavier-uniform draw, so two fixtures built after the same seed carry
+    /// byte-identical weights — the only way a two-instance A/B can compare
+    /// trajectories.
+    pub(crate) fn seeded_tiny_paged_inner_with_draft(seed: u64) -> Option<Gemma4Inner> {
+        // SAFETY: test-local; the gemma4 tiny fixtures are the only users of
+        // the global PRNG in this binary.
+        unsafe { mlx_sys::mlx_seed(seed) };
+        tiny_paged_inner_with_draft()
+    }
+
+    /// Per-group free-block counts — what the sliding prune half of the
+    /// settle actually moves.
+    pub(crate) fn paged_free_blocks(inner: &Gemma4Inner) -> Option<Vec<u32>> {
+        let coordinator = inner.kv_cache_coordinator.as_ref()?;
+        let mut group_ids: Vec<usize> = coordinator
+            .routes()
+            .iter()
+            .map(|route| route.group_id)
+            .collect();
+        group_ids.sort_unstable();
+        group_ids.dedup();
+        group_ids
+            .into_iter()
+            .map(|group_id| {
+                coordinator
+                    .adapter(group_id)
+                    .ok()?
+                    .block_telemetry()
+                    .ok()
+                    .map(|telemetry| telemetry.free_blocks)
+            })
+            .collect()
+    }
+
+    /// The paged rows sequence `seq_id` has COMMITTED, or `None` when no
+    /// live request names it.
+    pub(crate) fn committed_paged_tokens(inner: &Gemma4Inner, seq_id: u32) -> Option<Vec<u32>> {
+        inner
+            .kv_cache_coordinator
+            .as_ref()?
+            .full_adapter()
+            .request_tokens_for(seq_id)
+            .map(<[u32]>::to_vec)
+    }
+
+    /// FAIL-CLOSED regression: a REAL (unmocked) error AFTER the prefill has
+    /// advanced the paged cursor must release the request and drop the whole
+    /// warm session — history, media keys, per-turn stash — so no later turn
+    /// can prefix-match into rows the history knows nothing about; and the
+    /// very next turn must succeed via the cold path.
     ///
-    /// Error injection: sliding_window 2 with the default depth (draft
-    /// block_size 3) makes the first cycle's 4-row verify block violate
-    /// `snapshot_before_verify`'s window >= block invariant — the error
-    /// fires at the verify seam of cycle 1, after `dspark_prefill_with_tap`
-    /// appended the whole prompt to every active cache.
+    /// Error injection: `target_layer_ids` in DESCENDING order. The tap
+    /// validator (`validate_paged_tap_layer_ids`) requires strictly
+    /// ascending decoder indices and rejects the very first tapped chunk —
+    /// after `record_tokens_all` advanced every group's cursor for it.
     #[test]
-    fn dspark_turn_error_fails_closed_then_cold_turn_recovers() {
-        let mut inner = Gemma4Inner::new(tiny_target_config_with_window(2))
-            .expect("tiny window-2 Gemma4Inner must construct");
+    fn dspark_paged_turn_error_fails_closed_then_cold_turn_recovers() {
+        let Some(mut inner) = seeded_tiny_paged_inner_with_draft(0xD1_FA11_0001) else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
+        };
+        let mut broken = tiny_draft_config_value();
+        broken["target_layer_ids"] = serde_json::json!([2, 0]);
         inner.draft = Some(Gemma4Draft::Dspark(
-            DsparkDraftModel::new(tiny_draft_config()).expect("tiny draft model"),
+            DsparkDraftModel::new(
+                serde_json::from_value(broken).expect("descending-tap draft config"),
+            )
+            .expect("tiny draft model"),
         ));
         let tokenizer = tiny_qwen_tokenizer();
         let tokens: Vec<u32> = vec![0, 1, 2, 3];
+        let seq_id = inner.active_paged_seq;
+        let epilogues_abandoned_before = crate::engine::spec_paged::abandoned_spec_turn_epilogues();
 
-        // Turn 1: unset depth resolves to block_size 3 → 1+3 verify rows
-        // over a 2-token window → hard error mid-turn.
-        let err = run_tiny_draft_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 8))
-            .expect_err("a depth-3 verify block must violate the window-2 rollback invariant");
+        let err =
+            run_tiny_paged_draft_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 8))
+                .expect_err("descending tap layer ids must be rejected by the paged layer loop");
         assert!(
-            err.reason.contains("sliding window") && err.reason.contains("verify block"),
-            "expected the snapshot_before_verify window guard, got: {}",
+            err.reason.contains("layer_ids"),
+            "expected the paged tap layer-id guard, got: {}",
             err.reason
         );
+
+        assert_eq!(
+            crate::engine::spec_paged::abandoned_spec_turn_epilogues(),
+            epilogues_abandoned_before,
+            "a failed speculative turn must discharge its epilogue through \
+             SpecTurnEpilogue::abort, not abandon it (L-EPILOGUE)"
+        );
+
         // Fail CLOSED: nothing warm-reusable may survive the error.
-        assert!(inner.caches.is_none(), "caches must be dropped");
         assert!(
             inner.cached_token_history.is_empty(),
-            "cached_token_history must be cleared (it never covered the prefilled K/V)"
+            "cached_token_history must be cleared (it never covered the prefilled rows)"
         );
         assert!(
             inner.draft_turn_state.is_none(),
@@ -1825,14 +2134,17 @@ pub(crate) mod tests {
         assert_eq!(
             ChatBackend::verify_cache_prefix(&inner, &tokens, true),
             0,
-            "no prefix hit may match against the dropped session"
+            "no prefix hit may match against the released request"
         );
 
-        // Turn 2: depth 1 → verify blocks of <= 2 rows fit the window; the
-        // turn must run cold end-to-end and land fully consistent.
+        // Turn 2 on a sound draft: the turn must run cold end-to-end and land
+        // fully consistent.
+        inner.draft = Some(Gemma4Draft::Dspark(
+            DsparkDraftModel::new(tiny_draft_config()).expect("tiny draft model"),
+        ));
         let mut recovery_config = tiny_turn_config(Some(1), 3);
         recovery_config.reasoning_effort = Some("high".to_string());
-        let res = run_tiny_draft_turn(&mut inner, &tokenizer, &tokens, &recovery_config)
+        let res = run_tiny_paged_draft_turn(&mut inner, &tokenizer, &tokens, &recovery_config)
             .expect("the next turn after fail-closed must succeed via the cold path");
         assert_eq!(res.finish_reason, "length");
         assert!(
@@ -1846,26 +2158,16 @@ pub(crate) mod tests {
         assert_eq!(res.num_tokens, 3, "budget-3 length exit");
 
         // Length-exit AR parity (keep-all + materialize): the saved history
-        // holds prompt + ALL generated tokens and every ACTIVE cache offset
-        // equals the history length — the final token's K/V was
-        // materialized by `dspark_materialize_final`.
+        // holds prompt + ALL generated tokens, and the paged rows ARE that
+        // history — no speculative row outlived its cycle.
         let history = inner.cached_token_history.clone();
         assert_eq!(history.len(), tokens.len() + res.num_tokens as usize);
         assert_eq!(&history[..tokens.len()], &tokens[..]);
-        let mask = dspark_shared_slot_mask(&inner.config);
-        let caches = inner
-            .caches
-            .as_ref()
-            .expect("live caches after a successful turn");
-        for (i, cache) in caches.iter().enumerate() {
-            let expected = if mask[i] { 0 } else { history.len() as i32 };
-            assert_eq!(
-                cache.get_offset(),
-                expected,
-                "cache {i} offset must equal the saved history length \
-                 (length-exit materialize; shared slots stay unwritten)"
-            );
-        }
+        assert_eq!(
+            committed_paged_tokens(&inner, seq_id).as_deref(),
+            Some(history.as_slice()),
+            "the committed paged rows must be exactly the saved history"
+        );
     }
 
     // ── streaming cancellation (whole-turn) ────────────────────────────
@@ -1891,31 +2193,26 @@ pub(crate) mod tests {
         }
     }
 
-    /// WHOLE-TURN streaming cancellation through `draft_chat_turn`: a
+    /// WHOLE-TURN streaming cancellation through `run_paged_dspark_turn`: a
     /// cancel raised from the chunk sink must terminate the stream promptly
     /// ("cancelled", bounded block-granular overrun — never running on to
-    /// the budget) and leave the cached session state consistent (AR-parity
+    /// the budget) and leave the paged session consistent (AR-parity
     /// drop-last: the final emitted token is persisted in NEITHER the
-    /// history NOR the caches; offsets equal the history), with the next
-    /// turn running normally. Chunk-vs-residual byte accounting for the
-    /// cancel suffix is pinned at the engine seam
-    /// (`dspark_turn_streaming_cancel_in_clamp_commits_exactly_once`),
-    /// where the mid-clamp cancel point is injectable; a sink-driven flip
-    /// lands at the next loop-top by construction.
+    /// history NOR the pool), with the next turn running normally.
+    /// Chunk-vs-residual byte accounting for the cancel suffix is pinned at
+    /// the engine seam
+    /// (`dspark_turn_streaming_cancel_in_clamp_commits_exactly_once`), where
+    /// the mid-clamp cancel point is injectable; a sink-driven flip lands at
+    /// the next loop-top by construction.
     #[test]
     fn dspark_streaming_cancel_whole_turn_state_consistent() {
-        // Placeholder weights come from MLX's global PRNG (`Linear::new` is
-        // Xavier-uniform); pin it so the token stream — and with it the
-        // chunk/flip timing the `n` bound below asserts on — is identical
-        // on every run (the repo's established `mlx_seed` test pattern).
-        unsafe { mlx_sys::mlx_seed(0xD5_9A4B_0001) };
-        let mut inner =
-            Gemma4Inner::new(tiny_target_config()).expect("tiny Gemma4Inner must construct");
-        inner.draft = Some(Gemma4Draft::Dspark(
-            DsparkDraftModel::new(tiny_draft_config()).expect("tiny draft model"),
-        ));
+        let Some(mut inner) = seeded_tiny_paged_inner_with_draft(0xD5_9A4B_0001) else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
+        };
         let tokenizer = tiny_qwen_tokenizer();
         let tokens: Vec<u32> = vec![0, 1, 2, 3];
+        let seq_id = inner.active_paged_seq;
         // Budget 12 with a flip after 2 chunks: a broken cancel would run to
         // the length exit and emit ~12 chunks.
         let mut config = tiny_turn_config(Some(1), 12);
@@ -1927,32 +2224,17 @@ pub(crate) mod tests {
             cancelled: Arc::clone(&cancelled),
             flip_after: 2,
         };
-        let p = ChatBackend::resolve_params(&inner, &config);
-        let thinking = ChatBackend::thinking_setup(&inner, &config);
-        let mut args = WholeTurnArgs {
-            tokens: &tokens,
-            tokenizer: &tokenizer,
-            eos_id: 999,
-            config: &config,
-            params: &p,
-            thinking,
-            plan: TurnPlan {
-                is_delta: false,
-                input_media: MediaCapabilities::NONE,
-                context_media: MediaCapabilities::NONE,
-                use_paged_attention: false,
-                decoder: DecoderPlan::Speculative(SpeculativeKind::DraftModel),
-            },
-            sink: Some(&sink),
-            cancelled: Some(&cancelled),
-            media: MediaInputs {
-                images: &[],
-                audio: &[],
-            },
-        };
-        let out = inner
-            .draft_chat_turn(&mut args)
-            .expect("streaming cancelled turn must complete cleanly");
+        let out = run_tiny_paged_turn(
+            &mut inner,
+            &tokenizer,
+            &tokens,
+            &config,
+            true,
+            999,
+            Some(&sink),
+            Some(&cancelled),
+        )
+        .expect("streaming cancelled turn must complete cleanly");
         assert!(
             matches!(out, TurnOutput::Streamed),
             "streaming turn must return TurnOutput::Streamed"
@@ -1976,7 +2258,7 @@ pub(crate) mod tests {
         );
 
         // AR-parity cancelled save: the final emitted token is dropped from
-        // the history AND was never committed to the caches.
+        // the history AND never survives in the pool.
         let history = inner.cached_token_history.clone();
         assert_eq!(
             history.len(),
@@ -1984,24 +2266,47 @@ pub(crate) mod tests {
             "cancelled turn must persist prompt + generated minus the final token"
         );
         assert_eq!(&history[..tokens.len()], &tokens[..]);
-        let mask = dspark_shared_slot_mask(&inner.config);
-        let caches = inner.caches.as_ref().expect("live caches after the turn");
-        for (i, cache) in caches.iter().enumerate() {
-            let expected = if mask[i] { 0 } else { history.len() as i32 };
-            assert_eq!(
-                cache.get_offset(),
-                expected,
-                "cache {i} offset must equal the saved history length after a cancel"
-            );
-        }
-        assert!(
+        assert_eq!(
+            committed_paged_tokens(&inner, seq_id).as_deref(),
+            Some(history.as_slice()),
+            "the committed paged rows must be exactly the saved history"
+        );
+        // Warm-reusability after a cancel is a PAGED-LANE property, not a
+        // speculative one, so it is asserted against the plain paged AR lane
+        // on an identically seeded fixture rather than against a constant —
+        // a control that moves with the lane instead of rotting beside it.
+        let ar_live = {
+            let mut ar_inner =
+                seeded_tiny_paged_inner_with_draft(0xD5_9A4B_0001).expect("seeded AR fixture");
+            let ar_cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ar_sink = CancelAfterSink {
+                chunks: std::sync::Mutex::new(Vec::new()),
+                cancelled: Arc::clone(&ar_cancelled),
+                flip_after: 2,
+            };
+            run_tiny_paged_turn(
+                &mut ar_inner,
+                &tokenizer,
+                &tokens,
+                &config,
+                false,
+                999,
+                Some(&ar_sink),
+                Some(&ar_cancelled),
+            )
+            .expect("paged AR cancelled turn must complete cleanly");
+            ChatBackend::has_live_session(&ar_inner)
+        };
+        assert_eq!(
             ChatBackend::has_live_session(&inner),
-            "a cleanly cancelled turn leaves a warm-reusable session (AR parity)"
+            ar_live,
+            "a cancelled speculative turn must leave the session exactly as warm \
+             (or as cold) as a cancelled AR turn does"
         );
 
         // The next turn runs normally (fresh prompt: the longer saved
         // history is a prefix-miss, so it takes the cold path).
-        let res = run_tiny_draft_turn(
+        let res = run_tiny_paged_draft_turn(
             &mut inner,
             &tokenizer,
             &tokens,

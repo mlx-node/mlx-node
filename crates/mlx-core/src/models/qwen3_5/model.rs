@@ -14,8 +14,8 @@ use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, MtpBackend, MtpStepper, MtpTurnSetup, PagedBackend,
-    PagedPrefix, ResetScope, SaveStateArgs, ThinkingSetup, TrainBackend, TurnOutput, TurnSetup,
-    WholeTurnArgs,
+    PagedPrefix, ResetScope, SaveStateArgs, SpecFrontier, ThinkingSetup, TrainBackend, TurnOutput,
+    TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::{
     ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
@@ -26,6 +26,7 @@ use crate::engine::plan::{
     SpeculativePlan,
 };
 use crate::engine::recurrent_state::{HYBRID_LIVE_STATE_UNITS, RecurrentStateTable};
+use crate::engine::spec_owner::SpecOwner;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -713,6 +714,47 @@ fn dense_paged_linear_caches_ready(
     true
 }
 
+/// Signed skew between the adapter's recorded token count and the drop-last
+/// token history a dense paged epilogue is about to persist, `None` when they
+/// agree. Both sides drop the SAME unforwarded final token (the paged decode
+/// loop never forwards the last sampled token, and the saved history drops it
+/// too), so agreement is STRICT equality — any ±1 tolerance here would either
+/// mask a real one-token skew or arm the refuse-to-persist latch forever.
+fn dense_paged_frontier_skew(adapter_recorded_len: usize, history_len: usize) -> Option<i64> {
+    let skew = adapter_recorded_len as i64 - history_len as i64;
+    (skew != 0).then_some(skew)
+}
+
+/// Exact bit-level equality of two arrays (test oracle only). 16-bit floats
+/// compare on their raw bit patterns via the native extraction; everything
+/// else round-trips through f32 and compares `to_bits`, so `-0.0 != 0.0` and
+/// differing NaN payloads count as differences — exactly what a
+/// state-equals-its-key audit needs.
+pub(crate) fn arrays_bits_equal_for_test(a: &MxArray, b: &MxArray) -> Result<bool> {
+    a.eval();
+    b.eval();
+    let (da, db) = (a.dtype()?, b.dtype()?);
+    if da != db {
+        return Ok(false);
+    }
+    match da {
+        crate::array::DType::BFloat16 | crate::array::DType::Float16 => {
+            Ok(a.to_uint16_native()? == b.to_uint16_native()?)
+        }
+        _ => {
+            let av = a.to_float32()?;
+            let bv = b.to_float32()?;
+            if av.len() != bv.len() {
+                return Ok(false);
+            }
+            Ok(av
+                .iter()
+                .zip(bv.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits()))
+        }
+    }
+}
+
 fn clone_dense_linear_layer_caches(
     config: &Qwen3_5Config,
     caches: &[Qwen3_5LayerCache],
@@ -838,6 +880,38 @@ pub(crate) struct Qwen35Inner {
     /// stepper handles the rollback, so tests can verify that a positive tail
     /// actually arms the family latch.
     pub(crate) flat_mtp_last_rollback_unemitted: usize,
+    /// Paged twin of `flat_mtp_last_rollback_unemitted`: the engine-computed
+    /// accepted-but-unemitted tail of the most recent PAGED MTP turn. The
+    /// paged epilogues record it (instead of discarding the turn outcome) so
+    /// tests can verify the mid-cycle GDN rewind actually had a tail to act on.
+    pub(crate) paged_mtp_last_rollback_unemitted: usize,
+    /// Count of paged MTP mid-cycle stops whose GDN recurrent state was
+    /// tape-replayed back to the drop-last-of-emitted frontier
+    /// (`DenseMtpStepper::rollback_unemitted`, Paged arm). A rewind path that
+    /// silently goes dead shows up as this staying flat while
+    /// `paged_mtp_gdn_invalidations` climbs.
+    paged_mtp_gdn_rewinds: u64,
+    /// Count of paged GDN invalidations: a failed mid-cycle GDN rewind, or an
+    /// epilogue frontier disagreement that armed `paged_gdn_state_dirty`.
+    paged_mtp_gdn_invalidations: u64,
+    /// Refuse-to-persist latch for the paged dense GDN state. Armed when a
+    /// paged epilogue's frontier check finds the adapter's recorded token
+    /// count disagreeing with the drop-last history it is about to persist.
+    /// While armed: `remember_dense_gdn_history_checkpoint` refuses to store
+    /// (and drops the stale checkpoint), and `prepare_dense_gdn_prefix_state`
+    /// skips every live/history reuse arm, falling to a recompute source
+    /// (checkpoint-ladder replay, cold sidecar, or full GDN re-prefill).
+    /// Cleared after a recompute arm runs and on release/reset. The heal is
+    /// GDN-only — the adapter's content-addressed K/V stays live/registered.
+    paged_gdn_state_dirty: bool,
+    /// Test-only one-shot: force the next epilogue frontier check to report a
+    /// mismatch so the `paged_gdn_state_dirty` refuse-and-heal path can be
+    /// exercised deterministically (pattern of `ForceFlatMtpDesyncForTest`).
+    paged_gdn_force_mismatch_for_test: bool,
+    /// The arm the most recent `prepare_dense_gdn_prefix_state` resolved to
+    /// (`"live"`, `"last_history"`, …). Test observability only — the trace
+    /// line carrying the same value needs a tracing subscriber to see.
+    last_gdn_prefix_prepare_state: &'static str,
     /// Training state owned by the model thread.
     /// Created when `InitTraining` command is received, destroyed when training ends.
     pub(crate) training_state: Option<crate::training_state::ModelThreadTrainingState>,
@@ -954,6 +1028,31 @@ fn apply_qwen35_dense_planned_decoder(config: &mut ChatConfig, decoder: DecoderP
     planned_mtp
 }
 
+/// Test-only between-turn snapshot of the paged-MTP GDN bookkeeping, read via
+/// [`Qwen35Cmd::MtpPagedGdnStateForTest`]. Serialized behind the model thread,
+/// so it observes the fully-finalized preceding turn.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct MtpPagedGdnStateForTest {
+    /// Whether the block-paged adapter is installed (the paged MTP lane).
+    pub paged_active: bool,
+    /// `cached_token_history.len()` — the committed drop-last history.
+    pub history_len: usize,
+    /// Engine-computed accepted-but-unemitted tail of the most recent paged
+    /// MTP turn (`paged_mtp_last_rollback_unemitted`).
+    pub last_rollback_unemitted: usize,
+    /// Mid-cycle GDN rewinds performed (`paged_mtp_gdn_rewinds`).
+    pub gdn_rewinds: u64,
+    /// GDN invalidations: failed rewinds + epilogue frontier disagreements.
+    pub gdn_invalidations: u64,
+    /// Whether the refuse-to-persist latch is currently armed.
+    pub state_dirty: bool,
+    /// Whether a GDN history checkpoint is currently stored.
+    pub has_history_checkpoint: bool,
+    /// The arm the most recent `prepare_dense_gdn_prefix_state` resolved to.
+    pub last_prefix_prepare_state: &'static str,
+}
+
 /// Commands dispatched from NAPI methods to the dedicated model thread.
 pub(crate) enum Qwen35Cmd {
     /// All chat-session traffic (sync + streaming starts/continues/tool
@@ -1008,6 +1107,25 @@ pub(crate) enum Qwen35Cmd {
     /// mid-cycle cancel.
     #[doc(hidden)]
     ForceFlatMtpDesyncForTest { reply: ResponseTx<()> },
+    /// Test-only: snapshot the paged-MTP GDN bookkeeping between turns — see
+    /// [`MtpPagedGdnStateForTest`].
+    #[doc(hidden)]
+    MtpPagedGdnStateForTest {
+        reply: ResponseTx<MtpPagedGdnStateForTest>,
+    },
+    /// Test-only: arm the one-shot forced frontier mismatch so the NEXT paged
+    /// epilogue takes the refuse-to-persist branch deterministically (the
+    /// natural trigger is a swallowed adapter-truncate failure, which no test
+    /// can provoke on demand). Pattern of `ForceFlatMtpDesyncForTest`.
+    #[doc(hidden)]
+    ForcePagedGdnMismatchForTest { reply: ResponseTx<()> },
+    /// Test-only state oracle: recompute GDN over the persisted history
+    /// checkpoint's own token key from FRESH caches and bit-compare the
+    /// conv/recurrent arrays against the checkpoint. `Ok(true)` iff every
+    /// linear layer matches exactly — i.e. the persisted state equals what
+    /// its key claims it is.
+    #[doc(hidden)]
+    GdnHistoryCheckpointOracleForTest { reply: ResponseTx<bool> },
     /// Training-session commands shared with the model-neutral engine. The
     /// thread loop routes these to
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
@@ -1160,6 +1278,25 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         Qwen35Cmd::ForceFlatMtpDesyncForTest { reply } => {
             inner.flat_mtp_caches_desynced = true;
             let _ = reply.send(Ok(()));
+        }
+        Qwen35Cmd::MtpPagedGdnStateForTest { reply } => {
+            let _ = reply.send(Ok(MtpPagedGdnStateForTest {
+                paged_active: inner.paged_adapter.is_some(),
+                history_len: inner.cached_token_history.len(),
+                last_rollback_unemitted: inner.paged_mtp_last_rollback_unemitted,
+                gdn_rewinds: inner.paged_mtp_gdn_rewinds,
+                gdn_invalidations: inner.paged_mtp_gdn_invalidations,
+                state_dirty: inner.paged_gdn_state_dirty,
+                has_history_checkpoint: inner.gdn_last_history_checkpoint.is_some(),
+                last_prefix_prepare_state: inner.last_gdn_prefix_prepare_state,
+            }));
+        }
+        Qwen35Cmd::ForcePagedGdnMismatchForTest { reply } => {
+            inner.paged_gdn_force_mismatch_for_test = true;
+            let _ = reply.send(Ok(()));
+        }
+        Qwen35Cmd::GdnHistoryCheckpointOracleForTest { reply } => {
+            let _ = reply.send(inner.gdn_history_checkpoint_recompute_matches_for_test());
         }
         // --- Training commands ---
         Qwen35Cmd::Train(train_cmd) => {
@@ -1364,10 +1501,6 @@ pub(crate) struct ChatDecodeInputs {
     /// forwarded. `prompt_hidden.shape(1) == prompt_hidden_ids.len()`.
     /// `Some` iff `prompt_hidden` is `Some`.
     pub prompt_hidden_ids: Option<Vec<u32>>,
-    /// Absolute committed-history position of `prompt_hidden_ids[0]`'s hidden
-    /// row. Zero for full committed history; non-zero for last-window prompt
-    /// seeding.
-    pub prompt_hidden_position_base: usize,
 }
 
 // ========== Qwen35Inner implementation ==========
@@ -1452,6 +1585,12 @@ impl Qwen35Inner {
             flat_mtp_caches_desynced: false,
             flat_full_reprefill_count: 0,
             flat_mtp_last_rollback_unemitted: 0,
+            paged_mtp_last_rollback_unemitted: 0,
+            paged_mtp_gdn_rewinds: 0,
+            paged_mtp_gdn_invalidations: 0,
+            paged_gdn_state_dirty: false,
+            paged_gdn_force_mismatch_for_test: false,
+            last_gdn_prefix_prepare_state: "",
             training_state: None,
             mtp,
             mtp_weights_loaded: false,
@@ -2062,6 +2201,9 @@ impl Qwen35Inner {
         self.gdn_root_cache_owner_id = None;
         self.gdn_root_cache_owner_is_explicit = false;
         self.paged_finalize_failed = false;
+        // A released/reset session has no GDN state left to refuse persisting.
+        self.paged_gdn_state_dirty = false;
+        self.paged_gdn_force_mismatch_for_test = false;
     }
 
     /// Tear down a partially prepared or partially executed paged turn.
@@ -2101,6 +2243,37 @@ impl Qwen35Inner {
         self.discard_dense_paged_session();
     }
 
+    /// I4 frontier agreement for a dense paged epilogue: the adapter's
+    /// recorded tokens and the drop-last history about to be persisted must
+    /// sit at ONE frontier before any GDN state is keyed on that history.
+    /// STRICT equality (see [`dense_paged_frontier_skew`]). Disagreement arms
+    /// the `paged_gdn_state_dirty` refuse-to-persist latch consumed by
+    /// [`Self::remember_dense_gdn_history_checkpoint`] (refuses + drops the
+    /// stale checkpoint) and [`Self::prepare_dense_gdn_prefix_state`] (next
+    /// turn falls to a recompute arm); the adapter K/V itself stays —
+    /// content-addressed prefix reuse is unaffected by a GDN-side skew.
+    fn check_dense_paged_frontier(&mut self, history_len: usize, context: &str) {
+        let Some(adapter) = self.paged_adapter.as_ref() else {
+            return;
+        };
+        let adapter_recorded_len = adapter.request_tokens().len();
+        let skew = if std::mem::take(&mut self.paged_gdn_force_mismatch_for_test) {
+            Some(1)
+        } else {
+            dense_paged_frontier_skew(adapter_recorded_len, history_len)
+        };
+        if let Some(skew) = skew {
+            tracing::error!(
+                target: "mlx_core::qwen3_5::paged",
+                "dense paged epilogue frontier disagreement ({context}): adapter \
+                 recorded {adapter_recorded_len} tokens, drop-last history has \
+                 {history_len} (skew {skew}); refusing to persist GDN state",
+            );
+            self.paged_gdn_state_dirty = true;
+            self.paged_mtp_gdn_invalidations += 1;
+        }
+    }
+
     /// Fallible terminal lifecycle for the hand-written paged cores.
     ///
     /// Unlike [`PagedBackend::finalize_paged_turn`], these cores can propagate
@@ -2113,11 +2286,17 @@ impl Qwen35Inner {
     /// Unlike the engine hook there is no release to order against: these cores
     /// only ever keep the request live, so the adapter's cold-chain frontier is
     /// still set when the capture reads it.
+    ///
+    /// `expected_history_len` is the drop-last history length the caller is
+    /// about to publish; the frontier check runs here because these cores set
+    /// `cached_token_history` only after finalization returns.
     fn finalize_dense_manual_paged_turn(
         &mut self,
         image_token_positions: &[(u32, u64)],
         cache_salt: u64,
+        expected_history_len: usize,
     ) -> Result<()> {
+        self.check_dense_paged_frontier(expected_history_len, "manual epilogue");
         let finalize_result = self
             .paged_adapter
             .as_mut()
@@ -2132,7 +2311,13 @@ impl Qwen35Inner {
             });
         match finalize_result {
             Ok(_) => {
-                self.capture_dense_gdn_cold_sidecar(image_token_positions, cache_salt);
+                // A frontier disagreement must not enqueue new durable GDN
+                // state this turn; the prefill-time checkpoints the capture
+                // reads are clean, but the persist surface is refused as a
+                // class while the latch is armed.
+                if !self.paged_gdn_state_dirty {
+                    self.capture_dense_gdn_cold_sidecar(image_token_positions, cache_salt);
+                }
                 Ok(())
             }
             Err(error) => {
@@ -2187,6 +2372,30 @@ impl Qwen35Inner {
             self.gdn_last_history_checkpoint = None;
             return Ok(trace.finish(total_start));
         }
+        if self.paged_gdn_state_dirty {
+            // Refuse-to-persist: this turn's epilogue found the adapter and
+            // the saved history disagreeing on the frontier, so the live GDN
+            // state cannot be keyed on `cached_token_history`. Drop the stale
+            // checkpoint too so no later lookup resurrects state that does not
+            // match its token key. GDN-only — the adapter K/V stays.
+            self.gdn_last_history_checkpoint = None;
+            return Ok(trace.finish(total_start));
+        }
+        // L-KEY (I4): the state cloned below is keyed on
+        // `cached_token_history`, and a paged session's GDN state sits at the
+        // adapter's recorded frontier (the paged forwards and rollbacks move
+        // both together). A caller that publishes without first running
+        // `check_dense_paged_frontier` (which arms the latch consumed above)
+        // trips this in debug builds instead of storing state ≠ its key.
+        #[cfg(debug_assertions)]
+        if let Some(adapter) = self.paged_adapter.as_ref() {
+            let gdn_frontier = adapter.request_tokens().len();
+            debug_assert_eq!(
+                gdn_frontier,
+                self.cached_token_history.len(),
+                "GDN history checkpoint key disagrees with the paged frontier",
+            );
+        }
 
         let eval_start = trace_enabled.then(std::time::Instant::now);
         eval_layer_caches(&self.caches)?;
@@ -2216,6 +2425,61 @@ impl Qwen35Inner {
         trace.update_ms = update_start.map(elapsed_ms).unwrap_or(0.0);
         trace.stored = true;
         Ok(trace.finish(total_start))
+    }
+
+    /// Test-only state oracle behind
+    /// [`Qwen35Cmd::GdnHistoryCheckpointOracleForTest`]: recompute GDN over
+    /// the persisted history checkpoint's OWN token key from fresh caches and
+    /// bit-compare every linear layer's conv/recurrent arrays against the
+    /// checkpoint. `Ok(true)` iff the persisted state equals what its key
+    /// claims. Catches any persistence surface holding state ahead of (or
+    /// behind) its token count — including future ones.
+    fn gdn_history_checkpoint_recompute_matches_for_test(&mut self) -> Result<bool> {
+        let Some(checkpoint) = self.gdn_last_history_checkpoint.as_ref() else {
+            return Err(Error::from_reason(
+                "GDN state oracle: no history checkpoint is stored",
+            ));
+        };
+        let tokens = checkpoint.tokens.clone();
+        let reference = clone_dense_linear_layer_caches(&self.config, &checkpoint.caches)
+            .ok_or_else(|| {
+                Error::from_reason("GDN state oracle: checkpoint caches are not ready")
+            })?;
+        let mut recomputed = fresh_dense_layer_caches(&self.config);
+        let embed = self.embedding.clone();
+        super::paged_forward::run_gdn_only_prefill_materialized(
+            &tokens,
+            &embed,
+            &mut self.layers,
+            &mut recomputed,
+            None,
+        )?;
+        for layer_idx in 0..self.config.num_layers as usize {
+            if !self.config.is_linear_layer(layer_idx) {
+                continue;
+            }
+            let (
+                Qwen3_5LayerCache::Linear(checkpoint_arrays),
+                Qwen3_5LayerCache::Linear(recomputed_arrays),
+            ) = (&reference[layer_idx], &recomputed[layer_idx])
+            else {
+                return Err(Error::from_reason(format!(
+                    "GDN state oracle: layer {layer_idx} is not Linear on both sides",
+                )));
+            };
+            for slot in 0..2 {
+                match (checkpoint_arrays.get(slot), recomputed_arrays.get(slot)) {
+                    (None, None) => {}
+                    (Some(a), Some(b)) => {
+                        if !arrays_bits_equal_for_test(a, b)? {
+                            return Ok(false);
+                        }
+                    }
+                    _ => return Ok(false),
+                }
+            }
+        }
+        Ok(true)
     }
 
     fn find_dense_gdn_prefix_checkpoint(
@@ -2846,6 +3110,37 @@ impl Qwen35Inner {
         cache_salt: u64,
         continued_live_prefix: bool,
     ) -> Result<DenseGdnPrefixPreparation> {
+        let dirty = self.paged_gdn_state_dirty;
+        let result = self.prepare_dense_gdn_prefix_state_inner(
+            tokens,
+            cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+            continued_live_prefix,
+        );
+        if let Ok(preparation) = &result {
+            self.last_gdn_prefix_prepare_state = preparation.state;
+            if dirty {
+                // The armed latch skipped every live/history reuse arm inside,
+                // so this preparation came from a recompute source
+                // (checkpoint-ladder replay, cold sidecar, or full GDN
+                // re-prefill over the prompt tokens) — the skew is healed.
+                self.paged_gdn_state_dirty = false;
+            }
+        }
+        result
+    }
+
+    fn prepare_dense_gdn_prefix_state_inner(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        continued_live_prefix: bool,
+    ) -> Result<DenseGdnPrefixPreparation> {
         let image_aware_prefix = extra_keys_per_block.iter().any(|keys| !keys.is_empty());
         let trace_enabled = inference_trace_enabled();
         let inference_info_enabled =
@@ -2884,20 +3179,27 @@ impl Qwen35Inner {
             );
             preparation
         };
+        // While the refuse-to-persist latch is armed, every arm that would
+        // hand back live or history-keyed GDN state is skipped: that state's
+        // frontier disagreed with its token key at the last epilogue. Control
+        // falls to the recompute arms below, which derive state purely from
+        // the prompt tokens (the wrapper clears the latch after one of them
+        // runs).
+        let gdn_state_dirty = self.paged_gdn_state_dirty;
         let gdn_caches_ready =
             dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
-        if gdn_caches_ready && continued_live_prefix {
+        if !gdn_state_dirty && gdn_caches_ready && continued_live_prefix {
             return Ok(finish("live", cached_prefix_len, 0));
         }
 
         let gdn_prefix_from_history = cached_prefix_len > 0
             && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
-        if gdn_caches_ready && gdn_prefix_from_history {
+        if !gdn_state_dirty && gdn_caches_ready && gdn_prefix_from_history {
             return Ok(finish("last_history", cached_prefix_len, 0));
         }
 
-        if cached_prefix_len > 0 {
+        if !gdn_state_dirty && cached_prefix_len > 0 {
             let history_lookup_start = trace_enabled.then(std::time::Instant::now);
             let history_checkpoint =
                 self.find_dense_gdn_history_checkpoint(tokens, cached_prefix_len, None);
@@ -3049,24 +3351,68 @@ impl Qwen35Inner {
         continued_live_prefix: bool,
         image_key: u64,
     ) -> Result<bool> {
+        let dirty = self.paged_gdn_state_dirty;
+        let result = self.prepare_dense_gdn_vlm_prefix_state_inner(
+            tokens,
+            cached_prefix_len,
+            block_size,
+            extra_keys_per_block,
+            cache_salt,
+            continued_live_prefix,
+            image_key,
+        );
+        if result.is_ok() && dirty {
+            // The armed latch skipped every live/history reuse arm inside, so
+            // this preparation came from a recompute source (a prefill-time
+            // prefix checkpoint, or fresh caches followed by the caller's
+            // full image merge from position zero) — the skew is healed.
+            // Mirrors the text twin's wrapper.
+            self.paged_gdn_state_dirty = false;
+        }
+        result
+    }
+
+    fn prepare_dense_gdn_vlm_prefix_state_inner(
+        &mut self,
+        tokens: &[u32],
+        cached_prefix_len: u32,
+        block_size: u32,
+        extra_keys_per_block: &[Vec<u64>],
+        cache_salt: u64,
+        continued_live_prefix: bool,
+        image_key: u64,
+    ) -> Result<bool> {
         if cached_prefix_len == 0 {
             self.caches = Some(fresh_dense_layer_caches(&self.config));
             return Ok(false);
         }
 
+        // While the refuse-to-persist latch is armed, the live /
+        // active-history / history-checkpoint arms are skipped exactly like
+        // the text twin's: that state's frontier disagreed with its token key
+        // at the last epilogue. The prefix-checkpoint arm below stays
+        // available — it is prefill-time state keyed on grid positions, not
+        // on the skewed end-of-turn history (the wrapper clears the latch
+        // once a recompute arm has run).
+        let gdn_state_dirty = self.paged_gdn_state_dirty;
         let caches_ready = dense_paged_linear_caches_ready(&self.config, self.caches.as_deref());
-        if caches_ready && continued_live_prefix && self.cached_image_key == Some(image_key) {
+        if !gdn_state_dirty
+            && caches_ready
+            && continued_live_prefix
+            && self.cached_image_key == Some(image_key)
+        {
             return Ok(true);
         }
         let active_history_matches = caches_ready
             && self.cached_image_key == Some(image_key)
             && self.cached_token_history.len() == cached_prefix_len as usize
             && tokens.starts_with(&self.cached_token_history);
-        if active_history_matches {
+        if !gdn_state_dirty && active_history_matches {
             return Ok(true);
         }
-        if let Some(checkpoint) =
-            self.find_dense_gdn_history_checkpoint(tokens, cached_prefix_len, Some(image_key))
+        if !gdn_state_dirty
+            && let Some(checkpoint) =
+                self.find_dense_gdn_history_checkpoint(tokens, cached_prefix_len, Some(image_key))
         {
             self.caches = Some(checkpoint);
             return Ok(true);
@@ -3684,20 +4030,13 @@ impl Qwen35Inner {
         // logits-only prefill — they do not feed the dense MTP
         // committed-history path.
         //
-        // `MLX_MTP_NO_PROMPT_PREFILL=1` opts OUT — the prefill stays
-        // logits-only and the MTP committed-history starts empty.
-        //
         // Cache-reuse turns: when `cached_prefix_len > 0` the prefill
         // only processes the uncached SUFFIX, so the captured hidden
         // tensor would cover the suffix — not the full prompt. The
         // prompt-prefill seed REQUIRES the full prompt's hiddens, so it
         // is skipped on cache-reuse turns; committed-history still runs
         // (it starts empty and builds from decode tokens — correct).
-        let want_prompt_hidden = p.enable_mtp
-            && self.has_mtp_weights()
-            && !mtp_decode::mtp_no_prompt_prefill()
-            && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(prefill_tokens.len());
+        let want_prompt_hidden = p.enable_mtp && self.has_mtp_weights() && cached_prefix_len == 0;
 
         // === Text prefill ===
         profiler.begin_prefill();
@@ -3714,7 +4053,7 @@ impl Qwen35Inner {
                     &self.final_norm,
                     &self.lm_head,
                     generation_stream,
-                    Some(mtp_prompt_history.keep_tokens),
+                    Some(prefill_tokens.len()),
                     turn_cancel.as_deref(),
                 )
                 .map(|(logits, ph)| {
@@ -3786,18 +4125,9 @@ impl Qwen35Inner {
             embedding,
             generation_stream,
             params: p,
-            // `prompt_hidden` is `Some` iff the hidden-emitting prefill ran;
-            // pair it with the exact prompt tail whose hiddens it holds.
-            prompt_hidden_ids: prompt_hidden.as_ref().map(|_| {
-                let start = mtp_prompt_history
-                    .hidden_start_token_index()
-                    .min(prefill_tokens.len());
-                prefill_tokens[start..].to_vec()
-            }),
-            prompt_hidden_position_base: prompt_hidden
-                .as_ref()
-                .map(|_| mtp_prompt_history.position_base)
-                .unwrap_or(0),
+            // `prompt_hidden` is `Some` iff the hidden-emitting prefill ran,
+            // and that prefill always covers the whole prompt.
+            prompt_hidden_ids: prompt_hidden.as_ref().map(|_| prefill_tokens.clone()),
             prompt_hidden,
         })
     }
@@ -4009,7 +4339,6 @@ impl Qwen35Inner {
             // MTP committed-history cache.
             prompt_hidden: None,
             prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
         })
     }
 
@@ -4055,7 +4384,6 @@ impl Qwen35Inner {
             params: p,
             prompt_hidden,
             prompt_hidden_ids,
-            prompt_hidden_position_base,
         } = inputs;
 
         // Pure-Rust ("eager") dense MTP. Gated on the same per-request /
@@ -4127,10 +4455,9 @@ impl Qwen35Inner {
             // engine-owned (`engine::run_mtp_turn`) and drives the
             // `DenseMtpStepper` (`MtpBackend::begin_mtp_decode`). The stepper
             // captures the embedding table + config and runs the prompt-prefix
-            // seed before the loop; the 11 former `MtpOps` closures are its
-            // `MtpStepper` methods. The `profiler.set_label("mtp_eager")` relabel
-            // moved into `DenseMtpStepper::profiler_relabel` (applied once at
-            // turn entry by the engine).
+            // seed before the loop. The `profiler.set_label("mtp_eager")`
+            // relabel lives in `DenseMtpStepper::profiler_relabel` (applied
+            // once at turn entry by the engine).
             let mut rng = rand::rng();
 
             // Preserve the eager block's initial `async_eval_arrays(&[&y])`
@@ -4161,7 +4488,6 @@ impl Qwen35Inner {
                     generation_stream,
                     prompt_hidden,
                     prompt_hidden_ids,
-                    prompt_hidden_position_base,
                     // H2: sync turns cancel through the engine loop's
                     // ungated polls (this site has no StreamingCtx).
                     cancel_flag: turn_cancel.as_deref(),
@@ -4344,7 +4670,6 @@ impl Qwen35Inner {
         generation_stream: Stream,
         prompt_hidden: Option<MxArray>,
         prompt_hidden_ids: Option<Vec<u32>>,
-        prompt_hidden_position_base: usize,
         last_in_cache: &mut bool,
     ) -> Result<()> {
         // The turn profiler relabel ("mtp_eager") now moves into
@@ -4390,7 +4715,6 @@ impl Qwen35Inner {
                 generation_stream,
                 prompt_hidden,
                 prompt_hidden_ids,
-                prompt_hidden_position_base,
                 // H2: the same flag StreamingCtx carries — the engine's
                 // ungated polls and the streaming reads are idempotent.
                 cancel_flag: Some(cancelled),
@@ -4407,6 +4731,56 @@ impl Qwen35Inner {
         }
 
         Ok(())
+    }
+
+    /// Turn-admission speculative reservation for the paged MTP arm: reserve
+    /// the lookahead rows past the (post-prefill) prompt cursor, sized by
+    /// `engine::mtp_turn::turn_lookahead_rows` off the model's
+    /// [`SpeculativePlan`] (I1 — the plan property is the single source).
+    /// This guarantees the FIRST cycle; the engine loop re-reserves the same
+    /// margin before every later cycle through
+    /// [`MtpStepper::reserve_cycle_lookahead`], where exhaustion degrades
+    /// that cycle to a Step-A AR token instead of gating the whole turn.
+    ///
+    /// `Ok(false)` means the pool cannot hold even one verify cycle: the
+    /// caller must run the turn autoregressively instead of erroring it
+    /// (vLLM schedules such a request without its spec tokens rather than
+    /// failing it). AR decode grows one row at a time against the same
+    /// lazily-allocated tail, so it can still make progress where a
+    /// `depth + 1`-row verify write could not. Non-capacity errors (missing
+    /// adapter, poisoned allocator) still fail the turn.
+    fn reserve_paged_mtp_lookahead(&mut self, p: &engine::ChatParams, site: &str) -> Result<bool> {
+        let Some(plan) = self.execution_plan().speculative else {
+            // The MTP arms gate on `has_mtp_weights()`, which is exactly what
+            // publishes the speculative plan — unreachable, but proceeding
+            // without a reservation only restores lazy allocation.
+            debug_assert!(
+                false,
+                "{site}: paged MTP admission without a speculative plan"
+            );
+            return Ok(true);
+        };
+        let rows = u32::try_from(crate::engine::mtp_turn::turn_lookahead_rows(plan, p))
+            .unwrap_or(u32::MAX);
+        let adapter = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason(format!("{site}: paged_adapter is None")))?;
+        match adapter.reserve_rows(rows) {
+            Ok(_) => Ok(true),
+            Err(e) if e.starts_with("context_length_exceeded:") => {
+                tracing::warn!(
+                    target: "mlx_core::qwen3_5::paged",
+                    lookahead_rows = rows,
+                    "{site}: speculative lookahead reservation exhausted the \
+                     paged pool; falling back to autoregressive decode: {e}"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(Error::from_reason(format!(
+                "{site}: speculative lookahead reservation: {e}"
+            ))),
+        }
     }
 
     /// Block-paged variant of [`Self::vision_mtp_whole_turn_core`].
@@ -4656,7 +5030,13 @@ impl Qwen35Inner {
         let (generated_tokens, finish_reason, mtp_profiler) = match forward_result {
             Ok(t) => {
                 let image_token_positions = self.cached_paged_image_token_positions.clone();
-                self.finalize_dense_manual_paged_turn(&image_token_positions, cache_salt)?;
+                // Drop-last history length published below (frontier check).
+                let expected_history_len = tokens.len() + t.0.len().saturating_sub(1);
+                self.finalize_dense_manual_paged_turn(
+                    &image_token_positions,
+                    cache_salt,
+                    expected_history_len,
+                )?;
                 t
             }
             Err(e) => {
@@ -4789,9 +5169,7 @@ impl Qwen35Inner {
         // the suffix-only prefill cannot produce the full prompt's hidden
         // tensor.
         let eager_mtp_paged = p.enable_mtp && self.has_mtp_weights();
-        let want_prompt_hidden =
-            eager_mtp_paged && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
+        let want_prompt_hidden = eager_mtp_paged && cached_prefix_len == 0;
         let mut mtp_profiler = begin_paged_mtp_profiler(eager_mtp_paged, suffix_len);
 
         // === PREFILL ===
@@ -4800,7 +5178,7 @@ impl Qwen35Inner {
             suffix,
             cached_prefix_len,
             gdn_prefix_already_primed,
-            want_prompt_hidden.then_some(mtp_prompt_history.keep_tokens),
+            want_prompt_hidden.then_some(tokens.len()),
             &layer_kinds,
             "paged_turn_sync_core_inner",
         )?;
@@ -4844,6 +5222,12 @@ impl Qwen35Inner {
             eager_mtp_paged
         );
 
+        // Pre-cycle lookahead reservation while AR fallback is still an
+        // option — allocator exhaustion inside the verify loop would instead
+        // surface as a turn error and invalidate the paged session.
+        let eager_mtp_paged =
+            eager_mtp_paged && self.reserve_paged_mtp_lookahead(p, "paged_turn_sync_core_inner")?;
+
         if eager_mtp_paged {
             // Pure-Rust ("eager") paged MTP.
             // The main Step-A / verify forwards route through the paged adapter
@@ -4865,29 +5249,23 @@ impl Qwen35Inner {
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-            // Prompt-tail ids + position base for the committed-history seed.
-            // `prompt_hidden` is only `Some` when `want_prompt_hidden` held,
-            // which already requires `cached_prefix_len == 0` (=> position_base
-            // is 0 on those turns), so committed-history v2 is correct.
-            let prompt_hidden_position_base = mtp_prompt_history.position_base;
-            let prompt_hidden_ids: Vec<u32> = {
-                let start = mtp_prompt_history
-                    .hidden_start_token_index()
-                    .min(tokens.len());
-                tokens[start..].to_vec()
-            };
+            // Prompt-tail ids for the committed-history seed. `prompt_hidden`
+            // is only `Some` when `want_prompt_hidden` held, which already
+            // requires `cached_prefix_len == 0`, so the captured hiddens cover
+            // the whole prompt.
+            let prompt_hidden_ids: Vec<u32> = tokens.to_vec();
 
             let mut rng = rand::rng();
 
             // The propose/verify whole-turn loop is engine-owned
             // (`run_mtp_turn`) and drives the `DenseMtpStepper` in its PAGED
-            // mode: `begin_mtp_decode` moves `self.paged_adapter` into the
-            // stepper for the turn, runs the committed-history prompt seed, and
-            // routes the Step-A / verify forwards through the adapter; the
-            // stepper's `Drop` restores the adapter into `self.paged_adapter`
-            // before this call returns, so the paged-history save below finds
+            // mode: `begin_mtp_decode` claims the adapter's active sequence as
+            // the turn's owner, runs the committed-history prompt seed, and
+            // routes the Step-A / verify forwards through the adapter, which
+            // stays on `self` throughout so the paged-history save below finds
             // it. The paged path commits cache state through its own
-            // paged-history save, so `outcome.last_in_cache` is unused here.
+            // paged-history save; the turn outcome's rewind tail is consumed
+            // below (`last_in_cache` stays inert — dense paged is drop-last).
             let outcome = crate::engine::mtp_turn::run_mtp_turn(
                 self,
                 &mut rng,
@@ -4907,14 +5285,17 @@ impl Qwen35Inner {
                     generation_stream,
                     prompt_hidden,
                     prompt_hidden_ids: Some(prompt_hidden_ids),
-                    prompt_hidden_position_base,
                     // H2: sync paged MTP cancels through the engine loop's
                     // ungated polls (no StreamingCtx on this site).
                     cancel_flag: turn_cancel.as_deref(),
                 },
                 None,
             )?;
-            let _ = outcome.last_in_cache;
+            // dense paged always saves drop-last, so `last_in_cache` is inert
+            // here; the engine-computed rewind tail is recorded so the
+            // epilogue's frontier check (and tests) can see the mid-cycle
+            // stop was acted on rather than discarded.
+            self.paged_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
 
             // `self.caches` already holds the live GDN state (the eager paged
             // forwards wrote it directly) — nothing to export.
@@ -5315,7 +5696,11 @@ impl Qwen35Inner {
         // already-successful generation output.
         let keep_live_ok = p.reuse_cache
             && self
-                .finalize_dense_manual_paged_turn(&image_token_positions, p.cache_salt)
+                .finalize_dense_manual_paged_turn(
+                    &image_token_positions,
+                    p.cache_salt,
+                    full_history.len(),
+                )
                 .is_ok();
         let continuable = if keep_live_ok {
             self.cached_token_history = full_history;
@@ -5708,7 +6093,11 @@ impl Qwen35Inner {
         // failure downgrades to NON-continuable rather than discarding output.
         let keep_live_ok = p.reuse_cache
             && self
-                .finalize_dense_manual_paged_turn(&image_token_positions, p.cache_salt)
+                .finalize_dense_manual_paged_turn(
+                    &image_token_positions,
+                    p.cache_salt,
+                    full_history.len(),
+                )
                 .is_ok();
         let continuable = if keep_live_ok {
             self.cached_token_history = full_history;
@@ -6126,7 +6515,13 @@ impl Qwen35Inner {
         let (generated_tokens, finish_reason, decode_profiler) = match result {
             Ok(t) => {
                 let image_token_positions = self.cached_paged_image_token_positions.clone();
-                self.finalize_dense_manual_paged_turn(&image_token_positions, cache_salt)?;
+                // Drop-last history length published below (frontier check).
+                let expected_history_len = tokens.len() + t.0.len().saturating_sub(1);
+                self.finalize_dense_manual_paged_turn(
+                    &image_token_positions,
+                    cache_salt,
+                    expected_history_len,
+                )?;
                 t
             }
             Err(e) => {
@@ -6380,9 +6775,7 @@ impl Qwen35Inner {
         // committed-history v2 seed, same as the sync core. Only capture it
         // when the eager paged MTP arm will actually run.
         let eager_mtp_paged = p.enable_mtp && self.has_mtp_weights();
-        let want_prompt_hidden =
-            eager_mtp_paged && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(tokens.len());
+        let want_prompt_hidden = eager_mtp_paged && cached_prefix_len == 0;
         let inference_info_enabled =
             tracing::enabled!(target: "mlx_core::inference", tracing::Level::INFO);
         let prefill_trace_start = inference_info_enabled.then(std::time::Instant::now);
@@ -6394,11 +6787,7 @@ impl Qwen35Inner {
                 suffix_tokens = suffix_len,
                 cached_prefix_tokens = cached_prefix_len,
                 mtp = eager_mtp_paged,
-                keep_prompt_hidden_tokens = if want_prompt_hidden {
-                    mtp_prompt_history.keep_tokens
-                } else {
-                    0
-                },
+                keep_prompt_hidden_tokens = if want_prompt_hidden { tokens.len() } else { 0 },
                 "prefill started"
             );
         }
@@ -6409,7 +6798,7 @@ impl Qwen35Inner {
             suffix,
             cached_prefix_len,
             gdn_prefix_already_primed,
-            want_prompt_hidden.then_some(mtp_prompt_history.keep_tokens),
+            want_prompt_hidden.then_some(tokens.len()),
             &layer_kinds,
             "paged_turn_stream_core_inner",
         )?;
@@ -6460,6 +6849,11 @@ impl Qwen35Inner {
         let mut decode_progress_last_generated = 0usize;
         let mut decode_progress_next_generated = 32usize;
 
+        // Pre-cycle lookahead reservation while AR fallback is still an
+        // option — same rationale as the sync twin.
+        let eager_mtp_paged = eager_mtp_paged
+            && self.reserve_paged_mtp_lookahead(p, "paged_turn_stream_core_inner")?;
+
         if eager_mtp_paged {
             // Pure-Rust ("eager") paged MTP — streaming twin of the sync core's
             // `eager_mtp_paged` arm. Same stepper spine; the engine's
@@ -6478,13 +6872,7 @@ impl Qwen35Inner {
             let _wired_ctx =
                 crate::stream::WiredLimitContext::new(model_size_bytes, vec![generation_stream]);
 
-            let prompt_hidden_position_base = mtp_prompt_history.position_base;
-            let prompt_hidden_ids: Vec<u32> = {
-                let start = mtp_prompt_history
-                    .hidden_start_token_index()
-                    .min(tokens.len());
-                tokens[start..].to_vec()
-            };
+            let prompt_hidden_ids: Vec<u32> = tokens.to_vec();
 
             let mut rng = rand::rng();
 
@@ -6495,7 +6883,6 @@ impl Qwen35Inner {
                     turn_id = trace_turn_id,
                     depth = p.mtp_depth,
                     prompt_hidden_tokens = prompt_hidden_ids.len(),
-                    position_base = prompt_hidden_position_base,
                     elapsed_ms = turn_trace_start.map(elapsed_ms).unwrap_or(0.0),
                     "MTP decode started"
                 );
@@ -6507,8 +6894,9 @@ impl Qwen35Inner {
             // shared incremental detokenizer + the default ChatML emitter so
             // accepted tokens stream out `cb` per token; the stepper's `Drop`
             // restores `self.paged_adapter` before this call returns (the
-            // paged-history save below relies on it). `outcome.last_in_cache` is
-            // unused (the paged-history save owns cache state).
+            // paged-history save below relies on it). The turn outcome's rewind
+            // tail is consumed below (`last_in_cache` stays inert — dense paged
+            // is drop-last; the paged-history save owns cache state).
             let mut emitter = crate::engine::backend::DefaultStreamEmitter;
             let streaming = crate::engine::decode::StreamingCtx {
                 callback: cb.0,
@@ -6539,14 +6927,17 @@ impl Qwen35Inner {
                     generation_stream,
                     prompt_hidden,
                     prompt_hidden_ids: Some(prompt_hidden_ids),
-                    prompt_hidden_position_base,
                     // H2: the same flag StreamingCtx carries — the engine's
                     // ungated polls and the streaming reads are idempotent.
                     cancel_flag: Some(cancelled),
                 },
                 Some(streaming),
             )?;
-            let _ = outcome.last_in_cache;
+            // dense paged always saves drop-last, so `last_in_cache` is inert
+            // here; the engine-computed rewind tail is recorded so the
+            // epilogue's frontier check (and tests) can see the mid-cycle
+            // stop was acted on rather than discarded.
+            self.paged_mtp_last_rollback_unemitted = outcome.rollback_unemitted;
 
             return Ok((generated_tokens, finish_reason, Some(profiler)));
         }
@@ -6940,7 +7331,6 @@ impl Qwen35Inner {
                 generation_stream,
                 None,
                 None,
-                0,
                 &mut last_in_cache,
             )?;
         } else {
@@ -7367,9 +7757,7 @@ impl Qwen35Inner {
         // only the hidden-emitting prefill produces. Skip on cache-reuse turns
         // (the captured hidden would cover the SUFFIX, not the full prompt) —
         // committed-history still runs (it builds from decode tokens).
-        let want_prompt_hidden =
-            eager_mtp && !mtp_decode::mtp_no_prompt_prefill() && cached_prefix_len == 0;
-        let mtp_prompt_history = mtp_decode::mtp_prompt_history_selection(prefill_tokens.len());
+        let want_prompt_hidden = eager_mtp && cached_prefix_len == 0;
         let mut prompt_hidden: Option<MxArray> = None;
 
         // Text prefill
@@ -7386,7 +7774,7 @@ impl Qwen35Inner {
                     &self.final_norm,
                     &self.lm_head,
                     generation_stream,
-                    Some(mtp_prompt_history.keep_tokens),
+                    Some(prefill_tokens.len()),
                     turn_cancel.as_deref(),
                 )
                 .map(|(logits, ph)| {
@@ -7446,18 +7834,10 @@ impl Qwen35Inner {
         let mut last_is_reasoning = starts_in_thinking;
         let mut reasoning_tracker = engine::ReasoningTracker::from_setup(&thinking, think_end_id);
 
-        // Pair the captured prompt hidden with the exact prompt tail whose
-        // hiddens it holds (mirrors the non-stream caller at 1708-1717).
-        let prompt_hidden_ids: Option<Vec<u32>> = prompt_hidden.as_ref().map(|_| {
-            let start = mtp_prompt_history
-                .hidden_start_token_index()
-                .min(prefill_tokens.len());
-            prefill_tokens[start..].to_vec()
-        });
-        let prompt_hidden_position_base = prompt_hidden
-            .as_ref()
-            .map(|_| mtp_prompt_history.position_base)
-            .unwrap_or(0);
+        // The hidden-emitting prefill always covers the whole prompt, so the
+        // captured hidden pairs with every prefill token.
+        let prompt_hidden_ids: Option<Vec<u32>> =
+            prompt_hidden.as_ref().map(|_| prefill_tokens.clone());
 
         // Whether the final committed token reached the physical KV/GDN cache;
         // written by the decode driver so the save below drops it when it was
@@ -7485,7 +7865,6 @@ impl Qwen35Inner {
                 generation_stream,
                 prompt_hidden,
                 prompt_hidden_ids,
-                prompt_hidden_position_base,
                 &mut last_in_cache,
             )?;
         } else {
@@ -7953,6 +8332,7 @@ impl Qwen35Inner {
                 Some(true),
                 tools.as_deref(),
                 enable_thinking,
+                false,
             )?;
 
             let prompt_array =
@@ -9574,8 +9954,10 @@ impl PagedBackend for Qwen35Inner {
         // replaying GDN over it. Runs BEFORE the release below, which resets the
         // captured-chain frontier to 0. Skipped when the finalize failed: the
         // K/V chain the sidecar would anchor on was not published, so nothing
-        // could ever select it.
-        if finalize_error.is_none() {
+        // could ever select it. Also skipped while the refuse-to-persist latch
+        // is armed — same gate as the manual epilogue, so no durable GDN state
+        // is enqueued anywhere while a frontier disagreement stands.
+        if finalize_error.is_none() && !self.paged_gdn_state_dirty {
             self.capture_dense_gdn_cold_sidecar(
                 &self.cached_paged_image_token_positions,
                 cache_salt,
@@ -9654,6 +10036,11 @@ impl PagedBackend for Qwen35Inner {
             full_history.extend_from_slice(&generated[..upto]);
         }
         self.cached_token_history = full_history;
+        // I4 frontier agreement before any GDN state is keyed on the history
+        // just published. A disagreement arms the refuse-to-persist latch the
+        // checkpoint store below consumes.
+        let history_len = self.cached_token_history.len();
+        self.check_dense_paged_frontier(history_len, "paged history save");
         // GDN history checkpoint — must run AFTER the history is set (it
         // snapshots the live recurrent caches keyed on `cached_token_history`),
         // BEFORE clearing the image key. A checkpoint/eval failure here
@@ -9833,6 +10220,12 @@ impl Qwen35Inner {
         {
             planned_mtp = false;
             config.enable_mtp = Some(false);
+            // THIS turn leaves the speculative lane. The generic paged driver
+            // below dispatches on `plan.decoder`, and dense implements no
+            // paged speculative core (its MTP lives in the forked cores
+            // above), so a stale `Speculative` would fail the turn on the
+            // erroring default hook instead of decoding it autoregressively.
+            args.plan.decoder = DecoderPlan::Autoregressive;
         }
         debug_assert!(!planned_mtp || self.has_mtp_weights());
         let mut p = extract_chat_params(&config);
@@ -9945,29 +10338,26 @@ impl DecodeStep for Qwen35Decode<'_> {
 }
 
 /// Per-turn pure-Rust ("eager") dense MTP stepper the engine-owned
-/// [`crate::engine::mtp_turn::run_mtp_turn`] drives.
-///
-/// The 11 `MtpOps` closures of the old `chat_with_caches_inner` eager-MTP
-/// block become [`MtpStepper`] methods; the per-cycle scratch the closures
-/// captured in `RefCell`/`Cell` (the GDN tape, the pre-verify snapshot, the
-/// stashed replay error, the desync latch, the committed-history bookkeeping)
-/// becomes PLAIN struct fields — the engine calls the methods strictly
-/// sequentially and non-nested, so the interior mutability the closures needed
-/// to share `&mut self` is gone.
+/// [`crate::engine::mtp_turn::run_mtp_turn`] drives. The per-cycle scratch
+/// (the GDN tape, the pre-verify snapshot, the stashed replay error, the
+/// desync latch, the committed-history bookkeeping) are plain fields: the
+/// engine calls the methods strictly sequentially and non-nested.
 ///
 /// Drives BOTH the FLAT and the block-PAGED dense MTP turn, selected by
-/// [`MtpStepMode`]: the flat mode runs the eager pre-norm forwards against
-/// `inner.caches`; the paged mode routes the main Step-A / verify forwards
-/// through the captured [`PagedKVCacheAdapter`]
+/// [`Self::owner`]: with no owner the eager pre-norm forwards run against
+/// `inner.caches`; with one, the main Step-A / verify forwards route through
+/// `inner.paged_adapter`
 /// ([`super::paged_forward::run_paged_step_with_hidden`] /
 /// [`super::paged_forward::run_paged_verify_step`]) while the GDN recurrent
 /// state stays FLAT in `inner.caches` Linear slots. Only four methods
 /// (`forward_with_hidden`, `verify_step`, `rollback`, `rollback_unemitted`)
-/// branch on the mode; every other method is mode-identical (the drafter and
-/// the committed-history commit are paged-agnostic). The paged adapter is moved
-/// into the stepper at [`MtpBackend::begin_mtp_decode`] and restored into
-/// `inner.paged_adapter` by [`Drop`] so the post-turn paged-history save finds
-/// it, on EVERY exit path of `run_mtp_turn`.
+/// branch on it; every other method is path-identical (the drafter and the
+/// committed-history commit are paged-agnostic).
+///
+/// The adapter stays ON THE MODEL for the whole turn (I6): each paged touch
+/// borrows it back through [`SpecOwner::resolve`], which refuses once the
+/// adapter's active request is no longer this turn's. That refusal is what
+/// makes the borrow-back sound, so nothing has to be moved out and restored.
 pub(crate) struct DenseMtpStepper<'a> {
     /// The model — owns layers / caches / mtp / final_norm / lm_head and the
     /// `flat_mtp_caches_desynced` latch. == the closures'
@@ -9994,6 +10384,34 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// GDN tape recorded by `verify_step`, consumed by `rollback`. == the
     /// closures' `tape_cell`.
     tape: Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    /// Number of tape steps the retained snapshot + tape currently represent
+    /// as the cycle's committed GDN frontier: set to the recorded step count
+    /// (`depth + 1`) by `verify_step`, overwritten to `accepted_steps`
+    /// (`accepted_drafts + 1`) by `rollback`. `rollback_unemitted` subtracts
+    /// `unemitted` in these SAME units, so the mid-cycle rewind target
+    /// (`last_cycle_steps - unemitted`) is immune to tape-step-unit skew.
+    last_cycle_steps: usize,
+    /// The paged verify cycle [`MtpStepper::verify_step`] opened around the
+    /// verify core's own row write, consumed by [`MtpStepper::rollback`]'s
+    /// facade commit — the one place the adapter's speculative rows are
+    /// retracted, so the commit arithmetic cannot drift from the
+    /// conformance surface. `None` in flat mode, between cycles, and when
+    /// the adapter names no active sequence (the verify core then fails on
+    /// its own `record_tokens` and the turn never reaches a rollback).
+    open_cycle: Option<crate::engine::spec_paged::VerifyTicket>,
+    /// Absolute tokens the GDN recurrent state has consumed, reported by
+    /// [`MtpStepper::frontier`] against the ATTENTION side's ground truth
+    /// (adapter recorded rows / flat full-attention offset). Seeded from the
+    /// attention frontier at construction (the two sides are aligned at turn
+    /// entry) and moved ONLY where the recurrent state actually moves:
+    /// `forward_with_hidden` +1, `verify_step` +depth+1, replay-driven
+    /// rollbacks to `recurrent_snapshot_base + steps`. `None` after a failed
+    /// replay — the count is then unknown and the stashed error fail-closes
+    /// the turn.
+    recurrent_frontier: Option<u64>,
+    /// [`Self::recurrent_frontier`] captured by `snapshot_main_linear` — the
+    /// base the replay-driven rollbacks land relative to.
+    recurrent_snapshot_base: Option<u64>,
     /// Error stashed by the infallible `rollback` replay, surfaced by
     /// `take_replay_error`. == the closures' `replay_err_cell`.
     replay_err: Option<Error>,
@@ -10005,34 +10423,226 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// Config clone for the per-cycle drafter cache reset/fresh build. == the
     /// closures' captured `config`.
     config: Qwen3_5Config,
-    /// Flat vs. paged main-forward routing. `Paged` owns the turn's
-    /// [`PagedKVCacheAdapter`] (moved in at `begin_mtp_decode`, restored into
-    /// `inner.paged_adapter` by [`Drop`]).
-    mode: MtpStepMode,
+    /// The sequence this turn's paged main-forwards belong to, claimed at
+    /// `begin_mtp_decode`. `None` runs the flat main path.
+    owner: Option<SpecOwner>,
     /// Per-layer attention/linear classification consumed by the paged
     /// forwards. Empty on the flat path (unused there).
     layer_kinds: Vec<super::decoder_layer::Qwen3_5LayerKind>,
 }
 
-/// Main-forward routing for [`DenseMtpStepper`]: `Flat` runs the eager
-/// pre-norm forwards against `inner.caches`; `Paged` routes full-attention
-/// K/V through the owned adapter while GDN state stays flat. The adapter is
-/// boxed so the unit `Flat` variant does not pad out to the adapter's size.
-enum MtpStepMode {
-    Flat,
-    Paged(Box<PagedKVCacheAdapter>),
-}
-
 impl Drop for DenseMtpStepper<'_> {
     fn drop(&mut self) {
-        // Restore the paged adapter into the model so the post-turn
-        // paged-history save (which runs AFTER `run_mtp_turn` returns) finds
-        // `inner.paged_adapter == Some`. Firing in `Drop` covers EVERY exit
+        // A turn that failed between the verify write and its rollback (any
+        // `?` in the engine's accept path) leaves the cycle open; close it
+        // here so the ticket's abandoned-cycle guard does not turn that error
+        // return into a debug-build panic. Firing in `Drop` covers EVERY exit
         // path of `run_mtp_turn` — the `Ok` tail, the `take_replay_error`
-        // early return, and any mid-loop `?` propagation. Idempotent: the
-        // adapter is taken out of `mode` here, so a second drop is a no-op.
-        if let MtpStepMode::Paged(adapter) = std::mem::replace(&mut self.mode, MtpStepMode::Flat) {
-            self.inner.paged_adapter = Some(*adapter);
+        // early return, and any mid-loop `?` propagation.
+        self.close_abandoned_cycle();
+    }
+}
+
+impl DenseMtpStepper<'_> {
+    /// Restore the pre-verify snapshot and replay the first `steps` recorded
+    /// tape steps into the live main caches — the shared GDN replay both
+    /// `rollback` (to `accepted_steps`) and the paged `rollback_unemitted`
+    /// (to `last_cycle_steps - unemitted`) drive. Pure over
+    /// `(snapshot, tape, steps)`: `steps == 0` degenerates to a bare snapshot
+    /// restore. On the flat path full-attention layers rewind via `kv.trim`;
+    /// on the paged path their K/V lives in the pool (rewound by the adapter)
+    /// and the flat shells are skipped.
+    fn replay_main_linear_to(&mut self, steps: usize) -> Result<()> {
+        let paged = self.owner.is_some();
+        let snap = match self.snap.as_ref() {
+            Some(Ok(s)) => s,
+            Some(Err(e)) => {
+                return Err(Error::from_reason(format!(
+                    "eager MTP replay: snapshot failed: {}",
+                    e.reason
+                )));
+            }
+            None => {
+                return Err(Error::from_reason(
+                    "eager MTP replay: snapshot missing (snapshot_main_linear \
+                     did not run)",
+                ));
+            }
+        };
+        let tape = &self.tape;
+        let inner = &mut *self.inner;
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("eager MTP replay: inner.caches is None"))?;
+        super::layer_cache::replay_mtp_snapshot_to(
+            caches,
+            snap,
+            tape,
+            steps,
+            paged,
+            "eager MTP replay",
+        )
+    }
+
+    /// The attention side's ground-truth frontier: the paged adapter's
+    /// recorded rows, or the first flat FullAttention cache's offset.
+    fn attention_frontier(&self) -> Option<u64> {
+        match self.owner {
+            Some(owner) => Some(
+                owner
+                    .resolve_ref(&self.inner.paged_adapter, DENSE_PAGED_MTP)
+                    .ok()?
+                    .request_tokens()
+                    .len() as u64,
+            ),
+            None => {
+                let caches = self.inner.caches.as_ref()?;
+                caches
+                    .iter()
+                    .find(|c| matches!(c, Qwen3_5LayerCache::FullAttention(_)))
+                    .map(|c| c.offset().max(0) as u64)
+            }
+        }
+    }
+
+    /// The paged speculative cache the facade (`engine::spec_paged`)
+    /// addresses: the model's adapter, borrowed back through the turn's
+    /// owner, iff `seq_id` is that owner. Any other id is refused — a facade
+    /// call must never re-activate a different request mid-turn — and a flat
+    /// turn has no paged cache to hand out.
+    fn paged_cache_for(
+        &mut self,
+        seq_id: u32,
+    ) -> std::result::Result<&mut PagedKVCacheAdapter, String> {
+        let owner = self.owner.ok_or_else(|| {
+            format!("{DENSE_PAGED_MTP}: a flat turn has no paged speculative cache")
+        })?;
+        owner.accepts(seq_id, DENSE_PAGED_MTP)?;
+        owner.resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
+    }
+
+    /// The paged half of [`MtpStepper::verify_step`]: slice `ids` to exactly
+    /// the `depth + 1` rows the core records, OPEN the facade cycle around
+    /// that write, then run it. The open is pure — it reads the pre-write
+    /// frontier off the adapter and mints the ticket — so a verify that
+    /// fails afterwards leaves the adapter exactly where the un-ticketed
+    /// path left it.
+    ///
+    /// The cycle is opened AFTER the fallible id work so a malformed `ids`
+    /// never mints a ticket, and BEFORE the write so the ticket's basis is
+    /// the pre-write cursor: the commit checks the cursor moved by exactly
+    /// the promised rows, which is what refuses a core that wrote a
+    /// different width.
+    fn paged_verify_step(
+        &mut self,
+        ids: &MxArray,
+        depth: usize,
+    ) -> Result<mtp_decode::MtpVerifyOutput> {
+        // Slice `ids` to exactly `depth+1` defensively so the adapter
+        // records exactly K+1 tokens — the rollback count depends on it.
+        let id_window = ids.to_int32().map_err(|e| {
+            Error::from_reason(format!(
+                "eager paged MTP verify_step: ids to_int32: {}",
+                e.reason
+            ))
+        })?;
+        if id_window.len() < depth + 1 {
+            return Err(Error::from_reason(format!(
+                "eager paged MTP verify_step: ids has {} elements, need {}",
+                id_window.len(),
+                depth + 1
+            )));
+        }
+        let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
+        let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
+        let owner = self
+            .owner
+            .expect("paged_verify_step is only reached on a paged turn");
+        self.open_verify_cycle(owner, depth + 1);
+        let inner = &mut *self.inner;
+        let adapter = owner
+            .resolve(&mut inner.paged_adapter, "eager paged MTP verify_step")
+            .map_err(Error::from_reason)?;
+        // Cross-turn M-RoPE delta carried by a text turn that warm-
+        // continues an image prefill; 0 for pure-text sessions.
+        let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
+        let caches = inner
+            .caches
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("eager paged MTP verify_step: caches is None"))?;
+        let tape = &mut self.tape;
+        super::paged_forward::run_paged_verify_step(
+            &verify_in,
+            &inner.embedding,
+            &mut inner.layers,
+            caches,
+            &inner.final_norm,
+            &inner.lm_head,
+            &self.layer_kinds,
+            adapter,
+            tape,
+            rope_deltas,
+        )
+    }
+
+    /// Mint the cycle ticket the verify core's own row write belongs to.
+    ///
+    /// Failure is not fatal and not silent: the only way to reach it is an
+    /// adapter that no longer answers to this turn's owner, whose
+    /// `record_tokens` fails the verify a few lines later, so the pre-facade
+    /// error semantics stand.
+    fn open_verify_cycle(&mut self, owner: SpecOwner, rows: usize) {
+        self.close_abandoned_cycle();
+        let seq_id = owner.seq_id();
+        match crate::engine::spec_paged::SpecPagedCache::open_core_write_cycle(self, seq_id, rows) {
+            Ok(ticket) => self.open_cycle = Some(ticket),
+            Err(e) => tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                "eager MTP-paged verify cycle ({rows} rows) could not be opened \
+                 (the rollback falls back to a direct adapter retraction): {e}",
+            ),
+        }
+    }
+
+    /// Close a cycle abandoned between its verify write and its rollback.
+    /// Keeping every written row is what the un-ticketed path did — they
+    /// stay recorded past the emitted frontier and the epilogue's
+    /// length-agreement check refuses to persist the turn — so a full keep
+    /// retracts nothing and this consumes the ticket instead of letting its
+    /// abandoned-cycle guard fire.
+    /// The turn's paged adapter, borrowed back through the owner. Tests
+    /// assert on adapter state across a whole turn; production reaches it
+    /// through `paged_cache_for` or an inline `owner.resolve`.
+    #[cfg(test)]
+    fn owned_adapter(&self) -> &PagedKVCacheAdapter {
+        self.owner
+            .expect("the turn must be paged")
+            .resolve_ref(&self.inner.paged_adapter, DENSE_PAGED_MTP)
+            .expect("the paged adapter must still answer to the turn's owner")
+    }
+
+    #[cfg(test)]
+    fn owned_adapter_mut(&mut self) -> &mut PagedKVCacheAdapter {
+        self.owner
+            .expect("the turn must be paged")
+            .resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
+            .expect("the paged adapter must still answer to the turn's owner")
+    }
+
+    fn close_abandoned_cycle(&mut self) {
+        let Some(ticket) = self.open_cycle.take() else {
+            return;
+        };
+        let (seq_id, rows) = (ticket.seq_id(), ticket.rows());
+        if let Err(e) =
+            crate::engine::spec_paged::SpecPagedCache::commit_cycle(self, seq_id, ticket, rows)
+        {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                "eager MTP-paged abandoned verify cycle on sequence {seq_id} \
+                 ({rows} rows) could not be closed cleanly (ignored): {e}",
+            );
         }
     }
 }
@@ -10066,8 +10676,8 @@ impl MtpStepper for DenseMtpStepper<'_> {
         ids: &MxArray,
         embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)> {
-        match &mut self.mode {
-            MtpStepMode::Flat => {
+        let output = match self.owner {
+            None => {
                 let inner = &mut *self.inner;
                 let pre =
                     forward_pre_norm_inner(ids, embedding, &mut inner.layers, &mut inner.caches)?;
@@ -10076,10 +10686,16 @@ impl MtpStepper for DenseMtpStepper<'_> {
                 let hidden = h3.squeeze(Some(&[1]))?;
                 Ok((logits, hidden, true))
             }
-            MtpStepMode::Paged(adapter) => {
+            Some(owner) => {
                 ids.eval();
                 let token_id = ids.item_at_int32(0)? as u32;
                 let inner = &mut *self.inner;
+                let adapter = owner
+                    .resolve(
+                        &mut inner.paged_adapter,
+                        "eager paged MTP forward_with_hidden",
+                    )
+                    .map_err(Error::from_reason)?;
                 // Cross-turn M-RoPE delta carried by a text turn that warm-
                 // continues an image prefill; 0 for pure-text sessions.
                 let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
@@ -10099,7 +10715,14 @@ impl MtpStepper for DenseMtpStepper<'_> {
                 )?;
                 Ok((logits, hidden, true))
             }
+        };
+        if output.is_ok()
+            && let Some(frontier) = self.recurrent_frontier.as_mut()
+        {
+            // The main forward consumed one token on the GDN side.
+            *frontier += 1;
         }
+        output
     }
 
     // One MTP draft step on the eager drafter. `h_next` is `[1, 1, hidden]`;
@@ -10125,68 +10748,40 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     // Batched verify: run the K+1 verify ids through the main stack,
-    // advancing `inner.caches` by K+1, recording the GDN tape.
+    // advancing `inner.caches` by K+1, recording the GDN tape. The paged
+    // half also opens the facade cycle its core write belongs to
+    // ([`DenseMtpStepper::paged_verify_step`]); `rollback` closes it.
     fn verify_step(
         &mut self,
         ids: &MxArray,
         embedding: &Embedding,
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
-        match &mut self.mode {
-            MtpStepMode::Flat => {
-                let _ = depth;
-                let inner = &mut *self.inner;
-                let tape = &mut self.tape;
-                eager_verify_step(
-                    &mut inner.layers,
-                    &mut inner.caches,
-                    &inner.final_norm,
-                    &inner.lm_head,
-                    ids,
-                    embedding,
-                    Some(tape),
-                )
-            }
-            MtpStepMode::Paged(adapter) => {
-                // Slice `ids` to exactly `depth+1` defensively so the adapter
-                // records exactly K+1 tokens — the rollback count depends on it.
-                let id_window = ids.to_int32().map_err(|e| {
-                    Error::from_reason(format!(
-                        "eager paged MTP verify_step: ids to_int32: {}",
-                        e.reason
-                    ))
-                })?;
-                if id_window.len() < depth + 1 {
-                    return Err(Error::from_reason(format!(
-                        "eager paged MTP verify_step: ids has {} elements, need {}",
-                        id_window.len(),
-                        depth + 1
-                    )));
-                }
-                let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
-                let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
-                let inner = &mut *self.inner;
-                // Cross-turn M-RoPE delta carried by a text turn that warm-
-                // continues an image prefill; 0 for pure-text sessions.
-                let rope_deltas = inner.cached_rope_deltas.unwrap_or(0);
-                let caches = inner.caches.as_mut().ok_or_else(|| {
-                    Error::from_reason("eager paged MTP verify_step: caches is None")
-                })?;
-                let tape = &mut self.tape;
-                super::paged_forward::run_paged_verify_step(
-                    &verify_in,
-                    &inner.embedding,
-                    &mut inner.layers,
-                    caches,
-                    &inner.final_norm,
-                    &inner.lm_head,
-                    &self.layer_kinds,
-                    adapter,
-                    tape,
-                    rope_deltas,
-                )
+        let output = if self.owner.is_some() {
+            self.paged_verify_step(ids, depth)
+        } else {
+            let inner = &mut *self.inner;
+            let tape = &mut self.tape;
+            eager_verify_step(
+                &mut inner.layers,
+                &mut inner.caches,
+                &inner.final_norm,
+                &inner.lm_head,
+                ids,
+                embedding,
+                Some(tape),
+            )
+        };
+        if output.is_ok() {
+            // The recorded tape step count for this cycle: the anchor plus D
+            // drafts. `rollback` overwrites it with the accepted count.
+            self.last_cycle_steps = depth + 1;
+            if let Some(frontier) = self.recurrent_frontier.as_mut() {
+                // Verify consumed the anchor plus D drafts on the GDN side.
+                *frontier += depth as u64 + 1;
             }
         }
+        output
     }
 
     // No native argmax-only / sparse verify on the eager path — the accept
@@ -10200,7 +10795,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
         // paged-aware so we capture only the GDN (Linear) state and skip the
         // shells — `rollback` rewinds those via the adapter and never reads
         // their snapshot.
-        let paged = matches!(self.mode, MtpStepMode::Paged(_));
+        let paged = self.owner.is_some();
         let inner = &*self.inner;
         let snap = match inner.caches.as_ref() {
             Some(caches) => super::layer_cache::snapshot_all_mtp(caches, paged),
@@ -10209,6 +10804,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
             )),
         };
         self.snap = Some(snap);
+        self.recurrent_snapshot_base = self.recurrent_frontier;
     }
 
     // Pure-Rust GDN tape replay — the correctness keystone. Fires on BOTH
@@ -10223,126 +10819,89 @@ impl MtpStepper for DenseMtpStepper<'_> {
         // tape replay. On full accept `rejected == 0` (no-op). Flat layers keep
         // their full-attention K/V in `inner.caches` and rewind it via `kv.trim`
         // inside the replay loop instead.
-        let paged = matches!(self.mode, MtpStepMode::Paged(_));
-        if let MtpStepMode::Paged(adapter) = &mut self.mode {
-            let rejected = depth.saturating_sub(accepted_drafts);
-            if rejected > 0
-                && let Err(e) = adapter.rollback_last_tokens(rejected as u32)
-            {
-                tracing::warn!(
-                    target: "mlx_core::qwen3_5::paged",
-                    "eager MTP-paged rollback_last_tokens({rejected}) failed \
-                     (ignored): {e}",
-                );
+        //
+        // The retraction goes through the cycle `verify_step` opened, so the
+        // adapter half of this rollback and the facade's conformance surface
+        // are the same arithmetic: the commit derives its rollback as
+        // `rows - keep` = `(depth + 1) - (accepted_drafts + 1)`, which is the
+        // `depth - accepted_drafts` this path always applied.
+        if let Some(owner) = self.owner {
+            match self.open_cycle.take() {
+                Some(ticket) => {
+                    let seq_id = ticket.seq_id();
+                    // `keep` is CLAMPED to the rows the cycle wrote, exactly
+                    // as the `saturating_sub` it replaces clamped the rejected
+                    // count. `accepted_drafts <= depth` is an engine
+                    // invariant; were it ever broken, the clamp keeps this on
+                    // the commit's checked path — retracting zero rows, as the
+                    // `saturating_sub` did — instead of leaving through an Err
+                    // and a log line.
+                    let keep = (accepted_drafts + 1).min(ticket.rows());
+                    if let Err(e) = crate::engine::spec_paged::SpecPagedCache::commit_cycle(
+                        self, seq_id, ticket, keep,
+                    ) {
+                        tracing::warn!(
+                            target: "mlx_core::qwen3_5::paged",
+                            "eager MTP-paged verify commit (keep {keep} of the cycle's \
+                             rows) failed (ignored): {e}",
+                        );
+                    }
+                }
+                None => {
+                    // No cycle to close: `verify_step` could not open one,
+                    // which also fails the verify itself, so production never
+                    // lands here. Retract directly rather than leave rejected
+                    // rows recorded.
+                    let rejected = depth.saturating_sub(accepted_drafts);
+                    if rejected > 0
+                        && let Err(e) = owner
+                            .resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
+                            .map_err(Error::from_reason)
+                            .and_then(|adapter| {
+                                adapter.rollback_last_tokens(rejected as u32).map_err(|e| {
+                                    Error::from_reason(format!("adapter rollback: {e}"))
+                                })
+                            })
+                    {
+                        tracing::warn!(
+                            target: "mlx_core::qwen3_5::paged",
+                            "eager MTP-paged rollback_last_tokens({rejected}) outside a \
+                             verify cycle failed (ignored): {e}",
+                        );
+                    }
+                }
             }
         }
         let accepted_steps = accepted_drafts + 1;
-        let result: Result<()> = (|| {
-            let snap = match self.snap.as_ref() {
-                Some(Ok(s)) => s,
-                Some(Err(e)) => {
-                    return Err(Error::from_reason(format!(
-                        "eager MTP rollback: snapshot failed: {}",
-                        e.reason
-                    )));
-                }
-                None => {
-                    return Err(Error::from_reason(
-                        "eager MTP rollback: snapshot missing (snapshot_main_linear \
-                         did not run)",
-                    ));
-                }
-            };
-            let tape = &self.tape;
-            let inner = &mut *self.inner;
-            let caches = inner
-                .caches
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("eager MTP rollback: inner.caches is None"))?;
-            if caches.len() != snap.len() || caches.len() != tape.len() {
-                return Err(Error::from_reason(format!(
-                    "eager MTP rollback: length mismatch (caches {}, snapshot {}, \
-                     tape {})",
-                    caches.len(),
-                    snap.len(),
-                    tape.len(),
-                )));
+        self.last_cycle_steps = accepted_steps;
+        match self.replay_main_linear_to(accepted_steps) {
+            Ok(()) => {
+                self.recurrent_frontier = self
+                    .recurrent_snapshot_base
+                    .map(|base| base + accepted_steps as u64);
             }
-            for (idx, cache) in caches.iter_mut().enumerate() {
-                let Some(layer_tape) = tape[idx].as_ref() else {
-                    if paged {
-                        // Full-attention layer on the paged path: K/V lives in
-                        // the paged pool and was already rewound by
-                        // `adapter.rollback_last_tokens` above. The
-                        // `inner.caches` FullAttention slot is unused on the
-                        // paged path, so skip it.
-                        continue;
-                    }
-                    // Full-attention layer: rewind the offset to
-                    // `snapshot_offset + accepted_steps` so the next forward
-                    // overwrites the rejected drafts. No-op on full accept.
-                    match &snap[idx] {
-                        super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { offset } => {
-                            let kv = cache.as_kv_cache_mut().ok_or_else(|| {
-                                Error::from_reason(format!(
-                                    "eager MTP rollback: layer {idx} has a \
-                                     FullAttention snapshot but its cache slot is \
-                                     not FullAttention",
-                                ))
-                            })?;
-                            let target = *offset + accepted_steps as i32;
-                            kv.trim(target);
-                        }
-                        super::layer_cache::Qwen3_5LayerSnapshot::Linear { .. } => {
-                            return Err(Error::from_reason(format!(
-                                "eager MTP rollback: layer {idx} has no GDN tape \
-                                 but a Linear snapshot",
-                            )));
-                        }
-                    }
-                    continue;
-                };
-                let arrays = cache.as_arrays_cache_mut().ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "eager MTP rollback: layer {idx} has a GDN tape but its \
-                         cache slot is not Linear",
-                    ))
-                })?;
-                let (snap_conv, snap_rec) = match &snap[idx] {
-                    super::layer_cache::Qwen3_5LayerSnapshot::Linear {
-                        conv_state,
-                        recurrent_state,
-                    } => (conv_state.as_ref(), recurrent_state.as_ref()),
-                    super::layer_cache::Qwen3_5LayerSnapshot::FullAttention { .. } => {
-                        return Err(Error::from_reason(format!(
-                            "eager MTP rollback: layer {idx} GDN tape but \
-                             FullAttention snapshot",
-                        )));
-                    }
-                };
-                let window = layer_tape.kernel.window_len()? as usize;
-                if accepted_steps > window {
-                    return Err(Error::from_reason(format!(
-                        "eager MTP rollback: accepted_steps {accepted_steps} \
-                         exceeds recorded window {window} at layer {idx}",
-                    )));
-                }
-                layer_tape.replay_into(arrays, snap_conv, snap_rec, accepted_steps)?;
+            Err(e) => {
+                self.recurrent_frontier = None;
+                self.replay_err = Some(e);
             }
-            Ok(())
-        })();
-        if let Err(e) = result {
-            self.replay_err = Some(e);
         }
     }
 
     // On rejection (partial accept): the GDN tape replay in `rollback`
     // already reconstructed the AR-exact main cache state, so no re-forward
-    // loop is needed. This only surfaces a stashed replay error and clears
-    // the per-cycle snapshot + tape.
+    // loop is needed. This only surfaces a stashed replay error.
+    //
+    // The per-cycle snapshot + tape are deliberately RETAINED: both are
+    // re-armed by the next cycle anyway (`snapshot_main_linear` overwrites
+    // `snap`; the verify cores clear + re-record `tape` at record time), and
+    // a mid-cycle stop after THIS cycle still needs them — the paged
+    // `rollback_unemitted` replays the GDN state back to the emitted frontier
+    // from exactly this snapshot + tape. The accept shapes were asymmetric
+    // before this retention: full-accept cycles skip this hook entirely (the
+    // engine only replays on rejection), so their snapshot + tape always
+    // survived to the emit loop; retention merely extends that same lifetime
+    // to partial accepts.
     fn restore_and_replay_main(&mut self, _accepted: &[u32], _embedding: &Embedding) -> Result<()> {
-        self.snap = None;
-        self.tape.clear();
         if let Some(e) = self.replay_err.take() {
             return Err(e);
         }
@@ -10439,6 +10998,29 @@ impl MtpStepper for DenseMtpStepper<'_> {
         }
     }
 
+    // Per-cycle paged twin of `reserve_paged_mtp_lookahead`: re-reserve the
+    // lookahead region past the adapter's CURRENT cursor so this cycle's
+    // verify writes land in pre-allocated blocks (the turn-entry reservation
+    // only covered the first cycle's cursor). The mechanism — adapter
+    // `reserve_rows` plus the capacity-exhaustion mapping — lives once, in
+    // the stepper's `SpecPagedCache::reserve_lookahead`; this hook only
+    // names the turn's active sequence for it. Exhaustion reports AR
+    // fallback with untouched adapter state; the flat mode has no
+    // reservation semantics and is always covered.
+    fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
+        let Some(owner) = self.owner else {
+            return Ok(true);
+        };
+        let seq_id = owner.seq_id();
+        crate::engine::spec_paged::SpecPagedCache::reserve_lookahead(self, seq_id, rows).map_err(
+            |e| {
+                Error::from_reason(format!(
+                    "eager paged MTP per-cycle lookahead reservation ({rows} rows): {e}"
+                ))
+            },
+        )
+    }
+
     // Bound the lazy graph: materialize the token plus the main GDN/full-attn
     // caches; on a budget-forced step also the logits.
     fn eval_step(&self, token: &MxArray, logits: &MxArray, budget_forced: bool) {
@@ -10458,24 +11040,79 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     fn rollback_unemitted(&mut self, unemitted: usize) {
-        match &mut self.mode {
-            MtpStepMode::Flat => {
-                if unemitted > 0 {
-                    self.mtp_desynced = true;
-                }
+        let Some(owner) = self.owner else {
+            if unemitted > 0 {
+                self.mtp_desynced = true;
             }
-            MtpStepMode::Paged(adapter) => {
-                // Truncate the live paged adapter by the accepted-but-unemitted
-                // tokens; the paged path never sets the FLAT desync latch.
-                if let Err(e) = adapter.rollback_last_tokens(unemitted as u32) {
-                    tracing::warn!(
-                        target: "mlx_core::qwen3_5::paged",
-                        "eager MTP-paged rollback_unemitted({unemitted}) failed \
-                         (ignored): {e}",
-                    );
-                }
+            return;
+        };
+        // Truncate the live paged adapter by the accepted-but-unemitted
+        // tokens; the paged path never sets the FLAT desync latch. An adapter
+        // truncate failure is not fatal here: the epilogue's frontier check
+        // sees the skew and refuses to persist.
+        if let Err(e) = owner
+            .resolve(&mut self.inner.paged_adapter, DENSE_PAGED_MTP)
+            .map_err(Error::from_reason)
+            .and_then(|adapter| {
+                adapter
+                    .rollback_last_tokens(unemitted as u32)
+                    .map_err(|e| Error::from_reason(format!("adapter rollback: {e}")))
+            })
+        {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                "eager MTP-paged rollback_unemitted({unemitted}) adapter \
+                 truncate failed (epilogue frontier check refuses to \
+                 persist): {e}",
+            );
+        }
+        // Paged GDN rewind twin of the adapter truncate above: replay the
+        // retained snapshot + tape to `last_cycle_steps - unemitted` steps so
+        // the recurrent state lands on the SAME drop-last-of-emitted frontier
+        // as the adapter and the to-be-saved history. The skew vs the saved
+        // history is exactly `unemitted` tokens (the history also drops the
+        // last emitted token, which the adapter/GDN never consumed);
+        // `unemitted == last_cycle_steps` degenerates to a pure snapshot
+        // restore (a stop before any cycle token was emitted). A replay
+        // failure is stashed in `replay_err` — the engine polls
+        // `take_replay_error` right after this hook and fail-closes the turn
+        // through `invalidate_dense_paged_session`.
+        if self.replay_err.is_some() {
+            // The turn is already failing; the stashed error aborts it and
+            // invalidates the session, so a second (snapshot-less) replay
+            // attempt would only shadow the root cause.
+            return;
+        }
+        let Some(target) = self.last_cycle_steps.checked_sub(unemitted) else {
+            self.inner.paged_mtp_gdn_invalidations += 1;
+            self.recurrent_frontier = None;
+            self.replay_err = Some(Error::from_reason(format!(
+                "eager MTP-paged rollback_unemitted: unemitted {unemitted} exceeds \
+                 the cycle's committed steps {}",
+                self.last_cycle_steps
+            )));
+            return;
+        };
+        match self.replay_main_linear_to(target) {
+            Ok(()) => {
+                self.recurrent_frontier = self
+                    .recurrent_snapshot_base
+                    .map(|base| base + target as u64);
+                self.inner.paged_mtp_gdn_rewinds += 1;
+            }
+            Err(e) => {
+                self.recurrent_frontier = None;
+                self.inner.paged_mtp_gdn_invalidations += 1;
+                self.replay_err = Some(e);
             }
         }
+    }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        Some(SpecFrontier {
+            attn_tokens: self.attention_frontier()?,
+            recurrent_tokens: self.recurrent_frontier,
+        })
     }
 
     fn take_replay_error(&mut self) -> Option<Error> {
@@ -10483,15 +11120,144 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     fn into_desynced(self) -> bool {
-        // Paged truncates its adapter in `rollback_unemitted` and never touches
-        // the FLAT desync latch, so it always reports `false`. The adapter is
-        // restored into `inner.paged_adapter` by the `Drop` impl that runs as
-        // `self` falls out of scope here. (`self` is consumed by value rather
-        // than destructured because the `Drop` impl forbids moving fields out.)
-        match self.mode {
-            MtpStepMode::Flat => self.mtp_desynced,
-            MtpStepMode::Paged(_) => false,
+        // Paged rewinds BOTH sides of a mid-cycle stop in `rollback_unemitted`
+        // — the adapter cursor by truncation and the GDN recurrent state by
+        // tape replay — so every paged target-state kind already sits at the
+        // drop-last-of-emitted frontier and reporting `false` is honest; it
+        // never touches the FLAT desync latch. A rewind failure routes through
+        // `take_replay_error` → session invalidation instead. (`self` is
+        // consumed by value rather than destructured because the `Drop` impl
+        // forbids moving fields out.)
+        self.owner.is_none() && self.mtp_desynced
+    }
+}
+
+/// Context prefix for every owner-addressed refusal on this family's paged
+/// speculative path.
+const DENSE_PAGED_MTP: &str = "dense paged MTP facade";
+
+/// The refusal both facade writers return for this family; see the
+/// `SpecPagedCache` impl docs below.
+fn dense_core_writes_its_own_rows(seq_id: u32) -> String {
+    format!(
+        "dense paged MTP facade: the verify core records sequence {seq_id}'s rows \
+         itself — open the cycle with open_core_write_cycle around that write \
+         instead of record_verify/record_rows"
+    )
+}
+
+/// Facade conformance for the dense paged MTP turn (`engine::spec_paged`):
+/// the cache is the model's paged adapter, borrowed back through the turn's
+/// [`SpecOwner`] ([`DenseMtpStepper::paged_cache_for`] refuses any other id).
+///
+/// # What production routes through here, and what it does not
+///
+/// PRODUCTION-ROUTED — these are the turn's only path, so conformance and
+/// production cannot drift:
+///
+/// * `reserve_lookahead` — [`MtpStepper::reserve_cycle_lookahead`] delegates
+///   here for the mechanism ([`PagedKVCacheAdapter::reserve_rows`] plus the
+///   capacity-exhaustion mapping) and only names the active sequence.
+/// * `open_core_write_cycle` + `commit_cycle` — the dense verify core
+///   records its `[anchor, drafts..]` slice as part of the forward, so
+///   [`MtpStepper::verify_step`] opens the cycle AROUND that write and
+///   [`MtpStepper::rollback`] closes it. The commit is the adapter half of
+///   that rollback; the GDN tape replay and the recurrent frontier update
+///   are layered on top of it and stay the stepper's.
+///
+/// REFUSED — the verify core writes this family's rows:
+///
+/// * `record_verify` and the `record_rows` primitive under it would write
+///   rows the verify forward never wrote. Paired with `verify_step` they
+///   record the cycle's rows twice; on their own, every row a commit KEEPS
+///   advances the adapter while the recurrent state stands still, and the
+///   two frontiers desync — the skew
+///   [`Qwen35Inner::check_dense_paged_frontier`] cannot see, since it
+///   compares the adapter against the history and never against the GDN
+///   count. Both return `Err`, so `open_core_write_cycle` is the only way to
+///   open a cycle here and no facade row can outlive one.
+///
+/// NOT production-routed — conformance surface only:
+///
+/// * `settle_committed` / `settle_captures_durable_state` — see below.
+///
+/// `rollback_unemitted` retracts COMMITTED rows after a mid-cycle stop, past
+/// the end of the cycle the commit already closed, so it stays a direct
+/// [`PagedKVCacheAdapter::rollback_last_tokens`] and is outside this
+/// contract.
+///
+/// `settle_committed` is the IDENTITY for this family, by construction: the
+/// dense adapter is full-attention-only (`sliding_window == 0`, so no
+/// per-step prune exists), and every durable surface — GDN history
+/// checkpoints, cold sidecars, the paged-history save, prefix registration —
+/// runs in the turn epilogue at the committed frontier (I3, enforced by the
+/// `paged_gdn_state_dirty` latch and the epilogue length agreement), never
+/// per step. There is no settle work to re-anchor, so the method only
+/// validates its arguments and touches nothing. Conformance tests for this
+/// family therefore MUST NOT gate on settle side effects — they would pass
+/// vacuously — and assert the reservation/commit block accounting instead.
+impl crate::engine::spec_paged::SpecPagedCache for DenseMtpStepper<'_> {
+    fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> std::result::Result<bool, String> {
+        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+        match self.paged_cache_for(seq_id)?.reserve_rows(rows) {
+            Ok(_) => Ok(true),
+            Err(e) if e.starts_with("context_length_exceeded:") => {
+                tracing::warn!(
+                    target: "mlx_core::qwen3_5::paged",
+                    lookahead_rows = rows,
+                    "dense paged MTP lookahead reservation exhausted the paged \
+                     pool; the cycle degrades to autoregressive decode: {e}"
+                );
+                Ok(false)
+            }
+            Err(e) => Err(e),
         }
+    }
+
+    fn record_rows(&mut self, seq_id: u32, _tokens: &[u32]) -> std::result::Result<(), String> {
+        Err(dense_core_writes_its_own_rows(seq_id))
+    }
+
+    fn record_verify(
+        &mut self,
+        seq_id: u32,
+        _tokens: &[u32],
+    ) -> std::result::Result<crate::engine::spec_paged::VerifyTicket, String> {
+        Err(dense_core_writes_its_own_rows(seq_id))
+    }
+
+    fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
+        let rows = u32::try_from(rows).map_err(|_| {
+            format!("dense paged MTP commit rollback of {rows} rows does not fit u32")
+        })?;
+        self.paged_cache_for(seq_id)?.rollback_last_tokens(rows)
+    }
+
+    fn settle_committed(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: u64,
+    ) -> std::result::Result<(), String> {
+        // The identity (see the impl docs): validate only, touch nothing.
+        let recorded = self.paged_cache_for(seq_id)?.request_tokens().len() as u64;
+        if committed_tokens > recorded {
+            return Err(format!(
+                "dense paged MTP settle_committed: committed frontier \
+                 {committed_tokens} exceeds recorded token count {recorded}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn settle_captures_durable_state(&self) -> bool {
+        // The identity settle (see the impl docs) touches nothing at all.
+        false
+    }
+
+    fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
+        self.owner
+            .filter(|owner| owner.seq_id() == seq_id)
+            .and_then(|_| MtpStepper::frontier(self))
     }
 }
 
@@ -10512,33 +11278,47 @@ impl MtpBackend for Qwen35Inner {
         let embedding = self.embedding.clone();
         let config = self.config.clone();
 
-        // Committed-history is only correct when the prompt tail's hiddens
-        // start at absolute position 0 (the eager drafter derives RoPE purely
-        // from the local cache offset) AND the matching prompt seed is
-        // actually present. Cache-reuse continuations do not capture
-        // full-prompt hiddens; their default position base is still zero, so
-        // checking the base alone would falsely advertise an empty drafter
-        // cache as prompt-committed. Chained cycles would then skip the
-        // main-model anchor against that nonexistent history and could
-        // diverge from the full-reprefill heal. Seedless turns fall back to
-        // v1 cycle-history.
-        let has_prompt_seed = setup.prompt_hidden_position_base == 0
-            && setup.prompt_hidden.is_some()
+        // Committed history needs the prompt seed itself, not just a prompt.
+        // Cache-reuse continuations do not capture full-prompt hiddens;
+        // advertising an empty drafter cache as prompt-committed would let
+        // chained cycles skip the main-model anchor against a nonexistent
+        // history and diverge from the full-reprefill heal. Seedless turns
+        // fall back to cycle history.
+        let has_prompt_seed = setup.prompt_hidden.is_some()
             && setup.prompt_hidden_ids.is_some_and(|ids| !ids.is_empty());
         let use_committed = has_prompt_seed;
 
         // Auto-select the main-forward routing: the paged cores leave a paged
-        // adapter on `self`, so `take()` moves it into the stepper for the turn
-        // (restored by `Drop`); the flat cores have none and run flat. The
-        // paged forwards need the per-layer kind classification (unused flat).
-        let (mode, layer_kinds) = match self.paged_adapter.take() {
+        // adapter on `self`, so the turn claims its active sequence as the
+        // owner and borrows the adapter back per touch; the flat cores have
+        // none and run flat. The paged forwards need the per-layer kind
+        // classification (unused flat).
+        let (owner, layer_kinds) = match self.paged_adapter.as_mut() {
             Some(adapter) => {
+                let owner = SpecOwner::claim(adapter.active_seq_id(), "eager paged MTP turn entry")
+                    .map_err(Error::from_reason)?;
+                // Reserve the speculative lookahead region before any cycle
+                // writes (I1: `setup.lookahead_rows` comes from the
+                // `SpeculativePlan` property — never a local `depth + 1`).
+                // The paged cores reserved this same margin at their
+                // AR-fallback gate, so this normally takes the covered no-op
+                // branch; a caller that skips that gate still fails HERE,
+                // pre-cycle with untouched state, instead of mid-verify.
+                // Later cycles are covered by the engine loop's per-cycle
+                // `reserve_cycle_lookahead` call on the stepper.
+                if setup.lookahead_rows > 0 {
+                    let rows = u32::try_from(setup.lookahead_rows).unwrap_or(u32::MAX);
+                    adapter.reserve_rows(rows).map_err(|e| {
+                        Error::from_reason(format!(
+                            "eager paged MTP lookahead reservation ({rows} rows): {e}"
+                        ))
+                    })?;
+                }
                 // Cached once at construction (see the field rustdoc); clone is
                 // a copy of the turn-constant classification.
-                let layer_kinds = self.layer_kinds.clone();
-                (MtpStepMode::Paged(Box::new(adapter)), layer_kinds)
+                (Some(owner), self.layer_kinds.clone())
             }
-            None => (MtpStepMode::Flat, Vec::new()),
+            None => (None, Vec::new()),
         };
 
         let mut stepper = DenseMtpStepper {
@@ -10549,13 +11329,22 @@ impl MtpBackend for Qwen35Inner {
             chained_cycles_supported: has_prompt_seed,
             snap: None,
             tape: Vec::new(),
+            last_cycle_steps: 0,
+            open_cycle: None,
+            recurrent_frontier: None,
+            recurrent_snapshot_base: None,
             replay_err: None,
             mtp_desynced: false,
             embedding,
             config,
-            mode,
+            owner,
             layer_kinds,
         };
+        // The GDN recurrent state is aligned with the attention state at turn
+        // entry (both consumed exactly the prefilled history), so the
+        // recurrent bookkeeping seeds from the attention side's ground truth;
+        // cross-turn skew is the epilogue length-agreement checks' job.
+        stepper.recurrent_frontier = stepper.attention_frontier();
 
         // Prompt-prefix seed (v2 committed-history only): commit the
         // contiguous run
@@ -10630,7 +11419,6 @@ impl MtpBackend for Qwen35Inner {
                 seed_tokens,
                 chunks = seed_chunks,
                 max_chunk_tokens = 7,
-                position_base = setup.prompt_hidden_position_base,
                 setup_elapsed_ms = seed_trace_start.map(elapsed_ms).unwrap_or(0.0),
                 "MTP prompt seed completed"
             );
@@ -10957,6 +11745,7 @@ impl ChatBackend for Qwen35Inner {
                 // MTP probe and dense `paged_turn` handled MTP directly.
                 supported_context_media: MediaCapabilities::IMAGES,
                 supports_paged_attention: true,
+                supports_streaming: true,
             }),
         }
     }
@@ -11374,6 +12163,38 @@ impl Qwen3_5Model {
     pub async fn force_flat_mtp_desync_for_test(&self) -> Result<()> {
         crate::model_thread::send_and_await(&self.thread, |reply| {
             Qwen35Cmd::ForceFlatMtpDesyncForTest { reply }
+        })
+        .await
+    }
+
+    /// Test-only between-turn snapshot of the paged-MTP GDN bookkeeping —
+    /// the paged twin of [`Self::mtp_flat_state_for_test`]. See
+    /// [`MtpPagedGdnStateForTest`].
+    #[doc(hidden)]
+    pub async fn mtp_paged_gdn_state_for_test(&self) -> Result<MtpPagedGdnStateForTest> {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::MtpPagedGdnStateForTest { reply }
+        })
+        .await
+    }
+
+    /// Test-only: force the NEXT paged epilogue's frontier check to report a
+    /// mismatch, arming the GDN refuse-to-persist latch deterministically.
+    #[doc(hidden)]
+    pub async fn force_paged_gdn_mismatch_for_test(&self) -> Result<()> {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::ForcePagedGdnMismatchForTest { reply }
+        })
+        .await
+    }
+
+    /// Test-only state oracle: recompute GDN over the persisted history
+    /// checkpoint's own token key from fresh caches and bit-compare against
+    /// the checkpoint arrays. `Ok(true)` iff every linear layer matches.
+    #[doc(hidden)]
+    pub async fn gdn_history_checkpoint_oracle_for_test(&self) -> Result<bool> {
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35Cmd::GdnHistoryCheckpointOracleForTest { reply }
         })
         .await
     }
@@ -14082,11 +14903,17 @@ mod paged_construction_tests {
     }
 
     fn paged_inner_or_skip(test_name: &str) -> Option<(Qwen35Inner, Qwen3_5Config)> {
+        paged_inner_with_cfg_or_skip(test_name, tiny_paged_forward_cfg())
+    }
+
+    fn paged_inner_with_cfg_or_skip(
+        test_name: &str,
+        cfg: Qwen3_5Config,
+    ) -> Option<(Qwen35Inner, Qwen3_5Config)> {
         // Only a device-less host licenses a skip. A `LayerKVPool::new: ...
         // must be > 0` means the test config stopped producing a usable pool,
         // and skipping on that is a silent green — see `metal_device_absent`.
         let unavailable = crate::test_support::metal_device_absent;
-        let cfg = tiny_paged_forward_cfg();
         match Qwen35Inner::new(cfg.clone()) {
             Ok(mut inner) => match inner.initialize_paged_adapter() {
                 Ok(()) => Some((inner, cfg)),
@@ -15013,7 +15840,7 @@ mod paged_construction_tests {
         seed_dense_paged_image_session(&mut inner);
 
         let error = inner
-            .finalize_dense_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)], 0)
+            .finalize_dense_manual_paged_turn(&[(1, 0xA11C), (2, 0xA11C)], 0, 4)
             .expect_err("missing adapter must fail manual finalization");
         assert!(error.to_string().contains("paged finalization failed"));
         assert!(inner.caches.is_none());
@@ -15820,7 +16647,7 @@ mod paged_construction_tests {
         let _serialized = crate::cold_tier::sidecar_counter_test_lock();
         let before = crate::cold_tier::cold_sidecar_telemetry();
         inner
-            .finalize_dense_manual_paged_turn(&[], 0)
+            .finalize_dense_manual_paged_turn(&[], 0, prompt.len())
             .expect("manual paged finalization must succeed");
         let after = crate::cold_tier::cold_sidecar_telemetry();
 
@@ -15885,7 +16712,7 @@ mod paged_construction_tests {
         let _serialized = crate::cold_tier::sidecar_counter_test_lock();
         let before = crate::cold_tier::cold_sidecar_telemetry();
         inner
-            .finalize_dense_manual_paged_turn(&[(4, 99)], 0)
+            .finalize_dense_manual_paged_turn(&[(4, 99)], 0, prompt.len())
             .expect("manual paged finalization must succeed");
         let after = crate::cold_tier::cold_sidecar_telemetry();
 
@@ -15904,6 +16731,40 @@ mod paged_construction_tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// L-KEY (I4) tripwire: a publish site that keys GDN state on a history
+    /// disagreeing with the paged frontier — without first running
+    /// `check_dense_paged_frontier`, which would arm the refuse-to-persist
+    /// latch — must trip the debug assert inside
+    /// `remember_dense_gdn_history_checkpoint` instead of storing state that
+    /// does not match its token key.
+    ///
+    /// Catches: removing that assert — the publish then proceeds silently
+    /// and this test fails on the missing panic. (`catch_unwind` rather than
+    /// `#[should_panic]` so the no-Metal self-skip can still pass.)
+    #[test]
+    fn history_checkpoint_publish_asserts_the_paged_frontier() {
+        let Some(mut inner) = dense_inner_with_test_adapter_or_skip(
+            "history_checkpoint_publish_asserts_the_paged_frontier",
+        ) else {
+            return;
+        };
+        let prompt: Vec<u32> = (0u32..32).collect();
+        record_whole_paged_request(&mut inner, &prompt);
+        // One token short of the adapter's 32 recorded rows with the latch
+        // NOT armed — the exact shape a future check-less publish site would
+        // hand the store.
+        inner.cached_token_history = prompt[..prompt.len() - 1].to_vec();
+        assert!(!inner.paged_gdn_state_dirty);
+
+        let publish = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = inner.remember_dense_gdn_history_checkpoint();
+        }));
+        assert!(
+            publish.is_err(),
+            "a checkpoint publish keyed off the paged frontier must trip the L-KEY debug assert"
+        );
     }
 
     /// The chunk size every paged prefill reads. Single-shot materializes no GDN
@@ -16129,6 +16990,773 @@ mod paged_construction_tests {
         adapter.release_request().expect("release_request");
         let _ = std::fs::remove_dir_all(&root);
     }
+
+    /// I6 gate: a paged speculative turn ADDRESSES the model's adapter, it
+    /// does not take it. Three things follow, and each is one assertion here:
+    ///
+    ///   * the adapter stays reachable through `inner.paged_adapter` for the
+    ///     whole turn, and the turn's writes land on THAT adapter — a stepper
+    ///     that moved a copy out would leave the model's cursor at the prompt;
+    ///   * a facade write addressed to any other sequence is refused, so a
+    ///     turn can never drive a cache that has moved to another request;
+    ///   * a paged turn whose adapter names no active request is refused AT
+    ///     ENTRY with the adapter untouched, instead of running Step A against
+    ///     it and failing at the verify write.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn paged_mtp_turn_addresses_the_model_adapter_instead_of_taking_it() {
+        use crate::engine::spec_paged::SpecPagedCache;
+
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.n_mtp_layers = 1;
+        let Some((mut inner, _cfg)) = paged_inner_with_cfg_or_skip(
+            "paged_mtp_turn_addresses_the_model_adapter_instead_of_taking_it",
+            cfg,
+        ) else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        inner.mtp_weights_loaded = true;
+
+        let prompt: Vec<u32> = (0..24u32).map(|i| (i * 5 + 7) % 257).collect();
+        reset_paged_request(&mut inner, &prompt);
+        run_dense_paged_prefill_with_size(&mut inner, &prompt, &prompt, 0, 2048)
+            .expect("dense paged prefill")
+            .eval();
+
+        let depth = 2usize;
+        let lookahead = inner
+            .execution_plan()
+            .speculative
+            .expect("dense MTP checkpoint must publish a speculative plan")
+            .lookahead_rows(depth);
+        let setup = MtpTurnSetup {
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
+            first_sampled_token: 21,
+            lookahead_rows: lookahead,
+        };
+
+        let seq_id = {
+            let mut step = inner.begin_mtp_decode(&setup).expect("begin_mtp_decode");
+            let seq_id = step
+                .owned_adapter()
+                .active_seq_id()
+                .expect("active request");
+
+            // A facade WRITE addressed to a foreign sequence is refused. The
+            // frontier read is already gated elsewhere; this is the write half,
+            // and it is what stops a re-pointed cache from being driven.
+            let err = SpecPagedCache::reserve_lookahead(&mut step, seq_id + 1, lookahead)
+                .expect_err("a foreign sequence must be refused by the facade");
+            assert!(
+                err.contains("not this turn's owner"),
+                "the refusal must name the owner mismatch, got: {err}"
+            );
+
+            // One real Step-A forward, so the turn actually writes a row.
+            let ids = MxArray::from_int32(&[21], &[1, 1]).expect("step-A ids");
+            let embedding = step.embedding().clone();
+            let (logits, _hidden, _squeeze) = step
+                .forward_with_hidden(&ids, &embedding)
+                .expect("Step-A forward on the model's adapter");
+            logits.eval();
+            seq_id
+        };
+
+        // The write landed on the MODEL's adapter, not on a copy the stepper
+        // owned and handed back.
+        let adapter = inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter stays on model");
+        assert_eq!(adapter.active_seq_id(), Some(seq_id));
+        assert_eq!(
+            adapter.current_token_count(),
+            prompt.len() as u32 + 1,
+            "the turn's Step-A row must be visible on the model's own adapter"
+        );
+
+        // Entry refusal: no active request means no addressable sequence, so
+        // the turn never starts and the adapter is left exactly as it was.
+        let blocks_before = adapter.num_allocated_blocks();
+        inner
+            .paged_adapter
+            .as_mut()
+            .expect("adapter")
+            .release_request()
+            .expect("release_request");
+        let err = inner
+            .begin_mtp_decode(&setup)
+            .err()
+            .expect("a paged turn with no active request must be refused at entry");
+        assert!(
+            err.reason.contains("no active request"),
+            "the entry refusal must name the missing request, got: {}",
+            err.reason
+        );
+        let adapter = inner
+            .paged_adapter
+            .as_ref()
+            .expect("the refused turn must not consume the adapter");
+        assert!(
+            adapter.num_allocated_blocks() <= blocks_before,
+            "a refused turn must not reserve lookahead blocks"
+        );
+    }
+
+    /// Cross-module gate for the reserve→verify seam (T1/T2/T3 wiring) and
+    /// for the facade cycle the dense paged commit is routed through
+    /// (`engine::spec_paged`). Every cycle here is a REAL verify forward, so
+    /// every row the block table holds was written by one.
+    ///
+    /// Geometry: exactly one block of prompt, then production cycles until a
+    /// cycle's `+lookahead` margin crosses out of the allocated tail. The
+    /// TURN-ENTRY reservation is pinned by the first crossing (prompt block
+    /// → prompt + lookahead), the PER-CYCLE facade reservation by the second
+    /// — a reservation that never reaches the allocator then shows up as a
+    /// mid-verify allocation on that cycle instead of passing vacuously.
+    ///
+    /// Catches: I1 drift (the plan property diverging from what verify
+    /// actually writes), a dead reserve→record seam (reservation not
+    /// reaching the adapter, or advancing the cursor), a verify/rollback
+    /// pair whose net adapter growth escapes the reserved margin, and a
+    /// ONE-SIDED commit — an adapter rollback that does not land the
+    /// recurrent state with it, which the full `SpecFrontier` equality after
+    /// every cycle pins. That last shape is invisible to the release
+    /// backstop `check_dense_paged_frontier`, which compares the adapter
+    /// against the history and never against the GDN count.
+    ///
+    /// The tail segment catches one more: `record_verify` / `record_rows`
+    /// answering anything but `Err` on this family, which would hand a
+    /// driver a cycle whose kept rows the recurrent state never saw.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn paged_mtp_lookahead_reservation_covers_verify() {
+        use crate::engine::spec_paged::{NoSettleInCycle, SpecPagedCache};
+
+        /// `(allocated blocks, recorded rows)` of the turn's paged adapter.
+        fn adapter_stats(step: &DenseMtpStepper<'_>) -> (usize, u32) {
+            let adapter = step.owned_adapter();
+            (
+                adapter.num_allocated_blocks(),
+                adapter.current_token_count(),
+            )
+        }
+
+        /// One production cycle in the engine's order: per-cycle facade
+        /// reservation → snapshot → verify over `depth + 1` real ids →
+        /// partial-accept rollback keeping the anchor and one draft. Asserts
+        /// what must hold on EVERY cycle, and returns the block count before
+        /// and after the reservation so the caller can see which cycle's
+        /// margin crossed a block boundary.
+        fn run_cycle(
+            step: &mut DenseMtpStepper<'_>,
+            seq_id: u32,
+            embedding: &Embedding,
+            depth: usize,
+            lookahead: usize,
+            block_size: u32,
+            first_id: i32,
+        ) -> (usize, usize) {
+            use crate::engine::spec_paged::SpecPagedCache;
+
+            let (pre_blocks, pre_cursor) = adapter_stats(step);
+            assert!(
+                SpecPagedCache::reserve_lookahead(step, seq_id, lookahead)
+                    .expect("per-cycle facade reservation"),
+                "a reservation the pool can hold must cover the cycle"
+            );
+            let (reserved_blocks, reserved_cursor) = adapter_stats(step);
+            assert_eq!(
+                reserved_cursor, pre_cursor,
+                "the reservation must not advance the cursor"
+            );
+
+            step.snapshot_main_linear();
+            let ids: Vec<i32> = (0..=depth as i32).map(|i| first_id + i).collect();
+            let verify_ids =
+                MxArray::from_int32(&ids, &[1, (depth + 1) as i64]).expect("verify ids");
+            step.verify_step(&verify_ids, embedding, depth)
+                .expect("paged verify step")
+                .hiddens
+                .eval();
+            assert!(
+                step.open_cycle.is_some(),
+                "the verify write must OPEN the cycle its rollback closes — an \
+                 un-ticketed write leaves the retraction outside the facade"
+            );
+            let (verify_blocks, verify_cursor) = adapter_stats(step);
+            assert_eq!(
+                verify_blocks, reserved_blocks,
+                "the verify write must allocate ZERO new blocks after the reservation"
+            );
+            assert_eq!(
+                verify_blocks,
+                (pre_cursor as usize + lookahead).div_ceil(block_size as usize),
+                "the reservation must cover exactly cursor + lookahead rows"
+            );
+            assert_eq!(
+                verify_cursor,
+                pre_cursor + lookahead as u32,
+                "the verify write must record exactly the reserved rows"
+            );
+
+            step.rollback(/* accepted_drafts */ 1, depth);
+            assert!(
+                step.take_replay_error().is_none(),
+                "the GDN tape replay must succeed on the partial accept"
+            );
+            assert!(
+                step.open_cycle.is_none(),
+                "the rollback must CONSUME the cycle's ticket"
+            );
+            let (committed_blocks, committed_cursor) = adapter_stats(step);
+            assert_eq!(
+                committed_blocks, reserved_blocks,
+                "rollback is bookkeeping-only — no block may move"
+            );
+            let growth = committed_cursor - pre_cursor;
+            assert_eq!(growth, 2, "committed rows = accepted drafts + anchor");
+            assert!(
+                (growth as usize) <= lookahead,
+                "total adapter growth must fit the reserved lookahead region"
+            );
+            // The facade commit is the ADAPTER half of `rollback`; the GDN
+            // tape replay is the other half. A commit that retracts only the
+            // adapter leaves the recurrent side `depth - accepted` rows
+            // ahead, which is exactly what one frontier catches.
+            assert_eq!(
+                MtpStepper::frontier(step),
+                Some(SpecFrontier {
+                    attn_tokens: u64::from(committed_cursor),
+                    recurrent_tokens: Some(u64::from(committed_cursor)),
+                }),
+                "the cycle's commit must land the adapter AND the recurrent state on \
+                 ONE frontier"
+            );
+            (pre_blocks, reserved_blocks)
+        }
+
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.n_mtp_layers = 1;
+        let Some((mut inner, _cfg)) =
+            paged_inner_with_cfg_or_skip("paged_mtp_lookahead_reservation_covers_verify", cfg)
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        // Random-init MTP module + loaded marker so `execution_plan()`
+        // publishes the speculative plan (the drafter itself never runs
+        // here — every driven cycle is snapshot → verify → rollback).
+        inner.mtp_weights_loaded = true;
+
+        // Exactly one full block of prompt: the lookahead region then starts
+        // ON a block boundary, the worst case for a mid-verify allocation.
+        let block_size = inner.paged_adapter.as_ref().expect("adapter").block_size();
+        let prompt: Vec<u32> = (0..block_size).map(|i| (i * 5 + 7) % 257).collect();
+        reset_paged_request(&mut inner, &prompt);
+        run_dense_paged_prefill_with_size(&mut inner, &prompt, &prompt, 0, 2048)
+            .expect("dense paged prefill")
+            .eval();
+
+        let depth = 3usize;
+        let plan = inner
+            .execution_plan()
+            .speculative
+            .expect("dense MTP checkpoint must publish a speculative plan");
+        let lookahead = plan.lookahead_rows(depth);
+        assert_eq!(lookahead, depth + 1);
+
+        let (pre_blocks, prompt_len) = {
+            let adapter = inner.paged_adapter.as_ref().expect("adapter");
+            (
+                adapter.num_allocated_blocks(),
+                adapter.current_token_count(),
+            )
+        };
+        assert_eq!(prompt_len, prompt.len() as u32);
+
+        let setup = MtpTurnSetup {
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
+            first_sampled_token: 21,
+            lookahead_rows: lookahead,
+        };
+        let mut step = inner.begin_mtp_decode(&setup).expect("begin_mtp_decode");
+
+        // Turn-entry reservation: blocks grow to cover prompt + lookahead,
+        // the cursor does not move.
+        let (entry_blocks, entry_cursor) = adapter_stats(&step);
+        assert_eq!(
+            entry_blocks,
+            (prompt.len() + lookahead).div_ceil(block_size as usize),
+            "the turn-entry reservation must cover prompt + lookahead rows"
+        );
+        assert!(
+            entry_blocks > pre_blocks,
+            "the prompt ends ON a block boundary, so the turn-entry reservation must \
+             cross into a new block"
+        );
+        assert_eq!(
+            entry_cursor, prompt_len,
+            "the reservation must not advance the cursor"
+        );
+
+        let seq_id = step
+            .owned_adapter()
+            .active_seq_id()
+            .expect("active request");
+        assert_eq!(
+            SpecPagedCache::frontier(&step, seq_id),
+            MtpStepper::frontier(&step),
+            "the facade frontier must be the stepper's frontier accessor, reused"
+        );
+        assert_eq!(
+            SpecPagedCache::frontier(&step, seq_id + 1),
+            None,
+            "a sequence that is not the turn's must have no facade frontier"
+        );
+
+        // Decode real cycles until one cycle's `+lookahead` margin crosses
+        // out of the allocated tail. Only the PER-CYCLE facade reservation
+        // covers that block — the turn-entry one is long spent — so that
+        // cycle is where a dead reservation surfaces as a mid-verify
+        // allocation.
+        let embedding = step.embedding().clone();
+        let mut crossing_cycle = None;
+        for cycle in 0..block_size as usize {
+            let (before, after) = run_cycle(
+                &mut step,
+                seq_id,
+                &embedding,
+                depth,
+                lookahead,
+                block_size,
+                21 + 10 * cycle as i32,
+            );
+            if after > before {
+                crossing_cycle = Some(cycle);
+                break;
+            }
+        }
+        let crossing_cycle = crossing_cycle.expect(
+            "some cycle's lookahead margin must cross a block boundary, or the \
+             per-cycle reservation is never exercised",
+        );
+        assert!(
+            crossing_cycle > 0,
+            "the crossing must be paid for by a PER-CYCLE reservation, not by the \
+             turn-entry one"
+        );
+        let (committed_blocks, committed_cursor) = adapter_stats(&step);
+
+        // ── L-SETTLE, executable on the real stepper ──
+        // The facade's own writers are REFUSED on this family — the verify
+        // core records its rows itself, and a facade row a commit kept would
+        // advance the adapter while the recurrent state stood still.
+        let mut cache = NoSettleInCycle::new(step);
+        let kv_rows: [u32; 2] = [71, 72];
+        let err = cache
+            .record_verify(seq_id, &kv_rows)
+            .expect_err("record_verify must be refused on the dense stepper");
+        assert!(
+            err.contains("open_core_write_cycle"),
+            "the refusal must name the opener that replaces it: {err}"
+        );
+        let err = cache
+            .record_rows(seq_id, &kv_rows)
+            .expect_err("record_rows must be refused on the dense stepper");
+        assert!(
+            err.contains("open_core_write_cycle"),
+            "the refusal must name the opener that replaces it: {err}"
+        );
+        assert_eq!(
+            adapter_stats(cache.inner()),
+            (committed_blocks, committed_cursor),
+            "a refused facade write must leave the adapter exactly where it was"
+        );
+
+        // So the law runs on the PRODUCTION shape: the cycle
+        // `open_core_write_cycle` opens around a write the core performs —
+        // here the adapter `record_tokens` the paged verify core makes —
+        // committed with a keep of ZERO. The rows are retracted whole, which
+        // keeps this segment frontier-neutral and leaves every surviving
+        // block-table row backed by a real verify write.
+        assert!(
+            cache
+                .reserve_lookahead(seq_id, kv_rows.len())
+                .expect("KV-half reservation"),
+            "two rows fit the tail the crossing cycle allocated"
+        );
+        let (kv_blocks, _) = adapter_stats(cache.inner());
+        let ticket = cache
+            .open_core_write_cycle(seq_id, kv_rows.len())
+            .expect("open the cycle around the core write");
+        cache
+            .inner_mut()
+            .owned_adapter_mut()
+            .record_tokens(&kv_rows)
+            .expect("the core write the cycle was opened around");
+        assert_eq!(
+            adapter_stats(cache.inner()),
+            (kv_blocks, committed_cursor + kv_rows.len() as u32),
+            "the core write must land in the reserved tail"
+        );
+
+        // The ordering law is executable on the real stepper. This family's
+        // identity settle is lawful at exactly this basis once the cycle is
+        // closed (asserted below), so the refusal here is the checker's, not
+        // the implementation's argument validation.
+        let err = cache
+            .settle_committed(seq_id, u64::from(committed_cursor))
+            .expect_err("an in-cycle settle must trip the order check");
+        assert!(err.contains("L-SETTLE"), "unexpected error text: {err}");
+
+        cache
+            .commit_cycle(seq_id, ticket, 0)
+            .expect("a keep of zero retracts the whole core write");
+        assert!(
+            !cache.settle_captures_durable_state(),
+            "the identity settle captures nothing; this family's durable surfaces run \
+             in the turn epilogue, and a `true` here would bar the in-cycle settle a \
+             permissive call-order checker admits"
+        );
+        cache
+            .settle_committed(seq_id, u64::from(committed_cursor))
+            .expect("the identity settle is lawful once the cycle is closed");
+        cache
+            .settle_committed(seq_id, u64::from(committed_cursor) + 1)
+            .expect_err("a committed frontier past the cursor must be refused");
+
+        let mut step = cache.into_inner();
+        assert_eq!(
+            adapter_stats(&step),
+            (kv_blocks, committed_cursor),
+            "a fully retracted out-of-band cycle must leave the block table and the \
+             cursor exactly where it found them"
+        );
+        assert_eq!(
+            MtpStepper::frontier(&step),
+            Some(SpecFrontier {
+                attn_tokens: u64::from(committed_cursor),
+                recurrent_tokens: Some(u64::from(committed_cursor)),
+            }),
+            "an out-of-band write touches no recurrent state, so a fully retracted \
+             cycle must be frontier-neutral"
+        );
+
+        // Real decode still advances on the same request, and both sides
+        // move together.
+        let next_ids = MxArray::from_int32(&[29], &[1, 1]).expect("ar ids");
+        let (logits, _hidden, _needs_squeeze) = step
+            .forward_with_hidden(&next_ids, &embedding)
+            .expect("AR forward after the facade cycles");
+        logits.eval();
+        let (ar_blocks, ar_cursor) = adapter_stats(&step);
+        assert_eq!(
+            ar_cursor,
+            committed_cursor + 1,
+            "AR decode must advance one row past the committed frontier"
+        );
+        assert_eq!(ar_blocks, committed_blocks);
+        assert_eq!(
+            MtpStepper::frontier(&step),
+            Some(SpecFrontier {
+                attn_tokens: u64::from(ar_cursor),
+                recurrent_tokens: Some(u64::from(ar_cursor)),
+            }),
+            "an AR step must move the adapter and the recurrent state together"
+        );
+
+        drop(step);
+        assert!(
+            inner.paged_adapter.is_some(),
+            "the adapter stays on the model for the whole speculative turn"
+        );
+    }
+
+    /// Failure path of the same seam: a reservation the pool cannot hold
+    /// must signal AR fallback (`Ok(false)`) with adapter state untouched —
+    /// never a turn error — and plain AR decode must still make progress on
+    /// the same request afterwards.
+    ///
+    /// Catches: exhaustion routed to `Err` (turn error → session
+    /// invalidation), and a failed reservation corrupting the request's
+    /// block table or cursor.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn paged_mtp_lookahead_exhaustion_falls_back_to_ar() {
+        use crate::engine::types::ChatConfig;
+
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.n_mtp_layers = 1;
+        let Some((mut inner, _cfg)) =
+            paged_inner_with_cfg_or_skip("paged_mtp_lookahead_exhaustion_falls_back_to_ar", cfg)
+        else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        inner.mtp_weights_loaded = true;
+
+        let block_size = inner.paged_adapter.as_ref().expect("adapter").block_size();
+        let prompt: Vec<u32> = (0..block_size).map(|i| (i * 5 + 7) % 257).collect();
+        reset_paged_request(&mut inner, &prompt);
+        run_dense_paged_prefill_with_size(&mut inner, &prompt, &prompt, 0, 2048)
+            .expect("dense paged prefill")
+            .eval();
+
+        let mut p = extract_chat_params(&ChatConfig {
+            enable_mtp: Some(true),
+            ..ChatConfig::default()
+        });
+        // The public surface clamps `mtp_depth` to [1, 5]; drive the params
+        // struct directly so the reservation exceeds `max_capacity_tokens`.
+        p.mtp_depth = inner
+            .paged_adapter
+            .as_ref()
+            .expect("adapter")
+            .max_capacity_tokens() as usize;
+
+        let (blocks_before, cursor_before) = {
+            let adapter = inner.paged_adapter.as_ref().expect("adapter");
+            (
+                adapter.num_allocated_blocks(),
+                adapter.current_token_count(),
+            )
+        };
+        let admitted = inner
+            .reserve_paged_mtp_lookahead(&p, "exhaustion_test")
+            .expect("capacity exhaustion must not error the turn");
+        assert!(
+            !admitted,
+            "an over-capacity reservation must signal AR fallback"
+        );
+        {
+            let adapter = inner.paged_adapter.as_ref().expect("adapter");
+            assert_eq!(adapter.num_allocated_blocks(), blocks_before);
+            assert_eq!(adapter.current_token_count(), cursor_before);
+        }
+
+        // A cycle-sized reservation still fits and admits MTP.
+        p.mtp_depth = 3;
+        assert!(
+            inner
+                .reserve_paged_mtp_lookahead(&p, "exhaustion_test")
+                .expect("in-capacity reservation"),
+            "a reservation the pool can hold must admit the MTP arm"
+        );
+
+        // The AR fallback can proceed: one real paged decode step on the
+        // same request.
+        let logits = {
+            let layer_kinds = inner.layer_kinds.clone();
+            let embed = inner.embedding.clone();
+            let caches_ref = inner.caches.as_mut().expect("caches");
+            let adapter = inner.paged_adapter.as_mut().expect("adapter");
+            super::super::paged_forward::run_paged_decode_step(
+                21,
+                &embed,
+                &mut inner.layers,
+                caches_ref,
+                &inner.final_norm,
+                &inner.lm_head,
+                &layer_kinds,
+                adapter,
+                0,
+            )
+            .expect("AR decode step after fallback")
+        };
+        logits.eval();
+        assert_eq!(
+            inner
+                .paged_adapter
+                .as_ref()
+                .expect("adapter")
+                .current_token_count(),
+            cursor_before + 1,
+            "AR decode must advance one row past the prompt"
+        );
+    }
+
+    /// Cycle-2 twin of the exhaustion gate, driving the SAME stepper seam
+    /// the engine loop calls (`MtpStepper::reserve_cycle_lookahead`) on a
+    /// REAL paged model. After a first verify cycle + partial-accept
+    /// rollback has moved the frontier, the per-cycle reservation must
+    /// (a) grow the block table to cover the NEW cursor + lookahead before
+    /// cycle 2's verify — the prompt is sized so that margin CROSSES a block
+    /// boundary the turn-entry reservation never covered, so a
+    /// "reservation skipped on cycle ≥ 2" mutation fails the pre-verify
+    /// block count — (b) report AR fallback (`Ok(false)`) with untouched
+    /// adapter state on a reservation the pool cannot hold — never a turn
+    /// error — and (c) leave Step-A-style AR decode advancing on the same
+    /// request afterwards.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn paged_mtp_lookahead_cycle2_exhaustion_falls_back_to_ar() {
+        let mut cfg = tiny_paged_forward_cfg();
+        cfg.n_mtp_layers = 1;
+        let Some((mut inner, _cfg)) = paged_inner_with_cfg_or_skip(
+            "paged_mtp_lookahead_cycle2_exhaustion_falls_back_to_ar",
+            cfg,
+        ) else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+        inner.mtp_weights_loaded = true;
+
+        // `prompt = 2 * block_size - 4`: the turn-entry reservation covers
+        // exactly 2 blocks (cursor + lookahead = 2 * block_size), cycle 1's
+        // verify fills them, and the partial-accept rollback leaves the
+        // cursor at `2 * block_size - 2` — cycle 2's `+lookahead` margin then
+        // needs a 3rd block only a per-cycle reservation can pre-allocate.
+        let block_size = inner.paged_adapter.as_ref().expect("adapter").block_size();
+        assert!(block_size >= 5, "prompt sizing needs block_size >= 5");
+        let prompt: Vec<u32> = (0..(2 * block_size - 4))
+            .map(|i| (i * 5 + 7) % 257)
+            .collect();
+        reset_paged_request(&mut inner, &prompt);
+        run_dense_paged_prefill_with_size(&mut inner, &prompt, &prompt, 0, 2048)
+            .expect("dense paged prefill")
+            .eval();
+
+        let depth = 3usize;
+        let plan = inner
+            .execution_plan()
+            .speculative
+            .expect("dense MTP checkpoint must publish a speculative plan");
+        let lookahead = plan.lookahead_rows(depth);
+        assert_eq!(lookahead, depth + 1);
+        let prompt_len = prompt.len() as u32;
+
+        let setup = MtpTurnSetup {
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
+            first_sampled_token: 21,
+            lookahead_rows: lookahead,
+        };
+        let mut step = inner.begin_mtp_decode(&setup).expect("begin_mtp_decode");
+
+        // Cycle 1 in the engine's order: snapshot → verify → partial accept.
+        let embedding = step.embedding().clone();
+        step.snapshot_main_linear();
+        let verify_ids =
+            MxArray::from_int32(&[21, 22, 23, 24], &[1, (depth + 1) as i64]).expect("verify ids");
+        step.verify_step(&verify_ids, &embedding, depth)
+            .expect("cycle-1 verify")
+            .hiddens
+            .eval();
+        step.rollback(/* accepted_drafts */ 1, depth);
+        assert!(
+            step.take_replay_error().is_none(),
+            "cycle-1 replay must succeed"
+        );
+        let (blocks_after_cycle1, cursor_after_cycle1) = {
+            let adapter = step.owned_adapter();
+            (
+                adapter.num_allocated_blocks(),
+                adapter.current_token_count(),
+            )
+        };
+        assert_eq!(cursor_after_cycle1, prompt_len + 2);
+        assert_eq!(
+            blocks_after_cycle1,
+            (prompt.len() + lookahead).div_ceil(block_size as usize),
+            "cycle 1 stays inside the turn-entry reservation"
+        );
+
+        // (a) Cycle 2's reservation covers the MOVED cursor + lookahead.
+        assert!(
+            step.reserve_cycle_lookahead(lookahead)
+                .expect("in-capacity per-cycle reservation"),
+            "a reservation the pool can hold must admit cycle 2"
+        );
+        let reserved_blocks = {
+            let adapter = step.owned_adapter();
+            assert_eq!(
+                adapter.current_token_count(),
+                cursor_after_cycle1,
+                "the reservation must not advance the cursor"
+            );
+            adapter.num_allocated_blocks()
+        };
+        assert_eq!(
+            reserved_blocks,
+            (cursor_after_cycle1 as usize + lookahead).div_ceil(block_size as usize),
+            "cycle 2's reservation must cover cursor + lookahead rows"
+        );
+        assert!(
+            reserved_blocks > blocks_after_cycle1,
+            "cycle 2's margin crosses a block boundary — skipping the \
+             per-cycle reservation would leave the turn-entry block count"
+        );
+
+        // Cycle 2's verify then writes into pre-allocated blocks only.
+        step.snapshot_main_linear();
+        let verify_ids2 =
+            MxArray::from_int32(&[25, 26, 27, 28], &[1, (depth + 1) as i64]).expect("verify ids");
+        step.verify_step(&verify_ids2, &embedding, depth)
+            .expect("cycle-2 verify")
+            .hiddens
+            .eval();
+        {
+            let adapter = step.owned_adapter();
+            assert_eq!(
+                adapter.num_allocated_blocks(),
+                reserved_blocks,
+                "cycle 2's verify must allocate ZERO new blocks after its reservation"
+            );
+        }
+        step.rollback(/* accepted_drafts */ 1, depth);
+        assert!(
+            step.take_replay_error().is_none(),
+            "cycle-2 replay must succeed"
+        );
+
+        // (b) A reservation the pool cannot hold: AR fallback, state untouched.
+        let (blocks_before, cursor_before, over_capacity) = {
+            let adapter = step.owned_adapter();
+            (
+                adapter.num_allocated_blocks(),
+                adapter.current_token_count(),
+                adapter.max_capacity_tokens() as usize,
+            )
+        };
+        let admitted = step
+            .reserve_cycle_lookahead(over_capacity)
+            .expect("capacity exhaustion must not error the cycle");
+        assert!(
+            !admitted,
+            "an over-capacity per-cycle reservation must signal AR fallback"
+        );
+        {
+            let adapter = step.owned_adapter();
+            assert_eq!(adapter.num_allocated_blocks(), blocks_before);
+            assert_eq!(adapter.current_token_count(), cursor_before);
+        }
+
+        // (c) The AR fallback still advances: one Step-A-style forward on the
+        // SAME stepper (the engine's next-iteration path after the skip).
+        let next_ids = MxArray::from_int32(&[29], &[1, 1]).expect("ar ids");
+        let (logits, _hidden, _needs_squeeze) = step
+            .forward_with_hidden(&next_ids, &embedding)
+            .expect("AR forward after fallback");
+        logits.eval();
+        {
+            let adapter = step.owned_adapter();
+            assert_eq!(
+                adapter.current_token_count(),
+                cursor_before + 1,
+                "AR decode must advance one row past the rewound frontier"
+            );
+        }
+
+        drop(step);
+        assert!(
+            inner.paged_adapter.is_some(),
+            "the adapter stays on the model for the whole speculative turn"
+        );
+    }
 }
 #[cfg(test)]
 mod layer_kinds_cache_tests {
@@ -16189,10 +17817,10 @@ mod layer_kinds_cache_tests {
 }
 
 #[cfg(test)]
-mod mtp_gate_state_tests {
-    //! Cheap construction-only tests for the MTP acceptance-gate state on
-    //! `Qwen35Inner` (no Metal: `new` defers the paged pool, and
-    //! `reset_caches_sync` on a fresh inner touches no GPU state).
+mod paged_gdn_frontier_tests {
+    //! Cheap no-Metal tests for the dense paged epilogue frontier check and
+    //! the GDN refuse-to-persist latch (arrays stay lazy; every asserted path
+    //! returns before an eval).
 
     use super::*;
     use crate::models::qwen3_5::config::Qwen3_5Config;
@@ -16227,6 +17855,258 @@ mod mtp_gate_state_tests {
             persist_paged_cache: None,
             n_mtp_layers: 0,
         }
+    }
+
+    /// Catches: replacing the strict equality with a ±1 tolerance. Either
+    /// direction of a one-token skew must register as disagreement — the
+    /// exact off-by-one this check exists to refuse.
+    #[test]
+    fn frontier_skew_is_strict_equality_both_directions() {
+        assert_eq!(dense_paged_frontier_skew(10, 10), None);
+        assert_eq!(dense_paged_frontier_skew(11, 10), Some(1));
+        assert_eq!(dense_paged_frontier_skew(9, 10), Some(-1));
+        assert_eq!(dense_paged_frontier_skew(0, 0), None);
+        assert_eq!(dense_paged_frontier_skew(1, 0), Some(1));
+        assert_eq!(dense_paged_frontier_skew(0, 1), Some(-1));
+    }
+
+    /// Catches: persist-while-dirty (the latch set but never consumed by the
+    /// checkpoint store) and the store forgetting to drop the stale
+    /// checkpoint alongside its refusal.
+    #[test]
+    fn dirty_latch_refuses_history_checkpoint_persist() {
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
+        inner.cached_token_history = vec![1, 2, 3];
+        // Ready linear caches so the ONLY reason not to store is the latch.
+        let mut caches = fresh_dense_layer_caches(&inner.config);
+        for (idx, cache) in caches.iter_mut().enumerate() {
+            if !inner.config.is_linear_layer(idx) {
+                continue;
+            }
+            let Qwen3_5LayerCache::Linear(arrays) = cache else {
+                panic!("linear layer slot must be Linear");
+            };
+            arrays
+                .set(0, MxArray::from_float32(&[0.0], &[1]).expect("conv"))
+                .expect("set conv");
+            arrays
+                .set(1, MxArray::from_float32(&[0.0], &[1]).expect("rec"))
+                .expect("set rec");
+        }
+        inner.caches = Some(caches);
+        inner.gdn_last_history_checkpoint = Some(DenseGdnHistoryCheckpoint {
+            owner_id: String::new(),
+            image_key: None,
+            tokens: vec![1, 2],
+            caches: fresh_dense_layer_caches(&inner.config),
+        });
+        inner.paged_gdn_state_dirty = true;
+
+        let trace = inner
+            .remember_dense_gdn_history_checkpoint()
+            .expect("remember must not error while dirty");
+        assert!(!trace.stored, "the dirty latch must refuse to store");
+        assert!(
+            inner.gdn_last_history_checkpoint.is_none(),
+            "the stale checkpoint must be dropped alongside the refusal"
+        );
+        assert!(
+            inner.paged_gdn_state_dirty,
+            "the store must not clear the latch — the next turn's prepare does"
+        );
+    }
+
+    /// Catches: a latch that is never cleared (a permanent recompute cliff) —
+    /// after a recompute arm runs, the latch must drop.
+    #[test]
+    fn dirty_latch_clears_after_recompute_arm() {
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
+        inner.paged_gdn_state_dirty = true;
+        let prep = inner
+            .prepare_dense_gdn_prefix_state(&[1, 2, 3], 0, 16, &[], 0, false)
+            .expect("cold prepare");
+        assert_eq!(prep.state, "cold", "no prefix -> the cold recompute arm");
+        assert!(
+            !inner.paged_gdn_state_dirty,
+            "a recompute arm must clear the refuse-to-persist latch"
+        );
+        assert_eq!(inner.last_gdn_prefix_prepare_state, "cold");
+    }
+
+    /// Catches: the release/reset path forgetting the latch — a fresh session
+    /// must never inherit a refuse-to-persist state.
+    #[test]
+    fn reset_clears_dirty_latch_and_armer() {
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
+        inner.paged_gdn_state_dirty = true;
+        inner.paged_gdn_force_mismatch_for_test = true;
+        inner.reset_caches_sync().expect("reset");
+        assert!(!inner.paged_gdn_state_dirty);
+        assert!(!inner.paged_gdn_force_mismatch_for_test);
+    }
+}
+
+#[cfg(test)]
+mod mtp_gate_state_tests {
+    //! Cheap tests for the MTP acceptance-gate state on `Qwen35Inner` and
+    //! for what a gated turn does to its plan (no Metal: `new` defers the
+    //! paged pool, `reset_caches_sync` on a fresh inner touches no GPU state,
+    //! and an adapter-less paged turn stops at the preflight).
+
+    use super::*;
+    use crate::engine::plan::{MediaInputs, TurnPlan};
+    use crate::models::qwen3_5::config::Qwen3_5Config;
+
+    fn tiny_cfg() -> Qwen3_5Config {
+        Qwen3_5Config {
+            vocab_size: 1024,
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 4,
+            num_kv_heads: 2,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 16,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 1024,
+            pad_token_id: 0,
+            eos_token_id: 0,
+            bos_token_id: 0,
+            linear_num_value_heads: 4,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 16,
+            linear_value_head_dim: 16,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 0.25,
+            rope_theta: 100_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            use_block_paged_cache: None,
+            persist_paged_cache: None,
+            n_mtp_layers: 0,
+        }
+    }
+
+    /// A minimal real tokenizer so `WholeTurnArgs` can be built without a
+    /// checkpoint (mirrors `engine::paged_turn`'s fixture).
+    fn tiny_tokenizer() -> Arc<Qwen3Tokenizer> {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": null,
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "a": 0, "b": 1, "c": 2, "<unk>": 3 },
+                "unk_token": "<unk>"
+            }
+        }"#;
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-gate-plan-tok-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("fixture dir: {e}"));
+        let path = dir.join("tokenizer.json");
+        std::fs::write(&path, json).unwrap_or_else(|e| panic!("fixture write: {e}"));
+        let tok =
+            Qwen3Tokenizer::from_file(&path).unwrap_or_else(|e| panic!("fixture tokenizer: {e}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        Arc::new(tok)
+    }
+
+    /// Dense forks its own paged MTP core, so the acceptance gate runs in
+    /// `paged_whole_turn` instead of in `admit_paged_speculative_decode` the
+    /// way MoE's does. A gated turn falls through to the generic paged driver,
+    /// which dispatches on `plan.decoder` — so the gate has to restate the
+    /// plan, or the fall-through lands on the erroring default hook and fails
+    /// the turn it was supposed to decode autoregressively.
+    ///
+    /// MUTATION: drop the `args.plan.decoder = DecoderPlan::Autoregressive`
+    /// restatement — the final assertion fails.
+    #[test]
+    fn a_gated_paged_mtp_turn_leaves_the_speculative_lane() {
+        let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct");
+
+        // Dense implements no paged speculative core, so the generic driver's
+        // speculative branch is a turn FAILURE, not an autoregressive
+        // fallback. That is what the restatement below has to avoid.
+        let probe = extract_chat_params(&ChatConfig::default());
+        let refusal =
+            <Qwen35Inner as PagedBackend>::admit_paged_speculative_decode(&mut inner, &probe)
+                .expect_err("dense must inherit the erroring default hook");
+        assert!(
+            refusal
+                .reason
+                .contains("implements no paged speculative core"),
+            "unexpected refusal: {}",
+            refusal.reason
+        );
+
+        // 0-of-5 accepted first drafts: confidently below break-even.
+        assert!(
+            mtp_decode::mtp_accept_gate_blocks(0, 5),
+            "fixture counts must block the gate"
+        );
+        inner.mtp_draft_accepted = 0;
+        inner.mtp_draft_attempted = 5;
+
+        let tokenizer = tiny_tokenizer();
+        let config = ChatConfig {
+            enable_mtp: Some(true),
+            max_new_tokens: Some(4),
+            ..ChatConfig::default()
+        };
+        let params = extract_chat_params(&config);
+        let tokens = [1u32, 2, 3];
+        let mut args = WholeTurnArgs {
+            tokens: &tokens,
+            tokenizer: &tokenizer,
+            eos_id: 0,
+            config: &config,
+            params: &params,
+            thinking: ThinkingSetup {
+                enabled: false,
+                budget: None,
+            },
+            plan: TurnPlan {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                use_paged_attention: true,
+                decoder: DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            },
+            sink: None,
+            cancelled: None,
+            media: MediaInputs {
+                images: &[],
+                audio: &[],
+            },
+        };
+
+        // The adapter-less fixture stops the turn at the paged preflight,
+        // which runs AFTER the gate — far enough to observe the restated plan
+        // without a GPU.
+        let err = match inner.paged_whole_turn(&mut args) {
+            Ok(_) => panic!("an adapter-less fixture cannot pass the paged preflight"),
+            Err(e) => e,
+        };
+        assert!(
+            err.reason.contains("paged cache is not initialized"),
+            "expected the preflight refusal, got: {}",
+            err.reason
+        );
+        assert_eq!(
+            args.plan.decoder,
+            DecoderPlan::Autoregressive,
+            "a gated turn must leave the speculative lane before the generic \
+             paged driver reads plan.decoder"
+        );
     }
 
     #[test]

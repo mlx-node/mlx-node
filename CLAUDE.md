@@ -17,6 +17,7 @@ There are already some wild used inference implementations for your reference:
 - [docs/models.md](docs/models.md) — Model implementations, ChatSession API, streaming, VLM, document pipelines
 - [docs/privacy-filter.md](docs/privacy-filter.md) — PII detection & redaction (openai/privacy-filter port)
 - [docs/training.md](docs/training.md) — GRPO, SFT, autograd, optimizers, `mlx-train` TUI, persistence
+- [docs/vllm-speculative-alignment.md](docs/vllm-speculative-alignment.md) — Speculative × paged KV vs vLLM: adopted laws, permanent divergences (with reopen triggers), and the remaining alignment ladder
 - [docs/paged-cache.md](docs/paged-cache.md) — Block-paged KV cache support matrix and parity gates
 - [docs/ffi-cpp.md](docs/ffi-cpp.md) — C++ FFI bridge, compiled Qwen3.5 forward paths, Metal shaders
 - [docs/perf.md](docs/perf.md) — Profiling, env-var inventory, GPU arch detection, quantization

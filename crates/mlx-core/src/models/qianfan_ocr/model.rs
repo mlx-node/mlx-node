@@ -595,6 +595,7 @@ impl QianfanOCRInner {
             crate::engine::resolve_enable_thinking(config),
             MultimodalContentOrder::ImagesThenText,
             Some(QIANFAN_IMAGE_TEMPLATE_PLACEHOLDER),
+            false,
         )?;
         let placeholder_tokens = self
             .tokenizer

@@ -10,7 +10,7 @@ use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
 use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
-    SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
+    SaveStateArgs, SpecFrontier, StreamEmitter, TurnOutput, TurnSetup, WholeTurnArgs,
 };
 use crate::engine::cmd::ChatCmd;
 use crate::engine::params::ChatParams;
@@ -18,6 +18,7 @@ use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
 };
+use crate::engine::spec_paged::SpecPagedCache;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
@@ -46,7 +47,7 @@ use super::attention::{
 };
 use super::config::Gemma4Config;
 use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
-use super::dspark::DsparkTap;
+use super::dspark::{DsparkContextCache, DsparkTap};
 use super::layer_cache::Gemma4LayerCache;
 use super::sliding_sidecar;
 use crate::engine;
@@ -468,12 +469,127 @@ impl Gemma4KVCacheCoordinator {
         Ok(())
     }
 
+    /// Reserve block capacity for `rows` rows past `seq_id`'s cursor in EVERY
+    /// KV group, or in none of them — the speculative lookahead region
+    /// ([`PagedKVCacheAdapter::reserve_rows`]) held atomically across the
+    /// full+sliding groups so a verify write can never find one group covered
+    /// and another exhausted mid-cycle.
+    ///
+    /// The adapter has no primitive that returns freshly reserved blocks to
+    /// its allocator (reservation extends the block table in place), so
+    /// cross-group atomicity is an exact admission pre-flight rather than a
+    /// rollback: a group can satisfy `needed` new blocks iff its allocator
+    /// holds `free + reclaimable >= needed` (the `BlockAllocator::can_allocate`
+    /// contract — reclaimable counts exactly the cache-only blocks `allocate`
+    /// may evict), and nothing else can allocate between the pre-flight and
+    /// the reservation because every group's allocator is owned by this
+    /// coordinator and driven only from the model thread. A reservation that
+    /// still fails after its group passed the pre-flight is therefore an
+    /// invariant violation, not a capacity signal, and surfaces as a
+    /// non-capacity `Err`.
+    ///
+    /// Capacity exhaustion in ANY group fails the whole call with a
+    /// `context_length_exceeded:` error and zero net block growth; callers
+    /// map that onto the skip-cycle/AR-fallback path.
+    ///
+    /// Returns the total number of NEW blocks allocated across groups.
+    pub(crate) fn reserve_rows_all(
+        &mut self,
+        seq_id: u32,
+        rows: u32,
+    ) -> std::result::Result<u32, String> {
+        for group_id in 0..self.inner.groups().len() {
+            let adapter = self.adapter_mut(group_id)?;
+            adapter.activate_request(seq_id)?;
+            let current_tokens = adapter
+                .request_tokens_for(seq_id)
+                .map(|tokens| tokens.len() as u32)
+                .ok_or_else(|| {
+                    format!("Gemma4 KV group {group_id} has no sequence {seq_id} to reserve for")
+                })?;
+            let new_total = current_tokens.checked_add(rows).ok_or_else(|| {
+                format!(
+                    "Gemma4 KV group {group_id} reservation overflows the token cursor \
+                     (current={current_tokens}, rows={rows})"
+                )
+            })?;
+            let capacity = adapter.max_capacity_tokens();
+            if new_total > capacity {
+                return Err(format!(
+                    "context_length_exceeded: Gemma4 KV group {group_id} cannot reserve \
+                     {rows} lookahead row(s) at cursor {current_tokens} (capacity \
+                     {capacity} tokens)"
+                ));
+            }
+            let block_size = adapter.block_size();
+            if block_size == 0 {
+                return Err(format!("Gemma4 KV group {group_id} has block_size 0"));
+            }
+            let current_blocks = adapter
+                .block_table_for(seq_id)
+                .map(|table| table.num_blocks() as u32)
+                .ok_or_else(|| {
+                    format!("Gemma4 KV group {group_id} has no block table for {seq_id}")
+                })?;
+            let needed_blocks = new_total
+                .div_ceil(block_size)
+                .saturating_sub(current_blocks);
+            let telemetry = adapter.block_telemetry()?;
+            let available = telemetry
+                .free_blocks
+                .saturating_add(telemetry.reclaimable_blocks);
+            if needed_blocks > available {
+                return Err(format!(
+                    "context_length_exceeded: Gemma4 KV group {group_id} needs \
+                     {needed_blocks} block(s) for {rows} lookahead row(s) but only \
+                     {available} are free or reclaimable"
+                ));
+            }
+        }
+        let mut new_blocks = 0u32;
+        for group_id in 0..self.inner.groups().len() {
+            let reserved = self
+                .adapter_mut(group_id)?
+                .reserve_rows_for(seq_id, rows)
+                .map_err(|error| {
+                    format!(
+                        "Gemma4 KV group {group_id} reservation failed after its admission \
+                         pre-flight passed (invariant violation, earlier groups keep their \
+                         reservation): {error}"
+                    )
+                })?;
+            new_blocks = new_blocks.saturating_add(reserved);
+        }
+        Ok(new_blocks)
+    }
+
     pub(crate) fn prune_sliding_all(&mut self, seq_id: u32) -> std::result::Result<u32, String> {
         let mut released = 0u32;
         for group_id in 0..self.inner.groups().len() {
             released = released.saturating_add(
                 self.adapter_mut(group_id)?
                     .prune_sliding_window_for(seq_id)?,
+            );
+        }
+        Ok(released)
+    }
+
+    /// [`Self::prune_sliding_all`] anchored at the COMMITTED frontier instead
+    /// of each group's write cursor
+    /// ([`PagedKVCacheAdapter::prune_sliding_window_for_committed`]): between
+    /// a speculative verify write and its commit the cursor sits up to the
+    /// whole lookahead ahead, and a cursor-basis prune in that gap can retire
+    /// a block the rollback returns the committed window into (I9/I10).
+    pub(crate) fn prune_sliding_all_committed(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: u32,
+    ) -> std::result::Result<u32, String> {
+        let mut released = 0u32;
+        for group_id in 0..self.inner.groups().len() {
+            released = released.saturating_add(
+                self.adapter_mut(group_id)?
+                    .prune_sliding_window_for_committed(seq_id, committed_tokens)?,
             );
         }
         Ok(released)
@@ -549,6 +665,21 @@ impl Gemma4KVCacheCoordinator {
         first_error.map_or(Ok(released), Err)
     }
 
+    /// The one frontier every cache group agrees on for `seq_id`, in the
+    /// shape both paged speculative facade scopes report it
+    /// ([`PruneOnlySpecPagedCache`], [`Gemma4SpecPagedCache`]).
+    ///
+    /// Pure-attention family: the adapters' recorded rows are the whole
+    /// per-token state, so `recurrent_tokens` is structurally `None`.
+    pub(crate) fn spec_frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
+        self.request_token_count_all(seq_id)
+            .ok()
+            .map(|attn_tokens| SpecFrontier {
+                attn_tokens: u64::from(attn_tokens),
+                recurrent_tokens: None,
+            })
+    }
+
     pub(crate) fn release_all_and_purge(&mut self) -> std::result::Result<u32, String> {
         let mut released = 0u32;
         let mut first_error = None;
@@ -562,6 +693,155 @@ impl Gemma4KVCacheCoordinator {
             }
         }
         first_error.map_or(Ok(released), Err)
+    }
+}
+
+/// The paged speculative cache contract (`engine::spec_paged`) at
+/// COORDINATOR scope: the four cycle primitives, and a settle that covers
+/// only the settle work the coordinator itself owns — pending-write eval plus
+/// the committed-basis sliding prune.
+///
+/// That settle is a strict SUBSET of either owning family's settle. Both
+/// families that hold this coordinator layer a durable cold-checkpoint rung
+/// walk between those same two coordinator calls — gemma4 in
+/// [`Gemma4Inner::settle_grouped_kv_step_at`], Muse Glimmer in its
+/// `settle_paged_kv_step` — so a driver that settles through this type
+/// instead of its family's settle skips rung capture. That costs acceptance
+/// on a warm restore and never correctness, which is why no correctness gate
+/// can see it; the name is the warning, and
+/// `family_settle_at_the_committed_frontier_captures_the_cold_rung` is the
+/// gate.
+///
+/// A gemma4 driver therefore takes [`Gemma4SpecPagedCache`], which routes the
+/// settle through the family frontier. What is left for this type: the
+/// coordinator-scope conformance gates (the L-SETTLE prune proofs, which are
+/// about the prune and want nothing else running), and a caller that owns no
+/// family-level settle at all.
+pub(crate) struct PruneOnlySpecPagedCache<'a>(&'a mut Gemma4KVCacheCoordinator);
+
+#[allow(dead_code)]
+impl<'a> PruneOnlySpecPagedCache<'a> {
+    pub(crate) fn new(coordinator: &'a mut Gemma4KVCacheCoordinator) -> Self {
+        Self(coordinator)
+    }
+
+    pub(crate) fn coordinator(&self) -> &Gemma4KVCacheCoordinator {
+        self.0
+    }
+}
+
+impl SpecPagedCache for PruneOnlySpecPagedCache<'_> {
+    fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> std::result::Result<bool, String> {
+        let rows = u32::try_from(rows).unwrap_or(u32::MAX);
+        match self.0.reserve_rows_all(seq_id, rows) {
+            Ok(_) => Ok(true),
+            Err(error) if error.starts_with("context_length_exceeded:") => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn record_rows(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
+        self.0.record_tokens_all(seq_id, tokens)
+    }
+
+    fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
+        let rows = u32::try_from(rows)
+            .map_err(|_| format!("Gemma4 commit rollback of {rows} rows does not fit u32"))?;
+        self.0.rollback_last_tokens_all(seq_id, rows)
+    }
+
+    fn settle_committed(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: u64,
+    ) -> std::result::Result<(), String> {
+        let committed = u32::try_from(committed_tokens).map_err(|_| {
+            format!("Gemma4 committed frontier {committed_tokens} does not fit u32")
+        })?;
+        self.0.eval_pending_pool_writes_all()?;
+        self.0
+            .prune_sliding_all_committed(seq_id, committed)
+            .map(|_| ())
+    }
+
+    fn settle_captures_durable_state(&self) -> bool {
+        // The settle above is pending-write eval plus a committed-basis
+        // prune: nothing published, nothing freed above the cutoff. The
+        // cold-rung walk lives one level up, out of this scope's reach —
+        // which is what [`Gemma4SpecPagedCache`] answers `true` for.
+        false
+    }
+
+    fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
+        self.0.spec_frontier(seq_id)
+    }
+}
+
+/// The same contract at FAMILY scope, and the one a gemma4 paged speculative
+/// driver holds.
+///
+/// The four cycle primitives are the coordinator's, delegated to
+/// [`PruneOnlySpecPagedCache`] so the cycle arithmetic stays single-sourced;
+/// the settle is the family's ([`Gemma4Inner::settle_grouped_kv_step_at`]),
+/// which walks the cold-checkpoint rungs the coordinator cannot reach before
+/// running that same committed-basis prune. The rung walk is what makes this
+/// settle irreversible, so [`SpecPagedCache::settle_captures_durable_state`]
+/// answers `true` and L-SETTLE keeps it out of an open cycle entirely.
+pub(crate) struct Gemma4SpecPagedCache<'a>(&'a mut Gemma4Inner);
+
+#[allow(dead_code)]
+impl<'a> Gemma4SpecPagedCache<'a> {
+    pub(crate) fn new(inner: &'a mut Gemma4Inner) -> Self {
+        Self(inner)
+    }
+
+    pub(crate) fn model(&self) -> &Gemma4Inner {
+        self.0
+    }
+
+    fn coordinator_cache(&mut self) -> std::result::Result<PruneOnlySpecPagedCache<'_>, String> {
+        self.0
+            .kv_cache_coordinator
+            .as_mut()
+            .map(PruneOnlySpecPagedCache::new)
+            .ok_or_else(|| "Gemma4 hybrid KV coordinator missing".to_string())
+    }
+}
+
+impl SpecPagedCache for Gemma4SpecPagedCache<'_> {
+    fn reserve_lookahead(&mut self, seq_id: u32, rows: usize) -> std::result::Result<bool, String> {
+        self.coordinator_cache()?.reserve_lookahead(seq_id, rows)
+    }
+
+    fn record_rows(&mut self, seq_id: u32, tokens: &[u32]) -> std::result::Result<(), String> {
+        self.coordinator_cache()?.record_rows(seq_id, tokens)
+    }
+
+    fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> std::result::Result<(), String> {
+        self.coordinator_cache()?.rollback_rows(seq_id, rows)
+    }
+
+    fn settle_committed(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: u64,
+    ) -> std::result::Result<(), String> {
+        let committed = u32::try_from(committed_tokens).map_err(|_| {
+            format!("Gemma4 committed frontier {committed_tokens} does not fit u32")
+        })?;
+        self.0
+            .settle_grouped_kv_step_at(seq_id, committed)
+            .map_err(|error| error.reason)
+    }
+
+    fn settle_captures_durable_state(&self) -> bool {
+        // The family settle walks the cold-checkpoint rungs, and a captured
+        // checkpoint is not retractable by a rollback.
+        true
+    }
+
+    fn frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
+        self.0.kv_cache_coordinator.as_ref()?.spec_frontier(seq_id)
     }
 }
 
@@ -863,12 +1143,14 @@ pub(crate) struct Gemma4Inner {
     /// defensively inside [`ChatBackend::prefill`] / the vision cores).
     /// Shared across turns by the session API.
     pub(crate) caches: Option<Vec<Gemma4LayerCache>>,
-    /// Selects the request-local flat target cache lane used by MTP/DSpark.
+    /// Selects the request-local flat target cache lane used by the ASSISTANT
+    /// drafter.
     ///
     /// A loaded draft may coexist with the resident paged pools. The
     /// scheduler installs exactly one owner's flat caches here while an
-    /// exclusive speculative command runs, then parks them again. Ordinary
-    /// AR/media commands leave this false and use `active_paged_seq`.
+    /// exclusive assistant-draft command runs, then parks them again. Every
+    /// other command — AR, media, and DSpark — leaves this false and uses
+    /// `active_paged_seq`.
     active_flat_session: bool,
     /// Tokens (post image-expansion) whose KV state is currently live in
     /// `caches`. Maintained in parallel with `caches` for prefix-reuse
@@ -906,11 +1188,11 @@ pub(crate) struct Gemma4Inner {
     pub(crate) kv_cache_coordinator: Option<Gemma4KVCacheCoordinator>,
     /// Sequence selected by the scheduler while model-neutral paged and media
     /// hooks run. Ownerless legacy turns use sequence zero.
-    active_paged_seq: u32,
+    pub(crate) active_paged_seq: u32,
     /// Draft model for speculative decoding (`Gemma4LoadOptions::
-    /// draft_model_path`), either [`Gemma4Draft`] variant. Draft target caches
-    /// use a per-owner flat lane while ordinary text/media owners continue to
-    /// use the resident grouped paged pools.
+    /// draft_model_path`), either [`Gemma4Draft`] variant. An assistant draft's
+    /// target caches use a per-owner flat lane; DSpark verifies against the
+    /// resident grouped paged pools, like every ordinary text/media owner.
     pub(crate) draft: Option<Gemma4Draft>,
     /// Per-turn draft handoff: the whole-turn core builds the variant's
     /// prefill-derived state (DSpark fused-context cache / assistant
@@ -2426,12 +2708,6 @@ impl Gemma4Inner {
         }
     }
 
-    /// Whether ANY draft variant is loaded (the speculative whole-turn
-    /// gate; see `mtp_turn`).
-    pub(crate) fn has_draft(&self) -> bool {
-        self.draft.is_some()
-    }
-
     pub(crate) fn set_active_paged_owner(&mut self, seq_id: u32) {
         self.active_flat_session = false;
         self.active_paged_seq = seq_id;
@@ -2632,6 +2908,21 @@ impl Gemma4Inner {
     }
 
     fn remember_grouped_sliding_cold_checkpoint(&mut self, seq_id: u32) -> Result<()> {
+        self.remember_grouped_sliding_cold_checkpoint_at_frontier(seq_id, None)
+    }
+
+    /// [`Self::remember_grouped_sliding_cold_checkpoint`] with the rung walk
+    /// capped at a COMMITTED frontier. `None` keeps the write-cursor basis
+    /// (every recorded token is committed — the autoregressive shape);
+    /// `Some(committed)` refuses any rung past the committed length so a
+    /// durable checkpoint can never capture rows a speculative rollback may
+    /// still retract (I3/I9). A committed frontier past the cursor is clamped
+    /// to it — the committed frontier trails the cursor by definition.
+    fn remember_grouped_sliding_cold_checkpoint_at_frontier(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: Option<u32>,
+    ) -> Result<()> {
         let candidates = {
             let Some(coordinator) = self.kv_cache_coordinator.as_ref() else {
                 return Ok(());
@@ -2644,16 +2935,14 @@ impl Gemma4Inner {
             let Some(recorded) = full.current_token_count_for(seq_id) else {
                 return Ok(());
             };
+            let frontier = committed_tokens.map_or(recorded, |committed| committed.min(recorded));
             let block_size = full.block_size();
             let caps = gemma4_sliding_retention_caps_for_cold_tier(&self.config, cold, block_size);
             let Some(tokens) = full.request_tokens_for(seq_id) else {
                 return Ok(());
             };
-            caps.anchors
-                .as_slice()
-                .iter()
-                .copied()
-                .filter(|&boundary| boundary <= recorded)
+            gemma4_cold_rung_candidates(caps.anchors.as_slice(), frontier)
+                .into_iter()
                 .filter_map(|boundary| {
                     tokens
                         .get(..boundary as usize)
@@ -2706,18 +2995,42 @@ impl Gemma4Inner {
     }
 
     fn settle_grouped_kv_step(&mut self, seq_id: u32) -> Result<()> {
+        self.settle_grouped_kv_step_at_basis(seq_id, None)
+    }
+
+    /// [`Self::settle_grouped_kv_step`] anchored at a COMMITTED frontier: the
+    /// settle a paged speculative turn runs post-commit, where the cold-rung
+    /// walk and the sliding prune both consume the committed length instead
+    /// of the write cursor (I9). The autoregressive callers stay on
+    /// [`Self::settle_grouped_kv_step`], whose cursor basis is unchanged.
+    ///
+    /// This is what [`Gemma4SpecPagedCache::settle_committed`] routes to; the
+    /// rung walk is the half [`PruneOnlySpecPagedCache`] cannot reach.
+    fn settle_grouped_kv_step_at(&mut self, seq_id: u32, committed_tokens: u32) -> Result<()> {
+        self.settle_grouped_kv_step_at_basis(seq_id, Some(committed_tokens))
+    }
+
+    fn settle_grouped_kv_step_at_basis(
+        &mut self,
+        seq_id: u32,
+        committed_tokens: Option<u32>,
+    ) -> Result<()> {
         self.kv_cache_coordinator
             .as_mut()
             .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
             .eval_pending_pool_writes_all()
             .map_err(Error::from_reason)?;
-        self.remember_grouped_sliding_cold_checkpoint(seq_id)?;
-        self.kv_cache_coordinator
+        self.remember_grouped_sliding_cold_checkpoint_at_frontier(seq_id, committed_tokens)?;
+        let coordinator = self
+            .kv_cache_coordinator
             .as_mut()
-            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
-            .prune_sliding_all(seq_id)
-            .map(|_| ())
-            .map_err(Error::from_reason)
+            .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?;
+        match committed_tokens {
+            None => coordinator.prune_sliding_all(seq_id),
+            Some(committed) => coordinator.prune_sliding_all_committed(seq_id, committed),
+        }
+        .map(|_| ())
+        .map_err(Error::from_reason)
     }
 
     pub(crate) fn scheduled_cold_anchor_rungs(&self) -> Vec<u32> {
@@ -4845,6 +5158,44 @@ impl Gemma4Inner {
         })
     }
 
+    /// [`project_paged_hidden_rows`] over this model's head — the shared
+    /// projection tail of the paged forwards. `last_only == true` is the
+    /// prefill tails' last-token projection; `last_only == false` is the
+    /// all-rows verify shape.
+    pub(crate) fn project_paged_hidden(
+        &self,
+        hidden_states: &MxArray,
+        last_only: bool,
+    ) -> Result<MxArray> {
+        project_paged_hidden_rows(
+            hidden_states,
+            &self.final_norm,
+            &self.embed_tokens,
+            &self.lm_head,
+            self.embed_weight_t.as_ref(),
+            &self.config,
+            last_only,
+        )
+    }
+
+    /// Fuse one tapped chunk's residual hiddens and append one draft
+    /// context row per token at `position_base`.
+    fn append_dspark_prefill_rows(
+        &self,
+        draft_tap: Option<&mut Gemma4DsparkPrefillTap<'_>>,
+        captured: &[MxArray],
+        position_base: i32,
+    ) -> Result<()> {
+        let Some(draft_tap) = draft_tap else {
+            return Ok(());
+        };
+        let draft = self.dspark_draft().ok_or_else(|| {
+            Error::from_reason("Gemma4 tapped paged prefill: no DSpark draft model loaded")
+        })?;
+        let fused = draft.fuse_context(captured)?;
+        draft_tap.ctx.append(draft, &fused, position_base)
+    }
+
     /// Run a paged-attention prefill over the full prompt, dispatching
     /// per-layer between the adapter (global layers) and the existing
     /// flat path (sliding layers).
@@ -4877,13 +5228,21 @@ impl Gemma4Inner {
     /// `<turn|>` stop signal to be missed and the decoder to fall into
     /// the all-zero-input cycle (`mean(V)` attention output → `id+1`
     /// counting cascade).
-    fn run_paged_prefill_chunk(
+    ///
+    /// `draft_tap` is `Some` on a DSpark speculative turn: each chunk's
+    /// residual hiddens are cloned, fused, and appended to the draft's
+    /// context before the chunk's graph is dropped, so the full prompt's
+    /// tapped hiddens are never held at once. The target-side walk is the
+    /// same either way — the tap only clones — which is what makes a
+    /// speculative turn's prompt K/V bit-identical to the plain paged turn's.
+    pub(crate) fn run_paged_prefill_chunk(
         &mut self,
         full_tokens: &[u32],
         suffix_tokens: &[u32],
         cached_prefix_len: u32,
         sliding_primed_prefix_len: u32,
         _cache_salt: u64,
+        mut draft_tap: Option<&mut Gemma4DsparkPrefillTap<'_>>,
     ) -> Result<MxArray> {
         if suffix_tokens.is_empty() {
             return Err(Error::from_reason(
@@ -4924,12 +5283,23 @@ impl Gemma4Inner {
                 .record_tokens_all(self.active_paged_seq, chunk)
                 .map_err(Error::from_reason)?;
             let absolute_position = suffix_start.saturating_add(position);
+            let mut tap = draft_tap
+                .as_deref()
+                .map(|draft_tap| DsparkTap::new(draft_tap.layer_ids));
             let hidden = self.run_paged_prefill_layer_loop(
                 chunk,
                 absolute_position as u32,
                 absolute_position as u32,
                 &layer_kinds,
+                tap.as_mut(),
             )?;
+            if let Some(tap) = tap {
+                self.append_dspark_prefill_rows(
+                    draft_tap.as_deref_mut(),
+                    &tap.captured,
+                    absolute_position as i32,
+                )?;
+            }
             hidden.eval();
             let coordinator = self
                 .kv_cache_coordinator
@@ -4957,12 +5327,19 @@ impl Gemma4Inner {
             .record_tokens_all(self.active_paged_seq, final_token)
             .map_err(Error::from_reason)?;
         let final_position = suffix_start.saturating_add(final_index);
-        let mut hidden_states = self.run_paged_prefill_layer_loop(
+        let mut tap = draft_tap
+            .as_deref()
+            .map(|draft_tap| DsparkTap::new(draft_tap.layer_ids));
+        let hidden_states = self.run_paged_prefill_layer_loop(
             final_token,
             final_position as u32,
             final_position as u32,
             &layer_kinds,
+            tap.as_mut(),
         )?;
+        if let Some(tap) = tap {
+            self.append_dspark_prefill_rows(draft_tap, &tap.captured, final_position as i32)?;
+        }
         self.kv_cache_coordinator
             .as_mut()
             .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
@@ -4970,27 +5347,7 @@ impl Gemma4Inner {
             .map_err(Error::from_reason)?;
         self.remember_grouped_sliding_cold_checkpoint(self.active_paged_seq)?;
 
-        hidden_states = self.final_norm.forward(&hidden_states)?;
-        let logits = if let Some(ref head) = self.lm_head {
-            head.forward(&hidden_states)?
-        } else if self.embed_tokens.is_packed_quantized() {
-            self.embed_tokens.as_linear(&hidden_states)?
-        } else if let Some(ref weight_t) = self.embed_weight_t {
-            hidden_states.matmul(weight_t)?
-        } else {
-            hidden_states.matmul(&self.embed_tokens.get_weight().transpose(Some(&[1, 0]))?)?
-        };
-        let logits = if let Some(cap) = self.config.final_logit_softcapping {
-            let cap_arr = MxArray::scalar_float_like(cap, &logits)?;
-            let handle = unsafe { mlx_sys::mlx_logit_softcap(logits.handle.0, cap_arr.handle.0) };
-            MxArray::from_handle(handle, "logit_softcap")?
-        } else {
-            logits
-        };
-        let last_seq_len = logits.shape_at(1)?;
-        logits
-            .slice_axis(1, last_seq_len - 1, last_seq_len)?
-            .squeeze(Some(&[0, 1]))
+        self.project_paged_hidden(&hidden_states, true)
     }
 
     /// Execute one scheduler-pinned Gemma 4 prefill slice.
@@ -5038,6 +5395,7 @@ impl Gemma4Inner {
                 first_logical_position,
                 first_logical_position,
                 &layer_kinds,
+                None,
             )?;
             hidden.eval();
             let coordinator = self
@@ -5073,25 +5431,14 @@ impl Gemma4Inner {
             final_position,
             final_position,
             &layer_kinds,
+            None,
         )?;
         self.kv_cache_coordinator
             .as_mut()
             .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
             .eval_pending_pool_writes_all()
             .map_err(Error::from_reason)?;
-        let hidden = self.final_norm.forward(&hidden)?;
-        let logits = lm_head_logits(
-            &hidden,
-            &self.embed_tokens,
-            &self.lm_head,
-            self.embed_weight_t.as_ref(),
-            &self.config,
-        )?;
-        Ok(Some(
-            logits
-                .slice_axis(1, logits.shape_at(1)? - 1, logits.shape_at(1)?)?
-                .squeeze(Some(&[0, 1]))?,
-        ))
+        Ok(Some(self.project_paged_hidden(&hidden, true)?))
     }
 
     /// One forward pass through the embed → PLE → layer-loop pipeline
@@ -5114,12 +5461,13 @@ impl Gemma4Inner {
     /// on the paged adapter so `update_keys_values`'s alignment check
     /// (`first_logical_position == current_token_count - chunk.len()`)
     /// passes.
-    fn run_paged_prefill_layer_loop(
+    pub(crate) fn run_paged_prefill_layer_loop(
         &mut self,
         chunk_tokens: &[u32],
         first_logical_position: u32,
         cached_prefix_len_for_chunk: u32,
         layer_kinds: &[Gemma4LayerKind],
+        mut tap: Option<&mut DsparkTap<'_>>,
     ) -> Result<MxArray> {
         let chunk_len = chunk_tokens.len() as u32;
         if chunk_len == 0 {
@@ -5127,6 +5475,7 @@ impl Gemma4Inner {
                 "run_paged_prefill_layer_loop: chunk_tokens must be non-empty",
             ));
         }
+        validate_paged_tap_layer_ids(tap.as_deref(), self.layers.len())?;
         let trace_enabled = inference_trace_enabled();
         let trace_start = trace_enabled.then(std::time::Instant::now);
         if trace_enabled {
@@ -5271,6 +5620,15 @@ impl Gemma4Inner {
             }
             hidden_states = next_hidden_states;
 
+            // Residual-stream hidden of layer `layer_idx` (post residual add,
+            // pre final-norm) — the same capture point as `forward_body`'s
+            // flat tap; the compute graph is otherwise unchanged.
+            if let Some(t) = tap.as_deref_mut()
+                && t.layer_ids.contains(&layer_idx)
+            {
+                t.captured.push(hidden_states.clone());
+            }
+
             // Smooth the prefill memory peak: every K layers, materialize the
             // residual stream so MLX can release the upstream graph nodes
             // (embedding + every prior layer's attention/MLP/PLE intermediates)
@@ -5317,6 +5675,7 @@ impl Gemma4Inner {
         cached_prefix_len_for_chunk: u32,
         layer_kinds: &[Gemma4LayerKind],
         overlay_type_ids: Option<&MxArray>,
+        mut tap: Option<&mut DsparkTap<'_>>,
     ) -> Result<MxArray> {
         let chunk_len = chunk_token_ids.len() as u32;
         if chunk_len == 0 {
@@ -5324,6 +5683,7 @@ impl Gemma4Inner {
                 "run_paged_vlm_prefill_layer_loop: chunk_token_ids must be non-empty",
             ));
         }
+        validate_paged_tap_layer_ids(tap.as_deref(), self.layers.len())?;
 
         let input_ids = MxArray::from_uint32(chunk_token_ids, &[1, chunk_len as i64])?;
         let mut hidden_states = chunk_embeds.clone();
@@ -5454,6 +5814,15 @@ impl Gemma4Inner {
                 shared_inputs,
             )?;
             hidden_states = next_hidden_states;
+
+            // Residual-stream hidden of layer `layer_idx` (post residual add,
+            // pre final-norm) — the same capture point as `forward_body`'s
+            // flat tap; the compute graph is otherwise unchanged.
+            if let Some(t) = tap.as_deref_mut()
+                && t.layer_ids.contains(&layer_idx)
+            {
+                t.captured.push(hidden_states.clone());
+            }
 
             crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
         }
@@ -5643,6 +6012,7 @@ impl Gemma4Inner {
                     pass1_position,
                     layer_kinds,
                     chunk_type_ids.as_ref(),
+                    None,
                 )?;
                 _hidden.eval();
                 if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
@@ -5687,6 +6057,7 @@ impl Gemma4Inner {
             // Pass 2 is the single final token (seq_len==1); the overlay never
             // applies to a single-token query.
             None,
+            None,
         )?;
         if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
             coordinator
@@ -5728,7 +6099,11 @@ impl Gemma4Inner {
     }
 
     /// Run one paged decode step for a scheduler-owned sequence.
-    fn run_paged_decode_step_for(&mut self, seq_id: u32, token_id: u32) -> Result<MxArray> {
+    pub(crate) fn run_paged_decode_step_for(
+        &mut self,
+        seq_id: u32,
+        token_id: u32,
+    ) -> Result<MxArray> {
         let first_logical_position = {
             let coordinator = self.kv_cache_coordinator.as_mut().ok_or_else(|| {
                 Error::from_reason("run_paged_decode_step: paged_adapter is None")
@@ -6257,7 +6632,6 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
-            None,
         )?;
         // `true` requests the engine's `squeeze(Some(&[1]))`: the eager
         // forward returns `[1, 1, vocab]`.
@@ -6293,7 +6667,6 @@ impl DecodeStep for Gemma4Decode<'_> {
             inner.embed_weight_t.as_ref(),
             inner.ple.as_ref(),
             &inner.config,
-            None,
         )?;
         Ok(())
     }
@@ -6383,7 +6756,6 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         let _logits = self.inner.run_paged_decode_step(token_id)?;
         Ok(())
     }
-    // end_decode → default Ok(()).
 }
 
 /// Gemma4 paged prefix state: the common boundary owned by every physical
@@ -6391,11 +6763,11 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
 /// `full_tokens` retains the prompt so `run_paged_prefill_chunk` can verify that
 /// the supplied suffix starts exactly at the common absolute cursor.
 pub(crate) struct Gemma4PrefixState {
-    effective_cached_prefix_len: usize,
+    pub(crate) effective_cached_prefix_len: usize,
     suffix_len: usize,
-    sliding_primed_prefix_len: u32,
-    cache_salt: u64,
-    full_tokens: Vec<u32>,
+    pub(crate) sliding_primed_prefix_len: u32,
+    pub(crate) cache_salt: u64,
+    pub(crate) full_tokens: Vec<u32>,
 }
 
 impl PagedPrefix for Gemma4PrefixState {
@@ -6470,6 +6842,7 @@ impl PagedBackend for Gemma4Inner {
             prefix.effective_cached_prefix_len as u32,
             prefix.sliding_primed_prefix_len,
             prefix.cache_salt,
+            None,
         )
     }
 
@@ -6540,6 +6913,10 @@ impl PagedBackend for Gemma4Inner {
             let _ = coordinator.release_request_all(self.active_paged_seq);
         }
         self.caches = None;
+        // The paged speculative prefill stashes the drafter's whole-prompt
+        // context BEFORE the anchor sample, so an abort raised in that
+        // window inherits a stash nothing downstream can consume.
+        self.draft_turn_state = None;
         self.clear_reuse_state();
     }
 
@@ -6778,12 +7155,14 @@ impl ChatBackend for Gemma4Inner {
         tok: &Qwen3Tokenizer,
         messages: &[ChatMessage],
         config: &ChatConfig,
+        preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
         let tokens = tok.apply_chat_template_sync(
             messages,
             Some(true),
             config.tools.as_deref(),
             engine::resolve_enable_thinking(config),
+            preserve_thinking,
         )?;
         self.record_output_parser_prompt_state(tok, &tokens)?;
         Ok(tokens)
@@ -6956,7 +7335,6 @@ impl ChatBackend for Gemma4Inner {
                 &self.final_norm,
                 self.ple.as_ref(),
                 &self.config,
-                None,
                 self.turn_cancel.as_deref(),
             )?;
         }
@@ -6986,7 +7364,6 @@ impl ChatBackend for Gemma4Inner {
                 self.embed_weight_t.as_ref(),
                 self.ple.as_ref(),
                 &self.config,
-                None,
             )?
         };
         logits.squeeze(Some(&[1]))
@@ -7046,12 +7423,36 @@ impl ChatBackend for Gemma4Inner {
 
     fn execution_plan(&self) -> ExecutionPlan {
         // The scheduler selects one physical cache lane before entering the
-        // model-neutral planner. A speculative command temporarily installs
-        // flat target caches, so hide the resident paged pools for that
-        // command; ordinary AR/media commands expose them as usual.
+        // model-neutral planner. An ASSISTANT-draft command temporarily
+        // installs flat target caches, so the resident paged pools are hidden
+        // for that command; every other command exposes them as usual.
         let paged_available = self.kv_cache_coordinator.is_some() && !self.active_flat_session;
         let image_components_loaded = self.image_path_loaded();
         let audio_embedder_loaded = self.embed_audio.is_some();
+        let speculative = match self.draft.as_ref() {
+            // DSpark proposes over tapped residual hiddens and verifies as a
+            // block against the target's PAGED pools; there is no flat lane
+            // for it, so it is offered only where those pools are visible.
+            Some(Gemma4Draft::Dspark(_)) => paged_available.then_some(SpeculativePlan {
+                kind: SpeculativeKind::DraftModel,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::NONE,
+                supports_paged_attention: true,
+                supports_streaming: true,
+            }),
+            // The assistant drafter reads the target's flat `Gemma4LayerCache`
+            // K/V arrays directly for its Q-only attention, which the pools
+            // cannot hand it — so it declares no paged support and the planner
+            // routes it to the flat speculative handler.
+            Some(Gemma4Draft::Assistant(_)) => Some(SpeculativePlan {
+                kind: SpeculativeKind::DraftModel,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::NONE,
+                supports_paged_attention: false,
+                supports_streaming: true,
+            }),
+            None => None,
+        };
         ExecutionPlan {
             media: gemma4_media_plan(
                 image_components_loaded,
@@ -7061,17 +7462,7 @@ impl ChatBackend for Gemma4Inner {
             paged_attention: paged_available.then_some(PagedAttentionPlan {
                 supports_delta: true,
             }),
-            speculative: self.has_draft().then_some(SpeculativePlan {
-                kind: SpeculativeKind::DraftModel,
-                supported_input_media: MediaCapabilities::NONE,
-                supported_context_media: MediaCapabilities::NONE,
-                // Proposal/verification uses the request's flat target cache
-                // lane. `execution_plan` hides the resident paged pools while
-                // that lane is installed, so the planner reaches the
-                // speculative whole-turn core without claiming paged draft
-                // support that does not exist.
-                supports_paged_attention: false,
-            }),
+            speculative,
         }
     }
 
@@ -7139,6 +7530,9 @@ impl ChatBackend for Gemma4Inner {
         )
     }
 
+    const REASONING_CLOSE_TAG: &'static str =
+        crate::models::gemma4::output_parser::reasoning_close_tag();
+
     fn template_history_comparison_tokens<'a>(
         &self,
         tokens: &'a [u32],
@@ -7151,33 +7545,36 @@ impl ChatBackend for Gemma4Inner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        if matches!(args.plan.decoder, DecoderPlan::Speculative(_)) {
-            debug_assert!(args.media.is_empty());
-            return self.draft_chat_turn(args);
-        }
         // The execution plan admits every text turn shape (fresh + delta,
-        // sync + streaming) when the adapter is loaded. The generic paged
-        // engine drives the lifecycle via [`PagedBackend`].
+        // sync + streaming) when the adapter is loaded. Both decoders drive
+        // the SAME paged lifecycle (prime → prefill → … → epilogue); they
+        // differ only in what runs between the first sample and the epilogue.
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.kv_cache_coordinator.is_some());
-        debug_assert!(matches!(args.plan.decoder, DecoderPlan::Autoregressive));
         debug_assert!(self.paged_text_turn_context.is_empty());
         self.paged_text_turn_context = args.plan.context_media;
-        let result = crate::engine::paged_turn::run_paged_turn(self, args);
+        let result = match args.plan.decoder {
+            DecoderPlan::Speculative(_) => {
+                debug_assert!(args.media.is_empty());
+                crate::engine::dspark_turn::run_paged_dspark_turn(self, args)
+            }
+            DecoderPlan::Autoregressive => crate::engine::paged_turn::run_paged_turn(self, args),
+        };
         self.paged_text_turn_context = MediaCapabilities::NONE;
         result
     }
 
-    /// Draft speculative-decode whole-turn path (either [`Gemma4Draft`]
-    /// variant). The execution plan admits this handler only after request
-    /// opt-in, with a loaded draft, flat KV, and text-only input.
+    /// FLAT-lane draft speculative-decode whole-turn path. The execution
+    /// plan admits this handler only after request opt-in, with the loaded
+    /// draft the flat lane serves (the assistant), flat KV, and text-only
+    /// input; DSpark declares paged support and reaches `run_paged_turn`.
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         debug_assert!(args.media.is_empty());
         debug_assert!(matches!(
             args.plan.decoder,
             DecoderPlan::Speculative(SpeculativeKind::DraftModel)
         ));
-        self.draft_chat_turn(args)
+        self.flat_draft_chat_turn(args)
     }
 
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
@@ -7546,8 +7943,6 @@ fn is_greedy_sampling(config: Option<SamplingConfig>) -> bool {
 /// When `inputs_embeds` is provided, uses it directly (skipping embedding lookup).
 /// When `per_layer_inputs` is provided, uses it directly (skipping PLE computation).
 ///
-/// When `tap` is provided, the residual-stream hidden of each tapped layer
-/// (post residual add, PRE final-norm) is pushed onto `tap.captured` in
 /// `layer_ids` order; the compute graph is otherwise unchanged.
 pub(crate) fn forward_body(
     input_ids: Option<&MxArray>,
@@ -7559,22 +7954,7 @@ pub(crate) fn forward_body(
     ple: Option<&PleComponents>,
     per_layer_inputs: Option<&MxArray>,
     config: &Gemma4Config,
-    mut tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
-    if let Some(t) = tap.as_deref() {
-        let mut previous: Option<usize> = None;
-        for &id in t.layer_ids {
-            if id >= layers.len() || previous.is_some_and(|prev| id <= prev) {
-                return Err(Error::from_reason(format!(
-                    "forward_body: tap layer_ids {:?} must be strictly ascending decoder indices below {}",
-                    t.layer_ids,
-                    layers.len()
-                )));
-            }
-            previous = Some(id);
-        }
-    }
-
     // Step 1: Embedding (or use pre-computed embeddings)
     let mut h = if let Some(embeds) = inputs_embeds {
         embeds
@@ -7725,15 +8105,6 @@ pub(crate) fn forward_body(
                 shared_kv.insert(i, (keys, values));
             }
         }
-
-        // Residual-stream hidden of layer i (post residual add, pre
-        // final-norm — HF `hidden_states[i + 1]`), captured for both the
-        // regular and the KV-shared branch.
-        if let Some(t) = tap.as_deref_mut()
-            && t.layer_ids.contains(&i)
-        {
-            t.captured.push(h.clone());
-        }
     }
 
     // Final norm
@@ -7753,7 +8124,6 @@ pub(crate) fn forward_inner(
     embed_weight_t: Option<&MxArray>,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
-    tap: Option<&mut DsparkTap<'_>>,
 ) -> Result<MxArray> {
     let h = forward_body(
         Some(input_ids),
@@ -7765,7 +8135,6 @@ pub(crate) fn forward_inner(
         ple,
         None,
         config,
-        tap,
     )?;
     lm_head_logits(&h, embedding, lm_head, embed_weight_t, config)
 }
@@ -7815,43 +8184,64 @@ pub(crate) fn lm_head_logits(
     }
 }
 
-/// Run the target over a `[1, T]` verify block at the current cache offset,
-/// capturing the tapped hidden states, and return the `[1, T, vocab]` logits.
+/// Draft-side accumulator a TAPPED paged prefill fills.
 ///
-/// This is exactly the existing T>1-at-offset forward (`forward_inner`, with
-/// the same masks/rope the chunked prefill uses). It does not sample and
-/// touches no history bookkeeping; caches advance by T. Callers pair it with
-/// `snapshot_before_verify` / `commit_after_verify` for rollback.
-pub(crate) fn dspark_verify_forward(
-    block_ids: &MxArray,
-    embedding: &Embedding,
-    layers: &[Gemma4DecoderLayer],
-    caches: &mut [Gemma4LayerCache],
+/// `layer_ids` are the drafter's target decoder indices (strictly ascending);
+/// `ctx` is the drafter's fused-context cache, which gains one row per
+/// prefilled token at its absolute sequence position.
+pub(crate) struct Gemma4DsparkPrefillTap<'a> {
+    pub(crate) layer_ids: &'a [usize],
+    pub(crate) ctx: &'a mut DsparkContextCache,
+}
+
+/// Final-norm + LM-head + softcap projection over a paged residual
+/// `[1, T, hidden]` — the tail every paged forward runs after its layer loop.
+///
+/// `last_only == false` keeps every row (`[1, T, vocab]`): the speculative
+/// verify shape, one logit row per drafted position, reusing the decode
+/// tail's head/softcap idiom unchanged over T rows. `last_only == true`
+/// reproduces the paged prefill tails' last-token projection exactly —
+/// project all rows, then slice row T-1 and squeeze to `[vocab]` — so the
+/// two modes differ only in the final slice.
+pub(crate) fn project_paged_hidden_rows(
+    hidden_states: &MxArray,
     final_norm: &RMSNorm,
+    embedding: &Embedding,
     lm_head: &Option<LinearProj>,
     embed_weight_t: Option<&MxArray>,
-    ple: Option<&PleComponents>,
     config: &Gemma4Config,
-    tap: &mut DsparkTap<'_>,
+    last_only: bool,
 ) -> Result<MxArray> {
-    if block_ids.ndim()? != 2 || block_ids.shape_at(0)? != 1 || block_ids.shape_at(1)? < 1 {
-        return Err(Error::from_reason(format!(
-            "dspark_verify_forward expects block_ids shaped [1, T] with T >= 1, got {:?}",
-            block_ids.shape()?.as_ref()
-        )));
+    let hidden = final_norm.forward(hidden_states)?;
+    let logits = lm_head_logits(&hidden, embedding, lm_head, embed_weight_t, config)?;
+    if !last_only {
+        return Ok(logits);
     }
-    forward_inner(
-        block_ids,
-        embedding,
-        layers,
-        caches,
-        final_norm,
-        lm_head,
-        embed_weight_t,
-        ple,
-        config,
-        Some(tap),
-    )
+    let last_seq_len = logits.shape_at(1)?;
+    logits
+        .slice_axis(1, last_seq_len - 1, last_seq_len)?
+        .squeeze(Some(&[0, 1]))
+}
+
+/// The paged layer loops' twin of `forward_body`'s tap validation: capture
+/// order is push-in-loop, so `layer_ids` must be strictly ascending decoder
+/// indices below the layer count.
+fn validate_paged_tap_layer_ids(tap: Option<&DsparkTap<'_>>, num_layers: usize) -> Result<()> {
+    let Some(t) = tap else {
+        return Ok(());
+    };
+    let mut previous: Option<usize> = None;
+    for &id in t.layer_ids {
+        if id >= num_layers || previous.is_some_and(|prev| id <= prev) {
+            return Err(Error::from_reason(format!(
+                "paged layer loop: tap layer_ids {:?} must be strictly ascending decoder \
+                 indices below {num_layers}",
+                t.layer_ids
+            )));
+        }
+        previous = Some(id);
+    }
+    Ok(())
 }
 
 /// Run the target over a `[1, T]` verify block at the current cache offset
@@ -7859,8 +8249,7 @@ pub(crate) fn dspark_verify_forward(
 /// `[1, T, hidden]` post-final-norm hidden state (the assistant draft chains
 /// its next round's `h_prev` from the hidden at the last kept slot).
 ///
-/// Same forward as [`dspark_verify_forward`] minus the residual-stream tap:
-/// it does not sample and touches no history bookkeeping; caches advance by
+/// It does not sample and touches no history bookkeeping; caches advance by
 /// T. Callers pair it with `snapshot_before_verify` / `commit_after_verify`
 /// for rollback.
 pub(crate) fn assistant_verify_forward(
@@ -7890,7 +8279,6 @@ pub(crate) fn assistant_verify_forward(
         ple,
         None,
         config,
-        None,
     )?;
     let logits = lm_head_logits(&hidden, embedding, lm_head, embed_weight_t, config)?;
     Ok((logits, hidden))
@@ -8478,6 +8866,21 @@ fn gemma4_sliding_retention_caps(
 fn gemma4_sliding_cold_ladder_wanted(cold: Option<&ColdTierContext>) -> bool {
     cold.and_then(|cold| cold.sidecar_policy.as_ref())
         .is_some_and(|policy| policy.group() == mlx_paged_attn::ColdGroup::SlidingWindow)
+}
+
+/// Anchor rungs the grouped cold-checkpoint walk may capture at `frontier`
+/// tokens: every rung at or below the frontier, INCLUSIVE — a rung landing
+/// exactly on the frontier is exactly the boundary a settle is entitled to
+/// capture. The frontier is the write cursor on the autoregressive basis and
+/// the committed length on the speculative basis; the comparison is the same
+/// either way, which is what keeps the two settle bases bit-equal when
+/// committed == cursor.
+fn gemma4_cold_rung_candidates(anchors: &[u32], frontier: u32) -> Vec<u32> {
+    anchors
+        .iter()
+        .copied()
+        .filter(|&boundary| boundary <= frontier)
+        .collect()
 }
 
 /// Retention caps for a turn whose adapter carries `cold`.
@@ -9474,7 +9877,6 @@ fn prefill_body_gemma4(
     final_norm: &RMSNorm,
     ple: Option<&PleComponents>,
     config: &Gemma4Config,
-    mut tap: Option<&mut DsparkTap<'_>>,
     turn_cancel: Option<&AtomicBool>,
 ) -> Result<()> {
     let total_len = prompt.shape_at(1)?;
@@ -9529,7 +9931,6 @@ fn prefill_body_gemma4(
             ple,
             chunk_ple.as_ref(),
             config,
-            tap.as_deref_mut(),
         )?;
         eval_gemma4_caches(caches)?;
         crate::array::clear_cache();
@@ -9562,7 +9963,6 @@ fn prefill_body_gemma4(
             ple,
             remaining_ple.as_ref(),
             config,
-            tap,
         )?;
     }
 
@@ -9696,7 +10096,7 @@ fn prompt_holds_media_placeholders(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::engine::plan::{TurnPath, TurnPlan, TurnRequest};
     use crate::models::gemma4::output_parser::{StreamSegment, parse_gemma4_output};
@@ -11543,7 +11943,7 @@ mod tests {
     /// Production text of this file: everything above the unit-test module.
     fn production_source() -> &'static str {
         include_str!("model.rs")
-            .split_once("#[cfg(test)]\nmod tests {")
+            .split_once("#[cfg(test)]\npub(crate) mod tests {")
             .expect("model.rs must contain its unit-test module")
             .0
     }
@@ -11738,75 +12138,134 @@ mod tests {
         }
     }
 
-    /// A speculative / native-MTP gemma4 turn publishes no sliding
-    /// decode-boundary checkpoint — not a rung, not even a cadence entry. That
-    /// is harmless only because a draft turn has no paged adapter, and so no
-    /// cold tier for a rung to serve:
+    /// The FLAT draft lane still publishes no sliding decode-boundary
+    /// checkpoint, and that stays harmless only while it owns no paged state:
+    /// `capture_gemma4_sliding_cold_sidecar` needs a `PagedKVCacheAdapter`,
+    /// and an assistant turn runs on `Gemma4LayerCache` arrays with the pools
+    /// hidden. `assistant_decode.rs` must therefore never reach for the
+    /// adapter — the day it does, the publisher has to be wired in, and NOT
+    /// as a copy of the AR call: speculative decode accepts a variable number
+    /// of tokens per cycle, so the cursor can step from below a rung to above
+    /// it without ever landing on it.
     ///
-    /// ```text
-    ///   load_from_dir sees a draft  ->  use_block_paged_cache = Some(false)
-    ///                               ->  Gemma4Inner::new builds no adapter
-    ///                               ->  build_cold_tier_context returns None
-    ///                               ->  capture_gemma4_sliding_cold_sidecar returns at line 1
-    /// ```
-    ///
-    /// Load-time coexistence is pinned by the corresponding persistence tests;
-    /// this test keeps the draft core itself isolated from paged KV mutation.
-    /// This is the other half, and the tripwire: the day a draft turn gains a
-    /// paged adapter, the sliding decode publisher has to be wired into the
-    /// accept loop — and that is NOT a copy of the AR call, because speculative
-    /// decode accepts a variable number of tokens per cycle, so the cursor can
-    /// step from below a rung to above it without ever landing on it. The
-    /// predicate would have to be "a boundary lies in `(previous, current]`",
-    /// the same `gemma4_sliding_checkpoint_boundaries_crossed` shape the prefill
-    /// chunk walk uses, and the snapshot would have to be sliced back to that
-    /// boundary rather than taken at the cursor.
+    /// The paged DSpark lane already answers this. Its post-commit settle
+    /// (`Gemma4DsparkStepper::settle_at_committed_frontier` ->
+    /// `settle_grouped_kv_step_at`) walks `gemma4_cold_rung_candidates`, whose
+    /// predicate is `boundary <= frontier` rather than `boundary == frontier`,
+    /// so a jumped rung is still captured — pinned end to end by
+    /// `family_settle_at_the_committed_frontier_captures_the_cold_rung`.
     #[test]
-    fn gemma4_draft_decode_paths_never_touch_the_paged_adapter() {
-        for (label, source) in [
-            ("dspark_decode.rs", include_str!("dspark_decode.rs")),
-            ("assistant_decode.rs", include_str!("assistant_decode.rs")),
-        ] {
-            // Comments name the field to explain why it is absent; code must not.
-            let code = source
-                .lines()
-                .map(str::trim)
-                .filter(|line| !line.starts_with("//"))
-                .collect::<Vec<_>>()
-                .join("\n");
-            assert!(
-                !code.contains("paged_adapter"),
-                "{label} mentions `paged_adapter`. A draft turn used to be flat by \
-                 construction, which is the only reason it is safe for the draft decode \
-                 loops not to publish a sliding decode-boundary checkpoint. If that has \
-                 changed, wire the publisher in — with a crossed-boundary predicate, not \
-                 a landed-on-boundary one: a variable accept count can jump the cursor \
-                 straight over a rung"
-            );
-        }
+    fn the_flat_draft_decode_path_never_touches_the_paged_adapter() {
+        let source = include_str!("assistant_decode.rs");
+        // Comments name the field to explain why it is absent; code must not.
+        let code = source
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("paged_adapter") && !code.contains("kv_cache_coordinator"),
+            "assistant_decode.rs reaches for paged state. The flat lane owning no paged \
+             state is the only reason it is safe for it not to publish a sliding \
+             decode-boundary checkpoint. If that has changed, wire the publisher in — \
+             with a crossed-boundary predicate, not a landed-on-boundary one: a variable \
+             accept count can jump the cursor straight over a rung"
+        );
     }
 
-    /// A draft turn's real, production-derived plan: no paged adapter, so the
-    /// turn reaches the speculative handler.
+    /// A DSpark turn's real, production-derived plan: the paged pools are
+    /// visible, so the plan advertises paged draft support and the turn
+    /// reaches the PAGED handler, where `run_paged_turn`'s speculative branch
+    /// drives `run_paged_dspark_turn`.
     ///
-    /// `tiny_inner_with_draft` is the in-crate stand-in for the flat lane a
-    /// loaded target scheduler installs for one speculative command.
+    /// This is the positive control for the two edits that enable D1 — the
+    /// `supports_paged_attention` flip and the scheduler's narrowed flat-lane
+    /// predicate. Either one alone is not enough: with the pools hidden
+    /// (`install_flat_owner_caches`) a DSpark request advertises no
+    /// speculative plan at all and downgrades to AR, which the second half of
+    /// this test pins.
     #[test]
-    fn gemma4_flat_draft_plan_routes_to_the_speculative_handler() {
-        let inner = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
+    fn gemma4_paged_dspark_plan_routes_to_the_paged_handler() {
+        let Some(inner) =
+            crate::models::gemma4::dspark_decode::tests::tiny_paged_inner_with_draft()
+        else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
+        };
+        let execution = inner.execution_plan();
+        assert!(
+            execution.paged_attention.is_some(),
+            "a DSpark command runs on the paged lane, so the pools stay visible"
+        );
+        let speculative = match execution.speculative {
+            Some(s) => s,
+            None => panic!("a loaded DSpark draft must be advertised on the paged lane"),
+        };
+        assert!(
+            speculative.supports_paged_attention,
+            "DSpark proposal/verification is implemented against the paged pools"
+        );
+
+        let request = TurnRequest {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            speculative_requested: true,
+            streaming: false,
+        };
+        let plan = TurnPlan::resolve(execution, request);
+        assert_eq!(
+            plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            "paged + DSpark + opt-in must select the draft decoder"
+        );
+        assert_eq!(
+            plan.path(),
+            TurnPath::Paged,
+            "`path()` checks paged first; `run_paged_turn`'s speculative branch \
+             owns the turn from there"
+        );
+
+        // Hiding the pools does not silently downgrade to a flat DSpark turn —
+        // there is none. The plan drops speculation entirely and says so.
+        let mut hidden = inner;
+        hidden.install_flat_owner_caches(None);
+        let hidden_execution = hidden.execution_plan();
+        assert!(
+            hidden_execution.speculative.is_none(),
+            "with the pools hidden a DSpark draft has no lane, so none is offered"
+        );
+        assert_eq!(
+            TurnPlan::resolve(hidden_execution, request).decoder,
+            DecoderPlan::Autoregressive,
+            "a laneless DSpark request downgrades to exact AR rather than dropping"
+        );
+        assert!(
+            hidden.kv_cache_coordinator.is_some(),
+            "hiding the pools must not destroy them"
+        );
+    }
+
+    /// The ASSISTANT drafter keeps the flat lane: its Q-only attention reads
+    /// the target's flat `Gemma4LayerCache` K/V directly, so its plan declares
+    /// no paged support and the turn reaches the flat speculative handler.
+    #[test]
+    fn gemma4_assistant_draft_plan_routes_to_the_flat_speculative_handler() {
+        let inner = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_assistant_draft();
         let execution = inner.execution_plan();
 
         assert!(
             execution.paged_attention.is_none(),
-            "the flat draft lane must hide paged attention from the turn planner"
+            "the flat assistant lane must hide paged attention from the turn planner"
         );
         let speculative = match execution.speculative {
             Some(s) => s,
-            None => panic!("tiny_inner_with_draft carries a draft; the plan must advertise it"),
+            None => panic!("tiny_inner_with_assistant_draft carries a draft; advertise it"),
         };
         assert!(
             !speculative.supports_paged_attention,
-            "gemma4 draft proposal/verification is implemented against flat KV only"
+            "the assistant drafter has no paged proposal/verification path"
         );
 
         let plan = TurnPlan::resolve(
@@ -11816,117 +12275,112 @@ mod tests {
                 input_media: MediaCapabilities::NONE,
                 context_media: MediaCapabilities::NONE,
                 speculative_requested: true,
+                streaming: false,
             },
         );
         assert_eq!(
             plan.decoder,
             DecoderPlan::Speculative(SpeculativeKind::DraftModel),
-            "flat + draft + opt-in must select the draft decoder"
+            "flat + assistant draft + opt-in must select the draft decoder"
         );
         assert_eq!(
             plan.path(),
             TurnPath::Speculative,
-            "the draft decoder only runs when `path()` also lands on the speculative \
-             handler; `run_paged_turn` has no speculative branch to fall back on"
+            "the assistant decoder runs through `run_speculative_turn`"
         );
     }
 
-    /// The model-neutral planner cannot execute the flat draft while paged
-    /// attention is exposed for the same command. This negative control makes
-    /// the scheduler's dynamic lane selection mutation-sensitive: speculative
-    /// commands must hide the resident paged pools before planning.
+    /// One PAGED owner serves media turns and speculative turns in the same
+    /// session, and the media state decides which decoder it gets: while the
+    /// live prefix carries media the speculative plan does not cover it and
+    /// the turn downgrades to exact AR on the SAME owner; once a fresh
+    /// text turn replaces that context, speculation is admitted again — no
+    /// lane switch, no second owner, and the coordinator is never rebuilt.
     ///
-    /// ```text
-    ///   paged ON + supports_paged_attention:false  -> decoder downgraded to AR
-    ///   paged ON + supports_paged_attention:TRUE   -> decoder Speculative, but
-    ///                                                 path() tests paged FIRST
-    ///   ...both land on TurnPath::Paged -> engine::paged_turn, which never
-    ///      reads `plan.decoder` (the only mentions in that file are its own
-    ///      test fixture and a JSON key). The `debug_assert!` in
-    ///      `run_paged_turn` is compiled out of release.
-    /// ```
-    ///
-    /// The second row is the point. It is the shape a future change produces
-    /// when someone reads "draft turns are flat by construction", decides to
-    /// lift the restriction, and flips `supports_paged_attention` to `true`
-    /// here without touching the load path — and it still does not run. Paged
-    /// speculative decode needs a branch inside `engine::paged_turn`, not a
-    /// flag flip.
+    /// Mutation this catches: widening the DSpark plan's
+    /// `supported_context_media`, which would run speculation over a media
+    /// prefix the drafter's tapped context never saw.
     #[test]
-    fn gemma4_paged_planner_requires_the_scheduler_selected_flat_lane() {
-        let inner = crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
-        let flat = inner.execution_plan();
-        let speculative = match flat.speculative {
-            Some(s) => s,
-            None => panic!("tiny_inner_with_draft carries a draft; the plan must advertise it"),
+    fn gemma4_paged_owner_serves_media_then_speculative_turns() {
+        let Some(mut inner) =
+            crate::models::gemma4::dspark_decode::tests::tiny_paged_inner_with_draft()
+        else {
+            eprintln!("skipping: this build cannot back the paged KV pools");
+            return;
         };
+        inner.set_active_paged_owner(21);
+        let coordinator_groups = inner
+            .kv_cache_coordinator
+            .as_ref()
+            .map(|coordinator| coordinator.routes().len());
 
-        // Exactly what dropping the load-path forcing produces: the same draft
-        // plan, plus the paged adapter `unwrap_or(true)` would have built.
-        let paged_and_draft = ExecutionPlan {
-            paged_attention: Some(PagedAttentionPlan {
-                supports_delta: true,
-            }),
-            ..flat
-        };
-
-        let request = TurnRequest {
-            is_delta: false,
-            input_media: MediaCapabilities::NONE,
-            context_media: MediaCapabilities::NONE,
-            speculative_requested: true,
-        };
-
-        let plan = TurnPlan::resolve(paged_and_draft, request);
+        // A live media prefix: speculation is offered but does not cover the
+        // context, so the planner downgrades this turn only.
+        inner.media_session_context = MediaCapabilities::IMAGES;
+        let continued = TurnPlan::resolve(
+            inner.execution_plan(),
+            TurnRequest {
+                is_delta: true,
+                input_media: MediaCapabilities::NONE,
+                context_media: inner.media_session_context,
+                speculative_requested: true,
+                streaming: false,
+            },
+        );
         assert_eq!(
-            plan.decoder,
+            continued.decoder,
             DecoderPlan::Autoregressive,
-            "paged ON + a paged-incapable proposer must downgrade to plain AR — the draft \
-             is loaded and resident, and not one draft forward runs"
+            "a speculative request over a media prefix must downgrade, not run"
         );
         assert_eq!(
-            plan.path(),
+            continued.path(),
             TurnPath::Paged,
-            "`path()` checks paged BEFORE speculative, so the turn goes to \
-             `engine::paged_turn`, which never reads `plan.decoder`. Silent loss of the \
-             measured draft speedup — the exact outcome the explicit-`true` config is \
-             hard-errored for. Keep the load path forcing paged OFF whenever a draft \
-             resolves"
+            "the downgraded turn stays on the same paged owner"
         );
 
-        // Flipping the capability flag alone does NOT fix it.
-        let flag_flipped = ExecutionPlan {
-            speculative: Some(SpeculativePlan {
-                supports_paged_attention: true,
-                ..speculative
-            }),
-            ..paged_and_draft
-        };
-        let flipped_plan = TurnPlan::resolve(flag_flipped, request);
-        assert_eq!(
-            flipped_plan.decoder,
-            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
-            "with the flag set, resolve() no longer downgrades the decoder"
+        // A fresh text turn replaces the media context; the same owner now
+        // takes the speculative decoder.
+        inner.media_session_context = MediaCapabilities::NONE;
+        let fresh = TurnPlan::resolve(
+            inner.execution_plan(),
+            TurnRequest {
+                is_delta: false,
+                input_media: MediaCapabilities::NONE,
+                context_media: MediaCapabilities::NONE,
+                speculative_requested: true,
+                streaming: false,
+            },
         );
         assert_eq!(
-            flipped_plan.path(),
-            TurnPath::Paged,
-            "...and the turn STILL routes to `engine::paged_turn`, which has no \
-             speculative branch, so the draft is still never stepped — now without even \
-             the AR downgrade to make the plan honest. Setting \
-             `supports_paged_attention: true` is not the missing piece; a speculative \
-             branch inside `engine::paged_turn` (plus a CROSSED-boundary sliding \
-             checkpoint predicate, since a variable accept count jumps rungs) is"
+            fresh.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+            "a text-only prefix on the same owner admits speculation"
+        );
+        assert_eq!(fresh.path(), TurnPath::Paged);
+        assert_eq!(
+            inner.active_paged_seq, 21,
+            "both turns run on the one owner the scheduler selected"
+        );
+        assert_eq!(
+            inner
+                .kv_cache_coordinator
+                .as_ref()
+                .map(|coordinator| coordinator.routes().len()),
+            coordinator_groups,
+            "neither turn may rebuild the grouped coordinator"
         );
     }
 
+    /// The one lane that still installs flat caches — the ASSISTANT drafter —
+    /// must HIDE the resident paged pools for its command, not destroy them:
+    /// the very next AR command on the same loaded model runs paged.
     #[test]
-    fn gemma4_resident_paged_pools_are_hidden_only_for_the_flat_draft_lane() {
+    fn gemma4_resident_paged_pools_are_hidden_only_for_the_assistant_lane() {
         if !crate::engine::persistence::compiled_forward_backend_available() {
             return;
         }
         let mut draft_fixture =
-            crate::models::gemma4::dspark_decode::tests::tiny_inner_with_draft();
+            crate::models::gemma4::dspark_decode::tests::tiny_inner_with_assistant_draft();
         let mut inner = Gemma4Inner::new(paged_tiny_config(Some(true)))
             .expect("construct tiny paged Gemma4 target");
         inner.draft = draft_fixture.draft.take();
@@ -11940,6 +12394,7 @@ mod tests {
                 input_media: MediaCapabilities::NONE,
                 context_media: MediaCapabilities::NONE,
                 speculative_requested: true,
+                streaming: false,
             },
         );
         assert_eq!(
@@ -11957,6 +12412,7 @@ mod tests {
                 input_media: MediaCapabilities::NONE,
                 context_media: MediaCapabilities::NONE,
                 speculative_requested: false,
+                streaming: false,
             },
         );
         assert_eq!(ar_plan.path(), TurnPath::Paged);
@@ -13320,7 +13776,7 @@ mod tests {
     }
 
     #[cfg(test)]
-    fn cast_paged_tiny_weights_to_bf16(inner: &mut super::Gemma4Inner) {
+    pub(crate) fn cast_paged_tiny_weights_to_bf16(inner: &mut super::Gemma4Inner) {
         use crate::array::{DType, MxArray};
         let cast = |array: &MxArray| -> MxArray {
             array.astype(DType::BFloat16).expect("astype BFloat16")
@@ -13431,7 +13887,7 @@ mod tests {
             return;
         }
 
-        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, 0, 0) {
+        let last_logits = match inner.run_paged_prefill_chunk(&prompt, &prompt, 0, 0, 0, None) {
             Ok(l) => l,
             Err(e) => {
                 let msg = e.reason.to_string();
@@ -14450,16 +14906,13 @@ mod prefix_cache_decision_tests {
 }
 
 #[cfg(test)]
-mod dspark_tap_tests {
-    //! Tap purity: threading a `DsparkTap` through the Gemma4 forward
-    //! paths must leave the compute graph byte-identical to a tap-less
-    //! run, while capturing the residual-stream hiddens of the tapped
-    //! layers. Runs a tiny random-weight Gemma4 (4 layers, hybrid
-    //! sliding/global types, one KV-shared layer) through the REAL
-    //! `forward_body` / `forward_inner` / `dspark_verify_forward` paths.
+mod flat_verify_tests {
+    //! The FLAT verify seam on a tiny random-weight Gemma4 (4 layers, hybrid
+    //! sliding/global types, one KV-shared layer): the real `forward_body` /
+    //! `assistant_verify_forward` paths plus the snapshot/commit rollback the
+    //! assistant drafter runs around every block.
 
     use super::*;
-    use crate::models::gemma4::dspark::DsparkTap;
 
     fn tiny_config() -> Gemma4Config {
         serde_json::from_value(serde_json::json!({
@@ -14521,206 +14974,1604 @@ mod dspark_tap_tests {
         assert_eq!(a_bits, b_bits, "{ctx}: bits");
     }
 
+    /// The flat verify seam on a real tiny model: snapshot -> T>1 block
+    /// forward at offset -> partial-keep commit.
+    ///
+    /// The 3-token block runs at offset 6 and crosses the sliding window
+    /// (6+3 > 8), so the windowed-mask path is exercised; the KV-shared
+    /// layer reads its anchor's cache and its own vec entry must stay
+    /// untouched through both the write and the rollback.
     #[test]
-    fn dspark_tap_purity_and_verify_forward() {
+    fn flat_verify_snapshot_and_partial_commit() {
         let config = tiny_config();
         let (embedding, layers, final_norm) = tiny_model(&config);
 
-        // 6-token prefill then a 3-token verify block: the block runs
-        // T>1 at offset 6, which also crosses the sliding window (6+3 > 8)
-        // so the windowed-mask path is exercised.
         let prefill_ids = MxArray::from_int32(&[3, 9, 17, 25, 33, 41], &[1, 6]).unwrap();
         let block_ids = MxArray::from_int32(&[7, 11, 13], &[1, 3]).unwrap();
-
-        // Pass A: no tap.
-        let mut caches_a = init_caches_for_config(&config);
-        let hidden_a = forward_body(
-            Some(&prefill_ids),
-            None,
-            &embedding,
-            &layers,
-            &mut caches_a,
-            &final_norm,
-            None,
-            None,
-            &config,
-            None,
-        )
-        .unwrap();
-        let logits_a = forward_inner(
-            &block_ids,
-            &embedding,
-            &layers,
-            &mut caches_a,
-            &final_norm,
-            &None,
-            None,
-            None,
-            &config,
-            None,
-        )
-        .unwrap();
-
-        // Pass B: tapped, including the KV-shared layer 3 (anchor = layer 1),
-        // with the real snapshot → verify → commit flow around the verify.
-        let layer_ids = [0usize, 2, 3];
         let shared_slots = dspark_shared_slot_mask(&config);
         assert_eq!(
             shared_slots,
             vec![false, false, false, true],
             "config-derived shared-slot mask"
         );
-        let mut caches_b = init_caches_for_config(&config);
-        let mut prefill_tap = DsparkTap::new(&layer_ids);
-        let hidden_b = forward_body(
+
+        let mut caches = init_caches_for_config(&config);
+        forward_body(
             Some(&prefill_ids),
             None,
             &embedding,
             &layers,
-            &mut caches_b,
+            &mut caches,
             &final_norm,
             None,
             None,
             &config,
-            Some(&mut prefill_tap),
         )
         .unwrap();
         let rollback = super::super::layer_cache::snapshot_before_verify(
-            &caches_b,
+            &caches,
             block_ids.shape_at(1).unwrap() as usize,
             &shared_slots,
         )
         .unwrap();
-        let mut verify_tap = DsparkTap::new(&layer_ids);
-        let logits_b = dspark_verify_forward(
+        let (logits, _hidden) = assistant_verify_forward(
             &block_ids,
             &embedding,
             &layers,
-            &mut caches_b,
+            &mut caches,
             &final_norm,
             &None,
             None,
             None,
             &config,
-            &mut verify_tap,
         )
         .unwrap();
+        assert_eq!(logits.shape().unwrap().to_vec(), vec![1, 3, 64]);
 
-        // Tap must not perturb the compute graph.
-        assert_bitwise_eq(&hidden_a, &hidden_b, "prefill hidden");
-        assert_bitwise_eq(&logits_a, &logits_b, "verify logits");
-        assert_eq!(logits_b.shape().unwrap().to_vec(), vec![1, 3, 64]);
-
-        // One [B, T, hidden] capture per tapped layer, per forward call.
-        assert_eq!(prefill_tap.captured.len(), layer_ids.len());
-        for arr in &prefill_tap.captured {
-            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 6, 32]);
-        }
-        assert_eq!(verify_tap.captured.len(), layer_ids.len());
-        for arr in &verify_tap.captured {
-            assert_eq!(arr.shape().unwrap().to_vec(), vec![1, 3, 32]);
-        }
-
-        // Different layers must yield different hiddens (real per-layer
-        // captures, not one array pushed repeatedly).
-        let first = verify_tap.captured[0].to_float32().unwrap().to_vec();
-        let second = verify_tap.captured[1].to_float32().unwrap().to_vec();
-        assert_ne!(first, second, "captures must differ across layers");
-
-        // Caches advance by T on both passes; the KV-shared layer's own
-        // vec entry is never written (it reads its anchor's cache).
-        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+        // Caches advance by T; the KV-shared layer's own vec entry is never
+        // written (it reads its anchor's cache).
+        for (idx, cache) in caches.iter().enumerate().take(3) {
             assert_eq!(cache.get_offset(), 9, "cache {idx} offset");
-            assert_eq!(caches_a[idx].get_offset(), 9, "cache {idx} tapless offset");
         }
         assert_eq!(
-            caches_b[3].get_offset(),
+            caches[3].get_offset(),
             0,
             "KV-shared layer's cache entry must stay untouched"
         );
 
         // Partial-keep commit on the real model: active caches land at
         // prefill + keep, the shared slot stays untouched.
-        super::super::layer_cache::commit_after_verify(&mut caches_b, &rollback, 1).unwrap();
-        for (idx, cache) in caches_b.iter().enumerate().take(3) {
+        super::super::layer_cache::commit_after_verify(&mut caches, &rollback, 1).unwrap();
+        for (idx, cache) in caches.iter().enumerate().take(3) {
             assert_eq!(cache.get_offset(), 7, "cache {idx} post-commit offset");
         }
         assert_eq!(
-            caches_b[3].get_offset(),
+            caches[3].get_offset(),
             0,
             "KV-shared layer's cache entry must stay untouched after commit"
         );
     }
+}
 
-    #[test]
-    fn dspark_tap_rejects_unsorted_or_out_of_range_layer_ids() {
-        let config = tiny_config();
-        let (embedding, layers, final_norm) = tiny_model(&config);
-        let ids = MxArray::from_int32(&[3, 9], &[1, 2]).unwrap();
+#[cfg(test)]
+mod spec_paged_substrate_tests {
+    //! T-D0.3 gating tests: the committed-frontier settle, the atomic
+    //! cross-group reservation, the all-rows projection, and the paged-loop
+    //! tap — every one behavior-neutral for the autoregressive lane.
 
-        for bad in [vec![2usize, 0], vec![1, 1], vec![7]] {
-            let mut caches = init_caches_for_config(&config);
-            let mut tap = DsparkTap::new(&bad);
-            let result = forward_body(
-                Some(&ids),
-                None,
-                &embedding,
-                &layers,
-                &mut caches,
-                &final_norm,
-                None,
-                None,
-                &config,
-                Some(&mut tap),
-            );
-            assert!(result.is_err(), "layer_ids {bad:?} must be rejected");
+    use super::flat_verify_tests::assert_bitwise_eq;
+    use super::*;
+    use crate::engine::spec_paged::SpecPagedCache;
+
+    /// Tiny hybrid config whose PAGED coordinator builds for real in
+    /// `Gemma4Inner::new`: production pool constraints require block size
+    /// 8/16/32 and head size >= 32, and `paged_cache_memory_mb` keeps the
+    /// full group's Metal pool at ~8 MiB.
+    fn tiny_paged_config_value() -> serde_json::Value {
+        serde_json::json!({
+            "vocab_size": 64,
+            "hidden_size": 8,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 256,
+            "sliding_window": 16,
+            "layer_types": [
+                "sliding_attention",
+                "full_attention",
+                "sliding_attention",
+                "full_attention"
+            ],
+            "use_block_paged_cache": true,
+            "paged_block_size": 8,
+            "paged_cache_memory_mb": 8,
+            "final_logit_softcapping": 30.0,
+            "eos_token_ids": []
+        })
+    }
+
+    fn tiny_paged_config() -> Gemma4Config {
+        serde_json::from_value(tiny_paged_config_value())
+            .expect("tiny paged Gemma4 config must deserialize")
+    }
+
+    /// [`tiny_paged_config`] with the FULL-attention group first in
+    /// `layer_types`, so grouping assigns it the lower group id — the
+    /// atomicity test's mutation (partial reservation leaking the earlier
+    /// group's blocks) needs the full group reserved before the sliding
+    /// group's exhaustion is reached.
+    fn tiny_paged_config_full_first() -> Gemma4Config {
+        let mut value = tiny_paged_config_value();
+        value["layer_types"] = serde_json::json!([
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention"
+        ]);
+        serde_json::from_value(value).expect("tiny paged Gemma4 config must deserialize")
+    }
+
+    /// Placeholder pool sized to the allocator, or `None` (skip) without a
+    /// Metal device — the `paged_kv_cache_adapter` test-shim pattern.
+    fn maybe_test_pool(
+        num_blocks: u32,
+        block_size: u32,
+    ) -> Option<Arc<mlx_paged_attn::LayerKVPool>> {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            num_kv_heads: 1,
+            head_size: 32,
+            num_layers: 2,
+            ..mlx_paged_attn::PagedAttentionConfig::default()
+        };
+        match mlx_paged_attn::LayerKVPool::new_for_test(
+            cfg,
+            num_blocks,
+            2,
+            mlx_paged_attn::metal::MetalDtype::Float16,
+        ) {
+            Ok(pool) => Some(Arc::new(pool)),
+            Err(error) if error.contains("No Metal device found") => None,
+            Err(error) => panic!("unexpected new_for_test failure: {error}"),
         }
     }
 
-    #[test]
-    fn dspark_verify_forward_rejects_bad_block_shape() {
-        let config = tiny_config();
-        let (embedding, layers, final_norm) = tiny_model(&config);
-        let layer_ids = [0usize];
+    /// Real grouped coordinator over the tiny full-first config, with
+    /// per-kind allocator sizes so a test can seed exhaustion in exactly one
+    /// group. Returns `None` (skip) without Metal.
+    fn maybe_grouped_coordinator(
+        full_blocks: u32,
+        sliding_blocks: u32,
+    ) -> Option<Gemma4KVCacheCoordinator> {
+        let config = tiny_paged_config_full_first();
+        let block_size = 8u32;
+        let specs = compute_layer_kv_cache_specs(&config, block_size, KVCacheDType::BFloat16)
+            .expect("tiny specs must build");
+        let groups = compute_layer_kv_cache_groups(
+            &config,
+            block_size,
+            KVCacheDType::BFloat16,
+            gemma4_paged_prefill_group_max_chunk(),
+        )
+        .expect("tiny groups must build");
+        let mut adapters = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let blocks = match group.attention_kind {
+                AttentionKind::Full => full_blocks,
+                AttentionKind::SlidingWindow { .. } => sliding_blocks,
+            };
+            let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+                blocks, block_size,
+            )));
+            let pool = maybe_test_pool(blocks, block_size)?;
+            let adapter = match group.attention_kind {
+                AttentionKind::Full => PagedKVCacheAdapter::new(allocator, pool, block_size),
+                AttentionKind::SlidingWindow { sliding_window } => {
+                    PagedKVCacheAdapter::new_sliding(
+                        allocator,
+                        pool,
+                        block_size,
+                        sliding_window,
+                        256,
+                    )
+                }
+            }
+            .expect("tiny adapter must construct");
+            adapters.push(adapter);
+        }
+        Some(
+            Gemma4KVCacheCoordinator::new(&specs, groups, adapters, 4)
+                .expect("tiny coordinator must construct"),
+        )
+    }
 
-        // Batch > 1 is rejected.
-        let batch2 = MxArray::from_int32(&[1, 2], &[2, 1]).unwrap();
-        let mut caches = init_caches_for_config(&config);
-        let mut tap = DsparkTap::new(&layer_ids);
-        assert!(
-            dspark_verify_forward(
-                &batch2,
-                &embedding,
-                &layers,
-                &mut caches,
-                &final_norm,
-                &None,
-                None,
-                None,
-                &config,
-                &mut tap,
-            )
-            .is_err()
+    fn group_count(coordinator: &Gemma4KVCacheCoordinator) -> usize {
+        coordinator.inner.groups().len()
+    }
+
+    fn allocated_per_group(coordinator: &Gemma4KVCacheCoordinator) -> Vec<usize> {
+        (0..group_count(coordinator))
+            .map(|group_id| {
+                coordinator
+                    .adapter(group_id)
+                    .expect("group adapter")
+                    .num_allocated_blocks()
+            })
+            .collect()
+    }
+
+    /// Seed exhaustion in the sliding group AFTER the full group could
+    /// reserve: the whole call must fail as capacity exhaustion with zero net
+    /// block growth in EVERY group. Mutation this catches: dropping the
+    /// cross-group admission pre-flight, which reserves the full group's
+    /// blocks and then leaks them when the sliding group exhausts.
+    #[test]
+    fn reserve_rows_all_is_atomic_across_groups() {
+        let Some(mut coordinator) = maybe_grouped_coordinator(64, 4) else {
+            return;
+        };
+        // Precondition of the mutation this test exists to catch: the full
+        // group must be reserved BEFORE the sliding group exhausts, i.e. it
+        // must iterate first. If grouping order ever flips, fail loudly here
+        // rather than silently weakening the gate.
+        assert_eq!(
+            coordinator
+                .adapter(0)
+                .expect("group 0 adapter")
+                .sliding_window(),
+            0,
+            "test precondition: the full-attention group must have the lower group id"
         );
 
-        // 1-D input is rejected.
-        let flat = MxArray::from_int32(&[1, 2], &[2]).unwrap();
-        let mut caches = init_caches_for_config(&config);
-        let mut tap = DsparkTap::new(&layer_ids);
+        coordinator.reset_scheduled_request(7).expect("reset");
+        coordinator
+            .record_tokens_all(7, &(0..12).collect::<Vec<_>>())
+            .expect("seed 12 tokens");
+        // Sliding group: 4 blocks = null + 2 recorded, 1 free. 24 lookahead
+        // rows need ceil(36/8) - 2 = 3 new blocks per group.
+        let before = allocated_per_group(&coordinator);
+        let error = coordinator
+            .reserve_rows_all(7, 24)
+            .expect_err("sliding exhaustion must fail the whole reservation");
         assert!(
-            dspark_verify_forward(
-                &flat,
-                &embedding,
-                &layers,
-                &mut caches,
-                &final_norm,
-                &None,
+            error.starts_with("context_length_exceeded:"),
+            "exhaustion must keep the adapter's capacity error shape, got: {error}"
+        );
+        assert_eq!(
+            allocated_per_group(&coordinator),
+            before,
+            "a failed cross-group reservation must leak zero blocks in any group"
+        );
+        assert_eq!(
+            coordinator.request_token_count_all(7).expect("token count"),
+            12,
+            "a failed reservation must not advance any cursor"
+        );
+
+        // The facade maps the same exhaustion onto the skip-cycle signal.
+        assert!(
+            !PruneOnlySpecPagedCache::new(&mut coordinator)
+                .reserve_lookahead(7, 24)
+                .expect("exhaustion is not an error at the facade"),
+            "facade must report pool exhaustion as Ok(false)"
+        );
+        assert_eq!(allocated_per_group(&coordinator), before);
+
+        // A coverable reservation lands in every group without advancing the
+        // cursor, and the following verify-shaped write allocates nothing.
+        let groups = group_count(&coordinator) as u32;
+        let new_blocks = coordinator
+            .reserve_rows_all(7, 8)
+            .expect("8 lookahead rows fit every group");
+        assert_eq!(new_blocks, groups, "ceil(20/8) - 2 = 1 new block per group");
+        assert_eq!(
+            coordinator.request_token_count_all(7).expect("token count"),
+            12,
+            "reservation must not advance the cursor"
+        );
+        let reserved = allocated_per_group(&coordinator);
+        coordinator
+            .record_tokens_all(7, &(12..20).collect::<Vec<_>>())
+            .expect("verify write into the reserved region");
+        assert_eq!(
+            allocated_per_group(&coordinator),
+            reserved,
+            "the reserved lookahead region must absorb the verify write with zero allocation"
+        );
+
+        // Facade conformance on the same real coordinator: frontier is the
+        // one count every group agrees on, commit is exact cursor arithmetic,
+        // and the committed settle reaches the committed-cutoff prune (whose
+        // adapter guard rejects a frontier past the cursor).
+        let mut cache = PruneOnlySpecPagedCache::new(&mut coordinator);
+        assert_eq!(
+            cache.frontier(7),
+            Some(SpecFrontier {
+                attn_tokens: 20,
+                recurrent_tokens: None
+            })
+        );
+        assert_eq!(cache.frontier(99), None);
+        let ticket = cache
+            .record_verify(7, &[40, 41, 42])
+            .expect("record verify");
+        cache
+            .commit_cycle(7, ticket, 1)
+            .expect("commit keep=1 of 3");
+        assert_eq!(
+            cache.frontier(7),
+            Some(SpecFrontier {
+                attn_tokens: 21,
+                recurrent_tokens: None
+            })
+        );
+        cache.settle_committed(7, 21).expect("committed settle");
+        assert!(
+            cache
+                .settle_committed(7, 22)
+                .expect_err("a committed frontier past the cursor must be rejected")
+                .contains("exceeds recorded token count"),
+            "the committed settle must route through the committed-cutoff prune's guard"
+        );
+    }
+
+    fn sliding_group_id(coordinator: &Gemma4KVCacheCoordinator) -> usize {
+        (0..group_count(coordinator))
+            .find(|&group_id| {
+                coordinator
+                    .adapter(group_id)
+                    .expect("group adapter")
+                    .sliding_window()
+                    > 0
+            })
+            .expect("the tiny hybrid config must build a sliding group")
+    }
+
+    /// Cross-module gate (engine ↔ gemma4, T-D0.2 ↔ T-D0.3): the REAL
+    /// grouped coordinator driven through the facade call order the
+    /// `spec_paged` mock tests verified — reserve → record D+1 →
+    /// `commit_cycle(ticket, keep)` → settle at the committed frontier —
+    /// wrapped in `NoSettleInCycle` so an ordering law stays executable on
+    /// the real type. Anti-vacuity: every step is asserted through real
+    /// block accounting (the reservation grows each group, the verify write
+    /// allocates nothing, no settle work fires inside the cycle), never
+    /// method presence.
+    ///
+    /// The checker here is the STRICTER of the two on purpose: it refuses a
+    /// settle of ANY basis inside an open cycle, which is the shape of a
+    /// driver that settles only post-commit. The identical in-cycle
+    /// committed-basis call is LAWFUL under `NoDurableSettleInCycle` — see
+    /// the sibling gates `gemma4_coordinator_is_lawful_under_the_permissive_checker`
+    /// and `settle_committed_never_nulls_the_rollback_range_at_coordinator_level`,
+    /// which drive it and assert it prunes correctly. The two verdicts are a
+    /// deliberate split between the two checkers, not a contradiction about
+    /// the coordinator.
+    ///
+    /// Geometry (window 16, block 8): committed prompt 36, verify anchor +
+    /// 4 drafts → cursor 41, so the verify rows straddle a window edge.
+    ///
+    /// Mutation this catches: a coordinator impl satisfying the trait but
+    /// violating the ordering laws — `record_verify` settling at the write
+    /// cursor mid-cycle frees sliding blocks the commit's rollback returns
+    /// the window into (fails the mid-cycle accounting AND the post-commit
+    /// live-window backing); a commit rolling back anything but exactly the
+    /// cycle's unaccepted rows fails the cross-group frontier equality.
+    #[test]
+    fn gemma4_coordinator_conforms_to_the_facade_call_order() {
+        use crate::engine::spec_paged::NoSettleInCycle;
+
+        let Some(mut coordinator) = maybe_grouped_coordinator(64, 16) else {
+            return;
+        };
+        let sliding_group = sliding_group_id(&coordinator);
+        coordinator.reset_scheduled_request(7).expect("reset");
+        coordinator
+            .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
+            .expect("seed the committed prompt");
+        let mut cache = NoSettleInCycle::new(PruneOnlySpecPagedCache::new(&mut coordinator));
+
+        let seeded = allocated_per_group(cache.inner().coordinator());
+        assert!(
+            cache.reserve_lookahead(7, 5).expect("reserve"),
+            "5 lookahead rows fit every group"
+        );
+        let reserved = allocated_per_group(cache.inner().coordinator());
+        for (group_id, (before, after)) in seeded.iter().zip(&reserved).enumerate() {
+            assert_eq!(
+                after - before,
+                1,
+                "group {group_id}: ceil(41/8) - ceil(36/8) = 1 new block"
+            );
+        }
+        assert_eq!(
+            cache
+                .inner()
+                .coordinator()
+                .request_token_count_all(7)
+                .expect("count"),
+            36,
+            "the reservation must not advance any group's cursor"
+        );
+
+        let ticket = cache
+            .record_verify(7, &[100, 101, 102, 103, 104])
+            .expect("record anchor + 4 drafts");
+        assert_eq!(
+            allocated_per_group(cache.inner().coordinator()),
+            reserved,
+            "the verify write must allocate ZERO new blocks and free none — \
+             no settle work may fire inside the cycle (L-SETTLE)"
+        );
+        assert_eq!(
+            cache
+                .inner()
+                .coordinator()
+                .request_token_count_all(7)
+                .expect("count"),
+            41
+        );
+
+        // The ordering law is executable on the real coordinator too.
+        let err = cache
+            .settle_committed(7, 36)
+            .expect_err("an in-cycle settle must trip the order check");
+        assert!(err.contains("L-SETTLE"), "unexpected error text: {err}");
+        assert_eq!(
+            allocated_per_group(cache.inner().coordinator()),
+            reserved,
+            "the refused settle must never reach the coordinator"
+        );
+
+        cache
+            .commit_cycle(7, ticket, 1)
+            .expect("keep the anchor, roll back the 4 rejected drafts");
+        assert_eq!(
+            cache.frontier(7),
+            Some(SpecFrontier {
+                attn_tokens: 37,
+                recurrent_tokens: None
+            }),
+            "the facade frontier must land on the committed row count"
+        );
+        for group_id in 0..group_count(cache.inner().coordinator()) {
+            assert_eq!(
+                cache
+                    .inner()
+                    .coordinator()
+                    .adapter(group_id)
+                    .expect("group adapter")
+                    .current_token_count_for(7),
+                Some(37),
+                "group {group_id} must agree on the committed frontier after the commit"
+            );
+        }
+        assert_eq!(
+            allocated_per_group(cache.inner().coordinator()),
+            reserved,
+            "rollback is bookkeeping-only — no block may move"
+        );
+
+        // The lawful settle, post-commit at the frontier the commit landed
+        // on: cutoff 37 - 16 = 21 retires exactly sliding blocks 0-1 and
+        // leaves the window the rollback returned into backed.
+        cache.settle_committed(7, 37).expect("post-commit settle");
+        let settled = allocated_per_group(cache.inner().coordinator());
+        for (group_id, (before, after)) in reserved.iter().zip(&settled).enumerate() {
+            let expected = if group_id == sliding_group { 2 } else { 0 };
+            assert_eq!(
+                before - after,
+                expected,
+                "group {group_id}: the committed settle must retire exactly the \
+                 out-of-window blocks"
+            );
+        }
+        let sliding = cache
+            .inner()
+            .coordinator()
+            .adapter(sliding_group)
+            .expect("sliding adapter");
+        let ids: Vec<u32> = sliding
+            .block_table_for(7)
+            .expect("sliding block table")
+            .blocks()
+            .iter()
+            .map(|block| block.block_id)
+            .collect();
+        assert_eq!(ids[0], ids[1], "retired blocks share the null sentinel");
+        assert!(
+            ids[2..].iter().all(|&id| id != ids[0]),
+            "the live window the commit returned into must remain physically backed"
+        );
+    }
+
+    /// Cross-module gate (engine ↔ gemma4): the REAL coordinator under the
+    /// PERMISSIVE checker — the executable form of L-SETTLE as written, and
+    /// the only wrapper a per-chunk-settling driver can be built inside.
+    /// Inside an open cycle it must ADMIT the committed-basis settle (this
+    /// family's per-chunk settle, which is what the committed basis exists
+    /// for) and REFUSE the write-cursor basis, and the admitted settle must
+    /// reach the real prune: cutoff 36 - 16 = 20 retires exactly the two
+    /// out-of-window sliding blocks.
+    ///
+    /// The sibling gate `gemma4_coordinator_conforms_to_the_facade_call_order`
+    /// runs the same call order through the stricter `NoSettleInCycle`,
+    /// where the identical settle is refused — a deliberate split between
+    /// the two checkers.
+    ///
+    /// Mutations this catches: (a) the coordinator declaring
+    /// `settle_captures_durable_state() == true`, which would make the
+    /// permissive checker refuse the lawful settle; (b) the checker admitting
+    /// the cursor-basis settle; (c) the admitted settle not reaching the
+    /// coordinator's prune.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn gemma4_coordinator_is_lawful_under_the_permissive_checker() {
+        use crate::engine::spec_paged::NoDurableSettleInCycle;
+
+        let Some(mut coordinator) = maybe_grouped_coordinator(64, 16) else {
+            return;
+        };
+        let sliding_group = sliding_group_id(&coordinator);
+        coordinator.reset_scheduled_request(7).expect("reset");
+        coordinator
+            .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
+            .expect("seed the committed prompt");
+        assert!(
+            !PruneOnlySpecPagedCache::new(&mut coordinator).settle_captures_durable_state(),
+            "the coordinator-scope settle is pending-write eval plus a committed-basis \
+             prune; the cold-rung walk lives one level up, out of this facade's reach"
+        );
+        let mut cache = NoDurableSettleInCycle::new(PruneOnlySpecPagedCache::new(&mut coordinator));
+
+        assert!(
+            cache.reserve_lookahead(7, 5).expect("reserve"),
+            "5 lookahead rows fit every group"
+        );
+        let ticket = cache
+            .record_verify(7, &[100, 101, 102, 103, 104])
+            .expect("record anchor + 4 drafts");
+        let recorded = allocated_per_group(cache.inner().coordinator());
+
+        // Write-cursor basis: refused, and it must not reach the coordinator.
+        let err = cache
+            .settle_committed(7, 41)
+            .expect_err("a cursor-basis settle inside a cycle must trip");
+        assert!(err.contains("L-SETTLE"), "unexpected error text: {err}");
+        assert_eq!(
+            allocated_per_group(cache.inner().coordinator()),
+            recorded,
+            "the refused settle must never reach the coordinator"
+        );
+
+        // Committed basis: admitted, and it reaches the committed-cutoff prune.
+        cache
+            .settle_committed(7, 36)
+            .expect("a committed-basis settle is lawful inside an open cycle");
+        let settled = allocated_per_group(cache.inner().coordinator());
+        for (group_id, (before, after)) in recorded.iter().zip(&settled).enumerate() {
+            let expected = if group_id == sliding_group { 2 } else { 0 };
+            assert_eq!(
+                before - after,
+                expected,
+                "group {group_id}: the admitted settle must retire exactly the \
+                 out-of-window blocks (36 - 16 = 20)"
+            );
+        }
+
+        cache
+            .commit_cycle(7, ticket, 1)
+            .expect("keep the anchor, roll back the 4 rejected drafts");
+        assert_eq!(
+            cache.frontier(7),
+            Some(SpecFrontier {
+                attn_tokens: 37,
+                recurrent_tokens: None
+            }),
+            "the facade frontier must land on the committed row count"
+        );
+
+        let cache = cache.into_inner();
+        let ids: Vec<u32> = cache
+            .coordinator()
+            .adapter(sliding_group)
+            .expect("sliding adapter")
+            .block_table_for(7)
+            .expect("sliding block table")
+            .blocks()
+            .iter()
+            .map(|block| block.block_id)
+            .collect();
+        assert_eq!(ids[0], ids[1], "retired blocks share the null sentinel");
+        assert!(
+            ids[2..].iter().all(|&id| id != ids[0]),
+            "the live window the commit returned into must remain physically backed"
+        );
+    }
+
+    /// Cross-module gate (adapter ↔ gemma4, T-D0.1 ↔ T-D0.3): the
+    /// coordinator's committed settle must route through the ADAPTER's
+    /// committed-cutoff prune — the rollback-range read-back gate
+    /// (`prune_committed_cutoff_never_nulls_rollback_range`) re-run at
+    /// coordinator level. The settle here fires between the verify write and
+    /// the commit ON PURPOSE: that gap is what the committed basis exists
+    /// for (the family layer loop settles per chunk while speculative rows
+    /// are pending), and exactly where a cursor-basis prune retires a block
+    /// the commit's rollback returns the window into.
+    ///
+    /// Geometry (window 16, block 8): committed 36 → cutoff 20 retires
+    /// sliding blocks 0-1; a cursor-basis cutoff (41 - 16 = 25) would also
+    /// null block 2, which holds live positions 21-23 of the post-rollback
+    /// window [21, 37).
+    ///
+    /// Mutation this catches: the coordinator (`settle_committed` /
+    /// `prune_sliding_all_committed`) calling the cursor-basis prune.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn settle_committed_never_nulls_the_rollback_range_at_coordinator_level() {
+        let Some(mut coordinator) = maybe_grouped_coordinator(64, 16) else {
+            return;
+        };
+        let sliding_group = sliding_group_id(&coordinator);
+        coordinator.reset_scheduled_request(7).expect("reset");
+        coordinator
+            .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
+            .expect("seed the committed prompt");
+
+        let mut cache = PruneOnlySpecPagedCache::new(&mut coordinator);
+        assert!(
+            cache.reserve_lookahead(7, 5).expect("reserve"),
+            "5 lookahead rows fit every group"
+        );
+        let ticket = cache
+            .record_verify(7, &[100, 101, 102, 103, 104])
+            .expect("record anchor + 4 drafts");
+
+        let recorded = allocated_per_group(cache.coordinator());
+        cache
+            .settle_committed(7, 36)
+            .expect("settle at the pre-verify committed frontier");
+        let settled = allocated_per_group(cache.coordinator());
+        for (group_id, (before, after)) in recorded.iter().zip(&settled).enumerate() {
+            let expected = if group_id == sliding_group { 2 } else { 0 };
+            assert_eq!(
+                before - after,
+                expected,
+                "group {group_id}: the committed cutoff (36 - 16 = 20) retires \
+                 blocks 0-1 only — a cursor cutoff (41 - 16 = 25) would take 3"
+            );
+        }
+
+        cache
+            .commit_cycle(7, ticket, 1)
+            .expect("roll back the 4 rejected drafts");
+        assert_eq!(coordinator.request_token_count_all(7).expect("count"), 37);
+
+        // The post-rollback live window [21, 37) reads back...
+        coordinator
+            .adapter_mut(sliding_group)
+            .expect("sliding adapter")
+            .read_kv_range(0, 21, 16)
+            .expect("the post-rollback live window must be readable");
+        // ...and is physically backed. `read_kv_range`'s liveness floor is
+        // cursor-derived and cannot see a null placeholder behind an
+        // in-window position, so the Ok alone does not prove backing — the
+        // block ids are the proof.
+        let ids: Vec<u32> = coordinator
+            .adapter(sliding_group)
+            .expect("sliding adapter")
+            .block_table_for(7)
+            .expect("sliding block table")
+            .blocks()
+            .iter()
+            .map(|block| block.block_id)
+            .collect();
+        assert_eq!(
+            ids[0], ids[1],
+            "blocks wholly out of the committed window share the null sentinel"
+        );
+        assert!(
+            ids[2..5].iter().all(|&id| id != ids[0]),
+            "the rollback range the commit returned into must remain physically backed"
+        );
+    }
+
+    /// The facade checks the ticket's sequence FIRST, before the full-accept
+    /// path can return: a commit that rolls back nothing still names a
+    /// sequence, and committing sequence A's cycle against sequence B must
+    /// not pass just because the arithmetic happens to work out.
+    ///
+    /// Both sequences are parked on the SAME frontier here on purpose, so the
+    /// ticket's basis-plus-width check and the landing post-condition both
+    /// pass against the wrong sequence — the sequence id is the only thing
+    /// left that can catch it. The full accept (`keep == rows`) is the shape
+    /// that has no other reason to touch the cache at all.
+    ///
+    /// Mutation this catches: moving the ticket's sequence check after the
+    /// zero-rollback path in `engine::spec_paged::SpecPagedCache::commit_cycle`
+    /// — the foreign commit then returns `Ok`.
+    #[test]
+    fn a_foreign_ticket_is_refused_on_the_full_accept_path() {
+        let Some(mut coordinator) = maybe_grouped_coordinator(64, 16) else {
+            return;
+        };
+        coordinator.reset_scheduled_request(7).expect("reset 7");
+        coordinator.reset_scheduled_request(8).expect("reset 8");
+        coordinator
+            .record_tokens_all(7, &(0..36).collect::<Vec<_>>())
+            .expect("seed sequence 7");
+        // Sequence 8 sits exactly where sequence 7's cycle will END, so the
+        // ticket describes 8's cursor just as well as 7's.
+        coordinator
+            .record_tokens_all(8, &(0..39).collect::<Vec<_>>())
+            .expect("seed sequence 8 at the frontier 7's cycle lands on");
+
+        let mut cache = PruneOnlySpecPagedCache::new(&mut coordinator);
+        let ticket = cache
+            .record_verify(7, &[100, 101, 102])
+            .expect("open sequence 7's cycle");
+        assert_eq!(ticket.pre_attn_tokens(), 36);
+        assert_eq!(cache.frontier(7).expect("frontier 7").attn_tokens, 39);
+        assert_eq!(cache.frontier(8).expect("frontier 8").attn_tokens, 39);
+
+        let err = cache
+            .commit_cycle(8, ticket, 3)
+            .expect_err("sequence 8 may not be committed with sequence 7's ticket");
+        assert!(
+            err.contains("sequence 7's verify ticket"),
+            "the sequence mismatch must be what is reported, got: {err}"
+        );
+        assert_eq!(
+            cache.frontier(7).expect("frontier 7").attn_tokens,
+            39,
+            "the refused commit must leave sequence 7's open cycle untouched"
+        );
+        assert_eq!(
+            cache.frontier(8).expect("frontier 8").attn_tokens,
+            39,
+            "the refused commit must not roll back the sequence it named"
+        );
+    }
+
+    /// Bit-equal row `T-1`: the all-rows projection's last row must be the
+    /// last-only projection exactly. Mutation this catches: a projection row
+    /// off-by-one in either mode.
+    #[test]
+    fn paged_all_rows_logits_row_minus_one_matches_last_only() {
+        let config = tiny_paged_config();
+        let embedding = Embedding::new(config.vocab_size as u32, config.hidden_size as u32)
+            .expect("tiny embedding");
+        let final_norm = RMSNorm::new(config.hidden_size as u32, Some(config.rms_norm_eps))
+            .expect("tiny final norm");
+        let hidden = MxArray::random_uniform(&[1, 4, config.hidden_size as i64], -1.0, 1.0, None)
+            .expect("random hidden");
+
+        let all_rows = project_paged_hidden_rows(
+            &hidden,
+            &final_norm,
+            &embedding,
+            &None,
+            None,
+            &config,
+            false,
+        )
+        .expect("all-rows projection");
+        assert_eq!(
+            all_rows.shape().unwrap().to_vec(),
+            vec![1, 4, config.vocab_size as i64],
+            "all-rows mode must keep one logit row per position"
+        );
+        let last_only =
+            project_paged_hidden_rows(&hidden, &final_norm, &embedding, &None, None, &config, true)
+                .expect("last-only projection");
+        assert_eq!(
+            last_only.shape().unwrap().to_vec(),
+            vec![config.vocab_size as i64],
+            "last-only mode must squeeze to [vocab]"
+        );
+
+        let row_t_minus_1 = all_rows
+            .slice_axis(1, 3, 4)
+            .and_then(|row| row.squeeze(Some(&[0, 1])))
+            .expect("slice row T-1");
+        assert_bitwise_eq(&row_t_minus_1, &last_only, "all-rows row T-1 vs last-only");
+
+        // The rows must be genuinely per-position, not one row broadcast.
+        let row_0 = all_rows
+            .slice_axis(1, 0, 1)
+            .and_then(|row| row.squeeze(Some(&[0, 1])))
+            .expect("slice row 0");
+        row_0.eval();
+        assert_ne!(
+            row_0.to_float32().unwrap().to_vec(),
+            last_only.to_float32().unwrap().to_vec(),
+            "distinct positions must project to distinct logit rows"
+        );
+    }
+
+    /// One sequence's full settle trace: per-settle block-id snapshots for
+    /// every group, the cursor at each settle, and the captured cold rungs.
+    struct SettleTrace {
+        step_block_ids: Vec<Vec<Vec<u32>>>,
+        cursors: Vec<u32>,
+        rungs: Vec<(u32, Vec<u32>)>,
+    }
+
+    fn drive_settles(inner: &mut Gemma4Inner, seq_id: u32, committed_basis: bool) -> SettleTrace {
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .reset_scheduled_request(seq_id)
+            .expect("reset");
+        // Chunks of 3 keep the prune cutoff off block alignment; the 5-chunk
+        // lands one settle exactly on the first cold anchor rung
+        // (block_size * 4 = 32) so the rung walk actually captures.
+        let schedule = [3u32, 3, 3, 3, 3, 3, 3, 3, 3, 5, 3, 3];
+        let mut next_token = 0u32;
+        let mut step_block_ids = Vec::new();
+        let mut cursors = Vec::new();
+        for chunk_len in schedule {
+            let tokens: Vec<u32> = (next_token..next_token + chunk_len).collect();
+            next_token += chunk_len;
+            inner
+                .kv_cache_coordinator
+                .as_mut()
+                .expect("coordinator")
+                .record_tokens_all(seq_id, &tokens)
+                .expect("record chunk");
+            let cursor = inner
+                .kv_cache_coordinator
+                .as_ref()
+                .expect("coordinator")
+                .full_adapter()
+                .current_token_count_for(seq_id)
+                .expect("cursor");
+            if committed_basis {
+                inner
+                    .settle_grouped_kv_step_at(seq_id, cursor)
+                    .expect("committed-basis settle");
+            } else {
+                inner
+                    .settle_grouped_kv_step(seq_id)
+                    .expect("cursor-basis settle");
+            }
+            cursors.push(cursor);
+            let coordinator = inner.kv_cache_coordinator.as_ref().expect("coordinator");
+            let groups = (0..group_count(coordinator))
+                .map(|group_id| {
+                    coordinator
+                        .adapter(group_id)
+                        .expect("group adapter")
+                        .block_table_for(seq_id)
+                        .expect("block table")
+                        .blocks()
+                        .iter()
+                        .map(|block| block.block_id)
+                        .collect::<Vec<u32>>()
+                })
+                .collect::<Vec<_>>();
+            step_block_ids.push(groups);
+        }
+        let rungs = inner
+            .grouped_sliding_cold_checkpoints
+            .get(&seq_id)
+            .map(|checkpoints| {
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| (checkpoint.boundary, checkpoint.tokens.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .release_request_all(seq_id)
+            .expect("release");
+        SettleTrace {
+            step_block_ids,
+            cursors,
+            rungs,
+        }
+    }
+
+    /// Per-step nulled-position patterns for one trace: a position is nulled
+    /// iff its block id equals the trace-final id of position 0 (the shared
+    /// null sentinel once the window has passed block 0; the sentinel block
+    /// is adapter-owned and never freed, so no live block can alias it).
+    fn null_patterns(trace: &SettleTrace) -> Vec<Vec<Vec<bool>>> {
+        let final_step = trace.step_block_ids.last().expect("at least one settle");
+        let null_ids: Vec<u32> = final_step.iter().map(|ids| ids[0]).collect();
+        trace
+            .step_block_ids
+            .iter()
+            .map(|groups| {
+                groups
+                    .iter()
+                    .zip(&null_ids)
+                    .map(|(ids, &null_id)| ids.iter().map(|&id| id == null_id).collect())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// When committed == cursor (every autoregressive step), the
+    /// committed-basis settle must be indistinguishable from the cursor-basis
+    /// settle: bit-equal nulled-block sets in every group at every step, and
+    /// identical captured checkpoint rungs. Mutations this catches: the
+    /// settle refactor changing autoregressive behavior (either basis arm
+    /// drifting by even one token moves a retirement boundary or drops the
+    /// on-frontier rung).
+    #[test]
+    fn settle_at_committed_equals_cursor_when_equal() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!("skipping settle_at_committed_equals_cursor_when_equal: Metal unavailable");
+            return;
+        }
+        let mut inner =
+            Gemma4Inner::new(tiny_paged_config()).expect("tiny paged Gemma4Inner must construct");
+        if inner.kv_cache_coordinator.is_none() {
+            eprintln!(
+                "skipping settle_at_committed_equals_cursor_when_equal: no paged coordinator"
+            );
+            return;
+        }
+
+        // A real sliding cold tier so the rung walk actually captures — an
+        // empty-ladder run would compare nothing.
+        let root = std::env::temp_dir().join(format!(
+            "mlx-gemma4-spec-paged-settle-{}",
+            std::process::id()
+        ));
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        let policy = sliding_sidecar::policy(&inner.config)
+            .expect("tiny geometry must yield a sliding sidecar policy");
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .full_adapter_mut()
+            .set_cold_tier(ColdTierContext {
+                manager: Arc::new(manager),
+                fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                    b"gemma4-spec-paged-settle".as_slice(),
+                ]),
+                sidecar_policy: Some(policy),
+            });
+
+        let cursor_trace = drive_settles(&mut inner, 21, false);
+        let committed_trace = drive_settles(&mut inner, 22, true);
+
+        assert_eq!(cursor_trace.cursors, committed_trace.cursors);
+        assert_eq!(
+            null_patterns(&cursor_trace),
+            null_patterns(&committed_trace),
+            "committed == cursor must null bit-equal block sets in every group at every settle"
+        );
+
+        // Non-vacuity: the window actually retired blocks...
+        let final_patterns = null_patterns(&cursor_trace);
+        let final_step = final_patterns.last().expect("final settle");
+        assert!(
+            final_step
+                .iter()
+                .any(|pattern| pattern.iter().filter(|&&nulled| nulled).count() >= 2),
+            "the schedule must drive at least two blocks out of a sliding window"
+        );
+        // ...and the rung walk captured the on-frontier anchor, identically.
+        let expected_rungs = vec![(32u32, (0..32).collect::<Vec<u32>>())];
+        assert_eq!(
+            cursor_trace.rungs, expected_rungs,
+            "the cursor-basis settle must capture the rung landing exactly on the frontier"
+        );
+        assert_eq!(
+            committed_trace.rungs, expected_rungs,
+            "the committed-basis settle must capture the same rung at committed == cursor"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The model-level committed-basis settle BELOW the cursor — the gap
+    /// [`settle_at_committed_equals_cursor_when_equal`] cannot see: with
+    /// committed < cursor, the rung walk and the sliding prune must both
+    /// consume the committed frontier, never the write cursor.
+    ///
+    /// Geometry (window 16, block 8, first anchor rung 32): the cursor lands
+    /// exactly on the rung, committed 26 sits below it. The committed cutoff
+    /// (26 - 16 = 10) retires sliding block 0 only; a cursor cutoff
+    /// (32 - 16 = 16) would also null block 1, which holds live positions
+    /// 10-15 of the committed window [10, 26). The boundary-32 rows are still
+    /// live at settle time (`read_sliding_groups_at` succeeds only while the
+    /// sliding cursor sits exactly on the boundary), so a cursor-basis rung
+    /// walk WOULD capture a durable checkpoint a rollback below it can no
+    /// longer retract.
+    ///
+    /// Mutations this catches:
+    /// `remember_grouped_sliding_cold_checkpoint_at_frontier` ignoring
+    /// `committed_tokens` in its frontier (captures boundary 32 > committed);
+    /// the `Some(committed)` arm of `settle_grouped_kv_step_at_basis` routing
+    /// to the cursor-basis `prune_sliding_all`.
+    #[test]
+    fn settle_below_cursor_stays_on_the_committed_basis() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!(
+                "skipping settle_below_cursor_stays_on_the_committed_basis: Metal unavailable"
+            );
+            return;
+        }
+        let mut inner =
+            Gemma4Inner::new(tiny_paged_config()).expect("tiny paged Gemma4Inner must construct");
+        if inner.kv_cache_coordinator.is_none() {
+            eprintln!(
+                "skipping settle_below_cursor_stays_on_the_committed_basis: no paged coordinator"
+            );
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-gemma4-spec-paged-settle-below-{}",
+            std::process::id()
+        ));
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        let policy = sliding_sidecar::policy(&inner.config)
+            .expect("tiny geometry must yield a sliding sidecar policy");
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .full_adapter_mut()
+            .set_cold_tier(ColdTierContext {
+                manager: Arc::new(manager),
+                fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                    b"gemma4-spec-paged-settle-below".as_slice(),
+                ]),
+                sidecar_policy: Some(policy),
+            });
+        assert_eq!(
+            inner.scheduled_cold_anchor_rungs().first(),
+            Some(&32),
+            "test precondition: the ladder must publish the rung the cursor lands on"
+        );
+
+        let seq_id = 23u32;
+        let committed = 26u32;
+        {
+            let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+            coordinator.reset_scheduled_request(seq_id).expect("reset");
+            coordinator
+                .record_tokens_all(seq_id, &(0..32).collect::<Vec<_>>())
+                .expect("record 26 committed + 6 speculative rows up to the rung edge");
+            assert!(
+                coordinator
+                    .read_sliding_groups_at(seq_id, 32)
+                    .expect("boundary read")
+                    .is_some(),
+                "test precondition: the boundary-32 rows must be live, so only the \
+                 committed basis refuses the capture"
+            );
+        }
+        let coordinator = inner.kv_cache_coordinator.as_ref().expect("coordinator");
+        let sliding_group = sliding_group_id(coordinator);
+        let sliding_block_ids = |inner: &Gemma4Inner| -> Vec<u32> {
+            inner
+                .kv_cache_coordinator
+                .as_ref()
+                .expect("coordinator")
+                .adapter(sliding_group)
+                .expect("sliding adapter")
+                .block_table_for(seq_id)
+                .expect("sliding block table")
+                .blocks()
+                .iter()
+                .map(|block| block.block_id)
+                .collect()
+        };
+        let ids_before = sliding_block_ids(&inner);
+        let allocated_before = allocated_per_group(coordinator);
+
+        inner
+            .settle_grouped_kv_step_at(seq_id, committed)
+            .expect("committed-basis settle below the cursor");
+
+        let captured: Vec<u32> = inner
+            .grouped_sliding_cold_checkpoints
+            .get(&seq_id)
+            .map(|checkpoints| {
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| checkpoint.boundary)
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            captured.iter().all(|&boundary| boundary <= committed),
+            "the rung walk must never capture a boundary past the committed frontier, \
+             got {captured:?}"
+        );
+
+        let allocated_after =
+            allocated_per_group(inner.kv_cache_coordinator.as_ref().expect("coordinator"));
+        for (group_id, (before, after)) in allocated_before.iter().zip(&allocated_after).enumerate()
+        {
+            let expected = if group_id == sliding_group { 1 } else { 0 };
+            assert_eq!(
+                before - after,
+                expected,
+                "group {group_id}: the committed cutoff (26 - 16 = 10) retires sliding \
+                 block 0 only — a cursor cutoff (32 - 16 = 16) would take 2"
+            );
+        }
+        let ids_after = sliding_block_ids(&inner);
+        assert_ne!(
+            ids_after[0], ids_before[0],
+            "block 0 sits wholly below the committed window and must be remapped to \
+             the null sentinel"
+        );
+        assert_eq!(
+            ids_after[1..],
+            ids_before[1..],
+            "every block the committed window [10, 26) still touches must keep its \
+             physical backing"
+        );
+
+        let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+        coordinator
+            .rollback_last_tokens_all(seq_id, 6)
+            .expect("roll back the 6 speculative rows");
+        assert_eq!(
+            coordinator.request_token_count_all(seq_id).expect("count"),
+            committed
+        );
+        coordinator
+            .adapter_mut(sliding_group)
+            .expect("sliding adapter")
+            .read_kv_range(0, 10, 16)
+            .expect("the committed window [10, 26) must be readable after the rollback");
+        let null_id = ids_after[0];
+        assert!(
+            sliding_block_ids(&inner)[1..]
+                .iter()
+                .all(|&id| id != null_id),
+            "the rollback range the settle preserved must remain physically backed"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One speculative cycle at whichever facade scope is handed in, landing
+    /// the committed frontier exactly on the first cold anchor rung: 29
+    /// committed rows, a 5-row verify write to cursor 34, commit keep=3 →
+    /// committed 32, then the settle under test. The rung is capturable only
+    /// while the sliding cursor sits exactly on the boundary
+    /// (`read_sliding_groups_at`), which the rollback is what establishes.
+    fn drive_cycle_onto_the_cold_rung<C: SpecPagedCache>(cache: &mut C, seq_id: u32) {
+        assert!(
+            cache.reserve_lookahead(seq_id, 5).expect("reserve"),
+            "5 lookahead rows fit every group"
+        );
+        let ticket = cache
+            .record_verify(seq_id, &[200, 201, 202, 203, 204])
+            .expect("record anchor + 4 drafts");
+        assert_eq!(
+            cache.frontier(seq_id).expect("frontier").attn_tokens,
+            34,
+            "the verify write must sit 5 rows past the committed prompt"
+        );
+        cache
+            .commit_cycle(seq_id, ticket, 3)
+            .expect("keep the anchor and 2 drafts");
+        assert_eq!(
+            cache.frontier(seq_id).expect("frontier").attn_tokens,
+            32,
+            "the commit must land the committed frontier on the anchor rung"
+        );
+        cache
+            .settle_committed(seq_id, 32)
+            .expect("settle at the committed frontier");
+    }
+
+    /// Settle OWNERSHIP: a family-level driver settling at the committed
+    /// frontier must get the cold-rung walk. [`Gemma4SpecPagedCache`] routes
+    /// its settle through [`Gemma4Inner::settle_grouped_kv_step_at`] and
+    /// captures the rung; [`PruneOnlySpecPagedCache`] structurally cannot
+    /// reach it — its settle is the coordinator's pending-write eval plus the
+    /// committed prune — so a driver holding the coordinator scope loses rung
+    /// capture silently. The loss costs acceptance on a warm restore and
+    /// never correctness, which is why no other gate can see it.
+    ///
+    /// Both scopes are driven through the SAME call order
+    /// ([`drive_cycle_onto_the_cold_rung`]), so the facade is the only
+    /// variable, and the coordinator scope is asserted to still prune — it is
+    /// lossy, not broken.
+    ///
+    /// Mutation this catches: routing `Gemma4SpecPagedCache::settle_committed`
+    /// through the coordinator's prune-only settle — the rung map stays empty.
+    #[test]
+    fn family_settle_at_the_committed_frontier_captures_the_cold_rung() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!(
+                "skipping family_settle_at_the_committed_frontier_captures_the_cold_rung: \
+                 Metal unavailable"
+            );
+            return;
+        }
+        let mut inner =
+            Gemma4Inner::new(tiny_paged_config()).expect("tiny paged Gemma4Inner must construct");
+        if inner.kv_cache_coordinator.is_none() {
+            eprintln!(
+                "skipping family_settle_at_the_committed_frontier_captures_the_cold_rung: \
+                 no paged coordinator"
+            );
+            return;
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("mlx-gemma4-spec-paged-rung-{}", std::process::id()));
+        let manager = mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
+            .expect("temp-dir cold cache must open");
+        let policy = sliding_sidecar::policy(&inner.config)
+            .expect("tiny geometry must yield a sliding sidecar policy");
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .full_adapter_mut()
+            .set_cold_tier(ColdTierContext {
+                manager: Arc::new(manager),
+                fingerprint: mlx_paged_attn::ColdCacheFingerprint::from_components([
+                    b"gemma4-spec-paged-rung".as_slice(),
+                ]),
+                sidecar_policy: Some(policy),
+            });
+        assert_eq!(
+            inner.scheduled_cold_anchor_rungs().first(),
+            Some(&32),
+            "test precondition: the ladder must publish the rung the commit lands on"
+        );
+
+        fn seed(inner: &mut Gemma4Inner, seq_id: u32) {
+            let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+            coordinator
+                .reset_scheduled_request(seq_id)
+                .expect("reset the sequence");
+            coordinator
+                .record_tokens_all(seq_id, &(0..29).collect::<Vec<_>>())
+                .expect("seed 29 committed rows");
+        }
+
+        /// Both settles prune; `ids[0] == ids[1]` is the cutoff (32 - 16 =
+        /// 16) having retired sliding blocks 0-1 onto the shared null
+        /// sentinel, with the live window still physically backed.
+        fn assert_pruned(inner: &Gemma4Inner, sliding_group: usize, seq_id: u32) {
+            let ids: Vec<u32> = inner
+                .kv_cache_coordinator
+                .as_ref()
+                .expect("coordinator")
+                .adapter(sliding_group)
+                .expect("sliding adapter")
+                .block_table_for(seq_id)
+                .expect("sliding block table")
+                .blocks()
+                .iter()
+                .map(|block| block.block_id)
+                .collect();
+            assert_eq!(
+                ids[0], ids[1],
+                "sequence {seq_id}: the settle must retire the two out-of-window \
+                 sliding blocks onto the null sentinel"
+            );
+            assert!(
+                ids[2..].iter().all(|&id| id != ids[0]),
+                "sequence {seq_id}: the committed window must remain physically backed"
+            );
+        }
+
+        let sliding_group =
+            sliding_group_id(inner.kv_cache_coordinator.as_ref().expect("coordinator"));
+
+        // Family scope: the settle walks the rungs.
+        let family_seq = 24u32;
+        seed(&mut inner, family_seq);
+        drive_cycle_onto_the_cold_rung(&mut Gemma4SpecPagedCache::new(&mut inner), family_seq);
+        let captured: Vec<(u32, usize)> = inner
+            .grouped_sliding_cold_checkpoints
+            .get(&family_seq)
+            .map(|checkpoints| {
+                checkpoints
+                    .iter()
+                    .map(|checkpoint| (checkpoint.boundary, checkpoint.tokens.len()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            captured,
+            vec![(32, 32)],
+            "the family settle must capture the rung the committed frontier landed on"
+        );
+        assert_pruned(&inner, sliding_group, family_seq);
+        inner
+            .kv_cache_coordinator
+            .as_mut()
+            .expect("coordinator")
+            .release_request_all(family_seq)
+            .expect("release the family sequence");
+
+        // Coordinator scope: the same call order prunes exactly as the family
+        // settle did and captures nothing, because the rung walk lives one
+        // level up.
+        let prune_only_seq = 25u32;
+        seed(&mut inner, prune_only_seq);
+        drive_cycle_onto_the_cold_rung(
+            &mut PruneOnlySpecPagedCache::new(
+                inner.kv_cache_coordinator.as_mut().expect("coordinator"),
+            ),
+            prune_only_seq,
+        );
+        assert!(
+            inner
+                .grouped_sliding_cold_checkpoints
+                .get(&prune_only_seq)
+                .is_none_or(|checkpoints| checkpoints.is_empty()),
+            "the coordinator scope cannot reach the rung walk"
+        );
+        assert_pruned(&inner, sliding_group, prune_only_seq);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of settle ownership: the family settle can capture a
+    /// cold checkpoint, which no rollback retracts, so it must DECLARE
+    /// itself durable and L-SETTLE must keep it out of an open cycle
+    /// entirely. The coordinator scope is admitted for the identical
+    /// in-cycle call (`gemma4_coordinator_is_lawful_under_the_permissive_checker`)
+    /// — the split between the two verdicts is the whole reason the
+    /// declaration exists.
+    ///
+    /// Geometry (window 16, block 8): committed 36, verify anchor + 4 drafts
+    /// → cursor 41, commit keep=1 → 37, whose post-commit cutoff (37 - 16 =
+    /// 21) retires exactly the two out-of-window sliding blocks.
+    ///
+    /// Mutation this catches: `Gemma4SpecPagedCache::settle_captures_durable_state`
+    /// answering `false` — the permissive checker then admits an in-cycle
+    /// family settle, which is where a rung capture lands on a frontier the
+    /// commit can still roll back under.
+    #[test]
+    fn the_family_settle_is_refused_inside_an_open_cycle() {
+        use crate::engine::spec_paged::NoDurableSettleInCycle;
+
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            eprintln!(
+                "skipping the_family_settle_is_refused_inside_an_open_cycle: Metal unavailable"
+            );
+            return;
+        }
+        let mut inner =
+            Gemma4Inner::new(tiny_paged_config()).expect("tiny paged Gemma4Inner must construct");
+        if inner.kv_cache_coordinator.is_none() {
+            eprintln!(
+                "skipping the_family_settle_is_refused_inside_an_open_cycle: no paged coordinator"
+            );
+            return;
+        }
+
+        let seq_id = 27u32;
+        {
+            let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+            coordinator
+                .reset_scheduled_request(seq_id)
+                .expect("reset the sequence");
+            coordinator
+                .record_tokens_all(seq_id, &(0..36).collect::<Vec<_>>())
+                .expect("seed the committed prompt");
+        }
+        let sliding_group =
+            sliding_group_id(inner.kv_cache_coordinator.as_ref().expect("coordinator"));
+
+        let mut cache = NoDurableSettleInCycle::new(Gemma4SpecPagedCache::new(&mut inner));
+        assert!(
+            cache.reserve_lookahead(seq_id, 5).expect("reserve"),
+            "5 lookahead rows fit every group"
+        );
+        let ticket = cache
+            .record_verify(seq_id, &[100, 101, 102, 103, 104])
+            .expect("record anchor + 4 drafts");
+        let recorded = allocated_per_group(
+            cache
+                .inner()
+                .model()
+                .kv_cache_coordinator
+                .as_ref()
+                .expect("coordinator"),
+        );
+
+        // The committed basis is not enough at family scope: a durable
+        // capture may not run inside a cycle at any basis.
+        let err = cache
+            .settle_committed(seq_id, 36)
+            .expect_err("an in-cycle family settle must trip the durability check");
+        assert!(
+            err.contains("captures durable state"),
+            "unexpected error text: {err}"
+        );
+        assert_eq!(
+            allocated_per_group(
+                cache
+                    .inner()
+                    .model()
+                    .kv_cache_coordinator
+                    .as_ref()
+                    .expect("coordinator")
+            ),
+            recorded,
+            "the refused settle must never reach the coordinator"
+        );
+
+        cache
+            .commit_cycle(seq_id, ticket, 1)
+            .expect("keep the anchor, roll back the 4 rejected drafts");
+        cache
+            .settle_committed(seq_id, 37)
+            .expect("post-commit the family settle is lawful");
+        let settled = allocated_per_group(
+            cache
+                .inner()
+                .model()
+                .kv_cache_coordinator
+                .as_ref()
+                .expect("coordinator"),
+        );
+        for (group_id, (before, after)) in recorded.iter().zip(&settled).enumerate() {
+            let expected = if group_id == sliding_group { 2 } else { 0 };
+            assert_eq!(
+                before - after,
+                expected,
+                "group {group_id}: the post-commit family settle must retire exactly \
+                 the out-of-window blocks (37 - 16 = 21)"
+            );
+        }
+    }
+
+    /// Tap purity on the REAL paged layer loops (text and VLM), driven on a
+    /// real checkpoint: threading a `DsparkTap` must leave the residual
+    /// stream bit-identical to a tap-less run while capturing one
+    /// `[1, T, hidden]` per tapped layer. Mutation this catches: the tap
+    /// perturbing the forward.
+    ///
+    /// Env-gated (the paged K/V write path requires bf16 weights, which the
+    /// random-init tiny model cannot provide):
+    /// `MLX_TEST_GEMMA4_MODEL_PATH` — a bf16 Gemma4 checkout (the
+    /// `gemma4_dspark.rs` target). Unset -> skip with a message.
+    #[test]
+    fn paged_layer_loop_tap_purity_is_bit_identical() {
+        let Ok(model_path) = std::env::var("MLX_TEST_GEMMA4_MODEL_PATH") else {
+            eprintln!(
+                "skipping paged_layer_loop_tap_purity_is_bit_identical: set \
+                 MLX_TEST_GEMMA4_MODEL_PATH (bf16 Gemma4 checkout)"
+            );
+            return;
+        };
+        let (mut inner, _weight_bytes) =
+            Gemma4Inner::load_from_dir(&model_path, None).expect("gemma4 checkout must load");
+        assert!(
+            inner.kv_cache_coordinator.is_some(),
+            "a bf16 Gemma4 checkout must build its paged coordinator"
+        );
+        let layer_kinds = inner.compute_layer_kinds().expect("layer kinds");
+        let tokens = [3u32, 9, 17, 25, 33, 41];
+        let layer_ids = [0usize, inner.layers.len() / 2, inner.layers.len() - 1];
+
+        let fresh_chunk = |inner: &mut Gemma4Inner, seq_id: u32| {
+            let coordinator = inner.kv_cache_coordinator.as_mut().expect("coordinator");
+            coordinator.reset_scheduled_request(seq_id).expect("reset");
+            coordinator
+                .record_tokens_all(seq_id, &tokens)
+                .expect("record chunk");
+        };
+
+        // Text loop: pass A tap-less, pass B tapped, separate sequences of
+        // the same loaded model (fresh chunks at position 0 attend only to
+        // in-chunk K/V, so the two passes see identical inputs).
+        fresh_chunk(&mut inner, 11);
+        let hidden_a = inner
+            .run_paged_prefill_layer_loop(&tokens, 0, 0, &layer_kinds, None)
+            .expect("tap-less paged loop");
+        hidden_a.eval();
+
+        fresh_chunk(&mut inner, 12);
+        let mut tap = DsparkTap::new(&layer_ids);
+        let hidden_b = inner
+            .run_paged_prefill_layer_loop(&tokens, 0, 0, &layer_kinds, Some(&mut tap))
+            .expect("tapped paged loop");
+        hidden_b.eval();
+
+        assert_bitwise_eq(&hidden_a, &hidden_b, "paged text loop hidden");
+        assert_eq!(tap.captured.len(), layer_ids.len());
+        let hidden_size = inner.config.hidden_size as i64;
+        for capture in &tap.captured {
+            assert_eq!(
+                capture.shape().unwrap().to_vec(),
+                vec![1, tokens.len() as i64, hidden_size]
+            );
+        }
+        let first = tap.captured[0].to_float32().unwrap().to_vec();
+        let second = tap.captured[1].to_float32().unwrap().to_vec();
+        assert_ne!(first, second, "captures must differ across layers");
+
+        // Unsorted / out-of-range tap ids are rejected before any compute.
+        for bad in [vec![2usize, 0], vec![1, 1], vec![inner.layers.len()]] {
+            let mut bad_tap = DsparkTap::new(&bad);
+            fresh_chunk(&mut inner, 13);
+            assert!(
+                inner
+                    .run_paged_prefill_layer_loop(&tokens, 0, 0, &layer_kinds, Some(&mut bad_tap))
+                    .is_err(),
+                "tap layer_ids {bad:?} must be rejected"
+            );
+        }
+
+        // VLM loop: identical A/B purity over caller-provided embeddings.
+        let ids = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64]).expect("ids");
+        let embeds = inner
+            .embed_tokens
+            .forward(&ids)
+            .and_then(|embeds| embeds.mul_scalar((inner.config.hidden_size as f64).sqrt()))
+            .expect("chunk embeds");
+
+        fresh_chunk(&mut inner, 14);
+        let vlm_a = inner
+            .run_paged_vlm_prefill_layer_loop(&tokens, &embeds, 0, 0, &layer_kinds, None, None)
+            .expect("tap-less paged VLM loop");
+        vlm_a.eval();
+
+        fresh_chunk(&mut inner, 15);
+        let mut vlm_tap = DsparkTap::new(&layer_ids);
+        let vlm_b = inner
+            .run_paged_vlm_prefill_layer_loop(
+                &tokens,
+                &embeds,
+                0,
+                0,
+                &layer_kinds,
                 None,
-                None,
-                &config,
-                &mut tap,
+                Some(&mut vlm_tap),
             )
-            .is_err()
+            .expect("tapped paged VLM loop");
+        vlm_b.eval();
+
+        assert_bitwise_eq(&vlm_a, &vlm_b, "paged VLM loop hidden");
+        assert_eq!(vlm_tap.captured.len(), layer_ids.len());
+        for capture in &vlm_tap.captured {
+            assert_eq!(
+                capture.shape().unwrap().to_vec(),
+                vec![1, tokens.len() as i64, hidden_size]
+            );
+        }
+    }
+
+    /// The rung-candidate walk is inclusive at the frontier and identical
+    /// for the two bases when committed == cursor — the pure half of the
+    /// settle-equality gate. Mutation this catches: an exclusive (`<`)
+    /// frontier comparison dropping the rung a settle lands on exactly.
+    #[test]
+    fn cold_rung_candidates_include_the_on_frontier_anchor() {
+        let anchors = [32u32, 128, 512];
+        assert_eq!(gemma4_cold_rung_candidates(&anchors, 31), Vec::<u32>::new());
+        assert_eq!(
+            gemma4_cold_rung_candidates(&anchors, 32),
+            vec![32],
+            "a rung landing exactly on the frontier is capturable"
+        );
+        assert_eq!(gemma4_cold_rung_candidates(&anchors, 200), vec![32, 128]);
+        assert_eq!(
+            gemma4_cold_rung_candidates(&anchors, 512),
+            vec![32, 128, 512]
         );
     }
 }
@@ -14734,9 +16585,8 @@ mod assistant_seam_tests {
     //! random-weight Gemma4 (4 hybrid layers, one KV-shared) through the
     //! REAL forward paths.
 
-    use super::dspark_tap_tests::{assert_bitwise_eq, tiny_model};
+    use super::flat_verify_tests::{assert_bitwise_eq, tiny_model};
     use super::*;
-    use crate::models::gemma4::dspark::DsparkTap;
 
     /// Tiny flat-path Gemma4 config (mirrors the DSpark decode tests):
     /// 4 hybrid layers, one KV-shared.
@@ -14936,7 +16786,6 @@ mod assistant_seam_tests {
                 None,
                 None,
                 config,
-                None,
             )
             .unwrap();
 
@@ -14951,7 +16800,6 @@ mod assistant_seam_tests {
                 None,
                 None,
                 config,
-                None,
             )
             .unwrap();
             let logits_b = lm_head_logits(&hidden, &embedding, &None, None, config).unwrap();
@@ -14966,10 +16814,9 @@ mod assistant_seam_tests {
 
     // ── assistant verify forward ───────────────────────────────────────
 
-    /// Same forward as `dspark_verify_forward` (bitwise-equal logits against
-    /// an empty-tap run on equivalent fresh caches), plus the post-final-norm
-    /// hidden as the second tuple element; caches advance by T and bad block
-    /// shapes are rejected.
+    /// Same forward as `forward_inner` (bitwise-equal logits on equivalent
+    /// fresh caches), plus the post-final-norm hidden as the second tuple
+    /// element; caches advance by T and bad block shapes are rejected.
     #[test]
     fn assistant_verify_forward_returns_hidden_and_logits() {
         let config = tiny_target_config();
@@ -14990,16 +16837,14 @@ mod assistant_seam_tests {
                 None,
                 None,
                 &config,
-                None,
             )
             .unwrap()
         };
 
-        // Reference: dspark_verify_forward with an EMPTY tap.
+        // Reference: the plain block forward the assistant seam wraps.
         let mut caches_a = init_caches_for_config(&config);
         prefill(&mut caches_a);
-        let mut tap = DsparkTap::new(&[]);
-        let logits_a = dspark_verify_forward(
+        let logits_a = forward_inner(
             &block_ids,
             &embedding,
             &layers,
@@ -15009,10 +16854,8 @@ mod assistant_seam_tests {
             None,
             None,
             &config,
-            &mut tap,
         )
         .unwrap();
-        assert!(tap.captured.is_empty(), "empty tap must capture nothing");
 
         // Assistant seam on equivalent fresh caches.
         let mut caches_b = init_caches_for_config(&config);
@@ -15047,7 +16890,6 @@ mod assistant_seam_tests {
             None,
             None,
             &config,
-            None,
         )
         .unwrap();
         assert_bitwise_eq(&hidden_ref, &hidden, "post-final-norm hidden");
@@ -15086,5 +16928,43 @@ mod assistant_seam_tests {
                 bad.shape().unwrap().as_ref()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod reasoning_close_tag_seam_tests {
+    //! The one CI-runnable check that Gemma4 actually reaches the session
+    //! continuation verifier with its own reasoning-close tag.
+    //!
+    //! `render_live_continuation` reads `B::REASONING_CLOSE_TAG` and normalizes
+    //! the template-owned whitespace around exactly that tag. `</think>` never
+    //! appears in a Gemma4 render, so the default answer makes the splice fail
+    //! silently and every reasoning turn ends the live session — a whole-session
+    //! regression that no unit test of the parser would notice.
+    //!
+    //! Read through the trait, not from
+    //! [`super::super::output_parser::reasoning_close_tag`] directly: what has
+    //! to hold is that the wiring resolves to that tag, and calling the free
+    //! function would prove only that the free function returns itself.
+
+    use crate::engine::backend::{ChatBackend, REASONING_CLOSE_TAG_DEFAULT};
+    use crate::models::gemma4::model::Gemma4Inner;
+    use crate::models::gemma4::output_parser;
+
+    #[test]
+    fn gemma4_backend_declares_its_own_reasoning_close_tag() {
+        assert_ne!(
+            <Gemma4Inner as ChatBackend>::REASONING_CLOSE_TAG,
+            REASONING_CLOSE_TAG_DEFAULT,
+            "Gemma4 closes its reasoning channel with <channel|>; inheriting the \
+             </think> default silently disables warm continuation after every \
+             reasoning turn",
+        );
+        assert_eq!(
+            <Gemma4Inner as ChatBackend>::REASONING_CLOSE_TAG,
+            output_parser::reasoning_close_tag(),
+            "the tag the session verifier normalizes on must be the tag the \
+             Gemma4 output parser splits reasoning from content on",
+        );
     }
 }

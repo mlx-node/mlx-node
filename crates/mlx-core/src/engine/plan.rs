@@ -12,7 +12,8 @@
 //!   hybrid model owns (sliding, convolutional, and recurrent state remains
 //!   model-owned);
 //! - speculative decoding decorates the target execution and may opt into
-//!   paged attention, current-turn media, and live-session media independently.
+//!   paged attention, streaming, current-turn media, and live-session media
+//!   independently.
 
 /// Media kinds a loaded model (or speculative decoder) accepts.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -146,6 +147,34 @@ pub(crate) enum SpeculativeKind {
     DraftModel,
 }
 
+/// Execution lane for an admitted speculative turn.
+///
+/// Computed only by [`SpeculativePlan::lane`] and consulted by every
+/// admission gate, so de-barriering speculation is a one-property flip
+/// rather than a per-gate hunt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SpeculativeLane {
+    /// Whole-turn exclusive execution through the ordered command lane.
+    Barrier,
+    /// Admission into the continuous-batching scheduler alongside plain
+    /// autoregressive rows.
+    Scheduled,
+}
+
+/// Drafted rows one speculative verify cycle carries, tagged by the
+/// quantity's origin so a native MTP chain depth and an external draft
+/// block size can never be conflated: they are different load-time numbers
+/// that only coincidentally share the `+ 1` anchor arithmetic.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum SpeculativeDraftWidth {
+    /// Native MTP chain depth `D` — `D` chained head steps per cycle.
+    Depth(usize),
+    /// External draft-model block size `L` — one drafted block per cycle
+    /// (gemma4 DSpark block size, muse DFlash mask width).
+    DraftBlockSize(usize),
+}
+
 /// Load-time admission policy for a speculative decoder.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct SpeculativePlan {
@@ -160,6 +189,91 @@ pub(crate) struct SpeculativePlan {
     /// Whether proposal/verification is implemented against the target's
     /// paged attention state.
     pub supports_paged_attention: bool,
+    /// Whether this decoder has a streaming arm. A decoder without one is
+    /// not admitted on a sink-bearing turn; the target's own autoregressive
+    /// path serves it instead of the decoder normalizing itself away
+    /// mid-turn.
+    pub supports_streaming: bool,
+}
+
+impl SpeculativePlan {
+    /// The one streaming admission decision. [`TurnPlan::resolve`] and the
+    /// scheduler's barrier gate both call this; neither re-derives it.
+    pub const fn admits_streaming(self, streaming: bool) -> bool {
+        self.supports_streaming || !streaming
+    }
+
+    /// The one Barrier-vs-Scheduled decision every admission gate consults.
+    ///
+    /// Always [`SpeculativeLane::Barrier`] today, and it must stay that way
+    /// until four things exist, none of which does:
+    ///   * a scheduler step contract wider than one token per decode row
+    ///     (`engine::scheduler` hard-codes `StepKind::Decode => 1` and one
+    ///     `generated_token` per row);
+    ///   * a batched ragged verify — every [`crate::engine::backend::MtpStepper`]
+    ///     signature bakes in batch 1;
+    ///   * per-owner speculative state, so two speculative rows cannot
+    ///     clobber one model-level drafter cache / tape / snapshot;
+    ///   * re-entrant speculative drivers — `run_mtp_turn` / `run_dspark_turn`
+    ///     own the whole turn plus `&mut model`.
+    ///
+    /// The gemma4/muse `execute_barrier` flat-lane owner installs are
+    /// cache-layout decisions (which cache representation a live owner
+    /// occupies), not lane decisions, and remain family-owned regardless of
+    /// this value.
+    pub const fn lane(self) -> SpeculativeLane {
+        SpeculativeLane::Barrier
+    }
+
+    /// Rows one speculative verify cycle appends to attention state: the
+    /// anchor row plus `depth` draft rows.
+    ///
+    /// The single source for the speculative slot margin (vLLM's
+    /// `num_lookahead_tokens`): every reserver reads this; none re-derives
+    /// `depth + 1` locally.
+    ///
+    /// Depth-parameterized form for the engine MTP loop
+    /// (`engine::mtp_turn::turn_lookahead_rows`), whose per-cycle quantity
+    /// is a chain depth. Reservers sized by an external draft block cannot
+    /// use it — this form has no way to know a block size — and go through
+    /// [`Self::lookahead_rows_for`] with
+    /// [`SpeculativeDraftWidth::DraftBlockSize`] instead.
+    pub const fn lookahead_rows(self, depth: usize) -> usize {
+        depth + 1
+    }
+
+    /// [`Self::lookahead_rows`], per kind: the TARGET-side verify rows one
+    /// cycle appends — [`SpeculativeKind::NativeMtp`] writes `depth + 1`
+    /// (anchor + `D` chained drafts), [`SpeculativeKind::DraftModel`]
+    /// (DSpark, DFlash, assistant) writes `draft_block_size + 1` (anchor +
+    /// `L` block drafts). The width must be the plan kind's own quantity;
+    /// a mismatched pairing is a reservation-accounting bug at the call
+    /// site and panics rather than sizing the pool from the wrong number.
+    ///
+    /// Divergence from vLLM, deliberate: vLLM's `num_lookahead_tokens`
+    /// counts drafter-WRITTEN rows (DFlash reserves `K + 1` for the
+    /// drafter, `config/vllm.py:622-646`) because its drafter KV is
+    /// pool-resident; our drafter KV is off-pool (non-goal N1 — it dies
+    /// with its owner and never registers), so the reservation counts the
+    /// target's verify rows only. vLLM's harmless over-reserve for its
+    /// read-only gemma4_mtp drafter is likewise not copied.
+    ///
+    /// `engine::dspark_turn::run_paged_dspark_turn` sizes its per-cycle
+    /// `SpecPagedCache::reserve_lookahead` from this, so the reservation
+    /// comes from the plan property rather than a re-derived local formula
+    /// (I1).
+    pub const fn lookahead_rows_for(self, width: SpeculativeDraftWidth) -> usize {
+        match (self.kind, width) {
+            (SpeculativeKind::NativeMtp, SpeculativeDraftWidth::Depth(depth)) => depth + 1,
+            (SpeculativeKind::DraftModel, SpeculativeDraftWidth::DraftBlockSize(block)) => {
+                block + 1
+            }
+            (SpeculativeKind::NativeMtp, SpeculativeDraftWidth::DraftBlockSize(_))
+            | (SpeculativeKind::DraftModel, SpeculativeDraftWidth::Depth(_)) => {
+                panic!("speculative draft width kind does not match the plan's kind")
+            }
+        }
+    }
 }
 
 /// Immutable inference features resolved when a model is loaded.
@@ -193,6 +307,10 @@ pub(crate) struct TurnRequest {
     /// resolve this as [`MediaCapabilities::NONE`].
     pub context_media: MediaCapabilities,
     pub speculative_requested: bool,
+    /// Whether the caller attached a streaming sink. Carried as a request
+    /// fact so the scheduler's lane gate and the planner cannot answer it
+    /// differently.
+    pub streaming: bool,
 }
 
 /// Decoder selected for one turn.
@@ -228,32 +346,43 @@ impl TurnPlan {
     /// Media outside the target's admission set is rejected by the session
     /// before prompt rendering. Backend-validated media still reaches the
     /// family handler for its specific error. This function decides which
-    /// compatible optional features can participate; an incompatible
-    /// speculative combination falls back to the exact target autoregressive
-    /// path and never drops the turn.
+    /// compatible optional features can participate; a decoder the request
+    /// cannot use falls back to the exact target autoregressive path and
+    /// never drops the turn.
+    ///
+    /// This is the ONLY answer to "will this turn speculate?". Speculative
+    /// admission is decided first and the attention lane follows it, so a
+    /// family handler never has to re-route a turn the plan described
+    /// wrongly.
     pub const fn resolve(execution: ExecutionPlan, request: TurnRequest) -> Self {
-        let use_paged_attention = match execution.paged_attention {
-            Some(paged) => !request.is_delta || paged.supports_delta,
-            None => false,
-        };
-
-        let decoder = if request.speculative_requested {
-            match execution.speculative {
-                Some(speculative)
-                    if speculative
+        let speculative = match execution.speculative {
+            Some(speculative)
+                if request.speculative_requested
+                    && speculative
                         .supported_input_media
                         .supports(request.input_media)
-                        && speculative
-                            .supported_context_media
-                            .supports(request.context_media)
-                        && (!use_paged_attention || speculative.supports_paged_attention) =>
-                {
-                    DecoderPlan::Speculative(speculative.kind)
-                }
-                _ => DecoderPlan::Autoregressive,
+                    && speculative
+                        .supported_context_media
+                        .supports(request.context_media)
+                    && speculative.admits_streaming(request.streaming) =>
+            {
+                Some(speculative)
             }
-        } else {
-            DecoderPlan::Autoregressive
+            _ => None,
+        };
+
+        // A decoder that cannot read the paged pools takes the flat lane WITH
+        // its target. Dropping it to paged autoregressive instead deletes the
+        // speculation the request asked for.
+        let use_paged_attention = match (execution.paged_attention, speculative) {
+            (Some(_), Some(speculative)) if !speculative.supports_paged_attention => false,
+            (Some(paged), _) => !request.is_delta || paged.supports_delta,
+            (None, _) => false,
+        };
+
+        let decoder = match speculative {
+            Some(speculative) => DecoderPlan::Speculative(speculative.kind),
+            None => DecoderPlan::Autoregressive,
         };
 
         Self {
@@ -294,6 +423,7 @@ mod tests {
         supported_input_media: MediaCapabilities::NONE,
         supported_context_media: MediaCapabilities::NONE,
         supports_paged_attention: true,
+        supports_streaming: true,
     };
 
     fn request(
@@ -307,7 +437,104 @@ mod tests {
             input_media,
             context_media,
             speculative_requested,
+            streaming: false,
         }
+    }
+
+    fn streaming_request(speculative_requested: bool) -> TurnRequest {
+        TurnRequest {
+            streaming: true,
+            ..request(
+                false,
+                MediaCapabilities::NONE,
+                MediaCapabilities::NONE,
+                speculative_requested,
+            )
+        }
+    }
+
+    #[test]
+    fn all_current_speculative_plans_are_barrier() {
+        let media_shapes = [
+            MediaCapabilities::NONE,
+            MediaCapabilities::IMAGES,
+            MediaCapabilities::AUDIO,
+            MediaCapabilities::IMAGES_AND_AUDIO,
+        ];
+        for kind in [SpeculativeKind::NativeMtp, SpeculativeKind::DraftModel] {
+            for supported_input_media in media_shapes {
+                for supported_context_media in media_shapes {
+                    for supports_paged_attention in [false, true] {
+                        for supports_streaming in [false, true] {
+                            let plan = SpeculativePlan {
+                                kind,
+                                supported_input_media,
+                                supported_context_media,
+                                supports_paged_attention,
+                                supports_streaming,
+                            };
+                            assert_eq!(
+                                plan.lane(),
+                                SpeculativeLane::Barrier,
+                                "no speculative configuration may reach the scheduled lane \
+                                 before its admission accounting exists: {plan:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lookahead_rows_counts_anchor_plus_drafts() {
+        assert_eq!(MTP_PAGED.lookahead_rows(1), 2);
+        assert_eq!(MTP_PAGED.lookahead_rows(4), 5);
+    }
+
+    #[test]
+    fn lookahead_rows_per_kind() {
+        let native = MTP_PAGED;
+        let draft = SpeculativePlan {
+            kind: SpeculativeKind::DraftModel,
+            ..MTP_PAGED
+        };
+
+        // NativeMtp: anchor + D chained drafts.
+        assert_eq!(
+            native.lookahead_rows_for(SpeculativeDraftWidth::Depth(1)),
+            2
+        );
+        assert_eq!(
+            native.lookahead_rows_for(SpeculativeDraftWidth::Depth(4)),
+            5
+        );
+
+        // DraftModel (DSpark/DFlash/assistant): anchor + L block drafts.
+        assert_eq!(
+            draft.lookahead_rows_for(SpeculativeDraftWidth::DraftBlockSize(7)),
+            8
+        );
+        assert_eq!(
+            draft.lookahead_rows_for(SpeculativeDraftWidth::DraftBlockSize(4)),
+            5
+        );
+
+        // The two quantities are not interchangeable: sizing a kind's
+        // reservation from the other kind's number must refuse, not return
+        // a uniformly-`depth + 1` answer.
+        assert!(
+            std::panic::catch_unwind(
+                || native.lookahead_rows_for(SpeculativeDraftWidth::DraftBlockSize(7))
+            )
+            .is_err(),
+            "a NativeMtp plan accepted an external draft block size"
+        );
+        assert!(
+            std::panic::catch_unwind(|| draft.lookahead_rows_for(SpeculativeDraftWidth::Depth(1)))
+                .is_err(),
+            "a DraftModel plan accepted a native MTP chain depth"
+        );
     }
 
     #[test]
@@ -398,8 +625,18 @@ mod tests {
         assert_eq!(plan.path(), TurnPath::Paged);
     }
 
+    /// A flat-only decoder on a paged target keeps the speculation and takes
+    /// the FLAT lane with its target. Resolving it to paged autoregressive
+    /// instead is the shape that made families re-route the turn behind the
+    /// planner's back.
+    ///
+    /// MUTATION: restore the paged-first ordering (compute
+    /// `use_paged_attention` from `execution.paged_attention` alone, then gate
+    /// the decoder on `!use_paged_attention || supports_paged_attention`) —
+    /// the decoder resolves `Autoregressive` and the path resolves `Paged`,
+    /// so both assertions fail.
     #[test]
-    fn incompatible_paged_speculation_falls_back_to_target_ar() {
+    fn a_flat_only_decoder_on_a_paged_target_keeps_speculating_on_the_flat_lane() {
         let execution = ExecutionPlan {
             media: MediaPlan::NONE,
             paged_attention: Some(PAGED),
@@ -417,8 +654,111 @@ mod tests {
                 true,
             ),
         );
-        assert_eq!(plan.decoder, DecoderPlan::Autoregressive);
-        assert_eq!(plan.path(), TurnPath::Paged);
+        assert_eq!(
+            plan.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+        );
+        assert!(!plan.use_paged_attention);
+        assert_eq!(plan.path(), TurnPath::Speculative);
+
+        // Without the opt-in the same target is an ordinary paged turn.
+        let unrequested = TurnPlan::resolve(
+            execution,
+            request(
+                false,
+                MediaCapabilities::NONE,
+                MediaCapabilities::NONE,
+                false,
+            ),
+        );
+        assert_eq!(unrequested.decoder, DecoderPlan::Autoregressive);
+        assert!(unrequested.use_paged_attention);
+        assert_eq!(unrequested.path(), TurnPath::Paged);
+    }
+
+    /// A decoder with no streaming arm is refused on a sink-bearing turn and
+    /// the target's own autoregressive lane serves it — on BOTH the paged and
+    /// the flat target shape.
+    ///
+    /// MUTATION: drop the `admits_streaming` conjunct from `resolve` — every
+    /// `assert_eq!(.., DecoderPlan::Autoregressive)` below fails.
+    #[test]
+    fn a_decoder_without_a_streaming_arm_is_refused_on_a_streaming_turn() {
+        let sync_only = SpeculativePlan {
+            supports_paged_attention: false,
+            supports_streaming: false,
+            ..MTP_PAGED
+        };
+
+        let paged_target = ExecutionPlan {
+            media: MediaPlan::NONE,
+            paged_attention: Some(PAGED),
+            speculative: Some(sync_only),
+        };
+        let streamed = TurnPlan::resolve(paged_target, streaming_request(true));
+        assert_eq!(streamed.decoder, DecoderPlan::Autoregressive);
+        assert!(streamed.use_paged_attention);
+        assert_eq!(streamed.path(), TurnPath::Paged);
+
+        let flat_target = ExecutionPlan {
+            paged_attention: None,
+            ..paged_target
+        };
+        let streamed_flat = TurnPlan::resolve(flat_target, streaming_request(true));
+        assert_eq!(streamed_flat.decoder, DecoderPlan::Autoregressive);
+        assert_eq!(streamed_flat.path(), TurnPath::Generic);
+
+        // The same plan still speculates without a sink.
+        let synced = TurnPlan::resolve(
+            paged_target,
+            request(
+                false,
+                MediaCapabilities::NONE,
+                MediaCapabilities::NONE,
+                true,
+            ),
+        );
+        assert_eq!(
+            synced.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
+        );
+        assert_eq!(synced.path(), TurnPath::Speculative);
+    }
+
+    /// A decoder that DOES stream is unaffected by the request fact.
+    ///
+    /// MUTATION: reduce `admits_streaming` to `!streaming` — the `streaming =
+    /// true` leg here fails while the sync-only test above still passes, so
+    /// the two pin the predicate from both sides. A full inversion
+    /// (`!self.supports_streaming || !streaming`) is NOT that mutation: it
+    /// flips the sync-only decoder's answer too and fails both tests.
+    #[test]
+    fn a_streaming_capable_decoder_is_admitted_on_both_turn_shapes() {
+        let execution = ExecutionPlan {
+            media: MediaPlan::NONE,
+            paged_attention: Some(PAGED),
+            speculative: Some(MTP_PAGED),
+        };
+        for streamed in [false, true] {
+            let plan = TurnPlan::resolve(
+                execution,
+                TurnRequest {
+                    streaming: streamed,
+                    ..request(
+                        false,
+                        MediaCapabilities::NONE,
+                        MediaCapabilities::NONE,
+                        true,
+                    )
+                },
+            );
+            assert_eq!(
+                plan.decoder,
+                DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+                "streaming={streamed}"
+            );
+            assert_eq!(plan.path(), TurnPath::Paged, "streaming={streamed}");
+        }
     }
 
     #[test]

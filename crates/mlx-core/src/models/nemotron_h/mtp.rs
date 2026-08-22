@@ -423,11 +423,13 @@ mod mtp_turn_tests {
     use crate::engine::backend::{
         ChatBackend, MtpBackend, MtpStepper, MtpTurnSetup, ThinkingSetup,
     };
-    use crate::engine::mtp_turn::{MtpTurnArgs, run_mtp_turn};
+    use crate::engine::mtp_turn::{MtpTurnArgs, run_mtp_turn, turn_lookahead_rows};
     use crate::engine::params::extract_chat_params;
     use crate::engine::penalties::ReasoningTracker;
     use crate::engine::persistence::compiled_forward_backend_available;
-    use crate::engine::plan::{MediaCapabilities, TurnPath, TurnPlan, TurnRequest};
+    use crate::engine::plan::{
+        DecoderPlan, MediaCapabilities, SpeculativeKind, TurnPath, TurnPlan, TurnRequest,
+    };
     use crate::engine::types::ChatConfig;
     use crate::models::nemotron_h::config::NemotronHConfig;
     use crate::models::nemotron_h::layer_cache::NemotronHLayerCache;
@@ -695,7 +697,6 @@ mod mtp_turn_tests {
                     generation_stream: stream,
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
-                    prompt_hidden_position_base: 0,
                     cancel_flag: None,
                 },
                 None,
@@ -850,6 +851,25 @@ mod mtp_turn_tests {
         inner.mtp_weights_loaded = true;
         assert!(inner.has_mtp_weights());
         inner
+    }
+
+    /// `MtpTurnSetup` for the flat drafter tests, with `lookahead_rows` read
+    /// off the model's own `SpeculativePlan` exactly as `run_mtp_turn` reads it
+    /// (I1 — no reserver re-derives `depth + 1` locally). NemotronH's
+    /// `begin_mtp_decode` ignores the margin, because its native MTP is
+    /// flat-cache only and has no paged region to reserve; taking it off the
+    /// plan anyway keeps these tests from pinning a value production never
+    /// sends.
+    fn flat_mtp_setup(inner: &NemotronHInner, first_sampled_token: u32) -> MtpTurnSetup<'static> {
+        MtpTurnSetup {
+            prompt_hidden: None,
+            prompt_hidden_ids: None,
+            first_sampled_token,
+            lookahead_rows: inner
+                .execution_plan()
+                .speculative
+                .map_or(0, |plan| turn_lookahead_rows(plan, &greedy_params())),
+        }
     }
 
     fn greedy_params() -> crate::engine::params::ChatParams {
@@ -1039,12 +1059,7 @@ mod mtp_turn_tests {
     fn begin_mtp_decode_refuses_an_unseeded_drafter() {
         let mut inner = mtp_ready_inner();
         assert!(inner.pending_mtp_draft_seed.is_none());
-        let setup = MtpTurnSetup {
-            prompt_hidden: None,
-            prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
-            first_sampled_token: 5,
-        };
+        let setup = flat_mtp_setup(&inner, 5);
         let err = inner
             .begin_mtp_decode(&setup)
             .err()
@@ -1091,12 +1106,7 @@ mod mtp_turn_tests {
         let mut run = |with_draft: bool| -> Vec<f32> {
             inner.reset_caches_internal();
             let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
-            let setup = MtpTurnSetup {
-                prompt_hidden: None,
-                prompt_hidden_ids: None,
-                prompt_hidden_position_base: 0,
-                first_sampled_token: 7,
-            };
+            let setup = flat_mtp_setup(&inner, 7);
             let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
             assert_eq!(step.committed_len(), prompt.len() as i32);
             assert_eq!(step.draft_kv_offset(), prompt.len() as i32);
@@ -1181,12 +1191,7 @@ mod mtp_turn_tests {
 
         inner.reset_caches_internal();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
-        let setup = MtpTurnSetup {
-            prompt_hidden: None,
-            prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
-            first_sampled_token: 7,
-        };
+        let setup = flat_mtp_setup(&inner, 7);
         let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
         assert_eq!(step.draft_kv_offset(), t);
 
@@ -1239,12 +1244,7 @@ mod mtp_turn_tests {
 
         inner.reset_caches_internal();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
-        let setup = MtpTurnSetup {
-            prompt_hidden: None,
-            prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
-            first_sampled_token: 7,
-        };
+        let setup = flat_mtp_setup(&inner, 7);
         let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
 
         // One full cycle: draft, then commit two tokens.
@@ -1339,12 +1339,7 @@ mod mtp_turn_tests {
 
         inner.reset_caches_internal();
         let _y = prefill_and_seed_mtp(&mut inner, &prompt, stream, &p).expect("seed");
-        let setup = MtpTurnSetup {
-            prompt_hidden: None,
-            prompt_hidden_ids: None,
-            prompt_hidden_position_base: 0,
-            first_sampled_token: 7,
-        };
+        let setup = flat_mtp_setup(&inner, 7);
         let mut step = inner.begin_mtp_decode(&setup).expect("stepper");
 
         step.begin_cycle(false);
@@ -1391,7 +1386,13 @@ mod mtp_turn_tests {
         assert!(err2.reason.contains("paged_block_size"), "{}", err2.reason);
     }
 
-    /// the exact wiring the real-checkpoint E2E was missing.
+    /// The PLAN itself routes an MTP-requested turn to the flat speculative
+    /// core on a paged model — the family has no re-routing override left to
+    /// compensate with, so anything the plan gets wrong here decodes wrong.
+    ///
+    /// MUTATION: flip `supports_streaming` to `true` in `execution_plan` —
+    /// the streaming leg then resolves `Speculative`/`TurnPath::Speculative`
+    /// and both of its assertions fail.
     #[test]
     fn mtp_request_on_paged_model_routes_to_flat_core() {
         if !compiled_forward_backend_available() {
@@ -1410,49 +1411,41 @@ mod mtp_turn_tests {
         assert!(exec.paged_attention.is_some(), "paged adapter exposed");
         assert!(exec.speculative.is_some(), "MTP plan present");
 
-        // Engine resolution: paged attention wins, the speculative decoder
-        // is not admitted, and the turn resolves to the Paged path.
-        let plan = TurnPlan::resolve(
-            exec,
-            TurnRequest {
-                is_delta: false,
-                input_media: MediaCapabilities::NONE,
-                context_media: MediaCapabilities::NONE,
-                speculative_requested: true,
-            },
-        );
-        assert_eq!(
-            plan.path(),
-            TurnPath::Paged,
-            "engine resolves paged+MTP to the paged path (the override compensates)"
-        );
-
-        // The family's run_paged_turn override compensates: any sync
-        // MTP-requested turn on an MTP-capable model routes flat.
-        let mut chat_cfg = ChatConfig {
-            enable_mtp: Some(true),
-            ..ChatConfig::default()
+        let request = |speculative_requested: bool, streaming: bool| TurnRequest {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            speculative_requested,
+            streaming,
         };
-        let p = extract_chat_params(&chat_cfg);
-        assert!(
-            inner.mtp_flat_routing_required(&p, false),
-            "sync enable_mtp turn on an MTP-capable paged model must route flat"
+
+        // A sync MTP request takes the flat lane WITH its target: the draft
+        // head reads the flat KV, so the paged pools step aside.
+        let sync = TurnPlan::resolve(exec, request(true, false));
+        assert_eq!(
+            sync.decoder,
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp),
+            "a sync enable_mtp turn on an MTP-capable paged model must plan MTP"
         );
-        assert!(
-            !inner.mtp_flat_routing_required(&p, true),
-            "streaming MTP turns keep the paged AR fallback"
-        );
-        chat_cfg.enable_mtp = None;
-        let p_ar = extract_chat_params(&chat_cfg);
-        assert!(
-            !inner.mtp_flat_routing_required(&p_ar, false),
-            "plain AR turns must stay on the paged lane"
-        );
+        assert_eq!(sync.path(), TurnPath::Speculative);
+        assert!(!sync.use_paged_attention);
+
+        // The flat MTP core has no streaming arm, so a streaming request keeps
+        // the target's own paged autoregressive lane.
+        let streamed = TurnPlan::resolve(exec, request(true, true));
+        assert_eq!(streamed.decoder, DecoderPlan::Autoregressive);
+        assert_eq!(streamed.path(), TurnPath::Paged);
+
+        // Plain AR turns stay on the paged lane.
+        let plain = TurnPlan::resolve(exec, request(false, false));
+        assert_eq!(plain.decoder, DecoderPlan::Autoregressive);
+        assert_eq!(plain.path(), TurnPath::Paged);
+
+        // With no loaded head there is no speculative plan to admit.
         inner.mtp_weights_loaded = false;
-        assert!(
-            !inner.mtp_flat_routing_required(&p, false),
-            "MTP requested without a loaded head must not route flat"
-        );
+        let disarmed = TurnPlan::resolve(inner.execution_plan(), request(true, false));
+        assert_eq!(disarmed.decoder, DecoderPlan::Autoregressive);
+        assert_eq!(disarmed.path(), TurnPath::Paged);
     }
 
     /// Real-checkpoint T=0 lossless gate (env-gated:
@@ -1536,7 +1529,6 @@ mod mtp_turn_tests {
                 generation_stream: stream,
                 prompt_hidden: None,
                 prompt_hidden_ids: None,
-                prompt_hidden_position_base: 0,
                 cancel_flag: None,
             },
             None,

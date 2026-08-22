@@ -26,14 +26,16 @@
 use napi::bindgen_prelude::*;
 
 use crate::array::{DType, MxArray};
-use crate::engine::backend::{DsparkProposal, DsparkStepper, DsparkVerifyOutput};
+use crate::engine::backend::{DsparkProposal, DsparkStepper, DsparkVerifyOutput, SpecFrontier};
 use crate::engine::params::ChatParams;
 use crate::sampling;
 use crate::stream::{Stream, StreamContext};
 
 use super::assistant::AssistantSharedKv;
 use super::dspark::sample_index_from_probs;
-use super::layer_cache::{Gemma4VerifyRollback, commit_after_verify, snapshot_before_verify};
+use super::layer_cache::{
+    Gemma4VerifyRollback, active_cache_frontier, commit_after_verify, snapshot_before_verify,
+};
 use super::model::{
     AssistantKvSources, GEMMA4_PREFILL_STEP_SIZE, Gemma4Inner, assistant_verify_forward,
     compute_ple, eval_gemma4_caches, forward_body, lm_head_logits,
@@ -315,6 +317,17 @@ impl DsparkStepper for Gemma4AssistantStepper<'_> {
         // decode eval pattern: token only, never the logits).
         MxArray::async_eval_arrays(&[token]);
     }
+
+    fn frontier(&self) -> Option<SpecFrontier> {
+        // Pure-attention target the Q-only draft reads through KV sharing:
+        // the frontier is the common offset every active target cache sits
+        // at ([`active_cache_frontier`]); the draft owns no cache of its own.
+        let caches = self.inner.caches.as_ref()?;
+        Some(SpecFrontier {
+            attn_tokens: active_cache_frontier(caches, &self.shared_slots)?,
+            recurrent_tokens: None,
+        })
+    }
 }
 
 impl Gemma4Inner {
@@ -322,11 +335,9 @@ impl Gemma4Inner {
     /// byte-identical to the AR path, plus the LAST prompt token's
     /// post-final-norm hidden.
     ///
-    /// Mirrors `dspark_prefill_with_tap` MINUS all tap/fuse/context work
-    /// (same upfront embedding/PLE, same 512-token chunking, same eval
-    /// cadence and `clear_cache`, same last-token split) — the last token
-    /// runs `forward_body` with the hidden kept, then the `lm_head_logits`
-    /// tail, which composes to exactly `forward_inner`.
+    /// The last token runs `forward_body` with the hidden kept, then the
+    /// `lm_head_logits` tail, which composes to exactly `forward_inner` —
+    /// that split is what keeps the target compute byte-identical to AR.
     ///
     /// Returns the sampling-ready last-token logits `[1, vocab]` plus the
     /// turn's [`AssistantTurnState`].
@@ -376,7 +387,7 @@ impl Gemma4Inner {
                     // Cooperative-cancel checkpoint (H1b) at every chunk
                     // boundary after the first chunk (a one-chunk prefill is
                     // the single-shot case and stays uncancellable). The Err
-                    // rides `draft_chat_turn`'s `draft_fail_closed` arm.
+                    // rides `flat_draft_chat_turn`'s `draft_fail_closed` arm.
                     if offset > 0
                         && inner
                             .turn_cancel
@@ -405,7 +416,6 @@ impl Gemma4Inner {
                         inner.ple.as_ref(),
                         chunk_ple.as_ref(),
                         &inner.config,
-                        None,
                     )?;
                     // Eval cadence mirrors `prefill_body_gemma4`: full
                     // chunks eval+clear between iterations; the remainder
@@ -438,7 +448,6 @@ impl Gemma4Inner {
                 inner.ple.as_ref(),
                 None,
                 &inner.config,
-                None,
             )?;
             let logits = lm_head_logits(
                 &hidden,
@@ -474,7 +483,7 @@ mod tests {
     use crate::models::gemma4::assistant::AssistantDraftModel;
     use crate::models::gemma4::dspark::DsparkContextCache;
     use crate::models::gemma4::dspark_decode::tests::{
-        CancelAfterSink, run_tiny_draft_turn, tiny_assistant_config,
+        CancelAfterSink, run_tiny_flat_draft_turn, tiny_assistant_config,
         tiny_inner_with_assistant_draft, tiny_inner_with_draft, tiny_qwen_tokenizer,
         tiny_target_config, tiny_target_config_with_window, tiny_turn_config,
     };
@@ -768,7 +777,7 @@ mod tests {
     // ── fail-closed error path (whole-turn core) ───────────────────────
 
     /// FAIL-CLOSED regression on the ASSISTANT variant (the port of the
-    /// DSpark `dspark_turn_error_fails_closed_then_cold_turn_recovers`
+    /// DSpark `dspark_paged_turn_error_fails_closed_then_cold_turn_recovers`
     /// test): a REAL (unmocked) stepper error AFTER prefill has advanced
     /// the target caches must drop the entire warm session, and the very
     /// next turn must succeed via the cold path.
@@ -791,8 +800,9 @@ mod tests {
 
         // Turn 1: unset depth resolves to ASSISTANT_DEFAULT_DEPTH (3) →
         // 1+3 verify rows over a 2-token window → hard error mid-turn.
-        let err = run_tiny_draft_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 8))
-            .expect_err("a depth-3 verify block must violate the window-2 rollback invariant");
+        let err =
+            run_tiny_flat_draft_turn(&mut inner, &tokenizer, &tokens, &tiny_turn_config(None, 8))
+                .expect_err("a depth-3 verify block must violate the window-2 rollback invariant");
         assert!(
             err.reason.contains("sliding window") && err.reason.contains("verify block"),
             "expected the snapshot_before_verify window guard, got: {}",
@@ -820,7 +830,7 @@ mod tests {
 
         // Turn 2: depth 1 → verify blocks of <= 2 rows fit the window; the
         // turn must run cold end-to-end and land fully consistent.
-        let res = run_tiny_draft_turn(
+        let res = run_tiny_flat_draft_turn(
             &mut inner,
             &tokenizer,
             &tokens,
@@ -858,7 +868,7 @@ mod tests {
 
     // ── streaming cancellation (whole-turn) ────────────────────────────
 
-    /// WHOLE-TURN streaming cancellation through `draft_chat_turn` on the
+    /// WHOLE-TURN streaming cancellation through `flat_draft_chat_turn` on the
     /// ASSISTANT variant (mechanical port of the DSpark
     /// `dspark_streaming_cancel_whole_turn_state_consistent` test): a
     /// cancel raised from the chunk sink must terminate the stream promptly
@@ -916,7 +926,7 @@ mod tests {
             },
         };
         let out = inner
-            .draft_chat_turn(&mut args)
+            .flat_draft_chat_turn(&mut args)
             .expect("streaming cancelled turn must complete cleanly");
         assert!(
             matches!(out, TurnOutput::Streamed),
@@ -971,7 +981,7 @@ mod tests {
 
         // The next turn runs normally (fresh prompt: the longer saved
         // history is a prefix-miss, so it takes the cold path).
-        let res = run_tiny_draft_turn(
+        let res = run_tiny_flat_draft_turn(
             &mut inner,
             &tokenizer,
             &tokens,

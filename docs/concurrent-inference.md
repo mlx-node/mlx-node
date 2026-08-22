@@ -371,13 +371,16 @@ above as a cooled median-of-three 4-bit result.
   rather than wrong: the chunk scan pads the final chunk of each forward
   (the `pad_size` step in `models/nemotron_h/mamba2.rs`) and carries the recurrent state
   across, so a mid-chunk boundary changes the reduction order, not the
-  semantics. MTP-requested turns stay exclusive (the engine's `enable_mtp`
-  barrier), but "exclusive" is not the same as "unspeculated": on a paged
-  model a **synchronous** MTP turn re-routes to the FLAT speculative core
-  (`run_paged_turn`'s re-route branch, `models/nemotron_h/model.rs`), not to paged AR.
-  Only a **streaming** MTP turn falls back to paged AR, because the flat core
-  has no streaming arm (`mtp_flat_routing_required`,
-  `models/nemotron_h/model.rs`). Symbols, not line numbers: this file moves
+  semantics. A **synchronous** MTP turn stays exclusive and speculates: the
+  plan resolves it to the FLAT speculative core (`TurnPlan::resolve`,
+  `engine/plan.rs`), because the family declares
+  `supports_paged_attention: false` and a flat-only decoder takes the flat
+  lane WITH its target. A **streaming** MTP turn is a different shape: the
+  flat core has no streaming arm (`supports_streaming: false`), so the plan
+  resolves it to plain paged AR and `chat_requires_barrier` leaves it on the
+  scheduled lane. The barrier gate and the planner read one answer
+  (`SpeculativePlan::admits_streaming`); neither family code nor the
+  scheduler holds a second opinion. Symbols, not line numbers: this file moves
   every week. That barrier is exactly why the family does NOT auto-enable
   MTP: `mtpAutoEnabled()` returns false unless `MLX_NEMOTRON_MTP_DEFAULT=1`,
   so the scheduled lane is what a default session gets. The old throughput

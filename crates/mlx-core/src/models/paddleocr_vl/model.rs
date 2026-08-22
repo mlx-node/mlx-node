@@ -344,6 +344,7 @@ impl VLModelInner {
             None,
             MultimodalContentOrder::ImagesThenText,
             None,
+            false,
         )?;
         let token_ids = expand_paddle_image_tokens(
             &template_tokens,
@@ -882,6 +883,7 @@ impl VLModelInner {
                 None,
                 MultimodalContentOrder::ImagesThenText,
                 None,
+                false,
             )?;
             let token_ids = expand_paddle_image_tokens(
                 &template_tokens,

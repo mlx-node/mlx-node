@@ -25,6 +25,8 @@ pub(crate) mod plan;
 pub(crate) mod recurrent_state;
 pub(crate) mod scheduler;
 pub(crate) mod session;
+pub(crate) mod spec_owner;
+pub(crate) mod spec_paged;
 pub mod types;
 pub(crate) mod vision;
 

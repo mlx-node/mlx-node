@@ -908,14 +908,13 @@ async fn session_start_accepts_images_for_vlm() {
 // on the MTP decode path, matching the AR `decode_loop!` semantics.
 // ---------------------------------------------------------------------
 //
-// The MTP decode macro (`decode_loop_mtp!` in `mtp_decode.rs`) used to
-// UNCONDITIONALLY push the prefill-seed token before its loop's length
-// check, so `maxNewTokens == 0` emitted ONE token where AR's
-// `for step in 0..max` emits ZERO. A NEGATIVE budget additionally wrapped
-// through `as usize` to an effectively unbounded cap, so only EOS /
-// repetition / cancellation could ever stop generation. The fix clamps
-// the budget (`($max).max(0) as usize`) once and guards the initial emit
-// on it, so MTP now matches AR: 0 new tokens for a nonpositive budget.
+// The MTP turn loop used to UNCONDITIONALLY push the prefill-seed token
+// before its length check, so `maxNewTokens == 0` emitted ONE token where
+// AR's `for step in 0..max` emits ZERO. A NEGATIVE budget additionally
+// wrapped through `as usize` to an effectively unbounded cap, so only EOS /
+// repetition / cancellation could ever stop generation. The fix clamps the
+// budget (`max.max(0) as usize`) once and guards the initial emit on it, so
+// MTP now matches AR: 0 new tokens for a nonpositive budget.
 //
 // This test exercises BOTH the MTP-enabled config (the regression) and
 // the AR baseline (the parity target).
@@ -924,8 +923,8 @@ async fn session_start_accepts_images_for_vlm() {
 // `enable_mtp = true` but the loaded checkpoint has NO MTP head, the
 // engine's gate (`enable_mtp && has_mtp_weights()`) silently falls back
 // to the AR `decode_loop!`. In that case the "MTP" assertions below would
-// actually re-test the AR path and pass WITHOUT ever entering
-// `decode_loop_mtp!` — a false positive. To prevent that, we first probe
+// actually re-test the AR path and pass WITHOUT ever entering the MTP turn
+// loop — a false positive. To prevent that, we first probe
 // the load-time `has_mtp_weights()` signal AND run a small positive-budget
 // MTP generation, confirming via the performance stat
 // (`mtp_mean_accepted_tokens`) that the MTP decode path genuinely ran. If
@@ -934,15 +933,15 @@ async fn session_start_accepts_images_for_vlm() {
 // passed.
 //
 // COVERAGE HONESTY: with an MTP-capable checkpoint this directly catches
-// the 1-vs-0 budget regression in `decode_loop_mtp!`. NOT covered here:
+// the 1-vs-0 budget regression in the MTP turn loop. NOT covered here:
 // (1) the deterministic pre-cancel-flag sub-case (the non-streaming
 //     `chat_session_start` harness can't pre-set a `CancelHandle` before
 //     loop entry — see the note further down; the `max_as_usize == 0`
 //     short-circuit is placed as the loop's first statement, so the
 //     pre-cancelled path is covered by reasoning + statement placement,
 //     not a runtime pre-set); and
-// (2) the MoE call-site (`decode_loop_mtp!` is also expanded for the MoE
-//     model, exercised only by a separate MoE checkpoint).
+// (2) the MoE call-site (`run_mtp_turn` also drives the MoE stepper,
+//     exercised only by a separate MoE checkpoint).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "needs MLX_TEST_MODEL_PATH pointing to a real Qwen3.5 Dense checkpoint"]
 async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
@@ -1014,7 +1013,7 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
     // tokens are generated so MTP acceptance is NOT observable; therefore we
     // run a SMALL POSITIVE-budget MTP generation and require the runtime
     // performance stat `mtp_mean_accepted_tokens` to be present — proof the
-    // `decode_loop_mtp!` path executed at least one cycle.
+    // MTP turn loop executed at least one cycle.
     if !model.has_mtp_weights() {
         eprintln!(
             "skipping MTP assertions: checkpoint at {} has no MTP head \
@@ -1210,7 +1209,7 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
         .is_some();
     if !mtp_ran {
         eprintln!(
-            "skipping: MTP head present but decode_loop_mtp! did not run \
+            "skipping: MTP head present but the MTP turn loop did not run \
              (mtp_mean_accepted_tokens absent)"
         );
         return;

@@ -46,6 +46,17 @@ fn bytes_starts_with(src: &str, pos: usize, needle: &str) -> bool {
 
 const CHANNEL_OPEN: &str = "<|channel>";
 const CHANNEL_CLOSE: &str = "<channel|>";
+
+/// The tag that closes a Gemma4 reasoning block, both in the bytes the model
+/// generates and in the `'<|channel>thought\n' + thinking + '\n<channel|>'`
+/// the checkpoint template re-renders from `reasoning_content`.
+///
+/// The session continuation verifier normalizes template-owned whitespace
+/// around exactly this tag; `</think>` never appears in a Gemma4 render, so a
+/// wrong answer here silently ends every reasoning session.
+pub(crate) const fn reasoning_close_tag() -> &'static str {
+    CHANNEL_CLOSE
+}
 const TOOL_CALL_OPEN: &str = "<|tool_call>";
 const TOOL_CALL_CLOSE: &str = "<tool_call|>";
 const TURN_OPEN: &str = "<|turn>";
@@ -1175,6 +1186,33 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The session continuation verifier keys its whitespace normalization on
+    /// [`reasoning_close_tag`], so that tag has to be the same boundary the
+    /// parser splits reasoning from content on. Drive both over one committed
+    /// generation rather than comparing constants: the model writes
+    /// `…Paris.<channel|>Paris` where the template re-renders
+    /// `…Paris.\n<channel|>Paris`, and only a tag that lands on that seam can
+    /// absorb the difference.
+    #[test]
+    fn reasoning_close_tag_is_the_parser_boundary() {
+        const COMMITTED: &str = "<|channel>thought\nThe capital is Paris.<channel|>Paris";
+        let parsed = parse_gemma4_output(COMMITTED);
+        assert_eq!(parsed.thinking.as_deref(), Some("The capital is Paris."));
+        assert_eq!(parsed.text, "Paris");
+
+        let (reasoning_side, content_side) = COMMITTED
+            .split_once(reasoning_close_tag())
+            .expect("the committed generation closes its channel with the declared tag");
+        assert!(
+            reasoning_side.ends_with(parsed.thinking.as_deref().expect("thinking parsed")),
+            "the declared tag must close the span the parser reported as reasoning",
+        );
+        assert_eq!(
+            content_side, parsed.text,
+            "the declared tag must open the span the parser reported as content",
+        );
+    }
 
     #[test]
     fn parse_plain_text_no_markers() {

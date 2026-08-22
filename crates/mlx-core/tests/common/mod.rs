@@ -1,27 +1,21 @@
-//! Shared harness for the synthetic MoE MTP integration tests
-//! (`qwen3_5_moe_mtp_synthetic_v1.rs` / `qwen3_5_moe_mtp_synthetic_v2.rs`).
+//! Shared harness for the synthetic MoE MTP integration test
+//! (`qwen3_5_moe_mtp_synthetic.rs`).
 //!
-//! Those are two SEPARATE test binaries on purpose: the MoE stepper reads
-//! `MLX_QWEN35_MOE_MTP_COMMITTED_HISTORY` exactly once per process (via
-//! `OnceLock`), so each binary pins one flag state — v1 leaves the flag
-//! unset (cycle-history default), v2 sets it before any model work
-//! (committed-history).
+//! It builds a TINY random-init MoE checkpoint that ships a real MTP head,
+//! reloads it, and decodes the same prompt with MTP off (plain AR reference)
+//! and on. The fixture pins `use_block_paged_cache: false`, so this is the
+//! always-on route through `MoeMtpStepper`'s FLAT mode — the PAGED mode needs
+//! real PagedAttention head geometry and is gated on a real checkpoint by
+//! `qwen3_5_moe_paged_mtp_parity.rs`.
 //!
-//! The harness builds a TINY random-init MoE checkpoint that ships a real
-//! MTP head, reloads it, and decodes the same prompt with MTP off (plain AR
-//! reference) and on. Every local real MoE-MTP checkpoint is a VLM export
-//! whose config forces the block-paged KV backend — where the eager MoE MTP
-//! stepper is unreachable — so this synthetic checkpoint is the only
-//! always-on end-to-end route through `MoeMtpStepper`.
-//!
-//! What each test asserts — all four are deterministic on random weights:
+//! What the test asserts — all four are deterministic on random weights:
 //! 1. `has_mtp_weights()` is true after reload (gates the random-save
 //!    `mtp.*` emission and the `mtp_num_hidden_layers` config round-trip).
 //! 2. The plain AR baseline decodes exactly `max_new_tokens` tokens (EOS is
 //!    unreachable by construction — see the prompt comment below).
-//! 3. The MTP decode completes crash-free across every draft/verify (and,
-//!    under v2, trim/commit) cycle with the same full token budget,
-//!    `mtp_cycles > 1`, and a populated `mtp_mean_accepted_tokens`.
+//! 3. The MTP decode completes crash-free across every draft/verify cycle
+//!    with the same full token budget, `mtp_cycles > 1`, and a populated
+//!    `mtp_mean_accepted_tokens`.
 //! 4. Within-mode determinism: a second MTP decode of the same prompt on the
 //!    same loaded model is byte-identical to the first. This catches
 //!    allocator-dependent garbage (e.g. an out-of-bounds gather); the repeat
@@ -31,17 +25,13 @@
 //! host: on random weights `mtp.text == ar.text` flips on ~10-15% of fresh
 //! checkpoint draws — greedy argmax near-ties (random logits over a 250k
 //! vocab have tiny top-2 gaps, and MTP's batched verify kernels round
-//! differently from AR's single-token decode kernels, well above 1 ULP).
-//! Exoneration of the v2 port: the flag-OFF v1 path (byte-for-byte the
-//! pre-existing cycle-history code) fails at the SAME rate as v2, depth-1
-//! and depth-4 MTP outputs are byte-identical to each other, and the flips
-//! are late single tokens after dozens of byte-clean cycles — so the assert
-//! measures kernel rounding, not port correctness (verify re-derives every
-//! emitted token from the MAIN model at T=0, so the drafter's cache policy
-//! cannot change which tokens are emitted). The MTP==AR byte-identity gate
-//! lives in the real-weights deep test
-//! (`qwen3_5_moe_mtp_committed_history.rs`), where bf16 real-distribution
-//! logits keep top-2 gaps far above kernel rounding.
+//! differently from AR's single-token decode kernels, well above 1 ULP) —
+//! and the flips are late single tokens after dozens of byte-clean cycles.
+//! Verify re-derives every emitted token from the MAIN model at T=0, so the
+//! drafter cannot change which tokens are emitted; the assert would measure
+//! kernel rounding, not stepper correctness. The MTP==AR byte-identity gate
+//! lives in the real-weights parity test, where bf16 real-distribution logits
+//! keep top-2 gaps far above kernel rounding.
 
 use std::path::{Path, PathBuf};
 
@@ -182,9 +172,8 @@ fn user_message(content: &str) -> ChatMessage {
 /// deterministic assertions documented in the module header: the MTP head
 /// engages after reload, the AR baseline and the MTP decode both complete
 /// the full token budget, the MTP run reports cycles/acceptance metrics,
-/// and a repeat MTP decode is byte-identical to the first. `mode_label`
-/// only labels messages (v1 vs v2 — the flag itself is process state owned
-/// by the calling test binary).
+/// and a repeat MTP decode is byte-identical to the first. `mode_label` only
+/// labels messages.
 ///
 /// Graceful skips (eprintln + return) ONLY for environment gaps: non-macOS
 /// (no Metal) or no local Qwen tokenizer. Everything else is a hard failure —

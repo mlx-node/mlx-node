@@ -524,6 +524,39 @@ impl Qwen3Tokenizer {
         )
     }
 
+    /// Teach Gemma4 templates to honor the `preserve_thinking` context flag on
+    /// assistant turns that carry no tool call.
+    ///
+    /// Gemma4 gates historical reasoning on `loop.index0 >
+    /// ns_turn.last_user_idx` and grants `preserve_thinking` only to tool-call
+    /// turns, so re-rendering a completed transcript deletes the
+    /// `<|channel>thought` block of every plain assistant answer. The live KV
+    /// still holds those tokens, so the next turn's render is not an extension
+    /// of the committed prefix and a warm session can never continue — it cold-
+    /// replays the whole conversation instead. See
+    /// [`RenderContextOptions::preserve_thinking`] for who pays that and who
+    /// opts in.
+    ///
+    /// The rewrite is deliberately narrow:
+    /// - only the two published Gemma4 gate spellings are extended, and each
+    ///   is widened by a leading `preserve_thinking or`, so the flag being
+    ///   false reproduces upstream exactly — byte for byte;
+    /// - the parentheses are load-bearing on the second spelling, whose gate
+    ///   sits inside an `{%- if thinking_text and … -%}` conjunction;
+    /// - both spellings are folded over rather than returned on first match,
+    ///   so a template that ever carried both gates keeps neither un-widened.
+    fn enable_gemma4_preserve_thinking(template: &str) -> String {
+        const GEMMA4_GATES: [&str; 2] = [
+            "(loop.index0 > ns_turn.last_user_idx) or (preserve_thinking and message.get('tool_calls'))",
+            "loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')",
+        ];
+        GEMMA4_GATES
+            .iter()
+            .fold(template.to_string(), |rewritten, gate| {
+                rewritten.replace(gate, &format!("(preserve_thinking or ({gate}))"))
+            })
+    }
+
     /// Parenthesize a call keyword argument whose value is a bare conditional
     /// expression, so a stock minijinja `Environment` can parse the template.
     ///
@@ -2292,6 +2325,7 @@ impl Qwen3Tokenizer {
         // they never alter the rendered output (LFM2.5 et al. use them only to
         // mark assistant-generated token spans for training masks).
         let template_str = Self::enable_legacy_preserve_thinking(template_str);
+        let template_str = Self::enable_gemma4_preserve_thinking(&template_str);
         let template_str = Self::neutralize_generation_tags(&template_str);
         // Parenthesize any call kwarg whose value is a bare ternary — minijinja
         // parses that value with `parse_expr_noif` and hard-fails at PARSE time,
@@ -2358,22 +2392,24 @@ impl Qwen3Tokenizer {
         // Setting to false adds empty <think></think> tags which DISABLES thinking.
         // bos_token/eos_token: used by Gemma4 and other templates ({{ bos_token }}).
         //
-        // `preserve_thinking=true` keeps `reasoning_content` rendered on
-        // EVERY prior assistant turn, not just on the most recent one after
-        // the last user query. Qwen3.5/3.6's template gate is
-        //   `preserve_thinking or loop.index0 > ns.last_query_index`
-        // which means when a NEW user message arrives mid-session,
-        // `last_query_index` jumps forward and all earlier assistant turns
-        // silently drop their `<think>…</think>` blocks on re-render. That
-        // flips the token prefix at the first reasoning boundary, so the
-        // server's tier-2 KV cache misses entirely and the next turn cold-
-        // prefills the full conversation. Pinning `preserve_thinking=true`
-        // keeps the rendered prompt byte-stable turn over turn so
-        // `verify_cache_prefix_direct` can reuse the prior cached prefix.
+        // `preserve_thinking` decides whether prior assistant turns keep their
+        // reasoning block on re-render; it is opt-in and only a stateful session
+        // turns it on. See [`RenderContextOptions::preserve_thinking`] for what
+        // each answer costs.
         //
-        // Templates that don't read `preserve_thinking` (e.g. Qwen3
-        // non-thinking, LFM2, Gemma4) ignore the extra key — minijinja
-        // treats unknown variables in `context!` as a no-op on access.
+        // It stays an EXPLICIT key rather than moving into the merge layer for
+        // two reasons: the gates read it unguarded (`preserve_thinking or …`),
+        // so it must always be defined; and `context!` resolves an explicit key
+        // ahead of every `..` layer, so no future merge source can quietly
+        // shadow the caller's answer.
+        //
+        // Templates that don't read `preserve_thinking` (Qwen3 non-thinking,
+        // LFM2.5-1.2B-Thinking, Muse-Glimmer) ignore the extra key — minijinja
+        // treats unknown variables in `context!` as a no-op on access. Gemma4
+        // does read it, via `Self::enable_gemma4_preserve_thinking`.
+        // LFM2.5-1.2B-Thinking ignoring it does NOT mean it renders as shipped:
+        // it reads the sibling `keep_past_thinking` key, which is pinned ON
+        // below regardless of `render_ctx`. See that key's comment.
         //
         // `..build_render_context(...)` merges the caller's optional globals in as
         // a fallback layer (precedence is left to right, so nothing above can be
@@ -2410,10 +2446,27 @@ impl Qwen3Tokenizer {
         );
         ctx_map.insert(
             "preserve_thinking".to_string(),
-            minijinja::Value::from(true),
+            minijinja::Value::from(render_ctx.preserve_thinking),
         );
-        // LFM2.5-1.2B-Thinking predates the shared
-        // `preserve_thinking` name and uses this equivalent flag.
+        // LFM2.5-1.2B-Thinking predates the shared `preserve_thinking`
+        // name and spells the same idea as `keep_past_thinking`.
+        //
+        // KNOWN DIVERGENCE, deliberately NOT wired to `render_ctx`. This key is
+        // pinned ON for every caller, one-shot renders included, so an
+        // lfm2-style thinking template keeps every prior assistant thought
+        // where upstream drops it: the shipped template defaults the flag to
+        // false (`lfm2.5-1.2b-thinking/chat_template.jinja:2`) and gates the
+        // `</think>`-split on it (:36), and transformers, mlx-lm and vLLM all
+        // render it as shipped. The byte-identical-to-upstream property claimed
+        // for `preserve_thinking` at
+        // [`RenderContextOptions::preserve_thinking`] therefore does NOT hold
+        // for this family — nor for Nemotron-H, whose `truncate_history_thinking`
+        // below is pinned the same way for the same reason.
+        //
+        // Pinned since `4fef3b33` (PR #109). Making it opt-in the same way
+        // changes what every LFM2.5-thinking prompt renders, for a family with
+        // its own cache-reuse story, so it is tracked as its own product
+        // decision rather than settled here.
         ctx_map.insert(
             "keep_past_thinking".to_string(),
             minijinja::Value::from(true),
@@ -2628,12 +2681,19 @@ impl Qwen3Tokenizer {
     /// Apply chat template synchronously (for internal use by chat())
     ///
     /// This is a synchronous version of apply_chat_template for use in blocking tasks.
+    ///
+    /// `preserve_thinking` is stated by every caller rather than defaulted, so
+    /// the answer a render used is readable at its call site: the continuation
+    /// verifier compares several renders of one conversation and they only line
+    /// up when all of them answered the same way. See
+    /// [`RenderContextOptions::preserve_thinking`].
     pub(crate) fn apply_chat_template_sync(
         &self,
         messages: &[ChatMessage],
         add_generation_prompt: Option<bool>,
         tools: Option<&[ToolDefinition]>,
         enable_thinking: Option<bool>,
+        preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
         self.apply_chat_template_sync_with_content_order(
             messages,
@@ -2642,6 +2702,7 @@ impl Qwen3Tokenizer {
             enable_thinking,
             MultimodalContentOrder::TextThenMedia,
             None,
+            preserve_thinking,
         )
     }
 
@@ -2660,6 +2721,7 @@ impl Qwen3Tokenizer {
         enable_thinking: Option<bool>,
         content_order: MultimodalContentOrder,
         existing_image_placeholder: Option<&str>,
+        preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
         let formatted = self.render_chat_template_sync_with_content_order(
             messages,
@@ -2668,7 +2730,10 @@ impl Qwen3Tokenizer {
             enable_thinking,
             content_order,
             existing_image_placeholder,
-            RenderContextOptions::default(),
+            RenderContextOptions {
+                preserve_thinking,
+                ..RenderContextOptions::default()
+            },
         )?;
 
         // Encode the formatted text (don't add extra special tokens)
@@ -2687,6 +2752,7 @@ impl Qwen3Tokenizer {
         add_generation_prompt: Option<bool>,
         tools: Option<&[ToolDefinition]>,
         enable_thinking: Option<bool>,
+        preserve_thinking: bool,
     ) -> Result<String> {
         self.render_chat_template_sync_with_content_order(
             messages,
@@ -2695,7 +2761,10 @@ impl Qwen3Tokenizer {
             enable_thinking,
             MultimodalContentOrder::TextThenMedia,
             None,
-            RenderContextOptions::default(),
+            RenderContextOptions {
+                preserve_thinking,
+                ..RenderContextOptions::default()
+            },
         )
     }
 
@@ -2849,9 +2918,9 @@ pub enum MultimodalContentOrder {
 
 /// Caller-supplied template globals that no template can derive on its own.
 ///
-/// Both keys are `Option` and an unset one is left **out** of the render context
-/// entirely rather than passed as an empty string, because the templates that
-/// read them branch on definedness.
+/// The two `Option` keys are left **out** of the render context entirely when
+/// unset, rather than passed as an empty string, because the templates that
+/// read them branch on definedness. `preserve_thinking` is always defined.
 ///
 /// # Neither value is neutralised, because neither is caller text
 ///
@@ -2887,6 +2956,55 @@ pub(crate) struct RenderContextOptions {
     /// substitutes `high` when this is undefined or empty, so leaving it `None` is
     /// not the same as sending `high` textually — it just lets the template decide.
     pub reasoning_strength: Option<String>,
+    /// Keep the `reasoning_content` of assistant turns that precede the last
+    /// user message. **Default `false`: this is opt-in, and only a stateful
+    /// session opts in.**
+    ///
+    /// # What `true` costs
+    ///
+    /// It overrides the checkpoint's own gate. Gemma4 scopes
+    /// `preserve_thinking` to assistant turns that carry a `tool_calls` field;
+    /// the Qwen3.6 and LFM2.5 gates spell it as `preserve_thinking or
+    /// loop.index0 > <index of the last user turn>`. Setting it therefore does
+    /// not back-fill a flag the template was waiting for — it widens a scope the
+    /// template author chose.
+    /// A Gemma4 multi-turn prompt then carries EVERY prior chain of thought and
+    /// grows without a cap: measured over three turns on `gemma-4-12b-it`,
+    /// 0 → 2 rendered thought blocks and 66 → 104 prompt tokens.
+    ///
+    /// # Why a stateful session sets it anyway
+    ///
+    /// The live KV cache physically holds the tokens of the thought the model
+    /// just generated. A re-render that deletes them stops being an extension of
+    /// the committed prefix, so `verify_cache_prefix` misses and every
+    /// continuation cold-replays the whole conversation
+    /// (`cached_tokens = 0`). A [`crate::engine::session`] turn owns both the
+    /// transcript and that cache, so it opts in and keeps the prefix reusable.
+    ///
+    /// # Why every other caller leaves it `false`
+    ///
+    /// transformers 5.5.0, mlx-lm, mlx-vlm and vLLM all render these templates
+    /// AS SHIPPED and none of them sets the flag, so they drop prior thoughts.
+    /// A one-shot render (`/v1/chat/completions`, the NAPI
+    /// `applyChatTemplate`, a GRPO rollout) has no cache to protect and must
+    /// stay byte-identical to those four. Both mlx-lm and vLLM do let a
+    /// *client* pass the flag, and vLLM additionally ships a vendored Gemma4
+    /// template already spelling the widened gate
+    /// (`examples/tool_chat_template_gemma4.jinja:236`).
+    ///
+    /// # The scope of that last claim
+    ///
+    /// It is about THIS flag. It is not a crate-wide invariant, because the
+    /// render context also pins a sibling key ON unconditionally:
+    /// `keep_past_thinking => true`, the pre-`preserve_thinking` spelling that
+    /// lfm2-style thinking templates read. Those templates default it to
+    /// `false` and gate the `</think>` split on it
+    /// (`lfm2.5-1.2b-thinking/chat_template.jinja:2` and `:36`), so on that
+    /// family a one-shot render keeps prior thoughts and is NOT byte-identical
+    /// to upstream. Known and tracked divergence, pinned since `4fef3b33`
+    /// (PR #109); see the comment on that key in
+    /// [`Qwen3Tokenizer::render_chat_template_jinja2_with_content_order`].
+    pub preserve_thinking: bool,
 }
 
 /// Python `json.dumps` default separators: `", "` between items and `": "` after
@@ -3336,7 +3454,7 @@ mod tests {
         }];
 
         let error = tokenizer
-            .apply_chat_template_sync(&messages, Some(true), None, None)
+            .apply_chat_template_sync(&messages, Some(true), None, None, false)
             .unwrap_err();
         assert!(
             error.to_string().contains(MISSING_CHAT_TEMPLATE_ERROR),
@@ -3949,12 +4067,18 @@ mod tests {
             },
         ];
 
-        let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+        let session_render = render_as_session_turn(template, &messages, true, None)
+            .expect("legacy Qwen template should render");
+        assert_eq!(session_render, "<think>private chain</think>answer");
+
+        // The same opt-in the Gemma4 gate gets: a one-shot render keeps the
+        // upstream scope, which drops a thought that precedes the last user
+        // message.
+        let default_render = Qwen3Tokenizer::render_chat_template_jinja2(
             template, &messages, None, true, None, "<bos>", "<eos>",
         )
         .expect("legacy Qwen template should render");
-
-        assert_eq!(rendered, "<think>private chain</think>answer");
+        assert_eq!(default_render, "answer");
     }
 
     #[test]
@@ -4071,6 +4195,10 @@ mod tests {
             RenderContextOptions {
                 current_date: Some(PROBE_DATE.to_string()),
                 reasoning_strength: None,
+                // The one-shot default. The Nemotron gate this test pins reads
+                // `truncate_history_thinking`, not `preserve_thinking`, so the
+                // pin has to hold for a caller that opts into nothing.
+                preserve_thinking: false,
             },
         )
         .expect("Nemotron template should render");
@@ -4689,6 +4817,7 @@ mod tests {
             RenderContextOptions {
                 current_date: Some(PROBE_DATE.to_string()),
                 reasoning_strength: None,
+                preserve_thinking: false,
             },
         )
     }
@@ -5723,6 +5852,349 @@ mod tests {
         );
     }
 
+    /// The two Gemma4 historical-reasoning gates, copied verbatim from
+    /// `.cache/models/gemma-4-{12b,26b-a4b,e2b}-it/chat_template.jinja:240` and
+    /// `.cache/models/gemma-4-{31b-it,12b-it-qat-q4_0-mlx,26b-a4b-nvfp4-mlx}
+    /// /chat_template.jinja:239`. Kept as source here rather than behind a
+    /// checkpoint, so the property is gated in CI too;
+    /// [`gemma4_real_template_preserves_prior_turn_thinking`] proves the copy
+    /// still matches a shipped template.
+    const GEMMA4_THINKING_GATES: [&str; 2] = [
+        "(loop.index0 > ns_turn.last_user_idx) or (preserve_thinking and message.get('tool_calls'))",
+        "loop.index0 > ns_turn.last_user_idx and message.get('tool_calls')",
+    ];
+
+    /// Render the way a stateful [`crate::engine::session`] turn renders —
+    /// `preserve_thinking` on, read from the session's own constant so a test
+    /// cannot drift from the value production uses.
+    ///
+    /// Every other render in this file goes through the default path, which is
+    /// what a one-shot caller gets.
+    fn render_as_session_turn(
+        template: &str,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        enable_thinking: Option<bool>,
+    ) -> std::result::Result<String, String> {
+        Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+            template,
+            messages,
+            None,
+            add_generation_prompt,
+            enable_thinking,
+            "<bos>",
+            "<eos>",
+            MultimodalContentOrder::TextThenMedia,
+            None,
+            RenderContextOptions {
+                preserve_thinking: crate::engine::session::SESSION_PRESERVE_THINKING,
+                ..RenderContextOptions::default()
+            },
+        )
+    }
+
+    /// Minimal stand-in for the Gemma4 reasoning channel: the same
+    /// `last_user_idx` scan, the same `{gate}` conjunction shape, and the same
+    /// emitted block, with everything else stripped.
+    fn gemma4_thinking_channel_template(gate: &str) -> String {
+        format!(
+            "{{%- set ns_turn = namespace(last_user_idx=0) -%}}\
+             {{%- for i in range(messages | length) -%}}\
+             {{%- if messages[i]['role'] == 'user' -%}}\
+             {{%- set ns_turn.last_user_idx = i -%}}{{%- endif -%}}{{%- endfor -%}}\
+             {{%- set preserve_thinking = preserve_thinking | default(false) -%}}\
+             {{%- for message in messages -%}}\
+             {{%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}}\
+             {{%- if thinking_text and {gate} -%}}\
+             {{{{- '<|channel>thought\\n' + thinking_text + '\\n<channel|>' -}}}}{{%- endif -%}}\
+             {{{{- message['content'] -}}}}{{%- endfor -%}}"
+        )
+    }
+
+    /// Three-message transcript whose middle assistant turn carries a chain of
+    /// thought: the shape a warm continuation re-renders.
+    fn gemma4_thinking_history() -> [ChatMessage; 3] {
+        let mut assistant = user_msg("Paris", 0);
+        assistant.role = "assistant".to_string();
+        assistant.reasoning_content = Some("The capital of France is Paris.".to_string());
+        [
+            user_msg("What is the capital of France?", 0),
+            assistant,
+            user_msg("And of Italy?", 0),
+        ]
+    }
+
+    /// A Gemma4 session commits the `<|channel>thought` block it generated into
+    /// the KV cache, so a re-render that drops it on the next user turn is not
+    /// an extension of the committed prefix and the warm session cold-replays
+    /// (`cached_tokens = 0` on every continuation). Both shipped gate spellings
+    /// must therefore honor the `preserve_thinking` flag a session render sets,
+    /// exactly as the legacy Qwen gate does.
+    #[test]
+    fn gemma4_history_gate_honors_preserve_thinking() {
+        let history = gemma4_thinking_history();
+
+        for gate in GEMMA4_THINKING_GATES {
+            let template = gemma4_thinking_channel_template(gate);
+            let rendered = render_as_session_turn(&template, &history, false, Some(true))
+                .unwrap_or_else(|e| panic!("render failed for gate {gate}: {e}"));
+            assert_eq!(
+                rendered,
+                "What is the capital of France?\
+                 <|channel>thought\nThe capital of France is Paris.\n<channel|>Paris\
+                 And of Italy?",
+                "gate {gate} dropped the committed reasoning block",
+            );
+
+            // Both spellings sit inside a `thinking_text and …` conjunction, so
+            // the widened disjunct has to stay parenthesized: a message with
+            // tool_calls and no reasoning would otherwise satisfy the gate and
+            // render `'<|channel>thought\n' + none`.
+            let mut calling = user_msg("", 0);
+            calling.role = "assistant".to_string();
+            calling.tool_calls = Some(vec![tool_call(Some("call_1"), "do_thing")]);
+            let no_reasoning = [user_msg("Do it.", 0), calling];
+            let rendered = render_as_session_turn(&template, &no_reasoning, false, Some(true))
+                .unwrap_or_else(|e| panic!("render failed for gate {gate}: {e}"));
+            assert_eq!(
+                rendered, "Do it.",
+                "gate {gate} rendered a channel block for a message with no reasoning",
+            );
+        }
+    }
+
+    /// `preserve_thinking` is OPT-IN, and only a stateful session opts in.
+    ///
+    /// A one-shot render — `/v1/chat/completions`, the NAPI
+    /// `applyChatTemplate`, a GRPO rollout — owns no KV cache, so it has
+    /// nothing to protect and must stay byte-identical to transformers,
+    /// mlx-lm, mlx-vlm and vLLM, all of which render these templates as shipped
+    /// and drop a prior assistant turn's thought. Driven through
+    /// [`Qwen3Tokenizer::render_chat_template_jinja2`], the entry point the
+    /// NAPI one-shot render actually uses, so this pins the DEFAULT and not
+    /// merely the struct field.
+    #[test]
+    fn gemma4_history_reasoning_is_off_in_a_default_render() {
+        let history = gemma4_thinking_history();
+
+        for gate in GEMMA4_THINKING_GATES {
+            let template = gemma4_thinking_channel_template(gate);
+            let default_render = Qwen3Tokenizer::render_chat_template_jinja2(
+                &template,
+                &history,
+                None,
+                false,
+                Some(true),
+                "<bos>",
+                "<eos>",
+            )
+            .unwrap_or_else(|e| panic!("default render failed for gate {gate}: {e}"));
+            assert_eq!(
+                default_render, "What is the capital of France?ParisAnd of Italy?",
+                "gate {gate}: a default render must drop the prior turn's thought",
+            );
+
+            let session_render = render_as_session_turn(&template, &history, false, Some(true))
+                .unwrap_or_else(|e| panic!("session render failed for gate {gate}: {e}"));
+            assert!(
+                session_render
+                    .contains("<|channel>thought\nThe capital of France is Paris.\n<channel|>"),
+                "gate {gate}: a session render must keep the prior turn's thought:\n\
+                 {session_render}",
+            );
+        }
+    }
+
+    /// The rewrite must be invisible to every template that is not Gemma4, and
+    /// must widen the gate by exactly one `preserve_thinking or` disjunct — the
+    /// flag being false has to reproduce the shipped condition, and the
+    /// parentheses have to survive the `{%- if thinking_text and … -%}`
+    /// conjunction the second spelling sits inside.
+    #[test]
+    fn gemma4_preserve_thinking_rewrite_is_narrow() {
+        for untouched in [
+            "{%- if thinking_text and loop.index0 > ns.last_query_index -%}x{%- endif -%}",
+            "{%- set thinking_gate = preserve_thinking -%}",
+            "",
+        ] {
+            assert_eq!(
+                Qwen3Tokenizer::enable_gemma4_preserve_thinking(untouched),
+                untouched,
+                "non-Gemma4 template was rewritten",
+            );
+        }
+        for gate in GEMMA4_THINKING_GATES {
+            assert_eq!(
+                Qwen3Tokenizer::enable_gemma4_preserve_thinking(gate),
+                format!("(preserve_thinking or ({gate}))"),
+            );
+        }
+
+        // A template carrying both spellings must come back with both widened.
+        // Stopping at the first match would leave the second gate on the
+        // upstream scope while the first honors the flag, so one assistant turn
+        // in the render would keep its thought and another would drop it.
+        let both = format!(
+            "{{%- if thinking_text and {} -%}}a{{%- endif -%}}\
+             {{%- if thinking_text and {} -%}}b{{%- endif -%}}",
+            GEMMA4_THINKING_GATES[0], GEMMA4_THINKING_GATES[1],
+        );
+        let rewritten = Qwen3Tokenizer::enable_gemma4_preserve_thinking(&both);
+        for gate in GEMMA4_THINKING_GATES {
+            assert!(
+                rewritten.contains(&format!("(preserve_thinking or ({gate}))")),
+                "gate {gate} left un-widened in a template carrying both:\n{rewritten}",
+            );
+        }
+    }
+
+    /// The two gate rewrites are ORDER-DEPENDENT, and neither function says so
+    /// on its own.
+    ///
+    /// [`Qwen3Tokenizer::enable_legacy_preserve_thinking`] bails out and returns
+    /// the template untouched the moment it contains the substring
+    /// `preserve_thinking`, and
+    /// [`Qwen3Tokenizer::enable_gemma4_preserve_thinking`] INSERTS that exact
+    /// substring when it widens the gate spelling that does not already carry
+    /// it. Legacy therefore has to run first. Swapping the two calls in
+    /// [`Qwen3Tokenizer::render_chat_template_jinja2_with_content_order`]
+    /// silently disables the legacy rewrite — no compile error, and nothing
+    /// else in this file notices, because no shipped checkpoint carries both
+    /// gate families at once.
+    ///
+    /// Driven through the full render entry point rather than by calling the
+    /// two helpers by hand: the ordering is the thing under test, and a test
+    /// that picks its own order cannot see the production one.
+    #[test]
+    fn legacy_gate_rewrite_runs_before_the_gemma4_one() {
+        const LEGACY_GATE: &str = "loop.index0 > ns.last_query_index";
+        // Spelling 1 already contains `preserve_thinking`, so it would suppress
+        // the legacy rewrite from the raw source text alone and prove nothing
+        // about the call order. The hazard lives on spelling 2.
+        let gemma4_gate = GEMMA4_THINKING_GATES[1];
+        assert!(
+            !gemma4_gate.contains("preserve_thinking"),
+            "this fixture only bites on the gate spelling that lacks the flag",
+        );
+
+        // `L` marks the legacy gate firing, `G` the Gemma4 one. Two messages,
+        // `[user, assistant]`, so the last-user index is 0 and message 0 fails
+        // BOTH gates on their upstream scope — it can only emit if the widened
+        // `preserve_thinking or` disjunct is present.
+        let template = format!(
+            "{{%- set ns = namespace(last_query_index=0) -%}}\
+             {{%- set ns_turn = namespace(last_user_idx=0) -%}}\
+             {{%- for i in range(messages | length) -%}}\
+             {{%- if messages[i]['role'] == 'user' -%}}\
+             {{%- set ns.last_query_index = i -%}}\
+             {{%- set ns_turn.last_user_idx = i -%}}\
+             {{%- endif -%}}{{%- endfor -%}}\
+             {{%- for message in messages -%}}\
+             {{%- if {LEGACY_GATE} -%}}L{{%- endif -%}}\
+             {{%- if {gemma4_gate} -%}}G{{%- endif -%}}\
+             {{%- endfor -%}}"
+        );
+        assert!(
+            !template.contains("preserve_thinking"),
+            "the fixture must start out unaware of the flag:\n{template}",
+        );
+
+        let mut assistant = user_msg("", 0);
+        assistant.role = "assistant".to_string();
+        let messages = [user_msg("What is the capital of France?", 0), assistant];
+
+        let render = |preserve_thinking: bool| {
+            Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+                &template,
+                &messages,
+                None,
+                false,
+                None,
+                "<bos>",
+                "<eos>",
+                MultimodalContentOrder::TextThenMedia,
+                None,
+                RenderContextOptions {
+                    preserve_thinking,
+                    ..RenderContextOptions::default()
+                },
+            )
+            .unwrap_or_else(|e| {
+                panic!("render failed (preserve_thinking={preserve_thinking}): {e}")
+            })
+        };
+
+        // Flag ON: both gates must be widened, so every message emits both
+        // marks. Run the Gemma4 rewrite first and the legacy one is skipped,
+        // message 0 loses its `L`, and this reads `GLG`.
+        assert_eq!(
+            render(true),
+            "LGLG",
+            "a gate was left un-widened — `enable_legacy_preserve_thinking` must \
+             run BEFORE `enable_gemma4_preserve_thinking`",
+        );
+
+        // Flag OFF: the widening is a pure disjunct, so both gates fall back to
+        // their upstream scope. This also proves the fixture is not emitting
+        // `L`/`G` unconditionally.
+        assert_eq!(
+            render(false),
+            "L",
+            "a widened gate changed behaviour with the flag off",
+        );
+    }
+
+    /// Guard the inline copies above against checkpoint drift, and prove the
+    /// property end to end on the real template. Opt in with
+    /// `MLX_TEST_GEMMA4_TEMPLATE_PATH=/path/to/gemma-4-*/chat_template.jinja`.
+    #[test]
+    #[ignore = "requires a local Gemma4 checkpoint; set MLX_TEST_GEMMA4_TEMPLATE_PATH to its chat_template.jinja"]
+    fn gemma4_real_template_preserves_prior_turn_thinking() {
+        let Ok(path) = std::env::var("MLX_TEST_GEMMA4_TEMPLATE_PATH") else {
+            panic!("set MLX_TEST_GEMMA4_TEMPLATE_PATH to a Gemma4 chat_template.jinja");
+        };
+        let tmpl = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path}: {e}"));
+        assert!(
+            GEMMA4_THINKING_GATES.iter().any(|gate| tmpl.contains(gate)),
+            "{path} spells its historical-reasoning gate in neither form this file pins",
+        );
+
+        let thinking_assistant = || {
+            let mut assistant = user_msg("Paris", 0);
+            assistant.role = "assistant".to_string();
+            assistant.reasoning_content = Some("The capital of France is Paris.".to_string());
+            assistant
+        };
+        let completed = [
+            user_msg("What is the capital of France?", 0),
+            thinking_assistant(),
+        ];
+        let with_follow_up = [
+            user_msg("What is the capital of France?", 0),
+            thinking_assistant(),
+            user_msg("And of Italy?", 0),
+        ];
+        let render = |messages: &[ChatMessage], generation_prompt: bool| {
+            render_as_session_turn(&tmpl, messages, generation_prompt, Some(true))
+                .unwrap_or_else(|e| panic!("Gemma4 thinking-history render failed: {e}"))
+        };
+
+        let completed_render = render(&completed, false);
+        let full_render = render(&with_follow_up, true);
+        assert!(
+            completed_render
+                .contains("<|channel>thought\nThe capital of France is Paris.\n<channel|>Paris"),
+            "committed turn did not re-render its reasoning block:\n{completed_render}",
+        );
+        // The reuse contract the session engine checks: the next turn's render
+        // extends the completed one, so the committed KV prefix stays valid.
+        assert!(
+            full_render.starts_with(&completed_render),
+            "continuation render is not an extension of the committed render\n\
+             completed:\n{completed_render}\nfull:\n{full_render}",
+        );
+    }
+
     #[test]
     fn function_call_arg_order_survives_jinja_round_trip() {
         // Args string exactly as pi-mono would echo it back — note
@@ -6137,7 +6609,7 @@ mod tests {
     /// that is exactly how a dead sanitizer shipped before.
     fn render_user_through(tokenizer: &Qwen3Tokenizer, content: &str) -> String {
         tokenizer
-            .render_chat_template_sync(&[user_msg(content, 0)], Some(false), None, None)
+            .render_chat_template_sync(&[user_msg(content, 0)], Some(false), None, None, false)
             .expect("echo template renders")
     }
 
@@ -6309,7 +6781,13 @@ mod tests {
         );
         // Through the checkpoint's OWN template, not an echo stub.
         let rendered = tokenizer
-            .render_chat_template_sync(&[user_msg(HOSTILE_USER_CONTENT, 0)], Some(true), None, None)
+            .render_chat_template_sync(
+                &[user_msg(HOSTILE_USER_CONTENT, 0)],
+                Some(true),
+                None,
+                None,
+                false,
+            )
             .expect("the checkpoint's own chat template must render");
         // The template's own structural markers are of course present, so count
         // instead: exactly one user turn, one generation prompt, and no forged turn.
@@ -6442,6 +6920,7 @@ mod tests {
                     Some(true),
                     None,
                     None,
+                    false,
                 )
                 .expect("the checkpoint's own chat template must render")
         };
@@ -6583,6 +7062,7 @@ mod tests {
                     Some(true),
                     None,
                     None,
+                    false,
                 )
                 .expect("the checkpoint's own chat template must render")
         };
@@ -6633,6 +7113,7 @@ mod tests {
                     Some(true),
                     None,
                     None,
+                    false,
                 )
                 .expect("the checkpoint's own chat template must render")
         };
@@ -6646,6 +7127,7 @@ mod tests {
                 Some(true),
                 None,
                 None,
+                false,
             )
             .expect_err("a marker inside tool_call_id must fail the render")
             .to_string();
@@ -6721,6 +7203,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect_err("colliding ids must fail the render, not be silently merged")
             .to_string();
@@ -6777,7 +7260,7 @@ mod tests {
         // And it still renders, with both calls intact.
         let (_dir, tokenizer) = muse_field_fixture("muse-id-duplicate");
         let rendered = tokenizer
-            .render_chat_template_sync(&messages, Some(false), None, None)
+            .render_chat_template_sync(&messages, Some(false), None, None, false)
             .expect("a duplicate id carries no marker, so nothing may refuse it");
         assert!(
             rendered.contains("[tool=18C, clear][tcid=call_1]"),
@@ -6811,7 +7294,7 @@ mod tests {
             ),
         ] {
             let error = tokenizer
-                .render_chat_template_sync(&messages, Some(false), None, None)
+                .render_chat_template_sync(&messages, Some(false), None, None, false)
                 .expect_err(label)
                 .to_string();
             assert!(
@@ -6830,7 +7313,7 @@ mod tests {
             vec![tool_result_answering("call_9")],
         ] {
             tokenizer
-                .render_chat_template_sync(&messages, Some(false), None, None)
+                .render_chat_template_sync(&messages, Some(false), None, None, false)
                 .expect("a clean id must render");
         }
     }
@@ -6864,6 +7347,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect_err("a manufactured key collision must fail the render")
             .to_string();
@@ -6891,6 +7375,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect_err("the collision must be refused whichever key carries the marker")
             .to_string();
@@ -6915,6 +7400,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect_err("a nested key collision must fail the render")
             .to_string();
@@ -6935,7 +7421,13 @@ mod tests {
                 Some(r#"{"city<|eot|>": {"type": "string"}, "city ": {"type": "string"}}"#.into());
         }
         let error = tokenizer
-            .render_chat_template_sync(&[user_msg("hi", 0)], Some(false), Some(&[tool]), None)
+            .render_chat_template_sync(
+                &[user_msg("hi", 0)],
+                Some(false),
+                Some(&[tool]),
+                None,
+                false,
+            )
             .expect_err("a schema key collision must fail the render")
             .to_string();
         assert!(
@@ -6959,6 +7451,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect("a key with no collision must still render");
         assert!(
@@ -7038,6 +7531,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect("a non-Muse family must not be refused for a marker in an id or a key");
         for expected in [
@@ -7067,6 +7561,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_with(field, key)]),
                     None,
+                    false,
                 )
                 .expect("the checkpoint's own chat template must render")
         };
@@ -7118,6 +7613,7 @@ mod tests {
                 Some(true),
                 None,
                 None,
+                false,
             )
             .expect_err("a marker inside a tool name must fail the render, not be rewritten");
         let error = error.to_string();
@@ -7135,6 +7631,7 @@ mod tests {
                 Some(true),
                 None,
                 None,
+                false,
             )
             .expect("a clean tool name must still render");
     }
@@ -7146,7 +7643,13 @@ mod tests {
         let mut tool = tool_with(BENIGN_FIELD, BENIGN_KEY);
         tool.function.name = "wx<|message|>.forecast".to_string();
         let error = tokenizer
-            .render_chat_template_sync(&[user_msg("weather?", 0)], Some(true), Some(&[tool]), None)
+            .render_chat_template_sync(
+                &[user_msg("weather?", 0)],
+                Some(true),
+                Some(&[tool]),
+                None,
+                false,
+            )
             .expect_err("a marker inside a tool-definition name must fail the render");
         let error = error.to_string();
         assert!(
@@ -7162,6 +7665,7 @@ mod tests {
                 Some(true),
                 Some(&[tool_with(BENIGN_FIELD, BENIGN_KEY)]),
                 None,
+                false,
             )
             .expect("a clean tool name must still render");
         assert!(
@@ -7258,6 +7762,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_named(name)]),
                     None,
+                    false,
                 )
                 .map(|rendered| format!("RENDERED: {rendered}"))
                 .expect_err(&format!("tool name {name:?} must fail the render"))
@@ -7286,6 +7791,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_named(name)]),
                     None,
+                    false,
                 )
                 .unwrap_or_else(|e| panic!("tool name {name:?} is legal but was refused: {e}"));
             assert!(
@@ -7337,6 +7843,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_named(name)]),
                     None,
+                    false,
                 )
                 .unwrap_or_else(|e| {
                     panic!(
@@ -7409,6 +7916,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_named(name)]),
                     None,
+                    false,
                 )
                 .map(|rendered| format!("RENDERED: {rendered}"))
                 .expect_err(&format!("tool name {name:?} must fail the real render"))
@@ -7425,6 +7933,7 @@ mod tests {
                     Some(true),
                     Some(&[tool_named(name)]),
                     None,
+                    false,
                 )
                 .unwrap_or_else(|e| panic!("tool name {name:?} is legal but was refused: {e}"));
             assert!(
@@ -7528,6 +8037,7 @@ mod tests {
                         Some(true),
                         Some(&[tool_named(name)]),
                         None,
+                        false,
                     )
                     .unwrap_or_else(|e| panic!("{family} refused the legal name {name:?}: {e}"));
                 // Both families JSON-encode it, so the escaped spelling is what to
@@ -7616,7 +8126,7 @@ mod tests {
             // hostile one would abort before the other ten sites could be measured.
             let (messages, tools) = every_hostile_field(&field, &field, "call_1");
             let rendered = tokenizer
-                .render_chat_template_sync(&messages, Some(false), Some(&tools), None)
+                .render_chat_template_sync(&messages, Some(false), Some(&tools), None, false)
                 .expect("the field template must render");
             assert_eq!(
                 encoded_control_ids(&tokenizer, &rendered),
@@ -7676,6 +8186,7 @@ mod tests {
                 Some(false),
                 None,
                 None,
+                false,
             )
             .expect("the field template must render");
         assert_eq!(
@@ -7717,7 +8228,7 @@ mod tests {
         tools[0].function.name = format!("wx{HOSTILE_KEY}.forecast");
 
         let rendered = tokenizer
-            .render_chat_template_sync(&named, Some(false), Some(&tools), None)
+            .render_chat_template_sync(&named, Some(false), Some(&tools), None, false)
             .expect("a non-Muse family's prompt must still render, markers and all");
 
         // Each site, named, so a failure says which field was touched. `content` is
@@ -7852,8 +8363,18 @@ mod tests {
     }
 
     /// Blast-radius gate for detection, mirroring the ternary transform's: load every
-    /// installed tokenizer and assert only Muse-Glimmer's vocabulary enables the
-    /// sanitizer. Opt in with `MLX_TEST_MODEL_CACHE_DIR`.
+    /// installed tokenizer and assert the set whose vocabulary enables the sanitizer
+    /// is EXACTLY the set of Muse-Glimmer checkpoints. Opt in with
+    /// `MLX_TEST_MODEL_CACHE_DIR`.
+    ///
+    /// The oracle is the checkpoint's directory name, which is filesystem identity
+    /// and not derived from the code under test, and the comparison is a
+    /// biconditional over every loadable tokenizer in the cache, so all three ways
+    /// of breaking detection go red here: firing for one extra family, firing for
+    /// every family, and firing for none. It is stated as that property rather than
+    /// as a literal list of cache directories because converting another
+    /// Muse-Glimmer quant is not a regression, and a gate that goes red for one
+    /// teaches the next reader to relax it.
     #[test]
     #[ignore = "requires a local model cache; set MLX_TEST_MODEL_CACHE_DIR and run with --ignored"]
     fn only_muse_glimmer_vocabularies_enable_the_marker_sanitizer() {
@@ -7862,8 +8383,16 @@ mod tests {
         };
         let entries = std::fs::read_dir(&root).unwrap_or_else(|e| panic!("read_dir {root}: {e}"));
 
+        /// Directory-name oracle for "this checkpoint IS a Muse-Glimmer", used
+        /// only to name the expected partition — detection itself reads the
+        /// vocabulary, so the two sides of the comparison stay independent.
+        fn is_muse_glimmer(dir_name: &str) -> bool {
+            dir_name.to_ascii_lowercase().contains("muse-glimmer")
+        }
+
         let mut seen = 0usize;
         let mut enabled: Vec<String> = Vec::new();
+        let mut muse_glimmer: Vec<String> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path().join("tokenizer.json");
             if !path.exists() {
@@ -7873,19 +8402,38 @@ mod tests {
                 continue;
             };
             seen += 1;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_muse_glimmer(&name) {
+                muse_glimmer.push(name.clone());
+            }
             if !Qwen3Tokenizer::detect_control_markers(&tokenizer).is_empty() {
-                enabled.push(entry.file_name().to_string_lossy().into_owned());
+                enabled.push(name);
             }
         }
+        enabled.sort();
+        muse_glimmer.sort();
 
         assert!(
             seen >= 2,
             "only {seen} tokenizer(s) loaded from {root} — this gate needs the real cache",
         );
+        // Non-vacuity, both directions. Without a Muse-Glimmer checkpoint the
+        // comparison below would pass on a detector that never fires; without a
+        // non-Muse-Glimmer one it would pass on a detector that always fires.
+        assert!(
+            !muse_glimmer.is_empty(),
+            "no Muse-Glimmer checkpoint in {root} — this gate cannot prove the \
+             sanitizer ever turns ON",
+        );
+        assert!(
+            muse_glimmer.len() < seen,
+            "all {seen} checkpoints in {root} are Muse-Glimmer — this gate cannot \
+             prove the sanitizer ever stays OFF",
+        );
         assert_eq!(
-            enabled,
-            vec!["muse-glimmer-30b".to_string()],
-            "exactly one installed checkpoint may enable the marker sanitizer",
+            enabled, muse_glimmer,
+            "the marker sanitizer must be enabled for every Muse-Glimmer \
+             checkpoint and for no other ({seen} tokenizers loaded from {root})",
         );
         eprintln!("loaded {seen} tokenizers, sanitizer enabled for {enabled:?}");
     }
@@ -7956,6 +8504,7 @@ mod tests {
         let ctx = super::Qwen3Tokenizer::build_render_context(super::RenderContextOptions {
             current_date: Some("2026-08-10".to_string()),
             reasoning_strength: Some("low".to_string()),
+            preserve_thinking: false,
         });
         assert_eq!(
             env.get_template("t").unwrap().render(&ctx).unwrap(),
@@ -7977,6 +8526,7 @@ mod tests {
         let ctx = super::Qwen3Tokenizer::build_render_context(super::RenderContextOptions {
             current_date: None,
             reasoning_strength: None,
+            preserve_thinking: false,
         });
         assert_eq!(
             env.get_template("t").unwrap().render(&ctx).unwrap(),
@@ -8016,6 +8566,7 @@ mod tests {
             super::RenderContextOptions {
                 current_date: Some("2026-08-10".to_string()),
                 reasoning_strength: Some("low".to_string()),
+                preserve_thinking: false,
             },
         )
         .expect("template renders");

@@ -457,6 +457,40 @@ pub(crate) fn commit_after_verify(
     Ok(())
 }
 
+/// The single frontier every ACTIVE cache currently sits at — the same
+/// per-cache offset totals [`commit_after_verify`] validates on every
+/// commit, hoisted into an accessor for the family steppers'
+/// `DsparkStepper::frontier`. Shared slots (KV-shared layers, never written
+/// by a forward — see [`snapshot_before_verify`]) are skipped; entries past
+/// the end of `shared_slots` count as active, so a family with no shared
+/// layers may pass `&[]`. Returns `None` when there is no active cache or
+/// the active offsets disagree with each other — a frontier violation the
+/// caller reports as "unknown" rather than picking a side.
+///
+/// Reachable only through `DsparkStepper::frontier`, which nothing calls —
+/// the `SpecPagedCache` facade's `frontier` is the cache-side, `seq_id`-keyed
+/// method and never routes through that hook — so the lib target sees this
+/// whole chain as dead and only this file's unit test exercises it.
+#[allow(dead_code)]
+pub(crate) fn active_cache_frontier(
+    caches: &[Gemma4LayerCache],
+    shared_slots: &[bool],
+) -> Option<u64> {
+    let mut frontier: Option<i32> = None;
+    for (idx, cache) in caches.iter().enumerate() {
+        if shared_slots.get(idx).copied().unwrap_or(false) {
+            continue;
+        }
+        let offset = cache.get_offset();
+        match frontier {
+            None => frontier = Some(offset),
+            Some(seen) if seen != offset => return None,
+            Some(_) => {}
+        }
+    }
+    frontier.map(|offset| offset.max(0) as u64)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,5 +1043,30 @@ mod tests {
         assert!(!global.is_sliding());
         assert!(global.snapshot_sliding().unwrap().is_none());
         assert!(global.restore_sliding_snapshot(&snapshot).is_err());
+    }
+
+    /// `active_cache_frontier` reports the one offset every ACTIVE cache
+    /// shares, skips shared slots (and treats a short mask as all-active),
+    /// and refuses disagreement instead of picking a side.
+    #[test]
+    fn active_cache_frontier_reads_the_common_active_offset() {
+        let mut caches = vec![
+            Gemma4LayerCache::new_global(),
+            Gemma4LayerCache::new_sliding(8),
+            Gemma4LayerCache::new_global(),
+        ];
+        // Shared slot (index 2) is never written; active caches see 3 tokens.
+        let shared = [false, false, true];
+        apply_appends(&mut caches[0], &[vec![1.0, 2.0, 3.0]]);
+        apply_appends(&mut caches[1], &[vec![1.0, 2.0, 3.0]]);
+        assert_eq!(active_cache_frontier(&caches, &shared), Some(3));
+        // An empty mask counts every entry as active — the unwritten shared
+        // slot (offset 0) then disagrees with the written caches.
+        assert_eq!(active_cache_frontier(&caches, &[]), None);
+        // No caches ⇒ no frontier.
+        assert_eq!(active_cache_frontier(&[], &[]), None);
+        // One active cache ahead of the others is a violation, not a value.
+        apply_appends(&mut caches[0], &[vec![4.0]]);
+        assert_eq!(active_cache_frontier(&caches, &shared), None);
     }
 }

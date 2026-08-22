@@ -68,6 +68,19 @@ impl NemotronHLayerCache {
         }
     }
 
+    /// This layer's live attention offset, or `None` for a Mamba/MoE layer.
+    ///
+    /// Ungated on purpose, unlike [`Self::as_kv_cache`]: `MtpStepper::frontier`
+    /// has to name the attention frontier in a RELEASE build too, and it takes
+    /// `&self`. Handing back the scalar rather than the cache keeps the
+    /// gating intent — no production caller gets a read-only `KVCache` view.
+    pub(crate) fn attention_offset(&self) -> Option<i32> {
+        match self {
+            NemotronHLayerCache::Attention(c) => Some(c.get_offset()),
+            NemotronHLayerCache::Mamba(_) | NemotronHLayerCache::MoE => None,
+        }
+    }
+
     /// Snapshot this cache (clones refcounted handles - no GPU copy).
     pub fn snapshot(&self) -> NemotronHLayerSnapshot {
         match self {

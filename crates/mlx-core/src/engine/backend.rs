@@ -25,9 +25,12 @@ use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::models::qwen3_5::mtp_decode::{MtpCommitAnchor, MtpVerifyOutput};
 use crate::nn::Embedding;
 use crate::profiling::PerformanceMetrics;
-use crate::sampling::SamplingConfig;
 use crate::stream::Stream;
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+
+/// The reasoning-close tag used by every family whose template writes
+/// `</think>`; [`ChatBackend::REASONING_CLOSE_TAG`] overrides it per family.
+pub(crate) const REASONING_CLOSE_TAG_DEFAULT: &str = "</think>";
 
 /// Per-step decode operations for one generation turn.
 ///
@@ -737,17 +740,26 @@ pub(crate) trait ChatBackend {
     /// (`apply_chat_template_sync` with `add_generation_prompt = true`,
     /// the request tools, and `resolve_enable_thinking`). Missing templates
     /// fail closed; model wire formats are never reconstructed in Rust.
+    ///
+    /// `preserve_thinking` is the turn's answer to
+    /// [`crate::tokenizer::RenderContextOptions::preserve_thinking`] and the
+    /// caller owns it. An implementation must forward the value it was given:
+    /// the continuation verifier re-renders the same conversation several ways
+    /// and compares the results, so a render that answers differently from its
+    /// siblings silently ends the session's prefix reuse.
     fn render_prompt(
         &self,
         tok: &Qwen3Tokenizer,
         messages: &[ChatMessage],
         config: &ChatConfig,
+        preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
         tok.apply_chat_template_sync(
             messages,
             Some(true),
             config.tools.as_deref(),
             resolve_enable_thinking(config),
+            preserve_thinking,
         )
     }
 
@@ -1120,6 +1132,19 @@ pub(crate) trait ChatBackend {
         false
     }
 
+    /// The tag a checkpoint template writes to close a rendered reasoning
+    /// block, and the model writes to end a generated one.
+    ///
+    /// The continuation verifier normalizes template-owned whitespace around
+    /// exactly this tag, so a family whose reasoning channel closes with
+    /// anything else must say so here or every reasoning turn ends its live
+    /// session. Gemma4 closes with `<channel|>`.
+    ///
+    /// An associated const rather than a method: the answer depends only on
+    /// the family, and a test can then read a family's answer
+    /// (`<Family as ChatBackend>::REASONING_CLOSE_TAG`) without a loaded model.
+    const REASONING_CLOSE_TAG: &'static str = REASONING_CLOSE_TAG_DEFAULT;
+
     /// Convert a live cached-history token stream to the logical form emitted
     /// by the checkpoint chat template for comparison only.
     ///
@@ -1141,8 +1166,10 @@ pub(crate) trait ChatBackend {
     // contract documented above.
 
     /// Execute a turn whose eligible attention layers use the paged adapter.
-    /// The plan may also select speculative decoding; dense Qwen3.5 handles
-    /// that supported composition inside this executor.
+    /// The plan may also select speculative decoding; every family whose
+    /// [`crate::engine::plan::SpeculativePlan`] declares
+    /// `supports_paged_attention` — Qwen3.5 dense and MoE native MTP, gemma4
+    /// DSpark — handles that composition inside this executor.
     fn run_paged_turn(&mut self, _args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         Err(Error::from_reason(format!(
             "{} execution plan selected paged attention but the backend has no paged executor",
@@ -1185,6 +1212,50 @@ pub(crate) trait ChatBackend {
 /// [`crate::engine::decode::run_decode_loop`] — the GAT stepper owning
 /// `&mut self` dissolves the `&mut paged_adapter` + `&layers`
 /// double-borrow that forced the per-family inlined paged loops.
+/// Everything a family's paged SPECULATIVE decode needs from the generic
+/// paged turn driver, handed over in place of the autoregressive decode loop.
+///
+/// The driver builds these from the same locals it would have fed
+/// [`crate::engine::decode::run_decode_loop`], so a speculative decode and an
+/// autoregressive one land on the SAME turn prologue (prime → prefill → first
+/// sample) and the SAME epilogue (reconcile → finalize → save). That is what
+/// keeps L-EPILOGUE (I11) structural rather than a convention each family
+/// re-derives.
+/// The refusal both [`PagedBackend`] speculative hooks default to.
+///
+/// Reached only when a family's [`ChatBackend::execution_plan`] published
+/// `supports_paged_attention: true` for its speculative plan while the family
+/// implements no paged speculative core, so it fails the turn instead of
+/// degrading: a silent decline would ship the flag as a permanent, invisible
+/// autoregressive fallback that no test could see.
+pub(crate) fn paged_speculative_core_missing<T>() -> Result<T> {
+    Err(Error::from_reason(
+        "paged speculative decode: this family's speculative plan publishes \
+         supports_paged_attention but it implements no paged speculative core",
+    ))
+}
+
+pub(crate) struct PagedSpeculativeArgs<'a, 'b, 'c> {
+    /// First generated token, already sampled from the prefill logits.
+    pub y: MxArray,
+    /// Prompt length, so the family can compare its own post-decode frontier
+    /// against the drop-last history the epilogue is about to persist.
+    pub prompt_len: usize,
+    pub params: &'a ChatParams,
+    pub reasoning_tracker: &'a mut crate::engine::penalties::ReasoningTracker,
+    pub profiler: &'a mut DecodeProfiler,
+    pub max_new_tokens: i32,
+    pub eos_id: u32,
+    pub generated_tokens: &'a mut Vec<u32>,
+    pub token_history: &'a mut Vec<u32>,
+    pub finish_reason: &'a mut String,
+    pub first_token_instant: &'a mut Option<std::time::Instant>,
+    pub report_perf: bool,
+    pub generation_stream: Stream,
+    pub cancel_flag: Option<&'a AtomicBool>,
+    pub streaming: Option<crate::engine::decode::StreamingCtx<'b, 'c>>,
+}
+
 pub(crate) trait PagedBackend: ChatBackend {
     /// Per-step paged decode stepper. Borrows `&mut self` for the whole
     /// decode loop (the analog of [`ChatBackend::Decode`]). Pure-eager
@@ -1247,6 +1318,39 @@ pub(crate) trait PagedBackend: ChatBackend {
     /// positions array; gemma4 adds a diagnostic step counter), then drives
     /// [`crate::engine::decode::run_decode_loop`].
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>>;
+
+    /// Whether this turn's paged SPECULATIVE decode is admitted, checked
+    /// while the autoregressive fallback is still available.
+    ///
+    /// Called once, after prefill and the first sample, ONLY when the resolved
+    /// plan selected a speculative decoder. The family reserves whatever
+    /// pre-cycle capacity its speculative lane needs here (I1: the lookahead
+    /// region), so exhaustion degrades to autoregressive decode with untouched
+    /// state instead of erroring mid-verify. `Ok(false)` runs the generic
+    /// autoregressive loop.
+    ///
+    /// The default is an ERROR, not a decline: this hook is reached only when
+    /// the family's own [`ChatBackend::execution_plan`] published
+    /// `supports_paged_attention: true` for its speculative plan, so inheriting
+    /// the default means the flag was flipped without a core. Failing loudly
+    /// keeps those two edits one change — a silent decline would ship as a
+    /// permanent, invisible autoregressive fallback.
+    fn admit_paged_speculative_decode(&mut self, _params: &ChatParams) -> Result<bool> {
+        paged_speculative_core_missing()
+    }
+
+    /// Run the whole paged speculative decode, in place of
+    /// [`crate::engine::decode::run_decode_loop`].
+    ///
+    /// Reached only when [`Self::admit_paged_speculative_decode`] returned
+    /// `true`, so the default is unreachable and refuses loudly rather than
+    /// silently emitting nothing.
+    fn run_paged_speculative_decode(
+        &mut self,
+        _args: PagedSpeculativeArgs<'_, '_, '_>,
+    ) -> Result<()> {
+        paged_speculative_core_missing()
+    }
 
     /// Post-turn adapter lifecycle, run by the engine AFTER the decode
     /// scope drops the stepper and BEFORE [`Self::save_paged_history`].
@@ -1424,21 +1528,24 @@ pub(crate) struct MtpTurnSetup<'a> {
     /// `prompt_hidden.shape(1) == prompt_hidden_ids.len()`. `Some` iff
     /// `prompt_hidden` is `Some`.
     pub prompt_hidden_ids: Option<&'a [u32]>,
-    /// Absolute committed-history position of `prompt_hidden_ids[0]`'s hidden
-    /// row. Zero for full committed history; non-zero for last-window prompt
-    /// seeding (which disables the v2 committed-history prompt seed).
-    pub prompt_hidden_position_base: usize,
     /// The first generated token (sampled from the prefill logits BEFORE the
     /// turn). Already materialized — the prompt seed appends it to the
     /// committed run `[prompt_ids[1..], y]`. == the eager block's
     /// `y.item_at_int32(0)` read.
     pub first_sampled_token: u32,
+    /// Speculative lookahead margin, in target-cache rows:
+    /// `engine::mtp_turn::turn_lookahead_rows` of the backend's
+    /// [`crate::engine::plan::SpeculativePlan`] (I1 — the plan property is
+    /// the single source; consumers never re-derive `depth + 1`). A paged
+    /// stepper reserves this many rows past the prompt cursor in
+    /// `begin_mtp_decode` so verify writes land in pre-reserved blocks. `0`
+    /// ⇒ the backend declares no speculative plan: no margin is defined and
+    /// nothing is reserved (flat steppers ignore the field entirely).
+    pub lookahead_rows: usize,
 }
 
 /// Sub-trait of [`ChatBackend`] for families whose MTP speculative-decode
-/// whole-turn flows through the engine-owned propose/verify loop instead
-/// of the former family-local `decode_loop_mtp!` macro + `MtpOps` closure
-/// bundle (now removed).
+/// whole turn flows through the engine-owned propose/verify loop.
 ///
 /// Split out of [`ChatBackend`] for the SAME reason as [`PagedBackend`]:
 /// the GAT (`type MtpDecode<'a>`) has no stable trait-level default, so
@@ -1448,13 +1555,10 @@ pub(crate) struct MtpTurnSetup<'a> {
 /// `run_mtp_turn(self, args)`; MTP-less families do not implement
 /// it.
 ///
-/// The engine-owned loop (`run_mtp_turn`) is the relocated
-/// `decode_loop_mtp!` outer body + `run_mtp_cycle_inner` (both now
-/// removed), calling the [`MtpStepper`] methods where those called `ops.*`. The stepper
-/// borrows `&mut self` for the whole turn (the analog of
+/// The engine-owned loop (`run_mtp_turn`) calls the [`MtpStepper`] methods.
+/// The stepper borrows `&mut self` for the whole turn (the analog of
 /// [`PagedBackend::PagedDecode`] / [`ChatBackend::Decode`]) and holds the
 /// per-cycle snapshot/tape/replay-error as its own fields.
-///
 pub(crate) trait MtpBackend: ChatBackend {
     /// Per-turn MTP propose/verify stepper. Borrows `&mut self` for the
     /// whole decode loop. The per-cycle GDN tape / linear-cache snapshot /
@@ -1480,22 +1584,36 @@ pub(crate) trait MtpBackend: ChatBackend {
     fn record_turn_mtp_acceptance(&mut self, _accepted: u64, _attempted: u64) {}
 }
 
-/// Per-turn MTP stepper the engine-owned propose/verify loop drives — the
-/// 11 closures of the former `MtpOps` bundle (now removed) as trait
-/// methods, plus the macro-level orchestration hooks the engine takes
-/// over (`profiler_relabel` / `embedding_weight` /
-/// `committed_history_active` / `take_replay_error` / `into_desynced`).
-/// The `== MtpOps::*` notes on each method below map it to its origin
-/// closure for historical reference.
+/// One named count per target-state kind a speculative stepper tracks —
+/// the I4 frontier. Counts are ABSOLUTE consumed-token totals (prompt
+/// included), so the two sides of a hybrid stack compare directly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SpecFrontier {
+    /// Tokens the attention K/V state has consumed — the paged adapter's
+    /// recorded rows, or a flat full-attention cache offset.
+    pub attn_tokens: u64,
+    /// Tokens the recurrent (GDN) state has consumed, when the stepper
+    /// tracks one. `None` for pure-attention families AND for a hybrid
+    /// stepper that cannot currently name the count (e.g. after a failed
+    /// tape replay, where the stashed error fail-closes the turn instead).
+    /// When `Some`, it must equal `attn_tokens` at every post-rollback
+    /// point — a disagreement is a one-sided rewind.
+    pub recurrent_tokens: Option<u64>,
+}
+
+/// Per-turn MTP stepper the engine-owned propose/verify loop drives:
+/// the forward/draft/verify/commit/rollback primitives plus the
+/// orchestration hooks the engine reads (`profiler_relabel` /
+/// `embedding` / `committed_history_active` / `take_replay_error` /
+/// `into_desynced`).
 ///
 /// The `&mut self` borrow model is strictly sequential: the engine calls
 /// exactly one method at a time, threading the lazy [`MxArray`] outputs of
 /// one call into the next. `eval_step` / `eval_step_with_chained_hidden`
 /// are `&self` (they only SCHEDULE async eval — no state mutation), every
 /// other forward/draft/verify/rollback/commit method is `&mut self`. The
-/// GDN tape + linear snapshot are private stepper fields (`Scratch`), so
-/// they never cross the trait — exactly as the former `run_mtp_cycle_inner`
-/// kept them inside the `MtpOps` closures' captured environment.
+/// GDN tape + linear snapshot are private stepper fields, so they never
+/// cross the trait.
 ///
 /// # Invariants the engine must preserve (each gated byte-identical)
 ///   * async_eval batching — every `async_eval` stays INSIDE a method;
@@ -1520,10 +1638,10 @@ pub(crate) trait MtpStepper {
     /// the chained-cycle commit anchor
     /// (`MtpCommitAnchor::SkipAlreadyCommittedAnchor` instead of
     /// `IncludeAnchor`) and the `chained_anchor` argument of
-    /// [`Self::begin_cycle`]. Both the dense and MoE eager steppers
-    /// report this whenever their flag-gated `use_committed` gate holds;
-    /// steppers with no committed-history support return `false`.
-    /// == `MtpOps::committed_history_active`.
+    /// [`Self::begin_cycle`]. The dense eager stepper reports this whenever
+    /// its prompt-seed gate holds; steppers with no committed-history support
+    /// return `false` — including the MoE stepper, which has no
+    /// hidden-emitting prefill to seed one from.
     fn committed_history_active(&self) -> bool;
 
     /// Whether this turn may reuse the previous verify hidden to skip the
@@ -1545,9 +1663,8 @@ pub(crate) trait MtpStepper {
     }
 
     /// Single main-path forward returning `(logits, hidden, needs_squeeze)`
-    /// — `hidden` is `[1, hidden_size]` bf16. == `MtpOps::forward_with_hidden`
-    /// (the `F` closure). Step A's forward + the per-accepted-draft replay
-    /// forwards both go through here.
+    /// — `hidden` is `[1, hidden_size]` bf16. Step A's forward + the
+    /// per-accepted-draft replay forwards both go through here.
     fn forward_with_hidden(
         &mut self,
         ids: &MxArray,
@@ -1555,12 +1672,12 @@ pub(crate) trait MtpStepper {
     ) -> Result<(MxArray, MxArray, bool)>;
 
     /// One MTP draft step returning `(h_next [1,1,hidden], draft_logits
-    /// [1,vocab])`. == `MtpOps::draft_step` (the `D` closure).
+    /// [1,vocab])`.
     fn draft_step(&mut self, prev_h: &MxArray, prev_emb: &MxArray) -> Result<(MxArray, MxArray)>;
 
     /// MTP verify step returning verify logits `[1, depth+1, vocab]` +
     /// hiddens `[1, depth+1, hidden]`. RECORDS the GDN tape (consumed by
-    /// [`Self::rollback`]). == `MtpOps::verify_step` (the `V` closure).
+    /// [`Self::rollback`]).
     fn verify_step(
         &mut self,
         ids: &MxArray,
@@ -1568,61 +1685,28 @@ pub(crate) trait MtpStepper {
         depth: usize,
     ) -> Result<MtpVerifyOutput>;
 
-    /// Greedy argmax-only verify fast path (T=0, penalties no-op,
-    /// no tracing). `None` = this stepper has no such fast path and the
-    /// engine falls back to [`Self::verify_step`]. == the
-    /// `MtpOps::verify_step_argmax_only` `Option<Box<dyn FnMut>>` field
-    /// (None on every eager path today).
-    fn verify_step_argmax_only(
-        &mut self,
-        _ids: &MxArray,
-        _embedding: &Embedding,
-        _depth: usize,
-    ) -> Option<Result<MtpVerifyOutput>> {
-        None
-    }
-
-    /// Native-sparse verify fast path. `None` = unavailable, fall back to
-    /// [`Self::verify_step`]. == the `MtpOps::verify_step_sparse`
-    /// `Option<Box<dyn FnMut>>` field (None on every eager path today).
-    fn verify_step_sparse(
-        &mut self,
-        _ids: &MxArray,
-        _embedding: &Embedding,
-        _depth: usize,
-        _cfg: &SamplingConfig,
-    ) -> Option<Result<MtpVerifyOutput>> {
-        None
-    }
-
     /// Snapshot the main path's K/V + GDN linear caches + decode offset
-    /// before verify. == `MtpOps::snapshot_main_linear` (the `S` closure).
-    /// Stores into the stepper's own scratch fields.
+    /// before verify. Stores into the stepper's own scratch fields.
     fn snapshot_main_linear(&mut self);
 
     /// Rewind the MTP draft state to the accepted prefix and REPLAY the
     /// GDN tape from the snapshot. Infallible at the call boundary (any
-    /// replay error is STASHED and surfaced by [`Self::take_replay_error`]
-    /// — see the `R` closure `MtpOps::rollback`, which is `FnMut(usize,
-    /// usize)` with no `Result`). `accepted_drafts` / `depth` match the
-    /// cycle's accept count and effective depth.
+    /// replay error is STASHED and surfaced by [`Self::take_replay_error`]).
+    /// `accepted_drafts` / `depth` match the cycle's accept count and
+    /// effective depth.
     fn rollback(&mut self, accepted_drafts: usize, depth: usize);
 
     /// On rejection: restore the linear caches + main offset to the
     /// snapshot point, then run ONE eager `forward_with_hidden` per
     /// accepted draft so the main linear state catches up. `accepted` is
-    /// the accepted-draft prefix (NOT the residual). ==
-    /// `MtpOps::restore_and_replay_main` (the `RR` closure).
+    /// the accepted-draft prefix (NOT the residual).
     fn restore_and_replay_main(&mut self, accepted: &[u32], embedding: &Embedding) -> Result<()>;
 
     /// Committed-history commit. Appends `K+2` exact committed K/V slots
     /// to the persistent MTP cache. The `anchor` selects the commit
     /// payload policy (engine-chosen [`MtpCommitAnchor`]); the model
-    /// consumes it. A no-op impl keeps the cycle-history policy (tests, or
-    /// dense/MoE steppers whose flag-gated `use_committed` gate is off).
-    /// == `MtpOps::commit_mtp` (the `CM` closure) — `(anchor,
-    /// prev_hidden [1,1,hidden], verify_hiddens [1,D+1,hidden],
-    /// committed_ids [K+2], k_accepted, embedding_weight)`.
+    /// consumes it. A no-op impl keeps the cycle-history policy (tests, the
+    /// MoE stepper, or the dense stepper on a turn with no prompt seed).
     fn commit_mtp(
         &mut self,
         anchor: MtpCommitAnchor,
@@ -1636,27 +1720,48 @@ pub(crate) trait MtpStepper {
     /// Re-anchor the MTP draft caches/offset to the main path's current
     /// position, once per outer iteration AFTER Step A. `chained_anchor`
     /// is `cycle_seed_was_chained && committed_history_active` — the same
-    /// arg the engine loop passes. == `MtpOps::begin_cycle` (the `B` closure).
+    /// arg the engine loop passes.
     fn begin_cycle(&mut self, chained_anchor: bool);
 
+    /// Reserve the speculative lookahead region for the cycle about to run,
+    /// measured past the stepper's CURRENT committed frontier. The engine
+    /// calls this once per cycle, right before the cycle's drafts/verify —
+    /// the turn-entry reservation in `begin_mtp_decode` only guarantees the
+    /// FIRST cycle's rows, because every committed token moves the frontier.
+    /// `Ok(true)` = the verify write is covered (or this stepper has no
+    /// reservation semantics — the default for flat/MoE). `Ok(false)` = pool
+    /// exhaustion with untouched state: the engine skips the cycle and lets
+    /// Step A decode one token autoregressively instead of erroring the
+    /// turn. Non-capacity failures are `Err`.
+    fn reserve_cycle_lookahead(&mut self, _rows: usize) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Schedule async eval for an emitted token (+ logits on the
-    /// budget-forced path). `&self` — schedules only, no mutation. ==
-    /// `MtpOps::eval_step` (the `E` closure, which is `Fn`).
+    /// budget-forced path). `&self` — schedules only, no mutation.
     fn eval_step(&self, token: &MxArray, logits: &MxArray, budget_forced: bool);
 
     /// Fused chained-hidden eval — folds `verify_hiddens[:, K, :]` into the
     /// SAME `async_eval` batch as the just-set token. `&self` — schedules
     /// only. MUST be called at the iteration boundary EXACTLY where the
-    /// engine loop calls it; do NOT reorder. == `MtpOps::eval_step_with_chained_hidden`
-    /// (the `EX` closure, which is `Fn`).
+    /// engine loop calls it; do NOT reorder.
     fn eval_step_with_chained_hidden(&self, token: &MxArray, chained_h: &MxArray);
 
     /// On a mid-cycle stop (EOS / cancel / length / repetition cutoff)
     /// after some-but-not-all of the cycle's tokens were emitted: receives
     /// the count of accepted-but-unemitted tokens. The paged path
-    /// truncates the live adapter; dense / MoE pass a no-op. ==
-    /// `MtpOps::rollback_unemitted` (the `RU` closure).
+    /// truncates the live adapter; dense / MoE pass a no-op.
     fn rollback_unemitted(&mut self, unemitted: usize);
+
+    /// The stepper's CURRENT target-state frontier ([`SpecFrontier`]), or
+    /// `None` when it cannot name one (missing caches). REQUIRED — no
+    /// default, so a new stepper cannot silently omit its recurrent side.
+    /// The engine reads it in debug builds right after [`Self::rollback`]
+    /// (post-replay) and [`Self::rollback_unemitted`] and asserts
+    /// `recurrent_tokens == attn_tokens` whenever the recurrent count is
+    /// known — the I4 tripwire against one-sided rewinds. Release builds
+    /// rely on the families' epilogue length-agreement checks instead.
+    fn frontier(&self) -> Option<SpecFrontier>;
 
     /// Take any error stashed by an infallible [`Self::rollback`] replay,
     /// so the engine can surface it with `?` after the (infallible)
@@ -1791,6 +1896,20 @@ pub(crate) trait DsparkStepper {
         ))
     }
 
+    /// Reserve the speculative lookahead region for the cycle about to run,
+    /// measured past the stepper's CURRENT committed frontier. The engine
+    /// calls this once per cycle, right before the cycle's propose/verify:
+    /// every committed token moves the frontier, so a turn-entry reservation
+    /// would cover only the first cycle. `Ok(true)` = the coming verify write
+    /// is covered, or this stepper has no reservation semantics (the flat
+    /// default). `Ok(false)` = pool exhaustion with untouched state — the
+    /// engine drops this cycle's draft block and takes one autoregressive
+    /// step THROUGH verify instead of erroring the turn. Non-capacity
+    /// failures are `Err`.
+    fn reserve_cycle_lookahead(&mut self, _rows: usize) -> Result<bool> {
+        Ok(true)
+    }
+
     /// Draft up to `max_len` tokens conditioned on `anchor_id` (the last
     /// emitted token, whose K/V is NOT yet in the target cache — the
     /// engine's subsequent [`Self::verify`] writes it at position 0).
@@ -1846,6 +1965,21 @@ pub(crate) trait DsparkStepper {
     /// iteration boundary on the continue path (the analog of
     /// [`MtpStepper::eval_step_with_chained_hidden`]'s placement).
     fn eval_boundary(&self, token: &MxArray);
+
+    /// The stepper's current target-state frontier ([`SpecFrontier`]), or
+    /// `None` when it cannot name one (missing caches, or active target
+    /// caches disagreeing with each other). The draft-model targets are
+    /// pure attention, so `recurrent_tokens` is `None`; `attn_tokens` is
+    /// the common offset every ACTIVE target cache sits at — the same
+    /// per-cache totals `gemma4::layer_cache::commit_after_verify`
+    /// validates on every commit. REQUIRED for the same reason as
+    /// [`MtpStepper::frontier`], but unlike it nothing calls this one: the
+    /// [`crate::engine::spec_paged::SpecPagedCache`] facade's `frontier` is
+    /// the CACHE-side, `seq_id`-keyed method and never routes through this
+    /// hook. It stays required so every stepper can answer the question
+    /// `run_mtp_turn`'s debug asserts put to [`MtpStepper`].
+    #[allow(dead_code)]
+    fn frontier(&self) -> Option<SpecFrontier>;
 }
 
 /// Per-family training backend the model-neutral training-command handler
