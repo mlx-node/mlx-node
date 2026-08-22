@@ -491,7 +491,7 @@ fn parse_eos_token_ids(value: &Value) -> Vec<i32> {
 ///
 /// Exhaustively checks embed_tokens, final norm, and per-layer attention + MLP weights,
 /// including o_proj, up_proj, down_proj, all 4 norms, v_proj (when !k_eq_v),
-/// and MoE weights (when enabled).
+/// PLE components (when enabled), and MoE weights (when enabled).
 ///
 /// Quantized variants are NOT special-cased: every quant format this loader
 /// understands (affine, mxfp4/mxfp8, nvfp4, sym8) stores its payload under
@@ -516,6 +516,19 @@ fn validate_required_weights(
     }
     if !has("norm.weight") {
         return Err(Error::from_reason("Missing required weight: norm.weight"));
+    }
+    if config.per_layer_input_embeds {
+        for key in [
+            "embed_tokens_per_layer.weight",
+            "per_layer_model_projection.weight",
+            "per_layer_projection_norm.weight",
+        ] {
+            if !has(key) {
+                return Err(Error::from_reason(format!(
+                    "Missing required weight: {key}"
+                )));
+            }
+        }
     }
 
     // Per-layer required weights
@@ -618,6 +631,21 @@ fn validate_required_weights(
                     "Missing required weight: {}",
                     key
                 )));
+            }
+        }
+
+        if config.per_layer_input_embeds {
+            for suffix in [
+                "per_layer_input_gate.weight",
+                "per_layer_projection.weight",
+                "post_per_layer_input_norm.weight",
+            ] {
+                let key = format!("{prefix}.{suffix}");
+                if !has(&key) {
+                    return Err(Error::from_reason(format!(
+                        "Missing required weight: {key}"
+                    )));
+                }
             }
         }
 
@@ -1634,11 +1662,13 @@ fn apply_weights(
                 ple.embed_tokens_per_layer.load_weight(w)?;
                 info!("PLE embed_tokens_per_layer loaded");
             }
-            if let Some(w) = params.get("per_layer_model_projection.weight") {
-                // Quantizable linear (convert keeps it bf16 today) — cheap
-                // in-class dtype guard.
+            if let Some(ql) = try_build_ql("per_layer_model_projection")? {
+                ple.per_layer_model_projection.set_quantized(ql);
+                info!("PLE per_layer_model_projection loaded (quantized)");
+            } else if let Some(w) = params.get("per_layer_model_projection.weight") {
                 ensure_dense_weight_floating("per_layer_model_projection.weight", w)?;
-                ple.per_layer_model_projection.set_weight(w)?;
+                ple.per_layer_model_projection
+                    .set_weight(w, "per_layer_model_projection")?;
                 info!("PLE per_layer_model_projection loaded");
             }
             if let Some(w) = params.get("per_layer_projection_norm.weight") {
@@ -1809,22 +1839,21 @@ fn apply_weights(
             layer.set_layer_scalar(w)?;
         }
 
-        // PLE per-layer weights. The two PLE linears are quantizable
-        // projections (convert keeps them bf16 today) — cheap in-class
-        // dtype guards; the norm below is never quantized.
+        // PLE per-layer weights. The projections may be quantized independently;
+        // the norm below remains dense.
         if layer.has_ple() {
-            if let Some(w) = params.get(&format!("{}.per_layer_input_gate.weight", prefix)) {
-                ensure_dense_weight_floating(
-                    &format!("{}.per_layer_input_gate.weight", prefix),
-                    w,
-                )?;
+            let gate_prefix = format!("{}.per_layer_input_gate", prefix);
+            if let Some(ql) = try_build_ql(&gate_prefix)? {
+                layer.set_per_layer_input_gate_quantized(ql)?;
+            } else if let Some(w) = params.get(&format!("{}.weight", gate_prefix)) {
+                ensure_dense_weight_floating(&format!("{}.weight", gate_prefix), w)?;
                 layer.set_per_layer_input_gate_weight(w)?;
             }
-            if let Some(w) = params.get(&format!("{}.per_layer_projection.weight", prefix)) {
-                ensure_dense_weight_floating(
-                    &format!("{}.per_layer_projection.weight", prefix),
-                    w,
-                )?;
+            let projection_prefix = format!("{}.per_layer_projection", prefix);
+            if let Some(ql) = try_build_ql(&projection_prefix)? {
+                layer.set_per_layer_projection_quantized(ql)?;
+            } else if let Some(w) = params.get(&format!("{}.weight", projection_prefix)) {
+                ensure_dense_weight_floating(&format!("{}.weight", projection_prefix), w)?;
                 layer.set_per_layer_projection_weight(w)?;
             }
             if let Some(w) = params.get(&format!("{}.post_per_layer_input_norm.weight", prefix)) {
@@ -4531,6 +4560,85 @@ mod tests {
         }
     }
 
+    #[test]
+    fn validate_required_weights_fails_closed_for_ple() {
+        let make_config = |ple: bool| -> Gemma4Config {
+            serde_json::from_value(serde_json::json!({
+                "vocab_size": 8,
+                "hidden_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "intermediate_size": 16,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": true,
+                "max_position_embeddings": 64,
+                "per_layer_input_embeds": ple,
+                "hidden_size_per_layer_input": if ple { Some(8) } else { None },
+                "vocab_size_per_layer_input": if ple { Some(8) } else { None }
+            }))
+            .expect("minimal Gemma4Config")
+        };
+        let dummy = || MxArray::from_float32(&[0.0], &[1]).expect("dummy");
+        let full = || -> HashMap<String, MxArray> {
+            let mut params = HashMap::new();
+            for key in [
+                "embed_tokens.weight",
+                "norm.weight",
+                "embed_tokens_per_layer.weight",
+                "per_layer_model_projection.weight",
+                "per_layer_projection_norm.weight",
+                "layers.0.self_attn.q_proj.weight",
+                "layers.0.self_attn.k_proj.weight",
+                "layers.0.self_attn.v_proj.weight",
+                "layers.0.self_attn.o_proj.weight",
+                "layers.0.self_attn.q_norm.weight",
+                "layers.0.self_attn.k_norm.weight",
+                "layers.0.layer_scalar",
+                "layers.0.mlp.gate_proj.weight",
+                "layers.0.mlp.up_proj.weight",
+                "layers.0.mlp.down_proj.weight",
+                "layers.0.input_layernorm.weight",
+                "layers.0.post_attention_layernorm.weight",
+                "layers.0.pre_feedforward_layernorm.weight",
+                "layers.0.post_feedforward_layernorm.weight",
+                "layers.0.per_layer_input_gate.weight",
+                "layers.0.per_layer_projection.weight",
+                "layers.0.post_per_layer_input_norm.weight",
+            ] {
+                params.insert(key.to_string(), dummy());
+            }
+            params
+        };
+
+        let ple_config = make_config(true);
+        validate_required_weights(&full(), &ple_config)
+            .expect("complete PLE checkpoint must validate");
+        for missing in [
+            "embed_tokens_per_layer.weight",
+            "per_layer_model_projection.weight",
+            "per_layer_projection_norm.weight",
+            "layers.0.per_layer_input_gate.weight",
+            "layers.0.per_layer_projection.weight",
+            "layers.0.post_per_layer_input_norm.weight",
+        ] {
+            let mut params = full();
+            params.remove(missing);
+            let err = validate_required_weights(&params, &ple_config)
+                .expect_err("every enabled PLE component must be required");
+            assert!(
+                format!("{err}").contains(missing),
+                "error must name {missing}, got: {err}"
+            );
+        }
+
+        let mut non_ple = full();
+        non_ple.retain(|key, _| !key.contains("per_layer"));
+        validate_required_weights(&non_ple, &make_config(false))
+            .expect("non-PLE checkpoints must not require PLE weights");
+    }
+
     /// An untied Gemma4 checkpoint that carries `lm_head.scales` (and
     /// `.biases`) but NO `lm_head.weight` must be rejected by both
     /// `validate_required_weights` and `apply_weights`; a tied checkpoint
@@ -4942,6 +5050,196 @@ mod tests {
                 inner.lm_head.is_none(),
                 "tied lm_head must remain None when tie_word_embeddings=true"
             );
+        }
+    }
+
+    #[test]
+    fn ple_projections_install_quantized_and_dense_weights() {
+        use super::super::quantized_linear::LinearProj;
+
+        let config: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "intermediate_size": 64,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 64,
+            "use_block_paged_cache": false,
+            "per_layer_input_embeds": true,
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": 8
+        }))
+        .expect("minimal PLE Gemma4Config");
+
+        let packed = |rows: i64, cols: i64| {
+            MxArray::from_float32(&vec![0.0f32; (rows * cols) as usize], &[rows, cols])
+                .expect("from_float32")
+                .astype(DType::Uint32)
+                .expect("uint32")
+        };
+        let bf16 = |rows: i64, cols: i64, value: f32| {
+            MxArray::from_float32(&vec![value; (rows * cols) as usize], &[rows, cols])
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16")
+        };
+        let groups = [
+            ("per_layer_model_projection", 32, 8, 2),
+            ("layers.0.per_layer_input_gate", 32, 8, 2),
+            ("layers.0.per_layer_projection", 64, 4, 1),
+        ];
+
+        let mut quantized = HashMap::new();
+        for (prefix, rows, packed_cols, sidecar_cols) in groups {
+            quantized.insert(format!("{prefix}.weight"), packed(rows, packed_cols));
+            quantized.insert(format!("{prefix}.scales"), bf16(rows, sidecar_cols, 0.5));
+            quantized.insert(format!("{prefix}.biases"), bf16(rows, sidecar_cols, 0.0));
+        }
+
+        let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+        apply_weights(
+            &mut inner,
+            &quantized,
+            &config,
+            4,
+            32,
+            Some(PerLayerMode::Affine),
+            &HashMap::new(),
+        )
+        .expect("all quantized PLE projections must load");
+        assert!(matches!(
+            inner.ple.as_ref().expect("PLE").per_layer_model_projection,
+            LinearProj::Quantized(_)
+        ));
+        assert_eq!(
+            inner.layers[0].ple_projections_are_quantized(),
+            (true, true)
+        );
+        let input = bf16(1, 64, 1.0);
+        let output = inner
+            .ple
+            .as_ref()
+            .expect("PLE")
+            .per_layer_model_projection
+            .forward(&input)
+            .expect("quantized model-level PLE projection forward");
+        assert_eq!(output.shape().expect("shape").as_ref(), &[1, 32]);
+
+        let dense = HashMap::from([
+            (
+                "per_layer_model_projection.weight".to_string(),
+                bf16(32, 64, 0.01),
+            ),
+            (
+                "layers.0.per_layer_input_gate.weight".to_string(),
+                bf16(32, 64, 0.01),
+            ),
+            (
+                "layers.0.per_layer_projection.weight".to_string(),
+                bf16(64, 32, 0.01),
+            ),
+        ]);
+        let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+        apply_weights(
+            &mut inner,
+            &dense,
+            &config,
+            4,
+            32,
+            Some(PerLayerMode::Affine),
+            &HashMap::new(),
+        )
+        .expect("dense PLE projections must remain supported");
+        assert!(matches!(
+            inner.ple.as_ref().expect("PLE").per_layer_model_projection,
+            LinearProj::Standard(_)
+        ));
+        assert_eq!(
+            inner.layers[0].ple_projections_are_quantized(),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn ple_quantized_projection_sidecars_fail_closed() {
+        use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
+
+        let config: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 64,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "intermediate_size": 64,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": true,
+            "max_position_embeddings": 64,
+            "use_block_paged_cache": false,
+            "per_layer_input_embeds": true,
+            "hidden_size_per_layer_input": 32,
+            "vocab_size_per_layer_input": 8
+        }))
+        .expect("minimal PLE Gemma4Config");
+        let packed = |rows: i64, cols: i64| {
+            MxArray::from_float32(&vec![0.0f32; (rows * cols) as usize], &[rows, cols])
+                .expect("from_float32")
+                .astype(DType::Uint32)
+                .expect("uint32")
+        };
+        let sidecar = |rows: i64, cols: i64| {
+            MxArray::from_float32(&vec![0.5f32; (rows * cols) as usize], &[rows, cols])
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("bf16")
+        };
+
+        for (prefix, rows, packed_cols, sidecar_cols) in [
+            ("per_layer_model_projection", 32, 8, 2),
+            ("layers.0.per_layer_input_gate", 32, 8, 2),
+            ("layers.0.per_layer_projection", 64, 4, 1),
+        ] {
+            let truncated = HashMap::from([
+                (format!("{prefix}.weight"), packed(rows, packed_cols)),
+                (format!("{prefix}.biases"), sidecar(rows, sidecar_cols)),
+            ]);
+            let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+            let err = apply_weights(
+                &mut inner,
+                &truncated,
+                &config,
+                4,
+                32,
+                Some(PerLayerMode::Affine),
+                &HashMap::new(),
+            )
+            .expect_err("packed PLE weight without scales must fail loud");
+            let message = format!("{err}");
+            assert!(message.contains(prefix), "got: {message}");
+            assert!(message.contains("non-float dtype"), "got: {message}");
+
+            let missing_bias = HashMap::from([
+                (format!("{prefix}.weight"), packed(rows, packed_cols)),
+                (format!("{prefix}.scales"), sidecar(rows, sidecar_cols)),
+            ]);
+            let mut inner = Gemma4Inner::new(config.clone()).expect("Gemma4Inner::new");
+            let err = apply_weights(
+                &mut inner,
+                &missing_bias,
+                &config,
+                4,
+                32,
+                Some(PerLayerMode::Affine),
+                &HashMap::new(),
+            )
+            .expect_err("affine PLE weight without biases must fail loud");
+            let message = format!("{err}");
+            assert!(message.contains(prefix), "got: {message}");
+            assert!(message.contains(SYMMETRIC_ZERO_POINT_KEY), "got: {message}");
         }
     }
 

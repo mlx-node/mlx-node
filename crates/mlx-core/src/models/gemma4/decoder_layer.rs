@@ -10,7 +10,9 @@ use super::diagnostic;
 use super::layer_cache::Gemma4LayerCache;
 use super::mlp::GemmaMLP;
 use super::moe::{Gemma4MoE, Gemma4Router};
-use super::quantized_linear::{Gemma4MLPVariant, QuantizedLinear, QuantizedSwitchLinear};
+use super::quantized_linear::{
+    Gemma4MLPVariant, LinearProj, QuantizedLinear, QuantizedSwitchLinear,
+};
 
 /// Per-layer routing kind for Gemma4's paged dispatch.
 ///
@@ -106,8 +108,8 @@ pub struct Gemma4DecoderLayer {
 
     // PLE (Per-Layer Embeddings) per-layer components.
     // Only present when config.per_layer_input_embeds is true.
-    per_layer_input_gate: Option<Linear>,
-    per_layer_projection: Option<Linear>,
+    per_layer_input_gate: Option<LinearProj>,
+    per_layer_projection: Option<LinearProj>,
     post_per_layer_input_norm: Option<RMSNorm>,
 
     // MoE components (None for dense-only models like E2B).
@@ -144,8 +146,16 @@ impl Gemma4DecoderLayer {
         let (per_layer_input_gate, per_layer_projection, post_per_layer_input_norm) =
             if config.per_layer_input_embeds && ple_dim > 0 {
                 (
-                    Some(Linear::new(h, ple_dim as u32, Some(false))?),
-                    Some(Linear::new(ple_dim as u32, h, Some(false))?),
+                    Some(LinearProj::Standard(Linear::new(
+                        h,
+                        ple_dim as u32,
+                        Some(false),
+                    )?)),
+                    Some(LinearProj::Standard(Linear::new(
+                        ple_dim as u32,
+                        h,
+                        Some(false),
+                    )?)),
                     Some(RMSNorm::new(h, eps)?),
                 )
             } else {
@@ -545,7 +555,7 @@ impl Gemma4DecoderLayer {
 
     pub fn set_per_layer_input_gate_weight(&mut self, w: &MxArray) -> Result<()> {
         if let Some(ref mut gate) = self.per_layer_input_gate {
-            gate.set_weight(w)
+            gate.set_weight(w, "per_layer_input_gate")
         } else {
             Err(Error::from_reason(
                 "per_layer_input_gate not initialized (PLE not enabled)",
@@ -555,7 +565,29 @@ impl Gemma4DecoderLayer {
 
     pub fn set_per_layer_projection_weight(&mut self, w: &MxArray) -> Result<()> {
         if let Some(ref mut proj) = self.per_layer_projection {
-            proj.set_weight(w)
+            proj.set_weight(w, "per_layer_projection")
+        } else {
+            Err(Error::from_reason(
+                "per_layer_projection not initialized (PLE not enabled)",
+            ))
+        }
+    }
+
+    pub fn set_per_layer_input_gate_quantized(&mut self, ql: QuantizedLinear) -> Result<()> {
+        if let Some(ref mut gate) = self.per_layer_input_gate {
+            gate.set_quantized(ql);
+            Ok(())
+        } else {
+            Err(Error::from_reason(
+                "per_layer_input_gate not initialized (PLE not enabled)",
+            ))
+        }
+    }
+
+    pub fn set_per_layer_projection_quantized(&mut self, ql: QuantizedLinear) -> Result<()> {
+        if let Some(ref mut proj) = self.per_layer_projection {
+            proj.set_quantized(ql);
+            Ok(())
         } else {
             Err(Error::from_reason(
                 "per_layer_projection not initialized (PLE not enabled)",
@@ -576,6 +608,14 @@ impl Gemma4DecoderLayer {
     /// Returns true if this layer has PLE components.
     pub fn has_ple(&self) -> bool {
         self.per_layer_input_gate.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ple_projections_are_quantized(&self) -> (bool, bool) {
+        (
+            matches!(self.per_layer_input_gate, Some(LinearProj::Quantized(_))),
+            matches!(self.per_layer_projection, Some(LinearProj::Quantized(_))),
+        )
     }
 
     /// Returns true if this layer has MoE components.
