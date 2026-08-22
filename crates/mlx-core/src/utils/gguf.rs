@@ -2786,7 +2786,12 @@ fn prepare_muse_secondary_config(
         Error::from_reason(format!("Failed to parse {}: {e}", config_path.display()))
     })?;
 
-    let carries_merged_dflash = config.get("dflash_config").is_some();
+    // `MuseGlimmerConfig`'s `Option<MuseGlimmerDFlashConfig>` reads an explicit
+    // `null` as absent, so key presence is not the marker: a config spelling
+    // the optional field out as null carries no companion at all.
+    let carries_merged_dflash = config
+        .get("dflash_config")
+        .is_some_and(|value| !value.is_null());
 
     if !profiles.is_empty() {
         let companion_quantization = preserved_source_quantization(gguf, import_k_quants)?
@@ -6219,6 +6224,103 @@ mod tests {
                 "q6k"
             );
         }
+    }
+
+    #[test]
+    fn a_null_dflash_marker_does_not_refuse_the_first_companion_pass() {
+        // `dflash_config` is optional, so a config may spell its absence out as
+        // an explicit null. The loader reads that as no companion, and the
+        // guard has to agree: an unscoped target override beside a null marker
+        // is the target's own, not a previous draft pass's.
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-null-dflash-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        let target = serde_json::json!({"bits": 6, "group_size": 16, "mode": "q6k"});
+        let mut primary = valid_muse_target_config();
+        primary["dflash_config"] = serde_json::Value::Null;
+        for alias in ["quantization", "quantization_config"] {
+            primary[alias] = serde_json::json!({
+                "bits": 6,
+                "group_size": 16,
+                "mode": "q6k",
+                "language_model.model.layers.0.self_attn.q_proj": target.clone(),
+            });
+        }
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&primary).expect("serialize primary config"),
+        )
+        .expect("write primary config");
+
+        let raw = fs::read_to_string(&config_path).expect("read back primary config");
+        let on_disk: serde_json::Value = serde_json::from_str(&raw).expect("parse primary config");
+        assert_eq!(
+            on_disk.get("dflash_config"),
+            Some(&serde_json::Value::Null),
+            "ANTI-VACUITY: the config this pass reads must carry the marker key with a null \
+             value, or key presence and a real companion are indistinguishable here: {on_disk}"
+        );
+        assert!(
+            on_disk["quantization"]
+                .get("language_model.model.layers.0.self_attn.q_proj")
+                .is_some(),
+            "ANTI-VACUITY: the block must hold an unscoped entry, or the guard's second \
+             conjunct is never reached: {on_disk}"
+        );
+        assert!(
+            crate::models::muse_glimmer::config::MuseGlimmerConfig::from_json_str(&raw)
+                .expect("the null-marker config must still load")
+                .dflash_config
+                .is_none(),
+            "ANTI-VACUITY: the loader must read the null as absent, or this config does \
+             describe a merged companion and refusing it is right"
+        );
+
+        let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("a null marker is not a merged companion")
+            .expect("companion config update");
+        let config: serde_json::Value =
+            serde_json::from_str(&prepared).expect("parse companion config");
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            config["quantization"], config["quantization_config"],
+            "aliases must agree or the loader refuses the checkpoint"
+        );
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(config[block]["mode"], "q6k");
+            assert_eq!(
+                config[block]["language_model.model.language_model.layers.0.self_attn.q_proj"]["mode"],
+                "q6k",
+                "the target override must be rescoped, not dropped"
+            );
+            assert_eq!(
+                config[block]["language_model.model.layers.0.self_attn.q_proj"]["mode"], "q4k",
+                "the draft profile owns the unscoped namespace after the rescope"
+            );
+        }
+        assert_eq!(config["dflash_config"]["block_size"], 16);
     }
 
     #[test]
