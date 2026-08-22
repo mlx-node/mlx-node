@@ -240,6 +240,35 @@ impl CacheLimitCoordinator {
             .fold(0u64, u64::saturating_add)
     }
 
+    /// Register `pool_bytes` only if the live pool sum is still `expected_total`.
+    /// `None` means another load reserved in between; the caller should resize.
+    pub fn try_register_pool_if_total_eq(
+        &self,
+        expected_total: u64,
+        pool_bytes: u64,
+    ) -> Option<PoolCacheLimitGuard> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let current = state
+            .pools
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        if current != expected_total {
+            return None;
+        }
+        let id = state.next_id;
+        state.next_id = state.next_id.saturating_add(1);
+        state.pools.insert(id, pool_bytes);
+        info!(
+            "[cache_limit] register paged pool guard={} bytes={:.2} GB (live_pools={})",
+            id,
+            pool_bytes as f64 / ONE_GIB,
+            state.pools.len(),
+        );
+        recompute_locked(&mut state);
+        Some(PoolCacheLimitGuard { id })
+    }
+
     /// Register a private paged-KV pool so the MLX freelist ceiling is
     /// debited by memory that MLX's own allocator counters cannot see.
     pub fn register_pool(&self, pool_bytes: u64) -> PoolCacheLimitGuard {
@@ -752,6 +781,27 @@ mod tests {
         assert_eq!(
             coordinator().registered_pool_bytes().saturating_sub(before),
             8 * GB
+        );
+    }
+
+    #[test]
+    fn try_register_pool_if_total_eq_rejects_stale_snapshot() {
+        let before = coordinator().registered_pool_bytes();
+        let _occupant = coordinator().register_pool(GB);
+        assert!(
+            coordinator()
+                .try_register_pool_if_total_eq(before, GB)
+                .is_none(),
+            "stale sibling snapshot must not insert a second pool"
+        );
+        let current = coordinator().registered_pool_bytes();
+        let accepted = coordinator().try_register_pool_if_total_eq(current, 2 * GB);
+        assert!(accepted.is_some(), "matching snapshot must reserve");
+        assert_eq!(
+            coordinator()
+                .registered_pool_bytes()
+                .saturating_sub(current),
+            2 * GB
         );
     }
 

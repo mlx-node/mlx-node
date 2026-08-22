@@ -171,6 +171,9 @@ pub(crate) struct NemotronHInner {
     /// through the adapter (indexed by attention-layer ordinal 0..6); mamba
     /// and moe layers keep their own per-request state / stateless forward.
     pub(crate) paged_adapter: Option<PagedKVCacheAdapter>,
+    /// Registered when the adaptive pool is reserved, before Metal alloc, so a
+    /// concurrent load cannot reuse the same headroom. Taken by `load_with_thread`.
+    pub(crate) pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
     /// Per-request recurrent state for the scheduler lane: one full
     /// `Vec<NemotronHLayerCache>` per live sequence, swapped into `caches` for serial
     /// prefill and stacked into `[N, ...]` rows for batched decode.
@@ -232,6 +235,7 @@ impl NemotronHInner {
             mtp_seed_failures: 0,
             gen_defaults: crate::engine::ModelGenerationDefaults::default(),
             paged_adapter,
+            pool_cache_limit_guard: None,
             scheduled_caches: HashMap::new(),
             active_scheduled_seq: None,
             last_paged_prefill_reused_mamba_state: false,
@@ -744,22 +748,40 @@ impl NemotronHInner {
             )));
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-        let sizing = mlx_paged_attn::profile::load_time_pool_sizing_with_reserved(
-            requested_blocks,
-            attn_layer_count,
-            num_kv_heads,
-            head_size,
-            block_size,
-            cache_dtype,
-            crate::cache_limit::coordinator().registered_pool_bytes(),
-        )
-        .map_err(|error| {
-            Error::from_reason(format!(
-                "NemotronH adaptive paged cache sizing failed safely; refusing an uncapped \
-                 pool request: {error}"
-            ))
-        })?;
-        let selected_blocks = sizing.selected_blocks;
+        let coordinator = crate::cache_limit::coordinator();
+        let (selected_blocks, pool_guard) = {
+            let mut reserved = None;
+            for _ in 0..8 {
+                let sibling = coordinator.registered_pool_bytes();
+                let sizing = mlx_paged_attn::profile::load_time_pool_sizing_with_reserved(
+                    requested_blocks,
+                    attn_layer_count,
+                    num_kv_heads,
+                    head_size,
+                    block_size,
+                    cache_dtype,
+                    sibling,
+                )
+                .map_err(|error| {
+                    Error::from_reason(format!(
+                        "NemotronH adaptive paged cache sizing failed safely; refusing an uncapped \
+                         pool request: {error}"
+                    ))
+                })?;
+                if let Some(guard) =
+                    coordinator.try_register_pool_if_total_eq(sibling, sizing.selected_bytes)
+                {
+                    reserved = Some((sizing.selected_blocks, guard));
+                    break;
+                }
+            }
+            reserved.ok_or_else(|| {
+                Error::from_reason(
+                    "NemotronH adaptive paged cache sizing failed safely; concurrent pool \
+                     reservation kept racing",
+                )
+            })?
+        };
         let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
             selected_blocks,
             block_size,
@@ -777,6 +799,7 @@ impl NemotronHInner {
                 ))
             })?,
         );
+        self.pool_cache_limit_guard = Some(pool_guard);
         Ok(())
     }
 

@@ -348,10 +348,13 @@ pub(crate) fn scheduler_per_seq_context() -> u32 {
 }
 
 pub(crate) fn scheduler_per_seq_context_override() -> Option<u32> {
-    std::env::var("MLX_PAGED_PER_SEQ_CTX")
-        .ok()
-        .and_then(|value| value.parse::<u32>().ok())
-        .filter(|&value| value > 0)
+    static VALUE: OnceLock<Option<u32>> = OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("MLX_PAGED_PER_SEQ_CTX")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .filter(|&value| value > 0)
+    })
 }
 
 pub(crate) fn scheduled_turn_context(

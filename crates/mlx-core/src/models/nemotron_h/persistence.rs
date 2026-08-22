@@ -997,7 +997,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
-            let (inner, weight_bytes) = load_inner(&model_path)?;
+            let (mut inner, weight_bytes) = load_inner(&model_path)?;
             let pool_bytes = inner
                 .paged_adapter
                 .as_ref()
@@ -1006,8 +1006,10 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
                 .map_err(Error::from_reason)?
                 .unwrap_or(0);
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
-            let pool_cache_limit_guard = (pool_bytes != 0)
-                .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
+            let pool_cache_limit_guard = inner.pool_cache_limit_guard.take().or_else(|| {
+                (pool_bytes != 0)
+                    .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes))
+            });
             let mtp_active = inner.has_mtp_weights();
             let paged_active = inner.paged_adapter.is_some();
             let context_limits =

@@ -657,9 +657,8 @@ export declare class MuseGlimmerModel {
   hasBlockPagedCache(): boolean;
   maxConcurrentSequences(): number;
   /**
-   * Conservative model-wide context snapshot used by higher layers for
-   * compaction. It includes the paged AR limit even when DFlash is present,
-   * because DFlash is opt-in per request and can be disabled by the caller.
+   * Model-wide context snapshot used by higher layers for compaction.
+   * `effective_window_tokens` is min(trained, live pool).
    */
   contextLimits(): MuseGlimmerContextLimits;
   schedulerStats(): Promise<SchedulerStats>;
@@ -4235,9 +4234,8 @@ export declare const enum MultimodalContentOrder {
 
 /**
  * Trained and physically available active-context limits for one loaded
- * Muse-Glimmer model. The effective window is conservative across both
- * execution modes: DFlash may use the flat cache, but callers can disable it
- * per request and fall back to the paged AR scheduler.
+ * Muse-Glimmer model. Values are snapshots because the physical pool is fixed
+ * for the lifetime of the resident model.
  */
 export interface MuseGlimmerContextLimits {
   trainedWindowTokens: number;
@@ -4305,8 +4303,10 @@ export interface NemotronHConfig {
   /** Number of MTP predictor steps (`num_nextn_predict_layers`). */
   nMtpLayers: number;
   /**
-   * Optional block-paged KV cache memory cap in MiB. None resolves to the
-   * default 2048 MiB pool; explicit values are honored.
+   * Optional block-paged KV cache memory cap in MiB. `None` requests one
+   * `max_position_embeddings` sequence (6 GiB on Lightning 30B-A3B) then
+   * clips with load-time Metal/RAM sizing after weights. Explicit values
+   * skip the auto-sizer.
    */
   pagedCacheMemoryMb?: number;
   /** Optional paged block size in tokens (default 16). */
