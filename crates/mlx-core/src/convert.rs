@@ -4262,14 +4262,15 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         HashMap::new();
     if !source_by_handle.is_empty() {
         for (dest_name, array) in converted_tensors.iter() {
-            if let Some(prov) = source_by_handle.get(&(array.as_raw_ptr() as usize)) {
+            if let Some(prov) = source_by_handle.get(&(array.as_raw_ptr() as usize))
+                && prov.matches(array)
+            {
                 dest_passthrough.insert(dest_name.clone(), prov.source.clone());
             }
         }
     }
-    // Release the pinned source handles before the streaming save drains
-    // `converted_tensors` — `dest_passthrough` carries only file locations, no
-    // arrays, so the keep-alive clones are no longer needed.
+    // `dest_passthrough` now carries every file location still needed, and the
+    // map holds no arrays, so this just releases the entries.
     drop(source_by_handle);
 
     let save_start = std::time::Instant::now();

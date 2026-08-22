@@ -23,11 +23,12 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
+use std::sync::{Arc, Weak};
 
 use napi::bindgen_prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::array::{DType, MxArray};
+use crate::array::{DType, MxArray, MxHandle};
 
 /// Supported tensor data types in SafeTensors format
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -382,15 +383,27 @@ pub struct PassthroughSource {
 /// A recorded source tensor's provenance, keyed during convert by the loaded
 /// MLX array's raw handle pointer.
 ///
-/// `_keep_alive` pins the source `MxArray` (a clone shares the `Arc<MxHandle>`)
-/// for the whole convert so its handle pointer can never be freed and reused by
-/// a later allocation — without this, a dropped source's address could be
-/// recycled by an `astype`/quantize result and falsely match as a passthrough.
-/// The clone is a lazy handle (no materialized data), so the memory cost is just
-/// the handle structs.
+/// `alive` is weak on purpose. It still proves identity — an entry whose source
+/// was dropped fails to upgrade, so a recycled handle address can never match as
+/// a false passthrough — but it does not keep the source resident. A strong
+/// clone did: this map lives until immediately before the save, so any recorded
+/// tensor that convert later transforms or quantizes had its dense bytes pinned
+/// for the whole run.
 pub struct SourceProvenance {
-    _keep_alive: MxArray,
+    alive: Weak<MxHandle>,
     pub source: PassthroughSource,
+}
+
+impl SourceProvenance {
+    /// True when `dest` is the very array this entry was recorded for.
+    ///
+    /// A failed upgrade means the source is gone, which is exactly when its
+    /// handle address may have been recycled by a later allocation.
+    pub fn matches(&self, dest: &MxArray) -> bool {
+        self.alive
+            .upgrade()
+            .is_some_and(|handle| Arc::ptr_eq(&handle, &dest.handle))
+    }
 }
 
 /// For one SOURCE safetensors file, record the on-disk location of every tensor
@@ -410,12 +423,9 @@ pub struct SourceProvenance {
 ///
 /// Tensors below [`raw_passthrough_threshold_bytes`] are also excluded. The
 /// writer's raw path demands `dest_len >= raw_threshold` AND
-/// `src.byte_len == dest_len`, so a smaller entry can never be consulted, while
-/// `_keep_alive` still pins its source for the whole convert — the quantize
-/// loop then materializes that source and the pin holds the dense bytes to the
-/// end. Excluding a tensor cannot reintroduce the ABA hazard the pin defends
-/// against: an entry that was never inserted has no pointer for a recycled
-/// address to collide with, and every retained entry is still pinned.
+/// `src.byte_len == dest_len`, so a smaller entry can never be consulted.
+/// Excluding a tensor cannot produce a false passthrough: an entry that was
+/// never inserted has no pointer for a recycled address to collide with.
 pub fn record_passthrough_sources<P: AsRef<Path>>(
     source_file: P,
     loaded: &HashMap<String, MxArray>,
@@ -449,23 +459,16 @@ pub(crate) fn record_passthrough_sources_with<P: AsRef<Path>>(
             _ => continue,
         };
         let byte_len = info.data_offsets[1] - info.data_offsets[0];
-        // Unusable below the writer's size gate, and the pin below is not free.
-        // See fn doc.
+        // Unusable below the writer's size gate. See fn doc.
         if (byte_len as u64) < raw_threshold {
             continue;
         }
         let file_offset = (st.data_offset + info.data_offsets[0]) as u64;
-        // Keep the source array alive (clone shares the `Arc<MxHandle>`) so its
-        // raw handle pointer is PINNED for the whole convert. This closes an ABA
-        // hazard: if a source array were dropped and its MLX buffer freed, a
-        // later `astype`/quantize allocation could reuse the same address and
-        // collide with a stale entry — a false passthrough = corrupt output.
-        // Pinning the handle guarantees no other array can ever hold this
-        // pointer, so a dest handle match is genuinely the same array.
+        // Weak, not a clone: see `SourceProvenance`.
         out.insert(
             array.as_raw_ptr() as usize,
             SourceProvenance {
-                _keep_alive: array.clone(),
+                alive: Arc::downgrade(&array.handle),
                 source: PassthroughSource {
                     file_path: path.to_path_buf(),
                     file_offset,
@@ -1256,10 +1259,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Provenance must only be recorded for tensors the writer's raw path can
-    /// actually use, because every recorded entry pins its source array alive
-    /// for the whole conversion. Recording sub-threshold tensors is what kept
-    /// an entire AWQ-prescaled bf16 checkpoint resident.
+    /// Provenance is only recorded for tensors the writer's raw path can
+    /// actually use: below the threshold the writer never consults the entry.
     #[test]
     fn passthrough_provenance_skips_tensors_below_the_raw_threshold() {
         let dir = std::env::temp_dir().join(format!("st_prov_{}", std::process::id()));
@@ -1292,13 +1293,139 @@ mod tests {
         assert!(
             !out.contains_key(&small_ptr),
             "a sub-threshold tensor must NOT be recorded: the writer could never \
-             use the entry and the pinned clone would hold the source resident"
+             use the entry"
         );
         assert_eq!(
             out.len(),
             1,
             "exactly one entry expected, got {}",
             out.len()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Writes one bf16 tensor of `rows × cols` to a fresh temp dir and returns
+    /// the dir plus the file path. Caller removes the dir.
+    fn write_one_bf16_tensor(
+        tag: &str,
+        name: &str,
+        rows: i64,
+        cols: i64,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("st_prov_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.safetensors");
+        let arr = MxArray::from_bfloat16(&vec![0x3F80u16; (rows * cols) as usize], &[rows, cols])
+            .unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert(name.to_string(), arr);
+        save_safetensors(&path, &mut tensors, None).unwrap();
+        (dir, path)
+    }
+
+    /// The recorded entry must not own its source. Convert holds this map until
+    /// immediately before the save, so a strong clone would keep every recorded
+    /// tensor's dense bytes resident for the whole run.
+    #[test]
+    fn provenance_does_not_keep_its_source_resident() {
+        use crate::array::memory::{get_active_memory, synchronize_and_clear_cache};
+
+        // [4096, 8192] bf16 = 64 MiB. `get_active_memory` is process-wide, so
+        // this measurement depends on `RUST_TEST_THREADS = "1"` in
+        // `.cargo/config.toml`.
+        const ROWS: i64 = 4096;
+        const COLS: i64 = 8192;
+        let dense = (ROWS * COLS) as f64 * 2.0;
+        let (dir, path) = write_one_bf16_tensor("resident", "big", ROWS, COLS);
+
+        synchronize_and_clear_cache();
+        let baseline = get_active_memory();
+
+        let loaded = SafeTensorsFile::load(&path)
+            .unwrap()
+            .load_tensors(&path)
+            .unwrap();
+        loaded.get("big").unwrap().eval();
+
+        let mut out = HashMap::new();
+        record_passthrough_sources_with(&path, &loaded, &mut out, 1).unwrap();
+        // A recording that dropped the tensor would also free it, and would pass
+        // the assertion below for the wrong reason.
+        assert_eq!(out.len(), 1, "the tensor must have been recorded");
+
+        synchronize_and_clear_cache();
+        let with_dense = get_active_memory();
+
+        // Instrument the control first: if the source never became resident,
+        // the drop below would prove nothing.
+        assert!(
+            with_dense - baseline > dense * 0.5,
+            "the source is not resident, so this test cannot measure a release: \
+             baseline={baseline}, with_dense={with_dense}, dense={dense}"
+        );
+
+        // `out` is still alive: it is now the only thing that could hold the
+        // source.
+        drop(loaded);
+        synchronize_and_clear_cache();
+        let after = get_active_memory();
+
+        assert!(
+            after - baseline < dense * 0.25,
+            "provenance kept the dense source resident: \
+             baseline={baseline}, with_dense={with_dense}, after={after}, dense={dense}"
+        );
+        assert_eq!(out.len(), 1, "the entry must still be present");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Once the source is gone its handle address may be recycled by a later
+    /// allocation, so a dead entry must never match.
+    #[test]
+    fn provenance_entry_stops_matching_when_its_source_dies() {
+        let (dir, path) = write_one_bf16_tensor("dead", "big", 16, 16);
+
+        let loaded = SafeTensorsFile::load(&path)
+            .unwrap()
+            .load_tensors(&path)
+            .unwrap();
+        let mut out = HashMap::new();
+        record_passthrough_sources_with(&path, &loaded, &mut out, 1).unwrap();
+        assert_eq!(out.len(), 1);
+
+        drop(loaded);
+
+        let other = MxArray::from_bfloat16(&[0x4000u16; 256], &[16, 16]).unwrap();
+        let prov = out.values().next().unwrap();
+        assert!(
+            !prov.matches(&other),
+            "an entry whose source is gone must never match"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn provenance_matches_only_the_array_it_recorded() {
+        let (dir, path) = write_one_bf16_tensor("identity", "big", 16, 16);
+
+        let loaded = SafeTensorsFile::load(&path)
+            .unwrap()
+            .load_tensors(&path)
+            .unwrap();
+        let recorded = loaded.get("big").unwrap();
+        let mut out = HashMap::new();
+        record_passthrough_sources_with(&path, &loaded, &mut out, 1).unwrap();
+
+        let prov = out.get(&(recorded.as_raw_ptr() as usize)).unwrap();
+        assert!(prov.matches(recorded), "the recorded array must match");
+
+        let other = MxArray::from_bfloat16(&[0x4000u16; 256], &[16, 16]).unwrap();
+        assert!(
+            !prov.matches(&other),
+            "a different live array must not match"
         );
 
         std::fs::remove_dir_all(&dir).ok();
