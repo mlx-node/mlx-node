@@ -2757,6 +2757,11 @@ fn validate_muse_dflash_tensor_descriptors(
     Ok(())
 }
 
+/// Where both a SafeTensors target override and a DFlash draft override land
+/// once `normalize_override_key` has reduced them, so a key here names one of
+/// the two and the config does not say which.
+const UNSCOPED_LAYER_OVERRIDE_PREFIX: &str = "language_model.model.layers.";
+
 /// Secondary Muse mmproj files share the target's config.json. Unlike a
 /// uniform affine companion, Meta's file deliberately mixes Q4_K and Q6_K,
 /// so every packed projection needs an explicit mode entry in that shared
@@ -2781,6 +2786,13 @@ fn prepare_muse_secondary_config(
         Error::from_reason(format!("Failed to parse {}: {e}", config_path.display()))
     })?;
 
+    // `MuseGlimmerConfig`'s `Option<MuseGlimmerDFlashConfig>` reads an explicit
+    // `null` as absent, so key presence is not the marker: a config spelling
+    // the optional field out as null carries no companion at all.
+    let carries_merged_dflash = config
+        .get("dflash_config")
+        .is_some_and(|value| !value.is_null());
+
     if !profiles.is_empty() {
         let companion_quantization = preserved_source_quantization(gguf, import_k_quants)?
             .ok_or_else(|| {
@@ -2788,55 +2800,104 @@ fn prepare_muse_secondary_config(
                     "Muse-Glimmer companion has quantized profiles but no quantization metadata",
                 )
             })?;
-        // A target config may carry only one alias. Seed the missing one from its
-        // SIBLING, not from the companion block: seeding from the companion gives
-        // the two aliases different top-level geometry and different overrides, and
-        // the loader rejects a config whose aliases disagree.
-        let seed = config
-            .get("quantization")
-            .or_else(|| config.get("quantization_config"))
-            .cloned()
-            .unwrap_or_else(|| companion_quantization.clone());
+        // The two aliases name one block, so it is built once and written to
+        // both: a target carrying only `quantization` must not gain a
+        // `quantization_config` that describes a different checkpoint, and the
+        // loader rejects a config whose aliases disagree.
+        let mut target_block = None;
         for key in ["quantization", "quantization_config"] {
-            if config.get(key).is_none() {
-                config[key] = seed.clone();
-            }
-            let quant = config
-                .get_mut(key)
-                .and_then(serde_json::Value::as_object_mut)
-                .ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "Muse-Glimmer companion GGUF is K-quantized but {} has a non-object '{key}'",
-                        config_path.display()
-                    ))
-                })?;
-            // SafeTensors conversion writes target overrides as
-            // `language_model.model.layers.*`, which the shared parser reduces
-            // to the same bare `layers.*` namespace used by DFlash. Scope the
-            // target entries one wrapper deeper before adding companion
-            // profiles so target and draft layer 0 cannot overwrite each
-            // other. Main-GGUF conversion already emits this scoped form.
-            let target_keys = quant
-                .keys()
-                .filter_map(|entry| {
-                    entry
-                        .strip_prefix("language_model.model.layers.")
-                        .map(|rest| (entry.clone(), rest.to_string()))
-                })
-                .collect::<Vec<_>>();
-            for (source, rest) in target_keys {
-                let value = quant.remove(&source).expect("collected quantization key");
-                let target = format!("language_model.model.language_model.layers.{rest}");
-                if quant.insert(target.clone(), value).is_some() {
+            let Some(alias) = config.get(key) else {
+                continue;
+            };
+            let alias = alias.as_object().ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Muse-Glimmer companion GGUF is K-quantized but {} has a non-object '{key}'",
+                    config_path.display()
+                ))
+            })?;
+            if let Some(sibling) = &target_block {
+                if sibling != alias {
                     return Err(Error::from_reason(format!(
-                        "Muse-Glimmer companion quantization collides with existing scoped target override '{target}'"
+                        "Muse-Glimmer target {} has conflicting 'quantization' and \
+                         'quantization_config' blocks; they must be identical",
+                        config_path.display()
                     )));
                 }
-            }
-            for (prefix, profile) in &profiles {
-                quant.insert(prefix.clone(), profile.to_json());
+            } else {
+                target_block = Some(alias.clone());
             }
         }
+
+        // A completed companion merge leaves `dflash_config` beside a block
+        // whose target overrides have all been rescoped away from
+        // `UNSCOPED_LAYER_OVERRIDE_PREFIX` and whose remaining entries under it
+        // are the draft's. Rescoping those would invent a target override, and
+        // the spelling alone cannot distinguish them. The marker by itself does
+        // not prove this: `--config-dir` at an already converted directory
+        // copies it forward beside a block a quantizing or source-preserving
+        // primary rebuilt one wrapper deeper. That primary rebuilds neither
+        // alias when its GGUF is dense and no quantization was asked for, so
+        // the copied block reaches this merge verbatim, describing another
+        // checkpoint's weights. This binds the block rather than the running
+        // companion — the loop below walks the target block, so a vision pass
+        // over the same config invents the same phantom.
+        if carries_merged_dflash
+            && let Some(stale) = target_block.as_ref().and_then(|block| {
+                block
+                    .keys()
+                    .find(|key| key.starts_with(UNSCOPED_LAYER_OVERRIDE_PREFIX))
+            })
+        {
+            return Err(Error::from_reason(format!(
+                "{} carries a merged DFlash companion and its quantization block still holds \
+                 '{stale}', which a previous draft pass wrote in the namespace a target \
+                 override also uses; nothing on disk records which of the two it is. Point \
+                 --config-dir at the base model directory instead of a converted output, or \
+                 re-run the primary conversion so it rebuilds the quantization block.",
+                config_path.display()
+            )));
+        }
+
+        // SafeTensors conversion writes target overrides as
+        // `language_model.model.layers.*`, which the shared parser reduces to
+        // the same bare `layers.*` namespace used by DFlash. Scope the target
+        // entries one wrapper deeper before adding companion profiles so target
+        // and draft layer 0 cannot overwrite each other. Main-GGUF conversion
+        // already emits this scoped form. Only a block that came from a target
+        // alias is rescoped: the companion's own keys are already in the draft
+        // namespace, and the profiles below restate them verbatim.
+        let mut quant = match target_block {
+            Some(mut block) => {
+                let target_keys = block
+                    .keys()
+                    .filter_map(|entry| {
+                        entry
+                            .strip_prefix(UNSCOPED_LAYER_OVERRIDE_PREFIX)
+                            .map(|rest| (entry.clone(), rest.to_string()))
+                    })
+                    .collect::<Vec<_>>();
+                for (source, rest) in target_keys {
+                    let value = block.remove(&source).expect("collected quantization key");
+                    let target = format!("language_model.model.language_model.layers.{rest}");
+                    if block.insert(target.clone(), value).is_some() {
+                        return Err(Error::from_reason(format!(
+                            "Muse-Glimmer companion quantization collides with existing scoped target override '{target}'"
+                        )));
+                    }
+                }
+                block
+            }
+            None => companion_quantization
+                .as_object()
+                .cloned()
+                .expect("preserved_source_quantization builds a JSON object"),
+        };
+        for (prefix, profile) in &profiles {
+            quant.insert(prefix.clone(), profile.to_json());
+        }
+        let quant = serde_json::Value::Object(quant);
+        config["quantization"] = quant.clone();
+        config["quantization_config"] = quant;
     }
 
     if is_dflash {
@@ -5684,6 +5745,709 @@ mod tests {
         }
         assert_eq!(config["dflash_config"]["block_size"], 16);
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn companion_seed_does_not_rescope_draft_keys_into_the_target_namespace() {
+        use crate::models::muse_glimmer::persistence::{
+            muse_projection_quant, quant_lookup_prefix,
+        };
+        use crate::models::quant_dispatch::{
+            PerLayerMode, PerLayerQuant, load_quant_settings_from_disk,
+        };
+
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-companion-seed-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        let primary = valid_muse_target_config();
+        assert!(
+            primary.get("quantization").is_none() && primary.get("quantization_config").is_none(),
+            "ANTI-VACUITY: the fixture must carry NEITHER alias, or the companion never seeds \
+             the block and nothing below is exercised"
+        );
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&primary).expect("serialize dense target config"),
+        )
+        .expect("write dense target config");
+
+        let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("prepare K-quant DFlash with dense target")
+            .expect("companion config update");
+        let config: serde_json::Value =
+            serde_json::from_str(&prepared).expect("parse companion config");
+
+        assert_eq!(
+            config["quantization"], config["quantization_config"],
+            "aliases must agree or the loader refuses the checkpoint"
+        );
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                config[block]["language_model.model.layers.0.self_attn.q_proj"]["mode"], "q4k",
+                "the draft's own override must survive in '{block}'"
+            );
+            assert!(
+                config[block]
+                    .get("language_model.model.language_model.layers.0.self_attn.q_proj")
+                    .is_none(),
+                "'{block}' rescoped the draft's own key into the target's namespace: {}",
+                config[block]
+            );
+        }
+
+        fs::write(&config_path, &prepared).expect("write prepared config");
+        let (bits, group_size, top_mode, overrides) =
+            load_quant_settings_from_disk(&root, 4, 64).expect("load prepared quant settings");
+        let default = PerLayerQuant {
+            bits,
+            group_size,
+            mode: top_mode.unwrap_or(PerLayerMode::Affine),
+            input_amax: None,
+        };
+        assert_eq!(
+            muse_projection_quant("layers.0.self_attn.q_proj", &overrides, default).mode,
+            PerLayerMode::Q4K,
+            "the draft projection must still resolve to its own K-quant geometry"
+        );
+        // Spelling-independent: the loader normalizes every config key, so a
+        // companion entry under ANY spelling that reduces to a target
+        // projection's scoped key silently retypes that projection.
+        let layers = config["text_config"]["num_hidden_layers"]
+            .as_u64()
+            .expect("fixture states the target layer count");
+        let mut target_prefixes = vec!["model.language_model.embed_tokens".to_string()];
+        for index in 0..layers {
+            for projection in [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "self_attn.gate_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ] {
+                target_prefixes.push(format!("model.language_model.layers.{index}.{projection}"));
+            }
+        }
+        for prefix in target_prefixes {
+            let scoped = quant_lookup_prefix(&prefix);
+            assert!(
+                !overrides.contains_key(&scoped),
+                "a companion profile resolved onto target projection '{prefix}' as '{scoped}'"
+            );
+        }
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_second_companion_pass_over_a_merged_config_is_refused() {
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-repeat-companion-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&valid_muse_target_config()).expect("serialize dense target config"),
+        )
+        .expect("write dense target config");
+
+        let first = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("first companion pass")
+            .expect("companion config update");
+        let merged: serde_json::Value =
+            serde_json::from_str(&first).expect("parse merged companion config");
+        assert!(
+            merged.get("dflash_config").is_some(),
+            "ANTI-VACUITY: pass 1 must write the marker the guard keys on"
+        );
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                merged[block]["language_model.model.layers.0.self_attn.q_proj"]["mode"], "q4k",
+                "ANTI-VACUITY: pass 1 must record the draft profile in '{block}', or the \
+                 phantom check below passes on an empty block"
+            );
+            assert!(
+                merged[block]
+                    .get("language_model.model.language_model.layers.0.self_attn.q_proj")
+                    .is_none(),
+                "ANTI-VACUITY: pass 1 already produced the phantom, so a refused pass 2 \
+                 would prove nothing: {}",
+                merged[block]
+            );
+        }
+
+        fs::write(&config_path, &first).expect("feed pass 1 output back as the target config");
+        let error = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect_err("a repeated companion merge must be refused");
+        assert!(
+            error.reason.contains("carries a merged DFlash companion")
+                && error
+                    .reason
+                    .contains("language_model.model.layers.0.self_attn.q_proj"),
+            "unexpected error: {}",
+            error.reason
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_primary_copied_dflash_marker_does_not_refuse_the_draft_pass() {
+        // `--config-dir` at an already converted Muse directory copies that
+        // directory's `dflash_config` into the fresh staged output, so the
+        // marker on its own does not mean the staged block has been merged.
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let draft = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-copied-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let source = root.join("converted");
+        let output = root.join("output");
+        fs::create_dir_all(&source).expect("create converted source directory");
+
+        // The `--config-dir` directory is a real previous conversion, so its
+        // config is exactly what a completed DFlash merge writes.
+        let seed = source.join("config.json");
+        fs::write(
+            &seed,
+            serde_json::to_vec(&valid_muse_target_config()).expect("serialize dense target config"),
+        )
+        .expect("write dense target config");
+        let previous = prepare_muse_secondary_config(&seed, &draft, true)
+            .expect("previous companion pass")
+            .expect("companion config update");
+        fs::write(&seed, &previous).expect("install the previous run's merged config");
+        let previous: serde_json::Value =
+            serde_json::from_str(&previous).expect("parse the previous merged config");
+        assert!(
+            previous.get("dflash_config").is_some()
+                && previous["quantization"]
+                    .get("language_model.model.layers.0.self_attn.q_proj")
+                    .is_some(),
+            "ANTI-VACUITY: the copied directory must carry both the marker and the previous \
+             draft's own override, or nothing below is exercised: {previous}"
+        );
+
+        // Two source profiles, so `preserved_source_quantization` names every
+        // tensor and the regenerated block is observably in the target
+        // namespace rather than merely empty.
+        let mut q4_0 = [0u8; 18];
+        q4_0[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        q4_0[2..].fill(0x87);
+        let mut q4_1 = [0u8; 20];
+        q4_1[..2].copy_from_slice(&half::f16::from_f32(0.5).to_bits().to_le_bytes());
+        q4_1[2..4].copy_from_slice(&half::f16::from_f32(-0.25).to_bits().to_le_bytes());
+        q4_1[4..].fill(0x87);
+        let gguf_data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("muse-glimmer".to_string()),
+            )],
+            &[
+                ("blk.0.attn_q.weight", &[32, 1], GgufTensorType::Q4_0, &q4_0),
+                ("blk.1.attn_q.weight", &[32, 1], GgufTensorType::Q4_1, &q4_1),
+            ],
+        );
+        let input = root.join("model.gguf");
+        fs::write(&input, gguf_data).expect("write Muse main GGUF");
+
+        convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: Some(source.to_string_lossy().into_owned()),
+            dtype: None,
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(false),
+        })
+        .await
+        .expect("primary Muse conversion");
+
+        let staged_path = output.join("config.json");
+        let staged: serde_json::Value =
+            serde_json::from_slice(&fs::read(&staged_path).expect("read staged config"))
+                .expect("parse staged config");
+        assert!(
+            staged.get("dflash_config").is_some(),
+            "ANTI-VACUITY: the primary pass must copy the marker through, or the draft pass \
+             below never reaches the guard: {staged}"
+        );
+        for block in ["quantization", "quantization_config"] {
+            assert!(
+                staged[block]
+                    .as_object()
+                    .expect("the primary pass rewrites both aliases")
+                    .keys()
+                    .all(|key| !key.starts_with("language_model.model.layers.")),
+                "the primary pass kept the previous draft's overrides in '{block}': {}",
+                staged[block]
+            );
+            assert_eq!(
+                staged[block]["language_model.model.language_model.layers.0.self_attn.q_proj"]["mode"],
+                "affine",
+                "the regenerated block must describe the new weights in the target namespace"
+            );
+        }
+
+        let prepared = prepare_muse_secondary_config(&staged_path, &draft, true)
+            .expect("a primary-copied marker must not refuse the draft pass")
+            .expect("companion config update");
+        let merged: serde_json::Value =
+            serde_json::from_str(&prepared).expect("parse merged companion config");
+        fs::remove_dir_all(root).ok();
+
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                merged[block]["language_model.model.layers.0.self_attn.q_proj"]["mode"], "q4k",
+                "the draft's own override must land in '{block}'"
+            );
+            assert_eq!(
+                merged[block]["language_model.model.language_model.layers.0.self_attn.q_proj"]["mode"],
+                "affine",
+                "the target's regenerated override must survive in '{block}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dense_primary_keeps_the_copied_block_so_the_draft_pass_is_refused() {
+        // The sibling test above covers a primary that rebuilds the block. A
+        // primary whose GGUF carries no quantized tensor and that is not asked
+        // to quantize writes neither alias, so the previous run's block reaches
+        // the staged output verbatim — draft overrides included, in the
+        // namespace a target override also uses.
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let draft = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-dense-primary-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        let source = root.join("converted");
+        let output = root.join("output");
+        fs::create_dir_all(&source).expect("create converted source directory");
+
+        let seed = source.join("config.json");
+        fs::write(
+            &seed,
+            serde_json::to_vec(&valid_muse_target_config()).expect("serialize dense target config"),
+        )
+        .expect("write dense target config");
+        let previous = prepare_muse_secondary_config(&seed, &draft, true)
+            .expect("previous companion pass")
+            .expect("companion config update");
+        fs::write(&seed, &previous).expect("install the previous run's merged config");
+        let previous: serde_json::Value =
+            serde_json::from_str(&previous).expect("parse the previous merged config");
+        assert!(
+            previous.get("dflash_config").is_some()
+                && previous["quantization"]
+                    .get("language_model.model.layers.0.self_attn.q_proj")
+                    .is_some(),
+            "ANTI-VACUITY: the copied directory must carry both the marker and the previous \
+             draft's own override, or nothing below is exercised: {previous}"
+        );
+
+        let f16_weight = vec![0u8; 32 * 2];
+        let gguf_data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("muse-glimmer".to_string()),
+            )],
+            &[(
+                "blk.0.attn_q.weight",
+                &[32, 1],
+                GgufTensorType::F16,
+                &f16_weight,
+            )],
+        );
+        let input = root.join("model.gguf");
+        fs::write(&input, gguf_data).expect("write Muse main GGUF");
+
+        let primary =
+            parse_gguf(input.to_string_lossy().into_owned()).expect("parse Muse main GGUF");
+        assert!(
+            preserved_source_quantization(&primary, true)
+                .expect("primary source quantization")
+                .is_none(),
+            "ANTI-VACUITY: the primary GGUF must be entirely dense, or the conversion takes \
+             the rebuilding arm the sibling test already covers"
+        );
+
+        convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: input.to_string_lossy().into_owned(),
+            output_dir: output.to_string_lossy().into_owned(),
+            config_source_dir: Some(source.to_string_lossy().into_owned()),
+            dtype: None,
+            verbose: Some(false),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: None,
+            vlm_key_prefix: Some(false),
+            quant_mxfp: Some(false),
+            import_k_quants: Some(false),
+        })
+        .await
+        .expect("primary Muse conversion");
+
+        let staged_path = output.join("config.json");
+        let staged: serde_json::Value =
+            serde_json::from_slice(&fs::read(&staged_path).expect("read staged config"))
+                .expect("parse staged config");
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                staged[block], previous[block],
+                "a dense primary must leave '{block}' exactly as --config-dir wrote it"
+            );
+        }
+
+        let error = prepare_muse_secondary_config(&staged_path, &draft, true)
+            .expect_err("a copied draft override must refuse the draft pass");
+        fs::remove_dir_all(root).ok();
+        assert!(
+            error.reason.contains("carries a merged DFlash companion")
+                && error
+                    .reason
+                    .contains("language_model.model.layers.0.self_attn.q_proj"),
+            "unexpected error: {}",
+            error.reason
+        );
+    }
+
+    #[test]
+    fn a_copied_draft_override_refuses_even_a_vision_companion() {
+        // The rescope walks the TARGET block, not the companion's own profiles,
+        // so a vision pass over a block that still holds the previous draft's
+        // entries invents the same phantom a second draft pass would.
+        let mut draft_tensors = complete_muse_glimmer_dflash_tensors();
+        draft_tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let draft = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: draft_tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors: draft_tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let vision = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 1,
+            metadata: muse_glimmer_mmproj_metadata(),
+            tensors: vec![GgufTensorInfo {
+                name: "v.blk.0.attn_q.weight".to_string(),
+                n_dims: 2,
+                dims: vec![1536, 1536],
+                tensor_type: GgufTensorType::Q4K,
+                offset: 0,
+            }],
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-vision-after-merge-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&valid_muse_target_config()).expect("serialize dense target config"),
+        )
+        .expect("write dense target config");
+        let merged = prepare_muse_secondary_config(&config_path, &draft, true)
+            .expect("draft pass")
+            .expect("companion config update");
+        fs::write(&config_path, &merged).expect("install the merged config");
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).expect("read back merged config"))
+                .expect("parse merged config");
+        assert!(
+            on_disk.get("dflash_config").is_some()
+                && on_disk["quantization"]
+                    .get("language_model.model.layers.0.self_attn.q_proj")
+                    .is_some(),
+            "ANTI-VACUITY: the config this pass reads must carry both the marker and an \
+             unattributable entry, or the refusal below proves nothing: {on_disk}"
+        );
+
+        let error = prepare_muse_secondary_config(&config_path, &vision, true)
+            .expect_err("a vision pass must not rescope the previous draft's overrides");
+        fs::remove_dir_all(root).ok();
+        assert!(
+            error.reason.contains("carries a merged DFlash companion")
+                && error
+                    .reason
+                    .contains("language_model.model.layers.0.self_attn.q_proj"),
+            "unexpected error: {}",
+            error.reason
+        );
+    }
+
+    #[test]
+    fn a_quantized_mmproj_companion_is_not_refused_by_the_dflash_guard() {
+        // The marker alone is not the signal: this block holds no entry under
+        // the namespace the rescope walks, so a mixed-quant mmproj must still
+        // record its own modes.
+        let tensors = vec![
+            GgufTensorInfo {
+                name: "v.blk.0.attn_q.weight".to_string(),
+                n_dims: 2,
+                dims: vec![1536, 1536],
+                tensor_type: GgufTensorType::Q4K,
+                offset: 0,
+            },
+            GgufTensorInfo {
+                name: "v.blk.0.attn_out.weight".to_string(),
+                n_dims: 2,
+                dims: vec![1536, 1536],
+                tensor_type: GgufTensorType::Q6K,
+                offset: 0,
+            },
+        ];
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: muse_glimmer_mmproj_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-mmproj-after-dflash-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        let mut primary = valid_muse_target_config();
+        primary["dflash_config"] = serde_json::json!({"block_size": 16});
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&primary).expect("serialize merged target config"),
+        )
+        .expect("write merged target config");
+        let on_disk: serde_json::Value =
+            serde_json::from_slice(&fs::read(&config_path).expect("read back target config"))
+                .expect("parse target config");
+        assert!(
+            on_disk.get("dflash_config").is_some(),
+            "ANTI-VACUITY: the config this pass reads must carry the marker, or the guard is \
+             never reached and the 'is_dflash' conjunct goes unobserved"
+        );
+
+        let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("a vision companion writes no draft profiles and must not be refused")
+            .expect("companion config update");
+        let config: serde_json::Value =
+            serde_json::from_str(&prepared).expect("parse companion config");
+        fs::remove_dir_all(root).ok();
+
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(
+                config[block]["language_model.model.vision_tower.layers.0.attn.q_proj"]["mode"],
+                "q4k"
+            );
+            assert_eq!(
+                config[block]["language_model.model.vision_tower.layers.0.attn.proj"]["mode"],
+                "q6k"
+            );
+        }
+    }
+
+    #[test]
+    fn a_null_dflash_marker_does_not_refuse_the_first_companion_pass() {
+        // `dflash_config` is optional, so a config may spell its absence out as
+        // an explicit null. The loader reads that as no companion, and the
+        // guard has to agree: an unscoped target override beside a null marker
+        // is the target's own, not a previous draft pass's.
+        let mut tensors = complete_muse_glimmer_dflash_tensors();
+        tensors
+            .iter_mut()
+            .find(|tensor| tensor.name == "blk.0.attn_q.weight")
+            .expect("complete DFlash tensor inventory")
+            .tensor_type = GgufTensorType::Q4K;
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: tensors.len() as u64,
+            metadata: complete_muse_glimmer_dflash_metadata(),
+            tensors,
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-muse-null-dflash-marker-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).expect("create config directory");
+        let config_path = root.join("config.json");
+        let target = serde_json::json!({"bits": 6, "group_size": 16, "mode": "q6k"});
+        let mut primary = valid_muse_target_config();
+        primary["dflash_config"] = serde_json::Value::Null;
+        for alias in ["quantization", "quantization_config"] {
+            primary[alias] = serde_json::json!({
+                "bits": 6,
+                "group_size": 16,
+                "mode": "q6k",
+                "language_model.model.layers.0.self_attn.q_proj": target.clone(),
+            });
+        }
+        fs::write(
+            &config_path,
+            serde_json::to_vec(&primary).expect("serialize primary config"),
+        )
+        .expect("write primary config");
+
+        let raw = fs::read_to_string(&config_path).expect("read back primary config");
+        let on_disk: serde_json::Value = serde_json::from_str(&raw).expect("parse primary config");
+        assert_eq!(
+            on_disk.get("dflash_config"),
+            Some(&serde_json::Value::Null),
+            "ANTI-VACUITY: the config this pass reads must carry the marker key with a null \
+             value, or key presence and a real companion are indistinguishable here: {on_disk}"
+        );
+        assert!(
+            on_disk["quantization"]
+                .get("language_model.model.layers.0.self_attn.q_proj")
+                .is_some(),
+            "ANTI-VACUITY: the block must hold an unscoped entry, or the guard's second \
+             conjunct is never reached: {on_disk}"
+        );
+        assert!(
+            crate::models::muse_glimmer::config::MuseGlimmerConfig::from_json_str(&raw)
+                .expect("the null-marker config must still load")
+                .dflash_config
+                .is_none(),
+            "ANTI-VACUITY: the loader must read the null as absent, or this config does \
+             describe a merged companion and refusing it is right"
+        );
+
+        let prepared = prepare_muse_secondary_config(&config_path, &gguf, true)
+            .expect("a null marker is not a merged companion")
+            .expect("companion config update");
+        let config: serde_json::Value =
+            serde_json::from_str(&prepared).expect("parse companion config");
+        fs::remove_dir_all(root).ok();
+
+        assert_eq!(
+            config["quantization"], config["quantization_config"],
+            "aliases must agree or the loader refuses the checkpoint"
+        );
+        for block in ["quantization", "quantization_config"] {
+            assert_eq!(config[block]["mode"], "q6k");
+            assert_eq!(
+                config[block]["language_model.model.language_model.layers.0.self_attn.q_proj"]["mode"],
+                "q6k",
+                "the target override must be rescoped, not dropped"
+            );
+            assert_eq!(
+                config[block]["language_model.model.layers.0.self_attn.q_proj"]["mode"], "q4k",
+                "the draft profile owns the unscoped namespace after the rescope"
+            );
+        }
+        assert_eq!(config["dflash_config"]["block_size"], 16);
     }
 
     #[test]
