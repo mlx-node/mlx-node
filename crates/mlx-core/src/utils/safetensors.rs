@@ -408,18 +408,14 @@ pub struct SourceProvenance {
 /// on-disk bytes are a pure little-endian bit layout byte-identical to what the
 /// MLX writer emits. Other dtypes are excluded conservatively.
 ///
-/// Tensors below [`raw_passthrough_threshold_bytes`] are ALSO excluded, because
-/// each recorded entry pins its source array alive (see `_keep_alive`) for the
-/// whole conversion. The writer's raw path is gated on
-/// `dest_len >= raw_threshold`, so an entry below it can never be consulted —
-/// recording one buys nothing and costs the tensor's full resident footprint
-/// once something materializes it. On an AWQ run that is the difference between
-/// holding two tensors and holding the entire bf16 checkpoint: AWQ pre-scaling
-/// forces each source to materialize, and a pinned clone then keeps every one
-/// of them resident. Excluding a tensor cannot reintroduce the ABA hazard the
-/// pin defends against — an entry that was never inserted has no pointer for a
-/// recycled address to collide with, and the entries that remain are still
-/// pinned.
+/// Tensors below [`raw_passthrough_threshold_bytes`] are also excluded. The
+/// writer's raw path demands `dest_len >= raw_threshold` AND
+/// `src.byte_len == dest_len`, so a smaller entry can never be consulted, while
+/// `_keep_alive` still pins its source for the whole convert — the quantize
+/// loop then materializes that source and the pin holds the dense bytes to the
+/// end. Excluding a tensor cannot reintroduce the ABA hazard the pin defends
+/// against: an entry that was never inserted has no pointer for a recycled
+/// address to collide with, and every retained entry is still pinned.
 pub fn record_passthrough_sources<P: AsRef<Path>>(
     source_file: P,
     loaded: &HashMap<String, MxArray>,
@@ -431,9 +427,9 @@ pub fn record_passthrough_sources<P: AsRef<Path>>(
 /// [`record_passthrough_sources`] with the size gate lifted into an argument.
 ///
 /// The threshold is a parameter purely so it is assertable without
-/// `std::env::set_var`: that is `unsafe` and races every other test thread in
-/// this binary, and several tests here call [`save_safetensors`], which reads
-/// the same variable on its own raw path.
+/// `std::env::set_var`, which is `unsafe` against any concurrent `getenv` and
+/// would also reach the sibling tests that call [`save_safetensors`], since the
+/// writer resolves the same variable on its own raw path.
 pub(crate) fn record_passthrough_sources_with<P: AsRef<Path>>(
     source_file: P,
     loaded: &HashMap<String, MxArray>,
@@ -453,9 +449,8 @@ pub(crate) fn record_passthrough_sources_with<P: AsRef<Path>>(
             _ => continue,
         };
         let byte_len = info.data_offsets[1] - info.data_offsets[0];
-        // Below the writer's raw-path size gate this entry is unusable, and the
-        // `_keep_alive` clone below would pin the source for the whole convert
-        // for nothing. See fn doc.
+        // Unusable below the writer's size gate, and the pin below is not free.
+        // See fn doc.
         if (byte_len as u64) < raw_threshold {
             continue;
         }
@@ -1286,10 +1281,7 @@ mod tests {
         let small_ptr = loaded.get("small").unwrap().as_raw_ptr() as usize;
         let big_ptr = loaded.get("big").unwrap().as_raw_ptr() as usize;
 
-        // Threshold between the two (512 B > 100 ≥ 32 B), passed directly.
-        // Setting MLX_CONVERT_RAW_THRESHOLD_BYTES here instead would be
-        // `unsafe` and would race the sibling tests that call
-        // `save_safetensors`, which reads that variable.
+        // Threshold between the two: 512 B >= 100 > 32 B.
         let mut out = HashMap::new();
         record_passthrough_sources_with(&path, &loaded, &mut out, 100).unwrap();
 
