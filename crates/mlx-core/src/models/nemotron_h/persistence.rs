@@ -42,7 +42,7 @@ use crate::models::qwen3_5_moe::quantized_linear::{
 use crate::tokenizer::Qwen3Tokenizer;
 
 use super::config::{NemotronHConfig, parse_config};
-use super::model::{NemotronHInner, NemotronHModel};
+use super::model::{NemotronHInner, NemotronHModel, reserve_configured_paged_pool};
 use super::sparse_moe::ExpertProj;
 
 /// Strip the HF backbone. model wrapper from a tensor or quant key.
@@ -959,7 +959,13 @@ pub(crate) fn load_inner(model_path: &str) -> Result<(NemotronHInner, u64)> {
     let params = sanitize_weights(std::mem::take(&mut raw_params), &config)?;
     info!("NemotronH sanitized to {} tensors", params.len());
 
+    // Configured pools allocate inside `new`. Reserve first so a concurrent
+    // uncapped Nemotron load's adaptive sizer sees the bytes before Metal
+    // alloc; the CAS path in `size_paged_pool_after_weight_load` does not
+    // cover this branch.
+    let configured_pool_guard = reserve_configured_paged_pool(&config)?;
     let mut inner = NemotronHInner::new(config.clone())?;
+    inner.pool_cache_limit_guard = configured_pool_guard;
     inner.set_gen_defaults(parse_generation_defaults(path));
     // Quantized projections dispatch different matmul kernels for M=1 vs M>=2
     // rows, so the batched decode lane must run them per row to stay
@@ -970,6 +976,7 @@ pub(crate) fn load_inner(model_path: &str) -> Result<(NemotronHInner, u64)> {
 
     let weight_refs: Vec<&MxArray> = params.values().collect();
     crate::array::memory::materialize_weights(&weight_refs)?;
+    inner.size_paged_pool_after_weight_load()?;
 
     let tokenizer_path = path.join("tokenizer.json");
     if tokenizer_path.exists() {
@@ -996,8 +1003,19 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
-            let (inner, weight_bytes) = load_inner(&model_path)?;
+            let (mut inner, weight_bytes) = load_inner(&model_path)?;
+            let pool_bytes = inner
+                .paged_adapter
+                .as_ref()
+                .map(crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter::pool_allocated_bytes)
+                .transpose()
+                .map_err(Error::from_reason)?
+                .unwrap_or(0);
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
+            let pool_cache_limit_guard = inner.pool_cache_limit_guard.take().or_else(|| {
+                (pool_bytes != 0)
+                    .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes))
+            });
             let mtp_active = inner.has_mtp_weights();
             let paged_active = inner.paged_adapter.is_some();
             let context_limits =
@@ -1009,6 +1027,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
                 (
                     config,
                     cache_limit_guard,
+                    pool_cache_limit_guard,
                     mtp_active,
                     paged_active,
                     context_limits,
@@ -1018,7 +1037,14 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
         |state, receiver| state.drive(receiver),
     );
 
-    let (config, cache_limit_guard, mtp_active, paged_active, context_limits) = init_rx
+    let (
+        config,
+        cache_limit_guard,
+        pool_cache_limit_guard,
+        mtp_active,
+        paged_active,
+        context_limits,
+    ) = init_rx
         .await
         .map_err(|_| Error::from_reason("Model thread exited during load"))??;
 
@@ -1029,6 +1055,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<NemotronHModel> {
         paged_active,
         context_limits,
         _cache_limit_guard: cache_limit_guard,
+        _pool_cache_limit_guard: pool_cache_limit_guard,
     })
 }
 

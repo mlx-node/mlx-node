@@ -69,8 +69,10 @@ pub struct NemotronHConfig {
     pub n_mtp_layers: i32,
 
     // --- Block-paged KV cache ---
-    /// Optional block-paged KV cache memory cap in MiB. None resolves to the
-    /// default 2048 MiB pool; explicit values are honored.
+    /// Optional block-paged KV cache memory cap in MiB. `None` requests one
+    /// `max_position_embeddings` sequence (6 GiB on Lightning 30B-A3B) then
+    /// clips with load-time Metal/RAM sizing after weights. Explicit values
+    /// skip the auto-sizer.
     #[serde(default)]
     pub paged_cache_memory_mb: Option<u32>,
     /// Optional paged block size in tokens (default 16).

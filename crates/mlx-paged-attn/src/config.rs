@@ -1,5 +1,8 @@
 //! Configuration types for PagedAttention
 
+const BYTES_PER_MIB: u64 = 1024 * 1024;
+const MIN_FULL_SEQUENCE_MEMORY_MB: u32 = 256;
+
 /// Configuration for PagedAttention
 #[derive(Debug, Clone)]
 pub struct PagedAttentionConfig {
@@ -80,6 +83,40 @@ impl PagedAttentionConfig {
         }
 
         Ok(())
+    }
+
+    /// MiB needed to cache one sequence of `max_seq_len` tokens (bf16 K+V).
+    ///
+    /// `num_layers` is the physical full-attention layer count, not the
+    /// model's total mixer count. Zero inputs return the 256 MiB floor.
+    pub fn memory_mb_for_one_full_sequence(
+        max_seq_len: u32,
+        block_size: u32,
+        head_size: u32,
+        num_kv_heads: u32,
+        num_layers: u32,
+    ) -> u32 {
+        if max_seq_len == 0
+            || block_size == 0
+            || head_size == 0
+            || num_kv_heads == 0
+            || num_layers == 0
+        {
+            return MIN_FULL_SEQUENCE_MEMORY_MB;
+        }
+
+        let max_blocks = u64::from(max_seq_len.div_ceil(block_size));
+        let bytes_per_block = 2u64
+            .saturating_mul(u64::from(num_kv_heads))
+            .saturating_mul(u64::from(head_size))
+            .saturating_mul(u64::from(block_size))
+            .saturating_mul(2)
+            .saturating_mul(u64::from(num_layers));
+        let required_mb = bytes_per_block
+            .saturating_mul(max_blocks)
+            .div_ceil(BYTES_PER_MIB)
+            .max(u64::from(MIN_FULL_SEQUENCE_MEMORY_MB));
+        u32::try_from(required_mb).unwrap_or(u32::MAX)
     }
 
     /// Calculate the number of blocks that can be allocated
@@ -233,5 +270,29 @@ mod tests {
         let result = config.validate();
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("block_size 16 or 32"));
+    }
+
+    #[test]
+    fn one_full_sequence_mb_for_nemotron_lightning() {
+        // 1_048_576 tokens, block 16, head 128, 2 kv, 6 attn layers, bf16 K+V
+        let mb = PagedAttentionConfig::memory_mb_for_one_full_sequence(1_048_576, 16, 128, 2, 6);
+        assert_eq!(mb, 6144);
+        let cfg = PagedAttentionConfig {
+            block_size: 16,
+            gpu_memory_mb: mb,
+            head_size: 128,
+            num_kv_heads: 2,
+            num_layers: 6,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(1_048_576),
+            max_batch_size: Some(32),
+        };
+        assert_eq!(cfg.max_cached_tokens(), 1_048_576);
+    }
+
+    #[test]
+    fn one_full_sequence_mb_matches_qwen35_35b_a3b() {
+        let mb = PagedAttentionConfig::memory_mb_for_one_full_sequence(262_144, 16, 256, 2, 10);
+        assert_eq!(mb, 5_120);
     }
 }

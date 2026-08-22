@@ -228,6 +228,47 @@ impl CacheLimitCoordinator {
         CacheLimitGuard { id }
     }
 
+    /// Sum of every live private paged-KV pool registered with this
+    /// coordinator. Used by load-time pool sizers so a second model does
+    /// not treat another model's Metal buffers as free headroom.
+    pub fn registered_pool_bytes(&self) -> u64 {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .pools
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add)
+    }
+
+    /// Register `pool_bytes` only if the live pool sum is still `expected_total`.
+    /// `None` means another load reserved in between; the caller should resize.
+    pub fn try_register_pool_if_total_eq(
+        &self,
+        expected_total: u64,
+        pool_bytes: u64,
+    ) -> Option<PoolCacheLimitGuard> {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let current = state
+            .pools
+            .values()
+            .copied()
+            .fold(0u64, u64::saturating_add);
+        if current != expected_total {
+            return None;
+        }
+        let id = state.next_id;
+        state.next_id = state.next_id.saturating_add(1);
+        state.pools.insert(id, pool_bytes);
+        info!(
+            "[cache_limit] register paged pool guard={} bytes={:.2} GB (live_pools={})",
+            id,
+            pool_bytes as f64 / ONE_GIB,
+            state.pools.len(),
+        );
+        recompute_locked(&mut state);
+        Some(PoolCacheLimitGuard { id })
+    }
+
     /// Register a private paged-KV pool so the MLX freelist ceiling is
     /// debited by memory that MLX's own allocator counters cannot see.
     pub fn register_pool(&self, pool_bytes: u64) -> PoolCacheLimitGuard {
@@ -599,6 +640,9 @@ mod tests {
     /// never observes another's `MLX_GPU_HEADROOM_GB` setting.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
+    /// Serializes tests that mutate the process-wide pool registry.
+    static POOL_LOCK: Mutex<()> = Mutex::new(());
+
     /// RAII guard that unsets the env var on drop. Any test that calls
     /// `std::env::set_var(GPU_HEADROOM_ENV, ...)` should wrap the call
     /// in one of these so a panic cannot leak the variable into the
@@ -730,6 +774,40 @@ mod tests {
         let with_pool = compute_cache_limit(36 * GB, 8 * GB, 96 * GB);
         assert_eq!(without_pool.saturating_sub(with_pool), 8 * GB);
         approx_eq_gb(with_pool, 37.6);
+    }
+
+    #[test]
+    fn registered_pool_bytes_tracks_live_guards() {
+        let _lock = POOL_LOCK.lock().unwrap();
+        let before = coordinator().registered_pool_bytes();
+        let _g1 = coordinator().register_pool(3 * GB);
+        let _g2 = coordinator().register_pool(5 * GB);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            8 * GB
+        );
+    }
+
+    #[test]
+    fn try_register_pool_if_total_eq_rejects_stale_snapshot() {
+        let _lock = POOL_LOCK.lock().unwrap();
+        let before = coordinator().registered_pool_bytes();
+        let _occupant = coordinator().register_pool(GB);
+        assert!(
+            coordinator()
+                .try_register_pool_if_total_eq(before, GB)
+                .is_none(),
+            "stale sibling snapshot must not insert a second pool"
+        );
+        let current = coordinator().registered_pool_bytes();
+        let accepted = coordinator().try_register_pool_if_total_eq(current, 2 * GB);
+        assert!(accepted.is_some(), "matching snapshot must reserve");
+        assert_eq!(
+            coordinator()
+                .registered_pool_bytes()
+                .saturating_sub(current),
+            2 * GB
+        );
     }
 
     // ── env override: MLX_GPU_HEADROOM_GB ─────────────────────────
