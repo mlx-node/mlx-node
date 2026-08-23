@@ -33,8 +33,12 @@
 use crate::config::PagedAttentionConfig;
 use crate::metal::MetalDtype;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
 #[cfg(target_os = "macos")]
 use metal::Buffer;
+#[cfg(target_os = "macos")]
+use std::sync::RwLock;
 
 #[cfg(target_os = "macos")]
 fn inference_trace_file() -> Option<&'static str> {
@@ -136,7 +140,13 @@ const TEST_POOL_MAX_BYTES: u64 = 256 << 20;
 /// crate type-checks; the kernel dispatch APIs are macOS-only.
 pub struct LayerKVPool {
     config: PagedAttentionConfig,
-    num_blocks: u32,
+
+    /// Hard ceiling on the block count this pool can reach, fixed at
+    /// construction. [`Self::new`] allocates for `num_blocks` immediately and
+    /// permits [`Self::grow_to`] up to `max_num_blocks`. When the two are
+    /// equal the pool is not growable and behaves exactly like the original
+    /// fixed-size pool.
+    max_num_blocks: u32,
 
     /// Element dtype of the on-GPU K/V cache. Threaded through to
     /// `reshape_and_cache` (write side) and `paged_attention` (gather side)
@@ -156,17 +166,56 @@ pub struct LayerKVPool {
     /// dispatch through the wrong kernel-element-size path.
     cache_dtype: MetalDtype,
 
-    /// `(key_cache, value_cache)` per layer. Indexed by `layer_idx`.
-    /// On non-macOS this is a placeholder vector of unit tuples to keep
-    /// the structure consistent without allocating GPU memory.
+    /// Bumped on every successful [`Self::grow_to`]. Consumers that cache
+    /// per-layer MLX array views ([`Self::key_cache_array_raw`] /
+    /// [`Self::value_cache_array_raw`]) compare against this to detect that
+    /// the buffers their views wrap were swapped out and must be rebuilt.
+    generation: AtomicU64,
+
+    /// The swappable half of the pool, behind one lock so [`Self::grow_to`]
+    /// can build-then-swap through `&self`.
     #[cfg(target_os = "macos")]
-    layers: Vec<(Buffer, Buffer)>,
+    inner: RwLock<PoolInner>,
 
     #[cfg(not(target_os = "macos"))]
     num_layers: u32,
+    #[cfg(not(target_os = "macos"))]
+    num_blocks: u32,
+}
+
+/// The swappable half of a [`LayerKVPool`]: the per-layer Metal buffers and
+/// the block count they were allocated for. `grow_to` replaces this
+/// wholesale — it never mutates a buffer in place — so a reader holding a
+/// cloned `Buffer` handle keeps a consistent (older) generation of the pool.
+#[cfg(target_os = "macos")]
+struct PoolInner {
+    /// `(key_cache, value_cache)` per layer. Indexed by `layer_idx`.
+    layers: Vec<(Buffer, Buffer)>,
+    /// Number of physical block slots the current buffers were sized for.
+    num_blocks: u32,
 }
 
 impl LayerKVPool {
+    /// Read-lock the swappable pool state. Poisoning is recovered rather
+    /// than propagated, matching `cold_cache`: the lock's only writer
+    /// (`grow_to`) performs no panicking operation while holding it, so a
+    /// poisoned lock still holds a complete, consistent generation.
+    #[cfg(target_os = "macos")]
+    fn inner_read(&self) -> std::sync::RwLockReadGuard<'_, PoolInner> {
+        self.inner
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Write-lock the swappable pool state. See [`Self::inner_read`] for the
+    /// poisoning policy.
+    #[cfg(target_os = "macos")]
+    fn inner_write(&self) -> std::sync::RwLockWriteGuard<'_, PoolInner> {
+        self.inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Validate and resolve `(element_size, x)` from the supplied
     /// `cache_dtype`, asserting the caller's `(use_fp8, dtype)` combination
     /// is one of the kernel-supported pairs:
@@ -237,7 +286,8 @@ impl LayerKVPool {
     /// element_size` is free to overflow `u64` on a geometry no allocator
     /// would ever satisfy. Unchecked, that wraps to a small size in release
     /// and panics in debug; checked, it is an ordinary `Err`.
-    #[cfg(target_os = "macos")]
+    ///
+    /// Not macOS-gated: [`Self::total_bytes`] needs it on every platform.
     fn block_bytes_for(
         config: &PagedAttentionConfig,
         cache_dtype: MetalDtype,
@@ -305,15 +355,18 @@ impl LayerKVPool {
         key_block_size: u64,
         value_block_size: u64,
     ) -> Result<(), String> {
-        let (key_cache, value_cache) = self.layers.get(layer_idx).ok_or_else(|| {
-            format!(
-                "{context}: layer_idx {layer_idx} out of range (num_layers = {})",
-                self.layers.len()
-            )
-        })?;
+        let (key_cache, value_cache) = {
+            let inner = self.inner_read();
+            inner.layers.get(layer_idx).cloned().ok_or_else(|| {
+                format!(
+                    "{context}: layer_idx {layer_idx} out of range (num_layers = {})",
+                    inner.layers.len()
+                )
+            })?
+        };
         for (side, buffer, block_bytes) in [
-            ("key", key_cache, key_block_size),
-            ("value", value_cache, value_block_size),
+            ("key", &key_cache, key_block_size),
+            ("value", &value_cache, value_block_size),
         ] {
             let slot_end = Self::block_slot_end(block_id, block_bytes).ok_or_else(|| {
                 format!(
@@ -346,7 +399,8 @@ impl LayerKVPool {
         key_block_size: u64,
         value_block_size: u64,
     ) -> Result<(), String> {
-        for layer_idx in 0..self.layers.len() {
+        let num_layers = self.inner_read().layers.len();
+        for layer_idx in 0..num_layers {
             self.check_slot_fits(
                 context,
                 layer_idx,
@@ -375,8 +429,15 @@ impl LayerKVPool {
     /// `Float32` and other widths are rejected — the kernel instantiation
     /// list only covers the 2-byte (half, bfloat16) and 1-byte (uchar) cases.
     ///
+    /// The pool is allocated for `num_blocks` block slots immediately.
+    /// `max_num_blocks` (must be `>= num_blocks`) is the ceiling
+    /// [`Self::grow_to`] may later raise the pool to. When
+    /// `max_num_blocks == num_blocks` the pool is not growable and behavior
+    /// is byte-identical to the original fixed-size pool.
+    ///
     /// Returns `Err` for invalid configurations:
     /// - `num_blocks == 0`
+    /// - `max_num_blocks < num_blocks`
     /// - `config.num_layers == 0`
     /// - `config.validate()` fails
     /// - `cache_dtype` mismatched with `config.use_fp8()`
@@ -385,11 +446,18 @@ impl LayerKVPool {
     pub fn new(
         config: PagedAttentionConfig,
         num_blocks: u32,
+        max_num_blocks: u32,
         cache_dtype: MetalDtype,
     ) -> Result<Self, String> {
         config.validate()?;
         if num_blocks == 0 {
             return Err("LayerKVPool::new: num_blocks must be > 0".to_string());
+        }
+        if max_num_blocks < num_blocks {
+            return Err(format!(
+                "LayerKVPool::new: max_num_blocks ({max_num_blocks}) must be >= num_blocks \
+                 ({num_blocks})"
+            ));
         }
         if config.num_layers == 0 {
             return Err("LayerKVPool::new: config.num_layers must be > 0".to_string());
@@ -450,9 +518,10 @@ impl LayerKVPool {
 
             Ok(Self {
                 config,
-                num_blocks,
+                max_num_blocks,
                 cache_dtype,
-                layers,
+                generation: AtomicU64::new(0),
+                inner: RwLock::new(PoolInner { layers, num_blocks }),
             })
         }
 
@@ -464,9 +533,11 @@ impl LayerKVPool {
             let _ = (_element_size, x);
             Ok(Self {
                 num_layers: config.num_layers,
-                config,
                 num_blocks,
+                config,
+                max_num_blocks,
                 cache_dtype,
+                generation: AtomicU64::new(0),
             })
         }
     }
@@ -577,9 +648,10 @@ impl LayerKVPool {
 
             Ok(Self {
                 config: cfg,
-                num_blocks,
+                max_num_blocks: num_blocks,
                 cache_dtype,
-                layers,
+                generation: AtomicU64::new(0),
+                inner: RwLock::new(PoolInner { layers, num_blocks }),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -588,7 +660,9 @@ impl LayerKVPool {
                 num_layers,
                 config: cfg,
                 num_blocks,
+                max_num_blocks: num_blocks,
                 cache_dtype,
+                generation: AtomicU64::new(0),
             })
         }
     }
@@ -645,9 +719,13 @@ impl LayerKVPool {
             // so this is sufficient for adapter-lifecycle tests.
             Ok(Self {
                 config: cfg,
-                num_blocks,
+                max_num_blocks: num_blocks,
                 cache_dtype,
-                layers: Vec::new(),
+                generation: AtomicU64::new(0),
+                inner: RwLock::new(PoolInner {
+                    layers: Vec::new(),
+                    num_blocks,
+                }),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -656,16 +734,142 @@ impl LayerKVPool {
                 num_layers,
                 config: cfg,
                 num_blocks,
+                max_num_blocks: num_blocks,
                 cache_dtype,
+                generation: AtomicU64::new(0),
             })
         }
+    }
+
+    /// Grow the pool's per-layer K/V buffers to hold `new_num_blocks` block
+    /// slots, preserving every byte of the existing blocks.
+    ///
+    /// For each layer, a new (key, value) `StorageModePrivate` buffer pair is
+    /// allocated at the larger size and the *entire* old buffer is copied to
+    /// offset 0 of the new one with a blit `copy_from_buffer` (the vLLM
+    /// layout keeps block `i` at byte offset `i * block_bytes`, so existing
+    /// block ids address the same bytes before and after). All copies run on
+    /// one committed command buffer that is awaited with
+    /// `wait_until_completed`. Only after the copy has completed successfully
+    /// are the new buffers swapped in and [`Self::generation`] bumped — any
+    /// allocation or blit failure returns `Err` with the old state untouched
+    /// (build-then-swap).
+    ///
+    /// Returns `Ok(false)` — a no-op — when `new_num_blocks` is `<=` the
+    /// current [`Self::num_blocks`] or exceeds [`Self::max_num_blocks`].
+    /// Returns `Ok(true)` when the swap happened.
+    ///
+    /// # Caller contract
+    ///
+    /// - Call only from the model's own thread, with **no turn in flight**:
+    ///   all GPU dispatches against the pool re-bind buffers per call and
+    ///   wait synchronously, but nothing here cancels work that is already
+    ///   submitted.
+    /// - Any pending pool writes must be flushed (they are — the write paths
+    ///   block on completion — so an idle model thread satisfies this).
+    /// - Callers holding cached array views of the old buffers must rebuild
+    ///   them; [`Self::generation`] exists for that lazy invalidation.
+    /// - The `BlockAllocator` is grown separately (`grow_by`); this method
+    ///   only reallocates physical storage.
+    #[cfg(target_os = "macos")]
+    pub fn grow_to(&self, new_num_blocks: u32) -> Result<bool, String> {
+        use crate::metal::command_buffer::observe;
+        use crate::metal::{MetalState, is_metal_extraction_supported};
+        use metal::MTLResourceOptions;
+
+        // Fast path: decline without the write lock.
+        {
+            let inner = self.inner_read();
+            if new_num_blocks <= inner.num_blocks || new_num_blocks > self.max_num_blocks {
+                return Ok(false);
+            }
+            if inner.layers.is_empty() {
+                return Err(
+                    "LayerKVPool::grow_to: pool has zero layers (validation-only pool)".to_string(),
+                );
+            }
+        }
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+
+        // Same expression the blit ranges are addressed from — allocation
+        // and copy sizes cannot drift apart.
+        let (key_block_size, value_block_size) =
+            Self::block_bytes_for(&self.config, self.cache_dtype)?;
+
+        let mut inner = self.inner_write();
+        // Re-check under the write lock: another grow may have landed while
+        // we waited for it.
+        if new_num_blocks <= inner.num_blocks || new_num_blocks > self.max_num_blocks {
+            return Ok(false);
+        }
+        let old_num_blocks = inner.num_blocks;
+        let overflow = |side: &str, per_block: u64, blocks: u32| {
+            format!(
+                "LayerKVPool::grow_to: {side} cache size overflows u64 ({per_block} bytes per \
+                 block x {blocks} blocks)"
+            )
+        };
+        let new_key_size = key_block_size
+            .checked_mul(new_num_blocks as u64)
+            .ok_or_else(|| overflow("key", key_block_size, new_num_blocks))?;
+        let new_value_size = value_block_size
+            .checked_mul(new_num_blocks as u64)
+            .ok_or_else(|| overflow("value", value_block_size, new_num_blocks))?;
+        let old_key_bytes = key_block_size
+            .checked_mul(old_num_blocks as u64)
+            .ok_or_else(|| overflow("key", key_block_size, old_num_blocks))?;
+        let old_value_bytes = value_block_size
+            .checked_mul(old_num_blocks as u64)
+            .ok_or_else(|| overflow("value", value_block_size, old_num_blocks))?;
+
+        // Build first: every new buffer is allocated and every copy has
+        // completed before `inner` is touched, so any failure leaves the old
+        // state untouched.
+        let state = MetalState::get()?;
+        let mut new_layers = Vec::with_capacity(inner.layers.len());
+        for _ in 0..inner.layers.len() {
+            let key_cache = state
+                .device
+                .new_buffer(new_key_size, MTLResourceOptions::StorageModePrivate);
+            let value_cache = state
+                .device
+                .new_buffer(new_value_size, MTLResourceOptions::StorageModePrivate);
+            new_layers.push((key_cache, value_cache));
+        }
+
+        let command_buffer = state.command_queue.new_command_buffer();
+        let blit = command_buffer.new_blit_command_encoder();
+        for ((old_key, old_value), (new_key, new_value)) in
+            inner.layers.iter().zip(new_layers.iter())
+        {
+            blit.copy_from_buffer(old_key, 0, new_key, 0, old_key_bytes);
+            blit.copy_from_buffer(old_value, 0, new_value, 0, old_value_bytes);
+        }
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        observe(&command_buffer, "LayerKVPool::grow_to")?;
+
+        inner.layers = new_layers;
+        inner.num_blocks = new_num_blocks;
+        self.generation.fetch_add(1, Ordering::AcqRel);
+        Ok(true)
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn grow_to(&self, _new_num_blocks: u32) -> Result<bool, String> {
+        Err("grow_to is only supported on macOS (Metal backend)".to_string())
     }
 
     /// Number of transformer layers covered by this pool.
     pub fn num_layers(&self) -> usize {
         #[cfg(target_os = "macos")]
         {
-            self.layers.len()
+            self.inner_read().layers.len()
         }
         #[cfg(not(target_os = "macos"))]
         {
@@ -673,9 +877,46 @@ impl LayerKVPool {
         }
     }
 
-    /// Number of physical blocks in each layer's K/V buffer.
+    /// Number of physical blocks in each layer's K/V buffer. This is the
+    /// *currently allocated* size — it increases when [`Self::grow_to`]
+    /// succeeds.
     pub fn num_blocks(&self) -> u32 {
-        self.num_blocks
+        #[cfg(target_os = "macos")]
+        {
+            self.inner_read().num_blocks
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            self.num_blocks
+        }
+    }
+
+    /// Hard ceiling on [`Self::num_blocks`], fixed at construction.
+    pub fn max_num_blocks(&self) -> u32 {
+        self.max_num_blocks
+    }
+
+    /// Monotonic counter bumped on every successful [`Self::grow_to`];
+    /// starts at 0. Consumers caching per-layer array views compare their
+    /// snapshot against this to know the buffers were swapped and the views
+    /// must be rebuilt.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Total bytes the pool's K/V buffers currently occupy, summed over both
+    /// sides and all layers — for cache-limit accounting. Follows
+    /// [`Self::num_blocks`], so it reflects the live allocation after a
+    /// grow. Saturates rather than panicking if the geometry overflows
+    /// `u64` (constructors reject such geometries; this is defensive).
+    pub fn total_bytes(&self) -> u64 {
+        let per_block_per_layer = match Self::block_bytes_for(&self.config, self.cache_dtype) {
+            Ok((key, value)) => key.saturating_add(value),
+            Err(_) => return 0,
+        };
+        per_block_per_layer
+            .saturating_mul(self.num_blocks() as u64)
+            .saturating_mul(self.num_layers() as u64)
     }
 
     /// Block size in tokens (alias of `config().block_size`).
@@ -698,16 +939,26 @@ impl LayerKVPool {
 
     /// Get the key cache buffer for a layer. `None` if `layer_idx` is out
     /// of range.
+    ///
+    /// The returned `Buffer` is a clone of the pool's handle (a Metal
+    /// retain): it stays valid even if a later [`Self::grow_to`] swaps the
+    /// pool's buffers, but it then addresses the *old*, smaller allocation.
     #[cfg(target_os = "macos")]
-    pub fn key_cache(&self, layer_idx: u32) -> Option<&Buffer> {
-        self.layers.get(layer_idx as usize).map(|(k, _)| k)
+    pub fn key_cache(&self, layer_idx: u32) -> Option<Buffer> {
+        self.inner_read()
+            .layers
+            .get(layer_idx as usize)
+            .map(|(k, _)| k.clone())
     }
 
     /// Get the value cache buffer for a layer. `None` if `layer_idx` is
-    /// out of range.
+    /// out of range. Same retain semantics as [`Self::key_cache`].
     #[cfg(target_os = "macos")]
-    pub fn value_cache(&self, layer_idx: u32) -> Option<&Buffer> {
-        self.layers.get(layer_idx as usize).map(|(_, v)| v)
+    pub fn value_cache(&self, layer_idx: u32) -> Option<Buffer> {
+        self.inner_read()
+            .layers
+            .get(layer_idx as usize)
+            .map(|(_, v)| v.clone())
     }
 
     /// Wrap the K cache buffer for `layer_idx` as a zero-copy MLX `array`
@@ -740,24 +991,30 @@ impl LayerKVPool {
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
         }
-        if layer_idx as usize >= self.layers.len() {
-            return Err(format!(
-                "LayerKVPool::key_cache_array_raw: layer_idx {} out of range \
-                 (num_layers = {})",
-                layer_idx,
-                self.layers.len()
-            ));
-        }
-        let (key_cache, _) = &self.layers[layer_idx as usize];
+        let key_cache = {
+            let inner = self.inner_read();
+            let Some((key_cache, _)) = inner.layers.get(layer_idx as usize) else {
+                return Err(format!(
+                    "LayerKVPool::key_cache_array_raw: layer_idx {} out of range \
+                     (num_layers = {})",
+                    layer_idx,
+                    inner.layers.len()
+                ));
+            };
+            // Clone the handle (a Metal retain) and drop the lock: the view
+            // built below wraps this generation of the buffer regardless of
+            // any later `grow_to`.
+            key_cache.clone()
+        };
 
         let (_element_size, x) = Self::cache_dtype_layout(self.config.use_fp8(), self.cache_dtype)?;
         let dims = self.key_cache_shape(x);
         let dtype_code = bridge_dtype_code(self.cache_dtype)?;
 
-        // SAFETY: `key_cache` lives at least as long as `&self`; the FFI
-        // call retains the MTL::Buffer (refcount + 1) and installs a
-        // matching `release()` deleter on the resulting array, so the
-        // array view holds its own reference independently of this pool.
+        // SAFETY: `key_cache` is a retained handle valid for the rest of
+        // this call; the FFI call retains the MTL::Buffer (refcount + 1) and
+        // installs a matching `release()` deleter on the resulting array, so
+        // the array view holds its own reference independently of this pool.
         let arr = unsafe {
             mlx_sys::mlx_array_from_metal_buffer_view(
                 key_cache.as_ptr() as *mut _,
@@ -788,15 +1045,18 @@ impl LayerKVPool {
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
         }
-        if layer_idx as usize >= self.layers.len() {
-            return Err(format!(
-                "LayerKVPool::value_cache_array_raw: layer_idx {} out of range \
-                 (num_layers = {})",
-                layer_idx,
-                self.layers.len()
-            ));
-        }
-        let (_, value_cache) = &self.layers[layer_idx as usize];
+        let value_cache = {
+            let inner = self.inner_read();
+            let Some((_, value_cache)) = inner.layers.get(layer_idx as usize) else {
+                return Err(format!(
+                    "LayerKVPool::value_cache_array_raw: layer_idx {} out of range \
+                     (num_layers = {})",
+                    layer_idx,
+                    inner.layers.len()
+                ));
+            };
+            value_cache.clone()
+        };
 
         let dims = self.value_cache_shape();
         let dtype_code = bridge_dtype_code(self.cache_dtype)?;
@@ -825,7 +1085,7 @@ impl LayerKVPool {
     /// host.
     pub fn key_cache_shape(&self, x: u32) -> [i64; 5] {
         [
-            self.num_blocks as i64,
+            self.num_blocks() as i64,
             self.config.num_kv_heads as i64,
             (self.config.head_size / x) as i64,
             self.config.block_size as i64,
@@ -838,7 +1098,7 @@ impl LayerKVPool {
     /// host.
     pub fn value_cache_shape(&self) -> [i64; 4] {
         [
-            self.num_blocks as i64,
+            self.num_blocks() as i64,
             self.config.num_kv_heads as i64,
             self.config.head_size as i64,
             self.config.block_size as i64,
@@ -900,15 +1160,21 @@ impl LayerKVPool {
             return Err("Metal GPU not available".to_string());
         }
 
-        if layer_idx as usize >= self.layers.len() {
-            return Err(format!(
-                "LayerKVPool::write_kv: layer_idx {} out of range (num_layers = {})",
-                layer_idx,
-                self.layers.len()
-            ));
-        }
-
-        let (key_cache, value_cache) = &self.layers[layer_idx as usize];
+        let (key_cache, value_cache) = {
+            let inner = self.inner_read();
+            match inner.layers.get(layer_idx as usize) {
+                // Clone the pair (Metal retains) and drop the lock before
+                // any GPU work.
+                Some(pair) => pair.clone(),
+                None => {
+                    return Err(format!(
+                        "LayerKVPool::write_kv: layer_idx {} out of range (num_layers = {})",
+                        layer_idx,
+                        inner.layers.len()
+                    ));
+                }
+            }
+        };
 
         if slot_mapping.is_empty() {
             return Ok(());
@@ -1053,8 +1319,8 @@ impl LayerKVPool {
             dispatch_reshape_and_cache_raw(
                 &key_raw,
                 &value_raw,
-                key_cache,
-                value_cache,
+                &key_cache,
+                &value_cache,
                 &slot_raw,
                 &params,
                 input_dtype,
@@ -1177,14 +1443,20 @@ impl LayerKVPool {
             return Err("Metal GPU not available".to_string());
         }
 
-        if layer_idx as usize >= self.layers.len() {
-            return Err(format!(
-                "LayerKVPool::gather_attention: layer_idx {} out of range \
-                 (num_layers = {})",
-                layer_idx,
-                self.layers.len()
-            ));
-        }
+        let (key_cache, value_cache) = {
+            let inner = self.inner_read();
+            match inner.layers.get(layer_idx as usize) {
+                Some(pair) => pair.clone(),
+                None => {
+                    return Err(format!(
+                        "LayerKVPool::gather_attention: layer_idx {} out of range \
+                         (num_layers = {})",
+                        layer_idx,
+                        inner.layers.len()
+                    ));
+                }
+            }
+        };
         if block_ids.is_empty() {
             return Err(
                 "LayerKVPool::gather_attention: block_ids empty (no allocated blocks)".to_string(),
@@ -1198,8 +1470,6 @@ impl LayerKVPool {
         if num_query_heads == 0 {
             return Err("LayerKVPool::gather_attention: num_query_heads must be > 0".to_string());
         }
-
-        let (key_cache, value_cache) = &self.layers[layer_idx as usize];
 
         // Synchronize MLX so the queries tensor is materialized.
         synchronize_mlx();
@@ -1292,12 +1562,13 @@ impl LayerKVPool {
         // SAFETY: query_info.buffer_ptr was just extracted (and MLX
         // synchronized); block_tables_buffer and context_lens_buffer are
         // bindings on the stack held until after the synchronous dispatch
-        // returns; key_cache / value_cache live for the lifetime of the pool.
+        // returns; key_cache / value_cache are retained handles that live
+        // until the end of this call.
         unsafe {
             dispatch_paged_attention_auto_with_route(
                 &query_raw,
-                key_cache,
-                value_cache,
+                &key_cache,
+                &value_cache,
                 &block_tables_buffer,
                 &context_lens_buffer,
                 num_tokens_in_request,
@@ -1345,28 +1616,31 @@ impl LayerKVPool {
             return Err("Metal GPU not available".to_string());
         }
 
-        if layer_idx as usize >= self.layers.len() {
-            return Err(format!(
-                "LayerKVPool::read_blocks_to_host: layer_idx {} out of range \
-                 (num_layers = {})",
-                layer_idx,
-                self.layers.len()
-            ));
-        }
+        let (key_cache, value_cache, num_blocks) = {
+            let inner = self.inner_read();
+            let Some(pair) = inner.layers.get(layer_idx as usize) else {
+                return Err(format!(
+                    "LayerKVPool::read_blocks_to_host: layer_idx {} out of range \
+                     (num_layers = {})",
+                    layer_idx,
+                    inner.layers.len()
+                ));
+            };
+            (pair.0.clone(), pair.1.clone(), inner.num_blocks)
+        };
         if block_ids.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
         for &id in block_ids {
-            if id >= self.num_blocks {
+            if id >= num_blocks {
                 return Err(format!(
                     "LayerKVPool::read_blocks_to_host: block_id {} >= num_blocks {} \
                      (out-of-range physical block)",
-                    id, self.num_blocks
+                    id, num_blocks
                 ));
             }
         }
 
-        let (key_cache, value_cache) = &self.layers[layer_idx as usize];
         let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
         // The largest id owns the highest slot, so checking it alone bounds
         // every blit this call encodes.
@@ -1405,14 +1679,14 @@ impl LayerKVPool {
             let key_dst_offset = i as u64 * key_block_size;
             let value_dst_offset = i as u64 * value_block_size;
             blit_encoder.copy_from_buffer(
-                key_cache,
+                &key_cache,
                 key_src_offset,
                 &key_staging,
                 key_dst_offset,
                 key_block_size,
             );
             blit_encoder.copy_from_buffer(
-                value_cache,
+                &value_cache,
                 value_src_offset,
                 &value_staging,
                 value_dst_offset,
@@ -1483,18 +1757,24 @@ impl LayerKVPool {
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
         }
-        if self.layers.is_empty() {
+        // Clone the layer handles (Metal retains) and snapshot the block
+        // count under one read, then drop the lock before any GPU work.
+        let (layers, num_blocks) = {
+            let inner = self.inner_read();
+            (inner.layers.clone(), inner.num_blocks)
+        };
+        if layers.is_empty() {
             return Err("LayerKVPool::read_block_all_layers: pool has zero layers".to_string());
         }
-        if block_id >= self.num_blocks {
+        if block_id >= num_blocks {
             return Err(format!(
                 "LayerKVPool::read_block_all_layers: block_id {} >= num_blocks {} \
                  (out-of-range physical block)",
-                block_id, self.num_blocks
+                block_id, num_blocks
             ));
         }
         let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
-        let num_layers = self.layers.len();
+        let num_layers = layers.len();
         self.check_slot_fits_all_layers(
             "LayerKVPool::read_block_all_layers",
             block_id,
@@ -1533,7 +1813,7 @@ impl LayerKVPool {
 
         let command_buffer = state.command_queue.new_command_buffer();
         let blit = command_buffer.new_blit_command_encoder();
-        for (layer_idx, (key_cache, value_cache)) in self.layers.iter().enumerate() {
+        for (layer_idx, (key_cache, value_cache)) in layers.iter().enumerate() {
             blit.copy_from_buffer(
                 key_cache,
                 block_id as u64 * key_block_size,
@@ -1614,18 +1894,23 @@ impl LayerKVPool {
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
         }
-        if layer_idx as usize >= self.layers.len() {
-            return Err(format!(
-                "LayerKVPool::write_blocks_from_host: layer_idx {} out of range (num_layers = {})",
-                layer_idx,
-                self.layers.len()
-            ));
-        }
+        let (key_cache, value_cache, num_blocks) = {
+            let inner = self.inner_read();
+            let Some(pair) = inner.layers.get(layer_idx as usize) else {
+                return Err(format!(
+                    "LayerKVPool::write_blocks_from_host: layer_idx {} out of range \
+                     (num_layers = {})",
+                    layer_idx,
+                    inner.layers.len()
+                ));
+            };
+            (pair.0.clone(), pair.1.clone(), inner.num_blocks)
+        };
         for &id in block_ids {
-            if id >= self.num_blocks {
+            if id >= num_blocks {
                 return Err(format!(
                     "LayerKVPool::write_blocks_from_host: block_id {} >= num_blocks {}",
-                    id, self.num_blocks
+                    id, num_blocks
                 ));
             }
         }
@@ -1666,21 +1951,20 @@ impl LayerKVPool {
         let value_staging = state
             .device
             .new_buffer_with_slice(values_bytes, MTLResourceOptions::StorageModeShared);
-        let (key_cache, value_cache) = &self.layers[layer_idx as usize];
         let command_buffer = state.command_queue.new_command_buffer();
         let blit = command_buffer.new_blit_command_encoder();
         for (i, &block_id) in block_ids.iter().enumerate() {
             blit.copy_from_buffer(
                 &key_staging,
                 i as u64 * key_block_size,
-                key_cache,
+                &key_cache,
                 block_id as u64 * key_block_size,
                 key_block_size,
             );
             blit.copy_from_buffer(
                 &value_staging,
                 i as u64 * value_block_size,
-                value_cache,
+                &value_cache,
                 block_id as u64 * value_block_size,
                 value_block_size,
             );
@@ -1748,20 +2032,26 @@ impl LayerKVPool {
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
         }
-        if self.layers.is_empty() {
+        // Clone the layer handles (Metal retains) and snapshot the block
+        // count under one read, then drop the lock before any GPU work.
+        let (pool_layers, num_blocks) = {
+            let inner = self.inner_read();
+            (inner.layers.clone(), inner.num_blocks)
+        };
+        if pool_layers.is_empty() {
             return Err("LayerKVPool::write_block_all_layers: pool has zero layers".to_string());
         }
-        if layers.len() != self.layers.len() {
+        if layers.len() != pool_layers.len() {
             return Err(format!(
                 "LayerKVPool::write_block_all_layers: layer count {} != pool num_layers {}",
                 layers.len(),
-                self.layers.len()
+                pool_layers.len()
             ));
         }
-        if block_id >= self.num_blocks {
+        if block_id >= num_blocks {
             return Err(format!(
                 "LayerKVPool::write_block_all_layers: block_id {} >= num_blocks {}",
-                block_id, self.num_blocks
+                block_id, num_blocks
             ));
         }
         let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
@@ -1831,7 +2121,7 @@ impl LayerKVPool {
 
         let command_buffer = state.command_queue.new_command_buffer();
         let blit = command_buffer.new_blit_command_encoder();
-        for (layer_idx, (key_cache, value_cache)) in self.layers.iter().enumerate() {
+        for (layer_idx, (key_cache, value_cache)) in pool_layers.iter().enumerate() {
             blit.copy_from_buffer(
                 &key_staging,
                 layer_idx as u64 * key_block_size,
@@ -1885,7 +2175,7 @@ mod tests {
     #[test]
     fn test_new_rejects_zero_num_blocks() {
         let config = base_config(2);
-        let res = LayerKVPool::new(config, 0, MetalDtype::Float16);
+        let res = LayerKVPool::new(config, 0, 0, MetalDtype::Float16);
         assert!(res.is_err(), "expected error, got Ok");
         let msg = res.err().unwrap();
         assert!(
@@ -1902,7 +2192,7 @@ mod tests {
             num_layers: 0,
             ..base_config(2)
         };
-        let res = LayerKVPool::new(config, 4, MetalDtype::Float16);
+        let res = LayerKVPool::new(config, 4, 4, MetalDtype::Float16);
         assert!(res.is_err(), "expected error, got Ok");
     }
 
@@ -1913,7 +2203,7 @@ mod tests {
             block_size: 64,
             ..base_config(2)
         };
-        let res = LayerKVPool::new(bad, 4, MetalDtype::Float16);
+        let res = LayerKVPool::new(bad, 4, 4, MetalDtype::Float16);
         assert!(res.is_err(), "expected validation error, got Ok");
     }
 
@@ -1923,7 +2213,7 @@ mod tests {
     #[test]
     fn test_new_rejects_uchar_dtype_without_fp8() {
         let cfg = base_config(2);
-        let res = LayerKVPool::new(cfg, 4, MetalDtype::UChar);
+        let res = LayerKVPool::new(cfg, 4, 4, MetalDtype::UChar);
         assert!(res.is_err(), "expected dtype/FP8 mismatch error");
         let msg = res.err().unwrap();
         assert!(
@@ -1944,7 +2234,7 @@ mod tests {
             use_fp8_cache: Some(true),
             ..base_config(2)
         };
-        let res = LayerKVPool::new(cfg, 4, MetalDtype::Float16);
+        let res = LayerKVPool::new(cfg, 4, 4, MetalDtype::Float16);
         assert!(res.is_err(), "expected FP8/dtype mismatch error");
         let msg = res.err().unwrap();
         assert!(
@@ -1958,7 +2248,7 @@ mod tests {
     #[test]
     fn test_new_rejects_float32_dtype() {
         let cfg = base_config(2);
-        let res = LayerKVPool::new(cfg, 4, MetalDtype::Float32);
+        let res = LayerKVPool::new(cfg, 4, 4, MetalDtype::Float32);
         assert!(res.is_err(), "expected Float32 rejection");
         let msg = res.err().unwrap();
         assert!(
@@ -1971,7 +2261,7 @@ mod tests {
     #[test]
     fn test_new_allocates_per_layer_buffers() {
         let config = base_config(3);
-        let pool = match LayerKVPool::new(config, 4, MetalDtype::Float16) {
+        let pool = match LayerKVPool::new(config, 4, 4, MetalDtype::Float16) {
             Ok(p) => p,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_new_allocates_per_layer_buffers: {e}");
@@ -1999,7 +2289,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_new_allocates_bf16_pool() {
-        let pool = match LayerKVPool::new(base_config(2), 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(base_config(2), 4, 4, MetalDtype::BFloat16) {
             Ok(p) => p,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_new_allocates_bf16_pool: {e}");
@@ -2018,7 +2308,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_cache_view_shapes_non_fp8() {
-        let pool = match LayerKVPool::new(base_config(2), 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(base_config(2), 4, 4, MetalDtype::BFloat16) {
             Ok(p) => p,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_cache_view_shapes_non_fp8: {e}");
@@ -2047,7 +2337,7 @@ mod tests {
             use_fp8_cache: Some(true),
             ..base_config(2)
         };
-        let pool = match LayerKVPool::new(cfg, 4, MetalDtype::UChar) {
+        let pool = match LayerKVPool::new(cfg, 4, 4, MetalDtype::UChar) {
             Ok(p) => p,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_cache_view_shapes_fp8: {e}");
@@ -2071,7 +2361,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_cache_array_raw_round_trip() {
-        let pool = match LayerKVPool::new(base_config(2), 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(base_config(2), 4, 4, MetalDtype::BFloat16) {
             Ok(p) => p,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_cache_array_raw_round_trip: {e}");
@@ -2098,7 +2388,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn test_bf16_raw_block_host_metal_round_trip() {
-        let pool = match LayerKVPool::new(base_config(1), 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(base_config(1), 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_bf16_raw_block_host_metal_round_trip: {e}");
@@ -2204,7 +2494,7 @@ mod tests {
     #[test]
     fn test_batched_block_io_matches_per_layer_path() {
         const LAYERS: usize = 4;
-        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, 4, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_batched_block_io_matches_per_layer_path: {e}");
@@ -2285,7 +2575,7 @@ mod tests {
     #[test]
     fn test_batched_write_rejections_leave_pool_unmodified() {
         const LAYERS: usize = 4;
-        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, 4, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_batched_write_rejections_leave_pool_unmodified: {e}");
@@ -2400,20 +2690,21 @@ mod tests {
     /// layer 0 passes with this in place.
     #[cfg(target_os = "macos")]
     fn shrink_layer_buffer(
-        pool: &mut LayerKVPool,
+        pool: &LayerKVPool,
         layer_idx: usize,
         side: ShrinkSide,
     ) -> (Buffer, Buffer) {
         use crate::metal::MetalState;
         use metal::MTLResourceOptions;
         let state = MetalState::get().expect("metal state for the shrink");
-        let saved = pool.layers[layer_idx].clone();
+        let mut inner = pool.inner_write();
+        let saved = inner.layers[layer_idx].clone();
         let stub = state
             .device
             .new_buffer(1, MTLResourceOptions::StorageModePrivate);
         match side {
-            ShrinkSide::Key => pool.layers[layer_idx].0 = stub,
-            ShrinkSide::Value => pool.layers[layer_idx].1 = stub,
+            ShrinkSide::Key => inner.layers[layer_idx].0 = stub,
+            ShrinkSide::Value => inner.layers[layer_idx].1 = stub,
         }
         saved
     }
@@ -2460,7 +2751,7 @@ mod tests {
     #[test]
     fn batched_block_io_rejects_a_layer_buffer_too_small_for_the_slot() {
         const LAYERS: usize = 4;
-        let mut pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, 4, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping batched_block_io_rejects_a_layer_buffer_too_small: {e}");
@@ -2484,7 +2775,7 @@ mod tests {
 
         let victim = LAYERS - 1;
         for side in [ShrinkSide::Key, ShrinkSide::Value] {
-            let saved = shrink_layer_buffer(&mut pool, victim, side);
+            let saved = shrink_layer_buffer(&pool, victim, side);
 
             let read_err = pool.read_block_all_layers(2).expect_err(
                 "reading a block out of a 1-byte layer buffer must be rejected, not blitted",
@@ -2510,7 +2801,7 @@ mod tests {
             // Restore the real buffer, then prove neither rejection touched the
             // pool: both must return before the first blit is encoded, which is
             // the partial-overwrite invariant `write_block_all_layers` documents.
-            pool.layers[victim] = saved;
+            pool.inner_write().layers[victim] = saved;
             assert_eq!(
                 snapshot_pool(&pool),
                 before,
@@ -2531,7 +2822,7 @@ mod tests {
     #[test]
     fn per_layer_block_io_rejects_a_layer_buffer_too_small_for_the_slot() {
         const LAYERS: usize = 4;
-        let mut pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, 4, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping per_layer_block_io_rejects_a_layer_buffer_too_small: {e}");
@@ -2551,7 +2842,7 @@ mod tests {
 
         let victim = LAYERS - 1;
         for side in [ShrinkSide::Key, ShrinkSide::Value] {
-            let saved = shrink_layer_buffer(&mut pool, victim, side);
+            let saved = shrink_layer_buffer(&pool, victim, side);
 
             let read_err = pool
                 .read_blocks_to_host(victim as u32, &[2])
@@ -2576,7 +2867,7 @@ mod tests {
             pool.read_blocks_to_host(0, &[2])
                 .expect("a correctly sized layer must still transfer");
 
-            pool.layers[victim] = saved;
+            pool.inner_write().layers[victim] = saved;
             assert_eq!(
                 snapshot_pool(&pool),
                 before,
@@ -2614,13 +2905,14 @@ mod tests {
         let (key_block_size, value_block_size) =
             pool.block_bytes_per_layer().expect("pool geometry");
         for layer in 0..LAYERS as usize {
+            let inner = pool.inner_read();
             assert_eq!(
-                pool.layers[layer].0.length(),
+                inner.layers[layer].0.length(),
                 key_block_size * NUM_BLOCKS as u64,
                 "layer {layer} key buffer must hold every block slot"
             );
             assert_eq!(
-                pool.layers[layer].1.length(),
+                inner.layers[layer].1.length(),
                 value_block_size * NUM_BLOCKS as u64,
                 "layer {layer} value buffer must hold every block slot"
             );
@@ -2686,6 +2978,161 @@ mod tests {
         );
     }
 
+    /// `max_num_blocks < num_blocks` is a contradiction: the pool would
+    /// start larger than its own growth ceiling. Rejected before any Metal
+    /// work, so this runs without a GPU.
+    #[test]
+    fn test_new_rejects_max_below_num_blocks() {
+        let res = LayerKVPool::new(base_config(2), 4, 2, MetalDtype::Float16);
+        let msg = res
+            .err()
+            .expect("max_num_blocks < num_blocks must be rejected");
+        assert!(
+            msg.contains("max_num_blocks"),
+            "error must mention max_num_blocks, got: {msg}"
+        );
+    }
+
+    /// End-to-end growth: a pool allocated small with headroom up to
+    /// `max_num_blocks` preserves every written byte across two grows, the
+    /// newly exposed block-id range is writable, no-op and over-max grows
+    /// return `Ok(false)`, and `generation` tracks exactly the successful
+    /// swaps.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn grow_to_preserves_bytes_and_extends_the_writable_range() {
+        const LAYERS: u32 = 3;
+        const INITIAL: u32 = 4;
+        const MAX: u32 = 8;
+        let pool = match LayerKVPool::new(base_config(LAYERS), INITIAL, MAX, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping grow_to_preserves_bytes_and_extends_the_writable_range: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        assert_eq!(pool.num_blocks(), INITIAL);
+        assert_eq!(pool.max_num_blocks(), MAX);
+        assert_eq!(pool.generation(), 0);
+        // heads=2 * head_size=64 * block_size=8 * sizeof(bf16)=2 per side.
+        let per_side = 2 * 64 * 8 * 2u64;
+        let expected_total = |blocks: u32| per_side * 2 * blocks as u64 * LAYERS as u64;
+        assert_eq!(pool.total_bytes(), expected_total(INITIAL));
+        let old_layer0_key = pool.key_cache(0).expect("layer 0 key buffer");
+
+        // Seed every initial block with a per-layer, per-block pattern.
+        let mut seeds: Vec<Vec<BlockLayerBytes>> = Vec::new();
+        for block in 0..INITIAL {
+            let payload = distinct_layer_bytes(LAYERS as usize, per_side as usize)
+                .into_iter()
+                .map(|(k, v)| {
+                    (
+                        k.iter().map(|b| b ^ (block as u8)).collect::<Vec<u8>>(),
+                        v.iter().map(|b| b ^ (block as u8)).collect::<Vec<u8>>(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let borrowed: Vec<(&[u8], &[u8])> = payload
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            pool.write_block_all_layers(block, &borrowed)
+                .expect("seed write");
+            seeds.push(payload);
+        }
+
+        // No-op grows: below, equal, and beyond the max all decline without
+        // touching state.
+        for target in [INITIAL - 1, INITIAL, MAX + 1] {
+            assert!(
+                !pool.grow_to(target).expect("no-op grow"),
+                "grow_to({target}) must be a no-op"
+            );
+        }
+        assert_eq!(pool.num_blocks(), INITIAL);
+        assert_eq!(pool.generation(), 0);
+
+        // First grow: 4 -> 6.
+        assert!(pool.grow_to(6).expect("grow to 6"));
+        assert_eq!(pool.num_blocks(), 6);
+        assert_eq!(pool.generation(), 1);
+        assert_eq!(pool.total_bytes(), expected_total(6));
+        // The swap really happened: the pool now hands out a different buffer.
+        assert_ne!(
+            pool.key_cache(0).expect("layer 0 key buffer").as_ptr(),
+            old_layer0_key.as_ptr(),
+            "a successful grow must swap in freshly allocated buffers"
+        );
+
+        // Second grow: 6 -> 8 (the max). Composes with the first.
+        assert!(pool.grow_to(MAX).expect("grow to max"));
+        assert_eq!(pool.num_blocks(), MAX);
+        assert_eq!(pool.generation(), 2);
+        assert_eq!(pool.total_bytes(), expected_total(MAX));
+        assert!(
+            !pool.grow_to(MAX + 1).expect("over-max grow"),
+            "growing past max_num_blocks must decline"
+        );
+        assert_eq!(pool.generation(), 2);
+
+        // Every byte written before both grows reads back identically.
+        for (block, payload) in seeds.iter().enumerate() {
+            let read_back = pool
+                .read_block_all_layers(block as u32)
+                .expect("readback of pre-grow block");
+            assert_eq!(
+                &read_back, payload,
+                "block {block} must survive both grows byte-for-byte"
+            );
+        }
+
+        // The newly exposed range is writable and readable.
+        for block in [5u32, 7] {
+            let payload = distinct_layer_bytes(LAYERS as usize, per_side as usize);
+            let borrowed: Vec<(&[u8], &[u8])> = payload
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            pool.write_block_all_layers(block, &borrowed)
+                .expect("write into the grown range");
+            let read_back = pool
+                .read_block_all_layers(block)
+                .expect("readback from the grown range");
+            assert_eq!(read_back, payload, "block {block} in the grown range");
+        }
+
+        // And the pre-grow bytes are still intact after those writes.
+        for (block, payload) in seeds.iter().enumerate() {
+            let read_back = pool
+                .read_block_all_layers(block as u32)
+                .expect("final readback of pre-grow block");
+            assert_eq!(
+                &read_back, payload,
+                "block {block} after grown-range writes"
+            );
+        }
+    }
+
+    /// Test-only constructors pin `max_num_blocks == num_blocks`: a pool
+    /// built by `new_for_test` is not growable and `grow_to` declines.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn new_for_test_pools_are_not_growable() {
+        let pool = match LayerKVPool::new_for_test(base_config(2), 4, 2, MetalDtype::Float16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping new_for_test_pools_are_not_growable: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new_for_test failure: {e}"),
+        };
+        assert_eq!(pool.max_num_blocks(), 4);
+        assert!(!pool.grow_to(6).expect("grow past max"));
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(pool.generation(), 0);
+    }
+
     /// A command buffer that aborts must turn into an `Err`, not a silent
     /// success. The input here is FULLY valid, so every validation path
     /// returns `Ok` and the only thing that can produce an error is reading
@@ -2702,7 +3149,7 @@ mod tests {
         use crate::metal::command_buffer::arm_failure;
 
         const LAYERS: usize = 4;
-        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, 4, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_batched_write_reports_a_failed_command_buffer: {e}");
@@ -2753,7 +3200,7 @@ mod tests {
         use crate::metal::command_buffer::arm_failure;
 
         const LAYERS: usize = 4;
-        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, 4, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_batched_read_reports_a_failed_command_buffer: {e}");
@@ -2810,7 +3257,7 @@ mod tests {
         //    per FP8 element = 2048.
         // V: heads=2 * head_size=64 * block_size=16, one byte = 2048.
         const PER_SIDE: usize = 2 * (64 / 16) * 16 * 16;
-        let pool = match LayerKVPool::new(fp8_config(LAYERS as u32), 4, MetalDtype::UChar) {
+        let pool = match LayerKVPool::new(fp8_config(LAYERS as u32), 4, 4, MetalDtype::UChar) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_fp8_batched_block_io_matches_per_layer_path: {e}");
@@ -2890,7 +3337,7 @@ mod tests {
             head_size: 80,
             ..base_config(LAYERS as u32)
         };
-        let pool = match LayerKVPool::new(cfg, 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(cfg, 4, 4, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_bf16_block_io_at_head_size_80: {e}");
@@ -2964,7 +3411,7 @@ mod tests {
             cfg.validate().is_ok(),
             "head_size 120 must be config-legal, or this test proves nothing"
         );
-        let msg = match LayerKVPool::new(cfg, 4, MetalDtype::UChar) {
+        let msg = match LayerKVPool::new(cfg, 4, 4, MetalDtype::UChar) {
             Ok(_) => panic!("expected head_size/pack-factor rejection, got Ok"),
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -2986,7 +3433,7 @@ mod tests {
             ..base_config(2)
         };
         assert!(
-            LayerKVPool::new(bf16, 4, MetalDtype::BFloat16).is_ok(),
+            LayerKVPool::new(bf16, 4, 4, MetalDtype::BFloat16).is_ok(),
             "head_size 120 is a multiple of the BF16 pack factor and must be accepted"
         );
     }
@@ -3067,7 +3514,7 @@ mod upload_batching_bench {
                 max_seq_len: Some(4096),
                 max_batch_size: Some(1),
             };
-            let pool = match LayerKVPool::new(c, 8, MetalDtype::BFloat16) {
+            let pool = match LayerKVPool::new(c, 8, 8, MetalDtype::BFloat16) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("  {label}: skipped ({e})");
@@ -3181,7 +3628,7 @@ mod upload_batching_bench {
                 max_seq_len: Some(4096),
                 max_batch_size: Some(1),
             };
-            let pool = match LayerKVPool::new(c, 8, MetalDtype::BFloat16) {
+            let pool = match LayerKVPool::new(c, 8, 8, MetalDtype::BFloat16) {
                 Ok(p) => p,
                 Err(e) => {
                     eprintln!("  {label}: skipped ({e})");
@@ -3218,9 +3665,9 @@ mod upload_batching_bench {
                 let cb = st.command_queue.new_command_buffer();
                 let bl = cb.new_blit_command_encoder();
                 for x in 0..l as usize {
-                    let (kc, vc) = &pool.layers[x];
-                    bl.copy_from_buffer(&ks, 0, kc, bid as u64 * per_side as u64, per_side as u64);
-                    bl.copy_from_buffer(&vs, 0, vc, bid as u64 * per_side as u64, per_side as u64);
+                    let (kc, vc) = pool.inner_read().layers[x].clone();
+                    bl.copy_from_buffer(&ks, 0, &kc, bid as u64 * per_side as u64, per_side as u64);
+                    bl.copy_from_buffer(&vs, 0, &vc, bid as u64 * per_side as u64, per_side as u64);
                 }
                 bl.end_encoding();
                 cb.commit();
@@ -3247,7 +3694,7 @@ mod upload_batching_bench {
             eprintln!("skipping: no Metal");
             return;
         }
-        let pool = match LayerKVPool::new(cfg(), 8, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(cfg(), 8, 8, MetalDtype::BFloat16) {
             Ok(p) => p,
             Err(e) => {
                 eprintln!("skipping: {e}");
@@ -3289,12 +3736,18 @@ mod upload_batching_bench {
             let cb = state.command_queue.new_command_buffer();
             let blit = cb.new_blit_command_encoder();
             for l in 0..L as usize {
-                let (kc, vc) = &pool.layers[l];
-                blit.copy_from_buffer(&ks, 0, kc, block_id as u64 * key_block_size, key_block_size);
+                let (kc, vc) = pool.inner_read().layers[l].clone();
+                blit.copy_from_buffer(
+                    &ks,
+                    0,
+                    &kc,
+                    block_id as u64 * key_block_size,
+                    key_block_size,
+                );
                 blit.copy_from_buffer(
                     &vs,
                     0,
-                    vc,
+                    &vc,
                     block_id as u64 * value_block_size,
                     value_block_size,
                 );
@@ -3334,20 +3787,20 @@ mod upload_batching_bench {
         let t = Instant::now();
         for _ in 0..REPS {
             for l in 0..L as usize {
-                let (kc, vc) = &pool.layers[l];
+                let (kc, vc) = pool.inner_read().layers[l].clone();
                 let cb = state.command_queue.new_command_buffer();
                 let blit = cb.new_blit_command_encoder();
                 blit.copy_from_buffer(
                     &ks_reuse,
                     0,
-                    kc,
+                    &kc,
                     block_id as u64 * key_block_size,
                     key_block_size,
                 );
                 blit.copy_from_buffer(
                     &vs_reuse,
                     0,
-                    vc,
+                    &vc,
                     block_id as u64 * value_block_size,
                     value_block_size,
                 );
@@ -3372,12 +3825,18 @@ mod upload_batching_bench {
                 let vs = state
                     .device
                     .new_buffer_with_slice(&values, MTLResourceOptions::StorageModeShared);
-                let (kc, vc) = &pool.layers[l];
-                blit.copy_from_buffer(&ks, 0, kc, block_id as u64 * key_block_size, key_block_size);
+                let (kc, vc) = pool.inner_read().layers[l].clone();
+                blit.copy_from_buffer(
+                    &ks,
+                    0,
+                    &kc,
+                    block_id as u64 * key_block_size,
+                    key_block_size,
+                );
                 blit.copy_from_buffer(
                     &vs,
                     0,
-                    vc,
+                    &vc,
                     block_id as u64 * value_block_size,
                     value_block_size,
                 );

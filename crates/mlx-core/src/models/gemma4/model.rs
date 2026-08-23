@@ -2553,13 +2553,18 @@ impl Gemma4Inner {
                 let allocator = Arc::new(std::sync::Mutex::new(
                     mlx_paged_attn::BlockAllocator::new(desired_blocks, block_size),
                 ));
-                let pool = mlx_paged_attn::LayerKVPool::new(pa_config, desired_blocks, cache_dtype)
-                    .map_err(|error| {
-                        napi::Error::from_reason(format!(
-                            "Failed to construct Gemma4 KV group {} pool: {error}",
-                            group.group_id
-                        ))
-                    })?;
+                let pool = mlx_paged_attn::LayerKVPool::new(
+                    pa_config,
+                    desired_blocks,
+                    desired_blocks,
+                    cache_dtype,
+                )
+                .map_err(|error| {
+                    napi::Error::from_reason(format!(
+                        "Failed to construct Gemma4 KV group {} pool: {error}",
+                        group.group_id
+                    ))
+                })?;
                 let adapter = match group.attention_kind {
                     AttentionKind::Full => {
                         PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)

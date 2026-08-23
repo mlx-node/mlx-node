@@ -3276,6 +3276,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             16,
+            16,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -3835,7 +3836,7 @@ mod tests {
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
-        let pool = match LayerKVPool::new(cfg, 4, mlx_paged_attn::metal::MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(cfg, 4, 4, mlx_paged_attn::metal::MetalDtype::BFloat16) {
             Ok(pool) => Arc::new(pool),
             Err(err) => {
                 eprintln!("skipping Gemma4 paged-prefill operator parity: {err}");

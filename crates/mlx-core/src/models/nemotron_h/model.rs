@@ -367,12 +367,17 @@ fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAd
         plan.num_blocks,
         plan.block_size,
     )));
-    let pool = mlx_paged_attn::LayerKVPool::new(plan.pa_config, plan.num_blocks, plan.cache_dtype)
-        .map_err(|e| {
-            Error::from_reason(format!(
-                "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
-            ))
-        })?;
+    let pool = mlx_paged_attn::LayerKVPool::new(
+        plan.pa_config,
+        plan.num_blocks,
+        plan.num_blocks,
+        plan.cache_dtype,
+    )
+    .map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
+        ))
+    })?;
     let adapter =
         PagedKVCacheAdapter::new(allocator, Arc::new(pool), plan.block_size).map_err(|e| {
             Error::from_reason(format!(
@@ -838,12 +843,17 @@ impl NemotronHInner {
             selected_blocks,
             block_size,
         )));
-        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, selected_blocks, cache_dtype)
-            .map_err(|e| {
-                Error::from_reason(format!(
-                    "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
-                ))
-            })?;
+        let pool = mlx_paged_attn::LayerKVPool::new(
+            pa_config,
+            selected_blocks,
+            selected_blocks,
+            cache_dtype,
+        )
+        .map_err(|e| {
+            Error::from_reason(format!(
+                "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
+            ))
+        })?;
         self.paged_adapter = Some(
             PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
                 Error::from_reason(format!(
@@ -3672,6 +3682,7 @@ mod scheduler_tests {
         )));
         let pool = mlx_paged_attn::LayerKVPool::new(
             pa_config,
+            num_blocks,
             num_blocks,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         )

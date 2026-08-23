@@ -61,7 +61,7 @@ fn try_make_fixture(cache_dtype: MetalDtype) -> Option<Fixture> {
         max_seq_len: Some(64),
         max_batch_size: Some(2),
     };
-    let pool = match LayerKVPool::new(cfg, NUM_BLOCKS, cache_dtype) {
+    let pool = match LayerKVPool::new(cfg, NUM_BLOCKS, NUM_BLOCKS, cache_dtype) {
         Ok(p) => Arc::new(p),
         Err(e) if e.contains("No Metal device found") => {
             eprintln!("skipping: {e}");

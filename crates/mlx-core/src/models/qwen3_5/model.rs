@@ -1714,7 +1714,7 @@ impl Qwen35Inner {
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
             num_blocks, block_size,
         )));
-        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
+        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, num_blocks, cache_dtype)
             .map_err(|e| Error::from_reason(format!("Failed to construct Qwen3.5 KV pool: {e}")))?;
         self.paged_adapter = Some(
             PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {

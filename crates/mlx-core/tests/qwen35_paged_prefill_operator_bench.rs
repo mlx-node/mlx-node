@@ -325,6 +325,7 @@ fn build_adapter(context: u32) -> BenchResult<PagedKVCacheAdapter> {
     let pool = Arc::new(LayerKVPool::new(
         paged_config,
         num_blocks,
+        num_blocks,
         MetalDtype::BFloat16,
     )?);
     let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, BLOCK_SIZE)));

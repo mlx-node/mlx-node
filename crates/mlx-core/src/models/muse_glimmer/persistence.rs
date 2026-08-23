@@ -364,6 +364,7 @@ fn build_paged_runtime(config: &MuseGlimmerConfig) -> Result<Option<MusePagedRun
         let pool = mlx_paged_attn::LayerKVPool::new(
             pa_config,
             blocks,
+            blocks,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         )
         .map_err(|error| {

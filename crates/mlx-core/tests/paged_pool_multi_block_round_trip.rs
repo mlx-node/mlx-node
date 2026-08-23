@@ -41,7 +41,7 @@ fn multi_block_round_trip_bf16_head_dim_512() {
         max_seq_len: Some(64),
         max_batch_size: Some(2),
     };
-    let pool = match LayerKVPool::new(cfg.clone(), 8, MetalDtype::BFloat16) {
+    let pool = match LayerKVPool::new(cfg.clone(), 8, 8, MetalDtype::BFloat16) {
         Ok(p) => Arc::new(p),
         Err(e) => {
             eprintln!("skipping multi_block_round_trip_bf16_head_dim_512: {e}");

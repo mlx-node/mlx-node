@@ -2893,7 +2893,8 @@ mod restore_decomposition_bench {
             max_batch_size: Some(1),
         };
         let total_blocks = (BENCH_BLOCKS * 2 + 4) as u32;
-        let pool = match LayerKVPool::new(config, total_blocks, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, total_blocks, total_blocks, MetalDtype::BFloat16)
+        {
             Ok(pool) => pool,
             Err(e) => {
                 eprintln!("skipping bench: {e}");
@@ -4129,13 +4130,14 @@ mod write_decomposition_bench {
                 max_seq_len: Some(4096),
                 max_batch_size: Some(1),
             };
-            let pool = match LayerKVPool::new(config, total_blocks, MetalDtype::BFloat16) {
-                Ok(pool) => pool,
-                Err(e) => {
-                    eprintln!("  {}: skipped ({e})", geometry.label);
-                    continue;
-                }
-            };
+            let pool =
+                match LayerKVPool::new(config, total_blocks, total_blocks, MetalDtype::BFloat16) {
+                    Ok(pool) => pool,
+                    Err(e) => {
+                        eprintln!("  {}: skipped ({e})", geometry.label);
+                        continue;
+                    }
+                };
             let allocator = Mutex::new(BlockAllocator::new(total_blocks, BENCH_BLOCK_SIZE as u32));
             let Some(block) = allocator.lock().unwrap().allocate() else {
                 eprintln!("  {}: skipped (no free block)", geometry.label);
@@ -4997,7 +4999,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping layout_mismatch_on_layer_bytes_is_rejected_at_validation: {e}");
@@ -6955,7 +6957,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping transactional_restore_uploads_then_publishes: {e}");
@@ -7048,7 +7050,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping post_decode_restore_failure_counts_one_miss: {e}");
@@ -7144,7 +7146,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -7228,7 +7230,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -7340,7 +7342,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -7463,7 +7465,7 @@ mod tests {
         // Separate capture and restore pools so a byte match can only come
         // from the cold tier, never from source bytes lingering in a shared
         // physical block (a genuine restart discards the GPU buffers).
-        let pool_src = match LayerKVPool::new(config.clone(), 4, MetalDtype::BFloat16) {
+        let pool_src = match LayerKVPool::new(config.clone(), 4, 4, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping multi_block_prefix_restores_after_restart: {e}");
@@ -7471,7 +7473,7 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
         };
-        let pool_dst = LayerKVPool::new(config, 4, MetalDtype::BFloat16).unwrap();
+        let pool_dst = LayerKVPool::new(config, 4, 4, MetalDtype::BFloat16).unwrap();
 
         let bytes_per_side = 64 * 8 * 2usize;
         let pattern = |seed: usize| -> (Vec<u8>, Vec<u8>) {

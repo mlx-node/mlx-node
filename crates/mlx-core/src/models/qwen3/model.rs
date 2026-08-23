@@ -1192,12 +1192,13 @@ impl Qwen3Inner {
 
             // BFloat16 = Qwen3 production dtype.
             let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-            let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype)
-                .map_err(|e| {
-                    napi::Error::from_reason(format!(
-                        "Failed to construct LayerKVPool for block-paged adapter: {e}"
-                    ))
-                })?;
+            let pool =
+                mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, num_blocks, cache_dtype)
+                    .map_err(|e| {
+                        napi::Error::from_reason(format!(
+                            "Failed to construct LayerKVPool for block-paged adapter: {e}"
+                        ))
+                    })?;
 
             let adapter =
                 PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
@@ -1297,10 +1298,15 @@ impl Qwen3Inner {
             sizing.selected_blocks,
             block_size,
         )));
-        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, sizing.selected_blocks, cache_dtype)
-            .map_err(|error| {
-                Error::from_reason(format!("Failed to construct Qwen3 KV pool: {error}"))
-            })?;
+        let pool = mlx_paged_attn::LayerKVPool::new(
+            pa_config,
+            sizing.selected_blocks,
+            sizing.selected_blocks,
+            cache_dtype,
+        )
+        .map_err(|error| {
+            Error::from_reason(format!("Failed to construct Qwen3 KV pool: {error}"))
+        })?;
         self.paged_adapter = Some(
             PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|error| {
                 Error::from_reason(format!("Failed to construct Qwen3 paged adapter: {error}"))

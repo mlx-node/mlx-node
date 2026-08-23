@@ -9889,7 +9889,7 @@ mod tests {
             max_batch_size: Some(1),
         };
         // Real pools (not `new_for_test`) so KV bytes actually round-trip.
-        let pool_src = match LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16) {
+        let pool_src = match LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16) {
             Ok(pool) => Arc::new(pool),
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -9996,7 +9996,8 @@ mod tests {
         // --- Restart: fresh allocator + pool + adapter, same fingerprint. ---
         drop(adapter_src);
         drop(manager_src);
-        let pool_dst = Arc::new(LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16).unwrap());
+        let pool_dst =
+            Arc::new(LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16).unwrap());
         let alloc_dst = new_allocator(8, 8);
         let mut adapter_dst = PagedKVCacheAdapter::new(alloc_dst, Arc::clone(&pool_dst), 8)
             .expect("restore adapter ctor");
@@ -10067,7 +10068,7 @@ mod tests {
             max_seq_len: Some(64),
             max_batch_size: Some(1),
         };
-        let pool_src = match LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16) {
+        let pool_src = match LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16) {
             Ok(pool) => Arc::new(pool),
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -10180,7 +10181,8 @@ mod tests {
         // Builds a fresh allocator + pool + adapter over the same cold root —
         // one simulated process restart.
         let fresh = |keys: &[Vec<u64>]| -> (Arc<LayerKVPool>, CachedPrefix) {
-            let pool = Arc::new(LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16).unwrap());
+            let pool =
+                Arc::new(LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16).unwrap());
             let mut adapter = PagedKVCacheAdapter::new(new_allocator(8, 8), Arc::clone(&pool), 8)
                 .expect("restore adapter ctor");
             adapter.set_cold_tier(ColdTierContext {
@@ -10297,7 +10299,7 @@ mod tests {
             max_seq_len: Some(64),
             max_batch_size: Some(1),
         };
-        let pool_src = match LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16) {
+        let pool_src = match LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16) {
             Ok(pool) => Arc::new(pool),
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -10418,7 +10420,8 @@ mod tests {
         // One simulated process restart: fresh pool, allocator, adapter and
         // manager over the same cold root.
         let fresh = |policy: Option<mlx_paged_attn::ColdSidecarPolicy>, per_block: bool| {
-            let pool = Arc::new(LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16).unwrap());
+            let pool =
+                Arc::new(LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16).unwrap());
             let manager = Arc::new(
                 mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
                     .expect("reopen cold cache"),
@@ -12994,6 +12997,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -13055,6 +13059,7 @@ mod tests {
         // template, NOT a re-derivation from the input dtype).
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
+            4,
             4,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
@@ -13543,6 +13548,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             NUM_BLOCKS,
+            NUM_BLOCKS,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
             Ok(pool) => Arc::new(pool),
@@ -13644,6 +13650,7 @@ mod tests {
         };
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
+            NUM_BLOCKS,
             NUM_BLOCKS,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
@@ -13848,6 +13855,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -13916,6 +13924,7 @@ mod tests {
         };
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
+            4,
             4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
@@ -13994,6 +14003,7 @@ mod tests {
         };
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
+            4,
             4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
@@ -14076,6 +14086,7 @@ mod tests {
         };
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
+            4,
             4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
@@ -14208,6 +14219,7 @@ mod tests {
         };
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
+            16,
             16,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
@@ -14448,6 +14460,7 @@ mod tests {
         };
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
+            16,
             16,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
@@ -14911,6 +14924,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             NUM_BLOCKS,
+            NUM_BLOCKS,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -15130,6 +15144,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(pool) => Arc::new(pool),
@@ -15209,6 +15224,7 @@ mod tests {
         };
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
+            4,
             4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
@@ -15357,6 +15373,7 @@ mod tests {
         };
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
+            4,
             4,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
@@ -15591,6 +15608,7 @@ mod tests {
         };
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
+            4,
             4,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
