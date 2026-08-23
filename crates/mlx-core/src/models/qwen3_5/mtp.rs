@@ -46,9 +46,9 @@ use super::config::Qwen3_5Config;
 use super::decoder_layer::{AttentionType, DecoderLayer};
 use super::layer_cache::Qwen3_5LayerCache;
 use super::quantized_linear::{
-    LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, is_quantized_checkpoint,
-    try_build_mxfp4_quantized_linear, try_build_mxfp8_quantized_linear,
-    try_build_nvfp4_quantized_linear, try_build_quantized_linear,
+    LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, is_quantized_checkpoint,
+    try_build_kquant_quantized_linear, try_build_mxfp4_quantized_linear,
+    try_build_mxfp8_quantized_linear, try_build_nvfp4_quantized_linear, try_build_quantized_linear,
 };
 
 /// Reject unsupported plain-E4M3 state before any MTP dense setter can see raw
@@ -308,30 +308,38 @@ impl Qwen3_5MTPModule {
         // Fresh per-prefix quant resolver, duplicating the closure in
         // `apply_weights_inner`. Surgical duplication is preferred over a
         // wide refactor of the dense persistence loader.
-        let try_build_ql = |params: &HashMap<String, MxArray>, prefix: &str| {
-            let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
-            match plq.mode {
-                PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
-                PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
-                PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
-                // The upfront state guard rejects explicit metadata / Uint8
-                // storage. A body-level FP8 default with BF16 MTP weights may
-                // still resolve here and correctly takes the dense fallback.
-                PerLayerMode::Fp8E4m3 => None,
-                PerLayerMode::Affine => {
-                    try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
-                }
-                // Unreachable in practice: `apply_weights_inner` skips the MTP
-                // load entirely for sym8 checkpoints (the dense loader
-                // disables speculative MTP under sym8). `None` here keeps the
-                // exhaustive match honest without silently mis-packing.
-                PerLayerMode::Sym8 => None,
-                // Unreachable: the dense loader disables MTP for K-quant
-                // checkpoints (`has_kquant_mode` gate), and an imported GGUF
-                // never ships an MTP head. `None` fails soft into AR decode.
-                PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => None,
-            }
-        };
+        let try_build_ql =
+            |params: &HashMap<String, MxArray>, prefix: &str| -> Result<Option<QuantizedLinear>> {
+                let plq = per_layer_quant.get(prefix).copied().unwrap_or(default_plq);
+                Ok(match plq.mode {
+                    PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_linear(params, prefix),
+                    PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_linear(params, prefix),
+                    PerLayerMode::Nvfp4 => try_build_nvfp4_quantized_linear(params, prefix),
+                    // The upfront state guard rejects explicit metadata / Uint8
+                    // storage. A body-level FP8 default with BF16 MTP weights may
+                    // still resolve here and correctly takes the dense fallback.
+                    PerLayerMode::Fp8E4m3 => None,
+                    PerLayerMode::Affine => {
+                        try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
+                    }
+                    // Unreachable in practice: `apply_weights_inner` skips the MTP
+                    // load entirely for sym8 checkpoints (the dense loader
+                    // disables speculative MTP under sym8). `None` here keeps the
+                    // exhaustive match honest without silently mis-packing.
+                    PerLayerMode::Sym8 => None,
+                    // Direct Qwen3.8 GGUFs may carry a packed inline MTP head;
+                    // build each projection with its exact source mode.
+                    PerLayerMode::Q6K
+                    | PerLayerMode::Q4K
+                    | PerLayerMode::Q5K
+                    | PerLayerMode::Q3K
+                    | PerLayerMode::IQ4NL
+                    | PerLayerMode::IQ4XS
+                    | PerLayerMode::IQ3S => {
+                        try_build_kquant_quantized_linear(params, prefix, plq.mode, "qwen3_5_mtp")?
+                    }
+                })
+            };
 
         // Top-level normalizations.
         if let Some(w) = params.get("mtp.pre_fc_norm_hidden.weight") {
@@ -346,11 +354,10 @@ impl Qwen3_5MTPModule {
 
         // fc projection. Installs through the same mode-aware `try_build_ql`
         // dispatch as the attention/MLP projections below, so a quantized fc
-        // honors its per-layer mode (affine / mxfp8 / mxfp4 / nvfp4) instead
-        // of being forced through affine-only dequant. A bf16 fc (no
-        // `.scales`) stays a `LinearProj::Standard` — the identical dense
-        // matmul as before; our checkpoints keep the MTP fc bf16.
-        if let Some(ql) = try_build_ql(params, "mtp.fc") {
+        // honors its per-layer mode (including native K/IQ modes) instead of
+        // being forced through affine-only dequant. A bf16 fc (no `.scales`)
+        // stays a `LinearProj::Standard` and uses the dense matmul as before.
+        if let Some(ql) = try_build_ql(params, "mtp.fc")? {
             self.fc.set_quantized(ql);
         } else if let Some(w) = params.get("mtp.fc.weight") {
             self.fc.set_weight(w, "mtp.fc")?;
@@ -381,22 +388,22 @@ impl Qwen3_5MTPModule {
             };
 
             if is_quantized {
-                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix)) {
+                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.q_proj", prefix))? {
                     attn.set_quantized_q_proj(ql);
                 } else if let Some(w) = params.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
                     attn.set_q_proj_weight(w)?;
                 }
-                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix)) {
+                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.k_proj", prefix))? {
                     attn.set_quantized_k_proj(ql);
                 } else if let Some(w) = params.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
                     attn.set_k_proj_weight(w)?;
                 }
-                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix)) {
+                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.v_proj", prefix))? {
                     attn.set_quantized_v_proj(ql);
                 } else if let Some(w) = params.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
                     attn.set_v_proj_weight(w)?;
                 }
-                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix)) {
+                if let Some(ql) = try_build_ql(params, &format!("{}.self_attn.o_proj", prefix))? {
                     attn.set_quantized_o_proj(ql);
                 } else if let Some(w) = params.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
                     attn.set_o_proj_weight(w)?;
@@ -448,9 +455,9 @@ impl Qwen3_5MTPModule {
                         let gate_key = format!("{}.mlp.gate_proj", prefix);
                         let up_key = format!("{}.mlp.up_proj", prefix);
                         let down_key = format!("{}.mlp.down_proj", prefix);
-                        let q_gate = try_build_ql(params, &gate_key);
-                        let q_up = try_build_ql(params, &up_key);
-                        let q_down = try_build_ql(params, &down_key);
+                        let q_gate = try_build_ql(params, &gate_key)?;
+                        let q_up = try_build_ql(params, &up_key)?;
+                        let q_down = try_build_ql(params, &down_key)?;
                         if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
                             layer.set_quantized_dense_mlp(qg, qu, qd);
                         } else {
@@ -649,6 +656,7 @@ mod tests {
         // (head_dim divisible by 2 for RoPE). full_attention_interval=4
         // makes layer 3 a full-attention layer; n_mtp_layers=1.
         Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 4,

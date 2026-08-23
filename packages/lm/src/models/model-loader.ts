@@ -5,7 +5,7 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, extname, join } from 'node:path';
 
 import {
   Gemma4Model as NativeGemma4Model,
@@ -422,7 +422,11 @@ export async function loadSession(
 
 export async function detectModelType(modelPath: string): Promise<ModelType> {
   try {
-    const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
+    const configPath =
+      extname(modelPath).toLowerCase() === '.gguf'
+        ? join(dirname(modelPath), 'config.json')
+        : join(modelPath, 'config.json');
+    const raw = await readFile(configPath, 'utf-8');
     const config = normalizeConfig(modelPath, JSON.parse(raw));
     const baseFamily = config.usesDefaultModelType
       ? MODEL_FAMILY_INDEX.defaultForNullishModelType

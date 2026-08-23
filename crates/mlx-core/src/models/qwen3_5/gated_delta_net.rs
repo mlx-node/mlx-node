@@ -106,9 +106,14 @@ pub struct GatedDeltaNet {
     // Projections
     in_proj_qkvz: LinearProj, // hidden → key_dim*2 + value_dim*2 (q,k,v,z combined)
     in_proj_ba: LinearProj,   // hidden → num_v_heads * 2 (b and a combined)
-    conv1d: Conv1d,           // depthwise conv, groups = conv_dim
-    norm: RMSNormGated,       // per-head norm: weight dim = value_head_dim
-    out_proj: LinearProj,     // value_dim → hidden
+    // Dynamic GGUFs can assign different packed modes to each half. In that
+    // case the source projections stay split and each uses its own native
+    // quantized matmul; no dense weight materialization is needed.
+    split_in_proj_qkv_z: Option<(LinearProj, LinearProj)>,
+    split_in_proj_b_a: Option<(LinearProj, LinearProj)>,
+    conv1d: Conv1d,       // depthwise conv, groups = conv_dim
+    norm: RMSNormGated,   // per-head norm: weight dim = value_head_dim
+    out_proj: LinearProj, // value_dim → hidden
 
     // Learnable parameters
     dt_bias: MxArray, // [num_v_heads]
@@ -123,6 +128,7 @@ pub struct GatedDeltaNet {
     value_dim: i32,
     conv_dim: i32,
     conv_kernel_dim: i32,
+    tiled_gguf_layout: bool,
     /// Pre-stacked `[w_qkvz; w_ba]` transposed to `[hidden, qkvz_dim + ba_dim]`.
     /// Populated by `finalize_in_proj()` after weights are loaded. When present
     /// (and non-quantized), `forward()` does ONE matmul + two slices instead of
@@ -178,6 +184,8 @@ impl GatedDeltaNet {
         Ok(Self {
             in_proj_qkvz: LinearProj::Standard(in_proj_qkvz),
             in_proj_ba: LinearProj::Standard(in_proj_ba),
+            split_in_proj_qkv_z: None,
+            split_in_proj_b_a: None,
             conv1d,
             norm,
             out_proj: LinearProj::Standard(out_proj),
@@ -191,6 +199,7 @@ impl GatedDeltaNet {
             value_dim,
             conv_dim,
             conv_kernel_dim,
+            tiled_gguf_layout: config.qwen35_gguf_gdn_layout.as_deref() == Some("tiled"),
             in_proj_qkvz_ba_t: None,
         })
     }
@@ -204,6 +213,10 @@ impl GatedDeltaNet {
     /// Standard linears. Quantized models stay on the unfused 2-matmul
     /// path (no-op here).
     pub fn finalize_in_proj(&mut self) -> Result<()> {
+        if self.split_in_proj_qkv_z.is_some() || self.split_in_proj_b_a.is_some() {
+            self.in_proj_qkvz_ba_t = None;
+            return Ok(());
+        }
         match (&self.in_proj_qkvz, &self.in_proj_ba) {
             (LinearProj::Standard(_), LinearProj::Standard(_)) => {}
             _ => return Ok(()),
@@ -258,33 +271,48 @@ impl GatedDeltaNet {
         // MLX_DISABLE_E51_STACKED_GDN_IN_PROJ=1 reverts to the two-matmul path.
         let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
         let ba_dim = (self.num_v_heads * 2) as i64;
-        let (qkvz, ba) = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t
+        let stacked = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t
             && std::env::var("MLX_DISABLE_E51_STACKED_GDN_IN_PROJ").is_err()
         {
             let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
             let qkvz = combined.slice_axis(2, 0, qkvz_dim)?;
             let ba = combined.slice_axis(2, qkvz_dim, qkvz_dim + ba_dim)?;
-            (qkvz, ba)
+            Some((qkvz, ba))
         } else {
-            // Unfused path: two separate matmuls.
-            let qkvz = self.in_proj_qkvz.forward(x)?;
-            let ba = self.in_proj_ba.forward(x)?;
-            (qkvz, ba)
+            None
         };
 
-        // Split ba into b and a: each [B, T, num_v_heads]
-        let b = ba.slice_axis(2, 0, self.num_v_heads as i64)?;
-        let a = ba.slice_axis(2, self.num_v_heads as i64, (self.num_v_heads * 2) as i64)?;
+        let (qkv, z) = if let Some((qkv_proj, z_proj)) = &self.split_in_proj_qkv_z {
+            (qkv_proj.forward(x)?, z_proj.forward(x)?)
+        } else {
+            let qkvz = if let Some((qkvz, _)) = &stacked {
+                qkvz.clone()
+            } else {
+                self.in_proj_qkvz.forward(x)?
+            };
+            (
+                qkvz.slice_axis(2, 0, self.conv_dim as i64)?,
+                qkvz.slice_axis(
+                    2,
+                    self.conv_dim as i64,
+                    (self.key_dim * 2 + self.value_dim * 2) as i64,
+                )?,
+            )
+        };
 
-        // Split qkvz: qkv goes through conv, z bypasses
-        // qkv: [B, T, key_dim*2 + value_dim] = [B, T, conv_dim]
-        // z: [B, T, value_dim]
-        let qkv = qkvz.slice_axis(2, 0, self.conv_dim as i64)?;
-        let z = qkvz.slice_axis(
-            2,
-            self.conv_dim as i64,
-            (self.key_dim * 2 + self.value_dim * 2) as i64,
-        )?;
+        let (b, a) = if let Some((b_proj, a_proj)) = &self.split_in_proj_b_a {
+            (b_proj.forward(x)?, a_proj.forward(x)?)
+        } else {
+            let ba = if let Some((_, ba)) = &stacked {
+                ba.clone()
+            } else {
+                self.in_proj_ba.forward(x)?
+            };
+            (
+                ba.slice_axis(2, 0, self.num_v_heads as i64)?,
+                ba.slice_axis(2, self.num_v_heads as i64, (self.num_v_heads * 2) as i64)?,
+            )
+        };
 
         // Apply mask before conv to prevent masked values leaking through convolution
         let qkv = if let Some(m) = mask {
@@ -384,6 +412,14 @@ impl GatedDeltaNet {
         let k_normed = rms_norm_no_weight(&k, 1e-6)?;
         let q = q_normed.mul_scalar(inv_scale * inv_scale)?;
         let k = k_normed.mul_scalar(inv_scale)?;
+        if self.tiled_gguf_layout
+            && (self.num_k_heads <= 0 || self.num_v_heads % self.num_k_heads != 0)
+        {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 tiled GGUF GDN layout requires Hv ({}) to be divisible by Hk ({})",
+                self.num_v_heads, self.num_k_heads
+            )));
+        }
 
         // Run gated delta recurrence
         let recurrent_state = cache.as_deref().and_then(|c| c.get(1));
@@ -402,6 +438,7 @@ impl GatedDeltaNet {
                 recurrent_state,
                 mask,
                 use_kernel,
+                self.tiled_gguf_layout,
                 Some(&mut kernel_sink),
             )?;
             if let (Some(sink), Some(kernel), Some(qkv)) = (tape_sink.take(), kernel_sink, tape_qkv)
@@ -414,18 +451,35 @@ impl GatedDeltaNet {
             }
             result
         } else {
-            gated_delta_update(
-                &q,
-                &k,
-                &v,
-                &a,
-                &b,
-                &self.a_log,
-                &self.dt_bias,
-                recurrent_state,
-                mask,
-                use_kernel,
-            )?
+            if self.tiled_gguf_layout {
+                gated_delta_update_with_tape(
+                    &q,
+                    &k,
+                    &v,
+                    &a,
+                    &b,
+                    &self.a_log,
+                    &self.dt_bias,
+                    recurrent_state,
+                    mask,
+                    use_kernel,
+                    true,
+                    None,
+                )?
+            } else {
+                gated_delta_update(
+                    &q,
+                    &k,
+                    &v,
+                    &a,
+                    &b,
+                    &self.a_log,
+                    &self.dt_bias,
+                    recurrent_state,
+                    mask,
+                    use_kernel,
+                )?
+            }
         };
 
         // Update recurrent state in cache
@@ -456,10 +510,12 @@ impl GatedDeltaNet {
 
     pub fn set_in_proj_qkvz_weight(&mut self, w: &MxArray) -> Result<()> {
         self.in_proj_qkvz_ba_t = None; // invalidate stacked cache
+        self.split_in_proj_qkv_z = None;
         self.in_proj_qkvz.set_weight(w, "in_proj_qkvz")
     }
     pub fn set_in_proj_ba_weight(&mut self, w: &MxArray) -> Result<()> {
         self.in_proj_qkvz_ba_t = None;
+        self.split_in_proj_b_a = None;
         self.in_proj_ba.set_weight(w, "in_proj_ba")
     }
     pub fn set_conv1d_weight(&mut self, w: &MxArray) -> Result<()> {
@@ -494,11 +550,21 @@ impl GatedDeltaNet {
 
     pub fn set_quantized_in_proj_qkvz(&mut self, ql: QuantizedLinear) {
         self.in_proj_qkvz_ba_t = None;
+        self.split_in_proj_qkv_z = None;
         self.in_proj_qkvz.set_quantized(ql);
     }
     pub fn set_quantized_in_proj_ba(&mut self, ql: QuantizedLinear) {
         self.in_proj_qkvz_ba_t = None;
+        self.split_in_proj_b_a = None;
         self.in_proj_ba.set_quantized(ql);
+    }
+    pub fn set_quantized_in_proj_qkv_z(&mut self, qkv: QuantizedLinear, z: QuantizedLinear) {
+        self.in_proj_qkvz_ba_t = None;
+        self.split_in_proj_qkv_z = Some((LinearProj::Quantized(qkv), LinearProj::Quantized(z)));
+    }
+    pub fn set_quantized_in_proj_b_a(&mut self, b: QuantizedLinear, a: QuantizedLinear) {
+        self.in_proj_qkvz_ba_t = None;
+        self.split_in_proj_b_a = Some((LinearProj::Quantized(b), LinearProj::Quantized(a)));
     }
     pub fn set_quantized_out_proj(&mut self, ql: QuantizedLinear) {
         self.out_proj.set_quantized(ql);
@@ -509,6 +575,8 @@ impl GatedDeltaNet {
     pub fn is_quantized(&self) -> bool {
         self.in_proj_qkvz.is_quantized()
             || self.in_proj_ba.is_quantized()
+            || self.split_in_proj_qkv_z.is_some()
+            || self.split_in_proj_b_a.is_some()
             || self.out_proj.is_quantized()
     }
 

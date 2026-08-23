@@ -70,7 +70,13 @@ fn build_lfm2_qsl(
         PerLayerMode::Affine => {
             try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
         }
-        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+        PerLayerMode::Q6K
+        | PerLayerMode::Q4K
+        | PerLayerMode::Q5K
+        | PerLayerMode::Q3K
+        | PerLayerMode::IQ4NL
+        | PerLayerMode::IQ4XS
+        | PerLayerMode::IQ3S => {
             try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "lfm2_moe")?
         }
         // FAIL-LOUD: the 3-D stacked experts have no sym8 dispatch
@@ -123,7 +129,13 @@ fn build_lfm2_gate_ql(
         PerLayerMode::Affine => {
             try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
         }
-        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+        PerLayerMode::Q6K
+        | PerLayerMode::Q4K
+        | PerLayerMode::Q5K
+        | PerLayerMode::Q3K
+        | PerLayerMode::IQ4NL
+        | PerLayerMode::IQ4XS
+        | PerLayerMode::IQ3S => {
             try_build_kquant_quantized_linear(params, prefix, plq.mode, "lfm2_moe")?
         }
         // FAIL-LOUD: the router gate is deliberately kept affine-8 by convert
@@ -182,9 +194,13 @@ fn build_lfm2_non_moe_ql(
         }
         PerLayerMode::Affine => try_build_quantized_linear(params, base, plq.group_size, plq.bits),
         PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, base)?,
-        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
-            try_build_kquant_quantized_linear(params, base, plq.mode, "lfm2")?
-        }
+        PerLayerMode::Q6K
+        | PerLayerMode::Q4K
+        | PerLayerMode::Q5K
+        | PerLayerMode::Q3K
+        | PerLayerMode::IQ4NL
+        | PerLayerMode::IQ4XS
+        | PerLayerMode::IQ3S => try_build_kquant_quantized_linear(params, base, plq.mode, "lfm2")?,
     })
 }
 
@@ -357,7 +373,13 @@ fn plq_to_packed_params(plq: PerLayerQuant, ctx: &str) -> Result<(i32, i32, &'st
                  default), so this checkpoint is malformed; refusing to load"
             )));
         }
-        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+        PerLayerMode::Q6K
+        | PerLayerMode::Q4K
+        | PerLayerMode::Q5K
+        | PerLayerMode::Q3K
+        | PerLayerMode::IQ4NL
+        | PerLayerMode::IQ4XS
+        | PerLayerMode::IQ3S => {
             return Err(Error::from_reason(format!(
                 "lfm2: '{ctx}' resolved to K-quant ({:?}), but the packed embedding / \
                  quant-info path does not support ggml K-quants — a K-quant GGUF import keeps \

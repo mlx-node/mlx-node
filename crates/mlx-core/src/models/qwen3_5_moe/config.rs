@@ -187,6 +187,7 @@ impl Qwen3_5MoeConfig {
             // dense config it maps to never attaches a cold tier of its own.
             persist_paged_cache: None,
             n_mtp_layers: self.n_mtp_layers,
+            qwen35_gguf_gdn_layout: None,
         }
     }
 

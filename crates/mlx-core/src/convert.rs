@@ -380,7 +380,11 @@ pub(crate) mod recipe {
             | PerLayerMode::Sym8
             | PerLayerMode::Q6K
             | PerLayerMode::Q4K
-            | PerLayerMode::Q5K => {
+            | PerLayerMode::Q5K
+            | PerLayerMode::Q3K
+            | PerLayerMode::IQ4NL
+            | PerLayerMode::IQ4XS
+            | PerLayerMode::IQ3S => {
                 return Err(Error::from_reason(format!(
                     "Qwen vision source mode {mode:?} is not a uniform packed mode supported by the dense vision sanitizer; dequantize the vision tower before conversion"
                 )));
@@ -7331,11 +7335,15 @@ fn validate_existing_quantized_entry(
         // including the interleave factor of 2 the q4k/q5k `(sc, m)` / `(d, dmin)`
         // pairs carry, so the generic affine shape check below cannot describe
         // them — this arm validates in full and returns.
-        "q4k" | "q5k" | "q6k" => {
+        "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs" | "iq3s" => {
             let format = match entry.mode.as_str() {
+                "q3k" => KQuantFormat::Q3K,
                 "q4k" => KQuantFormat::Q4K,
                 "q5k" => KQuantFormat::Q5K,
-                _ => KQuantFormat::Q6K,
+                "q6k" => KQuantFormat::Q6K,
+                "iq4nl" => KQuantFormat::IQ4NL,
+                "iq4xs" => KQuantFormat::IQ4XS,
+                _ => KQuantFormat::IQ3S,
             };
             validate_existing_kquant_entry(weight, scales, weights, prefix, entry, format)?;
             return Ok(());
@@ -7484,10 +7492,11 @@ fn validate_existing_kquant_entry(
         )));
     }
     let k = weight_cols * 32 / bits;
-    if k % QK_K as i64 != 0 {
+    if k % format.block_size() as i64 != 0 {
         return Err(Error::from_reason(format!(
             "already-quantized {mode} group '{prefix}' decodes to K={k}, not a multiple of the \
-             {QK_K}-value ggml super-block"
+             {}-value ggml block",
+            format.block_size(),
         )));
     }
     let k = k as usize;
@@ -7530,11 +7539,13 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
         ndim == 2 || ndim == 3
     } else if mode == "sym8" {
         last_dim % 16 == 0
-    } else if matches!(mode, "q4k" | "q5k" | "q6k") {
+    } else if matches!(mode, "q3k" | "q4k" | "q5k" | "q6k" | "iq4xs" | "iq3s") {
         // K-quants are packed in 256-value ggml super-blocks; the sub-scale
         // group_size (16 or 32) is a within-block subdivision, so the emission
         // gate is the super-block, not the group.
         last_dim % (QK_K as i32) == 0
+    } else if mode == "iq4nl" {
+        last_dim % 32 == 0
     } else {
         last_dim % group_size == 0
     })
@@ -12790,7 +12801,7 @@ mod tests {
     }
 
     /// The same guard covers a `--gguf-kquant` import directory, whose config
-    /// carries `mode: q4k/q5k/q6k` plus a per-tensor entry for every K-quant
+    /// carries the native packed `mode` plus a per-tensor entry for every K/IQ
     /// group. Bare `-q` would replace all of it with affine/4/64 while leaving
     /// ggml's packed blocks on disk untouched.
     ///

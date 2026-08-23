@@ -118,18 +118,22 @@ async function removeMetallibsForCpuOnlyBuild() {
   console.log('Removed stale metallibs from MLX_DISABLE_METAL CPU-only build outputs.');
 }
 
-// Derive the napi addon file name + the matching `npm/<triple>/` directory
-// from the current platform/arch. napi-rs emits `mlx-core.<triple>.node`
-// where the triple is e.g. `darwin-arm64` or `linux-arm64-gnu`.
-function nativeAddonTriple(): string {
-  if (process.platform === 'darwin') {
-    return `darwin-${process.arch}`;
+// Derive the matching `npm/<triple>/` directory from napi-rs's actual output.
+// This must not use `process.arch`: an x64 Node under Rosetta can legitimately
+// drive the configured aarch64 Rust build.
+function nativeAddonTriple(actualName: string): string {
+  const match = /^mlx-core\.(.+)\.node$/.exec(actualName);
+  if (match == null) {
+    throw new Error(`[build.ts] unrecognized native addon output: ${actualName}`);
   }
-  if (process.platform === 'linux') {
-    // glibc only for this milestone (GB10 is glibc); musl is out of scope.
-    return `linux-${process.arch}-gnu`;
+  const triple = match[1];
+  if (process.platform === 'darwin' && !triple.startsWith('darwin-')) {
+    throw new Error(`[build.ts] expected a Darwin addon, got ${actualName}`);
   }
-  throw new Error(`[build.ts] unsupported platform for native addon: ${process.platform}`);
+  if (process.platform === 'linux' && !triple.startsWith('linux-')) {
+    throw new Error(`[build.ts] expected a Linux addon, got ${actualName}`);
+  }
+  return triple;
 }
 
 async function copyNativeAddon(outputs: Awaited<typeof task>) {
@@ -137,9 +141,9 @@ async function copyNativeAddon(outputs: Awaited<typeof task>) {
   if (!nodeOutput) {
     throw new Error('[build.ts smoke check] native addon output missing from napi build');
   }
-  const triple = nativeAddonTriple();
-  const expectedName = `mlx-core.${triple}.node`;
   const actualName = basename(nodeOutput.path);
+  const triple = nativeAddonTriple(actualName);
+  const expectedName = `mlx-core.${triple}.node`;
   if (actualName !== expectedName) {
     throw new Error(
       `[build.ts smoke check] expected native addon output ${expectedName}, got ${actualName} at ${nodeOutput.path}`,

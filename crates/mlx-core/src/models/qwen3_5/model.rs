@@ -11949,6 +11949,10 @@ pub struct Qwen3_5Model {
     /// `image_processor` for exact preflight geometry.
     pub(crate) spatial_merge_size: i32,
     pub(crate) context_limits: Qwen3_5ContextLimits,
+    /// Directory containing tokenizer/config assets for this loaded model.
+    /// For direct GGUF loads this is the lossless native-packed cache rather
+    /// than the source file path.
+    pub(crate) model_assets_path: String,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop, so the global cap can shrink once JS GCs
     /// the wrapper.
@@ -11959,6 +11963,14 @@ pub struct Qwen3_5Model {
 
 #[napi]
 impl Qwen3_5Model {
+    /// Resolved directory containing this model's tokenizer/config assets.
+    /// Streaming wrappers use it after a direct GGUF load so chat templating
+    /// reads the reconstructed sidecars from the native-packed cache.
+    #[napi]
+    pub fn model_assets_path(&self) -> String {
+        self.model_assets_path.clone()
+    }
+
     /// Whether the block-paged KV cache adapter is active on this model
     /// instance.
     ///
@@ -12057,6 +12069,16 @@ impl Qwen3_5Model {
     /// - tokenizer.json + tokenizer_config.json
     #[napi]
     pub async fn load(path: String) -> Result<Qwen3_5Model> {
+        let source = std::path::Path::new(&path);
+        if source.is_file()
+            && source
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            let cache = crate::utils::gguf::prepare_qwen35_native_gguf(source).await?;
+            return persistence::load_with_thread(&cache.to_string_lossy()).await;
+        }
         persistence::load_with_thread(&path).await
     }
 
@@ -14784,6 +14806,7 @@ mod paged_construction_tests {
 
     fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
         Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 8,
@@ -17886,6 +17909,7 @@ mod layer_kinds_cache_tests {
 
     fn tiny_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 8,
@@ -17939,6 +17963,7 @@ mod paged_gdn_frontier_tests {
 
     fn tiny_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 2,
@@ -18071,6 +18096,7 @@ mod mtp_gate_state_tests {
 
     fn tiny_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 2,

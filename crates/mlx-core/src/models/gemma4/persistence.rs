@@ -1330,7 +1330,13 @@ fn resolve_packed_embed_params<'a>(
                 biases,
             })
         }
-        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+        PerLayerMode::Q6K
+        | PerLayerMode::Q4K
+        | PerLayerMode::Q5K
+        | PerLayerMode::Q3K
+        | PerLayerMode::IQ4NL
+        | PerLayerMode::IQ4XS
+        | PerLayerMode::IQ3S => {
             // Real gemma4 UD GGUFs ship `token_embd` as a K-quant (e.g. Q6_K).
             // A K-quant group is a uint32 `.weight`, integer sub-block `.scales`
             // (int8 for Q6_K, uint8 for Q4_K/Q5_K), and a MANDATORY float16
@@ -1412,7 +1418,13 @@ fn build_gemma_ql(
             try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
         }
         PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+        PerLayerMode::Q6K
+        | PerLayerMode::Q4K
+        | PerLayerMode::Q5K
+        | PerLayerMode::Q3K
+        | PerLayerMode::IQ4NL
+        | PerLayerMode::IQ4XS
+        | PerLayerMode::IQ3S => {
             try_build_kquant_quantized_linear(params, prefix, plq.mode, "gemma4")?
         }
     })
@@ -1441,7 +1453,13 @@ fn build_gemma_qsl(
         PerLayerMode::Affine => {
             try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits)
         }
-        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+        PerLayerMode::Q6K
+        | PerLayerMode::Q4K
+        | PerLayerMode::Q5K
+        | PerLayerMode::Q3K
+        | PerLayerMode::IQ4NL
+        | PerLayerMode::IQ4XS
+        | PerLayerMode::IQ3S => {
             try_build_kquant_quantized_switch_linear(params, prefix, plq.mode, "gemma4")?
         }
         PerLayerMode::Sym8 => {

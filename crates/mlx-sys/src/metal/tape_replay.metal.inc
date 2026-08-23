@@ -13,7 +13,7 @@ R"(
         auto n = thread_position_in_grid.z;
         auto b_idx = n / Hv;
         auto hv_idx = n % Hv;
-        auto hk_idx = hv_idx / (Hv / Hk);
+        auto hk_idx = hv_idx % Hk;
         constexpr int n_per_t = Dk / 32;
 
         // tape: [B, T, Hv, Dv]

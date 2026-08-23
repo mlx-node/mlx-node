@@ -15,8 +15,8 @@ use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
     ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    has_kquant_mode, has_sym8_mode, merge_per_layer, mode_to_str, normalize_per_layer_key,
-    parse_mode_str, parse_quant_settings, resolve_default_mode, select_quantization_block,
+    has_sym8_mode, merge_per_layer, mode_to_str, normalize_per_layer_key, parse_mode_str,
+    parse_quant_settings, resolve_default_mode, select_quantization_block,
 };
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -85,6 +85,32 @@ use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 /// but our model expects merged in_proj_qkvz and in_proj_ba.
 /// Concatenates .weight, .scales, and .biases along axis 0.
 pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> Result<()> {
+    fn companion_layouts_match(
+        params: &HashMap<String, MxArray>,
+        left: &str,
+        right: &str,
+    ) -> Result<bool> {
+        for suffix in ["weight", "scales", "biases"] {
+            let a = params.get(&format!("{left}.{suffix}"));
+            let b = params.get(&format!("{right}.{suffix}"));
+            match (a, b) {
+                (Some(a), Some(b)) => {
+                    let a_shape = a.shape()?;
+                    let b_shape = b.shape()?;
+                    if a.dtype()? != b.dtype()?
+                        || a_shape.len() != b_shape.len()
+                        || a_shape.get(1..) != b_shape.get(1..)
+                    {
+                        return Ok(false);
+                    }
+                }
+                (None, None) => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
     // Merge in_proj_qkv + in_proj_z → in_proj_qkvz
     let split_qkv_keys: Vec<String> = result
         .keys()
@@ -94,8 +120,16 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
 
     for qkv_key in &split_qkv_keys {
         let prefix = qkv_key.strip_suffix(".in_proj_qkv.weight").unwrap();
+        let qkv_prefix = format!("{}.in_proj_qkv", prefix);
+        let z_prefix = format!("{}.in_proj_z", prefix);
         let z_weight_key = format!("{}.in_proj_z.weight", prefix);
         if !result.contains_key(&z_weight_key) {
+            continue;
+        }
+        // Dynamic GGUFs may intentionally assign different qtypes to qkv and
+        // z. Packed buffers with different bit widths/sidecar geometry cannot
+        // be concatenated. Leave those projections split for the GDN runtime.
+        if !companion_layouts_match(result, &qkv_prefix, &z_prefix)? {
             continue;
         }
 
@@ -123,8 +157,13 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
 
     for b_key in &split_b_keys {
         let prefix = b_key.strip_suffix(".in_proj_b.weight").unwrap();
+        let b_prefix = format!("{}.in_proj_b", prefix);
+        let a_prefix = format!("{}.in_proj_a", prefix);
         let a_weight_key = format!("{}.in_proj_a.weight", prefix);
         if !result.contains_key(&a_weight_key) {
+            continue;
+        }
+        if !companion_layouts_match(result, &b_prefix, &a_prefix)? {
             continue;
         }
 
@@ -528,12 +567,6 @@ fn parse_mtp_mode(
              supported by the dense or MoE MTP heads; official recipes keep all mtp.* tensors BF16"
         )));
     }
-    if crate::models::quant_dispatch::is_kquant_mode(mode) {
-        return Err(Error::from_reason(format!(
-            "Unsupported MTP quantization mode '{mode:?}' at {context}: ggml K-quants are only \
-             imported from GGUFs, which never ship an MTP head; MTP tensors are affine/mxfp/bf16"
-        )));
-    }
     Ok(mode)
 }
 
@@ -553,11 +586,16 @@ fn parse_mtp_i32(value: &Value, context: &str) -> Result<i32> {
 fn validate_mtp_bits(bits: i32, mode: PerLayerMode, context: &str) -> Result<()> {
     let valid = match mode {
         PerLayerMode::Affine => matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
-        PerLayerMode::Mxfp4 | PerLayerMode::Nvfp4 => bits == 4,
-        PerLayerMode::Mxfp8 | PerLayerMode::Sym8 => bits == 8,
-        // K-quants and fp8_e4m3 are never MTP modes (rejected in
-        // `parse_mtp_mode`); reject defensively so the match stays exhaustive.
-        PerLayerMode::Fp8E4m3 | PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => false,
+        PerLayerMode::Mxfp4
+        | PerLayerMode::Nvfp4
+        | PerLayerMode::Q4K
+        | PerLayerMode::IQ4NL
+        | PerLayerMode::IQ4XS => bits == 4,
+        PerLayerMode::Mxfp8 | PerLayerMode::Sym8 | PerLayerMode::IQ3S => bits == 8,
+        PerLayerMode::Q6K => bits == 6,
+        PerLayerMode::Q5K => bits == 5,
+        PerLayerMode::Q3K => bits == 3,
+        PerLayerMode::Fp8E4m3 => false,
     };
     if !valid {
         return Err(Error::from_reason(format!(
@@ -576,7 +614,11 @@ fn parse_mtp_bits(
     let Some(value) = value else {
         return Ok(match mode {
             PerLayerMode::Mxfp4 | PerLayerMode::Nvfp4 => 4,
-            PerLayerMode::Mxfp8 | PerLayerMode::Sym8 => 8,
+            PerLayerMode::Mxfp8 | PerLayerMode::Sym8 | PerLayerMode::IQ3S => 8,
+            PerLayerMode::Q4K | PerLayerMode::IQ4NL | PerLayerMode::IQ4XS => 4,
+            PerLayerMode::Q6K => 6,
+            PerLayerMode::Q5K => 5,
+            PerLayerMode::Q3K => 3,
             _ => absent_default,
         });
     };
@@ -594,7 +636,12 @@ fn parse_mtp_group_size(
     let Some(value) = value else {
         return Ok(match mode {
             PerLayerMode::Mxfp4 | PerLayerMode::Mxfp8 => 32,
-            PerLayerMode::Nvfp4 => 16,
+            PerLayerMode::Nvfp4 | PerLayerMode::Q6K | PerLayerMode::Q3K => 16,
+            PerLayerMode::Q4K
+            | PerLayerMode::Q5K
+            | PerLayerMode::IQ4NL
+            | PerLayerMode::IQ4XS
+            | PerLayerMode::IQ3S => 32,
             PerLayerMode::Sym8 => -1,
             _ => absent_default,
         });
@@ -613,13 +660,13 @@ fn parse_mtp_group_size(
         PerLayerMode::Affine => matches!(group_size, 32 | 64 | 128),
         PerLayerMode::Mxfp4 | PerLayerMode::Mxfp8 => group_size == 32,
         PerLayerMode::Nvfp4 => group_size == 16,
-        // K-quants and sym8/fp8_e4m3 are never MTP modes (rejected in
-        // `parse_mtp_mode`); reject defensively to keep the match exhaustive.
-        PerLayerMode::Sym8
-        | PerLayerMode::Fp8E4m3
-        | PerLayerMode::Q6K
-        | PerLayerMode::Q4K
-        | PerLayerMode::Q5K => false,
+        PerLayerMode::Q6K | PerLayerMode::Q3K => group_size == 16,
+        PerLayerMode::Q4K
+        | PerLayerMode::Q5K
+        | PerLayerMode::IQ4NL
+        | PerLayerMode::IQ4XS
+        | PerLayerMode::IQ3S => group_size == 32,
+        PerLayerMode::Sym8 | PerLayerMode::Fp8E4m3 => false,
     };
     if !valid {
         return Err(Error::from_reason(format!(
@@ -1223,7 +1270,13 @@ fn apply_weights_inner_with_residency(
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-            PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => {
+            PerLayerMode::Q6K
+            | PerLayerMode::Q4K
+            | PerLayerMode::Q5K
+            | PerLayerMode::Q3K
+            | PerLayerMode::IQ4NL
+            | PerLayerMode::IQ4XS
+            | PerLayerMode::IQ3S => {
                 try_build_kquant_quantized_linear(params, prefix, plq.mode, "qwen3_5")?
             }
         };
@@ -1358,10 +1411,19 @@ fn apply_weights_inner_with_residency(
                     // sym8 group (int8 `.weight` whose `.scales` was
                     // stripped) makes `try_build_ql` return `Ok(None)`, and
                     // the int8 bytes must NEVER reach the dense bf16 route.
-                    if let Some(ql) =
-                        try_build_ql(params, &format!("{}.linear_attn.in_proj_qkvz", prefix))?
-                    {
+                    let merged_qkvz = format!("{}.linear_attn.in_proj_qkvz", prefix);
+                    let merged_qkvz_ql = if params.contains_key(&format!("{merged_qkvz}.weight")) {
+                        try_build_ql(params, &merged_qkvz)?
+                    } else {
+                        None
+                    };
+                    if let Some(ql) = merged_qkvz_ql {
                         gdn.set_quantized_in_proj_qkvz(ql);
+                    } else if let (Some(qkv), Some(z)) = (
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_qkv", prefix))?,
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_z", prefix))?,
+                    ) {
+                        gdn.set_quantized_in_proj_qkv_z(qkv, z);
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_qkvz.weight", prefix))
                     {
@@ -1371,10 +1433,19 @@ fn apply_weights_inner_with_residency(
                         )?;
                         gdn.set_in_proj_qkvz_weight(w)?;
                     }
-                    if let Some(ql) =
-                        try_build_ql(params, &format!("{}.linear_attn.in_proj_ba", prefix))?
-                    {
+                    let merged_ba = format!("{}.linear_attn.in_proj_ba", prefix);
+                    let merged_ba_ql = if params.contains_key(&format!("{merged_ba}.weight")) {
+                        try_build_ql(params, &merged_ba)?
+                    } else {
+                        None
+                    };
+                    if let Some(ql) = merged_ba_ql {
                         gdn.set_quantized_in_proj_ba(ql);
+                    } else if let (Some(b), Some(a)) = (
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_b", prefix))?,
+                        try_build_ql(params, &format!("{}.linear_attn.in_proj_a", prefix))?,
+                    ) {
+                        gdn.set_quantized_in_proj_b_a(b, a);
                     } else if let Some(w) =
                         params.get(&format!("{}.linear_attn.in_proj_ba.weight", prefix))
                     {
@@ -1671,17 +1742,11 @@ fn apply_weights_inner_with_residency(
     // `mtp.forward`; the module sits next to the main model and reads from
     // the same params HashMap.
     if let Some(mtp) = inner.mtp.as_mut() {
-        // sym8/K-quant v1 scope: MTP is OUT. The MTP quant builders map both
-        // `PerLayerMode::Sym8` and every K-quant mode to `None`, and an
-        // imported GGUF never ships an MTP head — skip the load and fail soft
-        // into plain AR decode, mirroring the missing-weights branch.
-        if has_sym8_mode(top_level_mode, per_layer_quant)
-            || has_kquant_mode(top_level_mode, per_layer_quant)
-        {
+        if has_sym8_mode(top_level_mode, per_layer_quant) {
             inner.mtp_weights_loaded = false;
             warn!(
-                "Qwen3.5: sym8/K-quant checkpoint with config.n_mtp_layers={} — MTP is not \
-                 supported on the imported-quant path; disabling speculative MTP.",
+                "Qwen3.5: sym8 checkpoint with config.n_mtp_layers={} — MTP is not \
+                 supported on the sym8 path; disabling speculative MTP.",
                 config.n_mtp_layers
             );
         } else {
@@ -1787,7 +1852,8 @@ fn validate_mandatory_weights(
 /// hybrid scheduler after loading all weights inside the init function.
 /// Returns a `Qwen3_5Model` thin shell with the thread handle.
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
-    let model_path = model_path.to_string();
+    let model_assets_path = model_path.to_string();
+    let model_path = model_assets_path.clone();
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
@@ -2227,6 +2293,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         image_processor,
         spatial_merge_size,
         context_limits,
+        model_assets_path,
         _cache_limit_guard: cache_limit_guard,
         _pool_cache_limit_guard: pool_cache_limit_guard,
     })
@@ -2370,6 +2437,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         // (`resolve_persist_cold`), so this stays a strict tri-state read.
         persist_paged_cache: raw.get("persist_paged_cache").and_then(|v| v.as_bool()),
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
+        qwen35_gguf_gdn_layout: raw
+            .get("qwen35_gguf_gdn_layout")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -2558,6 +2629,57 @@ pub fn create_random_qwen35_checkpoint<'env>(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn packed_projection(rows: i64, weight_cols: i64) -> (MxArray, MxArray, MxArray) {
+        (
+            MxArray::zeros(&[rows, weight_cols], Some(DType::Uint32)).unwrap(),
+            MxArray::zeros(&[rows, 2], Some(DType::Int8)).unwrap(),
+            MxArray::zeros(&[rows, 1], Some(DType::Float16)).unwrap(),
+        )
+    }
+
+    #[test]
+    fn split_gdn_projections_with_different_packed_layouts_stay_split() {
+        let prefix = "layers.0.linear_attn";
+        let mut params = HashMap::new();
+        let (qkv_w, qkv_s, qkv_b) = packed_projection(6, 4);
+        let (z_w, z_s, z_b) = packed_projection(2, 5);
+        params.insert(format!("{prefix}.in_proj_qkv.weight"), qkv_w);
+        params.insert(format!("{prefix}.in_proj_qkv.scales"), qkv_s);
+        params.insert(format!("{prefix}.in_proj_qkv.biases"), qkv_b);
+        params.insert(format!("{prefix}.in_proj_z.weight"), z_w);
+        params.insert(format!("{prefix}.in_proj_z.scales"), z_s);
+        params.insert(format!("{prefix}.in_proj_z.biases"), z_b);
+
+        merge_split_projections(&mut params).unwrap();
+
+        assert!(params.contains_key(&format!("{prefix}.in_proj_qkv.weight")));
+        assert!(params.contains_key(&format!("{prefix}.in_proj_z.weight")));
+        assert!(!params.contains_key(&format!("{prefix}.in_proj_qkvz.weight")));
+    }
+
+    #[test]
+    fn split_gdn_projections_with_matching_packed_layouts_are_merged() {
+        let prefix = "layers.0.linear_attn";
+        let mut params = HashMap::new();
+        let (qkv_w, qkv_s, qkv_b) = packed_projection(6, 4);
+        let (z_w, z_s, z_b) = packed_projection(2, 4);
+        params.insert(format!("{prefix}.in_proj_qkv.weight"), qkv_w);
+        params.insert(format!("{prefix}.in_proj_qkv.scales"), qkv_s);
+        params.insert(format!("{prefix}.in_proj_qkv.biases"), qkv_b);
+        params.insert(format!("{prefix}.in_proj_z.weight"), z_w);
+        params.insert(format!("{prefix}.in_proj_z.scales"), z_s);
+        params.insert(format!("{prefix}.in_proj_z.biases"), z_b);
+
+        merge_split_projections(&mut params).unwrap();
+
+        let merged = params
+            .get(&format!("{prefix}.in_proj_qkvz.weight"))
+            .expect("compatible packed projections must merge");
+        assert_eq!(merged.shape().unwrap().as_ref(), &[8, 4]);
+        assert!(!params.contains_key(&format!("{prefix}.in_proj_qkv.weight")));
+        assert!(!params.contains_key(&format!("{prefix}.in_proj_z.weight")));
+    }
 
     #[test]
     fn packed_qwen_embedding_fallback_is_explicit_truthy_and_default_on() {
@@ -3069,6 +3191,7 @@ mod tests {
     /// per-layer linear loop is empty), keeping the fixture tiny.
     fn no_mtp_layer_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 4,

@@ -87,6 +87,7 @@ fn ggml_decode_row(format: KQuantFormat, row_blocks: &[u8], k: usize) -> Vec<f32
             KQuantFormat::Q4K => dequantize_row_q4_K(x, y, k as i64),
             KQuantFormat::Q5K => dequantize_row_q5_K(x, y, k as i64),
             KQuantFormat::Q6K => dequantize_row_q6_K(x, y, k as i64),
+            _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
         }
     }
     out
@@ -453,6 +454,7 @@ fn gen_block(format: KQuantFormat, blk: &mut [u8], p: Profile, rng: &mut Lcg, bl
                 assert_eq!((sc, m), (ls[j], lm[j]), "scale packer disagrees at j={j}");
             }
         }
+        _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
     }
 }
 
@@ -903,6 +905,7 @@ fn run_format(format: KQuantFormat) -> FormatRun {
                             *cov.submins.entry(want_m).or_default() += 1;
                         }
                     }
+                    _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
                 }
             }
             for v in 0..spec.k {
@@ -912,6 +915,7 @@ fn run_format(format: KQuantFormat) -> FormatRun {
                     KQuantFormat::Q6K => q6k_code(blk, v % QK_K),
                     KQuantFormat::Q4K => q4k_code(blk, v % QK_K),
                     KQuantFormat::Q5K => q5k_code(blk, v % QK_K),
+                    _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
                 };
                 let got_code = extract_code(w, v, bits);
                 assert_eq!(
@@ -948,6 +952,7 @@ fn run_format(format: KQuantFormat) -> FormatRun {
                     KQuantFormat::Q6K => q6k_code(blk, v % QK_K),
                     KQuantFormat::Q4K => q4k_code(blk, v % QK_K),
                     KQuantFormat::Q5K => q5k_code(blk, v % QK_K),
+                    _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
                 };
                 // Q6_K's folded bias turns ggml's -0.0 into +0.0 and nothing
                 // else. Both sides must be exactly zero to qualify, and only
@@ -1048,6 +1053,7 @@ fn assert_coverage(format: KQuantFormat, cov: &Coverage) {
                  its hard half was never exercised"
             );
         }
+        _ => panic!("legacy ggml parity fixture does not implement {format:?}"),
     }
     assert!(cov.d_subnormal > 0, "no binary16-subnormal super-scale");
     assert!(cov.d_zero > 0, "no zero super-scale");

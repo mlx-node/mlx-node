@@ -2165,6 +2165,7 @@ mod tests {
 
     fn tiny_cfg() -> Qwen3_5Config {
         Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
             vocab_size: 32,
             hidden_size: 32,
             num_layers: 1,

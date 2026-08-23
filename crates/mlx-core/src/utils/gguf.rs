@@ -26,7 +26,7 @@ use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
-use crate::utils::gguf_kquant::{KQuantArrays, KQuantFormat, KQuantRepacker, KQuantScales, QK_K};
+use crate::utils::gguf_kquant::{KQuantArrays, KQuantFormat, KQuantRepacker, KQuantScales};
 use crate::utils::safetensors::save_safetensors;
 
 // ── GGUF Constants ──────────────────────────────────────────────────────────
@@ -45,9 +45,13 @@ pub enum GgufTensorType {
     Q4_0 = 2,
     Q4_1 = 3,
     Q8_0 = 8,
+    Q3K = 11,
     Q4K = 12,
     Q5K = 13,
     Q6K = 14,
+    IQ4NL = 20,
+    IQ3S = 21,
+    IQ4XS = 23,
     BF16 = 30,
 }
 
@@ -59,9 +63,13 @@ impl GgufTensorType {
             2 => Some(Self::Q4_0),
             3 => Some(Self::Q4_1),
             8 => Some(Self::Q8_0),
+            11 => Some(Self::Q3K),
             12 => Some(Self::Q4K),
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
+            20 => Some(Self::IQ4NL),
+            21 => Some(Self::IQ3S),
+            23 => Some(Self::IQ4XS),
             30 => Some(Self::BF16),
             _ => None,
         }
@@ -78,6 +86,7 @@ impl GgufTensorType {
             Self::Q4_0 => 18, // block size: 2 byte scale + 16 bytes (32 x 4-bit)
             Self::Q4_1 => 20, // 2 byte scale + 2 byte bias + 16 bytes
             Self::Q8_0 => 34, // 2 byte scale + 32 bytes
+            Self::Q3K | Self::IQ3S => 110,
             // f16 d + f16 dmin + 12 packed 6-bit (sub-scale, min) pairs +
             // 128 nibble bytes for 256 values.
             Self::Q4K => 144,
@@ -86,6 +95,8 @@ impl GgufTensorType {
             // 128 low-nibble bytes + 64 high-two-bit bytes + 16 signed
             // sub-scales + one f16 super-scale for 256 values.
             Self::Q6K => 210,
+            Self::IQ4NL => 18,
+            Self::IQ4XS => 136,
         }
     }
 
@@ -100,7 +111,8 @@ impl GgufTensorType {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
-            Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            Self::IQ4NL => 32,
+            Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ3S | Self::IQ4XS => 256,
         }
     }
 
@@ -129,6 +141,10 @@ impl GgufTensorType {
             Self::Q4K => Some(KQuantFormat::Q4K),
             Self::Q5K => Some(KQuantFormat::Q5K),
             Self::Q6K => Some(KQuantFormat::Q6K),
+            Self::Q3K => Some(KQuantFormat::Q3K),
+            Self::IQ4NL => Some(KQuantFormat::IQ4NL),
+            Self::IQ3S => Some(KQuantFormat::IQ3S),
+            Self::IQ4XS => Some(KQuantFormat::IQ4XS),
             Self::F32 | Self::F16 | Self::BF16 | Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => None,
         }
     }
@@ -140,9 +156,13 @@ impl GgufTensorType {
             Self::Q4_0 => "Q4_0",
             Self::Q4_1 => "Q4_1",
             Self::Q8_0 => "Q8_0",
+            Self::Q3K => "Q3_K",
             Self::Q4K => "Q4_K",
             Self::Q5K => "Q5_K",
             Self::Q6K => "Q6_K",
+            Self::IQ4NL => "IQ4_NL",
+            Self::IQ3S => "IQ3_S",
+            Self::IQ4XS => "IQ4_XS",
             Self::BF16 => "BF16",
         }
     }
@@ -742,7 +762,11 @@ pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
         | GgufTensorType::BF16
         | GgufTensorType::Q4K
         | GgufTensorType::Q5K
-        | GgufTensorType::Q6K => None,
+        | GgufTensorType::Q6K
+        | GgufTensorType::Q3K
+        | GgufTensorType::IQ4NL
+        | GgufTensorType::IQ4XS
+        | GgufTensorType::IQ3S => None,
     }
 }
 
@@ -981,11 +1005,12 @@ fn load_kquant_repack(
 ) -> Result<Vec<(String, MxArray)>> {
     let shape = tensor.mlx_shape();
     let last_dim = shape.last().copied().unwrap_or(0);
-    if last_dim <= 0 || !(last_dim as usize).is_multiple_of(QK_K) {
+    if last_dim <= 0 || !(last_dim as usize).is_multiple_of(format.block_size()) {
         return Err(Error::from_reason(format!(
-            "{} tensor '{}' has last dimension {last_dim}; expected a positive multiple of {QK_K}",
+            "{} tensor '{}' has last dimension {last_dim}; expected a positive multiple of {}",
             tensor.tensor_type.name(),
-            tensor.name
+            tensor.name,
+            format.block_size(),
         )));
     }
     let k = last_dim as usize;
@@ -1052,7 +1077,7 @@ fn load_kquant_repack(
 pub struct GgufLoadOptions {
     /// Log progress every 50 tensors.
     pub verbose: bool,
-    /// Repack ggml Q4_K / Q5_K / Q6_K blocks into MLX K-quant arrays.
+    /// Repack supported ggml K/IQ blocks into native MLX packed arrays.
     ///
     /// Off by default, which is the pre-K-quant behaviour: Q6_K is accepted
     /// only as the Gemma4 token embedding and dequantized to BF16, and Q4_K /
@@ -1177,7 +1202,7 @@ fn is_muse_glimmer_dflash_gguf(metadata: &HashMap<String, GgufMetaValue>) -> boo
 
 /// The three names a quantized tensor group ships under. Both GGUF quant
 /// importers emit the same trio: `load_quantized_tensor` (affine Q4_0/Q4_1/Q8_0)
-/// and `load_kquant_repack` (Q4_K/Q5_K/Q6_K) each write `{base}.weight` plus a
+/// and `load_kquant_repack` (supported K/IQ formats) each write `{base}.weight` plus a
 /// `{base}.scales` / `{base}.biases` sidecar pair. Loaders probe the sidecar by
 /// name to decide a tensor is quantized (e.g. `embed_tokens.scales`), so a
 /// rename that moves only `.weight` strands the sidecars under their old names
@@ -1412,8 +1437,48 @@ fn gguf_name_to_hf_for_metadata(
     } else if is_muse_glimmer_dflash_gguf(metadata) {
         muse_glimmer_dflash_name_to_hf(name)
     } else {
-        Some(gguf_name_to_hf(name))
+        Some(qwen35_name_to_hf(name, metadata))
     }
+}
+
+/// Qwen3.5 GGUFs with inline MTP encode the draft layer as the final block and
+/// attach the four nextn projections/norms to that same block. HF/MLX stores
+/// those tensors under the mtp prefix, outside the main decoder layer list.
+fn qwen35_name_to_hf(name: &str, metadata: &HashMap<String, GgufMetaValue>) -> String {
+    let arch = metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        .unwrap_or("");
+    if !matches!(arch, "qwen35" | "qwen35moe") {
+        return gguf_name_to_hf(name);
+    }
+    let Some(block_count) = metadata
+        .get(&format!("{arch}.block_count"))
+        .and_then(GgufMetaValue::as_u64)
+    else {
+        return gguf_name_to_hf(name);
+    };
+    let Some(mtp_index) = block_count.checked_sub(1) else {
+        return gguf_name_to_hf(name);
+    };
+    let prefix = format!("blk.{mtp_index}.");
+    let Some(suffix) = name.strip_prefix(&prefix) else {
+        return gguf_name_to_hf(name);
+    };
+
+    for (gguf, mlx) in [
+        ("nextn.eh_proj", "mtp.fc"),
+        ("nextn.enorm", "mtp.pre_fc_norm_embedding"),
+        ("nextn.hnorm", "mtp.pre_fc_norm_hidden"),
+        ("nextn.shared_head_norm", "mtp.norm"),
+    ] {
+        if let Some(mapped) = rename_global_quant_group(suffix, gguf, mlx) {
+            return mapped;
+        }
+    }
+
+    let mapped = gguf_name_to_hf(name);
+    mapped.replacen(&format!("model.layers.{mtp_index}."), "mtp.layers.0.", 1)
 }
 
 /// Remap GGUF tensor name to HuggingFace-style name (standard LLM mapping)
@@ -1719,10 +1784,28 @@ fn reinterleave_cols(arr: &MxArray, n_heads: i64, head_dim: i64) -> Result<MxArr
 fn fixup_qwen35_linear_attn(
     weights: &mut HashMap<String, MxArray>,
     metadata: &HashMap<String, GgufMetaValue>,
+    preserve_tiled_layout: bool,
 ) -> Result<()> {
     // Detect Qwen3.5 by checking for linear attention weights
     let has_linear_attn = weights.keys().any(|k| k.contains("linear_attn."));
     if !has_linear_attn {
+        return Ok(());
+    }
+
+    if preserve_tiled_layout {
+        // The fused GDN runtime consumes llama.cpp's tiled value-head order
+        // directly. Only ssm_a's numeric representation differs: GGUF stores
+        // -exp(A_log), while the model keeps A_log and applies -exp at runtime.
+        let keys = weights
+            .keys()
+            .filter(|key| key.ends_with("linear_attn.A_log"))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(arr) = weights.remove(&key) {
+                weights.insert(key, arr.negative()?.log()?);
+            }
+        }
         return Ok(());
     }
 
@@ -2127,9 +2210,13 @@ impl SourceQuantProfile {
             // `load_kquant_repack` keeps ggml's geometry verbatim, so the
             // triple is read off the repacker format rather than restated
             // here; `k_quant_format` stays the only type -> format mapping.
-            GgufTensorType::Q4K | GgufTensorType::Q5K | GgufTensorType::Q6K => {
-                ty.k_quant_format().map(Self::k_quant)
-            }
+            GgufTensorType::Q3K
+            | GgufTensorType::Q4K
+            | GgufTensorType::Q5K
+            | GgufTensorType::Q6K
+            | GgufTensorType::IQ4NL
+            | GgufTensorType::IQ4XS
+            | GgufTensorType::IQ3S => ty.k_quant_format().map(Self::k_quant),
         }
     }
 
@@ -2198,7 +2285,7 @@ impl SourceQuantProfile {
 /// Describe tensors that were already quantized in the GGUF source.
 ///
 /// Q4_0/Q4_1/Q8_0 go through `load_quantized_tensor` and — when the K-quant
-/// import is on — Q4_K/Q5_K/Q6_K go through `load_kquant_repack`. Neither path
+/// import is on — supported K/IQ tensors go through `load_kquant_repack`. Neither path
 /// changes the source block geometry, so that geometry has to reach the output
 /// config even when the caller never asked for a `--quantize` pass; otherwise
 /// Gemma4 falls back to the runtime's generic group-size default (64) and
@@ -3022,12 +3109,18 @@ pub struct GgufConversionOptions {
     /// Forces `group_size = 32` for upgraded layers.
     pub quant_mxfp: Option<bool>,
 
-    /// Import ggml Q4_K / Q5_K / Q6_K tensors as MLX K-quant arrays instead of
+    /// Import supported ggml K/IQ tensors as native MLX packed arrays instead of
     /// rejecting them (default: false). The blocks are repacked, never
-    /// dequantized, so the output keeps the source file's weights and byte size.
+    /// dequantized, so the output preserves the source quantized values. IQ3_S
+    /// expands only its integer grid/sign encoding to signed 8-bit codes.
     /// With this off, Q6_K remains the Gemma4 token-embedding BF16 fallback and
     /// Q4_K / Q5_K are an error.
     pub import_k_quants: Option<bool>,
+
+    /// Preserve Qwen3.5/3.8 GGUF GDN tensors in llama.cpp's tiled value-head
+    /// order. The runtime consumes this layout directly and avoids any packed
+    /// weight permutation. Intended for native GGUF execution.
+    pub native_qwen35_layout: Option<bool>,
 }
 
 #[napi(object)]
@@ -3037,6 +3130,145 @@ pub struct GgufConversionResult {
     pub output_path: String,
     pub tensor_names: Vec<String>,
     pub source_format: String,
+}
+
+fn write_embedded_gpt2_tokenizer(
+    metadata: &HashMap<String, GgufMetaValue>,
+    output_dir: &Path,
+) -> Result<bool> {
+    let Some(GgufMetaValue::String(model)) = metadata.get("tokenizer.ggml.model") else {
+        return Ok(false);
+    };
+    if model != "gpt2" {
+        return Ok(false);
+    }
+    let Some(GgufMetaValue::ArrayString(tokens)) = metadata.get("tokenizer.ggml.tokens") else {
+        return Ok(false);
+    };
+    let Some(GgufMetaValue::ArrayI32(types)) = metadata.get("tokenizer.ggml.token_type") else {
+        return Ok(false);
+    };
+    let Some(GgufMetaValue::ArrayString(merges)) = metadata.get("tokenizer.ggml.merges") else {
+        return Ok(false);
+    };
+    if tokens.len() != types.len() {
+        return Err(Error::from_reason(format!(
+            "GGUF tokenizer token/type length mismatch: {} tokens vs {} types",
+            tokens.len(),
+            types.len()
+        )));
+    }
+
+    let mut vocab = serde_json::Map::new();
+    let mut added = Vec::new();
+    for (id, (token, token_type)) in tokens.iter().zip(types).enumerate() {
+        match *token_type {
+            // GGML_TOKEN_TYPE_NORMAL
+            1 => {
+                vocab.insert(token.clone(), serde_json::json!(id));
+            }
+            // GGML_TOKEN_TYPE_CONTROL / USER_DEFINED. These are the exact
+            // special-token rows represented by added_tokens in HF's Qwen
+            // tokenizer; UNUSED rows deliberately remain ID holes.
+            3 | 4 => added.push(serde_json::json!({
+                "id": id,
+                "content": token,
+                "single_word": false,
+                "lstrip": false,
+                "rstrip": false,
+                "normalized": false,
+                "special": true
+            })),
+            _ => {}
+        }
+    }
+
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": added,
+        "normalizer": {"type": "NFC"},
+        "pre_tokenizer": {
+            "type": "Sequence",
+            "pretokenizers": [
+                {
+                    "type": "Split",
+                    "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},
+                    "behavior": "Isolated",
+                    "invert": false
+                },
+                {
+                    "type": "ByteLevel",
+                    "add_prefix_space": false,
+                    "trim_offsets": false,
+                    "use_regex": false
+                }
+            ]
+        },
+        "post_processor": {
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "trim_offsets": false,
+            "use_regex": false
+        },
+        "decoder": {
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "trim_offsets": false,
+            "use_regex": false
+        },
+        "model": {
+            "type": "BPE",
+            "dropout": null,
+            "unk_token": null,
+            "continuing_subword_prefix": "",
+            "end_of_word_suffix": "",
+            "fuse_unk": false,
+            "byte_fallback": false,
+            "ignore_merges": false,
+            "vocab": vocab,
+            "merges": merges
+        }
+    });
+    let bytes = serde_json::to_vec(&tokenizer).map_err(|error| {
+        Error::from_reason(format!("Failed to serialize GGUF tokenizer: {error}"))
+    })?;
+    fs::write(output_dir.join("tokenizer.json"), bytes)
+        .map_err(|error| Error::from_reason(format!("Failed to write tokenizer.json: {error}")))?;
+
+    // A standalone GGUF has no Hugging Face sidecars. Preserve the embedded
+    // template and special-token spellings so the regular chat-session loader
+    // behaves exactly as it does for a downloaded tokenizer snapshot.
+    let mut tokenizer_config = serde_json::Map::new();
+    if let Some(GgufMetaValue::String(template)) = metadata.get("tokenizer.chat_template") {
+        tokenizer_config.insert("chat_template".into(), serde_json::json!(template));
+        fs::write(output_dir.join("chat_template.jinja"), template).map_err(|error| {
+            Error::from_reason(format!("Failed to write chat_template.jinja: {error}"))
+        })?;
+    }
+    for (metadata_key, config_key) in [
+        ("tokenizer.ggml.bos_token_id", "bos_token"),
+        ("tokenizer.ggml.eos_token_id", "eos_token"),
+        ("tokenizer.ggml.padding_token_id", "pad_token"),
+    ] {
+        if let Some(token) = metadata
+            .get(metadata_key)
+            .and_then(GgufMetaValue::as_u32)
+            .and_then(|id| tokens.get(id as usize))
+        {
+            tokenizer_config.insert(config_key.into(), serde_json::json!(token));
+        }
+    }
+    let config_bytes = serde_json::to_vec(&tokenizer_config).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to serialize GGUF tokenizer config: {error}"
+        ))
+    })?;
+    fs::write(output_dir.join("tokenizer_config.json"), config_bytes).map_err(|error| {
+        Error::from_reason(format!("Failed to write tokenizer_config.json: {error}"))
+    })?;
+    Ok(true)
 }
 
 fn apply_gguf_awq_prescaling(
@@ -3154,6 +3386,7 @@ pub async fn convert_gguf_to_safetensors(
     }
 
     let import_k_quants = options.import_k_quants.unwrap_or(false);
+    let native_qwen35_layout = options.native_qwen35_layout.unwrap_or(false);
 
     // Plain Qwen3 has no quantized inference runtime. Preserving Q4_0/Q4_1/
     // Q8_0 or K-quant source groups would successfully write an artifact whose
@@ -3175,7 +3408,10 @@ pub async fn convert_gguf_to_safetensors(
     // previously crossed the MLX FFI boundary with impossible packed geometry
     // and aborted the process with an uncaught foreign exception. Fail from the
     // header instead of loading or mutating any tensor payload.
-    if import_k_quants && let Some((tensor, mapped)) = qwen35_kquant_dense_fixup_target(&gguf) {
+    if import_k_quants
+        && !native_qwen35_layout
+        && let Some((tensor, mapped)) = qwen35_kquant_dense_fixup_target(&gguf)
+    {
         return Err(Error::from_reason(format!(
             "GGUF tensor '{}' ({}) maps to Qwen3.5 linear-attention tensor '{}', which requires a head-axis reinterleave during conversion. --gguf-kquant cannot safely apply that dense transform to packed codes without also reordering the group's .scales/.biases, so this source cannot currently be imported losslessly. Use a floating-point source or a preconverted checkpoint. Rejected from the GGUF header before tensor data was loaded.",
             tensor.name,
@@ -3184,7 +3420,7 @@ pub async fn convert_gguf_to_safetensors(
         )));
     }
 
-    // K-quant import repacks ggml's Q4_K/Q5_K/Q6_K blocks bit-for-bit and never
+    // K-quant import losslessly repacks supported ggml K/IQ blocks and never
     // dequantizes them, so any path that would re-quantize the model — an
     // explicit `--quantize`, a `--q-recipe`, the `--q-mxfp` upgrade, or
     // `--imatrix-path` AWQ pre-scaling — both contradicts the import and forces
@@ -3207,7 +3443,7 @@ pub async fn convert_gguf_to_safetensors(
             return Err(Error::from_reason(
                 "K-quant GGUF import cannot be combined with re-quantization \
                  (--quantize / --q-recipe / --q-mxfp / --imatrix-path): ggml \
-                 Q4_K/Q5_K/Q6_K blocks are imported bit-for-bit and never \
+                 supported K/IQ blocks are losslessly imported and never \
                  dequantized. Import them as-is, or drop --gguf-kquant to convert \
                  a dequantized copy.",
             ));
@@ -3432,7 +3668,7 @@ pub async fn convert_gguf_to_safetensors(
     fixup_shapes(&mut weights)?;
 
     // Fix Qwen3.5 linear attention head deinterleaving and A_log conversion
-    fixup_qwen35_linear_attn(&mut weights, &gguf.metadata)?;
+    fixup_qwen35_linear_attn(&mut weights, &gguf.metadata, native_qwen35_layout)?;
 
     // Optional dtype conversion (only for non-quantized weights)
     if let Some(dtype_str) = &options.dtype {
@@ -3794,6 +4030,10 @@ pub async fn convert_gguf_to_safetensors(
                 serde_json::Value::String("interleaved".to_string());
         }
 
+        if native_qwen35_layout {
+            config_json["qwen35_gguf_gdn_layout"] = serde_json::Value::String("tiled".to_string());
+        }
+
         if do_quantize {
             let quant_obj = crate::convert::build_quantization_object(
                 quant_bits,
@@ -3870,6 +4110,11 @@ pub async fn convert_gguf_to_safetensors(
                 );
             }
         }
+        if !output_dir.join("tokenizer.json").exists()
+            && write_embedded_gpt2_tokenizer(&gguf.metadata, &output_dir)?
+        {
+            info!("Reconstructed tokenizer.json from embedded GGUF GPT-2 metadata");
+        }
     } else {
         if let Some(config) = prepared_muse_secondary_config {
             fs::write(&muse_secondary_config_path, config).map_err(|error| {
@@ -3901,12 +4146,100 @@ pub async fn convert_gguf_to_safetensors(
     })
 }
 
+/// Prepare the lossless native-packed cache used when a Qwen3.5/3.8 model is
+/// loaded from a GGUF file path. Quantized source blocks are only repacked;
+/// they are never expanded into a dense floating-point weight tensor. Native
+/// F32 norms/biases are narrowed to BF16 so they do not promote inference
+/// activations away from the model's BF16 execution/cache dtype.
+pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
+    let input_path = input_path.canonicalize().map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to canonicalize GGUF path '{}': {error}",
+            input_path.display()
+        ))
+    })?;
+    let metadata = fs::metadata(&input_path).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to stat GGUF path '{}': {error}",
+            input_path.display()
+        ))
+    })?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let stem = input_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("model")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let parent = input_path.parent().unwrap_or(Path::new("."));
+    let output_dir = parent
+        .join(".mlx-node-native")
+        .join(format!("{stem}-{}-{modified}", metadata.len()));
+    let marker = output_dir.join(".complete");
+    let marker_is_current = fs::read_to_string(&marker)
+        .is_ok_and(|contents| contents.contains("format=2\n") && contents.contains("dtype=bf16\n"));
+    if marker_is_current
+        && output_dir.join("model.safetensors").is_file()
+        && output_dir.join("config.json").is_file()
+    {
+        return Ok(output_dir);
+    }
+
+    convert_gguf_to_safetensors(GgufConversionOptions {
+        input_path: input_path.to_string_lossy().into_owned(),
+        output_dir: output_dir.to_string_lossy().into_owned(),
+        config_source_dir: Some(parent.to_string_lossy().into_owned()),
+        dtype: Some("bfloat16".to_string()),
+        verbose: Some(true),
+        quantize: Some(false),
+        quant_bits: None,
+        quant_group_size: None,
+        quant_mode: None,
+        quant_recipe: None,
+        imatrix_path: None,
+        output_filename: None,
+        vlm_key_prefix: None,
+        quant_mxfp: None,
+        import_k_quants: Some(true),
+        native_qwen35_layout: Some(true),
+    })
+    .await?;
+    fs::write(
+        &marker,
+        format!(
+            "format=2\nsource={}\nsize={}\nmodified_ns={}\nlayout=tiled\ndtype=bf16\n",
+            input_path.display(),
+            metadata.len(),
+            modified
+        ),
+    )
+    .map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to finalize native GGUF cache '{}': {error}",
+            output_dir.display()
+        ))
+    })?;
+    Ok(output_dir)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::gguf_kquant::repack_kquant;
+    use crate::utils::gguf_kquant::{QK_K, repack_kquant};
 
     fn build_minimal_gguf(
         metadata: &[(&str, GgufMetaValue)],
@@ -4890,6 +5223,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(true),
+            native_qwen35_layout: None,
         })
         .await
         .unwrap();
@@ -4979,6 +5313,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(true),
+            native_qwen35_layout: None,
         })
         .await;
         let err = match result {
@@ -6026,6 +6361,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(false),
+            native_qwen35_layout: None,
         })
         .await
         .expect("primary Muse conversion");
@@ -6173,6 +6509,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(false),
+            native_qwen35_layout: None,
         })
         .await
         .expect("primary Muse conversion");
@@ -6635,6 +6972,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(true),
+            native_qwen35_layout: None,
         })
         .await;
         let error = match outcome {
@@ -6736,6 +7074,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(true),
+            native_qwen35_layout: None,
         })
         .await;
         let error = match outcome {
@@ -7403,6 +7742,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(false),
+            native_qwen35_layout: None,
         })
         .await
         .unwrap();
@@ -7583,6 +7923,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(false),
+            native_qwen35_layout: None,
         })
         .await;
         let Err(err) = converted else {
@@ -7668,6 +8009,7 @@ mod tests {
                     vlm_key_prefix: Some(false),
                     quant_mxfp: Some(false),
                     import_k_quants: Some(false),
+                    native_qwen35_layout: None,
                 };
 
             let Err(err) = convert_gguf_to_safetensors(options(&output, None)).await else {
@@ -7761,6 +8103,7 @@ mod tests {
                     vlm_key_prefix: Some(false),
                     quant_mxfp: Some(false),
                     import_k_quants: Some(false),
+                    native_qwen35_layout: None,
                 })
                 .await
                 .unwrap();
@@ -7890,6 +8233,7 @@ mod tests {
                 vlm_key_prefix: Some(false),
                 quant_mxfp: Some(false),
                 import_k_quants: Some(false),
+                native_qwen35_layout: None,
             })
             .await;
             fs::remove_dir_all(&root).ok();
@@ -8012,6 +8356,7 @@ mod tests {
                 vlm_key_prefix: Some(false),
                 quant_mxfp: Some(false),
                 import_k_quants: Some(import_k_quants),
+                native_qwen35_layout: None,
             };
             (root, options)
         }

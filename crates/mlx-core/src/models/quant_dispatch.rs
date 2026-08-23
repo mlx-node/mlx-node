@@ -143,6 +143,18 @@ pub enum PerLayerMode {
     /// ggml Q5_K: identical layout to `Q4K` with a 5-bit weight plane. Mode
     /// string `"q5k"`.
     Q5K,
+    /// ggml Q3_K: 3-bit symmetric 256-value super-block with signed int8
+    /// sub-scales. Codes stay packed at three bits and are decoded in-kernel.
+    Q3K,
+    /// ggml IQ4_NL: 4-bit indices into ggml's non-linear 16-value grid, with
+    /// one float16 scale per 32-value block.
+    IQ4NL,
+    /// ggml IQ4_XS: IQ4_NL codes with signed sub-scales under a 256-value
+    /// float16 super-scale.
+    IQ4XS,
+    /// ggml IQ3_S: grid/sign codes losslessly expanded to signed integer
+    /// magnitudes and packed at eight bits; no floating weight is materialized.
+    IQ3S,
 }
 
 /// Per-layer quantization metadata parsed from `config.json`.
@@ -187,6 +199,10 @@ pub fn parse_mode_str(s: Option<&str>) -> Option<PerLayerMode> {
         Some("q6k") => Some(PerLayerMode::Q6K),
         Some("q4k") => Some(PerLayerMode::Q4K),
         Some("q5k") => Some(PerLayerMode::Q5K),
+        Some("q3k") => Some(PerLayerMode::Q3K),
+        Some("iq4nl") => Some(PerLayerMode::IQ4NL),
+        Some("iq4xs") => Some(PerLayerMode::IQ4XS),
+        Some("iq3s") => Some(PerLayerMode::IQ3S),
         _ => None,
     }
 }
@@ -217,14 +233,24 @@ pub(crate) fn mode_to_str(mode: PerLayerMode) -> &'static str {
         PerLayerMode::Q6K => "q6k",
         PerLayerMode::Q4K => "q4k",
         PerLayerMode::Q5K => "q5k",
+        PerLayerMode::Q3K => "q3k",
+        PerLayerMode::IQ4NL => "iq4nl",
+        PerLayerMode::IQ4XS => "iq4xs",
+        PerLayerMode::IQ3S => "iq3s",
     }
 }
 
-/// True when `mode` is one of the ggml K-quant families (Q6_K / Q4_K / Q5_K).
+/// True when `mode` is one of the supported ggml K/IQ packed families.
 pub fn is_kquant_mode(mode: PerLayerMode) -> bool {
     matches!(
         mode,
-        PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K
+        PerLayerMode::Q6K
+            | PerLayerMode::Q4K
+            | PerLayerMode::Q5K
+            | PerLayerMode::Q3K
+            | PerLayerMode::IQ4NL
+            | PerLayerMode::IQ4XS
+            | PerLayerMode::IQ3S
     )
 }
 
@@ -250,15 +276,8 @@ pub fn has_sym8_mode(
         || per_layer.values().any(|p| p.mode == PerLayerMode::Sym8)
 }
 
-/// True when the resolved quantization settings reference a ggml K-quant mode
-/// (Q6_K / Q4_K / Q5_K) anywhere — top-level default OR any per-layer override.
-///
-/// Used by the LM loaders to scope-gate a K-quant checkpoint the same way
-/// `has_sym8_mode` scopes sym8: the speculative MTP head is disabled (the MTP
-/// builders map every K-quant mode to `None`, and an imported GGUF never ships
-/// an MTP head), so the loader fail-softs to plain AR decode. K-quants pack
-/// their weights as uint32 like affine, so — unlike sym8 — the paged KV cache
-/// and vision encoders stay supported.
+/// True when the resolved quantization settings reference a supported ggml
+/// K/IQ packed mode anywhere — top-level default or a per-layer override.
 pub fn has_kquant_mode(
     top_level_mode: Option<PerLayerMode>,
     per_layer: &HashMap<String, PerLayerQuant>,
@@ -455,6 +474,10 @@ pub(crate) fn kquant_mode_params(mode: PerLayerMode) -> Option<(&'static str, i3
         PerLayerMode::Q6K => Some(("q6k", 6, 16, DType::Int8)),
         PerLayerMode::Q4K => Some(("q4k", 4, 32, DType::Uint8)),
         PerLayerMode::Q5K => Some(("q5k", 5, 32, DType::Uint8)),
+        PerLayerMode::Q3K => Some(("q3k", 3, 16, DType::Int8)),
+        PerLayerMode::IQ4NL => Some(("iq4nl", 4, 32, DType::Int8)),
+        PerLayerMode::IQ4XS => Some(("iq4xs", 4, 32, DType::Int8)),
+        PerLayerMode::IQ3S => Some(("iq3s", 8, 32, DType::Int8)),
         _ => None,
     }
 }
@@ -597,7 +620,8 @@ fn parse_explicit_mode(value: Option<&Value>, context: &str) -> Result<Option<Pe
     parse_mode_str(Some(mode)).map(Some).ok_or_else(|| {
         Error::from_reason(format!(
             "Unknown quantization mode '{mode}' at {context}; supported modes are affine, \
-             mxfp4, mxfp8, nvfp4, fp8_e4m3, sym8, q6k, q4k, and q5k"
+             mxfp4, mxfp8, nvfp4, fp8_e4m3, sym8, q3k, q4k, q5k, q6k, \
+             iq4nl, iq4xs, and iq3s"
         ))
     })
 }
@@ -654,12 +678,16 @@ fn parse_i32(value: &Value, context: &str) -> Result<i32> {
 fn parse_bits(value: &Value, mode: Option<PerLayerMode>, context: &str) -> Result<i32> {
     let bits = parse_i32(value, context)?;
     let valid = match mode {
-        Some(PerLayerMode::Mxfp4) | Some(PerLayerMode::Nvfp4) | Some(PerLayerMode::Q4K) => {
-            bits == 4
-        }
-        Some(PerLayerMode::Mxfp8) | Some(PerLayerMode::Fp8E4m3) | Some(PerLayerMode::Sym8) => {
-            bits == 8
-        }
+        Some(PerLayerMode::Mxfp4)
+        | Some(PerLayerMode::Nvfp4)
+        | Some(PerLayerMode::Q4K)
+        | Some(PerLayerMode::IQ4NL)
+        | Some(PerLayerMode::IQ4XS) => bits == 4,
+        Some(PerLayerMode::Mxfp8)
+        | Some(PerLayerMode::Fp8E4m3)
+        | Some(PerLayerMode::Sym8)
+        | Some(PerLayerMode::IQ3S) => bits == 8,
+        Some(PerLayerMode::Q3K) => bits == 3,
         Some(PerLayerMode::Q6K) => bits == 6,
         Some(PerLayerMode::Q5K) => bits == 5,
         Some(PerLayerMode::Affine) | None => matches!(bits, 2 | 3 | 4 | 5 | 6 | 8),
@@ -688,8 +716,12 @@ fn parse_group_size(value: &Value, mode: Option<PerLayerMode>, context: &str) ->
     let valid = match mode {
         Some(PerLayerMode::Mxfp4) | Some(PerLayerMode::Mxfp8) => group_size == 32,
         Some(PerLayerMode::Nvfp4) => group_size == 16,
-        Some(PerLayerMode::Q6K) => group_size == 16,
-        Some(PerLayerMode::Q4K) | Some(PerLayerMode::Q5K) => group_size == 32,
+        Some(PerLayerMode::Q6K) | Some(PerLayerMode::Q3K) => group_size == 16,
+        Some(PerLayerMode::Q4K)
+        | Some(PerLayerMode::Q5K)
+        | Some(PerLayerMode::IQ4NL)
+        | Some(PerLayerMode::IQ4XS)
+        | Some(PerLayerMode::IQ3S) => group_size == 32,
         Some(PerLayerMode::Fp8E4m3) | Some(PerLayerMode::Sym8) => false,
         Some(PerLayerMode::Affine) | None => matches!(group_size, 32 | 64 | 128),
     };
@@ -911,8 +943,18 @@ fn parse_per_layer_entries(
             Some(value) => parse_group_size(value, Some(mode), &format!("{context}.group_size"))?,
             None if matches!(mode, PerLayerMode::Mxfp4 | PerLayerMode::Mxfp8) => 32,
             None if mode == PerLayerMode::Nvfp4 => 16,
-            None if mode == PerLayerMode::Q6K => 16,
-            None if matches!(mode, PerLayerMode::Q4K | PerLayerMode::Q5K) => 32,
+            None if matches!(mode, PerLayerMode::Q6K | PerLayerMode::Q3K) => 16,
+            None if matches!(
+                mode,
+                PerLayerMode::Q4K
+                    | PerLayerMode::Q5K
+                    | PerLayerMode::IQ4NL
+                    | PerLayerMode::IQ4XS
+                    | PerLayerMode::IQ3S
+            ) =>
+            {
+                32
+            }
             None if mode == PerLayerMode::Fp8E4m3 => crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
             None if mode == PerLayerMode::Sym8 => SYM8_GROUP_SIZE_SENTINEL,
             None => {
@@ -1152,6 +1194,10 @@ pub fn merge_per_layer(
             PerLayerMode::Q6K => 8,
             PerLayerMode::Q5K => 7,
             PerLayerMode::Q4K => 6,
+            PerLayerMode::IQ3S => 9,
+            PerLayerMode::IQ4XS => 8,
+            PerLayerMode::IQ4NL => 7,
+            PerLayerMode::Q3K => 6,
             PerLayerMode::Affine => 5,
             PerLayerMode::Fp8E4m3 => 4,
             PerLayerMode::Sym8 => 3,

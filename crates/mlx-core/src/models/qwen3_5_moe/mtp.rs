@@ -362,7 +362,13 @@ impl Qwen3_5MoeMTPModule {
                 // Unreachable: the MoE loader disables MTP for K-quant
                 // checkpoints (`checkpoint_has_kquant` gate); an imported GGUF
                 // never ships an MTP head. `None` fails soft into AR decode.
-                PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => None,
+                PerLayerMode::Q6K
+                | PerLayerMode::Q4K
+                | PerLayerMode::Q5K
+                | PerLayerMode::Q3K
+                | PerLayerMode::IQ4NL
+                | PerLayerMode::IQ4XS
+                | PerLayerMode::IQ3S => None,
             }
         };
         let try_build_qsl = |params: &HashMap<String, MxArray>, prefix: &str| {
@@ -381,7 +387,13 @@ impl Qwen3_5MoeMTPModule {
                 // Unreachable: see try_build_ql above.
                 PerLayerMode::Sym8 => None,
                 // Unreachable: see try_build_ql above (K-quant MTP is gated off).
-                PerLayerMode::Q6K | PerLayerMode::Q4K | PerLayerMode::Q5K => None,
+                PerLayerMode::Q6K
+                | PerLayerMode::Q4K
+                | PerLayerMode::Q5K
+                | PerLayerMode::Q3K
+                | PerLayerMode::IQ4NL
+                | PerLayerMode::IQ4XS
+                | PerLayerMode::IQ3S => None,
             }
         };
 
