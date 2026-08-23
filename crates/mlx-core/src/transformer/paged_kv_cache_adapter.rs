@@ -1933,6 +1933,11 @@ pub struct PagedKVCacheAdapter {
     /// `set_cold_tier` ownership pattern: the adapter shares the `Arc` with
     /// its caller.
     pool_growth_notifier: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+
+    /// Test-only override for the pre-grow headroom probe: receives the
+    /// grow-target block count and returns the probe's `selected_blocks`.
+    #[cfg(test)]
+    grow_headroom_probe_override: Option<Arc<dyn Fn(u32) -> Result<u32, String> + Send + Sync>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -2221,6 +2226,8 @@ impl PagedKVCacheAdapter {
             #[cfg(target_os = "macos")]
             grouped_d512_capability_cache: None,
             pool_growth_notifier: None,
+            #[cfg(test)]
+            grow_headroom_probe_override: None,
         })
     }
 
@@ -2235,6 +2242,16 @@ impl PagedKVCacheAdapter {
     /// re-registration wires this hook; `None` (the default) is a no-op.
     pub fn set_pool_growth_notifier(&mut self, notifier: Option<Arc<dyn Fn(u64) + Send + Sync>>) {
         self.pool_growth_notifier = notifier;
+    }
+
+    /// Test-only override for the pre-grow headroom probe; `None` restores
+    /// the live Metal probe.
+    #[cfg(test)]
+    pub(crate) fn set_grow_headroom_probe_override(
+        &mut self,
+        probe: Option<Arc<dyn Fn(u32) -> Result<u32, String> + Send + Sync>>,
+    ) {
+        self.grow_headroom_probe_override = probe;
     }
 
     /// The cold-tier context this adapter persists through, if any. Exposed so
@@ -3826,13 +3843,19 @@ impl PagedKVCacheAdapter {
     /// 3. Target `min(pool.max_num_blocks, max(2 × current, current +
     ///    needed))`; `grow_to` is a no-op `Ok(false)` when the target does
     ///    not exceed the live count.
-    /// 4. On success, extend the allocator to match, drop this adapter's
+    /// 4. Probe the live Metal headroom for the target BEFORE `grow_to`
+    ///    builds the new generation: the blit transiently holds the old and
+    ///    new buffers, so the peak (old live + new + sibling registered
+    ///    pools) must fit the safe budget. A probe that selects fewer
+    ///    blocks declines the grow (step 5 is skipped).
+    /// 5. On success, extend the allocator to match, drop this adapter's
     ///    per-layer pool views (they wrap the pre-grow buffers), run the
     ///    growth notifier with the new total bytes, and log one line.
     ///
-    /// Any failure (flush error, poisoned mutex, `Err` from `grow_to`, or a
-    /// no-op grow) logs at warn and returns `false` — the caller proceeds to
-    /// its existing eviction/error path. Never panics.
+    /// Any failure (flush error, poisoned mutex, headroom probe error or
+    /// decline, `Err` from `grow_to`, or a no-op grow) logs at warn and
+    /// returns `false` — the caller proceeds to its existing
+    /// eviction/error path. Never panics.
     fn try_grow_pool(&mut self, needed_additional_blocks: u32) -> bool {
         #[cfg(target_os = "macos")]
         if let Err(e) = self.eval_pending_pool_writes() {
@@ -3862,6 +3885,25 @@ impl PagedKVCacheAdapter {
                 .saturating_mul(2)
                 .max(current.saturating_add(needed_additional_blocks)),
         );
+        #[cfg(target_os = "macos")]
+        match self.grow_headroom_probe(new_num_blocks) {
+            Ok(selected) if selected < new_num_blocks => {
+                tracing::warn!(
+                    target: "mlx_core::paged_kv",
+                    "paged KV pool grow declined: headroom probe caps the pool at {selected} \
+                     blocks (< {new_num_blocks} requested)"
+                );
+                return false;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "mlx_core::paged_kv",
+                    "paged KV pool grow declined: headroom probe failed: {e}"
+                );
+                return false;
+            }
+        }
         let old_total_bytes = self.layer_kv_pool.total_bytes();
         match self.layer_kv_pool.grow_to(new_num_blocks) {
             Ok(true) => {}
@@ -3900,6 +3942,38 @@ impl PagedKVCacheAdapter {
             new_total_bytes as f64 / (1024.0 * 1024.0),
         );
         true
+    }
+
+    /// Pre-grow headroom probe: ask the load-time sizer how many blocks of
+    /// the grow-target size the live Metal budget can back, reserving the
+    /// full old+new transient — this pool's current bytes stay live during
+    /// the blit, and every sibling pool registered with the coordinator
+    /// counts against the same budget. Read-only (no allocations); `Err`
+    /// must fail the grow closed.
+    #[cfg(target_os = "macos")]
+    fn grow_headroom_probe(&self, new_num_blocks: u32) -> Result<u32, String> {
+        #[cfg(test)]
+        if let Some(probe) = self.grow_headroom_probe_override.as_ref() {
+            return probe(new_num_blocks);
+        }
+        let config = self.layer_kv_pool.config();
+        let own_bytes = self.layer_kv_pool.total_bytes();
+        let extra_reserved_bytes = own_bytes.saturating_add(
+            crate::cache_limit::coordinator()
+                .registered_pool_bytes()
+                .saturating_sub(own_bytes),
+        );
+        mlx_paged_attn::profile::load_time_pool_sizing_with_reserved(
+            new_num_blocks,
+            self.layer_kv_pool.num_layers() as u32,
+            config.num_kv_heads,
+            config.head_size,
+            config.block_size,
+            self.layer_kv_pool.cache_dtype(),
+            extra_reserved_bytes,
+        )
+        .map(|sizing| sizing.selected_blocks)
+        .map_err(|error| error.to_string())
     }
 
     /// Reserve block capacity for `extra` rows past the current cursor
@@ -16115,6 +16189,75 @@ mod tests {
         let notified = notifications.lock().unwrap().clone();
         assert_eq!(notified.len(), 2, "notifier must fire once per grow");
         assert_eq!(notified[1], pool.total_bytes());
+    }
+
+    /// **Grow decline**: a headroom probe that selects fewer blocks than the
+    /// grow target must decline the grow BEFORE `grow_to` builds the
+    /// transient old+new peak; the pool, allocator, and generation all stay
+    /// put and the caller's eviction/error fallback proceeds unchanged.
+    /// Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_grow_declined_when_headroom_probe_selects_fewer_blocks() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!(
+                    "skipping test_grow_declined_when_headroom_probe_selects_fewer_blocks: {e}"
+                );
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        // Probe caps the 4 -> 8 grow at 7 blocks: try_grow_pool must decline
+        // without calling grow_to.
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(|requested| {
+            Ok(requested.saturating_sub(1))
+        })));
+        assert_eq!(pool.num_blocks(), 4);
+        assert!(
+            !adapter.try_grow_pool(4),
+            "probe selecting 7 < 8 must decline the grow"
+        );
+        assert_eq!(
+            pool.num_blocks(),
+            4,
+            "a declined grow must leave the pool at its current size"
+        );
+        assert_eq!(
+            pool.generation(),
+            0,
+            "a declined grow must not bump the generation"
+        );
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 4);
+
+        // A probe that allows the target lets the grow proceed as before.
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        assert!(
+            adapter.try_grow_pool(4),
+            "probe selecting the full target must allow the grow"
+        );
+        assert_eq!(pool.num_blocks(), 8);
+        assert_eq!(pool.generation(), 1);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 8);
     }
 
     /// **Generation guard**: adapter B caches per-layer pool views at

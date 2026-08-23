@@ -837,6 +837,15 @@ impl LayerKVPool {
             let value_cache = state
                 .device
                 .new_buffer(new_value_size, MTLResourceOptions::StorageModePrivate);
+            // Metal hands out nil buffers when an allocation cannot be
+            // backed; bail before any blit so the build-then-swap guarantee
+            // holds (old generation untouched on error).
+            if key_cache.as_ptr().is_null() || value_cache.as_ptr().is_null() {
+                return Err(
+                    "LayerKVPool::grow_to: Metal returned a nil buffer for the new generation"
+                        .to_string(),
+                );
+            }
             new_layers.push((key_cache, value_cache));
         }
 
