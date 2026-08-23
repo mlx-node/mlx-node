@@ -289,6 +289,29 @@ impl CacheLimitCoordinator {
         PoolCacheLimitGuard { id }
     }
 
+    /// Replace a live paged pool's byte accounting in place. Dynamic
+    /// (grow-on-demand) pools grow their Metal footprint after load, and the
+    /// cap must debit the NEW total — the entry's lifetime is still owned by
+    /// the guard from `register_pool`. No-op when the id is unknown (guard
+    /// already dropped) or the byte total is unchanged.
+    pub fn update_pool(&self, id: u64, new_bytes: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(bytes) = state.pools.get_mut(&id) else {
+            return;
+        };
+        if *bytes == new_bytes {
+            return;
+        }
+        *bytes = new_bytes;
+        info!(
+            "[cache_limit] update paged pool guard={} bytes={:.2} GB (live_pools={})",
+            id,
+            new_bytes as f64 / ONE_GIB,
+            state.pools.len(),
+        );
+        recompute_locked(&mut state);
+    }
+
     fn unregister(&self, id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.profiles.remove(&id).is_some() {
@@ -322,6 +345,15 @@ pub struct CacheLimitGuard {
 
 pub struct PoolCacheLimitGuard {
     id: u64,
+}
+
+impl PoolCacheLimitGuard {
+    /// Coordinator id this pool entry is registered under. Captured by the
+    /// growth notifier closure (id is `Copy`, no guard sharing needed) so a
+    /// grown pool can `update_pool` its own entry while the guard stays put.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
 }
 
 impl Drop for PoolCacheLimitGuard {
@@ -807,6 +839,46 @@ mod tests {
                 .registered_pool_bytes()
                 .saturating_sub(current),
             2 * GB
+        );
+    }
+
+    #[test]
+    fn update_pool_replaces_a_live_entry_and_drops_unknown_ids() {
+        let _lock = POOL_LOCK.lock().unwrap();
+        let before = coordinator().registered_pool_bytes();
+        let guard = coordinator().register_pool(GB);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            GB,
+            "register_pool must debit the initial pool"
+        );
+        coordinator().update_pool(guard.id(), 3 * GB);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            3 * GB,
+            "update_pool must replace the entry with the grown total"
+        );
+        // An id nobody owns (e.g. a guard that raced a model teardown) is
+        // silently ignored — the coordinator never resurrects dropped pools.
+        coordinator().update_pool(guard.id() + 1, GB);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            3 * GB,
+            "an unknown id must not add a new entry"
+        );
+        // Idempotent no-op: a repeated equal byte total must not change the
+        // registry (and skips the recompute entirely).
+        coordinator().update_pool(guard.id(), 3 * GB);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            3 * GB,
+            "an unchanged byte total must be a no-op"
+        );
+        drop(guard);
+        assert_eq!(
+            coordinator().registered_pool_bytes(),
+            before,
+            "dropping the guard must unregister the updated entry"
         );
     }
 
