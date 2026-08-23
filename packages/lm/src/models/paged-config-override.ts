@@ -31,6 +31,7 @@ export const QWEN35_PAGED_MODEL_TYPES = ['qwen3_5', 'qwen3_5_moe'] as const;
 
 const QWEN35_CACHE_FLOOR_MODEL_TYPES = new Set<string>(QWEN35_PAGED_MODEL_TYPES);
 const DEFAULT_QWEN35_PAGED_CACHE_MB = 16_384;
+const DEFAULT_QWEN35_PAGED_CACHE_INITIAL_MB = 2_048;
 const QWEN35_MTP_DRAFTER_DIR = 'mtp-drafter';
 const QWEN35_DENSE_NESTED_MTP_SIDECAR = 'mtp/weights.safetensors';
 
@@ -146,12 +147,21 @@ export class PagedConfigOverrideManager {
     const pagedEnabled = config.use_block_paged_cache === true;
     const configuredMemoryMb = positiveNumber(config.paged_cache_memory_mb);
     const memorySatisfied = cacheFloorMb === undefined || (configuredMemoryMb ?? 0) >= cacheFloorMb;
+    // The clone writes `paged_cache_initial_memory_mb = min(initialMb, maxMb)`.
+    // A source whose field already equals that value needs no clone; an absent
+    // or different field does, or the new start-small default would silently
+    // skip every already-paged Qwen3.5 checkpoint (they lack the field).
+    const initialMb = QWEN35_CACHE_FLOOR_MODEL_TYPES.has(modelType) ? resolveQwen35InitialMb() : undefined;
+    const configuredInitialMb = positiveNumber(config.paged_cache_initial_memory_mb);
+    const initialSatisfied =
+      initialMb === undefined ||
+      configuredInitialMb === Math.min(initialMb, Math.max(configuredMemoryMb ?? 0, cacheFloorMb ?? 0));
     // Even an already-paged Gemma config must be cloned when `draft/` exists:
     // returning the source would expose the draft to native auto-discovery and
     // trigger the flat-speculation/paged-cache conflict. An authoritative
     // persist directive that disagrees with the source likewise blocks the
     // pass-through so the resolved value reaches the loader.
-    if (pagedEnabled && memorySatisfied && !hasEmbeddedGemmaDraft && !persistOverrideNeeded) {
+    if (pagedEnabled && memorySatisfied && initialSatisfied && !hasEmbeddedGemmaDraft && !persistOverrideNeeded) {
       return modelPath;
     }
 
@@ -164,7 +174,7 @@ export class PagedConfigOverrideManager {
     const existing = this.overrides.get(cacheKey);
     if (existing !== undefined) return existing;
 
-    const pending = this.createOverride(sourcePath, config, cacheFloorMb, modelType, persistPagedCache);
+    const pending = this.createOverride(sourcePath, config, cacheFloorMb, initialMb, modelType, persistPagedCache);
     this.overrides.set(cacheKey, pending);
     try {
       return await pending;
@@ -199,6 +209,7 @@ export class PagedConfigOverrideManager {
     sourcePath: string,
     sourceConfig: Record<string, unknown>,
     cacheFloorMb: number | undefined,
+    initialMb: number | undefined,
     modelType: string,
     persistPagedCache: boolean | undefined,
   ): Promise<string> {
@@ -218,6 +229,14 @@ export class PagedConfigOverrideManager {
     }
     if (cacheFloorMb !== undefined) {
       config.paged_cache_memory_mb = Math.max(positiveNumber(sourceConfig.paged_cache_memory_mb) ?? 0, cacheFloorMb);
+    }
+    if (initialMb !== undefined) {
+      // Authoritative initial (grow-on-demand) budget, clamped to the max just
+      // written above so it can never exceed the pool ceiling. `initialMb` is
+      // always >= 1 and the max is floored by `cacheFloorMb` (>= 1) for the
+      // same families, so this never writes 0 — which the native loader rejects.
+      const maxMb = positiveNumber(config.paged_cache_memory_mb) ?? 0;
+      config.paged_cache_initial_memory_mb = Math.min(initialMb, maxMb);
     }
     await writeFile(join(overrideDir, 'config.json'), JSON.stringify(config, null, 2), 'utf-8');
 
@@ -350,4 +369,11 @@ function resolveQwen35CacheFloorMb(): number {
   if (raw == null || raw === '') return DEFAULT_QWEN35_PAGED_CACHE_MB;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_QWEN35_PAGED_CACHE_MB;
+}
+
+function resolveQwen35InitialMb(): number {
+  const raw = process.env.MLX_PAGED_CACHE_INITIAL_MB;
+  if (raw == null || raw === '') return DEFAULT_QWEN35_PAGED_CACHE_INITIAL_MB;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_QWEN35_PAGED_CACHE_INITIAL_MB;
 }

@@ -50,10 +50,11 @@ describe('PagedConfigOverrideManager launch-claude policy', () => {
     }
   });
 
-  it('returns the original path when the paged flag and Qwen memory floor are satisfied', async () => {
+  it('returns the original path when the paged flag and Qwen memory and initial floors are satisfied', async () => {
     const src = await makeFixture('qwen3_5', {
       use_block_paged_cache: true,
       paged_cache_memory_mb: 32_768,
+      paged_cache_initial_memory_mb: 2_048,
     });
     const manager = launchClaudeManager();
     try {

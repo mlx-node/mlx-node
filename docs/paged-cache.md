@@ -18,6 +18,52 @@ attention to separate paged groups and aliases KV-shared layers to their anchor.
 
 `BlockAllocator` and `LayerKVPool` are intentionally split so the legacy `CacheEngineManager` path (used by `use_paged_attention`, a different flag — see below) is unaffected. `paged_cache_memory_mb` defaults to 2048 when `None`.
 
+## Pool growth: start small, double on exhaustion
+
+The `qwen3_5` and `qwen3_5_moe` loaders size the paged pool in two steps. The
+**initial** pool is allocated at load from `paged_cache_initial_memory_mb`
+(config.json) or `MLX_PAGED_CACHE_INITIAL_MB` (env wins over the config field;
+a set-but-unparseable env value falls back to config). The **max** is the
+existing budget — `paged_cache_memory_mb`, or the auto one-full-context default
+when unset — minus whatever `load_time_pool_sizing` clamps for live unified
+memory.
+
+When a reservation outruns free + evictable blocks, the adapter grows before
+evicting LRU cache-only entries (`PagedKVCacheAdapter::try_grow_pool`): the new
+block count is `min(max, max(2 × current, current + needed))` — double the
+current pool, or jump straight to what the reservation needs when that is
+larger, never past the max. Each reservation gets one grow before allocation
+plus one retry on mid-loop exhaustion; a reservation that still cannot fit
+falls through to the existing eviction/error path. The load log reports both
+sides distinctly — `initial_blocks=` plus `effective_window_tokens=` computed
+from the max — and a dynamic pool adds a
+`paged pool is dynamic (grow-on-demand)` line.
+
+| Knob                              | Source                                  | Role                                                                                                                     |
+| --------------------------------- | --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `paged_cache_initial_memory_mb`   | config.json (qwen3_5 / qwen3_5_moe)     | Initial pool size in MiB. Unset = the max itself — the historical fixed-size pool, byte-identical behavior.              |
+| `MLX_PAGED_CACHE_INITIAL_MB`      | env (wins over the config field)        | Same, u32 MiB. Unparseable values are ignored (config field, then the unset default).                                    |
+| `paged_cache_memory_mb`           | config.json                             | MAX pool size in MiB (auto one-full-context when unset).                                                                  |
+| `MLX_PAGED_CACHE_MEMORY_MB`       | env (agent override manager only)       | Floor the manager writes for the max into the cloned config; unparseable falls back to the 16 GiB floor.                 |
+
+The agent override manager (`packages/lm/src/models/paged-config-override.ts`)
+writes `paged_cache_initial_memory_mb = 2048` into the cloned config for
+`qwen3_5` / `qwen3_5_moe`, overridable with `MLX_PAGED_CACHE_INITIAL_MB`, and
+clamped to the resolved max so it never exceeds the pool ceiling. Other
+families are not given the field — their loaders have no initial knob and must
+not receive one. Checkpoints resolved WITHOUT the manager (a library caller
+loading the path directly) keep the historical behavior: unset initial =
+static full-size pool.
+
+**Transient double memory during grow.** `LayerKVPool::grow_to` allocates the
+new generation's per-layer Metal buffers wholesale and swaps them in; the old
+buffers stay alive until outstanding GPU work and any cached MLX array views
+drop their handles, so peak unified-memory use briefly approaches old + new
+before the old generation is released. The growth notifier
+(`CacheLimitCoordinator::update_pool`) re-debits the coordinator with the new
+total at the same point, so the global cap tracks the grown pool rather than
+the initial one.
+
 ## Prefix-cache security domains
 
 The native `ChatConfig.cacheSalt` field (Responses and Anthropic APIs:
