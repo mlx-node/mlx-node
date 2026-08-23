@@ -67,6 +67,16 @@ pub struct Qwen3_5MoeConfig {
     #[napi(ts_type = "number | undefined")]
     pub paged_cache_memory_mb: Option<u32>,
 
+    /// Initial paged KV pool size in MiB for the grow-on-demand pool: the
+    /// pool starts at this size and grows toward the max budget
+    /// (`paged_cache_memory_mb` or the auto one-full-context default) on
+    /// exhaustion. Unset (default) makes the initial pool equal the max —
+    /// the historical fixed-pool behavior. `MLX_PAGED_CACHE_INITIAL_MB` wins
+    /// over this field at load time.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub paged_cache_initial_memory_mb: Option<u32>,
+
     /// Block size for paged attention (tokens per block).
     /// Only used when `use_block_paged_cache` is true.
     /// Default: 16.
@@ -189,6 +199,7 @@ impl Qwen3_5MoeConfig {
             partial_rotary_factor: self.partial_rotary_factor,
             rope_theta: self.rope_theta,
             paged_cache_memory_mb: self.paged_cache_memory_mb,
+            paged_cache_initial_memory_mb: self.paged_cache_initial_memory_mb,
             paged_block_size: self.paged_block_size,
             use_block_paged_cache: self.use_block_paged_cache,
             // MoE cold-tier persistence is a separate (unproven) family; the
