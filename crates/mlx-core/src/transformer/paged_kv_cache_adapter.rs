@@ -2140,11 +2140,15 @@ impl PagedKVCacheAdapter {
                  negative mask width masks every key instead of erroring."
             ));
         }
-        let (allocator_block_size, allocator_num_blocks) = {
+        let (allocator_block_size, allocator_num_blocks, allocator_max_num_blocks) = {
             let guard = allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            (guard.block_size(), guard.num_blocks())
+            (
+                guard.block_size(),
+                guard.num_blocks(),
+                guard.max_num_blocks(),
+            )
         };
         if block_size != allocator_block_size {
             return Err(format!(
@@ -2164,6 +2168,14 @@ impl PagedKVCacheAdapter {
                 "num_blocks mismatch: allocator has {allocator_num_blocks}, layer_kv_pool has \
                  {}. The pool's GPU storage must cover every block the allocator can hand out.",
                 layer_kv_pool.num_blocks()
+            ));
+        }
+        if allocator_max_num_blocks != layer_kv_pool.max_num_blocks() {
+            return Err(format!(
+                "max_num_blocks mismatch: allocator has {allocator_max_num_blocks}, \
+                 layer_kv_pool has {}. Pool growth must extend the allocator to every block \
+                 the pool's storage can reach, or logical capacity desyncs from physical.",
+                layer_kv_pool.max_num_blocks()
             ));
         }
         // Capacity surfaces derive from the MAXIMUM block count: the live
@@ -3925,8 +3937,18 @@ impl PagedKVCacheAdapter {
                 return false;
             }
         }
-        guard.grow_by(new_num_blocks - current);
+        let added = guard.grow_by(new_num_blocks - current);
         let new_num_blocks = guard.num_blocks();
+        let pool_added = self.layer_kv_pool.num_blocks().saturating_sub(current);
+        if added != pool_added {
+            // Defensive: the constructor validates equal maxima, so the
+            // allocator's grow cap can never diverge from the pool's.
+            tracing::warn!(
+                target: "mlx_core::paged_kv",
+                "paged KV pool grow diverged from the allocator: allocator added {added} \
+                 block(s) ({current} -> {new_num_blocks}) while the pool grew {pool_added}"
+            );
+        }
         drop(guard);
 
         // This adapter's cached per-layer views wrap the pre-grow buffers;
@@ -11420,6 +11442,46 @@ mod tests {
         assert!(
             msg.contains("num_blocks"),
             "error must reference num_blocks, got: {msg}"
+        );
+    }
+
+    /// `PagedKVCacheAdapter::new` must reject an allocator/pool pair whose
+    /// MAXIMUM block counts disagree. `try_grow_pool` sizes the grow from
+    /// the pool's max while `BlockAllocator::grow_by` silently caps at the
+    /// allocator's lower max, so mismatched maxima would leave logical
+    /// capacity short of the physical pool after a grow.
+    #[test]
+    fn test_new_rejects_pool_max_num_blocks_mismatch() {
+        let allocator = new_allocator(8, 8); // num 8, max 8
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        // Pool with the matching live count (8) but a LARGER max (16).
+        let larger_max_pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            8,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) => {
+                eprintln!("skipping test_new_rejects_pool_max_num_blocks_mismatch: {e}");
+                return;
+            }
+        };
+        let res = PagedKVCacheAdapter::new(allocator, larger_max_pool, 8);
+        assert!(res.is_err(), "expected max_num_blocks mismatch error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("max_num_blocks"),
+            "error must reference max_num_blocks, got: {msg}"
         );
     }
 
