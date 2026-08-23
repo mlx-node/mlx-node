@@ -5048,6 +5048,64 @@ mod tests {
         );
     }
 
+    /// `layout_matches_pool` keys on per-layer geometry only — a layout never
+    /// encodes the pool's block count, so two pools that agree on every
+    /// geometry field but differ in `num_blocks` must both accept the same
+    /// layout. This keeps cold restores transparent to the grow-on-demand
+    /// pool: a block written by a small initial pool must restore into the
+    /// grown pool (and vice versa).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn layout_is_transparent_to_pool_block_count() {
+        use crate::PagedAttentionConfig;
+        use crate::metal::MetalDtype;
+
+        let config = PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 1,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(32),
+            max_batch_size: Some(1),
+        };
+        let small = match LayerKVPool::new(config.clone(), 2, 2, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping layout_is_transparent_to_pool_block_count: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let large = match LayerKVPool::new(config, 6, 6, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping layout_is_transparent_to_pool_block_count: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        assert_ne!(
+            small.num_blocks(),
+            large.num_blocks(),
+            "the fixture must actually differ in block count"
+        );
+
+        let (key_bytes, value_bytes) = pool_layer_bytes(&small).unwrap();
+        let layout = ColdCacheLayout {
+            block_size: small.block_size(),
+            num_layers: small.num_layers() as u32,
+            num_kv_heads: small.config().num_kv_heads,
+            head_size: small.config().head_size,
+            cache_dtype: format!("{:?}", small.cache_dtype()),
+            key_bytes_per_layer: key_bytes,
+            value_bytes_per_layer: value_bytes,
+        };
+        assert!(layout_matches_pool(&layout, &small));
+        assert!(layout_matches_pool(&layout, &large));
+    }
+
     /// Sidecars occupy quota like any other object, so the startup scan must
     /// index them — an unaccounted file would sit outside eviction forever.
     #[test]

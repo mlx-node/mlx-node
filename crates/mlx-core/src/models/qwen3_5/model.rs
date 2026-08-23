@@ -1755,12 +1755,12 @@ impl Qwen35Inner {
             })?,
         );
         info!(
-            "Qwen3.5 paged adapter enabled after weight materialization: num_blocks={}, \
+            "Qwen3.5 paged adapter enabled after weight materialization: initial_blocks={}, \
              block_size={}, effective_window_tokens={}, trained_window_tokens={}, \
              requested_memory_mib={}, requested_source={}, sizing_source={}",
             num_blocks,
             block_size,
-            num_blocks.saturating_mul(block_size).min(max_seq_len),
+            max_num_blocks.saturating_mul(block_size).min(max_seq_len),
             max_seq_len,
             requested_memory_mb,
             requested_source,
