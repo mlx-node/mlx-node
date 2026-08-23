@@ -3856,7 +3856,12 @@ impl PagedKVCacheAdapter {
     /// decline, `Err` from `grow_to`, or a no-op grow) logs at warn and
     /// returns `false` — the caller proceeds to its existing
     /// eviction/error path. Never panics.
-    fn try_grow_pool(&mut self, needed_additional_blocks: u32) -> bool {
+    ///
+    /// `pub(crate)` so the engine's hybrid scheduler can grow from
+    /// admission's no-live-turns Reject edge
+    /// (`HybridSchedulerState::try_grow_reservation_pool`); admission runs
+    /// on the model thread, so the same thread/contract holds there.
+    pub(crate) fn try_grow_pool(&mut self, needed_additional_blocks: u32) -> bool {
         #[cfg(target_os = "macos")]
         if let Err(e) = self.eval_pending_pool_writes() {
             tracing::warn!(
