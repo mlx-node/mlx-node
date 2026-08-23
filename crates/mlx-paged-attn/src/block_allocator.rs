@@ -1091,6 +1091,15 @@ impl BlockAllocator {
             .count() as u32
     }
 
+    /// Total blocks [`Self::allocate`] could currently hand out: genuinely
+    /// free blocks plus evictable cache-only prefix entries (the set
+    /// `try_evict_lru_for_allocation` draws from). Adapter growth
+    /// pre-flights against this so `allocate` never evicts a cache-only
+    /// block the pool could instead cover by growing.
+    pub fn free_or_evictable_blocks(&self) -> u32 {
+        self.num_free_blocks() + self.num_evictable_blocks()
+    }
+
     /// Set the maximum number of entries the prefix cache will hold before
     /// the LRU eviction loop fires on subsequent inserts.
     ///
@@ -1395,6 +1404,33 @@ mod tests {
 
         allocator.free(block);
         assert_eq!(allocator.num_free_blocks(), 10);
+    }
+
+    #[test]
+    fn test_free_or_evictable_blocks_counts_free_plus_cache_only() {
+        let mut allocator = BlockAllocator::new(4, 4, 4);
+        // Prefix caching is off by default; enable it so register_prefix
+        // actually installs entries (same as the LRU tests below).
+        allocator.max_prefix_cache_entries = 4;
+        assert_eq!(allocator.free_or_evictable_blocks(), 4);
+
+        // A registered prefix entry is not evictable while the request
+        // still holds its logical ref (refcount 2: the request's ref from
+        // `allocate` plus the cache's ref from `register_prefix`): only the
+        // 3 free blocks count.
+        let block = allocator.allocate().unwrap();
+        allocator.register_prefix(Arc::clone(&block), 0xAAAA);
+        assert_eq!(block.get_ref_count(), 2);
+        assert_eq!(allocator.num_free_blocks(), 3);
+        assert_eq!(allocator.num_evictable_blocks(), 0);
+        assert_eq!(allocator.free_or_evictable_blocks(), 3);
+
+        // Releasing the request's logical ref (refcount 1: only the cache's
+        // own entry) makes the block evictable.
+        block.decref();
+        drop(block);
+        assert_eq!(allocator.num_evictable_blocks(), 1);
+        assert_eq!(allocator.free_or_evictable_blocks(), 4);
     }
 
     #[test]
