@@ -1892,10 +1892,23 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         .unwrap_or(0);
                     Ok((inner, weight_bytes, pool_bytes))
                 })();
-            let (inner, weight_bytes, pool_bytes) = load_result?;
+            let (mut inner, weight_bytes, pool_bytes) = load_result?;
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
             let pool_cache_limit_guard = (pool_bytes != 0)
                 .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
+            // Dynamic (grow-on-demand) pools re-register their byte total on
+            // every grow. The closure captures only the guard's id (Copy), so
+            // the guard itself stays on this model for its whole lifetime —
+            // the coordinator entry must outlive every grow the adapter makes.
+            if let (Some(guard), Some(adapter)) = (
+                pool_cache_limit_guard.as_ref(),
+                inner.paged_adapter.as_mut(),
+            ) {
+                let pool_id = guard.id();
+                adapter.set_pool_growth_notifier(Some(std::sync::Arc::new(move |bytes| {
+                    crate::cache_limit::coordinator().update_pool(pool_id, bytes);
+                })));
+            }
 
             let model_id = inner.model_id;
             let config_out = inner.config.clone();
@@ -1959,7 +1972,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         spatial_merge_size,
         context_limits,
         _cache_limit_guard: cache_limit_guard,
-        _pool_cache_limit_guard: pool_cache_limit_guard,
+        pool_cache_limit_guard,
     })
 }
 
@@ -2077,6 +2090,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
             }),
         paged_cache_memory_mb: raw
             .get("paged_cache_memory_mb")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        paged_cache_initial_memory_mb: raw
+            .get("paged_cache_initial_memory_mb")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
         paged_block_size: raw
@@ -2247,6 +2264,7 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(256),
+            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: Some(true),
             persist_paged_cache: None,
@@ -2518,6 +2536,7 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
             persist_paged_cache: None,

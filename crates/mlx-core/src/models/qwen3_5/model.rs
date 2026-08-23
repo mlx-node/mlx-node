@@ -1628,7 +1628,10 @@ impl Qwen35Inner {
 
     /// Construct the physical paged KV pool after checkpoint weights have
     /// been installed and materialized. The configured memory value is a
-    /// requested maximum; live unified-memory/Metal probes may only reduce it.
+    /// requested maximum; live unified-memory/Metal probes may only reduce
+    /// it. The pool starts at `paged_cache_initial_memory_mb` (or the max
+    /// itself when unset — the historical fixed behavior) and grows on
+    /// demand toward the max.
     pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
         if !self.config.use_block_paged_cache.unwrap_or(true)
             || !crate::engine::persistence::compiled_forward_backend_available()
@@ -1680,7 +1683,10 @@ impl Qwen35Inner {
             )));
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-        let (num_blocks, sizing_source) = if self.config.paged_cache_memory_mb.is_some() {
+        // `max_num_blocks` is the dynamic ceiling the live pool grows toward;
+        // `load_time_pool_sizing` keeps clamping the MAX only, exactly as
+        // before the initial/max split.
+        let (max_num_blocks, sizing_source) = if self.config.paged_cache_memory_mb.is_some() {
             (requested_blocks, "explicit".to_string())
         } else {
             let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
@@ -1711,11 +1717,38 @@ impl Qwen35Inner {
             )
         };
 
+        // Initial pool: `MLX_PAGED_CACHE_INITIAL_MB` (env wins) or the config
+        // field, clamped into [1 block, max]. Unset → the max itself.
+        let initial_mb = super::config::qwen35_resolve_paged_cache_initial_memory_mb(
+            self.config.paged_cache_initial_memory_mb,
+            std::env::var(super::config::MLX_PAGED_CACHE_INITIAL_MB_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let (num_blocks, initial_pool_mib) = super::config::qwen35_initial_pool_blocks(
+            initial_mb,
+            requested_memory_mb,
+            max_num_blocks,
+            &pa_config,
+        )
+        .map_err(|()| {
+            Error::from_reason(format!(
+                "Qwen3.5 block-paged adapter: requested initial paged cache {} MiB \
+                         cannot hold one block",
+                initial_mb.unwrap_or(0)
+            ))
+        })?;
+
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            num_blocks, num_blocks, block_size,
+            num_blocks,
+            max_num_blocks,
+            block_size,
         )));
-        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, num_blocks, cache_dtype)
-            .map_err(|e| Error::from_reason(format!("Failed to construct Qwen3.5 KV pool: {e}")))?;
+        let pool =
+            mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, max_num_blocks, cache_dtype)
+                .map_err(|e| {
+                    Error::from_reason(format!("Failed to construct Qwen3.5 KV pool: {e}"))
+                })?;
         self.paged_adapter = Some(
             PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
                 Error::from_reason(format!("Failed to construct Qwen3.5 paged adapter: {e}"))
@@ -1733,6 +1766,13 @@ impl Qwen35Inner {
             requested_source,
             sizing_source,
         );
+        if num_blocks < max_num_blocks {
+            info!(
+                "Qwen3.5 paged pool is dynamic (grow-on-demand): initial_blocks={num_blocks}, \
+                 max_blocks={max_num_blocks}, initial_pool_mib={}, max_pool_mib={requested_memory_mb}",
+                initial_pool_mib.unwrap_or(0)
+            );
+        }
         Ok(())
     }
 
@@ -11885,8 +11925,10 @@ pub struct Qwen3_5GenerationResult {
 }
 
 /// Trained and physically available active-context limits for one loaded
-/// Qwen3.5 model. Values are snapshots because the physical pool is fixed for
-/// the lifetime of the resident model.
+/// Qwen3.5 model. Values are snapshots taken at load: `effective_window`
+/// derives from the pool's MAX capacity (grow-on-demand pools are preflighted
+/// against the ceiling they grow toward), while `paged_block_capacity` is the
+/// physical pool size actually allocated at load and may lag after a grow.
 #[napi(object)]
 #[derive(Debug, Clone)]
 pub struct Qwen3_5ContextLimits {
@@ -11957,8 +11999,12 @@ pub struct Qwen3_5Model {
     /// coordinator on drop, so the global cap can shrink once JS GCs
     /// the wrapper.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
-    /// RAII debit for the native paged KV pool.
-    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
+    /// RAII debit for the native paged KV pool. Owned for the whole model
+    /// lifetime so the coordinator entry (updated in place by the adapter's
+    /// growth notifier via `update_pool`) cannot be dropped while the pool
+    /// may still grow. Never read directly — retained for its `Drop`.
+    #[allow(dead_code)]
+    pub(crate) pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
 }
 
 #[napi]
@@ -14830,6 +14876,7 @@ mod paged_construction_tests {
             partial_rotary_factor: 0.25,
             rope_theta: 100_000.0,
             paged_cache_memory_mb: Some(64),
+            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: if use_block_paged { Some(true) } else { None },
             persist_paged_cache: None,
@@ -16671,6 +16718,125 @@ mod paged_construction_tests {
         adapter.release_request().expect("release_request");
     }
 
+    /// Dynamic (grow-on-demand) dense pool end to end: a tiny initial pool
+    /// must grow to hold a prefill that exceeds it, fire the growth notifier
+    /// with the new total bytes, stop growing once the prompt fits, and
+    /// produce byte-identical logits to a repeat run on the grown pool.
+    #[test]
+    #[ignore = "requires Metal GPU; run with --ignored"]
+    fn test_dense_initial_pool_grows_to_hold_a_long_prefill() {
+        let mut cfg = tiny_paged_forward_cfg();
+        // Geometry: 2 attn layers × 2 KV heads × 32 head × 16 tokens × 2
+        // sides × 2 bytes = 8 KiB per block. 1 MiB initial → 128 blocks; the
+        // 3000-token prompt needs 188. The max stays at the config's 256 MiB
+        // (PagedAttentionConfig::validate floors gpu_memory_mb at 256), so
+        // the first grow lands on min(2×128, 128+60) = 256 blocks.
+        cfg.max_position_embeddings = 8192;
+        cfg.paged_cache_initial_memory_mb = Some(1);
+        let Some((mut inner, cfg)) = paged_inner_with_cfg_or_skip(
+            "test_dense_initial_pool_grows_to_hold_a_long_prefill",
+            cfg,
+        ) else {
+            return;
+        };
+        cast_qwen35_inner_weights_bf16(&mut inner);
+
+        let (initial_blocks, max_blocks) = {
+            let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+            let pool = adapter.layer_kv_pool();
+            let max = pool.max_num_blocks();
+            let live = adapter.block_capacity();
+            assert!(
+                live < max,
+                "initial pool must sit below the max ceiling: {live} vs {max}"
+            );
+            (live, max)
+        };
+        assert!(initial_blocks >= 1);
+
+        let grown_bytes = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+            let observed = grown_bytes.clone();
+            adapter.set_pool_growth_notifier(Some(std::sync::Arc::new(move |bytes| {
+                observed.store(bytes, std::sync::atomic::Ordering::Relaxed);
+            })));
+        }
+
+        // Longer than two initial blocks: growth must happen before eviction.
+        let prompt: Vec<u32> = (0u32..3000).map(|i| (i * 17 + 5) % 257).collect();
+        reset_paged_request(&mut inner, &prompt);
+        let (logits_a, checkpoint_a) = run_dense_paged_prefill_with_size_and_checkpoint(
+            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 0,
+        )
+        .expect("dynamic-pool single-shot A");
+        assert!(
+            checkpoint_a.is_empty(),
+            "chunk_size=0 must not split to capture a GDN checkpoint"
+        );
+        assert_finite_vocab_logits(&logits_a, cfg.vocab_size, "dynamic-pool A");
+
+        {
+            let adapter = inner.paged_adapter.as_ref().expect("paged_adapter");
+            let pool = adapter.layer_kv_pool();
+            let live = adapter.block_capacity();
+            assert!(
+                live > initial_blocks,
+                "the pool must have grown past its initial size: {live} vs {initial_blocks}"
+            );
+            assert!(
+                live <= max_blocks,
+                "growth must stay capped at the max ceiling: {live} vs {max_blocks}"
+            );
+            assert_eq!(
+                pool.max_num_blocks(),
+                max_blocks,
+                "the max ceiling is fixed for the pool's lifetime"
+            );
+            assert_eq!(
+                grown_bytes.load(std::sync::atomic::Ordering::Relaxed),
+                pool.total_bytes(),
+                "the notifier must report the new TOTAL pool bytes"
+            );
+            assert_eq!(pool.num_blocks(), live);
+            assert_eq!(
+                adapter.current_token_count() as usize,
+                prompt.len(),
+                "dynamic-pool cursor"
+            );
+        }
+
+        // Second run on the grown pool: no further growth, identical logits.
+        let bytes_after_a = grown_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        reset_paged_request(&mut inner, &prompt);
+        let (logits_b, _checkpoint_b) = run_dense_paged_prefill_with_size_and_checkpoint(
+            &mut inner, &prompt, &prompt, 0, /* chunk_size */ 0,
+        )
+        .expect("dynamic-pool single-shot B");
+        assert_finite_vocab_logits(&logits_b, cfg.vocab_size, "dynamic-pool B");
+        assert_eq!(
+            grown_bytes.load(std::sync::atomic::Ordering::Relaxed),
+            bytes_after_a,
+            "a prompt that already fits must not grow the pool again"
+        );
+
+        let a = logits_to_f32_vec(&logits_a);
+        let b = logits_to_f32_vec(&logits_b);
+        assert_eq!(a.len(), cfg.vocab_size as usize);
+        assert_eq!(b.len(), cfg.vocab_size as usize);
+        for (i, (left, right)) in a.iter().zip(b.iter()).enumerate() {
+            let abs_diff = (left - right).abs();
+            assert!(
+                abs_diff <= 1e-6,
+                "the grown pool must decode byte-identically to the initial run at index {i}: \
+                 first={left}, second={right}, abs_diff={abs_diff}"
+            );
+        }
+
+        let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
+        adapter.release_request().expect("release_request");
+    }
+
     /// Dense inner carrying a real adapter over a test-sized `LayerKVPool`.
     ///
     /// `initialize_paged_adapter` sizes a pool for a real checkpoint and needs a
@@ -17933,6 +18099,7 @@ mod layer_kinds_cache_tests {
             partial_rotary_factor: 0.25,
             rope_theta: 100_000.0,
             paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
             persist_paged_cache: None,
@@ -17987,6 +18154,7 @@ mod paged_gdn_frontier_tests {
             partial_rotary_factor: 0.25,
             rope_theta: 100_000.0,
             paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
             persist_paged_cache: None,
@@ -18120,6 +18288,7 @@ mod mtp_gate_state_tests {
             partial_rotary_factor: 0.25,
             rope_theta: 100_000.0,
             paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
             persist_paged_cache: None,
