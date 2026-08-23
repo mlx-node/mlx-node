@@ -400,7 +400,7 @@ impl Lfm2Inner {
             }
 
             let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-                num_blocks, block_size,
+                num_blocks, num_blocks, block_size,
             )));
 
             let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
@@ -505,6 +505,7 @@ impl Lfm2Inner {
             max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
         };
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            sizing.selected_blocks,
             sizing.selected_blocks,
             block_size,
         )));

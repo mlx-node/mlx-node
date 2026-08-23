@@ -162,7 +162,7 @@ mod tests {
 
     #[test]
     fn test_sequence_block_table() {
-        let mut allocator = BlockAllocator::new(10, 32);
+        let mut allocator = BlockAllocator::new(10, 10, 32);
         let mut table = SequenceBlockTable::new(0, 32);
 
         // Initially empty
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn physical_revision_tracks_only_physical_table_mutations() {
-        let mut allocator = BlockAllocator::new(4, 32);
+        let mut allocator = BlockAllocator::new(4, 4, 32);
         let mut table = SequenceBlockTable::new(0, 32);
         assert_eq!(table.physical_revision(), 0);
 

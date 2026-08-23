@@ -365,6 +365,7 @@ fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAd
     };
     let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
         plan.num_blocks,
+        plan.num_blocks,
         plan.block_size,
     )));
     let pool = mlx_paged_attn::LayerKVPool::new(
@@ -840,6 +841,7 @@ impl NemotronHInner {
             })?
         };
         let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            selected_blocks,
             selected_blocks,
             block_size,
         )));
@@ -3678,7 +3680,7 @@ mod scheduler_tests {
             max_batch_size: Some(32),
         };
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            num_blocks, block_size,
+            num_blocks, num_blocks, block_size,
         )));
         let pool = mlx_paged_attn::LayerKVPool::new(
             pa_config,

@@ -8912,7 +8912,9 @@ mod tests {
     }
 
     fn new_allocator(num_blocks: u32, block_size: u32) -> Arc<Mutex<BlockAllocator>> {
-        Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)))
+        Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )))
     }
 
     /// Build a placeholder `LayerKVPool` matching the allocator's capacity.
@@ -13007,7 +13009,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(42).unwrap();
         adapter.allocate_suffix_blocks(2).unwrap();
@@ -13069,7 +13071,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(43).unwrap();
         adapter.allocate_suffix_blocks(2).unwrap();
@@ -13557,7 +13559,9 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK_SIZE)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            NUM_BLOCKS, NUM_BLOCKS, BLOCK_SIZE,
+        )));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("adapter");
         adapter.reset_for_new_request(0).expect("reset");
         adapter
@@ -13660,7 +13664,9 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK_SIZE)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            NUM_BLOCKS, NUM_BLOCKS, BLOCK_SIZE,
+        )));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("adapter");
         let element_count = NUM_KV_HEADS * HEAD_SIZE;
         let keys = MxArray::from_bfloat16(
@@ -13864,7 +13870,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -13936,7 +13942,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -14013,7 +14019,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -14098,7 +14104,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -14229,7 +14235,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, BLOCK_SIZE)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, 16, BLOCK_SIZE)));
         let mut adapter =
             PagedKVCacheAdapter::new_sliding(allocator, pool, BLOCK_SIZE, WINDOW, 128)
                 .expect("sliding adapter");
@@ -14467,7 +14473,7 @@ mod tests {
             Ok(p) => Arc::new(p),
             Err(e) => return Err(e.to_string()),
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, FIX_BLOCK_SIZE)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, 16, FIX_BLOCK_SIZE)));
         let mut adapter = if window == 0 {
             PagedKVCacheAdapter::new(allocator, pool, FIX_BLOCK_SIZE)?
         } else {
@@ -14940,7 +14946,9 @@ mod tests {
             Err(e) => panic!("pool construction failed for a non-GPU reason: {e}"),
         };
         let new_sliding = |window: u32| {
-            let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK)));
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+                NUM_BLOCKS, NUM_BLOCKS, BLOCK,
+            )));
             PagedKVCacheAdapter::new_sliding(allocator, Arc::clone(&pool), BLOCK, window, 128)
         };
 
@@ -15155,7 +15163,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(11).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -15236,7 +15244,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter =
             PagedKVCacheAdapter::new(Arc::clone(&allocator), pool, 8).expect("adapter");
 
@@ -15383,7 +15391,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(99).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -15618,7 +15626,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(8).unwrap();
@@ -15739,7 +15747,9 @@ mod tests {
             }
             Err(error) => panic!("create multi-head test pool: {error}"),
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
         let mut adapter = PagedKVCacheAdapter::new_sliding(allocator, pool, block_size, 32, 64)
             .expect("create sliding adapter");
         let elements = num_kv_heads as usize * boundary as usize * head_size as usize;
@@ -16383,7 +16393,9 @@ mod tests {
     fn test_build_paged_attention_inputs_basic() {
         let block_size = 8u32;
         let num_blocks = 8u32;
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
         let Some(mut adapter) = maybe_adapter(allocator, block_size) else {
             eprintln!("skipping test_build_paged_attention_inputs_basic: Metal unavailable");
             return;
@@ -16457,7 +16469,9 @@ mod tests {
     fn test_build_paged_attention_inputs_rejects_bound_violations() {
         let block_size = 8u32;
         let num_blocks = 8u32;
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
         let Some(mut adapter) = maybe_adapter(allocator, block_size) else {
             eprintln!(
                 "skipping test_build_paged_attention_inputs_rejects_bound_violations: Metal \
@@ -16513,7 +16527,9 @@ mod tests {
     fn test_build_paged_attention_inputs_no_active_request() {
         let block_size = 8u32;
         let num_blocks = 4u32;
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
         let Some(adapter) = maybe_adapter(allocator, block_size) else {
             eprintln!(
                 "skipping test_build_paged_attention_inputs_no_active_request: Metal unavailable"
@@ -16539,7 +16555,9 @@ mod tests {
     fn test_build_paged_attention_inputs_zero_chunk() {
         let block_size = 8u32;
         let num_blocks = 4u32;
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
         let Some(mut adapter) = maybe_adapter(allocator, block_size) else {
             eprintln!("skipping test_build_paged_attention_inputs_zero_chunk: Metal unavailable");
             return;

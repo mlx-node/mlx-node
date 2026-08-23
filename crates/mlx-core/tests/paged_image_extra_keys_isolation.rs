@@ -53,7 +53,9 @@ fn build_adapter() -> PagedKVCacheAdapter {
     };
     let pool = LayerKVPool::new_for_validation_only(cfg, NUM_BLOCKS, 2, MetalDtype::Float16)
         .expect("new_for_validation_only must succeed on every platform");
-    let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK_SIZE)));
+    let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+        NUM_BLOCKS, NUM_BLOCKS, BLOCK_SIZE,
+    )));
     PagedKVCacheAdapter::new(allocator, Arc::new(pool), BLOCK_SIZE).expect("adapter ctor")
 }
 

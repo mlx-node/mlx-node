@@ -3297,6 +3297,7 @@ mod tests {
         };
         let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
             16,
+            16,
             DENSE_BLOCK,
         )));
         let mut adapter =
@@ -3843,7 +3844,7 @@ mod tests {
                 return Ok(());
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();

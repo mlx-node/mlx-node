@@ -73,7 +73,9 @@ fn try_make_fixture(cache_dtype: MetalDtype) -> Option<Fixture> {
         }
         Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
     };
-    let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK_SIZE)));
+    let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+        NUM_BLOCKS, NUM_BLOCKS, BLOCK_SIZE,
+    )));
     let adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), BLOCK_SIZE)
         .expect("PagedKVCacheAdapter::new must succeed when pool/allocator agree");
     Some(Fixture { adapter, allocator })

@@ -48,7 +48,7 @@ fn multi_block_round_trip_bf16_head_dim_512() {
             return;
         }
     };
-    let allocator = Arc::new(Mutex::new(BlockAllocator::new(8, 16)));
+    let allocator = Arc::new(Mutex::new(BlockAllocator::new(8, 8, 16)));
     let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 16).expect("adapter");
     adapter.reset_for_new_request(0).unwrap();
     adapter.allocate_suffix_blocks(32).unwrap();

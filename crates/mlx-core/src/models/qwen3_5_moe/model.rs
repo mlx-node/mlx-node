@@ -1009,7 +1009,7 @@ impl Qwen35MoeInner {
             )
         };
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            num_blocks, block_size,
+            num_blocks, num_blocks, block_size,
         )));
         let pool = mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, num_blocks, cache_dtype)
             .map_err(|e| {
@@ -11491,7 +11491,7 @@ mod paged_construction_tests {
             }
         };
         let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            NUM_BLOCKS, BLOCK_SIZE,
+            NUM_BLOCKS, NUM_BLOCKS, BLOCK_SIZE,
         )));
         let adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE)
             .expect("test paged adapter must construct");

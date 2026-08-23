@@ -2909,7 +2909,11 @@ mod restore_decomposition_bench {
             payload_bytes as f64 / 1e6
         );
 
-        let allocator = Mutex::new(BlockAllocator::new(total_blocks, BENCH_BLOCK_SIZE));
+        let allocator = Mutex::new(BlockAllocator::new(
+            total_blocks,
+            total_blocks,
+            BENCH_BLOCK_SIZE,
+        ));
         let root = temp_root("bench-restore");
         let manager = ColdCacheManager::open_at(root.clone(), 8 * GIB, 0, 32).unwrap();
 
@@ -4138,7 +4142,11 @@ mod write_decomposition_bench {
                         continue;
                     }
                 };
-            let allocator = Mutex::new(BlockAllocator::new(total_blocks, BENCH_BLOCK_SIZE as u32));
+            let allocator = Mutex::new(BlockAllocator::new(
+                total_blocks,
+                total_blocks,
+                BENCH_BLOCK_SIZE as u32,
+            ));
             let Some(block) = allocator.lock().unwrap().allocate() else {
                 eprintln!("  {}: skipped (no free block)", geometry.label);
                 continue;
@@ -6965,7 +6973,7 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
         };
-        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let allocator = Mutex::new(BlockAllocator::new(2, 2, 8));
         let source = allocator.lock().unwrap().allocate().unwrap();
         let bytes_per_side = 64 * 8 * 2;
         let keys: Vec<u8> = (0..bytes_per_side).map(|i| (i % 251) as u8).collect();
@@ -7058,7 +7066,7 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
         };
-        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let allocator = Mutex::new(BlockAllocator::new(2, 2, 8));
         let source = allocator.lock().unwrap().allocate().unwrap();
         let bytes_per_side = 64 * 8 * 2;
         let keys: Vec<u8> = (0..bytes_per_side).map(|i| (i % 251) as u8).collect();
@@ -7156,7 +7164,7 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
         };
-        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let allocator = Mutex::new(BlockAllocator::new(2, 2, 8));
         let source = allocator.lock().unwrap().allocate().unwrap();
 
         let root = temp_root("capture-cb-fail");
@@ -7240,7 +7248,7 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
         };
-        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let allocator = Mutex::new(BlockAllocator::new(2, 2, 8));
         let source = allocator.lock().unwrap().allocate().unwrap();
         let bytes_per_side = 64 * 8 * 2;
         let keys: Vec<u8> = (0..bytes_per_side).map(|i| (i % 251) as u8).collect();
@@ -7354,7 +7362,7 @@ mod tests {
         };
         // Three allocator blocks against a two-block pool: ids 0 and 1 are
         // valid pool blocks, id 2 is not.
-        let allocator = Mutex::new(BlockAllocator::new(3, 8));
+        let allocator = Mutex::new(BlockAllocator::new(3, 3, 8));
         let source = allocator.lock().unwrap().allocate().unwrap();
         let held = allocator.lock().unwrap().allocate().unwrap();
         assert_eq!(source.block_id, 0);
@@ -7488,7 +7496,7 @@ mod tests {
         let (k0, v0) = pattern(1);
         let (k1, v1) = pattern(2);
 
-        let capture_alloc = Mutex::new(BlockAllocator::new(4, 8));
+        let capture_alloc = Mutex::new(BlockAllocator::new(4, 4, 8));
         let src0 = capture_alloc.lock().unwrap().allocate().unwrap();
         let src1 = capture_alloc.lock().unwrap().allocate().unwrap();
         pool_src
@@ -7551,7 +7559,7 @@ mod tests {
         drop(manager);
 
         let reopened = ColdCacheManager::open_at(root.clone(), GIB, 0, 4).unwrap();
-        let fresh_alloc = Mutex::new(BlockAllocator::new(4, 8));
+        let fresh_alloc = Mutex::new(BlockAllocator::new(4, 4, 8));
 
         let hot = chain_hashes(&tokens, 8, extra_keys, cache_salt);
         assert_eq!(hot.len(), 2);
@@ -7635,7 +7643,7 @@ mod tests {
         // A partial background read is an all-or-nothing miss: neither the
         // successfully decoded head nor the missing tail may become hot, and
         // every destination reservation must return to the allocator.
-        let partial_alloc = Mutex::new(BlockAllocator::new(2, 8));
+        let partial_alloc = Mutex::new(BlockAllocator::new(2, 2, 8));
         let partial_reserved: Vec<_> = (0..2)
             .map(|_| partial_alloc.lock().unwrap().allocate().unwrap())
             .collect();

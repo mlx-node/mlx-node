@@ -40,7 +40,9 @@ fn build_test_pool(num_blocks: u32, block_size: u32) -> Option<Arc<LayerKVPool>>
 
 fn build_adapter(num_blocks: u32, block_size: u32) -> Option<PagedKVCacheAdapter> {
     let pool = build_test_pool(num_blocks, block_size)?;
-    let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+    let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+        num_blocks, num_blocks, block_size,
+    )));
     Some(PagedKVCacheAdapter::new(allocator, pool, block_size).expect("adapter ctor"))
 }
 

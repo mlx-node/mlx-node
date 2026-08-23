@@ -119,8 +119,16 @@ pub struct BlockAllocator {
     /// All allocated blocks (block_id -> block)
     allocated: HashMap<u32, Arc<PhysicalBlock>>,
 
-    /// Total number of blocks in the pool
+    /// Current number of blocks in the pool. [`Self::grow_by`] can raise
+    /// this up to `max_num_blocks`.
     num_blocks: u32,
+
+    /// Hard ceiling on the block count this allocator can reach, fixed at
+    /// construction. [`Self::new`] manages `num_blocks` ids immediately and
+    /// permits [`Self::grow_by`] up to `max_num_blocks`. When the two are
+    /// equal the allocator is not growable and behaves exactly like the
+    /// original fixed-size allocator.
+    max_num_blocks: u32,
 
     /// Block size in tokens
     block_size: u32,
@@ -216,15 +224,25 @@ impl BlockAllocator {
     /// Create a new block allocator
     ///
     /// # Arguments
-    /// * `num_blocks` - Total number of blocks to manage
+    /// * `num_blocks` - Number of blocks to manage immediately
+    /// * `max_num_blocks` - Hard ceiling [`Self::grow_by`] may later raise
+    ///   the pool to (must be `>= num_blocks`). When equal to `num_blocks`
+    ///   the allocator is not growable and behavior is identical to the
+    ///   original fixed-size allocator.
     /// * `block_size` - Number of tokens per block
-    pub fn new(num_blocks: u32, block_size: u32) -> Self {
+    pub fn new(num_blocks: u32, max_num_blocks: u32, block_size: u32) -> Self {
+        assert!(
+            max_num_blocks >= num_blocks,
+            "BlockAllocator::new: max_num_blocks ({max_num_blocks}) must be >= num_blocks \
+             ({num_blocks})"
+        );
         let free_blocks: VecDeque<u32> = (0..num_blocks).collect();
 
         Self {
             free_blocks,
             allocated: HashMap::with_capacity(num_blocks as usize),
             num_blocks,
+            max_num_blocks,
             block_size,
             prefix_cache: HashMap::new(),
             prefix_cache_identities: HashMap::new(),
@@ -1007,6 +1025,41 @@ impl BlockAllocator {
         self.num_blocks
     }
 
+    /// Get the hard ceiling on the block count (see [`Self::grow_by`]).
+    pub fn max_num_blocks(&self) -> u32 {
+        self.max_num_blocks
+    }
+
+    /// Grow the pool by up to `additional` blocks, capped at
+    /// `max_num_blocks`. Returns the number of blocks actually added (0 when
+    /// already at the cap).
+    ///
+    /// The new ids (`old_num_blocks..new_num_blocks`) are pushed onto the
+    /// back of the free queue, behind any previously freed ids; existing
+    /// allocations, prefix-cache entries, and LRU order are untouched.
+    /// `num_blocks` bumps to the new total and `max_prefix_cache_entries`
+    /// is rescaled with the same formula the constructor uses
+    /// (`num_blocks`), which discards any
+    /// [`Self::set_max_prefix_cache_entries`] override.
+    ///
+    /// The caller must have already grown the backing `LayerKVPool` to cover
+    /// the new id range (the allocator owns no GPU memory) — the adapter
+    /// performs `pool.grow_to` first and calls this only on success.
+    pub fn grow_by(&mut self, additional: u32) -> u32 {
+        let target = self
+            .num_blocks
+            .saturating_add(additional)
+            .min(self.max_num_blocks);
+        if target == self.num_blocks {
+            return 0;
+        }
+        let added = target - self.num_blocks;
+        self.free_blocks.extend(self.num_blocks..target);
+        self.num_blocks = target;
+        self.max_prefix_cache_entries = self.num_blocks as usize;
+        added
+    }
+
     /// Get the block size
     pub fn block_size(&self) -> u32 {
         self.block_size
@@ -1332,7 +1385,7 @@ mod tests {
 
     #[test]
     fn test_allocate_and_free() {
-        let mut allocator = BlockAllocator::new(10, 32);
+        let mut allocator = BlockAllocator::new(10, 10, 32);
 
         assert_eq!(allocator.num_free_blocks(), 10);
 
@@ -1346,7 +1399,7 @@ mod tests {
 
     #[test]
     fn test_reference_counting() {
-        let mut allocator = BlockAllocator::new(10, 32);
+        let mut allocator = BlockAllocator::new(10, 10, 32);
 
         let block = allocator.allocate().unwrap();
         assert_eq!(block.get_ref_count(), 1);
@@ -1368,7 +1421,7 @@ mod tests {
 
     #[test]
     fn test_prefix_cache() {
-        let mut allocator = BlockAllocator::new(10, 32);
+        let mut allocator = BlockAllocator::new(10, 10, 32);
 
         let block = allocator.allocate().unwrap();
         let hash = hash_tokens(&[1, 2, 3], 0, &[]);
@@ -1392,7 +1445,7 @@ mod tests {
         // cache's logical reference). LRU eviction is what eventually
         // returns the block to the free pool — see
         // `test_lru_eviction_returns_block_to_free_pool`.
-        let mut allocator = BlockAllocator::new(10, 32);
+        let mut allocator = BlockAllocator::new(10, 10, 32);
 
         let block = allocator.allocate().unwrap();
         let hash = hash_tokens(&[1, 2, 3], 0, &[]);
@@ -1423,7 +1476,7 @@ mod tests {
 
     #[test]
     fn test_purge_prefix_cache() {
-        let mut allocator = BlockAllocator::new(10, 32);
+        let mut allocator = BlockAllocator::new(10, 10, 32);
 
         // Cache-only entry: external handle freed, only the cache's
         // logical ref keeps it alive (the post-`release_request` state).
@@ -1464,7 +1517,7 @@ mod tests {
     #[test]
     fn test_prefix_cache_eviction_cleanup() {
         // This test verifies that evicted blocks are properly cleaned up
-        let mut allocator = BlockAllocator::new(10, 32);
+        let mut allocator = BlockAllocator::new(10, 10, 32);
         allocator.max_prefix_cache_entries = 2; // Small cache for testing
 
         let block1 = allocator.allocate().unwrap();
@@ -1508,7 +1561,7 @@ mod tests {
     fn test_prefix_cache_disabled() {
         // This test verifies that setting max_prefix_cache_entries = 0 disables caching
         // and doesn't cause infinite loop
-        let mut allocator = BlockAllocator::new(10, 32);
+        let mut allocator = BlockAllocator::new(10, 10, 32);
         allocator.max_prefix_cache_entries = 0; // Disable prefix caching
 
         let block = allocator.allocate().unwrap();
@@ -1526,7 +1579,7 @@ mod tests {
     fn test_prefix_cache_eviction_safety() {
         // This test verifies that even if lru_order becomes desynchronized,
         // we don't infinite loop
-        let mut allocator = BlockAllocator::new(10, 32);
+        let mut allocator = BlockAllocator::new(10, 10, 32);
         allocator.max_prefix_cache_entries = 1;
 
         let block1 = allocator.allocate().unwrap();
@@ -1567,7 +1620,7 @@ mod tests {
 
     #[test]
     fn test_find_longest_cache_hit_empty_registry() {
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         let (blocks, n) = allocator.find_longest_cache_hit(&[1, 2, 3, 4, 5, 6, 7, 8], 4, &[], 0);
         assert!(blocks.is_empty());
         assert_eq!(n, 0);
@@ -1575,7 +1628,7 @@ mod tests {
 
     #[test]
     fn test_find_longest_cache_hit_full_match() {
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         let tokens: Vec<u32> = (0..8).collect();
 
         // Allocate two blocks and cache them.
@@ -1597,7 +1650,7 @@ mod tests {
     fn test_find_longest_cache_hit_partial_prefix() {
         // Cache 2 blocks (8 tokens). Lookup 12 tokens that share the first 8.
         // Third block was never cached -> hit count is 2 blocks / 8 tokens.
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         let tokens_a: Vec<u32> = (0..8).collect();
         let mut tokens_b = tokens_a.clone();
         tokens_b.extend([100, 101, 102, 103]);
@@ -1617,7 +1670,7 @@ mod tests {
     fn test_find_longest_cache_hit_chain_isolation() {
         // Cache 3 blocks for sequence A. Sequence B shares first block but
         // diverges in block 2. The hash chain must isolate -> only 1 block hits.
-        let mut allocator = BlockAllocator::new(16, 4);
+        let mut allocator = BlockAllocator::new(16, 16, 4);
         let tokens_a: Vec<u32> = vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
         let tokens_b: Vec<u32> = vec![1, 2, 3, 4, 99, 99, 99, 99, 9, 10, 11, 12];
 
@@ -1635,7 +1688,7 @@ mod tests {
 
     #[test]
     fn test_find_longest_cache_hit_short_input() {
-        let mut allocator = BlockAllocator::new(4, 4);
+        let mut allocator = BlockAllocator::new(4, 4, 4);
         let (blocks, n) = allocator.find_longest_cache_hit(&[1, 2, 3], 4, &[], 0);
         assert!(blocks.is_empty());
         assert_eq!(n, 0);
@@ -1648,7 +1701,7 @@ mod tests {
     #[test]
     fn test_find_longest_cache_hit_zero_block_size() {
         // Defensive: block_size == 0 should not panic / infinite loop.
-        let mut allocator = BlockAllocator::new(4, 4);
+        let mut allocator = BlockAllocator::new(4, 4, 4);
         let (blocks, n) = allocator.find_longest_cache_hit(&[1, 2, 3, 4], 0, &[], 0);
         assert!(blocks.is_empty());
         assert_eq!(n, 0);
@@ -1656,7 +1709,7 @@ mod tests {
 
     #[test]
     fn test_cache_full_blocks_oversize_returns_err() {
-        let mut allocator = BlockAllocator::new(4, 4);
+        let mut allocator = BlockAllocator::new(4, 4, 4);
         let b0 = allocator.allocate().unwrap();
         let b1 = allocator.allocate().unwrap();
         // 2 blocks * block_size 4 = 8 tokens required, but only 4 supplied.
@@ -1667,7 +1720,7 @@ mod tests {
     #[test]
     fn test_cache_full_blocks_extra_keys_mismatch() {
         // Cache with extra_keys=[100], lookup with extra_keys=[] -> miss.
-        let mut allocator = BlockAllocator::new(4, 4);
+        let mut allocator = BlockAllocator::new(4, 4, 4);
         let tokens: Vec<u32> = (0..8).collect();
         let b0 = allocator.allocate().unwrap();
         let b1 = allocator.allocate().unwrap();
@@ -1704,8 +1757,8 @@ mod tests {
     #[test]
     fn cache_salt_only_affects_first_block_hash() {
         // --- Property 1: cache_salt == 0 is byte-equal to today ---
-        let mut alloc_zero_a = BlockAllocator::new(8, 4);
-        let mut alloc_zero_b = BlockAllocator::new(8, 4);
+        let mut alloc_zero_a = BlockAllocator::new(8, 8, 4);
+        let mut alloc_zero_b = BlockAllocator::new(8, 8, 4);
         let tokens: Vec<u32> = (0..8).collect();
         for alloc in [&mut alloc_zero_a, &mut alloc_zero_b] {
             let b0 = alloc.allocate().unwrap();
@@ -1727,7 +1780,7 @@ mod tests {
         assert_eq!(n_b, 0);
 
         // --- Property 2: A != B isolates block 0 ---
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         let b0 = allocator.allocate().unwrap();
         let b1 = allocator.allocate().unwrap();
         allocator
@@ -1778,7 +1831,7 @@ mod tests {
 
         // A chain registered through the public API is reachable at exactly
         // the helper's hashes.
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         let b0 = allocator.allocate().unwrap();
         let b1 = allocator.allocate().unwrap();
         let b2 = allocator.allocate().unwrap();
@@ -1877,7 +1930,7 @@ mod tests {
     /// our recomputed reference hash would not.
     #[test]
     fn cache_salt_not_mixed_into_block_n_for_n_gt_0() {
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         let toks: Vec<u32> = (0..12).collect();
         let salt = 0xDEAD_BEEF_DEAD_BEEFu64;
 
@@ -1978,7 +2031,7 @@ mod tests {
     /// This test exists to kill those mutants.
     #[test]
     fn cache_salt_composes_with_uniform_extra_keys() {
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         let toks: Vec<u32> = (0..8).collect();
         const K1: u64 = 0xCAFE_F00D_DEAD_BEEF;
         const K2: u64 = 0x0123_4567_89AB_CDEF;
@@ -2054,7 +2107,7 @@ mod tests {
     /// non-empty-per-block-keys + non-zero-salt branch is killed.
     #[test]
     fn cache_salt_composes_with_per_block_extra_keys() {
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         let toks: Vec<u32> = (0..12).collect();
         let per_block_keys: Vec<Vec<u64>> = vec![vec![0xAA], vec![0xBB], vec![0xCC]];
         let salt: u64 = 0xDEAD_BEEF_DEAD_BEEFu64;
@@ -2118,7 +2171,7 @@ mod tests {
 
     #[test]
     fn test_register_lookup_refcount_lifecycle() {
-        let mut allocator = BlockAllocator::new(4, 4);
+        let mut allocator = BlockAllocator::new(4, 4, 4);
         let block = allocator.allocate().unwrap();
         // Newly allocated -> ref_count == 1.
         assert_eq!(block.get_ref_count(), 1);
@@ -2148,7 +2201,7 @@ mod tests {
 
     #[test]
     fn test_lru_eviction_order() {
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         allocator.max_prefix_cache_entries = 3;
 
         // Register 4 blocks with distinct hashes; the oldest registration
@@ -2198,7 +2251,7 @@ mod tests {
         // evicted (Case 1 displacement); the block's net ref_count is
         // unchanged since the cache decrefs the old alias and increfs
         // the new one.
-        let mut allocator = BlockAllocator::new(4, 4);
+        let mut allocator = BlockAllocator::new(4, 4, 4);
         let initial_free = allocator.num_free_blocks();
 
         let block = allocator.allocate().unwrap();
@@ -2244,7 +2297,7 @@ mod tests {
         // vs [99]). After freeing, neither
         // hash can hand back the freed block via find_longest_cache_hit —
         // i.e. extra_keys isolation must hold across freed entries.
-        let mut allocator = BlockAllocator::new(4, 4);
+        let mut allocator = BlockAllocator::new(4, 4, 4);
         let tokens: Vec<u32> = vec![1, 2, 3, 4];
 
         let b0 = allocator.allocate().unwrap();
@@ -2288,7 +2341,7 @@ mod tests {
         // call is dropped (no-op). The first registration stays
         // authoritative; block_a's ref_count includes the cache's logical
         // ref; block_b's is unchanged because it was never inserted.
-        let mut allocator = BlockAllocator::new(4, 4);
+        let mut allocator = BlockAllocator::new(4, 4, 4);
         let initial_free = allocator.num_free_blocks();
 
         let block_a = allocator.allocate().unwrap();
@@ -2338,7 +2391,7 @@ mod tests {
         // At capacity, re-registering the SAME (block, hash) pair must be a
         // pure LRU refresh — it must NOT trigger capacity eviction of
         // unrelated entries, since the cache size doesn't grow.
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         allocator.max_prefix_cache_entries = 3;
 
         let block_1 = allocator.allocate().unwrap();
@@ -2408,7 +2461,7 @@ mod tests {
         // bumps LRU order and would confound the outcome). It refreshes the
         // OLDEST entry via `register_prefix` and checks membership through the
         // non-bumping `prefix_cache.contains_key`.
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         allocator.max_prefix_cache_entries = 3;
 
         let block_1 = allocator.allocate().unwrap();
@@ -2463,7 +2516,7 @@ mod tests {
         // The collision drop must be a true no-op for block_b: hash_a stays
         // pointing at block_a, AND block_b's prior valid alias under hash_b
         // must NOT be torn down.
-        let mut allocator = BlockAllocator::new(4, 4);
+        let mut allocator = BlockAllocator::new(4, 4, 4);
 
         let block_a = allocator.allocate().unwrap();
         let block_b = allocator.allocate().unwrap();
@@ -2501,7 +2554,7 @@ mod tests {
     /// monotonically until allocation fails).
     #[test]
     fn test_lru_eviction_returns_block_to_free_pool() {
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         allocator.max_prefix_cache_entries = 2;
         let initial_free = allocator.num_free_blocks();
 
@@ -2567,7 +2620,7 @@ mod tests {
     /// order, not insertion-of-cache-only) is the one selected.
     #[test]
     fn test_allocate_evicts_lru_when_pool_exhausted() {
-        let mut allocator = BlockAllocator::new(3, 4);
+        let mut allocator = BlockAllocator::new(3, 3, 4);
 
         // Allocate all three blocks.
         let b1 = allocator.allocate().unwrap();
@@ -2618,7 +2671,7 @@ mod tests {
     /// request handle, ref_count > 1), `allocate()` returns None.
     #[test]
     fn test_allocate_returns_none_when_all_cache_in_use() {
-        let mut allocator = BlockAllocator::new(2, 4);
+        let mut allocator = BlockAllocator::new(2, 2, 4);
 
         // Allocate two blocks; register each but DO NOT free the
         // request's handle. Each ends up at ref_count = 2 (alloc + cache).
@@ -2697,7 +2750,7 @@ mod tests {
     /// allocator could in fact satisfy via the eviction fallback.
     #[test]
     fn test_can_allocate_counts_evictable_cache_blocks() {
-        let mut allocator = BlockAllocator::new(2, 4);
+        let mut allocator = BlockAllocator::new(2, 2, 4);
 
         // Allocate, register, free both blocks. Both end up cache-pinned
         // at ref_count = 1.
@@ -2736,7 +2789,7 @@ mod tests {
     /// collision.
     #[test]
     fn test_register_prefix_returns_correct_bool() {
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
         allocator.max_prefix_cache_entries = 4;
 
         let b1 = allocator.allocate().unwrap();
@@ -2785,7 +2838,7 @@ mod tests {
     /// prefix that never coherently existed.
     #[test]
     fn test_cache_full_blocks_aborts_on_collision() {
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
 
         let tokens: Vec<u32> = (0..12).collect(); // 3 full blocks.
         let block_size = 4u32;
@@ -2840,7 +2893,7 @@ mod tests {
     /// sequence sees exactly 1 hit (block 0), then misses on block 1.
     #[test]
     fn test_cache_full_blocks_partial_chain() {
-        let mut allocator = BlockAllocator::new(8, 4);
+        let mut allocator = BlockAllocator::new(8, 8, 4);
 
         let tokens: Vec<u32> = (0..12).collect();
         let block_size = 4u32;
@@ -2913,7 +2966,7 @@ mod tests {
     /// prefill at the same stale prefix.
     #[test]
     fn test_cache_full_blocks_continues_past_verified_existing_prefix() {
-        let mut allocator = BlockAllocator::new(12, 4);
+        let mut allocator = BlockAllocator::new(12, 12, 4);
         let block_size = 4u32;
 
         let old_tokens: Vec<u32> = (0..8).collect();
@@ -2981,7 +3034,7 @@ mod tests {
         let empty_per_block: Vec<Vec<u64>> = (0..num_full).map(|_| Vec::new()).collect();
 
         // Cache via the uniform API.
-        let mut a_uniform = BlockAllocator::new(8, block_size);
+        let mut a_uniform = BlockAllocator::new(8, 8, block_size);
         let blocks_uniform: Vec<Arc<PhysicalBlock>> = (0..num_full)
             .map(|_| a_uniform.allocate().unwrap())
             .collect();
@@ -2993,7 +3046,7 @@ mod tests {
         // independent — but they must STILL collide if both APIs hash the
         // same way, which would manifest as a Case 2 collision drop. We
         // assert hash equivalence directly below to avoid that subtlety).
-        let mut a_per_block = BlockAllocator::new(8, block_size);
+        let mut a_per_block = BlockAllocator::new(8, 8, block_size);
         let blocks_pb: Vec<Arc<PhysicalBlock>> = (0..num_full)
             .map(|_| a_per_block.allocate().unwrap())
             .collect();
@@ -3030,7 +3083,7 @@ mod tests {
         let per_block_a: Vec<Vec<u64>> = vec![vec![0xAAAA, 0], Vec::new()];
         let per_block_b: Vec<Vec<u64>> = vec![vec![0xBBBB, 0], Vec::new()];
 
-        let mut allocator = BlockAllocator::new(8, block_size);
+        let mut allocator = BlockAllocator::new(8, 8, block_size);
 
         // Request A: cache blocks under image-A's per-block keys.
         let blocks_a: Vec<Arc<PhysicalBlock>> = (0..num_full)
@@ -3076,7 +3129,7 @@ mod tests {
         // Image B differs ONLY on block 2.
         let per_block_b: Vec<Vec<u64>> = vec![Vec::new(), Vec::new(), vec![0xBBBB, 0], Vec::new()];
 
-        let mut allocator = BlockAllocator::new(8, block_size);
+        let mut allocator = BlockAllocator::new(8, 8, block_size);
         let blocks_a: Vec<Arc<PhysicalBlock>> = (0..num_full)
             .map(|_| allocator.allocate().unwrap())
             .collect();
@@ -3104,7 +3157,7 @@ mod tests {
     fn test_per_block_rejects_length_mismatch() {
         let tokens: Vec<u32> = (0..8).collect();
         let block_size = 4u32;
-        let mut allocator = BlockAllocator::new(8, block_size);
+        let mut allocator = BlockAllocator::new(8, 8, block_size);
         let b0 = allocator.allocate().unwrap();
         let b1 = allocator.allocate().unwrap();
 
@@ -3130,7 +3183,7 @@ mod tests {
 
         // Cache 4 blocks under all-empty per-block keys.
         let per_block_full: Vec<Vec<u64>> = (0..num_full).map(|_| Vec::new()).collect();
-        let mut allocator = BlockAllocator::new(8, block_size);
+        let mut allocator = BlockAllocator::new(8, 8, block_size);
         let blocks: Vec<Arc<PhysicalBlock>> = (0..num_full)
             .map(|_| allocator.allocate().unwrap())
             .collect();
@@ -3153,7 +3206,7 @@ mod tests {
     /// cached_prefix_len=0. The cap scales to num_blocks to prevent this.
     #[test]
     fn long_chain_survives_registration_without_head_eviction() {
-        let mut a = BlockAllocator::new(2000, 16);
+        let mut a = BlockAllocator::new(2000, 2000, 16);
         let token_ids: Vec<u32> = (0..1100 * 16).map(|i| i as u32).collect();
         let blocks: Vec<_> = (0..1100).map(|_| a.allocate().unwrap()).collect();
         let n = a
@@ -3167,7 +3220,7 @@ mod tests {
 
     #[test]
     fn restored_batch_preflights_every_block_before_publishing_any() {
-        let mut allocator = BlockAllocator::new(4, 4);
+        let mut allocator = BlockAllocator::new(4, 4, 4);
         let existing = allocator.allocate().expect("existing block");
         allocator
             .publish_restored_prefix(Arc::clone(&existing), 22, &[8, 9, 10, 11], 0, &[], 0, 0)
@@ -3206,5 +3259,90 @@ mod tests {
         );
         assert_eq!(first.get_ref_count(), 1);
         assert_eq!(second.get_ref_count(), 1);
+    }
+
+    #[test]
+    fn test_grow_by_preserves_state_and_allocates_new_ids() {
+        let mut allocator = BlockAllocator::new(4, 8, 4);
+        assert_eq!(allocator.max_num_blocks(), 8);
+
+        // Live allocation + a registered prefix-cache entry that must both
+        // survive the grow untouched.
+        let live = allocator.allocate().unwrap();
+        let cached = allocator.allocate().unwrap();
+        let hash = hash_tokens(&[1, 2, 3, 4], 0, &[]);
+        assert!(allocator.register_prefix(Arc::clone(&cached), hash));
+
+        assert_eq!(allocator.grow_by(4), 4);
+        assert_eq!(allocator.total_blocks(), 8);
+        assert_eq!(allocator.num_blocks(), 8);
+
+        // Existing allocations and the prefix-cache entry survive.
+        assert_eq!(allocator.num_allocated_blocks(), 2);
+        assert!(allocator.allocated.contains_key(&live.block_id));
+        let hit = allocator
+            .lookup_prefix(hash)
+            .expect("prefix-cache entry survives grow_by");
+        assert_eq!(hit.block_id, cached.block_id);
+
+        // The two pre-existing free ids come first (freed/reused ids stay
+        // ahead of the freshly grown range), then the new ids 4..8 in order.
+        let mut ids = Vec::new();
+        while let Some(block) = allocator.allocate() {
+            ids.push(block.block_id);
+        }
+        assert_eq!(ids, vec![2, 3, 4, 5, 6, 7]);
+        assert_eq!(allocator.num_free_blocks(), 0);
+    }
+
+    #[test]
+    fn test_grow_by_caps_at_max_num_blocks() {
+        let mut allocator = BlockAllocator::new(4, 6, 4);
+        // Requesting beyond the cap grows only up to max_num_blocks.
+        assert_eq!(allocator.grow_by(10), 2);
+        assert_eq!(allocator.total_blocks(), 6);
+        assert_eq!(allocator.num_free_blocks(), 6);
+        // At the cap, further growth is a no-op.
+        assert_eq!(allocator.grow_by(1), 0);
+        assert_eq!(allocator.total_blocks(), 6);
+
+        // The pool serves exactly the ids 0..6 then reports exhaustion.
+        let ids: Vec<u32> =
+            std::iter::from_fn(|| allocator.allocate().map(|b| b.block_id)).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4, 5]);
+        assert!(allocator.allocate().is_none());
+    }
+
+    #[test]
+    fn test_grow_by_no_op_when_max_equals_initial() {
+        let mut allocator = BlockAllocator::new(4, 4, 4);
+        assert_eq!(allocator.grow_by(3), 0);
+        assert_eq!(allocator.total_blocks(), 4);
+        assert_eq!(allocator.num_free_blocks(), 4);
+    }
+
+    #[test]
+    fn test_grow_by_rescales_prefix_cache_capacity() {
+        // The constructor scales max_prefix_cache_entries to num_blocks;
+        // grow_by applies the same formula, so a pool grown 4 -> 8 holds 8
+        // cache entries without LRU capacity eviction.
+        let mut allocator = BlockAllocator::new(4, 8, 4);
+        assert_eq!(allocator.grow_by(4), 4);
+        for i in 0..8u64 {
+            let block = allocator.allocate().unwrap();
+            assert!(allocator.register_prefix(block, 1000 + i));
+        }
+        for i in 0..8u64 {
+            assert!(
+                allocator.lookup_prefix(1000 + i).is_some(),
+                "entry {i} evicted despite rescaled capacity"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "max_num_blocks")]
+    fn test_new_rejects_max_below_initial() {
+        let _ = BlockAllocator::new(8, 4, 4);
     }
 }

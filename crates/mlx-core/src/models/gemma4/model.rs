@@ -2551,7 +2551,7 @@ impl Gemma4Inner {
                 }
                 total_physical_blocks = total_physical_blocks.saturating_add(desired_blocks);
                 let allocator = Arc::new(std::sync::Mutex::new(
-                    mlx_paged_attn::BlockAllocator::new(desired_blocks, block_size),
+                    mlx_paged_attn::BlockAllocator::new(desired_blocks, desired_blocks, block_size),
                 ));
                 let pool = mlx_paged_attn::LayerKVPool::new(
                     pa_config,
@@ -15170,7 +15170,7 @@ mod spec_paged_substrate_tests {
                 AttentionKind::SlidingWindow { .. } => sliding_blocks,
             };
             let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-                blocks, block_size,
+                blocks, blocks, block_size,
             )));
             let pool = maybe_test_pool(blocks, block_size)?;
             let adapter = match group.attention_kind {

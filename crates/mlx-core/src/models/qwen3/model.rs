@@ -1187,7 +1187,7 @@ impl Qwen3Inner {
             }
 
             let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-                num_blocks, block_size,
+                num_blocks, num_blocks, block_size,
             )));
 
             // BFloat16 = Qwen3 production dtype.
@@ -1295,6 +1295,7 @@ impl Qwen3Inner {
             max_batch_size: Some(scheduler_max_num_seqs_for(32) as u32),
         };
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            sizing.selected_blocks,
             sizing.selected_blocks,
             block_size,
         )));
