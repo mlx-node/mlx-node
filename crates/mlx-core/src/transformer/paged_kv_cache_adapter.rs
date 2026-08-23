@@ -763,6 +763,7 @@ impl DenseAttentionWindow {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PagedBlockTelemetry {
     pub total_blocks: u32,
+    pub max_total_blocks: u32,
     pub free_blocks: u32,
     pub reclaimable_blocks: u32,
     pub allocated_blocks: u32,
@@ -8023,6 +8024,7 @@ impl PagedKVCacheAdapter {
             .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?;
         Ok(PagedBlockTelemetry {
             total_blocks: allocator.num_blocks(),
+            max_total_blocks: allocator.max_num_blocks(),
             free_blocks: allocator.num_free_blocks(),
             reclaimable_blocks: allocator.num_evictable_blocks(),
             allocated_blocks: allocator.num_allocated_blocks(),

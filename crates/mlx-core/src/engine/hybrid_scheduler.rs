@@ -53,6 +53,7 @@ pub(crate) struct ScheduledRestoreResult<P> {
 #[derive(Clone, Copy)]
 pub(crate) struct SchedulerCacheSnapshot {
     pub blocks: BlockTelemetry,
+    pub max_total_blocks: u32,
     pub bytes_per_block: u64,
 }
 
@@ -131,6 +132,7 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
                 reclaimable_blocks: blocks.reclaimable_blocks,
                 allocated_blocks: blocks.allocated_blocks,
             },
+            max_total_blocks: blocks.max_total_blocks,
             bytes_per_block,
         }))
     }
@@ -403,6 +405,24 @@ pub(crate) fn reservation_fits_empty_pool(
         .saturating_add(recurrent_state_bytes);
     let cap = u64::from(total_blocks).saturating_mul(bytes_per_block);
     need <= cap
+}
+
+/// Max-pool admission ceiling: a reservation that cannot fit even the
+/// pool's maximum (grow-target) block count must hard-error at admission,
+/// because the grow hook is only reachable during turn execution. Live
+/// free-block pressure is a separate concern handled by
+/// `try_reserve_reclaiming_idle` on CURRENT counts.
+pub(crate) fn exceeds_max_pool_ceiling(
+    snapshot: &SchedulerCacheSnapshot,
+    reservation_blocks: u32,
+    candidate_state_bytes: u64,
+) -> bool {
+    !reservation_fits_empty_pool(
+        reservation_blocks,
+        snapshot.max_total_blocks,
+        snapshot.bytes_per_block,
+        candidate_state_bytes,
+    )
 }
 
 /// Keep-live blocks already allocated for `seq_id` that a continuation
@@ -1836,6 +1856,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         ))
     }
 
+    fn context_length_exceeded_max(reservation_blocks: u32, max_total_blocks: u32) -> Error {
+        Error::from_reason(format!(
+            "context_length_exceeded: request requires {} paged blocks but the max pool holds {}",
+            reservation_blocks, max_total_blocks
+        ))
+    }
+
     fn admit_prepared(
         &mut self,
         prepared: Box<PreparedTurn>,
@@ -1869,18 +1896,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         } else {
             self.inner.recurrent_state_bytes()
         };
-        if cache_snapshot.is_some_and(|snapshot| {
-            !reservation_fits_empty_pool(
-                prepared.reservation_blocks,
-                snapshot.blocks.total_blocks,
-                snapshot.bytes_per_block,
-                candidate_state_bytes,
-            )
+        if cache_snapshot.as_ref().is_some_and(|snapshot| {
+            exceeds_max_pool_ceiling(snapshot, prepared.reservation_blocks, candidate_state_bytes)
         }) {
             self.cleanup_rejected_prepared(&prepared);
-            let total_blocks = cache_snapshot.map_or(0, |snapshot| snapshot.blocks.total_blocks);
+            let max_total_blocks = cache_snapshot.map_or(0, |snapshot| snapshot.max_total_blocks);
             prepared.response.send_error(
-                Self::context_length_exceeded(prepared.reservation_blocks, total_blocks),
+                Self::context_length_exceeded_max(prepared.reservation_blocks, max_total_blocks),
                 prepared.cancelled.as_ref(),
             );
             return Ok(None);
@@ -3236,6 +3258,7 @@ mod tests {
                 reclaimable_blocks: 0,
                 allocated_blocks: 0,
             },
+            max_total_blocks: total_blocks,
             bytes_per_block,
         };
         assert!(reservation_fits_empty_pool(
@@ -3301,6 +3324,7 @@ mod tests {
                 reclaimable_blocks: 0,
                 allocated_blocks: 100,
             },
+            max_total_blocks: 100,
             bytes_per_block: 4096,
         };
         let outcome = state
@@ -3394,6 +3418,7 @@ mod tests {
                 reclaimable_blocks: 0,
                 allocated_blocks: 100,
             },
+            max_total_blocks: 100,
             bytes_per_block: 4096,
         };
         let error = state
@@ -3419,6 +3444,7 @@ mod tests {
                 reclaimable_blocks: 0,
                 allocated_blocks: 60,
             },
+            max_total_blocks: 100,
             bytes_per_block: 4096,
         };
         let reservation_blocks = 70u32;
@@ -3447,6 +3473,58 @@ mod tests {
         assert!(
             matches!(with_credit, MemoryReserveOutcome::Admitted),
             "charge 10 vs free 40 must admit: {with_credit:?}"
+        );
+    }
+
+    /// Admission's must-fit hard-reject is measured against the MAX pool the
+    /// grow hook can reach during turn execution, not the CURRENT block
+    /// count. A reservation above the current pool but below the max must
+    /// NOT be hard-rejected at admission (the live free-blocks logic then
+    /// admits or defers it exactly as before); only a reservation above the
+    /// max is rejected, with the `context_length_exceeded` family marker
+    /// naming the max pool size.
+    #[test]
+    fn admission_ceiling_uses_max_pool_not_current_pool() {
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 40,
+                free_blocks: 40,
+                reclaimable_blocks: 0,
+                allocated_blocks: 0,
+            },
+            max_total_blocks: 100,
+            bytes_per_block: 4096,
+        };
+        let reservation_blocks = 70u32;
+        // Guards the regression: the old current-pool ceiling would have
+        // hard-rejected 70 blocks against a 40-block live pool.
+        assert!(
+            !reservation_fits_empty_pool(
+                reservation_blocks,
+                snapshot.blocks.total_blocks,
+                snapshot.bytes_per_block,
+                0,
+            ),
+            "70 blocks do not fit the CURRENT 40-block pool"
+        );
+        assert!(
+            !exceeds_max_pool_ceiling(&snapshot, reservation_blocks, 0),
+            "70 blocks fit the 100-block MAX pool: admission must not hard-reject, \
+             so the turn can defer/admit while the grow hook reaches it"
+        );
+        assert!(
+            exceeds_max_pool_ceiling(&snapshot, 101, 0),
+            "101 blocks exceed the max pool: admission must reject"
+        );
+        let error =
+            HybridSchedulerState::<Qwen35Inner>::context_length_exceeded_max(101, 100).reason;
+        assert!(
+            error.starts_with("context_length_exceeded"),
+            "max-ceiling reject keeps the family marker: {error}"
+        );
+        assert!(
+            error.contains("max pool holds 100"),
+            "max-ceiling reject states the max pool size, not the current one: {error}"
         );
     }
 
@@ -3704,6 +3782,7 @@ mod tests {
                 reclaimable_blocks: 0,
                 allocated_blocks: 100,
             },
+            max_total_blocks: 100,
             bytes_per_block: 4096,
         };
         let mut unpin_calls = 0u32;
