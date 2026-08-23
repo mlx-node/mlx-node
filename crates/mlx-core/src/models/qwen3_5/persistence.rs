@@ -15,8 +15,8 @@ use crate::models::quant_dispatch::{
     PlainFp8Residency, default_per_layer_quant, defer_plain_fp8_materialization, effective_plq_for,
     ensure_affine_biases_present, ensure_dense_weight_floating, ensure_int8_storage_resolves_sym8,
     ensure_kquant_storage_resolves_kquant, ensure_plain_fp8_storage_resolves_fp8_e4m3,
-    has_sym8_mode, merge_per_layer, mode_to_str, normalize_per_layer_key, parse_mode_str,
-    parse_quant_settings, resolve_default_mode, select_quantization_block,
+    has_sym8_mode, is_kquant_mode, merge_per_layer, mode_to_str, normalize_per_layer_key,
+    parse_mode_str, parse_quant_settings, resolve_default_mode, select_quantization_block,
 };
 use crate::nn::LayerNorm;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -53,8 +53,7 @@ fn should_load_packed_qwen_embedding(
     bits: i32,
     disable_value: Option<&str>,
 ) -> bool {
-    mode == PerLayerMode::Affine
-        && bits < 8
+    (is_kquant_mode(mode) || (mode == PerLayerMode::Affine && bits < 8))
         && packed_qwen_embedding_enabled_from_env(disable_value)
 }
 
@@ -64,10 +63,13 @@ fn should_load_packed_qwen_embedding(
 pub(crate) fn packed_qwen_embedding_enabled(mode: PerLayerMode, bits: i32) -> bool {
     let value = std::env::var(DISABLE_PACKED_QWEN_EMBEDDING_ENV).ok();
     // The tied-head projection is decode-critical. Exact same-binary E2E runs
-    // show that keeping sub-byte embeddings packed wins decisively, while the
-    // 8-bit affine head is faster after the one-time dense materialization.
-    // Keep the optimization on the measured shape class and leave every 8-bit
-    // mode on the legacy dense path until its packed head is proven faster.
+    // show that keeping sub-byte affine embeddings packed wins decisively,
+    // while the 8-bit affine head is faster after the one-time dense
+    // materialization. K/IQ embeddings must remain packed as well: their
+    // gather-then-dequant lookup is native, and eagerly decoding a large GGUF
+    // token table defeats native K/IQ residency. Leave other unmeasured 8-bit
+    // and floating-point modes on the legacy path until their packed head is
+    // proven faster.
     should_load_packed_qwen_embedding(mode, bits, value.as_deref())
 }
 use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
@@ -1331,10 +1333,10 @@ fn apply_weights_inner_with_residency(
         // Every inference consumer now carries `Embedding` itself: flat and
         // paged lookup call `forward`, tied logits call `as_linear`, MTP draft /
         // verify gather through `forward`, and VLM text merge does the same.
-        // Keep measured sub-byte affine embeddings packed regardless of cache
-        // backend, declared MTP depth, or vision presence. MTP execution is
-        // gated later by `has_mtp_weights()` (the actually loaded weight set),
-        // never merely by `config.n_mtp_layers`.
+        // Keep measured sub-byte affine and native GGUF K/IQ embeddings packed
+        // regardless of cache backend, declared MTP depth, or vision presence.
+        // MTP execution is gated later by `has_mtp_weights()` (the actually
+        // loaded weight set), never merely by `config.n_mtp_layers`.
         let prefer_packed = packed_qwen_embedding_enabled(plq.mode, plq.bits);
         // Resolve the packing mode from the checkpoint rather than assuming
         // affine: a GGUF `token_embd` repacked to q6k/q4k/q5k must decode as
@@ -1353,7 +1355,7 @@ fn apply_weights_inner_with_residency(
                 embed_mode,
             )?;
             info!(
-                "Loaded packed-quantized embedding ({}-bit {embed_mode}, quantized_matmul on forward + tied lm_head)",
+                "Loaded packed-quantized embedding ({}-bit {embed_mode}, gather-dequant lookup; packed matmul for tied lm_head)",
                 plq.bits
             );
         } else {
@@ -1366,7 +1368,7 @@ fn apply_weights_inner_with_residency(
                 embed_mode,
             )?;
             info!(
-                "Loaded quantized embedding ({}-bit {embed_mode}, quantized_matmul on forward)",
+                "Loaded dense embedding decoded from {}-bit {embed_mode} (full-table dequant; dense lookup/matmul)",
                 plq.bits
             );
         }
@@ -1658,9 +1660,10 @@ fn apply_weights_inner_with_residency(
                 if let Some(w) = params.get(&format!("{}.self_attn.o_proj.bias", prefix)) {
                     attn.set_o_proj_bias(Some(w))?;
                 }
-                // Precompute the block-ordered q_proj weight so forward()/
-                // forward_paged() split queries/gate without a strided
-                // reshape-copy. No-op for quantized q_proj.
+                // Finalize the block-ordered q/gate split once: dense
+                // projections cache a transpose, while affine and native
+                // K/IQ projections reorder packed operands without
+                // dequantizing.
                 attn.finalize_q_gate_block()?;
             }
         }
@@ -2712,7 +2715,7 @@ mod tests {
     }
 
     #[test]
-    fn packed_qwen_embedding_is_limited_to_sub_byte_weights() {
+    fn packed_qwen_embedding_covers_sub_byte_affine_and_native_k_iq() {
         for bits in [2, 3, 4, 5, 6] {
             assert!(
                 should_load_packed_qwen_embedding(PerLayerMode::Affine, bits, None),
@@ -2725,11 +2728,33 @@ mod tests {
         );
         assert!(
             !should_load_packed_qwen_embedding(PerLayerMode::Mxfp4, 4, None),
-            "unmeasured packing modes should stay on the dense path"
+            "unmeasured non-K/IQ packing modes should stay on the dense path"
+        );
+        for (mode, bits) in [
+            (PerLayerMode::Q3K, 3),
+            (PerLayerMode::Q4K, 4),
+            (PerLayerMode::Q5K, 5),
+            (PerLayerMode::Q6K, 6),
+            (PerLayerMode::IQ4NL, 4),
+            (PerLayerMode::IQ4XS, 4),
+            (PerLayerMode::IQ3S, 8),
+        ] {
+            assert!(
+                should_load_packed_qwen_embedding(mode, bits, None),
+                "native {mode:?} embeddings must stay packed"
+            );
+        }
+        assert!(
+            !should_load_packed_qwen_embedding(PerLayerMode::Sym8, 8, None),
+            "sym8 has a separate non-MLX packing contract"
         );
         assert!(
-            !should_load_packed_qwen_embedding(PerLayerMode::Affine, 6, Some("1")),
-            "the fallback must disable an otherwise eligible embedding"
+            !should_load_packed_qwen_embedding(PerLayerMode::Fp8E4m3, 8, None),
+            "plain E4M3 reconstructs through a separate backend"
+        );
+        assert!(
+            !should_load_packed_qwen_embedding(PerLayerMode::Q4K, 4, Some("1")),
+            "the fallback must disable the exact Q4_K embedding route"
         );
     }
 

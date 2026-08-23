@@ -100,10 +100,11 @@ async function readPackageFile(
 }
 
 function usage(): string {
-  return `Usage: oxnode scripts/benchmark-model.ts <model-directory> [options]
+  return `Usage: oxnode scripts/benchmark-model.ts <model-path> [options]
 
-Benchmarks one model artifact in isolated child processes. Every sample includes
-a fresh model load followed by one deterministic ChatSession generation.
+Benchmarks one model artifact (a native model directory or directly loadable
+GGUF file) in isolated child processes. Every sample includes a fresh model load
+followed by one deterministic ChatSession generation.
 
 Options:
   --runs <count>             Measured runs (default: ${DEFAULT_RUNS})
@@ -509,7 +510,7 @@ async function writeJsonAtomically(
   }
 }
 
-async function assertModelDirectory(modelPath: string): Promise<void> {
+async function assertModelPath(modelPath: string): Promise<void> {
   let modelStat;
   try {
     modelStat = await stat(modelPath);
@@ -519,12 +520,13 @@ async function assertModelDirectory(modelPath: string): Promise<void> {
       { cause: error },
     );
   }
-  if (!modelStat.isDirectory())
-    throw new Error(`Model path is not a directory: ${modelPath}`);
+  if (!modelStat.isDirectory() && !modelStat.isFile()) {
+    throw new Error(`Model path is neither a directory nor a file: ${modelPath}`);
+  }
 }
 
 async function runParent(options: CliOptions): Promise<void> {
-  await assertModelDirectory(options.modelPath);
+  await assertModelPath(options.modelPath);
   const startedAt = new Date();
   const environment = await environmentMetadata();
   const warmups: RunReport[] = [];

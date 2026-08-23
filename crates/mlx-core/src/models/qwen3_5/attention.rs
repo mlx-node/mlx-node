@@ -61,9 +61,9 @@ pub struct Qwen3_5Attention {
     /// fails MLX's `prepare_reshape` free-view check and dispatches a real
     /// strided `copy_gpu_inplace` (`CopyType::General`) Metal kernel on
     /// every call — this cache makes that copy a one-time load-time cost
-    /// instead of a per-forward one. Affine quantized q_proj stores the same
-    /// block order directly in its packed operands instead of using this
-    /// duplicate dense cache; other quantization modes retain the fallback.
+    /// instead of a per-forward one. Affine and native GGUF K/IQ q_proj store
+    /// the same block order directly in their packed operands instead of using
+    /// this duplicate dense cache; other quantization modes retain the fallback.
     q_gate_block_t: Option<MxArray>,
     /// Reordered `[2*num_heads*head_dim]` q_proj bias matching
     /// `q_gate_block_t`'s column order. `None` when q_proj has no bias.
@@ -519,7 +519,7 @@ impl Qwen3_5Attention {
     /// [B,T,H*D])`.
     ///
     /// Fast path (`finalize_q_gate_block()` installed either the dense cache or
-    /// an affine quantized block layout): one projection followed by two flat
+    /// a packed quantized block layout): one projection followed by two flat
     /// `slice_axis` calls. Both halves are already row-contiguous, so queries'
     /// `[B,T,H,D]` reshape is a free view and gate needs no reshape at all.
     /// `MLX_DISABLE_QGATE_BLOCK_SPLIT=1` is sampled by the finalizer at load
@@ -1643,9 +1643,10 @@ impl Qwen3_5Attention {
     /// comment for why the checkpoint's native per-head-interleaved column
     /// order forces a strided copy on every call.
     ///
-    /// Safe to call repeatedly (idempotent). Affine quantized q_proj consumes
-    /// its native-order packed operands and replaces them with materialized
-    /// block-order arrays. Other quantization modes remain on the fallback.
+    /// Safe to call repeatedly (idempotent). Affine and native GGUF K/IQ
+    /// q_proj consume their native-order packed operands and replace them with
+    /// materialized block-order arrays. Other quantization modes remain on the
+    /// fallback.
     pub fn finalize_q_gate_block(&mut self) -> Result<()> {
         self.finalize_q_gate_block_enabled(std::env::var("MLX_DISABLE_QGATE_BLOCK_SPLIT").is_err())
     }
@@ -1658,7 +1659,7 @@ impl Qwen3_5Attention {
         let d = self.head_dim as i64;
 
         if let LinearProj::Quantized(q_lin) = &mut self.q_proj {
-            q_lin.finalize_affine_q_gate_block(self.num_heads, self.head_dim)?;
+            q_lin.finalize_packed_q_gate_block(self.num_heads, self.head_dim)?;
             return Ok(());
         }
 
@@ -2553,6 +2554,103 @@ mod tests {
             block_gate.to_uint16_native()?,
             native_gate.to_uint16_native()?,
             "block-order affine gates must be bit-identical to native per-head splitting"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn q4k_quantized_q_gate_block_matches_native_h4_with_bias() -> Result<()> {
+        use crate::utils::gguf_kquant::{KQuantFormat, KQuantScales, repack_kquant};
+
+        let mut cfg = tiny_cfg();
+        cfg.hidden_size = 256;
+        cfg.head_dim = 32;
+        cfg.num_heads = 4;
+        cfg.num_kv_heads = 2;
+        cfg.intermediate_size = 512;
+        let h = cfg.num_heads as i64;
+        let d = cfg.head_dim as i64;
+        let hidden = cfg.hidden_size as i64;
+        let rows = 2 * h * d;
+        let format = KQuantFormat::Q4K;
+
+        // One deterministic ggml Q4_K block per output row. Repack through the
+        // same importer as a UD GGUF; keep d/dmin small and finite so the M=2
+        // qmv_wide comparison is numerically well-conditioned.
+        let mut state = 0x5147_4b21u64;
+        let mut blocks = (0..rows as usize * format.block_bytes())
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                (state >> 33) as u8
+            })
+            .collect::<Vec<_>>();
+        for row in 0..rows as usize {
+            let base = row * format.block_bytes();
+            blocks[base] = 0x00;
+            blocks[base + 1] = 0x24; // d = f16 0.015625
+            blocks[base + 2] = 0x00;
+            blocks[base + 3] = 0x20; // dmin = f16 0.0078125
+        }
+        let packed = repack_kquant(format, &blocks, rows as usize, hidden as usize)?;
+        let weight = MxArray::from_uint32(
+            &packed.weight,
+            &[rows, format.weight_cols(hidden as usize) as i64],
+        )?;
+        let scales = match &packed.scales {
+            KQuantScales::Unsigned(values) => {
+                MxArray::from_uint8(values, &[rows, format.scales_cols(hidden as usize) as i64])?
+            }
+            KQuantScales::Signed(_) => panic!("Q4_K scales must be unsigned"),
+        };
+        let quant_biases = MxArray::from_float16(
+            &packed.biases,
+            &[rows, format.biases_cols(hidden as usize) as i64],
+        )?;
+        let additive_values = (0..rows)
+            .map(|i| ((i as f32) * 0.031 - 0.2).cos() * 0.1)
+            .collect::<Vec<_>>();
+        let additive_bias =
+            MxArray::from_float32(&additive_values, &[rows])?.astype(DType::BFloat16)?;
+
+        let make_q_proj = || {
+            QuantizedLinear::new(
+                weight.clone(),
+                scales.clone(),
+                Some(quant_biases.clone()),
+                Some(additive_bias.clone()),
+                32,
+                4,
+                "q4k".to_string(),
+            )
+        };
+        let mut block = Qwen3_5Attention::new(&cfg)?;
+        let mut native = Qwen3_5Attention::new(&cfg)?;
+        block.set_quantized_q_proj(make_q_proj());
+        native.set_quantized_q_proj(make_q_proj());
+        block.finalize_q_gate_block_enabled(true)?;
+        native.finalize_q_gate_block_enabled(false)?;
+        assert!(block.q_proj.has_q_gate_block_layout());
+        assert!(!native.q_proj.has_q_gate_block_layout());
+        assert!(block.q_gate_block_t.is_none());
+
+        let x_values = (0..2 * hidden)
+            .map(|i| ((i as f32) * 0.023 + 0.7).sin())
+            .collect::<Vec<_>>();
+        let x = MxArray::from_float32(&x_values, &[1, 2, hidden])?.astype(DType::BFloat16)?;
+        let (block_q, block_gate) = block.project_q_gate(&x, 1, 2)?;
+        let (native_q, native_gate) = native.project_q_gate(&x, 1, 2)?;
+        MxArray::eval_arrays(&[&block_q, &block_gate, &native_q, &native_gate])?;
+        assert_eq!(
+            block_q.to_uint16_native()?,
+            native_q.to_uint16_native()?,
+            "block-order Q4_K queries must be bit-identical to native per-head splitting"
+        );
+        assert_eq!(
+            block_gate.to_uint16_native()?,
+            native_gate.to_uint16_native()?,
+            "block-order Q4_K gates must be bit-identical to native per-head splitting"
         );
         Ok(())
     }

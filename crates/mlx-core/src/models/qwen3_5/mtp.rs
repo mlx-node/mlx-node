@@ -440,9 +440,9 @@ impl Qwen3_5MTPModule {
             if let Some(w) = params.get(&format!("{}.self_attn.o_proj.bias", prefix)) {
                 attn.set_o_proj_bias(Some(w))?;
             }
-            // Precompute the block-ordered q_proj weight so forward()/
-            // forward_paged() split queries/gate without a strided
-            // reshape-copy. No-op for quantized q_proj.
+            // Finalize the block-ordered q/gate split once: dense projections
+            // cache a transpose, while affine and native K/IQ projections
+            // reorder their packed row-coupled operands without dequantizing.
             attn.finalize_q_gate_block()?;
 
             // MLP — dense or per-mode quantized via the same swap as

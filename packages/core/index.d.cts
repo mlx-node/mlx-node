@@ -3800,7 +3800,8 @@ export interface GgufConversionOptions {
   /**
    * Import supported ggml K/IQ tensors as native MLX packed arrays instead of
    * rejecting them (default: false). The blocks are repacked, never
-   * dequantized, so the output keeps the source file's weights and byte size.
+   * dequantized, so the output preserves the source quantized values. IQ3_S
+   * expands only its integer grid/sign encoding to signed 8-bit codes.
    * With this off, Q6_K remains the Gemma4 token-embedding BF16 fallback and
    * Q4_K / Q5_K are an error.
    */
