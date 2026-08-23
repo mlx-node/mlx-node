@@ -1713,7 +1713,9 @@ pub struct PagedKVCacheAdapter {
     /// the live window. `0` retains the ordinary full-attention semantics.
     sliding_window: u32,
     /// Logical context limit. Full-attention adapters derive this from their
-    /// physical pool; sliding adapters decouple it from the bounded live pool.
+    /// pool's MAXIMUM physical capacity (`max_num_blocks`, which the live
+    /// pool grows toward); sliding adapters decouple it from the bounded
+    /// live pool.
     logical_max_tokens: u32,
     /// Permanently reserved placeholder used by sparse sliding block tables.
     /// It is never written or freed through a request lifecycle; the paged
@@ -1922,6 +1924,14 @@ pub struct PagedKVCacheAdapter {
     /// result here removes even the FFI call from every layer/token.
     #[cfg(target_os = "macos")]
     grouped_d512_capability_cache: Option<(i32, Result<bool, String>)>,
+
+    /// Optional hook invoked once per successful pool grow with the pool's
+    /// new total K/V bytes (all layers, both sides). The cache-limit pool
+    /// re-registration lands through this (see `set_pool_growth_notifier`);
+    /// `None` (the default) is a no-op. Follows the `set_scale_manager` /
+    /// `set_cold_tier` ownership pattern: the adapter shares the `Arc` with
+    /// its caller.
+    pool_growth_notifier: Option<Arc<dyn Fn(u64) + Send + Sync>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1968,6 +1978,10 @@ struct NativePoolArrays {
     key: MxArray,
     value: MxArray,
     dirty: bool,
+    /// [`LayerKVPool::generation`] the views were built against. A grow
+    /// swaps the pool's Metal buffers, so any consumer must rebuild when
+    /// this no longer matches the live pool.
+    generation: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -2146,7 +2160,11 @@ impl PagedKVCacheAdapter {
                 layer_kv_pool.num_blocks()
             ));
         }
-        let physical_capacity_tokens = layer_kv_pool.num_blocks().saturating_mul(block_size);
+        // Capacity surfaces derive from the MAXIMUM block count: the live
+        // pool starts smaller and grows toward it, so deriving from the
+        // current count would make logical capacity shrink and grow with
+        // each realloc.
+        let physical_capacity_tokens = layer_kv_pool.max_num_blocks().saturating_mul(block_size);
         let logical_max_tokens = logical_max_tokens.unwrap_or(physical_capacity_tokens);
         let null_block = if sliding_window == 0 {
             None
@@ -2201,6 +2219,7 @@ impl PagedKVCacheAdapter {
             decode_planning_cache: None,
             #[cfg(target_os = "macos")]
             grouped_d512_capability_cache: None,
+            pool_growth_notifier: None,
         })
     }
 
@@ -2208,6 +2227,13 @@ impl PagedKVCacheAdapter {
     /// every persisted block off `ctx.fingerprint`.
     pub fn set_cold_tier(&mut self, ctx: ColdTierContext) {
         self.cold_tier = Some(ctx);
+    }
+
+    /// Install (or clear) the callback that fires once per successful pool
+    /// grow with the pool's new total K/V bytes. The cache-limit pool
+    /// re-registration wires this hook; `None` (the default) is a no-op.
+    pub fn set_pool_growth_notifier(&mut self, notifier: Option<Arc<dyn Fn(u64) + Send + Sync>>) {
+        self.pool_growth_notifier = notifier;
     }
 
     /// The cold-tier context this adapter persists through, if any. Exposed so
@@ -3568,8 +3594,11 @@ impl PagedKVCacheAdapter {
     /// number of NEW blocks allocated.
     ///
     /// Errors if the allocator can't fulfil the request (no free blocks).
-    /// On partial failure (some allocations succeeded before the pool ran
-    /// out), the already-allocated blocks are rolled back into the pool to
+    /// On allocator exhaustion the adapter first attempts ONE pool grow
+    /// (`try_grow_pool`) and retries the reservation; only if it is still
+    /// exhausted does the error surface. On partial failure (some
+    /// allocations succeeded before the pool ran out), the
+    /// already-allocated blocks are rolled back into the pool to
     /// avoid leaks.
     ///
     /// ## Lazy decode allocation
@@ -3592,7 +3621,7 @@ impl PagedKVCacheAdapter {
                 "context_length_exceeded: requested {total_tokens} tokens, paged cache capacity is {capacity} tokens"
             ));
         }
-        let block_table = self.block_table.as_mut().ok_or_else(|| {
+        self.block_table.as_ref().ok_or_else(|| {
             "allocate_suffix_blocks called before reset_for_new_request".to_string()
         })?;
 
@@ -3607,32 +3636,46 @@ impl PagedKVCacheAdapter {
             return Ok(0);
         }
 
-        let mut guard = self
-            .allocator
-            .lock()
-            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-
+        let mut grew_once = false;
         let mut newly_allocated: Vec<Arc<PhysicalBlock>> =
             Vec::with_capacity(needed_blocks as usize);
-        for i in 0..needed_blocks {
-            match guard.allocate() {
-                Some(block) => newly_allocated.push(block),
-                None => {
-                    // Roll back partial allocations to keep the pool consistent.
-                    for partial in newly_allocated.drain(..) {
-                        guard.free(partial);
+        loop {
+            let mut guard = self
+                .allocator
+                .lock()
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+            let mut exhausted_at = None;
+            for i in 0..needed_blocks {
+                match guard.allocate() {
+                    Some(block) => newly_allocated.push(block),
+                    None => {
+                        exhausted_at = Some(i);
+                        // Roll back partial allocations to keep the pool consistent.
+                        for partial in newly_allocated.drain(..) {
+                            guard.free(partial);
+                        }
+                        break;
                     }
-                    return Err(format!(
-                        "context_length_exceeded: paged cache could not reserve {needed_blocks} \
-                         block(s) for {total_tokens} tokens (reserved {i} before rollback, \
-                         capacity {} tokens)",
-                        capacity
-                    ));
                 }
             }
+            drop(guard);
+            let Some(i) = exhausted_at else {
+                break;
+            };
+            // Exhaustion: grow the pool once and retry the whole
+            // reservation; still exhausted -> existing error path.
+            if grew_once || !self.try_grow_pool(needed_blocks) {
+                return Err(format!(
+                    "context_length_exceeded: paged cache could not reserve {needed_blocks} \
+                     block(s) for {total_tokens} tokens (reserved {i} before rollback, \
+                     capacity {} tokens)",
+                    capacity
+                ));
+            }
+            grew_once = true;
         }
-        drop(guard);
 
+        let block_table = self.block_table.as_mut().expect("checked above");
         for block in newly_allocated {
             block_table.add_block(block);
         }
@@ -3655,10 +3698,12 @@ impl PagedKVCacheAdapter {
     /// crosses block boundaries (vLLM's decode pattern; see
     /// `vllm/v1/core/kv_cache_manager.py::allocate_slots`).
     ///
-    /// On allocator exhaustion, the already-allocated blocks within this
-    /// call are rolled back so the request's block_table is unchanged
-    /// (caller-visible state stays consistent with the pre-call state and
-    /// the next decode step can choose to abort gracefully).
+    /// On allocator exhaustion, the adapter first attempts ONE pool grow
+    /// (`try_grow_pool`) and retries the reservation; if it is still
+    /// exhausted, the already-allocated blocks within this call are rolled
+    /// back so the request's block_table is unchanged (caller-visible state
+    /// stays consistent with the pre-call state and the next decode step
+    /// can choose to abort gracefully).
     fn ensure_blocks_for_total_tokens(&mut self, new_total_tokens: u32) -> Result<u32, String> {
         let capacity = self.max_capacity_tokens();
         if new_total_tokens > capacity {
@@ -3667,48 +3712,154 @@ impl PagedKVCacheAdapter {
                  paged cache capacity is {capacity} tokens"
             ));
         }
-        let block_table = self.block_table.as_mut().ok_or_else(|| {
-            "ensure_blocks_for_total_tokens called before reset_for_new_request".to_string()
-        })?;
+        let current_blocks = {
+            let block_table = self.block_table.as_ref().ok_or_else(|| {
+                "ensure_blocks_for_total_tokens called before reset_for_new_request".to_string()
+            })?;
+            block_table.num_blocks() as u32
+        };
         if self.block_size == 0 {
             return Err("block_size must be > 0".to_string());
         }
-        let current_blocks = block_table.num_blocks() as u32;
         let needed_total_blocks = new_total_tokens.div_ceil(self.block_size);
         if needed_total_blocks <= current_blocks {
             return Ok(0);
         }
         let to_allocate = needed_total_blocks - current_blocks;
 
-        let mut guard = self
-            .allocator
-            .lock()
-            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        let mut grew_once = false;
         let mut newly_allocated: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(to_allocate as usize);
-        for i in 0..to_allocate {
-            match guard.allocate() {
-                Some(block) => newly_allocated.push(block),
-                None => {
-                    // Roll back partial allocations to keep the pool consistent.
-                    for partial in newly_allocated.drain(..) {
-                        guard.free(partial);
+        loop {
+            let mut guard = self
+                .allocator
+                .lock()
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+            let mut exhausted_at = None;
+            for i in 0..to_allocate {
+                match guard.allocate() {
+                    Some(block) => newly_allocated.push(block),
+                    None => {
+                        exhausted_at = Some(i);
+                        // Roll back partial allocations to keep the pool consistent.
+                        for partial in newly_allocated.drain(..) {
+                            guard.free(partial);
+                        }
+                        break;
                     }
-                    return Err(format!(
-                        "context_length_exceeded: paged decode could not reserve {to_allocate} \
-                         more block(s) (request had {current_blocks}, needs {needed_total_blocks} \
-                         for {new_total_tokens} tokens, reserved {i} before rollback, capacity \
-                         {} tokens)",
-                        capacity
-                    ));
                 }
             }
+            drop(guard);
+            let Some(i) = exhausted_at else {
+                break;
+            };
+            // Exhaustion: grow the pool once and retry the whole
+            // reservation; still exhausted -> existing error path.
+            if grew_once || !self.try_grow_pool(to_allocate) {
+                return Err(format!(
+                    "context_length_exceeded: paged decode could not reserve {to_allocate} \
+                     more block(s) (request had {current_blocks}, needs {needed_total_blocks} \
+                     for {new_total_tokens} tokens, reserved {i} before rollback, capacity \
+                     {} tokens)",
+                    capacity
+                ));
+            }
+            grew_once = true;
         }
-        drop(guard);
 
+        let block_table = self.block_table.as_mut().expect("checked above");
         for block in newly_allocated {
             block_table.add_block(block);
         }
         Ok(to_allocate)
+    }
+
+    /// Grow the shared pool (and allocator) once, called when allocation
+    /// exhausts the live block count.
+    ///
+    /// Order matters:
+    /// 1. Flush this adapter's pending native pool writes and synchronize
+    ///    MLX — the grow blit copies the whole buffer, so no lazy GPU write
+    ///    may still be in flight against it.
+    /// 2. Take the allocator mutex, then `pool.grow_to` (which takes the
+    ///    pool's write lock internally) — allocator first, pool second, and
+    ///    the pool read lock is never held across the call.
+    /// 3. Target `min(pool.max_num_blocks, max(2 × current, current +
+    ///    needed))`; `grow_to` is a no-op `Ok(false)` when the target does
+    ///    not exceed the live count.
+    /// 4. On success, extend the allocator to match, drop this adapter's
+    ///    per-layer pool views (they wrap the pre-grow buffers), run the
+    ///    growth notifier with the new total bytes, and log one line.
+    ///
+    /// Any failure (flush error, poisoned mutex, `Err` from `grow_to`, or a
+    /// no-op grow) logs at warn and returns `false` — the caller proceeds to
+    /// its existing eviction/error path. Never panics.
+    fn try_grow_pool(&mut self, needed_additional_blocks: u32) -> bool {
+        #[cfg(target_os = "macos")]
+        if let Err(e) = self.eval_pending_pool_writes() {
+            tracing::warn!(
+                target: "mlx_core::paged_kv",
+                "paged KV pool grow aborted: could not flush pending pool writes: {e}"
+            );
+            return false;
+        }
+        // Wait for all queued GPU work before the pool's blit reallocates
+        // the underlying Metal buffers.
+        crate::array::memory::synchronize();
+
+        let mut guard = match self.allocator.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::warn!(
+                    target: "mlx_core::paged_kv",
+                    "paged KV pool grow aborted: BlockAllocator mutex poisoned: {e}"
+                );
+                return false;
+            }
+        };
+        let current = guard.num_blocks();
+        let new_num_blocks = self.layer_kv_pool.max_num_blocks().min(
+            current
+                .saturating_mul(2)
+                .max(current.saturating_add(needed_additional_blocks)),
+        );
+        let old_total_bytes = self.layer_kv_pool.total_bytes();
+        match self.layer_kv_pool.grow_to(new_num_blocks) {
+            Ok(true) => {}
+            Ok(false) => {
+                // Already at/above the target or capped at max — nothing
+                // allocatable appeared.
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "mlx_core::paged_kv",
+                    "paged KV pool grow to {new_num_blocks} blocks failed: {e}"
+                );
+                return false;
+            }
+        }
+        guard.grow_by(new_num_blocks - current);
+        let new_num_blocks = guard.num_blocks();
+        drop(guard);
+
+        // This adapter's cached per-layer views wrap the pre-grow buffers;
+        // drop all of them. Other adapters sharing the pool rebuild lazily
+        // via the generation guard.
+        #[cfg(target_os = "macos")]
+        self.clear_native_graph_state();
+
+        let new_total_bytes = self.layer_kv_pool.total_bytes();
+        if let Some(notifier) = self.pool_growth_notifier.as_ref() {
+            notifier(new_total_bytes);
+        }
+        tracing::info!(
+            target: "mlx_core::paged_kv",
+            "paged KV pool grew {current} -> {new_num_blocks} blocks \
+             ({:.2} -> {:.2} MiB)",
+            old_total_bytes as f64 / (1024.0 * 1024.0),
+            new_total_bytes as f64 / (1024.0 * 1024.0),
+        );
+        true
     }
 
     /// Reserve block capacity for `extra` rows past the current cursor
@@ -4158,13 +4309,20 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.num_layers()
             ));
         }
-        if self.native_pool_arrays[idx].is_none() {
+        let pool_generation = self.layer_kv_pool.generation();
+        if self.native_pool_arrays[idx]
+            .as_ref()
+            .is_none_or(|state| state.generation != pool_generation)
+        {
+            // First use, or the pool grew (possibly driven by another
+            // adapter sharing it) and the cached views wrap dead buffers.
             let key = self.raw_key_pool_array(layer_idx)?;
             let value = self.raw_value_pool_array(layer_idx)?;
             self.native_pool_arrays[idx] = Some(NativePoolArrays {
                 key,
                 value,
                 dirty: false,
+                generation: pool_generation,
             });
         }
         let state = self.native_pool_arrays[idx]
@@ -4192,6 +4350,7 @@ impl PagedKVCacheAdapter {
             key,
             value,
             dirty: true,
+            generation: self.layer_kv_pool.generation(),
         });
         Ok(())
     }
@@ -4263,10 +4422,19 @@ impl PagedKVCacheAdapter {
     pub fn eval_pending_pool_writes(&mut self) -> Result<(), String> {
         let mut dirty_layers = Vec::new();
         let mut arrays: Vec<MxArray> = Vec::new();
-        for (layer_idx, state) in self.native_pool_arrays.iter().enumerate() {
-            let Some(state) = state.as_ref() else {
+        let pool_generation = self.layer_kv_pool.generation();
+        for (layer_idx, slot) in self.native_pool_arrays.iter_mut().enumerate() {
+            let Some(state) = slot.as_ref() else {
                 continue;
             };
+            if state.generation != pool_generation {
+                // The pool grew since these views were built (another
+                // adapter sharing the pool may have driven it). Evaling
+                // them would write into the pre-grow buffers; drop them so
+                // the next consumer rebuilds against the live pool.
+                *slot = None;
+                continue;
+            }
             if state.dirty {
                 dirty_layers.push(layer_idx);
                 arrays.push(state.key.clone());
@@ -4307,6 +4475,12 @@ impl PagedKVCacheAdapter {
         let Some(Some(state)) = self.native_pool_arrays.get(idx) else {
             return Ok(());
         };
+        if state.generation != self.layer_kv_pool.generation() {
+            // Stale views (pool grew elsewhere): nothing useful to eval,
+            // and evaling would write into the pre-grow buffers.
+            self.native_pool_arrays[idx] = None;
+            return Ok(());
+        }
         if !state.dirty {
             return Ok(());
         }
@@ -8303,7 +8477,9 @@ impl PagedKVCacheAdapter {
     /// the buffer refcount that keeps the GPU memory alive.
     #[cfg(target_os = "macos")]
     pub fn key_pool_array(&self, layer_idx: u32) -> Result<MxArray, String> {
-        if let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize) {
+        if let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize)
+            && state.generation == self.layer_kv_pool.generation()
+        {
             return Ok(state.key.clone());
         }
         self.raw_key_pool_array(layer_idx)
@@ -8313,7 +8489,9 @@ impl PagedKVCacheAdapter {
     /// See [`Self::key_pool_array`] for ownership semantics.
     #[cfg(target_os = "macos")]
     pub fn value_pool_array(&self, layer_idx: u32) -> Result<MxArray, String> {
-        if let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize) {
+        if let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize)
+            && state.generation == self.layer_kv_pool.generation()
+        {
             return Ok(state.value.clone());
         }
         self.raw_value_pool_array(layer_idx)
@@ -15704,6 +15882,259 @@ mod tests {
             assert!(
                 elem.abs() < 0.01,
                 "K[{i}] = {elem}, expected 0.0 (initial K was zeros)"
+            );
+        }
+    }
+
+    /// **Growth happy path**: an adapter over a 4-block pool with a 16-block
+    /// max grows on allocation exhaustion. Asserts the target arithmetic
+    /// (`min(max, max(2*current, current+needed))`), that pre-grow KV
+    /// survives the blit copy, that post-grow writes land in the new
+    /// buffers (round-trip via `read_kv_range`), and that the growth
+    /// notifier fires once per grow with the new total bytes. Skipped on
+    /// no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_pool_grows_on_allocator_exhaustion_and_kv_roundtrips() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!(
+                    "skipping test_pool_grows_on_allocator_exhaustion_and_kv_roundtrips: {e}"
+                );
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        let notifications: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let notifications = Arc::clone(&notifications);
+            adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+                notifications.lock().unwrap().push(bytes);
+            })));
+        }
+
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(pool.generation(), 0);
+
+        adapter.reset_for_new_request(7).unwrap();
+
+        // Write 8 tokens (1 block) against the initial pool: V = 1.0.
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let k = MxArray::from_bfloat16(&vec![0u16; 8 * 64], &[8, 1, 64]).expect("k zeros");
+        let v = MxArray::from_bfloat16(&vec![0x3f80u16; 8 * 64], &[8, 1, 64]).expect("v ones");
+        match adapter.update_keys_values(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!(
+                    "skipping test_pool_grows_on_allocator_exhaustion_and_kv_roundtrips: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+        }
+
+        // 5 more blocks requested with only 3 free -> exhaustion -> grow to
+        // min(16, max(2*4, 4+5)) = 9 blocks, then the reservation retries.
+        let allocated = adapter.allocate_suffix_blocks(40).unwrap();
+        assert_eq!(allocated, 5);
+        assert_eq!(pool.num_blocks(), 9, "pool must grow to 9 blocks");
+        assert_eq!(pool.generation(), 1);
+        assert_eq!(
+            allocator.lock().unwrap().num_blocks(),
+            9,
+            "allocator must track the grown pool"
+        );
+        let notified = notifications.lock().unwrap().clone();
+        assert_eq!(notified.len(), 1, "notifier must fire once per grow");
+        assert_eq!(
+            notified[0],
+            pool.total_bytes(),
+            "notifier receives the pool's new total bytes"
+        );
+
+        // Write the remaining 32 tokens: V = 2.0.
+        adapter
+            .record_tokens(&(9..=40).collect::<Vec<u32>>())
+            .unwrap();
+        let k2 = MxArray::from_bfloat16(&vec![0u16; 32 * 64], &[32, 1, 64]).expect("k2 zeros");
+        let v2 = MxArray::from_bfloat16(&vec![0x4000u16; 32 * 64], &[32, 1, 64]).expect("v2 twos");
+        match adapter.update_keys_values(0, &k2, &v2, 8) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!(
+                    "skipping test_pool_grows_on_allocator_exhaustion_and_kv_roundtrips: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error from second update_keys_values: {e}"),
+        }
+
+        // Round-trip: pre-grow tokens still 1.0 (blit copy), post-grow 2.0.
+        let (_k_out, v_out) = match adapter.read_kv_range(0, 0, 40) {
+            Ok(t) => t,
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!(
+                    "skipping test_pool_grows_on_allocator_exhaustion_and_kv_roundtrips: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error from read_kv_range: {e}"),
+        };
+        let v_f32 = v_out
+            .astype(DType::Float32)
+            .expect("astype f32 on V")
+            .reshape(&[40 * 64])
+            .expect("flatten V");
+        v_f32.eval();
+        for i in 0..(40 * 64) {
+            let token = i / 64;
+            let expected = if token < 8 { 1.0 } else { 2.0 };
+            let elem = v_f32
+                .item_at_float32(i)
+                .unwrap_or_else(|e| panic!("item_at_float32({i}): {e}"));
+            assert!(
+                (elem - expected).abs() < 0.01,
+                "V[{i}] = {elem}, expected {expected} at token {token}"
+            );
+        }
+
+        // Second exhaustion exercises the 2x branch: current=9, needed=8 ->
+        // max(18, 17) = 18, capped at the pool max 16.
+        let allocated = adapter.allocate_suffix_blocks(64).unwrap();
+        assert_eq!(allocated, 8);
+        assert_eq!(pool.num_blocks(), 16, "second grow reaches the pool max");
+        assert_eq!(pool.generation(), 2);
+        let notified = notifications.lock().unwrap().clone();
+        assert_eq!(notified.len(), 2, "notifier must fire once per grow");
+        assert_eq!(notified[1], pool.total_bytes());
+    }
+
+    /// **Generation guard**: adapter B caches per-layer pool views at
+    /// generation 0; adapter A (sharing the pool) exhausts and grows it.
+    /// B's next native write must rebuild its views against the grown
+    /// buffers — otherwise the write lands in the dead pre-grow buffers and
+    /// the readback shows garbage. Also proves the blit preserved B's
+    /// earlier KV. Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_shared_pool_generation_guard_rebuilds_views() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_shared_pool_generation_guard_rebuilds_views: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter_a = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter a");
+        let mut adapter_b = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter b");
+
+        // B writes 8 tokens (V = 1.0) through the graph-native path so its
+        // per-layer views are cached at generation 0, then flushes.
+        adapter_b.reset_for_new_request(1).unwrap();
+        adapter_b.allocate_suffix_blocks(8).unwrap();
+        adapter_b.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let k = MxArray::from_bfloat16(&vec![0u16; 8 * 64], &[8, 1, 64]).expect("k zeros");
+        let v = MxArray::from_bfloat16(&vec![0x3f80u16; 8 * 64], &[8, 1, 64]).expect("v ones");
+        match adapter_b.update_keys_values_native(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_shared_pool_generation_guard_rebuilds_views: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from update_keys_values_native: {e}"),
+        }
+        adapter_b
+            .eval_pending_pool_writes()
+            .expect("flush B writes");
+        assert_eq!(pool.generation(), 0);
+
+        // A exhausts the 3 remaining free blocks -> grows the shared pool.
+        adapter_a.reset_for_new_request(2).unwrap();
+        let allocated = adapter_a.allocate_suffix_blocks(40).unwrap();
+        assert_eq!(allocated, 5);
+        assert_eq!(pool.num_blocks(), 9, "pool must grow to 9 blocks");
+        assert_eq!(pool.generation(), 1);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 9);
+
+        // B writes 2 more tokens (V = 2.0). Its cached views are generation
+        // 0; the guard must rebuild them against the grown buffers.
+        adapter_b.record_tokens(&[11, 12]).unwrap();
+        let k2 = MxArray::from_bfloat16(&vec![0u16; 2 * 64], &[2, 1, 64]).expect("k2 zeros");
+        let v2 = MxArray::from_bfloat16(&vec![0x4000u16; 2 * 64], &[2, 1, 64]).expect("v2 twos");
+        match adapter_b.update_keys_values_native(0, &k2, &v2, 8) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_shared_pool_generation_guard_rebuilds_views: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from second update_keys_values_native: {e}"),
+        }
+        adapter_b
+            .eval_pending_pool_writes()
+            .expect("flush B writes");
+
+        let (_k_out, v_out) = match adapter_b.read_kv_range(0, 0, 10) {
+            Ok(t) => t,
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_shared_pool_generation_guard_rebuilds_views: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from read_kv_range: {e}"),
+        };
+        let v_f32 = v_out
+            .astype(DType::Float32)
+            .expect("astype f32 on V")
+            .reshape(&[10 * 64])
+            .expect("flatten V");
+        v_f32.eval();
+        for i in 0..(10 * 64) {
+            let token = i / 64;
+            let expected = if token < 8 { 1.0 } else { 2.0 };
+            let elem = v_f32
+                .item_at_float32(i)
+                .unwrap_or_else(|e| panic!("item_at_float32({i}): {e}"));
+            assert!(
+                (elem - expected).abs() < 0.01,
+                "V[{i}] = {elem}, expected {expected} at token {token} (stale pre-grow \
+                 views would leave post-grow tokens unwritten)"
             );
         }
     }
