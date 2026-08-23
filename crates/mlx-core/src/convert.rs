@@ -4262,14 +4262,15 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         HashMap::new();
     if !source_by_handle.is_empty() {
         for (dest_name, array) in converted_tensors.iter() {
-            if let Some(prov) = source_by_handle.get(&(array.as_raw_ptr() as usize)) {
+            if let Some(prov) = source_by_handle.get(&(array.as_raw_ptr() as usize))
+                && prov.matches(array)
+            {
                 dest_passthrough.insert(dest_name.clone(), prov.source.clone());
             }
         }
     }
-    // Release the pinned source handles before the streaming save drains
-    // `converted_tensors` — `dest_passthrough` carries only file locations, no
-    // arrays, so the keep-alive clones are no longer needed.
+    // `dest_passthrough` now carries every file location still needed, and the
+    // map holds no arrays, so this just releases the entries.
     drop(source_by_handle);
 
     let save_start = std::time::Instant::now();
@@ -6855,6 +6856,13 @@ const QUANTIZE_TILE_NUM_EXPERTS: i64 = 32;
 /// remainder (256 → 8 tiles of 32; 128 → 4; 64 → 2; 32 → 1).
 const QUANTIZE_TILE_THRESHOLD_NUM_EXPERTS: i64 = 32;
 
+/// Dense source bytes the quantize loop may retire between allocator flushes.
+///
+/// The every-50-tensors cadence alone is size-blind: fifty MoE expert stacks
+/// and fifty small projections differ by orders of magnitude, so it cannot
+/// bound the high-water mark. A byte budget can.
+const QUANTIZE_FLUSH_BYTE_BUDGET: usize = 1 << 30;
+
 /// Quantize a plain per-output-channel E4M3 weight, tiling large 3-D expert
 /// stacks along axis 0. This mirrors [`quantize_with_optional_tiling`]'s
 /// watchdog discipline: each expert tile is evaluated and synchronized before
@@ -8214,6 +8222,7 @@ fn quantize_weights_inner(
 
     let mut per_layer_overrides = preexisting_overrides;
     let mut count = 0;
+    let mut bytes_since_flush: usize = 0;
 
     for entry in &entries {
         let array = match weights.remove(&entry.key) {
@@ -8229,8 +8238,10 @@ fn quantize_weights_inner(
             continue;
         }
 
-        // Eval to materialize (prevents lazy graph OOM)
+        // Eval to materialize (prevents lazy graph OOM). This is also where an
+        // AWQ pre-scale graph gets executed, one tensor at a time.
         array.eval();
+        let source_bytes = array.nbytes();
 
         let (q_weight, q_scales, q_biases) =
             if entry.mode == crate::quant::fp8_weight::FP8_E4M3_MODE {
@@ -8256,6 +8267,19 @@ fn quantize_weights_inner(
                 )?
             };
 
+        // Materialize the triplet BEFORE releasing the dense source.
+        // `mlx_quantize` returns LAZY arrays whose graph still holds `array`
+        // alive, so storing them un-evaluated pins every dense input until the
+        // safetensors writer finally evaluates it. Fallible on purpose: the
+        // writer used to own this materialization and could report an OOM, so
+        // taking it over here must not swallow one.
+        let mut triplet: Vec<&MxArray> = vec![&q_weight, &q_scales];
+        if let Some(b) = &q_biases {
+            triplet.push(b);
+        }
+        MxArray::eval_arrays_with_context(&triplet, &format!("quantize '{}'", entry.key))?;
+        drop(array);
+
         let prefix = entry.key.strip_suffix(".weight").unwrap_or(&entry.key);
         weights.insert(format!("{}.weight", prefix), q_weight);
         weights.insert(format!("{}.scales", prefix), q_scales);
@@ -8278,9 +8302,11 @@ fn quantize_weights_inner(
         );
 
         count += 1;
+        bytes_since_flush += source_bytes;
 
-        if count % 50 == 0 {
+        if bytes_since_flush >= QUANTIZE_FLUSH_BYTE_BUDGET || count % 50 == 0 {
             crate::array::memory::synchronize_and_clear_cache();
+            bytes_since_flush = 0;
             info!("  Quantized {}/{} tensors...", count, entries.len());
         }
     }
@@ -8485,6 +8511,8 @@ pub(crate) fn reject_awq_for_prequantized_body(weights: &HashMap<String, MxArray
 /// Note: self_attn.o_proj and linear_attn.out_proj are NOT covered — their inputs
 /// come from attention/GDN computation, not from a norm layer. These tensors should
 /// be kept at bf16 or quantized without AWQ correction.
+///
+/// The rewritten tensors are left LAZY on return. See the tail of the function.
 pub(crate) fn apply_awq_prescaling(
     weights: &mut HashMap<String, MxArray>,
     imatrix: &crate::utils::imatrix::ImatrixData,
@@ -8652,10 +8680,13 @@ pub(crate) fn apply_awq_prescaling(
         }
     }
 
-    // Eval all modified weights to materialize
-    for w in weights.values() {
-        w.eval();
-    }
+    // No eval here on purpose. The rewritten tensors stay lazy, so a checkpoint
+    // that fits on disk does not have to fit in RAM as bf16 before quantization
+    // shrinks it. `quantize_weights_inner` materializes and drops one tensor at
+    // a time, and the safetensors writer does the same for the tensors it
+    // skips, so the pre-scale multiply runs there at a bounded peak.
+    // `awq_prescaling_survives_lazy_materialization` pins the emitted bytes
+    // against the eval-everything-first ordering.
 
     info!(
         "AWQ pre-scaling complete: modified {} weight tensors",
@@ -9187,6 +9218,355 @@ mod tests {
                 "layer 0 gate[{j}] × pre_ffn_norm[{j}] = {prod}, fold must be balanced"
             );
         }
+    }
+
+    /// Deterministic LCG — both arms of an A/B run must see bit-identical
+    /// inputs, and pulling in a RNG crate for that is not worth it.
+    fn awq_lcg(seed: u64, n: usize) -> Vec<f32> {
+        let mut s = seed | 1;
+        (0..n)
+            .map(|_| {
+                s = s
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                // 24 random bits → [-1.0, 1.0)
+                ((s >> 40) as f32 / (1u32 << 23) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    /// bf16 tensor of `shape` filled from `seed`. bf16 because the rounding it
+    /// applies is part of what must match between the two arms.
+    fn awq_bf16(seed: u64, shape: &[i64]) -> MxArray {
+        let numel: usize = shape.iter().product::<i64>() as usize;
+        MxArray::from_float32(&awq_lcg(seed, numel), shape)
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("astype bfloat16")
+    }
+
+    /// Strictly positive importance vector (AWQ clamps at 1e-8 and raises to
+    /// `ratio`, so a zero would flatten the group and hide ordering bugs).
+    fn awq_importance(seed: u64, n: usize) -> Vec<f32> {
+        awq_lcg(seed, n)
+            .into_iter()
+            .map(|v| v.abs() + 0.25)
+            .collect()
+    }
+
+    /// Exact byte image of a tensor, dtype-faithful.
+    ///
+    /// Packed `Uint32` weights MUST go through `to_uint32`: routing them
+    /// through f32 loses every value above 2^24, which would let a real
+    /// divergence in the packed nibbles compare equal.
+    fn awq_tensor_bytes(array: &MxArray) -> Vec<u8> {
+        array.eval();
+        match array.dtype().expect("dtype") {
+            DType::Uint32 => array
+                .to_uint32()
+                .expect("to_uint32")
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            DType::Float16 | DType::BFloat16 => array
+                .to_uint16_native()
+                .expect("to_uint16_native")
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            DType::Int32 => array
+                .to_int32()
+                .expect("to_int32")
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect(),
+            // f32, u8 and i8 all round-trip through f32 without loss.
+            _ => array
+                .to_float32()
+                .expect("to_float32")
+                .iter()
+                .flat_map(|v| v.to_bits().to_le_bytes())
+                .collect(),
+        }
+    }
+
+    fn assert_weight_maps_bitwise_equal(
+        left: &HashMap<String, MxArray>,
+        right: &HashMap<String, MxArray>,
+    ) {
+        let mut left_keys: Vec<&String> = left.keys().collect();
+        let mut right_keys: Vec<&String> = right.keys().collect();
+        left_keys.sort();
+        right_keys.sort();
+        assert_eq!(left_keys, right_keys, "key sets must match");
+
+        for key in left_keys {
+            let (a, b) = (&left[key], &right[key]);
+            assert_eq!(
+                a.dtype().expect("dtype"),
+                b.dtype().expect("dtype"),
+                "dtype differs for {key}"
+            );
+            let a_shape = a.shape().expect("shape");
+            let b_shape = b.shape().expect("shape");
+            let a_dims: &[i64] = a_shape.as_ref();
+            let b_dims: &[i64] = b_shape.as_ref();
+            assert_eq!(a_dims, b_dims, "shape differs for {key}");
+            assert_eq!(
+                awq_tensor_bytes(a),
+                awq_tensor_bytes(b),
+                "bytes differ for {key}"
+            );
+        }
+    }
+
+    /// Two-layer synthetic checkpoint that exercises every AWQ group:
+    /// layer 0 is a GatedDeltaNet layer (Group D) and layer 1 is a
+    /// full-attention layer (Group C); both carry an MLP (Groups A and B).
+    /// Shapes are quantizable at group_size=64 and include tensors AWQ must
+    /// leave alone (`o_proj`, `embed_tokens`) so an over-broad change is
+    /// caught too.
+    fn awq_fixture() -> (HashMap<String, MxArray>, crate::utils::imatrix::ImatrixData) {
+        use crate::utils::imatrix::ImatrixData;
+
+        const K: i64 = 128; // input features
+        const N: i64 = 64; // output features
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        let mut importance: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut seed = 1u64;
+        let mut next_seed = || {
+            seed += 1;
+            seed
+        };
+
+        // Layer 0 — GatedDeltaNet (Group D).
+        for key in [
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.layers.0.linear_attn.in_proj_z.weight",
+            "model.layers.0.linear_attn.in_proj_a.weight",
+            "model.layers.0.linear_attn.in_proj_b.weight",
+        ] {
+            weights.insert(key.into(), awq_bf16(next_seed(), &[N, K]));
+        }
+        // Group D derives its scale from qkv + z only.
+        for key in [
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.layers.0.linear_attn.in_proj_z.weight",
+        ] {
+            importance.insert(key.into(), awq_importance(next_seed(), K as usize));
+        }
+        weights.insert(
+            "model.layers.0.linear_attn.out_proj.weight".into(),
+            awq_bf16(next_seed(), &[K, N]),
+        );
+
+        // Layer 1 — full attention (Group C).
+        for key in [
+            "model.layers.1.self_attn.q_proj.weight",
+            "model.layers.1.self_attn.k_proj.weight",
+            "model.layers.1.self_attn.v_proj.weight",
+        ] {
+            weights.insert(key.into(), awq_bf16(next_seed(), &[N, K]));
+            importance.insert(key.into(), awq_importance(next_seed(), K as usize));
+        }
+        // o_proj reads attention output, not a norm — AWQ must not touch it,
+        // and no importance entry is registered for it.
+        weights.insert(
+            "model.layers.1.self_attn.o_proj.weight".into(),
+            awq_bf16(next_seed(), &[K, N]),
+        );
+
+        // Shared per-layer structure: MLP (Groups A + B) and both norms.
+        for layer in 0..2 {
+            weights.insert(
+                format!("model.layers.{layer}.mlp.gate_proj.weight"),
+                awq_bf16(next_seed(), &[N, K]),
+            );
+            weights.insert(
+                format!("model.layers.{layer}.mlp.up_proj.weight"),
+                awq_bf16(next_seed(), &[N, K]),
+            );
+            // down_proj is [out=K, in=N]; Group B's scale length is its INPUT
+            // dim, which is also up_proj's output dim — that is the coupling
+            // the two groups share through up_proj.
+            weights.insert(
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+                awq_bf16(next_seed(), &[K, N]),
+            );
+            importance.insert(
+                format!("model.layers.{layer}.mlp.gate_proj.weight"),
+                awq_importance(next_seed(), K as usize),
+            );
+            importance.insert(
+                format!("model.layers.{layer}.mlp.up_proj.weight"),
+                awq_importance(next_seed(), K as usize),
+            );
+            importance.insert(
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+                awq_importance(next_seed(), N as usize),
+            );
+            weights.insert(
+                format!("model.layers.{layer}.input_layernorm.weight"),
+                awq_bf16(next_seed(), &[K]),
+            );
+            weights.insert(
+                format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                awq_bf16(next_seed(), &[K]),
+            );
+        }
+
+        // Never AWQ-scaled, never quantized at embed_quantizable=false.
+        weights.insert(
+            "model.embed_tokens.weight".into(),
+            awq_bf16(next_seed(), &[256, K]),
+        );
+
+        (
+            weights,
+            ImatrixData {
+                importance,
+                chunk_count: 1,
+                chunk_size: 1,
+            },
+        )
+    }
+
+    /// `apply_awq_prescaling` leaves its rewritten tensors lazy, so the
+    /// pre-scale multiply is executed inside `quantize_weights_inner` instead
+    /// of before it. Moving where MLX runs a graph must not move a bit: one arm
+    /// materializes the whole map first (what this pass used to do), the other
+    /// does not, and the packed weights, scales, biases and per-layer overrides
+    /// must agree exactly. This is a guard on MLX's evaluation order, not on
+    /// our own call sites — it holds today with or without the quantize loop's
+    /// `array.eval()`.
+    #[test]
+    fn awq_prescaling_survives_lazy_materialization() {
+        let (mut eager, imatrix) = awq_fixture();
+        let (mut lazy, _) = awq_fixture();
+        let num_layers = infer_num_layers_from_weights(&eager);
+        assert_eq!(num_layers, 2, "fixture must present two layers");
+
+        let eager_modified =
+            apply_awq_prescaling(&mut eager, &imatrix, 0.5, num_layers).expect("eager AWQ");
+        let lazy_modified =
+            apply_awq_prescaling(&mut lazy, &imatrix, 0.5, num_layers).expect("lazy AWQ");
+
+        // Group A (gate+up+norm) ×2, Group B (down+up) ×2, Group C (q+k+v+norm),
+        // Group D (qkv+z+a+b+norm) = 6 + 4 + 4 + 5 = 19.
+        assert_eq!(
+            eager_modified, 19,
+            "fixture must exercise all four AWQ groups"
+        );
+        assert_eq!(lazy_modified, 19, "both arms rewrite the same tensors");
+
+        // The arm the quantizer must reproduce: everything resident up front,
+        // which is what this pass used to do for the whole map.
+        for w in eager.values() {
+            w.eval();
+        }
+
+        let eager_overrides =
+            quantize_weights_pub(&mut eager, 4, 64, "affine", false).expect("eager quantize");
+        let lazy_overrides =
+            quantize_weights_pub(&mut lazy, 4, 64, "affine", false).expect("lazy quantize");
+
+        assert_eq!(
+            eager_overrides, lazy_overrides,
+            "per-layer quantization overrides must match"
+        );
+        assert!(
+            eager
+                .keys()
+                .any(|k| k == "model.layers.1.self_attn.q_proj.scales"),
+            "fixture must actually reach the quantizer"
+        );
+        assert!(
+            eager
+                .get("model.embed_tokens.weight")
+                .map(|a| a.dtype().expect("dtype") == DType::BFloat16)
+                .unwrap_or(false),
+            "embed_tokens must stay dense bf16 at embed_quantizable=false"
+        );
+        assert_weight_maps_bitwise_equal(&eager, &lazy);
+    }
+
+    /// The quantized triplet must not keep its dense bf16 input alive.
+    ///
+    /// `mlx_quantize` returns lazy arrays whose graph references the source
+    /// weight; if they are stored un-evaluated, every dense input stays
+    /// resident until the safetensors writer finally evaluates it — the whole
+    /// checkpoint at once, which is the OOM this change exists to fix. Measured
+    /// through MLX's own allocator rather than RSS so page-cache noise cannot
+    /// mask it.
+    #[test]
+    fn quantize_releases_dense_sources_instead_of_pinning_them() {
+        use crate::array::memory::{get_active_memory, synchronize_and_clear_cache};
+
+        // 24 × [1024, 4096] bf16 = 8 MiB each, 192 MiB dense in total.
+        // `get_active_memory` is process-wide, so this measurement depends on
+        // `RUST_TEST_THREADS = "1"` in `.cargo/config.toml` — other tests in
+        // this binary do allocate tens of MB.
+        const TENSORS: usize = 24;
+        const ROWS: i64 = 1024;
+        const COLS: i64 = 4096;
+        let total_dense = (ROWS * COLS) as f64 * 2.0 * TENSORS as f64;
+
+        synchronize_and_clear_cache();
+        let baseline = get_active_memory();
+
+        // One filler buffer reused for every tensor: `from_float32` copies into
+        // a fresh MLX allocation each time, so the tensors are still distinct
+        // buffers — this only avoids regenerating 100M pseudo-random floats.
+        let filler = vec![0.125f32; (ROWS * COLS) as usize];
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        for i in 0..TENSORS {
+            let array = MxArray::from_float32(&filler, &[ROWS, COLS])
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("astype bfloat16");
+            array.eval();
+            weights.insert(format!("model.layers.{i}.self_attn.q_proj.weight"), array);
+        }
+        synchronize_and_clear_cache();
+        let with_dense = get_active_memory();
+
+        // Hosts whose MLX build reports no allocator statistics (the accessor
+        // returns 0 on a caught exception) cannot support this assertion.
+        // Skip rather than fail — the bitwise tests above still cover
+        // correctness.
+        if with_dense - baseline < total_dense * 0.5 {
+            eprintln!(
+                "skipping: MLX allocator stats unusable (baseline={baseline}, with_dense={with_dense})"
+            );
+            return;
+        }
+
+        quantize_weights_pub(&mut weights, 4, 64, "affine", false).expect("quantize");
+        synchronize_and_clear_cache();
+        let after = get_active_memory();
+
+        // A quantize that emitted nothing would also free the sources, and
+        // would pass the assertion below for the wrong reason.
+        assert_eq!(
+            weights.keys().filter(|k| k.ends_with(".scales")).count(),
+            TENSORS,
+            "every source must have been quantized"
+        );
+
+        // 4-bit affine output is ~25% of the bf16 input plus scales/biases,
+        // ~28% all in. Above half the dense footprint means the sources are
+        // still pinned; below a sixth means the outputs went missing too.
+        assert!(
+            after - baseline < total_dense * 0.5,
+            "dense bf16 sources still resident after quantization: \
+             baseline={baseline}, with_dense={with_dense}, after={after}, dense={total_dense}"
+        );
+        assert!(
+            after - baseline > total_dense * 0.15,
+            "quantized outputs are not resident either: \
+             baseline={baseline}, with_dense={with_dense}, after={after}, dense={total_dense}"
+        );
     }
 
     /// Registry-consistency gate: for the exhaustive set of supported
