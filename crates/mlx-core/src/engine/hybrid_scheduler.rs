@@ -2341,7 +2341,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     let reservation_blocks = turn.block_reservation_total;
                     self.fail_preempted(
                         turn,
-                        Self::context_length_exceeded(reservation_blocks, total_blocks).reason,
+                        Self::context_length_exceeded(reservation_blocks, total_blocks)
+                            .reason
+                            .clone(),
                     );
                     return;
                 }

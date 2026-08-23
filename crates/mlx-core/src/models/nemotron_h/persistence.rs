@@ -1324,7 +1324,8 @@ mod tests {
             let err = load_inner(dir.to_str().unwrap())
                 .err()
                 .unwrap_or_else(|| panic!("{tag}: load_inner must FAIL on this checkpoint"))
-                .reason;
+                .reason
+                .clone();
             let _ = fs::remove_dir_all(&dir);
             err
         };
@@ -1825,7 +1826,7 @@ mod tests {
             per_layer.insert(format!("layers.7.mixer.{proj}"), mxfp8);
             let err = reject_legacy_mxfp8_mamba(&per_layer)
                 .expect_err("an mxfp8 mamba projection must be rejected");
-            let msg = err.reason;
+            let msg = err.reason.clone();
             assert!(msg.contains(&format!("layers.7.mixer.{proj}")), "{msg}");
             assert!(msg.contains("mxfp8"), "{msg}");
             assert!(msg.contains("mlx convert -m nemotron_h"), "{msg}");
@@ -1875,7 +1876,8 @@ mod tests {
         );
         let msg = require_affine_sidecars(&legacy, prefix)
             .expect_err("Uint8 scales are the mxfp8 payload")
-            .reason;
+            .reason
+            .clone();
         assert!(msg.contains("Uint8"), "{msg}");
         assert!(msg.contains("mlx convert -m nemotron_h"), "{msg}");
 
@@ -1884,7 +1886,8 @@ mod tests {
         no_biases.insert(format!("{prefix}.scales"), f_scales.clone());
         let msg = require_affine_sidecars(&no_biases, prefix)
             .expect_err("a missing .biases sidecar must be rejected")
-            .reason;
+            .reason
+            .clone();
         assert!(msg.contains(".biases"), "{msg}");
         assert!(msg.contains("mlx convert -m nemotron_h"), "{msg}");
 
@@ -1900,7 +1903,8 @@ mod tests {
         );
         let msg = require_affine_sidecars(&skewed, prefix)
             .expect_err("a shape-skewed .biases must be rejected")
-            .reason;
+            .reason
+            .clone();
         assert!(msg.contains("must match"), "{msg}");
     }
 
@@ -1927,7 +1931,8 @@ mod tests {
         );
         let msg = apply_nvfp4(&params)
             .expect_err("a BF16 router bias must be rejected")
-            .reason;
+            .reason
+            .clone();
         assert!(msg.contains("e_score_correction_bias"), "{msg}");
         assert!(msg.contains("BF16"), "{msg}");
         assert!(msg.contains("mlx convert -m nemotron_h"), "{msg}");
@@ -1966,7 +1971,8 @@ mod tests {
         let quant_cfg = select_quantization_block(&raw).unwrap();
         let msg = parse_nemotron_quant_settings(quant_cfg)
             .expect_err("input_amax on nvfp4 must be rejected")
-            .reason;
+            .reason
+            .clone();
         assert!(msg.contains("input_amax"), "{msg}");
 
         assert!(admits_static_fp8_activation(PerLayerMode::Affine, 8, 32));

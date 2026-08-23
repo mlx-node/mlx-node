@@ -66,7 +66,7 @@ pub(crate) struct PleComponents {
     /// Embedding table: [vocab_size_per_layer_input, num_layers * ple_dim]
     pub embed_tokens_per_layer: Embedding,
     /// Projection: [hidden_size, num_layers * ple_dim]
-    pub per_layer_model_projection: Linear,
+    pub per_layer_model_projection: LinearProj,
     /// Norm applied per ple_dim slice: weight shape [ple_dim]
     pub per_layer_projection_norm: RMSNorm,
     /// Scale factor: 2.0^(-0.5) = 1/sqrt(2) for per_layer_input_scale
@@ -831,7 +831,7 @@ impl SpecPagedCache for Gemma4SpecPagedCache<'_> {
         })?;
         self.0
             .settle_grouped_kv_step_at(seq_id, committed)
-            .map_err(|error| error.reason)
+            .map_err(|error| error.reason.clone())
     }
 
     fn settle_captures_durable_state(&self) -> bool {
@@ -2268,11 +2268,11 @@ impl Gemma4Inner {
                 let total_ple_dim = (num_layers as i32) * ple_dim;
                 Some(PleComponents {
                     embed_tokens_per_layer: Embedding::new(vocab_ple as u32, total_ple_dim as u32)?,
-                    per_layer_model_projection: Linear::new(
+                    per_layer_model_projection: LinearProj::Standard(Linear::new(
                         hidden_size,
                         total_ple_dim as u32,
                         Some(false),
-                    )?,
+                    )?),
                     per_layer_projection_norm: RMSNorm::new(
                         ple_dim as u32,
                         Some(config.rms_norm_eps),

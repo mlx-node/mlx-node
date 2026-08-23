@@ -3862,7 +3862,11 @@ mod scheduler_tests {
         fn send(&self, chunk: Result<ChatStreamChunk>) {
             match chunk {
                 Ok(chunk) => self.chunks.lock().expect("chunks").push(chunk),
-                Err(error) => self.errors.lock().expect("errors").push(error.reason),
+                Err(error) => self
+                    .errors
+                    .lock()
+                    .expect("errors")
+                    .push(error.reason.clone()),
             }
         }
     }
