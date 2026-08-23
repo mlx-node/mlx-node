@@ -49,11 +49,12 @@ from the max — and a dynamic pool adds a
 The agent override manager (`packages/lm/src/models/paged-config-override.ts`)
 writes `paged_cache_initial_memory_mb = 2048` into the cloned config for
 `qwen3_5` / `qwen3_5_moe`, overridable with `MLX_PAGED_CACHE_INITIAL_MB`, and
-clamped to the resolved max so it never exceeds the pool ceiling. Other
-families are not given the field — their loaders have no initial knob and must
-not receive one. Checkpoints resolved WITHOUT the manager (a library caller
-loading the path directly) keep the historical behavior: unset initial =
-static full-size pool.
+clamped to the resolved max so it never exceeds the pool ceiling. The override
+manager normalizes a larger configured initial down to the default; raise it
+via `MLX_PAGED_CACHE_INITIAL_MB`. Other families are not given the field —
+their loaders have no initial knob and must not receive one. Checkpoints
+resolved WITHOUT the manager (a library caller loading the path directly)
+keep the historical behavior: unset initial = static full-size pool.
 
 **Transient double memory during grow.** `LayerKVPool::grow_to` allocates the
 new generation's per-layer Metal buffers wholesale and swaps them in; the old
