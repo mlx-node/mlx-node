@@ -157,6 +157,13 @@ pub struct Qwen3_5Config {
     /// unavailable.
     #[serde(default)]
     pub n_mtp_layers: i32,
+
+    /// Internal layout marker written by native Qwen3.5/3.8 GGUF conversion.
+    /// `Some("tiled")` keeps llama.cpp's value-head order and lets GDN map
+    /// value head h to key head h % Hk without permuting packed weights.
+    #[serde(default)]
+    #[napi(ts_type = "string | undefined")]
+    pub qwen35_gguf_gdn_layout: Option<String>,
 }
 
 fn default_linear_num_value_heads() -> i32 {
@@ -293,6 +300,7 @@ mod tests {
     #[test]
     fn gdn_state_bytes_follow_the_real_conv_and_recurrent_shapes() {
         let config = Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
             vocab_size: 32,
             hidden_size: 16,
             num_layers: 4,

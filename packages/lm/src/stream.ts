@@ -672,7 +672,12 @@ export function makeStreamingModel<
       // concrete subclass declared per family supplies the prototype and
       // `instanceof ConcreteSubclass` holds.
       Object.setPrototypeOf(instance, this.prototype);
-      if (recordPath) rememberModelPath(instance, modelPath);
+      if (recordPath) {
+        const resolvedAssetsPath = (
+          instance as { modelAssetsPath?: () => string }
+        ).modelAssetsPath?.();
+        rememberModelPath(instance, resolvedAssetsPath ?? modelPath);
+      }
       return instance as unknown as StreamingModel;
     }
 

@@ -2771,6 +2771,7 @@ mod tests {
 
     fn tiny_config() -> Qwen3_5Config {
         Qwen3_5Config {
+            qwen35_gguf_gdn_layout: None,
             vocab_size: 1024,
             hidden_size: 64,
             num_layers: 8,
@@ -2837,6 +2838,7 @@ mod tests {
             use_block_paged_cache: None,
             persist_paged_cache: None,
             n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
         }
     }
 

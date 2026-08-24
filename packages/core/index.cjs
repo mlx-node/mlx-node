@@ -807,6 +807,7 @@ module.exports.formatDocument = nativeBinding.formatDocument;
 module.exports.gdnPrefixCheckpointLimit = nativeBinding.gdnPrefixCheckpointLimit;
 module.exports.getMemorySnapshot = nativeBinding.getMemorySnapshot;
 module.exports.getProfilingData = nativeBinding.getProfilingData;
+module.exports.ggufArchitecture = nativeBinding.ggufArchitecture;
 module.exports.isProfilingEnabled = nativeBinding.isProfilingEnabled;
 module.exports.memoryStats = nativeBinding.memoryStats;
 module.exports.MultimodalContentOrder = nativeBinding.MultimodalContentOrder;

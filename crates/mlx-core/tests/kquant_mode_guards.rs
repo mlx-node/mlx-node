@@ -77,7 +77,16 @@ struct KQuant {
     biases_cols: i64,
 }
 
-const KQUANTS: [KQuant; 3] = [
+const KQUANTS: [KQuant; 7] = [
+    KQuant {
+        mode: "q3k",
+        bits: 3,
+        group_size: 16,
+        scales_signed: true,
+        weight_cols: 24,
+        scales_cols: 16,
+        biases_cols: 1,
+    },
     KQuant {
         mode: "q6k",
         bits: 6,
@@ -104,6 +113,33 @@ const KQUANTS: [KQuant; 3] = [
         weight_cols: 40,
         scales_cols: 16,
         biases_cols: 2,
+    },
+    KQuant {
+        mode: "iq4nl",
+        bits: 4,
+        group_size: 32,
+        scales_signed: true,
+        weight_cols: 32,
+        scales_cols: 8,
+        biases_cols: 8,
+    },
+    KQuant {
+        mode: "iq4xs",
+        bits: 4,
+        group_size: 32,
+        scales_signed: true,
+        weight_cols: 32,
+        scales_cols: 8,
+        biases_cols: 1,
+    },
+    KQuant {
+        mode: "iq3s",
+        bits: 8,
+        group_size: 32,
+        scales_signed: true,
+        weight_cols: 64,
+        scales_cols: 8,
+        biases_cols: 1,
     },
 ];
 
@@ -487,9 +523,9 @@ const HALF_SCALES: [u16; 6] = [0x3000, 0x2C00, 0x3400, 0x2E66, 0x3155, 0x2800];
 /// `(&[N], K)`; for a non-transposed one the packed axis is the output dim, so
 /// it is `(&[K], N)`. An expert stack prepends to `leading`.
 ///
-/// All three arrays hold a fixed number of entries per 256-value super-block,
-/// so the `KQUANTS` column counts — which are stated for one super-block —
-/// scale linearly.
+/// All three arrays hold a fixed number of entries per 256 decoded values, so
+/// the `KQUANTS` column counts scale linearly. IQ4_NL stores eight independent
+/// 32-value source blocks in that span, hence its eight bias entries.
 fn filled_kquant_weights(kq: &KQuant, leading: &[i64], packed: i64) -> Weights {
     assert_eq!(packed % K, 0, "packed dim must be whole super-blocks");
     let rows: i64 = leading.iter().product();
@@ -509,7 +545,7 @@ fn filled_kquant_weights(kq: &KQuant, leading: &[i64], packed: i64) -> Weights {
     let weight: Vec<u32> = (0..rows * weight_cols).map(|_| lcg(&mut st)).collect();
     let scales_len = (rows * scales_cols) as usize;
     let scales = if kq.scales_signed {
-        // q6k sub-scales are signed.
+        // Symmetric K-quants and IQ modes use signed sub-scales.
         let v: Vec<i8> = (0..scales_len)
             .map(|_| (lcg(&mut st) % 17) as i8 - 8)
             .collect();

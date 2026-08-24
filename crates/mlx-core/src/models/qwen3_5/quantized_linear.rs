@@ -479,10 +479,10 @@ pub fn try_build_kquant_quantized_linear(
 
 /// Linear layer backed by a serialized quantized weight format.
 ///
-/// Affine/MX/NVFP modes use packed Uint32 weights and MLX quantized_matmul;
-/// sym8 uses dedicated int8 kernels. Plain `fp8_e4m3` is the intentionally
-/// non-native exception: it retains raw Uint8 checkpoint storage, reconstructs
-/// BF16 once at load, and uses ordinary A16 matmul.
+/// Affine, MX/NVFP, and native GGUF K/IQ modes use packed weights and MLX
+/// quantized_matmul; sym8 uses dedicated int8 kernels. Plain `fp8_e4m3` is the
+/// intentionally non-native exception: it retains raw Uint8 checkpoint
+/// storage, reconstructs BF16 once at load, and uses ordinary A16 matmul.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 enum QuantizedOutputLayout {
     #[default]
@@ -527,11 +527,11 @@ fn q_gate_block_permutation(num_heads: i32, head_dim: i32, output_rows: i64) -> 
 pub struct QuantizedLinear {
     weight: MxArray,         // Packed uint32 quantized weights [out, in_packed]
     scales: MxArray,         // Quantization scales
-    biases: Option<MxArray>, // Quantization biases (for affine mode)
+    biases: Option<MxArray>, // Affine biases or native K/IQ floating sidecars
     bias: Option<MxArray>,   // Linear bias (additive)
     group_size: i32,
     bits: i32,
-    mode: String, // "affine", "mxfp8", "mxfp4", "nvfp4", "fp8_e4m3", or "sym8"
+    mode: String, // affine, MX/NVFP, native GGUF K/IQ, fp8_e4m3, or sym8
     // Reconstructed BF16 `[N,K]` weight for the plain E4M3 correctness
     // fallback. `Some` iff mode == fp8_e4m3; activations remain A16.
     fp8_dequant_weight: Option<MxArray>,
@@ -680,15 +680,18 @@ impl QuantizedLinear {
         }
     }
 
-    /// Reorder an affine q/gate projection's output rows from checkpoint order
+    /// Reorder a packed q/gate projection's output rows from checkpoint order
     /// `[Q_h0,G_h0,Q_h1,G_h1,...]` to `[Q_all_heads,G_all_heads]`.
     ///
     /// All row-coupled operands are materialized together before replacing the
-    /// stored arrays. Once this returns `true`, the original-order arrays are
-    /// no longer retained by the projection. Non-affine or incompatible direct
-    /// constructor inputs stay untouched and return `false` so attention keeps
-    /// using its native per-head split.
-    pub(crate) fn finalize_affine_q_gate_block(
+    /// stored arrays. Affine and every native GGUF K/IQ mode are row-coupled:
+    /// permuting axis 0 of weight/scales/quantization-bias sidecars preserves
+    /// the packed code stream and never dequantizes it. Once this returns
+    /// `true`, the original-order arrays are no longer retained by the
+    /// projection. Other modes or incompatible direct-constructor inputs stay
+    /// untouched and return `false` so attention keeps its native per-head
+    /// split.
+    pub(crate) fn finalize_packed_q_gate_block(
         &mut self,
         num_heads: i32,
         head_dim: i32,
@@ -696,7 +699,10 @@ impl QuantizedLinear {
         if self.output_layout == QuantizedOutputLayout::QGateBlock {
             return Ok(true);
         }
-        if self.mode != DEFAULT_QUANT_MODE {
+        let mode = crate::models::quant_dispatch::parse_mode_str(Some(&self.mode));
+        let row_permutable = self.mode == DEFAULT_QUANT_MODE
+            || mode.is_some_and(crate::models::quant_dispatch::is_kquant_mode);
+        if !row_permutable {
             return Ok(false);
         }
 
@@ -719,7 +725,7 @@ impl QuantizedLinear {
             || quant_biases_shape.len() != 2
             || weight_shape[0] != expected_rows
             || scales_shape[0] != expected_rows
-            || quant_biases_shape != scales_shape
+            || quant_biases_shape[0] != expected_rows
             || !additive_bias_compatible
         {
             return Ok(false);
@@ -977,8 +983,8 @@ impl QuantizedLinear {
         self.biases.as_ref()
     }
 
-    /// Quantization mode discriminator string ("affine", "mxfp8", "mxfp4",
-    /// "nvfp4", "fp8_e4m3", or "sym8").
+    /// Quantization mode discriminator string (affine, MX/NVFP, native GGUF
+    /// K/IQ, `fp8_e4m3`, or `sym8`).
     pub fn mode(&self) -> &str {
         &self.mode
     }
@@ -1183,7 +1189,7 @@ mod q_gate_block_tests {
             DEFAULT_QUANT_MODE.to_string(),
         );
 
-        assert!(linear.finalize_affine_q_gate_block(h, d).unwrap());
+        assert!(linear.finalize_packed_q_gate_block(h, d).unwrap());
         assert!(linear.has_q_gate_block_layout());
         assert_ne!(linear.weight.as_raw_ptr(), original_ptrs[0]);
         assert_ne!(linear.scales.as_raw_ptr(), original_ptrs[1]);
@@ -1230,8 +1236,83 @@ mod q_gate_block_tests {
         );
 
         assert!(
-            linear.finalize_affine_q_gate_block(h, d).unwrap(),
+            linear.finalize_packed_q_gate_block(h, d).unwrap(),
             "the finalized layout must be idempotent"
+        );
+    }
+
+    #[test]
+    fn q4k_q_gate_block_reorders_different_companion_widths_without_dequantizing() {
+        let h = 3;
+        let d = 2;
+        let rows = 12i64;
+        let permutation = q_gate_block_permutation(h, d, rows).unwrap();
+        let weight_values = (0..rows)
+            .flat_map(|row| [row as u32 * 100, row as u32 * 100 + 1])
+            .collect::<Vec<_>>();
+        let scales_values = (0..rows)
+            .flat_map(|row| {
+                [
+                    row as u8 * 4,
+                    row as u8 * 4 + 1,
+                    row as u8 * 4 + 2,
+                    row as u8 * 4 + 3,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let quant_bias_values = (0..rows)
+            .flat_map(|row| [0x3000u16 + row as u16, 0x3400u16 + row as u16])
+            .collect::<Vec<_>>();
+
+        let mut linear = QuantizedLinear::new(
+            MxArray::from_uint32(&weight_values, &[rows, 2]).unwrap(),
+            MxArray::from_uint8(&scales_values, &[rows, 4]).unwrap(),
+            Some(MxArray::from_float16(&quant_bias_values, &[rows, 2]).unwrap()),
+            None,
+            32,
+            4,
+            "q4k".to_string(),
+        );
+
+        assert!(linear.finalize_packed_q_gate_block(h, d).unwrap());
+        assert!(linear.has_q_gate_block_layout());
+        assert_eq!(linear.weight.dtype().unwrap(), crate::array::DType::Uint32);
+        assert_eq!(linear.scales.dtype().unwrap(), crate::array::DType::Uint8);
+        assert_eq!(
+            linear.biases.as_ref().unwrap().dtype().unwrap(),
+            crate::array::DType::Float16
+        );
+
+        let expected_weight = permutation
+            .iter()
+            .flat_map(|&row| [row as u32 * 100, row as u32 * 100 + 1])
+            .collect::<Vec<_>>();
+        let expected_scales = permutation
+            .iter()
+            .flat_map(|&row| {
+                [
+                    row as u8 * 4,
+                    row as u8 * 4 + 1,
+                    row as u8 * 4 + 2,
+                    row as u8 * 4 + 3,
+                ]
+            })
+            .collect::<Vec<_>>();
+        let expected_biases = permutation
+            .iter()
+            .flat_map(|&row| [0x3000u16 + row as u16, 0x3400u16 + row as u16])
+            .collect::<Vec<_>>();
+        assert_eq!(linear.weight.to_uint32().unwrap().to_vec(), expected_weight);
+        assert_eq!(linear.scales.to_uint8().unwrap().to_vec(), expected_scales);
+        assert_eq!(
+            linear
+                .biases
+                .as_ref()
+                .unwrap()
+                .to_uint16_native()
+                .unwrap()
+                .to_vec(),
+            expected_biases
         );
     }
 
@@ -1251,7 +1332,7 @@ mod q_gate_block_tests {
             MXFP4_MODE.to_string(),
         );
         let original = non_affine.weight.as_raw_ptr();
-        assert!(!non_affine.finalize_affine_q_gate_block(3, 2).unwrap());
+        assert!(!non_affine.finalize_packed_q_gate_block(3, 2).unwrap());
         assert!(!non_affine.has_q_gate_block_layout());
         assert_eq!(non_affine.weight.as_raw_ptr(), original);
 
@@ -1265,7 +1346,7 @@ mod q_gate_block_tests {
             DEFAULT_QUANT_MODE.to_string(),
         );
         let original = incompatible.weight.as_raw_ptr();
-        assert!(!incompatible.finalize_affine_q_gate_block(3, 2).unwrap());
+        assert!(!incompatible.finalize_packed_q_gate_block(3, 2).unwrap());
         assert!(!incompatible.has_q_gate_block_layout());
         assert_eq!(incompatible.weight.as_raw_ptr(), original);
     }

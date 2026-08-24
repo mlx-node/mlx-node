@@ -16,17 +16,22 @@
 ///
 /// Reference: https://github.com/ggml-org/ggml/blob/master/docs/gguf.md
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
+use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::models::quant_dispatch::SYMMETRIC_ZERO_POINT_KEY;
-use crate::utils::gguf_kquant::{KQuantArrays, KQuantFormat, KQuantRepacker, KQuantScales, QK_K};
+use crate::utils::gguf_kquant::{KQuantArrays, KQuantFormat, KQuantRepacker, KQuantScales};
 use crate::utils::safetensors::save_safetensors;
 
 // ── GGUF Constants ──────────────────────────────────────────────────────────
@@ -34,6 +39,21 @@ use crate::utils::safetensors::save_safetensors;
 const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
 const GGUF_VERSION_3: u32 = 3;
 const GGUF_DEFAULT_ALIGNMENT: u64 = 32;
+
+const GGUF_RUNTIME_ASSET_FILES: &[&str] = &[
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "vocab.json",
+    "merges.txt",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "chat_template.jinja",
+    "generation_config.json",
+    "preprocessor_config.json",
+    "video_preprocessor_config.json",
+    "processor_config.json",
+    "viterbi_calibration.json",
+];
 
 // ── GGUF Tensor Types ───────────────────────────────────────────────────────
 
@@ -45,9 +65,13 @@ pub enum GgufTensorType {
     Q4_0 = 2,
     Q4_1 = 3,
     Q8_0 = 8,
+    Q3K = 11,
     Q4K = 12,
     Q5K = 13,
     Q6K = 14,
+    IQ4NL = 20,
+    IQ3S = 21,
+    IQ4XS = 23,
     BF16 = 30,
 }
 
@@ -59,9 +83,13 @@ impl GgufTensorType {
             2 => Some(Self::Q4_0),
             3 => Some(Self::Q4_1),
             8 => Some(Self::Q8_0),
+            11 => Some(Self::Q3K),
             12 => Some(Self::Q4K),
             13 => Some(Self::Q5K),
             14 => Some(Self::Q6K),
+            20 => Some(Self::IQ4NL),
+            21 => Some(Self::IQ3S),
+            23 => Some(Self::IQ4XS),
             30 => Some(Self::BF16),
             _ => None,
         }
@@ -78,6 +106,7 @@ impl GgufTensorType {
             Self::Q4_0 => 18, // block size: 2 byte scale + 16 bytes (32 x 4-bit)
             Self::Q4_1 => 20, // 2 byte scale + 2 byte bias + 16 bytes
             Self::Q8_0 => 34, // 2 byte scale + 32 bytes
+            Self::Q3K | Self::IQ3S => 110,
             // f16 d + f16 dmin + 12 packed 6-bit (sub-scale, min) pairs +
             // 128 nibble bytes for 256 values.
             Self::Q4K => 144,
@@ -86,6 +115,8 @@ impl GgufTensorType {
             // 128 low-nibble bytes + 64 high-two-bit bytes + 16 signed
             // sub-scales + one f16 super-scale for 256 values.
             Self::Q6K => 210,
+            Self::IQ4NL => 18,
+            Self::IQ4XS => 136,
         }
     }
 
@@ -100,7 +131,8 @@ impl GgufTensorType {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
-            Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            Self::IQ4NL => 32,
+            Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ3S | Self::IQ4XS => 256,
         }
     }
 
@@ -129,6 +161,10 @@ impl GgufTensorType {
             Self::Q4K => Some(KQuantFormat::Q4K),
             Self::Q5K => Some(KQuantFormat::Q5K),
             Self::Q6K => Some(KQuantFormat::Q6K),
+            Self::Q3K => Some(KQuantFormat::Q3K),
+            Self::IQ4NL => Some(KQuantFormat::IQ4NL),
+            Self::IQ3S => Some(KQuantFormat::IQ3S),
+            Self::IQ4XS => Some(KQuantFormat::IQ4XS),
             Self::F32 | Self::F16 | Self::BF16 | Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => None,
         }
     }
@@ -140,9 +176,13 @@ impl GgufTensorType {
             Self::Q4_0 => "Q4_0",
             Self::Q4_1 => "Q4_1",
             Self::Q8_0 => "Q8_0",
+            Self::Q3K => "Q3_K",
             Self::Q4K => "Q4_K",
             Self::Q5K => "Q5_K",
             Self::Q6K => "Q6_K",
+            Self::IQ4NL => "IQ4_NL",
+            Self::IQ3S => "IQ3_S",
+            Self::IQ4XS => "IQ4_XS",
             Self::BF16 => "BF16",
         }
     }
@@ -563,6 +603,26 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
     })
 }
 
+/// Read the architecture declared by a GGUF header without loading any tensor
+/// payloads. This is the model-family detection seam for standalone GGUF files
+/// that intentionally do not ship a sibling `config.json`.
+#[napi]
+pub fn gguf_architecture(input_path: String) -> Result<String> {
+    let gguf = parse_gguf(&input_path)?;
+    let architecture = gguf
+        .metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::from_reason(format!(
+                "GGUF file '{}' does not declare a non-empty general.architecture",
+                input_path
+            ))
+        })?;
+    Ok(architecture.to_string())
+}
+
 fn align_offset(offset: u64, alignment: u64) -> u64 {
     let remainder = offset % alignment;
     if remainder == 0 {
@@ -742,7 +802,11 @@ pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
         | GgufTensorType::BF16
         | GgufTensorType::Q4K
         | GgufTensorType::Q5K
-        | GgufTensorType::Q6K => None,
+        | GgufTensorType::Q6K
+        | GgufTensorType::Q3K
+        | GgufTensorType::IQ4NL
+        | GgufTensorType::IQ4XS
+        | GgufTensorType::IQ3S => None,
     }
 }
 
@@ -981,11 +1045,12 @@ fn load_kquant_repack(
 ) -> Result<Vec<(String, MxArray)>> {
     let shape = tensor.mlx_shape();
     let last_dim = shape.last().copied().unwrap_or(0);
-    if last_dim <= 0 || !(last_dim as usize).is_multiple_of(QK_K) {
+    if last_dim <= 0 || !(last_dim as usize).is_multiple_of(format.block_size()) {
         return Err(Error::from_reason(format!(
-            "{} tensor '{}' has last dimension {last_dim}; expected a positive multiple of {QK_K}",
+            "{} tensor '{}' has last dimension {last_dim}; expected a positive multiple of {}",
             tensor.tensor_type.name(),
-            tensor.name
+            tensor.name,
+            format.block_size(),
         )));
     }
     let k = last_dim as usize;
@@ -1052,7 +1117,7 @@ fn load_kquant_repack(
 pub struct GgufLoadOptions {
     /// Log progress every 50 tensors.
     pub verbose: bool,
-    /// Repack ggml Q4_K / Q5_K / Q6_K blocks into MLX K-quant arrays.
+    /// Repack supported ggml K/IQ blocks into native MLX packed arrays.
     ///
     /// Off by default, which is the pre-K-quant behaviour: Q6_K is accepted
     /// only as the Gemma4 token embedding and dequantized to BF16, and Q4_K /
@@ -1177,7 +1242,7 @@ fn is_muse_glimmer_dflash_gguf(metadata: &HashMap<String, GgufMetaValue>) -> boo
 
 /// The three names a quantized tensor group ships under. Both GGUF quant
 /// importers emit the same trio: `load_quantized_tensor` (affine Q4_0/Q4_1/Q8_0)
-/// and `load_kquant_repack` (Q4_K/Q5_K/Q6_K) each write `{base}.weight` plus a
+/// and `load_kquant_repack` (supported K/IQ formats) each write `{base}.weight` plus a
 /// `{base}.scales` / `{base}.biases` sidecar pair. Loaders probe the sidecar by
 /// name to decide a tensor is quantized (e.g. `embed_tokens.scales`), so a
 /// rename that moves only `.weight` strands the sidecars under their old names
@@ -1412,8 +1477,279 @@ fn gguf_name_to_hf_for_metadata(
     } else if is_muse_glimmer_dflash_gguf(metadata) {
         muse_glimmer_dflash_name_to_hf(name)
     } else {
-        Some(gguf_name_to_hf(name))
+        Some(qwen35_name_to_hf(name, metadata))
     }
+}
+
+const QWEN35_INLINE_MTP_NEXTN_SUFFIXES: [&str; 4] = [
+    "nextn.eh_proj.weight",
+    "nextn.enorm.weight",
+    "nextn.hnorm.weight",
+    "nextn.shared_head_norm.weight",
+];
+const QWEN35_INLINE_MTP_INDEX_METADATA: &str = "mlx_node.internal.qwen35_inline_mtp_index";
+
+/// Return the final GGUF block index when a Qwen3.5 file carries llama.cpp's
+/// inline one-layer MTP layout.
+///
+/// The architecture metadata alone cannot distinguish a plain final decoder
+/// block from an inline draft block. The four `nextn.*` descriptors are the
+/// structural witness: when any one is present, require the complete group on
+/// `blk.(block_count - 1)` so config synthesis and tensor remapping cannot
+/// disagree about whether that block belongs to the main decoder or MTP.
+fn qwen35_inline_mtp_index(gguf: &GgufFile) -> Result<Option<u64>> {
+    let arch = gguf
+        .metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        .unwrap_or("");
+    if !matches!(arch, "qwen35" | "qwen35moe") {
+        return Ok(None);
+    }
+
+    let nextn_names = gguf
+        .tensors
+        .iter()
+        .map(|tensor| tensor.name.as_str())
+        .filter(|name| name.contains(".nextn."))
+        .collect::<Vec<_>>();
+    if nextn_names.is_empty() {
+        return Ok(None);
+    }
+
+    let block_count = gguf
+        .metadata
+        .get(&format!("{arch}.block_count"))
+        .and_then(GgufMetaValue::as_u64)
+        .ok_or_else(|| {
+            Error::from_reason(format!(
+                "Qwen3.5 GGUF carries inline nextn tensors but is missing a positive \
+                 '{arch}.block_count'"
+            ))
+        })?;
+    let mtp_index = block_count.checked_sub(1).ok_or_else(|| {
+        Error::from_reason(format!(
+            "Qwen3.5 GGUF carries inline nextn tensors but '{arch}.block_count' is zero"
+        ))
+    })?;
+    let prefix = format!("blk.{mtp_index}.");
+    if let Some(unexpected) = nextn_names.iter().find(|name| !name.starts_with(&prefix)) {
+        return Err(Error::from_reason(format!(
+            "Qwen3.5 inline MTP tensor '{unexpected}' is outside the final GGUF block \
+             '{prefix}*'"
+        )));
+    }
+
+    for suffix in QWEN35_INLINE_MTP_NEXTN_SUFFIXES {
+        let required = format!("{prefix}{suffix}");
+        if !gguf.tensors.iter().any(|tensor| tensor.name == required) {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 inline MTP block {mtp_index} is incomplete: missing tensor '{required}'"
+            )));
+        }
+    }
+    Ok(Some(mtp_index))
+}
+
+fn apply_qwen35_inline_mtp_config(config: &mut serde_json::Value, mtp_index: Option<u64>) {
+    let Some(mtp_index) = mtp_index else {
+        return;
+    };
+    // `block_count` includes the inline MTP block, while the runtime's main
+    // decoder length does not. Qwen3.5 checkpoints in the HF ecosystem spell
+    // the draft depth as `mtp_num_hidden_layers`; emit the accepted legacy
+    // alias too so synthesized standalone configs are portable to readers that
+    // use `num_nextn_predict_layers`.
+    config["num_hidden_layers"] = serde_json::json!(mtp_index);
+    config["mtp_num_hidden_layers"] = serde_json::json!(1);
+    config["num_nextn_predict_layers"] = serde_json::json!(1);
+    apply_qwen35_layer_types(config);
+}
+
+fn apply_qwen35_layer_types(config: &mut serde_json::Value) {
+    let Some(num_layers) = config
+        .get("num_hidden_layers")
+        .and_then(|value| value.as_u64())
+    else {
+        return;
+    };
+    let Some(interval) = config
+        .get("full_attention_interval")
+        .and_then(|value| value.as_u64())
+    else {
+        return;
+    };
+    let layer_types = (0..num_layers)
+        .map(|index| {
+            let full_attention = interval > 0 && (index + 1).is_multiple_of(interval);
+            serde_json::Value::String(
+                if full_attention {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }
+                .to_string(),
+            )
+        })
+        .collect();
+    config["layer_types"] = serde_json::Value::Array(layer_types);
+}
+
+fn apply_qwen35_gdn_config(
+    config: &mut serde_json::Value,
+    metadata: &HashMap<String, GgufMetaValue>,
+) {
+    let Some(arch) = metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        .filter(|arch| matches!(*arch, "qwen35" | "qwen35moe"))
+    else {
+        return;
+    };
+    let get = |suffix: &str| {
+        metadata
+            .get(&format!("{arch}.{suffix}"))
+            .and_then(GgufMetaValue::as_u64)
+    };
+    let mut insert = |key: &str, value: Option<u64>| {
+        if let Some(value) = value {
+            config[key] = serde_json::json!(value);
+        }
+    };
+
+    // llama.cpp's Qwen3.5 schema spells the GatedDeltaNet geometry in SSM
+    // terms. `time_step_rank` is the value-head count, `group_count` is the
+    // key-head count, and `state_size` is the per-head key/value width. The
+    // independent `inner_size` is validated before standalone conversion and
+    // provides a fallback for older writers that omit `time_step_rank`.
+    let state_size = get("ssm.state_size");
+    let value_heads = get("ssm.time_step_rank").or_else(|| {
+        let inner_size = get("ssm.inner_size")?;
+        let state_size = state_size.filter(|value| *value > 0)?;
+        inner_size
+            .is_multiple_of(state_size)
+            .then_some(inner_size / state_size)
+    });
+    insert("linear_num_value_heads", value_heads);
+    insert("linear_num_key_heads", get("ssm.group_count"));
+    insert("linear_key_head_dim", state_size);
+    insert("linear_value_head_dim", state_size);
+    insert("linear_conv_kernel_dim", get("ssm.conv_kernel"));
+    insert("full_attention_interval", get("full_attention_interval"));
+
+    if let (Some(rotary), Some(head_dim)) =
+        (get("rope.dimension_count"), get("attention.key_length"))
+        && rotary > 0
+        && head_dim > 0
+        && rotary <= head_dim
+        && let Some(value) = serde_json::Number::from_f64(rotary as f64 / head_dim as f64)
+    {
+        config["partial_rotary_factor"] = serde_json::Value::Number(value);
+    }
+    apply_qwen35_layer_types(config);
+}
+
+fn validate_qwen35_standalone_geometry(metadata: &HashMap<String, GgufMetaValue>) -> Result<()> {
+    let Some(arch) = metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        .filter(|arch| matches!(*arch, "qwen35" | "qwen35moe"))
+    else {
+        return Ok(());
+    };
+    let required = |suffix: &str| -> Result<u64> {
+        let key = format!("{arch}.{suffix}");
+        metadata
+            .get(&key)
+            .and_then(GgufMetaValue::as_u64)
+            .ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Standalone Qwen3.5 GGUF is missing required GDN geometry metadata '{key}'"
+                ))
+            })
+    };
+    let state_size = required("ssm.state_size")?;
+    let inner_size = required("ssm.inner_size")?;
+    let key_heads = required("ssm.group_count")?;
+    let conv_kernel = required("ssm.conv_kernel")?;
+    let full_attention_interval = required("full_attention_interval")?;
+    if state_size == 0
+        || inner_size == 0
+        || key_heads == 0
+        || conv_kernel == 0
+        || full_attention_interval == 0
+    {
+        return Err(Error::from_reason(format!(
+            "Standalone Qwen3.5 GGUF has non-positive GDN geometry: state_size={state_size}, \
+             inner_size={inner_size}, group_count={key_heads}, conv_kernel={conv_kernel}, \
+             full_attention_interval={full_attention_interval}"
+        )));
+    }
+    let declared_value_heads = metadata
+        .get(&format!("{arch}.ssm.time_step_rank"))
+        .and_then(GgufMetaValue::as_u64);
+    let value_heads = match declared_value_heads {
+        Some(value_heads) if value_heads > 0 => value_heads,
+        Some(_) => {
+            return Err(Error::from_reason(
+                "Standalone Qwen3.5 GGUF has non-positive GDN geometry: time_step_rank=0"
+                    .to_string(),
+            ));
+        }
+        None if inner_size.is_multiple_of(state_size) => inner_size / state_size,
+        None => {
+            return Err(Error::from_reason(format!(
+                "Standalone Qwen3.5 GGUF cannot derive the value-head count without \
+                 ssm.time_step_rank: ssm.inner_size ({inner_size}) is not divisible by \
+                 ssm.state_size ({state_size})"
+            )));
+        }
+    };
+    let expected_inner = state_size.checked_mul(value_heads).ok_or_else(|| {
+        Error::from_reason("Standalone Qwen3.5 GGUF GDN geometry overflows u64".to_string())
+    })?;
+    if inner_size != expected_inner {
+        return Err(Error::from_reason(format!(
+            "Standalone Qwen3.5 GGUF has inconsistent GDN geometry: ssm.inner_size={inner_size}, \
+             but ssm.state_size ({state_size}) * ssm.time_step_rank ({value_heads}) = \
+             {expected_inner}"
+        )));
+    }
+    Ok(())
+}
+
+/// Qwen3.5 GGUFs with inline MTP encode the draft layer as the final block and
+/// attach the four nextn projections/norms to that same block. HF/MLX stores
+/// those tensors under the mtp prefix, outside the main decoder layer list.
+fn qwen35_name_to_hf(name: &str, metadata: &HashMap<String, GgufMetaValue>) -> String {
+    // Conversion annotates the in-memory metadata only after validating all
+    // four `nextn.*` descriptors. A bare qwen35 block_count is insufficient:
+    // files without inline MTP use their final block as an ordinary decoder
+    // layer and must retain `model.layers.(N-1)` names.
+    let Some(mtp_index) = metadata
+        .get(QWEN35_INLINE_MTP_INDEX_METADATA)
+        .and_then(GgufMetaValue::as_u64)
+    else {
+        return gguf_name_to_hf(name);
+    };
+    let prefix = format!("blk.{mtp_index}.");
+    let Some(suffix) = name.strip_prefix(&prefix) else {
+        return gguf_name_to_hf(name);
+    };
+
+    for (gguf, mlx) in [
+        ("nextn.eh_proj", "mtp.fc"),
+        ("nextn.enorm", "mtp.pre_fc_norm_embedding"),
+        ("nextn.hnorm", "mtp.pre_fc_norm_hidden"),
+        ("nextn.shared_head_norm", "mtp.norm"),
+    ] {
+        if let Some(mapped) = rename_global_quant_group(suffix, gguf, mlx) {
+            return mapped;
+        }
+    }
+
+    let mapped = gguf_name_to_hf(name);
+    mapped.replacen(&format!("model.layers.{mtp_index}."), "mtp.layers.0.", 1)
 }
 
 /// Remap GGUF tensor name to HuggingFace-style name (standard LLM mapping)
@@ -1719,10 +2055,28 @@ fn reinterleave_cols(arr: &MxArray, n_heads: i64, head_dim: i64) -> Result<MxArr
 fn fixup_qwen35_linear_attn(
     weights: &mut HashMap<String, MxArray>,
     metadata: &HashMap<String, GgufMetaValue>,
+    preserve_tiled_layout: bool,
 ) -> Result<()> {
     // Detect Qwen3.5 by checking for linear attention weights
     let has_linear_attn = weights.keys().any(|k| k.contains("linear_attn."));
     if !has_linear_attn {
+        return Ok(());
+    }
+
+    if preserve_tiled_layout {
+        // The fused GDN runtime consumes llama.cpp's tiled value-head order
+        // directly. Only ssm_a's numeric representation differs: GGUF stores
+        // -exp(A_log), while the model keeps A_log and applies -exp at runtime.
+        let keys = weights
+            .keys()
+            .filter(|key| key.ends_with("linear_attn.A_log"))
+            .cloned()
+            .collect::<Vec<_>>();
+        for key in keys {
+            if let Some(arr) = weights.remove(&key) {
+                weights.insert(key, arr.negative()?.log()?);
+            }
+        }
         return Ok(());
     }
 
@@ -1981,9 +2335,18 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
             serde_json::Value::String(name.to_string()),
         );
     }
+    // llama.cpp architecture identifiers are not always the Hugging Face
+    // model_type values consumed by mlx-node's public loader. Keep the GGUF
+    // architecture for metadata lookups below, but write the canonical config
+    // family so a synthesized cache is independently loadable as a directory.
+    let model_type = match arch.as_str() {
+        "qwen35" => "qwen3_5",
+        "qwen35moe" => "qwen3_5_moe",
+        _ => arch.as_str(),
+    };
     config.insert(
         "model_type".to_string(),
-        serde_json::Value::String(arch.clone()),
+        serde_json::Value::String(model_type.to_string()),
     );
 
     // Map GGUF keys to HF config keys
@@ -2081,7 +2444,20 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
         );
     }
 
-    serde_json::Value::Object(config)
+    for (gguf_key, config_key) in [
+        ("tokenizer.ggml.bos_token_id", "bos_token_id"),
+        ("tokenizer.ggml.eos_token_id", "eos_token_id"),
+        ("tokenizer.ggml.padding_token_id", "pad_token_id"),
+    ] {
+        if let Some(value) = metadata.get(gguf_key).and_then(GgufMetaValue::as_u64) {
+            config.insert(config_key.to_string(), serde_json::json!(value));
+        }
+    }
+
+    let mut config = serde_json::Value::Object(config);
+    apply_qwen35_gdn_config(&mut config, metadata);
+
+    config
 }
 
 /// What a `quantization` config entry says about one tensor: the
@@ -2127,9 +2503,13 @@ impl SourceQuantProfile {
             // `load_kquant_repack` keeps ggml's geometry verbatim, so the
             // triple is read off the repacker format rather than restated
             // here; `k_quant_format` stays the only type -> format mapping.
-            GgufTensorType::Q4K | GgufTensorType::Q5K | GgufTensorType::Q6K => {
-                ty.k_quant_format().map(Self::k_quant)
-            }
+            GgufTensorType::Q3K
+            | GgufTensorType::Q4K
+            | GgufTensorType::Q5K
+            | GgufTensorType::Q6K
+            | GgufTensorType::IQ4NL
+            | GgufTensorType::IQ4XS
+            | GgufTensorType::IQ3S => ty.k_quant_format().map(Self::k_quant),
         }
     }
 
@@ -2198,7 +2578,7 @@ impl SourceQuantProfile {
 /// Describe tensors that were already quantized in the GGUF source.
 ///
 /// Q4_0/Q4_1/Q8_0 go through `load_quantized_tensor` and — when the K-quant
-/// import is on — Q4_K/Q5_K/Q6_K go through `load_kquant_repack`. Neither path
+/// import is on — supported K/IQ tensors go through `load_kquant_repack`. Neither path
 /// changes the source block geometry, so that geometry has to reach the output
 /// config even when the caller never asked for a `--quantize` pass; otherwise
 /// Gemma4 falls back to the runtime's generic group-size default (64) and
@@ -3022,12 +3402,18 @@ pub struct GgufConversionOptions {
     /// Forces `group_size = 32` for upgraded layers.
     pub quant_mxfp: Option<bool>,
 
-    /// Import ggml Q4_K / Q5_K / Q6_K tensors as MLX K-quant arrays instead of
+    /// Import supported ggml K/IQ tensors as native MLX packed arrays instead of
     /// rejecting them (default: false). The blocks are repacked, never
-    /// dequantized, so the output keeps the source file's weights and byte size.
+    /// dequantized, so the output preserves the source quantized values. IQ3_S
+    /// expands only its integer grid/sign encoding to signed 8-bit codes.
     /// With this off, Q6_K remains the Gemma4 token-embedding BF16 fallback and
     /// Q4_K / Q5_K are an error.
     pub import_k_quants: Option<bool>,
+
+    /// Preserve Qwen3.5/3.8 GGUF GDN tensors in llama.cpp's tiled value-head
+    /// order. The runtime consumes this layout directly and avoids any packed
+    /// weight permutation. Intended for native GGUF execution.
+    pub native_qwen35_layout: Option<bool>,
 }
 
 #[napi(object)]
@@ -3037,6 +3423,148 @@ pub struct GgufConversionResult {
     pub output_path: String,
     pub tensor_names: Vec<String>,
     pub source_format: String,
+}
+
+fn write_embedded_gpt2_tokenizer(
+    metadata: &HashMap<String, GgufMetaValue>,
+    output_dir: &Path,
+) -> Result<bool> {
+    let Some(GgufMetaValue::String(model)) = metadata.get("tokenizer.ggml.model") else {
+        return Ok(false);
+    };
+    if model != "gpt2" {
+        return Ok(false);
+    }
+    let Some(GgufMetaValue::ArrayString(tokens)) = metadata.get("tokenizer.ggml.tokens") else {
+        return Ok(false);
+    };
+    let Some(GgufMetaValue::ArrayI32(types)) = metadata.get("tokenizer.ggml.token_type") else {
+        return Ok(false);
+    };
+    let Some(GgufMetaValue::ArrayString(merges)) = metadata.get("tokenizer.ggml.merges") else {
+        return Ok(false);
+    };
+    if tokens.len() != types.len() {
+        return Err(Error::from_reason(format!(
+            "GGUF tokenizer token/type length mismatch: {} tokens vs {} types",
+            tokens.len(),
+            types.len()
+        )));
+    }
+
+    let mut vocab = serde_json::Map::new();
+    let mut added = Vec::new();
+    for (id, (token, token_type)) in tokens.iter().zip(types).enumerate() {
+        match *token_type {
+            // GGML_TOKEN_TYPE_NORMAL
+            1 => {
+                vocab.insert(token.clone(), serde_json::json!(id));
+            }
+            // GGML_TOKEN_TYPE_CONTROL / USER_DEFINED. These are the exact
+            // special-token rows represented by added_tokens in HF's Qwen
+            // tokenizer; UNUSED rows deliberately remain ID holes.
+            3 | 4 => added.push(serde_json::json!({
+                "id": id,
+                "content": token,
+                "single_word": false,
+                "lstrip": false,
+                "rstrip": false,
+                "normalized": false,
+                "special": true
+            })),
+            _ => {}
+        }
+    }
+
+    let tokenizer = serde_json::json!({
+        "version": "1.0",
+        "truncation": null,
+        "padding": null,
+        "added_tokens": added,
+        // GGUF's embedded GPT-2 vocabulary and merges operate on the original
+        // byte sequence. No standard metadata here declares Unicode
+        // normalization, so synthesizing NFC would change decomposed prompts.
+        "normalizer": null,
+        "pre_tokenizer": {
+            "type": "Sequence",
+            "pretokenizers": [
+                {
+                    "type": "Split",
+                    "pattern": {"Regex": "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+"},
+                    "behavior": "Isolated",
+                    "invert": false
+                },
+                {
+                    "type": "ByteLevel",
+                    "add_prefix_space": false,
+                    "trim_offsets": false,
+                    "use_regex": false
+                }
+            ]
+        },
+        "post_processor": {
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "trim_offsets": false,
+            "use_regex": false
+        },
+        "decoder": {
+            "type": "ByteLevel",
+            "add_prefix_space": false,
+            "trim_offsets": false,
+            "use_regex": false
+        },
+        "model": {
+            "type": "BPE",
+            "dropout": null,
+            "unk_token": null,
+            "continuing_subword_prefix": "",
+            "end_of_word_suffix": "",
+            "fuse_unk": false,
+            "byte_fallback": false,
+            "ignore_merges": false,
+            "vocab": vocab,
+            "merges": merges
+        }
+    });
+    let bytes = serde_json::to_vec(&tokenizer).map_err(|error| {
+        Error::from_reason(format!("Failed to serialize GGUF tokenizer: {error}"))
+    })?;
+    fs::write(output_dir.join("tokenizer.json"), bytes)
+        .map_err(|error| Error::from_reason(format!("Failed to write tokenizer.json: {error}")))?;
+
+    // A standalone GGUF has no Hugging Face sidecars. Preserve the embedded
+    // template and special-token spellings so the regular chat-session loader
+    // behaves exactly as it does for a downloaded tokenizer snapshot.
+    let mut tokenizer_config = serde_json::Map::new();
+    if let Some(GgufMetaValue::String(template)) = metadata.get("tokenizer.chat_template") {
+        tokenizer_config.insert("chat_template".into(), serde_json::json!(template));
+        fs::write(output_dir.join("chat_template.jinja"), template).map_err(|error| {
+            Error::from_reason(format!("Failed to write chat_template.jinja: {error}"))
+        })?;
+    }
+    for (metadata_key, config_key) in [
+        ("tokenizer.ggml.bos_token_id", "bos_token"),
+        ("tokenizer.ggml.eos_token_id", "eos_token"),
+        ("tokenizer.ggml.padding_token_id", "pad_token"),
+    ] {
+        if let Some(token) = metadata
+            .get(metadata_key)
+            .and_then(GgufMetaValue::as_u32)
+            .and_then(|id| tokens.get(id as usize))
+        {
+            tokenizer_config.insert(config_key.into(), serde_json::json!(token));
+        }
+    }
+    let config_bytes = serde_json::to_vec(&tokenizer_config).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to serialize GGUF tokenizer config: {error}"
+        ))
+    })?;
+    fs::write(output_dir.join("tokenizer_config.json"), config_bytes).map_err(|error| {
+        Error::from_reason(format!("Failed to write tokenizer_config.json: {error}"))
+    })?;
+    Ok(true)
 }
 
 fn apply_gguf_awq_prescaling(
@@ -3126,7 +3654,7 @@ pub async fn convert_gguf_to_safetensors(
 
     // Parse GGUF header and metadata
     info!("Parsing GGUF file: {}", input_path.display());
-    let gguf = parse_gguf(&input_path)?;
+    let mut gguf = parse_gguf(&input_path)?;
 
     info!(
         "GGUF v{}: {} tensors, {} metadata keys",
@@ -3154,6 +3682,21 @@ pub async fn convert_gguf_to_safetensors(
     }
 
     let import_k_quants = options.import_k_quants.unwrap_or(false);
+    let native_qwen35_layout = options.native_qwen35_layout.unwrap_or(false);
+    // Validate the descriptor-level inline-MTP witness before any destination
+    // file can be created or truncated. The resulting index is also the exact
+    // main-decoder length to write when config.json must be synthesized.
+    let qwen35_inline_mtp_index = qwen35_inline_mtp_index(&gguf)?;
+    if let Some(index) = qwen35_inline_mtp_index {
+        // Keep tensor-name mapping and config synthesis on one validated
+        // witness without threading a second context argument through every
+        // descriptor-only mapping consumer. This key exists only in memory;
+        // extract_config copies a fixed GGUF field set, so it is never emitted.
+        gguf.metadata.insert(
+            QWEN35_INLINE_MTP_INDEX_METADATA.to_string(),
+            GgufMetaValue::Uint64(index),
+        );
+    }
 
     // Plain Qwen3 has no quantized inference runtime. Preserving Q4_0/Q4_1/
     // Q8_0 or K-quant source groups would successfully write an artifact whose
@@ -3175,7 +3718,10 @@ pub async fn convert_gguf_to_safetensors(
     // previously crossed the MLX FFI boundary with impossible packed geometry
     // and aborted the process with an uncaught foreign exception. Fail from the
     // header instead of loading or mutating any tensor payload.
-    if import_k_quants && let Some((tensor, mapped)) = qwen35_kquant_dense_fixup_target(&gguf) {
+    if import_k_quants
+        && !native_qwen35_layout
+        && let Some((tensor, mapped)) = qwen35_kquant_dense_fixup_target(&gguf)
+    {
         return Err(Error::from_reason(format!(
             "GGUF tensor '{}' ({}) maps to Qwen3.5 linear-attention tensor '{}', which requires a head-axis reinterleave during conversion. --gguf-kquant cannot safely apply that dense transform to packed codes without also reordering the group's .scales/.biases, so this source cannot currently be imported losslessly. Use a floating-point source or a preconverted checkpoint. Rejected from the GGUF header before tensor data was loaded.",
             tensor.name,
@@ -3184,7 +3730,7 @@ pub async fn convert_gguf_to_safetensors(
         )));
     }
 
-    // K-quant import repacks ggml's Q4_K/Q5_K/Q6_K blocks bit-for-bit and never
+    // K-quant import losslessly repacks supported ggml K/IQ blocks and never
     // dequantizes them, so any path that would re-quantize the model — an
     // explicit `--quantize`, a `--q-recipe`, the `--q-mxfp` upgrade, or
     // `--imatrix-path` AWQ pre-scaling — both contradicts the import and forces
@@ -3207,7 +3753,7 @@ pub async fn convert_gguf_to_safetensors(
             return Err(Error::from_reason(
                 "K-quant GGUF import cannot be combined with re-quantization \
                  (--quantize / --q-recipe / --q-mxfp / --imatrix-path): ggml \
-                 Q4_K/Q5_K/Q6_K blocks are imported bit-for-bit and never \
+                 supported K/IQ blocks are losslessly imported and never \
                  dequantized. Import them as-is, or drop --gguf-kquant to convert \
                  a dequantized copy.",
             ));
@@ -3337,6 +3883,16 @@ pub async fn convert_gguf_to_safetensors(
         ));
     }
 
+    // Direct native Qwen loads are allowed to synthesize a standalone config,
+    // so every GDN dimension the runtime consumes must be present and
+    // self-consistent in the GGUF header. Falling through to the loader's
+    // model-size-specific defaults can build random projections with plausible
+    // but wrong shapes. An authoritative sibling config remains the stronger
+    // source and intentionally bypasses this metadata completeness gate.
+    if is_primary_model && native_qwen35_layout && synthesized_config {
+        validate_qwen35_standalone_geometry(&gguf.metadata)?;
+    }
+
     // Validate and serialize every companion-driven config mutation before
     // loading tensor payloads or opening the destination SafeTensors file.
     // `save_safetensors` truncates an existing sidecar immediately; a missing
@@ -3432,7 +3988,7 @@ pub async fn convert_gguf_to_safetensors(
     fixup_shapes(&mut weights)?;
 
     // Fix Qwen3.5 linear attention head deinterleaving and A_log conversion
-    fixup_qwen35_linear_attn(&mut weights, &gguf.metadata)?;
+    fixup_qwen35_linear_attn(&mut weights, &gguf.metadata, native_qwen35_layout)?;
 
     // Optional dtype conversion (only for non-quantized weights)
     if let Some(dtype_str) = &options.dtype {
@@ -3754,7 +4310,9 @@ pub async fn convert_gguf_to_safetensors(
             serde_json::from_str(&data)
                 .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {e}")))?
         } else {
-            extract_config(&gguf.metadata)
+            let mut synthesized = extract_config(&gguf.metadata);
+            apply_qwen35_inline_mtp_config(&mut synthesized, qwen35_inline_mtp_index);
+            synthesized
         };
 
         // Measured off the tensor list and cross-checked against the header, so
@@ -3792,6 +4350,10 @@ pub async fn convert_gguf_to_safetensors(
             // Reordering packed rows here would violate lossless import.
             config_json["muse_glimmer_gguf_rope_layout"] =
                 serde_json::Value::String("interleaved".to_string());
+        }
+
+        if native_qwen35_layout {
+            config_json["qwen35_gguf_gdn_layout"] = serde_json::Value::String("tiled".to_string());
         }
 
         if do_quantize {
@@ -3832,21 +4394,7 @@ pub async fn convert_gguf_to_safetensors(
         // Copy the same runtime assets as the SafeTensors converter. In
         // particular unified Gemma4 requires its external chat template and
         // processor config in addition to tokenizer.json.
-        let asset_files = [
-            "tokenizer.json",
-            "tokenizer_config.json",
-            "vocab.json",
-            "merges.txt",
-            "special_tokens_map.json",
-            "added_tokens.json",
-            "chat_template.jinja",
-            "generation_config.json",
-            "preprocessor_config.json",
-            "video_preprocessor_config.json",
-            "processor_config.json",
-            "viterbi_calibration.json",
-        ];
-        for filename in &asset_files {
+        for filename in GGUF_RUNTIME_ASSET_FILES {
             let src = asset_dir.join(filename);
             if src.exists() {
                 let dst = output_dir.join(filename);
@@ -3869,6 +4417,11 @@ pub async fn convert_gguf_to_safetensors(
                     asset_dir.display()
                 );
             }
+        }
+        if !output_dir.join("tokenizer.json").exists()
+            && write_embedded_gpt2_tokenizer(&gguf.metadata, &output_dir)?
+        {
+            info!("Reconstructed tokenizer.json from embedded GGUF GPT-2 metadata");
         }
     } else {
         if let Some(config) = prepared_muse_secondary_config {
@@ -3901,12 +4454,442 @@ pub async fn convert_gguf_to_safetensors(
     })
 }
 
+/// Prepare the lossless native-packed cache used when a Qwen3.5/3.8 model is
+/// loaded from a GGUF file path. Quantized source blocks are only repacked;
+/// they are never expanded into a dense floating-point weight tensor. Native
+/// F32 norms/biases are narrowed to BF16 so they do not promote inference
+/// activations away from the model's BF16 execution/cache dtype.
+const QWEN35_NATIVE_CACHE_FORMAT: u32 = 5;
+const QWEN35_NATIVE_CACHE_DIR_ENV: &str = "MLX_NATIVE_GGUF_CACHE_DIR";
+
+fn qwen35_native_cache_candidates_from(
+    override_root: Option<PathBuf>,
+    xdg_cache_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temp: PathBuf,
+) -> Vec<PathBuf> {
+    if let Some(root) = override_root.filter(|path| !path.as_os_str().is_empty()) {
+        return vec![root];
+    }
+    let mut candidates = Vec::new();
+    if let Some(root) = xdg_cache_home.filter(|path| !path.as_os_str().is_empty()) {
+        candidates.push(root.join("mlx-node/native-gguf"));
+    }
+    if let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) {
+        #[cfg(target_os = "macos")]
+        candidates.push(home.join("Library/Caches/mlx-node/native-gguf"));
+        #[cfg(not(target_os = "macos"))]
+        candidates.push(home.join(".cache/mlx-node/native-gguf"));
+    }
+    candidates.push(temp.join("mlx-node/native-gguf"));
+    candidates.dedup();
+    candidates
+}
+
+fn initialize_qwen35_native_cache_root(root: &Path) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(root)?;
+    let probe = root.join(format!(
+        ".write-probe-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)?;
+    fs::remove_file(&probe)?;
+    root.canonicalize()
+}
+
+fn qwen35_native_cache_root() -> Result<PathBuf> {
+    let override_root = std::env::var_os(QWEN35_NATIVE_CACHE_DIR_ENV).map(PathBuf::from);
+    let candidates = qwen35_native_cache_candidates_from(
+        override_root.clone(),
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::temp_dir(),
+    );
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        match initialize_qwen35_native_cache_root(&candidate) {
+            Ok(root) => return Ok(root),
+            Err(error) => failures.push(format!("{}: {error}", candidate.display())),
+        }
+    }
+    let authority = if override_root.is_some() {
+        format!(" from {QWEN35_NATIVE_CACHE_DIR_ENV}")
+    } else {
+        String::new()
+    };
+    Err(Error::from_reason(format!(
+        "No writable native GGUF cache directory{authority}: {}",
+        failures.join("; ")
+    )))
+}
+
+fn qwen35_native_asset_digest(parent: &Path) -> Result<String> {
+    let mut hasher = Sha256::new();
+    for filename in std::iter::once("config.json").chain(GGUF_RUNTIME_ASSET_FILES.iter().copied()) {
+        hasher.update((filename.len() as u64).to_le_bytes());
+        hasher.update(filename.as_bytes());
+        let path = parent.join(filename);
+        match fs::File::open(&path) {
+            Ok(mut file) => {
+                hasher.update([1]);
+                let mut buffer = [0_u8; 64 * 1024];
+                loop {
+                    let read = file.read(&mut buffer).map_err(|error| {
+                        Error::from_reason(format!(
+                            "Failed to hash native GGUF source asset '{}': {error}",
+                            path.display()
+                        ))
+                    })?;
+                    if read == 0 {
+                        break;
+                    }
+                    hasher.update(&buffer[..read]);
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => hasher.update([0]),
+            Err(error) => {
+                return Err(Error::from_reason(format!(
+                    "Failed to open native GGUF source asset '{}': {error}",
+                    path.display()
+                )));
+            }
+        }
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+fn qwen35_native_source_identity_digest(input_path: &Path, metadata: &fs::Metadata) -> String {
+    let mut hasher = Sha256::new();
+    let path = input_path.as_os_str().as_encoded_bytes();
+    hasher.update((path.len() as u64).to_le_bytes());
+    hasher.update(path);
+    hasher.update(metadata.len().to_le_bytes());
+
+    // Hashing a multi-gigabyte GGUF on every cached load would dominate load
+    // time. Unix ctime cannot be restored by cp -p or ordinary users, while a
+    // replacement-by-rename changes the inode, so these fields detect both
+    // in-place rewrites and same-size/same-mtime artifact replacements.
+    #[cfg(unix)]
+    {
+        hasher.update(metadata.dev().to_le_bytes());
+        hasher.update(metadata.ino().to_le_bytes());
+        hasher.update(metadata.ctime().to_le_bytes());
+        hasher.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        for timestamp in [metadata.created().ok(), metadata.modified().ok()] {
+            let nanos = timestamp
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos())
+                .unwrap_or(0);
+            hasher.update(nanos.to_le_bytes());
+        }
+    }
+
+    hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn qwen35_native_prepare_mutex() -> &'static tokio::sync::Mutex<()> {
+    static MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+struct Qwen35NativeCacheLock {
+    _file: fs::File,
+}
+
+impl Qwen35NativeCacheLock {
+    #[cfg(unix)]
+    fn acquire(path: &Path) -> std::io::Result<Self> {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+        // SAFETY: `file` owns this live descriptor for at least the lifetime of
+        // the returned guard. `flock` changes only the kernel lock state for
+        // that descriptor, and Drop releases it before the file is closed.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { _file: file })
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_path: &Path) -> std::io::Result<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "native Qwen GGUF cache locking requires Unix flock",
+        ))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Qwen35NativeCacheLock {
+    fn drop(&mut self) {
+        // SAFETY: `_file` still owns a live descriptor here. Unlock failure is
+        // not actionable during Drop; closing the file releases the lock too.
+        unsafe {
+            libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn qwen35_native_cache_is_current(
+    output_dir: &Path,
+    source_identity_digest: &str,
+    asset_digest: &str,
+) -> bool {
+    let marker = output_dir.join(".complete");
+    fs::read_to_string(marker).is_ok_and(|contents| {
+        contents.contains(&format!("format={QWEN35_NATIVE_CACHE_FORMAT}\n"))
+            && contents.contains(&format!(
+                "source_identity_sha256={source_identity_digest}\n"
+            ))
+            && contents.contains(&format!("assets_sha256={asset_digest}\n"))
+            && contents.contains("dtype=bf16\n")
+            && output_dir.join("model.safetensors").is_file()
+            && output_dir.join("config.json").is_file()
+    })
+}
+
+pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
+    let cache_root = qwen35_native_cache_root()?;
+    prepare_qwen35_native_gguf_inner(input_path, &cache_root).await
+}
+
+#[cfg(test)]
+async fn prepare_qwen35_native_gguf_in(input_path: &Path, cache_root: &Path) -> Result<PathBuf> {
+    let cache_root = initialize_qwen35_native_cache_root(cache_root).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to create native GGUF cache root '{}': {error}",
+            cache_root.display()
+        ))
+    })?;
+    prepare_qwen35_native_gguf_inner(input_path, &cache_root).await
+}
+
+async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) -> Result<PathBuf> {
+    let input_path = input_path.canonicalize().map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to canonicalize GGUF path '{}': {error}",
+            input_path.display()
+        ))
+    })?;
+    let metadata = fs::metadata(&input_path).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to stat GGUF path '{}': {error}",
+            input_path.display()
+        ))
+    })?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let stem = input_path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .unwrap_or("model")
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .take(32)
+        .collect::<String>();
+    let parent = input_path.parent().unwrap_or(Path::new("."));
+    let source_identity_digest = qwen35_native_source_identity_digest(&input_path, &metadata);
+    let asset_digest = qwen35_native_asset_digest(parent)?;
+    let cache_key = format!(
+        "{stem}-{}-{modified}-v{QWEN35_NATIVE_CACHE_FORMAT}-{source_identity_digest}-{asset_digest}",
+        metadata.len(),
+    );
+    let output_dir = cache_root.join(&cache_key);
+
+    // The process lock closes the same-process flock ambiguity on BSD/macOS;
+    // the persistent per-key flock extends serialization across processes.
+    // Both are acquired before the marker check, so a queued caller observes
+    // the cache the first caller just published instead of converting twice.
+    let _process_lock = qwen35_native_prepare_mutex().lock().await;
+    let lock_path = cache_root.join(format!(".{cache_key}.lock"));
+    let lock_path_for_thread = lock_path.clone();
+    let _file_lock =
+        tokio::task::spawn_blocking(move || Qwen35NativeCacheLock::acquire(&lock_path_for_thread))
+            .await
+            .map_err(|error| {
+                Error::from_reason(format!(
+                    "Native GGUF cache lock task failed for '{}': {error}",
+                    lock_path.display()
+                ))
+            })?
+            .map_err(|error| {
+                Error::from_reason(format!(
+                    "Failed to lock native GGUF cache '{}': {error}",
+                    lock_path.display()
+                ))
+            })?;
+
+    let locked_asset_digest = qwen35_native_asset_digest(parent)?;
+    if locked_asset_digest != asset_digest {
+        return Err(Error::from_reason(
+            "Qwen3.5 sibling config/tokenizer assets changed while acquiring the native GGUF \
+             cache lock; retry the load"
+                .to_string(),
+        ));
+    }
+    let locked_metadata = fs::metadata(&input_path).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to restat GGUF path '{}' after acquiring the native cache lock: {error}",
+            input_path.display()
+        ))
+    })?;
+    if qwen35_native_source_identity_digest(&input_path, &locked_metadata) != source_identity_digest
+    {
+        return Err(Error::from_reason(
+            "Qwen3.5 GGUF source changed while acquiring the native cache lock; retry the load"
+                .to_string(),
+        ));
+    }
+    if qwen35_native_cache_is_current(&output_dir, &source_identity_digest, &asset_digest) {
+        return Ok(output_dir);
+    }
+
+    // `Some(dir)` means an explicitly authoritative config source to the
+    // converter. A standalone GGUF has no config by design, so pass `None` in
+    // that case: the converter still uses the GGUF parent for optional assets,
+    // while allowing config/tokenizer reconstruction from header metadata.
+    let has_sibling_config = parent.join("config.json").is_file();
+    let config_source_dir = has_sibling_config.then(|| parent.to_string_lossy().into_owned());
+    let staging_dir = cache_root.join(format!(
+        ".{cache_key}.staging-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let conversion = convert_gguf_to_safetensors(GgufConversionOptions {
+        input_path: input_path.to_string_lossy().into_owned(),
+        output_dir: staging_dir.to_string_lossy().into_owned(),
+        config_source_dir,
+        dtype: Some("bfloat16".to_string()),
+        verbose: Some(true),
+        quantize: Some(false),
+        quant_bits: None,
+        quant_group_size: None,
+        quant_mode: None,
+        quant_recipe: None,
+        imatrix_path: None,
+        output_filename: None,
+        vlm_key_prefix: None,
+        quant_mxfp: None,
+        import_k_quants: Some(true),
+        native_qwen35_layout: Some(true),
+    })
+    .await;
+    if let Err(error) = conversion {
+        fs::remove_dir_all(&staging_dir).ok();
+        return Err(error);
+    }
+
+    let final_asset_digest = match qwen35_native_asset_digest(parent) {
+        Ok(digest) => digest,
+        Err(error) => {
+            fs::remove_dir_all(&staging_dir).ok();
+            return Err(error);
+        }
+    };
+    if final_asset_digest != asset_digest {
+        fs::remove_dir_all(&staging_dir).ok();
+        return Err(Error::from_reason(
+            "Qwen3.5 sibling config/tokenizer assets changed during native GGUF preparation; \
+             discarded the staged cache, retry the load"
+                .to_string(),
+        ));
+    }
+    let final_metadata = match fs::metadata(&input_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            fs::remove_dir_all(&staging_dir).ok();
+            return Err(Error::from_reason(format!(
+                "Failed to restat GGUF path '{}' after native preparation: {error}",
+                input_path.display()
+            )));
+        }
+    };
+    if qwen35_native_source_identity_digest(&input_path, &final_metadata) != source_identity_digest
+    {
+        fs::remove_dir_all(&staging_dir).ok();
+        return Err(Error::from_reason(
+            "Qwen3.5 GGUF source changed during native preparation; discarded the staged cache, \
+             retry the load"
+                .to_string(),
+        ));
+    }
+    let marker = staging_dir.join(".complete");
+    if let Err(error) = fs::write(
+        marker,
+        format!(
+            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout=tiled\ndtype=bf16\n",
+            input_path.display(),
+            source_identity_digest,
+            metadata.len(),
+            modified,
+            asset_digest
+        ),
+    ) {
+        fs::remove_dir_all(&staging_dir).ok();
+        return Err(Error::from_reason(format!(
+            "Failed to finalize native GGUF cache '{}': {error}",
+            output_dir.display()
+        )));
+    }
+
+    // The format and asset digest are part of the directory key, so a current
+    // cache is never replaced. Only a prior interrupted/corrupt build can
+    // occupy this exact path; remove it while both locks are held, then publish
+    // the complete staging directory with one atomic rename.
+    if output_dir.exists() {
+        fs::remove_dir_all(&output_dir).map_err(|error| {
+            fs::remove_dir_all(&staging_dir).ok();
+            Error::from_reason(format!(
+                "Failed to remove incomplete native GGUF cache '{}': {error}",
+                output_dir.display()
+            ))
+        })?;
+    }
+    fs::rename(&staging_dir, &output_dir).map_err(|error| {
+        fs::remove_dir_all(&staging_dir).ok();
+        Error::from_reason(format!(
+            "Failed to publish native GGUF cache '{}' atomically: {error}",
+            output_dir.display()
+        ))
+    })?;
+    Ok(output_dir)
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::gguf_kquant::repack_kquant;
+    use crate::utils::gguf_kquant::{QK_K, repack_kquant};
 
     fn build_minimal_gguf(
         metadata: &[(&str, GgufMetaValue)],
@@ -4010,6 +4993,49 @@ mod tests {
     }
 
     #[test]
+    fn embedded_gpt2_tokenizer_preserves_decomposed_unicode_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-gguf-tokenizer-normalizer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let metadata = HashMap::from([
+            (
+                "tokenizer.ggml.model".to_string(),
+                GgufMetaValue::String("gpt2".to_string()),
+            ),
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                GgufMetaValue::ArrayString(vec!["e".into(), "Ì".into(), "ģ".into()]),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_string(),
+                GgufMetaValue::ArrayI32(vec![1, 1, 1]),
+            ),
+            (
+                "tokenizer.ggml.merges".to_string(),
+                GgufMetaValue::ArrayString(Vec::new()),
+            ),
+        ]);
+
+        assert!(write_embedded_gpt2_tokenizer(&metadata, &root).unwrap());
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("tokenizer.json")).unwrap()).unwrap();
+        assert!(json["normalizer"].is_null());
+        let tokenizer = tokenizers::Tokenizer::from_file(root.join("tokenizer.json")).unwrap();
+        assert!(tokenizer.get_normalizer().is_none());
+        assert_eq!(
+            tokenizer.encode("e\u{301}", false).unwrap().get_ids(),
+            &[0, 1, 2]
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
     fn test_parse_minimal_gguf() {
         let data = build_minimal_gguf(
             &[
@@ -4043,6 +5069,753 @@ mod tests {
         }
 
         fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn gguf_architecture_reads_header_without_tensor_payloads() {
+        let data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("qwen35".to_string()),
+            )],
+            &[],
+        );
+        let tmp = std::env::temp_dir().join(format!(
+            "mlx-node-gguf-architecture-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&tmp, data).unwrap();
+
+        assert_eq!(
+            gguf_architecture(tmp.to_string_lossy().into_owned()).unwrap(),
+            "qwen35"
+        );
+
+        fs::remove_file(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn native_qwen35_prepare_synthesizes_config_for_standalone_gguf() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-standalone-qwen35-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let data = build_minimal_gguf(
+            &[
+                (
+                    "general.architecture",
+                    GgufMetaValue::String("qwen35".to_string()),
+                ),
+                ("qwen35.embedding_length", GgufMetaValue::Uint32(1)),
+                ("qwen35.block_count", GgufMetaValue::Uint32(2)),
+                ("qwen35.ssm.state_size", GgufMetaValue::Uint32(2)),
+                ("qwen35.ssm.inner_size", GgufMetaValue::Uint32(6)),
+                ("qwen35.ssm.time_step_rank", GgufMetaValue::Uint32(3)),
+                ("qwen35.ssm.group_count", GgufMetaValue::Uint32(1)),
+                ("qwen35.ssm.conv_kernel", GgufMetaValue::Uint32(4)),
+                ("qwen35.full_attention_interval", GgufMetaValue::Uint32(2)),
+            ],
+            &[
+                ("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0]),
+                (
+                    "blk.1.nextn.eh_proj.weight",
+                    &[1],
+                    GgufTensorType::BF16,
+                    &[0, 0],
+                ),
+                (
+                    "blk.1.nextn.enorm.weight",
+                    &[1],
+                    GgufTensorType::BF16,
+                    &[0, 0],
+                ),
+                (
+                    "blk.1.nextn.hnorm.weight",
+                    &[1],
+                    GgufTensorType::BF16,
+                    &[0, 0],
+                ),
+                (
+                    "blk.1.nextn.shared_head_norm.weight",
+                    &[1],
+                    GgufTensorType::BF16,
+                    &[0, 0],
+                ),
+            ],
+        );
+        let input = root.join("standalone.gguf");
+        fs::write(&input, data).unwrap();
+        let cache_root = root.join("native-cache");
+
+        let output = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "standalone GGUF preparation must synthesize config.json: {}",
+                    error.reason
+                )
+            });
+        let config: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.join("config.json")).expect("synthesized config.json"),
+        )
+        .unwrap();
+        assert_eq!(config["model_type"], serde_json::json!("qwen3_5"));
+        assert_eq!(config["num_hidden_layers"], serde_json::json!(1));
+        assert_eq!(config["mtp_num_hidden_layers"], serde_json::json!(1));
+        assert_eq!(config["num_nextn_predict_layers"], serde_json::json!(1));
+        assert_eq!(config["linear_num_value_heads"], serde_json::json!(3));
+        assert_eq!(config["linear_num_key_heads"], serde_json::json!(1));
+        assert_eq!(config["linear_key_head_dim"], serde_json::json!(2));
+        assert_eq!(config["linear_value_head_dim"], serde_json::json!(2));
+        assert_eq!(config["linear_conv_kernel_dim"], serde_json::json!(4));
+        assert_eq!(config["full_attention_interval"], serde_json::json!(2));
+        assert_eq!(
+            config["layer_types"],
+            serde_json::json!(["linear_attention"])
+        );
+        assert!(output.join("model.safetensors").is_file());
+        let marker = fs::read_to_string(output.join(".complete")).unwrap();
+        assert!(marker.contains(&format!("format={QWEN35_NATIVE_CACHE_FORMAT}\n")));
+        assert!(marker.contains("assets_sha256="));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn qwen35_exact_header_geometry_synthesizes_runtime_fields_and_layer_pattern() {
+        let metadata = HashMap::from([
+            (
+                "general.architecture".to_string(),
+                GgufMetaValue::String("qwen35".to_string()),
+            ),
+            ("qwen35.block_count".to_string(), GgufMetaValue::Uint32(65)),
+            (
+                "qwen35.attention.key_length".to_string(),
+                GgufMetaValue::Uint32(256),
+            ),
+            (
+                "qwen35.rope.dimension_count".to_string(),
+                GgufMetaValue::Uint32(64),
+            ),
+            (
+                "qwen35.ssm.state_size".to_string(),
+                GgufMetaValue::Uint32(128),
+            ),
+            (
+                "qwen35.ssm.inner_size".to_string(),
+                GgufMetaValue::Uint32(6144),
+            ),
+            (
+                "qwen35.ssm.time_step_rank".to_string(),
+                GgufMetaValue::Uint32(48),
+            ),
+            (
+                "qwen35.ssm.group_count".to_string(),
+                GgufMetaValue::Uint32(16),
+            ),
+            (
+                "qwen35.ssm.conv_kernel".to_string(),
+                GgufMetaValue::Uint32(4),
+            ),
+            (
+                "qwen35.full_attention_interval".to_string(),
+                GgufMetaValue::Uint32(4),
+            ),
+            (
+                "tokenizer.ggml.bos_token_id".to_string(),
+                GgufMetaValue::Uint32(151643),
+            ),
+            (
+                "tokenizer.ggml.eos_token_id".to_string(),
+                GgufMetaValue::Uint32(151645),
+            ),
+        ]);
+
+        validate_qwen35_standalone_geometry(&metadata).unwrap();
+        let mut config = extract_config(&metadata);
+        apply_qwen35_inline_mtp_config(&mut config, Some(64));
+        assert_eq!(config["num_hidden_layers"], serde_json::json!(64));
+        assert_eq!(config["linear_num_value_heads"], serde_json::json!(48));
+        assert_eq!(config["linear_num_key_heads"], serde_json::json!(16));
+        assert_eq!(config["linear_key_head_dim"], serde_json::json!(128));
+        assert_eq!(config["linear_value_head_dim"], serde_json::json!(128));
+        assert_eq!(config["linear_conv_kernel_dim"], serde_json::json!(4));
+        assert_eq!(config["full_attention_interval"], serde_json::json!(4));
+        assert_eq!(config["partial_rotary_factor"], serde_json::json!(0.25));
+        assert_eq!(config["bos_token_id"], serde_json::json!(151643));
+        assert_eq!(config["eos_token_id"], serde_json::json!(151645));
+        let layer_types = config["layer_types"].as_array().unwrap();
+        assert_eq!(layer_types.len(), 64);
+        assert_eq!(layer_types[0], serde_json::json!("linear_attention"));
+        assert_eq!(layer_types[3], serde_json::json!("full_attention"));
+        assert_eq!(layer_types[63], serde_json::json!("full_attention"));
+    }
+
+    #[test]
+    fn qwen35_standalone_geometry_fails_closed_when_missing_or_inconsistent() {
+        let mut metadata = HashMap::from([
+            (
+                "general.architecture".to_string(),
+                GgufMetaValue::String("qwen35".to_string()),
+            ),
+            (
+                "qwen35.ssm.state_size".to_string(),
+                GgufMetaValue::Uint32(128),
+            ),
+        ]);
+        let missing = validate_qwen35_standalone_geometry(&metadata).unwrap_err();
+        assert!(missing.reason.contains("qwen35.ssm.inner_size"));
+
+        metadata.extend([
+            (
+                "qwen35.ssm.inner_size".to_string(),
+                GgufMetaValue::Uint32(6145),
+            ),
+            (
+                "qwen35.ssm.time_step_rank".to_string(),
+                GgufMetaValue::Uint32(48),
+            ),
+            (
+                "qwen35.ssm.group_count".to_string(),
+                GgufMetaValue::Uint32(16),
+            ),
+            (
+                "qwen35.ssm.conv_kernel".to_string(),
+                GgufMetaValue::Uint32(4),
+            ),
+            (
+                "qwen35.full_attention_interval".to_string(),
+                GgufMetaValue::Uint32(4),
+            ),
+        ]);
+        let inconsistent = validate_qwen35_standalone_geometry(&metadata).unwrap_err();
+        assert!(inconsistent.reason.contains("ssm.inner_size=6145"));
+        assert!(
+            inconsistent
+                .reason
+                .contains("128) * ssm.time_step_rank (48) = 6144")
+        );
+
+        metadata.insert(
+            "qwen35.ssm.inner_size".to_string(),
+            GgufMetaValue::Uint32(6144),
+        );
+        metadata.remove("qwen35.ssm.time_step_rank");
+        validate_qwen35_standalone_geometry(&metadata).unwrap();
+        let config = extract_config(&metadata);
+        assert_eq!(config["linear_num_value_heads"], serde_json::json!(48));
+
+        metadata.insert(
+            "qwen35.ssm.inner_size".to_string(),
+            GgufMetaValue::Uint32(6145),
+        );
+        let not_divisible = validate_qwen35_standalone_geometry(&metadata).unwrap_err();
+        assert!(
+            not_divisible
+                .reason
+                .contains("cannot derive the value-head count")
+        );
+        assert!(not_divisible.reason.contains("is not divisible"));
+    }
+
+    #[test]
+    fn qwen35_native_cache_root_prefers_override_then_application_cache() {
+        let override_root = PathBuf::from("/override");
+        let xdg = PathBuf::from("/xdg");
+        let home = PathBuf::from("/home/tester");
+        let temp = PathBuf::from("/tmp/tester");
+        assert_eq!(
+            qwen35_native_cache_candidates_from(
+                Some(override_root.clone()),
+                Some(xdg.clone()),
+                Some(home.clone()),
+                temp.clone(),
+            ),
+            vec![override_root]
+        );
+        assert_eq!(
+            qwen35_native_cache_candidates_from(None, Some(xdg), Some(home.clone()), temp.clone())
+                [0],
+            PathBuf::from("/xdg/mlx-node/native-gguf")
+        );
+        let without_xdg = qwen35_native_cache_candidates_from(None, None, Some(home), temp.clone());
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            without_xdg[0],
+            PathBuf::from("/home/tester/Library/Caches/mlx-node/native-gguf")
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            without_xdg[0],
+            PathBuf::from("/home/tester/.cache/mlx-node/native-gguf")
+        );
+        assert_eq!(without_xdg.last(), Some(&temp.join("mlx-node/native-gguf")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn qwen35_native_prepare_never_writes_beside_read_only_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-read-only-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("source");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("config.json"), r#"{"model_type":"qwen3_5"}"#).unwrap();
+        let input = source.join("model.gguf");
+        fs::write(
+            &input,
+            build_minimal_gguf(
+                &[
+                    (
+                        "general.architecture",
+                        GgufMetaValue::String("qwen35".to_string()),
+                    ),
+                    ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+                ],
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
+        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root).await;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = prepared.unwrap();
+
+        assert!(output.starts_with(cache_root.canonicalize().unwrap()));
+        assert!(!source.join(".mlx-node-native").exists());
+        assert!(output.join("model.safetensors").is_file());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn qwen35_native_cache_tracks_source_asset_presence_and_contents() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-assets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("model.gguf");
+        fs::write(
+            &input,
+            build_minimal_gguf(
+                &[
+                    (
+                        "general.architecture",
+                        GgufMetaValue::String("qwen35".to_string()),
+                    ),
+                    ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+                    ("qwen35.ssm.state_size", GgufMetaValue::Uint32(2)),
+                    ("qwen35.ssm.inner_size", GgufMetaValue::Uint32(4)),
+                    ("qwen35.ssm.time_step_rank", GgufMetaValue::Uint32(2)),
+                    ("qwen35.ssm.group_count", GgufMetaValue::Uint32(1)),
+                    ("qwen35.ssm.conv_kernel", GgufMetaValue::Uint32(4)),
+                    ("qwen35.full_attention_interval", GgufMetaValue::Uint32(1)),
+                ],
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+            ),
+        )
+        .unwrap();
+        let cache_root = root.join("native-cache");
+
+        let standalone = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        fs::write(
+            root.join("config.json"),
+            r#"{"model_type":"qwen3_5","asset_sentinel":1}"#,
+        )
+        .unwrap();
+        let added = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        fs::write(
+            root.join("config.json"),
+            r#"{"model_type":"qwen3_5","asset_sentinel":2}"#,
+        )
+        .unwrap();
+        let edited_same_size = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+
+        assert_ne!(
+            standalone, added,
+            "adding config.json must change the cache key"
+        );
+        assert_ne!(
+            added, edited_same_size,
+            "same-size asset edits must change the key"
+        );
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(edited_same_size.join("config.json")).unwrap())
+                .unwrap();
+        assert_eq!(config["asset_sentinel"], serde_json::json!(2));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn qwen35_native_cache_key_separates_sanitized_source_name_collisions() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-source-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.json"), r#"{"model_type":"qwen3_5"}"#).unwrap();
+        let metadata = [
+            (
+                "general.architecture",
+                GgufMetaValue::String("qwen35".to_string()),
+            ),
+            ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+        ];
+        let left_input = root.join("model!.gguf");
+        let right_input = root.join("model?.gguf");
+        fs::write(
+            &left_input,
+            build_minimal_gguf(
+                &metadata,
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &right_input,
+            build_minimal_gguf(
+                &metadata,
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[1, 0])],
+            ),
+        )
+        .unwrap();
+        let shared_modified = fs::metadata(&left_input).unwrap().modified().unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&right_input)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(shared_modified))
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&left_input).unwrap().len(),
+            fs::metadata(&right_input).unwrap().len()
+        );
+        assert_eq!(
+            fs::metadata(&left_input).unwrap().modified().unwrap(),
+            fs::metadata(&right_input).unwrap().modified().unwrap()
+        );
+        let cache_root = root.join("native-cache");
+
+        let left = prepare_qwen35_native_gguf_in(&left_input, &cache_root)
+            .await
+            .unwrap();
+        let right = prepare_qwen35_native_gguf_in(&right_input, &cache_root)
+            .await
+            .unwrap();
+        assert_ne!(
+            left, right,
+            "canonical source identity must participate in the key"
+        );
+        let left_marker = fs::read_to_string(left.join(".complete")).unwrap();
+        let right_marker = fs::read_to_string(right.join(".complete")).unwrap();
+        let source_line = |marker: &str| {
+            marker
+                .lines()
+                .find(|line| line.starts_with("source_identity_sha256="))
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(source_line(&left_marker), source_line(&right_marker));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn qwen35_native_cache_detects_same_size_same_mtime_source_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-source-replacement-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.json"), r#"{"model_type":"qwen3_5"}"#).unwrap();
+        let metadata = [
+            (
+                "general.architecture",
+                GgufMetaValue::String("qwen35".to_string()),
+            ),
+            ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+        ];
+        let input = root.join("model.gguf");
+        let replacement = root.join("replacement.gguf");
+        fs::write(
+            &input,
+            build_minimal_gguf(
+                &metadata,
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &replacement,
+            build_minimal_gguf(
+                &metadata,
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[1, 0])],
+            ),
+        )
+        .unwrap();
+        let original_metadata = fs::metadata(&input).unwrap();
+        let original_modified = original_metadata.modified().unwrap();
+        let cache_root = root.join("native-cache");
+        let original = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+
+        OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        fs::rename(&replacement, &input).unwrap();
+        let replacement_metadata = fs::metadata(&input).unwrap();
+        assert_eq!(replacement_metadata.len(), original_metadata.len());
+        assert_eq!(replacement_metadata.modified().unwrap(), original_modified);
+
+        let replaced = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert_ne!(
+            original, replaced,
+            "same-size/same-mtime replacement must not reuse the prior cache"
+        );
+        let original_marker = fs::read_to_string(original.join(".complete")).unwrap();
+        let replaced_marker = fs::read_to_string(replaced.join(".complete")).unwrap();
+        let source_identity = |marker: &str| {
+            marker
+                .lines()
+                .find(|line| line.starts_with("source_identity_sha256="))
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(
+            source_identity(&original_marker),
+            source_identity(&replaced_marker)
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_qwen35_native_prepares_publish_one_complete_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-concurrent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.json"), r#"{"model_type":"qwen3_5"}"#).unwrap();
+        let input = root.join("model.gguf");
+        fs::write(
+            &input,
+            build_minimal_gguf(
+                &[
+                    (
+                        "general.architecture",
+                        GgufMetaValue::String("qwen35".to_string()),
+                    ),
+                    ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+                ],
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+            ),
+        )
+        .unwrap();
+        let cache_root = root.join("native-cache");
+
+        let (left, right) = tokio::join!(
+            prepare_qwen35_native_gguf_in(&input, &cache_root),
+            prepare_qwen35_native_gguf_in(&input, &cache_root)
+        );
+        let left = left.unwrap();
+        let right = right.unwrap();
+        assert_eq!(left, right);
+        assert!(left.join("model.safetensors").is_file());
+        assert!(left.join("config.json").is_file());
+        assert!(left.join(".complete").is_file());
+        let staged = fs::read_dir(&cache_root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".staging-"))
+            .count();
+        assert_eq!(staged, 0, "no staging directory may survive publication");
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn qwen35_native_cache_lock_serializes_separate_processes() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-process-lock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let lock_path = root.join("cache.lock");
+        let started_path = root.join("child.started");
+        let acquired_path = root.join("child.acquired");
+        let parent_lock = Qwen35NativeCacheLock::acquire(&lock_path).unwrap();
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("utils::gguf::tests::qwen35_native_cache_lock_child")
+            .arg("--ignored")
+            .env("MLX_NODE_QWEN35_LOCK_TEST_PATH", &lock_path)
+            .env("MLX_NODE_QWEN35_LOCK_TEST_STARTED", &started_path)
+            .env("MLX_NODE_QWEN35_LOCK_TEST_ACQUIRED", &acquired_path)
+            .spawn()
+            .unwrap();
+
+        for _ in 0..500 {
+            if started_path.is_file() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(started_path.is_file(), "child never reached the flock call");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(
+            acquired_path.try_exists().is_ok_and(|exists| !exists),
+            "child acquired the same cache-key lock while the parent still held it"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child exited instead of blocking on the parent lock"
+        );
+
+        drop(parent_lock);
+        let status = child.wait().unwrap();
+        assert!(status.success(), "lock-test child failed: {status}");
+        assert!(acquired_path.is_file());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "helper process for qwen35_native_cache_lock_serializes_separate_processes"]
+    fn qwen35_native_cache_lock_child() {
+        let lock_path = PathBuf::from(
+            std::env::var_os("MLX_NODE_QWEN35_LOCK_TEST_PATH").expect("lock-test child path"),
+        );
+        let started_path = PathBuf::from(
+            std::env::var_os("MLX_NODE_QWEN35_LOCK_TEST_STARTED")
+                .expect("lock-test child started path"),
+        );
+        let acquired_path = PathBuf::from(
+            std::env::var_os("MLX_NODE_QWEN35_LOCK_TEST_ACQUIRED")
+                .expect("lock-test child acquired path"),
+        );
+        fs::write(started_path, b"started").unwrap();
+        let _lock = Qwen35NativeCacheLock::acquire(&lock_path).unwrap();
+        fs::write(acquired_path, b"acquired").unwrap();
+    }
+
+    #[test]
+    fn qwen35_without_nextn_keeps_full_synthesized_decoder_count() {
+        let mut gguf = source_quant_fixture(&[("blk.1.attn_norm.weight", GgufTensorType::BF16)]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("qwen35".into()),
+        );
+        gguf.metadata
+            .insert("qwen35.block_count".into(), GgufMetaValue::Uint32(2));
+
+        let mtp_index = qwen35_inline_mtp_index(&gguf).unwrap();
+        assert_eq!(mtp_index, None);
+        let mut config = extract_config(&gguf.metadata);
+        apply_qwen35_inline_mtp_config(&mut config, mtp_index);
+        assert_eq!(config["num_hidden_layers"], serde_json::json!(2));
+        assert!(config.get("mtp_num_hidden_layers").is_none());
+        assert_eq!(
+            gguf_name_to_hf_for_metadata("blk.1.attn_norm.weight", &gguf.metadata).as_deref(),
+            Some("model.layers.1.input_layernorm.weight"),
+            "the final non-MTP block must remain in the main decoder namespace"
+        );
+    }
+
+    #[test]
+    fn incomplete_qwen35_inline_mtp_group_fails_before_conversion() {
+        let mut gguf =
+            source_quant_fixture(&[("blk.1.nextn.eh_proj.weight", GgufTensorType::BF16)]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("qwen35".into()),
+        );
+        gguf.metadata
+            .insert("qwen35.block_count".into(), GgufMetaValue::Uint32(2));
+
+        let error = qwen35_inline_mtp_index(&gguf).unwrap_err();
+        assert!(error.reason.contains("inline MTP block 1 is incomplete"));
+        assert!(error.reason.contains("nextn.enorm.weight"));
+    }
+
+    #[test]
+    fn validated_qwen35_inline_mtp_witness_controls_final_block_remap() {
+        let mut gguf = source_quant_fixture(&[
+            ("blk.1.nextn.eh_proj.weight", GgufTensorType::BF16),
+            ("blk.1.nextn.enorm.weight", GgufTensorType::BF16),
+            ("blk.1.nextn.hnorm.weight", GgufTensorType::BF16),
+            ("blk.1.nextn.shared_head_norm.weight", GgufTensorType::BF16),
+            ("blk.1.attn_norm.weight", GgufTensorType::BF16),
+        ]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("qwen35".into()),
+        );
+        gguf.metadata
+            .insert("qwen35.block_count".into(), GgufMetaValue::Uint32(2));
+
+        let mtp_index = qwen35_inline_mtp_index(&gguf).unwrap().unwrap();
+        gguf.metadata.insert(
+            QWEN35_INLINE_MTP_INDEX_METADATA.into(),
+            GgufMetaValue::Uint64(mtp_index),
+        );
+        assert_eq!(
+            gguf_name_to_hf_for_metadata("blk.1.nextn.eh_proj.weight", &gguf.metadata).as_deref(),
+            Some("mtp.fc.weight")
+        );
+        assert_eq!(
+            gguf_name_to_hf_for_metadata("blk.1.attn_norm.weight", &gguf.metadata).as_deref(),
+            Some("mtp.layers.0.input_layernorm.weight")
+        );
     }
 
     #[test]
@@ -4890,6 +6663,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(true),
+            native_qwen35_layout: None,
         })
         .await
         .unwrap();
@@ -4979,6 +6753,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(true),
+            native_qwen35_layout: None,
         })
         .await;
         let err = match result {
@@ -6026,6 +7801,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(false),
+            native_qwen35_layout: None,
         })
         .await
         .expect("primary Muse conversion");
@@ -6173,6 +7949,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(false),
+            native_qwen35_layout: None,
         })
         .await
         .expect("primary Muse conversion");
@@ -6635,6 +8412,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(true),
+            native_qwen35_layout: None,
         })
         .await;
         let error = match outcome {
@@ -6736,6 +8514,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(true),
+            native_qwen35_layout: None,
         })
         .await;
         let error = match outcome {
@@ -7269,6 +9048,46 @@ mod tests {
     }
 
     #[test]
+    fn merged_gdn_resolves_matching_split_q4k_overrides_not_file_default() {
+        // Make Q6_K the modal file-wide profile while both halves of the
+        // mergeable GDN projection use Q4_K. `preserved_source_quantization`
+        // intentionally records the source names; the runtime's merged-prefix
+        // resolver must consume those two split entries rather than Q6_K.
+        let gguf = source_quant_fixture(&[
+            ("blk.0.attn_q.weight", GgufTensorType::Q6K),
+            ("blk.0.attn_k.weight", GgufTensorType::Q6K),
+            ("blk.0.ffn_down.weight", GgufTensorType::Q6K),
+            ("blk.0.attn_qkv.weight", GgufTensorType::Q4K),
+            ("blk.0.attn_gate.weight", GgufTensorType::Q4K),
+        ]);
+        let quant = preserved_source_quantization(&gguf, true).unwrap().unwrap();
+        let (bits, group_size, top_level_mode, per_layer) =
+            crate::models::quant_dispatch::parse_quant_settings(Some(&quant), 4, 64).unwrap();
+        let default = crate::models::quant_dispatch::default_per_layer_quant(
+            bits,
+            group_size,
+            crate::models::quant_dispatch::resolve_default_mode(top_level_mode, false),
+        );
+        let merged = crate::models::quant_dispatch::effective_plq_for(
+            "layers.0.linear_attn.in_proj_qkvz",
+            &per_layer,
+            default,
+            None,
+        );
+
+        assert_eq!(
+            default.mode,
+            crate::models::quant_dispatch::PerLayerMode::Q6K
+        );
+        assert_eq!(
+            merged.mode,
+            crate::models::quant_dispatch::PerLayerMode::Q4K
+        );
+        assert_eq!(merged.bits, 4);
+        assert_eq!(merged.group_size, 32);
+    }
+
+    #[test]
     fn k_quant_source_metadata_is_named_even_in_a_uniform_file() {
         // Unsloth Dynamic GGUFs are mixed by construction, so a K-quant tensor
         // is named whether or not this particular file happens to look uniform.
@@ -7403,6 +9222,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(false),
+            native_qwen35_layout: None,
         })
         .await
         .unwrap();
@@ -7583,6 +9403,7 @@ mod tests {
             vlm_key_prefix: Some(false),
             quant_mxfp: Some(false),
             import_k_quants: Some(false),
+            native_qwen35_layout: None,
         })
         .await;
         let Err(err) = converted else {
@@ -7668,6 +9489,7 @@ mod tests {
                     vlm_key_prefix: Some(false),
                     quant_mxfp: Some(false),
                     import_k_quants: Some(false),
+                    native_qwen35_layout: None,
                 };
 
             let Err(err) = convert_gguf_to_safetensors(options(&output, None)).await else {
@@ -7761,6 +9583,7 @@ mod tests {
                     vlm_key_prefix: Some(false),
                     quant_mxfp: Some(false),
                     import_k_quants: Some(false),
+                    native_qwen35_layout: None,
                 })
                 .await
                 .unwrap();
@@ -7890,6 +9713,7 @@ mod tests {
                 vlm_key_prefix: Some(false),
                 quant_mxfp: Some(false),
                 import_k_quants: Some(false),
+                native_qwen35_layout: None,
             })
             .await;
             fs::remove_dir_all(&root).ok();
@@ -8012,6 +9836,7 @@ mod tests {
                 vlm_key_prefix: Some(false),
                 quant_mxfp: Some(false),
                 import_k_quants: Some(import_k_quants),
+                native_qwen35_layout: None,
             };
             (root, options)
         }

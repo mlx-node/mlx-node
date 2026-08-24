@@ -90,8 +90,8 @@ extern "C" {
 /// Run the gated delta recurrence using a custom Metal kernel.
 ///
 /// Inputs:
-///   q: [B, T, Hk, Dk]  - queries (GQA-expanded by caller)
-///   k: [B, T, Hk, Dk]  - keys (GQA-expanded by caller)
+///   q: [B, T, Hk, Dk]  - queries (expanded, or compact tiled-GGUF heads)
+///   k: [B, T, Hk, Dk]  - keys (expanded, or compact tiled-GGUF heads)
 ///   v: [B, T, Hv, Dv]  - values
 ///   g: [B, T, Hv]       - decay gate (non-vectorized for Qwen3.5)
 ///   beta: [B, T, Hv]    - beta (sigmoid already applied by caller)

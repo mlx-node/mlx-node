@@ -113,6 +113,14 @@ pub struct Qwen3_5MoeConfig {
     /// unavailable.
     #[serde(default)]
     pub n_mtp_layers: i32,
+
+    /// Internal layout marker written by native Qwen3.5/3.8 GGUF conversion.
+    /// `Some("tiled")` keeps llama.cpp's value-head order and lets the shared
+    /// GDN runtime map value head h to key head h % Hk without permuting
+    /// packed weights.
+    #[serde(default)]
+    #[napi(ts_type = "string | undefined")]
+    pub qwen35_gguf_gdn_layout: Option<String>,
 }
 
 fn default_linear_num_value_heads() -> i32 {
@@ -187,6 +195,7 @@ impl Qwen3_5MoeConfig {
             // dense config it maps to never attaches a cold tier of its own.
             persist_paged_cache: None,
             n_mtp_layers: self.n_mtp_layers,
+            qwen35_gguf_gdn_layout: self.qwen35_gguf_gdn_layout.clone(),
         }
     }
 

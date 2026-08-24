@@ -5,10 +5,11 @@
  */
 
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, extname, join } from 'node:path';
 
 import {
   Gemma4Model as NativeGemma4Model,
+  ggufArchitecture,
   HarrierModel,
   Lfm2Model as NativeLfm2Model,
   MuseGlimmerModel as NativeMuseGlimmerModel,
@@ -20,7 +21,15 @@ import {
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
-import { Gemma4Model, Lfm2Model, MuseGlimmerModel, NemotronHModel, Qwen3Model, Qwen35Model, Qwen35MoeModel } from '../stream.js';
+import {
+  Gemma4Model,
+  Lfm2Model,
+  MuseGlimmerModel,
+  NemotronHModel,
+  Qwen3Model,
+  Qwen35Model,
+  Qwen35MoeModel,
+} from '../stream.js';
 
 /** Optional settings for {@link loadModel} / {@link loadSession}. */
 export interface LoadModelOptions {
@@ -273,6 +282,10 @@ function buildModelFamilyIndex<const Family extends ModelFamilyDescriptor>(
 
 const MODEL_FAMILY_INDEX = buildModelFamilyIndex(MODEL_FAMILY_REGISTRY);
 
+// Only families whose native `load(path)` accepts a GGUF file belong here.
+// Qwen3.5-MoE currently consumes converted directories, not direct files.
+const GGUF_ARCHITECTURE_MODEL_TYPES = new Map<string, ModelType>([['qwen35', 'qwen3_5']]);
+
 function findFamily(modelType: ModelType): ModelFamilyDescriptor {
   const family = MODEL_FAMILY_INDEX.byModelType.get(modelType);
   if (family === undefined) {
@@ -421,8 +434,24 @@ export async function loadSession(
 }
 
 export async function detectModelType(modelPath: string): Promise<ModelType> {
+  const isGguf = extname(modelPath).toLowerCase() === '.gguf';
+  const configPath = isGguf ? join(dirname(modelPath), 'config.json') : join(modelPath, 'config.json');
+  let raw: string;
   try {
-    const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
+    raw = await readFile(configPath, 'utf-8');
+  } catch (e) {
+    if (isGguf && typeof e === 'object' && e !== null && 'code' in e && e.code === 'ENOENT') {
+      const architecture = ggufArchitecture(modelPath);
+      const modelType = GGUF_ARCHITECTURE_MODEL_TYPES.get(architecture);
+      if (modelType === undefined) {
+        throw new Error(`Unsupported GGUF architecture "${architecture}" in ${modelPath}`);
+      }
+      return modelType;
+    }
+    throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`);
+  }
+
+  try {
     const config = normalizeConfig(modelPath, JSON.parse(raw));
     const baseFamily = config.usesDefaultModelType
       ? MODEL_FAMILY_INDEX.defaultForNullishModelType

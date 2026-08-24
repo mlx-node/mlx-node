@@ -217,7 +217,7 @@ Quantization Arguments:
                         Required for legacy affine "unsloth". Optional for its
                         fixed --q-mxfp / --q-mode nvfp4 maps, but preferred
                         when matching calibration data is available.
-  --gguf-kquant         Import ggml Q4_K / Q5_K / Q6_K tensors as MLX K-quant
+  --gguf-kquant         Import supported ggml K/IQ tensors as native MLX packed weights
                         arrays instead of rejecting them. Blocks are repacked
                         bit-for-bit, never dequantized, so the output keeps the
                         source weights and byte size. Cannot be combined with
@@ -617,7 +617,7 @@ export async function run(argv: string[]) {
       );
       process.exit(1);
     }
-    // K-quant import (--gguf-kquant) repacks ggml Q4_K/Q5_K/Q6_K bit-for-bit and
+    // K-quant import (--gguf-kquant) losslessly repacks supported ggml K/IQ blocks and
     // never dequantizes, so any re-quantization flag both contradicts it and
     // forces whole-model float residency. Reject upfront (mirrors the native
     // guard in crates/mlx-core/src/utils/gguf.rs::convert_gguf_to_safetensors).

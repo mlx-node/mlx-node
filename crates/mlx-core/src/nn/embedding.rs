@@ -19,14 +19,15 @@ use std::sync::{
 /// packed-resident (real memory savings of `vocab × hidden × 2` bytes for a
 /// large vocab). `forward` does a per-row gather-then-dequant (only the looked-
 /// up rows are dequantized) and `as_linear` runs `mlx_quantized_matmul` for the
-/// tied lm_head. `mode` is the quantization mode string ("affine" / "mxfp4" /
-/// "mxfp8" / "nvfp4") threaded into both ops.
+/// tied lm_head. `mode` is the quantization mode string (affine, MX/NVFP, or
+/// native GGUF K/IQ) threaded into both ops.
 struct QuantizedEmbeddingBackend {
     /// Packed quantized weight `[num_embeddings, packed_dim]`.
     weight: MxArray,
     /// Quantization scales.
     scales: MxArray,
-    /// Quantization biases (affine mode only; `None` for mxfp4/mxfp8/nvfp4).
+    /// Affine biases or native K/IQ floating super-block sidecars; `None` for
+    /// MXFP4/MXFP8/NVFP4.
     biases: Option<MxArray>,
     group_size: i32,
     bits: i32,
@@ -290,11 +291,11 @@ impl Embedding {
     /// Pre-dequantizes the full table into `self.weight` — the packed
     /// weight/scales/biases are NOT retained. Kept as an exact compatibility
     /// fallback for callers that still require a dense table. `mode` is the quantization mode string
-    /// ("affine" / "mxfp4" / "mxfp8" / "nvfp4" / "q6k" / "q4k" / "q5k") the
-    /// dequant is decoded with — the caller passes the mode resolved from the
-    /// checkpoint, so a K-quant table decodes as K-quant instead of being
-    /// misread as affine. Do not route new callers here; use
-    /// `load_quantized_packed` for memory savings.
+    /// (affine, MXFP/NVFP, or native GGUF K/IQ) the dequant is decoded with —
+    /// the caller passes the mode resolved from the checkpoint, so a K/IQ
+    /// table decodes with its actual format instead of being misread as
+    /// affine. Do not route new callers here; use `load_quantized_packed` for
+    /// memory savings.
     pub fn load_quantized(
         &mut self,
         weight: &MxArray,
@@ -329,8 +330,9 @@ impl Embedding {
     /// Retains the packed `weight`/`scales`/(`biases`) AS-IS — does NOT
     /// dequantize the table. `forward` gather-then-dequantizes only the looked-
     /// up rows; `as_linear` runs `mlx_quantized_matmul`. The dense table is
-    /// never materialized, so the embedding stays packed-resident. Supports ALL
-    /// modes (affine + mxfp4/mxfp8/nvfp4); mxfp/nvfp pass `biases = None`.
+    /// never materialized, so the embedding stays packed-resident. Supports all
+    /// modes accepted by MLX quantized matmul/dequantize, including native GGUF
+    /// K/IQ; MXFP/NVFP pass `biases = None`.
     ///
     /// `self.weight` is left as a small placeholder (never read on the
     /// packed forward/logits paths).
@@ -381,9 +383,9 @@ impl Embedding {
     ///   only a tiny placeholder, so this DEQUANTIZES the full table on demand
     ///   from the packed backend and returns CORRECT `[vocab, hidden]` data — it
     ///   never returns the placeholder. The dense table is materialized only if a
-    ///   caller actually evals the result; the production lfm2 logits path uses
+    ///   caller actually evals the result; production logits paths use
     ///   `as_linear` (a `mlx_quantized_matmul` on the packed tensors) and never
-    ///   hits this, so no full dense table is resident under normal inference.
+    ///   hit this, so no full dense table is resident under normal inference.
     pub fn get_weight(&self) -> MxArray {
         if let Some(ref q) = self.quantized_packed {
             #[cfg(test)]
@@ -433,8 +435,9 @@ impl Embedding {
     }
 
     /// Whether this embedding holds a PACKED-quantized backend
-    /// (`load_quantized_packed`). When true, the tied-head logits path MUST use
-    /// `as_linear` (the dense `get_weight()` is only a placeholder).
+    /// (`load_quantized_packed`). When true, the tied-head logits path must use
+    /// `as_linear`; `get_weight()` is an explicit compatibility/export accessor
+    /// that constructs a full-table dequantization graph on demand.
     pub fn is_packed_quantized(&self) -> bool {
         self.quantized_packed.is_some()
     }
@@ -829,123 +832,138 @@ mod tests {
         );
     }
 
-    /// PACKED q6k embedding (the GGUF K-quant import path): a repacked
-    /// `token_embd` group loaded via `load_quantized_packed(..., "q6k")` must
+    /// PACKED q4k/q6k embeddings (the GGUF K-quant import path): a repacked
+    /// `token_embd` group loaded via `load_quantized_packed` must
     /// gather-then-dequant in `forward` and quantized-matmul in `as_linear`,
     /// both returning finite values that match a reference `mlx_dequantize` in
-    /// "q6k" mode. Regression guard for the fix on this branch: the embedding
+    /// the corresponding K-quant mode. Regression guard for this branch: the embedding
     /// consumers used to hardcode "affine", which cannot decode a K-quant group
-    /// (its int8 `.scales` fail affine's floating-scale check), so a K-quant
-    /// tied embedding could not load end-to-end. Builds the group through the
-    /// production repacker (`utils::gguf_kquant`) from synthetic ggml Q6_K
-    /// super-block bytes, so the whole import→decode chain is exercised.
+    /// (its integer `.scales` fail affine's floating-scale check), so a K-quant
+    /// embedding could not load end-to-end. Q4_K is the exact UD-Q4_K_XL input
+    /// embedding format; Q6_K covers the tied-head-capable symmetric layout.
+    /// Both groups are built through the production repacker from synthetic
+    /// ggml super-block bytes, so the whole import→decode chain is exercised.
     #[test]
-    fn packed_q6k_forward_and_as_linear_match_reference_dequant() {
+    fn packed_q4k_and_q6k_forward_and_as_linear_match_reference_dequant() {
         use crate::utils::gguf_kquant::{KQuantFormat, KQuantScales, QK_K, repack_kquant};
 
         let vocab = 6i64;
-        let hidden = 256i64; // one q6k super-block (256 values) per row
+        let hidden = 256i64; // one K-quant super-block per row
         let k = hidden as usize;
         let rows = vocab as usize;
-        let fmt = KQuantFormat::Q6K;
+        for (fmt, group_size, bits) in [(KQuantFormat::Q4K, 32, 4), (KQuantFormat::Q6K, 16, 6)] {
+            let mode = fmt.mlx_mode();
+            let block_bytes = fmt.block_bytes();
+            let sb_per_row = k / QK_K;
 
-        // Synthesize deterministic ggml Q6_K super-blocks: a fixed-seed LCG fills
-        // the ql/qh code planes and the int8 sub-scales, and each super-block's
-        // `d` (the f16 super-block scale at byte offset 208) is forced to a
-        // finite value (0.25 = f16 0x3400) so the decode is guaranteed finite.
-        let block_bytes = fmt.block_bytes();
-        let sb_per_row = k / QK_K;
-        let mut blocks: Vec<u8> = {
-            let mut state = 0xC0FFEEu64;
-            (0..rows * sb_per_row * block_bytes)
-                .map(|_| {
-                    state = state
-                        .wrapping_mul(6364136223846793005)
-                        .wrapping_add(1442695040888963407);
-                    (state >> 33) as u8
-                })
-                .collect()
-        };
-        for sb in 0..(rows * sb_per_row) {
-            let d_off = sb * block_bytes + 208; // Q6_K `d` offset
-            blocks[d_off] = 0x00;
-            blocks[d_off + 1] = 0x34; // f16 0.25, little-endian
-        }
-        let arrays = repack_kquant(fmt, &blocks, rows, k).expect("repack q6k");
+            // A fixed-seed LCG fills the code planes and sub-scales. Force
+            // each floating super-block scale to a small finite value: Q4_K
+            // stores `(d,dmin)` at bytes 0..4, while Q6_K stores `d` at 208.
+            let mut blocks: Vec<u8> = {
+                let mut state = 0xC0FFEEu64 ^ fmt.gguf_type() as u64;
+                (0..rows * sb_per_row * block_bytes)
+                    .map(|_| {
+                        state = state
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        (state >> 33) as u8
+                    })
+                    .collect()
+            };
+            for sb in 0..(rows * sb_per_row) {
+                let base = sb * block_bytes;
+                match fmt {
+                    KQuantFormat::Q4K => {
+                        blocks[base] = 0x00;
+                        blocks[base + 1] = 0x34; // d = f16 0.25
+                        blocks[base + 2] = 0x00;
+                        blocks[base + 3] = 0x30; // dmin = f16 0.125
+                    }
+                    KQuantFormat::Q6K => {
+                        blocks[base + 208] = 0x00;
+                        blocks[base + 209] = 0x34; // d = f16 0.25
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let arrays = repack_kquant(fmt, &blocks, rows, k)
+                .unwrap_or_else(|err| panic!("repack {mode}: {err}"));
+            let weight = MxArray::from_uint32(&arrays.weight, &[vocab, fmt.weight_cols(k) as i64])
+                .expect("weight");
+            let scales = match &arrays.scales {
+                KQuantScales::Signed(v) => {
+                    MxArray::from_int8(v, &[vocab, fmt.scales_cols(k) as i64])
+                }
+                KQuantScales::Unsigned(v) => {
+                    MxArray::from_uint8(v, &[vocab, fmt.scales_cols(k) as i64])
+                }
+            }
+            .expect("scales");
+            let biases = MxArray::from_float16(&arrays.biases, &[vocab, fmt.biases_cols(k) as i64])
+                .expect("biases");
 
-        let weight = MxArray::from_uint32(&arrays.weight, &[vocab, fmt.weight_cols(k) as i64])
-            .expect("weight");
-        let scales_i8 = match &arrays.scales {
-            KQuantScales::Signed(v) => v,
-            KQuantScales::Unsigned(_) => panic!("q6k scales must be signed int8"),
-        };
-        let scales =
-            MxArray::from_int8(scales_i8, &[vocab, fmt.scales_cols(k) as i64]).expect("scales");
-        let biases = MxArray::from_float16(&arrays.biases, &[vocab, fmt.biases_cols(k) as i64])
-            .expect("biases");
+            let mut emb = Embedding::new(vocab as u32, hidden as u32).expect("new");
+            emb.load_quantized_packed(&weight, &scales, Some(&biases), group_size, bits, mode)
+                .unwrap_or_else(|err| panic!("load packed {mode}: {err}"));
+            assert!(emb.is_packed_quantized());
 
-        let mut emb = Embedding::new(vocab as u32, hidden as u32).expect("new");
-        emb.load_quantized_packed(&weight, &scales, Some(&biases), 16, 6, "q6k")
-            .expect("load packed q6k");
-        assert!(emb.is_packed_quantized());
+            // Reference: dequantize the full table once in the same mode.
+            let full = dequantize(&weight, &scales, Some(&biases), group_size, bits, mode)
+                .unwrap_or_else(|err| panic!("dequant full {mode}: {err}"));
 
-        // Reference: dequantize the full table once, in q6k mode.
-        let full = dequantize(&weight, &scales, Some(&biases), 16, 6, "q6k").expect("dequant full");
-
-        // forward: gather-then-dequant must equal dequant-then-gather EXACTLY —
-        // K-quant dequant is per-row independent (no cross-row reduction), so
-        // the order of gather and dequant does not change the bits.
-        let idx = MxArray::from_int32(&[0, 3, 5, 1], &[4]).expect("idx");
-        let got = emb.forward(&idx).expect("forward");
-        let got_v = to_f32_vec(&got);
-        assert!(
-            got_v.iter().all(|v| v.is_finite()),
-            "q6k forward produced non-finite values"
-        );
-        let ref_rows = full.take(&idx, 0).expect("gather ref");
-        let max_err = max_abs_err(&got_v, &to_f32_vec(&ref_rows));
-        assert_eq!(
-            max_err, 0.0,
-            "packed q6k forward (gather-then-dequant) must equal dequant-then-gather: max_err={max_err}"
-        );
-
-        // as_linear: the tied-head quantized_matmul must run and stay finite.
-        let xdata: Vec<f32> = (0..(2 * hidden))
-            .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
-            .collect();
-        let x = MxArray::from_float32(&xdata, &[2, hidden])
-            .expect("x")
-            .astype(DType::BFloat16)
-            .expect("x bf16");
-        let logits = emb.as_linear(&x).expect("as_linear q6k");
-        let logits_v = to_f32_vec(&logits);
-        assert_eq!(logits_v.len(), (2 * vocab) as usize, "logits shape");
-        assert!(
-            logits_v.iter().all(|v| v.is_finite()),
-            "q6k as_linear produced non-finite values"
-        );
-
-        // Match `x @ dequant(table)^T` where the host's half-precision GEMM is
-        // trustworthy (the reference side is a bf16 GEMM; skip on hosts whose
-        // NAX half-GEMM fails the canary, exactly as the affine as_linear parity
-        // does — the quantized_matmul under test is CORRECT there, only its bf16
-        // dense-matmul oracle is broken). The tolerance is RELATIVE to the logit
-        // magnitude: the reference rounds the whole table to bf16 before the
-        // K=256 matmul, so at these synthetic magnitudes (~O(100)) its ~0.4%
-        // per-element rounding dominates — a fixed absolute bound would flag
-        // pure bf16 noise, while a wrong mode/transpose still errors or lands
-        // orders of magnitude off.
-        if !crate::test_support::half_gemm_untrustworthy() {
-            let full_t = full.transpose(Some(&[1, 0])).expect("transpose");
-            let ref_logits = x.matmul(&full_t).expect("ref matmul");
-            let ref_v = to_f32_vec(&ref_logits);
-            let scale = ref_v.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
-            let lmax = max_abs_err(&logits_v, &ref_v);
+            // K-quant dequant is row-independent, so gather-then-dequant must
+            // equal dequant-then-gather bit-for-bit.
+            let idx = MxArray::from_int32(&[0, 3, 5, 1], &[4]).expect("idx");
+            let got = emb
+                .forward(&idx)
+                .unwrap_or_else(|err| panic!("forward {mode}: {err}"));
+            let got_v = to_f32_vec(&got);
             assert!(
-                lmax <= 5e-2 * scale,
-                "packed q6k as_linear must match x @ dequant(table)^T within bf16 \
-                 GEMM tolerance: max_err={lmax}, ref_scale={scale}"
+                got_v.iter().all(|v| v.is_finite()),
+                "{mode} forward produced non-finite values"
             );
+            let ref_rows = full.take(&idx, 0).expect("gather ref");
+            let max_err = max_abs_err(&got_v, &to_f32_vec(&ref_rows));
+            assert_eq!(
+                max_err, 0.0,
+                "packed {mode} gather-dequant must equal dequant-then-gather: max_err={max_err}"
+            );
+
+            // Also exercise the tied-head path. The exact target is untied,
+            // but this proves that keeping Q4_K packed does not strand a tied
+            // checkpoint on an unsupported backend.
+            let xdata: Vec<f32> = (0..(2 * hidden))
+                .map(|i| ((i % 7) as f32 - 3.0) * 0.05)
+                .collect();
+            let x = MxArray::from_float32(&xdata, &[2, hidden])
+                .expect("x")
+                .astype(DType::BFloat16)
+                .expect("x bf16");
+            let logits = emb
+                .as_linear(&x)
+                .unwrap_or_else(|err| panic!("as_linear {mode}: {err}"));
+            let logits_v = to_f32_vec(&logits);
+            assert_eq!(logits_v.len(), (2 * vocab) as usize, "logits shape");
+            assert!(
+                logits_v.iter().all(|v| v.is_finite()),
+                "{mode} as_linear produced non-finite values"
+            );
+
+            // The reference side is a bf16 GEMM, so skip only on hosts whose
+            // half-GEMM canary is broken. Use a relative tolerance because the
+            // dense table is rounded to bf16 before the K=256 matmul.
+            if !crate::test_support::half_gemm_untrustworthy() {
+                let full_t = full.transpose(Some(&[1, 0])).expect("transpose");
+                let ref_logits = x.matmul(&full_t).expect("ref matmul");
+                let ref_v = to_f32_vec(&ref_logits);
+                let scale = ref_v.iter().fold(0f32, |m, v| m.max(v.abs())).max(1.0);
+                let lmax = max_abs_err(&logits_v, &ref_v);
+                assert!(
+                    lmax <= 5e-2 * scale,
+                    "packed {mode} as_linear must match x @ dequant(table)^T within bf16 \
+                     GEMM tolerance: max_err={lmax}, ref_scale={scale}"
+                );
+            }
         }
     }
 

@@ -1415,6 +1415,12 @@ export declare class QianfanOCRModel {
  */
 export declare class Qwen35Model {
   /**
+   * Resolved directory containing this model's tokenizer/config assets.
+   * Streaming wrappers use it after a direct GGUF load so chat templating
+   * reads the reconstructed sidecars from the native-packed cache.
+   */
+  modelAssetsPath(): string;
+  /**
    * Whether the block-paged KV cache adapter is active on this model
    * instance.
    *
@@ -3735,6 +3741,13 @@ export declare function getMemorySnapshot(): GpuMemorySnapshot;
 /** Retrieve all collected profiling data as a `ProfilingSession`. */
 export declare function getProfilingData(): ProfilingSession;
 
+/**
+ * Read the architecture declared by a GGUF header without loading any tensor
+ * payloads. This is the model-family detection seam for standalone GGUF files
+ * that intentionally do not ship a sibling `config.json`.
+ */
+export declare function ggufArchitecture(inputPath: string): string;
+
 export interface GgufConversionOptions {
   /** Path to the GGUF file */
   inputPath: string;
@@ -3792,13 +3805,20 @@ export interface GgufConversionOptions {
    */
   quantMxfp?: boolean;
   /**
-   * Import ggml Q4_K / Q5_K / Q6_K tensors as MLX K-quant arrays instead of
+   * Import supported ggml K/IQ tensors as native MLX packed arrays instead of
    * rejecting them (default: false). The blocks are repacked, never
-   * dequantized, so the output keeps the source file's weights and byte size.
+   * dequantized, so the output preserves the source quantized values. IQ3_S
+   * expands only its integer grid/sign encoding to signed 8-bit codes.
    * With this off, Q6_K remains the Gemma4 token-embedding BF16 fallback and
    * Q4_K / Q5_K are an error.
    */
   importKQuants?: boolean;
+  /**
+   * Preserve Qwen3.5/3.8 GGUF GDN tensors in llama.cpp's tiled value-head
+   * order. The runtime consumes this layout directly and avoids any packed
+   * weight permutation. Intended for native GGUF execution.
+   */
+  nativeQwen35Layout?: boolean;
 }
 
 export interface GgufConversionResult {
@@ -4739,6 +4759,12 @@ export interface Qwen35Config {
    * unavailable.
    */
   nMtpLayers: number;
+  /**
+   * Internal layout marker written by native Qwen3.5/3.8 GGUF conversion.
+   * `Some("tiled")` keeps llama.cpp's value-head order and lets GDN map
+   * value head h to key head h % Hk without permuting packed weights.
+   */
+  qwen35GgufGdnLayout?: string | undefined;
 }
 
 /**
@@ -4855,6 +4881,13 @@ export interface Qwen35MoeConfig {
    * unavailable.
    */
   nMtpLayers: number;
+  /**
+   * Internal layout marker written by native Qwen3.5/3.8 GGUF conversion.
+   * `Some("tiled")` keeps llama.cpp's value-head order and lets the shared
+   * GDN runtime map value head h to key head h % Hk without permuting
+   * packed weights.
+   */
+  qwen35GgufGdnLayout?: string | undefined;
 }
 
 /** Generation configuration for Qwen3.5 MoE */

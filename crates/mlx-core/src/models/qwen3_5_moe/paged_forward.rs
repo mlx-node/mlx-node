@@ -1223,6 +1223,7 @@ mod tests {
             use_block_paged_cache: Some(true),
             persist_paged_cache: None,
             n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
         }
     }
 

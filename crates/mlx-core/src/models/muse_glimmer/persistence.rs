@@ -82,7 +82,13 @@ pub(super) fn build_projection(
                 try_build_quantized_linear(params, prefix, plq.group_size, plq.bits)
             }
             PerLayerMode::Sym8 => try_build_sym8_quantized_linear(params, prefix)?,
-            PerLayerMode::Q4K | PerLayerMode::Q5K | PerLayerMode::Q6K => {
+            PerLayerMode::Q4K
+            | PerLayerMode::Q5K
+            | PerLayerMode::Q6K
+            | PerLayerMode::Q3K
+            | PerLayerMode::IQ4NL
+            | PerLayerMode::IQ4XS
+            | PerLayerMode::IQ3S => {
                 try_build_kquant_quantized_linear(params, prefix, plq.mode, "muse_glimmer")?
             }
         }

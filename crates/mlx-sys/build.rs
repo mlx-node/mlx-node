@@ -278,6 +278,20 @@ fn main() {
     // `CMAKE_OSX_ARCHITECTURES` is an Apple-only knob; setting it on Linux
     // confuses the GCC/CUDA toolchain. Only emit it on macOS.
     if is_macos {
+        // napi-rs invokes Cargo with an explicit Darwin target even when that
+        // target is the native Apple-silicon host. Some CMake launches then
+        // retain an x86_64 host processor while honoring the arm64 compiler
+        // flags, and upstream MLX rejects the configure before it can inspect
+        // CMAKE_OSX_ARCHITECTURES. Pin both views of the target architecture.
+        cfg.define("CMAKE_SYSTEM_NAME", "Darwin");
+        cfg.define(
+            "CMAKE_SYSTEM_PROCESSOR",
+            if target_arch == "aarch64" {
+                "arm64"
+            } else {
+                "x86_64"
+            },
+        );
         cfg.define(
             "CMAKE_OSX_ARCHITECTURES",
             if target_arch == "aarch64" {

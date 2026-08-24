@@ -207,8 +207,8 @@ fn gated_delta_chunked(
 /// kernel launches. ~10x faster than the ops-based sequential loop.
 ///
 /// Shapes:
-///   q: [B, T, Hk, Dk]  (already GQA-expanded to Hv heads by caller)
-///   k: [B, T, Hk, Dk]  (already GQA-expanded)
+///   q: [B, T, Hk, Dk]  (`Hk == Hv`, or compact tiled-GGUF heads)
+///   k: [B, T, Hk, Dk]  (`Hk == Hv`, or compact tiled-GGUF heads)
 ///   v: [B, T, Hv, Dv]
 ///   g: [B, T, Hv]       - decay gate
 ///   beta: [B, T, Hv]    - beta (sigmoid already applied)
@@ -261,9 +261,10 @@ fn gated_delta_kernel(
 /// Per-step GDN recurrence record for the eager MTP tape replay.
 ///
 /// Captures the EXACT inputs passed to [`gated_delta_kernel`] for the whole
-/// `[B, T, ...]` verify window — `q`/`k` are already GQA-expanded and
-/// RMS-norm-scaled, `g` is the post-`exp` decay (`g_log.exp()`), and `beta`
-/// is post-sigmoid. All handles are lazy `MxArray` clones (no eval, no copy).
+/// `[B, T, ...]` verify window — `q`/`k` are RMS-norm-scaled and either
+/// GQA-expanded or compact tiled-GGUF heads, `g` is the post-`exp` decay
+/// (`g_log.exp()`), and `beta` is post-sigmoid. All handles are lazy `MxArray`
+/// clones (no eval, no copy).
 ///
 /// On accept the replay slices each window tensor to step `t` as `[B, 1, ...]`
 /// and re-runs [`gated_delta_kernel`] AT T=1 per accepted step, threading the
@@ -273,9 +274,9 @@ fn gated_delta_kernel(
 /// whole window, which is the divergence the replay corrects.
 #[derive(Clone)]
 pub(crate) struct GdnKernelTape {
-    /// Queries `[B, T, Hv, Dk]` (GQA-expanded, RMS-norm-scaled).
+    /// Queries `[B, T, Hk, Dk]` (expanded or compact tiled, RMS-norm-scaled).
     pub q: MxArray,
-    /// Keys `[B, T, Hv, Dk]` (GQA-expanded, RMS-norm-scaled).
+    /// Keys `[B, T, Hk, Dk]` (expanded or compact tiled, RMS-norm-scaled).
     pub k: MxArray,
     /// Values `[B, T, Hv, Dv]`.
     pub v: MxArray,
@@ -306,7 +307,7 @@ impl GdnKernelTape {
     ) -> Result<MxArray> {
         let mut state = start_state.clone();
         for t in 0..accepted_steps as i64 {
-            let q_t = self.q.slice_axis(1, t, t + 1)?; // [B, 1, Hv, Dk]
+            let q_t = self.q.slice_axis(1, t, t + 1)?; // [B, 1, Hk, Dk]
             let k_t = self.k.slice_axis(1, t, t + 1)?;
             let v_t = self.v.slice_axis(1, t, t + 1)?;
             let g_t = self.g.slice_axis(1, t, t + 1)?; // [B, 1, Hv]
@@ -665,7 +666,9 @@ pub fn gated_delta_update(
     mask: Option<&MxArray>,
     use_kernel: bool,
 ) -> Result<(MxArray, MxArray)> {
-    gated_delta_update_with_tape(q, k, v, a, b, a_log, dt_bias, state, mask, use_kernel, None)
+    gated_delta_update_with_tape(
+        q, k, v, a, b, a_log, dt_bias, state, mask, use_kernel, false, None,
+    )
 }
 
 /// Tape-recording variant of [`gated_delta_update`].
@@ -673,10 +676,10 @@ pub fn gated_delta_update(
 /// Identical to [`gated_delta_update`] except that, when the per-step Metal
 /// kernel runs (`use_kernel`, `k_dim % 32 == 0`, not chunked), it records the
 /// exact `(q, k, v, g, beta)` window tensors into `tape_sink` for the eager
-/// MTP replay. The captured `q`/`k` are GQA-expanded + RMS-norm-scaled and `g`
-/// is `g_log.exp()` — i.e. EXACTLY the tensors handed to the kernel, by lazy
-/// `.clone()` (no eval). When `tape_sink` is `None` the behavior is
-/// byte-identical to [`gated_delta_update`].
+/// MTP replay. The captured `q`/`k` are RMS-norm-scaled and may retain compact
+/// tiled-GGUF heads; `g` is `g_log.exp()` — i.e. EXACTLY the tensors handed to
+/// the kernel, by lazy `.clone()` (no eval). When `tape_sink` is `None` the
+/// behavior is byte-identical to [`gated_delta_update`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gated_delta_update_with_tape(
     q: &MxArray,
@@ -689,6 +692,7 @@ pub(crate) fn gated_delta_update_with_tape(
     state: Option<&MxArray>,
     mask: Option<&MxArray>,
     use_kernel: bool,
+    tiled_gqa: bool,
     mut tape_sink: Option<&mut Option<GdnKernelTape>>,
 ) -> Result<(MxArray, MxArray)> {
     let batch = q.shape_at(0)?;
@@ -726,8 +730,17 @@ pub(crate) fn gated_delta_update_with_tape(
                 )));
             }
             let repeat_factor = num_v_heads / num_k_heads;
-            let q_expanded = q.repeat(repeat_factor as i32, 2)?;
-            let k_expanded = k.repeat(repeat_factor as i32, 2)?;
+            let (q_expanded, k_expanded) = if tiled_gqa {
+                (
+                    MxArray::tile(q, &[1, 1, repeat_factor as i32, 1])?,
+                    MxArray::tile(k, &[1, 1, repeat_factor as i32, 1])?,
+                )
+            } else {
+                (
+                    q.repeat(repeat_factor as i32, 2)?,
+                    k.repeat(repeat_factor as i32, 2)?,
+                )
+            };
             (q_expanded, k_expanded)
         } else {
             (q.clone(), k.clone())
@@ -784,8 +797,11 @@ pub(crate) fn gated_delta_update_with_tape(
         }
     };
 
-    // GQA head expansion: repeat q,k from Hk to Hv heads
-    let (q, k) = if num_v_heads != num_k_heads {
+    // Standard checkpoints group each key head contiguously and need
+    // repeat-interleave. GGUF Qwen3.5 keeps the value-major tiled order; the
+    // per-step Metal kernel consumes those compact heads directly and maps
+    // value head `hv` to key head `hv % Hk`, avoiding an activation copy.
+    let (q, k) = if num_v_heads != num_k_heads && !tiled_gqa {
         if num_k_heads == 0 {
             return Err(Error::from_reason(
                 "GatedDelta: num_k_heads is 0, cannot compute GQA repeat factor",
@@ -828,7 +844,16 @@ pub(crate) fn gated_delta_update_with_tape(
         if seq_len >= CHUNK_THRESHOLD && mask.is_none() {
             let choice = gdn_kernel_override();
             if should_use_chunked(seq_len, mask.is_none(), gpu_architecture_gen(), choice) {
-                match gated_delta_chunked(&q, &k, v, &g_log, &beta, &initial_state) {
+                let (chunk_q, chunk_k) = if tiled_gqa && num_v_heads != num_k_heads {
+                    let repeat_factor = num_v_heads / num_k_heads;
+                    (
+                        MxArray::tile(&q, &[1, 1, repeat_factor as i32, 1])?,
+                        MxArray::tile(&k, &[1, 1, repeat_factor as i32, 1])?,
+                    )
+                } else {
+                    (q.clone(), k.clone())
+                };
+                match gated_delta_chunked(&chunk_q, &chunk_k, v, &g_log, &beta, &initial_state) {
                     Ok(result) => return Ok(result),
                     Err(e) => {
                         // An explicit `MLX_GDN_KERNEL=chunked` force must be observable when it
@@ -867,7 +892,16 @@ pub(crate) fn gated_delta_update_with_tape(
 
     // Ops-based sequential loop fallback (also needs exp(g_log))
     let g = g_log.exp()?;
-    gated_delta_ops(&q, &k, v, &g, &beta, &initial_state, mask)
+    let (ops_q, ops_k) = if tiled_gqa && num_v_heads != num_k_heads {
+        let repeat_factor = num_v_heads / num_k_heads;
+        (
+            MxArray::tile(&q, &[1, 1, repeat_factor as i32, 1])?,
+            MxArray::tile(&k, &[1, 1, repeat_factor as i32, 1])?,
+        )
+    } else {
+        (q, k)
+    };
+    gated_delta_ops(&ops_q, &ops_k, v, &g, &beta, &initial_state, mask)
 }
 
 #[cfg(test)]
