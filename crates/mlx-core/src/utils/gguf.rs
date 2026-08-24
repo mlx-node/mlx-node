@@ -4430,6 +4430,72 @@ pub async fn convert_gguf_to_safetensors(
 /// F32 norms/biases are narrowed to BF16 so they do not promote inference
 /// activations away from the model's BF16 execution/cache dtype.
 const QWEN35_NATIVE_CACHE_FORMAT: u32 = 4;
+const QWEN35_NATIVE_CACHE_DIR_ENV: &str = "MLX_NATIVE_GGUF_CACHE_DIR";
+
+fn qwen35_native_cache_candidates_from(
+    override_root: Option<PathBuf>,
+    xdg_cache_home: Option<PathBuf>,
+    home: Option<PathBuf>,
+    temp: PathBuf,
+) -> Vec<PathBuf> {
+    if let Some(root) = override_root.filter(|path| !path.as_os_str().is_empty()) {
+        return vec![root];
+    }
+    let mut candidates = Vec::new();
+    if let Some(root) = xdg_cache_home.filter(|path| !path.as_os_str().is_empty()) {
+        candidates.push(root.join("mlx-node/native-gguf"));
+    }
+    if let Some(home) = home.filter(|path| !path.as_os_str().is_empty()) {
+        #[cfg(target_os = "macos")]
+        candidates.push(home.join("Library/Caches/mlx-node/native-gguf"));
+        #[cfg(not(target_os = "macos"))]
+        candidates.push(home.join(".cache/mlx-node/native-gguf"));
+    }
+    candidates.push(temp.join("mlx-node/native-gguf"));
+    candidates.dedup();
+    candidates
+}
+
+fn initialize_qwen35_native_cache_root(root: &Path) -> std::io::Result<PathBuf> {
+    fs::create_dir_all(root)?;
+    let probe = root.join(format!(
+        ".write-probe-{}-{}",
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&probe)?;
+    fs::remove_file(&probe)?;
+    root.canonicalize()
+}
+
+fn qwen35_native_cache_root() -> Result<PathBuf> {
+    let override_root = std::env::var_os(QWEN35_NATIVE_CACHE_DIR_ENV).map(PathBuf::from);
+    let candidates = qwen35_native_cache_candidates_from(
+        override_root.clone(),
+        std::env::var_os("XDG_CACHE_HOME").map(PathBuf::from),
+        std::env::var_os("HOME").map(PathBuf::from),
+        std::env::temp_dir(),
+    );
+    let mut failures = Vec::new();
+    for candidate in candidates {
+        match initialize_qwen35_native_cache_root(&candidate) {
+            Ok(root) => return Ok(root),
+            Err(error) => failures.push(format!("{}: {error}", candidate.display())),
+        }
+    }
+    let authority = if override_root.is_some() {
+        format!(" from {QWEN35_NATIVE_CACHE_DIR_ENV}")
+    } else {
+        String::new()
+    };
+    Err(Error::from_reason(format!(
+        "No writable native GGUF cache directory{authority}: {}",
+        failures.join("; ")
+    )))
+}
 
 fn qwen35_native_asset_digest(parent: &Path) -> Result<String> {
     let mut hasher = Sha256::new();
@@ -4541,6 +4607,22 @@ fn qwen35_native_cache_is_current(
 }
 
 pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
+    let cache_root = qwen35_native_cache_root()?;
+    prepare_qwen35_native_gguf_inner(input_path, &cache_root).await
+}
+
+#[cfg(test)]
+async fn prepare_qwen35_native_gguf_in(input_path: &Path, cache_root: &Path) -> Result<PathBuf> {
+    let cache_root = initialize_qwen35_native_cache_root(cache_root).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to create native GGUF cache root '{}': {error}",
+            cache_root.display()
+        ))
+    })?;
+    prepare_qwen35_native_gguf_inner(input_path, &cache_root).await
+}
+
+async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) -> Result<PathBuf> {
     let input_path = input_path.canonicalize().map_err(|error| {
         Error::from_reason(format!(
             "Failed to canonicalize GGUF path '{}': {error}",
@@ -4576,13 +4658,6 @@ pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
     let parent = input_path.parent().unwrap_or(Path::new("."));
     let source_digest = qwen35_native_source_digest(&input_path);
     let asset_digest = qwen35_native_asset_digest(parent)?;
-    let cache_root = parent.join(".mlx-node-native");
-    fs::create_dir_all(&cache_root).map_err(|error| {
-        Error::from_reason(format!(
-            "Failed to create native GGUF cache root '{}': {error}",
-            cache_root.display()
-        ))
-    })?;
     let cache_key = format!(
         "{stem}-{}-{modified}-v{QWEN35_NATIVE_CACHE_FORMAT}-{source_digest}-{asset_digest}",
         metadata.len(),
@@ -4943,8 +5018,9 @@ mod tests {
         );
         let input = root.join("standalone.gguf");
         fs::write(&input, data).unwrap();
+        let cache_root = root.join("native-cache");
 
-        let output = prepare_qwen35_native_gguf(&input)
+        let output = prepare_qwen35_native_gguf_in(&input, &cache_root)
             .await
             .unwrap_or_else(|error| {
                 panic!(
@@ -5094,6 +5170,83 @@ mod tests {
         );
     }
 
+    #[test]
+    fn qwen35_native_cache_root_prefers_override_then_application_cache() {
+        let override_root = PathBuf::from("/override");
+        let xdg = PathBuf::from("/xdg");
+        let home = PathBuf::from("/home/tester");
+        let temp = PathBuf::from("/tmp/tester");
+        assert_eq!(
+            qwen35_native_cache_candidates_from(
+                Some(override_root.clone()),
+                Some(xdg.clone()),
+                Some(home.clone()),
+                temp.clone(),
+            ),
+            vec![override_root]
+        );
+        assert_eq!(
+            qwen35_native_cache_candidates_from(None, Some(xdg), Some(home.clone()), temp.clone())
+                [0],
+            PathBuf::from("/xdg/mlx-node/native-gguf")
+        );
+        let without_xdg = qwen35_native_cache_candidates_from(None, None, Some(home), temp.clone());
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            without_xdg[0],
+            PathBuf::from("/home/tester/Library/Caches/mlx-node/native-gguf")
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            without_xdg[0],
+            PathBuf::from("/home/tester/.cache/mlx-node/native-gguf")
+        );
+        assert_eq!(without_xdg.last(), Some(&temp.join("mlx-node/native-gguf")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn qwen35_native_prepare_never_writes_beside_read_only_source() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-read-only-source-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let source = root.join("source");
+        let cache_root = root.join("cache");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("config.json"), r#"{"model_type":"qwen3_5"}"#).unwrap();
+        let input = source.join("model.gguf");
+        fs::write(
+            &input,
+            build_minimal_gguf(
+                &[
+                    (
+                        "general.architecture",
+                        GgufMetaValue::String("qwen35".to_string()),
+                    ),
+                    ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+                ],
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o555)).unwrap();
+        let prepared = prepare_qwen35_native_gguf_in(&input, &cache_root).await;
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = prepared.unwrap();
+
+        assert!(output.starts_with(cache_root.canonicalize().unwrap()));
+        assert!(!source.join(".mlx-node-native").exists());
+        assert!(output.join("model.safetensors").is_file());
+        fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn qwen35_native_cache_tracks_source_asset_presence_and_contents() {
         let root = std::env::temp_dir().join(format!(
@@ -5126,20 +5279,27 @@ mod tests {
             ),
         )
         .unwrap();
+        let cache_root = root.join("native-cache");
 
-        let standalone = prepare_qwen35_native_gguf(&input).await.unwrap();
+        let standalone = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
         fs::write(
             root.join("config.json"),
             r#"{"model_type":"qwen3_5","asset_sentinel":1}"#,
         )
         .unwrap();
-        let added = prepare_qwen35_native_gguf(&input).await.unwrap();
+        let added = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
         fs::write(
             root.join("config.json"),
             r#"{"model_type":"qwen3_5","asset_sentinel":2}"#,
         )
         .unwrap();
-        let edited_same_size = prepare_qwen35_native_gguf(&input).await.unwrap();
+        let edited_same_size = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
 
         assert_ne!(
             standalone, added,
@@ -5208,9 +5368,14 @@ mod tests {
             fs::metadata(&left_input).unwrap().modified().unwrap(),
             fs::metadata(&right_input).unwrap().modified().unwrap()
         );
+        let cache_root = root.join("native-cache");
 
-        let left = prepare_qwen35_native_gguf(&left_input).await.unwrap();
-        let right = prepare_qwen35_native_gguf(&right_input).await.unwrap();
+        let left = prepare_qwen35_native_gguf_in(&left_input, &cache_root)
+            .await
+            .unwrap();
+        let right = prepare_qwen35_native_gguf_in(&right_input, &cache_root)
+            .await
+            .unwrap();
         assert_ne!(
             left, right,
             "canonical source identity must participate in the key"
@@ -5255,10 +5420,11 @@ mod tests {
             ),
         )
         .unwrap();
+        let cache_root = root.join("native-cache");
 
         let (left, right) = tokio::join!(
-            prepare_qwen35_native_gguf(&input),
-            prepare_qwen35_native_gguf(&input)
+            prepare_qwen35_native_gguf_in(&input, &cache_root),
+            prepare_qwen35_native_gguf_in(&input, &cache_root)
         );
         let left = left.unwrap();
         let right = right.unwrap();
@@ -5266,7 +5432,7 @@ mod tests {
         assert!(left.join("model.safetensors").is_file());
         assert!(left.join("config.json").is_file());
         assert!(left.join(".complete").is_file());
-        let staged = fs::read_dir(root.join(".mlx-node-native"))
+        let staged = fs::read_dir(&cache_root)
             .unwrap()
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.file_name().to_string_lossy().contains(".staging-"))
