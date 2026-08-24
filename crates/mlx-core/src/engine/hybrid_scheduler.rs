@@ -428,14 +428,17 @@ pub(crate) fn exceeds_max_pool_ceiling(
 
 /// Block shortfall a one-shot pool grow must add on the no-live-turns
 /// Reject edge of `try_reserve_reclaiming_idle_with`, or `None` to keep the
-/// existing Reject path. `None` when the pool already sits at its max, the
-/// reservation exceeds the max-pool ceiling, or the shortfall is zero (a
-/// deny with zero block shortfall comes from the recurrent-state side,
-/// which a pool grow cannot fix).
+/// existing Reject path. The shortfall is measured in BYTES — reservation
+/// blocks plus candidate and already-scheduled recurrent state — because
+/// admission is a byte inequality over one shared budget, and each grown
+/// block adds `bytes_per_block` of budget. `None` when the pool already
+/// sits at its max, the reservation exceeds the max-pool ceiling, or the
+/// byte shortfall is zero.
 fn grow_needed_blocks(
     snapshot: &SchedulerCacheSnapshot,
     reservation_blocks: u32,
     candidate_state_bytes: u64,
+    existing_scheduled_state_bytes: u64,
 ) -> Option<u32> {
     if snapshot.blocks.total_blocks >= snapshot.max_total_blocks {
         return None;
@@ -443,13 +446,19 @@ fn grow_needed_blocks(
     if exceeds_max_pool_ceiling(snapshot, reservation_blocks, candidate_state_bytes) {
         return None;
     }
-    let shortfall = reservation_blocks.saturating_sub(
-        snapshot
-            .blocks
-            .free_blocks
-            .saturating_add(snapshot.blocks.reclaimable_blocks),
-    );
-    (shortfall > 0).then_some(shortfall)
+    let bytes_per_block = snapshot.bytes_per_block.max(1);
+    let available_bytes = u64::from(snapshot.blocks.free_blocks)
+        .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
+        .saturating_mul(bytes_per_block);
+    let need_bytes = u64::from(reservation_blocks)
+        .saturating_mul(bytes_per_block)
+        .saturating_add(candidate_state_bytes)
+        .saturating_add(existing_scheduled_state_bytes);
+    let shortfall_bytes = need_bytes.saturating_sub(available_bytes);
+    let shortfall_blocks = shortfall_bytes
+        .div_ceil(bytes_per_block)
+        .min(u64::from(u32::MAX)) as u32;
+    (shortfall_blocks > 0).then_some(shortfall_blocks)
 }
 
 /// Keep-live blocks already allocated for `seq_id` that a continuation
@@ -1911,20 +1920,25 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     /// One-shot pool grow for the no-live-turns Reject edge of
     /// `try_reserve_reclaiming_idle_with`: only when the pool sits below
     /// its max and the reservation still fits the max-pool ceiling does the
-    /// pool grow by the block shortfall over current free + reclaimable.
-    /// Returns the fresh snapshot so the caller can re-run the reserve
-    /// decision once. `Ok(None)` covers every keep-the-Reject-path case: no
-    /// paged adapter, pool already at max, reservation above the max
-    /// ceiling, zero shortfall, or a declined/failed grow. Admission runs
-    /// on the model thread, so the adapter grow contract holds.
+    /// pool grow by the byte shortfall (blocks plus recurrent state) over
+    /// current free + reclaimable. Returns the fresh snapshot so the caller
+    /// can re-run the reserve decision once. `Ok(None)` covers every
+    /// keep-the-Reject-path case: no paged adapter, pool already at max,
+    /// reservation above the max ceiling, zero shortfall, or a
+    /// declined/failed grow. Admission runs on the model thread, so the
+    /// adapter grow contract holds.
     fn try_grow_reservation_pool(
         &mut self,
         snapshot: &SchedulerCacheSnapshot,
         reservation_blocks: u32,
         candidate_state_bytes: u64,
     ) -> Result<Option<SchedulerCacheSnapshot>> {
-        let Some(needed) = grow_needed_blocks(snapshot, reservation_blocks, candidate_state_bytes)
-        else {
+        let Some(needed) = grow_needed_blocks(
+            snapshot,
+            reservation_blocks,
+            candidate_state_bytes,
+            self.inner.scheduled_recurrent_bytes(),
+        ) else {
             return Ok(None);
         };
         let Some(adapter) = self.inner.paged_adapter_mut() else {
@@ -3576,13 +3590,14 @@ mod tests {
             bytes_per_block: 4096,
         };
         assert_eq!(
-            grow_needed_blocks(&snapshot, 70, 0),
+            grow_needed_blocks(&snapshot, 70, 0, 0),
             Some(55),
             "70 reserved - (10 free + 5 reclaimable) = 55 blocks to grow"
         );
-        // Zero shortfall means the deny came from the recurrent-state side,
-        // which a pool grow cannot fix: keep the Reject path.
-        assert_eq!(grow_needed_blocks(&snapshot, 15, 0), None);
+        // No existing state: the byte formula matches the block formula.
+        // Zero shortfall means the reservation fits current free +
+        // reclaimable bytes, so there is nothing to grow for.
+        assert_eq!(grow_needed_blocks(&snapshot, 15, 0, 0), None);
         // A pool already at its max cannot grow.
         let at_max = SchedulerCacheSnapshot {
             blocks: BlockTelemetry {
@@ -3594,11 +3609,56 @@ mod tests {
             max_total_blocks: 100,
             bytes_per_block: 4096,
         };
-        assert_eq!(grow_needed_blocks(&at_max, 60, 0), None);
+        assert_eq!(grow_needed_blocks(&at_max, 60, 0, 0), None);
         // Above the max ceiling, admission must hard-error, not grow.
-        assert_eq!(grow_needed_blocks(&snapshot, 101, 0), None);
+        assert_eq!(grow_needed_blocks(&snapshot, 101, 0, 0), None);
         // Candidate recurrent state can push the reservation past the max.
-        assert_eq!(grow_needed_blocks(&snapshot, 70, 400_000), None);
+        assert_eq!(grow_needed_blocks(&snapshot, 70, 400_000, 0), None);
+    }
+
+    #[test]
+    fn grow_needed_blocks_covers_state_byte_overflow() {
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 40,
+                free_blocks: 15,
+                reclaimable_blocks: 0,
+                allocated_blocks: 25,
+            },
+            max_total_blocks: 100,
+            bytes_per_block: 4096,
+        };
+        // Blocks fit free exactly, but the candidate GDN state overflows the
+        // shared byte budget: grow ceil(10_000 / 4096) = 3 blocks.
+        assert_eq!(grow_needed_blocks(&snapshot, 15, 10_000, 0), Some(3));
+        // Already-scheduled state charges the same budget.
+        assert_eq!(grow_needed_blocks(&snapshot, 15, 5_000, 5_000), Some(3));
+        // Positive block shortfall plus state: the grow must cover the byte
+        // sum, not just the block count. 20*4096 + 10_000 - 15*4096 =
+        // 30_480 bytes -> ceil = 8 blocks (block-only math would say 5).
+        let needed = grow_needed_blocks(&snapshot, 20, 10_000, 0);
+        assert_eq!(needed, Some(8));
+        assert!(
+            u64::from(needed.expect("grow blocks")) * 4096 >= 30_480,
+            "grown blocks must cover the full byte shortfall"
+        );
+        // Recurrent state alone can push a block-fitting reservation past
+        // the max-pool ceiling: hard-error, no grow.
+        let fits_max_blocks = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 40,
+                free_blocks: 15,
+                reclaimable_blocks: 0,
+                allocated_blocks: 25,
+            },
+            max_total_blocks: 100,
+            bytes_per_block: 4096,
+        };
+        assert_eq!(
+            grow_needed_blocks(&fits_max_blocks, 50, 300_000, 0),
+            None,
+            "50 blocks fit the 100-block max, but +300_000 state bytes do not"
+        );
     }
 
     /// Real adapter over a 4-block pool with a 16-block max so a scheduler
@@ -3686,6 +3746,41 @@ mod tests {
         assert_eq!(
             grown.blocks.total_blocks, 8,
             "grow target min(16, max(2*4, 4+1)) is 8 blocks"
+        );
+    }
+
+    #[test]
+    fn state_overflow_reservation_grows_pool_and_admits() {
+        let Some((mut state, snapshot)) = growable_scheduler_state() else {
+            return;
+        };
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let bytes_per_block = snapshot.bytes_per_block;
+        // The reservation blocks fit current free exactly; only the
+        // candidate recurrent state overflows the shared byte budget.
+        let reservation_blocks = snapshot.blocks.free_blocks;
+        let candidate_state_bytes = u64::from(snapshot.blocks.free_blocks) * bytes_per_block + 1;
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, reservation_blocks, candidate_state_bytes, snapshot)
+            .expect("grow + re-reserve");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "a state-byte overflow within the max pool must grow and admit: {outcome:?}"
+        );
+        let grown = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("post-grow snapshot")
+            .expect("paged adapter present");
+        let needed = candidate_state_bytes.div_ceil(bytes_per_block) as u32;
+        assert_eq!(
+            grown.blocks.total_blocks,
+            4 + needed,
+            "grow target min(16, max(2*4, 4+{needed})) covers blocks plus state"
         );
     }
 
