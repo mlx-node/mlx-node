@@ -52,6 +52,7 @@ use super::switch_glu::SwitchGLU;
 fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
     config: &Qwen3_5MoeConfig,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<HashMap<String, MxArray>> {
     let mut result: HashMap<String, MxArray> = HashMap::new();
 
@@ -403,7 +404,7 @@ fn sanitize_weights(
         }
     }
 
-    crate::models::qwen3_5::persistence::merge_split_projections(&mut result)?;
+    crate::models::qwen3_5::persistence::merge_split_projections(&mut result, per_layer_quant)?;
 
     // For FP8 source checkpoints, keep dequantized bf16 weights as-is.
     // Re-quantizing (FP8→bf16→4bit or →MXFP8) compounds quantization error
@@ -1683,16 +1684,9 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                         (raw_params, None)
                     };
 
-                    // Sanitize weights
-                    let params = sanitize_weights(text_raw_params, &config)?;
-                    let quantized = is_quantized_checkpoint(&params);
-                    info!(
-                        "Sanitized to {} parameters (quantized={})",
-                        params.len(),
-                        quantized
-                    );
-
-                    // Parse quantization config
+                    // Parse quantization metadata before sanitizing so the
+                    // shared GDN fusion gate can compare the two split
+                    // projections' declared packing profiles.
                     let quant_cfg = select_quantization_block(&raw)?;
                     let (quant_bits, quant_group_size, top_level_mode, mut per_layer_quant) =
                         parse_quant_settings(
@@ -1700,6 +1694,15 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                             DEFAULT_QUANT_BITS,
                             DEFAULT_QUANT_GROUP_SIZE,
                         )?;
+
+                    // Sanitize weights
+                    let params = sanitize_weights(text_raw_params, &config, &per_layer_quant)?;
+                    let quantized = is_quantized_checkpoint(&params);
+                    info!(
+                        "Sanitized to {} parameters (quantized={})",
+                        params.len(),
+                        quantized
+                    );
 
                     // Augment the per-layer-quant table with the MTP head's
                     // quantization metadata derived from the
@@ -2622,7 +2625,8 @@ mod tests {
             }
         }
 
-        let out = sanitize_weights(params, &config).expect("K-quant expert stacking must succeed");
+        let out = sanitize_weights(params, &config, &HashMap::new())
+            .expect("K-quant expert stacking must succeed");
 
         for proj in ["gate_proj", "up_proj", "down_proj"] {
             let w = out

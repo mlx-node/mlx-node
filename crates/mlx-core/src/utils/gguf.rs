@@ -1461,24 +1461,102 @@ fn gguf_name_to_hf_for_metadata(
     }
 }
 
-/// Qwen3.5 GGUFs with inline MTP encode the draft layer as the final block and
-/// attach the four nextn projections/norms to that same block. HF/MLX stores
-/// those tensors under the mtp prefix, outside the main decoder layer list.
-fn qwen35_name_to_hf(name: &str, metadata: &HashMap<String, GgufMetaValue>) -> String {
-    let arch = metadata
+const QWEN35_INLINE_MTP_NEXTN_SUFFIXES: [&str; 4] = [
+    "nextn.eh_proj.weight",
+    "nextn.enorm.weight",
+    "nextn.hnorm.weight",
+    "nextn.shared_head_norm.weight",
+];
+const QWEN35_INLINE_MTP_INDEX_METADATA: &str = "mlx_node.internal.qwen35_inline_mtp_index";
+
+/// Return the final GGUF block index when a Qwen3.5 file carries llama.cpp's
+/// inline one-layer MTP layout.
+///
+/// The architecture metadata alone cannot distinguish a plain final decoder
+/// block from an inline draft block. The four `nextn.*` descriptors are the
+/// structural witness: when any one is present, require the complete group on
+/// `blk.(block_count - 1)` so config synthesis and tensor remapping cannot
+/// disagree about whether that block belongs to the main decoder or MTP.
+fn qwen35_inline_mtp_index(gguf: &GgufFile) -> Result<Option<u64>> {
+    let arch = gguf
+        .metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
         .unwrap_or("");
     if !matches!(arch, "qwen35" | "qwen35moe") {
-        return gguf_name_to_hf(name);
+        return Ok(None);
     }
-    let Some(block_count) = metadata
+
+    let nextn_names = gguf
+        .tensors
+        .iter()
+        .map(|tensor| tensor.name.as_str())
+        .filter(|name| name.contains(".nextn."))
+        .collect::<Vec<_>>();
+    if nextn_names.is_empty() {
+        return Ok(None);
+    }
+
+    let block_count = gguf
+        .metadata
         .get(&format!("{arch}.block_count"))
         .and_then(GgufMetaValue::as_u64)
-    else {
-        return gguf_name_to_hf(name);
+        .ok_or_else(|| {
+            Error::from_reason(format!(
+                "Qwen3.5 GGUF carries inline nextn tensors but is missing a positive \
+                 '{arch}.block_count'"
+            ))
+        })?;
+    let mtp_index = block_count.checked_sub(1).ok_or_else(|| {
+        Error::from_reason(format!(
+            "Qwen3.5 GGUF carries inline nextn tensors but '{arch}.block_count' is zero"
+        ))
+    })?;
+    let prefix = format!("blk.{mtp_index}.");
+    if let Some(unexpected) = nextn_names.iter().find(|name| !name.starts_with(&prefix)) {
+        return Err(Error::from_reason(format!(
+            "Qwen3.5 inline MTP tensor '{unexpected}' is outside the final GGUF block \
+             '{prefix}*'"
+        )));
+    }
+
+    for suffix in QWEN35_INLINE_MTP_NEXTN_SUFFIXES {
+        let required = format!("{prefix}{suffix}");
+        if !gguf.tensors.iter().any(|tensor| tensor.name == required) {
+            return Err(Error::from_reason(format!(
+                "Qwen3.5 inline MTP block {mtp_index} is incomplete: missing tensor '{required}'"
+            )));
+        }
+    }
+    Ok(Some(mtp_index))
+}
+
+fn apply_qwen35_inline_mtp_config(config: &mut serde_json::Value, mtp_index: Option<u64>) {
+    let Some(mtp_index) = mtp_index else {
+        return;
     };
-    let Some(mtp_index) = block_count.checked_sub(1) else {
+    // `block_count` includes the inline MTP block, while the runtime's main
+    // decoder length does not. Qwen3.5 checkpoints in the HF ecosystem spell
+    // the draft depth as `mtp_num_hidden_layers`; emit the accepted legacy
+    // alias too so synthesized standalone configs are portable to readers that
+    // use `num_nextn_predict_layers`.
+    config["num_hidden_layers"] = serde_json::json!(mtp_index);
+    config["mtp_num_hidden_layers"] = serde_json::json!(1);
+    config["num_nextn_predict_layers"] = serde_json::json!(1);
+}
+
+/// Qwen3.5 GGUFs with inline MTP encode the draft layer as the final block and
+/// attach the four nextn projections/norms to that same block. HF/MLX stores
+/// those tensors under the mtp prefix, outside the main decoder layer list.
+fn qwen35_name_to_hf(name: &str, metadata: &HashMap<String, GgufMetaValue>) -> String {
+    // Conversion annotates the in-memory metadata only after validating all
+    // four `nextn.*` descriptors. A bare qwen35 block_count is insufficient:
+    // files without inline MTP use their final block as an ordinary decoder
+    // layer and must retain `model.layers.(N-1)` names.
+    let Some(mtp_index) = metadata
+        .get(QWEN35_INLINE_MTP_INDEX_METADATA)
+        .and_then(GgufMetaValue::as_u64)
+    else {
         return gguf_name_to_hf(name);
     };
     let prefix = format!("blk.{mtp_index}.");
@@ -3387,7 +3465,7 @@ pub async fn convert_gguf_to_safetensors(
 
     // Parse GGUF header and metadata
     info!("Parsing GGUF file: {}", input_path.display());
-    let gguf = parse_gguf(&input_path)?;
+    let mut gguf = parse_gguf(&input_path)?;
 
     info!(
         "GGUF v{}: {} tensors, {} metadata keys",
@@ -3416,6 +3494,20 @@ pub async fn convert_gguf_to_safetensors(
 
     let import_k_quants = options.import_k_quants.unwrap_or(false);
     let native_qwen35_layout = options.native_qwen35_layout.unwrap_or(false);
+    // Validate the descriptor-level inline-MTP witness before any destination
+    // file can be created or truncated. The resulting index is also the exact
+    // main-decoder length to write when config.json must be synthesized.
+    let qwen35_inline_mtp_index = qwen35_inline_mtp_index(&gguf)?;
+    if let Some(index) = qwen35_inline_mtp_index {
+        // Keep tensor-name mapping and config synthesis on one validated
+        // witness without threading a second context argument through every
+        // descriptor-only mapping consumer. This key exists only in memory;
+        // extract_config copies a fixed GGUF field set, so it is never emitted.
+        gguf.metadata.insert(
+            QWEN35_INLINE_MTP_INDEX_METADATA.to_string(),
+            GgufMetaValue::Uint64(index),
+        );
+    }
 
     // Plain Qwen3 has no quantized inference runtime. Preserving Q4_0/Q4_1/
     // Q8_0 or K-quant source groups would successfully write an artifact whose
@@ -4019,7 +4111,9 @@ pub async fn convert_gguf_to_safetensors(
             serde_json::from_str(&data)
                 .map_err(|e| Error::from_reason(format!("Failed to parse config.json: {e}")))?
         } else {
-            extract_config(&gguf.metadata)
+            let mut synthesized = extract_config(&gguf.metadata);
+            apply_qwen35_inline_mtp_config(&mut synthesized, qwen35_inline_mtp_index);
+            synthesized
         };
 
         // Measured off the tensor list and cross-checked against the header, so
@@ -4217,8 +4311,15 @@ pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
         .join(".mlx-node-native")
         .join(format!("{stem}-{}-{modified}", metadata.len()));
     let marker = output_dir.join(".complete");
-    let marker_is_current = fs::read_to_string(&marker)
-        .is_ok_and(|contents| contents.contains("format=2\n") && contents.contains("dtype=bf16\n"));
+    let has_sibling_config = parent.join("config.json").is_file();
+    let marker_is_current = fs::read_to_string(&marker).is_ok_and(|contents| {
+        let config_semantics_are_current = contents.contains("format=3\n")
+            // v2 caches built from an authoritative sibling config already
+            // carry the correct decoder/MTP depths. Only standalone v2 caches
+            // used the now-fixed metadata-only layer count and must rebuild.
+            || (has_sibling_config && contents.contains("format=2\n"));
+        config_semantics_are_current && contents.contains("dtype=bf16\n")
+    });
     if marker_is_current
         && output_dir.join("model.safetensors").is_file()
         && output_dir.join("config.json").is_file()
@@ -4230,10 +4331,7 @@ pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
     // converter. A standalone GGUF has no config by design, so pass `None` in
     // that case: the converter still uses the GGUF parent for optional assets,
     // while allowing config/tokenizer reconstruction from header metadata.
-    let config_source_dir = parent
-        .join("config.json")
-        .is_file()
-        .then(|| parent.to_string_lossy().into_owned());
+    let config_source_dir = has_sibling_config.then(|| parent.to_string_lossy().into_owned());
     convert_gguf_to_safetensors(GgufConversionOptions {
         input_path: input_path.to_string_lossy().into_owned(),
         output_dir: output_dir.to_string_lossy().into_owned(),
@@ -4256,7 +4354,7 @@ pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
     fs::write(
         &marker,
         format!(
-            "format=2\nsource={}\nsize={}\nmodified_ns={}\nlayout=tiled\ndtype=bf16\n",
+            "format=3\nsource={}\nsize={}\nmodified_ns={}\nlayout=tiled\ndtype=bf16\n",
             input_path.display(),
             metadata.len(),
             modified
@@ -4460,8 +4558,35 @@ mod tests {
                     GgufMetaValue::String("qwen35".to_string()),
                 ),
                 ("qwen35.embedding_length", GgufMetaValue::Uint32(1)),
+                ("qwen35.block_count", GgufMetaValue::Uint32(2)),
             ],
-            &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+            &[
+                ("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0]),
+                (
+                    "blk.1.nextn.eh_proj.weight",
+                    &[1],
+                    GgufTensorType::BF16,
+                    &[0, 0],
+                ),
+                (
+                    "blk.1.nextn.enorm.weight",
+                    &[1],
+                    GgufTensorType::BF16,
+                    &[0, 0],
+                ),
+                (
+                    "blk.1.nextn.hnorm.weight",
+                    &[1],
+                    GgufTensorType::BF16,
+                    &[0, 0],
+                ),
+                (
+                    "blk.1.nextn.shared_head_norm.weight",
+                    &[1],
+                    GgufTensorType::BF16,
+                    &[0, 0],
+                ),
+            ],
         );
         let input = root.join("standalone.gguf");
         fs::write(&input, data).unwrap();
@@ -4479,10 +4604,83 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config["model_type"], serde_json::json!("qwen3_5"));
+        assert_eq!(config["num_hidden_layers"], serde_json::json!(1));
+        assert_eq!(config["mtp_num_hidden_layers"], serde_json::json!(1));
+        assert_eq!(config["num_nextn_predict_layers"], serde_json::json!(1));
         assert!(output.join("model.safetensors").is_file());
         assert!(output.join(".complete").is_file());
 
         fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn qwen35_without_nextn_keeps_full_synthesized_decoder_count() {
+        let mut gguf = source_quant_fixture(&[("blk.1.attn_norm.weight", GgufTensorType::BF16)]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("qwen35".into()),
+        );
+        gguf.metadata
+            .insert("qwen35.block_count".into(), GgufMetaValue::Uint32(2));
+
+        let mtp_index = qwen35_inline_mtp_index(&gguf).unwrap();
+        assert_eq!(mtp_index, None);
+        let mut config = extract_config(&gguf.metadata);
+        apply_qwen35_inline_mtp_config(&mut config, mtp_index);
+        assert_eq!(config["num_hidden_layers"], serde_json::json!(2));
+        assert!(config.get("mtp_num_hidden_layers").is_none());
+        assert_eq!(
+            gguf_name_to_hf_for_metadata("blk.1.attn_norm.weight", &gguf.metadata).as_deref(),
+            Some("model.layers.1.input_layernorm.weight"),
+            "the final non-MTP block must remain in the main decoder namespace"
+        );
+    }
+
+    #[test]
+    fn incomplete_qwen35_inline_mtp_group_fails_before_conversion() {
+        let mut gguf =
+            source_quant_fixture(&[("blk.1.nextn.eh_proj.weight", GgufTensorType::BF16)]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("qwen35".into()),
+        );
+        gguf.metadata
+            .insert("qwen35.block_count".into(), GgufMetaValue::Uint32(2));
+
+        let error = qwen35_inline_mtp_index(&gguf).unwrap_err();
+        assert!(error.reason.contains("inline MTP block 1 is incomplete"));
+        assert!(error.reason.contains("nextn.enorm.weight"));
+    }
+
+    #[test]
+    fn validated_qwen35_inline_mtp_witness_controls_final_block_remap() {
+        let mut gguf = source_quant_fixture(&[
+            ("blk.1.nextn.eh_proj.weight", GgufTensorType::BF16),
+            ("blk.1.nextn.enorm.weight", GgufTensorType::BF16),
+            ("blk.1.nextn.hnorm.weight", GgufTensorType::BF16),
+            ("blk.1.nextn.shared_head_norm.weight", GgufTensorType::BF16),
+            ("blk.1.attn_norm.weight", GgufTensorType::BF16),
+        ]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("qwen35".into()),
+        );
+        gguf.metadata
+            .insert("qwen35.block_count".into(), GgufMetaValue::Uint32(2));
+
+        let mtp_index = qwen35_inline_mtp_index(&gguf).unwrap().unwrap();
+        gguf.metadata.insert(
+            QWEN35_INLINE_MTP_INDEX_METADATA.into(),
+            GgufMetaValue::Uint64(mtp_index),
+        );
+        assert_eq!(
+            gguf_name_to_hf_for_metadata("blk.1.nextn.eh_proj.weight", &gguf.metadata).as_deref(),
+            Some("mtp.fc.weight")
+        );
+        assert_eq!(
+            gguf_name_to_hf_for_metadata("blk.1.attn_norm.weight", &gguf.metadata).as_deref(),
+            Some("mtp.layers.0.input_layernorm.weight")
+        );
     }
 
     #[test]
@@ -7712,6 +7910,46 @@ mod tests {
                 SYMMETRIC_ZERO_POINT_KEY: 8,
             })
         );
+    }
+
+    #[test]
+    fn merged_gdn_resolves_matching_split_q4k_overrides_not_file_default() {
+        // Make Q6_K the modal file-wide profile while both halves of the
+        // mergeable GDN projection use Q4_K. `preserved_source_quantization`
+        // intentionally records the source names; the runtime's merged-prefix
+        // resolver must consume those two split entries rather than Q6_K.
+        let gguf = source_quant_fixture(&[
+            ("blk.0.attn_q.weight", GgufTensorType::Q6K),
+            ("blk.0.attn_k.weight", GgufTensorType::Q6K),
+            ("blk.0.ffn_down.weight", GgufTensorType::Q6K),
+            ("blk.0.attn_qkv.weight", GgufTensorType::Q4K),
+            ("blk.0.attn_gate.weight", GgufTensorType::Q4K),
+        ]);
+        let quant = preserved_source_quantization(&gguf, true).unwrap().unwrap();
+        let (bits, group_size, top_level_mode, per_layer) =
+            crate::models::quant_dispatch::parse_quant_settings(Some(&quant), 4, 64).unwrap();
+        let default = crate::models::quant_dispatch::default_per_layer_quant(
+            bits,
+            group_size,
+            crate::models::quant_dispatch::resolve_default_mode(top_level_mode, false),
+        );
+        let merged = crate::models::quant_dispatch::effective_plq_for(
+            "layers.0.linear_attn.in_proj_qkvz",
+            &per_layer,
+            default,
+            None,
+        );
+
+        assert_eq!(
+            default.mode,
+            crate::models::quant_dispatch::PerLayerMode::Q6K
+        );
+        assert_eq!(
+            merged.mode,
+            crate::models::quant_dispatch::PerLayerMode::Q4K
+        );
+        assert_eq!(merged.bits, 4);
+        assert_eq!(merged.group_size, 32);
     }
 
     #[test]

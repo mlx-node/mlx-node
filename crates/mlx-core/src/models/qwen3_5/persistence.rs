@@ -86,7 +86,10 @@ use super::vision::{Qwen3_5VisionConfig, Qwen3_5VisionEncoder};
 /// mlx-vlm/mlx-lm store separate in_proj_qkv, in_proj_z, in_proj_a, in_proj_b,
 /// but our model expects merged in_proj_qkvz and in_proj_ba.
 /// Concatenates .weight, .scales, and .biases along axis 0.
-pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> Result<()> {
+pub(crate) fn merge_split_projections(
+    result: &mut HashMap<String, MxArray>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+) -> Result<()> {
     fn companion_layouts_match(
         params: &HashMap<String, MxArray>,
         left: &str,
@@ -113,6 +116,31 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
         Ok(true)
     }
 
+    fn declared_profiles_allow_merge(
+        per_layer_quant: &HashMap<String, PerLayerQuant>,
+        merged: &str,
+        left: &str,
+        right: &str,
+    ) -> bool {
+        let direct = per_layer_quant.get(merged);
+        let left = per_layer_quant.get(left);
+        let right = per_layer_quant.get(right);
+        if let Some(direct) = direct {
+            return left.is_none_or(|profile| profile == direct)
+                && right.is_none_or(|profile| profile == direct);
+        }
+        match (left, right) {
+            // Both sides inherit the same file-wide default, or explicitly
+            // name the same packing profile: one fused projection is valid.
+            (None, None) => true,
+            (Some(left), Some(right)) => left == right,
+            // A lone split override means its peer inherits the default. Even
+            // if the packed array shapes happen to match, one runtime mode
+            // cannot describe both halves, so retain the split representation.
+            _ => false,
+        }
+    }
+
     // Merge in_proj_qkv + in_proj_z → in_proj_qkvz
     let split_qkv_keys: Vec<String> = result
         .keys()
@@ -132,6 +160,10 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
         // z. Packed buffers with different bit widths/sidecar geometry cannot
         // be concatenated. Leave those projections split for the GDN runtime.
         if !companion_layouts_match(result, &qkv_prefix, &z_prefix)? {
+            continue;
+        }
+        let merged_prefix = format!("{}.in_proj_qkvz", prefix);
+        if !declared_profiles_allow_merge(per_layer_quant, &merged_prefix, &qkv_prefix, &z_prefix) {
             continue;
         }
 
@@ -168,6 +200,10 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
         if !companion_layouts_match(result, &b_prefix, &a_prefix)? {
             continue;
         }
+        let merged_prefix = format!("{}.in_proj_ba", prefix);
+        if !declared_profiles_allow_merge(per_layer_quant, &merged_prefix, &b_prefix, &a_prefix) {
+            continue;
+        }
 
         let b_w = result.remove(b_key).unwrap();
         let a_w = result.remove(&a_weight_key).unwrap();
@@ -194,6 +230,7 @@ pub(crate) fn merge_split_projections(result: &mut HashMap<String, MxArray>) -> 
 fn sanitize_weights(
     mut params: HashMap<String, MxArray>,
     config: &Qwen3_5Config,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<HashMap<String, MxArray>> {
     let mut result: HashMap<String, MxArray> = HashMap::new();
 
@@ -449,7 +486,7 @@ fn sanitize_weights(
         result.insert(name, array);
     }
 
-    merge_split_projections(&mut result)?;
+    merge_split_projections(&mut result, per_layer_quant)?;
 
     // For FP8 source checkpoints, keep dequantized bf16 weights as-is.
     // Re-quantizing (FP8→bf16→4bit or →MXFP8) compounds quantization error
@@ -2053,8 +2090,16 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     (raw_params, None)
                 };
 
+                // Parse quantization metadata before sanitizing: the sanitize
+                // pass may fuse matching GDN split buffers, and it must retain
+                // them as two projections when their declared packing profiles
+                // differ even if their physical array shapes happen to match.
+                let quant_cfg = select_quantization_block(&raw)?;
+                let (quant_bits, quant_group_size, top_level_mode, mut per_layer_quant) =
+                    parse_quant_settings(quant_cfg, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
+
                 // Sanitize weights
-                let mut params = sanitize_weights(text_raw_params, &config)?;
+                let mut params = sanitize_weights(text_raw_params, &config, &per_layer_quant)?;
                 let quantized = is_quantized_checkpoint(&params);
                 info!(
                     "Sanitized to {} parameters (quantized={})",
@@ -2062,10 +2107,6 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     quantized
                 );
 
-                // Parse quantization config
-                let quant_cfg = select_quantization_block(&raw)?;
-                let (quant_bits, quant_group_size, top_level_mode, mut per_layer_quant) =
-                    parse_quant_settings(quant_cfg, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
                 augment_mtplx_mtp_quantization(&raw, config.n_mtp_layers, &mut per_layer_quant)?;
 
                 // sym8 v1 scope: sym8 is only validated on the dense FLAT
@@ -2703,7 +2744,7 @@ mod tests {
         params.insert(format!("{prefix}.in_proj_z.scales"), z_s);
         params.insert(format!("{prefix}.in_proj_z.biases"), z_b);
 
-        merge_split_projections(&mut params).unwrap();
+        merge_split_projections(&mut params, &HashMap::new()).unwrap();
 
         assert!(params.contains_key(&format!("{prefix}.in_proj_qkv.weight")));
         assert!(params.contains_key(&format!("{prefix}.in_proj_z.weight")));
@@ -2723,7 +2764,7 @@ mod tests {
         params.insert(format!("{prefix}.in_proj_z.scales"), z_s);
         params.insert(format!("{prefix}.in_proj_z.biases"), z_b);
 
-        merge_split_projections(&mut params).unwrap();
+        merge_split_projections(&mut params, &HashMap::new()).unwrap();
 
         let merged = params
             .get(&format!("{prefix}.in_proj_qkvz.weight"))
@@ -2731,6 +2772,41 @@ mod tests {
         assert_eq!(merged.shape().unwrap().as_ref(), &[8, 4]);
         assert!(!params.contains_key(&format!("{prefix}.in_proj_qkv.weight")));
         assert!(!params.contains_key(&format!("{prefix}.in_proj_z.weight")));
+    }
+
+    #[test]
+    fn matching_split_buffers_with_different_declared_profiles_stay_split() {
+        let prefix = "layers.0.linear_attn";
+        let qkv_prefix = format!("{prefix}.in_proj_qkv");
+        let z_prefix = format!("{prefix}.in_proj_z");
+        let mut params = HashMap::new();
+        let (qkv_w, qkv_s, qkv_b) = packed_projection(6, 4);
+        let (z_w, z_s, z_b) = packed_projection(2, 4);
+        params.insert(format!("{qkv_prefix}.weight"), qkv_w);
+        params.insert(format!("{qkv_prefix}.scales"), qkv_s);
+        params.insert(format!("{qkv_prefix}.biases"), qkv_b);
+        params.insert(format!("{z_prefix}.weight"), z_w);
+        params.insert(format!("{z_prefix}.scales"), z_s);
+        params.insert(format!("{z_prefix}.biases"), z_b);
+
+        let q4k = PerLayerQuant {
+            bits: 4,
+            group_size: 32,
+            mode: PerLayerMode::Q4K,
+            input_amax: None,
+        };
+        let q5k = PerLayerQuant {
+            bits: 5,
+            mode: PerLayerMode::Q5K,
+            ..q4k
+        };
+        let profiles = HashMap::from([(qkv_prefix.clone(), q4k), (z_prefix.clone(), q5k)]);
+
+        merge_split_projections(&mut params, &profiles).unwrap();
+
+        assert!(params.contains_key(&format!("{qkv_prefix}.weight")));
+        assert!(params.contains_key(&format!("{z_prefix}.weight")));
+        assert!(!params.contains_key(&format!("{prefix}.in_proj_qkvz.weight")));
     }
 
     #[test]
