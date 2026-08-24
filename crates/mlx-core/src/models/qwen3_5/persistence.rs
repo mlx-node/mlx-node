@@ -1960,7 +1960,11 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             // coordinator. No process-wide active-memory sampling —
             // the sum of `params.values().nbytes()` is race-free and
             // deterministic. See `cache_limit.rs` module docs.
-            let load_result: Result<(Qwen35Inner, u64, u64)> = (|| {
+            let load_result: Result<(
+                Qwen35Inner,
+                u64,
+                Option<crate::cache_limit::PoolCacheLimitGuard>,
+            )> = (|| {
                 // Load config
                 let config_path = path.join("config.json");
                 let config_data = fs::read_to_string(&config_path)
@@ -2256,7 +2260,30 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     }
                     None => weights_resident,
                 };
-                inner.initialize_paged_adapter()?;
+                // Hold the process-wide pool-growth lock across the sizing
+                // probe → pool allocation → coordinator registration so a
+                // concurrent grow (or another model's load) cannot read
+                // sibling pool totals that miss this in-flight reservation,
+                // and this load cannot read totals that miss an in-flight
+                // grow. See `cache_limit::pool_growth_lock`. Registration is
+                // hoisted into this closure so the guard spans the whole
+                // sequence; the lock itself is dropped before the cold-tier
+                // fingerprint I/O below.
+                let pool_cache_limit_guard = {
+                    let _growth_guard = crate::cache_limit::pool_growth_lock()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    inner.initialize_paged_adapter()?;
+                    let pool_bytes = inner
+                        .paged_adapter
+                        .as_ref()
+                        .map(PagedKVCacheAdapter::pool_allocated_bytes)
+                        .transpose()
+                        .map_err(Error::from_reason)?
+                        .unwrap_or(0);
+                    (pool_bytes != 0)
+                        .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes))
+                };
 
                 // Fail-closed revalidation bracketing the WHOLE
                 // load-to-materialize-to-fingerprint span, then attach the SSD cold
@@ -2312,19 +2339,23 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // Count only the retained BF16 correctness fallback arrays.
                 weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
 
-                let pool_bytes = inner
-                    .paged_adapter
-                    .as_ref()
-                    .map(PagedKVCacheAdapter::pool_allocated_bytes)
-                    .transpose()
-                    .map_err(Error::from_reason)?
-                    .unwrap_or(0);
-                Ok((inner, weight_bytes, pool_bytes))
+                Ok((inner, weight_bytes, pool_cache_limit_guard))
             })();
-            let (inner, weight_bytes, pool_bytes) = load_result?;
+            let (mut inner, weight_bytes, pool_cache_limit_guard) = load_result?;
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
-            let pool_cache_limit_guard = (pool_bytes != 0)
-                .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes));
+            // Dynamic (grow-on-demand) pools re-register their byte total on
+            // every grow. The closure captures only the guard's id (Copy), so
+            // the guard itself stays on this model for its whole lifetime —
+            // the coordinator entry must outlive every grow the adapter makes.
+            if let (Some(guard), Some(adapter)) = (
+                pool_cache_limit_guard.as_ref(),
+                inner.paged_adapter.as_mut(),
+            ) {
+                let pool_id = guard.id();
+                adapter.set_pool_growth_notifier(Some(std::sync::Arc::new(move |bytes| {
+                    crate::cache_limit::coordinator().update_pool(pool_id, bytes);
+                })));
+            }
 
             let model_id = inner.model_id;
             let config_out = inner.config.clone();
@@ -2388,7 +2419,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
         context_limits,
         model_assets_path,
         _cache_limit_guard: cache_limit_guard,
-        _pool_cache_limit_guard: pool_cache_limit_guard,
+        pool_cache_limit_guard,
     })
 }
 /// Parse Qwen3.5 dense config from JSON.
@@ -2501,6 +2532,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5Config> {
         // remain available by setting `paged_cache_memory_mb` explicitly.
         paged_cache_memory_mb: raw
             .get("paged_cache_memory_mb")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        paged_cache_initial_memory_mb: raw
+            .get("paged_cache_initial_memory_mb")
             .and_then(|v| v.as_u64())
             .map(|v| v as u32),
         paged_block_size: raw
@@ -3458,6 +3493,7 @@ mod tests {
             partial_rotary_factor: 0.25,
             rope_theta: 100_000.0,
             paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: None,
             persist_paged_cache: None,

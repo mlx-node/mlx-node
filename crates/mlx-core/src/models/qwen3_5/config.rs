@@ -1,5 +1,10 @@
 use napi_derive::napi;
 
+/// Name of the env var that overrides `paged_cache_initial_memory_mb` at
+/// load time (u32 MiB). Env wins over config; unset both keeps the
+/// historical fixed pool (initial == max).
+pub(crate) const MLX_PAGED_CACHE_INITIAL_MB_ENV: &str = "MLX_PAGED_CACHE_INITIAL_MB";
+
 /// Derive the default paged-KV budget from the model's advertised context.
 ///
 /// Qwen3.5 checkpoints commonly advertise 262,144 tokens. The former fixed
@@ -32,6 +37,54 @@ pub(crate) fn qwen35_resolve_paged_cache_memory_mb(
         Some(memory_mb) => (memory_mb, "config"),
         None => (default_memory_mb, "auto_full_context"),
     }
+}
+
+/// Resolve the initial (grow-on-demand) paged-pool size in MiB.
+///
+/// `None` means "initial == max" — the historical fixed-pool behavior, byte
+/// identical to today. `MLX_PAGED_CACHE_INITIAL_MB` wins over the config
+/// field; a set-but-unparseable env value is ignored (same precedent as
+/// `resolve_qwen35_paged_default`). The environment override is an input
+/// rather than read here so unit tests can pin precedence without mutating
+/// process-global environment state.
+pub(crate) fn qwen35_resolve_paged_cache_initial_memory_mb(
+    configured_initial: Option<u32>,
+    env_override: Option<&str>,
+) -> Option<u32> {
+    match env_override.and_then(|raw| raw.trim().parse::<u32>().ok()) {
+        Some(mb) => Some(mb),
+        None => configured_initial,
+    }
+}
+
+/// Convert a resolved initial MiB budget into an initial block count.
+///
+/// Same MiB→blocks math as the max path (`PagedAttentionConfig::
+/// calculate_num_blocks`). `initial_mb == None` → the full max pool. A set
+/// budget is clamped to `min(initial, max)` — first in the MiB domain
+/// against `max_memory_mb`, then in the block domain against `max_blocks`
+/// (which adaptive load-time sizing may have reduced below what
+/// `max_memory_mb` itself holds). A budget that cannot hold one block is
+/// `Err(())`; the caller raises the family-specific load error.
+pub(crate) fn qwen35_initial_pool_blocks(
+    initial_mb: Option<u32>,
+    max_memory_mb: u32,
+    max_blocks: u32,
+    pa_config: &mlx_paged_attn::PagedAttentionConfig,
+) -> Result<(u32, Option<u32>), ()> {
+    let Some(mb) = initial_mb else {
+        return Ok((max_blocks, None));
+    };
+    let clamped_mb = mb.min(max_memory_mb);
+    let initial_config = mlx_paged_attn::PagedAttentionConfig {
+        gpu_memory_mb: clamped_mb,
+        ..pa_config.clone()
+    };
+    let blocks = initial_config.calculate_num_blocks();
+    if blocks == 0 {
+        return Err(());
+    }
+    Ok((blocks.min(max_blocks), Some(clamped_mb)))
 }
 
 /// Resolve the shared dense/MoE Qwen3.5 paged-cache policy.
@@ -98,6 +151,16 @@ pub struct Qwen3_5Config {
     #[serde(default)]
     #[napi(ts_type = "number | undefined")]
     pub paged_cache_memory_mb: Option<u32>,
+
+    /// Initial paged KV pool size in MiB for the grow-on-demand pool: the
+    /// pool starts at this size and grows toward the max budget
+    /// (`paged_cache_memory_mb` or the auto one-full-context default) on
+    /// exhaustion. Unset (default) makes the initial pool equal the max —
+    /// the historical fixed-pool behavior. `MLX_PAGED_CACHE_INITIAL_MB` wins
+    /// over this field at load time.
+    #[serde(default)]
+    #[napi(ts_type = "number | undefined")]
+    pub paged_cache_initial_memory_mb: Option<u32>,
 
     /// Block size for paged attention (tokens per block).
     /// Only used when `use_block_paged_cache` is true.
@@ -274,7 +337,8 @@ impl Qwen3_5Config {
 #[cfg(test)]
 mod tests {
     use super::{
-        Qwen3_5Config, qwen35_default_paged_cache_memory_mb, qwen35_resolve_paged_cache_memory_mb,
+        Qwen3_5Config, qwen35_default_paged_cache_memory_mb, qwen35_initial_pool_blocks,
+        qwen35_resolve_paged_cache_initial_memory_mb, qwen35_resolve_paged_cache_memory_mb,
         resolve_qwen35_paged_default,
     };
     use mlx_paged_attn::PagedAttentionConfig;
@@ -324,6 +388,7 @@ mod tests {
             partial_rotary_factor: 0.25,
             rope_theta: 10_000.0,
             paged_cache_memory_mb: None,
+            paged_cache_initial_memory_mb: None,
             paged_block_size: None,
             use_block_paged_cache: Some(true),
             persist_paged_cache: None,
@@ -388,5 +453,97 @@ mod tests {
         // The failing Image-agent turn was already beyond this physical
         // capacity while pi still correctly reported 40.4% of 262k.
         assert!(106_240 > config.max_cached_tokens());
+    }
+
+    #[test]
+    fn initial_memory_resolver_precedence_env_over_config() {
+        assert_eq!(
+            qwen35_resolve_paged_cache_initial_memory_mb(None, None),
+            None
+        );
+        assert_eq!(
+            qwen35_resolve_paged_cache_initial_memory_mb(Some(64), None),
+            Some(64)
+        );
+        assert_eq!(
+            qwen35_resolve_paged_cache_initial_memory_mb(Some(64), Some("128")),
+            Some(128),
+            "env must win over config"
+        );
+        assert_eq!(
+            qwen35_resolve_paged_cache_initial_memory_mb(None, Some(" 128 ")),
+            Some(128),
+            "whitespace-padded env values parse"
+        );
+        assert_eq!(
+            qwen35_resolve_paged_cache_initial_memory_mb(Some(64), Some("not-a-number")),
+            Some(64),
+            "an unparseable env value falls back to config"
+        );
+        assert_eq!(
+            qwen35_resolve_paged_cache_initial_memory_mb(None, Some("0")),
+            Some(0),
+            "env=0 is an explicit (rejected-at-load) zero budget, not absence"
+        );
+    }
+
+    #[test]
+    fn initial_pool_blocks_unset_means_initial_equals_max() {
+        // agents-a1 geometry: 320 KiB per block.
+        let (max_memory_mb, _) = (5_120, "auto_full_context");
+        let pa = paged_config(max_memory_mb, 256, 2, 10);
+        let max_blocks = pa.calculate_num_blocks();
+        assert_eq!(max_blocks, 16_384);
+        let (blocks, mb) = qwen35_initial_pool_blocks(None, max_memory_mb, max_blocks, &pa)
+            .expect("unset initial must succeed");
+        assert_eq!(blocks, max_blocks, "initial == max when unset");
+        assert_eq!(mb, None);
+    }
+
+    #[test]
+    fn initial_pool_blocks_smaller_than_max_uses_the_same_block_math() {
+        let max_memory_mb = 5_120;
+        let pa = paged_config(max_memory_mb, 256, 2, 10);
+        let max_blocks = pa.calculate_num_blocks();
+        // 1 MiB / (320 KiB per block) = 3 blocks.
+        let (blocks, mb) = qwen35_initial_pool_blocks(Some(1), max_memory_mb, max_blocks, &pa)
+            .expect("a 1 MiB initial budget must succeed");
+        assert_eq!(blocks, 3);
+        assert_eq!(mb, Some(1));
+        assert!(blocks < max_blocks, "initial must sit below the max pool");
+    }
+
+    #[test]
+    fn initial_pool_blocks_clamps_to_the_max_budget() {
+        let max_memory_mb = 5_120;
+        let pa = paged_config(max_memory_mb, 256, 2, 10);
+        let max_blocks = pa.calculate_num_blocks();
+        let (blocks, mb) = qwen35_initial_pool_blocks(Some(99_999), max_memory_mb, max_blocks, &pa)
+            .expect("an oversized initial budget clamps instead of failing");
+        assert_eq!(blocks, max_blocks);
+        assert_eq!(mb, Some(max_memory_mb));
+    }
+
+    #[test]
+    fn initial_pool_blocks_clamps_below_an_adaptively_sized_max() {
+        // `load_time_pool_sizing` may reduce the max below what the MiB
+        // budget holds; the block-domain clamp must respect the final max.
+        let max_memory_mb = 5_120;
+        let pa = paged_config(max_memory_mb, 256, 2, 10);
+        let adaptive_max_blocks = 100;
+        let (blocks, mb) =
+            qwen35_initial_pool_blocks(Some(64), max_memory_mb, adaptive_max_blocks, &pa)
+                .expect("initial within budget must succeed");
+        assert_eq!(blocks, adaptive_max_blocks);
+        assert_eq!(mb, Some(64));
+    }
+
+    #[test]
+    fn initial_pool_blocks_rejects_a_budget_that_cannot_hold_one_block() {
+        let pa = paged_config(5_120, 256, 2, 10);
+        assert!(
+            qwen35_initial_pool_blocks(Some(0), 5_120, 16_384, &pa).is_err(),
+            "0 MiB must fail with the one-block error"
+        );
     }
 }

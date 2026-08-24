@@ -194,6 +194,17 @@ impl Device {
         )
     }
 
+    /// Fallible variant of [`Self::new_buffer`]: returns `None` when Metal
+    /// hands back nil (the allocation could not be backed) instead of
+    /// panicking. Used by paged-KV pool growth, where an OOM must degrade
+    /// to a declined grow, not a model-thread panic.
+    #[inline]
+    pub fn try_new_buffer(&self, length: u64, options: MTLResourceOptions) -> Option<Buffer> {
+        self.0
+            .newBufferWithLength_options(length as usize, options)
+            .map(Buffer)
+    }
+
     /// Allocate a Metal buffer initialized from a slice of plain scalar values.
     #[inline]
     pub fn new_buffer_with_slice<T: MetalBufferElement>(
@@ -632,5 +643,20 @@ mod tests {
             command_buffer_outcome(command_buffer.status(), command_buffer.error(), "healthy")
                 .is_ok()
         );
+    }
+
+    /// The fallible allocation path must hand back a live buffer for a
+    /// request the device can back. A nil case cannot be forced without
+    /// real memory pressure, so only the `Some` arm is asserted here.
+    #[test]
+    fn try_new_buffer_returns_some_for_small_allocation() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("skipping try_new_buffer test: no Metal device");
+            return;
+        };
+        let buffer = device
+            .try_new_buffer(256, MTLResourceOptions::StorageModePrivate)
+            .expect("a 256-byte private buffer must allocate on any live device");
+        assert_eq!(buffer.length(), 256);
     }
 }

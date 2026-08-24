@@ -773,6 +773,7 @@ fn small_config_shell() -> Qwen3_5Config {
         partial_rotary_factor: 0.25,
         rope_theta: 100_000.0,
         paged_cache_memory_mb: None,
+        paged_cache_initial_memory_mb: None,
         paged_block_size: None,
         use_block_paged_cache: None,
         persist_paged_cache: None,

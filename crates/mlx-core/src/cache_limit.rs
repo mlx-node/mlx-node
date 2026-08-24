@@ -289,6 +289,29 @@ impl CacheLimitCoordinator {
         PoolCacheLimitGuard { id }
     }
 
+    /// Replace a live paged pool's byte accounting in place. Dynamic
+    /// (grow-on-demand) pools grow their Metal footprint after load, and the
+    /// cap must debit the NEW total — the entry's lifetime is still owned by
+    /// the guard from `register_pool`. No-op when the id is unknown (guard
+    /// already dropped) or the byte total is unchanged.
+    pub fn update_pool(&self, id: u64, new_bytes: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(bytes) = state.pools.get_mut(&id) else {
+            return;
+        };
+        if *bytes == new_bytes {
+            return;
+        }
+        *bytes = new_bytes;
+        info!(
+            "[cache_limit] update paged pool guard={} bytes={:.2} GB (live_pools={})",
+            id,
+            new_bytes as f64 / ONE_GIB,
+            state.pools.len(),
+        );
+        recompute_locked(&mut state);
+    }
+
     fn unregister(&self, id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.profiles.remove(&id).is_some() {
@@ -324,6 +347,15 @@ pub struct PoolCacheLimitGuard {
     id: u64,
 }
 
+impl PoolCacheLimitGuard {
+    /// Coordinator id this pool entry is registered under. Captured by the
+    /// growth notifier closure (id is `Copy`, no guard sharing needed) so a
+    /// grown pool can `update_pool` its own entry while the guard stays put.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
+    }
+}
+
 impl Drop for PoolCacheLimitGuard {
     fn drop(&mut self) {
         coordinator().unregister_pool(self.id);
@@ -340,6 +372,40 @@ impl Drop for CacheLimitGuard {
 pub fn coordinator() -> &'static CacheLimitCoordinator {
     static INSTANCE: OnceLock<CacheLimitCoordinator> = OnceLock::new();
     INSTANCE.get_or_init(CacheLimitCoordinator::new)
+}
+
+/// Process-wide lock serializing paged-KV pool growth AND load-time pool
+/// reservation across models.
+///
+/// Growth side: each loaded model runs `try_grow_pool` on its own
+/// `"mlx-model"` thread, and the headroom probe's sibling accounting
+/// (`registered_pool_bytes() − own_live`) is only sound when no other grow
+/// is in flight: two concurrent probes would both read the pre-grow totals,
+/// both pass, and both `grow_to`, transiently holding old+new buffers whose
+/// combined peak can exceed the unified-memory budget.
+///
+/// Load side: a loader probes live Metal headroom
+/// (`load_time_pool_sizing`), allocates its `LayerKVPool`, and only then
+/// debits the total via `register_pool`. Without this lock a concurrent
+/// grow (or another load) reads sibling totals that miss the in-flight
+/// reservation — and the loader reads totals that miss the in-flight grow
+/// — so the combined old+new+new-load transient can exceed the budget.
+/// Dynamic-pool loaders (qwen3_5, qwen3_5_moe) therefore hold this lock
+/// across the whole sizing-probe → `LayerKVPool::new` allocation →
+/// `register_pool` span, making the sibling totals a fresh read on both
+/// sides.
+///
+/// Lock ordering: this is the OUTERMOST lock in the growth and
+/// load-reservation paths — it is acquired BEFORE the coordinator mutex
+/// (`register_pool` / `update_pool` / `registered_pool_bytes`), the
+/// `BlockAllocator` mutex, and the pool's internal locks, so the order is
+/// always growth lock → coordinator mutex and growth lock → allocator
+/// mutex → pool locks. No code path may hold the coordinator mutex, the
+/// allocator mutex, or a pool lock and then take this lock, and the lock
+/// is never nested inside any of them.
+pub(crate) fn pool_growth_lock() -> &'static Mutex<()> {
+    static POOL_GROWTH_LOCK: Mutex<()> = Mutex::new(());
+    &POOL_GROWTH_LOCK
 }
 
 fn recompute_locked(state: &mut CoordState) {
@@ -807,6 +873,46 @@ mod tests {
                 .registered_pool_bytes()
                 .saturating_sub(current),
             2 * GB
+        );
+    }
+
+    #[test]
+    fn update_pool_replaces_a_live_entry_and_drops_unknown_ids() {
+        let _lock = POOL_LOCK.lock().unwrap();
+        let before = coordinator().registered_pool_bytes();
+        let guard = coordinator().register_pool(GB);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            GB,
+            "register_pool must debit the initial pool"
+        );
+        coordinator().update_pool(guard.id(), 3 * GB);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            3 * GB,
+            "update_pool must replace the entry with the grown total"
+        );
+        // An id nobody owns (e.g. a guard that raced a model teardown) is
+        // silently ignored — the coordinator never resurrects dropped pools.
+        coordinator().update_pool(guard.id() + 1, GB);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            3 * GB,
+            "an unknown id must not add a new entry"
+        );
+        // Idempotent no-op: a repeated equal byte total must not change the
+        // registry (and skips the recompute entirely).
+        coordinator().update_pool(guard.id(), 3 * GB);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            3 * GB,
+            "an unchanged byte total must be a no-op"
+        );
+        drop(guard);
+        assert_eq!(
+            coordinator().registered_pool_bytes(),
+            before,
+            "dropping the guard must unregister the updated entry"
         );
     }
 

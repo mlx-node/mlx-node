@@ -2551,15 +2551,20 @@ impl Gemma4Inner {
                 }
                 total_physical_blocks = total_physical_blocks.saturating_add(desired_blocks);
                 let allocator = Arc::new(std::sync::Mutex::new(
-                    mlx_paged_attn::BlockAllocator::new(desired_blocks, block_size),
+                    mlx_paged_attn::BlockAllocator::new(desired_blocks, desired_blocks, block_size),
                 ));
-                let pool = mlx_paged_attn::LayerKVPool::new(pa_config, desired_blocks, cache_dtype)
-                    .map_err(|error| {
-                        napi::Error::from_reason(format!(
-                            "Failed to construct Gemma4 KV group {} pool: {error}",
-                            group.group_id
-                        ))
-                    })?;
+                let pool = mlx_paged_attn::LayerKVPool::new(
+                    pa_config,
+                    desired_blocks,
+                    desired_blocks,
+                    cache_dtype,
+                )
+                .map_err(|error| {
+                    napi::Error::from_reason(format!(
+                        "Failed to construct Gemma4 KV group {} pool: {error}",
+                        group.group_id
+                    ))
+                })?;
                 let adapter = match group.attention_kind {
                     AttentionKind::Full => {
                         PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
@@ -15165,7 +15170,7 @@ mod spec_paged_substrate_tests {
                 AttentionKind::SlidingWindow { .. } => sliding_blocks,
             };
             let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-                blocks, block_size,
+                blocks, blocks, block_size,
             )));
             let pool = maybe_test_pool(blocks, block_size)?;
             let adapter = match group.attention_kind {

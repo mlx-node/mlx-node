@@ -1219,6 +1219,7 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(256),
+            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: Some(true),
             persist_paged_cache: None,

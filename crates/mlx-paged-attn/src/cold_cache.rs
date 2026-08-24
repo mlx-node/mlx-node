@@ -2893,7 +2893,8 @@ mod restore_decomposition_bench {
             max_batch_size: Some(1),
         };
         let total_blocks = (BENCH_BLOCKS * 2 + 4) as u32;
-        let pool = match LayerKVPool::new(config, total_blocks, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, total_blocks, total_blocks, MetalDtype::BFloat16)
+        {
             Ok(pool) => pool,
             Err(e) => {
                 eprintln!("skipping bench: {e}");
@@ -2908,7 +2909,11 @@ mod restore_decomposition_bench {
             payload_bytes as f64 / 1e6
         );
 
-        let allocator = Mutex::new(BlockAllocator::new(total_blocks, BENCH_BLOCK_SIZE));
+        let allocator = Mutex::new(BlockAllocator::new(
+            total_blocks,
+            total_blocks,
+            BENCH_BLOCK_SIZE,
+        ));
         let root = temp_root("bench-restore");
         let manager = ColdCacheManager::open_at(root.clone(), 8 * GIB, 0, 32).unwrap();
 
@@ -4129,14 +4134,19 @@ mod write_decomposition_bench {
                 max_seq_len: Some(4096),
                 max_batch_size: Some(1),
             };
-            let pool = match LayerKVPool::new(config, total_blocks, MetalDtype::BFloat16) {
-                Ok(pool) => pool,
-                Err(e) => {
-                    eprintln!("  {}: skipped ({e})", geometry.label);
-                    continue;
-                }
-            };
-            let allocator = Mutex::new(BlockAllocator::new(total_blocks, BENCH_BLOCK_SIZE as u32));
+            let pool =
+                match LayerKVPool::new(config, total_blocks, total_blocks, MetalDtype::BFloat16) {
+                    Ok(pool) => pool,
+                    Err(e) => {
+                        eprintln!("  {}: skipped ({e})", geometry.label);
+                        continue;
+                    }
+                };
+            let allocator = Mutex::new(BlockAllocator::new(
+                total_blocks,
+                total_blocks,
+                BENCH_BLOCK_SIZE as u32,
+            ));
             let Some(block) = allocator.lock().unwrap().allocate() else {
                 eprintln!("  {}: skipped (no free block)", geometry.label);
                 continue;
@@ -4997,7 +5007,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping layout_mismatch_on_layer_bytes_is_rejected_at_validation: {e}");
@@ -5036,6 +5046,64 @@ mod tests {
             !layout_matches_pool(&wrong_values, &pool),
             "a value_bytes mismatch must fail validation, not the upload"
         );
+    }
+
+    /// `layout_matches_pool` keys on per-layer geometry only — a layout never
+    /// encodes the pool's block count, so two pools that agree on every
+    /// geometry field but differ in `num_blocks` must both accept the same
+    /// layout. This keeps cold restores transparent to the grow-on-demand
+    /// pool: a block written by a small initial pool must restore into the
+    /// grown pool (and vice versa).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn layout_is_transparent_to_pool_block_count() {
+        use crate::PagedAttentionConfig;
+        use crate::metal::MetalDtype;
+
+        let config = PagedAttentionConfig {
+            block_size: 8,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 1,
+            num_layers: 1,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(32),
+            max_batch_size: Some(1),
+        };
+        let small = match LayerKVPool::new(config.clone(), 2, 2, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping layout_is_transparent_to_pool_block_count: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        let large = match LayerKVPool::new(config, 6, 6, MetalDtype::BFloat16) {
+            Ok(pool) => pool,
+            Err(e) if e.contains("No Metal device found") => {
+                eprintln!("skipping layout_is_transparent_to_pool_block_count: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
+        };
+        assert_ne!(
+            small.num_blocks(),
+            large.num_blocks(),
+            "the fixture must actually differ in block count"
+        );
+
+        let (key_bytes, value_bytes) = pool_layer_bytes(&small).unwrap();
+        let layout = ColdCacheLayout {
+            block_size: small.block_size(),
+            num_layers: small.num_layers() as u32,
+            num_kv_heads: small.config().num_kv_heads,
+            head_size: small.config().head_size,
+            cache_dtype: format!("{:?}", small.cache_dtype()),
+            key_bytes_per_layer: key_bytes,
+            value_bytes_per_layer: value_bytes,
+        };
+        assert!(layout_matches_pool(&layout, &small));
+        assert!(layout_matches_pool(&layout, &large));
     }
 
     /// Sidecars occupy quota like any other object, so the startup scan must
@@ -6955,7 +7023,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping transactional_restore_uploads_then_publishes: {e}");
@@ -6963,7 +7031,7 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
         };
-        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let allocator = Mutex::new(BlockAllocator::new(2, 2, 8));
         let source = allocator.lock().unwrap().allocate().unwrap();
         let bytes_per_side = 64 * 8 * 2;
         let keys: Vec<u8> = (0..bytes_per_side).map(|i| (i % 251) as u8).collect();
@@ -7048,7 +7116,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping post_decode_restore_failure_counts_one_miss: {e}");
@@ -7056,7 +7124,7 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
         };
-        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let allocator = Mutex::new(BlockAllocator::new(2, 2, 8));
         let source = allocator.lock().unwrap().allocate().unwrap();
         let bytes_per_side = 64 * 8 * 2;
         let keys: Vec<u8> = (0..bytes_per_side).map(|i| (i % 251) as u8).collect();
@@ -7144,7 +7212,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -7154,7 +7222,7 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
         };
-        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let allocator = Mutex::new(BlockAllocator::new(2, 2, 8));
         let source = allocator.lock().unwrap().allocate().unwrap();
 
         let root = temp_root("capture-cb-fail");
@@ -7228,7 +7296,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -7238,7 +7306,7 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
         };
-        let allocator = Mutex::new(BlockAllocator::new(2, 8));
+        let allocator = Mutex::new(BlockAllocator::new(2, 2, 8));
         let source = allocator.lock().unwrap().allocate().unwrap();
         let bytes_per_side = 64 * 8 * 2;
         let keys: Vec<u8> = (0..bytes_per_side).map(|i| (i % 251) as u8).collect();
@@ -7340,7 +7408,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -7352,7 +7420,7 @@ mod tests {
         };
         // Three allocator blocks against a two-block pool: ids 0 and 1 are
         // valid pool blocks, id 2 is not.
-        let allocator = Mutex::new(BlockAllocator::new(3, 8));
+        let allocator = Mutex::new(BlockAllocator::new(3, 3, 8));
         let source = allocator.lock().unwrap().allocate().unwrap();
         let held = allocator.lock().unwrap().allocate().unwrap();
         assert_eq!(source.block_id, 0);
@@ -7463,7 +7531,7 @@ mod tests {
         // Separate capture and restore pools so a byte match can only come
         // from the cold tier, never from source bytes lingering in a shared
         // physical block (a genuine restart discards the GPU buffers).
-        let pool_src = match LayerKVPool::new(config.clone(), 4, MetalDtype::BFloat16) {
+        let pool_src = match LayerKVPool::new(config.clone(), 4, 4, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping multi_block_prefix_restores_after_restart: {e}");
@@ -7471,7 +7539,7 @@ mod tests {
             }
             Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
         };
-        let pool_dst = LayerKVPool::new(config, 4, MetalDtype::BFloat16).unwrap();
+        let pool_dst = LayerKVPool::new(config, 4, 4, MetalDtype::BFloat16).unwrap();
 
         let bytes_per_side = 64 * 8 * 2usize;
         let pattern = |seed: usize| -> (Vec<u8>, Vec<u8>) {
@@ -7486,7 +7554,7 @@ mod tests {
         let (k0, v0) = pattern(1);
         let (k1, v1) = pattern(2);
 
-        let capture_alloc = Mutex::new(BlockAllocator::new(4, 8));
+        let capture_alloc = Mutex::new(BlockAllocator::new(4, 4, 8));
         let src0 = capture_alloc.lock().unwrap().allocate().unwrap();
         let src1 = capture_alloc.lock().unwrap().allocate().unwrap();
         pool_src
@@ -7549,7 +7617,7 @@ mod tests {
         drop(manager);
 
         let reopened = ColdCacheManager::open_at(root.clone(), GIB, 0, 4).unwrap();
-        let fresh_alloc = Mutex::new(BlockAllocator::new(4, 8));
+        let fresh_alloc = Mutex::new(BlockAllocator::new(4, 4, 8));
 
         let hot = chain_hashes(&tokens, 8, extra_keys, cache_salt);
         assert_eq!(hot.len(), 2);
@@ -7633,7 +7701,7 @@ mod tests {
         // A partial background read is an all-or-nothing miss: neither the
         // successfully decoded head nor the missing tail may become hot, and
         // every destination reservation must return to the allocator.
-        let partial_alloc = Mutex::new(BlockAllocator::new(2, 8));
+        let partial_alloc = Mutex::new(BlockAllocator::new(2, 2, 8));
         let partial_reserved: Vec<_> = (0..2)
             .map(|_| partial_alloc.lock().unwrap().allocate().unwrap())
             .collect();

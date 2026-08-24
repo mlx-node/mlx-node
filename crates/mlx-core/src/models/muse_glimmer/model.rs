@@ -1814,7 +1814,7 @@ mod spec_paged_settle_tests {
         let mut adapters = Vec::with_capacity(groups.len());
         for group in &groups {
             let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-                64, BLOCK_SIZE,
+                64, 64, BLOCK_SIZE,
             )));
             let pool = maybe_test_pool(64)?;
             let adapter = match group.attention_kind {

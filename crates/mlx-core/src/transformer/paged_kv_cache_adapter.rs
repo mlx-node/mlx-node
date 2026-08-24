@@ -763,6 +763,7 @@ impl DenseAttentionWindow {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct PagedBlockTelemetry {
     pub total_blocks: u32,
+    pub max_total_blocks: u32,
     pub free_blocks: u32,
     pub reclaimable_blocks: u32,
     pub allocated_blocks: u32,
@@ -1713,7 +1714,9 @@ pub struct PagedKVCacheAdapter {
     /// the live window. `0` retains the ordinary full-attention semantics.
     sliding_window: u32,
     /// Logical context limit. Full-attention adapters derive this from their
-    /// physical pool; sliding adapters decouple it from the bounded live pool.
+    /// pool's MAXIMUM physical capacity (`max_num_blocks`, which the live
+    /// pool grows toward); sliding adapters decouple it from the bounded
+    /// live pool.
     logical_max_tokens: u32,
     /// Permanently reserved placeholder used by sparse sliding block tables.
     /// It is never written or freed through a request lifecycle; the paged
@@ -1922,6 +1925,19 @@ pub struct PagedKVCacheAdapter {
     /// result here removes even the FFI call from every layer/token.
     #[cfg(target_os = "macos")]
     grouped_d512_capability_cache: Option<(i32, Result<bool, String>)>,
+
+    /// Optional hook invoked once per successful pool grow with the pool's
+    /// new total K/V bytes (all layers, both sides). The cache-limit pool
+    /// re-registration lands through this (see `set_pool_growth_notifier`);
+    /// `None` (the default) is a no-op. Follows the `set_scale_manager` /
+    /// `set_cold_tier` ownership pattern: the adapter shares the `Arc` with
+    /// its caller.
+    pool_growth_notifier: Option<Arc<dyn Fn(u64) + Send + Sync>>,
+
+    /// Test-only override for the pre-grow headroom probe: receives the
+    /// grow-target block count and returns the probe's `selected_blocks`.
+    #[cfg(test)]
+    grow_headroom_probe_override: Option<Arc<dyn Fn(u32) -> Result<u32, String> + Send + Sync>>,
 }
 
 #[cfg(target_os = "macos")]
@@ -1968,6 +1984,10 @@ struct NativePoolArrays {
     key: MxArray,
     value: MxArray,
     dirty: bool,
+    /// [`LayerKVPool::generation`] the views were built against. A grow
+    /// swaps the pool's Metal buffers, so any consumer must rebuild when
+    /// this no longer matches the live pool.
+    generation: u64,
 }
 
 #[cfg(target_os = "macos")]
@@ -2120,11 +2140,15 @@ impl PagedKVCacheAdapter {
                  negative mask width masks every key instead of erroring."
             ));
         }
-        let (allocator_block_size, allocator_num_blocks) = {
+        let (allocator_block_size, allocator_num_blocks, allocator_max_num_blocks) = {
             let guard = allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            (guard.block_size(), guard.num_blocks())
+            (
+                guard.block_size(),
+                guard.num_blocks(),
+                guard.max_num_blocks(),
+            )
         };
         if block_size != allocator_block_size {
             return Err(format!(
@@ -2146,7 +2170,19 @@ impl PagedKVCacheAdapter {
                 layer_kv_pool.num_blocks()
             ));
         }
-        let physical_capacity_tokens = layer_kv_pool.num_blocks().saturating_mul(block_size);
+        if allocator_max_num_blocks != layer_kv_pool.max_num_blocks() {
+            return Err(format!(
+                "max_num_blocks mismatch: allocator has {allocator_max_num_blocks}, \
+                 layer_kv_pool has {}. Pool growth must extend the allocator to every block \
+                 the pool's storage can reach, or logical capacity desyncs from physical.",
+                layer_kv_pool.max_num_blocks()
+            ));
+        }
+        // Capacity surfaces derive from the MAXIMUM block count: the live
+        // pool starts smaller and grows toward it, so deriving from the
+        // current count would make logical capacity shrink and grow with
+        // each realloc.
+        let physical_capacity_tokens = layer_kv_pool.max_num_blocks().saturating_mul(block_size);
         let logical_max_tokens = logical_max_tokens.unwrap_or(physical_capacity_tokens);
         let null_block = if sliding_window == 0 {
             None
@@ -2201,6 +2237,9 @@ impl PagedKVCacheAdapter {
             decode_planning_cache: None,
             #[cfg(target_os = "macos")]
             grouped_d512_capability_cache: None,
+            pool_growth_notifier: None,
+            #[cfg(test)]
+            grow_headroom_probe_override: None,
         })
     }
 
@@ -2208,6 +2247,23 @@ impl PagedKVCacheAdapter {
     /// every persisted block off `ctx.fingerprint`.
     pub fn set_cold_tier(&mut self, ctx: ColdTierContext) {
         self.cold_tier = Some(ctx);
+    }
+
+    /// Install (or clear) the callback that fires once per successful pool
+    /// grow with the pool's new total K/V bytes. The cache-limit pool
+    /// re-registration wires this hook; `None` (the default) is a no-op.
+    pub fn set_pool_growth_notifier(&mut self, notifier: Option<Arc<dyn Fn(u64) + Send + Sync>>) {
+        self.pool_growth_notifier = notifier;
+    }
+
+    /// Test-only override for the pre-grow headroom probe; `None` restores
+    /// the live Metal probe.
+    #[cfg(test)]
+    pub(crate) fn set_grow_headroom_probe_override(
+        &mut self,
+        probe: Option<Arc<dyn Fn(u32) -> Result<u32, String> + Send + Sync>>,
+    ) {
+        self.grow_headroom_probe_override = probe;
     }
 
     /// The cold-tier context this adapter persists through, if any. Exposed so
@@ -3568,9 +3624,13 @@ impl PagedKVCacheAdapter {
     /// number of NEW blocks allocated.
     ///
     /// Errors if the allocator can't fulfil the request (no free blocks).
-    /// On partial failure (some allocations succeeded before the pool ran
-    /// out), the already-allocated blocks are rolled back into the pool to
-    /// avoid leaks.
+    /// When the reservation exceeds free + evictable blocks the adapter
+    /// first grows the pool (`try_grow_pool`) BEFORE `allocate` can evict
+    /// LRU cache-only entries, and retries after a `None` from `allocate`
+    /// as a fallback; only if the reservation is still unfulfillable does
+    /// the error surface. On partial failure (some allocations succeeded
+    /// before the pool ran out), the already-allocated blocks are rolled
+    /// back into the pool to avoid leaks.
     ///
     /// ## Lazy decode allocation
     ///
@@ -3592,7 +3652,7 @@ impl PagedKVCacheAdapter {
                 "context_length_exceeded: requested {total_tokens} tokens, paged cache capacity is {capacity} tokens"
             ));
         }
-        let block_table = self.block_table.as_mut().ok_or_else(|| {
+        self.block_table.as_ref().ok_or_else(|| {
             "allocate_suffix_blocks called before reset_for_new_request".to_string()
         })?;
 
@@ -3607,32 +3667,76 @@ impl PagedKVCacheAdapter {
             return Ok(0);
         }
 
-        let mut guard = self
-            .allocator
-            .lock()
-            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        let mut grow_attempted = false;
+        // Growth BEFORE LRU eviction: if the reservation exceeds everything
+        // the allocator could hand out (free + evictable cache-only prefix
+        // entries), grow the pool first so `allocate` never evicts a cached
+        // block the pool could instead cover. Eviction remains the fallback:
+        // when at max, or when the grow fails, the loop below still lets
+        // `allocate` evict, and the retry-after-None path stays as a second
+        // safety net (e.g. blocks drained between this check and the loop).
+        // The grow is sized by the SHORTFALL over what the allocator can
+        // already hand out, not the total reservation — see `try_grow_pool`.
+        let shortfall = {
+            let guard = self
+                .allocator
+                .lock()
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+            needed_blocks.saturating_sub(guard.free_or_evictable_blocks())
+        };
+        if shortfall > 0 {
+            grow_attempted = true;
+            self.try_grow_pool(shortfall);
+        }
 
         let mut newly_allocated: Vec<Arc<PhysicalBlock>> =
             Vec::with_capacity(needed_blocks as usize);
-        for i in 0..needed_blocks {
-            match guard.allocate() {
-                Some(block) => newly_allocated.push(block),
-                None => {
-                    // Roll back partial allocations to keep the pool consistent.
-                    for partial in newly_allocated.drain(..) {
-                        guard.free(partial);
+        loop {
+            let mut guard = self
+                .allocator
+                .lock()
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+            let mut exhausted_at = None;
+            for i in 0..needed_blocks {
+                match guard.allocate() {
+                    Some(block) => newly_allocated.push(block),
+                    None => {
+                        exhausted_at = Some(i);
+                        // Roll back partial allocations to keep the pool consistent.
+                        for partial in newly_allocated.drain(..) {
+                            guard.free(partial);
+                        }
+                        break;
                     }
-                    return Err(format!(
-                        "context_length_exceeded: paged cache could not reserve {needed_blocks} \
-                         block(s) for {total_tokens} tokens (reserved {i} before rollback, \
-                         capacity {} tokens)",
-                        capacity
-                    ));
                 }
             }
+            drop(guard);
+            let Some(i) = exhausted_at else {
+                break;
+            };
+            // Exhaustion: grow the pool once and retry the whole
+            // reservation; still exhausted -> existing error path. The
+            // rolled-back partials restored the free count, so the
+            // shortfall is recomputed under a fresh lock.
+            let retry_shortfall = {
+                let guard = self
+                    .allocator
+                    .lock()
+                    .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+                needed_blocks.saturating_sub(guard.free_or_evictable_blocks())
+            };
+            if grow_attempted || !self.try_grow_pool(retry_shortfall) {
+                return Err(format!(
+                    "context_length_exceeded: paged cache could not reserve {needed_blocks} \
+                     block(s) for {total_tokens} tokens (reserved {i} before rollback, \
+                     capacity {} tokens)",
+                    capacity
+                ));
+            }
+            grow_attempted = true;
         }
-        drop(guard);
 
+        let block_table = self.block_table.as_mut().expect("checked above");
         for block in newly_allocated {
             block_table.add_block(block);
         }
@@ -3655,10 +3759,14 @@ impl PagedKVCacheAdapter {
     /// crosses block boundaries (vLLM's decode pattern; see
     /// `vllm/v1/core/kv_cache_manager.py::allocate_slots`).
     ///
-    /// On allocator exhaustion, the already-allocated blocks within this
-    /// call are rolled back so the request's block_table is unchanged
-    /// (caller-visible state stays consistent with the pre-call state and
-    /// the next decode step can choose to abort gracefully).
+    /// When the reservation exceeds free + evictable blocks the adapter
+    /// first grows the pool (`try_grow_pool`) BEFORE `allocate` can evict
+    /// LRU cache-only entries, and retries after a `None` from `allocate`
+    /// as a fallback; if it is still exhausted, the already-allocated
+    /// blocks within this call are rolled back so the request's
+    /// block_table is unchanged (caller-visible state stays consistent
+    /// with the pre-call state and the next decode step can choose to
+    /// abort gracefully).
     fn ensure_blocks_for_total_tokens(&mut self, new_total_tokens: u32) -> Result<u32, String> {
         let capacity = self.max_capacity_tokens();
         if new_total_tokens > capacity {
@@ -3667,48 +3775,293 @@ impl PagedKVCacheAdapter {
                  paged cache capacity is {capacity} tokens"
             ));
         }
-        let block_table = self.block_table.as_mut().ok_or_else(|| {
-            "ensure_blocks_for_total_tokens called before reset_for_new_request".to_string()
-        })?;
+        let current_blocks = {
+            let block_table = self.block_table.as_ref().ok_or_else(|| {
+                "ensure_blocks_for_total_tokens called before reset_for_new_request".to_string()
+            })?;
+            block_table.num_blocks() as u32
+        };
         if self.block_size == 0 {
             return Err("block_size must be > 0".to_string());
         }
-        let current_blocks = block_table.num_blocks() as u32;
         let needed_total_blocks = new_total_tokens.div_ceil(self.block_size);
         if needed_total_blocks <= current_blocks {
             return Ok(0);
         }
         let to_allocate = needed_total_blocks - current_blocks;
 
-        let mut guard = self
-            .allocator
-            .lock()
-            .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+        let mut grow_attempted = false;
+        // Growth BEFORE LRU eviction: see `allocate_suffix_blocks`. Eviction
+        // remains the fallback, and the retry-after-None path stays as a
+        // second safety net. The grow is sized by the shortfall over what
+        // the allocator can already hand out, not the total reservation.
+        let shortfall = {
+            let guard = self
+                .allocator
+                .lock()
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+            to_allocate.saturating_sub(guard.free_or_evictable_blocks())
+        };
+        if shortfall > 0 {
+            grow_attempted = true;
+            self.try_grow_pool(shortfall);
+        }
+
         let mut newly_allocated: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(to_allocate as usize);
-        for i in 0..to_allocate {
-            match guard.allocate() {
-                Some(block) => newly_allocated.push(block),
-                None => {
-                    // Roll back partial allocations to keep the pool consistent.
-                    for partial in newly_allocated.drain(..) {
-                        guard.free(partial);
+        loop {
+            let mut guard = self
+                .allocator
+                .lock()
+                .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+            let mut exhausted_at = None;
+            for i in 0..to_allocate {
+                match guard.allocate() {
+                    Some(block) => newly_allocated.push(block),
+                    None => {
+                        exhausted_at = Some(i);
+                        // Roll back partial allocations to keep the pool consistent.
+                        for partial in newly_allocated.drain(..) {
+                            guard.free(partial);
+                        }
+                        break;
                     }
-                    return Err(format!(
-                        "context_length_exceeded: paged decode could not reserve {to_allocate} \
-                         more block(s) (request had {current_blocks}, needs {needed_total_blocks} \
-                         for {new_total_tokens} tokens, reserved {i} before rollback, capacity \
-                         {} tokens)",
-                        capacity
-                    ));
                 }
             }
+            drop(guard);
+            let Some(i) = exhausted_at else {
+                break;
+            };
+            // Exhaustion: grow the pool once and retry the whole
+            // reservation; still exhausted -> existing error path. The
+            // rolled-back partials restored the free count, so the
+            // shortfall is recomputed under a fresh lock.
+            let retry_shortfall = {
+                let guard = self
+                    .allocator
+                    .lock()
+                    .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+                to_allocate.saturating_sub(guard.free_or_evictable_blocks())
+            };
+            if grow_attempted || !self.try_grow_pool(retry_shortfall) {
+                return Err(format!(
+                    "context_length_exceeded: paged decode could not reserve {to_allocate} \
+                     more block(s) (request had {current_blocks}, needs {needed_total_blocks} \
+                     for {new_total_tokens} tokens, reserved {i} before rollback, capacity \
+                     {} tokens)",
+                    capacity
+                ));
+            }
+            grow_attempted = true;
         }
-        drop(guard);
 
+        let block_table = self.block_table.as_mut().expect("checked above");
         for block in newly_allocated {
             block_table.add_block(block);
         }
         Ok(to_allocate)
+    }
+
+    /// Grow the shared pool (and allocator) once. Called pre-emptively when
+    /// a reservation exceeds the blocks `allocate` could hand out
+    /// (free + evictable — growth before LRU eviction), and as the retry
+    /// when `allocate` still returns `None`.
+    ///
+    /// `needed_additional_blocks` is the SHORTFALL — how many additional
+    /// blocks the reservation needs beyond what free + evictable can
+    /// already hand out — not the total reservation. It feeds both the
+    /// doubling floor (`current + needed`) and the partial-headroom
+    /// decline check, so passing the total would demand headroom for
+    /// blocks the allocator could already serve and decline grows that a
+    /// shortfall-sized probe would fund.
+    ///
+    /// Order matters:
+    /// 0. Take the process-wide growth lock (see
+    ///    [`crate::cache_limit::pool_growth_lock`]) and hold it across the
+    ///    whole body, so a concurrent grow on another model's thread — or a
+    ///    concurrent model load's pool reservation — cannot probe stale
+    ///    `registered_pool_bytes` totals while this grow's old+new transient
+    ///    is unregistered.
+    /// 1. Flush this adapter's pending native pool writes and synchronize
+    ///    MLX — the grow blit copies the whole buffer, so no lazy GPU write
+    ///    may still be in flight against it.
+    /// 2. Take the allocator mutex, then `pool.grow_to` (which takes the
+    ///    pool's write lock internally) — allocator first, pool second, and
+    ///    the pool read lock is never held across the call.
+    /// 3. Target `min(pool.max_num_blocks, max(2 × current, current +
+    ///    needed))`; `grow_to` is a no-op `Ok(false)` when the target does
+    ///    not exceed the live count.
+    /// 4. Probe the live Metal headroom for the target BEFORE `grow_to`
+    ///    builds the new generation: the blit transiently holds the old and
+    ///    new buffers, so the peak (old live + new + sibling registered
+    ///    pools) must fit the safe budget. A probe that selects fewer
+    ///    blocks declines the grow (step 5 is skipped).
+    /// 5. On success, extend the allocator to match, drop this adapter's
+    ///    per-layer pool views (they wrap the pre-grow buffers), run the
+    ///    growth notifier with the new total bytes, and log one line.
+    ///
+    /// Any failure (flush error, poisoned mutex, headroom probe error or
+    /// decline, `Err` from `grow_to`, or a no-op grow) logs at warn and
+    /// returns `false` — the caller proceeds to its existing
+    /// eviction/error path. A Metal allocation failure inside `grow_to`
+    /// also surfaces as `false`: the pool allocates its new generation via
+    /// the fallible `Device::try_new_buffer` and converts a nil buffer
+    /// into `Err`, so an OOM degrades to a declined grow instead of
+    /// panicking the model thread while the pool write lock is held.
+    ///
+    /// `pub(crate)` so the engine's hybrid scheduler can grow from
+    /// admission's no-live-turns Reject edge
+    /// (`HybridSchedulerState::try_grow_reservation_pool`); admission runs
+    /// on the model thread, so the same thread/contract holds there.
+    pub(crate) fn try_grow_pool(&mut self, needed_additional_blocks: u32) -> bool {
+        // Serialize the whole probe → grow → notify sequence process-wide
+        // (see crate::cache_limit::pool_growth_lock). Scope-drop releases
+        // the guard on every exit path, including the decline/failure
+        // returns below.
+        let _growth_guard = crate::cache_limit::pool_growth_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        #[cfg(target_os = "macos")]
+        if let Err(e) = self.eval_pending_pool_writes() {
+            tracing::warn!(
+                target: "mlx_core::paged_kv",
+                "paged KV pool grow aborted: could not flush pending pool writes: {e}"
+            );
+            return false;
+        }
+        // Wait for all queued GPU work before the pool's blit reallocates
+        // the underlying Metal buffers.
+        crate::array::memory::synchronize();
+
+        let mut guard = match self.allocator.lock() {
+            Ok(guard) => guard,
+            Err(e) => {
+                tracing::warn!(
+                    target: "mlx_core::paged_kv",
+                    "paged KV pool grow aborted: BlockAllocator mutex poisoned: {e}"
+                );
+                return false;
+            }
+        };
+        let current = guard.num_blocks();
+        let mut new_num_blocks = self.layer_kv_pool.max_num_blocks().min(
+            current
+                .saturating_mul(2)
+                .max(current.saturating_add(needed_additional_blocks)),
+        );
+        #[cfg(target_os = "macos")]
+        match self.grow_headroom_probe(new_num_blocks) {
+            Ok(selected) if selected < new_num_blocks => {
+                // Partial headroom: the probe's safe ceiling covers the
+                // required shortfall but not the doubling target. Grow to
+                // the selected count — the reservation then admits — rather
+                // than rejecting a request that a safe grow would serve.
+                // Decline only when even the shortfall does not fit.
+                let shortfall_target = current.saturating_add(needed_additional_blocks);
+                if selected >= shortfall_target && selected > current {
+                    tracing::info!(
+                        target: "mlx_core::paged_kv",
+                        "paged KV pool grow targeting partial headroom: {selected} blocks \
+                         (< {new_num_blocks} doubling target, covers shortfall {shortfall_target})"
+                    );
+                    new_num_blocks = selected;
+                } else {
+                    tracing::warn!(
+                        target: "mlx_core::paged_kv",
+                        "paged KV pool grow declined: headroom probe caps the pool at {selected} \
+                         blocks (< shortfall {shortfall_target}, {new_num_blocks} requested)"
+                    );
+                    return false;
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    target: "mlx_core::paged_kv",
+                    "paged KV pool grow declined: headroom probe failed: {e}"
+                );
+                return false;
+            }
+        }
+        let old_total_bytes = self.layer_kv_pool.total_bytes();
+        match self.layer_kv_pool.grow_to(new_num_blocks) {
+            Ok(true) => {}
+            Ok(false) => {
+                // Already at/above the target or capped at max — nothing
+                // allocatable appeared.
+                return false;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "mlx_core::paged_kv",
+                    "paged KV pool grow to {new_num_blocks} blocks failed: {e}"
+                );
+                return false;
+            }
+        }
+        let added = guard.grow_by(new_num_blocks - current);
+        let new_num_blocks = guard.num_blocks();
+        let pool_added = self.layer_kv_pool.num_blocks().saturating_sub(current);
+        if added != pool_added {
+            // Defensive: the constructor validates equal maxima, so the
+            // allocator's grow cap can never diverge from the pool's.
+            tracing::warn!(
+                target: "mlx_core::paged_kv",
+                "paged KV pool grow diverged from the allocator: allocator added {added} \
+                 block(s) ({current} -> {new_num_blocks}) while the pool grew {pool_added}"
+            );
+        }
+        drop(guard);
+
+        // This adapter's cached per-layer views wrap the pre-grow buffers;
+        // drop all of them. Other adapters sharing the pool rebuild lazily
+        // via the generation guard.
+        #[cfg(target_os = "macos")]
+        self.clear_native_graph_state();
+
+        let new_total_bytes = self.layer_kv_pool.total_bytes();
+        if let Some(notifier) = self.pool_growth_notifier.as_ref() {
+            notifier(new_total_bytes);
+        }
+        tracing::info!(
+            target: "mlx_core::paged_kv",
+            "paged KV pool grew {current} -> {new_num_blocks} blocks \
+             ({:.2} -> {:.2} MiB)",
+            old_total_bytes as f64 / (1024.0 * 1024.0),
+            new_total_bytes as f64 / (1024.0 * 1024.0),
+        );
+        true
+    }
+
+    /// Pre-grow headroom probe: ask the load-time sizer how many blocks of
+    /// the grow-target size the live Metal budget can back, reserving the
+    /// full old+new transient — this pool's current bytes stay live during
+    /// the blit, and every sibling pool registered with the coordinator
+    /// counts against the same budget. Read-only (no allocations); `Err`
+    /// must fail the grow closed.
+    #[cfg(target_os = "macos")]
+    fn grow_headroom_probe(&self, new_num_blocks: u32) -> Result<u32, String> {
+        #[cfg(test)]
+        if let Some(probe) = self.grow_headroom_probe_override.as_ref() {
+            return probe(new_num_blocks);
+        }
+        let config = self.layer_kv_pool.config();
+        let own_bytes = self.layer_kv_pool.total_bytes();
+        let extra_reserved_bytes = own_bytes.saturating_add(
+            crate::cache_limit::coordinator()
+                .registered_pool_bytes()
+                .saturating_sub(own_bytes),
+        );
+        mlx_paged_attn::profile::load_time_pool_sizing_with_reserved(
+            new_num_blocks,
+            self.layer_kv_pool.num_layers() as u32,
+            config.num_kv_heads,
+            config.head_size,
+            config.block_size,
+            self.layer_kv_pool.cache_dtype(),
+            extra_reserved_bytes,
+        )
+        .map(|sizing| sizing.selected_blocks)
+        .map_err(|error| error.to_string())
     }
 
     /// Reserve block capacity for `extra` rows past the current cursor
@@ -4158,13 +4511,20 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.num_layers()
             ));
         }
-        if self.native_pool_arrays[idx].is_none() {
+        let pool_generation = self.layer_kv_pool.generation();
+        if self.native_pool_arrays[idx]
+            .as_ref()
+            .is_none_or(|state| state.generation != pool_generation)
+        {
+            // First use, or the pool grew (possibly driven by another
+            // adapter sharing it) and the cached views wrap dead buffers.
             let key = self.raw_key_pool_array(layer_idx)?;
             let value = self.raw_value_pool_array(layer_idx)?;
             self.native_pool_arrays[idx] = Some(NativePoolArrays {
                 key,
                 value,
                 dirty: false,
+                generation: pool_generation,
             });
         }
         let state = self.native_pool_arrays[idx]
@@ -4192,6 +4552,7 @@ impl PagedKVCacheAdapter {
             key,
             value,
             dirty: true,
+            generation: self.layer_kv_pool.generation(),
         });
         Ok(())
     }
@@ -4263,10 +4624,30 @@ impl PagedKVCacheAdapter {
     pub fn eval_pending_pool_writes(&mut self) -> Result<(), String> {
         let mut dirty_layers = Vec::new();
         let mut arrays: Vec<MxArray> = Vec::new();
-        for (layer_idx, state) in self.native_pool_arrays.iter().enumerate() {
-            let Some(state) = state.as_ref() else {
+        let pool_generation = self.layer_kv_pool.generation();
+        for (layer_idx, slot) in self.native_pool_arrays.iter_mut().enumerate() {
+            let Some(state) = slot.as_ref() else {
                 continue;
             };
+            if state.generation != pool_generation {
+                // The pool grew since these views were built (another
+                // adapter sharing the pool may have driven it). Evaling
+                // them would write into the pre-grow buffers; drop them so
+                // the next consumer rebuilds against the live pool.
+                if state.dirty {
+                    // The write was never evaluated: its tokens are NOT in
+                    // any buffer. This is data loss for whoever issued the
+                    // write, so say so loudly instead of dropping silently.
+                    tracing::warn!(
+                        target: "mlx_core::paged_kv",
+                        "paged KV pool grow discarded an unevaluated native write for layer \
+                         {layer_idx}: the pool was grown while the write was still lazy, so \
+                         its tokens were never copied into the new buffers"
+                    );
+                }
+                *slot = None;
+                continue;
+            }
             if state.dirty {
                 dirty_layers.push(layer_idx);
                 arrays.push(state.key.clone());
@@ -4307,6 +4688,22 @@ impl PagedKVCacheAdapter {
         let Some(Some(state)) = self.native_pool_arrays.get(idx) else {
             return Ok(());
         };
+        if state.generation != self.layer_kv_pool.generation() {
+            // Stale views (pool grew elsewhere): nothing useful to eval,
+            // and evaling would write into the pre-grow buffers.
+            if state.dirty {
+                // The write was never evaluated: its tokens are NOT in any
+                // buffer. Log the loss instead of dropping silently.
+                tracing::warn!(
+                    target: "mlx_core::paged_kv",
+                    "paged KV pool grow discarded an unevaluated native write for layer \
+                     {layer_idx}: the pool was grown while the write was still lazy, so its \
+                     tokens were never copied into the new buffers"
+                );
+            }
+            self.native_pool_arrays[idx] = None;
+            return Ok(());
+        }
         if !state.dirty {
             return Ok(());
         }
@@ -7789,6 +8186,7 @@ impl PagedKVCacheAdapter {
             .map_err(|error| format!("BlockAllocator mutex poisoned: {error}"))?;
         Ok(PagedBlockTelemetry {
             total_blocks: allocator.num_blocks(),
+            max_total_blocks: allocator.max_num_blocks(),
             free_blocks: allocator.num_free_blocks(),
             reclaimable_blocks: allocator.num_evictable_blocks(),
             allocated_blocks: allocator.num_allocated_blocks(),
@@ -8303,7 +8701,9 @@ impl PagedKVCacheAdapter {
     /// the buffer refcount that keeps the GPU memory alive.
     #[cfg(target_os = "macos")]
     pub fn key_pool_array(&self, layer_idx: u32) -> Result<MxArray, String> {
-        if let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize) {
+        if let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize)
+            && state.generation == self.layer_kv_pool.generation()
+        {
             return Ok(state.key.clone());
         }
         self.raw_key_pool_array(layer_idx)
@@ -8313,7 +8713,9 @@ impl PagedKVCacheAdapter {
     /// See [`Self::key_pool_array`] for ownership semantics.
     #[cfg(target_os = "macos")]
     pub fn value_pool_array(&self, layer_idx: u32) -> Result<MxArray, String> {
-        if let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize) {
+        if let Some(Some(state)) = self.native_pool_arrays.get(layer_idx as usize)
+            && state.generation == self.layer_kv_pool.generation()
+        {
             return Ok(state.value.clone());
         }
         self.raw_value_pool_array(layer_idx)
@@ -8912,7 +9314,9 @@ mod tests {
     }
 
     fn new_allocator(num_blocks: u32, block_size: u32) -> Arc<Mutex<BlockAllocator>> {
-        Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)))
+        Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )))
     }
 
     /// Build a placeholder `LayerKVPool` matching the allocator's capacity.
@@ -9889,7 +10293,7 @@ mod tests {
             max_batch_size: Some(1),
         };
         // Real pools (not `new_for_test`) so KV bytes actually round-trip.
-        let pool_src = match LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16) {
+        let pool_src = match LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16) {
             Ok(pool) => Arc::new(pool),
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -9996,7 +10400,8 @@ mod tests {
         // --- Restart: fresh allocator + pool + adapter, same fingerprint. ---
         drop(adapter_src);
         drop(manager_src);
-        let pool_dst = Arc::new(LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16).unwrap());
+        let pool_dst =
+            Arc::new(LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16).unwrap());
         let alloc_dst = new_allocator(8, 8);
         let mut adapter_dst = PagedKVCacheAdapter::new(alloc_dst, Arc::clone(&pool_dst), 8)
             .expect("restore adapter ctor");
@@ -10067,7 +10472,7 @@ mod tests {
             max_seq_len: Some(64),
             max_batch_size: Some(1),
         };
-        let pool_src = match LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16) {
+        let pool_src = match LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16) {
             Ok(pool) => Arc::new(pool),
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -10180,7 +10585,8 @@ mod tests {
         // Builds a fresh allocator + pool + adapter over the same cold root —
         // one simulated process restart.
         let fresh = |keys: &[Vec<u64>]| -> (Arc<LayerKVPool>, CachedPrefix) {
-            let pool = Arc::new(LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16).unwrap());
+            let pool =
+                Arc::new(LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16).unwrap());
             let mut adapter = PagedKVCacheAdapter::new(new_allocator(8, 8), Arc::clone(&pool), 8)
                 .expect("restore adapter ctor");
             adapter.set_cold_tier(ColdTierContext {
@@ -10297,7 +10703,7 @@ mod tests {
             max_seq_len: Some(64),
             max_batch_size: Some(1),
         };
-        let pool_src = match LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16) {
+        let pool_src = match LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16) {
             Ok(pool) => Arc::new(pool),
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -10418,7 +10824,8 @@ mod tests {
         // One simulated process restart: fresh pool, allocator, adapter and
         // manager over the same cold root.
         let fresh = |policy: Option<mlx_paged_attn::ColdSidecarPolicy>, per_block: bool| {
-            let pool = Arc::new(LayerKVPool::new(make_config(), 8, MetalDtype::BFloat16).unwrap());
+            let pool =
+                Arc::new(LayerKVPool::new(make_config(), 8, 8, MetalDtype::BFloat16).unwrap());
             let manager = Arc::new(
                 mlx_paged_attn::ColdCacheManager::open_default_at(root.clone())
                     .expect("reopen cold cache"),
@@ -11096,6 +11503,46 @@ mod tests {
         assert!(
             msg.contains("num_blocks"),
             "error must reference num_blocks, got: {msg}"
+        );
+    }
+
+    /// `PagedKVCacheAdapter::new` must reject an allocator/pool pair whose
+    /// MAXIMUM block counts disagree. `try_grow_pool` sizes the grow from
+    /// the pool's max while `BlockAllocator::grow_by` silently caps at the
+    /// allocator's lower max, so mismatched maxima would leave logical
+    /// capacity short of the physical pool after a grow.
+    #[test]
+    fn test_new_rejects_pool_max_num_blocks_mismatch() {
+        let allocator = new_allocator(8, 8); // num 8, max 8
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        // Pool with the matching live count (8) but a LARGER max (16).
+        let larger_max_pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            8,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) => {
+                eprintln!("skipping test_new_rejects_pool_max_num_blocks_mismatch: {e}");
+                return;
+            }
+        };
+        let res = PagedKVCacheAdapter::new(allocator, larger_max_pool, 8);
+        assert!(res.is_err(), "expected max_num_blocks mismatch error");
+        let msg = res.err().unwrap();
+        assert!(
+            msg.contains("max_num_blocks"),
+            "error must reference max_num_blocks, got: {msg}"
         );
     }
 
@@ -12994,6 +13441,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -13003,7 +13451,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(42).unwrap();
         adapter.allocate_suffix_blocks(2).unwrap();
@@ -13056,6 +13504,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
             Ok(p) => Arc::new(p),
@@ -13064,7 +13513,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(43).unwrap();
         adapter.allocate_suffix_blocks(2).unwrap();
@@ -13543,6 +13992,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             NUM_BLOCKS,
+            NUM_BLOCKS,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
             Ok(pool) => Arc::new(pool),
@@ -13551,7 +14001,9 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK_SIZE)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            NUM_BLOCKS, NUM_BLOCKS, BLOCK_SIZE,
+        )));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("adapter");
         adapter.reset_for_new_request(0).expect("reset");
         adapter
@@ -13645,6 +14097,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             NUM_BLOCKS,
+            NUM_BLOCKS,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
             Ok(pool) => Arc::new(pool),
@@ -13653,7 +14106,9 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK_SIZE)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            NUM_BLOCKS, NUM_BLOCKS, BLOCK_SIZE,
+        )));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE).expect("adapter");
         let element_count = NUM_KV_HEADS * HEAD_SIZE;
         let keys = MxArray::from_bfloat16(
@@ -13848,6 +14303,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -13856,7 +14312,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -13917,6 +14373,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -13927,7 +14384,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -13995,6 +14452,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -14003,7 +14461,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -14077,6 +14535,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -14087,7 +14546,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -14209,6 +14668,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             16,
+            16,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -14217,7 +14677,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, BLOCK_SIZE)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, 16, BLOCK_SIZE)));
         let mut adapter =
             PagedKVCacheAdapter::new_sliding(allocator, pool, BLOCK_SIZE, WINDOW, 128)
                 .expect("sliding adapter");
@@ -14449,12 +14909,13 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             16,
+            16,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
             Err(e) => return Err(e.to_string()),
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, FIX_BLOCK_SIZE)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(16, 16, FIX_BLOCK_SIZE)));
         let mut adapter = if window == 0 {
             PagedKVCacheAdapter::new(allocator, pool, FIX_BLOCK_SIZE)?
         } else {
@@ -14911,6 +15372,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             NUM_BLOCKS,
+            NUM_BLOCKS,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -14926,7 +15388,9 @@ mod tests {
             Err(e) => panic!("pool construction failed for a non-GPU reason: {e}"),
         };
         let new_sliding = |window: u32| {
-            let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK)));
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+                NUM_BLOCKS, NUM_BLOCKS, BLOCK,
+            )));
             PagedKVCacheAdapter::new_sliding(allocator, Arc::clone(&pool), BLOCK, window, 128)
         };
 
@@ -15130,6 +15594,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(pool) => Arc::new(pool),
@@ -15140,7 +15605,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(11).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -15210,6 +15675,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(pool) => Arc::new(pool),
@@ -15220,7 +15686,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter =
             PagedKVCacheAdapter::new(Arc::clone(&allocator), pool, 8).expect("adapter");
 
@@ -15358,6 +15824,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
             Ok(p) => Arc::new(p),
@@ -15366,7 +15833,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(99).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();
@@ -15592,6 +16059,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg.clone(),
             4,
+            4,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
             Ok(p) => Arc::new(p),
@@ -15600,7 +16068,7 @@ mod tests {
                 return;
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(8).unwrap();
@@ -15682,6 +16150,688 @@ mod tests {
         }
     }
 
+    /// **Growth happy path**: an adapter over a 4-block pool with a 16-block
+    /// max grows on allocation exhaustion. Asserts the target arithmetic
+    /// (`min(max, max(2*current, current+needed))`), that growth precedes
+    /// LRU eviction (a cache-only prefix block survives both grows), that
+    /// post-grow writes land in the new buffers (round-trip via
+    /// `read_kv_range`), and that the growth notifier fires once per grow
+    /// with the new total bytes. Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_pool_grows_on_allocator_exhaustion_and_kv_roundtrips() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!(
+                    "skipping test_pool_grows_on_allocator_exhaustion_and_kv_roundtrips: {e}"
+                );
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        let notifications: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let notifications = Arc::clone(&notifications);
+            adapter.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+                notifications.lock().unwrap().push(bytes);
+            })));
+        }
+
+        assert_eq!(pool.num_blocks(), 4);
+        assert_eq!(pool.generation(), 0);
+
+        // Request A writes 8 tokens (1 block), registers the full block in
+        // the prefix cache, and releases — leaving exactly one evictable
+        // cache-only block (refcount 1) plus 3 free blocks.
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let k = MxArray::from_bfloat16(&vec![0u16; 8 * 64], &[8, 1, 64]).expect("k zeros");
+        let v = MxArray::from_bfloat16(&vec![0x3f80u16; 8 * 64], &[8, 1, 64]).expect("v ones");
+        match adapter.update_keys_values(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!(
+                    "skipping test_pool_grows_on_allocator_exhaustion_and_kv_roundtrips: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+        }
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(registered, 1);
+        adapter.release_request().unwrap();
+        {
+            let allocator = allocator.lock().unwrap();
+            assert_eq!(allocator.num_free_blocks(), 3);
+            assert_eq!(allocator.num_evictable_blocks(), 1);
+        }
+
+        // Request B needs 5 blocks with 3 free + 1 evictable = 4 available:
+        // growth must engage BEFORE any LRU eviction, so request A's cached
+        // block survives. The grow is sized by the shortfall (5 - 4 = 1), so
+        // the doubling floor dominates: min(16, max(2*4, 4+1)) = 8 blocks.
+        adapter.reset_for_new_request(8).unwrap();
+        let allocated = adapter.allocate_suffix_blocks(40).unwrap();
+        assert_eq!(allocated, 5);
+        assert_eq!(pool.num_blocks(), 8, "pool must grow to 8 blocks");
+        assert_eq!(pool.generation(), 1);
+        {
+            let allocator = allocator.lock().unwrap();
+            assert_eq!(
+                allocator.num_blocks(),
+                8,
+                "allocator must track the grown pool"
+            );
+            assert_eq!(
+                allocator.num_evictable_blocks(),
+                1,
+                "grow must precede eviction: request A's cached block must survive"
+            );
+        }
+        let notified = notifications.lock().unwrap().clone();
+        assert_eq!(notified.len(), 1, "notifier must fire once per grow");
+        assert_eq!(
+            notified[0],
+            pool.total_bytes(),
+            "notifier receives the pool's new total bytes"
+        );
+
+        // Write all 40 tokens: V = 2.0. Round-trip: every element must read
+        // back 2.0, proving the writes landed in the grown buffers.
+        adapter
+            .record_tokens(&(11..=50).collect::<Vec<u32>>())
+            .unwrap();
+        let k2 = MxArray::from_bfloat16(&vec![0u16; 40 * 64], &[40, 1, 64]).expect("k2 zeros");
+        let v2 = MxArray::from_bfloat16(&vec![0x4000u16; 40 * 64], &[40, 1, 64]).expect("v2 twos");
+        match adapter.update_keys_values(0, &k2, &v2, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!(
+                    "skipping test_pool_grows_on_allocator_exhaustion_and_kv_roundtrips: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error from second update_keys_values: {e}"),
+        }
+
+        let (_k_out, v_out) = match adapter.read_kv_range(0, 0, 40) {
+            Ok(t) => t,
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!(
+                    "skipping test_pool_grows_on_allocator_exhaustion_and_kv_roundtrips: {e}"
+                );
+                return;
+            }
+            Err(e) => panic!("unexpected error from read_kv_range: {e}"),
+        };
+        let v_f32 = v_out
+            .astype(DType::Float32)
+            .expect("astype f32 on V")
+            .reshape(&[40 * 64])
+            .expect("flatten V");
+        v_f32.eval();
+        for i in 0..(40 * 64) {
+            let elem = v_f32
+                .item_at_float32(i)
+                .unwrap_or_else(|e| panic!("item_at_float32({i}): {e}"));
+            assert!(
+                (elem - 2.0).abs() < 0.01,
+                "V[{i}] = {elem}, expected 2.0 (post-grow write must land in the new buffers)"
+            );
+        }
+
+        // Second exhaustion: current=8, needed=8, free+evictable=3 ->
+        // shortfall 5, min(16, max(2*8, 8+5)) = 16, capped at the pool max.
+        // The evictable cached block still survives.
+        let allocated = adapter.allocate_suffix_blocks(64).unwrap();
+        assert_eq!(allocated, 8);
+        assert_eq!(pool.num_blocks(), 16, "second grow reaches the pool max");
+        assert_eq!(pool.generation(), 2);
+        {
+            let allocator = allocator.lock().unwrap();
+            assert_eq!(
+                allocator.num_evictable_blocks(),
+                1,
+                "grow must still precede eviction after the second grow"
+            );
+        }
+        let notified = notifications.lock().unwrap().clone();
+        assert_eq!(notified.len(), 2, "notifier must fire once per grow");
+        assert_eq!(notified[1], pool.total_bytes());
+    }
+
+    /// **Grow decline**: a headroom probe that selects fewer blocks than the
+    /// grow target must decline the grow BEFORE `grow_to` builds the
+    /// transient old+new peak; the pool, allocator, and generation all stay
+    /// put and the caller's eviction/error fallback proceeds unchanged.
+    /// Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_grow_declined_when_headroom_probe_selects_fewer_blocks() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!(
+                    "skipping test_grow_declined_when_headroom_probe_selects_fewer_blocks: {e}"
+                );
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        // Probe caps the 4 -> 8 grow at 7 blocks: try_grow_pool must decline
+        // without calling grow_to.
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(|requested| {
+            Ok(requested.saturating_sub(1))
+        })));
+        assert_eq!(pool.num_blocks(), 4);
+        assert!(
+            !adapter.try_grow_pool(4),
+            "probe selecting 7 < 8 must decline the grow"
+        );
+        assert_eq!(
+            pool.num_blocks(),
+            4,
+            "a declined grow must leave the pool at its current size"
+        );
+        assert_eq!(
+            pool.generation(),
+            0,
+            "a declined grow must not bump the generation"
+        );
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 4);
+
+        // A probe that allows the target lets the grow proceed as before.
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        assert!(
+            adapter.try_grow_pool(4),
+            "probe selecting the full target must allow the grow"
+        );
+        assert_eq!(pool.num_blocks(), 8);
+        assert_eq!(pool.generation(), 1);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 8);
+    }
+
+    /// **Partial headroom**: a probe selecting fewer blocks than the
+    /// doubling target but at least `current + needed` must grow to the
+    /// selected count — a reservation that fits the shortfall must not be
+    /// rejected just because headroom cannot cover the full 2x target.
+    /// Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_grow_partial_headroom_targets_selected_blocks() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_grow_partial_headroom_targets_selected_blocks: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        // Probe caps the 4 -> 8 doubling target at 7 blocks: above the
+        // shortfall (4 + needed 2 = 6), below the target. The grow must
+        // land at 7, not decline.
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(|requested| {
+            Ok(requested.saturating_sub(1))
+        })));
+        assert!(
+            adapter.try_grow_pool(2),
+            "probe selecting 7 >= shortfall 6 must grow to the selected count"
+        );
+        assert_eq!(pool.num_blocks(), 7);
+        assert_eq!(pool.generation(), 1);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 7);
+    }
+
+    /// **Shortfall-sized grow (suffix allocation)**: with free + evictable
+    /// partially covering the reservation, `allocate_suffix_blocks` must pass
+    /// the DELTA (needed − handout-able) to `try_grow_pool`, not the total —
+    /// the probe must see `min(max, max(2*current, current+delta))` and the
+    /// grow must land there. Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_allocate_suffix_grow_requests_shortfall_not_total() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_allocate_suffix_grow_requests_shortfall_not_total: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        // Request A leaves one evictable cache-only block plus 3 free, so
+        // the allocator can hand out 4 blocks without growth.
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(registered, 1);
+        adapter.release_request().unwrap();
+        {
+            let allocator = allocator.lock().unwrap();
+            assert_eq!(allocator.free_or_evictable_blocks(), 4);
+        }
+
+        let probe_requests: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let probe_requests = Arc::clone(&probe_requests);
+            adapter.set_grow_headroom_probe_override(Some(Arc::new(move |requested| {
+                probe_requests.lock().unwrap().push(requested);
+                Ok(requested)
+            })));
+        }
+
+        // Needed 5, handout-able 4 → shortfall 1. The probe must see the
+        // delta-derived target min(16, max(2*4, 4+1)) = 8, not the
+        // total-derived 4+5 = 9.
+        adapter.reset_for_new_request(8).unwrap();
+        let allocated = adapter.allocate_suffix_blocks(40).unwrap();
+        assert_eq!(allocated, 5);
+        assert_eq!(
+            probe_requests.lock().unwrap().as_slice(),
+            &[8],
+            "try_grow_pool must be sized by the shortfall, not the total reservation"
+        );
+        assert_eq!(pool.num_blocks(), 8);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 8);
+    }
+
+    /// **Shortfall-sized grow (decode/`ensure_blocks_for_total_tokens`)**:
+    /// same delta contract as the suffix path, exercised through
+    /// `reserve_rows` on a request with no evictable blocks. Skipped on
+    /// no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_ensure_blocks_grow_requests_shortfall_not_total() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_ensure_blocks_grow_requests_shortfall_not_total: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        // One live block, 3 free, nothing evictable.
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        {
+            let allocator = allocator.lock().unwrap();
+            assert_eq!(allocator.free_or_evictable_blocks(), 3);
+        }
+
+        let probe_requests: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let probe_requests = Arc::clone(&probe_requests);
+            adapter.set_grow_headroom_probe_override(Some(Arc::new(move |requested| {
+                probe_requests.lock().unwrap().push(requested);
+                Ok(requested)
+            })));
+        }
+
+        // 8 live tokens + 40 reserved rows = 48 tokens → 6 blocks, 1 held →
+        // to_allocate 5 > 3 free → shortfall 2. The probe must see
+        // min(16, max(2*4, 4+2)) = 8, not the total-derived 4+5 = 9.
+        let allocated = adapter.reserve_rows(40).unwrap();
+        assert_eq!(allocated, 5);
+        assert_eq!(
+            probe_requests.lock().unwrap().as_slice(),
+            &[8],
+            "try_grow_pool must be sized by the shortfall, not the total reservation"
+        );
+        assert_eq!(pool.num_blocks(), 8);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 8);
+    }
+
+    /// **Growth serialization**: while the process-wide growth lock is held,
+    /// a concurrent `try_grow_pool` must block BEFORE its headroom probe
+    /// runs — the probe's sibling accounting
+    /// (`registered_pool_bytes() − own_live`) is only sound when no other
+    /// grow is in flight, so parking on the lock before the probe is the
+    /// property under test. The held-lock window uses a fixed sleep: the
+    /// assertion can only fail if the probe runs while the lock is held,
+    /// which scheduling latency alone cannot cause. Skipped on no-Metal
+    /// hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_try_grow_pool_blocks_on_process_wide_growth_lock() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_try_grow_pool_blocks_on_process_wide_growth_lock: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        let probe_ran = Arc::new(AtomicBool::new(false));
+        {
+            let probe_ran = Arc::clone(&probe_ran);
+            adapter.set_grow_headroom_probe_override(Some(Arc::new(move |requested| {
+                probe_ran.store(true, Ordering::SeqCst);
+                Ok(requested)
+            })));
+        }
+
+        let guard = crate::cache_limit::pool_growth_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let grower = std::thread::spawn(move || adapter.try_grow_pool(1));
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !probe_ran.load(Ordering::SeqCst),
+            "probe must not run while the growth lock is held"
+        );
+        assert_eq!(
+            pool.num_blocks(),
+            4,
+            "no grow may complete while the growth lock is held"
+        );
+        drop(guard);
+
+        assert!(
+            grower.join().expect("grow thread panicked"),
+            "grow must succeed once the growth lock is released"
+        );
+        assert!(
+            probe_ran.load(Ordering::SeqCst),
+            "probe must run after the growth lock is released"
+        );
+        assert_eq!(pool.num_blocks(), 8, "grow 4 -> 8 must land post-lock");
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 8);
+    }
+
+    /// **Generation guard**: adapter B caches per-layer pool views at
+    /// generation 0; adapter A (sharing the pool) exhausts and grows it.
+    /// B's next native write must rebuild its views against the grown
+    /// buffers — otherwise the write lands in the dead pre-grow buffers and
+    /// the readback shows garbage. Also proves the blit preserved B's
+    /// earlier KV. Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_shared_pool_generation_guard_rebuilds_views() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_shared_pool_generation_guard_rebuilds_views: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter_a = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter a");
+        let mut adapter_b = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter b");
+
+        // B writes 8 tokens (V = 1.0) through the graph-native path so its
+        // per-layer views are cached at generation 0, then flushes.
+        adapter_b.reset_for_new_request(1).unwrap();
+        adapter_b.allocate_suffix_blocks(8).unwrap();
+        adapter_b.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let k = MxArray::from_bfloat16(&vec![0u16; 8 * 64], &[8, 1, 64]).expect("k zeros");
+        let v = MxArray::from_bfloat16(&vec![0x3f80u16; 8 * 64], &[8, 1, 64]).expect("v ones");
+        match adapter_b.update_keys_values_native(0, &k, &v, 0) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_shared_pool_generation_guard_rebuilds_views: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from update_keys_values_native: {e}"),
+        }
+        adapter_b
+            .eval_pending_pool_writes()
+            .expect("flush B writes");
+        assert_eq!(pool.generation(), 0);
+
+        // A's 5-block reservation exceeds the 3 free blocks -> pre-allocate
+        // growth (before any eviction) grows the shared pool. Shortfall
+        // 5 - 3 = 2: min(16, max(2*4, 4+2)) = 8 blocks.
+        adapter_a.reset_for_new_request(2).unwrap();
+        let allocated = adapter_a.allocate_suffix_blocks(40).unwrap();
+        assert_eq!(allocated, 5);
+        assert_eq!(pool.num_blocks(), 8, "pool must grow to 8 blocks");
+        assert_eq!(pool.generation(), 1);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 8);
+
+        // B writes 2 more tokens (V = 2.0). Its cached views are generation
+        // 0; the guard must rebuild them against the grown buffers.
+        adapter_b.record_tokens(&[11, 12]).unwrap();
+        let k2 = MxArray::from_bfloat16(&vec![0u16; 2 * 64], &[2, 1, 64]).expect("k2 zeros");
+        let v2 = MxArray::from_bfloat16(&vec![0x4000u16; 2 * 64], &[2, 1, 64]).expect("v2 twos");
+        match adapter_b.update_keys_values_native(0, &k2, &v2, 8) {
+            Ok(()) => {}
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_shared_pool_generation_guard_rebuilds_views: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from second update_keys_values_native: {e}"),
+        }
+        adapter_b
+            .eval_pending_pool_writes()
+            .expect("flush B writes");
+
+        let (_k_out, v_out) = match adapter_b.read_kv_range(0, 0, 10) {
+            Ok(t) => t,
+            Err(e) if e.contains("Metal GPU not available") => {
+                eprintln!("skipping test_shared_pool_generation_guard_rebuilds_views: {e}");
+                return;
+            }
+            Err(e) => panic!("unexpected error from read_kv_range: {e}"),
+        };
+        let v_f32 = v_out
+            .astype(DType::Float32)
+            .expect("astype f32 on V")
+            .reshape(&[10 * 64])
+            .expect("flatten V");
+        v_f32.eval();
+        for i in 0..(10 * 64) {
+            let token = i / 64;
+            let expected = if token < 8 { 1.0 } else { 2.0 };
+            let elem = v_f32
+                .item_at_float32(i)
+                .unwrap_or_else(|e| panic!("item_at_float32({i}): {e}"));
+            assert!(
+                (elem - expected).abs() < 0.01,
+                "V[{i}] = {elem}, expected {expected} at token {token} (stale pre-grow \
+                 views would leave post-grow tokens unwritten)"
+            );
+        }
+    }
+
+    /// **CPU-only** (no Metal device required): dropping a stale native-pool
+    /// view entry is silent for clean entries but must take the warn path
+    /// when the entry is still dirty — its unevaluated write can never
+    /// land, so the discard is data loss. Uses the validation-only pool and
+    /// hand-pushed entries with a mismatched generation, exactly the state
+    /// a shared-pool grow leaves behind in another adapter's view cache.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_stale_native_pool_entries_are_dropped_not_evaluated() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 1,
+            ..mlx_paged_attn::PagedAttentionConfig::default()
+        };
+        let pool = Arc::new(
+            mlx_paged_attn::LayerKVPool::new_for_validation_only(
+                cfg,
+                4,
+                1,
+                mlx_paged_attn::metal::MetalDtype::Float16,
+            )
+            .expect("validation-only pool"),
+        );
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
+
+        // The validation-only pool reports num_layers() == 0, so push the
+        // entries by hand with a generation that no longer matches the pool.
+        let stale_generation = adapter.layer_kv_pool.generation() + 1;
+        let push_entry = |adapter: &mut PagedKVCacheAdapter, dirty: bool| {
+            let key = MxArray::from_int64(&[1], &[1]).expect("dummy key");
+            let value = MxArray::from_int64(&[1], &[1]).expect("dummy value");
+            adapter.native_pool_arrays.push(Some(NativePoolArrays {
+                key,
+                value,
+                dirty,
+                generation: stale_generation,
+            }));
+        };
+
+        // Dirty stale entries must be dropped (never evaluated) by both
+        // flush paths — the warn fires on this path.
+        push_entry(&mut adapter, true);
+        adapter.eval_pending_pool_writes().expect("pool flush");
+        assert!(
+            adapter.native_pool_arrays[0].is_none(),
+            "stale dirty entry must be dropped by the pool flush"
+        );
+
+        push_entry(&mut adapter, true);
+        adapter
+            .eval_pending_pool_write_for_layer(0)
+            .expect("per-layer flush");
+        assert!(
+            adapter.native_pool_arrays[0].is_none(),
+            "stale dirty entry must be dropped by the per-layer flush"
+        );
+
+        // Clean stale entries are also dropped, silently.
+        push_entry(&mut adapter, false);
+        adapter.eval_pending_pool_writes().expect("pool flush");
+        assert!(
+            adapter.native_pool_arrays[0].is_none(),
+            "stale clean entry must be dropped"
+        );
+    }
+
     /// A grouped sliding sidecar is decoded as `[B, H, T, D]`, while the
     /// Metal cache writer consumes contiguous `[T, H, D]`. Exercise more than
     /// one head with non-uniform BF16 bits so dropping the final materializing
@@ -15721,7 +16871,9 @@ mod tests {
             }
             Err(error) => panic!("create multi-head test pool: {error}"),
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
         let mut adapter = PagedKVCacheAdapter::new_sliding(allocator, pool, block_size, 32, 64)
             .expect("create sliding adapter");
         let elements = num_kv_heads as usize * boundary as usize * head_size as usize;
@@ -16365,7 +17517,9 @@ mod tests {
     fn test_build_paged_attention_inputs_basic() {
         let block_size = 8u32;
         let num_blocks = 8u32;
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
         let Some(mut adapter) = maybe_adapter(allocator, block_size) else {
             eprintln!("skipping test_build_paged_attention_inputs_basic: Metal unavailable");
             return;
@@ -16439,7 +17593,9 @@ mod tests {
     fn test_build_paged_attention_inputs_rejects_bound_violations() {
         let block_size = 8u32;
         let num_blocks = 8u32;
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
         let Some(mut adapter) = maybe_adapter(allocator, block_size) else {
             eprintln!(
                 "skipping test_build_paged_attention_inputs_rejects_bound_violations: Metal \
@@ -16495,7 +17651,9 @@ mod tests {
     fn test_build_paged_attention_inputs_no_active_request() {
         let block_size = 8u32;
         let num_blocks = 4u32;
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
         let Some(adapter) = maybe_adapter(allocator, block_size) else {
             eprintln!(
                 "skipping test_build_paged_attention_inputs_no_active_request: Metal unavailable"
@@ -16521,7 +17679,9 @@ mod tests {
     fn test_build_paged_attention_inputs_zero_chunk() {
         let block_size = 8u32;
         let num_blocks = 4u32;
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(num_blocks, block_size)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
         let Some(mut adapter) = maybe_adapter(allocator, block_size) else {
             eprintln!("skipping test_build_paged_attention_inputs_zero_chunk: Metal unavailable");
             return;

@@ -365,14 +365,20 @@ fn build_paged_adapter(config: &NemotronHConfig) -> Result<Option<PagedKVCacheAd
     };
     let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
         plan.num_blocks,
+        plan.num_blocks,
         plan.block_size,
     )));
-    let pool = mlx_paged_attn::LayerKVPool::new(plan.pa_config, plan.num_blocks, plan.cache_dtype)
-        .map_err(|e| {
-            Error::from_reason(format!(
-                "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
-            ))
-        })?;
+    let pool = mlx_paged_attn::LayerKVPool::new(
+        plan.pa_config,
+        plan.num_blocks,
+        plan.num_blocks,
+        plan.cache_dtype,
+    )
+    .map_err(|e| {
+        Error::from_reason(format!(
+            "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
+        ))
+    })?;
     let adapter =
         PagedKVCacheAdapter::new(allocator, Arc::new(pool), plan.block_size).map_err(|e| {
             Error::from_reason(format!(
@@ -800,6 +806,16 @@ impl NemotronHInner {
             )));
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+        // Hold the process-wide pool-growth lock across sizing → CAS
+        // reservation → pool allocation. The CAS retry loop only protects
+        // against registrations racing between its read and its commit;
+        // without this lock a concurrent qwen3_5 grow (or another loader)
+        // can probe sibling totals that miss this in-flight reservation and
+        // both allocations spend the same headroom. See
+        // `cache_limit::pool_growth_lock`.
+        let _growth_guard = crate::cache_limit::pool_growth_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let coordinator = crate::cache_limit::coordinator();
         let (selected_blocks, pool_guard) = {
             let mut reserved = None;
@@ -836,14 +852,20 @@ impl NemotronHInner {
         };
         let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
             selected_blocks,
+            selected_blocks,
             block_size,
         )));
-        let pool = mlx_paged_attn::LayerKVPool::new(pa_config, selected_blocks, cache_dtype)
-            .map_err(|e| {
-                Error::from_reason(format!(
-                    "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
-                ))
-            })?;
+        let pool = mlx_paged_attn::LayerKVPool::new(
+            pa_config,
+            selected_blocks,
+            selected_blocks,
+            cache_dtype,
+        )
+        .map_err(|e| {
+            Error::from_reason(format!(
+                "Failed to construct LayerKVPool for NemotronH block-paged adapter: {e}"
+            ))
+        })?;
         self.paged_adapter = Some(
             PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
                 Error::from_reason(format!(
@@ -3668,10 +3690,11 @@ mod scheduler_tests {
             max_batch_size: Some(32),
         };
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            num_blocks, block_size,
+            num_blocks, num_blocks, block_size,
         )));
         let pool = mlx_paged_attn::LayerKVPool::new(
             pa_config,
+            num_blocks,
             num_blocks,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         )

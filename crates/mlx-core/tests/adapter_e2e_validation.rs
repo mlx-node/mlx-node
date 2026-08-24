@@ -61,7 +61,7 @@ fn try_make_fixture(cache_dtype: MetalDtype) -> Option<Fixture> {
         max_seq_len: Some(64),
         max_batch_size: Some(2),
     };
-    let pool = match LayerKVPool::new(cfg, NUM_BLOCKS, cache_dtype) {
+    let pool = match LayerKVPool::new(cfg, NUM_BLOCKS, NUM_BLOCKS, cache_dtype) {
         Ok(p) => Arc::new(p),
         Err(e) if e.contains("No Metal device found") => {
             eprintln!("skipping: {e}");
@@ -73,7 +73,9 @@ fn try_make_fixture(cache_dtype: MetalDtype) -> Option<Fixture> {
         }
         Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
     };
-    let allocator = Arc::new(Mutex::new(BlockAllocator::new(NUM_BLOCKS, BLOCK_SIZE)));
+    let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+        NUM_BLOCKS, NUM_BLOCKS, BLOCK_SIZE,
+    )));
     let adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), BLOCK_SIZE)
         .expect("PagedKVCacheAdapter::new must succeed when pool/allocator agree");
     Some(Fixture { adapter, allocator })

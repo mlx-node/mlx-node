@@ -4704,6 +4704,15 @@ export interface Qwen35Config {
    */
   pagedCacheMemoryMb?: number | undefined;
   /**
+   * Initial paged KV pool size in MiB for the grow-on-demand pool: the
+   * pool starts at this size and grows toward the max budget
+   * (`paged_cache_memory_mb` or the auto one-full-context default) on
+   * exhaustion. Unset (default) makes the initial pool equal the max —
+   * the historical fixed-pool behavior. `MLX_PAGED_CACHE_INITIAL_MB` wins
+   * over this field at load time.
+   */
+  pagedCacheInitialMemoryMb?: number | undefined;
+  /**
    * Block size for paged attention (tokens per block).
    * Only used when `use_block_paged_cache` is true.
    * Default: 16.
@@ -4769,8 +4778,10 @@ export interface Qwen35Config {
 
 /**
  * Trained and physically available active-context limits for one loaded
- * Qwen3.5 model. Values are snapshots because the physical pool is fixed for
- * the lifetime of the resident model.
+ * Qwen3.5 model. Values are snapshots taken at load: `effective_window`
+ * derives from the pool's MAX capacity (grow-on-demand pools are preflighted
+ * against the ceiling they grow toward), while `paged_block_capacity` is the
+ * physical pool size actually allocated at load and may lag after a grow.
  */
 export interface Qwen35ContextLimits {
   trainedWindowTokens: number;
@@ -4837,6 +4848,15 @@ export interface Qwen35MoeConfig {
    * Default: automatically sized for one full-context sequence.
    */
   pagedCacheMemoryMb?: number | undefined;
+  /**
+   * Initial paged KV pool size in MiB for the grow-on-demand pool: the
+   * pool starts at this size and grows toward the max budget
+   * (`paged_cache_memory_mb` or the auto one-full-context default) on
+   * exhaustion. Unset (default) makes the initial pool equal the max —
+   * the historical fixed-pool behavior. `MLX_PAGED_CACHE_INITIAL_MB` wins
+   * over this field at load time.
+   */
+  pagedCacheInitialMemoryMb?: number | undefined;
   /**
    * Block size for paged attention (tokens per block).
    * Only used when `use_block_paged_cache` is true.

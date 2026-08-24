@@ -928,7 +928,8 @@ impl Qwen35MoeInner {
     }
 
     /// MoE mirror of the dense post-materialization adaptive paged-pool
-    /// initialization.
+    /// initialization. The pool starts at `paged_cache_initial_memory_mb`
+    /// (or the max itself when unset) and grows on demand toward the max.
     pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
         if !self.config.use_block_paged_cache.unwrap_or(true)
             || !crate::engine::persistence::compiled_forward_backend_available()
@@ -978,16 +979,26 @@ impl Qwen35MoeInner {
             )));
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
-        let (num_blocks, sizing_source) = if self.config.paged_cache_memory_mb.is_some() {
+        // `max_num_blocks` is the dynamic ceiling the live pool grows toward;
+        // `load_time_pool_sizing_with_reserved` keeps clamping the MAX only,
+        // exactly as before the initial/max split. Sibling pools registered
+        // with the cache-limit coordinator hold private Metal buffers the MLX
+        // active-memory probes cannot see, so their bytes are reserved
+        // explicitly; this runs inside the process-wide pool-growth lock (see
+        // persistence.rs), so the coordinator read is race-free. The explicit
+        // `paged_cache_memory_mb` cap is an operator override and stays
+        // unprobed by design.
+        let (max_num_blocks, sizing_source) = if self.config.paged_cache_memory_mb.is_some() {
             (requested_blocks, "explicit".to_string())
         } else {
-            let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
+            let sizing = mlx_paged_attn::profile::load_time_pool_sizing_with_reserved(
                 requested_blocks,
                 attn_layer_count,
                 num_kv_heads,
                 head_size,
                 block_size,
                 cache_dtype,
+                crate::cache_limit::coordinator().registered_pool_bytes(),
             )
             .map_err(|e| {
                 Error::from_reason(format!(
@@ -1008,13 +1019,39 @@ impl Qwen35MoeInner {
                 ),
             )
         };
+        // Initial pool: `MLX_PAGED_CACHE_INITIAL_MB` (env wins) or the config
+        // field, clamped into [1 block, max]. Unset → the max itself.
+        let initial_mb =
+            crate::models::qwen3_5::config::qwen35_resolve_paged_cache_initial_memory_mb(
+                self.config.paged_cache_initial_memory_mb,
+                std::env::var(crate::models::qwen3_5::config::MLX_PAGED_CACHE_INITIAL_MB_ENV)
+                    .ok()
+                    .as_deref(),
+            );
+        let (num_blocks, initial_pool_mib) =
+            crate::models::qwen3_5::config::qwen35_initial_pool_blocks(
+                initial_mb,
+                requested_memory_mb,
+                max_num_blocks,
+                &pa_config,
+            )
+            .map_err(|()| {
+                Error::from_reason(format!(
+                    "Qwen3.5 MoE block-paged adapter: requested initial paged cache {} MiB cannot \
+                 hold one block",
+                    initial_mb.unwrap_or(0)
+                ))
+            })?;
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            num_blocks, block_size,
+            num_blocks,
+            max_num_blocks,
+            block_size,
         )));
         let pool =
-            mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, cache_dtype).map_err(|e| {
-                Error::from_reason(format!("Failed to construct Qwen3.5 MoE KV pool: {e}"))
-            })?;
+            mlx_paged_attn::LayerKVPool::new(pa_config, num_blocks, max_num_blocks, cache_dtype)
+                .map_err(|e| {
+                    Error::from_reason(format!("Failed to construct Qwen3.5 MoE KV pool: {e}"))
+                })?;
         self.paged_adapter = Some(
             PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size).map_err(|e| {
                 Error::from_reason(format!(
@@ -1023,17 +1060,24 @@ impl Qwen35MoeInner {
             })?,
         );
         info!(
-            "Qwen3.5 MoE paged adapter enabled after weight materialization: num_blocks={}, \
+            "Qwen3.5 MoE paged adapter enabled after weight materialization: initial_blocks={}, \
              block_size={}, effective_window_tokens={}, trained_window_tokens={}, \
              requested_memory_mib={}, requested_source={}, sizing_source={}",
             num_blocks,
             block_size,
-            num_blocks.saturating_mul(block_size).min(max_seq_len),
+            max_num_blocks.saturating_mul(block_size).min(max_seq_len),
             max_seq_len,
             requested_memory_mb,
             requested_source,
             sizing_source,
         );
+        if num_blocks < max_num_blocks {
+            info!(
+                "Qwen3.5 MoE paged pool is dynamic (grow-on-demand): initial_blocks={num_blocks}, \
+                 max_blocks={max_num_blocks}, initial_pool_mib={}, max_pool_mib={requested_memory_mb}",
+                initial_pool_mib.unwrap_or(0)
+            );
+        }
         Ok(())
     }
 
@@ -10121,8 +10165,12 @@ pub struct Qwen3_5MoeModel {
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
     /// RAII debit for the native paged KV pool, whose Metal buffers are not
-    /// visible to MLX allocator accounting.
-    pub(crate) _pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
+    /// visible to MLX allocator accounting. Owned for the whole model
+    /// lifetime so the coordinator entry (updated in place by the adapter's
+    /// growth notifier via `update_pool`) cannot be dropped while the pool
+    /// may still grow. Never read directly — retained for its `Drop`.
+    #[allow(dead_code)]
+    pub(crate) pool_cache_limit_guard: Option<crate::cache_limit::PoolCacheLimitGuard>,
 }
 
 #[napi]
@@ -10749,6 +10797,7 @@ mod paged_construction_tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(64),
+            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: if use_block_paged { Some(true) } else { None },
             persist_paged_cache: None,
@@ -11491,7 +11540,7 @@ mod paged_construction_tests {
             }
         };
         let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            NUM_BLOCKS, BLOCK_SIZE,
+            NUM_BLOCKS, NUM_BLOCKS, BLOCK_SIZE,
         )));
         let adapter = PagedKVCacheAdapter::new(allocator, pool, BLOCK_SIZE)
             .expect("test paged adapter must construct");
@@ -12312,6 +12361,7 @@ mod mask_free_full_attention_parity_tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(64),
+            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: None,
             persist_paged_cache: None,

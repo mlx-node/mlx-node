@@ -3276,6 +3276,7 @@ mod tests {
         let pool = match mlx_paged_attn::LayerKVPool::new(
             cfg,
             16,
+            16,
             mlx_paged_attn::metal::MetalDtype::Float16,
         ) {
             Ok(p) => Arc::new(p),
@@ -3295,6 +3296,7 @@ mod tests {
             Err(e) => return Err(Error::from_reason(e.to_string())),
         };
         let allocator = Arc::new(Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            16,
             16,
             DENSE_BLOCK,
         )));
@@ -3835,14 +3837,14 @@ mod tests {
             max_seq_len: Some(64),
             max_batch_size: Some(2),
         };
-        let pool = match LayerKVPool::new(cfg, 4, mlx_paged_attn::metal::MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new(cfg, 4, 4, mlx_paged_attn::metal::MetalDtype::BFloat16) {
             Ok(pool) => Arc::new(pool),
             Err(err) => {
                 eprintln!("skipping Gemma4 paged-prefill operator parity: {err}");
                 return Ok(());
             }
         };
-        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 8)));
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 4, 8)));
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 8).expect("adapter");
         adapter.reset_for_new_request(7).unwrap();
         adapter.allocate_suffix_blocks(4).unwrap();

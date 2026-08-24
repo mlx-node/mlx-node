@@ -31,7 +31,7 @@ fn cfg(num_layers: u32) -> PagedAttentionConfig {
 /// return without panicking. Pool allocation needs `MetalState::get()`,
 /// which fails on CI runners without a GPU.
 fn maybe_pool(num_blocks: u32, dtype: MetalDtype) -> Option<LayerKVPool> {
-    match LayerKVPool::new(cfg(2), num_blocks, dtype) {
+    match LayerKVPool::new(cfg(2), num_blocks, num_blocks, dtype) {
         Ok(p) => Some(p),
         Err(e) if e.contains("No Metal device found") => None,
         Err(e) => panic!("unexpected LayerKVPool::new failure: {e}"),
@@ -95,7 +95,7 @@ fn fp8_view_shapes() {
         use_fp8_cache: Some(true),
         ..cfg(2)
     };
-    let pool = match LayerKVPool::new(cfg, 4, MetalDtype::UChar) {
+    let pool = match LayerKVPool::new(cfg, 4, 4, MetalDtype::UChar) {
         Ok(p) => p,
         Err(e) if e.contains("No Metal device found") => {
             eprintln!("skipping fp8_view_shapes: Metal unavailable");

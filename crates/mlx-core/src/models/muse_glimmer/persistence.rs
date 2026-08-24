@@ -359,10 +359,11 @@ fn build_paged_runtime(config: &MuseGlimmerConfig) -> Result<Option<MusePagedRun
             max_batch_size: Some(max_sequences),
         };
         let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
-            blocks, block_size,
+            blocks, blocks, block_size,
         )));
         let pool = mlx_paged_attn::LayerKVPool::new(
             pa_config,
+            blocks,
             blocks,
             mlx_paged_attn::metal::MetalDtype::BFloat16,
         )

@@ -36,7 +36,7 @@ fn build_populated_allocator(num_blocks: usize) -> (BlockAllocator, Vec<u32>) {
         num_blocks > PREFIX_BLOCKS,
         "num_blocks must exceed the shared-prefix block count"
     );
-    let mut allocator = BlockAllocator::new(num_blocks as u32, BLOCK_SIZE);
+    let mut allocator = BlockAllocator::new(num_blocks as u32, num_blocks as u32, BLOCK_SIZE);
 
     let filler_count = num_blocks - PREFIX_BLOCKS;
     for i in 0..filler_count {

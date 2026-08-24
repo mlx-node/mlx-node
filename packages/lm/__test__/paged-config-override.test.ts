@@ -172,3 +172,116 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
     expect('persistPagedCache' in config).toBe(false);
   });
 });
+
+describe('PagedConfigOverrideManager initial pool sizing', () => {
+  // The qwen3_5/qwen3_5_moe families get an authoritative start-small initial
+  // budget: 2048 MiB by default, `MLX_PAGED_CACHE_INITIAL_MB` env wins, and
+  // the value is clamped to the resolved max (`paged_cache_memory_mb` floor).
+  // Other families are untouched — the native loader has no initial knob for
+  // them and the clone must not invent a field it would ignore or reject.
+  it('writes the 2048 default initial next to the unchanged max floor for qwen3_5', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3_5' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const config = await readOverrideConfig(await manager.resolve(source, 'qwen3_5'));
+    expect(config.paged_cache_initial_memory_mb).toBe(2_048);
+    // The max floor logic is unchanged: an unset max still becomes 16 GiB.
+    expect(config.paged_cache_memory_mb).toBe(16_384);
+  });
+
+  it('does not touch a source initial already at the resolved default', async () => {
+    const source = await makeModelDir({
+      model_type: 'qwen3_5',
+      use_block_paged_cache: true,
+      paged_cache_memory_mb: 32_768,
+      paged_cache_initial_memory_mb: 2_048,
+    });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    expect(await manager.resolve(source, 'qwen3_5')).toBe(source);
+  });
+
+  it('blocks the pass-through when the initial knob is unsatisfied', async () => {
+    // Already paged, max above the floor, but NO initial field: the source
+    // must clone so the new default actually reaches the loader instead of
+    // silently loading as a static full-size pool.
+    const source = await makeModelDir({
+      model_type: 'qwen3_5',
+      use_block_paged_cache: true,
+      paged_cache_memory_mb: 32_768,
+    });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const resolved = await manager.resolve(source, 'qwen3_5');
+    expect(resolved).not.toBe(source);
+    expect((await readOverrideConfig(resolved)).paged_cache_initial_memory_mb).toBe(2_048);
+  });
+
+  it('honors MLX_PAGED_CACHE_INITIAL_MB over the 2048 default', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3_5_moe' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const previous = process.env.MLX_PAGED_CACHE_INITIAL_MB;
+    process.env.MLX_PAGED_CACHE_INITIAL_MB = '8192';
+    try {
+      const config = await readOverrideConfig(await manager.resolve(source, 'qwen3_5_moe'));
+      expect(config.paged_cache_initial_memory_mb).toBe(8_192);
+    } finally {
+      if (previous === undefined) delete process.env.MLX_PAGED_CACHE_INITIAL_MB;
+      else process.env.MLX_PAGED_CACHE_INITIAL_MB = previous;
+    }
+  });
+
+  it('falls back to the 2048 default for an unparseable MLX_PAGED_CACHE_INITIAL_MB', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3_5' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const previous = process.env.MLX_PAGED_CACHE_INITIAL_MB;
+    process.env.MLX_PAGED_CACHE_INITIAL_MB = 'not-a-number';
+    try {
+      const config = await readOverrideConfig(await manager.resolve(source, 'qwen3_5'));
+      expect(config.paged_cache_initial_memory_mb).toBe(2_048);
+    } finally {
+      if (previous === undefined) delete process.env.MLX_PAGED_CACHE_INITIAL_MB;
+      else process.env.MLX_PAGED_CACHE_INITIAL_MB = previous;
+    }
+  });
+
+  it('clamps the initial budget to the resolved max', async () => {
+    const source = await makeModelDir({ model_type: 'qwen3_5' });
+    const manager = new PagedConfigOverrideManager();
+    cleanups.push(() => manager.cleanup());
+
+    const previousInitial = process.env.MLX_PAGED_CACHE_INITIAL_MB;
+    const previousMemory = process.env.MLX_PAGED_CACHE_MEMORY_MB;
+    process.env.MLX_PAGED_CACHE_INITIAL_MB = '8192';
+    process.env.MLX_PAGED_CACHE_MEMORY_MB = '4096';
+    try {
+      const config = await readOverrideConfig(await manager.resolve(source, 'qwen3_5'));
+      expect(config.paged_cache_memory_mb).toBe(4_096);
+      expect(config.paged_cache_initial_memory_mb).toBe(4_096);
+    } finally {
+      if (previousInitial === undefined) delete process.env.MLX_PAGED_CACHE_INITIAL_MB;
+      else process.env.MLX_PAGED_CACHE_INITIAL_MB = previousInitial;
+      if (previousMemory === undefined) delete process.env.MLX_PAGED_CACHE_MEMORY_MB;
+      else process.env.MLX_PAGED_CACHE_MEMORY_MB = previousMemory;
+    }
+  });
+
+  it('leaves non-qwen3_5 families without an initial field', async () => {
+    for (const modelType of ['qwen3', 'lfm2', 'gemma4_unified', 'nemotron_h'] as const) {
+      const source = await makeModelDir({ model_type: modelType });
+      const manager = new PagedConfigOverrideManager();
+      cleanups.push(() => manager.cleanup());
+
+      const canonical = modelType === 'gemma4_unified' ? 'gemma4' : modelType;
+      const config = await readOverrideConfig(await manager.resolve(source, canonical));
+      expect('paged_cache_initial_memory_mb' in config).toBe(false);
+    }
+  });
+});

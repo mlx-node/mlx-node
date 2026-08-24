@@ -53,6 +53,7 @@ pub(crate) struct ScheduledRestoreResult<P> {
 #[derive(Clone, Copy)]
 pub(crate) struct SchedulerCacheSnapshot {
     pub blocks: BlockTelemetry,
+    pub max_total_blocks: u32,
     pub bytes_per_block: u64,
 }
 
@@ -131,6 +132,7 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
                 reclaimable_blocks: blocks.reclaimable_blocks,
                 allocated_blocks: blocks.allocated_blocks,
             },
+            max_total_blocks: blocks.max_total_blocks,
             bytes_per_block,
         }))
     }
@@ -403,6 +405,60 @@ pub(crate) fn reservation_fits_empty_pool(
         .saturating_add(recurrent_state_bytes);
     let cap = u64::from(total_blocks).saturating_mul(bytes_per_block);
     need <= cap
+}
+
+/// Max-pool admission ceiling: a reservation that cannot fit even the
+/// pool's maximum (grow-target) block count must hard-error at admission —
+/// no grow path can reach past the max pool. A reservation below the max
+/// but above CURRENT free capacity is handled by
+/// `try_reserve_reclaiming_idle`, which may grow the pool once on its
+/// no-live-turns Reject edge before rejecting.
+pub(crate) fn exceeds_max_pool_ceiling(
+    snapshot: &SchedulerCacheSnapshot,
+    reservation_blocks: u32,
+    candidate_state_bytes: u64,
+) -> bool {
+    !reservation_fits_empty_pool(
+        reservation_blocks,
+        snapshot.max_total_blocks,
+        snapshot.bytes_per_block,
+        candidate_state_bytes,
+    )
+}
+
+/// Block shortfall a one-shot pool grow must add on the no-live-turns
+/// Reject edge of `try_reserve_reclaiming_idle_with`, or `None` to keep the
+/// existing Reject path. The shortfall is measured in BYTES — reservation
+/// blocks plus candidate and already-scheduled recurrent state — because
+/// admission is a byte inequality over one shared budget, and each grown
+/// block adds `bytes_per_block` of budget. `None` when the pool already
+/// sits at its max, the reservation exceeds the max-pool ceiling, or the
+/// byte shortfall is zero.
+fn grow_needed_blocks(
+    snapshot: &SchedulerCacheSnapshot,
+    reservation_blocks: u32,
+    candidate_state_bytes: u64,
+    existing_scheduled_state_bytes: u64,
+) -> Option<u32> {
+    if snapshot.blocks.total_blocks >= snapshot.max_total_blocks {
+        return None;
+    }
+    if exceeds_max_pool_ceiling(snapshot, reservation_blocks, candidate_state_bytes) {
+        return None;
+    }
+    let bytes_per_block = snapshot.bytes_per_block.max(1);
+    let available_bytes = u64::from(snapshot.blocks.free_blocks)
+        .saturating_add(u64::from(snapshot.blocks.reclaimable_blocks))
+        .saturating_mul(bytes_per_block);
+    let need_bytes = u64::from(reservation_blocks)
+        .saturating_mul(bytes_per_block)
+        .saturating_add(candidate_state_bytes)
+        .saturating_add(existing_scheduled_state_bytes);
+    let shortfall_bytes = need_bytes.saturating_sub(available_bytes);
+    let shortfall_blocks = shortfall_bytes
+        .div_ceil(bytes_per_block)
+        .min(u64::from(u32::MAX)) as u32;
+    (shortfall_blocks > 0).then_some(shortfall_blocks)
 }
 
 /// Keep-live blocks already allocated for `seq_id` that a continuation
@@ -1785,6 +1841,30 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         )
     }
 
+    /// Unified-memory admission decision against one cache snapshot.
+    fn reserve_memory_decision(
+        &mut self,
+        snapshot: &SchedulerCacheSnapshot,
+        reservation_blocks: u32,
+        candidate_state_bytes: u64,
+    ) -> engine::scheduler::MemoryAdmission {
+        self.scheduler.try_reserve_memory(
+            engine::scheduler::MemoryTelemetry {
+                capacity_bytes: u64::from(snapshot.blocks.total_blocks)
+                    .saturating_mul(snapshot.bytes_per_block),
+                free_bytes: u64::from(snapshot.blocks.free_blocks)
+                    .saturating_mul(snapshot.bytes_per_block),
+                reclaimable_bytes: u64::from(snapshot.blocks.reclaimable_blocks)
+                    .saturating_mul(snapshot.bytes_per_block),
+            },
+            reservation_blocks,
+            snapshot.bytes_per_block,
+            self.inner.scheduled_recurrent_bytes(),
+            candidate_state_bytes,
+            scheduler_watermark_fraction(),
+        )
+    }
+
     fn try_reserve_reclaiming_idle_with<F>(
         &mut self,
         seq_id: SeqId,
@@ -1797,27 +1877,35 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         F: FnMut(&mut B, SeqId) -> Result<()>,
     {
         loop {
-            let decision = self.scheduler.try_reserve_memory(
-                engine::scheduler::MemoryTelemetry {
-                    capacity_bytes: u64::from(snapshot.blocks.total_blocks)
-                        .saturating_mul(snapshot.bytes_per_block),
-                    free_bytes: u64::from(snapshot.blocks.free_blocks)
-                        .saturating_mul(snapshot.bytes_per_block),
-                    reclaimable_bytes: u64::from(snapshot.blocks.reclaimable_blocks)
-                        .saturating_mul(snapshot.bytes_per_block),
-                },
-                reservation_blocks,
-                snapshot.bytes_per_block,
-                self.inner.scheduled_recurrent_bytes(),
-                candidate_state_bytes,
-                scheduler_watermark_fraction(),
-            );
+            let decision =
+                self.reserve_memory_decision(&snapshot, reservation_blocks, candidate_state_bytes);
             if decision.admitted {
                 return Ok(MemoryReserveOutcome::Admitted);
             }
             if !self.reclaim_one_idle_scheduled_with(seq_id, &mut release_cache)? {
                 if self.scheduler.has_live_turns() {
                     return Ok(MemoryReserveOutcome::Defer);
+                }
+                // No live turns: one pool grow may still make the
+                // reservation fit, so grow-and-retry once. The fit math
+                // itself stays on CURRENT free + reclaimable counts —
+                // capacity derived from the max pool would admit against
+                // phantom free blocks. A declined or failed grow keeps the
+                // existing Reject path byte-identical.
+                if let Some(grown) = self.try_grow_reservation_pool(
+                    &snapshot,
+                    reservation_blocks,
+                    candidate_state_bytes,
+                )? {
+                    snapshot = grown;
+                    let decision = self.reserve_memory_decision(
+                        &snapshot,
+                        reservation_blocks,
+                        candidate_state_bytes,
+                    );
+                    if decision.admitted {
+                        return Ok(MemoryReserveOutcome::Admitted);
+                    }
                 }
                 return Ok(MemoryReserveOutcome::Reject {
                     total_blocks: snapshot.blocks.total_blocks,
@@ -1829,10 +1917,50 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
+    /// One-shot pool grow for the no-live-turns Reject edge of
+    /// `try_reserve_reclaiming_idle_with`: only when the pool sits below
+    /// its max and the reservation still fits the max-pool ceiling does the
+    /// pool grow by the byte shortfall (blocks plus recurrent state) over
+    /// current free + reclaimable. Returns the fresh snapshot so the caller
+    /// can re-run the reserve decision once. `Ok(None)` covers every
+    /// keep-the-Reject-path case: no paged adapter, pool already at max,
+    /// reservation above the max ceiling, zero shortfall, or a
+    /// declined/failed grow. Admission runs on the model thread, so the
+    /// adapter grow contract holds.
+    fn try_grow_reservation_pool(
+        &mut self,
+        snapshot: &SchedulerCacheSnapshot,
+        reservation_blocks: u32,
+        candidate_state_bytes: u64,
+    ) -> Result<Option<SchedulerCacheSnapshot>> {
+        let Some(needed) = grow_needed_blocks(
+            snapshot,
+            reservation_blocks,
+            candidate_state_bytes,
+            self.inner.scheduled_recurrent_bytes(),
+        ) else {
+            return Ok(None);
+        };
+        let Some(adapter) = self.inner.paged_adapter_mut() else {
+            return Ok(None);
+        };
+        if !adapter.try_grow_pool(needed) {
+            return Ok(None);
+        }
+        self.inner.scheduler_cache_snapshot()
+    }
+
     fn context_length_exceeded(reservation_blocks: u32, total_blocks: u32) -> Error {
         Error::from_reason(format!(
             "context_length_exceeded: request requires {} paged blocks but the pool has {}",
             reservation_blocks, total_blocks
+        ))
+    }
+
+    fn context_length_exceeded_max(reservation_blocks: u32, max_total_blocks: u32) -> Error {
+        Error::from_reason(format!(
+            "context_length_exceeded: request requires {} paged blocks but the max pool holds {}",
+            reservation_blocks, max_total_blocks
         ))
     }
 
@@ -1869,18 +1997,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         } else {
             self.inner.recurrent_state_bytes()
         };
-        if cache_snapshot.is_some_and(|snapshot| {
-            !reservation_fits_empty_pool(
-                prepared.reservation_blocks,
-                snapshot.blocks.total_blocks,
-                snapshot.bytes_per_block,
-                candidate_state_bytes,
-            )
+        if cache_snapshot.as_ref().is_some_and(|snapshot| {
+            exceeds_max_pool_ceiling(snapshot, prepared.reservation_blocks, candidate_state_bytes)
         }) {
             self.cleanup_rejected_prepared(&prepared);
-            let total_blocks = cache_snapshot.map_or(0, |snapshot| snapshot.blocks.total_blocks);
+            let max_total_blocks = cache_snapshot.map_or(0, |snapshot| snapshot.max_total_blocks);
             prepared.response.send_error(
-                Self::context_length_exceeded(prepared.reservation_blocks, total_blocks),
+                Self::context_length_exceeded_max(prepared.reservation_blocks, max_total_blocks),
                 prepared.cancelled.as_ref(),
             );
             return Ok(None);
@@ -2795,6 +2918,7 @@ mod tests {
             partial_rotary_factor: 0.25,
             rope_theta: 100_000.0,
             paged_cache_memory_mb: Some(64),
+            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: None,
             persist_paged_cache: None,
@@ -2834,6 +2958,7 @@ mod tests {
             norm_topk_prob: true,
             mlp_only_layers: None,
             paged_cache_memory_mb: Some(64),
+            paged_cache_initial_memory_mb: None,
             paged_block_size: Some(16),
             use_block_paged_cache: None,
             persist_paged_cache: None,
@@ -3234,6 +3359,7 @@ mod tests {
                 reclaimable_blocks: 0,
                 allocated_blocks: 0,
             },
+            max_total_blocks: total_blocks,
             bytes_per_block,
         };
         assert!(reservation_fits_empty_pool(
@@ -3299,6 +3425,7 @@ mod tests {
                 reclaimable_blocks: 0,
                 allocated_blocks: 100,
             },
+            max_total_blocks: 100,
             bytes_per_block: 4096,
         };
         let outcome = state
@@ -3392,6 +3519,7 @@ mod tests {
                 reclaimable_blocks: 0,
                 allocated_blocks: 100,
             },
+            max_total_blocks: 100,
             bytes_per_block: 4096,
         };
         let error = state
@@ -3417,6 +3545,7 @@ mod tests {
                 reclaimable_blocks: 0,
                 allocated_blocks: 60,
             },
+            max_total_blocks: 100,
             bytes_per_block: 4096,
         };
         let reservation_blocks = 70u32;
@@ -3445,6 +3574,368 @@ mod tests {
         assert!(
             matches!(with_credit, MemoryReserveOutcome::Admitted),
             "charge 10 vs free 40 must admit: {with_credit:?}"
+        );
+    }
+
+    #[test]
+    fn grow_needed_blocks_measures_max_fitting_shortfall() {
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 40,
+                free_blocks: 10,
+                reclaimable_blocks: 5,
+                allocated_blocks: 25,
+            },
+            max_total_blocks: 100,
+            bytes_per_block: 4096,
+        };
+        assert_eq!(
+            grow_needed_blocks(&snapshot, 70, 0, 0),
+            Some(55),
+            "70 reserved - (10 free + 5 reclaimable) = 55 blocks to grow"
+        );
+        // No existing state: the byte formula matches the block formula.
+        // Zero shortfall means the reservation fits current free +
+        // reclaimable bytes, so there is nothing to grow for.
+        assert_eq!(grow_needed_blocks(&snapshot, 15, 0, 0), None);
+        // A pool already at its max cannot grow.
+        let at_max = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 100,
+                free_blocks: 10,
+                reclaimable_blocks: 0,
+                allocated_blocks: 90,
+            },
+            max_total_blocks: 100,
+            bytes_per_block: 4096,
+        };
+        assert_eq!(grow_needed_blocks(&at_max, 60, 0, 0), None);
+        // Above the max ceiling, admission must hard-error, not grow.
+        assert_eq!(grow_needed_blocks(&snapshot, 101, 0, 0), None);
+        // Candidate recurrent state can push the reservation past the max.
+        assert_eq!(grow_needed_blocks(&snapshot, 70, 400_000, 0), None);
+    }
+
+    #[test]
+    fn grow_needed_blocks_covers_state_byte_overflow() {
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 40,
+                free_blocks: 15,
+                reclaimable_blocks: 0,
+                allocated_blocks: 25,
+            },
+            max_total_blocks: 100,
+            bytes_per_block: 4096,
+        };
+        // Blocks fit free exactly, but the candidate GDN state overflows the
+        // shared byte budget: grow ceil(10_000 / 4096) = 3 blocks.
+        assert_eq!(grow_needed_blocks(&snapshot, 15, 10_000, 0), Some(3));
+        // Already-scheduled state charges the same budget.
+        assert_eq!(grow_needed_blocks(&snapshot, 15, 5_000, 5_000), Some(3));
+        // Positive block shortfall plus state: the grow must cover the byte
+        // sum, not just the block count. 20*4096 + 10_000 - 15*4096 =
+        // 30_480 bytes -> ceil = 8 blocks (block-only math would say 5).
+        let needed = grow_needed_blocks(&snapshot, 20, 10_000, 0);
+        assert_eq!(needed, Some(8));
+        assert!(
+            u64::from(needed.expect("grow blocks")) * 4096 >= 30_480,
+            "grown blocks must cover the full byte shortfall"
+        );
+        // Recurrent state alone can push a block-fitting reservation past
+        // the max-pool ceiling: hard-error, no grow.
+        let fits_max_blocks = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 40,
+                free_blocks: 15,
+                reclaimable_blocks: 0,
+                allocated_blocks: 25,
+            },
+            max_total_blocks: 100,
+            bytes_per_block: 4096,
+        };
+        assert_eq!(
+            grow_needed_blocks(&fits_max_blocks, 50, 300_000, 0),
+            None,
+            "50 blocks fit the 100-block max, but +300_000 state bytes do not"
+        );
+    }
+
+    /// Real adapter over a 4-block pool with a 16-block max so a scheduler
+    /// grow is observable. Panics without Metal; callers must skip first.
+    fn tiny_growable_paged_adapter() -> PagedKVCacheAdapter {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 16,
+            num_kv_heads: 1,
+            head_size: 128,
+            num_layers: 1,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(512),
+            max_batch_size: Some(32),
+        };
+        let pool = mlx_paged_attn::LayerKVPool::new(
+            cfg,
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        )
+        .expect("growable test LayerKVPool");
+        let allocator = Arc::new(std::sync::Mutex::new(mlx_paged_attn::BlockAllocator::new(
+            4, 16, 16,
+        )));
+        PagedKVCacheAdapter::new(allocator, Arc::new(pool), 16).expect("growable test adapter")
+    }
+
+    /// Nemotron-backed scheduler whose paged adapter is the growable
+    /// fixture (4 live blocks, 16 max) plus its real cache snapshot.
+    /// Returns `None` to skip when Metal is unavailable.
+    fn growable_scheduler_state()
+    -> Option<(HybridSchedulerState<NemotronHInner>, SchedulerCacheSnapshot)> {
+        let mut inner = match NemotronHInner::new(tiny_nemotron_paged_config()) {
+            Ok(inner) => inner,
+            Err(_) => {
+                eprintln!("skipping grow-path scheduler test: inner failed");
+                return None;
+            }
+        };
+        if inner.paged_adapter().is_none() {
+            eprintln!("skipping grow-path scheduler test: Metal unavailable");
+            return None;
+        }
+        inner.paged_adapter = Some(tiny_growable_paged_adapter());
+        let state = HybridSchedulerState::new(inner).expect("construct nemotron scheduler");
+        let snapshot = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("scheduler snapshot")
+            .expect("paged adapter present");
+        Some((state, snapshot))
+    }
+
+    #[test]
+    fn no_live_turns_reservation_grows_pool_once_and_admits() {
+        let Some((mut state, snapshot)) = growable_scheduler_state() else {
+            return;
+        };
+        assert_eq!(snapshot.blocks.total_blocks, 4);
+        assert_eq!(snapshot.blocks.free_blocks, 4);
+        assert_eq!(snapshot.max_total_blocks, 16);
+        assert!(!state.scheduler.has_live_turns());
+        assert!(state.idle_memory_victim(2).is_none());
+        // Force the headroom probe to pass so the one-shot grow outcome
+        // does not depend on the live Metal budget.
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let charge = snapshot.blocks.free_blocks + 1;
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .expect("grow + re-reserve");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "a max-fitting reservation above free+reclaimable must grow and admit: {outcome:?}"
+        );
+        let grown = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("post-grow snapshot")
+            .expect("paged adapter present");
+        assert_eq!(
+            grown.blocks.total_blocks, 8,
+            "grow target min(16, max(2*4, 4+1)) is 8 blocks"
+        );
+    }
+
+    #[test]
+    fn state_overflow_reservation_grows_pool_and_admits() {
+        let Some((mut state, snapshot)) = growable_scheduler_state() else {
+            return;
+        };
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let bytes_per_block = snapshot.bytes_per_block;
+        // The reservation blocks fit current free exactly; only the
+        // candidate recurrent state overflows the shared byte budget.
+        let reservation_blocks = snapshot.blocks.free_blocks;
+        let candidate_state_bytes = u64::from(snapshot.blocks.free_blocks) * bytes_per_block + 1;
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, reservation_blocks, candidate_state_bytes, snapshot)
+            .expect("grow + re-reserve");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "a state-byte overflow within the max pool must grow and admit: {outcome:?}"
+        );
+        let grown = state
+            .inner
+            .scheduler_cache_snapshot()
+            .expect("post-grow snapshot")
+            .expect("paged adapter present");
+        let needed = candidate_state_bytes.div_ceil(bytes_per_block) as u32;
+        assert_eq!(
+            grown.blocks.total_blocks,
+            4 + needed,
+            "grow target min(16, max(2*4, 4+{needed})) covers blocks plus state"
+        );
+    }
+
+    #[test]
+    fn declined_grow_preserves_no_live_turns_reject() {
+        let Some((mut state, snapshot)) = growable_scheduler_state() else {
+            return;
+        };
+        // Probe caps the pool below the shortfall target: try_grow_pool
+        // declines. (One below the DOUBLING target is partial headroom and
+        // grows — the decline edge only fires below current + needed.)
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(|requested| {
+                let _ = requested;
+                Ok(4)
+            })));
+        let charge = snapshot.blocks.free_blocks + 1;
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .expect("declined grow keeps Reject");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 4 }),
+            "a declined grow must keep the Reject path naming current counts: {outcome:?}"
+        );
+        assert_eq!(
+            state
+                .inner
+                .scheduler_cache_snapshot()
+                .expect("post-decline snapshot")
+                .expect("paged adapter present")
+                .blocks
+                .total_blocks,
+            4,
+            "a declined grow must not grow the pool"
+        );
+    }
+
+    #[test]
+    fn partial_headroom_grows_to_selected_and_admits() {
+        let Some((mut state, snapshot)) = growable_scheduler_state() else {
+            return;
+        };
+        // Probe caps the 4 -> 8 doubling target at 7 blocks: above the
+        // shortfall (current 4 + needed 1 = 5), below the target. The grow
+        // must land at the selected count, not decline.
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(|requested| {
+                Ok(requested.saturating_sub(1))
+            })));
+        let charge = snapshot.blocks.free_blocks + 1;
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .expect("partial grow + re-reserve");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "a partial-headroom grow covering the shortfall must admit: {outcome:?}"
+        );
+        assert_eq!(
+            state
+                .inner
+                .scheduler_cache_snapshot()
+                .expect("post-grow snapshot")
+                .expect("paged adapter present")
+                .blocks
+                .total_blocks,
+            7,
+            "the grow must land at the probe-selected 7 blocks"
+        );
+    }
+
+    #[test]
+    fn above_max_reservation_rejects_without_grow() {
+        let Some((mut state, snapshot)) = growable_scheduler_state() else {
+            return;
+        };
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, 17, 0, snapshot)
+            .expect("above-max Reject");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Reject { total_blocks: 4 }),
+            "a reservation above the max pool must Reject, not grow: {outcome:?}"
+        );
+        assert_eq!(
+            state
+                .inner
+                .scheduler_cache_snapshot()
+                .expect("post-reject snapshot")
+                .expect("paged adapter present")
+                .blocks
+                .total_blocks,
+            4,
+            "an above-max reservation must not grow the pool"
+        );
+    }
+
+    /// Admission's must-fit hard-reject is measured against the MAX pool the
+    /// grow hook can reach during turn execution, not the CURRENT block
+    /// count. A reservation above the current pool but below the max must
+    /// NOT be hard-rejected at admission (the live free-blocks logic then
+    /// admits or defers it exactly as before); only a reservation above the
+    /// max is rejected, with the `context_length_exceeded` family marker
+    /// naming the max pool size.
+    #[test]
+    fn admission_ceiling_uses_max_pool_not_current_pool() {
+        let snapshot = SchedulerCacheSnapshot {
+            blocks: BlockTelemetry {
+                total_blocks: 40,
+                free_blocks: 40,
+                reclaimable_blocks: 0,
+                allocated_blocks: 0,
+            },
+            max_total_blocks: 100,
+            bytes_per_block: 4096,
+        };
+        let reservation_blocks = 70u32;
+        // Guards the regression: the old current-pool ceiling would have
+        // hard-rejected 70 blocks against a 40-block live pool.
+        assert!(
+            !reservation_fits_empty_pool(
+                reservation_blocks,
+                snapshot.blocks.total_blocks,
+                snapshot.bytes_per_block,
+                0,
+            ),
+            "70 blocks do not fit the CURRENT 40-block pool"
+        );
+        assert!(
+            !exceeds_max_pool_ceiling(&snapshot, reservation_blocks, 0),
+            "70 blocks fit the 100-block MAX pool: admission must not hard-reject, \
+             so the turn can defer/admit while the grow hook reaches it"
+        );
+        assert!(
+            exceeds_max_pool_ceiling(&snapshot, 101, 0),
+            "101 blocks exceed the max pool: admission must reject"
+        );
+        let error =
+            HybridSchedulerState::<Qwen35Inner>::context_length_exceeded_max(101, 100).reason;
+        assert!(
+            error.starts_with("context_length_exceeded"),
+            "max-ceiling reject keeps the family marker: {error}"
+        );
+        assert!(
+            error.contains("max pool holds 100"),
+            "max-ceiling reject states the max pool size, not the current one: {error}"
         );
     }
 
@@ -3702,6 +4193,7 @@ mod tests {
                 reclaimable_blocks: 0,
                 allocated_blocks: 100,
             },
+            max_total_blocks: 100,
             bytes_per_block: 4096,
         };
         let mut unpin_calls = 0u32;
