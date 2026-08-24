@@ -20,6 +20,8 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufReader, Read, Seek, SeekFrom};
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use napi::bindgen_prelude::*;
@@ -1668,16 +1670,41 @@ fn validate_qwen35_standalone_geometry(metadata: &HashMap<String, GgufMetaValue>
     };
     let state_size = required("ssm.state_size")?;
     let inner_size = required("ssm.inner_size")?;
-    let value_heads = required("ssm.time_step_rank")?;
     let key_heads = required("ssm.group_count")?;
     let conv_kernel = required("ssm.conv_kernel")?;
-    let _full_attention_interval = required("full_attention_interval")?;
-    if state_size == 0 || value_heads == 0 || key_heads == 0 || conv_kernel == 0 {
+    let full_attention_interval = required("full_attention_interval")?;
+    if state_size == 0
+        || inner_size == 0
+        || key_heads == 0
+        || conv_kernel == 0
+        || full_attention_interval == 0
+    {
         return Err(Error::from_reason(format!(
             "Standalone Qwen3.5 GGUF has non-positive GDN geometry: state_size={state_size}, \
-             time_step_rank={value_heads}, group_count={key_heads}, conv_kernel={conv_kernel}"
+             inner_size={inner_size}, group_count={key_heads}, conv_kernel={conv_kernel}, \
+             full_attention_interval={full_attention_interval}"
         )));
     }
+    let declared_value_heads = metadata
+        .get(&format!("{arch}.ssm.time_step_rank"))
+        .and_then(GgufMetaValue::as_u64);
+    let value_heads = match declared_value_heads {
+        Some(value_heads) if value_heads > 0 => value_heads,
+        Some(_) => {
+            return Err(Error::from_reason(
+                "Standalone Qwen3.5 GGUF has non-positive GDN geometry: time_step_rank=0"
+                    .to_string(),
+            ));
+        }
+        None if inner_size.is_multiple_of(state_size) => inner_size / state_size,
+        None => {
+            return Err(Error::from_reason(format!(
+                "Standalone Qwen3.5 GGUF cannot derive the value-head count without \
+                 ssm.time_step_rank: ssm.inner_size ({inner_size}) is not divisible by \
+                 ssm.state_size ({state_size})"
+            )));
+        }
+    };
     let expected_inner = state_size.checked_mul(value_heads).ok_or_else(|| {
         Error::from_reason("Standalone Qwen3.5 GGUF GDN geometry overflows u64".to_string())
     })?;
@@ -4536,8 +4563,37 @@ fn qwen35_native_asset_digest(parent: &Path) -> Result<String> {
         .collect())
 }
 
-fn qwen35_native_source_digest(input_path: &Path) -> String {
-    Sha256::digest(input_path.as_os_str().as_encoded_bytes())
+fn qwen35_native_source_identity_digest(input_path: &Path, metadata: &fs::Metadata) -> String {
+    let mut hasher = Sha256::new();
+    let path = input_path.as_os_str().as_encoded_bytes();
+    hasher.update((path.len() as u64).to_le_bytes());
+    hasher.update(path);
+    hasher.update(metadata.len().to_le_bytes());
+
+    // Hashing a multi-gigabyte GGUF on every cached load would dominate load
+    // time. Unix ctime cannot be restored by cp -p or ordinary users, while a
+    // replacement-by-rename changes the inode, so these fields detect both
+    // in-place rewrites and same-size/same-mtime artifact replacements.
+    #[cfg(unix)]
+    {
+        hasher.update(metadata.dev().to_le_bytes());
+        hasher.update(metadata.ino().to_le_bytes());
+        hasher.update(metadata.ctime().to_le_bytes());
+        hasher.update(metadata.ctime_nsec().to_le_bytes());
+    }
+    #[cfg(not(unix))]
+    {
+        for timestamp in [metadata.created().ok(), metadata.modified().ok()] {
+            let nanos = timestamp
+                .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|value| value.as_nanos())
+                .unwrap_or(0);
+            hasher.update(nanos.to_le_bytes());
+        }
+    }
+
+    hasher
+        .finalize()
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
@@ -4592,13 +4648,15 @@ impl Drop for Qwen35NativeCacheLock {
 
 fn qwen35_native_cache_is_current(
     output_dir: &Path,
-    source_digest: &str,
+    source_identity_digest: &str,
     asset_digest: &str,
 ) -> bool {
     let marker = output_dir.join(".complete");
     fs::read_to_string(marker).is_ok_and(|contents| {
         contents.contains(&format!("format={QWEN35_NATIVE_CACHE_FORMAT}\n"))
-            && contents.contains(&format!("source_sha256={source_digest}\n"))
+            && contents.contains(&format!(
+                "source_identity_sha256={source_identity_digest}\n"
+            ))
             && contents.contains(&format!("assets_sha256={asset_digest}\n"))
             && contents.contains("dtype=bf16\n")
             && output_dir.join("model.safetensors").is_file()
@@ -4656,10 +4714,10 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
         .take(32)
         .collect::<String>();
     let parent = input_path.parent().unwrap_or(Path::new("."));
-    let source_digest = qwen35_native_source_digest(&input_path);
+    let source_identity_digest = qwen35_native_source_identity_digest(&input_path, &metadata);
     let asset_digest = qwen35_native_asset_digest(parent)?;
     let cache_key = format!(
-        "{stem}-{}-{modified}-v{QWEN35_NATIVE_CACHE_FORMAT}-{source_digest}-{asset_digest}",
+        "{stem}-{}-{modified}-v{QWEN35_NATIVE_CACHE_FORMAT}-{source_identity_digest}-{asset_digest}",
         metadata.len(),
     );
     let output_dir = cache_root.join(&cache_key);
@@ -4695,7 +4753,20 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
                 .to_string(),
         ));
     }
-    if qwen35_native_cache_is_current(&output_dir, &source_digest, &asset_digest) {
+    let locked_metadata = fs::metadata(&input_path).map_err(|error| {
+        Error::from_reason(format!(
+            "Failed to restat GGUF path '{}' after acquiring the native cache lock: {error}",
+            input_path.display()
+        ))
+    })?;
+    if qwen35_native_source_identity_digest(&input_path, &locked_metadata) != source_identity_digest
+    {
+        return Err(Error::from_reason(
+            "Qwen3.5 GGUF source changed while acquiring the native cache lock; retry the load"
+                .to_string(),
+        ));
+    }
+    if qwen35_native_cache_is_current(&output_dir, &source_identity_digest, &asset_digest) {
         return Ok(output_dir);
     }
 
@@ -4749,13 +4820,32 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
                 .to_string(),
         ));
     }
+    let final_metadata = match fs::metadata(&input_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            fs::remove_dir_all(&staging_dir).ok();
+            return Err(Error::from_reason(format!(
+                "Failed to restat GGUF path '{}' after native preparation: {error}",
+                input_path.display()
+            )));
+        }
+    };
+    if qwen35_native_source_identity_digest(&input_path, &final_metadata) != source_identity_digest
+    {
+        fs::remove_dir_all(&staging_dir).ok();
+        return Err(Error::from_reason(
+            "Qwen3.5 GGUF source changed during native preparation; discarded the staged cache, \
+             retry the load"
+                .to_string(),
+        ));
+    }
     let marker = staging_dir.join(".complete");
     if let Err(error) = fs::write(
         marker,
         format!(
-            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout=tiled\ndtype=bf16\n",
+            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout=tiled\ndtype=bf16\n",
             input_path.display(),
-            source_digest,
+            source_identity_digest,
             metadata.len(),
             modified,
             asset_digest
@@ -5168,6 +5258,27 @@ mod tests {
                 .reason
                 .contains("128) * ssm.time_step_rank (48) = 6144")
         );
+
+        metadata.insert(
+            "qwen35.ssm.inner_size".to_string(),
+            GgufMetaValue::Uint32(6144),
+        );
+        metadata.remove("qwen35.ssm.time_step_rank");
+        validate_qwen35_standalone_geometry(&metadata).unwrap();
+        let config = extract_config(&metadata);
+        assert_eq!(config["linear_num_value_heads"], serde_json::json!(48));
+
+        metadata.insert(
+            "qwen35.ssm.inner_size".to_string(),
+            GgufMetaValue::Uint32(6145),
+        );
+        let not_divisible = validate_qwen35_standalone_geometry(&metadata).unwrap_err();
+        assert!(
+            not_divisible
+                .reason
+                .contains("cannot derive the value-head count")
+        );
+        assert!(not_divisible.reason.contains("is not divisible"));
     }
 
     #[test]
@@ -5385,11 +5496,90 @@ mod tests {
         let source_line = |marker: &str| {
             marker
                 .lines()
-                .find(|line| line.starts_with("source_sha256="))
+                .find(|line| line.starts_with("source_identity_sha256="))
                 .unwrap()
                 .to_string()
         };
         assert_ne!(source_line(&left_marker), source_line(&right_marker));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn qwen35_native_cache_detects_same_size_same_mtime_source_replacement() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-source-replacement-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.json"), r#"{"model_type":"qwen3_5"}"#).unwrap();
+        let metadata = [
+            (
+                "general.architecture",
+                GgufMetaValue::String("qwen35".to_string()),
+            ),
+            ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+        ];
+        let input = root.join("model.gguf");
+        let replacement = root.join("replacement.gguf");
+        fs::write(
+            &input,
+            build_minimal_gguf(
+                &metadata,
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &replacement,
+            build_minimal_gguf(
+                &metadata,
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[1, 0])],
+            ),
+        )
+        .unwrap();
+        let original_metadata = fs::metadata(&input).unwrap();
+        let original_modified = original_metadata.modified().unwrap();
+        let cache_root = root.join("native-cache");
+        let original = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+
+        OpenOptions::new()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_modified))
+            .unwrap();
+        fs::rename(&replacement, &input).unwrap();
+        let replacement_metadata = fs::metadata(&input).unwrap();
+        assert_eq!(replacement_metadata.len(), original_metadata.len());
+        assert_eq!(replacement_metadata.modified().unwrap(), original_modified);
+
+        let replaced = prepare_qwen35_native_gguf_in(&input, &cache_root)
+            .await
+            .unwrap();
+        assert_ne!(
+            original, replaced,
+            "same-size/same-mtime replacement must not reuse the prior cache"
+        );
+        let original_marker = fs::read_to_string(original.join(".complete")).unwrap();
+        let replaced_marker = fs::read_to_string(replaced.join(".complete")).unwrap();
+        let source_identity = |marker: &str| {
+            marker
+                .lines()
+                .find(|line| line.starts_with("source_identity_sha256="))
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(
+            source_identity(&original_marker),
+            source_identity(&replaced_marker)
+        );
         fs::remove_dir_all(root).ok();
     }
 
