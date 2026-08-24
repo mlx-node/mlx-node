@@ -5184,7 +5184,7 @@ mod tests {
         );
         assert!(output.join("model.safetensors").is_file());
         let marker = fs::read_to_string(output.join(".complete")).unwrap();
-        assert!(marker.contains("format=4\n"));
+        assert!(marker.contains(&format!("format={QWEN35_NATIVE_CACHE_FORMAT}\n")));
         assert!(marker.contains("assets_sha256="));
 
         fs::remove_dir_all(root).ok();
