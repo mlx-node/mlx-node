@@ -98,28 +98,6 @@ use crate::inference_trace::{
 const PAGED_ATTENTION_V2_PARTITION_SIZE: u64 = 512;
 const PAGED_ATTENTION_V2_AUX_ELEM_LIMIT: u128 = i32::MAX as u128;
 
-/// Process-wide lock serializing paged-KV pool growth across models.
-///
-/// Each loaded model runs `try_grow_pool` on its own `"mlx-model"` thread,
-/// and the headroom probe's sibling accounting
-/// (`registered_pool_bytes() − own_live`) is only sound when no other grow
-/// is in flight: two concurrent probes would both read the pre-grow totals,
-/// both pass, and both `grow_to`, transiently holding old+new buffers whose
-/// combined peak can exceed the unified-memory budget. Holding this lock
-/// across the ENTIRE probe → grow → notifier sequence makes the sibling
-/// totals a fresh read again: a grow only starts after the previous grow's
-/// `update_pool` notifier committed its new total.
-///
-/// Lock ordering: this is the OUTERMOST lock in the growth path — it is
-/// acquired BEFORE the allocator mutex and the pool's internal locks (both
-/// taken inside `try_grow_pool`), so the order is always
-/// growth lock → allocator mutex → pool locks. The growth lock has exactly
-/// one acquisition site (`try_grow_pool`), so no code path can hold the
-/// allocator mutex or a pool lock and then take this lock, and the lock is
-/// never nested inside either of them. It must never be acquired anywhere
-/// else.
-static PAGED_KV_POOL_GROWTH_LOCK: Mutex<()> = Mutex::new(());
-
 /// The two paged-attention V2 entry points assign query rows differently.
 /// The fixed-row path treats each row as a sequence, while varlen keeps one
 /// sequence and assigns multiple query rows through `cu_seqlens_q`.
@@ -3869,8 +3847,9 @@ impl PagedKVCacheAdapter {
     ///
     /// Order matters:
     /// 0. Take the process-wide growth lock (see
-    ///    [`PAGED_KV_POOL_GROWTH_LOCK`]) and hold it across the whole body,
-    ///    so a concurrent grow on another model's thread cannot probe stale
+    ///    [`crate::cache_limit::pool_growth_lock`]) and hold it across the
+    ///    whole body, so a concurrent grow on another model's thread — or a
+    ///    concurrent model load's pool reservation — cannot probe stale
     ///    `registered_pool_bytes` totals while this grow's old+new transient
     ///    is unregistered.
     /// 1. Flush this adapter's pending native pool writes and synchronize
@@ -3894,7 +3873,11 @@ impl PagedKVCacheAdapter {
     /// Any failure (flush error, poisoned mutex, headroom probe error or
     /// decline, `Err` from `grow_to`, or a no-op grow) logs at warn and
     /// returns `false` — the caller proceeds to its existing
-    /// eviction/error path. Never panics.
+    /// eviction/error path. A Metal allocation failure inside `grow_to`
+    /// also surfaces as `false`: the pool allocates its new generation via
+    /// the fallible `Device::try_new_buffer` and converts a nil buffer
+    /// into `Err`, so an OOM degrades to a declined grow instead of
+    /// panicking the model thread while the pool write lock is held.
     ///
     /// `pub(crate)` so the engine's hybrid scheduler can grow from
     /// admission's no-live-turns Reject edge
@@ -3902,9 +3885,10 @@ impl PagedKVCacheAdapter {
     /// on the model thread, so the same thread/contract holds there.
     pub(crate) fn try_grow_pool(&mut self, needed_additional_blocks: u32) -> bool {
         // Serialize the whole probe → grow → notify sequence process-wide
-        // (see PAGED_KV_POOL_GROWTH_LOCK). Scope-drop releases the guard on
-        // every exit path, including the decline/failure returns below.
-        let _growth_guard = PAGED_KV_POOL_GROWTH_LOCK
+        // (see crate::cache_limit::pool_growth_lock). Scope-drop releases
+        // the guard on every exit path, including the decline/failure
+        // returns below.
+        let _growth_guard = crate::cache_limit::pool_growth_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         #[cfg(target_os = "macos")]
@@ -16409,7 +16393,7 @@ mod tests {
             })));
         }
 
-        let guard = PAGED_KV_POOL_GROWTH_LOCK
+        let guard = crate::cache_limit::pool_growth_lock()
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let grower = std::thread::spawn(move || adapter.try_grow_pool(1));

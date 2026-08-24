@@ -831,21 +831,23 @@ impl LayerKVPool {
         let state = MetalState::get()?;
         let mut new_layers = Vec::with_capacity(inner.layers.len());
         for _ in 0..inner.layers.len() {
+            // Metal hands out nil buffers when an allocation cannot be
+            // backed; the fallible allocator turns that into `None` so we
+            // bail before any blit and the build-then-swap guarantee holds
+            // (old generation untouched on error). `new_buffer` would panic
+            // here instead — while the caller holds the pool write lock.
             let key_cache = state
                 .device
-                .new_buffer(new_key_size, MTLResourceOptions::StorageModePrivate);
+                .try_new_buffer(new_key_size, MTLResourceOptions::StorageModePrivate);
             let value_cache = state
                 .device
-                .new_buffer(new_value_size, MTLResourceOptions::StorageModePrivate);
-            // Metal hands out nil buffers when an allocation cannot be
-            // backed; bail before any blit so the build-then-swap guarantee
-            // holds (old generation untouched on error).
-            if key_cache.as_ptr().is_null() || value_cache.as_ptr().is_null() {
+                .try_new_buffer(new_value_size, MTLResourceOptions::StorageModePrivate);
+            let (Some(key_cache), Some(value_cache)) = (key_cache, value_cache) else {
                 return Err(
                     "LayerKVPool::grow_to: Metal returned a nil buffer for the new generation"
                         .to_string(),
                 );
-            }
+            };
             new_layers.push((key_cache, value_cache));
         }
 

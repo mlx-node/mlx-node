@@ -374,6 +374,40 @@ pub fn coordinator() -> &'static CacheLimitCoordinator {
     INSTANCE.get_or_init(CacheLimitCoordinator::new)
 }
 
+/// Process-wide lock serializing paged-KV pool growth AND load-time pool
+/// reservation across models.
+///
+/// Growth side: each loaded model runs `try_grow_pool` on its own
+/// `"mlx-model"` thread, and the headroom probe's sibling accounting
+/// (`registered_pool_bytes() − own_live`) is only sound when no other grow
+/// is in flight: two concurrent probes would both read the pre-grow totals,
+/// both pass, and both `grow_to`, transiently holding old+new buffers whose
+/// combined peak can exceed the unified-memory budget.
+///
+/// Load side: a loader probes live Metal headroom
+/// (`load_time_pool_sizing`), allocates its `LayerKVPool`, and only then
+/// debits the total via `register_pool`. Without this lock a concurrent
+/// grow (or another load) reads sibling totals that miss the in-flight
+/// reservation — and the loader reads totals that miss the in-flight grow
+/// — so the combined old+new+new-load transient can exceed the budget.
+/// Dynamic-pool loaders (qwen3_5, qwen3_5_moe) therefore hold this lock
+/// across the whole sizing-probe → `LayerKVPool::new` allocation →
+/// `register_pool` span, making the sibling totals a fresh read on both
+/// sides.
+///
+/// Lock ordering: this is the OUTERMOST lock in the growth and
+/// load-reservation paths — it is acquired BEFORE the coordinator mutex
+/// (`register_pool` / `update_pool` / `registered_pool_bytes`), the
+/// `BlockAllocator` mutex, and the pool's internal locks, so the order is
+/// always growth lock → coordinator mutex and growth lock → allocator
+/// mutex → pool locks. No code path may hold the coordinator mutex, the
+/// allocator mutex, or a pool lock and then take this lock, and the lock
+/// is never nested inside any of them.
+pub(crate) fn pool_growth_lock() -> &'static Mutex<()> {
+    static POOL_GROWTH_LOCK: Mutex<()> = Mutex::new(());
+    &POOL_GROWTH_LOCK
+}
+
 fn recompute_locked(state: &mut CoordState) {
     // Env override takes absolute precedence and bypasses the baseline
     // tracking entirely. Behaviour preserved verbatim from the previous
