@@ -3675,16 +3675,18 @@ impl PagedKVCacheAdapter {
         // when at max, or when the grow fails, the loop below still lets
         // `allocate` evict, and the retry-after-None path stays as a second
         // safety net (e.g. blocks drained between this check and the loop).
-        let exceeds_handout = {
+        // The grow is sized by the SHORTFALL over what the allocator can
+        // already hand out, not the total reservation — see `try_grow_pool`.
+        let shortfall = {
             let guard = self
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            needed_blocks > guard.free_or_evictable_blocks()
+            needed_blocks.saturating_sub(guard.free_or_evictable_blocks())
         };
-        if exceeds_handout {
+        if shortfall > 0 {
             grow_attempted = true;
-            self.try_grow_pool(needed_blocks);
+            self.try_grow_pool(shortfall);
         }
 
         let mut newly_allocated: Vec<Arc<PhysicalBlock>> =
@@ -3713,8 +3715,17 @@ impl PagedKVCacheAdapter {
                 break;
             };
             // Exhaustion: grow the pool once and retry the whole
-            // reservation; still exhausted -> existing error path.
-            if grow_attempted || !self.try_grow_pool(needed_blocks) {
+            // reservation; still exhausted -> existing error path. The
+            // rolled-back partials restored the free count, so the
+            // shortfall is recomputed under a fresh lock.
+            let retry_shortfall = {
+                let guard = self
+                    .allocator
+                    .lock()
+                    .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+                needed_blocks.saturating_sub(guard.free_or_evictable_blocks())
+            };
+            if grow_attempted || !self.try_grow_pool(retry_shortfall) {
                 return Err(format!(
                     "context_length_exceeded: paged cache could not reserve {needed_blocks} \
                      block(s) for {total_tokens} tokens (reserved {i} before rollback, \
@@ -3782,17 +3793,18 @@ impl PagedKVCacheAdapter {
         let mut grow_attempted = false;
         // Growth BEFORE LRU eviction: see `allocate_suffix_blocks`. Eviction
         // remains the fallback, and the retry-after-None path stays as a
-        // second safety net.
-        let exceeds_handout = {
+        // second safety net. The grow is sized by the shortfall over what
+        // the allocator can already hand out, not the total reservation.
+        let shortfall = {
             let guard = self
                 .allocator
                 .lock()
                 .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
-            to_allocate > guard.free_or_evictable_blocks()
+            to_allocate.saturating_sub(guard.free_or_evictable_blocks())
         };
-        if exceeds_handout {
+        if shortfall > 0 {
             grow_attempted = true;
-            self.try_grow_pool(to_allocate);
+            self.try_grow_pool(shortfall);
         }
 
         let mut newly_allocated: Vec<Arc<PhysicalBlock>> = Vec::with_capacity(to_allocate as usize);
@@ -3820,8 +3832,17 @@ impl PagedKVCacheAdapter {
                 break;
             };
             // Exhaustion: grow the pool once and retry the whole
-            // reservation; still exhausted -> existing error path.
-            if grow_attempted || !self.try_grow_pool(to_allocate) {
+            // reservation; still exhausted -> existing error path. The
+            // rolled-back partials restored the free count, so the
+            // shortfall is recomputed under a fresh lock.
+            let retry_shortfall = {
+                let guard = self
+                    .allocator
+                    .lock()
+                    .map_err(|e| format!("BlockAllocator mutex poisoned: {e}"))?;
+                to_allocate.saturating_sub(guard.free_or_evictable_blocks())
+            };
+            if grow_attempted || !self.try_grow_pool(retry_shortfall) {
                 return Err(format!(
                     "context_length_exceeded: paged decode could not reserve {to_allocate} \
                      more block(s) (request had {current_blocks}, needs {needed_total_blocks} \
@@ -3844,6 +3865,14 @@ impl PagedKVCacheAdapter {
     /// a reservation exceeds the blocks `allocate` could hand out
     /// (free + evictable — growth before LRU eviction), and as the retry
     /// when `allocate` still returns `None`.
+    ///
+    /// `needed_additional_blocks` is the SHORTFALL — how many additional
+    /// blocks the reservation needs beyond what free + evictable can
+    /// already hand out — not the total reservation. It feeds both the
+    /// doubling floor (`current + needed`) and the partial-headroom
+    /// decline check, so passing the total would demand headroom for
+    /// blocks the allocator could already serve and decline grows that a
+    /// shortfall-sized probe would fund.
     ///
     /// Order matters:
     /// 0. Take the process-wide growth lock (see
@@ -16199,17 +16228,18 @@ mod tests {
 
         // Request B needs 5 blocks with 3 free + 1 evictable = 4 available:
         // growth must engage BEFORE any LRU eviction, so request A's cached
-        // block survives. min(16, max(2*4, 4+5)) = 9 blocks.
+        // block survives. The grow is sized by the shortfall (5 - 4 = 1), so
+        // the doubling floor dominates: min(16, max(2*4, 4+1)) = 8 blocks.
         adapter.reset_for_new_request(8).unwrap();
         let allocated = adapter.allocate_suffix_blocks(40).unwrap();
         assert_eq!(allocated, 5);
-        assert_eq!(pool.num_blocks(), 9, "pool must grow to 9 blocks");
+        assert_eq!(pool.num_blocks(), 8, "pool must grow to 8 blocks");
         assert_eq!(pool.generation(), 1);
         {
             let allocator = allocator.lock().unwrap();
             assert_eq!(
                 allocator.num_blocks(),
-                9,
+                8,
                 "allocator must track the grown pool"
             );
             assert_eq!(
@@ -16270,9 +16300,9 @@ mod tests {
             );
         }
 
-        // Second exhaustion exercises the 2x branch: current=9, needed=8 ->
-        // max(18, 17) = 18, capped at the pool max 16. The evictable cached
-        // block still survives.
+        // Second exhaustion: current=8, needed=8, free+evictable=3 ->
+        // shortfall 5, min(16, max(2*8, 8+5)) = 16, capped at the pool max.
+        // The evictable cached block still survives.
         let allocated = adapter.allocate_suffix_blocks(64).unwrap();
         assert_eq!(allocated, 8);
         assert_eq!(pool.num_blocks(), 16, "second grow reaches the pool max");
@@ -16406,6 +16436,142 @@ mod tests {
         assert_eq!(pool.num_blocks(), 7);
         assert_eq!(pool.generation(), 1);
         assert_eq!(allocator.lock().unwrap().num_blocks(), 7);
+    }
+
+    /// **Shortfall-sized grow (suffix allocation)**: with free + evictable
+    /// partially covering the reservation, `allocate_suffix_blocks` must pass
+    /// the DELTA (needed − handout-able) to `try_grow_pool`, not the total —
+    /// the probe must see `min(max, max(2*current, current+delta))` and the
+    /// grow must land there. Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_allocate_suffix_grow_requests_shortfall_not_total() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_allocate_suffix_grow_requests_shortfall_not_total: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        // Request A leaves one evictable cache-only block plus 3 free, so
+        // the allocator can hand out 4 blocks without growth.
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
+        assert_eq!(registered, 1);
+        adapter.release_request().unwrap();
+        {
+            let allocator = allocator.lock().unwrap();
+            assert_eq!(allocator.free_or_evictable_blocks(), 4);
+        }
+
+        let probe_requests: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let probe_requests = Arc::clone(&probe_requests);
+            adapter.set_grow_headroom_probe_override(Some(Arc::new(move |requested| {
+                probe_requests.lock().unwrap().push(requested);
+                Ok(requested)
+            })));
+        }
+
+        // Needed 5, handout-able 4 → shortfall 1. The probe must see the
+        // delta-derived target min(16, max(2*4, 4+1)) = 8, not the
+        // total-derived 4+5 = 9.
+        adapter.reset_for_new_request(8).unwrap();
+        let allocated = adapter.allocate_suffix_blocks(40).unwrap();
+        assert_eq!(allocated, 5);
+        assert_eq!(
+            probe_requests.lock().unwrap().as_slice(),
+            &[8],
+            "try_grow_pool must be sized by the shortfall, not the total reservation"
+        );
+        assert_eq!(pool.num_blocks(), 8);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 8);
+    }
+
+    /// **Shortfall-sized grow (decode/`ensure_blocks_for_total_tokens`)**:
+    /// same delta contract as the suffix path, exercised through
+    /// `reserve_rows` on a request with no evictable blocks. Skipped on
+    /// no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_ensure_blocks_grow_requests_shortfall_not_total() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_ensure_blocks_grow_requests_shortfall_not_total: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        // One live block, 3 free, nothing evictable.
+        adapter.reset_for_new_request(7).unwrap();
+        adapter.allocate_suffix_blocks(8).unwrap();
+        adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        {
+            let allocator = allocator.lock().unwrap();
+            assert_eq!(allocator.free_or_evictable_blocks(), 3);
+        }
+
+        let probe_requests: Arc<Mutex<Vec<u32>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let probe_requests = Arc::clone(&probe_requests);
+            adapter.set_grow_headroom_probe_override(Some(Arc::new(move |requested| {
+                probe_requests.lock().unwrap().push(requested);
+                Ok(requested)
+            })));
+        }
+
+        // 8 live tokens + 40 reserved rows = 48 tokens → 6 blocks, 1 held →
+        // to_allocate 5 > 3 free → shortfall 2. The probe must see
+        // min(16, max(2*4, 4+2)) = 8, not the total-derived 4+5 = 9.
+        let allocated = adapter.reserve_rows(40).unwrap();
+        assert_eq!(allocated, 5);
+        assert_eq!(
+            probe_requests.lock().unwrap().as_slice(),
+            &[8],
+            "try_grow_pool must be sized by the shortfall, not the total reservation"
+        );
+        assert_eq!(pool.num_blocks(), 8);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 8);
     }
 
     /// **Growth serialization**: while the process-wide growth lock is held,
@@ -16543,13 +16709,14 @@ mod tests {
         assert_eq!(pool.generation(), 0);
 
         // A's 5-block reservation exceeds the 3 free blocks -> pre-allocate
-        // growth (before any eviction) grows the shared pool.
+        // growth (before any eviction) grows the shared pool. Shortfall
+        // 5 - 3 = 2: min(16, max(2*4, 4+2)) = 8 blocks.
         adapter_a.reset_for_new_request(2).unwrap();
         let allocated = adapter_a.allocate_suffix_blocks(40).unwrap();
         assert_eq!(allocated, 5);
-        assert_eq!(pool.num_blocks(), 9, "pool must grow to 9 blocks");
+        assert_eq!(pool.num_blocks(), 8, "pool must grow to 8 blocks");
         assert_eq!(pool.generation(), 1);
-        assert_eq!(allocator.lock().unwrap().num_blocks(), 9);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 8);
 
         // B writes 2 more tokens (V = 2.0). Its cached views are generation
         // 0; the guard must rebuild them against the grown buffers.
