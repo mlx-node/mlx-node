@@ -1555,365 +1555,352 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                 u64,
                 Option<crate::cache_limit::PoolCacheLimitGuard>,
             );
-            let load_result: Result<LoadOutput> =
-                (|| -> Result<LoadOutput> {
-                    // Load config
-                    let config_path = path.join("config.json");
-                    let config_data = fs::read_to_string(&config_path)
-                        .map_err(|e| Error::from_reason(format!("Failed to read config: {}", e)))?;
-                    let raw: Value = serde_json::from_str(&config_data).map_err(|e| {
-                        Error::from_reason(format!("Failed to parse config: {}", e))
-                    })?;
+            let load_result: Result<LoadOutput> = (|| -> Result<LoadOutput> {
+                // Load config
+                let config_path = path.join("config.json");
+                let config_data = fs::read_to_string(&config_path)
+                    .map_err(|e| Error::from_reason(format!("Failed to read config: {}", e)))?;
+                let raw: Value = serde_json::from_str(&config_data)
+                    .map_err(|e| Error::from_reason(format!("Failed to parse config: {}", e)))?;
 
-                    let mut config = parse_config(&raw)?;
+                let mut config = parse_config(&raw)?;
 
-                    info!(
-                        "Qwen3.5 MoE config: {} layers, hidden={}, experts={}x{}",
-                        config.num_layers,
-                        config.hidden_size,
-                        config.num_experts,
-                        config.num_experts_per_tok
-                    );
+                info!(
+                    "Qwen3.5 MoE config: {} layers, hidden={}, experts={}x{}",
+                    config.num_layers,
+                    config.hidden_size,
+                    config.num_experts,
+                    config.num_experts_per_tok
+                );
 
-                    // Cold-tier persistence decision, resolved BEFORE the mmap so
-                    // the shard-identity bracket that guards it can straddle the
-                    // load. Precedence: explicit per-model config >
-                    // MLX_PERSIST_PAGED_CACHE env default > off
-                    // (see `resolve_persist_cold`).
-                    let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
-                    let persist_cold = resolve_persist_cold(
-                        "qwen3_5_moe",
-                        persist_env.as_deref(),
-                        config.persist_paged_cache,
-                    );
-                    let shard_snapshot_before_mmap = if persist_cold {
-                        snapshot_shard_identities(path)
-                    } else {
-                        None
-                    };
+                // Cold-tier persistence decision, resolved BEFORE the mmap so
+                // the shard-identity bracket that guards it can straddle the
+                // load. Precedence: explicit per-model config >
+                // MLX_PERSIST_PAGED_CACHE env default > off
+                // (see `resolve_persist_cold`).
+                let persist_env = std::env::var("MLX_PERSIST_PAGED_CACHE").ok();
+                let persist_cold = resolve_persist_cold(
+                    "qwen3_5_moe",
+                    persist_env.as_deref(),
+                    config.persist_paged_cache,
+                );
+                let shard_snapshot_before_mmap = if persist_cold {
+                    snapshot_shard_identities(path)
+                } else {
+                    None
+                };
 
-                    // Load all weights
-                    let mut raw_params = load_all_safetensors(path, false)?;
+                // Load all weights
+                let mut raw_params = load_all_safetensors(path, false)?;
 
-                    // Second snapshot, against the same inodes the mmap pinned;
-                    // paired with the after-fingerprint snapshot below it brackets
-                    // the WHOLE load-to-fingerprint span so a mid-load
-                    // model-directory swap can never bind the OLD weights to a NEW
-                    // revision's fingerprint.
-                    let shard_snapshot_at_mmap = if persist_cold {
-                        snapshot_shard_identities(path)
-                    } else {
-                        None
-                    };
+                // Second snapshot, against the same inodes the mmap pinned;
+                // paired with the after-fingerprint snapshot below it brackets
+                // the WHOLE load-to-fingerprint span so a mid-load
+                // model-directory swap can never bind the OLD weights to a NEW
+                // revision's fingerprint.
+                let shard_snapshot_at_mmap = if persist_cold {
+                    snapshot_shard_identities(path)
+                } else {
+                    None
+                };
 
-                    // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
-                    // of any mmap-backed weight (FP8 dequant + MTP-norm probe in
-                    // `sanitize_weights`, the per-layer finalize in
-                    // `apply_weights_moe_inner`, and the final `materialize_weights`).
-                    // On a slow/cold mmap source (e.g. a model served off a USB SSD)
-                    // the first GPU op to page-fault a cold region can exceed the
-                    // macOS GPU command-buffer watchdog (~5 s) and abort uncatchably.
-                    // Reading the shards (plus any `mtp-drafter/`) on the CPU first
-                    // makes every later eval hit resident pages. See
-                    // `prewarm_checkpoint_pages`.
-                    prewarm_checkpoint_pages(path);
+                // WATCHDOG / cold-mmap pre-warm — must precede the FIRST GPU eval
+                // of any mmap-backed weight (FP8 dequant + MTP-norm probe in
+                // `sanitize_weights`, the per-layer finalize in
+                // `apply_weights_moe_inner`, and the final `materialize_weights`).
+                // On a slow/cold mmap source (e.g. a model served off a USB SSD)
+                // the first GPU op to page-fault a cold region can exceed the
+                // macOS GPU command-buffer watchdog (~5 s) and abort uncatchably.
+                // Reading the shards (plus any `mtp-drafter/`) on the CPU first
+                // makes every later eval hit resident pages. See
+                // `prewarm_checkpoint_pages`.
+                prewarm_checkpoint_pages(path);
 
-                    // MTP head discovery precedence — supports two on-disk
-                    // checkpoint layouts:
-                    //   1. inline `mtp.*` tensors in the body shards (kept
-                    //      as-is by sanitize);
-                    //   2. mlx-vlm split `mtp-drafter/` directory (--q-mtp split convert).
-                    // MoE has no `mtp.safetensors` sidecar path; the
-                    // drafter merge only fires when the body carries NO inline
-                    // `mtp.*` tensors so inline always wins. The re-prefixed
-                    // `mtp.layers.{i}.mlp.switch_mlp.*` + `...gate.weight` keys
-                    // feed the existing sanitize + head module unchanged
-                    // (the drafter already ships experts STACKED into
-                    // switch_mlp.*, not per-expert `experts.*`).
-                    let has_inline_mtp = raw_params.keys().any(|name| name.contains("mtp."));
-                    if has_inline_mtp {
-                        info!(
-                            "Using inline mtp.* tensors from body shards (drafter merge skipped)"
-                        );
-                    } else if let Some(drafter_path) =
-                        crate::models::mtp_drafter::detect_drafter_safetensors(path)
-                        && let Some(drafter_params) =
-                            crate::models::mtp_drafter::load_drafter_tensors(
-                                &drafter_path,
-                                // Backbone is MoE (gates the drafter's
-                                // text_config), but the structural key gate
-                                // must use the per-layer MLP flavor: a
-                                // dense-flavored MoE-MTP layer ships dense
-                                // `mlp.*_proj` keys, not `switch_mlp.* +
-                                // mlp.gate`. Mirror `Qwen3_5MoeMTPModule::new`'s
-                                // `is_moe_layer(fa_idx)` so this drafter-merge
-                                // gate agrees with the inline gate + the head's
-                                // own flavor-aware apply_weights.
-                                crate::models::mtp_drafter::DrafterBodyVariant::Moe,
-                                super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&config),
-                                config.n_mtp_layers,
-                            )?
-                    {
-                        let drafter_count = drafter_params.len();
-                        raw_params.extend(drafter_params);
-                        info!(
-                            "Merged split MTP drafter tensors: added={} (re-prefixed mtp.*)",
-                            drafter_count
-                        );
-                    }
-                    info!("Loaded {} raw tensors", raw_params.len());
-
-                    // Split vision/text weights
-                    let has_vision = raw_params
-                        .keys()
-                        .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
-
-                    let (text_raw_params, vision_params) = if has_vision {
-                        let mut vision_params: HashMap<String, MxArray> = HashMap::new();
-                        let mut text_params: HashMap<String, MxArray> = HashMap::new();
-                        for (name, array) in raw_params {
-                            if let Some(vkey) = strip_qwen35_vision_weight_prefix(&name) {
-                                let vkey = vkey.to_string();
-                                vision_params.insert(vkey, array);
-                            } else {
-                                text_params.insert(name, array);
-                            }
-                        }
-                        info!(
-                            "Split: {} vision tensors, {} text tensors",
-                            vision_params.len(),
-                            text_params.len()
-                        );
-                        (text_params, Some(vision_params))
-                    } else {
-                        (raw_params, None)
-                    };
-
-                    // Parse quantization metadata before sanitizing so the
-                    // shared GDN fusion gate can compare the two split
-                    // projections' declared packing profiles.
-                    let quant_cfg = select_quantization_block(&raw)?;
-                    let (quant_bits, quant_group_size, top_level_mode, mut per_layer_quant) =
-                        parse_quant_settings(
-                            quant_cfg,
-                            DEFAULT_QUANT_BITS,
-                            DEFAULT_QUANT_GROUP_SIZE,
-                        )?;
-
-                    // Sanitize weights
-                    let params = sanitize_weights(text_raw_params, &config, &per_layer_quant)?;
-                    let quantized = is_quantized_checkpoint(&params);
-                    info!(
-                        "Sanitized to {} parameters (quantized={})",
-                        params.len(),
-                        quantized
-                    );
-
-                    // Augment the per-layer-quant table with the MTP head's
-                    // quantization metadata derived from the
-                    // `mtplx_mtp_quantization` config block, mirroring the dense
-                    // loader (`qwen3_5/persistence.rs`). Without this, a
-                    // `--q-mtp {cyankiwi,all}` MoE checkpoint reloads its
-                    // quantized MTP linears (router gate, switch_mlp experts,
-                    // shared expert + gate, attention) with the WRONG PLQ — the
-                    // gate-prefix would fall back to the 8-bit `default_gate_plq`
-                    // while convert packed them at the uniform 4-bit/gs32 affine
-                    // PLQ, corrupting the head. The suffix set is
-                    // flavor-derived from the SAME `mtp_mlp_variant` decision the
-                    // load-completeness gate uses (a dense-flavored MoE MTP layer
-                    // emits dense `mlp.{gate,up,down}_proj` keys, so it must use
-                    // the dense suffix list). Injected BEFORE
-                    // `apply_weights_moe_inner` so the MoE MTP path resolves
-                    // the correct PLQ.
-                    let mtp_linear_suffixes: &[&str] =
-                        match super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&config) {
-                            DrafterBodyVariant::Moe => &MTP_MOE_LAYER_LINEAR_SUFFIXES,
-                            DrafterBodyVariant::Dense => &MTP_LAYER_LINEAR_SUFFIXES,
-                        };
-                    augment_mtplx_mtp_quantization_with_suffixes(
-                        &raw,
+                // MTP head discovery precedence — supports two on-disk
+                // checkpoint layouts:
+                //   1. inline `mtp.*` tensors in the body shards (kept
+                //      as-is by sanitize);
+                //   2. mlx-vlm split `mtp-drafter/` directory (--q-mtp split convert).
+                // MoE has no `mtp.safetensors` sidecar path; the
+                // drafter merge only fires when the body carries NO inline
+                // `mtp.*` tensors so inline always wins. The re-prefixed
+                // `mtp.layers.{i}.mlp.switch_mlp.*` + `...gate.weight` keys
+                // feed the existing sanitize + head module unchanged
+                // (the drafter already ships experts STACKED into
+                // switch_mlp.*, not per-expert `experts.*`).
+                let has_inline_mtp = raw_params.keys().any(|name| name.contains("mtp."));
+                if has_inline_mtp {
+                    info!("Using inline mtp.* tensors from body shards (drafter merge skipped)");
+                } else if let Some(drafter_path) =
+                    crate::models::mtp_drafter::detect_drafter_safetensors(path)
+                    && let Some(drafter_params) = crate::models::mtp_drafter::load_drafter_tensors(
+                        &drafter_path,
+                        // Backbone is MoE (gates the drafter's
+                        // text_config), but the structural key gate
+                        // must use the per-layer MLP flavor: a
+                        // dense-flavored MoE-MTP layer ships dense
+                        // `mlp.*_proj` keys, not `switch_mlp.* +
+                        // mlp.gate`. Mirror `Qwen3_5MoeMTPModule::new`'s
+                        // `is_moe_layer(fa_idx)` so this drafter-merge
+                        // gate agrees with the inline gate + the head's
+                        // own flavor-aware apply_weights.
+                        crate::models::mtp_drafter::DrafterBodyVariant::Moe,
+                        super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&config),
                         config.n_mtp_layers,
-                        mtp_linear_suffixes,
-                        &mut per_layer_quant,
-                    )?;
+                    )?
+                {
+                    let drafter_count = drafter_params.len();
+                    raw_params.extend(drafter_params);
+                    info!(
+                        "Merged split MTP drafter tensors: added={} (re-prefixed mtp.*)",
+                        drafter_count
+                    );
+                }
+                info!("Loaded {} raw tensors", raw_params.len());
 
-                    // sym8 emits mixed-dtype K/V (f32 K after the f32-weight
-                    // k_norm, bf16 V) which the block-paged pool hard-rejects;
-                    // force the flat path before `Qwen35MoeInner::new` builds
-                    // the paged adapter. See `pin_sym8_to_flat_kv_cache`.
-                    pin_sym8_to_flat_kv_cache(&mut config, top_level_mode, &per_layer_quant);
+                // Split vision/text weights
+                let has_vision = raw_params
+                    .keys()
+                    .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
 
-                    if quant_cfg.is_some() {
-                        info!(
-                            "Using quantization config: bits={}, group_size={}, top_level_mode={:?}, per_layer_overrides={}",
-                            quant_bits,
-                            quant_group_size,
-                            top_level_mode,
-                            per_layer_quant.len()
-                        );
+                let (text_raw_params, vision_params) = if has_vision {
+                    let mut vision_params: HashMap<String, MxArray> = HashMap::new();
+                    let mut text_params: HashMap<String, MxArray> = HashMap::new();
+                    for (name, array) in raw_params {
+                        if let Some(vkey) = strip_qwen35_vision_weight_prefix(&name) {
+                            let vkey = vkey.to_string();
+                            vision_params.insert(vkey, array);
+                        } else {
+                            text_params.insert(name, array);
+                        }
                     }
+                    info!(
+                        "Split: {} vision tensors, {} text tensors",
+                        vision_params.len(),
+                        text_params.len()
+                    );
+                    (text_params, Some(vision_params))
+                } else {
+                    (raw_params, None)
+                };
 
-                    // Load tokenizer
-                    let tokenizer_path = path.join("tokenizer.json");
-                    let tokenizer = if tokenizer_path.exists() {
-                        info!("Loading tokenizer from: {}", tokenizer_path.display());
-                        Some(Qwen3Tokenizer::load_from_file_sync(
-                            tokenizer_path.to_str().ok_or_else(|| {
-                                Error::from_reason("Tokenizer path contains invalid UTF-8")
-                            })?,
-                        )?)
-                    } else {
-                        None
+                // Parse quantization metadata before sanitizing so the
+                // shared GDN fusion gate can compare the two split
+                // projections' declared packing profiles.
+                let quant_cfg = select_quantization_block(&raw)?;
+                let (quant_bits, quant_group_size, top_level_mode, mut per_layer_quant) =
+                    parse_quant_settings(quant_cfg, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
+
+                // Sanitize weights
+                let params = sanitize_weights(text_raw_params, &config, &per_layer_quant)?;
+                let quantized = is_quantized_checkpoint(&params);
+                info!(
+                    "Sanitized to {} parameters (quantized={})",
+                    params.len(),
+                    quantized
+                );
+
+                // Augment the per-layer-quant table with the MTP head's
+                // quantization metadata derived from the
+                // `mtplx_mtp_quantization` config block, mirroring the dense
+                // loader (`qwen3_5/persistence.rs`). Without this, a
+                // `--q-mtp {cyankiwi,all}` MoE checkpoint reloads its
+                // quantized MTP linears (router gate, switch_mlp experts,
+                // shared expert + gate, attention) with the WRONG PLQ — the
+                // gate-prefix would fall back to the 8-bit `default_gate_plq`
+                // while convert packed them at the uniform 4-bit/gs32 affine
+                // PLQ, corrupting the head. The suffix set is
+                // flavor-derived from the SAME `mtp_mlp_variant` decision the
+                // load-completeness gate uses (a dense-flavored MoE MTP layer
+                // emits dense `mlp.{gate,up,down}_proj` keys, so it must use
+                // the dense suffix list). Injected BEFORE
+                // `apply_weights_moe_inner` so the MoE MTP path resolves
+                // the correct PLQ.
+                let mtp_linear_suffixes: &[&str] =
+                    match super::mtp::Qwen3_5MoeMTPModule::mtp_mlp_variant(&config) {
+                        DrafterBodyVariant::Moe => &MTP_MOE_LAYER_LINEAR_SUFFIXES,
+                        DrafterBodyVariant::Dense => &MTP_LAYER_LINEAR_SUFFIXES,
                     };
+                augment_mtplx_mtp_quantization_with_suffixes(
+                    &raw,
+                    config.n_mtp_layers,
+                    mtp_linear_suffixes,
+                    &mut per_layer_quant,
+                )?;
 
-                    // Create inner model
-                    let mut inner = Qwen35MoeInner::new(config.clone())?;
-                    inner.row_exact_decode_projections =
-                        has_kquant_mode(top_level_mode, &per_layer_quant)
-                            || top_level_mode == Some(PerLayerMode::Affine)
-                            || per_layer_quant
-                                .values()
-                                .any(|quant| quant.mode == PerLayerMode::Affine);
-                    inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(
-                        path,
-                    ));
+                // sym8 emits mixed-dtype K/V (f32 K after the f32-weight
+                // k_norm, bf16 V) which the block-paged pool hard-rejects;
+                // force the flat path before `Qwen35MoeInner::new` builds
+                // the paged adapter. See `pin_sym8_to_flat_kv_cache`.
+                pin_sym8_to_flat_kv_cache(&mut config, top_level_mode, &per_layer_quant);
 
-                    // Apply weights directly to inner (no locks)
-                    let plain_fp8_residency = apply_weights_moe_inner_with_residency(
-                        &mut inner,
-                        &params,
-                        &config,
+                if quant_cfg.is_some() {
+                    info!(
+                        "Using quantization config: bits={}, group_size={}, top_level_mode={:?}, per_layer_overrides={}",
                         quant_bits,
                         quant_group_size,
                         top_level_mode,
-                        &per_layer_quant,
-                        has_vision,
-                    )?;
+                        per_layer_quant.len()
+                    );
+                }
 
-                    // Materialize mmap-backed weights
-                    let weights_resident = {
-                        let mut arrays: Vec<&MxArray> = params.values().collect();
-                        if !defer_plain_fp8_materialization() {
-                            arrays.extend(plain_fp8_residency.arrays());
-                        }
-                        crate::array::memory::materialize_weights(&arrays)?
-                    };
+                // Load tokenizer
+                let tokenizer_path = path.join("tokenizer.json");
+                let tokenizer = if tokenizer_path.exists() {
+                    info!("Loading tokenizer from: {}", tokenizer_path.display());
+                    Some(Qwen3Tokenizer::load_from_file_sync(
+                        tokenizer_path.to_str().ok_or_else(|| {
+                            Error::from_reason("Tokenizer path contains invalid UTF-8")
+                        })?,
+                    )?)
+                } else {
+                    None
+                };
 
-                    // Set tokenizer
-                    if let Some(tok) = tokenizer {
-                        inner.set_tokenizer(Arc::new(tok));
+                // Create inner model
+                let mut inner = Qwen35MoeInner::new(config.clone())?;
+                inner.row_exact_decode_projections =
+                    has_kquant_mode(top_level_mode, &per_layer_quant)
+                        || top_level_mode == Some(PerLayerMode::Affine)
+                        || per_layer_quant
+                            .values()
+                            .any(|quant| quant.mode == PerLayerMode::Affine);
+                inner.set_gen_defaults(crate::engine::persistence::parse_generation_defaults(path));
+
+                // Apply weights directly to inner (no locks)
+                let plain_fp8_residency = apply_weights_moe_inner_with_residency(
+                    &mut inner,
+                    &params,
+                    &config,
+                    quant_bits,
+                    quant_group_size,
+                    top_level_mode,
+                    &per_layer_quant,
+                    has_vision,
+                )?;
+
+                // Materialize mmap-backed weights
+                let weights_resident = {
+                    let mut arrays: Vec<&MxArray> = params.values().collect();
+                    if !defer_plain_fp8_materialization() {
+                        arrays.extend(plain_fp8_residency.arrays());
                     }
+                    crate::array::memory::materialize_weights(&arrays)?
+                };
 
-                    // Load vision encoder if present. Under sym8 the vision
-                    // tower is stripped (loud warn) — sym8 v1 is text-only,
-                    // mirroring the dense loader.
-                    let vision_params = load_vision_encoder_moe(
-                        &mut inner,
-                        vision_params,
-                        &raw,
-                        &config,
-                        top_level_mode,
-                        &per_layer_quant,
-                    )?;
+                // Set tokenizer
+                if let Some(tok) = tokenizer {
+                    inner.set_tokenizer(Arc::new(tok));
+                }
 
-                    // Delay physical paged-pool allocation until all text and
-                    // vision weights are resident so the live-memory cap sees
-                    // the actual model footprint. Combining the two witnesses
-                    // (rather than reassigning or shadowing) keeps the cold-tier
-                    // gate below the LAST materialize pass AND leaves the
-                    // fingerprint's zero-coverage fail-safe describing the text
-                    // shards, not only the vision tensors.
-                    let weights_resident = match vision_params.as_ref() {
-                        Some(vparams) => {
-                            let arrays: Vec<&MxArray> = vparams.values().collect();
-                            weights_resident
-                                .and(crate::array::memory::materialize_weights(&arrays)?)
-                        }
-                        None => weights_resident,
-                    };
-                    // Hold the process-wide pool-growth lock across the
-                    // sizing probe → pool allocation → coordinator
-                    // registration so a concurrent grow (or another model's
-                    // load) cannot read sibling pool totals that miss this
-                    // in-flight reservation, and this load cannot read totals
-                    // that miss an in-flight grow. See
-                    // `cache_limit::pool_growth_lock`. Registration is
-                    // hoisted into this closure so the guard spans the whole
-                    // sequence; the lock itself is dropped before the
-                    // cold-tier fingerprint I/O below.
-                    let pool_cache_limit_guard = {
-                        let _growth_guard = crate::cache_limit::pool_growth_lock()
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        inner.initialize_paged_adapter()?;
-                        let pool_bytes = inner
-                            .paged_adapter
-                            .as_ref()
-                            .map(PagedKVCacheAdapter::pool_allocated_bytes)
-                            .transpose()
-                            .map_err(Error::from_reason)?
-                            .unwrap_or(0);
-                        (pool_bytes != 0)
-                            .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes))
-                    };
+                // Load vision encoder if present. Under sym8 the vision
+                // tower is stripped (loud warn) — sym8 v1 is text-only,
+                // mirroring the dense loader.
+                let vision_params = load_vision_encoder_moe(
+                    &mut inner,
+                    vision_params,
+                    &raw,
+                    &config,
+                    top_level_mode,
+                    &per_layer_quant,
+                )?;
 
-                    // Fail-closed revalidation bracketing the WHOLE
-                    // load-to-materialize-to-fingerprint span, then attach the
-                    // SSD cold tier. The fingerprint (built from the paged pool
-                    // geometry + GDN sidecar geometry, so it needs the adapter
-                    // that `initialize_paged_adapter` just built) reads the
-                    // shards; only if shard identity is provably unchanged across
-                    // [before-mmap .. at-mmap .. after-fingerprint] is the tier
-                    // committed, so a mid-load directory swap can never bind OLD
-                    // weights to a NEW revision's fingerprint. The MoE context
-                    // carries a `ColdSidecarPolicy`, so the restore walk refuses
-                    // any boundary a validated GDN sidecar does not back.
-                    //
-                    // Both steps take the `materialize_weights` witness, so the
-                    // ordering that keeps a lazy `pread` from landing after the
-                    // identity read is enforced by the compiler rather than by
-                    // this call order.
-                    if persist_cold
-                        && let Some(ctx) =
-                            inner.build_cold_tier_context(&model_path, &weights_resident)
-                    {
-                        let after_fingerprint = snapshot_shard_identities(path);
-                        if shard_identities_stable(
-                            &shard_snapshot_before_mmap,
-                            &shard_snapshot_at_mmap,
-                            &after_fingerprint,
-                        ) {
-                            inner.attach_cold_tier(ctx, &weights_resident);
-                        } else {
-                            warn!(
-                                "cold-tier persistence disabled for {model_path}: model \
+                // Delay physical paged-pool allocation until all text and
+                // vision weights are resident so the live-memory cap sees
+                // the actual model footprint. Combining the two witnesses
+                // (rather than reassigning or shadowing) keeps the cold-tier
+                // gate below the LAST materialize pass AND leaves the
+                // fingerprint's zero-coverage fail-safe describing the text
+                // shards, not only the vision tensors.
+                let weights_resident = match vision_params.as_ref() {
+                    Some(vparams) => {
+                        let arrays: Vec<&MxArray> = vparams.values().collect();
+                        weights_resident.and(crate::array::memory::materialize_weights(&arrays)?)
+                    }
+                    None => weights_resident,
+                };
+                // Hold the process-wide pool-growth lock across the
+                // sizing probe → pool allocation → coordinator
+                // registration so a concurrent grow (or another model's
+                // load) cannot read sibling pool totals that miss this
+                // in-flight reservation, and this load cannot read totals
+                // that miss an in-flight grow. See
+                // `cache_limit::pool_growth_lock`. Registration is
+                // hoisted into this closure so the guard spans the whole
+                // sequence; the lock itself is dropped before the
+                // cold-tier fingerprint I/O below.
+                let pool_cache_limit_guard = {
+                    let _growth_guard = crate::cache_limit::pool_growth_lock()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    inner.initialize_paged_adapter()?;
+                    let pool_bytes = inner
+                        .paged_adapter
+                        .as_ref()
+                        .map(PagedKVCacheAdapter::pool_allocated_bytes)
+                        .transpose()
+                        .map_err(Error::from_reason)?
+                        .unwrap_or(0);
+                    (pool_bytes != 0)
+                        .then(|| crate::cache_limit::coordinator().register_pool(pool_bytes))
+                };
+
+                // Fail-closed revalidation bracketing the WHOLE
+                // load-to-materialize-to-fingerprint span, then attach the
+                // SSD cold tier. The fingerprint (built from the paged pool
+                // geometry + GDN sidecar geometry, so it needs the adapter
+                // that `initialize_paged_adapter` just built) reads the
+                // shards; only if shard identity is provably unchanged across
+                // [before-mmap .. at-mmap .. after-fingerprint] is the tier
+                // committed, so a mid-load directory swap can never bind OLD
+                // weights to a NEW revision's fingerprint. The MoE context
+                // carries a `ColdSidecarPolicy`, so the restore walk refuses
+                // any boundary a validated GDN sidecar does not back.
+                //
+                // Both steps take the `materialize_weights` witness, so the
+                // ordering that keeps a lazy `pread` from landing after the
+                // identity read is enforced by the compiler rather than by
+                // this call order.
+                if persist_cold
+                    && let Some(ctx) = inner.build_cold_tier_context(&model_path, &weights_resident)
+                {
+                    let after_fingerprint = snapshot_shard_identities(path);
+                    if shard_identities_stable(
+                        &shard_snapshot_before_mmap,
+                        &shard_snapshot_at_mmap,
+                        &after_fingerprint,
+                    ) {
+                        inner.attach_cold_tier(ctx, &weights_resident);
+                    } else {
+                        warn!(
+                            "cold-tier persistence disabled for {model_path}: model \
                                  directory changed during load (shard identity mismatch); \
                                  KV persistence stays off for safety"
-                            );
-                        }
+                        );
                     }
+                }
 
-                    // Deterministic weight-byte total for the cache-limit
-                    // coordinator. Includes text + vision weights when a
-                    // vision encoder is loaded. `saturating_add` guards
-                    // against overflow on a corrupted checkpoint.
-                    let mut weight_bytes: u64 = params
+                // Deterministic weight-byte total for the cache-limit
+                // coordinator. Includes text + vision weights when a
+                // vision encoder is loaded. `saturating_add` guards
+                // against overflow on a corrupted checkpoint.
+                let mut weight_bytes: u64 = params
+                    .values()
+                    .map(|a| a.nbytes() as u64)
+                    .fold(0u64, |acc, v| acc.saturating_add(v));
+                if let Some(ref vparams) = vision_params {
+                    weight_bytes = vparams
                         .values()
                         .map(|a| a.nbytes() as u64)
-                        .fold(0u64, |acc, v| acc.saturating_add(v));
-                    if let Some(ref vparams) = vision_params {
-                        weight_bytes = vparams
-                            .values()
-                            .map(|a| a.nbytes() as u64)
-                            .fold(weight_bytes, |acc, v| acc.saturating_add(v));
-                    }
-                    // The serialized Uint8 expert/dense weights and their
-                    // scales are already covered by `params`; only the
-                    // retained BF16 correctness reconstructions are extra.
-                    weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
+                        .fold(weight_bytes, |acc, v| acc.saturating_add(v));
+                }
+                // The serialized Uint8 expert/dense weights and their
+                // scales are already covered by `params`; only the
+                // retained BF16 correctness reconstructions are extra.
+                weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
 
-                    Ok((inner, weight_bytes, pool_cache_limit_guard))
-                })();
+                Ok((inner, weight_bytes, pool_cache_limit_guard))
+            })();
             let (mut inner, weight_bytes, pool_cache_limit_guard) = load_result?;
             let cache_limit_guard = crate::cache_limit::coordinator().register(weight_bytes);
             // Dynamic (grow-on-demand) pools re-register their byte total on
