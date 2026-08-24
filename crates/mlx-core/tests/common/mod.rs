@@ -93,6 +93,7 @@ fn tiny_mtp_config() -> Qwen3_5MoeConfig {
         use_block_paged_cache: Some(false),
         persist_paged_cache: None,
         n_mtp_layers: 1,
+        qwen35_gguf_gdn_layout: None,
     }
 }
 

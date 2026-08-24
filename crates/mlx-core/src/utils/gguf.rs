@@ -3481,7 +3481,10 @@ fn write_embedded_gpt2_tokenizer(
         "truncation": null,
         "padding": null,
         "added_tokens": added,
-        "normalizer": {"type": "NFC"},
+        // GGUF's embedded GPT-2 vocabulary and merges operate on the original
+        // byte sequence. No standard metadata here declares Unicode
+        // normalization, so synthesizing NFC would change decomposed prompts.
+        "normalizer": null,
         "pre_tokenizer": {
             "type": "Sequence",
             "pretokenizers": [
@@ -4456,7 +4459,7 @@ pub async fn convert_gguf_to_safetensors(
 /// they are never expanded into a dense floating-point weight tensor. Native
 /// F32 norms/biases are narrowed to BF16 so they do not promote inference
 /// activations away from the model's BF16 execution/cache dtype.
-const QWEN35_NATIVE_CACHE_FORMAT: u32 = 4;
+const QWEN35_NATIVE_CACHE_FORMAT: u32 = 5;
 const QWEN35_NATIVE_CACHE_DIR_ENV: &str = "MLX_NATIVE_GGUF_CACHE_DIR";
 
 fn qwen35_native_cache_candidates_from(
@@ -4987,6 +4990,49 @@ mod tests {
         }
 
         buf
+    }
+
+    #[test]
+    fn embedded_gpt2_tokenizer_preserves_decomposed_unicode_bytes() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-gguf-tokenizer-normalizer-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let metadata = HashMap::from([
+            (
+                "tokenizer.ggml.model".to_string(),
+                GgufMetaValue::String("gpt2".to_string()),
+            ),
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                GgufMetaValue::ArrayString(vec!["e".into(), "Ì".into(), "ģ".into()]),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_string(),
+                GgufMetaValue::ArrayI32(vec![1, 1, 1]),
+            ),
+            (
+                "tokenizer.ggml.merges".to_string(),
+                GgufMetaValue::ArrayString(Vec::new()),
+            ),
+        ]);
+
+        assert!(write_embedded_gpt2_tokenizer(&metadata, &root).unwrap());
+        let json: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("tokenizer.json")).unwrap()).unwrap();
+        assert!(json["normalizer"].is_null());
+        let tokenizer = tokenizers::Tokenizer::from_file(root.join("tokenizer.json")).unwrap();
+        assert!(tokenizer.get_normalizer().is_none());
+        assert_eq!(
+            tokenizer.encode("e\u{301}", false).unwrap().get_ids(),
+            &[0, 1, 2]
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

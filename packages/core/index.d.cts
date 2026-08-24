@@ -4881,6 +4881,13 @@ export interface Qwen35MoeConfig {
    * unavailable.
    */
   nMtpLayers: number;
+  /**
+   * Internal layout marker written by native Qwen3.5/3.8 GGUF conversion.
+   * `Some("tiled")` keeps llama.cpp's value-head order and lets the shared
+   * GDN runtime map value head h to key head h % Hk without permuting
+   * packed weights.
+   */
+  qwen35GgufGdnLayout?: string | undefined;
 }
 
 /** Generation configuration for Qwen3.5 MoE */

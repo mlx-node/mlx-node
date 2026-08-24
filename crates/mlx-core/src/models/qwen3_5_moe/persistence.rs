@@ -2101,6 +2101,10 @@ fn parse_config(raw: &Value) -> Result<Qwen3_5MoeConfig> {
         // (`resolve_persist_cold`), so this stays a strict tri-state read.
         persist_paged_cache: raw.get("persist_paged_cache").and_then(|v| v.as_bool()),
         n_mtp_layers: gi(&["mtp_num_hidden_layers", "num_nextn_predict_layers"], 0),
+        qwen35_gguf_gdn_layout: raw
+            .get("qwen35_gguf_gdn_layout")
+            .and_then(Value::as_str)
+            .map(str::to_string),
     })
 }
 
@@ -2186,6 +2190,28 @@ mod tests {
     };
     use std::collections::HashMap;
 
+    #[test]
+    fn native_tiled_gdn_layout_survives_moe_parse_and_dense_projection() {
+        let config = super::parse_config(&serde_json::json!({
+            "vocab_size": 128,
+            "hidden_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "intermediate_size": 128,
+            "num_experts": 4,
+            "num_experts_per_tok": 2,
+            "qwen35_gguf_gdn_layout": "tiled"
+        }))
+        .unwrap();
+
+        assert_eq!(config.qwen35_gguf_gdn_layout.as_deref(), Some("tiled"));
+        assert_eq!(
+            config.to_dense_config().qwen35_gguf_gdn_layout.as_deref(),
+            Some("tiled")
+        );
+    }
+
     /// Paged, tied, non-MTP, non-VLM `Qwen3_5MoeConfig` fixture. `head_dim = 32`
     /// (smallest valid block-paged pool head size); `hidden_size = num_heads *
     /// head_dim = 128`. Mirrors `paged_forward::tests::moe_paged_tiny_config`.
@@ -2225,6 +2251,7 @@ mod tests {
             use_block_paged_cache: Some(true),
             persist_paged_cache: None,
             n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
         }
     }
 
@@ -2495,6 +2522,7 @@ mod tests {
             use_block_paged_cache: None,
             persist_paged_cache: None,
             n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
         }
     }
 

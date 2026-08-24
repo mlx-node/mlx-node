@@ -10753,6 +10753,7 @@ mod paged_construction_tests {
             use_block_paged_cache: if use_block_paged { Some(true) } else { None },
             persist_paged_cache: None,
             n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
         }
     }
 
@@ -12315,6 +12316,7 @@ mod mask_free_full_attention_parity_tests {
             use_block_paged_cache: None,
             persist_paged_cache: None,
             n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
         }
     }
 
