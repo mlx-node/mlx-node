@@ -16,6 +16,11 @@ use super::sparse_moe::SparseMoeBlock;
 pub(crate) use crate::models::qwen3_5::decoder_layer::Qwen3_5LayerKind;
 
 /// Attention type for a decoder layer.
+///
+/// GDN carries native split packed-projection state and is the common hot path
+/// in this hybrid model. Keep it inline rather than adding a pointer chase to
+/// every linear-attention forward merely to equalize enum variant sizes.
+#[allow(clippy::large_enum_variant)]
 pub enum AttentionType {
     Linear(GatedDeltaNet),
     Full(Qwen3_5Attention),

@@ -583,6 +583,26 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
     })
 }
 
+/// Read the architecture declared by a GGUF header without loading any tensor
+/// payloads. This is the model-family detection seam for standalone GGUF files
+/// that intentionally do not ship a sibling `config.json`.
+#[napi]
+pub fn gguf_architecture(input_path: String) -> Result<String> {
+    let gguf = parse_gguf(&input_path)?;
+    let architecture = gguf
+        .metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Error::from_reason(format!(
+                "GGUF file '{}' does not declare a non-empty general.architecture",
+                input_path
+            ))
+        })?;
+    Ok(architecture.to_string())
+}
+
 fn align_offset(offset: u64, alignment: u64) -> u64 {
     let remainder = offset % alignment;
     if remainder == 0 {
@@ -2064,9 +2084,18 @@ pub fn extract_config(metadata: &HashMap<String, GgufMetaValue>) -> serde_json::
             serde_json::Value::String(name.to_string()),
         );
     }
+    // llama.cpp architecture identifiers are not always the Hugging Face
+    // model_type values consumed by mlx-node's public loader. Keep the GGUF
+    // architecture for metadata lookups below, but write the canonical config
+    // family so a synthesized cache is independently loadable as a directory.
+    let model_type = match arch.as_str() {
+        "qwen35" => "qwen3_5",
+        "qwen35moe" => "qwen3_5_moe",
+        _ => arch.as_str(),
+    };
     config.insert(
         "model_type".to_string(),
-        serde_json::Value::String(arch.clone()),
+        serde_json::Value::String(model_type.to_string()),
     );
 
     // Map GGUF keys to HF config keys
@@ -4197,10 +4226,18 @@ pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
         return Ok(output_dir);
     }
 
+    // `Some(dir)` means an explicitly authoritative config source to the
+    // converter. A standalone GGUF has no config by design, so pass `None` in
+    // that case: the converter still uses the GGUF parent for optional assets,
+    // while allowing config/tokenizer reconstruction from header metadata.
+    let config_source_dir = parent
+        .join("config.json")
+        .is_file()
+        .then(|| parent.to_string_lossy().into_owned());
     convert_gguf_to_safetensors(GgufConversionOptions {
         input_path: input_path.to_string_lossy().into_owned(),
         output_dir: output_dir.to_string_lossy().into_owned(),
-        config_source_dir: Some(parent.to_string_lossy().into_owned()),
+        config_source_dir,
         dtype: Some("bfloat16".to_string()),
         verbose: Some(true),
         quantize: Some(false),
@@ -4376,6 +4413,76 @@ mod tests {
         }
 
         fs::remove_file(&tmp).ok();
+    }
+
+    #[test]
+    fn gguf_architecture_reads_header_without_tensor_payloads() {
+        let data = build_minimal_gguf(
+            &[(
+                "general.architecture",
+                GgufMetaValue::String("qwen35".to_string()),
+            )],
+            &[],
+        );
+        let tmp = std::env::temp_dir().join(format!(
+            "mlx-node-gguf-architecture-{}-{}.gguf",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::write(&tmp, data).unwrap();
+
+        assert_eq!(
+            gguf_architecture(tmp.to_string_lossy().into_owned()).unwrap(),
+            "qwen35"
+        );
+
+        fs::remove_file(tmp).ok();
+    }
+
+    #[tokio::test]
+    async fn native_qwen35_prepare_synthesizes_config_for_standalone_gguf() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-standalone-qwen35-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let data = build_minimal_gguf(
+            &[
+                (
+                    "general.architecture",
+                    GgufMetaValue::String("qwen35".to_string()),
+                ),
+                ("qwen35.embedding_length", GgufMetaValue::Uint32(1)),
+            ],
+            &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+        );
+        let input = root.join("standalone.gguf");
+        fs::write(&input, data).unwrap();
+
+        let output = prepare_qwen35_native_gguf(&input)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "standalone GGUF preparation must synthesize config.json: {}",
+                    error.reason
+                )
+            });
+        let config: serde_json::Value = serde_json::from_slice(
+            &fs::read(output.join("config.json")).expect("synthesized config.json"),
+        )
+        .unwrap();
+        assert_eq!(config["model_type"], serde_json::json!("qwen3_5"));
+        assert!(output.join("model.safetensors").is_file());
+        assert!(output.join(".complete").is_file());
+
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

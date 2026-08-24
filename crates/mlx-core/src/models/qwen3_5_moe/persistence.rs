@@ -28,6 +28,7 @@ use crate::models::qwen3_5::persistence::{
 };
 use crate::models::qwen3_5::processing::Qwen35VLImageProcessor;
 use crate::models::qwen3_5::vision::Qwen3_5VisionEncoder;
+use crate::nn::Linear;
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
@@ -36,7 +37,7 @@ use super::decoder_layer::{AttentionType, MLPType};
 use super::model::{Qwen3_5MoeModel, Qwen35MoeInner, Qwen35MoeSchedulerState};
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, GATE_QUANT_BITS, GATE_QUANT_GROUP_SIZE,
-    MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
+    LinearProj, MLPVariant, PerLayerMode, PerLayerQuant, QuantizedLinear, QuantizedSwitchLinear,
     is_mxfp8_checkpoint, is_quantized_checkpoint, try_build_fp8_e4m3_quantized_linear,
     try_build_fp8_e4m3_quantized_switch_linear, try_build_kquant_quantized_linear,
     try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_linear,
@@ -615,6 +616,24 @@ fn apply_weights_moe_inner_with_residency(
         Ok(built)
     };
 
+    // `merge_split_projections` preserves Dynamic GGUF halves whose storage
+    // modes differ. Resolve each retained half independently so mixed
+    // packed+dense GDN projections do not fall through to constructor weights.
+    let try_build_linear_proj =
+        |params: &HashMap<String, MxArray>, prefix: &str| -> Result<Option<LinearProj>> {
+            if let Some(ql) = try_build_ql(params, prefix)? {
+                return Ok(Some(LinearProj::Quantized(ql)));
+            }
+            let weight_key = format!("{prefix}.weight");
+            let Some(weight) = params.get(&weight_key) else {
+                return Ok(None);
+            };
+            ensure_dense_weight_floating(&weight_key, weight)?;
+            Ok(Some(LinearProj::Standard(Linear::from_weights(
+                weight, None,
+            )?)))
+        };
+
     let try_build_qsl = |params: &HashMap<String, MxArray>,
                          prefix: &str|
      -> Result<Option<QuantizedSwitchLinear>> {
@@ -789,6 +808,26 @@ fn apply_weights_moe_inner_with_residency(
                             w,
                         )?;
                         gdn.set_in_proj_qkvz_weight(w)?;
+                    } else {
+                        let qkv_prefix = format!("{}.linear_attn.in_proj_qkv", prefix);
+                        let z_prefix = format!("{}.linear_attn.in_proj_z", prefix);
+                        match (
+                            try_build_linear_proj(params, &qkv_prefix)?,
+                            try_build_linear_proj(params, &z_prefix)?,
+                        ) {
+                            (Some(qkv), Some(z)) => gdn.set_split_in_proj_qkv_z(qkv, z),
+                            (None, None) => {}
+                            (Some(_), None) => {
+                                return Err(Error::from_reason(format!(
+                                    "Layer {i}: {qkv_prefix}.weight found but {z_prefix}.weight missing"
+                                )));
+                            }
+                            (None, Some(_)) => {
+                                return Err(Error::from_reason(format!(
+                                    "Layer {i}: {z_prefix}.weight found but {qkv_prefix}.weight missing"
+                                )));
+                            }
+                        }
                     }
 
                     if let Some(ql) =
@@ -803,6 +842,26 @@ fn apply_weights_moe_inner_with_residency(
                             w,
                         )?;
                         gdn.set_in_proj_ba_weight(w)?;
+                    } else {
+                        let b_prefix = format!("{}.linear_attn.in_proj_b", prefix);
+                        let a_prefix = format!("{}.linear_attn.in_proj_a", prefix);
+                        match (
+                            try_build_linear_proj(params, &b_prefix)?,
+                            try_build_linear_proj(params, &a_prefix)?,
+                        ) {
+                            (Some(b), Some(a)) => gdn.set_split_in_proj_b_a(b, a),
+                            (None, None) => {}
+                            (Some(_), None) => {
+                                return Err(Error::from_reason(format!(
+                                    "Layer {i}: {b_prefix}.weight found but {a_prefix}.weight missing"
+                                )));
+                            }
+                            (None, Some(_)) => {
+                                return Err(Error::from_reason(format!(
+                                    "Layer {i}: {a_prefix}.weight found but {b_prefix}.weight missing"
+                                )));
+                            }
+                        }
                     }
 
                     if let Some(ql) =
@@ -2163,6 +2222,101 @@ mod tests {
             use_block_paged_cache: Some(true),
             persist_paged_cache: None,
             n_mtp_layers: 0,
+        }
+    }
+
+    #[test]
+    fn mixed_q4k_dense_split_gdn_projections_install_through_moe_loader() {
+        let label = "mixed_q4k_dense_split_gdn_projections_install_through_moe_loader";
+        let mut config = moe_paged_tiny_cfg();
+        config.use_block_paged_cache = Some(false);
+        config.paged_cache_memory_mb = None;
+        let mut inner = match Qwen35MoeInner::new(config.clone()) {
+            Ok(inner) => inner,
+            Err(error) => {
+                let message = error.reason.to_string();
+                if message.contains("Metal")
+                    || message.contains("device")
+                    || message.contains("LayerKVPool")
+                {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {message}");
+                    return;
+                }
+                panic!("unexpected Qwen35MoeInner::new failure in {label}: {message}");
+            }
+        };
+
+        let dense_bf16 = |rows: i64, cols: i64| {
+            MxArray::from_float32(&vec![0.01; (rows * cols) as usize], &[rows, cols])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap()
+        };
+        let insert_q4k = |params: &mut HashMap<String, MxArray>, prefix: &str, rows: i64| {
+            params.insert(
+                format!("{prefix}.weight"),
+                MxArray::from_uint32(&vec![0; (rows * 4) as usize], &[rows, 4]).unwrap(),
+            );
+            params.insert(
+                format!("{prefix}.scales"),
+                MxArray::from_float32(&vec![1.0; (rows * 2) as usize], &[rows, 2])
+                    .unwrap()
+                    .astype(DType::Uint8)
+                    .unwrap(),
+            );
+            params.insert(
+                format!("{prefix}.biases"),
+                MxArray::from_float16(
+                    &vec![half::f16::from_f32(0.5).to_bits(); rows as usize],
+                    &[rows, 1],
+                )
+                .unwrap(),
+            );
+        };
+
+        let prefix = "layers.0.linear_attn";
+        let qkv_prefix = format!("{prefix}.in_proj_qkv");
+        let z_prefix = format!("{prefix}.in_proj_z");
+        let b_prefix = format!("{prefix}.in_proj_b");
+        let a_prefix = format!("{prefix}.in_proj_a");
+        let mut params = HashMap::new();
+        insert_q4k(&mut params, &qkv_prefix, 256);
+        params.insert(format!("{z_prefix}.weight"), dense_bf16(128, 128));
+        insert_q4k(&mut params, &b_prefix, 4);
+        params.insert(format!("{a_prefix}.weight"), dense_bf16(4, 128));
+
+        let q4k = PerLayerQuant {
+            bits: 4,
+            group_size: 32,
+            mode: PerLayerMode::Q4K,
+            input_amax: None,
+        };
+        let per_layer_quant = HashMap::from([(qkv_prefix, q4k), (b_prefix, q4k)]);
+
+        let error = apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            DEFAULT_QUANT_BITS,
+            DEFAULT_QUANT_GROUP_SIZE,
+            None,
+            &per_layer_quant,
+            false,
+        )
+        .expect_err("the intentionally partial checkpoint must fail completeness validation");
+        assert!(
+            error.reason.contains("missing mandatory weights"),
+            "mixed split installation must reach the final completeness gate: {}",
+            error.reason
+        );
+
+        match &inner.layers[0].attn {
+            AttentionType::Linear(gdn) => assert_eq!(
+                gdn.split_in_proj_quantized_sides(),
+                (Some((true, false)), Some((true, false))),
+                "each Q4_K half must stay packed while its BF16 peer stays dense"
+            ),
+            AttentionType::Full(_) => panic!("layer 0 must be a GDN layer"),
         }
     }
 

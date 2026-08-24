@@ -3741,6 +3741,13 @@ export declare function getMemorySnapshot(): GpuMemorySnapshot;
 /** Retrieve all collected profiling data as a `ProfilingSession`. */
 export declare function getProfilingData(): ProfilingSession;
 
+/**
+ * Read the architecture declared by a GGUF header without loading any tensor
+ * payloads. This is the model-family detection seam for standalone GGUF files
+ * that intentionally do not ship a sibling `config.json`.
+ */
+export declare function ggufArchitecture(inputPath: string): string;
+
 export interface GgufConversionOptions {
   /** Path to the GGUF file */
   inputPath: string;

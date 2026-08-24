@@ -558,13 +558,13 @@ impl GatedDeltaNet {
         self.split_in_proj_b_a = None;
         self.in_proj_ba.set_quantized(ql);
     }
-    pub fn set_quantized_in_proj_qkv_z(&mut self, qkv: QuantizedLinear, z: QuantizedLinear) {
+    pub fn set_split_in_proj_qkv_z(&mut self, qkv: LinearProj, z: LinearProj) {
         self.in_proj_qkvz_ba_t = None;
-        self.split_in_proj_qkv_z = Some((LinearProj::Quantized(qkv), LinearProj::Quantized(z)));
+        self.split_in_proj_qkv_z = Some((qkv, z));
     }
-    pub fn set_quantized_in_proj_b_a(&mut self, b: QuantizedLinear, a: QuantizedLinear) {
+    pub fn set_split_in_proj_b_a(&mut self, b: LinearProj, a: LinearProj) {
         self.in_proj_qkvz_ba_t = None;
-        self.split_in_proj_b_a = Some((LinearProj::Quantized(b), LinearProj::Quantized(a)));
+        self.split_in_proj_b_a = Some((b, a));
     }
     pub fn set_quantized_out_proj(&mut self, ql: QuantizedLinear) {
         self.out_proj.set_quantized(ql);
@@ -578,6 +578,21 @@ impl GatedDeltaNet {
             || self.split_in_proj_qkv_z.is_some()
             || self.split_in_proj_b_a.is_some()
             || self.out_proj.is_quantized()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn split_in_proj_quantized_sides(
+        &self,
+    ) -> (Option<(bool, bool)>, Option<(bool, bool)>) {
+        let qkv_z = self
+            .split_in_proj_qkv_z
+            .as_ref()
+            .map(|(qkv, z)| (qkv.is_quantized(), z.is_quantized()));
+        let b_a = self
+            .split_in_proj_b_a
+            .as_ref()
+            .map(|(b, a)| (b.is_quantized(), a.is_quantized()));
+        (qkv_z, b_a)
     }
 
     // ========== Weight getters (for training parameter extraction) ==========
