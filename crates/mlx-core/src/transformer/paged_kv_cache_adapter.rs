@@ -3914,7 +3914,7 @@ impl PagedKVCacheAdapter {
             }
         };
         let current = guard.num_blocks();
-        let new_num_blocks = self.layer_kv_pool.max_num_blocks().min(
+        let mut new_num_blocks = self.layer_kv_pool.max_num_blocks().min(
             current
                 .saturating_mul(2)
                 .max(current.saturating_add(needed_additional_blocks)),
@@ -3922,12 +3922,27 @@ impl PagedKVCacheAdapter {
         #[cfg(target_os = "macos")]
         match self.grow_headroom_probe(new_num_blocks) {
             Ok(selected) if selected < new_num_blocks => {
-                tracing::warn!(
-                    target: "mlx_core::paged_kv",
-                    "paged KV pool grow declined: headroom probe caps the pool at {selected} \
-                     blocks (< {new_num_blocks} requested)"
-                );
-                return false;
+                // Partial headroom: the probe's safe ceiling covers the
+                // required shortfall but not the doubling target. Grow to
+                // the selected count — the reservation then admits — rather
+                // than rejecting a request that a safe grow would serve.
+                // Decline only when even the shortfall does not fit.
+                let shortfall_target = current.saturating_add(needed_additional_blocks);
+                if selected >= shortfall_target && selected > current {
+                    tracing::info!(
+                        target: "mlx_core::paged_kv",
+                        "paged KV pool grow targeting partial headroom: {selected} blocks \
+                         (< {new_num_blocks} doubling target, covers shortfall {shortfall_target})"
+                    );
+                    new_num_blocks = selected;
+                } else {
+                    tracing::warn!(
+                        target: "mlx_core::paged_kv",
+                        "paged KV pool grow declined: headroom probe caps the pool at {selected} \
+                         blocks (< shortfall {shortfall_target}, {new_num_blocks} requested)"
+                    );
+                    return false;
+                }
             }
             Ok(_) => {}
             Err(e) => {
@@ -16342,6 +16357,55 @@ mod tests {
         assert_eq!(pool.num_blocks(), 8);
         assert_eq!(pool.generation(), 1);
         assert_eq!(allocator.lock().unwrap().num_blocks(), 8);
+    }
+
+    /// **Partial headroom**: a probe selecting fewer blocks than the
+    /// doubling target but at least `current + needed` must grow to the
+    /// selected count — a reservation that fits the shortfall must not be
+    /// rejected just because headroom cannot cover the full 2x target.
+    /// Skipped on no-Metal hosts.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_grow_partial_headroom_targets_selected_blocks() {
+        let cfg = mlx_paged_attn::PagedAttentionConfig {
+            block_size: 8,
+            num_kv_heads: 1,
+            head_size: 64,
+            num_layers: 2,
+            gpu_memory_mb: 256,
+            use_fp8_cache: Some(false),
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let pool = match mlx_paged_attn::LayerKVPool::new(
+            cfg.clone(),
+            4,
+            16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
+        ) {
+            Ok(p) => Arc::new(p),
+            Err(e) => {
+                eprintln!("skipping test_grow_partial_headroom_targets_selected_blocks: {e}");
+                return;
+            }
+        };
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(4, 16, 8)));
+        let mut adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+            .expect("adapter");
+
+        // Probe caps the 4 -> 8 doubling target at 7 blocks: above the
+        // shortfall (4 + needed 2 = 6), below the target. The grow must
+        // land at 7, not decline.
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(|requested| {
+            Ok(requested.saturating_sub(1))
+        })));
+        assert!(
+            adapter.try_grow_pool(2),
+            "probe selecting 7 >= shortfall 6 must grow to the selected count"
+        );
+        assert_eq!(pool.num_blocks(), 7);
+        assert_eq!(pool.generation(), 1);
+        assert_eq!(allocator.lock().unwrap().num_blocks(), 7);
     }
 
     /// **Growth serialization**: while the process-wide growth lock is held,

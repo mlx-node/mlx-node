@@ -3789,13 +3789,16 @@ mod tests {
         let Some((mut state, snapshot)) = growable_scheduler_state() else {
             return;
         };
-        // Probe selects one block below the target: try_grow_pool declines.
+        // Probe caps the pool below the shortfall target: try_grow_pool
+        // declines. (One below the DOUBLING target is partial headroom and
+        // grows — the decline edge only fires below current + needed.)
         state
             .inner
             .paged_adapter_mut()
             .expect("paged adapter")
             .set_grow_headroom_probe_override(Some(Arc::new(|requested| {
-                Ok(requested.saturating_sub(1))
+                let _ = requested;
+                Ok(4)
             })));
         let charge = snapshot.blocks.free_blocks + 1;
         let outcome = state
@@ -3815,6 +3818,42 @@ mod tests {
                 .total_blocks,
             4,
             "a declined grow must not grow the pool"
+        );
+    }
+
+    #[test]
+    fn partial_headroom_grows_to_selected_and_admits() {
+        let Some((mut state, snapshot)) = growable_scheduler_state() else {
+            return;
+        };
+        // Probe caps the 4 -> 8 doubling target at 7 blocks: above the
+        // shortfall (current 4 + needed 1 = 5), below the target. The grow
+        // must land at the selected count, not decline.
+        state
+            .inner
+            .paged_adapter_mut()
+            .expect("paged adapter")
+            .set_grow_headroom_probe_override(Some(Arc::new(|requested| {
+                Ok(requested.saturating_sub(1))
+            })));
+        let charge = snapshot.blocks.free_blocks + 1;
+        let outcome = state
+            .try_reserve_reclaiming_idle(2, charge, 0, snapshot)
+            .expect("partial grow + re-reserve");
+        assert!(
+            matches!(outcome, MemoryReserveOutcome::Admitted),
+            "a partial-headroom grow covering the shortfall must admit: {outcome:?}"
+        );
+        assert_eq!(
+            state
+                .inner
+                .scheduler_cache_snapshot()
+                .expect("post-grow snapshot")
+                .expect("paged adapter present")
+                .blocks
+                .total_blocks,
+            7,
+            "the grow must land at the probe-selected 7 blocks"
         );
     }
 
