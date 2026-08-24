@@ -806,6 +806,16 @@ impl NemotronHInner {
             )));
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
+        // Hold the process-wide pool-growth lock across sizing → CAS
+        // reservation → pool allocation. The CAS retry loop only protects
+        // against registrations racing between its read and its commit;
+        // without this lock a concurrent qwen3_5 grow (or another loader)
+        // can probe sibling totals that miss this in-flight reservation and
+        // both allocations spend the same headroom. See
+        // `cache_limit::pool_growth_lock`.
+        let _growth_guard = crate::cache_limit::pool_growth_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let coordinator = crate::cache_limit::coordinator();
         let (selected_blocks, pool_guard) = {
             let mut reserved = None;
