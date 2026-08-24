@@ -4470,6 +4470,13 @@ fn qwen35_native_asset_digest(parent: &Path) -> Result<String> {
         .collect())
 }
 
+fn qwen35_native_source_digest(input_path: &Path) -> String {
+    Sha256::digest(input_path.as_os_str().as_encoded_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn qwen35_native_prepare_mutex() -> &'static tokio::sync::Mutex<()> {
     static MUTEX: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -4517,10 +4524,15 @@ impl Drop for Qwen35NativeCacheLock {
     }
 }
 
-fn qwen35_native_cache_is_current(output_dir: &Path, asset_digest: &str) -> bool {
+fn qwen35_native_cache_is_current(
+    output_dir: &Path,
+    source_digest: &str,
+    asset_digest: &str,
+) -> bool {
     let marker = output_dir.join(".complete");
     fs::read_to_string(marker).is_ok_and(|contents| {
         contents.contains(&format!("format={QWEN35_NATIVE_CACHE_FORMAT}\n"))
+            && contents.contains(&format!("source_sha256={source_digest}\n"))
             && contents.contains(&format!("assets_sha256={asset_digest}\n"))
             && contents.contains("dtype=bf16\n")
             && output_dir.join("model.safetensors").is_file()
@@ -4559,8 +4571,10 @@ pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
                 '_'
             }
         })
+        .take(32)
         .collect::<String>();
     let parent = input_path.parent().unwrap_or(Path::new("."));
+    let source_digest = qwen35_native_source_digest(&input_path);
     let asset_digest = qwen35_native_asset_digest(parent)?;
     let cache_root = parent.join(".mlx-node-native");
     fs::create_dir_all(&cache_root).map_err(|error| {
@@ -4570,9 +4584,8 @@ pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
         ))
     })?;
     let cache_key = format!(
-        "{stem}-{}-{modified}-v{QWEN35_NATIVE_CACHE_FORMAT}-{}",
+        "{stem}-{}-{modified}-v{QWEN35_NATIVE_CACHE_FORMAT}-{source_digest}-{asset_digest}",
         metadata.len(),
-        asset_digest
     );
     let output_dir = cache_root.join(&cache_key);
 
@@ -4607,7 +4620,7 @@ pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
                 .to_string(),
         ));
     }
-    if qwen35_native_cache_is_current(&output_dir, &asset_digest) {
+    if qwen35_native_cache_is_current(&output_dir, &source_digest, &asset_digest) {
         return Ok(output_dir);
     }
 
@@ -4665,8 +4678,9 @@ pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
     if let Err(error) = fs::write(
         marker,
         format!(
-            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout=tiled\ndtype=bf16\n",
+            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout=tiled\ndtype=bf16\n",
             input_path.display(),
+            source_digest,
             metadata.len(),
             modified,
             asset_digest
@@ -5139,6 +5153,78 @@ mod tests {
             serde_json::from_slice(&fs::read(edited_same_size.join("config.json")).unwrap())
                 .unwrap();
         assert_eq!(config["asset_sentinel"], serde_json::json!(2));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn qwen35_native_cache_key_separates_sanitized_source_name_collisions() {
+        let root = std::env::temp_dir().join(format!(
+            "mlx-node-qwen35-source-key-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("config.json"), r#"{"model_type":"qwen3_5"}"#).unwrap();
+        let metadata = [
+            (
+                "general.architecture",
+                GgufMetaValue::String("qwen35".to_string()),
+            ),
+            ("qwen35.block_count", GgufMetaValue::Uint32(1)),
+        ];
+        let left_input = root.join("model!.gguf");
+        let right_input = root.join("model?.gguf");
+        fs::write(
+            &left_input,
+            build_minimal_gguf(
+                &metadata,
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[0, 0])],
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &right_input,
+            build_minimal_gguf(
+                &metadata,
+                &[("output_norm.weight", &[1], GgufTensorType::BF16, &[1, 0])],
+            ),
+        )
+        .unwrap();
+        let shared_modified = fs::metadata(&left_input).unwrap().modified().unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&right_input)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(shared_modified))
+            .unwrap();
+        assert_eq!(
+            fs::metadata(&left_input).unwrap().len(),
+            fs::metadata(&right_input).unwrap().len()
+        );
+        assert_eq!(
+            fs::metadata(&left_input).unwrap().modified().unwrap(),
+            fs::metadata(&right_input).unwrap().modified().unwrap()
+        );
+
+        let left = prepare_qwen35_native_gguf(&left_input).await.unwrap();
+        let right = prepare_qwen35_native_gguf(&right_input).await.unwrap();
+        assert_ne!(
+            left, right,
+            "canonical source identity must participate in the key"
+        );
+        let left_marker = fs::read_to_string(left.join(".complete")).unwrap();
+        let right_marker = fs::read_to_string(right.join(".complete")).unwrap();
+        let source_line = |marker: &str| {
+            marker
+                .lines()
+                .find(|line| line.starts_with("source_sha256="))
+                .unwrap()
+                .to_string()
+        };
+        assert_ne!(source_line(&left_marker), source_line(&right_marker));
         fs::remove_dir_all(root).ok();
     }
 
