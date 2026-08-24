@@ -980,18 +980,25 @@ impl Qwen35MoeInner {
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
         // `max_num_blocks` is the dynamic ceiling the live pool grows toward;
-        // `load_time_pool_sizing` keeps clamping the MAX only, exactly as
-        // before the initial/max split.
+        // `load_time_pool_sizing_with_reserved` keeps clamping the MAX only,
+        // exactly as before the initial/max split. Sibling pools registered
+        // with the cache-limit coordinator hold private Metal buffers the MLX
+        // active-memory probes cannot see, so their bytes are reserved
+        // explicitly; this runs inside the process-wide pool-growth lock (see
+        // persistence.rs), so the coordinator read is race-free. The explicit
+        // `paged_cache_memory_mb` cap is an operator override and stays
+        // unprobed by design.
         let (max_num_blocks, sizing_source) = if self.config.paged_cache_memory_mb.is_some() {
             (requested_blocks, "explicit".to_string())
         } else {
-            let sizing = mlx_paged_attn::profile::load_time_pool_sizing(
+            let sizing = mlx_paged_attn::profile::load_time_pool_sizing_with_reserved(
                 requested_blocks,
                 attn_layer_count,
                 num_kv_heads,
                 head_size,
                 block_size,
                 cache_dtype,
+                crate::cache_limit::coordinator().registered_pool_bytes(),
             )
             .map_err(|e| {
                 Error::from_reason(format!(
