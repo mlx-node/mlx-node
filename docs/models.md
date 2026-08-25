@@ -7,7 +7,7 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 | Model                      | `generate()` | Session API |  Training  | Notes                                                                            |
 | -------------------------- | :----------: | :---------: | :--------: | -------------------------------------------------------------------------------- |
 | **Qwen3**                  |     yes      |     yes     | GRPO + SFT | Speculative decoding; paged attention                                            |
-| **Qwen3.5 Dense**          |     yes      |     yes     | GRPO + SFT | Compiled C++ forward (see [ffi-cpp.md](ffi-cpp.md)); VLM variant                 |
+| **Qwen3.5 Dense**          |     yes      |     yes     | GRPO + SFT | Hybrid GDN/attention; native MTP; Qwen3.8 DFlash2; VLM variant                   |
 | **Qwen3.5 MoE**            |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant                            |
 | **Gemma4**                 |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark + assistant-MTP spec. decoding |
 | **Muse-Glimmer**           |     yes      |     yes     |     —      | Text decoder; Q4_K import; DFlash; hybrid paged AR                               |
@@ -106,6 +106,54 @@ for await (const event of session.sendStream('Hello!')) {
 
 The streaming bridge is implemented in `packages/lm/src/stream.ts`: native callback-based methods are captured at module load and re-exposed as `AsyncGenerator` via `_runChatStream`.
 
+## Qwen3.8 DFlash2
+
+Dense Qwen3.8 targets can attach the external
+[`z-lab/Qwen3.8-27B-DFlash2`](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
+checkpoint at load time:
+
+```typescript
+import { loadSession } from '@mlx-node/lm';
+
+const session = await loadSession('./models/qwen3.8-27b-mxfp4-mlx', {
+  draftModelPath: './models/qwen3.8-27b-dflash2',
+});
+const result = await session.send('Explain speculative decoding briefly.', {
+  config: { temperature: 0 },
+});
+```
+
+The companion shares the target embedding and LM head. Its five post-layer
+target taps are fused into a sliding draft context; each draft layer applies
+two-tap grouped dynamic convolutions around attention and the MLP. A rank-256
+selector then walks a conditional path through 16 candidates per position.
+At sampled temperatures the runtime retains those sparse conditional
+probabilities for exact rejection correction against the target distribution.
+
+The checkpoint's block size 8 means one verified anchor plus seven proposals.
+Unset `mtpDepth` uses all seven; an explicit value clamps to `[1, 7]`.
+`mtpAdaptiveDepth` is off by default. The target verify path is flat because
+accepted-prefix rollback must restore both full-attention KV and Qwen3.8's GDN
+recurrent state; normal `enableMtp: false` requests may still use paged AR.
+An external DFlash2 companion takes precedence over an inline native MTP head.
+
+The two cache lanes are deliberately owner-isolated. vLLM gives the DFlash
+layers their own scheduler-managed KV groups and derives their physical slots
+from the target request's block tables. mlx-node's current DFlash verifier is
+flat, so it enforces the equivalent invariant with a lane barrier: entering
+paged AR invalidates retained DFlash context; returning to DFlash performs a
+cold full-prompt flat prefill and purges the live paged prefix. Warm DFlash
+continuation is allowed only when the exact retained token prefix, every flat
+full-attention frontier, and the draft-context frontier agree. Equal lengths
+alone are never a cache hit. This makes DFlash -> paged AR -> DFlash safe, but
+the second transition pays a reprefill; it is not a zero-copy cache conversion.
+
+Loading is fail-closed: the loader requires `DFlash2DraftModel`, validates the
+target hidden size, vocabulary, tap indices, every expected tensor shape, and
+rejects missing or extra tensors before the model becomes available. The
+implementation follows the [official DFlash repository](https://github.com/z-lab/dflash)
+and [DFlash2 architecture description](https://inco.ai/blog/dflash2/).
+
 ## Muse-Glimmer Q4_K and DFlash
 
 Convert Meta's GGUF target, vision projector, and DFlash companion together.
@@ -183,7 +231,7 @@ overlay by default and enables the embedded draft only when
 - **Stats** — `ChatResult.performance` reports `mtpCycles` (actual draft+verify cycles executed) and `mtpMeanAcceptedTokensTotal` (mean committed tokens per speculative cycle, including the always-verified token). DSpark's target-only calibration/fallback cycles remain part of the overall token/decode-speed metrics but are intentionally excluded from these MTP acceptance fields.
 - **Knobs** — DSpark: with both knobs unset, full draft blocks (7 tokens on the v1 draft) are guarded by a short, per-turn target-AR/DSpark throughput calibration; if speculation loses on the current host and context, the remainder of that turn uses exact target-only decoding. The guard activates only when the generation budget can contain the AR probe plus two full-depth speculative probes; shorter generations preserve the fixed-block schedule. An explicit `mtpDepth` caps and pins the block, disabling the guard unless `mtpAdaptiveDepth: true` opts it back in; `mtpAdaptiveDepth: false` always disables it. Assistant: unset `mtpDepth` defaults to 3 drafts per cycle, explicit values clamp to [1, 8], and `mtpAdaptiveDepth` remains ignored.
 - **Memory** — the draft loads alongside the target (~6.9 GB extra for the bf16 DSpark 12B draft; ~0.8 GB for an assistant). Both variants run on the flat KV-cache path; a target config that explicitly enables `use_block_paged_cache` is rejected at load.
-- `draftModelPath` is gemma4-only: `loadModel` / `loadSession` reject it for every other family.
+- `draftModelPath` is supported by gemma4 and dense qwen3_5; other families reject it.
 
 ## Server-side sessions
 

@@ -408,7 +408,22 @@ Almost every flag belongs to pi and is forwarded verbatim; `mlx agent` only hand
 
 ### Model selection and first-run wizard
 
-`mlx agent` discovers local models under the resolved models directory (`--models-dir <dir>`, else `MLX_MODELS_DIR`, else `modelsDir` in `~/.mlx-node/config.json`, else `~/.mlx-node/models`). A dash-leading path must use the `--models-dir=<dir>` form so it is not mistaken for another flag.
+`mlx agent` discovers local models under the resolved models directory (`--models-dir <dir>`, else `MLX_MODELS_DIR`, else `modelsDir` in `~/.mlx-node/config.json`, else `~/.mlx-node/models`). A dash-leading path must use the `--models-dir=<dir>` form so it is not mistaken for another flag. Dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` targets are also discovered when placed directly in that directory or one level inside a downloaded GGUF repository; each appears under its filename stem. Other GGUF variants and companion files such as imatrix, mmproj, draft, or DFlash2-only checkpoints are not advertised as agent models.
+
+To pair an XL GGUF target with DFlash2 automatically, use the mlx-node agent's embedded `draft/` convention:
+
+```text
+~/.mlx-node/models/qwen38-q4xl/
+├── config.json
+├── tokenizer.json
+├── tokenizer_config.json
+├── Qwen3.8-27B-UD-Q4_K_XL.gguf
+└── draft/
+    ├── config.json
+    └── model.safetensors
+```
+
+The root config and tokenizer files belong to the Qwen3.8 target. `draft/config.json` must declare `DFlash2DraftModel` in `architectures`; the draft weights stay in that directory exactly as published by z-lab. `draft/` may be a symlink to an existing local Hugging Face checkout. The agent advertises only `mlx/Qwen3.8-27B-UD-Q4_K_XL`, then passes `draft/` to the loader when that target becomes resident. mlx-vlm itself has no equivalent combined layout: it receives the same two paths explicitly through `--model` and `--draft-model`.
 
 On a fresh run (no explicit `--model`/`--provider`/session flag), it injects the first discovered local model — honoring a persisted `/model` pick when that model is still present — so ambient cloud credentials (e.g. a stray `GROQ_API_KEY`) never win over the local model this command promises.
 

@@ -5,4 +5,6 @@ export interface DiscoveredModelLike {
   name: string;
   path: string;
   modelType: ModelType;
+  /** Optional external speculative drafter paired with this target checkpoint. */
+  draftModelPath?: string;
 }

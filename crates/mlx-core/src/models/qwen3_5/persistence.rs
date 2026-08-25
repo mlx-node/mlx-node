@@ -1940,7 +1940,10 @@ fn validate_mandatory_weights(
 /// Spawns a `ModelThread<Qwen35Cmd>` whose resident state owns the dense
 /// hybrid scheduler after loading all weights inside the init function.
 /// Returns a `Qwen3_5Model` thin shell with the thread handle.
-pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
+pub async fn load_with_thread(
+    model_path: &str,
+    draft_model_path: Option<String>,
+) -> Result<Qwen3_5Model> {
     let model_assets_path = model_path.to_string();
     let model_path = model_assets_path.clone();
 
@@ -2194,6 +2197,16 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                     crate::array::memory::materialize_weights(&arrays)?
                 };
 
+                let dflash2_weight_bytes = if let Some(draft_path) = draft_model_path.as_deref() {
+                    let (draft, bytes) = super::dflash2::load_dflash2(Path::new(draft_path))?;
+                    draft.validate_target(&config)?;
+                    inner.dflash2 = Some(draft);
+                    info!("Loaded external Qwen3.8 DFlash2 companion from {draft_path}");
+                    bytes
+                } else {
+                    0
+                };
+
                 // Set tokenizer
                 if let Some(tok) = tokenizer {
                     inner.set_tokenizer(Arc::new(tok));
@@ -2338,6 +2351,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
                 // The raw Uint8 weights + scales are already in `params`.
                 // Count only the retained BF16 correctness fallback arrays.
                 weight_bytes = weight_bytes.saturating_add(plain_fp8_residency.nbytes());
+                weight_bytes = weight_bytes.saturating_add(dflash2_weight_bytes);
 
                 Ok((inner, weight_bytes, pool_cache_limit_guard))
             })();
@@ -2363,7 +2377,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5Model> {
             let spatial_merge_size = inner.spatial_merge_size.unwrap_or(2);
             let tokenizer_out = inner.tokenizer.clone();
             let paged_active = inner.paged_adapter.is_some();
-            let mtp_active = inner.has_mtp_weights();
+            let mtp_active = inner.has_speculative_weights();
             let vision_active = super::model::qwen35_dense_vision_active(
                 inner.vision_encoder.is_some(),
                 inner.image_processor.is_some(),

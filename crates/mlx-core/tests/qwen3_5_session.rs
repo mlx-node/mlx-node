@@ -160,7 +160,7 @@ async fn qwen3_5_session_reset_purges_prefix_cache_cold_prefill() {
         Err(e) => panic!("failed to clone model dir with paged forced on: {e}"),
     };
 
-    let model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string())
+    let model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load paged Qwen3.5 Dense model");
     assert!(

@@ -399,6 +399,7 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         Ok(DsparkProposal {
             draft_ids,
             draft_dists,
+            draft_sparse_dists: Vec::new(),
         })
     }
 

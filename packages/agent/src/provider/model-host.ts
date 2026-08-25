@@ -168,7 +168,14 @@ export class MlxModelHost {
         const resolvedPath = COLD_TIER_RESTORE_FAMILIES.has(entry.modelType)
           ? await this.resolveModelPathFn(entry, { persistPagedCache: this.persistPagedCache })
           : await this.resolveModelPathFn(entry);
-        const model = await this.loadModelFn(resolvedPath);
+        // Preserve the ordinary one-argument call for unpaired checkpoints.
+        // A discovered DFlash2 companion is an explicit load option rather
+        // than a second advertised model: target and draft become one
+        // resident session and the native loader validates their compatibility.
+        const model =
+          entry.draftModelPath === undefined
+            ? await this.loadModelFn(resolvedPath)
+            : await this.loadModelFn(resolvedPath, { draftModelPath: entry.draftModelPath });
         const sessionModel = model as unknown as SessionCapableModel;
         const gemmaDraftActive = entry.modelType === 'gemma4' && sessionModel.hasMtpWeights?.() === true;
         if (this.requirePagedCache && sessionModel.hasBlockPagedCache?.() !== true && !gemmaDraftActive) {

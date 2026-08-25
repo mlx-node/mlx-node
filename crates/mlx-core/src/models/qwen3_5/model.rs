@@ -828,6 +828,11 @@ pub(crate) struct Qwen35Inner {
     pub(crate) layers: Vec<DecoderLayer>,
     pub(crate) final_norm: RMSNorm,
     pub(crate) lm_head: Option<LinearProj>,
+    /// Optional external DFlash2 companion. When installed it takes
+    /// precedence over the target checkpoint's inline one-layer MTP head.
+    pub(crate) dflash2: Option<super::dflash2::DFlash2Model>,
+    pub(crate) dflash2_context: Option<super::dflash2::DFlash2ContextCache>,
+    pub(crate) dflash2_turn_state: Option<super::dflash2_decode::DFlash2TurnState>,
     pub(crate) caches: Option<Vec<Qwen3_5LayerCache>>,
     pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) vision_encoder: Option<Arc<Qwen3_5VisionEncoder>>,
@@ -1585,6 +1590,9 @@ impl Qwen35Inner {
             layers,
             final_norm,
             lm_head,
+            dflash2: None,
+            dflash2_context: None,
+            dflash2_turn_state: None,
             caches: None,
             tokenizer: None,
             vision_encoder: None,
@@ -1933,9 +1941,16 @@ impl Qwen35Inner {
             }
         }
         self.caches = None;
+        self.dflash2_context = None;
+        self.dflash2_turn_state = None;
         self.scheduled_recurrent = RecurrentStateTable::stage2();
         self.active_scheduled_seq = None;
         self.clear_reuse_state();
+        // No cache owner remains after a full reset. Clear both transition
+        // latches so the next flat prefill becomes authoritative instead of
+        // inheriting the preceding paged/partial-MTP lane's provenance.
+        self.paged_full_attn_caches_dirty = false;
+        self.flat_mtp_caches_desynced = false;
         // A full session reset must also clear the MTP acceptance gate
         // state: a new independent chat on this model starts fresh (probes)
         // instead of inheriting the previous chat's rejection.
@@ -9621,6 +9636,10 @@ impl Qwen35Inner {
     pub(crate) fn has_mtp_weights(&self) -> bool {
         self.mtp.is_some() && self.mtp_weights_loaded
     }
+
+    pub(crate) fn has_speculative_weights(&self) -> bool {
+        self.dflash2.is_some() || self.has_mtp_weights()
+    }
 }
 
 /// Adapter giving the engine's [`ChunkSink`] the `.call()` shape the
@@ -10359,6 +10378,11 @@ impl Qwen35Inner {
         self.preflight_paged_context(args.tokens.len(), &mut constrained_params)?;
         // Only dirty the flat-attention mirror after deterministic preflight
         // succeeds. A rejected request has not touched the paged adapter.
+        // The DFlash2 context belongs to that flat mirror, so discard it at
+        // the same ownership boundary. In particular, a future equal-length
+        // prompt must not mistake this stale draft K/V for the paged prefix.
+        self.dflash2_context = None;
+        self.dflash2_turn_state = None;
         self.paged_full_attn_caches_dirty = true;
         let mut constrained_args = WholeTurnArgs {
             tokens: args.tokens,
@@ -11553,6 +11577,76 @@ impl Qwen35Inner {
     }
 }
 
+fn resolve_qwen35_chat_params(
+    config: &ChatConfig,
+    defaults: &crate::engine::ModelGenerationDefaults,
+    dflash_block_size: Option<usize>,
+) -> crate::engine::params::ChatParams {
+    // Mirror ChatBackend's default resolution before applying the
+    // algorithm-specific DFlash knobs. Overriding `resolve_params` must not
+    // discard generation_config.json defaults for ordinary Qwen turns.
+    let mut merged = config.clone();
+    crate::engine::apply_generation_defaults(&mut merged, defaults);
+    let mut params = crate::engine::extract_chat_params(&merged);
+    if let Some(block_size) = dflash_block_size {
+        params.mtp_depth = config
+            .mtp_depth
+            .map(|depth| (depth.max(1) as usize).min(block_size))
+            .unwrap_or(block_size);
+        params.mtp_adaptive_depth = config.mtp_adaptive_depth.unwrap_or(false);
+    }
+    params
+}
+
+#[cfg(test)]
+mod qwen35_param_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn dflash_override_preserves_generation_defaults_and_request_precedence() {
+        let defaults = crate::engine::ModelGenerationDefaults {
+            temperature: Some(0.35),
+            top_k: Some(17),
+            top_p: Some(0.82),
+            min_p: Some(0.04),
+            repetition_penalty: Some(1.08),
+            ..crate::engine::ModelGenerationDefaults::default()
+        };
+        let ordinary = resolve_qwen35_chat_params(&ChatConfig::default(), &defaults, None);
+        let sampling = ordinary.sampling_config.expect("sampling config");
+        assert_eq!(sampling.temperature, Some(0.35));
+        assert_eq!(sampling.top_k, Some(17));
+        assert_eq!(ordinary.repetition_penalty, 1.08);
+        assert_eq!(ordinary.mtp_depth, 1);
+
+        let params = resolve_qwen35_chat_params(&ChatConfig::default(), &defaults, Some(8));
+        let sampling = params.sampling_config.expect("sampling config");
+        assert_eq!(sampling.temperature, Some(0.35));
+        assert_eq!(sampling.top_k, Some(17));
+        assert_eq!(sampling.top_p, Some(0.82));
+        assert_eq!(sampling.min_p, Some(0.04));
+        assert_eq!(params.repetition_penalty, 1.08);
+        assert_eq!(params.mtp_depth, 8);
+
+        let explicit = resolve_qwen35_chat_params(
+            &ChatConfig {
+                temperature: Some(0.0),
+                top_k: Some(3),
+                repetition_penalty: Some(1.0),
+                mtp_depth: Some(2),
+                ..ChatConfig::default()
+            },
+            &defaults,
+            Some(8),
+        );
+        let sampling = explicit.sampling_config.expect("sampling config");
+        assert_eq!(sampling.temperature, Some(0.0));
+        assert_eq!(sampling.top_k, Some(3));
+        assert_eq!(explicit.repetition_penalty, 1.0);
+        assert_eq!(explicit.mtp_depth, 2);
+    }
+}
+
 impl ChatBackend for Qwen35Inner {
     fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
         self.tokenizer
@@ -11589,6 +11683,14 @@ impl ChatBackend for Qwen35Inner {
         Some(&self.gen_defaults)
     }
 
+    fn resolve_params(&self, config: &ChatConfig) -> crate::engine::params::ChatParams {
+        resolve_qwen35_chat_params(
+            config,
+            &self.gen_defaults,
+            self.dflash2.as_ref().map(|draft| draft.config.block_size),
+        )
+    }
+
     fn extra_eos_ids(&self) -> Vec<u32> {
         self.gen_defaults.eos_token_ids.clone()
     }
@@ -11603,6 +11705,8 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+        self.dflash2_context = None;
+        self.dflash2_turn_state = None;
         match scope {
             // Prefix-miss reset: reset each live layer cache, then install a
             // fresh hybrid cache vec. PRESERVES `cached_token_history` /
@@ -11803,6 +11907,26 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn execution_plan(&self) -> ExecutionPlan {
+        let speculative = if self.dflash2.is_some() {
+            Some(SpeculativePlan {
+                kind: SpeculativeKind::DraftModel,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::NONE,
+                // DFlash2 verification currently uses the flat hybrid-cache
+                // snapshot/tape replay path. The target's paged adapter stays
+                // installed for ordinary AR turns but is not used here.
+                supports_paged_attention: false,
+                supports_streaming: true,
+            })
+        } else {
+            self.has_mtp_weights().then_some(SpeculativePlan {
+                kind: SpeculativeKind::NativeMtp,
+                supported_input_media: MediaCapabilities::NONE,
+                supported_context_media: MediaCapabilities::IMAGES,
+                supports_paged_attention: true,
+                supports_streaming: true,
+            })
+        };
         ExecutionPlan {
             media: qwen35_dense_media_plan(
                 self.vision_encoder.is_some(),
@@ -11812,25 +11936,17 @@ impl ChatBackend for Qwen35Inner {
             paged_attention: self.paged_adapter.as_ref().map(|_| PagedAttentionPlan {
                 supports_delta: true,
             }),
-            speculative: self.has_mtp_weights().then_some(SpeculativePlan {
-                kind: SpeculativeKind::NativeMtp,
-                supported_input_media: MediaCapabilities::NONE,
-                // A text delta can continue an image-derived live session
-                // with native MTP. The current turn carries no image bytes;
-                // the eager paged-MTP core verifies against the target's
-                // existing paged KV context. This is the same route the old
-                // session dispatcher selected: its paged probe ran before the
-                // MTP probe and dense `paged_turn` handled MTP directly.
-                supported_context_media: MediaCapabilities::IMAGES,
-                supports_paged_attention: true,
-                supports_streaming: true,
-            }),
+            speculative,
         }
     }
 
     fn wired_limit_bytes(&self) -> Option<usize> {
         // Per-turn wired-memory limit = the model's estimated footprint.
-        Some(self.config.estimate_memory_bytes() as usize)
+        let draft = self
+            .dflash2
+            .as_ref()
+            .map_or(0usize, |draft| draft.weight_bytes as usize);
+        Some((self.config.estimate_memory_bytes() as usize).saturating_add(draft))
     }
 
     fn profiler_label(&self, is_delta: bool, is_streaming: bool) -> &'static str {
@@ -11892,11 +12008,13 @@ impl ChatBackend for Qwen35Inner {
         // MTP weights, flat-cache admission, and text-only input. The dense
         // core retains the algorithm-specific MTP gate and AR fallback.
         debug_assert!(args.media.is_empty());
-        debug_assert!(matches!(
-            args.plan.decoder,
-            DecoderPlan::Speculative(SpeculativeKind::NativeMtp)
-        ));
-        self.dense_whole_turn(args)
+        match args.plan.decoder {
+            DecoderPlan::Speculative(SpeculativeKind::DraftModel) => self.dflash2_chat_turn(args),
+            DecoderPlan::Speculative(SpeculativeKind::NativeMtp) => self.dense_whole_turn(args),
+            _ => Err(Error::from_reason(
+                "Qwen3.5 speculative turn received a non-speculative decoder plan",
+            )),
+        }
     }
 
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
@@ -11919,6 +12037,13 @@ pub struct Qwen3_5GenerationConfig {
     pub top_p: Option<f64>,
     #[napi(ts_type = "number | undefined")]
     pub min_p: Option<f64>,
+}
+
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct Qwen35LoadOptions {
+    /// External z-lab DFlash2 checkpoint directory.
+    pub draft_model_path: Option<String>,
 }
 
 /// Generation result
@@ -11977,11 +12102,11 @@ pub struct Qwen3_5Model {
     /// flat path. Dense image turns only run on the paged-vision core. Surfaced
     /// through the `hasBlockPagedCache()` NAPI method.
     pub(crate) paged_active: bool,
-    /// Snapshot of `Qwen35Inner::has_mtp_weights()` captured
+    /// Snapshot of `Qwen35Inner::has_speculative_weights()` captured
     /// at construction time, mirroring `paged_active`. Surfaced through
     /// the `hasMtpWeights()` NAPI method so the TS ChatSession can
-    /// auto-default `enableMtp = true` for checkpoints that ship an MTP
-    /// head without round-tripping through the model thread.
+    /// auto-default `enableMtp = true` for inline MTP or an attached DFlash2
+    /// companion without round-tripping through the model thread.
     pub(crate) mtp_active: bool,
     /// Snapshot of the fully loaded image execution stack. `true` only when
     /// the vision encoder and image processor were both installed and the
@@ -12062,11 +12187,9 @@ impl Qwen3_5Model {
         send_and_await(&self.thread, |reply| Qwen35Cmd::SchedulerStats { reply }).await
     }
 
-    /// Whether this checkpoint shipped an MTP head (module loaded by
-    /// `persistence::apply_weights_inner`). Snapshotted at load time from
-    /// `Qwen35Inner::has_mtp_weights()` so the TS `ChatSession` can
-    /// auto-default `enableMtp = true` for MTP-capable checkpoints without
-    /// dispatching a command into the model thread.
+    /// Whether this instance has an inline MTP head or external DFlash2
+    /// companion. Snapshotted at load time so `ChatSession` can auto-default
+    /// `enableMtp = true` without dispatching into the model thread.
     ///
     /// Note: this only reports weight availability. Whether the
     /// speculative-decode path actually runs on a given call also requires the
@@ -12121,7 +12244,8 @@ impl Qwen3_5Model {
     /// - model.safetensors (or model-*.safetensors)
     /// - tokenizer.json + tokenizer_config.json
     #[napi]
-    pub async fn load(path: String) -> Result<Qwen3_5Model> {
+    pub async fn load(path: String, options: Option<Qwen35LoadOptions>) -> Result<Qwen3_5Model> {
+        let draft_model_path = options.and_then(|options| options.draft_model_path);
         let source = std::path::Path::new(&path);
         if source.is_file()
             && source
@@ -12130,9 +12254,9 @@ impl Qwen3_5Model {
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
         {
             let cache = crate::utils::gguf::prepare_qwen35_native_gguf(source).await?;
-            return persistence::load_with_thread(&cache.to_string_lossy()).await;
+            return persistence::load_with_thread(&cache.to_string_lossy(), draft_model_path).await;
         }
-        persistence::load_with_thread(&path).await
+        persistence::load_with_thread(&path, draft_model_path).await
     }
 
     /// Generate text from a prompt token sequence.
@@ -12433,7 +12557,7 @@ crate::models::chat_napi::chat_napi_surface! {
 /// At 1024-prompt single-chunk the value is irrelevant — the loop is
 /// guarded by `total_len - offset > PREFILL_STEP_SIZE` so any T < step
 /// goes through the single `remaining` branch unchanged.
-const PREFILL_STEP_SIZE: i64 = 2048;
+pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
 /// Must be called between prefill chunks to break lazy dependency chains.
@@ -12812,6 +12936,71 @@ fn forward_pre_norm_inner_with_tape(
     }
 
     Ok(h)
+}
+
+/// Target forward used by the external DFlash2 stepper. Captures post-layer
+/// residuals in the companion checkpoint's declared order and optionally
+/// records the GDN recurrence tape needed to roll a speculative verify block
+/// back to its accepted prefix.
+pub(crate) fn forward_dflash2_with_taps(
+    inner: &mut Qwen35Inner,
+    input_ids: &MxArray,
+    tap_layers: &[usize],
+    record_tape: bool,
+) -> Result<(
+    MxArray,
+    Vec<MxArray>,
+    Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+)> {
+    if tap_layers.is_empty() || tap_layers.iter().any(|&layer| layer >= inner.layers.len()) {
+        return Err(Error::from_reason(format!(
+            "DFlash2 target tap layers are invalid: {tap_layers:?} for {} layers",
+            inner.layers.len()
+        )));
+    }
+    let mut hidden = inner.embedding.forward(input_ids)?;
+    let mut taps: Vec<Option<MxArray>> = vec![None; tap_layers.len()];
+    let mut tape = std::iter::repeat_with(|| None)
+        .take(inner.layers.len())
+        .collect::<Vec<_>>();
+    for index in 0..inner.layers.len() {
+        let cache = inner.caches.as_mut().map(|caches| &mut caches[index]);
+        hidden = if record_tape {
+            let mut slot = None;
+            let hidden = inner.layers[index].forward_with_tape(
+                &hidden,
+                None,
+                cache,
+                None,
+                true,
+                Some(&mut slot),
+            )?;
+            tape[index] = slot;
+            hidden
+        } else {
+            inner.layers[index].forward(&hidden, None, cache, None, true)?
+        };
+        for (slot, &tap_layer) in tap_layers.iter().enumerate() {
+            if tap_layer == index {
+                taps[slot] = Some(hidden.clone());
+            }
+        }
+    }
+    let taps = taps
+        .into_iter()
+        .enumerate()
+        .map(|(slot, tap)| {
+            tap.ok_or_else(|| {
+                Error::from_reason(format!(
+                    "DFlash2 target tap {} at layer {} was not captured",
+                    slot, tap_layers[slot]
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let normalized = inner.final_norm.forward(&hidden)?;
+    let logits = project_logits_from_hidden(&normalized, &inner.lm_head, &inner.embedding)?;
+    Ok((logits, taps, tape))
 }
 
 fn project_logits_from_hidden(
@@ -18252,9 +18441,13 @@ mod paged_gdn_frontier_tests {
         let mut inner = Qwen35Inner::new(tiny_cfg()).expect("construct tiny dense model");
         inner.paged_gdn_state_dirty = true;
         inner.paged_gdn_force_mismatch_for_test = true;
+        inner.paged_full_attn_caches_dirty = true;
+        inner.flat_mtp_caches_desynced = true;
         inner.reset_caches_sync().expect("reset");
         assert!(!inner.paged_gdn_state_dirty);
         assert!(!inner.paged_gdn_force_mismatch_for_test);
+        assert!(!inner.paged_full_attn_caches_dirty);
+        assert!(!inner.flat_mtp_caches_desynced);
     }
 }
 

@@ -121,6 +121,56 @@ pub(crate) struct SparseDistributionRows {
 }
 
 impl SparseDistribution {
+    pub(crate) fn from_parts(
+        token_ids: Vec<i32>,
+        mut probs: Vec<f64>,
+        vocab_size: usize,
+    ) -> Result<Self> {
+        if token_ids.is_empty() || token_ids.len() != probs.len() || vocab_size == 0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                format!(
+                    "invalid sparse distribution: ids={} probs={} vocab={vocab_size}",
+                    token_ids.len(),
+                    probs.len()
+                ),
+            ));
+        }
+        let mut seen = std::collections::HashSet::with_capacity(token_ids.len());
+        let mut total = 0.0f64;
+        for (&token_id, &prob) in token_ids.iter().zip(probs.iter()) {
+            if token_id < 0 || token_id as usize >= vocab_size || !seen.insert(token_id) {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!(
+                        "invalid sparse distribution token id {token_id} for vocab {vocab_size}"
+                    ),
+                ));
+            }
+            if !prob.is_finite() || prob < 0.0 {
+                return Err(Error::new(
+                    Status::InvalidArg,
+                    format!("invalid sparse distribution probability {prob}"),
+                ));
+            }
+            total += prob;
+        }
+        if !total.is_finite() || total <= 0.0 {
+            return Err(Error::new(
+                Status::InvalidArg,
+                "sparse distribution has no positive probability mass".to_string(),
+            ));
+        }
+        for prob in &mut probs {
+            *prob /= total;
+        }
+        Ok(Self {
+            token_ids,
+            probs,
+            vocab_size,
+        })
+    }
+
     pub(crate) fn as_row(&self) -> SparseDistributionRef<'_> {
         SparseDistributionRef {
             token_ids: &self.token_ids,
@@ -939,6 +989,72 @@ pub(crate) fn accept_with_residual_sparse<R: Rng + ?Sized>(
         false,
         sample_sparse_slices(&residual_ids, &residual_probs, rng)?,
     ))
+}
+
+/// Exact speculative acceptance for a dense target distribution and a sparse
+/// proposal. DFlash2's selector has only 16 candidates even when the target
+/// sampler has full-vocabulary support.
+pub(crate) fn accept_with_residual_dense_target_sparse_draft<R: Rng + ?Sized>(
+    target_p: &MxArray,
+    draft_q: SparseDistributionRef<'_>,
+    draft_id: i32,
+    rng: &mut R,
+) -> Result<(bool, i32)> {
+    if draft_id < 0 || target_p.ndim()? as usize != 1 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            "dense-target/sparse-draft acceptance requires a non-negative draft id and 1D target"
+                .to_string(),
+        ));
+    }
+    let vocab = target_p.shape_at(0)? as usize;
+    if vocab != draft_q.vocab_size || draft_id as usize >= vocab {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "dense-target/sparse-draft vocab mismatch: target={vocab} draft={} id={draft_id}",
+                draft_q.vocab_size
+            ),
+        ));
+    }
+
+    let target = target_p.astype(DType::Float32)?;
+    target.eval();
+    let p = f64::from(target.item_at_float32(draft_id as usize)?);
+    let q = draft_q.probability(draft_id);
+    let u: f64 = rng.random();
+    if u < acceptance_probability_from_probs(p, q) {
+        return Ok((true, draft_id));
+    }
+
+    // Rejection is the cold branch. Scatter only the selector's tiny support
+    // into a dense GPU row, then use the same MLX residual/categorical path as
+    // dense speculative acceptance. Accepted proposals never copy the full
+    // target distribution to CPU.
+    let ids = MxArray::from_int32(draft_q.token_ids, &[draft_q.token_ids.len() as i64])?;
+    let values = draft_q
+        .probs
+        .iter()
+        .map(|&prob| prob as f32)
+        .collect::<Vec<_>>();
+    let values = MxArray::from_float32(&values, &[values.len() as i64])?;
+    let sparse_dense =
+        MxArray::zeros(&[vocab as i64], Some(DType::Float32))?.put_along_axis(&ids, &values, 0)?;
+    let residual = target.sub(&sparse_dense)?.clip(Some(0.0), None)?;
+    let total_array = residual.sum(None, None)?;
+    total_array.eval();
+    let total = total_array.item_at_float32(0)?;
+    if !total.is_finite() || total <= 0.0 {
+        let best = target.argmax(0, None)?;
+        best.eval();
+        return Ok((false, best.item_at_int32(0)?));
+    }
+    let sampled = residual
+        .div_scalar(f64::from(total))?
+        .log()?
+        .categorical(Some(-1))?;
+    sampled.eval();
+    Ok((false, sampled.item_at_int32(0)?))
 }
 
 pub(crate) fn acceptance_probability_from_probs(p: f64, q: f64) -> f64 {
@@ -1986,6 +2102,26 @@ mod accept_with_residual_tests {
         let mut data = vec![0.0f32; vocab];
         data[token] = 1.0;
         MxArray::from_float32(&data, &[vocab as i64]).expect("from_float32")
+    }
+
+    #[test]
+    fn dense_target_sparse_draft_rejects_and_samples_full_vocab_residual() {
+        let target = MxArray::from_float32(&[0.1, 0.9, 0.0], &[3]).expect("target");
+        let draft =
+            SparseDistribution::from_parts(vec![0, 2], vec![0.8, 0.2], 3).expect("sparse draft");
+        let mut rng = ScriptedRng::new(&[u64::MAX]);
+        let (accepted, token) =
+            accept_with_residual_dense_target_sparse_draft(&target, draft.as_row(), 0, &mut rng)
+                .expect("dense/sparse correction");
+        assert!(!accepted);
+        assert_eq!(token, 1);
+    }
+
+    #[test]
+    fn sparse_distribution_constructor_rejects_duplicate_support() {
+        let error = SparseDistribution::from_parts(vec![1, 1], vec![0.5, 0.5], 3)
+            .expect_err("duplicate support must fail");
+        assert!(error.reason.contains("token id 1"));
     }
 
     /// SamplingConfig with `temperature = 1.0` — keeps the stochastic

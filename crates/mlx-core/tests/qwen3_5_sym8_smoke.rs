@@ -39,7 +39,7 @@ async fn sym8_checkpoint_loads_and_generates_coherent_text() {
         model_path
     );
 
-    let model = Qwen3_5Model::load(model_path.clone())
+    let model = Qwen3_5Model::load(model_path.clone(), None)
         .await
         .expect("failed to load sym8 Qwen3.5 model");
 

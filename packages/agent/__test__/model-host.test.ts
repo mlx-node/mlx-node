@@ -55,6 +55,21 @@ describe('MlxModelHost', () => {
     expect(host.residentId).toBe('qwen-small');
   });
 
+  it('loads an auto-discovered DFlash2 companion with its Qwen target', async () => {
+    const loader = vi.fn(async () => ({ hasBlockPagedCache: () => true }) as unknown as LoadableModel);
+    const model: DiscoveredModelLike = {
+      name: 'qwen38-q4xl',
+      path: '/models/qwen38-q4xl/Qwen3.8-27B-UD-Q4_K_XL.gguf',
+      modelType: 'qwen3_5',
+      draftModelPath: '/models/qwen38-q4xl/draft',
+    };
+    const host = new MlxModelHost([model], { loadModelFn: loader, requirePagedCache: true });
+
+    await getSession(host, model.name);
+
+    expect(loader).toHaveBeenCalledWith(model.path, { draftModelPath: model.draftModelPath });
+  });
+
   it('forwards the loaded model image capability through ChatSession', async () => {
     const loader = vi.fn(async () => ({ supportsImages: () => true }) as unknown as LoadableModel);
     const host = new MlxModelHost(MODELS, { loadModelFn: loader });

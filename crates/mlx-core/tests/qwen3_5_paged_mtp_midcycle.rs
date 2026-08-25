@@ -161,7 +161,7 @@ async fn load_paged_mtp_model_or_skip() -> Option<Qwen3_5Model> {
         model_dir.exists(),
         "MLX_TEST_MODEL_PATH does not exist: {model_path}"
     );
-    let model = Qwen3_5Model::load(model_path.clone())
+    let model = Qwen3_5Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 model");
     if !model.has_mtp_weights() {

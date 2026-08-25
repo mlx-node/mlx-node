@@ -513,6 +513,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             DsparkProposal {
                 draft_ids: Vec::new(),
                 draft_dists: Vec::new(),
+                draft_sparse_dists: Vec::new(),
             }
         };
         // Contract enforcement at the proposal boundary: `propose` may
@@ -621,11 +622,18 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             // Sampled path: per-position Leviathan accept + residual
             // resample against the stepper's proposal densities.
             (|| {
-                if proposal.draft_dists.len() != draft_len {
+                // A zero-draft cycle is the intentional AR-through-verify
+                // fallback: it owns no proposal rows and samples only the
+                // verifier boundary below. Enforce exclusive dense/sparse
+                // proposal ownership only when there is a drafted token.
+                let has_dense = draft_len > 0 && proposal.draft_dists.len() == draft_len;
+                let has_sparse = draft_len > 0 && proposal.draft_sparse_dists.len() == draft_len;
+                if draft_len > 0 && has_dense == has_sparse {
                     return Err(Error::from_reason(format!(
-                        "DSpark sampled accept requires one proposal distribution per \
-                         drafted token (got {} dists for {} drafts)",
+                        "DSpark sampled accept requires exactly one dense or sparse proposal \
+                         distribution per drafted token (got {} dense, {} sparse for {} drafts)",
                         proposal.draft_dists.len(),
+                        proposal.draft_sparse_dists.len(),
                         draft_len
                     )));
                 }
@@ -640,13 +648,22 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                     let p_target = sampling::sampling_distribution(&penalized, p.sampling_config)?
                         .astype(DType::Float32)?;
                     p_target.eval();
-                    let (accept, out_tok) = sampling::accept_with_residual(
-                        &p_target,
-                        &proposal.draft_dists[i],
-                        proposal.draft_ids[i],
-                        &sampling_cfg,
-                        rng,
-                    )?;
+                    let (accept, out_tok) = if has_sparse {
+                        sampling::accept_with_residual_dense_target_sparse_draft(
+                            &p_target,
+                            proposal.draft_sparse_dists[i].as_row(),
+                            proposal.draft_ids[i],
+                            rng,
+                        )?
+                    } else {
+                        sampling::accept_with_residual(
+                            &p_target,
+                            &proposal.draft_dists[i],
+                            proposal.draft_ids[i],
+                            &sampling_cfg,
+                            rng,
+                        )?
+                    };
                     if accept {
                         k += 1;
                         hist_extended.push(out_tok as u32);
@@ -1478,6 +1495,7 @@ mod tests {
             Ok(DsparkProposal {
                 draft_ids: script.draft_ids.clone(),
                 draft_dists,
+                draft_sparse_dists: Vec::new(),
             })
         }
 
@@ -2521,6 +2539,32 @@ mod tests {
             !out.last_in_cache,
             "the degenerate cycle's emitted token is its boundary — no K/V"
         );
+    }
+
+    #[test]
+    fn dspark_turn_sampled_remaining_one_degenerate_ar_cycle() {
+        // Sampled decoding uses the same zero-draft AR-through-verify cycle.
+        // With no drafted token both proposal distribution vectors are empty;
+        // that is valid and must sample row 0 rather than failing the
+        // dense-vs-sparse exclusivity check.
+        let mut backend =
+            MockDsparkBackend::sampled(16, vec![CycleScript::greedy(Vec::new(), vec![8])]);
+        let mut p = dense_params();
+        p.max_new_tokens = 2;
+        let out = drive_turn(&mut backend, p, 3, 15, 2);
+
+        assert_eq!(out.generated, vec![3, 8]);
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(
+            out.ledger,
+            vec![
+                Call::Verify { ids: vec![3] },
+                Call::Commit { keep: 1, total: 1 },
+                Call::EvalBoundary { token: 8 },
+            ]
+        );
+        assert!(out.acceptance.is_none());
+        assert!(!out.last_in_cache);
     }
 
     #[test]
