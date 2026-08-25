@@ -75,6 +75,27 @@ fn flat_attention_frontier(inner: &Qwen35Inner) -> Option<usize> {
     frontiers.all(|frontier| frontier == first).then_some(first)
 }
 
+fn constrain_dflash2_context_params(
+    prompt_tokens: usize,
+    target_capacity: i32,
+    draft_capacity: usize,
+    params: &mut crate::engine::params::ChatParams,
+) -> Result<usize> {
+    let target_capacity = usize::try_from(target_capacity.max(0)).unwrap_or(usize::MAX);
+    let capacity = target_capacity.min(draft_capacity);
+    super::model::constrain_paged_context_params(
+        "Qwen3.8 DFlash2",
+        prompt_tokens,
+        u32::try_from(capacity).unwrap_or(u32::MAX),
+        params,
+    )?;
+    Ok(capacity)
+}
+
+fn dflash2_final_token_fits_context(logical_len: i32, capacity: usize) -> bool {
+    usize::try_from(logical_len).is_ok_and(|logical_len| logical_len < capacity)
+}
+
 impl Qwen35DFlash2Stepper<'_> {
     fn ensure_clean(&self, operation: &str) -> Result<()> {
         if self.snapshot.is_some()
@@ -451,6 +472,15 @@ impl Qwen35Inner {
         let is_streaming = args.sink.is_some();
         let mut params = ChatBackend::resolve_params(self, args.config);
         params.extra_eos_ids = ChatBackend::extra_eos_ids(self);
+        let dflash_context_capacity = constrain_dflash2_context_params(
+            tokens.len(),
+            self.config.max_position_embeddings,
+            self.dflash2
+                .as_ref()
+                .expect("loaded DFlash2 companion")
+                .max_position_embeddings(),
+            &mut params,
+        )?;
         let prior_cached = if is_delta {
             self.cached_token_history.len()
         } else {
@@ -576,8 +606,12 @@ impl Qwen35Inner {
             Ok(outcome) => outcome.last_in_cache,
             Err(error) => return Err(self.dflash2_fail_closed(error)),
         };
+        let final_token_fits_context = self.dflash2_context.as_ref().is_some_and(|context| {
+            dflash2_final_token_fits_context(context.logical_len(), dflash_context_capacity)
+        });
         if finish_reason == "length"
             && !last_in_cache
+            && final_token_fits_context
             && let Some(&last) = generated.last()
         {
             if let Err(error) = self.dflash2_materialize_final(last, generation_stream) {
@@ -653,7 +687,34 @@ impl Qwen35Inner {
 
 #[cfg(test)]
 mod tests {
-    use super::reusable_dflash2_prefix;
+    use super::{
+        constrain_dflash2_context_params, dflash2_final_token_fits_context, reusable_dflash2_prefix,
+    };
+    use crate::engine::extract_chat_params;
+    use crate::engine::types::ChatConfig;
+
+    #[test]
+    fn context_budget_uses_the_smaller_target_or_draft_window() {
+        let mut params = extract_chat_params(&ChatConfig {
+            max_new_tokens: Some(64),
+            ..ChatConfig::default()
+        });
+        let capacity = constrain_dflash2_context_params(10, 16, 12, &mut params)
+            .expect("valid prompt is clamped");
+        assert_eq!(capacity, 12);
+        assert_eq!(params.max_new_tokens, 3);
+
+        let mut too_long = extract_chat_params(&ChatConfig::default());
+        let error = constrain_dflash2_context_params(13, 16, 12, &mut too_long)
+            .expect_err("prompt beyond draft context must fail before prefill");
+        assert!(error.reason.contains("effective active context is 12"));
+
+        assert!(dflash2_final_token_fits_context(11, capacity));
+        assert!(
+            !dflash2_final_token_fits_context(12, capacity),
+            "the final sampled token may be returned at capacity but must not be forwarded"
+        );
+    }
 
     #[test]
     fn continuation_requires_matching_prefix_and_flat_frontier() {

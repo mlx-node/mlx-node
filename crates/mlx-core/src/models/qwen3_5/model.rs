@@ -11577,6 +11577,76 @@ impl Qwen35Inner {
     }
 }
 
+fn resolve_qwen35_chat_params(
+    config: &ChatConfig,
+    defaults: &crate::engine::ModelGenerationDefaults,
+    dflash_block_size: Option<usize>,
+) -> crate::engine::params::ChatParams {
+    // Mirror ChatBackend's default resolution before applying the
+    // algorithm-specific DFlash knobs. Overriding `resolve_params` must not
+    // discard generation_config.json defaults for ordinary Qwen turns.
+    let mut merged = config.clone();
+    crate::engine::apply_generation_defaults(&mut merged, defaults);
+    let mut params = crate::engine::extract_chat_params(&merged);
+    if let Some(block_size) = dflash_block_size {
+        params.mtp_depth = config
+            .mtp_depth
+            .map(|depth| (depth.max(1) as usize).min(block_size))
+            .unwrap_or(block_size);
+        params.mtp_adaptive_depth = config.mtp_adaptive_depth.unwrap_or(false);
+    }
+    params
+}
+
+#[cfg(test)]
+mod qwen35_param_resolution_tests {
+    use super::*;
+
+    #[test]
+    fn dflash_override_preserves_generation_defaults_and_request_precedence() {
+        let defaults = crate::engine::ModelGenerationDefaults {
+            temperature: Some(0.35),
+            top_k: Some(17),
+            top_p: Some(0.82),
+            min_p: Some(0.04),
+            repetition_penalty: Some(1.08),
+            ..crate::engine::ModelGenerationDefaults::default()
+        };
+        let ordinary = resolve_qwen35_chat_params(&ChatConfig::default(), &defaults, None);
+        let sampling = ordinary.sampling_config.expect("sampling config");
+        assert_eq!(sampling.temperature, Some(0.35));
+        assert_eq!(sampling.top_k, Some(17));
+        assert_eq!(ordinary.repetition_penalty, 1.08);
+        assert_eq!(ordinary.mtp_depth, 1);
+
+        let params = resolve_qwen35_chat_params(&ChatConfig::default(), &defaults, Some(8));
+        let sampling = params.sampling_config.expect("sampling config");
+        assert_eq!(sampling.temperature, Some(0.35));
+        assert_eq!(sampling.top_k, Some(17));
+        assert_eq!(sampling.top_p, Some(0.82));
+        assert_eq!(sampling.min_p, Some(0.04));
+        assert_eq!(params.repetition_penalty, 1.08);
+        assert_eq!(params.mtp_depth, 8);
+
+        let explicit = resolve_qwen35_chat_params(
+            &ChatConfig {
+                temperature: Some(0.0),
+                top_k: Some(3),
+                repetition_penalty: Some(1.0),
+                mtp_depth: Some(2),
+                ..ChatConfig::default()
+            },
+            &defaults,
+            Some(8),
+        );
+        let sampling = explicit.sampling_config.expect("sampling config");
+        assert_eq!(sampling.temperature, Some(0.0));
+        assert_eq!(sampling.top_k, Some(3));
+        assert_eq!(explicit.repetition_penalty, 1.0);
+        assert_eq!(explicit.mtp_depth, 2);
+    }
+}
+
 impl ChatBackend for Qwen35Inner {
     fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
         self.tokenizer
@@ -11614,15 +11684,11 @@ impl ChatBackend for Qwen35Inner {
     }
 
     fn resolve_params(&self, config: &ChatConfig) -> crate::engine::params::ChatParams {
-        let mut params = crate::engine::extract_chat_params(config);
-        if let Some(draft) = self.dflash2.as_ref() {
-            params.mtp_depth = config
-                .mtp_depth
-                .map(|depth| (depth.max(1) as usize).min(draft.config.block_size))
-                .unwrap_or(draft.config.block_size);
-            params.mtp_adaptive_depth = config.mtp_adaptive_depth.unwrap_or(false);
-        }
-        params
+        resolve_qwen35_chat_params(
+            config,
+            &self.gen_defaults,
+            self.dflash2.as_ref().map(|draft| draft.config.block_size),
+        )
     }
 
     fn extra_eos_ids(&self) -> Vec<u32> {

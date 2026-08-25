@@ -630,6 +630,10 @@ pub(crate) struct DFlash2Model {
 }
 
 impl DFlash2Model {
+    pub(crate) fn max_position_embeddings(&self) -> usize {
+        self.config.max_position_embeddings
+    }
+
     pub(crate) fn validate_target(&self, target: &super::config::Qwen3_5Config) -> Result<()> {
         let invalid_tap = self
             .config
