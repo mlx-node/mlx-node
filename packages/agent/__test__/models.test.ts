@@ -209,6 +209,17 @@ describe('discoverMlxModels', () => {
         join(repo, 'config.json'),
         JSON.stringify({ model_type: 'qwen3_5', text_config: { max_position_embeddings: 65536 } }),
       );
+      const draft = join(repo, 'draft');
+      await mkdir(draft, { recursive: true });
+      await writeFile(
+        join(draft, 'config.json'),
+        JSON.stringify({
+          model_type: 'qwen3',
+          architectures: ['DFlash2DraftModel'],
+          dflash_config: { block_size: 8 },
+        }),
+      );
+      await writeFile(join(draft, 'model.safetensors'), 'draft weights');
       await Promise.all([
         writeFile(join(repo, 'Qwen3.8-27B-UD-Q3_K_XL.gguf'), 'q3'),
         writeFile(join(repo, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'), 'q4'),
@@ -224,11 +235,13 @@ describe('discoverMlxModels', () => {
           name: 'Qwen3.8-27B-UD-Q3_K_XL',
           path: join(repo, 'Qwen3.8-27B-UD-Q3_K_XL.gguf'),
           modelType: 'qwen3_5',
+          draftModelPath: draft,
         },
         {
           name: 'Qwen3.8-27B-UD-Q4_K_XL',
           path: join(repo, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'),
           modelType: 'qwen3_5',
+          draftModelPath: draft,
         },
       ]);
       expect(discovered.map((model) => model.piModel.contextWindow)).toEqual([65536, 65536]);
