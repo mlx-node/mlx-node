@@ -186,7 +186,7 @@ async fn qwen3_5_paged_vs_flat_greedy_token_parity() {
     };
 
     let prompts = parity_prompts();
-    let flat_model = Qwen3_5Model::load(flat_dir.to_string_lossy().to_string())
+    let flat_model = Qwen3_5Model::load(flat_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load flat-path Qwen3.5 model");
     let mut flat_results = Vec::with_capacity(prompts.len());
@@ -210,7 +210,7 @@ async fn qwen3_5_paged_vs_flat_greedy_token_parity() {
         .expect("flat-path Qwen3.5 model thread panicked during teardown");
     mlx_core::array::synchronize_and_clear_cache();
 
-    let paged_model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string())
+    let paged_model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load paged-path Qwen3.5 model");
     assert!(

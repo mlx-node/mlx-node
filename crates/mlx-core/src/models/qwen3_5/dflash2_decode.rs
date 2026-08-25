@@ -1,4 +1,4 @@
-//! DFlash speculative-turn integration for Muse-Glimmer.
+//! DFlash2 whole-turn integration for dense Qwen3.8.
 
 use std::time::Instant;
 
@@ -15,41 +15,44 @@ use crate::engine::dspark_turn::{DsparkTurnArgs, run_dspark_turn};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::params::generated_capacity_hint;
 use crate::engine::penalties::{ReasoningTracker, apply_all_penalties};
-use crate::models::gemma4::layer_cache::{
-    Gemma4VerifyRollback, active_cache_frontier, commit_after_verify, snapshot_before_verify,
-};
 use crate::stream::{DeviceType, Stream, StreamContext};
 
-use super::dflash::DFlashContextCache;
-use super::model::MuseGlimmerInner;
+use super::dflash2::DFlash2ContextCache;
+use super::layer_cache::{Qwen3_5LayerSnapshot, replay_mtp_snapshot_to, snapshot_all_mtp};
+use super::model::{PREFILL_STEP_SIZE, Qwen35Inner, async_eval_layer_caches};
 
-pub(crate) struct DFlashTurnState {
-    context: DFlashContextCache,
+pub(crate) struct DFlash2TurnState {
+    context: DFlash2ContextCache,
     next_position: i32,
 }
 
-pub(crate) struct MuseGlimmerDFlashStepper<'a> {
-    inner: &'a mut MuseGlimmerInner,
-    context: DFlashContextCache,
+pub(crate) struct Qwen35DFlash2Stepper<'a> {
+    inner: &'a mut Qwen35Inner,
+    context: DFlash2ContextCache,
     next_position: i32,
     tap_layers: Vec<usize>,
-    rollback: Option<Gemma4VerifyRollback>,
+    snapshot: Option<Vec<Qwen3_5LayerSnapshot>>,
+    tape: Option<Vec<Option<super::gated_delta_net::GdnLayerTape>>>,
     tapped: Option<Vec<MxArray>>,
+    verified_ids: Option<Vec<u32>>,
 }
 
-fn reusable_dflash_prefix(
+fn reusable_dflash2_prefix(
     is_delta: bool,
-    token_len: usize,
+    tokens: &[u32],
     prior_cached: usize,
     verified_hit: usize,
-    retained_context_len: Option<i32>,
+    retained_context_tokens: Option<&[u32]>,
+    flat_attention_frontier: Option<usize>,
+    flat_lane_authoritative: bool,
 ) -> usize {
     let candidate = if is_delta { prior_cached } else { verified_hit };
     if candidate > 0
-        && candidate < token_len
-        && i32::try_from(candidate)
-            .ok()
-            .is_some_and(|candidate| retained_context_len == Some(candidate))
+        && candidate < tokens.len()
+        && flat_lane_authoritative
+        && flat_attention_frontier == Some(candidate)
+        && retained_context_tokens
+            .is_some_and(|retained| retained.len() == candidate && retained == &tokens[..candidate])
     {
         candidate
     } else {
@@ -57,41 +60,73 @@ fn reusable_dflash_prefix(
     }
 }
 
-impl MuseGlimmerDFlashStepper<'_> {
+fn flat_attention_frontier(inner: &Qwen35Inner) -> Option<usize> {
+    let mut frontiers = inner.caches.as_ref()?.iter().filter_map(|cache| {
+        if matches!(
+            cache,
+            super::layer_cache::Qwen3_5LayerCache::FullAttention(_)
+        ) {
+            usize::try_from(cache.offset().max(0)).ok()
+        } else {
+            None
+        }
+    });
+    let first = frontiers.next()?;
+    frontiers.all(|frontier| frontier == first).then_some(first)
+}
+
+impl Qwen35DFlash2Stepper<'_> {
     fn ensure_clean(&self, operation: &str) -> Result<()> {
-        if self.rollback.is_some() || self.tapped.is_some() {
+        if self.snapshot.is_some()
+            || self.tape.is_some()
+            || self.tapped.is_some()
+            || self.verified_ids.is_some()
+        {
             return Err(Error::from_reason(format!(
-                "Muse-Glimmer DFlash {operation}: prior verify was not committed"
+                "Qwen3.8 DFlash2 {operation}: prior verify was not committed"
             )));
         }
         Ok(())
     }
 
-    fn target_forward(&mut self, ids: &[u32]) -> Result<(MxArray, Vec<MxArray>)> {
+    fn target_forward(
+        &mut self,
+        ids: &[u32],
+        record_tape: bool,
+    ) -> Result<(
+        MxArray,
+        Vec<MxArray>,
+        Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    )> {
         let ids = ids.iter().map(|&id| id as i32).collect::<Vec<_>>();
         let input = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
-        self.inner
-            .forward_with_taps_mode(&input, &self.tap_layers, false)
+        super::model::forward_dflash2_with_taps(self.inner, &input, &self.tap_layers, record_tape)
     }
 
-    fn append_tapped(&mut self, tapped: &[MxArray], keep: usize) -> Result<()> {
+    fn append_tapped(&mut self, tapped: &[MxArray], token_ids: &[u32]) -> Result<()> {
+        let keep = token_ids.len();
         let mut kept = Vec::with_capacity(tapped.len());
         for hidden in tapped {
             kept.push(hidden.slice_axis(1, 0, keep as i64)?);
         }
         let draft = self
             .inner
-            .dflash
+            .dflash2
             .as_ref()
-            .ok_or_else(|| Error::from_reason("Muse-Glimmer DFlash model disappeared"))?;
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?;
         let fused = draft.fuse_context(&kept)?;
-        self.context.append(draft, &fused, self.next_position)?;
+        self.context
+            .append(draft, &fused, self.next_position, token_ids)?;
         self.next_position = self.next_position.saturating_add(keep as i32);
         Ok(())
     }
+
+    fn attention_frontier(&self) -> Option<u64> {
+        flat_attention_frontier(self.inner).and_then(|frontier| u64::try_from(frontier).ok())
+    }
 }
 
-impl DsparkStepper for MuseGlimmerDFlashStepper<'_> {
+impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
     fn supports_adaptive_ar_fallback(&self) -> bool {
         true
     }
@@ -106,16 +141,26 @@ impl DsparkStepper for MuseGlimmerDFlashStepper<'_> {
 
     fn verify_ar_probe(&mut self, anchor_id: u32) -> Result<DsparkVerifyOutput> {
         self.ensure_clean("AR probe")?;
-        let (logits, tapped) = self.target_forward(&[anchor_id])?;
+        let (logits, tapped, _) = self.target_forward(&[anchor_id], false)?;
         self.tapped = Some(tapped);
+        self.verified_ids = Some(vec![anchor_id]);
         Ok(DsparkVerifyOutput { logits })
     }
 
     fn commit_ar_probe(&mut self) -> Result<()> {
         let tapped = self.tapped.take().ok_or_else(|| {
-            Error::from_reason("Muse-Glimmer DFlash AR probe has no tapped target state")
+            Error::from_reason("Qwen3.8 DFlash2 AR probe has no tapped target state")
         })?;
-        self.append_tapped(&tapped, 1)
+        let verified_ids = self.verified_ids.take().ok_or_else(|| {
+            Error::from_reason("Qwen3.8 DFlash2 AR probe has no token provenance")
+        })?;
+        if verified_ids.len() != 1 {
+            return Err(Error::from_reason(format!(
+                "Qwen3.8 DFlash2 AR probe retained {} token ids, expected 1",
+                verified_ids.len()
+            )));
+        }
+        self.append_tapped(&tapped, &verified_ids)
     }
 
     fn propose(
@@ -127,150 +172,184 @@ impl DsparkStepper for MuseGlimmerDFlashStepper<'_> {
     ) -> Result<DsparkProposal> {
         let draft = self
             .inner
-            .dflash
+            .dflash2
             .as_ref()
-            .ok_or_else(|| Error::from_reason("Muse-Glimmer DFlash model disappeared"))?;
-        let sampling = params.sampling_config.unwrap_or_default();
-        let (draft_ids, draft_dists) = draft.propose(
-            &self.inner.embed_tokens,
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?;
+        let temperature = params
+            .sampling_config
+            .unwrap_or_default()
+            .temperature
+            .unwrap_or(1.0);
+        let (draft_ids, draft_sparse_dists) = draft.propose(
+            &self.inner.embedding,
             self.inner.lm_head.as_ref(),
-            &self.inner.config.text_config,
             &self.context,
             anchor_id,
             max_len,
-            &sampling,
+            temperature,
             rng,
         )?;
         Ok(DsparkProposal {
             draft_ids,
-            draft_dists,
-            draft_sparse_dists: Vec::new(),
+            draft_dists: Vec::new(),
+            draft_sparse_dists,
         })
     }
 
     fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
         if verify_ids.is_empty() {
             return Err(Error::from_reason(
-                "Muse-Glimmer DFlash verify block must not be empty",
+                "Qwen3.8 DFlash2 verify block must not be empty",
             ));
         }
         self.ensure_clean("verify")?;
-        let rollback = snapshot_before_verify(
-            &self.inner.caches,
-            verify_ids.len(),
-            &vec![false; self.inner.caches.len()],
+        let snapshot = snapshot_all_mtp(
+            self.inner
+                .caches
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?,
+            false,
         )?;
-        let (logits, tapped) = self.target_forward(verify_ids)?;
-        self.rollback = Some(rollback);
+        let (logits, tapped, tape) = self.target_forward(verify_ids, true)?;
+        self.snapshot = Some(snapshot);
+        self.tape = Some(tape);
         self.tapped = Some(tapped);
+        self.verified_ids = Some(verify_ids.to_vec());
         Ok(DsparkVerifyOutput { logits })
     }
 
     fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
         if keep == 0 || keep > total_written {
             return Err(Error::from_reason(format!(
-                "Muse-Glimmer DFlash invalid commit keep={keep}, total={total_written}"
+                "Qwen3.8 DFlash2 invalid commit keep={keep}, total={total_written}"
             )));
         }
-        let rollback = self.rollback.take().ok_or_else(|| {
-            Error::from_reason("Muse-Glimmer DFlash commit has no pending target rollback")
-        })?;
-        let tapped = self.tapped.take().ok_or_else(|| {
-            Error::from_reason("Muse-Glimmer DFlash commit has no pending target taps")
-        })?;
-        commit_after_verify(&mut self.inner.caches, &rollback, keep)?;
-        self.append_tapped(&tapped, keep)
+        let snapshot = self
+            .snapshot
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 commit has no target snapshot"))?;
+        let tape = self
+            .tape
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 commit has no GDN tape"))?;
+        let tapped = self
+            .tapped
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 commit has no target taps"))?;
+        let verified_ids = self
+            .verified_ids
+            .take()
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 commit has no token provenance"))?;
+        if verified_ids.len() != total_written {
+            return Err(Error::from_reason(format!(
+                "Qwen3.8 DFlash2 commit wrote {total_written} rows for {} token ids",
+                verified_ids.len()
+            )));
+        }
+        replay_mtp_snapshot_to(
+            self.inner
+                .caches
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 target caches are absent"))?,
+            &snapshot,
+            &tape,
+            keep,
+            false,
+            "Qwen3.8 DFlash2 commit",
+        )?;
+        self.append_tapped(&tapped, &verified_ids[..keep])
     }
 
     fn finish(self) -> Result<()> {
-        self.inner.dflash_context = Some(self.context);
+        self.ensure_clean("finish")?;
+        self.inner.dflash2_context = Some(self.context);
         Ok(())
     }
 
     fn eval_boundary(&self, token: &MxArray) {
+        async_eval_layer_caches(&self.inner.caches);
         MxArray::async_eval_arrays(&[token]);
     }
 
     fn frontier(&self) -> Option<SpecFrontier> {
-        // Pure-attention target with no KV-shared slots (the empty mask
-        // counts every cache as active); the DFlash context cache is
-        // drafter-private, not target state.
         Some(SpecFrontier {
-            attn_tokens: active_cache_frontier(&self.inner.caches, &[])?,
-            recurrent_tokens: None,
+            attn_tokens: self.attention_frontier()?,
+            recurrent_tokens: Some(self.next_position.max(0) as u64),
         })
     }
 }
 
-impl DsparkBackend for MuseGlimmerInner {
+impl DsparkBackend for Qwen35Inner {
     type DsparkDecode<'a>
-        = MuseGlimmerDFlashStepper<'a>
+        = Qwen35DFlash2Stepper<'a>
     where
         Self: 'a;
 
     fn begin_dspark_decode(&mut self, block_size: usize) -> Result<Self::DsparkDecode<'_>> {
         let expected = self
-            .dflash
+            .dflash2
             .as_ref()
-            .ok_or_else(|| Error::from_reason("Muse-Glimmer has no loaded DFlash companion"))?
+            .ok_or_else(|| Error::from_reason("Qwen3.8 has no loaded DFlash2 companion"))?
             .config
             .block_size;
         if block_size != expected {
             return Err(Error::from_reason(format!(
-                "Muse-Glimmer DFlash block size {block_size} does not match checkpoint {expected}"
+                "Qwen3.8 DFlash2 block size {block_size} does not match checkpoint {expected}"
             )));
         }
-        let state = self.dflash_turn_state.take().ok_or_else(|| {
-            Error::from_reason("Muse-Glimmer DFlash decode requires tapped prefill state")
+        let state = self.dflash2_turn_state.take().ok_or_else(|| {
+            Error::from_reason("Qwen3.8 DFlash2 decode requires tapped prefill state")
         })?;
         let tap_layers = self
-            .dflash
+            .dflash2
             .as_ref()
-            .expect("checked DFlash companion")
+            .expect("checked DFlash2 companion")
             .config
             .target_layers
             .clone();
-        Ok(MuseGlimmerDFlashStepper {
+        Ok(Qwen35DFlash2Stepper {
             inner: self,
             context: state.context,
             next_position: state.next_position,
             tap_layers,
-            rollback: None,
+            snapshot: None,
+            tape: None,
             tapped: None,
+            verified_ids: None,
         })
     }
 }
 
-impl MuseGlimmerInner {
-    fn dflash_prefill(
+impl Qwen35Inner {
+    fn dflash2_prefill(
         &mut self,
         tokens: &[u32],
         position_base: i32,
         stream: Stream,
-    ) -> Result<(MxArray, DFlashTurnState)> {
+    ) -> Result<(MxArray, DFlash2TurnState)> {
         if tokens.is_empty() {
             return Err(Error::from_reason(
-                "Muse-Glimmer DFlash requires at least one prefill token",
+                "Qwen3.8 DFlash2 requires at least one prefill token",
             ));
         }
         let draft = self
-            .dflash
+            .dflash2
             .as_ref()
-            .ok_or_else(|| Error::from_reason("Muse-Glimmer has no loaded DFlash companion"))?;
+            .ok_or_else(|| Error::from_reason("Qwen3.8 has no loaded DFlash2 companion"))?;
         let tap_layers = draft.config.target_layers.clone();
         let draft_config = draft.config.clone();
-        let mut context = match self.dflash_context.take() {
+        let mut context = match self.dflash2_context.take() {
             Some(context) if context.logical_len() == position_base => context,
             Some(context) => {
                 return Err(Error::from_reason(format!(
-                    "Muse-Glimmer DFlash context length {} does not match cached prefix {position_base}",
+                    "Qwen3.8 DFlash2 context length {} does not match cached prefix {position_base}",
                     context.logical_len()
                 )));
             }
-            None if position_base == 0 => DFlashContextCache::new_at(&draft_config, 0),
+            None if position_base == 0 => DFlash2ContextCache::new(&draft_config),
             None => {
                 return Err(Error::from_reason(format!(
-                    "Muse-Glimmer DFlash cached prefix {position_base} has no retained draft context"
+                    "Qwen3.8 DFlash2 cached prefix {position_base} has no retained draft context"
                 )));
             }
         };
@@ -285,77 +364,87 @@ impl MuseGlimmerInner {
             {
                 return Err(Error::from_reason("prefill cancelled"));
             }
-            let end = (offset + super::model::PREFILL_STEP_SIZE as usize).min(tokens.len());
+            let end = (offset + PREFILL_STEP_SIZE as usize).min(tokens.len());
             let chunk = tokens[offset..end]
                 .iter()
                 .map(|&id| id as i32)
                 .collect::<Vec<_>>();
             let input = MxArray::from_int32(&chunk, &[1, chunk.len() as i64])?;
-            let (logits, taps) = {
+            let (logits, taps, _) = {
                 let _stream = StreamContext::new(stream);
-                self.forward_with_taps(&input, &tap_layers)?
+                super::model::forward_dflash2_with_taps(self, &input, &tap_layers, false)?
             };
             let draft = self
-                .dflash
+                .dflash2
                 .as_ref()
-                .ok_or_else(|| Error::from_reason("Muse-Glimmer DFlash model disappeared"))?;
+                .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?;
             let fused = draft.fuse_context(&taps)?;
-            context.append(draft, &fused, position_base + offset as i32)?;
-            last_logits = Some(logits);
+            context.append(
+                draft,
+                &fused,
+                position_base + offset as i32,
+                &tokens[offset..end],
+            )?;
+            let vocab = logits.shape_at(2)?;
+            last_logits = Some(
+                logits
+                    .slice_axis(1, chunk.len() as i64 - 1, chunk.len() as i64)?
+                    .reshape(&[vocab])?,
+            );
             if end < tokens.len() {
-                self.eval_caches()?;
+                super::model::eval_layer_caches(&self.caches)?;
+                context.eval()?;
                 crate::array::clear_cache();
             }
             offset = end;
         }
         Ok((
-            last_logits
-                .expect("non-empty prefill")
-                .squeeze(Some(&[1]))?,
-            DFlashTurnState {
+            last_logits.expect("non-empty DFlash2 prefill"),
+            DFlash2TurnState {
                 context,
                 next_position: position_base.saturating_add(tokens.len() as i32),
             },
         ))
     }
 
-    fn dflash_fail_closed(&mut self, error: Error) -> Error {
-        let _ = ChatBackend::reset_caches(self, ResetScope::PrefixMiss);
-        self.dflash_turn_state = None;
+    fn dflash2_fail_closed(&mut self, error: Error) -> Error {
+        let _ = ChatBackend::reset_caches(self, ResetScope::Command);
+        self.dflash2_turn_state = None;
         error
     }
 
-    fn dflash_materialize_final(&mut self, token: u32, stream: Stream) -> Result<()> {
+    fn dflash2_materialize_final(&mut self, token: u32, stream: Stream) -> Result<()> {
         let tap_layers = self
-            .dflash
+            .dflash2
             .as_ref()
-            .ok_or_else(|| Error::from_reason("Muse-Glimmer DFlash model disappeared"))?
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?
             .config
             .target_layers
             .clone();
         let input = MxArray::from_int32(&[token as i32], &[1, 1])?;
         let _stream = StreamContext::new(stream);
-        let (_, taps) = self.forward_with_taps(&input, &tap_layers)?;
+        let (_, taps, _) =
+            super::model::forward_dflash2_with_taps(self, &input, &tap_layers, false)?;
         let fused = self
-            .dflash
+            .dflash2
             .as_ref()
-            .ok_or_else(|| Error::from_reason("Muse-Glimmer DFlash model disappeared"))?
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))?
             .fuse_context(&taps)?;
-        let mut context = self.dflash_context.take().ok_or_else(|| {
-            Error::from_reason("Muse-Glimmer DFlash final token has no retained draft context")
+        let mut context = self.dflash2_context.take().ok_or_else(|| {
+            Error::from_reason("Qwen3.8 DFlash2 final token has no retained draft context")
         })?;
         let base = context.logical_len();
         let append_result = self
-            .dflash
+            .dflash2
             .as_ref()
-            .ok_or_else(|| Error::from_reason("Muse-Glimmer DFlash model disappeared"))
-            .and_then(|draft| context.append(draft, &fused, base));
-        self.dflash_context = Some(context);
+            .ok_or_else(|| Error::from_reason("Qwen3.8 DFlash2 model disappeared"))
+            .and_then(|draft| context.append(draft, &fused, base, &[token]));
+        self.dflash2_context = Some(context);
         append_result?;
-        self.eval_caches()
+        super::model::eval_layer_caches(&self.caches)
     }
 
-    pub(crate) fn dflash_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
+    pub(crate) fn dflash2_chat_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
         let tokenizer = args.tokenizer.clone();
         let tokens = args.tokens.to_vec();
         let is_delta = args.plan.is_delta;
@@ -367,26 +456,32 @@ impl MuseGlimmerInner {
         } else {
             0
         };
-        let retained_context_len = self
-            .dflash_context
-            .as_ref()
-            .map(DFlashContextCache::logical_len);
         let verified_hit = if is_delta {
             0
         } else {
             ChatBackend::verify_cache_prefix(self, &tokens, params.reuse_cache)
         };
-        let cached_prefix = reusable_dflash_prefix(
+        let flat_lane_authoritative =
+            !self.paged_full_attn_caches_dirty && !self.flat_mtp_caches_desynced;
+        let cached_prefix = reusable_dflash2_prefix(
             is_delta,
-            tokens.len(),
+            &tokens,
             prior_cached,
             verified_hit,
-            retained_context_len,
+            self.dflash2_context
+                .as_ref()
+                .map(DFlash2ContextCache::token_history),
+            flat_attention_frontier(self),
+            flat_lane_authoritative,
         );
         let prefill = if cached_prefix > 0 {
             tokens[cached_prefix..].to_vec()
         } else {
-            ChatBackend::reset_caches(self, ResetScope::PrefixMiss)?;
+            // A previous turn may have occupied the target's paged lane.
+            // Command reset also releases/purges that request before the
+            // DFlash2 flat-cache prefill rebuilds the complete prompt.
+            ChatBackend::reset_caches(self, ResetScope::Command)?;
+            self.init_caches_sync()?;
             tokens.clone()
         };
 
@@ -402,9 +497,9 @@ impl MuseGlimmerInner {
         profiler.snapshot_memory_before();
         profiler.begin_prefill();
         let (last_logits, state) =
-            match self.dflash_prefill(&prefill, cached_prefix as i32, generation_stream) {
+            match self.dflash2_prefill(&prefill, cached_prefix as i32, generation_stream) {
                 Ok(value) => value,
-                Err(error) => return Err(self.dflash_fail_closed(error)),
+                Err(error) => return Err(self.dflash2_fail_closed(error)),
             };
         profiler.end_prefill();
 
@@ -413,14 +508,16 @@ impl MuseGlimmerInner {
             .and_then(|logits| crate::sampling::sample(&logits, params.sampling_config))
         {
             Ok(token) => token,
-            Err(error) => return Err(self.dflash_fail_closed(error)),
+            Err(error) => return Err(self.dflash2_fail_closed(error)),
         };
         y.eval();
-        self.eval_caches()?;
+        if let Err(error) = super::model::eval_layer_caches(&self.caches) {
+            return Err(self.dflash2_fail_closed(error));
+        }
         if report_performance {
             first_token_instant = Some(Instant::now());
         }
-        self.dflash_turn_state = Some(state);
+        self.dflash2_turn_state = Some(state);
 
         let mut generated = Vec::with_capacity(generated_capacity_hint(params.max_new_tokens));
         let mut finish_reason = String::from("length");
@@ -433,9 +530,9 @@ impl MuseGlimmerInner {
             args.sink.map(|_| ChatBackend::stream_emitter(self));
         let turn_token_observer = ChatBackend::turn_token_observer(self);
         let block_size = self
-            .dflash
+            .dflash2
             .as_ref()
-            .expect("loaded DFlash companion")
+            .expect("loaded DFlash2 companion")
             .config
             .block_size;
         let mut rng = rand::rng();
@@ -477,13 +574,15 @@ impl MuseGlimmerInner {
         };
         let mut last_in_cache = match outcome {
             Ok(outcome) => outcome.last_in_cache,
-            Err(error) => return Err(self.dflash_fail_closed(error)),
+            Err(error) => return Err(self.dflash2_fail_closed(error)),
         };
         if finish_reason == "length"
             && !last_in_cache
             && let Some(&last) = generated.last()
         {
-            self.dflash_materialize_final(last, generation_stream)?;
+            if let Err(error) = self.dflash2_materialize_final(last, generation_stream) {
+                return Err(self.dflash2_fail_closed(error));
+            }
             last_in_cache = true;
         }
         let saved_generated = if !last_in_cache && !generated.is_empty() {
@@ -554,14 +653,43 @@ impl MuseGlimmerInner {
 
 #[cfg(test)]
 mod tests {
-    use super::reusable_dflash_prefix;
+    use super::reusable_dflash2_prefix;
 
     #[test]
-    fn continuation_reuses_only_a_matching_retained_dflash_context() {
-        assert_eq!(reusable_dflash_prefix(true, 14, 10, 0, Some(10)), 10);
-        assert_eq!(reusable_dflash_prefix(true, 14, 10, 0, None), 0);
-        assert_eq!(reusable_dflash_prefix(true, 14, 10, 0, Some(9)), 0);
-        assert_eq!(reusable_dflash_prefix(false, 14, 0, 10, Some(10)), 10);
-        assert_eq!(reusable_dflash_prefix(false, 14, 0, 10, Some(9)), 0);
+    fn continuation_requires_matching_prefix_and_flat_frontier() {
+        let tokens = (0..14).collect::<Vec<u32>>();
+        let retained = tokens[..10].to_vec();
+        assert_eq!(
+            reusable_dflash2_prefix(true, &tokens, 10, 0, Some(&retained), Some(10), true),
+            10
+        );
+        assert_eq!(
+            reusable_dflash2_prefix(true, &tokens, 10, 0, None, Some(10), true),
+            0
+        );
+        assert_eq!(
+            reusable_dflash2_prefix(false, &tokens, 0, 10, Some(&retained), Some(10), true),
+            10
+        );
+        assert_eq!(
+            reusable_dflash2_prefix(false, &tokens, 0, 10, Some(&retained), Some(9), true),
+            0
+        );
+    }
+
+    #[test]
+    fn same_length_different_prefix_and_paged_owner_are_cold_misses() {
+        let tokens = (0..14).collect::<Vec<u32>>();
+        let unrelated = (100..110).collect::<Vec<u32>>();
+        assert_eq!(
+            reusable_dflash2_prefix(true, &tokens, 10, 0, Some(&unrelated), Some(10), true,),
+            0,
+            "equal lengths do not establish cache provenance"
+        );
+        assert_eq!(
+            reusable_dflash2_prefix(true, &tokens, 10, 0, Some(&tokens[..10]), Some(10), false,),
+            0,
+            "a paged-owned target frontier cannot reuse flat DFlash2 state"
+        );
     }
 }

@@ -506,7 +506,8 @@ export interface SessionCapableModel {
   /**
    * MTP: whether the underlying native model can run speculative
    * decoding. Surfaced by `Qwen3_5Model` / `Qwen3_5MoeModel` (an MTP
-   * head shipped in the checkpoint and loaded by persistence) and by
+   * head shipped in the checkpoint, or an external DFlash2 companion on
+   * dense Qwen3.5) and by
    * `Gemma4Model` (an external draft model — DSpark or Google gemma-4
    * assistant, auto-detected from the draft's config.json — attached
    * via `loadModel` / `loadSession` `draftModelPath`; NOT in-checkpoint
@@ -544,9 +545,8 @@ export interface SessionCapableModel {
    *   verify FFI contract, and when unset native code currently pins
    *   depth 1. Setting `mtpDepth` explicitly pins that value unless
    *   the caller also passes `mtpAdaptiveDepth: true` to opt into
-   *   adaptive depth with the supplied maximum/seed. Gemma4 external
-   *   drafts resolve the field per draft variant instead — see the
-   *   Gemma4 section below.
+   *   adaptive depth with the supplied maximum/seed. External draft models
+   *   resolve the field against their checkpoint width instead — see below.
    * - **`mtpAdaptiveDepth`** — toggles the adaptive depth policy.
    *   Defaults to OFF for native MTP and assistants (Gemma4 DSpark has the
    *   family override documented below). When ON, the native-MTP default
@@ -569,6 +569,16 @@ export interface SessionCapableModel {
    * flag inventory), so omitting them from `defaultConfig` /
    * `SendOptions.config` is the recommended path for callers that
    * just want speculative decoding "on with sensible defaults".
+   *
+   * ## Qwen3.8 DFlash2 (`draftModelPath`)
+   *
+   * A dense Qwen3.8 target can attach `z-lab/Qwen3.8-27B-DFlash2`. Its
+   * checkpoint block size is 8 total target rows: one anchor plus seven
+   * proposals. With `mtpDepth` unset all seven proposals are used; an
+   * explicit value clamps to `[1, 7]`. `mtpAdaptiveDepth` is off by default
+   * and may be enabled explicitly for the engine's measured AR fallback.
+   * DFlash2 uses flat target caches so hybrid GDN state can be rewound by
+   * snapshot plus tape replay after verification.
    *
    * ## Gemma4 external drafts (`draftModelPath`)
    *

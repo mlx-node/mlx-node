@@ -513,6 +513,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             DsparkProposal {
                 draft_ids: Vec::new(),
                 draft_dists: Vec::new(),
+                draft_sparse_dists: Vec::new(),
             }
         };
         // Contract enforcement at the proposal boundary: `propose` may
@@ -621,11 +622,14 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             // Sampled path: per-position Leviathan accept + residual
             // resample against the stepper's proposal densities.
             (|| {
-                if proposal.draft_dists.len() != draft_len {
+                let has_dense = proposal.draft_dists.len() == draft_len;
+                let has_sparse = proposal.draft_sparse_dists.len() == draft_len;
+                if has_dense == has_sparse {
                     return Err(Error::from_reason(format!(
-                        "DSpark sampled accept requires one proposal distribution per \
-                         drafted token (got {} dists for {} drafts)",
+                        "DSpark sampled accept requires exactly one dense or sparse proposal \
+                         distribution per drafted token (got {} dense, {} sparse for {} drafts)",
                         proposal.draft_dists.len(),
+                        proposal.draft_sparse_dists.len(),
                         draft_len
                     )));
                 }
@@ -640,13 +644,22 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                     let p_target = sampling::sampling_distribution(&penalized, p.sampling_config)?
                         .astype(DType::Float32)?;
                     p_target.eval();
-                    let (accept, out_tok) = sampling::accept_with_residual(
-                        &p_target,
-                        &proposal.draft_dists[i],
-                        proposal.draft_ids[i],
-                        &sampling_cfg,
-                        rng,
-                    )?;
+                    let (accept, out_tok) = if has_sparse {
+                        sampling::accept_with_residual_dense_target_sparse_draft(
+                            &p_target,
+                            proposal.draft_sparse_dists[i].as_row(),
+                            proposal.draft_ids[i],
+                            rng,
+                        )?
+                    } else {
+                        sampling::accept_with_residual(
+                            &p_target,
+                            &proposal.draft_dists[i],
+                            proposal.draft_ids[i],
+                            &sampling_cfg,
+                            rng,
+                        )?
+                    };
                     if accept {
                         k += 1;
                         hist_extended.push(out_tok as u32);
@@ -1478,6 +1491,7 @@ mod tests {
             Ok(DsparkProposal {
                 draft_ids: script.draft_ids.clone(),
                 draft_dists,
+                draft_sparse_dists: Vec::new(),
             })
         }
 

@@ -620,9 +620,8 @@ export function makeStreamingModel<
   // constructor — e.g. `new Gemma4Model(config)` / `new QianfanOCRModel(config)`
   // — visible on the generated wrapper for TypeScript consumers. Likewise,
   // `Parameters<C['load']>` keeps each family's native load signature —
-  // `[modelPath]` for most, `[modelPath, options?]` for Gemma4
-  // (`Gemma4LoadOptions.draftModelPath` — external DSpark or Google
-  // assistant draft).
+  // `[modelPath]` for most, `[modelPath, options?]` for Gemma4 and dense
+  // Qwen3.5 external draft models.
   new (...args: ConstructorParameters<C>): StreamingInstance<C, O>;
   load(...args: Parameters<C["load"]>): Promise<StreamingInstance<C, O>>;
 } {
@@ -661,7 +660,7 @@ export function makeStreamingModel<
       ...rest: unknown[]
     ): Promise<StreamingModel> {
       // Forward any trailing family-specific load options verbatim (e.g.
-      // Gemma4's `Gemma4LoadOptions` with `draftModelPath`); families whose
+      // Gemma4/Qwen3.5 `draftModelPath`); families whose
       // native `load` takes only the path receive no extras. The public
       // signature is re-narrowed per family via `Parameters<C['load']>` in
       // the factory return type below.

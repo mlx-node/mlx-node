@@ -285,7 +285,7 @@ async fn qwen3_5_paged_vlm_correctness() {
     let paged_dir =
         clone_model_dir(&src, "qwen35-vlm-paged", true).expect("clone paged model dir failed");
 
-    let paged_model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string())
+    let paged_model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load paged-path Qwen3.5-VL model");
 
@@ -385,7 +385,7 @@ async fn qwen3_5_paged_vlm_image_prefix_cache_lifecycle() {
 
     let paged_dir = clone_model_dir(&src, "qwen35-vlm-image-prefix-cache", true)
         .expect("clone paged model dir failed");
-    let model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string())
+    let model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load paged-path Qwen3.5-VL model");
 
@@ -581,7 +581,7 @@ async fn qwen3_5_paged_vlm_continue_preserves_image_context() {
 
     let paged_dir = clone_model_dir(&src, "qwen35-vlm-paged-continue", true)
         .expect("clone paged model dir failed");
-    let paged_model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string())
+    let paged_model = Qwen3_5Model::load(paged_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load paged-path Qwen3.5-VL model");
 
@@ -672,7 +672,7 @@ async fn qwen3_5_flat_vlm_image_turn_errors_without_paged_backend() {
     // the vision→paged load-force, so no paged adapter is built.
     let flat_dir =
         clone_model_dir(&src, "qwen35-vlm-flat-error", false).expect("clone flat model dir failed");
-    let flat_model = Qwen3_5Model::load(flat_dir.to_string_lossy().to_string())
+    let flat_model = Qwen3_5Model::load(flat_dir.to_string_lossy().to_string(), None)
         .await
         .expect("failed to load flat-path Qwen3.5-VL model");
 

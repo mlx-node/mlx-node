@@ -74,7 +74,7 @@ async fn asymmetric_finish_and_cross_owner_warm_wave_match_serial() {
     // created. No sibling test runs in this binary.
     unsafe { std::env::set_var("MLX_CONTINUOUS_BATCHING", "1") };
     unsafe { std::env::set_var("MLX_SERVE_FORCE_SERIAL", "1") };
-    let model = load_with_thread(&path.to_string_lossy())
+    let model = load_with_thread(&path.to_string_lossy(), None)
         .await
         .expect("load qwen3.5");
     assert!(model.has_block_paged_cache(), "gate requires paged Qwen3.5");

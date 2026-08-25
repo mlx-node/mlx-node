@@ -243,7 +243,7 @@ async fn session_path_keeps_ttft_flat_across_turns() {
     );
 
     // Load the model via the normal async path.
-    let model = Qwen3_5Model::load(model_path.clone())
+    let model = Qwen3_5Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 model");
 
@@ -493,7 +493,7 @@ async fn stream_session_path_keeps_ttft_flat_across_turns() {
         model_path
     );
 
-    let model = Qwen3_5Model::load(model_path.clone())
+    let model = Qwen3_5Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 model");
 
@@ -630,7 +630,7 @@ async fn stream_session_cancellation_preserves_cache_for_next_turn() {
         model_path
     );
 
-    let model = Qwen3_5Model::load(model_path.clone())
+    let model = Qwen3_5Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 model");
 
@@ -750,7 +750,7 @@ async fn session_continue_rejects_images_with_restart_prefix() {
         model_path
     );
 
-    let model = Qwen3_5Model::load(model_path.clone())
+    let model = Qwen3_5Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 model");
 
@@ -796,7 +796,7 @@ async fn session_continue_tool_round_trips() {
         model_path
     );
 
-    let model = Qwen3_5Model::load(model_path.clone())
+    let model = Qwen3_5Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 model");
 
@@ -869,7 +869,7 @@ async fn session_start_accepts_images_for_vlm() {
     let image_uint8: napi::bindgen_prelude::Uint8Array =
         napi::bindgen_prelude::Uint8Array::new(image_bytes);
 
-    let model = Qwen3_5Model::load(model_path.clone())
+    let model = Qwen3_5Model::load(model_path.clone(), None)
         .await
         .expect("failed to load Qwen3.5 VLM model");
 
@@ -960,7 +960,7 @@ async fn nonpositive_budget_emits_zero_tokens_mtp_matches_ar() {
     );
 
     let flat_dir = flat_clone_model_dir(model_dir, "nonpos").expect("flat clone failed");
-    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().into_owned())
+    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().into_owned(), None)
         .await
         .expect("failed to load Qwen3.5 model");
 
@@ -1176,7 +1176,7 @@ async fn cancel_midcycle_then_continue_mtp_keeps_session_usable() {
     );
 
     let flat_dir = flat_clone_model_dir(model_dir, "cancel").expect("flat clone failed");
-    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().into_owned())
+    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().into_owned(), None)
         .await
         .expect("failed to load Qwen3.5 model");
 
@@ -1365,7 +1365,7 @@ async fn desync_heal_reprefills_to_uncancelled() {
         "MLX_TEST_MODEL_PATH does not exist: {model_path}"
     );
     let flat_dir = flat_clone_model_dir(model_dir, "heal").expect("flat clone failed");
-    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().into_owned())
+    let model = Qwen3_5Model::load(flat_dir.to_string_lossy().into_owned(), None)
         .await
         .expect("failed to load Qwen3.5 model");
     if !model.has_mtp_weights() {

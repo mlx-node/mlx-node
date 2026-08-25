@@ -1816,6 +1816,9 @@ pub(crate) struct DsparkProposal {
     /// (`sampling::is_greedy_temperature`) — greedy acceptance, with or
     /// without active penalties, is argmax-based and never reads `q`.
     pub draft_dists: Vec<MxArray>,
+    /// Sparse proposal rows for draft models with vocabulary-independent
+    /// support (DFlash2 uses a conditional top-16 selector).
+    pub draft_sparse_dists: Vec<crate::sampling::SparseDistribution>,
 }
 
 /// Output of [`DsparkStepper::verify`] — ONE batched target forward over

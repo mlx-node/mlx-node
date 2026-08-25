@@ -1444,11 +1444,9 @@ export declare class Qwen35Model {
   /** Snapshot scheduler occupancy plus unified block/recurrent admission. */
   schedulerStats(): Promise<SchedulerStats>;
   /**
-   * Whether this checkpoint shipped an MTP head (module loaded by
-   * `persistence::apply_weights_inner`). Snapshotted at load time from
-   * `Qwen35Inner::has_mtp_weights()` so the TS `ChatSession` can
-   * auto-default `enableMtp = true` for MTP-capable checkpoints without
-   * dispatching a command into the model thread.
+   * Whether this instance has an inline MTP head or external DFlash2
+   * companion. Snapshotted at load time so `ChatSession` can auto-default
+   * `enableMtp = true` without dispatching into the model thread.
    *
    * Note: this only reports weight availability. Whether the
    * speculative-decode path actually runs on a given call also requires the
@@ -1485,7 +1483,7 @@ export declare class Qwen35Model {
    * - model.safetensors (or model-*.safetensors)
    * - tokenizer.json + tokenizer_config.json
    */
-  static load(path: string): Promise<Qwen35Model>;
+  static load(path: string, options?: Qwen35LoadOptions | undefined | null): Promise<Qwen35Model>;
   /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35GenerationConfig): Promise<Qwen35GenerationResult>;
   /**
@@ -2725,10 +2723,14 @@ export interface ChatConfig {
    * Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
    * enable it.
    *
-   * Gemma4 external drafts (`draftModelPath`) resolve the field per draft
-   * variant instead (`gemma4/model.rs` `resolve_params`, always from the
-   * RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
-   * contract that does not apply to external drafts):
+   * External drafts (`draftModelPath`) resolve the field against their
+   * checkpoint width instead (always from the RAW config value — the
+   * engine's central `[1, 5]` clamp is an MTP-head contract that does not
+   * apply to external drafts):
+   * - Qwen3.8 DFlash2: checkpoint `block_size = 8` contains one target
+   *   anchor plus seven proposals. Unset uses all seven; an explicit value
+   *   clamps to `[1, 7]` and pins that depth unless
+   *   `mtpAdaptiveDepth: true` explicitly enables the break-even guard.
    * - DSpark: with both knobs unset, full draft blocks (the checkpoint's
    *   block size — 7 tokens on `dspark_gemma4_12b_block7`) run behind a
    *   short target-AR/DSpark break-even calibration. A short generation
@@ -2759,7 +2761,8 @@ export interface ChatConfig {
    *
    * Default: false, except Gemma4 DSpark and Muse-Glimmer DFlash enable the
    * measured break-even guard when both this field and `mtpDepth` are unset.
-   * An explicit value always wins over the family default.
+   * Qwen3.8 DFlash2 remains fixed-width by default. An explicit value always
+   * wins over the family default.
    */
   mtpAdaptiveDepth?: boolean | undefined;
 }
@@ -4805,6 +4808,11 @@ export interface Qwen35GenerationResult {
   text: string;
   numTokens: number;
   finishReason: string;
+}
+
+export interface Qwen35LoadOptions {
+  /** External z-lab DFlash2 checkpoint directory. */
+  draftModelPath?: string;
 }
 
 /**

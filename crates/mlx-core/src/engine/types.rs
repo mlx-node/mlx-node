@@ -133,10 +133,14 @@ pub struct ChatConfig {
     /// Adaptive depth is opt-in; set `mtpAdaptiveDepth: true` explicitly to
     /// enable it.
     ///
-    /// Gemma4 external drafts (`draftModelPath`) resolve the field per draft
-    /// variant instead (`gemma4/model.rs` `resolve_params`, always from the
-    /// RAW config value — the engine's central `[1, 5]` clamp is an MTP-head
-    /// contract that does not apply to external drafts):
+    /// External drafts (`draftModelPath`) resolve the field against their
+    /// checkpoint width instead (always from the RAW config value — the
+    /// engine's central `[1, 5]` clamp is an MTP-head contract that does not
+    /// apply to external drafts):
+    /// - Qwen3.8 DFlash2: checkpoint `block_size = 8` contains one target
+    ///   anchor plus seven proposals. Unset uses all seven; an explicit value
+    ///   clamps to `[1, 7]` and pins that depth unless
+    ///   `mtpAdaptiveDepth: true` explicitly enables the break-even guard.
     /// - DSpark: with both knobs unset, full draft blocks (the checkpoint's
     ///   block size — 7 tokens on `dspark_gemma4_12b_block7`) run behind a
     ///   short target-AR/DSpark break-even calibration. A short generation
@@ -166,7 +170,8 @@ pub struct ChatConfig {
     ///
     /// Default: false, except Gemma4 DSpark and Muse-Glimmer DFlash enable the
     /// measured break-even guard when both this field and `mtpDepth` are unset.
-    /// An explicit value always wins over the family default.
+    /// Qwen3.8 DFlash2 remains fixed-width by default. An explicit value always
+    /// wins over the family default.
     #[napi(ts_type = "boolean | undefined")]
     pub mtp_adaptive_depth: Option<bool>,
 }

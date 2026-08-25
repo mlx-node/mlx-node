@@ -8,6 +8,7 @@ import {
   loadModel,
   loadSession,
   MuseGlimmerModel,
+  Qwen35Model,
   type ModelType,
 } from '@mlx-node/lm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
@@ -173,10 +174,10 @@ describe.sequential('declarative model loader registry', () => {
     );
   });
 
-  it('preserves Gemma-only draft option validation', async () => {
+  it('rejects draftModelPath for families without external draft support', async () => {
     await writeConfig({ model_type: 'qwen3' });
     await expect(loadModel(tempDir, { draftModelPath: '/tmp/draft' })).rejects.toThrow(
-      `draftModelPath (speculative-decoding draft) is only supported by gemma4 models; ${tempDir} has model_type "qwen3"`,
+      `draftModelPath (speculative-decoding draft) is only supported by gemma4 and qwen3_5 models; ${tempDir} has model_type "qwen3"`,
     );
   });
 
@@ -188,6 +189,16 @@ describe.sequential('declarative model loader registry', () => {
     await expect(loadModel(tempDir, { draftModelPath: '/tmp/draft' })).resolves.toBe(loadedModel);
     expect(loadSpy).toHaveBeenCalledOnce();
     expect(loadSpy).toHaveBeenCalledWith(tempDir, { draftModelPath: '/tmp/draft' });
+  });
+
+  it('forwards draftModelPath through the dense Qwen3.5 family descriptor', async () => {
+    await writeConfig({ model_type: 'qwen3_5' });
+    const loadedModel = { model: 'qwen3_5' };
+    const loadSpy = vi.spyOn(Qwen35Model, 'load').mockResolvedValue(loadedModel as never);
+
+    await expect(loadModel(tempDir, { draftModelPath: '/tmp/dflash2' })).resolves.toBe(loadedModel);
+    expect(loadSpy).toHaveBeenCalledOnce();
+    expect(loadSpy).toHaveBeenCalledWith(tempDir, { draftModelPath: '/tmp/dflash2' });
   });
 
   it('loads Muse-Glimmer through its streaming wrapper', async () => {
