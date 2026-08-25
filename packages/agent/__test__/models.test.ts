@@ -15,6 +15,35 @@ async function writeModelDir(name: string, config: unknown): Promise<void> {
   await writeFile(join(dir, 'config.json'), JSON.stringify(config));
 }
 
+function u32(value: number): Buffer {
+  const buffer = Buffer.alloc(4);
+  buffer.writeUInt32LE(value);
+  return buffer;
+}
+
+function u64(value: number): Buffer {
+  const buffer = Buffer.alloc(8);
+  buffer.writeBigUInt64LE(BigInt(value));
+  return buffer;
+}
+
+function ggufString(value: string): Buffer {
+  const bytes = Buffer.from(value, 'utf8');
+  return Buffer.concat([u64(bytes.length), bytes]);
+}
+
+function minimalGguf(architecture: string): Buffer {
+  return Buffer.concat([
+    Buffer.from('GGUF'),
+    u32(3),
+    u64(0),
+    u64(1),
+    ggufString('general.architecture'),
+    u32(8),
+    ggufString(architecture),
+  ]);
+}
+
 beforeAll(async () => {
   modelsDir = await mkdtemp(join(tmpdir(), 'mlx-agent-models-'));
 
@@ -169,5 +198,101 @@ describe('discoverMlxModels', () => {
 
   it('returns an empty list for an unreadable models dir', async () => {
     expect(await discoverMlxModels(join(modelsDir, 'does-not-exist'))).toEqual([]);
+  });
+
+  it('discovers every nested Q<number>_K_XL target by its direct GGUF path', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-xl-gguf-'));
+    try {
+      const repo = join(root, 'qwen38-gguf');
+      await mkdir(repo, { recursive: true });
+      await writeFile(
+        join(repo, 'config.json'),
+        JSON.stringify({ model_type: 'qwen3_5', text_config: { max_position_embeddings: 65536 } }),
+      );
+      await Promise.all([
+        writeFile(join(repo, 'Qwen3.8-27B-UD-Q3_K_XL.gguf'), 'q3'),
+        writeFile(join(repo, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'), 'q4'),
+        writeFile(join(repo, 'Qwen3.8-27B-Q4_K_M.gguf'), 'ordinary variant'),
+        writeFile(join(repo, 'imatrix_unsloth.gguf'), 'imatrix'),
+        writeFile(join(repo, 'mmproj-Q4_K_XL.gguf'), 'mmproj'),
+        writeFile(join(repo, 'dflash-Q4_K_XL.gguf'), 'draft'),
+      ]);
+
+      const discovered = await discoverMlxModels(root);
+      expect(discovered.map((model) => model.discovered)).toEqual([
+        {
+          name: 'Qwen3.8-27B-UD-Q3_K_XL',
+          path: join(repo, 'Qwen3.8-27B-UD-Q3_K_XL.gguf'),
+          modelType: 'qwen3_5',
+        },
+        {
+          name: 'Qwen3.8-27B-UD-Q4_K_XL',
+          path: join(repo, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'),
+          modelType: 'qwen3_5',
+        },
+      ]);
+      expect(discovered.map((model) => model.piModel.contextWindow)).toEqual([65536, 65536]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('discovers a standalone top-level XL GGUF from its qwen35 header', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-standalone-gguf-'));
+    try {
+      const gguf = join(root, 'Qwen3.8-27B-UD-Q6_K_XL.gguf');
+      await writeFile(gguf, minimalGguf('qwen35'));
+
+      const [discovered] = await discoverMlxModels(root);
+      expect(discovered?.discovered).toEqual({
+        name: 'Qwen3.8-27B-UD-Q6_K_XL',
+        path: gguf,
+        modelType: 'qwen3_5',
+      });
+      expect(discovered?.piModel.contextWindow).toBe(262144);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not advertise DFlash2 companions or XL files from unsupported direct-GGUF families', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-nontarget-gguf-'));
+    try {
+      const draft = join(root, 'qwen38-dflash2');
+      await mkdir(draft, { recursive: true });
+      await writeFile(
+        join(draft, 'config.json'),
+        JSON.stringify({ model_type: 'qwen3', architectures: ['DFlash2DraftModel'] }),
+      );
+
+      const qwen3 = join(root, 'qwen3-gguf');
+      await mkdir(qwen3, { recursive: true });
+      await writeFile(join(qwen3, 'config.json'), JSON.stringify({ model_type: 'qwen3' }));
+      await writeFile(join(qwen3, 'Qwen3-8B-UD-Q5_K_XL.gguf'), 'unsupported direct qwen3');
+
+      const ordinary = join(root, 'qwen38-q4km-gguf');
+      await mkdir(ordinary, { recursive: true });
+      await writeFile(join(ordinary, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+      await writeFile(join(ordinary, 'Qwen3.8-27B-Q4_K_M.gguf'), 'unsupported direct variant');
+
+      expect(await discoverMlxModels(root)).toEqual([]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it('keeps a converted SafeTensors model discoverable when it retains an imatrix GGUF', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-converted-imatrix-'));
+    try {
+      const converted = join(root, 'qwen38-mlx');
+      await mkdir(converted, { recursive: true });
+      await writeFile(join(converted, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+      await writeFile(join(converted, 'model.safetensors'), 'weights');
+      await writeFile(join(converted, 'imatrix_unsloth.gguf'), 'calibration');
+
+      expect((await discoverMlxModels(root)).map((model) => model.discovered.name)).toEqual(['qwen38-mlx']);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
   });
 });

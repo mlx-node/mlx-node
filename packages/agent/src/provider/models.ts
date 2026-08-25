@@ -69,6 +69,44 @@ interface FamilyTraits {
 interface DiscoveryMetadata {
   contextWindow: number;
   supportsImages: boolean;
+  draftOnly: boolean;
+}
+
+/**
+ * Native direct-GGUF loading currently exists for dense Qwen3.5/Qwen3.8.
+ * Match the Unsloth Dynamic XL target names users download, while excluding
+ * ordinary Q4_K_M files and companion artifacts such as imatrix/mmproj/draft.
+ */
+const QWEN35_XL_GGUF = /(?:^|[-_.])Q\d+_K_XL\.gguf$/i;
+const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft)(?:[-_.]|$)/i;
+
+function isQwen35XlGguf(name: string): boolean {
+  return QWEN35_XL_GGUF.test(name) && !GGUF_COMPANION_NAME.test(name);
+}
+
+function ggufModelName(name: string): string {
+  return name.slice(0, -'.gguf'.length);
+}
+
+interface ModelFileInventory {
+  xlGgufs: string[];
+  hasGguf: boolean;
+  hasSafetensors: boolean;
+}
+
+async function modelFileInventory(modelDir: string): Promise<ModelFileInventory> {
+  try {
+    const files = (await readdir(modelDir, { withFileTypes: true }))
+      .filter((entry) => entry.isFile())
+      .map((entry) => entry.name);
+    return {
+      xlGgufs: files.filter(isQwen35XlGguf).sort(),
+      hasGguf: files.some((name) => name.toLowerCase().endsWith('.gguf')),
+      hasSafetensors: files.some((name) => name.toLowerCase().endsWith('.safetensors')),
+    };
+  } catch {
+    return { xlGgufs: [], hasGguf: false, hasSafetensors: false };
+  }
 }
 
 /**
@@ -148,24 +186,29 @@ async function readDiscoveryMetadata(
       modelType === 'gemma4'
         ? hasVisionConfig || nonEmptyRecord(config.unified_vision_config)
         : (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe') && hasVisionConfig;
+    const draftOnly = Array.isArray(config.architectures) && config.architectures.includes('DFlash2DraftModel');
 
     return {
       contextWindow: root ?? nested ?? fallbackContextWindow,
       supportsImages,
+      draftOnly,
     };
   } catch {
-    return { contextWindow: fallbackContextWindow, supportsImages: false };
+    return { contextWindow: fallbackContextWindow, supportsImages: false, draftOnly: false };
   }
 }
 
 /**
- * Scan `modelsDir` for chat-capable model subdirectories and build their
- * pi provider entries. Same tolerance as the cli discover walk: an
- * unreadable dir yields `[]`; entries with an undetectable config, a
- * non-generative type, or no launch preset are skipped silently
- * (warnings only when `MLX_DEBUG` is set). Cheap by contract — no
- * weights are loaded here. Results are sorted by directory name, which
- * becomes both the pi model `id` and display `name`.
+ * Scan `modelsDir` for chat-capable model subdirectories and native dense
+ * Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` files, then build their pi provider
+ * entries. XL files may live directly under `modelsDir` or one level inside a
+ * downloaded GGUF repository. Each is registered by filename stem so multiple
+ * quant variants in one repository remain independently selectable.
+ *
+ * Same tolerance as the cli discover walk: an unreadable dir yields `[]`;
+ * entries with an undetectable config, a non-generative type, or no launch
+ * preset are skipped silently (warnings only when `MLX_DEBUG` is set). Cheap
+ * by contract — no weights are loaded here. Results are sorted by model name.
  */
 export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo[]> {
   const debug = Boolean(process.env.MLX_DEBUG);
@@ -178,7 +221,71 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
   }
 
   const out: MlxModelInfo[] = [];
+  const usedNames = new Set<string>();
+
+  const append = async (
+    preferredName: string,
+    path: string,
+    metadataRoot: string,
+    modelType: ModelType,
+    scopeName: string,
+  ): Promise<void> => {
+    if (NON_GENERATIVE.has(modelType)) return;
+
+    const preset = launchPresetFor(modelType);
+    if (!preset) {
+      if (debug) console.warn(`[mlx] skip ${path}: no launch preset for ${modelType}`);
+      return;
+    }
+    const traits = FAMILY_TRAITS[modelType];
+    if (!traits) {
+      if (debug) console.warn(`[mlx] skip ${path}: no FAMILY_TRAITS entry for ${modelType}`);
+      return;
+    }
+
+    const metadata = await readDiscoveryMetadata(metadataRoot, modelType, traits.fallbackContextWindow);
+    if (metadata.draftOnly) {
+      if (debug) console.warn(`[mlx] skip ${path}: companion draft checkpoint is not a chat model`);
+      return;
+    }
+
+    let name = preferredName;
+    if (usedNames.has(name)) {
+      name = `${scopeName}-${preferredName}`;
+      let suffix = 2;
+      while (usedNames.has(name)) name = `${scopeName}-${preferredName}-${suffix++}`;
+    }
+    usedNames.add(name);
+    out.push({
+      discovered: { name, path, modelType },
+      piModel: {
+        id: name,
+        name,
+        reasoning: traits.reasoning,
+        thinkingLevelMap: traits.thinkingLevelMap,
+        input: metadata.supportsImages ? ['text', 'image'] : ['text'],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: metadata.contextWindow,
+        maxTokens: preset.maxOutputTokens,
+      },
+    });
+  };
+
   for (const entry of entries) {
+    if (entry.isFile() && isQwen35XlGguf(entry.name)) {
+      const full = join(modelsDir, entry.name);
+      try {
+        const modelType = await detectModelType(full);
+        if (modelType === 'qwen3_5') {
+          await append(ggufModelName(entry.name), full, modelsDir, modelType, basename(modelsDir));
+        } else if (debug) {
+          console.warn(`[mlx] skip ${full}: direct XL GGUF loading is not supported for ${modelType}`);
+        }
+      } catch (err) {
+        if (debug) console.warn(`[mlx] skip ${full}: ${(err as Error).message}`);
+      }
+      continue;
+    }
     if (!entry.isDirectory()) continue;
     const full = join(modelsDir, entry.name);
 
@@ -190,38 +297,31 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
       continue;
     }
 
-    if (NON_GENERATIVE.has(modelType)) continue;
-
-    const preset = launchPresetFor(modelType);
-    if (!preset) {
-      if (debug) console.warn(`[mlx] skip ${full}: no launch preset for ${modelType}`);
+    const inventory = await modelFileInventory(full);
+    const { xlGgufs } = inventory;
+    if (xlGgufs.length > 0) {
+      if (modelType !== 'qwen3_5') {
+        if (debug) {
+          console.warn(`[mlx] skip ${full}: direct XL GGUF loading is not supported for ${modelType}`);
+        }
+        continue;
+      }
+      for (const gguf of xlGgufs) {
+        await append(ggufModelName(gguf), join(full, gguf), full, modelType, entry.name);
+      }
       continue;
     }
-    const traits = FAMILY_TRAITS[modelType];
-    if (!traits) {
-      if (debug) console.warn(`[mlx] skip ${full}: no FAMILY_TRAITS entry for ${modelType}`);
+
+    // A raw GGUF repository is not itself a loadable model path. Only the
+    // selected native Qwen3.5 XL files above may be handed directly to the
+    // loader. Keep converted model directories discoverable when they retain
+    // an imatrix/source GGUF beside their actual SafeTensors weights.
+    if (inventory.hasGguf && !inventory.hasSafetensors) {
+      if (debug) console.warn(`[mlx] skip ${full}: no supported direct GGUF target`);
       continue;
     }
 
-    const name = basename(full);
-    const { contextWindow, supportsImages } = await readDiscoveryMetadata(
-      full,
-      modelType,
-      traits.fallbackContextWindow,
-    );
-    out.push({
-      discovered: { name, path: full, modelType },
-      piModel: {
-        id: name,
-        name,
-        reasoning: traits.reasoning,
-        thinkingLevelMap: traits.thinkingLevelMap,
-        input: supportsImages ? ['text', 'image'] : ['text'],
-        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow,
-        maxTokens: preset.maxOutputTokens,
-      },
-    });
+    await append(basename(full), full, full, modelType, entry.name);
   }
 
   out.sort((a, b) => (a.discovered.name < b.discovered.name ? -1 : a.discovered.name > b.discovered.name ? 1 : 0));
