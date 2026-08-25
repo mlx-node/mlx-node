@@ -622,9 +622,13 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             // Sampled path: per-position Leviathan accept + residual
             // resample against the stepper's proposal densities.
             (|| {
-                let has_dense = proposal.draft_dists.len() == draft_len;
-                let has_sparse = proposal.draft_sparse_dists.len() == draft_len;
-                if has_dense == has_sparse {
+                // A zero-draft cycle is the intentional AR-through-verify
+                // fallback: it owns no proposal rows and samples only the
+                // verifier boundary below. Enforce exclusive dense/sparse
+                // proposal ownership only when there is a drafted token.
+                let has_dense = draft_len > 0 && proposal.draft_dists.len() == draft_len;
+                let has_sparse = draft_len > 0 && proposal.draft_sparse_dists.len() == draft_len;
+                if draft_len > 0 && has_dense == has_sparse {
                     return Err(Error::from_reason(format!(
                         "DSpark sampled accept requires exactly one dense or sparse proposal \
                          distribution per drafted token (got {} dense, {} sparse for {} drafts)",
@@ -2535,6 +2539,32 @@ mod tests {
             !out.last_in_cache,
             "the degenerate cycle's emitted token is its boundary — no K/V"
         );
+    }
+
+    #[test]
+    fn dspark_turn_sampled_remaining_one_degenerate_ar_cycle() {
+        // Sampled decoding uses the same zero-draft AR-through-verify cycle.
+        // With no drafted token both proposal distribution vectors are empty;
+        // that is valid and must sample row 0 rather than failing the
+        // dense-vs-sparse exclusivity check.
+        let mut backend =
+            MockDsparkBackend::sampled(16, vec![CycleScript::greedy(Vec::new(), vec![8])]);
+        let mut p = dense_params();
+        p.max_new_tokens = 2;
+        let out = drive_turn(&mut backend, p, 3, 15, 2);
+
+        assert_eq!(out.generated, vec![3, 8]);
+        assert_eq!(out.finish_reason, "length");
+        assert_eq!(
+            out.ledger,
+            vec![
+                Call::Verify { ids: vec![3] },
+                Call::Commit { keep: 1, total: 1 },
+                Call::EvalBoundary { token: 8 },
+            ]
+        );
+        assert!(out.acceptance.is_none());
+        assert!(!out.last_in_cache);
     }
 
     #[test]

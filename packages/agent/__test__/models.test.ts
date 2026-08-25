@@ -295,4 +295,34 @@ describe('discoverMlxModels', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it('assigns colliding XL model IDs in sorted directory order', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-colliding-xl-'));
+    try {
+      // Create zeta first so filesystem insertion order disagrees with the
+      // stable lexical order discovery must use for persisted model IDs.
+      const zeta = join(root, 'zeta-repo');
+      const alpha = join(root, 'alpha-repo');
+      for (const repo of [zeta, alpha]) {
+        await mkdir(repo, { recursive: true });
+        await writeFile(join(repo, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+        await writeFile(join(repo, 'Shared-Qwen3.8-UD-Q4_K_XL.gguf'), 'target');
+      }
+
+      expect((await discoverMlxModels(root)).map((model) => model.discovered)).toEqual([
+        {
+          name: 'Shared-Qwen3.8-UD-Q4_K_XL',
+          path: join(alpha, 'Shared-Qwen3.8-UD-Q4_K_XL.gguf'),
+          modelType: 'qwen3_5',
+        },
+        {
+          name: 'zeta-repo-Shared-Qwen3.8-UD-Q4_K_XL',
+          path: join(zeta, 'Shared-Qwen3.8-UD-Q4_K_XL.gguf'),
+          modelType: 'qwen3_5',
+        },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
 });

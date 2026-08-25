@@ -219,6 +219,10 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
   } catch {
     return [];
   }
+  // Collision resolution below gives the first occurrence the bare filename
+  // stem. Directory enumeration order is unspecified, so sort before assigning
+  // IDs to keep persisted `mlx/<id>` selections stable across filesystems.
+  entries.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   const out: MlxModelInfo[] = [];
   const usedNames = new Set<string>();
