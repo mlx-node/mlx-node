@@ -21,6 +21,10 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./family-data": {
+      "types": "./dist/family-data.d.ts",
+      "import": "./dist/family-data.js"
     }
   },
   "scripts": {

@@ -1,6 +1,5 @@
 import type { ThinkingLevel } from '@earendil-works/pi-ai';
-import { createToolDefinition } from '@mlx-node/lm';
-import { LAUNCH_PRESETS } from '@mlx-node/server';
+import { createToolDefinition, serverLaunchPresetFor } from '@mlx-node/lm';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { buildChatConfig } from '../src/provider/chat-config.js';
@@ -22,18 +21,18 @@ describe('buildChatConfig', () => {
     }
   });
 
-  it('uses the LAUNCH_PRESETS sampling base and maxOutputTokens for the model type', () => {
+  it('uses the family launch-preset sampling base and maxOutputTokens for the model type', () => {
     const qwen = buildChatConfig('qwen3_5', undefined, undefined);
     expect(qwen.temperature).toBe(0.6);
     expect(qwen.topP).toBe(0.95);
     expect(qwen.topK).toBe(20);
     expect(qwen.minP).toBe(0.0);
-    expect(qwen.maxNewTokens).toBe(LAUNCH_PRESETS['qwen3_5']!.maxOutputTokens);
+    expect(qwen.maxNewTokens).toBe(serverLaunchPresetFor('qwen3_5')!.maxOutputTokens);
 
     const gemma = buildChatConfig('gemma4', undefined, undefined);
     expect(gemma.temperature).toBe(0.7);
     expect(gemma.topK).toBe(64);
-    expect(gemma.maxNewTokens).toBe(LAUNCH_PRESETS['gemma4']!.maxOutputTokens);
+    expect(gemma.maxNewTokens).toBe(serverLaunchPresetFor('gemma4')!.maxOutputTokens);
   });
 
   it('lets per-call options override the preset base', () => {
@@ -60,7 +59,7 @@ describe('buildChatConfig', () => {
       1.5,
       Number.MAX_SAFE_INTEGER + 1,
     ];
-    const presetMaxTokens = LAUNCH_PRESETS['qwen3_5']!.maxOutputTokens;
+    const presetMaxTokens = serverLaunchPresetFor('qwen3_5')!.maxOutputTokens;
 
     for (const invalid of invalidValues) {
       expect(
@@ -74,7 +73,7 @@ describe('buildChatConfig', () => {
 
   it('does not override when the option is absent', () => {
     const config = buildChatConfig('qwen3_5', {}, undefined);
-    expect(config.maxNewTokens).toBe(LAUNCH_PRESETS['qwen3_5']!.maxOutputTokens);
+    expect(config.maxNewTokens).toBe(serverLaunchPresetFor('qwen3_5')!.maxOutputTokens);
     expect(config.temperature).toBe(0.6);
   });
 
@@ -111,18 +110,27 @@ describe('buildChatConfig', () => {
     expect(config.repetitionPenalty).toBe(1.05);
     expect(config.maxNewTokens).toBe(8192);
     // Guard against silently re-aliasing onto the dense preset.
-    expect(config.temperature).not.toBe(LAUNCH_PRESETS['lfm2']!.sampling.temperature);
-    expect(config.topK).not.toBe(LAUNCH_PRESETS['lfm2']!.sampling.topK);
+    expect(config.temperature).not.toBe(serverLaunchPresetFor('lfm2')!.sampling.temperature);
+    expect(config.topK).not.toBe(serverLaunchPresetFor('lfm2')!.sampling.topK);
   });
 
   it('throws a clear error for a model type with no launch preset', () => {
     expect(() => buildChatConfig('harrier', undefined, undefined)).toThrow(/no launch preset .*harrier/i);
   });
 
-  it('does not mutate the shared LAUNCH_PRESETS sampling object', () => {
-    const before = { ...LAUNCH_PRESETS['qwen3_5']!.sampling };
+  it('pins the no-preset error known-types list byte-identically', () => {
+    // The historical order: the server LAUNCH_PRESETS literal's keys, then
+    // the agent-only overlay. The derived construction must never reorder it.
+    expect(() => buildChatConfig('harrier', undefined, undefined)).toThrow(
+      'buildChatConfig: no launch preset for model type "harrier" ' +
+        '(known types: qwen3, qwen3_5, qwen3_5_moe, gemma4, muse_glimmer, lfm2, nemotron_h, lfm2_moe)',
+    );
+  });
+
+  it('does not mutate the shared launch-preset sampling object', () => {
+    const before = { ...serverLaunchPresetFor('qwen3_5')!.sampling };
     const config = buildChatConfig('qwen3_5', { temperature: 0.99 }, undefined);
     expect(config.temperature).toBe(0.99);
-    expect(LAUNCH_PRESETS['qwen3_5']!.sampling).toEqual(before);
+    expect(serverLaunchPresetFor('qwen3_5')!.sampling).toEqual(before);
   });
 });

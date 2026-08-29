@@ -22,6 +22,15 @@ import {
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
 import {
+  familyDataFor,
+  MalformedModelConfigError,
+  matchFamily,
+  MODEL_FAMILY_DATA,
+  UnsupportedModelTypeError,
+  type ModelType,
+  type TrainableFamilyId,
+} from '../family-data.js';
+import {
   Gemma4Model,
   Lfm2Model,
   MuseGlimmerModel,
@@ -54,32 +63,9 @@ export interface LoadModelOptions {
   draftModelPath?: string;
 }
 
-type ModelKind = 'trainable' | 'loadable' | 'embedding' | 'vlm';
-
-interface NormalizedModelConfig {
-  readonly usesDefaultModelType: boolean;
-  readonly rawModelType: string | undefined;
-  readonly rawModelTypeLabel: string;
-  readonly architectures: ReadonlySet<string>;
-}
-
-interface ModelConfigMatchContext extends NormalizedModelConfig {
-  readonly modelType: string | undefined;
-}
-
-interface ModelConfigMatcher {
-  /** Exact raw `config.json` model_type values owned by this family. */
-  readonly rawModelTypes: readonly string[];
-  /** Optional higher-priority architecture probe for shared or absent model_type values. */
-  readonly architectureProbe?: (config: ModelConfigMatchContext) => boolean;
-}
-
 type NativeModelClass = abstract new (...args: never[]) => object;
 
-interface ModelFamilyDescriptor {
-  readonly modelType: string;
-  readonly kind: ModelKind;
-  readonly match: ModelConfigMatcher;
+interface LoaderBinding {
   readonly load: (modelPath: string, options?: LoadModelOptions) => Promise<unknown>;
   /**
    * Native `@mlx-node/core` class behind this family. The public
@@ -92,138 +78,73 @@ interface ModelFamilyDescriptor {
    * `loadModel` results.
    */
   readonly nativeModelClass: NativeModelClass;
-  readonly acceptsDraftModel?: true;
-  /** Backward-compatible fallback when config.json omits model_type or sets it to null. */
-  readonly defaultForNullishModelType?: true;
 }
 
 /**
- * Ordered source of truth for every supported model family. Each entry owns
- * its canonical `ModelType`, raw config aliases / architecture probes, loader,
- * and `ChatSession` eligibility:
- *
- *   - `'trainable'` — GRPO/SFT-capable LM (Qwen3 family); chat-capable.
- *   - `'loadable'`  — chat-capable LM with no trainer engine (Gemma4, LFM2).
- *   - `'embedding'` — no chat surface (Harrier); rejected by `loadSession`.
- *   - `'vlm'`       — VLM whose AsyncGenerator wrapper lives in
- *                     `@mlx-node/vlm` (importing it here would create a
- *                     circular package dependency), so `loadSession`
- *                     rejects it and routes callers to `@mlx-node/vlm`.
- *
- * A base family is selected from an explicit alias or the single declarative
- * nullish-model_type default, then architecture probes refine it in declaration
- * order. Gemma's unified architecture is authoritative (matching the native
- * loader); Harrier refines a Qwen3 base. Adding a family means adding one
- * descriptor here, without a second normalization or dispatch branch.
+ * Native half of the family registry: one loader + native class per
+ * `MODEL_FAMILY_DATA` row (the native-free half in `../family-data.ts`).
+ * `satisfies Record<ModelType, LoaderBinding>` makes the zip exhaustive both
+ * ways — a data row without a binding, or a binding without a row, fails to
+ * compile.
  */
-const MODEL_FAMILY_REGISTRY = [
-  {
-    modelType: 'gemma4',
-    kind: 'loadable',
-    match: {
-      rawModelTypes: ['gemma4', 'gemma4_text', 'gemma4_unified'],
-      architectureProbe: ({ architectures }) => architectures.has('Gemma4UnifiedForConditionalGeneration'),
-    },
+const LOADER_BINDINGS = {
+  gemma4: {
     load: (modelPath: string, options?: LoadModelOptions) =>
       Gemma4Model.load(
         modelPath,
         options?.draftModelPath === undefined ? null : { draftModelPath: options.draftModelPath },
       ),
     nativeModelClass: NativeGemma4Model,
-    acceptsDraftModel: true,
   },
-  {
-    modelType: 'muse_glimmer',
-    kind: 'loadable',
-    match: {
-      rawModelTypes: ['muse_glimmer', 'muse_glimmer_text'],
-      architectureProbe: ({ architectures }) => architectures.has('MuseGlimmerForConditionalGeneration'),
-    },
+  muse_glimmer: {
     load: (modelPath: string) => MuseGlimmerModel.load(modelPath),
     nativeModelClass: NativeMuseGlimmerModel,
   },
-  {
-    modelType: 'harrier',
-    kind: 'embedding',
-    match: {
-      rawModelTypes: ['harrier'],
-      architectureProbe: ({ modelType, architectures }) =>
-        modelType === 'qwen3' && architectures.has('Qwen3Model') && !architectures.has('Qwen3ForCausalLM'),
-    },
+  harrier: {
     load: (modelPath: string) => HarrierModel.load(modelPath),
     nativeModelClass: HarrierModel,
   },
-  {
-    modelType: 'qwen3',
-    kind: 'trainable',
-    match: { rawModelTypes: ['qwen3'] },
+  qwen3: {
     load: (modelPath: string) => Qwen3Model.load(modelPath),
     nativeModelClass: NativeQwen3Model,
-    defaultForNullishModelType: true,
   },
-  {
-    modelType: 'qwen3_5',
-    kind: 'trainable',
-    match: { rawModelTypes: ['qwen3_5'] },
+  qwen3_5: {
     load: (modelPath: string, options?: LoadModelOptions) =>
       Qwen35Model.load(
         modelPath,
         options?.draftModelPath === undefined ? null : { draftModelPath: options.draftModelPath },
       ),
     nativeModelClass: NativeQwen35Model,
-    acceptsDraftModel: true,
   },
-  {
-    modelType: 'qwen3_5_moe',
-    kind: 'trainable',
-    match: { rawModelTypes: ['qwen3_5_moe'] },
+  qwen3_5_moe: {
     load: (modelPath: string) => Qwen35MoeModel.load(modelPath),
     nativeModelClass: NativeQwen35MoeModel,
   },
-  {
-    modelType: 'lfm2',
-    kind: 'loadable',
-    match: { rawModelTypes: ['lfm2'] },
+  lfm2: {
     load: (modelPath: string) => Lfm2Model.load(modelPath),
     nativeModelClass: NativeLfm2Model,
   },
-  {
-    modelType: 'lfm2_moe',
-    kind: 'loadable',
-    match: { rawModelTypes: ['lfm2_moe'] },
+  lfm2_moe: {
     load: (modelPath: string) => Lfm2Model.load(modelPath),
     nativeModelClass: NativeLfm2Model,
   },
-  {
-    modelType: 'nemotron_h',
-    kind: 'loadable',
-    match: {
-      rawModelTypes: ['nemotron_h'],
-      architectureProbe: ({ architectures }) => architectures.has('NemotronHForCausalLM'),
-    },
+  nemotron_h: {
     load: (modelPath: string) => NemotronHModel.load(modelPath),
     nativeModelClass: NativeNemotronHModel,
   },
-  {
-    modelType: 'internvl_chat',
-    kind: 'vlm',
-    match: { rawModelTypes: ['internvl_chat'] },
+  internvl_chat: {
     load: (modelPath: string) => QianfanOCRModel.load(modelPath),
     nativeModelClass: QianfanOCRModel,
   },
-  {
-    modelType: 'qianfan-ocr',
-    kind: 'vlm',
-    match: { rawModelTypes: ['qianfan-ocr'] },
+  'qianfan-ocr': {
     load: (modelPath: string) => QianfanOCRModel.load(modelPath),
     nativeModelClass: QianfanOCRModel,
   },
-] as const satisfies readonly ModelFamilyDescriptor[];
+} as const satisfies Record<ModelType, LoaderBinding>;
 
-export type ModelType = (typeof MODEL_FAMILY_REGISTRY)[number]['modelType'];
+type LoaderBindings = typeof LOADER_BINDINGS;
 
-type RegisteredModelFamily = (typeof MODEL_FAMILY_REGISTRY)[number];
-type RegisteredTrainableFamily = Extract<RegisteredModelFamily, { readonly kind: 'trainable' }>;
+export type { ModelType };
 
 /**
  * Union of the native `@mlx-node/core` model classes across every registered
@@ -233,129 +154,30 @@ type RegisteredTrainableFamily = Extract<RegisteredModelFamily, { readonly kind:
  * native classes so downstream code can pass instances directly to Rust
  * engine factory methods without type conflicts.
  */
-export type LoadableModel = InstanceType<RegisteredModelFamily['nativeModelClass']>;
+export type LoadableModel = InstanceType<LoaderBindings[ModelType]['nativeModelClass']>;
 
 /**
  * Union accepted by trainer APIs: registered wrapper results plus their native
- * FFI instances. Both sides derive from the same trainable registry rows.
+ * FFI instances. Both sides derive from the same trainable family ids.
  */
 export type TrainableModel =
-  | Awaited<ReturnType<RegisteredTrainableFamily['load']>>
-  | InstanceType<RegisteredTrainableFamily['nativeModelClass']>;
+  | Awaited<ReturnType<LoaderBindings[TrainableFamilyId]['load']>>
+  | InstanceType<LoaderBindings[TrainableFamilyId]['nativeModelClass']>;
 
-interface ModelFamilyIndex<Family extends ModelFamilyDescriptor> {
-  readonly byModelType: ReadonlyMap<string, Family>;
-  readonly byRawModelType: ReadonlyMap<string, Family>;
-  readonly defaultForNullishModelType: Family;
-}
+// Only families whose native `load(path)` accepts a GGUF file carry a
+// `ggufArchitectures` row entry (see family-data.ts).
+const GGUF_ARCHITECTURE_MODEL_TYPES = new Map<string, ModelType>(
+  MODEL_FAMILY_DATA.flatMap((row) =>
+    'ggufArchitectures' in row ? row.ggufArchitectures.map((architecture) => [architecture, row.id] as const) : [],
+  ),
+);
 
-function buildModelFamilyIndex<const Family extends ModelFamilyDescriptor>(
-  registry: readonly Family[],
-): ModelFamilyIndex<Family> {
-  const byModelType = new Map<string, Family>();
-  const byRawModelType = new Map<string, Family>();
-  let defaultForNullishModelType: Family | undefined;
-
-  for (const family of registry) {
-    const previousFamily = byModelType.get(family.modelType);
-    if (previousFamily !== undefined) {
-      throw new Error(`Duplicate canonical model type "${family.modelType}" in model family registry`);
-    }
-    byModelType.set(family.modelType, family);
-
-    for (const rawModelType of family.match.rawModelTypes) {
-      const previous = byRawModelType.get(rawModelType);
-      if (previous !== undefined) {
-        throw new Error(
-          `Duplicate model_type alias "${rawModelType}" for "${previous.modelType}" and "${family.modelType}"`,
-        );
-      }
-      byRawModelType.set(rawModelType, family);
-    }
-
-    if (family.defaultForNullishModelType === true) {
-      if (defaultForNullishModelType !== undefined) {
-        throw new Error(
-          `Duplicate nullish-model_type defaults for "${defaultForNullishModelType.modelType}" and "${family.modelType}"`,
-        );
-      }
-      defaultForNullishModelType = family;
-    }
-  }
-
-  if (defaultForNullishModelType === undefined) {
-    throw new Error('Model family registry must declare exactly one nullish-model_type default');
-  }
-  return { byModelType, byRawModelType, defaultForNullishModelType };
-}
-
-const MODEL_FAMILY_INDEX = buildModelFamilyIndex(MODEL_FAMILY_REGISTRY);
-
-// Only families whose native `load(path)` accepts a GGUF file belong here.
-// Qwen3.5-MoE currently consumes converted directories, not direct files.
-const GGUF_ARCHITECTURE_MODEL_TYPES = new Map<string, ModelType>([['qwen35', 'qwen3_5']]);
-
-function findFamily(modelType: ModelType): ModelFamilyDescriptor {
-  const family = MODEL_FAMILY_INDEX.byModelType.get(modelType);
+function requireFamilyData(modelType: ModelType) {
+  const family = familyDataFor(modelType);
   if (family === undefined) {
     throw new Error(`Internal error: missing model family descriptor for "${modelType}"`);
   }
   return family;
-}
-
-function matchesArchitectureProbe(family: ModelFamilyDescriptor, config: ModelConfigMatchContext): boolean {
-  return family.match.architectureProbe?.(config) === true;
-}
-
-class MalformedModelConfigError extends Error {
-  constructor(modelPath: string, reason: string) {
-    super(`Malformed config.json in ${modelPath}: ${reason}`);
-    this.name = 'MalformedModelConfigError';
-  }
-}
-
-/**
- * Fail-closed validation: a config.json whose root is not a plain object,
- * or whose `architectures` is neither an array nor a string, is rejected
- * instead of coerced (coercion would fall through to the qwen3
- * nullish-model_type default and silently misroute the checkpoint).
- * Blessed lenient shapes stay accepted: `{}` root (qwen3 default),
- * missing/`null` `architectures` (empty set), bare-string `architectures`
- * (single-element set), and non-string array entries (filtered out).
- */
-function normalizeConfig(modelPath: string, config: unknown): NormalizedModelConfig {
-  if (typeof config !== 'object' || config === null || Array.isArray(config)) {
-    throw new MalformedModelConfigError(modelPath, 'root must be a JSON object');
-  }
-  const object = config as Record<string, unknown>;
-  const hasModelType = Object.hasOwn(object, 'model_type');
-  const rawModelTypeValue = hasModelType ? object.model_type : undefined;
-  const usesDefaultModelType = !hasModelType || rawModelTypeValue === null;
-  const rawModelType = typeof rawModelTypeValue === 'string' ? rawModelTypeValue : undefined;
-  const rawModelTypeLabel = hasModelType ? String(rawModelTypeValue) : '<missing>';
-  const rawArchitectures = 'architectures' in object ? object.architectures : undefined;
-  if (
-    rawArchitectures !== undefined &&
-    rawArchitectures !== null &&
-    !Array.isArray(rawArchitectures) &&
-    typeof rawArchitectures !== 'string'
-  ) {
-    throw new MalformedModelConfigError(modelPath, '"architectures" must be an array or a string');
-  }
-  const architectures = Array.isArray(rawArchitectures)
-    ? rawArchitectures.filter((architecture): architecture is string => typeof architecture === 'string')
-    : typeof rawArchitectures === 'string'
-      ? [rawArchitectures]
-      : [];
-
-  return { usesDefaultModelType, rawModelType, rawModelTypeLabel, architectures: new Set(architectures) };
-}
-
-class UnsupportedModelTypeError extends Error {
-  constructor(modelPath: string, rawModelTypeLabel: string) {
-    super(`Unsupported model_type "${rawModelTypeLabel}" in ${modelPath}/config.json`);
-    this.name = 'UnsupportedModelTypeError';
-  }
 }
 
 /**
@@ -368,14 +190,14 @@ function dispatchLoad(
   modelPath: string,
   options: LoadModelOptions | undefined,
 ): Promise<unknown> {
-  const family = findFamily(modelType);
-  if (options?.draftModelPath !== undefined && family.acceptsDraftModel !== true) {
+  if (options?.draftModelPath !== undefined && requireFamilyData(modelType).acceptsDraftModel !== true) {
     throw new Error(
       `draftModelPath (speculative-decoding draft) is only supported by gemma4 and qwen3_5 models; ` +
         `${modelPath} has model_type "${modelType}"`,
     );
   }
-  return family.load(modelPath, options);
+  const binding: LoaderBinding = LOADER_BINDINGS[modelType];
+  return binding.load(modelPath, options);
 }
 
 /**
@@ -428,7 +250,7 @@ export async function loadSession(
   options?: LoadModelOptions,
 ): Promise<ChatSession<SessionCapableModel>> {
   const modelType = await detectModelType(modelPath);
-  const kind = findFamily(modelType).kind;
+  const kind = requireFamilyData(modelType).kind;
   if (kind === 'embedding') {
     throw new Error('loadSession: embedding models (Harrier) cannot be wrapped in a ChatSession');
   }
@@ -460,17 +282,7 @@ export async function detectModelType(modelPath: string): Promise<ModelType> {
   }
 
   try {
-    const config = normalizeConfig(modelPath, JSON.parse(raw));
-    const baseFamily = config.usesDefaultModelType
-      ? MODEL_FAMILY_INDEX.defaultForNullishModelType
-      : config.rawModelType === undefined
-        ? undefined
-        : MODEL_FAMILY_INDEX.byRawModelType.get(config.rawModelType);
-    const matchContext: ModelConfigMatchContext = { ...config, modelType: baseFamily?.modelType };
-    const family =
-      MODEL_FAMILY_REGISTRY.find((candidate) => matchesArchitectureProbe(candidate, matchContext)) ?? baseFamily;
-    if (family === undefined) throw new UnsupportedModelTypeError(modelPath, config.rawModelTypeLabel);
-    return family.modelType;
+    return matchFamily(modelPath, JSON.parse(raw));
   } catch (e) {
     if (e instanceof UnsupportedModelTypeError || e instanceof MalformedModelConfigError) throw e;
     throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`);

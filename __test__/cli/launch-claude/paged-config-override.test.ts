@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readFile, readlink, rm, stat, writeFile } from 'node:fs
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { AGENT_PAGED_MODEL_TYPES, PagedConfigOverrideManager, QWEN35_PAGED_MODEL_TYPES } from '@mlx-node/lm';
+import { CHAT_FAMILY_IDS, PagedConfigOverrideManager, QWEN35_PAGED_MODEL_TYPES } from '@mlx-node/lm';
 import { describe, expect, it } from 'vite-plus/test';
 
 async function makeFixture(modelType: string, extraConfig: Record<string, unknown> = {}): Promise<string> {
@@ -261,7 +261,7 @@ describe('PagedConfigOverrideManager launch-claude policy', () => {
 
 describe('PagedConfigOverrideManager agent policy and lifecycle', () => {
   it('forces paged config for every agent chat family', async () => {
-    for (const modelType of AGENT_PAGED_MODEL_TYPES) {
+    for (const modelType of CHAT_FAMILY_IDS) {
       const src = await makeFixture(modelType, {
         use_block_paged_cache: false,
       });

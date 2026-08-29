@@ -54,6 +54,13 @@ describe('discoverModels', () => {
     expect(got).toEqual([]);
   });
 
+  it('skips lfm2_moe (agent-only preset; no server launch preset)', async () => {
+    makeModel('lfm-moe', { model_type: 'lfm2_moe' });
+    makeModel('lfm-dense', { model_type: 'lfm2' });
+    const got = await discoverModels(root);
+    expect(got.map((e) => e.name)).toEqual(['lfm-dense']);
+  });
+
   it('skips regular files in the directory', async () => {
     writeFileSync(join(root, 'stray.txt'), 'not a model');
     makeModel('qwen3-demo', { model_type: 'qwen3' });

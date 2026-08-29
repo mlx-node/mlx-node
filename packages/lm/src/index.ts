@@ -106,12 +106,38 @@ export {
   detectModelType,
   type LoadableModel,
   type TrainableModel,
-  type ModelType,
   type LoadModelOptions,
 } from './models/model-loader.js';
 
+// Native-free per-family registration data (also published as the
+// `@mlx-node/lm/family-data` subpath for consumers that must not dlopen the
+// addon; see family-data.ts).
 export {
-  AGENT_PAGED_MODEL_TYPES,
+  agentLaunchPresetFor,
+  CHAT_FAMILY_IDS,
+  familyDataFor,
+  familyTraitsFor,
+  GEMMA4_SAMPLING_DEFAULTS,
+  LFM2_SAMPLING_DEFAULTS,
+  matchFamily,
+  MODEL_FAMILY_DATA,
+  MUSE_GLIMMER_SAMPLING_DEFAULTS,
+  NEMOTRON_SAMPLING_DEFAULTS,
+  NON_GENERATIVE_FAMILY_IDS,
+  QWEN_SAMPLING_DEFAULTS,
+  rawModelTypeToCanonical,
+  serverLaunchPresetFor,
+  type ChatFamilyId,
+  type FamilyThinkingLevelMap,
+  type FamilyTraits,
+  type LaunchPreset,
+  type ModelFamilyData,
+  type ModelFamilyKind,
+  type ModelType,
+  type TrainableFamilyId,
+} from './family-data.js';
+
+export {
   PagedConfigOverrideManager,
   QWEN35_PAGED_MODEL_TYPES,
   type PagedConfigOverrideManagerOptions,

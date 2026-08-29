@@ -15,8 +15,8 @@
  */
 
 import type { ChatConfig, ChatMessage, ChatResult, ToolCallResult } from '@mlx-node/core';
-import type { SessionCapableModel } from '@mlx-node/lm';
-import { ModelRegistry, QWEN_SAMPLING_DEFAULTS } from '@mlx-node/server';
+import { QWEN_SAMPLING_DEFAULTS, type SessionCapableModel } from '@mlx-node/lm';
+import { ModelRegistry } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 // ---------------------------------------------------------------------------

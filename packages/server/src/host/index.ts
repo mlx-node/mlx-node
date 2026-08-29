@@ -40,7 +40,12 @@
 
 import type { Server } from 'node:http';
 
-import { loadModel as loadModelNative, PagedConfigOverrideManager, type LoadableModel } from '@mlx-node/lm';
+import {
+  loadModel as loadModelNative,
+  PagedConfigOverrideManager,
+  QWEN35_PAGED_MODEL_TYPES,
+  type LoadableModel,
+} from '@mlx-node/lm';
 
 import type { ServerHealth } from '../health.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
@@ -53,7 +58,7 @@ import { makeSwapController } from './swap.js';
 import { hostTempDirPrefix, sweepOrphanHostTempRoots } from './temp-root.js';
 
 /** Families `mlx launch claude` has historically forced onto the paged path. */
-export const DEFAULT_PAGED_MODEL_TYPES = ['qwen3_5', 'qwen3_5_moe'] as const;
+export const DEFAULT_PAGED_MODEL_TYPES = QWEN35_PAGED_MODEL_TYPES;
 
 /** Thrown when `modelsDir` holds nothing servable. Carries the dir for the caller's message. */
 export class NoModelsDiscoveredError extends Error {
