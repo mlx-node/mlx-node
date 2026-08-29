@@ -8,7 +8,15 @@ server on discrete HBM; mlx-node is a latency-first local runtime on unified mem
 model. Several vLLM designs exist to solve problems those constraints create. Where the constraint applies to
 us, copying is right. Where it does not, copying costs performance.
 
-Reference: `vllm` at `bd8865a299`. Our side is cited by symbol, not line number — line numbers rot.
+Reference: `vllm` at `4fc943b867`. Our side is cited by symbol, not line number — line numbers rot;
+vLLM line numbers below are pinned to that commit.
+
+vLLM now runs two stacks. Model Runner V2 is the default whenever Triton is present
+(`vllm/config/vllm.py` `use_v2_model_runner`, :643-675). DSpark, adaptive draft verification, mixed
+sliding/full DFlash drafts, and DFlash2 are V2-only — on V1 a DFlash2 checkpoint drafts through
+`DFlashProposer`, which never calls the DFlash2 candidate selector, so it silently degrades to
+DFlash1 (`_get_v1_model_runner_unsupported_features`, vllm.py:2589-2615). This document cites V2
+semantics where verified, with V1 as the fallback lineage.
 
 ---
 
@@ -22,8 +30,47 @@ These are vLLM's rules, and they are now ours. They are enforced in code, not ju
 | Maintain at the **committed** frontier, never the optimistic write cursor. No prune, checkpoint, sidecar, or registration between a verify write and its commit. | `kv_cache_manager.py` consumes committed lengths | Invariant I9. `prune_sliding_window_for_committed`, `settle_grouped_kv_step_at`, `MusePagedSettle::Committed`, and the L-SETTLE law on `SpecPagedCache` |
 | Never persist unverified tokens; cap every commit at the request's real token count. | prefix-cache commit capped at `request.num_tokens` | Invariant I3. The registration length guard on the adapter; the `paged_gdn_state_dirty` refuse-to-persist latch |
 | Reserve lookahead slots before the cycle; exhaustion degrades to AR, never to a mid-verify error. | `allocate_slots(..., num_lookahead_tokens=K)` | Invariant I1. `reserve_rows{,_for}`, `reserve_rows_all`, `MtpStepper::reserve_cycle_lookahead`, per **cycle** |
-| Greedy acceptance is `target_argmax[k] == draft[k]`, and the boundary token is the target's argmax. | `rejection_sampler.py` | `engine/dspark_turn.rs` greedy fast path; `run_mtp_turn`'s accept loop |
+| Greedy acceptance is `target_argmax[k] == draft[k]`, and the boundary token is the target's argmax. | `rejection_sampler.py` | `engine/dspark_turn.rs` greedy fast path; `run_mtp_turn`'s accept loop. The sampled arms: dense `accept_with_residual` and sparse `accept_with_residual_dense_target_sparse_draft` (DFlash2, `sampling.rs`), both consumed by `run_dspark_turn`'s sampled arm |
 | Prefix reuse is longest-common-prefix over full blocks. | `get_computed_blocks` → `find_longest_cache_hit` | `find_cached_prefix_for_prepare` → `BlockAllocator::find_longest_cache_hit` (**paged lane only** — see Part 3) |
+
+### Three constants, never conflated
+
+vLLM keeps three per-method speculative quantities apart, and its own docs forbid deriving one from
+another:
+
+1. **`num_lookahead_tokens`** — the drafter-written **KV reservation** past the target's query
+   range, per method: DFlash `K + 1`, eagle-family and `draft_model` `K`, else 0
+   (`vllm/config/vllm.py:594-618`).
+2. **`uniform_decode_query_len`** — the `1 + K` **verify query width** of a uniform decode batch.
+   vLLM documents that it must NOT be derived from (1): the two are different contracts and do not
+   differ by a constant (vllm.py:621-640).
+3. **`max_num_new_slots_for_drafting`** — the per-method **drafting input budget**: EAGLE3 0,
+   P-EAGLE `K - 1`, DFlash `K`, DSpark `K - 1`, MTP 0, `draft_model` 1, PARD `K`
+   (`vllm/config/speculative.py:1744-1782`).
+
+Our side: `SpeculativePlan::lookahead_rows_for` reserves TARGET verify rows — `width + 1`. That is
+numerically (2), and deliberately not (1), because our drafter KV is off-pool (the `plan.rs`
+non-goal: drafter state dies with its owner and never registers). (3) has no referent here until
+C2 gives drafts a shared step budget to spend.
+
+### The reference implementation moved (V1 → V2)
+
+The laws above were adopted from V1. The verified V2 law keeps the same shape: drafter layers are
+real attention layers found by the same set-difference and join the shared KV groups and
+`BlockTables` (`worker/gpu/spec_decode/speculator.py:177-194`, `attn_utils.py:52-65`); the first
+draft pass reuses the target's attention metadata AND per-layer slot mappings verbatim — there is
+NO post-rejection compaction, the rejected tail rides along as padding and its slots are re-written
+with throwaway drafter KV (`autoregressive/speculator.py:237-242, 300-317, 693-713`); loop steps
+advance positions with fused Triton kernels and recompute slots with the generic all-groups
+slot-mapping kernel (`block_table.py:183-339`); draft token values stay GPU-resident — the
+scheduler tracks counts and `[-1]` placeholders only (`model_runner.py:1183-1196, 1938-1950`;
+`input_batch.py:388-491`; `async_scheduler.py:19-49`).
+
+The X8-relevant part: V2 gave up V1's exact post-rejection compaction and accepts throwaway KV
+writes at rolled-back slots, in exchange for CPU-sync freedom — an exactness trade our strict
+byte-parity oracle (X8) deliberately does not make. On unified memory with one model thread the
+sync-freedom motivation largely evaporates: the thread already knows the accept count, with no D2H
+cost.
 
 ---
 
@@ -128,6 +175,18 @@ stateful `ChatSession` opts in, because it owns the transcript and the KV cache 
 cross-turn reuse. vLLM ships a vendored Gemma4 template with the same gate shape and lets clients set the flag;
 we scope it to the one caller that benefits.
 
+### X10. Scheduler-budget speculative accounting
+
+**vLLM:** per-method lookahead reservations, the per-method drafting input budget, uniform-decode
+`[-1]` padding, dynamic per-batch-size `K`, and DSpark adaptive verification (survival-product
+top-k against cudagraph-profiled cost curves). All of it exists to run drafts inside a shared step
+budget.
+**Us:** none of it. `SpeculativeLane::lane()` is const `Barrier`: a speculative turn owns the whole
+model thread, so there is no shared budget to account against.
+
+**Reopens if:** C2 lands. Adopt the per-method lookahead and the drafting input budget first;
+adaptive verification and dynamic `K` only if N>1 speculative rows ever become real.
+
 ---
 
 ## Part 3 — Still worth aligning (the ladder)
@@ -136,14 +195,14 @@ Everything here is a gap we intend to close. Ordered.
 
 | Stage | What | Gate |
 |---|---|---|
-| ~~**D1**~~ | **Landed.** gemma4 DSpark verifies against the paged pools through `SpecPagedCache`; `SpecTurnEpilogue` makes L-EPILOGUE executable for the driver that takes one — `run_paged_dspark_turn`, where an abandoned epilogue is counted and debug-asserts. It is opt-in, not a seal: `finish_paged_turn` stays reachable directly, and qwen3.5 DENSE paged MTP's forked epilogue (`paged_turn_sync_core`) never calls it at all, so that fork is still live and unobserved. The flat lane narrowed to the assistant drafter, whose Q-only attention reads flat `Gemma4LayerCache` K/V directly — that is D4. | **Met.** 2.3×–4.5× vs paged AR, same binary, `gemma4_dspark` e2e on Gemma-4-12B-IT + `dspark_gemma4_12b_block7`: 4.5× on `decode_wrap` (constrained count, sub-window prompt, the window wraps mid-DECODE — 90.2 vs 20.1 tok/s), 3.8× on `prefill_wrap` (the >1100-token prompt, the window wraps during PREFILL — 74.1 vs 19.5), 2.3× on `multi_cycle` (free-form, 200 tok — 45.9 vs 20.3). T=0 byte parity on both sliding-wrap legs |
+| ~~**D1**~~ | **Landed.** gemma4 DSpark verifies against the paged pools through `SpecPagedCache`; `SpecTurnEpilogue` makes L-EPILOGUE executable for the driver that takes one — `run_paged_dspark_turn`, where an abandoned epilogue is counted and debug-asserts. It is opt-in, not a seal: `finish_paged_turn` stays reachable directly, and qwen3.5 DENSE paged MTP's forked epilogue (`paged_turn_sync_core`) never calls it at all, so that fork is still live and unobserved. The flat lane still hosts the assistant drafter (whose Q-only attention reads flat `Gemma4LayerCache` K/V directly — that is D4) alongside muse DFlash, qwen3.8 DFlash2, nemotron_h MTP, and dense/MoE flat MTP. | **Met.** 2.3×–4.5× vs paged AR, same binary, `gemma4_dspark` e2e on Gemma-4-12B-IT + `dspark_gemma4_12b_block7`: 4.5× on `decode_wrap` (constrained count, sub-window prompt, the window wraps mid-DECODE — 90.2 vs 20.1 tok/s), 3.8× on `prefill_wrap` (the >1100-token prompt, the window wraps during PREFILL — 74.1 vs 19.5), 2.3× on `multi_cycle` (free-form, 200 tok — 45.9 vs 20.3). T=0 byte parity on both sliding-wrap legs |
 | ~~**D2**~~ | **Landed.** qwen3.5 MoE paged MTP. The MoE speculative plan publishes `supports_paged_attention`, and the generic paged driver runs the family's speculative core in place of the autoregressive loop (`PagedBackend::admit_paged_speculative_decode` + `run_paged_speculative_decode`), so both paged decoders share one epilogue. History is CYCLE history — dense's committed-history mode is gated on a prompt-hidden seed no MoE prefill can produce, so the flag and its inert seed were deleted rather than left as an unsatisfiable option. | **Met.** 1.28× at depth 2 and 1.23× at depth 1 vs paged AR (35B-A3B MXFP8-MTP, 400-token decode, release, alternating A/B in one binary); 1.15×/1.14× at depth 3/4. T=0 three-way parity paged-MTP == paged-AR == flat-MTP over screened fixtures |
-| **D3** | muse DFlash on paged. Needs `DecoderPlan::Speculative`, settle-as-parameter (landed in D0), and an admission cap at `min(prefix_hit, context.logical_len())`. | > paged AR |
+| **D3** | muse DFlash on paged. Needs `DecoderPlan::Speculative`, settle-as-parameter (landed in D0), and an admission cap at `min(prefix_hit, context.logical_len())`. DFlash2 widened this stage: two flat DFlash-style drafters now exist, and the qwen3.8 leg additionally needs GDN tape replay composed with pool rollback (precedent: dense paged MTP). | > paged AR, per leg |
 | **D4** | gemma4 assistant Q-only over target KV — vLLM's `kv_sharing_target_layer_name` shape, zero drafter KV. | Pool-kernel Q-only, or a clean 4K/16K/32K A/B. **NO-GO acceptable** |
-| **LCP-flat** | Longest-common-prefix reuse on the **flat** lane for pure-attention families. Today it returns 0 or everything; vLLM always keeps the common prefix. Sanctioned in `engine/cache.rs` for families without recurrent state. | Surfaced by the gemma4 continuation bug. D1 made it moot for gemma4 speculation; the flat lane now serves only the assistant drafter |
+| **LCP-flat** | Longest-common-prefix reuse on the **flat** lane for pure-attention families. Today it returns 0 or everything; vLLM always keeps the common prefix. Sanctioned in `engine/cache.rs` for families without recurrent state. | Surfaced by the gemma4 continuation bug. D1 made it moot for gemma4 DSpark; the flat lane still serves the assistant drafter, muse DFlash, qwen3.8 DFlash2, nemotron_h MTP, and dense/MoE flat MTP |
 | **B1** | `dense_gdn_consumed_tokens` audit stored in the checkpoint. | — |
 | ~~**B3**~~ | **Landed.** `engine::spec_owner::SpecOwner` addresses the paged adapter by the sequence a turn claimed at entry, so `DenseMtpStepper` no longer moves it out of the model and restores it in `Drop`. Was a soft prereq of D3 and a hard one of C2. | — |
-| **C2** | Scheduled-lane speculation — drafts as ordinary scheduled tokens instead of a barrier turn. **The largest remaining structural gap.** | LOOM Stage-1 + B3. Measure first: the depth-1 MTP ceiling is 1.1–1.15×, so this may stay default-off |
+| **C2** | Scheduled-lane speculation — drafts as ordinary scheduled tokens instead of a barrier turn. **The largest remaining structural gap.** Landing it is the reopen trigger for X10's budget accounting. | LOOM Stage-1 + B3. Measure first: the depth-1 MTP ceiling is 1.1–1.15×, so this may stay default-off |
 | **C3** | Drafter KV resident in the pool (full I8): DSpark private KV, DFlash retained context, MoE drafter cache. EAGLE tail-drop ships in the **same PR**, never before. | C2 paying off first |
 
 **Sequencing note.** C2 gates C3, and C3 is the trigger that would reopen X6. So the ladder is not merely a

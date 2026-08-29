@@ -603,12 +603,11 @@ pub(crate) struct WholeTurnArgs<'a> {
 ///
 /// # Implementer checklist (new family)
 ///
-/// REQUIRED — no default body; a new family MUST implement all 11
+/// REQUIRED — no default body; a new family MUST implement all 10
 /// methods + the `Decode` associated type:
 ///   * `tokenizer` — cloned handle or "not loaded" error
 ///   * `family_name` — stable tag for profiler/errors (e.g. `"lfm2"`)
 ///   * `session_eos_id` — session stop-token id
-///   * `thinking_setup` — resolve thinking-mode state from config
 ///   * `cached_token_history` — committed session history slice
 ///   * `reset_caches` — clear caches + session state (by `ResetScope`)
 ///   * `verify_cache_prefix` — all-or-nothing reusable-prefix length
@@ -622,6 +621,7 @@ pub(crate) struct WholeTurnArgs<'a> {
 /// qwen3_5/ChatML reference):
 ///   - render/finalize: `render_prompt`, `resolve_params`,
 ///     `finalize_turn`
+///   - thinking: `policy`, `thinking_setup`
 ///   - execution capabilities: `execution_plan`, `has_live_session`,
 ///     `session_media`
 ///   - decode/stop: `extra_eos_ids`, `eos_before_emit`,

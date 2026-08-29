@@ -3,9 +3,12 @@
 //! One speculative verify cycle touches the paged cache in exactly four
 //! moves — reserve the lookahead region, write the verify rows, commit the
 //! accepted prefix, settle durable state — and [`SpecPagedCache`] names them
-//! once, so every family (dense/MoE native MTP, gemma4 DSpark, muse DFlash,
-//! gemma4 assistant) lands on the same call order instead of re-deriving it
-//! against raw adapter/coordinator surfaces.
+//! once, so every paged speculative core (dense/MoE native MTP, gemma4
+//! DSpark) lands on the same call order instead of re-deriving it against
+//! raw adapter/coordinator surfaces. Muse DFlash and the gemma4 assistant
+//! verify/commit through flat `Gemma4LayerCache`
+//! `snapshot_before_verify`/`commit_after_verify` and never touch this
+//! facade; qwen3.8 DFlash2 is flat-only and off-facade as well.
 //!
 //! The middle two moves are one TRANSACTION: opening a cycle reads the
 //! pre-cycle frontier OFF THE CACHE and hands back a [`VerifyTicket`]
