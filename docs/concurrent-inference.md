@@ -19,8 +19,8 @@ paged decode clear-cache interval is 1024 steps
 
 ## Current status
 
-- Different sessions on one eligible Qwen3, LFM2, Qwen3.5 dense/MoE, Gemma4, or NemotronH
-  paged model may overlap. The server admits up to the native scheduler's physical
+- Different sessions on one eligible Qwen3, LFM2, Qwen3.5 dense/MoE, Gemma4, Muse-Glimmer,
+  or NemotronH paged model may overlap. The server admits up to the native scheduler's physical
   sequence capacity, and the model thread advances them together. A single
   `ChatSession` still allows only one turn in flight.
 - Flat-cache, training, save, and reset commands stay in exclusive/barrier
@@ -194,12 +194,17 @@ multi-model-hostile in `engine/cmd.rs:186-190`).
 
 ## Yardstick: vLLM v1
 
+The vLLM reference stack has since moved to the Model Runner V2 default, where drafts run as
+ordinary scheduled tokens — ours stay a barrier turn (see
+[vllm-speculative-alignment.md](vllm-speculative-alignment.md), X10); the rows below were verified
+against v1.
+
 | Mechanism                                                                   | vLLM v1                                          | mlx-node today                                                                                                                                                                             |
 | --------------------------------------------------------------------------- | ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Continuous batching (one shared forward per step; no prefill/decode phases) | Core scheduler loop                              | Qwen3, LFM2, Qwen3.5 dense/MoE, Gemma4, and NemotronH text rows share one scheduler and standard step executor; only Qwen3's optional ragged tensor packer supplies a specialized executor |
+| Continuous batching (one shared forward per step; no prefill/decode phases) | Core scheduler loop                              | Qwen3, LFM2, Qwen3.5 dense/MoE, Gemma4, Muse-Glimmer, and NemotronH text rows share one scheduler and standard step executor; only Qwen3's optional ragged tensor packer supplies a specialized executor |
 | Per-step token budget + chunked prefill                                     | Enabled by default                               | One 2048-token ceiling with decode-first planning and pinned per-request breaks                                                                                                            |
-| Live prefix sharing                                                         | Chained hashes, refcounts, and LRU               | Refcounted block pools across supported paged families; Qwen3, Qwen3.5, LFM2 and Gemma4 restore complete model state from SSD                                                              |
-| Admission / preemption                                                      | `max_num_seqs`, watermark, preempt-and-recompute | Sequence cap, reserve-aware watermark, and allocation-squeeze LIFO recompute; measured long prefixes may capture to SSD                                                                    |
+| Live prefix sharing                                                         | Chained hashes, refcounts, and LRU               | Refcounted block pools across supported paged families; Qwen3, Qwen3.5 dense/MoE, LFM2/2.5, Gemma4, and Muse-Glimmer restore complete model state from SSD                                 |
+| Admission / preemption                                                      | `max_num_seqs`, watermark, preempt-and-recompute (freed blocks stay prefix-cache-reusable; optional CPU/secondary offload connectors) | Sequence cap, reserve-aware watermark, and allocation-squeeze LIFO recompute; measured long prefixes may capture to SSD                                                                    |
 | Backend seam                                                                | Scheduler drives platform-specific workers       | `HybridSchedulerBackend` gives every supported family one request lifecycle and standard step executor while family hooks retain architecture-specific tensor/cache operations             |
 
 What does not transfer: CUDA-graph padding (MLX lazy graphs play that role),
