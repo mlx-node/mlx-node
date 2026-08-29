@@ -95,11 +95,11 @@ SafeTensors Gemma-4-26B-A4B MoE shape, the fixed
 available in two forms. The Apple map translates FP8-class weights to MXFP8;
 the DGX map retains NVFP4 weight storage and stores plain E4M3 FP8 weights with
 one scale per output channel.
-Both use the same AWQ imatrix pre-scaling when calibration is provided. The imatrix is optional
-for these fixed maps: without it, AWQ pre-scaling is skipped and quality may be
-lower, while the class map remains unchanged. Plain affine Unsloth still
-requires an imatrix. Matching calibration remains preferred when available;
-add `--imatrix-path ./imatrix_unsloth.gguf_file` to either command below.
+Neither map accepts `--imatrix-path`. AWQ pre-scaling divides weight columns by up to ~56x,
+which drives an NVFP4 block scale below the E4M3 minimum and annihilates the block, so the
+converter refuses the combination. Plain affine Unsloth still requires an imatrix.
+These fixed maps need no replacement: their encoders are data-free and choose
+their own block scales. See [Data-free encoder tuning](#data-free-encoder-tuning).
 
 ```bash
 # Apple MXFP variant: replace NVFP4 with MXFP4
@@ -135,6 +135,122 @@ performance parity. Embeddings, routers, GDN a/b, vision/audio, MTP,
 norms, recurrent parameters, and other unmatched tensors remain BF16. Gemma
 expert imatrix pre-scaling is not inferred from flat GGUF statistics. Plain affine Unsloth alone keeps
 the legacy Dynamic 2.0 recipe.
+
+### Data-free encoder tuning
+
+All three float block formats leave quality on the table in the encoder itself,
+with no calibration data involved. The converter closes all three in its own
+encoders: there is no flag and no untuned mode. Tuning changes what the
+checkpoint stores, never what the model computes — every rule below is exact in
+weight space or strictly closer to the source weights, and none of them touches
+an already-quantized body.
+
+Which rule you get follows from the **format**, not from a flag, so it does not
+matter how a tensor arrived at that format: any tensor emitted as MXFP4 or MXFP8
+goes through the in-tree encoders — via `--q-mxfp`, via `--q-mode mxfp4` /
+`--q-mode mxfp8` directly, or via `--q-recipe nvidia`, whose fixed map emits both
+without `--q-mxfp`. Any dense SwiGLU FFN whose whole `gate`/`up`/`down` trio is
+emitted as NVFP4 is preceded by the power-of-two lift — the trio is the unit,
+because the three exponents are solved together. One gap: the lift is a
+SafeTensors-lane pass, so `mlx convert` from a **GGUF** source emits unlifted
+NVFP4 (its MXFP4/MXFP8 tensors are encoder-tuned like any other).
+
+The resulting checkpoints stay byte-compatible with mlx-lm — same codec, same
+group size, same sidecars — but their block scales are not the bytes
+`mlx_quantize` would have written for the same weights.
+
+**NVFP4 — power-of-two lift.** A block's scale is `amax / 6` stored in E4M3,
+whose smallest normal value is `2^-6`. Real FFN weights put essentially every
+block scale below that, so the scale carries three bits instead of four and the
+smallest blocks round to the zero code and dequantize to nothing. Each dense
+SwiGLU FFN is rescaled by a power of two and the inverse folded into the norm
+the MLP reads, moving every block scale into the normal band.
+
+The fold is exact, not approximate. RMSNorm computes its reciprocal from the
+norm's *input*, so scaling the norm *weight* scales its output by exactly that
+factor; a power of two only shifts an exponent field, so no mantissa and no
+rounding decision changes anywhere downstream. silu is not homogeneous, which
+pins `gate_proj`'s factor to the inverse of the norm's; the elementwise product
+then passes an `up_proj`-side factor straight to `down_proj`'s input. So
+`gate == up + down` is forced — three tensors, two degrees of freedom — and the
+three exponents are solved together, never greedily per tensor.
+
+A layer is lifted only when its whole `gate`/`up`/`down` trio is bound for NVFP4,
+because the three exponents are solved together. A trio with a non-NVFP4 member
+has no solution to apply, so it is skipped — counted and warned about, like the
+cases below. This is not hypothetical: `--q-mode nvfp4 --q-recipe qwen3_5` hits
+it on **every** layer, because that recipe gives `down_proj` one bit more than
+the default and the NVFP4 upgrade promotes only 4-bit decisions, leaving
+`gate`/`up` NVFP4 and `down` 5-bit affine. Use `--q-recipe unsloth` for a
+uniformly NVFP4 FFN.
+
+MoE expert FFNs are **skipped, not lifted** — the skip is counted, and the count
+is warned about at the end of the pass, so the gap is visible in the convert and
+not only here. On `qwen3_5_moe` the norm the experts read also drives the softmax
+router and the sigmoid shared-expert gate, and neither is scale-invariant, so
+folding the inverse there would rescale routing while weight-space error
+improved. A Gemma4 MoE layer is different — its router reads the raw residual and
+its experts read their own `pre_feedforward_layernorm_2`
+(`crates/mlx-core/src/models/gemma4/decoder_layer.rs:442-458`) — but its expert
+FFNs are skipped too for now. Each Gemma4 MoE layer also carries a dense `mlp`
+whose absorber norm nothing else reads, and that dense FFN **is** lifted.
+
+`--dtype bfloat16` (or `float32`) is what gets the full lift. Under `float16` a
+layer whose folded norm would fall into the subnormal band — where the fold stops
+being exact — is skipped and warned about, with the rest of the model lifted
+normally.
+
+**MXFP4 — E8M0 exponent search.** MLX rounds `log2(amax / 6)` to nearest, which
+leaves the block maximum above E2M1's top code on roughly three blocks in five
+and clips it. Rounding the other way never clips but spends a binade of
+resolution on the other thirty-one values. The encoder tries both and keeps the
+lower squared error. E8M0 has no mantissa, so those two exponents are the entire
+candidate set. This needs an in-tree encoder: `mlx_quantize` takes its scales as
+output parameters only, so the tuned encoder — not MLX's — writes every MXFP4 and
+MXFP8 tensor the converter emits. MLX's own rounded encoder survives as a
+`#[cfg(test)]` reference, where two bit-identity tests pin it byte-for-byte
+against `mlx_quantize` and a third pins the production dispatch to the tuned one.
+
+**MXFP8 — E8M0 exponent ceiling.** The same defect, the larger blast radius: on
+the fixed MXFP map MXFP8 carries 233 of the 401 quantized tensors — every
+attention `q/k/v/o`, every GDN `in_proj_qkv`/`in_proj_z`/`out_proj`, the final
+eight FFNs and `lm_head` — against MXFP4's 168.
+
+Rounding lands the exponent within a factor of sqrt(2) either side of
+`amax / 448`, so exactly half of all blocks get one below their own maximum, and
+E4M3 then saturates that maximum by as much as 1.41x. The ceiling cannot: it is
+the smallest exponent whose power of two is at or above `amax / 448`. Measured
+on real Qwen3.5 and Qwen3.8 attention, GDN and FFN weights, that moves the
+relative error from 6.6-8.1% down to a flat 2.66% — a 2.5-3x cut, and 2.66% is
+E4M3's own element-grid floor, so what is left is the format rather than the
+scale.
+
+MXFP8 does not get MXFP4's two-candidate search, because at eight bits there is
+nothing for it to find. E4M3 spans `2^-9` to 448, about `2^17.8` of dynamic
+range, so the binade of headroom the ceiling spends costs a block of 32 nothing;
+E2M1 spans 0.5 to 6 and the same binade is a quarter of the format, which is why
+MXFP4's clip-versus-resolution trade is genuinely balanced and MXFP8's is not.
+Run against the per-block optimum on real weights, the ceiling ties it to four
+decimals on every tensor while the search costs 55% more encode time
+(19.6s versus 30.4s over Qwen3.8-27B's 10.6 G MXFP8 elements). NVIDIA modelopt,
+vLLM and CUTLASS all take the ceiling for E8M0, and Blackwell's
+`cvt.rp.satfinite.ue8m0x2.f32` does it in hardware; MLX itself already ceils on
+its CUDA backend and rounds to nearest only on Metal and CPU.
+
+The NVFP4 lift and the two MX rules are mutually exclusive by construction. The
+lift is a provable no-op on MXFP4 and MXFP8 — E8M0 spans `2^±127` with no
+subnormal band, so rescaling by `2^k` shifts every stored exponent by exactly
+`k` and leaves every packed element alone.
+
+```bash
+# NVFP4 map: the power-of-two lift, applied automatically.
+mlx convert -q --q-recipe unsloth --q-mode nvfp4 \
+  -i ./Qwen3.8-27B -o ./qwen3.8-27b-unsloth-nvfp4-mlx
+
+# MXFP map: the MXFP4 search over 168 tensors and the MXFP8 ceiling over 233.
+mlx convert -q --q-recipe unsloth --q-mxfp \
+  -i ./Qwen3.8-27B -o ./qwen3.8-27b-unsloth-mxfp4-mlx
+```
 
 ### NVIDIA modelopt recipe (data-free MXFP4 port)
 
@@ -198,7 +314,6 @@ mlx convert \
   --output .cache/models/qwen3.6-27b-unsloth-nvfp4-mtplx-sidecar \
   --model-type qwen3_5 \
   --quantize --q-mode nvfp4 --q-recipe unsloth \
-  --imatrix-path ./imatrix.gguf \
   --q-mtp cyankiwi
 ```
 
@@ -223,8 +338,8 @@ split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
 | `-d`, `--dtype`    | Target dtype: `float32` / `float16` / `bfloat16`                                              |
 | `-q`, `--quantize` | Enable quantization                                                                           |
 | `--q-recipe`       | One of `mixed_2_6`, `mixed_3_4`, `mixed_3_6`, `mixed_4_6`, `qwen3_5`, `unsloth`, `nvidia`     |
-| `--q-mode`         | `affine` (default), `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`                                      |
-| `--q-mxfp`         | Select Unsloth's fixed MXFP tensor-class map, or upgrade eligible decisions for other recipes |
+| `--q-mode`         | `affine` (default), `mxfp4`, `mxfp8`, `nvfp4`, or `sym8`. `mxfp4`/`mxfp8` always use the in-tree encoders, never MLX's; `nvfp4` also applies the power-of-two lift to dense FFNs (SafeTensors sources only) |
+| `--q-mxfp`         | Select Unsloth's fixed MXFP tensor-class map, or upgrade eligible decisions for other recipes; MX block exponents are always encoder-tuned |
 | `--q-mtp`          | Qwen MTP-quant policy: `off`, `cyankiwi`, `all`, or `split` (alias `drafter`)                 |
 | `--imatrix-path`   | Path to imatrix file for AWQ pre-scaling                                                      |
 | `--mmproj`         | Vision-encoder conversion path                                                                |

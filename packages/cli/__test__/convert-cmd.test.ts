@@ -505,7 +505,7 @@ describe('mlx convert Unsloth MXFP messaging', () => {
     expect(convertModel).not.toHaveBeenCalled();
   });
 
-  it('allows the requested fixed MXFP map without an imatrix and warns about skipped AWQ', async () => {
+  it('allows the requested fixed MXFP map without an imatrix and says the map wants none', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -526,11 +526,11 @@ describe('mlx convert Unsloth MXFP messaging', () => {
 
     const warnings = warnSpy.mock.calls.map((call) => String(call[0])).join('\n');
     expect(warnings).toContain(
-      'backend validation selects the requested fixed Qwen hybrid, exact SafeTensors Gemma4 MoE, or exact Muse-Glimmer MXFP map',
+      'The requested fixed Qwen hybrid, exact SafeTensors Gemma4 MoE, or exact Muse-Glimmer MXFP map',
     );
     expect(warnings).toContain('Muse-Glimmer MXFP map');
-    expect(warnings).toContain('AWQ pre-scaling will be skipped');
-    expect(warnings).toContain('quality may be lower');
+    expect(warnings).toContain('rejects one anyway');
+    expect(warnings).toContain('need no calibration');
     expect(warnings).toContain('unsupported inputs will be rejected');
     expect(convertModel).toHaveBeenCalledWith(
       expect.objectContaining({
@@ -541,7 +541,7 @@ describe('mlx convert Unsloth MXFP messaging', () => {
     );
   });
 
-  it('allows the requested fixed DGX map without an imatrix and warns about skipped AWQ', async () => {
+  it('allows the requested fixed DGX map without an imatrix and says the map wants none', async () => {
     vi.spyOn(console, 'log').mockImplementation(() => {});
     vi.spyOn(console, 'error').mockImplementation(() => {});
     const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
@@ -563,10 +563,10 @@ describe('mlx convert Unsloth MXFP messaging', () => {
 
     const warnings = warnSpy.mock.calls.map((call) => String(call[0])).join('\n');
     expect(warnings).toContain(
-      'backend validation selects the requested fixed Qwen hybrid or exact SafeTensors Gemma4 MoE',
+      'The requested fixed Qwen hybrid or exact SafeTensors Gemma4 MoE',
     );
-    expect(warnings).toContain('AWQ pre-scaling will be skipped');
-    expect(warnings).toContain('quality may be lower');
+    expect(warnings).toContain('rejects one anyway');
+    expect(warnings).toContain('need no calibration');
     expect(warnings).toContain('unsupported inputs will be rejected');
     expect(convertModel).toHaveBeenCalledWith(
       expect.objectContaining({

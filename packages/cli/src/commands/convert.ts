@@ -126,6 +126,23 @@ Quantization Arguments:
                         Routers/gates, 3D stacked experts, embeddings, and
                         K%16!=0 layers fall back to 8-bit affine (or bf16)
                         with per-layer overrides. NOT mlx-lm-loadable.
+                        nvfp4 = E2M1 elements with an E4M3 block scale, 4 bits
+                        over groups of 16. Those block scales sit below E4M3's
+                        smallest normal value on real FFN weights, so each
+                        carries three mantissa bits instead of four and the
+                        smallest blocks round to the zero code and dequantize to
+                        nothing. Every dense SwiGLU FFN is therefore rescaled by
+                        a power of two, with the inverse folded into the norm the
+                        MLP reads, moving those scales into the normal band. The
+                        fold is exact — a power of two only shifts an exponent
+                        field — so the FFN's output is bit-identical. This is
+                        unconditional; there is no flag and no untuned mode.
+                        MoE expert FFNs are skipped instead, and the skip is
+                        counted and logged: the norm an expert FFN reads also
+                        drives the router and, on qwen3_5_moe, the shared-expert
+                        gate, and neither softmax nor sigmoid is scale-invariant.
+                        Under --dtype float16 a layer whose folded norm would go
+                        subnormal is skipped too; --dtype bfloat16 lifts it.
   --q-mxfp              Upgrade quantization to micro-scaling FP (mxfp4 / mxfp8).
                         With --q-recipe unsloth, selects the fixed Unsloth
                         family map after backend validation. Qwen3.5/3.6:
@@ -134,11 +151,28 @@ Quantization Arguments:
                         Gemma-4-26B-A4B MoE:
                         all dense/expert FFNs=mxfp4 and attention q/k/v/o=mxfp8.
                         Gemma routers, embeddings/head, vision, norms, and all
-                        other tensors stay bf16. AWQ imatrix pre-scaling is
-                        applied when --imatrix-path is provided; it does not
-                        invent expert AWQ. Without it, the fixed class map is
-                        unchanged but quality may be lower. --q-bits/
-                        --q-group-size do not alter this map.
+                        other tensors stay bf16. --imatrix-path is rejected
+                        with this map: AWQ pre-scaling collapses float-scaled
+                        block scales. Nothing replaces it — the MX encoders
+                        below choose their own block scales and need no
+                        calibration data. --q-bits/--q-group-size do not alter
+                        this map.
+
+                        Both MX formats pick their own E8M0 block exponent
+                        rather than taking MLX's rounded one, always.
+                        MXFP4 tries the two candidate exponents and keeps the
+                        lower squared error: rounding to nearest leaves the
+                        block maximum above E2M1's top code on roughly three
+                        blocks in five and clips it, and E8M0 has no mantissa,
+                        so those two are the whole candidate set.
+                        MXFP8 takes the ceiling instead: rounding lands below
+                        the block maximum on exactly half of all blocks and E4M3
+                        then saturates it by up to 1.41x, while at eight bits a
+                        spare binade of headroom costs a block of 32 nothing. On
+                        Qwen3.8-27B attention, GDN and FFN weights the ceiling
+                        cuts the relative error from 6.6-8.1% to a flat 2.66%,
+                        which is E4M3's own grid floor. MXFP8 carries 233 of
+                        this map's 401 quantized tensors, MXFP4 the other 168.
 
                         Muse-Glimmer-30B: text-body matrices=mxfp4 except the
                         final seven attention output projections; those seven,
@@ -170,9 +204,8 @@ Quantization Arguments:
                         embed=5b, lm_head=6b, attn q/k/v=5b+AWQ,
                         o_proj/out_proj/in_proj_a/in_proj_b=8b affine)
                         "unsloth" legacy affine requires --imatrix-path.
-                        The fixed --q-mxfp / --q-mode nvfp4 maps may omit it;
-                        AWQ pre-scaling is then skipped and quality may be lower.
-                        A matching imatrix remains preferred when available.
+                        The fixed --q-mxfp / --q-mode nvfp4 maps reject it;
+                        their encoders are data-free and need no imatrix.
                         Add --q-mxfp for a verified Qwen hybrid, SafeTensors
                         Gemma4 MoE, or Muse-Glimmer fixed class map
                         (NVFP4 translated to MXFP4, FP8 translated to MXFP8).
@@ -214,9 +247,9 @@ Quantization Arguments:
                         require --quantize/--q-recipe.
   --imatrix-path <path> imatrix GGUF file for AWQ-style pre-scaling
                         Improves quantization quality using calibration data
-                        Required for legacy affine "unsloth". Optional for its
-                        fixed --q-mxfp / --q-mode nvfp4 maps, but preferred
-                        when matching calibration data is available.
+                        Required for legacy affine "unsloth". Rejected by its
+                        fixed --q-mxfp / --q-mode nvfp4 maps, which quantize to
+                        float-scaled formats AWQ cannot correct.
   --gguf-kquant         Import supported ggml K/IQ tensors as native MLX packed weights
                         arrays instead of rejecting them. Blocks are repacked
                         bit-for-bit, never dequantized, so the output keeps the
@@ -273,7 +306,7 @@ Examples:
   mlx convert -i .cache/models/qwen3.5-9b -o ./models/qwen35-recipe -q --q-recipe qwen3_5 -m qwen3_5
   mlx convert -i model-BF16.gguf -o ./models/awq-4bit -q --q-recipe unsloth --imatrix-path imatrix.gguf
   mlx convert -i .cache/models/Qwen3.5-27B -o ./models/qwen3.5-unsloth -q --q-recipe unsloth --imatrix-path imatrix.gguf
-  mlx convert -i .cache/models/Qwen3.5-27B -o ./models/qwen3.5-unsloth-mxfp4 -q --q-recipe unsloth --q-mxfp --imatrix-path imatrix.gguf
+  mlx convert -i .cache/models/Qwen3.5-27B -o ./models/qwen3.5-unsloth-mxfp4 -q --q-recipe unsloth --q-mxfp
 `);
 }
 
@@ -442,7 +475,7 @@ export async function run(argv: string[]) {
         ? 'fixed Qwen hybrid, exact SafeTensors Gemma4 MoE, or exact Muse-Glimmer MXFP map'
         : 'fixed Qwen hybrid or exact SafeTensors Gemma4 MoE DGX map';
       console.warn(
-        `Warning: no --imatrix-path was provided. If backend validation selects the requested ${fixedMapFamilies}, AWQ pre-scaling will be skipped and quality may be lower; unsupported inputs will be rejected.`,
+        `Warning: no --imatrix-path was provided. The requested ${fixedMapFamilies} rejects one anyway — its encoders choose their own block scales and need no calibration, so nothing is missing; unsupported inputs will be rejected.`,
       );
     }
     // The nvidia recipe is a data-free port with a fixed format map: it reads

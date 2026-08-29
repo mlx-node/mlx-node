@@ -736,8 +736,8 @@ fn parse_group_size(value: &Value, mode: Option<PerLayerMode>, context: &str) ->
 
 /// The only two weight shapes carrying a calibrated static per-tensor FP8
 /// (E4M3) activation scale: mxfp8 8/32 (qwen3_5 nvidia recipe attn/GDN) and
-/// affine 8/32 (nemotron_h mamba `mixer.{in,out}_proj`, which avoids mxfp8
-/// because MLX's E8M0 block exponent rounds to nearest, not ceil).
+/// affine 8/32 (nemotron_h mamba `mixer.{in,out}_proj`, held to affine by
+/// `reject_legacy_mxfp8_mamba` — see `convert::fp8_to_affine8`).
 ///
 /// Fail-closed: everything else with an `input_amax` is a stale or hand-edited
 /// config. Shared by the config parser below, the modelopt-schema parser in
