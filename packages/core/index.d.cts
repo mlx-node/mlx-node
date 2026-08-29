@@ -3218,6 +3218,15 @@ export declare function convertForeignWeights(options: ForeignConversionOptions)
 export declare function convertGgufToSafetensors(options: GgufConversionOptions): Promise<GgufConversionResult>;
 
 /**
+ * Every convertible `model_type` the converter registry accepts, in dispatch
+ * order — the native half of the CLI detect-table parity gate (same pattern
+ * as `cold_restore_families`): a family with a conversion recipe but no CLI
+ * detect row would otherwise convert generically and produce unloadable
+ * output.
+ */
+export declare function convertibleModelTypes(): Array<string>;
+
+/**
  * Convert a HuggingFace SafeTensors model to MLX format
  *
  * This function:

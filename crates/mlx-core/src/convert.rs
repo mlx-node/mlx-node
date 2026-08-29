@@ -108,7 +108,7 @@ struct ShardedModelIndex {
 /// Declarative per-family conversion recipes.
 ///
 /// Each convertible model family describes its convert-time behavior through
-/// one [`ConversionRecipe`] impl plus one registry line in [`recipe_for`].
+/// one [`ConversionRecipe`] impl plus one [`RECIPE_REGISTRY`] row.
 /// The recipe owns the family weight transform ([`ConversionRecipe::sanitize`])
 /// and a small set of asymmetry flags that the central convert path needs,
 /// replacing scattered per-family `matches!(model_type, ...)` checks.
@@ -153,10 +153,10 @@ pub(crate) mod recipe {
     pub(crate) trait ConversionRecipe {
         /// The HuggingFace `model_type` strings this recipe handles.
         ///
-        /// This is the recipe's self-declared registry coverage. The central
-        /// dispatch keys off the exact `model_type` string via [`recipe_for`],
-        /// so this method is consumed by the registry-consistency test; it
-        /// carries no runtime dispatch role.
+        /// [`RECIPE_REGISTRY`] is the single dispatch source; this method is
+        /// each recipe's self-declaration of that coverage, consumed only by
+        /// the registry-consistency test — a `#[cfg(test)]`-only consumer,
+        /// hence the `dead_code` allow.
         #[allow(dead_code)]
         fn model_types(&self) -> &'static [&'static str];
 
@@ -2662,43 +2662,58 @@ pub(crate) mod recipe {
         }
     }
 
-    /// Every convertible `model_type` the registry accepts, in dispatch order.
-    /// Single source of truth for the "unknown model type" error message and
-    /// the registry-consistency test; each entry MUST resolve via
-    /// [`recipe_for`] (asserted in `recipe_registry_reproduces_inline_flags`).
-    pub(crate) const CONVERTIBLE_MODEL_TYPES: &[&str] = &[
-        "qwen3_asr",
-        "qwen3_5",
-        "qwen3_5_moe",
-        "lfm2",
-        "lfm2_moe",
-        "paddleocr-vl",
-        "qianfan-ocr",
-        "privacy-filter",
-        "muse_glimmer",
-        "gemma4",
-        "gemma4_unified",
-        "nemotron_h",
+    type RecipeFactory = fn() -> Box<dyn ConversionRecipe>;
+
+    /// One row per convertible family: the exact HuggingFace `model_type`
+    /// strings it dispatches on, and its recipe factory. Key order is
+    /// load-bearing: flattened it is [`convertible_model_types`], which the
+    /// "unknown model type" error message joins verbatim.
+    pub(crate) const RECIPE_REGISTRY: &[(&[&str], RecipeFactory)] = &[
+        (&["qwen3_asr"], || Box::new(Qwen3AsrRecipe)),
+        (&["qwen3_5"], || Box::new(Qwen35Recipe { is_moe: false })),
+        (&["qwen3_5_moe"], || Box::new(Qwen35Recipe { is_moe: true })),
+        (&["lfm2", "lfm2_moe"], || Box::new(Lfm2Recipe)),
+        (&["paddleocr-vl"], || Box::new(PaddleOcrVlRecipe)),
+        (&["qianfan-ocr"], || Box::new(QianfanOcrRecipe)),
+        (&["privacy-filter"], || Box::new(PrivacyFilterRecipe)),
+        (&["muse_glimmer"], || Box::new(MuseGlimmerRecipe)),
+        (&["gemma4", "gemma4_unified"], || Box::new(Gemma4Recipe)),
+        (&["nemotron_h"], || Box::new(NemotronHRecipe)),
     ];
+
+    /// Every convertible `model_type` the registry accepts, in dispatch order
+    /// (the flattened [`RECIPE_REGISTRY`] keys). Drives the "unknown model
+    /// type" error message and the registry-consistency test; each entry
+    /// resolves via [`recipe_for`] by construction.
+    pub(crate) fn convertible_model_types() -> Vec<&'static str> {
+        RECIPE_REGISTRY
+            .iter()
+            .flat_map(|(keys, _)| keys.iter().copied())
+            .collect()
+    }
 
     /// Resolve a [`ConversionRecipe`] for an exact HuggingFace `model_type`
     /// string. Returns `None` for unknown / non-convertible types (the central
     /// dispatch keeps its own unknown-type error).
     pub(crate) fn recipe_for(model_type: &str) -> Option<Box<dyn ConversionRecipe>> {
-        match model_type {
-            "qwen3_asr" => Some(Box::new(Qwen3AsrRecipe)),
-            "qwen3_5" => Some(Box::new(Qwen35Recipe { is_moe: false })),
-            "qwen3_5_moe" => Some(Box::new(Qwen35Recipe { is_moe: true })),
-            "lfm2" | "lfm2_moe" => Some(Box::new(Lfm2Recipe)),
-            "paddleocr-vl" => Some(Box::new(PaddleOcrVlRecipe)),
-            "qianfan-ocr" => Some(Box::new(QianfanOcrRecipe)),
-            "privacy-filter" => Some(Box::new(PrivacyFilterRecipe)),
-            "muse_glimmer" => Some(Box::new(MuseGlimmerRecipe)),
-            "gemma4" | "gemma4_unified" => Some(Box::new(Gemma4Recipe)),
-            "nemotron_h" => Some(Box::new(NemotronHRecipe)),
-            _ => None,
-        }
+        RECIPE_REGISTRY
+            .iter()
+            .find(|(keys, _)| keys.contains(&model_type))
+            .map(|(_, factory)| factory())
     }
+}
+
+/// Every convertible `model_type` the converter registry accepts, in dispatch
+/// order — the native half of the CLI detect-table parity gate (same pattern
+/// as `cold_restore_families`): a family with a conversion recipe but no CLI
+/// detect row would otherwise convert generically and produce unloadable
+/// output.
+#[napi]
+pub fn convertible_model_types() -> Vec<String> {
+    recipe::convertible_model_types()
+        .into_iter()
+        .map(str::to_string)
+        .collect()
 }
 
 #[napi(object)]
@@ -3867,7 +3882,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 None => {
                     return Err(Error::from_reason(format!(
                         "Unknown model type: '{mt}'. Supported: {}",
-                        recipe::CONVERTIBLE_MODEL_TYPES.join(", ")
+                        recipe::convertible_model_types().join(", ")
                     )));
                 }
             },
@@ -11560,13 +11575,31 @@ mod tests {
     /// `matches!(model_type, ...)` classification of each family. `recipe_for`
     /// is the sole authority in `convert_model_inner`; this test pins the
     /// contract those flags must satisfy and exercises `model_types()` over
-    /// every entry in [`recipe::CONVERTIBLE_MODEL_TYPES`].
+    /// every entry in the flattened [`recipe::RECIPE_REGISTRY`] keys.
     #[test]
     fn recipe_registry_reproduces_inline_flags() {
-        // Every convertible model_type the central dispatch accepts — the
-        // registry's single source of truth, also driving the dispatch error.
-        let known = recipe::CONVERTIBLE_MODEL_TYPES;
-        for &mt in known {
+        // Flattened registry keys, in declaration order. The exact sequence is
+        // observable: the unknown-model-type dispatch error joins it verbatim.
+        let known = recipe::convertible_model_types();
+        assert_eq!(
+            known,
+            [
+                "qwen3_asr",
+                "qwen3_5",
+                "qwen3_5_moe",
+                "lfm2",
+                "lfm2_moe",
+                "paddleocr-vl",
+                "qianfan-ocr",
+                "privacy-filter",
+                "muse_glimmer",
+                "gemma4",
+                "gemma4_unified",
+                "nemotron_h",
+            ],
+            "registry key order feeds the unknown-model-type error text"
+        );
+        for mt in known {
             let r = recipe::recipe_for(mt)
                 .unwrap_or_else(|| panic!("recipe_for({mt}) must resolve a recipe"));
 
@@ -12213,7 +12246,7 @@ mod tests {
     #[test]
     fn gemma4_unified_is_convertible() {
         assert!(recipe::recipe_for("gemma4_unified").is_some());
-        assert!(recipe::CONVERTIBLE_MODEL_TYPES.contains(&"gemma4_unified"));
+        assert!(recipe::convertible_model_types().contains(&"gemma4_unified"));
         // Routes to the same recipe family as gemma4, and self-declares coverage.
         assert!(
             recipe::recipe_for("gemma4_unified")
