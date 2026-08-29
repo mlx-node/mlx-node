@@ -3,9 +3,10 @@
  * addon (the dashboard is a viewer process that must start without Metal).
  *
  * Model metadata (family label, quantization, context window) is parsed from
- * each checkpoint's `config.json` with a small standalone parser — deliberately
- * duplicated from `packages/lm` to avoid pulling in `@mlx-node/core`, mirroring
- * the same trade-off already made in `packages/agent/src/provider/models.ts`.
+ * each checkpoint's `config.json`. The family label runs the REAL registry
+ * detection — `matchFamily`, reached through the native-free
+ * `@mlx-node/agent/catalog` subpath — so the dashboard can never rot behind
+ * `packages/lm`'s registry rows again.
  */
 
 import {
@@ -26,6 +27,8 @@ import {
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
+import { matchFamily } from '@mlx-node/agent/catalog';
+
 export interface LocalModel {
   /** Checkpoint directory name under `modelsDir` (the model's local id). */
   name: string;
@@ -42,28 +45,6 @@ export interface LocalModel {
   /** Number of files in the checkpoint directory, recursively. */
   fileCount: number;
 }
-
-/**
- * Raw config aliases → canonical family label. Mirrors the alias rows of
- * `MODEL_FAMILY_REGISTRY` in `packages/lm/src/models/model-loader.ts`; only the
- * label mapping is duplicated (no loaders, no native classes).
- */
-const RAW_MODEL_TYPE_TO_LABEL: Record<string, string> = {
-  gemma4: 'gemma4',
-  gemma4_text: 'gemma4',
-  gemma4_unified: 'gemma4',
-  muse_glimmer: 'muse_glimmer',
-  muse_glimmer_text: 'muse_glimmer',
-  qwen3: 'qwen3',
-  qwen3_5: 'qwen3_5',
-  qwen3_5_moe: 'qwen3_5_moe',
-  lfm2: 'lfm2',
-  lfm2_moe: 'lfm2_moe',
-  harrier: 'harrier',
-  nemotron_h: 'nemotron_h',
-  internvl_chat: 'internvl_chat',
-  'qianfan-ocr': 'qianfan-ocr',
-};
 
 /**
  * Filename of the atomic-publish completion marker the download runner writes as
@@ -413,44 +394,20 @@ export function isSafeRelPath(p: string): boolean {
   return true;
 }
 
-function collectArchitectures(config: Record<string, unknown>): string[] {
-  const raw = config.architectures;
-  if (Array.isArray(raw)) return raw.filter((entry): entry is string => typeof entry === 'string');
-  if (typeof raw === 'string') return [raw];
-  return [];
-}
-
 /**
- * Family label from `config.json`, replicating the lm registry's detection
- * decisions (`detectModelType` in `packages/lm/src/models/model-loader.ts`) for
- * every family the alias map covers: alias (or the qwen3 nullish default) picks
- * a base family, then the architecture probes refine it in registry declaration
- * order — gemma4 unified, muse, harrier, nemotron. Where the loader fails
- * closed (malformed `architectures`, unknown `model_type`) the dashboard must
- * not throw on a foreign checkpoint, so those shapes fall back to the raw
- * `model_type` string (or `qwen3` when it is not a string).
+ * Family label from `config.json`: the registry's own `matchFamily` decides
+ * (alias or the qwen3 nullish default, refined by architecture probes in
+ * registry declaration order). Where the loader fails closed (malformed
+ * `architectures`, unknown `model_type`) the dashboard must not throw on a
+ * foreign checkpoint, so those shapes fall back to the raw `model_type`
+ * string (or `qwen3` when it is not a string).
  */
-function detectModelTypeLabel(config: Record<string, unknown>): string {
-  const raw = typeof config.model_type === 'string' ? config.model_type : undefined;
-  const fallback = raw ?? 'qwen3';
-  const rawArchitectures = 'architectures' in config ? config.architectures : undefined;
-  // The loader rejects this shape as malformed; the label falls back instead.
-  if (
-    rawArchitectures !== undefined &&
-    rawArchitectures !== null &&
-    !Array.isArray(rawArchitectures) &&
-    typeof rawArchitectures !== 'string'
-  ) {
-    return fallback;
+function detectModelTypeLabel(modelDir: string, config: Record<string, unknown>): string {
+  try {
+    return matchFamily(modelDir, config);
+  } catch {
+    return typeof config.model_type === 'string' ? config.model_type : 'qwen3';
   }
-  const architectures = new Set(collectArchitectures(config));
-  const usesDefaultModelType = !Object.hasOwn(config, 'model_type') || config.model_type === null;
-  const base = usesDefaultModelType ? 'qwen3' : raw === undefined ? undefined : RAW_MODEL_TYPE_TO_LABEL[raw];
-  if (architectures.has('Gemma4UnifiedForConditionalGeneration')) return 'gemma4';
-  if (architectures.has('MuseGlimmerForConditionalGeneration')) return 'muse_glimmer';
-  if (base === 'qwen3' && architectures.has('Qwen3Model') && !architectures.has('Qwen3ForCausalLM')) return 'harrier';
-  if (architectures.has('NemotronHForCausalLM')) return 'nemotron_h';
-  return base ?? fallback;
 }
 
 /**
@@ -697,7 +654,7 @@ export function discoverLocalModels(modelsDir: string): { models: LocalModel[]; 
     models.push({
       name: entry.name,
       path: full,
-      modelType: detectModelTypeLabel(config),
+      modelType: detectModelTypeLabel(full, config),
       quant: detectQuantLabel(config),
       contextWindow: detectContextWindow(config),
       sizeBytes,
