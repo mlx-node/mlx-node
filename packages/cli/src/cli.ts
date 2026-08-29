@@ -18,6 +18,7 @@ Commands:
   download dataset   Download a dataset from HuggingFace
   convert            Convert model weights to MLX format
   calibrate          Calibrate FP8 activation amax for --q-recipe nvidia models
+  eval               Score a checkpoint's output quality against a bf16 teacher
   redact             Redact PII from text using a privacy-filter model
   serve              Serve local models over an Anthropic/OpenAI-compatible API
   launch claude      Start a local server and spawn Claude Code pointed at it
@@ -32,6 +33,7 @@ Examples:
   mlx download dataset -d openai/gsm8k
   mlx convert -i ~/.mlx-node/models/qwen3-0.6b -o ~/.mlx-node/models/qwen3-0.6b-mlx -d bf16
   mlx calibrate -i ./qwen3.6-27b-nvidia-mxfp4-mlx --dataset ~/.cache/nvidia-calib/cnn_nemotron_v2_calib.jsonl
+  mlx eval score --model ./qwen3.8-27b-nvfp4-mlx --cache /tmp/teacher-27b
   mlx redact -m .cache/models/privacy-filter -i input.txt -o redacted.txt
   mlx serve --port 8080
   mlx launch claude
@@ -71,6 +73,13 @@ async function main() {
     case 'calibrate': {
       const rest = args.slice(1);
       const { run } = await import('./commands/calibrate.js');
+      await run(rest);
+      break;
+    }
+
+    case 'eval': {
+      const rest = args.slice(1);
+      const { run } = await import('./commands/eval.js');
       await run(rest);
       break;
     }

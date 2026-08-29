@@ -188,6 +188,19 @@ Output dtypes `{uint32, uint8}` are hard-coded in `fp_quantize`
 Checked on `[4096,4096]`: mxfp4 = 8,388,608 + 524,288 = 8,912,896 B ⇒ 4.25 ✓; nvfp4 = 8,388,608 +
 1,048,576 = 9,437,184 ⇒ 4.50 ✓.
 
+**Convert does not use MLX's encoder for mxfp4 or mxfp8.** The layout above is the
+format contract — codec, group size, sidecar shapes, dtypes — and it is what convert
+writes and what every loader reads. The *block exponent* inside it is chosen in-tree,
+on every convert, with no flag: `crates/mlx-core/src/quant/mxfp4_weight.rs` evaluates
+both candidate E8M0 exponents per block and keeps the lower squared error, and
+`crates/mlx-core/src/quant/mxfp8_weight.rs` takes the ceiling instead of MLX's
+round-to-nearest. So an mxfp4/mxfp8 checkpoint from `mlx convert` is byte-compatible
+with mlx-lm and dequantizes identically, but is NOT byte-identical to what
+`mlx_quantize` would have written for the same weights — it is closer to them. MLX's
+own rounding survives only as a `#[cfg(test)]` reference, which per-format
+bit-identity tests pin against `mlx_quantize`. nvfp4 keeps MLX's encoder, and adds a pre-quantization
+power-of-two lift on dense FFNs (see `docs/cli.md`, "Data-free encoder tuning").
+
 **The MLX nvfp4 quantizer writes no global scale.** The DGX port does not carry Unsloth's calibrated
 global scales. The `nemotron_h` modelopt *ingest* is the one exception — it emits a `.global_scale`
 sidecar rather than folding `weight_scale_2` into the per-group E4M3 scales; see the Nemotron-H NVFP4
@@ -1263,9 +1276,13 @@ what v1 cannot use:
   static amax (same mechanics as `mlx calibrate`'s sites, minus the calibration pass).
   These were **mxfp8 8/32** until the quantization-accuracy pass. MLX's `fp8.h` rounds the E8M0
   block exponent to **nearest** rather than ceil, so a per-tensor-E4M3 source loses 6.1191%
-  relative RMS (20.96% max/amax) through mxfp8 versus **0.6366%** (0.87% max/amax) through
+  relative RMS (20.96% max/amax) through MLX's mxfp8 versus **0.6366%** (0.87% max/amax) through
   affine 8/32 — 9.6x better, measured on a seeded Gaussian `[256, 2688]` fixture in
-  `nemotron_fp8_to_affine8_requant_error_within_tolerance`. The on-disk consequences:
+  `nemotron_fp8_to_affine8_requant_error_within_tolerance`. That measurement is against MLX's
+  encoder, which convert no longer uses for mxfp8: the in-tree ceiling encoder cannot saturate,
+  so the 6.1191% number does not describe today's mxfp8 and the affine-versus-mxfp8 margin here
+  is unmeasured. The decision stands until someone re-measures it — the load-side gate below
+  makes it two-sided, not a one-line swap. The on-disk consequences:
   `.scales` U8 -> BF16, a NEW BF16 `.biases`, `.weight` unchanged, and the per-layer mode string
   `"mxfp8"` -> `"affine"`. A pre-pass checkpoint is rejected at load with a regenerate hint
   (`reject_legacy_mxfp8_mamba` / `require_affine_sidecars`) rather than silently running 6% off,

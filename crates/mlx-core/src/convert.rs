@@ -2218,10 +2218,13 @@ pub(crate) mod recipe {
     /// Re-quantize a plain per-tensor FP8 (E4M3) weight into MLX affine 8-bit
     /// group-32. Returns (u32 packed weight, bf16 scales, bf16 biases).
     ///
-    /// Must NOT be re-gridded onto mxfp8: MLX's E8M0 block scale rounds
-    /// log2(amax/448) to NEAREST, so the scale lands up to sqrt(2) low and
-    /// E4M3 saturates on ~half the groups — an order of magnitude worse than
-    /// affine 8-bit at the same byte cost. The BF16 sidecars are deliberate:
+    /// Affine 8-bit, not mxfp8. The saturation that first ruled mxfp8 out is
+    /// gone — `quant::mxfp8_weight` takes the ceiling on every convert now, and
+    /// a ceiling exponent cannot leave a group's maximum past E4M3's top code —
+    /// so the remaining question is E4M3's own element grid against affine's,
+    /// which nothing here has measured. `reject_legacy_mxfp8_mamba` still holds
+    /// the mamba projections to affine at LOAD, so re-opening this is a
+    /// two-sided change, not a one-line swap. The BF16 sidecars are deliberate:
     /// they keep the affine qmm in the bf16 activation dtype.
     pub(crate) fn fp8_to_affine8(
         weight: &MxArray,
@@ -3872,18 +3875,97 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         }
     }; // end is_gemma_e2b_import else branch
 
-    // Apply AWQ pre-scaling if imatrix provided
     let mut converted_tensors = converted_tensors;
+
+    // lfm2/lfm2_moe opt INTO quantizing the token embedding: their
+    // `nn::Embedding` installs a PACKED-quantized backend (gather-dequant
+    // lookup + quantized tied-head matmul), so the embedding table can be
+    // quantized for real memory savings. Every other family keeps the embedding
+    // bf16 (unchanged). A TIED `lm_head` is dropped at sanitize, so this never
+    // quantizes an output head.
+    let embed_quantizable = model_type
+        .as_deref()
+        .and_then(recipe::recipe_for)
+        .is_some_and(|r| r.embed_quantizable());
+
+    // The class map has to be resolved before AWQ rewrites a single tensor —
+    // see `ResolvedClasses`. The quantize block below consumes this predicate
+    // rather than rebuilding one.
+    let classes = resolve_quant_classes(
+        &converted_tensors,
+        &config,
+        do_quantize,
+        is_privacy_filter,
+        model_type.as_deref(),
+        quant_recipe.as_deref(),
+        imatrix_path.as_deref(),
+        &quant_mode,
+        quant_bits,
+        quant_group_size,
+        quant_mxfp,
+        &quant_mtp,
+        embed_quantizable,
+    )?;
+
+    // Apply AWQ pre-scaling if imatrix provided
     if let Some(ref imatrix_path) = imatrix_path {
         reject_awq_for_prequantized_body(&converted_tensors)?;
         let imatrix = crate::utils::imatrix::parse_imatrix(imatrix_path)?;
         let num_layers = infer_num_layers_from_weights(&converted_tensors);
-        let modified = apply_awq_prescaling(&mut converted_tensors, &imatrix, 0.5, num_layers)?;
-        if modified == 0 {
+        let outcome = apply_awq_prescaling(
+            &mut converted_tensors,
+            &imatrix,
+            0.5,
+            num_layers,
+            classes.as_ref(),
+        )?;
+        if let Some(reason) = awq_no_op_refusal(&outcome) {
+            return Err(Error::from_reason(reason));
+        }
+        if outcome.modified == 0 {
             warn!(
                 "AWQ pre-scaling modified 0 weight tensors despite an imatrix being provided — \
                  the imatrix keys did not match any target weights (importance applied to nothing). \
                  Check that the imatrix corresponds to this model."
+            );
+        } else if outcome.skipped_groups > 0 {
+            warn!(
+                "AWQ pre-scaling skipped {} scale groups bound for a float-scaled quantization \
+                 format and corrected {} weight tensors.",
+                outcome.skipped_groups, outcome.modified
+            );
+        }
+    }
+
+    // The lift is data-free, so it runs outside the imatrix gate above — but it
+    // has to run after it, because it chooses its exponents from the final
+    // pre-quantization block magnitudes.
+    if let Some(classes) = classes.as_ref() {
+        let num_layers = infer_num_layers_from_weights(&converted_tensors);
+        let outcome = apply_nvfp4_pow2_lift(&mut converted_tensors, classes, num_layers)?;
+        // Gated: the lift now runs on every quantized convert, and an affine one
+        // would otherwise print "0 rescaled, 0 left alone" and read as a fault.
+        if outcome.lifted_layers > 0 || outcome.skipped_layers > 0 {
+            info!(
+                "NVFP4 power-of-two lift: {} FFN layers rescaled, {} left alone",
+                outcome.lifted_layers, outcome.skipped_layers
+            );
+        }
+        if outcome.partial_nvfp4_layers > 0 {
+            warn!(
+                "NVFP4 power-of-two lift: {} FFN layers left unlifted — only part of the \
+                 gate/up/down trio is bound for NVFP4, and the three exponents are solved \
+                 together. Their NVFP4 block scales stay in E4M3's subnormal band.",
+                outcome.partial_nvfp4_layers
+            );
+        }
+        if outcome.skipped_expert_tensors > 0 {
+            warn!(
+                "NVFP4 power-of-two lift: {} expert FFN tensors left unlifted — the norm an \
+                 expert FFN reads also feeds the router and, on qwen3_5_moe, the shared-expert \
+                 gate, and neither softmax nor sigmoid is scale-invariant. Their block scales \
+                 stay in E4M3's subnormal band.",
+                outcome.skipped_expert_tensors
             );
         }
     }
@@ -3918,17 +4000,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
         quant_group_size_effective = 16;
         quant_mode_effective = "nvfp4".to_string();
     }
-    // lfm2/lfm2_moe opt INTO quantizing the token embedding: their
-    // `nn::Embedding` installs a PACKED-quantized backend (gather-dequant
-    // lookup + quantized tied-head matmul), so the embedding table can be
-    // quantized for real memory savings. Every other family keeps the embedding
-    // bf16 (unchanged). A TIED `lm_head` is dropped at sanitize, so this never
-    // quantizes an output head.
-    let embed_quantizable = model_type
-        .as_deref()
-        .and_then(recipe::recipe_for)
-        .is_some_and(|r| r.embed_quantizable());
-    if do_quantize {
+    if let Some(classes) = classes.as_ref() {
         info!(
             "Quantizing weights: bits={}, group_size={}, mode={}{}{}",
             quant_bits,
@@ -3944,37 +4016,6 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                 String::new()
             }
         );
-
-        // Resolve and validate the fixed Unsloth map before dispatching to a
-        // model-specific quantization branch. Most recipes use the generic
-        // branch below, but privacy-filter owns a dedicated predicate and
-        // would otherwise bypass the late no-imatrix fail-closed gate.
-        let recipe_weight_keys = quant_recipe
-            .as_ref()
-            .map(|_| converted_tensors.keys().cloned().collect::<Vec<_>>());
-        let official_unsloth_kind = match (quant_recipe.as_deref(), recipe_weight_keys.as_deref()) {
-            (Some(recipe), Some(weight_keys)) => {
-                let kind = select_and_validate_official_unsloth_recipe(
-                    recipe,
-                    imatrix_path.as_deref(),
-                    quant_mxfp,
-                    &quant_mode,
-                    &config,
-                    model_type.as_deref(),
-                    weight_keys,
-                )
-                .map_err(Error::from_reason)?;
-                if recipe == "unsloth" && imatrix_path.is_none() {
-                    warn!("{}", UNSLOTH_NO_IMATRIX_WARNING);
-                }
-                kind
-            }
-            _ => None,
-        };
-        if let Some(kind) = official_unsloth_kind {
-            validate_official_unsloth_shapes(&converted_tensors, kind)
-                .map_err(Error::from_reason)?;
-        }
 
         if is_privacy_filter {
             // Privacy-filter has a dedicated predicate: quantize attention
@@ -3993,19 +4034,17 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                  ({}).",
                 quant_mode, quant_bits, quant_group_size, preserved_extra
             );
-            let predicate =
-                build_privacy_filter_predicate(quant_bits, quant_group_size, &quant_mode);
             // Discard any per-tensor overrides emitted by the inner quantizer
             // (it only records when bits/group_size/mode differ from defaults,
             // which is too sparse for our needs); we re-derive a complete
             // override map below from the resulting `.scales` keys.
             let _custom_overrides = quantize_weights_with_recipe_pub(
                 &mut converted_tensors,
-                quant_bits,
-                quant_group_size,
-                &quant_mode,
-                &*predicate,
-                embed_quantizable,
+                classes.bits,
+                classes.group_size,
+                &classes.mode,
+                classes.predicate.as_deref().expect(PREDICATE_RESOLVED),
+                classes.embed_quantizable,
             )?;
 
             // Build per-layer overrides for ALL quantized tensors so that the
@@ -4031,114 +4070,28 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                     }),
                 );
             }
-        } else if let Some(ref recipe) = quant_recipe {
-            let weight_keys = recipe_weight_keys
-                .as_deref()
-                .expect("recipe keys are collected whenever quant_recipe is present");
-            // Recipes emit affine `Custom` decisions for protected tensors
-            // (lm_head, AWQ-corrected attn/SSM projections, etc). Affine
-            // quantize only supports group_size ∈ {32, 64, 128}, so when the
-            // global mode is nvfp4 (which forces quant_group_size=16) we must
-            // pass a recipe-affine-appropriate group_size to the predicate
-            // builder. apply_nvfp4_upgrade still sets gs=16 on the 4-bit
-            // decisions it promotes, and the top-level config.json still
-            // records gs=16/mode=nvfp4 for the default dequantizer.
-            let recipe_gs = if quant_mode == "nvfp4" {
-                64
-            } else {
-                quant_group_size
-            };
-            let predicate = match official_unsloth_kind {
-                Some(kind) => build_official_unsloth_recipe(weight_keys, kind),
-                None => build_predicate_for_recipe(recipe, weight_keys, quant_bits, recipe_gs)
-                    .map_err(Error::from_reason)?,
-            };
-            let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
-                if quant_mxfp && official_unsloth_kind.is_none() {
-                    apply_mxfp_upgrade(predicate, quant_bits)
-                } else if quant_mode == "nvfp4" && official_unsloth_kind.is_none() {
-                    // Recipe + --q-mode nvfp4: promote 4-bit recipe decisions to
-                    // NVFP4 (group_size=16). Mutually exclusive with quant_mxfp,
-                    // since --q-mxfp requires --q-mode affine.
-                    apply_nvfp4_upgrade(predicate)
-                } else {
-                    predicate
-                };
-            // `--q-mtp split` (alias `drafter`) keeps the MTP head BF16 by
-            // contract: the head is extracted into a standalone `mtp-drafter/`
-            // directory below, and the on-disk drafter must NOT carry `.scales`
-            // (mlx-vlm trusts the drafter weights verbatim for a bf16 head). The
-            // BODY recipe quantization is unaffected — only the MTP-head linears
-            // are exempted here. So treat `split` like `off` for MTP-head quant
-            // and let the recipe predicate fall through (which already excludes
-            // `mtp.*` keys via `quantize_weights_inner`). Any other non-off
-            // policy (`cyankiwi`/`all`) still re-enables MTP quantization.
-            let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
-                if quant_mtp != "off" && quant_mtp != "split" {
-                    apply_mtp_quant_policy(predicate, quant_mtp.clone())
-                } else {
-                    predicate
-                };
-            // Muse's fixed map has exactly one packed format: every selected
-            // matrix is MXFP4/32 and every promoted/protected class stays
-            // dense. Record that honest global default instead of serializing
-            // 409 identical overrides below an unused affine-3 default. The
-            // dynamic boundary is represented by which tensors have `.scales`,
-            // not by a second packed mode.
-            let uniform_default = official_unsloth_uniform_default(official_unsloth_kind);
-            let (recipe_bits, recipe_group_size, recipe_mode) =
-                uniform_default.unwrap_or((quant_bits, quant_group_size, quant_mode.as_str()));
+        } else if quant_recipe.is_some() {
             per_layer_overrides = quantize_weights_with_recipe_pub(
                 &mut converted_tensors,
-                recipe_bits,
-                recipe_group_size,
-                recipe_mode,
-                &*predicate,
-                embed_quantizable,
+                classes.bits,
+                classes.group_size,
+                &classes.mode,
+                classes.predicate.as_deref().expect(PREDICATE_RESOLVED),
+                classes.embed_quantizable,
             )?;
-            if uniform_default.is_some() {
-                quant_bits_effective = recipe_bits;
-                quant_group_size_effective = recipe_group_size;
-                quant_mode_effective = recipe_mode.to_string();
+            if classes.uniform_default {
+                quant_bits_effective = classes.bits;
+                quant_group_size_effective = classes.group_size;
+                quant_mode_effective = classes.mode.clone();
                 debug_assert!(per_layer_overrides.is_empty());
             }
         } else {
-            // No recipe, non-privacy-filter. NVFP4 cannot land here — the
-            // legacy `quantize_weights` path uniformly applies the global
-            // mode/bits/group_size to every quantizable tensor, which for
-            // NVFP4 silently corrupts the sensitivity-critical tensors
-            // (linear_attn.out_proj, down_proj, etc.) that need affine
-            // 5/6/8-bit fallbacks. See `NVFP4_NO_RECIPE_ERROR` for the full
-            // rationale.
-            if quant_mode == "nvfp4" {
-                return Err(Error::from_reason(NVFP4_NO_RECIPE_ERROR.to_string()));
-            }
-            // --q-mxfp overrides the global mode + group_size so the
-            // legacy quantize path emits mxfp4/mxfp8 weights. The legacy path
-            // STILL emits per-layer overrides for special keys (router-gate
-            // upgrades, lm_head/router.proj affine downgrades, embed_tokens
-            // affine downgrades), and those overrides MUST be persisted to
-            // config.json so the loader dispatches to the correct builder.
-            let (effective_mode, effective_gs) = if quant_mxfp {
-                match quant_bits {
-                    8 => ("mxfp8".to_string(), 32),
-                    4 => ("mxfp4".to_string(), 32),
-                    _ => {
-                        return Err(Error::from_reason(format!(
-                            "--q-mxfp without a recipe requires --q-bits 4 or 8 (got {})",
-                            quant_bits
-                        )));
-                    }
-                }
-            } else {
-                (quant_mode.clone(), quant_group_size)
-            };
             per_layer_overrides = quantize_weights(
                 &mut converted_tensors,
-                quant_bits,
-                effective_gs,
-                &effective_mode,
-                embed_quantizable,
+                classes.bits,
+                classes.group_size,
+                &classes.mode,
+                classes.embed_quantizable,
             )?;
             if !per_layer_overrides.is_empty() {
                 info!(
@@ -4147,8 +4100,8 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
                     per_layer_overrides.keys().collect::<Vec<_>>()
                 );
             }
-            quant_mode_effective = effective_mode;
-            quant_group_size_effective = effective_gs;
+            quant_mode_effective = classes.mode.clone();
+            quant_group_size_effective = classes.group_size;
         }
     }
 
@@ -6204,11 +6157,17 @@ fn validate_official_unsloth_shapes(
 ///
 /// ## Why this is a faithful, data-free port
 ///
-/// - modelopt's MXFP4 weight quantizer is exactly MLX's: dynamic per-block
-///   absmax, E2M1 values, block size 32, E8M0 scales, and **uncalibrated**
-///   (modelopt does not calibrate the weight quantizer). `mlx_quantize(mode =
-///   "mxfp4")` implements the same algorithm, so no calibration data is needed
-///   to reproduce the weight quantization.
+/// - modelopt's MXFP4 weight quantizer needs no calibration data: dynamic
+///   per-block absmax, E2M1 values, block size 32, E8M0 scales, and
+///   **uncalibrated** (modelopt does not calibrate the weight quantizer). The
+///   class map below is therefore reproducible from the weights alone.
+/// - The emitted BYTES are not modelopt's, and are not `mlx_quantize`'s either:
+///   this recipe assigns modes `mxfp4`/`mxfp8`, and convert encodes both with
+///   its own `quant::mxfp4_weight` / `quant::mxfp8_weight` — the two-candidate
+///   E8M0 search and the E8M0 ceiling. Both pick a different block exponent
+///   than modelopt's and MLX's shared round-to-nearest on some blocks, and
+///   both are strictly closer to the source weights. What is ported is the
+///   tensor-class map; the encoder is deliberately ours.
 /// - modelopt's calibration only sets FP8 **activation** amax for the
 ///   attention / GDN tensors. mlx-node keeps activations and the KV cache in
 ///   bf16 (A16 > A8), so there is nothing to port from the calibration set —
@@ -7978,6 +7937,277 @@ fn resolve_legacy_entry(
     }))
 }
 
+/// The quantization decision for one key: the recipe predicate when there is
+/// one, the legacy ladder otherwise. `None` means the tensor stays dense.
+///
+/// Shared by `quantize_weights_inner`'s entry phase and by
+/// [`ResolvedClasses::mode_for`], so a pass that gates on a tensor's class
+/// cannot disagree with the quantizer that later applies it.
+fn resolve_quant_entry(
+    key: &str,
+    weights: &HashMap<String, MxArray>,
+    default_bits: i32,
+    default_group_size: i32,
+    default_mode: &str,
+    predicate: Option<&(dyn Fn(&str) -> QuantDecision + Send + Sync)>,
+    embed_quantizable: bool,
+) -> Result<Option<QuantEntry>> {
+    let Some(pred) = predicate else {
+        // `should_quantize` + the affine-only / router-gate / sym8 ladder,
+        // shared with the already-quantized skip arm so the two cannot drift.
+        return resolve_legacy_entry(
+            key,
+            weights,
+            default_bits,
+            default_group_size,
+            default_mode,
+            embed_quantizable,
+            /* for_existing */ false,
+        );
+    };
+    Ok(match pred(key) {
+        QuantDecision::Skip => None,
+        QuantDecision::Default => should_quantize(key, embed_quantizable).then(|| QuantEntry {
+            key: key.to_string(),
+            bits: default_bits,
+            group_size: default_group_size,
+            mode: default_mode.to_string(),
+        }),
+        QuantDecision::Custom {
+            bits,
+            group_size,
+            mode,
+        } => Some(QuantEntry {
+            key: key.to_string(),
+            bits,
+            group_size,
+            mode,
+        }),
+    })
+}
+
+/// Both the privacy-filter and recipe branches resolve a predicate; a `None`
+/// there means `resolve_quant_classes` and the dispatch below disagree.
+const PREDICATE_RESOLVED: &str = "privacy-filter and recipe classes resolve a predicate";
+
+/// The tensor-class map, resolved before anything mutates a weight.
+///
+/// AWQ pre-scaling divides weight columns by a normalized importance vector
+/// that on a real imatrix spans two orders of magnitude. NVFP4 keeps its
+/// per-16-element block scale in E4M3, where the smallest normal value is 2^-6
+/// and the subnormal step is 2^-9; real FFN block scales already sit in that
+/// subnormal band, so an AWQ division rounds them to the zero code and every
+/// weight in the block dequantizes to zero. Only the class map says a tensor is
+/// FP4-bound, so it has to be resolved first — and the quantize block consumes
+/// this very predicate, so the gate and the quantizer cannot drift.
+pub(crate) struct ResolvedClasses {
+    predicate: Option<Box<dyn Fn(&str) -> QuantDecision + Send + Sync>>,
+    bits: i32,
+    group_size: i32,
+    mode: String,
+    embed_quantizable: bool,
+    /// The selected fixed map has one packed format for every matrix it
+    /// selects, so `bits`/`group_size`/`mode` are the honest top-level default.
+    uniform_default: bool,
+}
+
+impl ResolvedClasses {
+    /// The decision the quantizer will apply to `key`, or `None` when it stays
+    /// dense.
+    fn entry_for(
+        &self,
+        key: &str,
+        weights: &HashMap<String, MxArray>,
+    ) -> Result<Option<QuantEntry>> {
+        resolve_quant_entry(
+            key,
+            weights,
+            self.bits,
+            self.group_size,
+            &self.mode,
+            self.predicate.as_deref(),
+            self.embed_quantizable,
+        )
+    }
+
+    /// The mode the quantizer will apply to `key`, or `None` when it stays dense.
+    fn mode_for(&self, key: &str, weights: &HashMap<String, MxArray>) -> Result<Option<String>> {
+        Ok(self.entry_for(key, weights)?.map(|entry| entry.mode))
+    }
+}
+
+/// Resolve the tensor-class map — the recipe/privacy predicate plus the
+/// defaults it falls back to — returning `None` when nothing is quantized.
+///
+/// Runs before AWQ so pre-scaling can see a tensor's target format, and the
+/// quantize block consumes the result rather than rebuilding it.
+#[allow(clippy::too_many_arguments)]
+fn resolve_quant_classes(
+    weights: &HashMap<String, MxArray>,
+    config: &serde_json::Value,
+    do_quantize: bool,
+    is_privacy_filter: bool,
+    model_type: Option<&str>,
+    quant_recipe: Option<&str>,
+    imatrix_path: Option<&str>,
+    quant_mode: &str,
+    quant_bits: i32,
+    quant_group_size: i32,
+    quant_mxfp: bool,
+    quant_mtp: &str,
+    embed_quantizable: bool,
+) -> Result<Option<ResolvedClasses>> {
+    if !do_quantize {
+        return Ok(None);
+    }
+
+    // Resolve and validate the fixed Unsloth map before dispatching to a
+    // model-specific branch. Most recipes use the generic branch below, but
+    // privacy-filter owns a dedicated predicate and would otherwise bypass the
+    // late no-imatrix fail-closed gate.
+    let recipe_weight_keys = quant_recipe.map(|_| weights.keys().cloned().collect::<Vec<_>>());
+    let official_unsloth_kind = match (quant_recipe, recipe_weight_keys.as_deref()) {
+        (Some(recipe), Some(weight_keys)) => {
+            let kind = select_and_validate_official_unsloth_recipe(
+                recipe,
+                imatrix_path,
+                quant_mxfp,
+                quant_mode,
+                config,
+                model_type,
+                weight_keys,
+            )
+            .map_err(Error::from_reason)?;
+            if recipe == "unsloth" && imatrix_path.is_none() {
+                warn!("{}", UNSLOTH_NO_IMATRIX_WARNING);
+            }
+            kind
+        }
+        _ => None,
+    };
+    if let Some(kind) = official_unsloth_kind {
+        validate_official_unsloth_shapes(weights, kind).map_err(Error::from_reason)?;
+    }
+
+    if is_privacy_filter {
+        return Ok(Some(ResolvedClasses {
+            predicate: Some(build_privacy_filter_predicate(
+                quant_bits,
+                quant_group_size,
+                quant_mode,
+            )),
+            bits: quant_bits,
+            group_size: quant_group_size,
+            mode: quant_mode.to_string(),
+            embed_quantizable,
+            uniform_default: false,
+        }));
+    }
+
+    let Some(recipe) = quant_recipe else {
+        // No recipe, non-privacy-filter. NVFP4 cannot land here — the legacy
+        // `quantize_weights` path uniformly applies the global
+        // mode/bits/group_size to every quantizable tensor, which for NVFP4
+        // silently corrupts the sensitivity-critical tensors
+        // (linear_attn.out_proj, down_proj, etc.) that need affine 5/6/8-bit
+        // fallbacks. See `NVFP4_NO_RECIPE_ERROR` for the full rationale.
+        if quant_mode == "nvfp4" {
+            return Err(Error::from_reason(NVFP4_NO_RECIPE_ERROR.to_string()));
+        }
+        // --q-mxfp overrides the global mode + group_size so the legacy
+        // quantize path emits mxfp4/mxfp8 weights. That path STILL emits
+        // per-layer overrides for special keys (router-gate upgrades,
+        // lm_head/router.proj affine downgrades, embed_tokens affine
+        // downgrades), and those MUST reach config.json so the loader
+        // dispatches to the correct builder.
+        let (mode, group_size) = if quant_mxfp {
+            match quant_bits {
+                8 => ("mxfp8".to_string(), 32),
+                4 => ("mxfp4".to_string(), 32),
+                _ => {
+                    return Err(Error::from_reason(format!(
+                        "--q-mxfp without a recipe requires --q-bits 4 or 8 (got {})",
+                        quant_bits
+                    )));
+                }
+            }
+        } else {
+            (quant_mode.to_string(), quant_group_size)
+        };
+        return Ok(Some(ResolvedClasses {
+            predicate: None,
+            bits: quant_bits,
+            group_size,
+            mode,
+            embed_quantizable,
+            uniform_default: false,
+        }));
+    };
+
+    let weight_keys = recipe_weight_keys
+        .as_deref()
+        .expect("recipe keys are collected whenever quant_recipe is present");
+    // Recipes emit affine `Custom` decisions for protected tensors (lm_head,
+    // AWQ-corrected attn/SSM projections, etc). Affine quantize only supports
+    // group_size ∈ {32, 64, 128}, so when the global mode is nvfp4 (which
+    // forces quant_group_size=16) we must pass a recipe-affine-appropriate
+    // group_size to the predicate builder. `apply_nvfp4_upgrade` still sets
+    // gs=16 on the 4-bit decisions it promotes, and the top-level config.json
+    // still records gs=16/mode=nvfp4 for the default dequantizer.
+    let recipe_gs = if quant_mode == "nvfp4" {
+        64
+    } else {
+        quant_group_size
+    };
+    let predicate = match official_unsloth_kind {
+        Some(kind) => build_official_unsloth_recipe(weight_keys, kind),
+        None => build_predicate_for_recipe(recipe, weight_keys, quant_bits, recipe_gs)
+            .map_err(Error::from_reason)?,
+    };
+    let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+        if quant_mxfp && official_unsloth_kind.is_none() {
+            apply_mxfp_upgrade(predicate, quant_bits)
+        } else if quant_mode == "nvfp4" && official_unsloth_kind.is_none() {
+            // Recipe + --q-mode nvfp4: promote 4-bit recipe decisions to NVFP4
+            // (group_size=16). Mutually exclusive with quant_mxfp, since
+            // --q-mxfp requires --q-mode affine.
+            apply_nvfp4_upgrade(predicate)
+        } else {
+            predicate
+        };
+    // `--q-mtp split` (alias `drafter`) keeps the MTP head BF16 by contract:
+    // the head is extracted into a standalone `mtp-drafter/` directory below,
+    // and the on-disk drafter must NOT carry `.scales` (mlx-vlm trusts the
+    // drafter weights verbatim for a bf16 head). The BODY recipe quantization
+    // is unaffected — only the MTP-head linears are exempted here. So treat
+    // `split` like `off` for MTP-head quant and let the recipe predicate fall
+    // through (which already excludes `mtp.*` keys via
+    // `quantize_weights_inner`). Any other non-off policy (`cyankiwi`/`all`)
+    // still re-enables MTP quantization.
+    let predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync> =
+        if quant_mtp != "off" && quant_mtp != "split" {
+            apply_mtp_quant_policy(predicate, quant_mtp.to_string())
+        } else {
+            predicate
+        };
+    // Muse's fixed map has exactly one packed format: every selected matrix is
+    // MXFP4/32 and every promoted/protected class stays dense. Record that
+    // honest global default instead of serializing 409 identical overrides
+    // below an unused affine-3 default. The dynamic boundary is represented by
+    // which tensors have `.scales`, not by a second packed mode.
+    let uniform_default = official_unsloth_uniform_default(official_unsloth_kind);
+    let (bits, group_size, mode) =
+        uniform_default.unwrap_or((quant_bits, quant_group_size, quant_mode));
+    Ok(Some(ResolvedClasses {
+        predicate: Some(predicate),
+        bits,
+        group_size,
+        mode: mode.to_string(),
+        embed_quantizable,
+        uniform_default: uniform_default.is_some(),
+    }))
+}
+
 /// Quantize weights in-place using MLX's quantize operation.
 ///
 /// Replaces qualifying `.weight` tensors with quantized (uint32 packed) versions
@@ -8167,49 +8397,15 @@ fn quantize_weights_inner(
                 continue;
             }
         }
-        if let Some(pred) = predicate {
-            match pred(key) {
-                QuantDecision::Skip => continue,
-                QuantDecision::Default => {
-                    if !should_quantize(key, embed_quantizable) {
-                        continue;
-                    }
-                    entries.push(QuantEntry {
-                        key: key.clone(),
-                        bits: default_bits,
-                        group_size: default_group_size,
-                        mode: default_mode.to_string(),
-                    });
-                }
-                QuantDecision::Custom {
-                    bits,
-                    group_size,
-                    mode,
-                } => {
-                    entries.push(QuantEntry {
-                        key: key.clone(),
-                        bits,
-                        group_size,
-                        mode,
-                    });
-                }
-            }
-        } else {
-            // Legacy path: `should_quantize` + the affine-only / router-gate /
-            // sym8 ladder, shared with the already-quantized skip arm above so
-            // the two cannot drift. See `resolve_legacy_entry`.
-            let Some(entry) = resolve_legacy_entry(
-                key,
-                weights,
-                default_bits,
-                default_group_size,
-                default_mode,
-                embed_quantizable,
-                /* for_existing */ false,
-            )?
-            else {
-                continue;
-            };
+        if let Some(entry) = resolve_quant_entry(
+            key,
+            weights,
+            default_bits,
+            default_group_size,
+            default_mode,
+            predicate,
+            embed_quantizable,
+        )? {
             entries.push(entry);
         }
     }
@@ -8265,6 +8461,18 @@ fn quantize_weights_inner(
                 // Per-output-channel symmetric int8: int8 [N,K] .weight (source
                 // orientation, NO packing) + f32 [N] .scales, NO .biases.
                 let (q, s) = sym8_quantize_store(&array, &entry.key)?;
+                (q, s, None)
+            } else if entry.mode == crate::quant::mxfp4_weight::MXFP4_MODE {
+                // In-tree encoder: `mlx_quantize` takes its scales as OUT
+                // parameters, so a per-block exponent search cannot be
+                // expressed through it.
+                let (q, s) = crate::quant::mxfp4_weight::quantize_mxfp4(&array, &entry.key)?;
+                (q, s, None)
+            } else if entry.mode == crate::quant::mxfp8_weight::MXFP8_MODE {
+                // Same reason as MXFP4, and the larger half of the map: the
+                // fixed MXFP class maps route attention, GDN, the final FFNs
+                // and lm_head here.
+                let (q, s) = crate::quant::mxfp8_weight::quantize_mxfp8(&array, &entry.key)?;
                 (q, s, None)
             } else {
                 let mode_c = CString::new(entry.mode.as_str())
@@ -8523,13 +8731,17 @@ pub(crate) fn reject_awq_for_prequantized_body(weights: &HashMap<String, MxArray
 /// come from attention/GDN computation, not from a norm layer. These tensors should
 /// be kept at bf16 or quantized without AWQ correction.
 ///
+/// A group is skipped wholesale when any member is bound for a format AWQ
+/// destroys; see [`awq_safe_mode`] and [`awq_group_eligible`].
+///
 /// The rewritten tensors are left LAZY on return. See the tail of the function.
 pub(crate) fn apply_awq_prescaling(
     weights: &mut HashMap<String, MxArray>,
     imatrix: &crate::utils::imatrix::ImatrixData,
     ratio: f32,
     num_layers: usize,
-) -> Result<usize> {
+    classes: Option<&ResolvedClasses>,
+) -> Result<AwqPrescaleOutcome> {
     info!(
         "Applying AWQ pre-scaling: {} layers, ratio={}, {} imatrix entries",
         num_layers,
@@ -8538,6 +8750,7 @@ pub(crate) fn apply_awq_prescaling(
     );
 
     let mut modified = 0usize;
+    let mut skipped_groups = 0usize;
 
     // Auto-detect key prefix: sanitized VLM models use "language_model.model.layers",
     // standard HF/GGUF models use "model.layers".
@@ -8569,7 +8782,14 @@ pub(crate) fn apply_awq_prescaling(
             format!("{prefix}.post_attention_layernorm.weight")
         };
 
-        if let Some(scales) = compute_group_a_scales(imatrix, &gate_key, &up_key, ratio)? {
+        let group_a = gate_awq_group(
+            compute_group_a_scales(imatrix, &gate_key, &up_key, ratio)?,
+            classes,
+            weights,
+            &[&gate_key, &up_key, &norm_key],
+            &mut skipped_groups,
+        )?;
+        if let Some(scales) = group_a {
             // gate_proj.weight *= scales (broadcast over columns: [out, in] * [1, in])
             if let Some(gate) = weights.remove(&gate_key) {
                 let scaled = scale_columns(&gate, &scales)?;
@@ -8594,7 +8814,14 @@ pub(crate) fn apply_awq_prescaling(
         // ── Group B: up_proj (rows) → down_proj (columns) ──
         let down_key = format!("{prefix}.mlp.down_proj.weight");
 
-        if let Some(scales) = compute_scales_for_key(imatrix, &down_key, ratio)? {
+        let group_b = gate_awq_group(
+            compute_scales_for_key(imatrix, &down_key, ratio)?,
+            classes,
+            weights,
+            &[&down_key, &up_key],
+            &mut skipped_groups,
+        )?;
+        if let Some(scales) = group_b {
             // down_proj.weight *= scales (broadcast over columns: [out, in] * [1, in])
             if let Some(down) = weights.remove(&down_key) {
                 let scaled = scale_columns(&down, &scales)?;
@@ -8618,10 +8845,18 @@ pub(crate) fn apply_awq_prescaling(
         let input_norm_key = format!("{prefix}.input_layernorm.weight");
 
         // Only apply if this layer has self_attn weights (full attention layer)
-        if weights.contains_key(&q_key)
-            && let Some(scales) =
-                compute_multi_key_scales(imatrix, &[&q_key, &k_key, &v_key], ratio)?
-        {
+        let group_c = if weights.contains_key(&q_key) {
+            gate_awq_group(
+                compute_multi_key_scales(imatrix, &[&q_key, &k_key, &v_key], ratio)?,
+                classes,
+                weights,
+                &[&q_key, &k_key, &v_key, &input_norm_key],
+                &mut skipped_groups,
+            )?
+        } else {
+            None
+        };
+        if let Some(scales) = group_c {
             for proj_key in [&q_key, &k_key, &v_key] {
                 if let Some(proj) = weights.remove(proj_key) {
                     let scaled = scale_columns(&proj, &scales)?;
@@ -8663,9 +8898,18 @@ pub(crate) fn apply_awq_prescaling(
         let b_key = format!("{prefix}.linear_attn.in_proj_b.weight");
 
         // Only apply if this layer has linear_attn weights (GDN layer)
-        if weights.contains_key(&qkv_key)
-            && let Some(scales) = compute_multi_key_scales(imatrix, &[&qkv_key, &z_key], ratio)?
-        {
+        let group_d = if weights.contains_key(&qkv_key) {
+            gate_awq_group(
+                compute_multi_key_scales(imatrix, &[&qkv_key, &z_key], ratio)?,
+                classes,
+                weights,
+                &[&qkv_key, &z_key, &a_key, &b_key, &input_norm_key],
+                &mut skipped_groups,
+            )?
+        } else {
+            None
+        };
+        if let Some(scales) = group_d {
             for proj_key in [&qkv_key, &z_key, &a_key, &b_key] {
                 if let Some(proj) = weights.remove(proj_key) {
                     let scaled = scale_columns(&proj, &scales)?;
@@ -8700,10 +8944,510 @@ pub(crate) fn apply_awq_prescaling(
     // against the eval-everything-first ordering.
 
     info!(
-        "AWQ pre-scaling complete: modified {} weight tensors",
-        modified
+        "AWQ pre-scaling complete: modified {} weight tensors, skipped {} scale groups",
+        modified, skipped_groups
     );
-    Ok(modified)
+    Ok(AwqPrescaleOutcome {
+        modified,
+        skipped_groups,
+    })
+}
+
+/// What [`apply_awq_prescaling`] did, so the caller can tell an imatrix that
+/// matched nothing from a class map that vetoed every group.
+pub(crate) struct AwqPrescaleOutcome {
+    pub(crate) modified: usize,
+    pub(crate) skipped_groups: usize,
+}
+
+/// Why an AWQ pass that corrected nothing has to fail rather than warn.
+///
+/// A class map that vetoed every group means the imatrix cannot reach a single
+/// tensor, so proceeding would silently ignore `--imatrix-path` and ship a
+/// checkpoint the user believes was calibrated. An imatrix that simply matched
+/// nothing is a different fault — it is reported as a warning about the imatrix
+/// itself, by the caller.
+fn awq_no_op_refusal(outcome: &AwqPrescaleOutcome) -> Option<String> {
+    (outcome.modified == 0 && outcome.skipped_groups > 0).then(|| {
+        format!(
+            "--imatrix-path has nothing it may correct under this quantization class map: all \
+             {} AWQ scale groups feed tensors bound for a float-scaled format \
+             (nvfp4/mxfp4/mxfp8/fp8_e4m3), where dividing a weight column by the AWQ scale \
+             collapses the E4M3 block scale to zero and annihilates the block. Re-run without \
+             --imatrix-path — the fixed FP4 class maps are data-free — or choose an affine \
+             recipe.",
+            outcome.skipped_groups
+        )
+    })
+}
+
+/// Refuse `--imatrix-path` for a GGUF conversion bound for a float-scaled
+/// format.
+///
+/// AWQ divides a weight column by its scale. Under a float-scaled format that
+/// drives the block scale to zero and annihilates the block, which is why
+/// [`gate_awq_group`] vetoes such a group in the SafeTensors lane. The GGUF
+/// lane builds its class map only after AWQ has run, so it cannot ask which
+/// groups a recipe leaves affine. It refuses the whole run instead.
+///
+/// This refusal is wider than the per-group veto, and knowingly so.
+/// `apply_mxfp_upgrade` promotes only 4- and 8-bit decisions, so
+/// `--q-mxfp --q-recipe qwen3_5 --q-bits 4` still leaves q/k/v and the GDN
+/// in_proj_qkv/z at 6-bit affine — Groups C and D, which a per-group gate would
+/// calibrate. Narrowing it needs the class map built above AWQ in the GGUF
+/// lane, which the SafeTensors ordering gets for free and this lane does not.
+pub(crate) fn reject_awq_for_float_quantization(
+    do_quantize: bool,
+    quant_mode: &str,
+    quant_mxfp: bool,
+) -> Result<()> {
+    if !do_quantize {
+        return Ok(());
+    }
+    let request = if quant_mxfp {
+        "--q-mxfp".to_string()
+    } else if matches!(quant_mode, "nvfp4" | "mxfp4" | "mxfp8") {
+        format!("--q-mode {quant_mode}")
+    } else {
+        return Ok(());
+    };
+    Err(Error::from_reason(format!(
+        "--imatrix-path is refused under {request}: dividing a weight column by its AWQ scale \
+         drives the block scale to zero and annihilates the block. The GGUF lane builds its \
+         class map after this point, so it cannot tell which groups a recipe leaves affine and \
+         refuses the whole run. Re-run without --imatrix-path — the FP4 class maps are \
+         data-free — or quantize affine."
+    )))
+}
+
+/// NVFP4 stores a block's scale as `amax / 6` in E4M3, whose smallest normal
+/// value is 2^-6.
+const E4M3_MIN_NORMAL_SCALE: f64 = 1.0 / 64.0;
+/// Largest finite E4M3 value; a block scale past it saturates.
+const E4M3_MAX_SCALE: f64 = 448.0;
+/// Largest E2M1 magnitude — what a block scale is chosen to reach.
+const E2M1_MAX_MAGNITUDE: f64 = 6.0;
+
+/// Expert-FFN tensors whose feeding norm also drives a router or a gate.
+///
+/// On `qwen3_5_moe` and `lfm2_moe` the norm the experts read is also read by
+/// the softmax router and the sigmoid shared-expert gate; neither is
+/// scale-invariant, so folding a scalar into it collapses routing toward
+/// uniform while weight-space error improves. gemma4's experts hang off a
+/// second norm with a different name again. The lift skips these and counts the
+/// skip, so the gap is visible in the convert and not only in a design note.
+const NVFP4_LIFT_MOE_MARKERS: [&str; 4] = [
+    ".experts.",
+    ".switch_mlp.",
+    ".switch_glu.",
+    ".shared_expert",
+];
+
+/// Powers of two by which a tensor may be rescaled with every non-empty
+/// block's E4M3 scale staying normal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LiftWindow {
+    lo: i32,
+    hi: i32,
+}
+
+impl LiftWindow {
+    /// `None` when the block dynamic range is wider than E4M3's normal band,
+    /// where no single power of two makes every block normal at once.
+    fn from_block_extremes(amax_min: f64, amax_max: f64) -> Option<Self> {
+        if amax_min <= 0.0 || !amax_max.is_finite() || amax_max < amax_min {
+            return None;
+        }
+        let fits_low =
+            |k: i32| amax_min * (k as f64).exp2() >= E4M3_MIN_NORMAL_SCALE * E2M1_MAX_MAGNITUDE;
+        let fits_high =
+            |k: i32| amax_max * (k as f64).exp2() <= E4M3_MAX_SCALE * E2M1_MAX_MAGNITUDE;
+
+        // The logarithm only seeds the search; the exact comparisons above
+        // decide, so a boundary case cannot land on the wrong side of a `ceil`.
+        let mut lo = (E4M3_MIN_NORMAL_SCALE * E2M1_MAX_MAGNITUDE / amax_min)
+            .log2()
+            .ceil() as i32;
+        if !fits_low(lo) {
+            lo += 1;
+        } else if fits_low(lo - 1) {
+            lo -= 1;
+        }
+        let mut hi = (E4M3_MAX_SCALE * E2M1_MAX_MAGNITUDE / amax_max)
+            .log2()
+            .floor() as i32;
+        if !fits_high(hi) {
+            hi -= 1;
+        } else if fits_high(hi + 1) {
+            hi += 1;
+        }
+        (lo <= hi && fits_low(lo) && fits_high(hi)).then_some(LiftWindow { lo, hi })
+    }
+
+    fn contains(&self, k: i32) -> bool {
+        self.lo <= k && k <= self.hi
+    }
+
+    fn middle(&self) -> i32 {
+        self.lo + (self.hi - self.lo) / 2
+    }
+}
+
+/// The power-of-two lift applied to each tensor of one SwiGLU FFN.
+///
+/// Rescaling the FFN norm by `2^-gate` forces gate_proj's own factor to
+/// `2^gate` exactly — silu is not homogeneous, so no other tensor can absorb
+/// it. up_proj and down_proj are coupled through the elementwise product,
+/// which passes an up-side factor straight through to down_proj's input. That
+/// makes `gate == up + down` a hard constraint: three tensors, two degrees of
+/// freedom. Solving the three greedily instead would leave down_proj with
+/// whatever exponent the other two happen to imply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FfnLift {
+    gate: i32,
+    up: i32,
+    down: i32,
+}
+
+/// Pick a lift for each of the three projections, or `None` when the windows
+/// cannot be satisfied together.
+fn solve_ffn_lift(gate: LiftWindow, up: LiftWindow, down: LiftWindow) -> Option<FfnLift> {
+    let lo = gate.lo.max(up.lo + down.lo);
+    let hi = gate.hi.min(up.hi + down.hi);
+    if lo > hi {
+        return None;
+    }
+    // Centre each tensor in its own window, then let the constraint place
+    // whichever one is left. The windows are octaves wide, so the centre is
+    // well away from both the zero-scale and the saturation cliff.
+    let gate_lift = gate.middle().clamp(lo, hi);
+    let up_lift = up.middle().clamp(
+        up.lo.max(gate_lift - down.hi),
+        up.hi.min(gate_lift - down.lo),
+    );
+    let lift = FfnLift {
+        gate: gate_lift,
+        up: up_lift,
+        down: gate_lift - up_lift,
+    };
+    (gate.contains(lift.gate) && up.contains(lift.up) && down.contains(lift.down)).then_some(lift)
+}
+
+/// Smallest positive normal of `dtype`, below which a folded norm weight loses
+/// mantissa bits and the fold stops being exact.
+fn min_normal_magnitude(dtype: DType) -> f64 {
+    match dtype {
+        DType::Float16 => (-14f64).exp2(),
+        _ => f32::MIN_POSITIVE as f64,
+    }
+}
+
+/// Smallest non-zero and largest `|value|` over `array`'s quantization blocks.
+///
+/// Returns `None` for an all-zero tensor, which the lift cannot help and does
+/// not need to.
+fn block_amax_extremes(array: &MxArray, group_size: i64) -> Result<Option<(f64, f64)>> {
+    let amax = array
+        .astype(DType::Float32)?
+        .reshape(&[-1, group_size])?
+        .abs()?
+        .max(Some(&[-1]), Some(false))?;
+    let largest = amax.max(None, Some(false))?;
+    largest.eval();
+    let largest_value = largest.item_at_float32(0)? as f64;
+    if largest_value <= 0.0 {
+        return Ok(None);
+    }
+    // Empty blocks are quantized to zero whatever the lift is, so they must not
+    // drag the lower bound down; substituting the maximum leaves them inert.
+    let zero = MxArray::zeros(&[1], Some(DType::Float32))?;
+    let smallest = amax
+        .greater(&zero)?
+        .where_(&amax, &largest)?
+        .min(None, Some(false))?;
+    smallest.eval();
+    Ok(Some((smallest.item_at_float32(0)? as f64, largest_value)))
+}
+
+/// Multiply `key` by `2^exponent`, exactly.
+///
+/// A power of two only shifts the exponent field, so the mantissa — and with
+/// it every rounding decision downstream — is untouched in BF16 and F32 alike.
+fn scale_by_power_of_two(
+    weights: &mut HashMap<String, MxArray>,
+    key: &str,
+    exponent: i32,
+) -> Result<()> {
+    let Some(array) = weights.remove(key) else {
+        return Err(Error::from_reason(format!(
+            "NVFP4 lift: '{key}' vanished between planning and application"
+        )));
+    };
+    let scaled = array.mul_scalar((exponent as f64).exp2())?;
+    weights.insert(key.to_string(), scaled);
+    Ok(())
+}
+
+/// What [`apply_nvfp4_pow2_lift`] did.
+#[derive(Debug)]
+pub(crate) struct Nvfp4LiftOutcome {
+    pub(crate) lifted_layers: usize,
+    pub(crate) skipped_layers: usize,
+    /// NVFP4-bound expert FFN tensors the lift left alone. Counted per TENSOR,
+    /// not per layer: a gemma4 MoE layer has BOTH a dense `mlp` the lift does
+    /// rescale and an expert stack it does not, so one layer index would land in
+    /// two counters at once. See [`count_nvfp4_moe_expert_tensors`].
+    pub(crate) skipped_expert_tensors: usize,
+    /// Dense FFN layers whose `gate`/`up`/`down` trio is only PARTLY bound for
+    /// NVFP4. The three exponents are solved together under `gate == up + down`,
+    /// so a trio with a non-NVFP4 member has no solution to apply. Counted
+    /// because the alternative is silence: on `--q-recipe qwen3_5` this is every
+    /// layer, and both other counters stay zero.
+    pub(crate) partial_nvfp4_layers: usize,
+}
+
+/// Count the NVFP4-bound expert FFN tensors the lift must leave alone.
+///
+/// The norm an expert FFN reads also feeds the router and, on `qwen3_5_moe`, the
+/// shared-expert gate. Neither softmax nor sigmoid is scale-invariant, so
+/// folding the inverse there would rescale routing while weight-space error
+/// improved. gemma4's router reads the raw residual instead
+/// (`models/gemma4/decoder_layer.rs:457`), so that reason does not hold for it —
+/// but the skip does, until a gemma4-specific absorber is measured. Its dense
+/// `mlp` reads a `pre_feedforward_layernorm` nothing else touches and IS lifted,
+/// by the loop in [`apply_nvfp4_pow2_lift`].
+///
+/// Per tensor, not per layer — see [`Nvfp4LiftOutcome::skipped_expert_tensors`].
+fn count_nvfp4_moe_expert_tensors(
+    weights: &HashMap<String, MxArray>,
+    classes: &ResolvedClasses,
+) -> Result<usize> {
+    let mut skipped = 0usize;
+    for key in weights.keys() {
+        if !NVFP4_LIFT_MOE_MARKERS.iter().any(|m| key.contains(m)) {
+            continue;
+        }
+        if classes.mode_for(key, weights)?.as_deref() != Some("nvfp4") {
+            continue;
+        }
+        skipped += 1;
+    }
+    Ok(skipped)
+}
+
+/// Lift NVFP4 block scales out of E4M3's subnormal band, data-free.
+///
+/// A dense SwiGLU FFN's block scales all sit below E4M3's smallest normal
+/// value on real weights, so the scale carries three bits instead of four and
+/// the smallest blocks round to the zero code and are annihilated outright.
+/// Multiplying a weight by a power of two moves every one of its block scales
+/// by the same number of octaves, and the FFN norm can absorb the inverse
+/// exactly, so the layer's output is unchanged.
+///
+/// Runs after AWQ and reads the class map, so it sees the final
+/// pre-quantization magnitudes and only touches tensors actually bound for
+/// NVFP4. It is a no-op on MXFP4 by construction — E8M0 is power-of-two only
+/// and has no subnormal band, so a lift shifts every exponent and changes no
+/// code — which is why the gate is an equality on `nvfp4`, not a test for
+/// "some 4-bit float format".
+pub(crate) fn apply_nvfp4_pow2_lift(
+    weights: &mut HashMap<String, MxArray>,
+    classes: &ResolvedClasses,
+    num_layers: usize,
+) -> Result<Nvfp4LiftOutcome> {
+    // Counted before the loop mutates anything, so the scan reads the same
+    // pre-lift map the refusal this replaced used to read.
+    let skipped_expert_tensors = count_nvfp4_moe_expert_tensors(weights, classes)?;
+
+    let layer_prefix = if weights
+        .keys()
+        .any(|k| k.starts_with("language_model.model.layers."))
+    {
+        "language_model.model.layers"
+    } else {
+        "model.layers"
+    };
+
+    let mut lifted_layers = 0usize;
+    let mut skipped_layers = 0usize;
+    let mut partial_nvfp4_layers = 0usize;
+
+    for i in 0..num_layers {
+        let prefix = format!("{layer_prefix}.{i}");
+        let keys = [
+            format!("{prefix}.mlp.gate_proj.weight"),
+            format!("{prefix}.mlp.up_proj.weight"),
+            format!("{prefix}.mlp.down_proj.weight"),
+        ];
+
+        // Counted, not short-circuited. A trio with SOME member bound for
+        // NVFP4 and some not cannot be lifted — the three exponents are solved
+        // together — and that is the one case a silent `continue` would hide.
+        // `--q-mode nvfp4 --q-recipe qwen3_5` lands here on every layer:
+        // `build_qwen35_recipe` gives `down_proj` `default_bits + 1` = 5 bits,
+        // and `apply_nvfp4_upgrade` promotes only 4-bit decisions, so gate and
+        // up come out NVFP4 while down stays 5-bit affine.
+        let mut group_size = None;
+        let mut nvfp4_members = 0usize;
+        for key in &keys {
+            let entry = weights
+                .contains_key(key)
+                .then(|| classes.entry_for(key, weights))
+                .transpose()?
+                .flatten();
+            if let Some(entry) = entry
+                && entry.mode == "nvfp4"
+            {
+                nvfp4_members += 1;
+                group_size = Some(entry.group_size as i64);
+            }
+        }
+        if nvfp4_members != keys.len() {
+            // Zero members is every non-NVFP4 convert, affine included. Silent
+            // by design, or this would fire on all of them.
+            if nvfp4_members > 0 {
+                partial_nvfp4_layers += 1;
+            }
+            continue;
+        }
+        let Some(group_size) = group_size else {
+            continue;
+        };
+        // A co-quantized trio is all-or-none for the loaders too, so a mixed
+        // one is already illegal — but a packed body would still be silently
+        // multiplied here, and `mul_scalar` would promote it to F32.
+        if keys.iter().any(|key| {
+            !matches!(
+                weights[key].dtype(),
+                Ok(DType::Float32 | DType::Float16 | DType::BFloat16)
+            )
+        }) {
+            warn!(
+                "NVFP4 lift: layer {i}'s FFN weights are not a floating dtype — the checkpoint is \
+                 already packed, so there is nothing left to rescale. Left unlifted."
+            );
+            skipped_layers += 1;
+            continue;
+        }
+
+        // The inverse must land on the norm whose output the MLP reads —
+        // the same choice AWQ Group A makes, for the same reason.
+        let sandwich_norm_key = format!("{prefix}.pre_feedforward_layernorm.weight");
+        let norm_key = if weights.contains_key(&sandwich_norm_key) {
+            sandwich_norm_key
+        } else {
+            format!("{prefix}.post_attention_layernorm.weight")
+        };
+        let Some(norm) = weights.get(&norm_key) else {
+            warn!(
+                "NVFP4 lift: layer {i} has NVFP4 FFN weights but no norm to absorb the inverse \
+                 ({norm_key} missing) — left unlifted"
+            );
+            skipped_layers += 1;
+            continue;
+        };
+        let norm_dtype = norm.dtype()?;
+        // Blocks of one: the norm is a vector and what the guard below needs is
+        // its smallest non-zero magnitude, not a quantization statistic.
+        let norm_extremes = block_amax_extremes(norm, 1)?;
+
+        let mut windows = Vec::with_capacity(keys.len());
+        for key in &keys {
+            let window =
+                block_amax_extremes(&weights[key], group_size)?.and_then(|(amax_min, amax_max)| {
+                    LiftWindow::from_block_extremes(amax_min, amax_max)
+                });
+            match window {
+                Some(window) => windows.push(window),
+                None => break,
+            }
+        }
+        crate::array::memory::synchronize_and_clear_cache();
+        let [gate_window, up_window, down_window] = windows[..] else {
+            skipped_layers += 1;
+            continue;
+        };
+        let Some(lift) = solve_ffn_lift(gate_window, up_window, down_window) else {
+            warn!(
+                "NVFP4 lift: layer {i}'s three FFN windows do not overlap under \
+                 gate = up + down — left unlifted"
+            );
+            skipped_layers += 1;
+            continue;
+        };
+        // The folded norm has to stay normal, or the fold stops being exact and
+        // the layer's output moves. Only reachable with --dtype float16.
+        if let Some((norm_min, _)) = norm_extremes
+            && norm_min * (-lift.gate as f64).exp2() < min_normal_magnitude(norm_dtype)
+        {
+            warn!(
+                "NVFP4 lift: dividing {norm_key} by 2^{} would push its smallest weight below \
+                 {norm_dtype:?}'s normal range, where the fold stops being exact — layer {i} left \
+                 unlifted. Convert with --dtype bfloat16 to lift it.",
+                lift.gate
+            );
+            skipped_layers += 1;
+            continue;
+        }
+
+        for (key, exponent) in keys.iter().zip([lift.gate, lift.up, lift.down]) {
+            scale_by_power_of_two(weights, key, exponent)?;
+        }
+        scale_by_power_of_two(weights, &norm_key, -lift.gate)?;
+        lifted_layers += 1;
+    }
+
+    Ok(Nvfp4LiftOutcome {
+        lifted_layers,
+        skipped_layers,
+        skipped_expert_tensors,
+        partial_nvfp4_layers,
+    })
+}
+
+/// Whether AWQ may reparameterize a tensor headed for `mode`.
+///
+/// AWQ is exact on a dense tensor and harmless on the integer-affine formats,
+/// whose per-group scale is a full-range float with a zero point to absorb the
+/// shift. Every float-scaled format is vetoed: NVFP4's E4M3 block scale is
+/// already subnormal on real FFN weights, so dividing a column by the AWQ scale
+/// rounds the block scale to zero and annihilates the block, and MXFP4/MXFP8/
+/// plain FP8 survive the division but were measured no better than doing
+/// nothing. This is an allowlist — a mode nobody has measured is vetoed.
+fn awq_safe_mode(mode: Option<&str>) -> bool {
+    matches!(mode, None | Some("affine") | Some("sym8"))
+}
+
+/// Drop a group's scales unless every present member may be reparameterized.
+///
+/// The gate is per GROUP, never per tensor: each group folds one inverse scale
+/// into a shared absorber (a norm, or up_proj's rows), so scaling one member
+/// and skipping a sibling would leave the sibling's inputs divided by `s` with
+/// uncompensated weights. `classes` is `None` when nothing will be quantized,
+/// where every mode is dense and AWQ is an exact reparameterization.
+fn gate_awq_group(
+    scales: Option<MxArray>,
+    classes: Option<&ResolvedClasses>,
+    weights: &HashMap<String, MxArray>,
+    group_keys: &[&str],
+    skipped_groups: &mut usize,
+) -> Result<Option<MxArray>> {
+    let Some(scales) = scales else {
+        return Ok(None);
+    };
+    let Some(classes) = classes else {
+        return Ok(Some(scales));
+    };
+    for key in group_keys {
+        if !weights.contains_key(*key) {
+            continue;
+        }
+        if !awq_safe_mode(classes.mode_for(key, weights)?.as_deref()) {
+            *skipped_groups += 1;
+            return Ok(None);
+        }
+    }
+    Ok(Some(scales))
 }
 
 /// Map a (possibly VLM-wrapped) weight key to its canonical imatrix key.
@@ -9093,13 +9837,13 @@ mod tests {
             chunk_size: 1,
         };
 
-        let modified = apply_awq_prescaling(&mut weights, &imatrix, 0.5, 2).expect("awq");
+        let outcome = apply_awq_prescaling(&mut weights, &imatrix, 0.5, 2, None).expect("awq");
 
         // Group D (qkv + z + a + b + norm = 5) on layer 0, Group C (q + k + v +
         // norm = 4) on layer 1. Before the prefix-decoupling fix this was 0
         // (silent no-op); before the a/b-compensation fix it was 7 (a/b skipped).
         assert_eq!(
-            modified, 9,
+            outcome.modified, 9,
             "AWQ must fire on VLM-prefixed weights and compensate in_proj_a/in_proj_b"
         );
     }
@@ -9181,8 +9925,8 @@ mod tests {
             chunk_size: 1,
         };
 
-        let modified = apply_awq_prescaling(&mut weights, &imatrix, 0.5, 2).expect("awq");
-        assert_eq!(modified, 6, "gate + up + one norm per layer");
+        let outcome = apply_awq_prescaling(&mut weights, &imatrix, 0.5, 2, None).expect("awq");
+        assert_eq!(outcome.modified, 6, "gate + up + one norm per layer");
 
         let expected_scales = [0.5f32, 1.0, 1.5, 2.0];
         let expected_inv: Vec<f32> = expected_scales.iter().map(|s| 1.0 / s).collect();
@@ -9458,18 +10202,31 @@ mod tests {
         let num_layers = infer_num_layers_from_weights(&eager);
         assert_eq!(num_layers, 2, "fixture must present two layers");
 
-        let eager_modified =
-            apply_awq_prescaling(&mut eager, &imatrix, 0.5, num_layers).expect("eager AWQ");
-        let lazy_modified =
-            apply_awq_prescaling(&mut lazy, &imatrix, 0.5, num_layers).expect("lazy AWQ");
+        // The affine class map both arms quantize under. It doubles as the
+        // control for the class-map gate: affine tensors stay eligible, so the
+        // counts below are the same ones this test asserted before the gate.
+        let classes = affine_classes();
+        let eager_outcome =
+            apply_awq_prescaling(&mut eager, &imatrix, 0.5, num_layers, Some(&classes))
+                .expect("eager AWQ");
+        let lazy_outcome =
+            apply_awq_prescaling(&mut lazy, &imatrix, 0.5, num_layers, Some(&classes))
+                .expect("lazy AWQ");
 
         // Group A (gate+up+norm) ×2, Group B (down+up) ×2, Group C (q+k+v+norm),
         // Group D (qkv+z+a+b+norm) = 6 + 4 + 4 + 5 = 19.
         assert_eq!(
-            eager_modified, 19,
+            eager_outcome.modified, 19,
             "fixture must exercise all four AWQ groups"
         );
-        assert_eq!(lazy_modified, 19, "both arms rewrite the same tensors");
+        assert_eq!(
+            eager_outcome.skipped_groups, 0,
+            "an affine class map must not veto a group"
+        );
+        assert_eq!(
+            lazy_outcome.modified, 19,
+            "both arms rewrite the same tensors"
+        );
 
         // The arm the quantizer must reproduce: everything resident up front,
         // which is what this pass used to do for the whole map.
@@ -9500,6 +10257,1223 @@ mod tests {
             "embed_tokens must stay dense bf16 at embed_quantizable=false"
         );
         assert_weight_maps_bitwise_equal(&eager, &lazy);
+    }
+    /// Ten dense FFN layers under the published Unsloth Qwen map: with
+    /// `final_eight_start == 2`, layers 0-1 land on NVFP4 and 2-9 on plain FP8,
+    /// which is the same low/high split the 27B ships at a size a unit test can
+    /// quantize. Weights sit at real FFN magnitude (±0.05) so every NVFP4 block
+    /// scale (`amax/6`) starts in the E4M3 subnormal band below 2^-6 — the band
+    /// an AWQ division collapses.
+    fn awq_nvfp4_fixture() -> (HashMap<String, MxArray>, crate::utils::imatrix::ImatrixData) {
+        use crate::utils::imatrix::ImatrixData;
+
+        const LAYERS: usize = 10;
+        const K: i64 = 128; // FFN input features
+        const N: i64 = 64; // FFN hidden features
+
+        let ffn = |seed: u64, shape: &[i64]| {
+            let numel: usize = shape.iter().product::<i64>() as usize;
+            let data: Vec<f32> = awq_lcg(seed, numel).into_iter().map(|v| v * 0.05).collect();
+            MxArray::from_float32(&data, shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("astype bfloat16")
+        };
+        // Eight decades of column importance. AWQ raises it to `ratio` 0.5 and
+        // normalizes by sqrt(max*min), so the least important columns come out
+        // divided by ~100 — the same order a real imatrix produces.
+        let importance = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|j| 10f32.powf(8.0 * j as f32 / (n - 1) as f32))
+                .collect()
+        };
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        let mut scores: HashMap<String, Vec<f32>> = HashMap::new();
+        let mut seed = 1u64;
+        let mut next_seed = || {
+            seed += 1;
+            seed
+        };
+
+        for layer in 0..LAYERS {
+            for key in ["gate_proj", "up_proj"] {
+                let key = format!("model.layers.{layer}.mlp.{key}.weight");
+                weights.insert(key.clone(), ffn(next_seed(), &[N, K]));
+                scores.insert(key, importance(K as usize));
+            }
+            let down = format!("model.layers.{layer}.mlp.down_proj.weight");
+            weights.insert(down.clone(), ffn(next_seed(), &[K, N]));
+            scores.insert(down, importance(N as usize));
+            weights.insert(
+                format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                awq_bf16(next_seed(), &[K]),
+            );
+        }
+
+        (
+            weights,
+            ImatrixData {
+                importance: scores,
+                chunk_count: 1,
+                chunk_size: 1,
+            },
+        )
+    }
+
+    /// Block scales that quantized to the E4M3 zero code. Every weight in such
+    /// a block dequantizes to zero. Only the FP4 modes store a `uint8` scale;
+    /// plain FP8's per-output-channel scale is BF16 and is not counted here.
+    fn fp4_zero_scale_count(weights: &HashMap<String, MxArray>) -> usize {
+        weights
+            .iter()
+            .filter(|(key, array)| {
+                key.ends_with(".scales") && array.dtype().expect("dtype") == DType::Uint8
+            })
+            .map(|(_, scales)| {
+                scales.eval();
+                scales
+                    .to_uint8()
+                    .expect("to_uint8")
+                    .iter()
+                    .filter(|byte| **byte == 0)
+                    .count()
+            })
+            .sum()
+    }
+
+    /// AWQ pre-scaling divides low-importance weight columns by up to two
+    /// orders of magnitude. NVFP4 keeps its per-16-element block scale in
+    /// E4M3, whose smallest normal value is 2^-6 and whose subnormal step is
+    /// 2^-9; real FFN block scales are already subnormal, so a division of that
+    /// size rounds them to the zero code and the whole block dequantizes to
+    /// zero. Nothing but the tensor-class map says a tensor is NVFP4-bound, and
+    /// it used to be resolved long after AWQ had already rewritten the weights.
+    #[test]
+    fn awq_leaves_nvfp4_block_scales_intact() {
+        let (mut baseline, imatrix) = awq_nvfp4_fixture();
+        let (mut scaled, _) = awq_nvfp4_fixture();
+        let num_layers = infer_num_layers_from_weights(&baseline);
+
+        let weight_keys: Vec<String> = baseline.keys().cloned().collect();
+        let predicate =
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::QwenNvfp4);
+        assert_eq!(
+            predicate("model.layers.0.mlp.gate_proj.weight"),
+            QuantDecision::Custom {
+                bits: 4,
+                group_size: 16,
+                mode: "nvfp4".to_string()
+            },
+            "fixture must actually reach the NVFP4 class"
+        );
+
+        let classes = classes_from_predicate(predicate, 4, 16, "nvfp4");
+        let outcome = apply_awq_prescaling(&mut scaled, &imatrix, 0.5, num_layers, Some(&classes))
+            .expect("awq");
+        assert_eq!(outcome.modified, 0, "no FFN tensor here may be AWQ-scaled");
+        assert_eq!(
+            outcome.skipped_groups,
+            2 * num_layers,
+            "Groups A and B are vetoed on every layer — NVFP4 below the final eight, plain FP8 \
+             above it"
+        );
+
+        let predicate = classes.predicate.as_deref().expect("predicate");
+        for map in [&mut baseline, &mut scaled] {
+            quantize_weights_with_recipe_pub(map, 4, 16, "nvfp4", predicate, false)
+                .expect("quantize");
+        }
+
+        assert_eq!(
+            fp4_zero_scale_count(&baseline),
+            0,
+            "data-free NVFP4 must not zero a single block scale — otherwise the fixture's \
+             magnitudes prove nothing about the AWQ arm"
+        );
+        assert_eq!(
+            fp4_zero_scale_count(&scaled),
+            0,
+            "AWQ pre-scaling annihilated NVFP4 blocks: their E4M3 scale fell under 2^-9 and \
+             rounded to zero"
+        );
+    }
+
+    /// Dense SwiGLU FFN at a magnitude that puts every NVFP4 block scale deep
+    /// in E4M3's subnormal band, where the smallest blocks round to the zero
+    /// code and are annihilated. `sandwich` gives the layer a gemma4-style
+    /// `pre_feedforward_layernorm` alongside its `post_attention_layernorm`.
+    fn nvfp4_lift_fixture(sandwich: bool) -> HashMap<String, MxArray> {
+        const LAYERS: usize = 3;
+        const HIDDEN: i64 = 128;
+        const INTERMEDIATE: i64 = 64;
+
+        let tensor = |seed: u64, shape: &[i64], scale: f32| {
+            let numel: usize = shape.iter().product::<i64>() as usize;
+            let data: Vec<f32> = awq_lcg(seed, numel)
+                .into_iter()
+                .map(|v| v * scale)
+                .collect();
+            MxArray::from_float32(&data, shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("astype bfloat16")
+        };
+
+        let mut weights: HashMap<String, MxArray> = HashMap::new();
+        let mut seed = 1u64;
+        let mut next_seed = || {
+            seed += 1;
+            seed
+        };
+        for layer in 0..LAYERS {
+            for key in ["gate_proj", "up_proj"] {
+                weights.insert(
+                    format!("model.layers.{layer}.mlp.{key}.weight"),
+                    tensor(next_seed(), &[INTERMEDIATE, HIDDEN], 0.002),
+                );
+            }
+            weights.insert(
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+                tensor(next_seed(), &[HIDDEN, INTERMEDIATE], 0.002),
+            );
+            weights.insert(
+                format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                tensor(next_seed(), &[HIDDEN], 1.0),
+            );
+            if sandwich {
+                weights.insert(
+                    format!("model.layers.{layer}.pre_feedforward_layernorm.weight"),
+                    tensor(next_seed(), &[HIDDEN], 1.0),
+                );
+            }
+        }
+        weights
+    }
+
+    /// A class map that sends every dense FFN projection to NVFP4 and leaves
+    /// everything else dense — the low-FFN half of the published Unsloth map,
+    /// without the layer-count arithmetic.
+    fn nvfp4_ffn_classes() -> ResolvedClasses {
+        classes_from_predicate(
+            Box::new(|key: &str| {
+                // The official Unsloth map sends every FFN projection to NVFP4,
+                // gemma4's `.experts.switch_glu.*` stack included.
+                if (key.contains(".mlp.") || key.contains(".experts."))
+                    && key.ends_with("_proj.weight")
+                {
+                    QuantDecision::Custom {
+                        bits: 4,
+                        group_size: 16,
+                        mode: "nvfp4".to_string(),
+                    }
+                } else {
+                    QuantDecision::Skip
+                }
+            }),
+            4,
+            16,
+            "nvfp4",
+        )
+    }
+
+    /// One FFN block exactly as `qwen3_5`'s decoder layer runs it: the norm the
+    /// MLP reads, then `down(silu(gate(x)) * up(x))`.
+    fn ffn_forward(
+        weights: &HashMap<String, MxArray>,
+        prefix: &str,
+        norm_key: &str,
+        x: &MxArray,
+    ) -> MxArray {
+        let mut norm = crate::nn::RMSNorm::new(
+            x.shape().unwrap().last().copied().unwrap() as u32,
+            Some(1e-6),
+        )
+        .expect("rms norm");
+        norm.set_weight(&weights[norm_key])
+            .expect("set norm weight");
+        let normed = norm.forward(x).expect("norm forward");
+        let project = |key: &str, input: &MxArray| {
+            input
+                .matmul(&weights[key].transpose(Some(&[1, 0])).expect("transpose"))
+                .expect("matmul")
+        };
+        let gate = project(&format!("{prefix}.mlp.gate_proj.weight"), &normed);
+        let up = project(&format!("{prefix}.mlp.up_proj.weight"), &normed);
+        let activated = crate::nn::Activations::silu(&gate)
+            .expect("silu")
+            .mul(&up)
+            .expect("mul");
+        project(&format!("{prefix}.mlp.down_proj.weight"), &activated)
+    }
+
+    /// The gate for the whole lift: if the inverse lands on the wrong norm, or
+    /// down_proj's exponent is not exactly `gate - up`, the FFN's output moves.
+    /// Weight-space error cannot see any of that.
+    ///
+    /// The assertion is bit-exactness, not a tolerance. A power of two only
+    /// shifts the exponent field, so every mantissa — and with it every
+    /// rounding decision in the norm, the matmuls and the silu — is untouched.
+    #[test]
+    fn nvfp4_lift_preserves_the_ffn_forward() {
+        let before = nvfp4_lift_fixture(false);
+        let mut after = nvfp4_lift_fixture(false);
+        let classes = nvfp4_ffn_classes();
+        let outcome = apply_nvfp4_pow2_lift(&mut after, &classes, 3).expect("lift");
+        assert_eq!(outcome.lifted_layers, 3, "every layer must be lifted");
+        assert_eq!(outcome.skipped_layers, 0);
+
+        let x = MxArray::from_float32(&awq_lcg(9_001, 4 * 128), &[4, 128])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("astype");
+        for layer in 0..3 {
+            let prefix = format!("model.layers.{layer}");
+            let norm_key = format!("{prefix}.post_attention_layernorm.weight");
+            let expected = ffn_forward(&before, &prefix, &norm_key, &x);
+            let actual = ffn_forward(&after, &prefix, &norm_key, &x);
+            assert_bfloat16_bit_exact(&actual, &expected, &format!("layer {layer} FFN output"));
+        }
+    }
+
+    /// A fold into the wrong norm is invisible to the forward test above unless
+    /// the layer actually has two norms to choose between. gemma4's sandwich
+    /// layer feeds the MLP from `pre_feedforward_layernorm`; its
+    /// `post_attention_layernorm` normalizes the attention output into the
+    /// residual and must come out untouched.
+    #[test]
+    fn nvfp4_lift_folds_into_the_norm_the_mlp_reads() {
+        let before = nvfp4_lift_fixture(true);
+        let mut after = nvfp4_lift_fixture(true);
+        let classes = nvfp4_ffn_classes();
+        apply_nvfp4_pow2_lift(&mut after, &classes, 3).expect("lift");
+
+        let x = MxArray::from_float32(&awq_lcg(9_002, 4 * 128), &[4, 128])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("astype");
+        for layer in 0..3 {
+            let prefix = format!("model.layers.{layer}");
+            let attention_norm = format!("{prefix}.post_attention_layernorm.weight");
+            assert_eq!(
+                awq_tensor_bytes(&after[&attention_norm]),
+                awq_tensor_bytes(&before[&attention_norm]),
+                "layer {layer}: the attention-side norm must be untouched"
+            );
+            let ffn_norm = format!("{prefix}.pre_feedforward_layernorm.weight");
+            assert_ne!(
+                awq_tensor_bytes(&after[&ffn_norm]),
+                awq_tensor_bytes(&before[&ffn_norm]),
+                "layer {layer}: the FFN norm must have absorbed the inverse"
+            );
+            let expected = ffn_forward(&before, &prefix, &ffn_norm, &x);
+            let actual = ffn_forward(&after, &prefix, &ffn_norm, &x);
+            assert_bfloat16_bit_exact(&actual, &expected, &format!("layer {layer} sandwich FFN"));
+        }
+    }
+
+    /// Block scales that landed in E4M3's subnormal band — exponent field zero,
+    /// so the scale carries fewer than its three mantissa bits, and at the
+    /// bottom of the band rounds to the zero code and takes the block with it.
+    fn fp4_subnormal_scale_count(weights: &HashMap<String, MxArray>) -> usize {
+        weights
+            .iter()
+            .filter(|(key, array)| {
+                key.ends_with(".scales") && array.dtype().expect("dtype") == DType::Uint8
+            })
+            .map(|(_, scales)| {
+                scales.eval();
+                scales
+                    .to_uint8()
+                    .expect("to_uint8")
+                    .iter()
+                    .filter(|byte| **byte & 0x78 == 0)
+                    .count()
+            })
+            .sum()
+    }
+
+    /// Relative error of the dequantized NVFP4 tensors against their sources.
+    fn nvfp4_relative_error(
+        sources: &HashMap<String, MxArray>,
+        quantized: &HashMap<String, MxArray>,
+    ) -> f64 {
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for (key, source) in sources.iter().filter(|(k, _)| k.contains(".mlp.")) {
+            let prefix = key.strip_suffix(".weight").expect("weight key");
+            let Some(scales) = quantized.get(&format!("{prefix}.scales")) else {
+                continue;
+            };
+            let mode_c = std::ffi::CString::new("nvfp4").unwrap();
+            let handle = unsafe {
+                mlx_sys::mlx_dequantize(
+                    quantized[key].as_raw_ptr(),
+                    scales.as_raw_ptr(),
+                    std::ptr::null_mut(),
+                    16,
+                    4,
+                    0,
+                    mode_c.as_ptr(),
+                )
+            };
+            assert!(!handle.is_null(), "mlx_dequantize failed for {key}");
+            let restored = MxArray::from_handle(handle, "nvfp4_dequant").unwrap();
+            let a: Vec<f32> = source
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            let b: Vec<f32> = restored.to_float32().unwrap().to_vec();
+            for (x, y) in a.iter().zip(b.iter()) {
+                num += ((*y - *x) as f64).powi(2);
+                den += (*x as f64).powi(2);
+            }
+        }
+        (num / den).sqrt()
+    }
+
+    /// Why the lift exists. The reference is the SOURCE weights either side, so
+    /// the comparison is against the same tensors — the lift changes what is
+    /// stored, not what the layer computes.
+    #[test]
+    fn nvfp4_lift_clears_the_subnormal_block_scales() {
+        let sources = nvfp4_lift_fixture(false);
+        let mut baseline = nvfp4_lift_fixture(false);
+        let mut lifted = nvfp4_lift_fixture(false);
+        let classes = nvfp4_ffn_classes();
+        apply_nvfp4_pow2_lift(&mut lifted, &classes, 3).expect("lift");
+
+        // The lifted weights are the ones the layer now stores, so error has to
+        // be measured against them, not against the unlifted sources.
+        let lifted_sources: HashMap<String, MxArray> =
+            lifted.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        for map in [&mut baseline, &mut lifted] {
+            quantize_weights_with_recipe_pub(
+                map,
+                4,
+                16,
+                "nvfp4",
+                classes.predicate.as_deref().expect("predicate"),
+                false,
+            )
+            .expect("quantize");
+        }
+
+        assert!(
+            fp4_zero_scale_count(&baseline) > 0,
+            "fixture must start with annihilated blocks or it proves nothing"
+        );
+        assert_eq!(
+            fp4_zero_scale_count(&lifted),
+            0,
+            "the lift must leave no block scale at the zero code"
+        );
+        assert!(
+            fp4_subnormal_scale_count(&baseline) > 0,
+            "fixture must start in the subnormal band"
+        );
+        assert_eq!(
+            fp4_subnormal_scale_count(&lifted),
+            0,
+            "the lift must move every block scale into E4M3's normal band"
+        );
+
+        let before = nvfp4_relative_error(&sources, &baseline);
+        let after = nvfp4_relative_error(&lifted_sources, &lifted);
+        assert!(
+            after < before,
+            "the lift must lower the error, got {after:.6} against {before:.6}"
+        );
+    }
+
+    /// Read back the power of two a tensor was multiplied by.
+    fn lift_exponent(before: &MxArray, after: &MxArray) -> i32 {
+        let a: Vec<f32> = before
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let b: Vec<f32> = after
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let (x, y) = a
+            .iter()
+            .zip(b.iter())
+            .find(|(x, _)| **x != 0.0)
+            .expect("a non-zero element");
+        let ratio = (y / x) as f64;
+        let exponent = ratio.log2().round() as i32;
+        assert!(
+            (ratio - (exponent as f64).exp2()).abs() < 1e-9 * ratio,
+            "the lift must be an exact power of two, got {ratio}"
+        );
+        exponent
+    }
+
+    /// silu is not homogeneous, so gate_proj's factor is pinned to the inverse
+    /// of the norm's; the elementwise product then passes an up-side factor
+    /// straight to down_proj's input. `gate == up + down` is therefore forced,
+    /// and a per-tensor greedy lift would violate it and change the output.
+    #[test]
+    fn nvfp4_lift_obeys_the_gate_equals_up_plus_down_constraint() {
+        let before = nvfp4_lift_fixture(false);
+        let mut after = nvfp4_lift_fixture(false);
+        apply_nvfp4_pow2_lift(&mut after, &nvfp4_ffn_classes(), 3).expect("lift");
+
+        for layer in 0..3 {
+            let prefix = format!("model.layers.{layer}");
+            let of = |name: &str| {
+                let key = format!("{prefix}.{name}");
+                lift_exponent(&before[&key], &after[&key])
+            };
+            let gate = of("mlp.gate_proj.weight");
+            let up = of("mlp.up_proj.weight");
+            let down = of("mlp.down_proj.weight");
+            let norm = of("post_attention_layernorm.weight");
+            assert_eq!(gate, up + down, "layer {layer}: gate must equal up + down");
+            assert_eq!(
+                norm, -gate,
+                "layer {layer}: the norm absorbs gate's inverse"
+            );
+        }
+    }
+
+    /// The norm an expert FFN reads also drives the router's softmax and, on
+    /// `qwen3_5_moe`, the shared-expert gate's sigmoid. Neither is
+    /// scale-invariant, so the fold would rescale routing while weight-space
+    /// error improved. The pass skips those tensors — and COUNTS them, because
+    /// the lift is unconditional now and an uncounted skip ships the gap
+    /// invisibly. The dense trio in the same fixture must still be lifted: a
+    /// gemma4 MoE layer carries both, and killing the whole convert over the
+    /// expert stack would take the dense lift with it.
+    /// The real `--q-mode nvfp4 --q-recipe qwen3_5` class map, not a hand-built
+    /// one: `build_qwen35_recipe` + `apply_nvfp4_upgrade` is what a user gets,
+    /// and it makes `down_proj` 5-bit affine while gate/up become NVFP4.
+    #[test]
+    fn nvfp4_lift_counts_a_partly_nvfp4_trio() {
+        let predicate = apply_nvfp4_upgrade(build_qwen35_recipe(4, 16));
+        let gate = predicate("model.layers.0.mlp.gate_proj.weight");
+        let down = predicate("model.layers.0.mlp.down_proj.weight");
+        assert!(
+            matches!(&gate, QuantDecision::Custom { mode, .. } if mode == "nvfp4"),
+            "gate_proj must resolve to nvfp4 under the real recipe, got {gate:?}"
+        );
+        assert!(
+            matches!(&down, QuantDecision::Custom { bits: 5, mode, .. } if mode == "affine"),
+            "down_proj must stay 5-bit affine — that is what makes the trio partial, got {down:?}"
+        );
+
+        let classes = classes_from_predicate(predicate, 4, 16, "nvfp4");
+        let before = nvfp4_lift_fixture(false);
+        let mut weights = nvfp4_lift_fixture(false);
+        let outcome = apply_nvfp4_pow2_lift(&mut weights, &classes, 3).expect("lift must not fail");
+
+        assert_eq!(
+            outcome.partial_nvfp4_layers, 3,
+            "every layer's trio is partly NVFP4 and must be counted, not passed over in silence"
+        );
+        assert_eq!(
+            outcome.lifted_layers, 0,
+            "a partial trio has no solution to apply"
+        );
+        assert_eq!(
+            outcome.skipped_layers, 0,
+            "skipped_layers counts layers the solver rejected, not ones it never reached"
+        );
+        for key in [
+            "model.layers.0.mlp.gate_proj.weight",
+            "model.layers.0.mlp.up_proj.weight",
+            "model.layers.0.mlp.down_proj.weight",
+            "model.layers.0.post_attention_layernorm.weight",
+        ] {
+            assert_eq!(
+                awq_tensor_bytes(&weights[key]),
+                awq_tensor_bytes(&before[key]),
+                "{key} must come out byte-identical"
+            );
+        }
+    }
+
+    /// Anti-vacuity for the counter above: an all-NVFP4 trio must still lift and
+    /// must NOT land in `partial_nvfp4_layers`.
+    #[test]
+    fn nvfp4_lift_does_not_count_a_whole_trio_as_partial() {
+        let mut weights = nvfp4_lift_fixture(false);
+        let outcome = apply_nvfp4_pow2_lift(&mut weights, &nvfp4_ffn_classes(), 3)
+            .expect("lift must not fail");
+        assert_eq!(outcome.lifted_layers, 3);
+        assert_eq!(
+            outcome.partial_nvfp4_layers, 0,
+            "a complete NVFP4 trio is not partial"
+        );
+    }
+
+    #[test]
+    fn nvfp4_lift_skips_and_counts_moe_expert_ffns() {
+        for expert_key in [
+            "model.layers.0.mlp.switch_mlp.gate_proj.weight",
+            "model.layers.0.mlp.shared_expert.gate_proj.weight",
+            "model.layers.0.experts.switch_glu.gate_proj.weight",
+        ] {
+            let before = nvfp4_lift_fixture(false);
+            let mut weights = nvfp4_lift_fixture(false);
+            let expert = MxArray::from_float32(&awq_lcg(77, 64 * 128), &[64, 128])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            weights.insert(expert_key.to_string(), expert.clone());
+            let outcome = apply_nvfp4_pow2_lift(&mut weights, &nvfp4_ffn_classes(), 3)
+                .expect("an NVFP4 expert FFN must be skipped, not refused");
+            assert_eq!(
+                outcome.skipped_expert_tensors, 1,
+                "{expert_key} must be counted, not silently passed over"
+            );
+            assert_eq!(
+                outcome.lifted_layers, 3,
+                "{expert_key}: the dense FFN trios must still be lifted — a gemma4 MoE layer's \
+                 dense mlp reads a norm nothing else touches"
+            );
+            assert_eq!(
+                awq_tensor_bytes(&weights[expert_key]),
+                awq_tensor_bytes(&expert),
+                "{expert_key} must come out byte-identical"
+            );
+            let dense = "model.layers.0.mlp.gate_proj.weight";
+            assert_ne!(
+                awq_tensor_bytes(&weights[dense]),
+                awq_tensor_bytes(&before[dense]),
+                "the dense FFN must not be collateral damage of the expert skip"
+            );
+        }
+    }
+
+    /// Every other lift refusal became a counted skip when the lift stopped
+    /// being opt-in: a convert that used to succeed without the flag must not
+    /// start failing because the flag went away. An already-packed body is the
+    /// one a recipe predicate still calls `nvfp4` — `resolve_quant_entry` reads
+    /// the class map, never the dtype — so re-feeding a shipped NVFP4 checkpoint
+    /// through `--quantize --q-mode nvfp4` lands here.
+    #[test]
+    fn nvfp4_lift_skips_an_already_packed_body() {
+        let mut weights = nvfp4_lift_fixture(false);
+        // What the quantizer leaves behind: a packed Uint32 body in the same key.
+        for key in [
+            "model.layers.1.mlp.gate_proj.weight",
+            "model.layers.1.mlp.up_proj.weight",
+            "model.layers.1.mlp.down_proj.weight",
+        ] {
+            let packed = weights[key]
+                .astype(DType::Float32)
+                .unwrap()
+                .astype(DType::Uint32)
+                .unwrap();
+            weights.insert(key.to_string(), packed);
+        }
+        let outcome = apply_nvfp4_pow2_lift(&mut weights, &nvfp4_ffn_classes(), 3)
+            .expect("a packed body must be skipped, not refused");
+        assert_eq!(outcome.lifted_layers, 2, "the two float layers must lift");
+        assert_eq!(
+            outcome.skipped_layers, 1,
+            "the packed layer must be counted as skipped"
+        );
+        assert_eq!(
+            weights["model.layers.1.mlp.gate_proj.weight"]
+                .dtype()
+                .unwrap(),
+            DType::Uint32,
+            "a skipped layer must not be touched — `mul_scalar` would promote it to F32"
+        );
+    }
+
+    /// The float16 refusal became a counted skip for the same reason the others
+    /// did, and it is the one a user reaches without asking for anything:
+    /// `--dtype float16 --q-mode nvfp4` used to need the flag to fail, and now
+    /// runs on every convert. A folded norm below float16's smallest normal
+    /// loses mantissa bits, so the fold stops being exact and the layer's
+    /// output would move — that layer must come out untouched, counted, and
+    /// with the rest of the model still lifted.
+    ///
+    /// The same norm VALUES in bfloat16 must lift, which is what makes this a
+    /// test of the dtype guard rather than of an arbitrary magnitude: 2^-12
+    /// only underflows once it is divided by the lift this fixture solves.
+    #[test]
+    fn nvfp4_lift_skips_a_float16_norm_that_would_fold_subnormal() {
+        let tiny_norm = |dtype: DType| {
+            let mut values = vec![1.0f32; 128];
+            // Divided by the lift this fixture solves, 2^-12 lands below
+            // float16's smallest normal (2^-14) and above bfloat16's.
+            values[7] = (-12f32).exp2();
+            MxArray::from_float32(&values, &[128])
+                .unwrap()
+                .astype(dtype)
+                .unwrap()
+        };
+        let norm_key = "model.layers.1.post_attention_layernorm.weight";
+        let ffn_key = "model.layers.1.mlp.gate_proj.weight";
+
+        let mut float16 = nvfp4_lift_fixture(false);
+        float16.insert(norm_key.to_string(), tiny_norm(DType::Float16));
+        let before = awq_tensor_bytes(&float16[ffn_key]);
+        let outcome = apply_nvfp4_pow2_lift(&mut float16, &nvfp4_ffn_classes(), 3)
+            .expect("a float16 norm that would fold subnormal must be skipped, not refused");
+        assert_eq!(
+            outcome.lifted_layers, 2,
+            "the other two layers must still be lifted"
+        );
+        assert_eq!(
+            outcome.skipped_layers, 1,
+            "the float16 layer must be counted as skipped"
+        );
+        assert_eq!(
+            awq_tensor_bytes(&float16[ffn_key]),
+            before,
+            "a skipped layer's FFN must come out byte-identical"
+        );
+        assert_eq!(
+            awq_tensor_bytes(&float16[norm_key]),
+            awq_tensor_bytes(&tiny_norm(DType::Float16)),
+            "a skipped layer's norm must not be divided by anything"
+        );
+
+        // Anti-vacuity: the guard is about float16's normal range, not about
+        // this norm being unusual. bfloat16 has the same exponent range as f32.
+        let mut bfloat16 = nvfp4_lift_fixture(false);
+        bfloat16.insert(norm_key.to_string(), tiny_norm(DType::BFloat16));
+        let outcome =
+            apply_nvfp4_pow2_lift(&mut bfloat16, &nvfp4_ffn_classes(), 3).expect("bfloat16 lift");
+        assert_eq!(
+            outcome.lifted_layers, 3,
+            "the same norm values in bfloat16 must lift — otherwise the float16 case above \
+             proves nothing about the dtype"
+        );
+        assert_ne!(
+            awq_tensor_bytes(&bfloat16[norm_key]),
+            awq_tensor_bytes(&tiny_norm(DType::BFloat16)),
+            "the bfloat16 norm must actually absorb the inverse"
+        );
+    }
+
+    /// The lift's OWN seam, driven through `convert_model` end to end.
+    ///
+    /// Every other lift test calls `apply_nvfp4_pow2_lift` directly, so the one
+    /// line in `convert_model_inner` that decides whether the pass runs at all
+    /// is not covered by any of them: re-gating that block, or deleting it,
+    /// would ship a converter that silently emits unlifted NVFP4 with the whole
+    /// suite green. The lift becoming unconditional is the headline of this
+    /// change, so it gets the same treatment as the encoder dispatch.
+    ///
+    /// The norm is the witness. Norms are never quantized, so the only thing
+    /// that can touch one between input and output is the fold, and the fold is
+    /// an exact division by a power of two. A layer the fixed map sends to
+    /// NVFP4 must come out divided; a final-eight layer, which the same map
+    /// sends to plain E4M3 FP8, must come out at exactly 1.0 — which is what
+    /// separates "the lift ran" from "something rescaled the model".
+    #[tokio::test]
+    async fn convert_model_lifts_nvfp4_ffn_layers() {
+        const LAYERS: usize = 12;
+        const HIDDEN: i64 = 128;
+        const INTERMEDIATE: i64 = 64;
+        // `build_official_unsloth_recipe` keeps the last eight FFNs at the high
+        // format, so only layers below this cut are NVFP4 and liftable.
+        const FINAL_EIGHT_START: usize = LAYERS - 8;
+
+        let base = std::env::temp_dir().join(format!(
+            "nvfp4_lift_convert_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis()
+        ));
+        let input = base.join("in");
+        let output = base.join("out");
+        std::fs::create_dir_all(&input).expect("create synthetic input dir");
+
+        // A verified Qwen3.5 hybrid is the checkpoint shape the fixed NVFP4
+        // class map is gated on: config family, --model-type, and the
+        // full-attention + GatedDeltaNet tensor inventory must all agree.
+        let config = serde_json::json!({
+            "model_type": "qwen3_5",
+            "num_hidden_layers": LAYERS,
+            "tie_word_embeddings": false,
+        });
+        std::fs::write(
+            input.join("config.json"),
+            serde_json::to_string_pretty(&config).unwrap(),
+        )
+        .expect("write config.json");
+
+        let mut seed = 1u64;
+        let mut ffn = |shape: &[i64]| {
+            seed += 1;
+            let numel: usize = shape.iter().product::<i64>() as usize;
+            // Real FFN magnitudes: this is what puts every block scale into
+            // E4M3's subnormal band and makes the lift non-trivial.
+            let data: Vec<f32> = awq_lcg(seed, numel)
+                .into_iter()
+                .map(|v| v * 0.002)
+                .collect();
+            MxArray::from_float32(&data, shape)
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("astype bfloat16")
+        };
+        let ones = || {
+            MxArray::from_float32(&[1.0f32; HIDDEN as usize], &[HIDDEN])
+                .expect("from_float32")
+                .astype(DType::BFloat16)
+                .expect("astype bfloat16")
+        };
+
+        let mut src: HashMap<String, MxArray> = HashMap::new();
+        for layer in 0..LAYERS {
+            for proj in ["gate_proj", "up_proj"] {
+                src.insert(
+                    format!("model.layers.{layer}.mlp.{proj}.weight"),
+                    ffn(&[INTERMEDIATE, HIDDEN]),
+                );
+            }
+            src.insert(
+                format!("model.layers.{layer}.mlp.down_proj.weight"),
+                ffn(&[HIDDEN, INTERMEDIATE]),
+            );
+            // Exactly 1.0 everywhere: the sanitizer's "already MLX format"
+            // probe reads an input_layernorm and skips its +1.0 shift, so the
+            // fold is the only thing left that can move a norm.
+            src.insert(
+                format!("model.layers.{layer}.input_layernorm.weight"),
+                ones(),
+            );
+            src.insert(
+                format!("model.layers.{layer}.post_attention_layernorm.weight"),
+                ones(),
+            );
+        }
+        // The hybrid witness: full attention plus the three GatedDeltaNet
+        // projections `has_qwen35_hybrid_weight_shape` requires.
+        for key in [
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.layers.0.linear_attn.in_proj_z.weight",
+            "model.layers.0.linear_attn.out_proj.weight",
+        ] {
+            src.insert(key.to_string(), ffn(&[HIDDEN, HIDDEN]));
+        }
+        crate::utils::safetensors::save_safetensors(
+            input.join("model.safetensors"),
+            &mut src,
+            None,
+        )
+        .expect("write synthetic model.safetensors");
+
+        convert_model(ConversionOptions {
+            input_dir: input.to_string_lossy().to_string(),
+            output_dir: output.to_string_lossy().to_string(),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(false),
+            model_type: Some("qwen3_5".to_string()),
+            quantize: Some(true),
+            quant_bits: Some(4),
+            quant_group_size: Some(16),
+            quant_mode: Some("nvfp4".to_string()),
+            quant_recipe: Some("unsloth".to_string()),
+            imatrix_path: None,
+            quant_mxfp: None,
+            quant_mtp: None,
+        })
+        .await
+        .expect("synthetic NVFP4 conversion must succeed");
+
+        let out_norm = |layer: usize| -> Vec<f32> {
+            let key =
+                format!("language_model.model.layers.{layer}.post_attention_layernorm.weight");
+            let index_path = output.join("model.safetensors.index.json");
+            let shard = if index_path.exists() {
+                let index: serde_json::Value = serde_json::from_str(
+                    &std::fs::read_to_string(&index_path).expect("index.json readable"),
+                )
+                .expect("index.json valid");
+                let name = index["weight_map"][&key]
+                    .as_str()
+                    .unwrap_or_else(|| panic!("{key} must appear in the weight map"))
+                    .to_string();
+                output.join(name)
+            } else {
+                output.join("model.safetensors")
+            };
+            let tensors = load_safetensors_lazy(&shard).expect("output shard must load");
+            let array = tensors
+                .get(&key)
+                .unwrap_or_else(|| panic!("{key} must survive the conversion"));
+            let f32_array = array.astype(DType::Float32).expect("astype f32");
+            f32_array.eval();
+            f32_array.to_float32().expect("to_float32").to_vec()
+        };
+
+        let lifted = out_norm(0);
+        let folded = lifted[0];
+        assert!(
+            folded < 1.0 && folded > 0.0,
+            "layer 0's norm must absorb the inverse of a positive lift, got {folded} — the lift \
+             did not run on the production path"
+        );
+        assert_eq!(
+            folded.log2(),
+            folded.log2().round(),
+            "the fold must be an exact power of two, got {folded}"
+        );
+        assert!(
+            lifted.iter().all(|value| *value == folded),
+            "a uniform norm must stay uniform: one scalar divides the whole vector"
+        );
+
+        // Anti-vacuity, both directions: the final-eight FFNs are plain E4M3
+        // FP8 in this map, not NVFP4, so their norms must be untouched. A
+        // blanket rescale — or a lift that ignored the class map — fails here.
+        assert!(
+            out_norm(LAYERS - 1).iter().all(|value| *value == 1.0),
+            "a final-eight layer is FP8, not NVFP4: its norm must come out at exactly 1.0"
+        );
+        assert!(
+            out_norm(FINAL_EIGHT_START - 1)
+                .iter()
+                .all(|value| *value == folded),
+            "every NVFP4 layer in this fixture has the same weight distribution and must take \
+             the same lift"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The lift is an equality on `nvfp4`, not a test for "some 4-bit float
+    /// format", because it can do nothing for MXFP4 and must not churn its
+    /// bytes. The second half proves the no-op is a property of E8M0 rather
+    /// than an assertion: E8M0 has no subnormal band, so rescaling a tensor by
+    /// a power of two shifts every stored exponent by exactly that much and
+    /// leaves every packed code alone.
+    #[test]
+    fn nvfp4_lift_leaves_mxfp4_alone() {
+        let before = nvfp4_lift_fixture(false);
+        let mut after = nvfp4_lift_fixture(false);
+        let mxfp4_classes = classes_from_predicate(
+            Box::new(|key: &str| {
+                if key.contains(".mlp.") && key.ends_with("_proj.weight") {
+                    QuantDecision::Custom {
+                        bits: 4,
+                        group_size: 32,
+                        mode: "mxfp4".to_string(),
+                    }
+                } else {
+                    QuantDecision::Skip
+                }
+            }),
+            4,
+            32,
+            "mxfp4",
+        );
+        let outcome = apply_nvfp4_pow2_lift(&mut after, &mxfp4_classes, 3).expect("lift");
+        assert_eq!(outcome.lifted_layers, 0, "MXFP4 must not be lifted");
+        for (key, tensor) in &before {
+            assert_eq!(
+                awq_tensor_bytes(&after[key]),
+                awq_tensor_bytes(tensor),
+                "{key} must be byte-identical"
+            );
+        }
+
+        let w = before["model.layers.0.mlp.gate_proj.weight"].clone();
+        let shifted = w.mul_scalar(128.0).unwrap();
+        let (packed, scales, _) = quantize_reference(&w, 32, 4, "mxfp4");
+        let (packed_shifted, scales_shifted, _) = quantize_reference(&shifted, 32, 4, "mxfp4");
+        assert_uint32_bit_exact(&packed_shifted, &packed, "mxfp4 codes under a 2^7 rescale");
+        let plain = scales.to_uint8().unwrap();
+        let moved = scales_shifted.to_uint8().unwrap();
+        for (i, (a, b)) in plain.iter().zip(moved.iter()).enumerate() {
+            assert_eq!(
+                *b as i32 - *a as i32,
+                7,
+                "scale byte {i} must move by exactly the 7 octaves of the rescale"
+            );
+        }
+    }
+
+    /// The window is the whole reason the lift needs no tuning: inside it every
+    /// block scale is normal and the E4M3 mantissa is fully used, so quality is
+    /// flat; outside it blocks are annihilated below and saturate above.
+    #[test]
+    fn lift_window_brackets_the_e4m3_normal_band() {
+        // amax = 6 * 2^-20 puts the scale 14 octaves below the normal minimum.
+        let window = LiftWindow::from_block_extremes(6.0 * (-20f64).exp2(), 6.0 * (-20f64).exp2())
+            .expect("a single-valued tensor always has a window");
+        assert_eq!(
+            window.lo, 14,
+            "2^-20 * 2^14 == 2^-6, E4M3's smallest normal"
+        );
+        assert_eq!(window.hi, 28, "2^-20 * 2^28 == 256, still under 448");
+        assert!(window.contains(window.middle()));
+
+        // A dynamic range wider than E4M3's normal band has no window at all.
+        assert_eq!(
+            LiftWindow::from_block_extremes(6.0 * (-40f64).exp2(), 6.0 * (-20f64).exp2()),
+            None
+        );
+        assert_eq!(LiftWindow::from_block_extremes(0.0, 0.0), None);
+    }
+
+    /// Two degrees of freedom for three tensors: the solver has to place all
+    /// three inside their own windows while `gate == up + down` holds, and say
+    /// so when it cannot.
+    #[test]
+    fn solve_ffn_lift_places_every_tensor_inside_its_window() {
+        let wide = LiftWindow { lo: 0, hi: 20 };
+        let lift = solve_ffn_lift(wide, wide, wide).expect("wide windows are satisfiable");
+        assert_eq!(lift.gate, lift.up + lift.down);
+        for (window, k) in [(wide, lift.gate), (wide, lift.up), (wide, lift.down)] {
+            assert!(window.contains(k), "{k} outside {window:?}");
+        }
+
+        // gate's window forces a small sum, so up and down cannot both sit at
+        // their own centres.
+        let narrow_gate = LiftWindow { lo: 4, hi: 5 };
+        let lift = solve_ffn_lift(narrow_gate, wide, wide).expect("still satisfiable");
+        assert!(narrow_gate.contains(lift.gate));
+        assert_eq!(lift.gate, lift.up + lift.down);
+
+        // up and down cannot reach gate's window between them.
+        assert_eq!(
+            solve_ffn_lift(
+                LiftWindow { lo: 30, hi: 40 },
+                LiftWindow { lo: 0, hi: 2 },
+                LiftWindow { lo: 0, hi: 2 }
+            ),
+            None
+        );
+    }
+
+    /// Class map for a plain affine quantize: no float-scaled format anywhere,
+    /// so every AWQ group stays eligible.
+    fn affine_classes() -> ResolvedClasses {
+        ResolvedClasses {
+            predicate: None,
+            bits: 4,
+            group_size: 64,
+            mode: "affine".to_string(),
+            embed_quantizable: false,
+            uniform_default: false,
+        }
+    }
+
+    fn classes_from_predicate(
+        predicate: Box<dyn Fn(&str) -> QuantDecision + Send + Sync>,
+        bits: i32,
+        group_size: i32,
+        mode: &str,
+    ) -> ResolvedClasses {
+        ResolvedClasses {
+            predicate: Some(predicate),
+            bits,
+            group_size,
+            mode: mode.to_string(),
+            embed_quantizable: false,
+            uniform_default: false,
+        }
+    }
+
+    /// Each AWQ group folds one inverse scale into an absorber its members
+    /// share — Group A's FFN norm, Group B's up_proj rows. Scaling one member
+    /// and skipping a sibling would leave the sibling's inputs divided by `s`
+    /// with uncompensated weights, so the gate has to be per group. A
+    /// deliberately illegal mixed trio (affine gate_proj, NVFP4 up_proj) must
+    /// therefore leave the whole layer untouched, norm included.
+    #[test]
+    fn awq_group_gate_is_all_or_none() {
+        let (before, imatrix) = awq_fixture();
+        let (mut weights, _) = awq_fixture();
+        let num_layers = infer_num_layers_from_weights(&weights);
+
+        let classes = classes_from_predicate(
+            Box::new(|key: &str| {
+                if key.ends_with("up_proj.weight") {
+                    QuantDecision::Custom {
+                        bits: 4,
+                        group_size: 16,
+                        mode: "nvfp4".to_string(),
+                    }
+                } else if should_quantize(key, false) {
+                    QuantDecision::Custom {
+                        bits: 4,
+                        group_size: 64,
+                        mode: "affine".to_string(),
+                    }
+                } else {
+                    QuantDecision::Skip
+                }
+            }),
+            4,
+            64,
+            "affine",
+        );
+
+        let outcome = apply_awq_prescaling(&mut weights, &imatrix, 0.5, num_layers, Some(&classes))
+            .expect("awq");
+
+        // Groups A and B both contain up_proj; C and D do not and still fire.
+        assert_eq!(
+            outcome.skipped_groups,
+            2 * num_layers,
+            "every group containing the NVFP4 up_proj must be skipped"
+        );
+        for layer in 0..num_layers {
+            for suffix in [
+                "mlp.gate_proj.weight",
+                "mlp.up_proj.weight",
+                "mlp.down_proj.weight",
+                "post_attention_layernorm.weight",
+            ] {
+                let key = format!("model.layers.{layer}.{suffix}");
+                assert_eq!(
+                    awq_tensor_bytes(&before[&key]),
+                    awq_tensor_bytes(&weights[&key]),
+                    "{key} must be byte-identical when its group is skipped"
+                );
+            }
+        }
+    }
+
+    /// A class map that vetoed every group must fail the convert, not warn:
+    /// proceeding would ship a checkpoint the user believes was calibrated.
+    /// An imatrix that merely matched nothing is a different fault and stays a
+    /// warning.
+    #[test]
+    fn awq_refuses_only_when_the_class_map_vetoed_everything() {
+        assert!(
+            awq_no_op_refusal(&AwqPrescaleOutcome {
+                modified: 0,
+                skipped_groups: 0,
+            })
+            .is_none(),
+            "an imatrix that matched nothing is a warning, not a refusal"
+        );
+        assert!(
+            awq_no_op_refusal(&AwqPrescaleOutcome {
+                modified: 12,
+                skipped_groups: 4,
+            })
+            .is_none(),
+            "a partially vetoed map still corrected tensors"
+        );
+        let reason = awq_no_op_refusal(&AwqPrescaleOutcome {
+            modified: 0,
+            skipped_groups: 20,
+        })
+        .expect("a fully vetoed map must refuse");
+        assert!(reason.contains("20"), "message must name the group count");
+        assert!(
+            reason.contains("nvfp4") && reason.contains("--imatrix-path"),
+            "message must name the format class and the offending flag: {reason}"
+        );
+    }
+
+    /// The GGUF lane cannot consult the class map, so it refuses the whole
+    /// FP4/MX-plus-imatrix combination up front. Affine and sym8 keep AWQ.
+    #[test]
+    fn gguf_lane_refuses_an_imatrix_only_for_float_formats() {
+        for (mode, mxfp) in [
+            ("nvfp4", false),
+            ("mxfp4", false),
+            ("mxfp8", false),
+            ("affine", true),
+        ] {
+            let err = reject_awq_for_float_quantization(true, mode, mxfp)
+                .expect_err("float-scaled quantization must refuse an imatrix");
+            assert!(
+                err.reason.contains("--imatrix-path"),
+                "message must name the offending flag: {}",
+                err.reason
+            );
+        }
+        assert!(reject_awq_for_float_quantization(true, "affine", false).is_ok());
+        assert!(reject_awq_for_float_quantization(true, "sym8", false).is_ok());
+        assert!(
+            reject_awq_for_float_quantization(false, "nvfp4", true).is_ok(),
+            "without --quantize no tensor reaches a float format"
+        );
+    }
+
+    /// The gate is a veto on float-scaled formats, not a switch that turns AWQ
+    /// off. Under the affine map every group must still fire, with the same
+    /// tensor count the pass produced before the gate existed.
+    #[test]
+    fn awq_still_fires_under_an_affine_class_map() {
+        let (mut weights, imatrix) = awq_fixture();
+        let num_layers = infer_num_layers_from_weights(&weights);
+        let classes = affine_classes();
+
+        let outcome = apply_awq_prescaling(&mut weights, &imatrix, 0.5, num_layers, Some(&classes))
+            .expect("awq");
+
+        assert_eq!(outcome.modified, 19, "all four groups must still fire");
+        assert_eq!(outcome.skipped_groups, 0, "affine is never vetoed");
+    }
+
+    /// `ResolvedClasses::mode_for` is what the gate reads; it has to agree with
+    /// the mode the quantizer actually applies, or a group is gated on a class
+    /// no tensor ever gets. Both go through `resolve_quant_entry`, and this
+    /// walks a realistic key list to pin that they cannot drift.
+    #[test]
+    fn resolved_class_mode_matches_the_emitted_scales() {
+        let (mut weights, _) = awq_nvfp4_fixture();
+        let weight_keys: Vec<String> = weights.keys().cloned().collect();
+        let predicate =
+            build_official_unsloth_recipe(&weight_keys, OfficialUnslothRecipeKind::QwenNvfp4);
+        let classes = classes_from_predicate(predicate, 4, 16, "nvfp4");
+
+        let expected: HashMap<String, Option<String>> = weight_keys
+            .iter()
+            .map(|key| {
+                (
+                    key.clone(),
+                    classes.mode_for(key, &weights).expect("mode_for"),
+                )
+            })
+            .collect();
+
+        quantize_weights_with_recipe_pub(
+            &mut weights,
+            4,
+            16,
+            "nvfp4",
+            classes.predicate.as_deref().expect("predicate"),
+            false,
+        )
+        .expect("quantize");
+
+        for (key, mode) in &expected {
+            let base = key.strip_suffix(".weight").expect("weight key");
+            let emitted = weights.get(&format!("{base}.scales"));
+            match mode.as_deref() {
+                // NVFP4 stores a uint8 E4M3 block scale; plain FP8 stores a
+                // BF16 per-output-channel scale. The dtype is the mode's
+                // fingerprint in the emitted checkpoint.
+                Some("nvfp4") => assert_eq!(
+                    emitted.expect("nvfp4 emits scales").dtype().expect("dtype"),
+                    DType::Uint8,
+                    "{key} resolved nvfp4 but did not emit a uint8 block scale"
+                ),
+                Some("fp8_e4m3") => assert_eq!(
+                    emitted.expect("fp8 emits scales").dtype().expect("dtype"),
+                    DType::BFloat16,
+                    "{key} resolved fp8_e4m3 but did not emit a bf16 channel scale"
+                ),
+                Some(other) => panic!("unexpected mode {other} for {key}"),
+                None => assert!(emitted.is_none(), "{key} resolved dense but was quantized"),
+            }
+        }
     }
 
     /// The quantized triplet must not keep its dense bf16 input alive.
@@ -12194,6 +14168,712 @@ mod tests {
         assert_uint32_bit_exact(&packed, &packed_ref, "tiled mxfp4 packed");
         assert_uint8_bit_exact(&scales, &scales_ref, "tiled mxfp4 scales");
         assert!(biases.is_none() && biases_ref.is_none());
+    }
+
+    /// Refuse a bit-identity fixture that straddles the f32 subnormal band.
+    ///
+    /// These fixtures are compared against `mlx_quantize`, whose Metal kernel is
+    /// flush-to-zero, so a subnormal element makes the expected bytes a property
+    /// of the GPU rather than of the format — MLX's own CPU path gives a third
+    /// answer. Worse, `astype` runs on the default device, so a machine whose
+    /// Metal flushes destroys the evidence while BUILDING the fixture and the
+    /// gate passes for the wrong reason. That is exactly how an MXFP4 mismatch
+    /// reached CI while passing locally.
+    ///
+    /// A subnormal is safe only where the whole block encodes to scale byte 0,
+    /// because both encoders then write 32 zero codes and cannot disagree.
+    /// `element_max` is the format's top magnitude — the divisor that turns a
+    /// block amax into its scale (6 for E2M1, 448 for E4M3).
+    fn assert_no_subnormal_under_a_normal_scale(rows: &[f32], element_max: f32, label: &str) {
+        for (index, block) in rows.as_chunks::<32>().0.iter().enumerate() {
+            let amax = block.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+            let subnormal_free = block
+                .iter()
+                .all(|v| *v == 0.0 || v.abs() >= f32::MIN_POSITIVE);
+            assert!(
+                subnormal_free || amax / element_max < f32::MIN_POSITIVE,
+                "{label} boundary block {index} holds an f32 subnormal under a \
+                 nonzero scale byte: mlx_quantize's answer there is a GPU \
+                 flush-to-zero artifact, not a fixed target to be identical to"
+            );
+        }
+    }
+
+    /// A BF16 tensor built to sit on every boundary the MXFP4 encoder has to
+    /// agree with MLX about: an all-zero block, a block whose `amax / 6` is
+    /// exactly a power of two, the seven E2M1 midpoints (which `fp4.h` and
+    /// MLX's CPU fallback round in opposite directions), and a negative zero.
+    fn mxfp4_boundary_tensor() -> MxArray {
+        // Every value here is exact in BF16: the ladder points have at most
+        // three mantissa bits and the scales are powers of two.
+        const TIES: [f32; 8] = [0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0];
+        let mut rows: Vec<f32> = Vec::new();
+
+        rows.extend(std::iter::repeat_n(0.0f32, 32));
+
+        // amax = 6 * 2^-3, so the block scale is exactly 2^-3 and the ladder
+        // points land on the tie thresholds after the division.
+        for scale_exp in [-3i32, 5, -20] {
+            let scale = (scale_exp as f32).exp2();
+            for value in TIES {
+                rows.push(value * scale);
+                rows.push(-value * scale);
+            }
+            rows.push(-0.0);
+            rows.push(0.0);
+            rows.extend(std::iter::repeat_n(0.125 * scale, 14));
+        }
+
+        // The E8M0 underflow boundary. `amax / 6` at 2^-126 is the smallest
+        // normal f32 and gets byte 1; below that it is subnormal, Metal flushes
+        // it, and the kernel's `scale == 0` branch writes 32 zero codes under
+        // byte 0 instead of dividing by 2^-127.
+        //
+        // Every element here stays at or above its block scale, i.e. out of the
+        // f32 subnormal range. An element BELOW the scale is a subnormal, and
+        // there `mlx_quantize` is not a fixed target to be identical to: its
+        // Metal kernel reads a flushed -0.0 and writes the zero code, its CPU
+        // path writes a third answer, and which one a machine produces is a
+        // property of the GPU rather than of MXFP4. The band is narrow —
+        // `amax` within about 1.5 binades above 6*2^-126 — and the codes it
+        // covers are asserted device-free in `mxfp4_weight`'s own tests.
+        for target_exp in [-126i32, -127, -131] {
+            let amax = 6.0f32 * (target_exp as f32).exp2();
+            rows.push(amax);
+            rows.push(-amax);
+            for k in 0..30u32 {
+                let sign = if k % 2 == 0 { 1.0 } else { -1.0 };
+                rows.push(sign * amax * (1.0f32 / 6.0 + (k / 2) as f32 / 45.0));
+            }
+        }
+
+        // Sweep the block maximum across a whole binade so `amax / 6` crosses
+        // the sqrt(2) point where MLX's rounding flips the exponent. BF16
+        // resolves 256 steps per binade; 64 of them is a dense enough walk.
+        for step in 0..64u32 {
+            let amax = 1.0f32 + step as f32 / 64.0;
+            rows.push(amax);
+            rows.push(-amax);
+            for k in 0..30u32 {
+                rows.push(amax * (k as f32 / 31.0 - 0.5));
+            }
+        }
+        assert_no_subnormal_under_a_normal_scale(&rows, 6.0, "mxfp4");
+        let rows_len = rows.len() as i64 / 32;
+        MxArray::from_float32(&rows, &[rows_len, 32])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+    }
+
+    /// The gate for the in-tree MXFP4 encoder: its `#[cfg(test)]` reference —
+    /// the shipping encoder with the search removed and nothing else — has to
+    /// write what `mlx_quantize` writes, byte for byte. That is what makes "the
+    /// search is the only difference from MLX" a measured claim.
+    #[test]
+    fn mxfp4_mlx_rounded_reference_is_bit_identical_to_mlx_quantize() {
+        let w = mxfp4_boundary_tensor();
+        w.eval();
+        let (packed, scales) = crate::quant::mxfp4_weight::quantize_mxfp4_mlx_rounded(
+            &w,
+            "test.mxfp4.boundary.weight",
+        )
+        .unwrap();
+        let (packed_ref, scales_ref, biases_ref) = quantize_reference(&w, 32, 4, "mxfp4");
+        assert!(biases_ref.is_none(), "mxfp4 must not emit biases");
+        assert_uint8_bit_exact(&scales, &scales_ref, "mxfp4 boundary scales");
+        assert_uint32_bit_exact(&packed, &packed_ref, "mxfp4 boundary packed");
+    }
+
+    /// Bit-identity has to survive a tensor with a real weight distribution,
+    /// not only the hand-picked boundaries — and the chunked path has to give
+    /// the same bytes as a single-shot encode.
+    #[test]
+    fn mxfp4_mlx_rounded_reference_is_bit_identical_on_a_random_tensor() {
+        for shape in [vec![512i64, 256], vec![48, 32, 64]] {
+            let w = MxArray::random_normal(&shape, 0.0, 0.02, Some(DType::Float32))
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            w.eval();
+            let (packed, scales) = crate::quant::mxfp4_weight::quantize_mxfp4_mlx_rounded(
+                &w,
+                "test.mxfp4.random.weight",
+            )
+            .unwrap();
+            let (packed_ref, scales_ref, _) = quantize_reference(&w, 32, 4, "mxfp4");
+            assert_uint8_bit_exact(&scales, &scales_ref, "mxfp4 random scales");
+            assert_uint32_bit_exact(&packed, &packed_ref, "mxfp4 random packed");
+        }
+    }
+
+    /// Same weights, same bytes, whether the encoder read the tensor in one
+    /// host copy or several. Chunking is what keeps a 3-D expert stack off the
+    /// heap, so it must not change the output.
+    #[test]
+    fn mxfp4_chunking_does_not_change_the_emitted_bytes() {
+        let w = MxArray::random_normal(&[2048, 4096], 0.0, 0.02, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        w.eval();
+        // 2048 x 4096 f32 is 32 MiB, so the encoder's budget splits it.
+        let (packed, scales) =
+            crate::quant::mxfp4_weight::quantize_mxfp4(&w, "test.mxfp4.chunked.weight").unwrap();
+        let half = w.slice_axis(0, 0, 1024).unwrap();
+        let rest = w.slice_axis(0, 1024, 2048).unwrap();
+        let (packed_a, scales_a) =
+            crate::quant::mxfp4_weight::quantize_mxfp4(&half, "half").unwrap();
+        let (packed_b, scales_b) =
+            crate::quant::mxfp4_weight::quantize_mxfp4(&rest, "rest").unwrap();
+        let joined_packed = MxArray::concatenate_many(vec![&packed_a, &packed_b], Some(0)).unwrap();
+        let joined_scales = MxArray::concatenate_many(vec![&scales_a, &scales_b], Some(0)).unwrap();
+        assert_uint32_bit_exact(&packed, &joined_packed, "chunked mxfp4 packed");
+        assert_uint8_bit_exact(&scales, &joined_scales, "chunked mxfp4 scales");
+    }
+
+    /// Dequantized relative error, so the search can be shown to beat MLX's
+    /// rounding rather than merely differ from it.
+    fn mxfp4_relative_error(source: &MxArray, packed: &MxArray, scales: &MxArray) -> f64 {
+        let mode_c = std::ffi::CString::new("mxfp4").unwrap();
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                packed.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                std::ptr::null_mut(),
+                32,
+                4,
+                0, // out_dtype = float32
+                mode_c.as_ptr(),
+            )
+        };
+        assert!(!handle.is_null(), "mlx_dequantize for mxfp4 failed");
+        let dequantized = MxArray::from_handle(handle, "mxfp4_dequant").unwrap();
+        let a: Vec<f32> = source
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let b: Vec<f32> = dequantized.to_float32().unwrap().to_vec();
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for (x, y) in a.iter().zip(b.iter()) {
+            num += ((*y - *x) as f64).powi(2);
+            den += (*x as f64).powi(2);
+        }
+        (num / den).sqrt()
+    }
+
+    /// The reason the encoder exists: picking the better of the two E8M0
+    /// exponents per block has to lower the error, and it has to do it by
+    /// letting some blocks clip rather than by never clipping.
+    #[test]
+    fn mxfp4_search_beats_mlx_rounding() {
+        let w = MxArray::random_normal(&[1024, 512], 0.0, 0.02, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        w.eval();
+        let (packed_off, scales_off) =
+            crate::quant::mxfp4_weight::quantize_mxfp4_mlx_rounded(&w, "off").unwrap();
+        let (packed_on, scales_on) = crate::quant::mxfp4_weight::quantize_mxfp4(&w, "on").unwrap();
+        let off = mxfp4_relative_error(&w, &packed_off, &scales_off);
+        let on = mxfp4_relative_error(&w, &packed_on, &scales_on);
+        assert!(
+            on < off,
+            "search must lower the error, got {on:.6} against {off:.6}"
+        );
+
+        // The win comes from moving blocks, not from a wholesale shift: some
+        // scale bytes must change and some must not.
+        let a = scales_off.to_uint8().unwrap();
+        let b = scales_on.to_uint8().unwrap();
+        let moved = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+        assert!(
+            moved > a.len() / 20 && moved < a.len() * 19 / 20,
+            "expected a mixed split, {moved} of {} scale bytes moved",
+            a.len()
+        );
+    }
+
+    /// Bit-identity against a checkpoint MLX actually wrote, not a synthetic
+    /// distribution. Skipped unless `MLX_TEST_MODEL_CACHE_DIR` points at a
+    /// model cache holding `qwen3.5-0.8b`.
+    #[test]
+    #[ignore = "requires a local model cache; set MLX_TEST_MODEL_CACHE_DIR and run with --ignored"]
+    fn mxfp4_mlx_rounded_reference_is_bit_identical_on_a_real_ffn_tensor() {
+        let cache = std::env::var("MLX_TEST_MODEL_CACHE_DIR")
+            .expect("MLX_TEST_MODEL_CACHE_DIR must point at a model cache");
+        let dir = std::path::Path::new(&cache).join("qwen3.5-0.8b");
+        let shard = dir.join("model.safetensors-00001-of-00001.safetensors");
+        assert!(
+            shard.exists(),
+            "{} is not present in the model cache",
+            shard.display()
+        );
+        let tensors = crate::utils::safetensors::load_safetensors_lazy(&shard).unwrap();
+        let mut checked = 0;
+        for suffix in ["gate_proj", "up_proj", "down_proj"] {
+            for layer in [0usize, 7, 15] {
+                let key = format!("model.language_model.layers.{layer}.mlp.{suffix}.weight");
+                let Some(w) = tensors.get(&key) else {
+                    continue;
+                };
+                w.eval();
+                let (packed, scales) =
+                    crate::quant::mxfp4_weight::quantize_mxfp4_mlx_rounded(w, &key).unwrap();
+                let (packed_ref, scales_ref, _) = quantize_reference(w, 32, 4, "mxfp4");
+                assert_uint8_bit_exact(&scales, &scales_ref, &format!("{key} scales"));
+                assert_uint32_bit_exact(&packed, &packed_ref, &format!("{key} packed"));
+                let off = mxfp4_relative_error(w, &packed_ref, &scales_ref);
+                let (packed_on, scales_on) =
+                    crate::quant::mxfp4_weight::quantize_mxfp4(w, &key).unwrap();
+                let on = mxfp4_relative_error(w, &packed_on, &scales_on);
+                eprintln!(
+                    "{key}: bit-identical; rel.err {:.4}% -> {:.4}%",
+                    100.0 * off,
+                    100.0 * on
+                );
+                assert!(on < off, "{key}: search must lower the error");
+                checked += 1;
+                crate::array::memory::synchronize_and_clear_cache();
+            }
+        }
+        assert!(checked > 0, "no FFN tensor matched — key spelling changed");
+    }
+
+    /// A BF16 tensor built to sit on every boundary the MXFP8 encoder has to
+    /// agree with MLX about: an all-zero block, a block whose `amax / 448` is
+    /// exactly a power of two, E4M3's normal and subnormal round-half-to-even
+    /// midpoints, the top code where the cast saturates, and a negative zero.
+    fn mxfp8_boundary_tensor() -> MxArray {
+        // Every value here is exact in BF16: E4M3's grid points carry three
+        // mantissa bits, their midpoints four, and the scales are powers of two.
+        const BOUNDARIES: [f32; 32] = [
+            448.0,  // top code, and the value the cast saturates at
+            432.0,  // midpoint 416 <-> 448, ties to the even 448
+            416.0,  // exact
+            400.0,  // midpoint 384 <-> 416, ties to the even 384
+            256.0,  // binade floor
+            248.0,  // midpoint 240 <-> 256, ties to the even 256
+            1.0,    // E4M3 exponent 0
+            1.0625, // midpoint 1.0 <-> 1.125, ties to the even 1.0
+            1.1875, // midpoint 1.125 <-> 1.25, ties to the even 1.25
+            // The subnormal band, written as multiples of E4M3's 2^-9 step.
+            0.015625,    // 2^-6, the smallest normal
+            8.5 / 512.0, // midpoint 2^-6 <-> 2^-6 * 1.125, ties to the even 2^-6
+            7.0 / 512.0, // the largest subnormal
+            7.5 / 512.0, // subnormal <-> normal midpoint, ties to the even 2^-6
+            1.0 / 512.0, // one step
+            0.5 / 512.0, // half a step, ties to zero
+            1.5 / 512.0, // 1.5 steps, ties to the even 2
+            2.5 / 512.0, // 2.5 steps, ties to the even 2
+            3.5 / 512.0, // 3.5 steps, ties to the even 4
+            -448.0,
+            -432.0,
+            -1.0625,
+            -7.5 / 512.0,
+            -0.5 / 512.0,
+            -0.0,
+            0.0,
+            2.0,
+            4.0,
+            8.0,
+            0.5,
+            0.25,
+            0.125,
+            0.0625,
+        ];
+
+        let mut rows: Vec<f32> = Vec::new();
+        rows.extend(std::iter::repeat_n(0.0f32, 32));
+
+        // The E8M0 underflow boundary, which decides whether the block is
+        // written at all. `amax / 448` at 2^-126 is the smallest normal f32 and
+        // gets byte 1; one binade below it is subnormal, which Metal flushes,
+        // so the kernel takes its `scale == 0` branch and writes 32 zero codes
+        // under byte 0. A real Qwen3.5 GDN `in_proj_qkv` has 448 such blocks.
+        for target_exp in [-126i32, -127, -131] {
+            let amax = 448.0f32 * (target_exp as f32).exp2();
+            rows.push(amax);
+            rows.push(-amax);
+            for k in 0..30u32 {
+                rows.push(amax * (k as f32 / 31.0 - 0.5));
+            }
+        }
+
+        // amax = 448 * 2^k, so the block scale is exactly 2^k and every value
+        // above lands on its intended grid point after the division.
+        for scale_exp in [0i32, -8, 12, -30] {
+            let scale = (scale_exp as f32).exp2();
+            rows.extend(BOUNDARIES.iter().map(|value| value * scale));
+        }
+
+        // Sweep the block maximum across a whole binade so `amax / 448` crosses
+        // the sqrt(2) point where MLX's rounding flips the exponent, and the
+        // power-of-two point where the ceiling stops adding one. BF16 resolves
+        // 256 steps per binade; 64 of them is a dense enough walk.
+        for step in 0..64u32 {
+            let amax = 448.0f32 * (1.0 + step as f32 / 64.0);
+            rows.push(amax);
+            rows.push(-amax);
+            for k in 0..30u32 {
+                rows.push(amax * (k as f32 / 31.0 - 0.5));
+            }
+        }
+        assert_no_subnormal_under_a_normal_scale(&rows, 448.0, "mxfp8");
+        let rows_len = rows.len() as i64 / 32;
+        MxArray::from_float32(&rows, &[rows_len, 32])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+    }
+
+    fn scale_bytes(weights: &HashMap<String, MxArray>, key: &str) -> Vec<u8> {
+        let scales = weights.get(key).expect("scales tensor");
+        scales.eval();
+        scales.to_uint8().expect("to_uint8")
+    }
+
+    /// Every other test in this module calls the in-tree encoders directly, so
+    /// shipping the dispatch arm wired to `mlx_quantize` — or to the wrong mode
+    /// — would be invisible. This drives `quantize_weights_inner` itself and
+    /// pins BOTH halves of what it emits — the packed body and the `.scales`
+    /// sidecar — TO the tuned encoder and AWAY from MLX's rounded one. Both
+    /// halves: an arm that took the tuned block scales but MLX's nibbles would
+    /// satisfy a scales-only assertion and ship a checkpoint that dequantizes
+    /// to neither encoder's output.
+    #[test]
+    fn quantize_dispatch_uses_the_tuned_mx_encoders() {
+        for (mode, bits, tensor) in [
+            ("mxfp8", 8, mxfp8_boundary_tensor()),
+            ("mxfp4", 4, mxfp4_boundary_tensor()),
+        ] {
+            let key = "model.layers.0.mlp.gate_proj.weight".to_string();
+            let mode_owned = mode.to_string();
+            let predicate = Box::new(move |_: &str| QuantDecision::Custom {
+                bits,
+                group_size: 32,
+                mode: mode_owned.clone(),
+            }) as Box<dyn Fn(&str) -> QuantDecision + Send + Sync>;
+            let classes = classes_from_predicate(predicate, bits, 32, mode);
+
+            let mut weights: HashMap<String, MxArray> = HashMap::new();
+            weights.insert(key.clone(), tensor.clone());
+            quantize_weights_with_recipe_pub(
+                &mut weights,
+                classes.bits,
+                classes.group_size,
+                mode,
+                classes.predicate.as_deref().expect("predicate"),
+                false,
+            )
+            .expect("quantize");
+            let prefix = key.strip_suffix(".weight").expect("weight suffix");
+            let emitted_scales = scale_bytes(&weights, &format!("{prefix}.scales"));
+            let emitted_packed = weights.get(&key).expect("packed body").clone();
+
+            tensor.eval();
+            let (tuned, mlx_rounded) = if mode == "mxfp8" {
+                (
+                    crate::quant::mxfp8_weight::quantize_mxfp8(&tensor, "tuned").unwrap(),
+                    crate::quant::mxfp8_weight::quantize_mxfp8_mlx_rounded(&tensor, "mlx").unwrap(),
+                )
+            } else {
+                (
+                    crate::quant::mxfp4_weight::quantize_mxfp4(&tensor, "tuned").unwrap(),
+                    crate::quant::mxfp4_weight::quantize_mxfp4_mlx_rounded(&tensor, "mlx").unwrap(),
+                )
+            };
+            let (tuned_packed, tuned_scales) = tuned;
+            let (rounded_packed, rounded_scales) = mlx_rounded;
+            for array in [
+                &tuned_packed,
+                &tuned_scales,
+                &rounded_packed,
+                &rounded_scales,
+            ] {
+                array.eval();
+            }
+            let tuned_scales_bytes = tuned_scales.to_uint8().expect("to_uint8");
+            let rounded_scales_bytes = rounded_scales.to_uint8().expect("to_uint8");
+            // Load-bearing: without it, a tuned encoder that had silently become
+            // the rounded one would still satisfy the assertions below.
+            assert_ne!(
+                tuned_scales_bytes, rounded_scales_bytes,
+                "the {mode} fixture must be one the two encoders disagree on, or the assertions \
+                 below prove nothing"
+            );
+            assert_eq!(
+                emitted_scales, tuned_scales_bytes,
+                "the {mode} dispatch arm must emit the tuned encoder's block scales"
+            );
+            assert_uint32_bit_exact(
+                &emitted_packed,
+                &tuned_packed,
+                &format!("{mode} dispatch arm packed body"),
+            );
+        }
+    }
+
+    /// The gate for the in-tree MXFP8 encoder: its `#[cfg(test)]` reference —
+    /// the shipping encoder with the ceiling swapped back for MLX's rounding and
+    /// nothing else — has to write what `mlx_quantize` writes, byte for byte.
+    #[test]
+    fn mxfp8_mlx_rounded_reference_is_bit_identical_to_mlx_quantize() {
+        let w = mxfp8_boundary_tensor();
+        w.eval();
+        let (packed, scales) = crate::quant::mxfp8_weight::quantize_mxfp8_mlx_rounded(
+            &w,
+            "test.mxfp8.boundary.weight",
+        )
+        .unwrap();
+        let (packed_ref, scales_ref, biases_ref) = quantize_reference(&w, 32, 8, "mxfp8");
+        assert!(biases_ref.is_none(), "mxfp8 must not emit biases");
+        assert_uint8_bit_exact(&scales, &scales_ref, "mxfp8 boundary scales");
+        assert_uint32_bit_exact(&packed, &packed_ref, "mxfp8 boundary packed");
+    }
+
+    /// Bit-identity has to survive a real weight distribution, not only the
+    /// hand-picked boundaries — and the chunked path has to give the same bytes
+    /// as a single-shot encode.
+    #[test]
+    fn mxfp8_mlx_rounded_reference_is_bit_identical_on_a_random_tensor() {
+        for shape in [vec![512i64, 256], vec![48, 32, 64]] {
+            let w = MxArray::random_normal(&shape, 0.0, 0.02, Some(DType::Float32))
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            w.eval();
+            let (packed, scales) = crate::quant::mxfp8_weight::quantize_mxfp8_mlx_rounded(
+                &w,
+                "test.mxfp8.random.weight",
+            )
+            .unwrap();
+            let (packed_ref, scales_ref, _) = quantize_reference(&w, 32, 8, "mxfp8");
+            assert_uint8_bit_exact(&scales, &scales_ref, "mxfp8 random scales");
+            assert_uint32_bit_exact(&packed, &packed_ref, "mxfp8 random packed");
+        }
+    }
+
+    /// Same weights, same bytes, whether the encoder read the tensor in one
+    /// host copy or several. Chunking is what keeps a 3-D expert stack off the
+    /// heap, so it must not change the output.
+    #[test]
+    fn mxfp8_chunking_does_not_change_the_emitted_bytes() {
+        let w = MxArray::random_normal(&[2048, 4096], 0.0, 0.02, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        w.eval();
+        // 2048 x 4096 f32 is 32 MiB, so the encoder's budget splits it.
+        let (packed, scales) =
+            crate::quant::mxfp8_weight::quantize_mxfp8(&w, "test.mxfp8.chunked.weight").unwrap();
+        let half = w.slice_axis(0, 0, 1024).unwrap();
+        let rest = w.slice_axis(0, 1024, 2048).unwrap();
+        let (packed_a, scales_a) =
+            crate::quant::mxfp8_weight::quantize_mxfp8(&half, "half").unwrap();
+        let (packed_b, scales_b) =
+            crate::quant::mxfp8_weight::quantize_mxfp8(&rest, "rest").unwrap();
+        let joined_packed = MxArray::concatenate_many(vec![&packed_a, &packed_b], Some(0)).unwrap();
+        let joined_scales = MxArray::concatenate_many(vec![&scales_a, &scales_b], Some(0)).unwrap();
+        assert_uint32_bit_exact(&packed, &joined_packed, "chunked mxfp8 packed");
+        assert_uint8_bit_exact(&scales, &joined_scales, "chunked mxfp8 scales");
+    }
+
+    /// Dequantized relative error, so the ceiling can be shown to beat MLX's
+    /// rounding rather than merely differ from it.
+    fn mxfp8_relative_error(source: &MxArray, packed: &MxArray, scales: &MxArray) -> f64 {
+        let mode_c = std::ffi::CString::new("mxfp8").unwrap();
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                packed.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                std::ptr::null_mut(),
+                32,
+                8,
+                0, // out_dtype = float32
+                mode_c.as_ptr(),
+            )
+        };
+        assert!(!handle.is_null(), "mlx_dequantize for mxfp8 failed");
+        let dequantized = MxArray::from_handle(handle, "mxfp8_dequant").unwrap();
+        let a: Vec<f32> = source
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let b: Vec<f32> = dequantized.to_float32().unwrap().to_vec();
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for (x, y) in a.iter().zip(b.iter()) {
+            num += ((*y - *x) as f64).powi(2);
+            den += (*x as f64).powi(2);
+        }
+        (num / den).sqrt()
+    }
+
+    /// The reason the encoder exists: the ceiling has to cut the error by the
+    /// measured 2.5-3x, and it has to do it by moving roughly half the scale
+    /// bytes — the half MLX rounded down and saturated.
+    #[test]
+    fn mxfp8_ceiling_beats_mlx_rounding() {
+        let w = MxArray::random_normal(&[1024, 512], 0.0, 0.02, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        w.eval();
+        let (packed_off, scales_off) =
+            crate::quant::mxfp8_weight::quantize_mxfp8_mlx_rounded(&w, "off").unwrap();
+        let (packed_on, scales_on) = crate::quant::mxfp8_weight::quantize_mxfp8(&w, "on").unwrap();
+        let off = mxfp8_relative_error(&w, &packed_off, &scales_off);
+        let on = mxfp8_relative_error(&w, &packed_on, &scales_on);
+        eprintln!(
+            "mxfp8 synthetic: rel.err {:.4}% -> {:.4}% ({:.2}x)",
+            100.0 * off,
+            100.0 * on,
+            off / on
+        );
+        // The win comes from the blocks MLX rounded down, so about half the
+        // bytes move and about half do not.
+        let a = scales_off.to_uint8().unwrap();
+        let b = scales_on.to_uint8().unwrap();
+        let moved = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+        eprintln!("mxfp8 synthetic: {moved} of {} scale bytes moved", a.len());
+        assert!(
+            on * 1.7 < off,
+            "the ceiling must cut the error by well over a third, got {on:.6} against {off:.6}"
+        );
+        assert!(
+            moved > a.len() * 3 / 10 && moved < a.len() * 7 / 10,
+            "expected about half the scale bytes to move, {moved} of {} did",
+            a.len()
+        );
+        // Every byte that moved went up by exactly one exponent, never down.
+        for (x, y) in a.iter().zip(b.iter()) {
+            assert!(y == x || *y == x.wrapping_add(1), "{x} -> {y}");
+        }
+    }
+
+    /// Why the encoder takes the ceiling instead of running MXFP4's two-
+    /// candidate search: at eight bits the search finds nothing the ceiling did
+    /// not already have. Kept as a measurement so the claim cannot go stale.
+    #[test]
+    fn mxfp8_ceil_is_not_beaten_by_the_two_candidate_search() {
+        let w = MxArray::random_normal(&[2048, 1024], 0.0, 0.02, Some(DType::Float32))
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        w.eval();
+        let (packed_ceil, scales_ceil) =
+            crate::quant::mxfp8_weight::quantize_mxfp8(&w, "ceil").unwrap();
+        let (packed_search, scales_search) =
+            crate::quant::mxfp8_weight::quantize_mxfp8_best_of_two(&w, "search").unwrap();
+        let ceil = mxfp8_relative_error(&w, &packed_ceil, &scales_ceil);
+        let search = mxfp8_relative_error(&w, &packed_search, &scales_search);
+        let a = scales_ceil.to_uint8().unwrap();
+        let b = scales_search.to_uint8().unwrap();
+        let differing = a.iter().zip(b.iter()).filter(|(x, y)| x != y).count();
+        eprintln!(
+            "mxfp8 ceil {:.6}% vs best-of-two {:.6}%; the search preferred the other \
+             candidate on {}/{} blocks",
+            100.0 * ceil,
+            100.0 * search,
+            differing,
+            a.len()
+        );
+        // The search is a per-block minimum over a set that contains the
+        // ceiling, so it can never be worse; the point is that it is not
+        // better by anything worth 2x the encode.
+        assert!(search <= ceil * (1.0 + 1e-12));
+        assert!(
+            ceil < search * 1.0005,
+            "the search beat the ceiling by more than 0.05%: {ceil:.8} against {search:.8}"
+        );
+    }
+
+    /// Bit-identity against a checkpoint MLX actually wrote, on the tensor
+    /// classes the fixed MXFP map routes to MXFP8 — attention q/k/v/o and the
+    /// GDN projections. Skipped unless `MLX_TEST_MODEL_CACHE_DIR` points at a
+    /// model cache holding `qwen3.5-0.8b`.
+    #[test]
+    #[ignore = "requires a local model cache; set MLX_TEST_MODEL_CACHE_DIR and run with --ignored"]
+    fn mxfp8_mlx_rounded_reference_is_bit_identical_on_real_checkpoint_tensors() {
+        let cache = std::env::var("MLX_TEST_MODEL_CACHE_DIR")
+            .expect("MLX_TEST_MODEL_CACHE_DIR must point at a model cache");
+        let dir = std::path::Path::new(&cache).join("qwen3.5-0.8b");
+        let shard = dir.join("model.safetensors-00001-of-00001.safetensors");
+        assert!(
+            shard.exists(),
+            "{} is not present in the model cache",
+            shard.display()
+        );
+        let tensors = crate::utils::safetensors::load_safetensors_lazy(&shard).unwrap();
+        // Layers 3/7/11/... are attention; the rest carry the GDN projections.
+        let keys: Vec<String> = [
+            (0usize, "linear_attn.in_proj_qkv"),
+            (0, "linear_attn.in_proj_z"),
+            (0, "linear_attn.out_proj"),
+            (5, "linear_attn.in_proj_qkv"),
+            (13, "linear_attn.out_proj"),
+            (3, "self_attn.q_proj"),
+            (3, "self_attn.k_proj"),
+            (3, "self_attn.v_proj"),
+            (3, "self_attn.o_proj"),
+            (11, "self_attn.q_proj"),
+            (11, "self_attn.o_proj"),
+        ]
+        .iter()
+        .map(|(layer, suffix)| format!("model.language_model.layers.{layer}.{suffix}.weight"))
+        .collect();
+
+        let mut checked = 0;
+        for key in &keys {
+            let Some(w) = tensors.get(key) else {
+                continue;
+            };
+            w.eval();
+            let (packed, scales) =
+                crate::quant::mxfp8_weight::quantize_mxfp8_mlx_rounded(w, key).unwrap();
+            let (packed_ref, scales_ref, biases_ref) = quantize_reference(w, 32, 8, "mxfp8");
+            assert!(biases_ref.is_none(), "mxfp8 must not emit biases");
+            assert_uint8_bit_exact(&scales, &scales_ref, &format!("{key} scales"));
+            assert_uint32_bit_exact(&packed, &packed_ref, &format!("{key} packed"));
+
+            let off = mxfp8_relative_error(w, &packed_ref, &scales_ref);
+            let (packed_on, scales_on) =
+                crate::quant::mxfp8_weight::quantize_mxfp8(w, key).unwrap();
+            let on = mxfp8_relative_error(w, &packed_on, &scales_on);
+            let (packed_search, scales_search) =
+                crate::quant::mxfp8_weight::quantize_mxfp8_best_of_two(w, key).unwrap();
+            let searched = mxfp8_relative_error(w, &packed_search, &scales_search);
+            let saturating = scales_ref
+                .to_uint8()
+                .unwrap()
+                .iter()
+                .zip(scales_on.to_uint8().unwrap().iter())
+                .filter(|(x, y)| x != y)
+                .count();
+            eprintln!(
+                "{key}: bit-identical; rel.err {:.4}% -> {:.4}% (best-of-two {:.4}%), \
+                 {:.1}% of blocks saturated",
+                100.0 * off,
+                100.0 * on,
+                100.0 * searched,
+                100.0 * saturating as f64 / scales_on.to_uint8().unwrap().len() as f64
+            );
+            assert!(on * 2.0 < off, "{key}: the ceiling must halve the error");
+            assert!(
+                on < searched * 1.0005,
+                "{key}: the search beat the ceiling by more than 0.05%"
+            );
+            checked += 1;
+            crate::array::memory::synchronize_and_clear_cache();
+        }
+        assert!(
+            checked > 0,
+            "no MXFP8-class tensor matched — key spelling changed"
+        );
     }
 
     #[test]
@@ -18382,8 +21062,11 @@ mod tests {
             "affine-8 requant max|d|/amax {max_rel} exceeds the measured budget (0.8669%)"
         );
 
-        // ANTI-VACUITY: mxfp8 on this exact fixture blows the budget by ~10x,
-        // so the assertions above discriminate rather than always passing.
+        // ANTI-VACUITY: `mlx_quantize`'s own mxfp8 on this exact fixture blows
+        // the budget by ~10x, so the assertions above discriminate rather than
+        // always passing. This is MLX's rounded E8M0, which is what ruled mxfp8
+        // out here; convert's own encoder takes the ceiling and has never been
+        // measured against affine on mamba projections — see `fp8_to_affine8`.
         let mxfp8_mode = std::ffi::CString::new("mxfp8").unwrap();
         let (mx_p, mx_s, mx_b) =
             quantize_with_optional_tiling(&reference, 32, 8, mxfp8_mode.as_c_str(), "mxfp8_anchor")

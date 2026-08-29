@@ -3573,7 +3573,10 @@ fn apply_gguf_awq_prescaling(
 ) -> Result<()> {
     crate::convert::reject_awq_for_prequantized_body(weights)?;
     let num_layers = crate::convert::infer_num_layers_from_weights(weights);
-    crate::convert::apply_awq_prescaling(weights, imatrix, 0.5, num_layers)?;
+    // The class map is resolved further down, after this pass; the FP4/MX
+    // combinations it would have vetoed are refused at the call site by
+    // `reject_awq_for_float_quantization`.
+    crate::convert::apply_awq_prescaling(weights, imatrix, 0.5, num_layers, None)?;
     Ok(())
 }
 
@@ -4030,6 +4033,11 @@ pub async fn convert_gguf_to_safetensors(
     // already been repacked to Uint32 + sidecars above, so the shared guard
     // must run before AWQ can multiply packed integers or fold norms twice.
     if let Some(ref imatrix_path) = options.imatrix_path {
+        crate::convert::reject_awq_for_float_quantization(
+            options.quantize.unwrap_or(false),
+            options.quant_mode.as_deref().unwrap_or("affine"),
+            options.quant_mxfp.unwrap_or(false),
+        )?;
         let imatrix = crate::utils::imatrix::parse_imatrix(imatrix_path)?;
         apply_gguf_awq_prescaling(&mut weights, &imatrix)?;
     }

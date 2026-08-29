@@ -2608,6 +2608,35 @@ export declare function calibrateActivationAmaxRaw(
   calibSeq: number,
 ): Promise<number>;
 
+/**
+ * Run the teacher over `texts` and write its top-`top_k` next-token
+ * distribution into `cache_dir`. Returns the number of rows written.
+ *
+ * Each row is tokenized RAW (no chat template, no BOS), truncated to `seq_len`
+ * tokens, and prefilled on fresh caches. The head is projected over positions
+ * in `logit_chunk`-sized chunks so the full-vocabulary logits never
+ * materialize for the whole sequence at once.
+ *
+ * `seq_len` is raised to 2 when lower: the first token primes the forward and
+ * has no target of its own, so a shorter row scores nothing. `top_k` is
+ * clamped to the teacher's vocabulary, so a wider request degrades to an exact
+ * full-vocab KL. The cache records both EFFECTIVE values, not the requested
+ * ones — the support width is what says how far a top-K KL can be trusted.
+ *
+ * A quantized teacher is accepted — anchoring on a released quantized
+ * checkpoint is a real comparison — but it is warned about and recorded in the
+ * cache, because every number then measures divergence from that checkpoint
+ * rather than from the bf16 model.
+ */
+export declare function captureTeacherLogits(
+  teacherPath: string,
+  texts: Array<string>,
+  seqLen: number,
+  topK: number,
+  logitChunk: number,
+  cacheDir: string,
+): Promise<number>;
+
 /** Unified chat configuration shared by all model variants (Qwen3, Qwen3.5, Qwen3.5 MoE). */
 export interface ChatConfig {
   /**
@@ -3354,6 +3383,34 @@ export interface EngineStepMetrics {
   peakMemoryMb: number;
   /** Active memory at end of step (MB) */
   activeMemoryMb: number;
+}
+
+/**
+ * Teacher-forced quality of one checkpoint against a cached reference.
+ *
+ * `mean_nll`, `perplexity` and `top1_agreement` are EXACT full-vocab numbers.
+ * `mean_kl_topk` is exact only over the teacher's cached support — read it
+ * together with `teacher_tail_mass`, which is the probability mass that support
+ * leaves out.
+ */
+export interface EvalReport {
+  rows: number;
+  positions: number;
+  topK: number;
+  /** Teacher the cache was captured from, carried through from its metadata. */
+  teacherPath: string;
+  /**
+   * That teacher was itself quantized, so every number below measures
+   * divergence from it rather than from the bf16 model.
+   */
+  teacherQuantized: boolean;
+  meanNll: number;
+  perplexity: number;
+  teacherMeanNll: number;
+  teacherPerplexity: number;
+  meanKlTopk: number;
+  teacherTailMass: number;
+  top1Agreement: number;
 }
 
 export interface ForeignConversionOptions {
@@ -5273,6 +5330,22 @@ export interface SchedulerStats {
   preemptionsRecompute: number;
   preemptionsSsd: number;
 }
+
+/**
+ * Teacher-force `model_path` over the token ids cached in `cache_dir` and
+ * report its NLL, perplexity, top-1 agreement and KL against the teacher.
+ *
+ * The candidate is refused when it cannot answer for the cached rows: a
+ * different `model_type`, a different tokenizer, or a different vocabulary
+ * width. Score reads its token ids FROM THE CACHE, so a tokenizer mismatch
+ * would otherwise report a finite, plausible number measured on the wrong
+ * text.
+ */
+export declare function scoreAgainstTeacher(
+  modelPath: string,
+  cacheDir: string,
+  logitChunk: number,
+): Promise<EvalReport>;
 
 /** Enable or disable profiling globally. */
 export declare function setProfilingEnabled(enabled: boolean): void;
