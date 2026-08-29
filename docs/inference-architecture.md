@@ -9,7 +9,7 @@ that owns them.
 
 ```text
 config.json
-  -> TypeScript MODEL_FAMILY_REGISTRY
+  -> TypeScript MODEL_FAMILY_DATA row + loader binding
   -> native model instance
   -> immutable ExecutionPlan
 
@@ -23,14 +23,16 @@ messages / delta + ChatConfig
 
 The two planning stages have different responsibilities:
 
-- `packages/lm/src/models/model-loader.ts` is the ordered registry for model
-  detection, aliases, loader selection, model kind, and family-specific load
-  options. Architecture probes and the legacy missing-`model_type` Qwen3
-  fallback are explicit registry policies. The unified-Gemma architecture is
-  authoritative even when `model_type` is explicit or malformed, matching the
-  native loader; without a recognized architecture probe, an explicit unknown
-  type fails closed. `ModelType`, `LoadableModel`, and `TrainableModel` are
-  derived from the registry rather than maintained as separate family lists.
+- `packages/lm/src/family-data.ts` is the ordered, native-free registry for
+  model detection, aliases, model kind, agent traits, and launch presets;
+  `packages/lm/src/models/model-loader.ts` zips one loader binding onto every
+  row for loader selection and family-specific load options. Architecture
+  probes and the legacy missing-`model_type` Qwen3 fallback are explicit
+  registry policies. The unified-Gemma architecture is authoritative even
+  when `model_type` is explicit or malformed, matching the native loader;
+  without a recognized architecture probe, an explicit unknown type fails
+  closed. `ModelType`, `LoadableModel`, and `TrainableModel` are derived from
+  the registry rather than maintained as separate family lists.
 - `crates/mlx-core/src/engine/plan.rs` resolves the capabilities of the loaded
   model against one request. `ExecutionPlan` is immutable load-time data;
   `TurnPlan` is compact request-time data and is computed before cache mutation.
@@ -58,7 +60,7 @@ cross-attention, and other state remains model-owned. Do not add a global
 Scheduling policy is nevertheless engine-owned. `HybridSchedulerState<B>`
 owns admission, owner/sequence mapping, block and recurrent-state reservation,
 prefill/decode planning, SSD waits, preemption, completion, and barriers for
-Qwen3, LFM2/2.5, Qwen3.5 Dense/MoE, Gemma4, and Nemotron 3.5 Lightning. `HybridSchedulerBackend` is the
+Qwen3, LFM2/2.5, Qwen3.5 Dense/MoE, Gemma4, Muse-Glimmer, and Nemotron 3.5 Lightning. `HybridSchedulerBackend` is the
 model-runner boundary: a family exposes its paged cache manager, auxiliary-state
 lifecycle, prefix construction/restore, and batched decode implementation.
 Environment-derived limits remain shared engine policy, not pass-through
@@ -118,9 +120,10 @@ both routes propose and verify tokens.
 | ------------- | ------------------------------------------------------------ | --------------- | --------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | Qwen3         | none                                                         | fresh and delta | none                                                                              | all paged turns use the shared paged executor                                                                             |
 | LFM2          | none                                                         | fresh and delta | none                                                                              | short-conv state is never paged: every paged turn (fresh or delta) rebuilds it from the full token stream via conv Pass-1 |
-| Qwen3.5 dense | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP, including paged target state and supported image-context continuation | plain paged AR may use the two-row GDN scheduler; multimedia/MTP retain the ordered path                                  |
+| Qwen3.5 dense | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP, including paged target state and supported image-context continuation; OR an external Qwen3.8 DFlash2 draft on flat target state only — a loaded draft dir shadows the native MTP plan | plain paged AR may use the two-row GDN scheduler; multimedia/MTP retain the ordered path                                  |
 | Qwen3.5 MoE   | images when encoder, processor, and paged adapter are loaded | fresh and delta | native MTP on flat target state                                                   | plain paged AR may use the two-row GDN/MoE scheduler; multimedia/MTP retain the ordered path                              |
 | Gemma4        | image/audio components that have a paged adapter             | fresh and delta | external draft on flat text-only state                                            | ordinary paged text AR uses grouped full/sliding batching; media and MTP/DSpark remain ordered barriers                   |
+| Muse-Glimmer  | none                                                         | fresh and delta, via the gemma4-shaped grouped full/sliding coordinator; the pools are hidden while a flat DFlash owner is live | external DFlash draft on flat target state, streaming-capable                     | DFlash turns serialize on the barrier lane                                                                                |
 | nemotron_h    | none                                                         | fresh and delta | native depth-1 MTP on flat target state; the draft head owns its own KV cache | plain paged AR may use the hybrid continuous-batching scheduler; MTP retains the ordered path                             |
 
 The table is a conformance description, not dispatch code. The source of truth
@@ -145,24 +148,32 @@ AR lane, and the head stays armed for the next turn. The only seeding failure th
 arrives as a recoverable error is an MLX eval/allocation failure, which is transient,
 and one inner is shared by every session on the loaded model.
 
-## Extension boundary
+## Extension boundary (native trait seam)
 
 Adding a conventional chat model should require these scoped pieces:
 
-1. Add one descriptor to `MODEL_FAMILY_REGISTRY`: canonical type, exact raw
-   aliases or a narrow architecture probe, kind, loader, native trainer-class
-   metadata when trainable, and supported load options.
+1. Add one `ModelFamilyData` row to `packages/lm/src/family-data.ts` — kind,
+   raw aliases or a narrow architecture probe, agent traits, launch preset,
+   optional GGUF architectures — plus one `LOADER_BINDINGS` entry in
+   `models/model-loader.ts`. The row type and the completeness/parity tests
+   enumerate the rest: a chat-kind row without traits or a preset, or a row
+   without a loader binding (and vice versa), fails to compile.
 2. Implement `ChatBackend` for prompt rendering, cache lifecycle, target
    forward/prefill, and model-specific defaults.
 3. Return an `ExecutionPlan` built only from immutable load-time state.
 4. Opt into the narrow traits that apply:
    - `PagedBackend` for shared block-paged attention lifecycle;
    - `MtpBackend` for native MTP proposal/verification;
-   - `DsparkBackend` for the current external-draft implementation;
+   - `DsparkBackend`/`DsparkStepper` for external-draft steppers — gemma4
+     DSpark and assistant drafts, muse DFlash, and qwen3.8 DFlash2 all
+     implement `DsparkStepper`; there is no separate DFlash trait;
    - a multimodal executor for processor/encoder output and embedding merge.
 5. Add planner conformance tests for every advertised combination, then real
    model parity tests for flat/paged, sync/stream, fresh/delta, and enabled/
    disabled speculation as applicable.
+6. Complete the cross-package registration fan-out. The full per-stage
+   checklist, with each required site and its failure mode, is
+   [docs/adding-a-model.md](adding-a-model.md).
 
 ### Model optimizations
 
@@ -192,8 +203,12 @@ classes remain statically typed exports, so a runtime native descriptor cannot
 construct or register them dynamically. The cold-restore family set is also
 mirrored deliberately in a native-free agent leaf used by CLI/catalog code;
 its parity test makes that duplication fail closed without loading the native
-addon. These boundaries should only be replaced by code generation that keeps
-the native-free import contract, not by a second runtime registry.
+addon. `packages/lm/src/family-data.ts` is the sanctioned shared native-free
+data module this boundary anticipated — one row per family, `import type`
+only, consumed through the `@mlx-node/lm/family-data` subpath and gated by a
+subprocess import test (`catalog-native-free.test.ts`) whose resolver bans
+the addon. These boundaries should only be replaced by code generation that
+keeps the native-free import contract, not by a second runtime registry.
 
 ## Cache and speculative safety
 

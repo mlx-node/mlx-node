@@ -1,0 +1,263 @@
+# Adding a model family
+
+The per-stage checklist for onboarding a new chat family, with the exact
+registration sites and what breaks when one is missed. The design rationale
+behind each seam lives in
+[docs/inference-architecture.md](inference-architecture.md); this document is
+the cost sheet. Stages are cumulative: a family can ship flat-only (Stage 0)
+and grow paged, batched, cold-restore, and speculative support later. Sites
+are cited by symbol, not line number — the files move.
+
+```text
+Stage 0  flat chat        ChatBackend + NAPI + registration fan-out
+Stage 1  paged            PagedBackend + pool + PagedAttentionPlan
+Stage 2  batched          HybridSchedulerBackend + batched decode forward
+Stage 3  cold restore     allowlist + sidecar codec + parity gate
+Stage 4  speculative      SpeculativePlan + Mtp* or Dspark* stepper
+```
+
+## Stage 0 — flat chat
+
+**Family module.** A directory `crates/mlx-core/src/models/<family>/` with
+`config.rs`, `model.rs`, `persistence.rs`, and the family tensor files
+(attention, mixer, decoder layer, layer cache). The forward pass, prefill,
+cache topology, and config parsing are the genuinely new work; everything
+below is glue with a working sibling to copy.
+
+**`ChatBackend`** (`engine/backend.rs`). 10 required methods — `tokenizer`,
+`family_name`, `session_eos_id`, `cached_token_history`, `reset_caches`,
+`verify_cache_prefix`, `save_cache_state`, `eval_caches`, `prefill`,
+`begin_decode` — plus the `type Decode<'a>: DecodeStep` GAT for the per-turn
+stepper. Around 29 more hooks are defaulted (thinking policy, prompt
+rendering, stream emitter, execution plan, the specialized `run_*_turn`
+executors, and friends); override only to diverge from the reference
+behavior. The implementer checklist in the trait's rustdoc is authoritative.
+
+**Command plumbing.** A family `Cmd` enum implementing `FromChatCmd`
+(`engine/cmd.rs`) and `HybridSchedulerCommand` (`engine/hybrid_scheduler.rs`).
+The minimum shape is `{ Chat(Box<ChatCmd>), SchedulerStats }`; trainable
+families add `Generate`/`Train`/`SaveModel` variants.
+
+**NAPI surface.** One `chat_napi_surface!` invocation
+(`models/chat_napi.rs`) emits the shared chat/streaming methods. The macro
+varies on exactly 3 axes: `thread_cmd` (the family command type wrapped via
+`FromChatCmd`), `thread:` direct vs `Option` (gemma4 alone holds an
+`Option<ModelThread>`), and `image_guard:` none / text-only / media. Beside
+it, roughly 9 hand-written `#[napi]` methods per family: `load` plus the
+probe surface (`has_mtp_weights`, `mtp_auto_enabled`,
+`has_block_paged_cache`, `context_limits`, `get_config`,
+`max_concurrent_sequences`, `scheduler_stats`, `num_parameters` on
+`NemotronHModel`, for example).
+
+**Loader spine.** `persistence.rs` spawns the model thread via
+`ModelThread::spawn_with_scheduler` (`model_thread.rs`) and registers weight
+bytes with the process cache-limit coordinator (`cache_limit.rs`). All seven
+chat families follow the same spine.
+
+**Tokenizer/template cost is data plus fixtures.** The template-engine
+compatibility layer — ternary-kwarg rewriting
+(`parenthesize_ternary_call_kwargs`) and Python `json.dumps` separators
+(`to_json_python_separators`, powering the `tojson` filter) — runs
+unconditionally for every family's template and is already-paid shared
+capability, not a recurring per-family cost. What a new family actually owes:
+
+- a control-marker const only if the family has an injectable control grammar
+  (the `MUSE_GLIMMER_CONTROL_MARKERS` pattern; `detect_control_markers`
+  returns empty for everyone else);
+- a family template gate in `tokenizer.rs` only if the HF template needs
+  rewrites to render byte-identically (nemotron needed ~66 lines);
+- a `render_fixture.py` row plus the golden
+  `tokenizer/fixtures/hf/<model>-<hash>.txt` byte-identity fixture — always.
+
+## Required registration sites
+
+The honest post-refactor fan-out for a minimal chat family (convert + load +
+serve + agent), one row per site with its failure mode. The old inventory of
+~12 hand-edited TS/Rust sites collapsed into this: the scattered per-family
+TS tables were deleted and now derive from one data row.
+
+| Site                                                                   | What you add                                                                                                                                                       | Failure mode if missed                                                                                                                                                                                             |
+| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `crates/mlx-core/src/models/mod.rs`                                    | `pub mod <family>;`                                                                                                                                                | compile error                                                                                                                                                                                                      |
+| `crates/mlx-core/src/convert.rs`                                       | one `ConversionRecipe` impl + one `RECIPE_REGISTRY` row (dispatch `recipe_for` and the `convertible_model_types` NAPI export both derive from the registry)         | registry-consistency test (`recipe_registry_reproduces_inline_flags`) goes red; a checkpoint of the family hits the hard "Unknown model type" convert error                                                        |
+| `packages/cli/src/commands/convert-detect.ts`                          | one `CONVERT_DETECT` row (row order is load-bearing and deliberately differs from the runtime loader's probe order)                                                | the convert-detect parity test (`convert-detect.test.ts`) goes red against native `convertibleModelTypes()` — without it, `mlx convert` with `-m` omitted silently converts generically and produces unloadable output |
+| `packages/lm/src/family-data.ts`                                       | one `MODEL_FAMILY_DATA` row: `kind`, `match` (raw aliases + optional architecture probe), `traits`, a launch preset, optional `ggufArchitectures`/`acceptsDraftModel` | a chat-kind row without `traits` or a preset **fails to compile** (the `ChatFamilyData` type requires them — this replaced the old silent discovery skips); `family-completeness.test.ts` backstops at runtime      |
+| `packages/lm/src/models/model-loader.ts`                               | one `LOADER_BINDINGS` entry (loader closure + native class)                                                                                                        | `satisfies Record<ModelType, LoaderBinding>` fails to compile — in both directions: a data row without a binding, or a binding without a row                                                                        |
+| `packages/lm/src/stream.ts`                                            | one `makeStreamingModel` wrapper class + a line in each compile-time conformance block (`_assertSessionCapable`, `_assertPreservedNativeSurfaces`)                  | `ChatSession<X>` stops type-checking downstream; a drifted override signature fails the conformance block at compile time                                                                                          |
+| `packages/lm/src/index.ts`                                             | export line(s) for the wrapper class and config types                                                                                                              | the family is unreachable from `@mlx-node/lm`                                                                                                                                                                      |
+| `yarn build:native`                                                    | regenerates BOTH committed `index.d.cts` copies + the `index.cjs` export line                                                                                      | CI declaration-drift failure (`packages/core/build.ts` `assertDeclarationCopiesMatch` hard-fails before and after generation)                                                                                       |
+
+**What this branch deleted.** The following hand-maintained per-family tables
+no longer exist; each decision now derives from the family's
+`MODEL_FAMILY_DATA` row (native-free, also published as the
+`@mlx-node/lm/family-data` subpath and re-exported through
+`@mlx-node/agent/catalog`):
+
+- `packages/server/src/presets.ts` (the whole file): sampling constants and
+  `LaunchPreset` moved into `family-data.ts`; server discovery calls
+  `serverLaunchPresetFor` (a family with only `agentLaunchPreset`, lfm2_moe,
+  stays deliberately invisible to server discovery).
+- `FAMILY_TRAITS` (agent provider): now `familyTraitsFor`.
+- `AGENT_LAUNCH_PRESETS` (agent chat-config): now `agentLaunchPresetFor`
+  (the agent overlay wins over `launchPreset` where both exist).
+- Both `NON_GENERATIVE` sets (agent + server): now
+  `NON_GENERATIVE_FAMILY_IDS`, derived from `kind`.
+- `AGENT_PAGED_MODEL_TYPES`: the `PagedConfigOverrideManager` default derives
+  from `CHAT_FAMILY_IDS`, so a new chat family can never be forgotten.
+  `QWEN35_PAGED_MODEL_TYPES` survives as the qwen3_5 cache-floor set, and the
+  server host's `DEFAULT_PAGED_MODEL_TYPES` aliases it.
+- The GGUF architecture map in `model-loader.ts`: derived from
+  `ggufArchitectures` rows.
+- The dashboard's `RAW_MODEL_TYPE_TO_LABEL`: labels go through the shared
+  `matchFamily` (via `@mlx-node/agent/catalog`) with the same raw-string
+  fallback.
+
+Family detection itself is the pure `matchFamily` in `family-data.ts`
+(byte-identical `MalformedModelConfigError` / `UnsupportedModelTypeError`
+strings); `detectModelType` in `model-loader.ts` keeps only the
+filesystem/GGUF half. The native-free contract on the leaf is enforced by
+`catalog-native-free.test.ts`, which imports the built subpaths in a node
+child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
+
+## Stage 1 — paged (exclusive-lane whole turns)
+
+- Implement **`PagedBackend`** (`engine/backend.rs`): 2 associated types —
+  `type PagedDecode<'a>: DecodeStep` and `type PrefixState: PagedPrefix` —
+  plus 6 required methods: `prime_prefix_state`, `paged_prefill`,
+  `begin_paged_decode`, `finalize_paged_turn`, `save_paged_history`,
+  `abort_paged_turn`. The paged speculative hooks default to a loud
+  flag-without-core error.
+- Construct the pool after weight materialization
+  (`PagedKVCacheAdapter::new`, or the grouped `Gemma4KVCacheCoordinator` for
+  full+sliding families — muse_glimmer reuses gemma4's coordinator), and
+  `register_pool` its bytes with the cache-limit coordinator.
+- Publish a `PagedAttentionPlan` from `execution_plan`.
+- Override `run_paged_turn` by **delegating to the shared driver
+  `engine::paged_turn::run_paged_turn`**. Six of seven families do; qwen3_5
+  dense keeps a forked `paged_whole_turn` core for historical eager-MTP
+  reasons — that fork is the exception, not the template. Do not copy it.
+
+## Stage 2 — batched (scheduled lane)
+
+- Implement **`HybridSchedulerBackend`** (`engine/hybrid_scheduler.rs`): 4
+  associated types (`Command`, `RestoreTicket`, `OwnerState`,
+  `StepExecutor<'a>`), `const SCHEDULER_NAME`, the defaulted consts
+  `ENABLED_BY_DEFAULT` / `CANCEL_PRECEDES_EOS` / `STREAM_EOS_TOKEN`, and 11
+  required methods: `paged_adapter`, `paged_adapter_mut`,
+  `max_position_embeddings`, `activate_paged_seq`,
+  `run_paged_decode_step_batched`, `replace_cached_token_history`,
+  `owner_tokens`, `capture_owner_state`, `build_scheduled_prefix`,
+  `step_executor`, `execute_barrier`. Roughly 26 further hooks are defaulted.
+- The **real family cost is `run_paged_decode_step_batched`** — the batched
+  decode forward taking `&[(SeqId, u32)]` rows to one `[rows, vocab]` logits
+  tensor. The scheduler state machine, admission, preemption, SSD parking,
+  and the generic `HybridStepExecutor` are engine-owned; family impls are
+  mostly one-line delegation around this forward.
+- Hybrid (recurrent) families additionally implement the recurrent hooks:
+  `recurrent_state_bytes`, `scheduled_recurrent_bytes`,
+  `has_scheduled_recurrent`, `can_activate_scheduled_recurrent`,
+  `activate_scheduled_recurrent`, `park_active_scheduled_recurrent`,
+  `release_scheduled_recurrent_for`. Recurrent bytes are charged against the
+  same pool budget at admission.
+- Grouped-coordinator families (gemma4, muse_glimmer) also override
+  `scheduler_capacity`, `prepare_scheduled_prefix`,
+  `run_scheduled_prefill_slice`, `finish_scheduled_decode_batch`, and write a
+  custom `execute_barrier` managing the flat-vs-paged owner lanes.
+- Gates: `ENABLED_BY_DEFAULT` is `false` only for qwen3_5 dense/MoE, which
+  opt in via `MLX_CONTINUOUS_BATCHING=1`; `MLX_SERVE_FORCE_SERIAL=1` is the
+  engine-generic whole-turn rollback for every scheduler family.
+
+## Stage 3 — cold restore (SSD)
+
+- Add the family to `COLD_RESTORE_FAMILIES` (`cold_tier.rs`) AND the TS
+  mirror `COLD_TIER_RESTORE_FAMILIES` (`packages/agent/src/cold-tier.ts`);
+  `cold-tier-families.test.ts` pins the pair against the native
+  `cold_restore_families()` getter without loading the addon.
+- The authorization rule, quoted from `cold_tier.rs`:
+
+  > Widening this list is a correctness decision, never a perf one, and it is
+  > authorized by exactly one thing: the family's restart-parity gate
+  > (`crates/mlx-core/tests/cold_tier_parity_harness.rs`) passing on real
+  > weights with `hits > 0` and `corruptions == 0`.
+
+  Off-list families fail closed: the tier stays off and the prefix is
+  recomputed, even with explicit config/env.
+- A family with out-of-pool state writes a sidecar codec
+  (geometry/policy/encode/decode) plus a capture function called after turn
+  finalize, and installs restores through the shared transactional
+  `try_install_cold_sidecar`. Dense and MoE qwen3_5 now share one capture
+  implementation — `capture_gdn_cold_sidecar` in `qwen3_5/gdn_sidecar.rs` —
+  so a new GDN-hybrid family reuses that skeleton (checkpoint-lineage
+  resolve, chain-frontier ceiling, disk dedup, telemetry counters) rather
+  than re-typing it. `sidecar_policy: None` (plain full-attention families)
+  gets KV capture/restore free from the finalize/lookup walks.
+
+## Stage 4 — speculative
+
+- Publish a `SpeculativePlan` from `execution_plan`. `SpeculativePlan::lane()`
+  is const `Barrier` today: every speculative turn serializes on the
+  exclusive lane regardless of family.
+- Choose the seam, then the engine loop follows:
+  - **Native MTP**: `MtpBackend` (`type MtpDecode` GAT + `begin_mtp_decode`)
+    plus an `MtpStepper`, served by `engine::mtp_turn::run_mtp_turn`.
+  - **External draft**: `DsparkBackend` (`type DsparkDecode` +
+    `begin_dspark_decode`) plus a `DsparkStepper`, served by
+    `engine::dspark_turn::run_dspark_turn` (paged verify additionally needs
+    `PagedDsparkBackend` + `run_paged_dspark_turn` — gemma4 DSpark only).
+    DFlash and DFlash2 reuse `DsparkStepper`; there is no separate DFlash
+    trait.
+
+  The two loops never merge — that is permanent divergence X4 in
+  [docs/vllm-speculative-alignment.md](vllm-speculative-alignment.md). Do not
+  build a wrapper that threads a mode flag across both.
+- **Ripple warnings, measured** (Qwen3.8 DFlash2, PR #130): adding one field
+  to the shared `DsparkProposal` struct touched every existing stepper
+  (gemma4 dspark + assistant, muse dflash — one line each); changing
+  `Qwen3_5Model::load`'s signature for the draft option touched 10 sibling
+  test files. Shared spec structs and load signatures are cross-family
+  surface; budget for the ripple.
+
+## Conditional sites
+
+**Trainable (+8).** `training_model.rs` — the `ModelType` enum,
+`config_field!` accessors, the `TrainingDispatch` enum, and its `send_train`
+match; a per-family factory in `sft/engine.rs` and in `grpo/engine.rs`; the
+`forward_hidden_states_dispatch` match in `utils/functional.rs`; and the two
+TS `instanceof` chains in `packages/trl` (`grpo-trainer.ts`,
+`sft-trainer.ts`).
+
+**Calibrate/eval (+2).** The `model_type` matches in `calibration/napi.rs`
+and `quality/napi.rs` (the default arm is a clean refusal, so skipping these
+degrades gracefully).
+
+**Direct GGUF load (+2).** A `ggufArchitectures` entry on the family-data row
+(TS side) and the `general.architecture` → model_type map in
+`utils/gguf.rs`.
+
+## Tests, CI, docs
+
+- **Per-family parity suites** follow a naming convention under
+  `crates/mlx-core/tests/`: `<family>_paged_vs_flat_parity.rs`,
+  `<family>_concurrent_batched_parity.rs`, `<family>_mtp_midcycle_state.rs`,
+  `<family>_cold_tier_parity.rs` — near-copies of the qwen3_5 equivalents.
+- **The `ci.yml` e2e matrix row is convention, not enforcement.** The whole
+  `model-test` job is opt-in via the `model-e2e` PR label. The `nemotron_h`
+  leg self-skips on every event until a self-hosted runner exists (~38 GB
+  disk / ~42 GB memory), and the qwen3_5_moe real-checkpoint gates are
+  LOCAL-only (its smallest published checkpoint is 35B-A3B; only the tiny
+  synthetic MoE fixture rides CI). A family merge should add the row, but
+  local gate transcripts in the PR body are the actual evidence.
+- **Docs**: a family merge conventionally touches ~9 files — `models.md`,
+  `cli.md`, `concurrent-inference.md`, `convert-quantize.md`,
+  `paged-cache.md`, `perf.md`, `inference-architecture.md`, `README.md`, and
+  `CLAUDE.md` (family lists and support matrices).
+
+## The codegen seam
+
+The "Required registration sites" section is deliberately one table: those
+rows are mechanically parallel data keyed on the family id, already pinned by
+compile-time exhaustiveness (`ChatFamilyData`, `satisfies Record<ModelType,
+LoaderBinding>`) and cross-language parity tests (convert-detect,
+cold-tier-families). If a generator ever emits the fan-out from one
+declaration, it replaces that section wholesale — the per-stage trait work
+above stays hand-written either way.
