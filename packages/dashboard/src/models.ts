@@ -52,12 +52,15 @@ const RAW_MODEL_TYPE_TO_LABEL: Record<string, string> = {
   gemma4: 'gemma4',
   gemma4_text: 'gemma4',
   gemma4_unified: 'gemma4',
+  muse_glimmer: 'muse_glimmer',
+  muse_glimmer_text: 'muse_glimmer',
   qwen3: 'qwen3',
   qwen3_5: 'qwen3_5',
   qwen3_5_moe: 'qwen3_5_moe',
   lfm2: 'lfm2',
   lfm2_moe: 'lfm2_moe',
   harrier: 'harrier',
+  nemotron_h: 'nemotron_h',
   internvl_chat: 'internvl_chat',
   'qianfan-ocr': 'qianfan-ocr',
 };
@@ -418,17 +421,36 @@ function collectArchitectures(config: Record<string, unknown>): string[] {
 }
 
 /**
- * Family label from `config.json`. Uses `model_type` (default `qwen3` when
- * missing, mirroring `packages/lm`'s nullish default) and refines by
- * `architectures` only where the native registry treats architecture as
- * authoritative — the gemma4 unified checkpoint, whose `model_type` may not
- * name the family.
+ * Family label from `config.json`, replicating the lm registry's detection
+ * decisions (`detectModelType` in `packages/lm/src/models/model-loader.ts`) for
+ * every family the alias map covers: alias (or the qwen3 nullish default) picks
+ * a base family, then the architecture probes refine it in registry declaration
+ * order — gemma4 unified, muse, harrier, nemotron. Where the loader fails
+ * closed (malformed `architectures`, unknown `model_type`) the dashboard must
+ * not throw on a foreign checkpoint, so those shapes fall back to the raw
+ * `model_type` string (or `qwen3` when it is not a string).
  */
 function detectModelTypeLabel(config: Record<string, unknown>): string {
-  if (collectArchitectures(config).includes('Gemma4UnifiedForConditionalGeneration')) return 'gemma4';
   const raw = typeof config.model_type === 'string' ? config.model_type : undefined;
-  if (raw !== undefined) return RAW_MODEL_TYPE_TO_LABEL[raw] ?? raw;
-  return 'qwen3';
+  const fallback = raw ?? 'qwen3';
+  const rawArchitectures = 'architectures' in config ? config.architectures : undefined;
+  // The loader rejects this shape as malformed; the label falls back instead.
+  if (
+    rawArchitectures !== undefined &&
+    rawArchitectures !== null &&
+    !Array.isArray(rawArchitectures) &&
+    typeof rawArchitectures !== 'string'
+  ) {
+    return fallback;
+  }
+  const architectures = new Set(collectArchitectures(config));
+  const usesDefaultModelType = !Object.hasOwn(config, 'model_type') || config.model_type === null;
+  const base = usesDefaultModelType ? 'qwen3' : raw === undefined ? undefined : RAW_MODEL_TYPE_TO_LABEL[raw];
+  if (architectures.has('Gemma4UnifiedForConditionalGeneration')) return 'gemma4';
+  if (architectures.has('MuseGlimmerForConditionalGeneration')) return 'muse_glimmer';
+  if (base === 'qwen3' && architectures.has('Qwen3Model') && !architectures.has('Qwen3ForCausalLM')) return 'harrier';
+  if (architectures.has('NemotronHForCausalLM')) return 'nemotron_h';
+  return base ?? fallback;
 }
 
 /**
