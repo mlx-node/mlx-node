@@ -27,10 +27,12 @@ export interface CalibrateResult {
 }
 
 /**
- * Read the first `count` `{"text": ...}` rows from a JSONL calibration file.
+ * Read the first `count` `{"text": ...}` rows from a JSONL dataset.
  * Blank lines and rows without a string `text` field are skipped.
+ *
+ * Shared with `mlx eval`, which reads the same row shape.
  */
-function readCalibTexts(datasetPath: string, count: number): string[] {
+export function readJsonlTexts(datasetPath: string, count: number): string[] {
   const raw = readFileSync(datasetPath, 'utf-8');
   const texts: string[] = [];
   for (const line of raw.split('\n')) {
@@ -75,7 +77,7 @@ export async function calibrate(opts: CalibrateOptions): Promise<CalibrateResult
   const calibSize = opts.calibSize ?? 1024;
   const calibSeq = opts.calibSeq ?? 512;
 
-  const rows = readCalibTexts(resolve(opts.dataset), calibSize);
+  const rows = readJsonlTexts(resolve(opts.dataset), calibSize);
   if (rows.length === 0) {
     throw new Error(`No {"text": ...} rows found in dataset ${opts.dataset}`);
   }

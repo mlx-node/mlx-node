@@ -361,6 +361,104 @@ at `~/.cache/nvidia-calib/cnn_nemotron_v2_calib.jsonl`. Running on a non-nvidia
 (no mxfp8 attn/GDN) model calibrates 0 projections and leaves `config.json`
 unchanged.
 
+## `mlx eval`
+
+Measures a converted checkpoint's **output quality** against a bf16 reference:
+teacher-forced NLL and perplexity, top-1 agreement, and KL divergence. Every
+other quality number in this repo — quantization error, AWQ deltas, recipe
+comparisons — is **weight-space** error, which says how far a dequantized tensor
+sits from the original and nothing about what the model emits.
+
+Two steps. The bf16 reference runs **once**; every candidate is then scored
+against what it wrote.
+
+```bash
+mlx eval cache --teacher .cache/models/qwen3.8-27b \
+  --dataset eval.jsonl --cache /tmp/teacher-27b --rows 64 --seq 512
+
+mlx eval score --model .cache/models/qwen3.8-27b-unsloth-nvfp4-mlx \
+  --cache /tmp/teacher-27b
+```
+
+```text
+model            .cache/models/qwen3.5-0.8b-q4
+teacher          .cache/models/qwen3.5-0.8b
+rows/positions   4 / 322
+nll              3.6660   (teacher 3.5166, +0.1494)
+perplexity       39.095   (teacher 33.669, +16.11%)
+kl_topk          0.13782  (K=512, teacher tail mass 0.04045)
+top1_agreement   77.64%
+```
+
+| Flag             | Purpose                                                                     |
+| ---------------- | --------------------------------------------------------------------------- |
+| `--teacher`      | Reference checkpoint, normally bf16 (`cache` mode, required)                |
+| `--model`, `-m`  | Candidate checkpoint to score (`score` mode, required)                      |
+| `--dataset`      | Eval JSONL of `{"text": "..."}` rows (`cache` mode, required)               |
+| `--cache`        | Teacher cache directory (required in both modes)                            |
+| `--rows`         | Dataset rows to capture (default `64`)                                      |
+| `--seq`          | Tokens kept per row (default `512`, minimum `2`)                            |
+| `--top-k`        | Retained support per position (default `1024`, clamped to the vocabulary)   |
+| `--logit-chunk`  | Positions per head projection (default `64`)                                |
+| `--json`         | Emit the report as one JSON object (`score` mode), for A/B scripting        |
+
+**Reading the numbers.** `nll`, `perplexity` and `top1_agreement` are exact over
+the full vocabulary. `kl_topk` is a KL over a `K+1`-way partition: one term per
+cached top-`K` token, plus a single aggregated bucket for everything outside that
+support. Both sides keep their own true full-vocabulary normaliser, and
+`teacher_tail_mass` is the teacher's share of that last bucket. The bucket is not
+cosmetic — the top-`K` terms **alone** are not a divergence and go negative
+whenever the candidate holds more mass on the teacher's support than the teacher
+does, which would rank it better than the teacher's own zero. It is still coarse
+outside the support, so a KL is only comparable across checkpoints while
+`teacher_tail_mass` stays small; raise `--top-k` if it does not.
+
+**One capture per cache directory.** Give each capture its own `--cache` path.
+Rows are written under fixed names, so two `mlx eval cache` runs against the
+same directory at the same time interleave their rows, and the one that finishes
+last publishes metadata describing a mixture. Nothing detects that afterwards. A
+`score` that overlaps a capture IS detected and refused — the capture clears the
+metadata before its first row and stamps a new one after its last, and `score`
+re-checks it after reading the rows.
+
+**What score refuses.** A candidate must be able to answer for the cached
+rows, so `score` requires the same `model_type`, the same `tokenizer.json`
+(by digest) and the same vocabulary width as the capture. Width alone is not
+enough: score reads its token ids from the cache and indexes the candidate's
+logits with the teacher's cached vocabulary indices, so a different tokenizer
+would report a finite, plausible number measured on the wrong text. `mlx convert`
+copies `tokenizer.json` verbatim, so a quantized checkpoint still matches the
+bf16 teacher it came from. The cache is also re-checked after scoring: if a
+capture replaced it mid-run, the score is refused rather than reported.
+
+**What the teacher is.** `--teacher` is normally the bf16 model, and every
+number is a divergence *from it*. A quantized checkpoint is accepted rather than
+refused — anchoring on a released reference, or A/B-ing two recipes against a
+shared one, is a real comparison — but the cache records that it was quantized
+and `score` prints the fact beside the teacher path. Read a report carrying that
+marker as "distance from this checkpoint", never as "distance from bf16".
+
+**Effective versus requested.** The first token of a row primes the forward and
+has no target of its own, so a row under 2 tokens scores nothing: `--seq 1` is
+raised to 2. `--top-k` is clamped to the teacher's vocabulary, which degrades to
+an exact full-vocab KL rather than erroring. The cache records what the rows
+actually hold in both cases, so a report's `K=` is the real support width.
+
+**What it does not tell you.** The eval runs the reference AR prefill lane, so it
+says nothing about paged KV, MTP or speculative decoding. It also produces no
+threshold — whether `+0.15` NLL is acceptable is a judgement about the
+checkpoint, not something the tool decides.
+
+Score mode reads its token ids **from the cache** and never re-tokenizes, so a
+dataset or tokenizer edit cannot silently produce a comparison against different
+text; a candidate whose vocabulary differs from the cache's is refused. Use a
+**held-out** eval set — scoring an imatrix-driven or activation-calibrated
+checkpoint on its own calibration data is train-on-test and flatters exactly the
+recipes a comparison is meant to separate.
+
+`qwen3_5` (dense) and `qwen3_5_moe`, dispatched on `model_type` the same way
+`mlx calibrate` is. Other families are refused, not silently approximated.
+
 ## `mlx serve`
 
 Runs the shared inference host (`@mlx-node/server/host`) in the foreground: discovers every model under the models dir, binds an Anthropic/OpenAI-compatible HTTP endpoint, and lazily loads a model on the first request that names one. At most one model stays resident; requesting another swaps it.

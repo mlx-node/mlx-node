@@ -26,6 +26,7 @@ pub mod optimizers;
 pub mod output_store;
 pub mod param_manager;
 pub mod profiling;
+pub mod quality;
 pub mod quant;
 pub mod response_store;
 pub mod sampling;

@@ -44,8 +44,9 @@ fn calib_guard() -> &'static tokio::sync::Mutex<()> {
 
 /// Read the top-level `model_type` from `<model_path>/config.json` — the
 /// discriminator [`calibrate_activation_amax_raw`] uses to pick the dense vs MoE
-/// loader + prefill command.
-fn read_model_type(model_path: &str) -> Result<String> {
+/// loader + prefill command. Shared with `mlx eval`, which dispatches the same
+/// way.
+pub(crate) fn read_model_type(model_path: &str) -> Result<String> {
     let config_path = Path::new(model_path).join("config.json");
     let data = std::fs::read_to_string(&config_path)
         .map_err(|e| Error::from_reason(format!("read {}: {e}", config_path.display())))?;
@@ -57,8 +58,8 @@ fn read_model_type(model_path: &str) -> Result<String> {
         .map(str::to_string)
         .ok_or_else(|| {
             Error::from_reason(format!(
-                "{}: config.json has no top-level \"model_type\" (calibration needs it to pick \
-                 the qwen3_5 / qwen3_5_moe loader)",
+                "{}: config.json has no top-level \"model_type\" (needed to pick the model \
+                 loader)",
                 config_path.display()
             ))
         })
