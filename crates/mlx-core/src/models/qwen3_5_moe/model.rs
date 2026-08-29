@@ -37,9 +37,9 @@ use crate::models::qwen3_5::gdn_checkpoint_store::{
     compute_paged_prefix_block_hash,
 };
 use crate::models::qwen3_5::gdn_checkpoint_store::{
-    GdnCheckpointLineage, GdnSidecarBoundary, compute_paged_prefix_block_hashes,
+    GdnCheckpointLineage, compute_paged_prefix_block_hashes,
     find_longest_valid_gdn_checkpoint_index, gdn_retention_caps, prune_gdn_checkpoints,
-    replay_gdn_cache_and_commit, select_gdn_sidecar_boundary,
+    replay_gdn_cache_and_commit,
 };
 use crate::models::qwen3_5::model::{
     IMAGE_TOKEN_ID, Qwen3_5ContextLimits, VisionCache, VisionCacheInner, async_eval_layer_caches,
@@ -2260,213 +2260,32 @@ impl Qwen35MoeInner {
         )
     }
 
-    /// Persist this turn's GDN recurrent state to the SSD cold tier. MoE mirror
-    /// of `Qwen35Inner::capture_dense_gdn_cold_sidecar`.
-    ///
-    /// Best-effort and infallible by construction — every failure path is a
-    /// silent skip. A missing sidecar is never a correctness problem: the restore
-    /// walk reconciles the candidate prefix down past that boundary and the state
-    /// is recomputed exactly as it is today.
-    ///
-    /// A GDN recurrent state is valid ONLY at the exact prefix length it was
-    /// produced at (vLLM `MambaSpec`), so the boundary is the DEEPEST
-    /// already-materialized in-memory GDN checkpoint (a rung of the
-    /// `gdn_prefill_checkpoint_boundaries` ladder a prior prefill published)
-    /// whose block-aligned prefix the persisted K/V chain ALSO reaches
-    /// (`cold_captured_blocks`). At most ONE sidecar per turn (~31 MiB on the
-    /// 35B-A3B); the writer queue is bounded. Media turns are skipped in v1 (the
-    /// GDN VLM exactness gate is not modeled on disk, so refusing is the
-    /// fail-closed answer).
-    ///
-    /// `image_token_positions` is the turn's OWN media map, passed in rather
-    /// than read off `self`: the VLM cores clear
-    /// `cached_paged_image_token_positions` before their prefill and reassign it
-    /// only after finalization returns, so a `self`-read guard would see an
-    /// empty vec on exactly the media turns it exists to refuse.
+    /// Cold-tier GDN sidecar capture
+    /// ([`crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar`]);
+    /// one sidecar is ~31 MiB on the 35B-A3B.
     fn capture_moe_gdn_cold_sidecar(&self, image_token_positions: &[(u32, u64)], cache_salt: u64) {
-        crate::cold_tier::cold_sidecar_counters().record_capture_reached();
-        let Some(adapter) = self.paged_adapter.as_ref() else {
-            return;
-        };
-        let Some(cold) = adapter.cold_tier() else {
-            return;
-        };
-        let Some(policy) = cold.sidecar_policy.as_ref() else {
-            return;
-        };
-        if policy.group() != mlx_paged_attn::ColdGroup::GdnState {
-            return;
-        }
-        // v1: text-only. See the doc comment.
-        if !image_token_positions.is_empty() {
-            return;
-        }
-        let cache_dtype = format!("{:?}", adapter.layer_kv_pool().cache_dtype());
         let dense_config = self.config.to_dense_config();
-        let Some(geometry) =
-            crate::models::qwen3_5::gdn_sidecar::geometry(&dense_config, &cache_dtype)
-        else {
-            return;
-        };
-        let block_size = adapter.block_size();
-        // The K/V capture walk that just ran spends its budget waiting for
-        // writer-queue slots, so it hands this sidecar a queue it may well have
-        // filled microseconds ago. A non-blocking offer here loses that race,
-        // and a dropped sidecar is strictly worse than a dropped block: the
-        // restore reconciles down to the deepest boundary a VALIDATED sidecar
-        // backs, so losing it makes the turn's entire persisted K/V chain
-        // unusable. Wait out the same budget the walk did.
-        let sidecar_wait = adapter.cold_capture_budget().max_walk;
-        if block_size == 0 {
-            return;
-        }
-        let request_tokens = adapter.request_tokens();
-        // Whole blocks of this request the persisted K/V chain actually covers.
-        let full_blocks = request_tokens.len() / block_size as usize;
-        let chain_blocks = (adapter.cold_captured_blocks() as usize).min(full_blocks);
-        if chain_blocks == 0 {
-            // A different diagnosis from the boundary miss below: the persisted
-            // chain covers no whole block of this request, so no checkpoint at
-            // any depth could have been used. This is the arm a genuinely cold
-            // process hits on its first turns, while the bounded writer queue is
-            // still ratcheting the chain forward.
-            crate::cold_tier::cold_sidecar_counters().record_chain_empty();
-            if inference_trace_enabled() {
-                write_inference_trace(format_args!(
-                    "[MLX_TRACE] qwen3_5_moe gdn_cold_sidecar_capture_skipped reason=persisted_chain_covers_no_whole_block cold_captured_blocks={} full_blocks={} block_size={} prompt_len={}",
-                    adapter.cold_captured_blocks(),
-                    full_blocks,
-                    block_size,
-                    request_tokens.len()
-                ));
-            }
-            return;
-        }
-        let ceiling_tokens = u32::try_from((chain_blocks as u64).saturating_mul(block_size as u64))
-            .unwrap_or(u32::MAX);
-        let extra_keys_per_block =
-            engine::build_paged_extra_keys(request_tokens.len(), block_size, image_token_positions);
-
-        // Deepest same-owner in-memory GDN checkpoint whose block-hash chain
-        // matches this request and whose prefix the K/V chain reaches. The
-        // sidecar uses the turn's exact cache security domain so capture and
-        // restore derive the same parent-linked chain.
-        let (idx, boundary) = match select_gdn_sidecar_boundary(
+        crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar(
+            "qwen3_5_moe",
+            self.paged_adapter.as_ref(),
             &self.gdn_prefix_checkpoints,
             &self.active_cache_owner_id,
-            request_tokens,
-            ceiling_tokens,
-            block_size,
-            &extra_keys_per_block,
+            &dense_config,
+            image_token_positions,
             cache_salt,
             |checkpoint| moe_paged_linear_caches_ready(&self.config, Some(&checkpoint.caches)),
-        ) {
-            GdnSidecarBoundary::Selected { index, boundary } => (index, boundary),
-            GdnSidecarBoundary::Missed(miss) => {
-                // Nothing is written and the restore walk will later reconcile
-                // the whole candidate prefix away. Count and trace it, otherwise
-                // a session that never persists recurrent state is
-                // indistinguishable from one that needs none.
-                crate::cold_tier::cold_sidecar_counters().record_boundary_skip();
-                if inference_trace_enabled() {
-                    let reason = match miss.deepest_retained {
-                        Some(deepest) if deepest > ceiling_tokens => {
-                            "deepest_checkpoint_past_chain_reach"
-                        }
-                        _ => "no_checkpoint_on_this_lineage_at_or_below_chain_reach",
-                    };
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3_5_moe gdn_cold_sidecar_capture_skipped reason={} ceiling_tokens={} chain_blocks={} cold_captured_blocks={} block_size={} prompt_len={} deepest_retained_boundary={} retained_for_owner={} retained_total={}",
-                        reason,
-                        ceiling_tokens,
-                        chain_blocks,
-                        adapter.cold_captured_blocks(),
-                        block_size,
-                        request_tokens.len(),
-                        miss.deepest_retained.unwrap_or(0),
-                        miss.retained_for_owner,
-                        miss.retained_total
-                    ));
-                }
-                return;
-            }
-        };
-        let checkpoint = &self.gdn_prefix_checkpoints[idx];
-
-        // Derive the GdnState chain key for blocks `0..boundary/block_size` — the
-        // KV chain recomputed under the `GdnState` domain tag (vLLM's
-        // `BlockHashWithGroupId`). `ColdTierWalk::deepest_backed_boundary`
-        // derives the identical chain on restore. Built BEFORE the payload so the
-        // `contains_in` dedup below can skip the whole encode (a device->host
-        // readback of tens of MiB) when the chain is already on disk.
-        let blocks = boundary as usize / block_size as usize;
-        let mut parent: Option<mlx_paged_attn::ColdCacheKey> = None;
-        for index in 0..blocks {
-            let (Some(extra_keys), Some(tokens)) = (
-                extra_keys_per_block.get(index),
-                request_tokens.get(index * block_size as usize..(index + 1) * block_size as usize),
-            ) else {
-                return;
-            };
-            parent = Some(mlx_paged_attn::ColdCacheKey::chain(
-                mlx_paged_attn::ColdGroup::GdnState,
-                cold.fingerprint,
-                parent,
-                tokens,
-                extra_keys,
-                cache_salt,
-                index,
-            ));
-        }
-        let Some(key) = parent else {
-            return;
-        };
-        // Already persisted for this exact chain: nothing to do. `contains_in` is
-        // explicitly side-effect free (no hit/miss accounting), so this arm must
-        // do its own — an unrecorded exit here reads downstream as `enqueued=0`,
-        // which is also what a collapsed checkpoint ladder produces.
-        if cold
-            .manager
-            .contains_in(&key, mlx_paged_attn::ColdGroup::GdnState)
-        {
-            crate::cold_tier::cold_sidecar_counters().record_already_persisted();
-            return;
-        }
-
-        let Ok(Some(tensors)) = crate::models::qwen3_5::gdn_sidecar::encode_tensors(
-            &dense_config,
-            &geometry,
-            &checkpoint.caches,
-            boundary,
-        ) else {
-            return;
-        };
-        let sidecar = mlx_paged_attn::ColdSidecar {
-            key,
-            fingerprint: cold.fingerprint,
-            layout: crate::models::qwen3_5::gdn_sidecar::layout_at(&geometry, boundary),
-            tensors,
-        };
-        match cold
-            .manager
-            .enqueue_sidecar_before(sidecar, std::time::Instant::now() + sidecar_wait)
-        {
-            Ok(true) => crate::cold_tier::cold_sidecar_counters().record_enqueued(),
-            // The bounded writer queue stayed full for the whole capture
-            // budget. Nothing is written and nothing failed, so this turn is
-            // otherwise indistinguishable from a successful capture.
-            Ok(false) => {
-                crate::cold_tier::cold_sidecar_counters().record_queue_drop();
-                tracing::debug!(
+            |checkpoint| &checkpoint.caches,
+            |boundary, error| match error {
+                None => tracing::debug!(
                     target: "mlx_core::qwen3_5_moe::paged",
                     "qwen3.5 MoE GDN sidecar dropped at boundary {boundary}: cold-cache writer queue full"
-                );
-            }
-            Err(error) => tracing::debug!(
-                target: "mlx_core::qwen3_5_moe::paged",
-                "qwen3.5 MoE GDN sidecar enqueue failed at boundary {boundary}: {error}"
-            ),
-        }
+                ),
+                Some(error) => tracing::debug!(
+                    target: "mlx_core::qwen3_5_moe::paged",
+                    "qwen3.5 MoE GDN sidecar enqueue failed at boundary {boundary}: {error}"
+                ),
+            },
+        );
     }
 
     pub(super) fn prepare_moe_gdn_prefix_state(
@@ -10162,28 +9981,13 @@ impl MtpBackend for Qwen35MoeInner {
 }
 
 impl Qwen35MoeInner {
-    /// MTP acceptance gate — see `mtp_decode::mtp_accept_gate_enabled`.
-    /// Mirrors the dense `Qwen35Inner::mtp_gate_allows` policy
-    /// (depth-1-scoped, confidence-aware on the aggregate; re-probes
-    /// after [`mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS`] gated turns).
     fn mtp_gate_allows(&mut self, requested_depth: u32) -> bool {
-        if !mtp_decode::mtp_accept_gate_enabled() || requested_depth > 1 {
-            return true;
-        }
-        let attempted = self.mtp_draft_attempted;
-        if attempted == 0 {
-            return true; // no history — probe
-        }
-        if !mtp_decode::mtp_accept_gate_blocks(self.mtp_draft_accepted, attempted) {
-            return true;
-        }
-        self.mtp_gated_turns += 1;
-        if self.mtp_gated_turns >= mtp_decode::MTP_ACCEPT_GATE_REPROBE_TURNS {
-            self.mtp_gated_turns = 0;
-            self.mtp_draft_accepted = 0;
-            self.mtp_draft_attempted = 0; // re-probe next turn
-        }
-        false
+        mtp_decode::mtp_gate_allows(
+            &mut self.mtp_draft_accepted,
+            &mut self.mtp_draft_attempted,
+            &mut self.mtp_gated_turns,
+            requested_depth,
+        )
     }
 }
 

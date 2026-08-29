@@ -185,6 +185,42 @@ pub(crate) fn mtp_accept_gate_blocks(accepted: u64, attempted: u64) -> bool {
     cdf < 0.05
 }
 
+/// MTP acceptance gate — see [`mtp_accept_gate_enabled`].
+/// `false` means the aggregated first-draft acceptance rate is below
+/// the break-even bound WITH 95% confidence, so this turn should run
+/// plain AR instead of paying the verify cost for zero speedup.
+/// Depth-1-scoped: the 0.6 threshold is depth-1 calibrated, and at
+/// depth > 1 the verify cost vs deeper-slot acceptance economics are
+/// not captured by a single threshold — the gate never blocks a
+/// depth>1 turn. First turn (no history) probes; after
+/// [`MTP_ACCEPT_GATE_REPROBE_TURNS`] consecutive gated turns the gate
+/// re-probes; the env knob disables the gate entirely. The counters are
+/// `&mut` because a blocked turn advances the gated-turn counter and
+/// may trigger the re-probe reset.
+pub(crate) fn mtp_gate_allows(
+    accepted: &mut u64,
+    attempted: &mut u64,
+    gated_turns: &mut u32,
+    requested_depth: u32,
+) -> bool {
+    if !mtp_accept_gate_enabled() || requested_depth > 1 {
+        return true;
+    }
+    if *attempted == 0 {
+        return true; // no history — probe
+    }
+    if !mtp_accept_gate_blocks(*accepted, *attempted) {
+        return true; // not confident the head is below break-even
+    }
+    *gated_turns += 1;
+    if *gated_turns >= MTP_ACCEPT_GATE_REPROBE_TURNS {
+        *gated_turns = 0;
+        *accepted = 0;
+        *attempted = 0; // re-probe next turn
+    }
+    false
+}
+
 /// Minimum GPU architecture generation for chained MTP cycles to default ON.
 /// M5+ (gen >= 17): chained is measured net-positive (affine +16%, nvfp4 byte-
 /// identical to AR). On M1–M4 (gen 13–16) a lazy-slice eval-scheduling stall makes
