@@ -113,11 +113,11 @@ export {
 // `@mlx-node/lm/family-data` subpath for consumers that must not dlopen the
 // addon; see family-data.ts).
 export {
-  agentLaunchPresetFor,
   CHAT_FAMILY_IDS,
   familyDataFor,
   familyTraitsFor,
   GEMMA4_SAMPLING_DEFAULTS,
+  launchPresetFor,
   LFM2_SAMPLING_DEFAULTS,
   matchFamily,
   MODEL_FAMILY_DATA,
@@ -126,7 +126,6 @@ export {
   NON_GENERATIVE_FAMILY_IDS,
   QWEN_SAMPLING_DEFAULTS,
   rawModelTypeToCanonical,
-  serverLaunchPresetFor,
   type ChatFamilyId,
   type FamilyThinkingLevelMap,
   type FamilyTraits,

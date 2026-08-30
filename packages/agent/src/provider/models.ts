@@ -22,7 +22,7 @@ import { basename, join } from 'node:path';
 
 import type { ProviderModelConfig } from '@earendil-works/pi-coding-agent';
 import {
-  agentLaunchPresetFor,
+  launchPresetFor,
   detectModelType,
   familyTraitsFor,
   NON_GENERATIVE_FAMILY_IDS,
@@ -198,7 +198,7 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     // Fail-closed guards: dead-by-construction for chat families (the
     // family-data row type requires traits + a preset), live for any foreign
     // string that slips through detection.
-    const preset = agentLaunchPresetFor(modelType);
+    const preset = launchPresetFor(modelType);
     if (!preset) {
       if (debug) console.warn(`[mlx] skip ${path}: no launch preset for ${modelType}`);
       return;

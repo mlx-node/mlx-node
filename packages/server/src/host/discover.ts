@@ -7,7 +7,7 @@ import { basename, join } from 'node:path';
 import {
   detectModelType,
   NON_GENERATIVE_FAMILY_IDS,
-  serverLaunchPresetFor,
+  launchPresetFor,
   type LaunchPreset,
   type ModelType,
 } from '@mlx-node/lm';
@@ -52,7 +52,7 @@ export async function discoverModels(dir: string): Promise<DiscoveredModel[]> {
 
     if (NON_GENERATIVE_FAMILY_IDS.has(modelType)) continue;
 
-    const preset = serverLaunchPresetFor(modelType);
+    const preset = launchPresetFor(modelType);
     if (!preset) {
       if (debug) console.warn(`[mlx] skip ${full}: no LAUNCH_PRESETS entry for ${modelType}`);
       continue;

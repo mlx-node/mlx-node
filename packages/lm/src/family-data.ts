@@ -208,27 +208,23 @@ interface ModelFamilyDataBase {
 }
 
 /**
- * A chat-capable family MUST declare `traits` and at least one launch preset —
- * this is the compile-time completeness gate that replaces the old silent
- * discovery skips (`FAMILY_TRAITS` / `LAUNCH_PRESETS` misses were debug-only
- * warnings). `launchPreset` is served to BOTH `@mlx-node/server` discovery and
- * the agent; `agentLaunchPreset` is agent-only and wins over `launchPreset`
- * where both exist. No family declares only `agentLaunchPreset` today — that
- * arm exists for a family whose sampling must differ between the two surfaces.
+ * A chat-capable family MUST declare `traits` and a `launchPreset` — this is
+ * the compile-time completeness gate that replaces the old silent discovery
+ * skips (`FAMILY_TRAITS` / `LAUNCH_PRESETS` misses were debug-only warnings).
+ * One preset serves every surface: `@mlx-node/server` discovery,
+ * `mlx launch claude` and `mlx agent`. A chat family is therefore reachable
+ * from all of them or from none, never from one and not another.
  */
-type ChatFamilyData = ModelFamilyDataBase & {
+interface ChatFamilyData extends ModelFamilyDataBase {
   readonly kind: 'trainable' | 'loadable';
   readonly traits: FamilyTraits;
-} & (
-    | { readonly launchPreset: LaunchPreset; readonly agentLaunchPreset?: LaunchPreset }
-    | { readonly launchPreset?: undefined; readonly agentLaunchPreset: LaunchPreset }
-  );
+  readonly launchPreset: LaunchPreset;
+}
 
 interface NonGenerativeFamilyData extends ModelFamilyDataBase {
   readonly kind: 'embedding' | 'vlm';
   readonly traits?: undefined;
   readonly launchPreset?: undefined;
-  readonly agentLaunchPreset?: undefined;
 }
 
 export type ModelFamilyData = ChatFamilyData | NonGenerativeFamilyData;
@@ -491,22 +487,12 @@ export function familyTraitsFor(modelType: string): FamilyTraits | undefined {
 }
 
 /**
- * Launch preset for `@mlx-node/server` discovery / `mlx launch claude`.
- * Deliberately blind to `agentLaunchPreset`: a family that overrides only the
- * agent surface must not thereby change what the server serves.
+ * Launch preset for every surface that serves a chat family:
+ * `@mlx-node/server` discovery, `mlx launch claude` and `mlx agent`.
+ * `undefined` only for a non-generative family or an unknown type.
  */
-export function serverLaunchPresetFor(modelType: string): LaunchPreset | undefined {
+export function launchPresetFor(modelType: string): LaunchPreset | undefined {
   return chatFamilyDataFor(modelType)?.launchPreset;
-}
-
-/**
- * Launch preset for `mlx agent` — the agent overlay wins over the server
- * preset (it exists precisely where the server row is absent or wrong for
- * the agent).
- */
-export function agentLaunchPresetFor(modelType: string): LaunchPreset | undefined {
-  const row = chatFamilyDataFor(modelType);
-  return row === undefined ? undefined : (row.agentLaunchPreset ?? row.launchPreset);
 }
 
 export class MalformedModelConfigError extends Error {

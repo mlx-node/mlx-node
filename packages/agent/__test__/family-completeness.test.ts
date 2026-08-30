@@ -11,34 +11,34 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  agentLaunchPresetFor,
   CHAT_FAMILY_IDS,
   familyTraitsFor,
   MODEL_FAMILY_DATA,
   NON_GENERATIVE_FAMILY_IDS,
   PagedConfigOverrideManager,
-  serverLaunchPresetFor,
+  launchPresetFor,
 } from '@mlx-node/lm';
 import { describe, expect, it } from 'vite-plus/test';
 
 describe('family-data completeness', () => {
   it.each([...CHAT_FAMILY_IDS])('chat family %s has traits and an agent launch preset', (id) => {
     expect(familyTraitsFor(id)).toBeDefined();
-    expect(agentLaunchPresetFor(id)).toBeDefined();
+    expect(launchPresetFor(id)).toBeDefined();
     expect(familyTraitsFor(id)!.fallbackContextWindow).toBeGreaterThan(0);
-    expect(agentLaunchPresetFor(id)!.maxOutputTokens).toBeGreaterThan(0);
+    expect(launchPresetFor(id)!.maxOutputTokens).toBeGreaterThan(0);
   });
 
-  it('serves lfm2_moe on both surfaces with the MoE card sampler', () => {
+  it('gives lfm2_moe the MoE card sampler, not the dense lfm2 one', () => {
     // lfm2_moe loads through the same wrapper and native class as dense
-    // lfm2, so neither surface may skip it.
-    for (const preset of [serverLaunchPresetFor('lfm2_moe'), agentLaunchPresetFor('lfm2_moe')]) {
-      expect(preset).toBeDefined();
-      // LiquidAI's MoE card values — NOT the dense lfm2 preset.
-      expect(preset!.sampling.temperature).toBe(0.2);
-      expect(preset!.sampling.topK).toBe(80);
-    }
-    expect(serverLaunchPresetFor('lfm2')!.sampling.temperature).toBe(0.05);
+    // lfm2, so every surface serves it — one preset, no per-surface split.
+    const moe = launchPresetFor('lfm2_moe');
+    expect(moe).toBeDefined();
+    // LiquidAI's MoE card values.
+    expect(moe!.sampling.temperature).toBe(0.2);
+    expect(moe!.sampling.topK).toBe(80);
+    // The dense family keeps its own, distinct values.
+    expect(launchPresetFor('lfm2')!.sampling.temperature).toBe(0.05);
+    expect(launchPresetFor('lfm2')!.sampling.topK).toBe(50);
   });
 
   it('forces the paged overlay by default for every chat family', async () => {

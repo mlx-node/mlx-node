@@ -1,14 +1,13 @@
 /**
  * Per-call `ChatConfig` assembly for the provider bridge.
  *
- * Base sampling + output budget come from the family-data launch presets
- * (`@mlx-node/lm` — the agent overlay wins over the server row), then pi's
- * per-call `SimpleStreamOptions` overlay on top.
+ * Base sampling + output budget come from the family-data launch preset
+ * (`@mlx-node/lm`), then pi's per-call `SimpleStreamOptions` overlay on top.
  */
 
 import type { SimpleStreamOptions, ThinkingLevel } from '@earendil-works/pi-ai';
 import {
-  agentLaunchPresetFor,
+  launchPresetFor,
   MODEL_FAMILY_DATA,
   type ChatConfig,
   type ModelFamilyData,
@@ -17,21 +16,17 @@ import {
 } from '@mlx-node/lm';
 
 /**
- * Model types the no-preset error names: trainable rows, then server-preset
- * loadable rows, then any agent-only rows, each group in registry order. The
- * grouping preserves the historical trainable-first order of the old
- * `LAUNCH_PRESETS` literal; the third group is empty while every chat family
- * declares a `launchPreset`. Pinned by
+ * Model types the no-preset error names: trainable rows, then loadable rows,
+ * each group in registry order. The grouping preserves the trainable-first
+ * order the old `LAUNCH_PRESETS` literal printed. Pinned by
  * `packages/agent/__test__/chat-config.test.ts`.
  */
 const KNOWN_PRESET_MODEL_TYPES: readonly string[] = (() => {
   const rows: readonly ModelFamilyData[] = MODEL_FAMILY_DATA;
   const chatRows = rows.filter((row) => row.kind === 'trainable' || row.kind === 'loadable');
-  const serverRows = chatRows.filter((row) => row.launchPreset !== undefined);
   return [
-    ...serverRows.filter((row) => row.kind === 'trainable'),
-    ...serverRows.filter((row) => row.kind === 'loadable'),
-    ...chatRows.filter((row) => row.launchPreset === undefined),
+    ...chatRows.filter((row) => row.kind === 'trainable'),
+    ...chatRows.filter((row) => row.kind === 'loadable'),
   ].map((row) => row.id);
 })();
 
@@ -81,7 +76,7 @@ export function buildChatConfig(
   resolvedReasoning = resolveReasoningMode(options?.reasoning),
   modelMaxTokens?: unknown,
 ): ChatConfig {
-  const preset = agentLaunchPresetFor(modelType);
+  const preset = launchPresetFor(modelType);
   if (!preset) {
     const known = KNOWN_PRESET_MODEL_TYPES.join(', ');
     throw new Error(`buildChatConfig: no launch preset for model type "${modelType}" (known types: ${known})`);

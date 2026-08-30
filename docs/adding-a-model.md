@@ -76,16 +76,16 @@ serve + agent), one row per site with its failure mode. The old inventory of
 ~12 hand-edited TS/Rust sites collapsed into this: the scattered per-family
 TS tables were deleted and now derive from one data row.
 
-| Site                                                                   | What you add                                                                                                                                                       | Failure mode if missed                                                                                                                                                                                             |
-| ---------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `crates/mlx-core/src/models/mod.rs`                                    | `pub mod <family>;`                                                                                                                                                | compile error                                                                                                                                                                                                      |
-| `crates/mlx-core/src/convert.rs`                                       | one `ConversionRecipe` impl + one `RECIPE_REGISTRY` row (dispatch `recipe_for` and the `convertible_model_types` NAPI export both derive from the registry)         | registry-consistency test (`recipe_registry_reproduces_inline_flags`) goes red; a checkpoint of the family hits the hard "Unknown model type" convert error                                                        |
-| `packages/cli/src/commands/convert-detect.ts`                          | one `CONVERT_DETECT` row (row order is load-bearing and deliberately differs from the runtime loader's probe order)                                                | the convert-detect parity test (`convert-detect.test.ts`) goes red against native `convertibleModelTypes()` — without it, `mlx convert` with `-m` omitted silently converts generically and produces unloadable output |
-| `packages/lm/src/family-data.ts`                                       | one `MODEL_FAMILY_DATA` row: `kind`, `match` (raw aliases + optional architecture probe), `traits`, a launch preset, optional `ggufArchitectures`/`acceptsDraftModel` | a chat-kind row without `traits` or a preset **fails to compile** (the `ChatFamilyData` type requires them — this replaced the old silent discovery skips); `family-completeness.test.ts` backstops at runtime      |
-| `packages/lm/src/models/model-loader.ts`                               | one `LOADER_BINDINGS` entry (loader closure + native class)                                                                                                        | `satisfies Record<ModelType, LoaderBinding>` fails to compile — in both directions: a data row without a binding, or a binding without a row                                                                        |
-| `packages/lm/src/stream.ts`                                            | one `makeStreamingModel` wrapper class + a line in each compile-time conformance block (`_assertSessionCapable`, `_assertPreservedNativeSurfaces`)                  | `ChatSession<X>` stops type-checking downstream; a drifted override signature fails the conformance block at compile time                                                                                          |
-| `packages/lm/src/index.ts`                                             | export line(s) for the wrapper class and config types                                                                                                              | the family is unreachable from `@mlx-node/lm`                                                                                                                                                                      |
-| `yarn build:native`                                                    | regenerates BOTH committed `index.d.cts` copies + the `index.cjs` export line                                                                                      | CI declaration-drift failure (`packages/core/build.ts` `assertDeclarationCopiesMatch` hard-fails before and after generation)                                                                                       |
+| Site                                          | What you add                                                                                                                                                          | Failure mode if missed                                                                                                                                                                                                 |
+| --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `crates/mlx-core/src/models/mod.rs`           | `pub mod <family>;`                                                                                                                                                   | compile error                                                                                                                                                                                                          |
+| `crates/mlx-core/src/convert.rs`              | one `ConversionRecipe` impl + one `RECIPE_REGISTRY` row (dispatch `recipe_for` and the `convertible_model_types` NAPI export both derive from the registry)           | registry-consistency test (`recipe_registry_reproduces_inline_flags`) goes red; a checkpoint of the family hits the hard "Unknown model type" convert error                                                            |
+| `packages/cli/src/commands/convert-detect.ts` | one `CONVERT_DETECT` row (row order is load-bearing and deliberately differs from the runtime loader's probe order)                                                   | the convert-detect parity test (`convert-detect.test.ts`) goes red against native `convertibleModelTypes()` — without it, `mlx convert` with `-m` omitted silently converts generically and produces unloadable output |
+| `packages/lm/src/family-data.ts`              | one `MODEL_FAMILY_DATA` row: `kind`, `match` (raw aliases + optional architecture probe), `traits`, a launch preset, optional `ggufArchitectures`/`acceptsDraftModel` | a chat-kind row without `traits` or a preset **fails to compile** (the `ChatFamilyData` type requires them — this replaced the old silent discovery skips); `family-completeness.test.ts` backstops at runtime         |
+| `packages/lm/src/models/model-loader.ts`      | one `LOADER_BINDINGS` entry (loader closure + native class)                                                                                                           | `satisfies Record<ModelType, LoaderBinding>` fails to compile — in both directions: a data row without a binding, or a binding without a row                                                                           |
+| `packages/lm/src/stream.ts`                   | one `makeStreamingModel` wrapper class + a line in each compile-time conformance block (`_assertSessionCapable`, `_assertPreservedNativeSurfaces`)                    | `ChatSession<X>` stops type-checking downstream; a drifted override signature fails the conformance block at compile time                                                                                              |
+| `packages/lm/src/index.ts`                    | export line(s) for the wrapper class and config types                                                                                                                 | the family is unreachable from `@mlx-node/lm`                                                                                                                                                                          |
+| `yarn build:native`                           | regenerates BOTH committed `index.d.cts` copies + the `index.cjs` export line                                                                                         | CI declaration-drift failure (`packages/core/build.ts` `assertDeclarationCopiesMatch` hard-fails before and after generation)                                                                                          |
 
 **What this branch deleted.** The following hand-maintained per-family tables
 no longer exist; each decision now derives from the family's
@@ -95,11 +95,11 @@ no longer exist; each decision now derives from the family's
 
 - `packages/server/src/presets.ts` (the whole file): sampling constants and
   `LaunchPreset` moved into `family-data.ts`; server discovery calls
-  `serverLaunchPresetFor` (a family with only `agentLaunchPreset`, lfm2_moe,
-  stays deliberately invisible to server discovery).
+  `launchPresetFor`.
 - `FAMILY_TRAITS` (agent provider): now `familyTraitsFor`.
-- `AGENT_LAUNCH_PRESETS` (agent chat-config): now `agentLaunchPresetFor`
-  (the agent overlay wins over `launchPreset` where both exist).
+- `AGENT_LAUNCH_PRESETS` (agent chat-config): gone. One `launchPreset` per
+  row serves every surface — server discovery, `mlx launch claude` and
+  `mlx agent` — so a chat family is reachable from all of them or none.
 - Both `NON_GENERATIVE` sets (agent + server): now
   `NON_GENERATIVE_FAMILY_IDS`, derived from `kind`.
 - `AGENT_PAGED_MODEL_TYPES`: the `PagedConfigOverrideManager` default derives
@@ -182,6 +182,7 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
 
   Off-list families fail closed: the tier stays off and the prefix is
   recomputed, even with explicit config/env.
+
 - A family with out-of-pool state writes a sidecar codec
   (geometry/policy/encode/decode) plus a capture function called after turn
   finalize, and installs restores through the shared transactional
@@ -210,6 +211,7 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
   The two loops never merge — that is permanent divergence X4 in
   [docs/vllm-speculative-alignment.md](vllm-speculative-alignment.md). Do not
   build a wrapper that threads a mode flag across both.
+
 - **Ripple warnings, measured** (Qwen3.8 DFlash2, PR #130): adding one field
   to the shared `DsparkProposal` struct touched every existing stepper
   (gemma4 dspark + assistant, muse dflash — one line each); changing
