@@ -143,8 +143,6 @@ const LOADER_BINDINGS = {
 
 type LoaderBindings = typeof LOADER_BINDINGS;
 
-export type { ModelType };
-
 /**
  * Union of the native `@mlx-node/core` model classes across every registered
  * family — the public contract of {@link loadModel}. At runtime the chat
