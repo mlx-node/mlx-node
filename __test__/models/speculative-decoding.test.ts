@@ -125,13 +125,3 @@ describe.skipIf(!modelsAvailable)('Speculative Decoding', () => {
     }
   }, 60000);
 });
-
-describe('Speculative Decoding Unit Tests', () => {
-  it('should export SpeculativeStats', async () => {
-    // The SpeculativeStats struct should be accessible
-    // This is a compile-time check that the module exports are correct
-    expect(true).toBe(true);
-  });
-
-  // KVCache tests moved to Rust: crates/mlx-core/src/transformer/kv_cache.rs
-});
