@@ -203,9 +203,8 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
     match cmd {
         // All chat-session traffic routes through the model-neutral
         // engine dispatcher against `Qwen35Inner`'s `ChatBackend` impl.
-        // (The engine dispatcher carries the historical NOTE forward: no
-        // per-request cache drain here — the TS idle sweeper in
-        // `@mlx-node/server` handles between-turn drains.)
+        // No per-request cache drain here — the TS idle sweeper in
+        // `@mlx-node/server` handles between-turn drains.
         Qwen35Cmd::Chat(chat_cmd) => {
             handle_chat_cmd(inner, chat_cmd);
         }
@@ -260,7 +259,6 @@ pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
         Qwen35Cmd::GdnHistoryCheckpointOracleForTest { reply } => {
             let _ = reply.send(inner.gdn_history_checkpoint_recompute_matches_for_test());
         }
-        // --- Training commands ---
         Qwen35Cmd::Train(train_cmd) => {
             handle_train_cmd(inner, train_cmd);
         }

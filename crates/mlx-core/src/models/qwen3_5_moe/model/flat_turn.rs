@@ -299,8 +299,8 @@ impl Qwen35MoeInner {
                     generation_stream,
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
-                    // H2: the same flag StreamingCtx carries — the engine's
-                    // ungated polls and the streaming reads are idempotent.
+                    // The same flag StreamingCtx carries — the engine's ungated polls and
+                    // the streaming reads are idempotent.
                     cancel_flag: Some(cancelled),
                 },
                 Some(streaming),
@@ -522,9 +522,8 @@ impl Qwen35MoeInner {
                 "chat_tokens_delta_sync requires a non-empty delta",
             ));
         }
-        // Text-only delta on image-bearing cache is intentional — the KV
-        // cache retains the image attention state from the prior prefill.
-        // See the sibling guard's doc in `qwen3_5/model.rs`. The engine's
+        // Text-only delta on an image-bearing cache is intentional — the KV cache
+        // retains the image attention state from the prior prefill. The engine's
         // `session_continue` gate filters real image-set changes with the
         // `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:` prefix so the TS
         // `ChatSession` can route those through `chatSessionStart`.
@@ -681,9 +680,7 @@ impl Qwen35MoeInner {
         if eager_mtp {
             // Delta-continuation eager MoE MTP — same engine-owned
             // `run_mtp_turn` loop + `MoeMtpStepper` as the fresh-prefill sync
-            // site (committed-history v2 within-turn when its opt-in flag is on;
-            // prompt-prefix seed inert here — see the `MoeMtpStepper` struct
-            // doc).
+            // site (prompt-prefix seed inert here — see the `MoeMtpStepper` struct doc).
             let mut rng = rand::rng();
             MxArray::async_eval_arrays(&[&y]);
 
@@ -706,8 +703,8 @@ impl Qwen35MoeInner {
                     generation_stream,
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
-                    // H2: sync turns cancel through the engine loop's
-                    // ungated polls (this site has no StreamingCtx).
+                    // Sync turns cancel through the engine loop's ungated polls
+                    // (this site has no StreamingCtx).
                     cancel_flag: turn_cancel.as_deref(),
                 },
                 None,
@@ -973,8 +970,7 @@ impl Qwen35MoeInner {
         if eager_mtp {
             // Streaming delta-continuation eager MoE MTP — same engine-owned
             // `run_mtp_turn` loop + `MoeMtpStepper` + `StreamingCtx` as the
-            // fresh-prefill stream site (committed-history v2 within-turn when
-            // its opt-in flag is on; prompt-prefix seed inert here — see the
+            // fresh-prefill stream site (prompt-prefix seed inert here — see the
             // `MoeMtpStepper` struct doc).
             let mut rng = rand::rng();
             MxArray::async_eval_arrays(&[&y]);
@@ -1009,8 +1005,8 @@ impl Qwen35MoeInner {
                     generation_stream,
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
-                    // H2: the same flag StreamingCtx carries — the engine's
-                    // ungated polls and the streaming reads are idempotent.
+                    // The same flag StreamingCtx carries — the engine's ungated polls and
+                    // the streaming reads are idempotent.
                     cancel_flag: Some(cancelled),
                 },
                 Some(streaming),

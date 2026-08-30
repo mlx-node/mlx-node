@@ -182,8 +182,6 @@ impl Qwen35Inner {
         Ok(rows_prefilled)
     }
 
-    // ========== Training methods (run on model thread) ==========
-
     /// Initialize training state with optimizer and configuration.
     /// Inherent body of [`TrainBackend::init_training_sync`].
     pub(super) fn init_training_sync_impl(
@@ -668,9 +666,8 @@ impl Qwen35Inner {
         if loss_value.is_nan() || loss_value.is_infinite() {
             warn!("Skipping step due to invalid loss: {}", loss_value);
             synchronize_and_clear_cache();
-            // Skipped steps must still advance the authoritative step counter
-            // (H1) and drop the cached generation so the next cycle starts
-            // clean.
+            // Skipped steps must still advance the authoritative step counter and
+            // drop the cached generation so the next cycle starts clean.
             let ts = self.training_state.as_mut().ok_or_else(|| {
                 Error::from_reason("Training state disappeared during GRPO loss handling")
             })?;
@@ -730,8 +727,8 @@ impl Qwen35Inner {
                     );
                 }
 
-                // Advance the authoritative step counter (H1) and clear the
-                // cached generation data so the next cycle starts clean.
+                // Advance the authoritative step counter and clear the cached
+                // generation data so the next cycle starts clean.
                 ts.clear_generation_cache();
                 ts.step += 1;
                 let new_step = ts.step;

@@ -48,11 +48,10 @@ impl Qwen35MoeInner {
         let seq_id = self.active_scheduled_seq.unwrap_or(0);
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
-        // Per-block extra_keys. See `paged_turn_sync_core` in
-        // qwen3_5/model.rs for the rationale; text-only paged dispatch
-        // builds an all-empty per-block vec which is bit-equal to
-        // passing `&[]` to the uniform API. VLM-paged would replace the
-        // empty positions with real (token_pos, image_hash) pairs.
+        // Per-block extra_keys: text-only paged dispatch builds an all-empty
+        // per-block vec, bit-equal to passing `&[]` to the uniform API.
+        // VLM-paged replaces the empty positions with real
+        // (token_pos, image_hash) pairs.
         let block_size = {
             let adapter = self.paged_adapter.as_ref().ok_or_else(|| {
                 Error::from_reason("MoE paged_turn_sync_core: paged_adapter is None")
@@ -71,7 +70,7 @@ impl Qwen35MoeInner {
         let lookup_extra_keys =
             engine::build_paged_extra_keys(tokens.len(), block_size, image_positions);
         let cache_salt = p.cache_salt;
-        // vLLM exact-prefix cap — see qwen3/model.rs:paged_turn_sync_core.
+        // vLLM exact-prefix cap: leave at least one prompt token to prefill.
         let max_cache_hit_tokens = total_budget.saturating_sub(1);
         let live_ready;
         let live_prefix_match;
@@ -300,7 +299,7 @@ impl Qwen35MoeInner {
             "MoE paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
-        // H2: clone the backend-installed per-turn cancel flag up front —
+        // Clone the backend-installed per-turn cancel flag up front —
         // the decode loop below borrows `self` mutably.
         let turn_cancel = self.turn_cancel.clone();
 
@@ -362,9 +361,9 @@ impl Qwen35MoeInner {
                 finish_reason = String::from("stop");
                 break;
             }
-            // H2 sync cancel poll — the SAME snapshot point as the MoE
-            // paged streaming twin (`paged_turn_stream_core_inner`): after
-            // the EOS check, before the repetition cutoff.
+            // Sync cancel poll — the SAME snapshot point as the MoE paged
+            // streaming twin (`paged_turn_stream_core_inner`): after the EOS
+            // check, before the repetition cutoff.
             if turn_cancel
                 .as_deref()
                 .is_some_and(|flag| flag.load(Ordering::Relaxed))

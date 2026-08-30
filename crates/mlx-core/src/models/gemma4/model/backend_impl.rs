@@ -577,10 +577,6 @@ impl ChatBackend for Gemma4Inner {
     }
 
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
-        // Legacy miss branch ran `reset_caches_sync()? +
-        // init_caches_sync()?` back-to-back (the flat prefill needs live
-        // caches); the explicit command reset only cleared (caches stay
-        // `None` until the next turn's lazy init).
         self.reset_caches_sync()?;
         if scope == ResetScope::PrefixMiss {
             self.init_caches_sync()?;
@@ -897,12 +893,6 @@ impl ChatBackend for Gemma4Inner {
             self.output_starts_in_reasoning_channel(),
         ))
     }
-
-    // `augment_performance` deliberately NOT overridden: the default
-    // (`profiler.fill_mtp_acceptance`) fills the `mtp_*` acceptance fields
-    // after a DSpark turn (and copies `profile_phases` when profiling is
-    // enabled). AR turns record no MTP cycle, so their acceptance fields
-    // stay `None` as before.
 
     fn has_live_session(&self) -> bool {
         !self.cached_token_history.is_empty()

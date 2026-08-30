@@ -42,11 +42,6 @@ impl ChatBackend for Qwen35MoeInner {
         self.gen_defaults.eos_token_ids.clone()
     }
 
-    // thinking: engine default `policy()` == `ThinkingPolicy::TemplateHonoring`
-    // → `thinking_setup` resolves to the legacy
-    // `{enabled: resolve_enable_thinking(config).unwrap_or(true),
-    //   budget: config.thinking_token_budget}`.
-
     fn cached_token_history(&self) -> &[u32] {
         &self.cached_token_history
     }
@@ -70,18 +65,12 @@ impl ChatBackend for Qwen35MoeInner {
             // Full clear including history, image key, rope deltas, GDN
             // checkpoints, via `reset_caches_sync`.
             //
-            // The EXPLICIT command reset must additionally restore a
-            // fully COLD paged state. `reset_caches_sync` does not touch
-            // the paged adapter at all (it only clears the flat caches +
-            // reuse state), so the prior turn's full blocks stay
-            // content-addressed in the per-instance BlockAllocator's
-            // prefix cache. A reset-then-rerun of the same prompt would
-            // then take the prefix-hit 1-token-suffix prefill
-            // (`find_cached_prefix_per_block_with_max_tokens` ->
-            // `find_longest_cache_hit`) instead of the cold full prefill,
-            // a different bf16 reduction order that can flip a greedy
-            // near-tie (observed on the lfm2 sibling; qwen3_5_moe shares
-            // the identical adapter lifecycle). One
+            // An EXPLICIT reset must ALSO purge the paged prefix cache:
+            // `reset_caches_sync` leaves the prior turn's blocks
+            // content-addressed, so a reset-then-rerun of the same prompt
+            // would take the prefix-hit 1-token-suffix prefill instead of
+            // the cold full prefill — a different bf16 reduction order that
+            // can flip a greedy near-tie. One
             // call both releases the live request and purges every
             // prefix-cache entry. `ResetScope::PrefixMiss` (turn-internal)
             // keeps the prefix cache: cross-request block reuse after a
@@ -212,8 +201,6 @@ impl ChatBackend for Qwen35MoeInner {
         Self: 'a;
 
     fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
-        // NOTE: no decode-entry `info!` trace here — unlike dense, the
-        // MoE path does not log a "chat_decode entry" line.
         let is_streaming = self.turn_is_streaming.get();
 
         let embedding = self.embedding.clone();
@@ -295,11 +282,7 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // BOTH paged decoders run through the generic `run_paged_turn`, which
-        // drives the adapter lifecycle via [`PagedBackend`]: autoregressive on
-        // the shared decode loop, native MTP on the speculative branch
-        // (`admit_paged_speculative_decode` + `run_paged_speculative_decode`).
-        // Sharing one driver is what keeps the two decoders on one epilogue.
+        // Sharing one driver is what keeps the two paged decoders on one epilogue.
         debug_assert!(args.plan.use_paged_attention);
         debug_assert!(self.paged_adapter.is_some());
         debug_assert!(matches!(
@@ -335,9 +318,6 @@ impl ChatBackend for Qwen35MoeInner {
     }
 
     fn run_multimodal_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        // The MoE cores own the full image pipeline (VLM prefill via
-        // `vlm_prefill_moe`, M-RoPE deltas, paged-backend validation,
-        // missing-encoder error).
         self.moe_whole_turn(args)
     }
 }
@@ -345,9 +325,8 @@ impl ChatBackend for Qwen35MoeInner {
 /// The speculative plan this family publishes once its MTP head is loaded.
 ///
 /// Named rather than inlined into [`ChatBackend::execution_plan`] so the
-/// routing gate can compose the REAL published plan with `TurnPlan::resolve`
-/// without standing up a 35B model — the flag and the core it promises then
-/// cannot drift apart unnoticed.
+/// routing gate can compose the REAL published plan without standing up a 35B
+/// model.
 ///
 /// Native MTP runs on BOTH lanes: the paged lane through the generic driver's
 /// speculative branch (`PagedBackend::admit_paged_speculative_decode` +

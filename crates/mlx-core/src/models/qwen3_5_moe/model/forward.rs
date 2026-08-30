@@ -144,11 +144,8 @@ pub(super) fn forward_inner(
 /// Default prefill chunk size (tokens per chunk).
 ///
 /// Matches the Qwen3.5 Dense path and Python mlx-lm's `prefill_step_size`
-/// default of 2048. Long-context prompts (40k+ tokens) would otherwise
-/// allocate all per-layer activations concurrently (batch=1 × seq × hidden
-/// plus a full attention score tensor per FA layer), blowing past the 96 GB
-/// wired limit on an M3 Max 128 GB box. Chunking bounds the per-layer
-/// transient peak at `chunk × hidden_dim` and inserts a cache-eval +
+/// default of 2048. Chunking bounds the per-layer transient peak at
+/// `chunk × hidden_dim` and inserts a cache-eval +
 /// `clear_cache` barrier between chunks so the transient allocator state
 /// does not accumulate across chunks.
 pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
@@ -231,7 +228,7 @@ fn chunked_prefill_with_size(
     // The returned logits from these chunks are thrown away because only
     // the final chunk's logits are consumed by the sampler.
     while total_len - offset > chunk_size {
-        // Cooperative-cancel checkpoint (H1b): abort at the chunk
+        // Cooperative-cancel checkpoint: abort at the chunk
         // boundary. The Err rides the flat engine's
         // `fail_closed_flat_turn` arm — no `save_cache_state`, the
         // session is invalidated, so the partially-advanced caches never

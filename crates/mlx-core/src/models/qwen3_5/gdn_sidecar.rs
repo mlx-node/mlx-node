@@ -201,8 +201,8 @@ impl GdnSidecarGeometry {
 /// Derive the sidecar geometry, or `None` when this checkpoint has no
 /// out-of-pool GDN state to persist (no linear layers, a conv kernel of 1, or a
 /// nonsensical head geometry) or a dtype the codec cannot round-trip. `None`
-/// means "install no policy": the family then behaves exactly as it did before
-/// sidecars existed.
+/// means "install no policy": the restore walk then reconciles nothing and the
+/// GDN state is recomputed.
 pub(crate) fn geometry(config: &Qwen3_5Config, cache_dtype: &str) -> Option<GdnSidecarGeometry> {
     let gdn_layers = u32::try_from(gdn_layers(config).len()).ok()?;
     if gdn_layers == 0 {
@@ -416,9 +416,8 @@ pub(crate) fn encode_tensors(
 /// (`cold_captured_blocks`). A sidecar past the chain's frontier could never
 /// be selected on restore, so writing one would only burn quota.
 ///
-/// At most ONE sidecar per turn; the writer queue is bounded. Media turns
-/// are skipped in v1: their image-aware keys already isolate them, but the
-/// GDN VLM exactness gate is not modeled here, so refusing is the
+/// At most ONE sidecar per turn; the writer queue is bounded. Media turns are
+/// skipped: the GDN VLM exactness gate is not modeled here, so refusing is the
 /// fail-closed answer.
 ///
 /// `image_token_positions` is the turn's OWN media map, passed in rather
@@ -461,7 +460,7 @@ pub(crate) fn capture_gdn_cold_sidecar<T: GdnCheckpointLineage>(
     if policy.group() != mlx_paged_attn::ColdGroup::GdnState {
         return;
     }
-    // v1: text-only. See the doc comment.
+    // Text-only: media turns are refused (see the fn doc).
     if !image_token_positions.is_empty() {
         return;
     }
@@ -990,9 +989,8 @@ mod tests {
         assert_eq!(per_checkpoint, 78_446_592);
     }
 
-    /// The figure above is a shape calculation. This checks it against what the
-    /// MLX allocator actually reserves for the same arrays. Ignored by default:
-    /// it allocates ~75 MiB on the GPU and needs a Metal device.
+    /// Checks the shape calculation above against what the MLX allocator actually
+    /// reserves. Ignored by default: needs a Metal device and allocates on the GPU.
     #[test]
     #[ignore = "allocates ~75 MiB of Metal buffers; run with --ignored"]
     fn a_27b_gdn_checkpoint_allocates_the_bytes_its_layout_claims() {

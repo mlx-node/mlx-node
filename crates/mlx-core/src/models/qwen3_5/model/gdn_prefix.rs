@@ -39,7 +39,7 @@ impl Qwen35Inner {
             self.gdn_last_history_checkpoint = None;
             return Ok(trace.finish(total_start));
         }
-        // L-KEY (I4): the state cloned below is keyed on
+        // The state cloned below is keyed on
         // `cached_token_history`, and a paged session's GDN state sits at the
         // adapter's recorded frontier (the paged forwards and rollbacks move
         // both together). A caller that publishes without first running
@@ -428,20 +428,8 @@ impl Qwen35Inner {
     /// attends over the whole cumulative range, and a break only marks where
     /// the recurrent state is snapshotted — but it is NOT numerically
     /// bit-identical: the chunk length is the GEMM's M, which selects a
-    /// different kernel class and accumulation order. The measured size of that
-    /// drift is documented on
-    /// `test_chunked_prefill_qwen3_5_moe_matches_single_shot_logits`, which
-    /// needs a RELAXED logit tolerance rather than bit-equality. That test
-    /// skips on `test_support::half_gemm_untrustworthy` — an 8x64 bf16 GEMM
-    /// correctness canary, NOT a GPU-generation gate, so on a host whose
-    /// half-precision GEMM is sound it runs and the tolerance is the real
-    /// claim. Either way it measures ONE logit vector at 96 tokens, which
-    /// bounds nothing about an argmax flip 30 greedy steps into a 1400-token
-    /// prompt. So turning persistence on can change the sampled tokens of an
-    /// otherwise identical request. That trade was already taken for autoregressive turns, which
-    /// have read this since the sidecar landed; the hand-written cores now take
-    /// it too rather than silently persisting K/V whose recurrent half no
-    /// restore can reconstruct.
+    /// different kernel class and accumulation order. So turning persistence on
+    /// can change the sampled tokens of an otherwise identical request.
     ///
     /// A caller must read this BEFORE it takes the `&mut self` borrows the
     /// prefill needs (`&mut self.layers` + `&mut self.paged_adapter`); an inline
@@ -555,8 +543,7 @@ impl Qwen35Inner {
     }
 
     /// Cold-tier GDN sidecar capture
-    /// ([`crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar`]); one sidecar is
-    /// ~75 MiB on the 27B.
+    /// ([`crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar`]).
     pub(super) fn capture_dense_gdn_cold_sidecar(
         &self,
         image_token_positions: &[(u32, u64)],
@@ -773,7 +760,7 @@ impl Qwen35Inner {
         // Cold-tier GDN sidecar: on-SSD recurrent state the restore walk brought
         // back for EXACTLY this cached prefix (reconcile-down guarantees the
         // boundary). Consulted only after every in-memory source above missed —
-        // i.e. the common process-restart case. v1 is text-only: an image-aware
+        // i.e. the common process-restart case. Text-only: an image-aware
         // prefix still goes through the exactness gates below.
         if cached_prefix_len > 0
             && !image_aware_prefix

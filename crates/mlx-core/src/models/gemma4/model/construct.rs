@@ -399,17 +399,10 @@ impl Gemma4Inner {
             None
         };
 
-        // Derive the per-layer paged-routing classification once here
-        // instead of on every paged prefill-chunk / decode-step call (see
-        // `compute_layer_kinds_from_kv_cache_specs`'s BTreeMap/BTreeSet
-        // grouping + sort). It's a pure function of `config`, which is
-        // immutable for the lifetime of this `Gemma4Inner`. Only meaningful
-        // when `paged_adapter` is `Some` — every caller first errors out on
-        // a `None` adapter before reading the result, so `Vec::new()` below
-        // is never read in that case. Guaranteed to succeed whenever
-        // `paged_adapter` built above, since that already validated a
-        // strictly stronger constraint (a single full-attention group) over
-        // the same specs.
+        // Derived once: a pure function of `config`, which is immutable for the
+        // lifetime of this `Gemma4Inner`. Only meaningful when `paged_adapter`
+        // is `Some` — every caller errors out on a `None` adapter before reading
+        // the result, so the `Vec::new()` fallback below is dead.
         let layer_kinds = if let Some(coordinator) = kv_cache_coordinator.as_ref() {
             layer_kinds_from_routes(coordinator.routes(), config.num_hidden_layers as usize)
                 .map_err(|e| {
@@ -564,13 +557,8 @@ impl Gemma4Inner {
 
     /// Return the per-layer routing list for the paged dispatch.
     ///
-    /// Cheap clone of `self.layer_kinds`, cached once in `Gemma4Inner::new`
-    /// instead of being re-derived (BTreeMap/BTreeSet grouping + a sort —
-    /// see [`compute_layer_kinds`] (free helper) and
-    /// `compute_layer_kinds_from_kv_cache_specs`) on every call. It's a pure
-    /// function of the immutable `Gemma4Config`, so recomputing it from
-    /// scratch on every paged prefill-chunk / decode-step call was pure
-    /// waste.
+    /// Cheap clone of the `layer_kinds` cached in `Gemma4Inner::new`; it does
+    /// not recompute.
     pub(crate) fn compute_layer_kinds(&self) -> Result<Vec<Gemma4LayerKind>> {
         Ok(self.layer_kinds.clone())
     }
@@ -590,10 +578,6 @@ impl Gemma4Inner {
 ///
 /// `paged_idx` counts physical non-shared layers within one group in decoder
 /// order. KV-shared layers do not consume a paged slot.
-///
-/// Lifted to a free helper so unit tests can drive it without owning a
-/// `Gemma4Inner` (which requires loaded weights). Mirrors LFM2's
-/// `compute_layer_kinds` pattern.
 #[cfg(test)]
 pub(crate) fn compute_layer_kinds(config: &Gemma4Config) -> Vec<Gemma4LayerKind> {
     compute_layer_kinds_from_kv_cache_specs(config)

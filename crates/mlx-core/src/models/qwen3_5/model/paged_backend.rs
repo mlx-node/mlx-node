@@ -425,7 +425,7 @@ impl PagedBackend for Qwen35Inner {
             );
         }
         // Always attempt the release for the non-reuse path, even when
-        // registration failed (mirrors the prior `register_error.or(release)`).
+        // registration failed.
         if release_pending && let Some(adapter) = self.paged_adapter.as_mut() {
             finalize_error = finalize_error.or(adapter.release_request().err());
         }
@@ -448,7 +448,7 @@ impl PagedBackend for Qwen35Inner {
         // `y.eval()` run on the MLX DEFAULT stream; running the forward on a
         // queue separate from the shared loop's top-of-iteration `y.eval()`
         // (always on the default stream) would force a cross-queue
-        // completion-wait every token (~5% on bandwidth-bound decode).
+        // completion-wait every token.
         // `paged_prefill` still runs on `generation_stream`. See the
         // `PagedBackend::paged_decode_stream` doc for the full mechanism.
         Stream::default(crate::stream::DeviceType::Gpu)
@@ -497,7 +497,7 @@ impl PagedBackend for Qwen35Inner {
             full_history.extend_from_slice(&generated[..upto]);
         }
         self.cached_token_history = full_history;
-        // I4 frontier agreement before any GDN state is keyed on the history
+        // Frontier agreement before any GDN state is keyed on the history
         // just published. A disagreement arms the refuse-to-persist latch the
         // checkpoint store below consumes.
         let history_len = self.cached_token_history.len();

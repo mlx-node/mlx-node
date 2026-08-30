@@ -53,8 +53,8 @@ fn tiny_moe_cfg() -> Qwen3_5MoeConfig {
     }
 }
 
-/// Pre-fix mask construction, kept here ONLY as a reference oracle —
-/// byte-for-byte the code this fix deletes from `forward_pre_norm_inner`.
+/// Reference oracle only — the explicit-mask forward this path replaced.
+/// Never call it from production.
 /// Builds an explicit causal mask sized from `caches[fa_idx]`'s offset
 /// and hands it to every full-attention layer.
 fn forward_with_explicit_causal_mask(

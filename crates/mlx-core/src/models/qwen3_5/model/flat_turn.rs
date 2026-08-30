@@ -402,7 +402,6 @@ impl Qwen35Inner {
         // plumbing (`has_images` is always false on this branch).
         let (expanded_tokens, current_image_cache_key) = (tokens.clone(), 0u64);
 
-        // === Cache reuse: prefix verification ===
         let cached_prefix_len = if self.flat_mtp_caches_desynced {
             0
         } else {
@@ -460,23 +459,12 @@ impl Qwen35Inner {
         // the new prompt is byte-for-byte identical to the cached history
         // and there is literally no delta to prefill. The decode loop still
         // needs a `last_logits` to sample from, so we must run *some*
-        // forward pass. Two options were considered:
-        //   1. Trim every layer cache by one token and reprefill the final
-        //      token. **Infeasible** for Qwen3.5 — the GDN linear-attention
-        //      layers store a recurrent state (`conv_state`,
-        //      `recurrent_state`) that cannot be rewound mid-sequence
-        //      without corrupting the hidden representation. Only the
-        //      full-attention layers support `KVCache::trim`, and applying
-        //      trim to the hybrid stack would produce silent miscompiles.
-        //   2. Full reset + full re-prefill. Wasteful when it triggers but
-        //      always correct, and this branch is a cold edge case —
-        //      real-world turns always append at least a user message, so
-        //      the cached prefix is strictly shorter than the new prompt.
-        //
-        // We take option 2. The full-reset is intentional, not a "wrong
-        // force-reset" to be patched out. See the invariant doc on
-        // `verify_cache_prefix_direct` for the underlying linear-attention
-        // rewind constraint.
+        // forward pass. The GDN linear-attention layers hold a recurrent state
+        // (`conv_state`, `recurrent_state`) that cannot be rewound mid-sequence,
+        // so a one-token trim is not an option — only the full-attention layers
+        // support `KVCache::trim`, and trimming the hybrid stack miscompiles
+        // silently. Full reset + re-prefill is wasteful but always correct, and
+        // this is a cold edge case.
         let (prefill_tokens, cached_prefix_len) = if prefill_tokens.is_empty() {
             info!("Zero-delta cache hit: resetting caches for full re-prefill");
             if let Some(ref mut caches) = self.caches {
@@ -531,7 +519,6 @@ impl Qwen35Inner {
         // (it starts empty and builds from decode tokens — correct).
         let want_prompt_hidden = p.enable_mtp && self.has_mtp_weights() && cached_prefix_len == 0;
 
-        // === Text prefill ===
         profiler.begin_prefill();
         let mut prompt_hidden: Option<MxArray> = None;
         let (last_logits, seq_len) = {
@@ -838,9 +825,8 @@ impl Qwen35Inner {
     /// Shared post-prefill pipeline: penalty → sample → decode loop (eager
     /// MTP or AR) → save cache state → finalize result.
     ///
-    /// Extracted from `vision_mtp_whole_turn_core` so it can also be driven by the text-only
-    /// session path (`chat_tokens_delta_sync`). Preserves the exact semantics
-    /// of `vision_mtp_whole_turn_core` for the existing caller — `token_history_init` is the
+    /// Driven by both `vision_mtp_whole_turn_core` and the text-only session path
+    /// (`chat_tokens_delta_sync`). `token_history_init` is the
     /// full pre-decode token sequence (used for penalty context and the decode
     /// loop's running history), and the decode loop mutates it in place.
     ///
@@ -929,7 +915,7 @@ impl Qwen35Inner {
         let mut y = sample(&last_logits, p.sampling_config)?;
         MxArray::async_eval_arrays(&[&y]);
 
-        // H2: clone the backend-installed per-turn cancel flag up front —
+        // Clone the backend-installed per-turn cancel flag up front —
         // the decode closures below borrow `self` mutably, so the flat AR
         // macro / eager-MTP loop read the clone, not `self.turn_cancel`.
         let turn_cancel = self.turn_cancel.clone();
@@ -981,7 +967,7 @@ impl Qwen35Inner {
                     generation_stream,
                     prompt_hidden,
                     prompt_hidden_ids,
-                    // H2: sync turns cancel through the engine loop's
+                    // Sync turns cancel through the engine loop's
                     // ungated polls (this site has no StreamingCtx).
                     cancel_flag: turn_cancel.as_deref(),
                 },
@@ -1165,9 +1151,6 @@ impl Qwen35Inner {
         prompt_hidden_ids: Option<Vec<u32>>,
         last_in_cache: &mut bool,
     ) -> Result<()> {
-        // The turn profiler relabel ("mtp_eager") now moves into
-        // `DenseMtpStepper::profiler_relabel`, applied once at turn entry by
-        // the engine — mirroring the SYNC site.
         MxArray::async_eval_arrays(&[&y]);
 
         let mut rng = rand::rng();
@@ -1208,7 +1191,7 @@ impl Qwen35Inner {
                 generation_stream,
                 prompt_hidden,
                 prompt_hidden_ids,
-                // H2: the same flag StreamingCtx carries — the engine's
+                // The same flag StreamingCtx carries — the engine's
                 // ungated polls and the streaming reads are idempotent.
                 cancel_flag: Some(cancelled),
             },
@@ -1479,7 +1462,6 @@ impl Qwen35Inner {
         // Save snapshot for save_cache_state_direct (prior history + delta).
         let save_tokens = full_token_history.clone();
 
-        // Decode setup
         let mut generated_tokens: Vec<u32> = Vec::new();
         let mut finish_reason = String::from("length");
         let mut decode_stream = tokenizer_for_decode.inner().decode_stream(true);

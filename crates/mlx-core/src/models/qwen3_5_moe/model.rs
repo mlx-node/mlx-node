@@ -74,8 +74,6 @@ use crate::stream::{DeviceType, Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 
-// This stays a FILE, not `model/mod.rs`: promoting it re-roots every
-// `#[path]`-declared child in the family. The seams live in `model/`.
 mod chat_backend;
 mod commands;
 mod flat_turn;
@@ -89,8 +87,6 @@ mod state;
 mod training;
 mod vision_turn;
 
-// Facade: the names the seams publish back into this hub, so the hub, the
-// cousin seams and the `#[cfg(test)]` children keep resolving them unqualified.
 #[cfg(test)]
 use self::chat_backend::qwen35_moe_speculative_plan;
 pub(crate) use self::commands::Qwen35MoeCmd;
@@ -120,19 +116,12 @@ use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35MoeInner {
     pub(crate) config: Qwen3_5MoeConfig,
-    /// The in-flight turn's cooperative-cancel flag, installed by the
-    /// sync and streaming session wrappers via
-    /// [`ChatBackend::set_turn_cancel_flag`] and cleared (`None`) in their
-    /// turn epilogue on every exit path.
-    /// Threaded into the engine AR prefill chunk loops (flat
-    /// `chunked_prefill` from `ChatBackend::prefill`, paged
-    /// `run_paged_prefill_chunk_with_size_and_checkpoint` from
-    /// `PagedBackend::paged_prefill` — MoE AR paged turns run the generic
-    /// engine); a set flag aborts at the next chunk boundary with the
-    /// distinguished `"prefill cancelled"` error, riding the engine's
-    /// fail-closed prefill-`Err` arms. The family's MTP, vision, and hidden
-    /// replay cores thread the same flag; single-shot prefills remain the
-    /// documented residual window.
+    /// The in-flight turn's cooperative-cancel flag, installed by the sync and
+    /// streaming session wrappers via [`ChatBackend::set_turn_cancel_flag`] and
+    /// cleared (`None`) in their turn epilogue on every exit path. A set flag
+    /// aborts at the next chunk boundary with the distinguished
+    /// `"prefill cancelled"` error, riding the engine's fail-closed
+    /// prefill-`Err` arms; a single-shot (unchunked) prefill is NOT cancellable.
     pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
     /// Turn-constant layer classification (`Linear` vs `FullAttentionPaged`),
     /// computed once in [`Self::new`] instead of re-derived on every paged
@@ -174,8 +163,7 @@ pub(crate) struct Qwen35MoeInner {
     /// republishing expanded image-placeholder history as a live session.
     paged_finalize_failed: bool,
     /// Engine-computed accepted-but-unemitted tail of the most recent paged
-    /// MTP turn, recorded so a test can see a mid-cycle stop was acted on
-    /// rather than discarded.
+    /// MTP turn.
     pub(crate) paged_mtp_last_rollback_unemitted: usize,
     /// Mid-cycle GDN rewinds this session performed. Pairs with
     /// `paged_mtp_gdn_invalidations`: a rewind that fails increments the
@@ -499,14 +487,8 @@ impl Qwen3_5MoeModel {
         .await
     }
 
-    // ---------------------------------------------------------------
-    // Test-only helpers: streaming session entry points that bypass
-    // ThreadsafeFunction and expose the mpsc receiver directly. Used
-    // by `crates/mlx-core/tests/qwen3_5_moe_session.rs` to exercise
-    // the streaming path from a pure-Rust integration test without a
-    // NAPI host. Marked `#[doc(hidden)]` because they're not part of
-    // the public API surface.
-    // ---------------------------------------------------------------
+    // Test-only streaming entry points that bypass ThreadsafeFunction and hand
+    // back the mpsc receiver, for `crates/mlx-core/tests/qwen3_5_moe_session.rs`.
 
     /// Test-only entry point that dispatches `ChatStreamSessionStart`
     /// and returns the raw mpsc receiver the model thread writes into.
@@ -661,9 +643,6 @@ mod paged_construction_tests;
 
 #[cfg(test)]
 mod mask_free_full_attention_parity_tests;
-
-#[cfg(test)]
-mod calibration_cmd_tests;
 
 #[cfg(test)]
 mod eval_teacher_forced_tests;

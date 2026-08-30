@@ -110,9 +110,7 @@ impl ChatBackend for Qwen35Inner {
                 // the same prompt would take the prefix-hit suffix-prefill
                 // path (`verify_cache_prefix_direct` > 0) — a different
                 // bf16 reduction order than the cold full prefill, enough
-                // to flip a greedy near-tie (observed on the lfm2 sibling:
-                // "says," vs "said" at token ~6; qwen3.5 shares the
-                // identical adapter lifecycle).
+                // to flip a greedy near-tie.
                 // Releasing the live request AND purging the prefix cache
                 // makes the next turn replay the cold prefill byte-for-byte.
                 if let Some(adapter) = self.paged_adapter.as_mut() {

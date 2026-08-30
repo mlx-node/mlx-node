@@ -2,7 +2,6 @@
 
 use super::*;
 
-// ========== Qwen35Inner implementation ==========
 // All these methods run on the dedicated model thread (synchronous, no locks).
 
 impl Qwen35Inner {
@@ -108,7 +107,7 @@ impl Qwen35Inner {
     /// been installed and materialized. The configured memory value is a
     /// requested maximum; live unified-memory/Metal probes may only reduce
     /// it. The pool starts at `paged_cache_initial_memory_mb` (or the max
-    /// itself when unset — the historical fixed behavior) and grows on
+    /// itself when unset) and grows on
     /// demand toward the max.
     pub(crate) fn initialize_paged_adapter(&mut self) -> Result<()> {
         if !self.config.use_block_paged_cache.unwrap_or(true)
@@ -163,8 +162,8 @@ impl Qwen35Inner {
         }
         let cache_dtype = mlx_paged_attn::metal::MetalDtype::BFloat16;
         // `max_num_blocks` is the dynamic ceiling the live pool grows toward;
-        // `load_time_pool_sizing_with_reserved` keeps clamping the MAX only,
-        // exactly as before the initial/max split. Sibling pools registered
+        // `load_time_pool_sizing_with_reserved` keeps clamping the MAX only.
+        // Sibling pools registered
         // with the cache-limit coordinator hold private Metal buffers the MLX
         // active-memory probes cannot see, so their bytes are reserved
         // explicitly; this runs inside the process-wide pool-growth lock (see
@@ -815,7 +814,7 @@ impl Qwen35Inner {
         self.discard_dense_paged_session();
     }
 
-    /// I4 frontier agreement for a dense paged epilogue: the adapter's
+    /// Frontier agreement for a dense paged epilogue: the adapter's
     /// recorded tokens and the drop-last history about to be persisted must
     /// sit at ONE frontier before any GDN state is keyed on that history.
     /// STRICT equality (see [`dense_paged_frontier_skew`]). Disagreement arms

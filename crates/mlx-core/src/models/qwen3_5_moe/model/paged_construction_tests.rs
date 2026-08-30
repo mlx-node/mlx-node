@@ -392,7 +392,7 @@ fn moe_gdn_retention_follows_the_installed_cold_sidecar_policy() {
 }
 
 /// MoE twin of
-/// `qwen3_5::model::tests::test_dense_ladder_survives_sibling_owners_through_the_model_call_site`.
+/// `qwen3_5::model::paged_construction_tests::test_dense_ladder_survives_sibling_owners_through_the_model_call_site`.
 /// The two share `prune_gdn_checkpoints` but not the call site that tells
 /// it which owner is publishing, which is exactly where they can drift.
 ///

@@ -74,7 +74,6 @@ impl Qwen35Inner {
         let mut first_token_instant: Option<std::time::Instant> = None;
         let trace_enabled = inference_trace_enabled();
 
-        // === Adapter lifecycle: warm continuation OR cold start ===
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
@@ -102,7 +101,7 @@ impl Qwen35Inner {
         let lookup_extra_keys =
             engine::build_paged_extra_keys(tokens.len(), block_size, image_positions);
         let cache_salt = p.cache_salt;
-        // vLLM exact-prefix cap — see qwen3/model.rs:paged_turn_sync_core.
+        // vLLM exact-prefix cap.
         // Ensures every paged turn has at least one suffix token to prefill,
         // even when the live cache (or a prior request's residue) already
         // covers the entire new prompt.
@@ -369,7 +368,7 @@ impl Qwen35Inner {
             "paged_turn_sync_core_inner: caller must cap max_cache_hit_tokens at prompt.len() - 1"
         );
 
-        // H2: clone the backend-installed per-turn cancel flag up front —
+        // Clone the backend-installed per-turn cancel flag up front —
         // the decode loop below borrows `self` mutably.
         let turn_cancel = self.turn_cancel.clone();
 
@@ -392,7 +391,6 @@ impl Qwen35Inner {
         let want_prompt_hidden = eager_mtp_paged && cached_prefix_len == 0;
         let mut mtp_profiler = begin_paged_mtp_profiler(eager_mtp_paged, suffix_len);
 
-        // === PREFILL ===
         let (last_logits, prompt_hidden, gdn_checkpoint) = self.run_dense_core_paged_prefill(
             tokens,
             suffix,
@@ -426,7 +424,6 @@ impl Qwen35Inner {
             *first_token_instant = Some(std::time::Instant::now());
         }
 
-        // === DECODE LOOP ===
         let max_new_tokens = p.max_new_tokens;
         let mut generated_tokens: Vec<u32> =
             Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
@@ -505,7 +502,7 @@ impl Qwen35Inner {
                     generation_stream,
                     prompt_hidden,
                     prompt_hidden_ids: Some(prompt_hidden_ids),
-                    // H2: sync paged MTP cancels through the engine loop's
+                    // Sync paged MTP cancels through the engine loop's
                     // ungated polls (no StreamingCtx on this site).
                     cancel_flag: turn_cancel.as_deref(),
                 },
@@ -532,7 +529,7 @@ impl Qwen35Inner {
                 finish_reason = String::from("stop");
                 break;
             }
-            // H2 sync cancel poll — the SAME snapshot point as the paged
+            // Sync cancel poll — the SAME snapshot point as the paged
             // streaming twin (`paged_turn_stream_core_inner`): after the
             // EOS check, before the repetition cutoff.
             if turn_cancel
@@ -656,7 +653,6 @@ impl Qwen35Inner {
         let mut first_token_instant: Option<std::time::Instant> = None;
         let sampling_config = p.sampling_config;
 
-        // === VLM image processing: expand placeholders + merge features ===
         let sms = self.spatial_merge_size.unwrap_or(2);
         let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
         let processed = img_proc.process_many(&image_refs)?;
@@ -699,7 +695,6 @@ impl Qwen35Inner {
         drop(processed);
         crate::array::clear_cache();
 
-        // === Image-aware paged-prefix lifecycle ===
         let total_budget = expanded_tokens.len() as u32;
         let block_size = self
             .paged_adapter
@@ -759,7 +754,6 @@ impl Qwen35Inner {
 
         let turn_cancel = self.turn_cancel.clone();
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
-            // === PREFILL ===
             let last_logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -801,7 +795,7 @@ impl Qwen35Inner {
                 first_token_instant = Some(std::time::Instant::now());
             }
 
-            // === DECODE LOOP (autoregressive, scalar-offset RoPE) ===
+            // Autoregressive decode: scalar-offset RoPE, not M-RoPE.
             let max_new_tokens = p.max_new_tokens;
             let mut generated_tokens: Vec<u32> =
                 Vec::with_capacity(engine::generated_capacity_hint(max_new_tokens));
@@ -817,7 +811,7 @@ impl Qwen35Inner {
                     finish_reason = String::from("stop");
                     break;
                 }
-                // H2 sync cancel poll — the SAME snapshot point as the
+                // Sync cancel poll — the SAME snapshot point as the
                 // vision paged streaming twin: after the EOS check, before
                 // the repetition cutoff.
                 if turn_cancel
@@ -1038,7 +1032,6 @@ impl Qwen35Inner {
         let mut streamed_text_len = 0usize;
         let mut last_is_reasoning = thinking_enabled;
 
-        // === VLM image processing: expand placeholders + merge features ===
         let sms = self.spatial_merge_size.unwrap_or(2);
         let image_refs: Vec<&[u8]> = images.iter().map(|v| v.as_slice()).collect();
         let processed = img_proc.process_many(&image_refs)?;
@@ -1077,7 +1070,6 @@ impl Qwen35Inner {
         drop(processed);
         crate::array::clear_cache();
 
-        // === Image-aware paged-prefix lifecycle ===
         let total_budget = expanded_tokens.len() as u32;
         let block_size = self
             .paged_adapter
@@ -1137,7 +1129,6 @@ impl Qwen35Inner {
 
         let turn_cancel = self.turn_cancel.clone();
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
-            // === PREFILL ===
             let last_logits = {
                 let _stream_ctx = StreamContext::new(generation_stream);
                 let caches_ref = self.caches.as_mut().ok_or_else(|| {
@@ -1511,7 +1502,6 @@ impl Qwen35Inner {
         let mut last_is_reasoning = thinking_enabled;
         let prefix_plan_start = inference_info_enabled.then(std::time::Instant::now);
 
-        // === Adapter lifecycle: warm continue OR cold start ===
         let seq_id: u32 = 0;
         // Lazy decode allocation: pass the prompt length only.
         let total_budget = tokens.len() as u32;
@@ -2147,7 +2137,7 @@ impl Qwen35Inner {
                     generation_stream,
                     prompt_hidden,
                     prompt_hidden_ids: Some(prompt_hidden_ids),
-                    // H2: the same flag StreamingCtx carries — the engine's
+                    // The same flag StreamingCtx carries — the engine's
                     // ungated polls and the streaming reads are idempotent.
                     cancel_flag: Some(cancelled),
                 },

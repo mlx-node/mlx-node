@@ -444,8 +444,7 @@ impl Gemma4Inner {
     ///
     /// Returns `(tokens, processed_images, audio_frames, new_image_key,
     /// new_audio_key, image_token_positions)`. Image-only turns never touch the audio path and leave
-    /// `audio_frames`/`new_audio_key` as `None` (byte-identical to the old
-    /// vision-only flow); audio-only turns never run the image processor and
+    /// `audio_frames`/`new_audio_key` as `None`; audio-only turns never run the image processor and
     /// leave `processed_images` empty + `new_image_key` `None`.
     #[allow(clippy::type_complexity)]
     fn prepare_multimodal_tokens(
@@ -523,7 +522,7 @@ impl Gemma4Inner {
     /// physical group finalizes and remains live. Missing/misaligned anchors
     /// fail closed.
     ///
-    /// ## R1 sliding-offset reconciliation (the length-finish materialize)
+    /// ## Sliding-offset reconciliation (the length-finish materialize)
     /// The vision decode loop never forwards the final sampled token, so after
     /// the loop the live (non-shared) sliding caches AND the global paged KV sit
     /// at offset `prefill_len + G - 1`. The drop-last history rule yields
@@ -535,7 +534,7 @@ impl Gemma4Inner {
     /// `Gemma4PagedDecode::materialize_final` → `run_paged_decode_step`) —
     /// advancing both caches to `prefill_len + G` so the kept-live global KV
     /// content-addresses against the saved history for the next delta's live
-    /// restore. (Verified byte-exact by the non-unified-image warm==cold golden.)
+    /// restore.
     #[allow(clippy::too_many_arguments)]
     fn finalize_vision_turn_media_state(
         &mut self,
@@ -566,7 +565,7 @@ impl Gemma4Inner {
         full_history.extend_from_slice(history_tokens);
 
         if continuable_eligible {
-            // R1: align the sliding caches with the keep-all history before any
+            // Align the sliding caches with the keep-all history before any
             // checkpoint. On a `"length"` finish the loop left the final token
             // unforwarded (offset == history.len() - 1); forward it now so both
             // the global paged KV and the sliding caches reach history.len().
@@ -698,8 +697,8 @@ impl Gemma4Inner {
         )?;
         let cached_prefix_len = turn.cached_prefix_len;
 
-        // H2: clone the backend-installed per-turn cancel flag before the
-        // closure — the decode loop inside borrows `self` mutably.
+        // Clone the backend-installed per-turn cancel flag before the closure —
+        // the decode loop inside borrows `self` mutably.
         let turn_cancel = self.turn_cancel.clone();
 
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
@@ -729,8 +728,8 @@ impl Gemma4Inner {
                 let token_id = y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
 
-                // H2 sync cancel poll — the SAME snapshot point as the
-                // gemma4 vision paged streaming twin
+                // Sync cancel poll — the SAME snapshot point as the gemma4
+                // vision paged streaming twin
                 // (`vision_paged_turn_stream_core`): right after the token
                 // push, BEFORE the EOS check.
                 if turn_cancel
@@ -1127,23 +1126,9 @@ impl Gemma4Inner {
         Ok(())
     }
 
-    // =================================================================
-    // Block-paged dispatch (paged_turn_sync_core + helpers).
-    //
-    // Mirrors vLLM's hybrid KV coordinator: global and sliding layers route to
-    // separate `PagedKVCacheAdapter` groups, while KV-shared layers alias their
-    // anchor's physical group through routes derived from `LayerKVCacheSpec`.
-    //
-    // Lifecycle (mirrors Qwen3 / LFM2):
-    // 1. Adapter cold-start (or warm-continue when previous turn
-    //    finalize_turn_keep_live'd a strict-prefix request).
-    // 2. Every group resumes the same owner cursor. Sliding adapters keep
-    //    absolute logical positions while pruning expired physical blocks.
-    // 3. Prefill via `run_paged_prefill_chunk` over the suffix.
-    // 4. Decode loop via `run_paged_decode_step`.
-    // 5. End-of-turn (success): `finalize_turn_keep_live` so the next
-    //    turn's `continue_turn` can build on top of the partial trailing
-    //    block's K/V (same partial-block carry trick as Qwen3 / LFM2).
+    // Block-paged dispatch. Global and sliding layers route to separate
+    // `PagedKVCacheAdapter` groups; KV-shared layers alias their anchor's
+    // physical group through routes derived from `LayerKVCacheSpec`.
     //
     // Caveats / scope:
     // * ordinary text rows fuse; media and speculative owners use scheduler
@@ -1152,7 +1137,6 @@ impl Gemma4Inner {
     //   the same reusable boundary. Same-owner live continuation is supported;
     // * exact live-prefix hits are capped at `prompt_len - 1` so the final
     //   prompt token is always recomputed to produce logits.
-    // =================================================================
 
     pub(super) fn invalidate_gemma4_hybrid_session(&mut self, reason: &'static str) {
         tracing::warn!(
@@ -1386,10 +1370,6 @@ impl Gemma4Inner {
         Ok(resolution)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Vision helpers
-// ---------------------------------------------------------------------------
 
 /// Expand image tokens in a token sequence.
 ///

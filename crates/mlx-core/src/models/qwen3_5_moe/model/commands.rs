@@ -16,19 +16,8 @@ pub(crate) enum Qwen35MoeCmd {
         config: Qwen3_5MoeGenerationConfig,
         reply: ResponseTx<Qwen3_5MoeGenerationResult>,
     },
-    /// Static FP8 activation-amax calibration prefill (NVIDIA modelopt
-    /// `MaxCalibrator`). MoE counterpart of the dense
-    /// [`crate::models::qwen3_5::model::Qwen35Cmd::CalibratePrefillRaw`]. For
-    /// each raw text: tokenize WITHOUT the chat template, truncate to
-    /// `calib_seq` tokens, then run PREFILL ONLY (no generation, no generated
-    /// token) so every mxfp8 attn/GDN projection's activation tap fires once,
-    /// resetting caches between rows. Runs on the model thread where the
-    /// tokenizer lives. The command body SELF-ARMS this model thread's
-    /// thread-local `ActivationAmaxCollector` flag (via `CalibrationArmGuard`)
-    /// for the prefill's duration; the NAPI caller drains+persists the collected
-    /// amax afterwards — this command never touches `config.json`. Replies with
-    /// the number of rows actually prefilled (rows that were empty after
-    /// tokenize+truncate are skipped).
+    /// Static FP8 activation-amax calibration prefill — see
+    /// [`Qwen35MoeInner::calibrate_prefill_raw_sync`] for the contract.
     CalibratePrefillRaw {
         texts: Vec<String>,
         calib_seq: u32,
@@ -177,11 +166,8 @@ impl TrainBackend for Qwen35MoeInner {
 /// Command handler for the dedicated model thread.
 pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCmd) {
     match cmd {
-        // All chat-session traffic routes through the model-neutral
-        // engine dispatcher against `Qwen35MoeInner`'s `ChatBackend`
-        // impl. (The engine dispatcher carries the historical NOTE
-        // forward: no per-request cache drain here — the TS idle
-        // sweeper in `@mlx-node/server` handles between-turn drains.)
+        // No per-request cache drain here — the TS idle sweeper in
+        // `@mlx-node/server` owns between-turn drains.
         Qwen35MoeCmd::Chat(chat_cmd) => {
             handle_chat_cmd(inner, chat_cmd);
         }
@@ -205,7 +191,6 @@ pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCm
         Qwen35MoeCmd::SaveModel { save_path, reply } => {
             let _ = reply.send(inner.save_model_sync(&save_path));
         }
-        // --- Training commands ---
         Qwen35MoeCmd::Train(train_cmd) => {
             handle_train_cmd(inner, train_cmd);
         }

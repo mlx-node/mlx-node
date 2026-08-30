@@ -6,17 +6,12 @@ use super::*;
 /// [`Gemma4Inner::verify_cache_prefix`] return value plus the incoming
 /// token count.
 ///
-/// Test-only mirror of the reset-or-reuse branch the engine session
-/// core (`engine::session::chat_turn_core`) takes from this backend's
-/// `verify_cache_prefix` return — separating the decision
-/// logic from the native state mutation so the "exact-match routes to
-/// miss" invariant can be pinned by pure-logic unit tests that do not
-/// require a loaded Gemma4 model. Production code keeps the inlined
-/// form for zero-overhead dispatch; this enum exists solely to drive
-/// `prefix_cache_decision_tests`'s four-case coverage (empty cache,
-/// strict-extend hit, divergence miss, exact-match miss). Any change
-/// to the inlined production branch MUST be mirrored here or the test
-/// ceases to guard the real code.
+/// Test-only mirror of the reset-or-reuse branch
+/// `engine::session::chat_turn_core` takes from this backend's
+/// `verify_cache_prefix` return, so the "exact-match routes to miss"
+/// invariant can be pinned without a loaded Gemma4 model. Any change to the
+/// inlined production branch MUST be mirrored here or
+/// `prefix_cache_decision_tests` ceases to guard the real code.
 #[cfg(test)]
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub(crate) enum PrefixCacheDecision {
@@ -56,8 +51,7 @@ pub(super) enum Gemma4SlidingRetentionPolicy {
     /// through `run_sliding_only_prefill`). Those are different spans of
     /// arithmetic in a different order, so they can emit different tokens. A
     /// persistence-OFF request gets nothing back for that risk, so it must not
-    /// take it — the same lesson `GDN_PREFIX_CHECKPOINTS_PER_OWNER_NO_LADDER`
-    /// records, where the divergence was measured at character 56.
+    /// take it.
     PreLadder,
     /// Ladder-aware: evict non-anchors first, oldest first, so the SHALLOW
     /// rungs survive a prefill that keeps ratcheting deeper cadence
@@ -104,20 +98,17 @@ impl Gemma4SlidingAnchorRungs {
 /// so [`Gemma4SlidingRetentionCaps`] stays `Copy`.
 ///
 /// A checkpoint at `boundary` holds `min(boundary, window)` token rows, so the
-/// cost of a retained SET is NOT `count * full_window`: across the rungs this
-/// ladder publishes it varies 16x on the 12B geometry (41.9 MB at 64 tokens,
-/// 671.1 MB at 1024). That is precisely why the entry COUNT
-/// [`gemma4_sliding_retention_caps_for_override`] derives from
-/// [`GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES`] is not a cap on bytes: it is
-/// derived from a PLANNED mix of shallow rungs and deep entries, and nothing
-/// forces the retained set to be that mix. Once the cursor is deep every
-/// retained entry is a full window, and six of those are 4026 MB against a
-/// declared 3072 MB ceiling.
+/// cost of a retained SET is NOT `count * full_window`. That is precisely why
+/// the entry COUNT [`gemma4_sliding_retention_caps_for_override`] derives from
+/// [`GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES`] is not a cap on bytes: it
+/// assumes a PLANNED mix of shallow rungs and deep entries, and nothing forces
+/// the retained set to be that mix. Once the cursor is deep every retained
+/// entry is a full window.
 ///
 /// Overrunning here is not "a cache tier degrades". MLX targets unified memory
 /// (see `docs/architecture.md`): weights, the paged KV pool and these
-/// checkpoints draw on ONE physical budget, so the extra gigabyte comes
-/// straight out of the pool and the weights.
+/// checkpoints draw on ONE physical budget, so the overrun comes straight out
+/// of the pool and the weights.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(super) struct Gemma4SlidingCheckpointBytes {
     pub(super) full_window_bytes: u64,
@@ -172,8 +163,7 @@ impl Gemma4SlidingCheckpointBytes {
 /// the prefill call site for a specific reason: whether a boundary is PUBLISHED
 /// ([`gemma4_sliding_chunk_checkpoint_boundaries`]), whether the entry it
 /// produces is MARKED an anchor, and whether retention then defers it must be
-/// three readings of one fact. Threading them separately is how the qwen3.5
-/// ladder shipped with a prefill body that published rungs nothing retained.
+/// three readings of one fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Gemma4SlidingRetentionCaps {
     pub(super) limit: usize,
@@ -182,14 +172,8 @@ pub(super) struct Gemma4SlidingRetentionCaps {
     /// Per-entry byte cost, so retention can bound the set in BYTES and not
     /// only in entries.
     ///
-    /// Carried on BOTH arms, and deliberately so. A persistence-OFF turn must
-    /// retain exactly what it retained before the ladder existed — a byte cap
-    /// that fired there would move which checkpoint a later warm turn resumes
-    /// from, and that changes emitted tokens. What stops it is `policy`, the
-    /// same single predicate that decides everything else about this turn. If
-    /// this field were zeroed on the `PreLadder` arm instead, the guard would
-    /// have a second, silent reason to hold and no test could tell whether the
-    /// real one still works.
+    /// Carried on BOTH arms: `policy`, not a zeroed cost model, is what keeps the
+    /// byte cap off a persistence-OFF turn.
     pub(super) bytes: Gemma4SlidingCheckpointBytes,
 }
 
@@ -806,10 +790,8 @@ pub(super) fn gemma4_sliding_checkpoint_estimated_bytes(config: &Gemma4Config) -
 /// The payload a sliding checkpoint holds is `min(boundary, window)` token
 /// rows — exactly what a live `RotatingKVCache` holds at that offset, and what
 /// `sliding_sidecar::payload_tokens` writes. Sizing every entry at a FULL
-/// window (which is what [`gemma4_sliding_checkpoint_estimated_bytes`] does, and
-/// all any pre-ladder caller needed) is what makes a sub-window rung look as
-/// expensive as a deep one: on the 12B geometry a rung at 64 tokens costs
-/// 41.9 MB, not the 671.1 MB the flat estimate charges it.
+/// window (what [`gemma4_sliding_checkpoint_estimated_bytes`] does) makes a
+/// sub-window rung look as expensive as a deep one.
 pub(super) fn gemma4_sliding_checkpoint_estimated_bytes_at(
     config: &Gemma4Config,
     boundary_tokens: u32,
@@ -980,12 +962,8 @@ pub(super) fn gemma4_sliding_decode_publishes_checkpoint(
 /// rungs are drawn from — ignoring the byte budget that may have truncated the
 /// published set, so this is a strict SUPERSET of `caps.anchors.contains`.
 ///
-/// Exists purely so the decode hot path can skip deriving `caps` on the steps
-/// that cannot possibly publish. It is a handful of integer ops; `caps` walks
-/// `num_hidden_layers` doing `String == "full_attention"` three times over (96
-/// string compares on the 12B) plus an env-var `OnceLock` read. HEAD returned
-/// early on every non-cadence decode step and this restores that, for the
-/// ladder arm and the persistence-OFF arm alike.
+/// A cheap integer screen so the decode hot path can skip deriving `caps` on
+/// steps that cannot publish.
 #[cfg(test)]
 pub(super) fn gemma4_sliding_prefix_len_is_on_the_anchor_grid(
     prefix_len: u32,
@@ -1016,28 +994,8 @@ pub(super) fn gemma4_sliding_prefix_len_is_on_the_anchor_grid(
 /// Retired private-checkpoint decision retained only as a pure policy test. The
 /// active grouped scheduler snapshots its configured anchor rungs directly.
 ///
-/// Ordering is deliberate, and it is what keeps this off the decode hot path:
-///
-/// ```text
-///   prefix_len == 0                        one compare
-///   cadence multiple                       one modulo
-///   is there a SlidingWindow sidecar       two pointer derefs + an enum compare
-///   block_size * 4^k for some k <= 4       at most four multiplies
-///   ---- only now ----
-///   derive caps                            walks num_hidden_layers at least
-///                                          three times, and up to seven on the
-///                                          ladder arm (the limit, the cost
-///                                          model, and one per admitted rung),
-///                                          each layer a `String ==
-///                                          "full_attention"` compare — 144+
-///                                          string compares on the 12B — plus
-///                                          an env-var OnceLock read
-/// ```
-///
-/// A persistence-OFF turn therefore pays exactly what it paid before the ladder
-/// existed: the cold-tier probe fails and it returns on the same non-boundary
-/// steps HEAD returned on, having derived no caps at all. A persist turn pays
-/// the derivation on the cadence boundaries plus at most four cursors a turn.
+/// Ordering is deliberate: the cheap cadence/grid screens run BEFORE `caps` is
+/// derived, so a non-publishing step never pays the derivation.
 #[cfg(test)]
 pub(super) fn gemma4_sliding_decode_boundary_plan(
     config: &Gemma4Config,
@@ -1113,20 +1071,16 @@ pub(super) enum Gemma4ColdCaptureSelection<C, K> {
 ///
 /// Retired private-checkpoint descent retained only as a pure policy test.
 ///
-/// Stopping at the first `Persisted` — what this used to do inline — makes the
-/// on-disk state ABSORBING. The next turn on the same prompt recomputes the
-/// same key, sees it present again, and exits before it can try anything
-/// shallower; a root that once acquired an unreachable object keeps it forever.
-/// It also stalls the anchor-rung ladder at its top, when the whole point of the
-/// ladder is to give a lagging K/V chain a SHALLOW boundary to reconcile down
-/// to. Only one candidate is ever captured per turn either way — the skips cost
-/// an index probe each.
+/// Stopping at the first `Persisted` would make the on-disk state ABSORBING:
+/// the next turn on the same prompt recomputes the same key, sees it present,
+/// and exits before it can try anything shallower. It would also stall the
+/// anchor-rung ladder at its top, when the whole point of the ladder is to give
+/// a lagging K/V chain a SHALLOW boundary to reconcile down to. Only one
+/// candidate is captured per turn either way — the skips cost an index probe.
 ///
 /// The return is [`Gemma4ColdCaptureSelection`] rather than an
 /// `(Option<_>, usize)` pair so that an all-`Underivable` descent cannot reach
-/// the caller wearing an already-persisted count of zero: that pair shape is
-/// what let the capture record `already_persisted` for a tier that holds
-/// nothing.
+/// the caller wearing an already-persisted count of zero.
 #[cfg(test)]
 pub(super) fn gemma4_select_cold_capture_candidate<C, K>(
     candidates: impl IntoIterator<Item = C>,
@@ -1215,9 +1169,7 @@ pub(super) fn gemma4_sliding_cold_sidecar_chain_key(
 /// the next capture recomputes the same key, `contains_in` reports it present,
 /// and the capture returns without trying anything shallower.
 ///
-/// Same rule, same reason as `qwen3_5::paged_forward::gdn_checkpoint_target`,
-/// which the GDN ladder has always used; gemma4's sliding prompt boundary is
-/// the one publisher that rounded the other way.
+/// Same rule as `qwen3_5::paged_forward::gdn_checkpoint_target`.
 #[cfg(test)]
 pub(super) fn gemma4_cold_restore_reachable_boundary(prompt_len: u32, block_size: u32) -> u32 {
     if block_size == 0 {
@@ -1242,15 +1194,11 @@ pub(super) fn gemma4_cold_restore_reachable_boundary(prompt_len: u32, block_size
 /// can spell — see that function.
 ///
 /// The `prompt_len` bound applies to the WHOLE capture, not only to the aligned
-/// prompt boundary that motivated it, and that is deliberate. It also drops the
-/// candidates the decode published inside the generated region, which turn N+1
-/// of a growing conversation really could name. One sidecar is written per
-/// turn, so this is a priority rule, and it spends that write on the deepest
-/// boundary a restore of THIS prompt can name — the replay a cold tier exists
-/// for, and the case that measured zero reuse — rather than on a deeper
-/// boundary that pays off only if the conversation continues with exactly these
-/// tokens. The give-up is one turn deep: turn N+1's own ceiling covers
-/// everything turn N discarded. See
+/// prompt boundary that motivated it. One sidecar is written per turn, so this
+/// is a PRIORITY rule: it spends that write on the deepest boundary a restore of
+/// THIS prompt can name, rather than on a deeper boundary that pays off only if
+/// the conversation continues with exactly these tokens. The give-up is one turn
+/// deep: turn N+1's own ceiling covers everything turn N discarded. See
 /// `the_capture_ceiling_gives_up_this_turns_generated_region_and_the_next_turn_covers_it`.
 ///
 /// A free function, and the reason is the same one
@@ -1302,10 +1250,7 @@ pub(super) fn gemma4_sliding_cold_capture_ceiling_blocks(
 /// chunk's boundary list AFTER the prompt boundary has been retained out of it,
 /// so its containment test is blind to precisely the coinciding case.
 ///
-/// Two properties this must keep, and both are why it is a function rather than
-/// an expression at the prefill call site (the `want_ladder` hard-coded `false`
-/// that reverted decode to cadence-only is the precedent — see
-/// [`gemma4_sliding_decode_boundary_plan`]):
+/// Two properties this must keep:
 ///
 ///  * gated on `caps.wants_ladder()`, like every other publisher here. A
 ///    persistence-OFF turn must snapshot exactly what it snapshotted before the
@@ -1457,12 +1402,10 @@ fn gemma4_sliding_checkpoint_is_strict_ancestor(
 /// 2 come up empty, every eligible entry below the newest is an anchor that IS
 /// an ancestor of the newest — all useful, one has to go — and the pre-ladder
 /// floor at step 4 is `position(|c| !protected)`, i.e. the SHALLOWEST entry,
-/// which is precisely the rung a lagging persisted chain can reach. gemma4's
-/// chain advances ~34 blocks (~544 tokens) a turn, so the shallow rungs are the
-/// only reachable ones for the first several turns and the deep ones are dead
-/// weight until then; giving up the deepest costs the least. Without step 3 the
-/// byte loop below re-creates the "born, then evicted" failure the anchor flag
-/// exists to prevent, inside the fix for the byte budget.
+/// which is precisely the rung a lagging persisted chain can reach. The shallow
+/// rungs are the only reachable ones for the first several turns, so giving up
+/// the deepest costs the least. Without step 3 the byte loop below re-creates
+/// the "born, then evicted" failure the anchor flag exists to prevent.
 ///
 /// Reachable, and not only through the byte loop: two image-protected prompt
 /// boundaries (`GEMMA4_IMAGE_PREFIX_CHECKPOINT_LIMIT`) are never eligible, so a
@@ -1558,12 +1501,9 @@ pub(super) fn trim_gemma4_sliding_prefix_checkpoints(
         }
     }
     // The count above is DERIVED from a byte budget, on the assumption that the
-    // slots the ladder added hold cheap sub-window rungs
-    // (`gemma4_sliding_cold_anchor_rungs` prices a 64-token rung at 41.9 MB, not
-    // 671.1 MB — which is the only reason a fourth rung fit). Nothing forces the
+    // slots the ladder added hold cheap sub-window rungs. Nothing forces the
     // retained set to BE that mix: once the cursor is past one window every
-    // retained entry is a full window, and `base_limit + anchors.len` = 6 of
-    // those is 4026 MB against a declared 3072 MB ceiling. So the budget has to
+    // retained entry is a full window and the set overruns. So the budget has to
     // be enforced where it is actually spent, in bytes, over the entries that
     // are actually here.
     //
@@ -1587,15 +1527,9 @@ pub(super) fn trim_gemma4_sliding_prefix_checkpoints(
     // `retained_bytes` is emitted on BOTH arms, deliberately. It is the one
     // number that says whether an eviction was a count decision or a byte
     // decision, and `caps.bytes` is populated on the `PreLadder` arm too (see
-    // `Gemma4SlidingRetentionCaps::bytes`), so it is just as meaningful there —
-    // a persistence-OFF turn showing 5120 MB retained under a 3072 MB ladder
-    // ceiling is exactly the fact an operator reading this line needs. Hiding it
-    // behind `wants_ladder()` would make the arm that does NOT enforce the
-    // budget the arm you cannot see the budget for. It costs one integer fold
-    // over at most `limit` entries, and only when `MLX_TRACE` is on AND
-    // something was actually evicted. Nothing in the repo parses this line
-    // (grep: it appears only here), so widening it is a diagnostic change, not
-    // an interface change.
+    // `Gemma4SlidingRetentionCaps::bytes`), so it is just as meaningful there.
+    // Hiding it behind `wants_ladder()` would make the arm that does NOT enforce
+    // the budget the arm you cannot see the budget for.
     if trace_enabled && evicted > 0 {
         write_inference_trace(format_args!(
             "[MLX_TRACE] gemma4 sliding_prefix_checkpoint_evict evicted={} limit={} policy={:?} remaining={} retained_bytes={} first_prefix_tokens={} last_prefix_tokens={} retained={:?}",

@@ -470,9 +470,9 @@ impl PagedBackend for Qwen35MoeInner {
             "the paged MoE MTP stepper must rewind both state kinds itself and never \
              arm the flat desync latch"
         );
-        // I4 at the epilogue boundary: the adapter and the drop-last history
-        // the epilogue is about to persist must sit at ONE frontier before any
-        // GDN state is keyed on that history. Runs BEFORE `finish_paged_turn`
+        // At the epilogue boundary: the adapter and the drop-last history the
+        // epilogue is about to persist must sit at ONE frontier before any GDN
+        // state is keyed on that history. Runs BEFORE `finish_paged_turn`
         // reconciles, because reconcile would roll the adapter back to the
         // history length without moving the recurrent state with it and hide
         // exactly the skew this catches.
@@ -551,14 +551,11 @@ impl PagedBackend for Qwen35MoeInner {
     }
 
     fn paged_decode_stream(&self, _generation_stream: Stream) -> Stream {
-        // Run the compiled-paged DECODE on the canonical DEFAULT stream, NOT the
-        // per-turn `generation_stream`. moe's compiled forward + every
-        // `y.eval()` run on the MLX DEFAULT stream; running the forward on a
-        // queue separate from the shared loop's top-of-iteration `y.eval()`
-        // (always on the default stream) would force a cross-queue
-        // completion-wait every token (~5% on bandwidth-bound decode).
-        // `paged_prefill` still runs on `generation_stream`. See the
-        // `PagedBackend::paged_decode_stream` doc for the full mechanism.
+        // DECODE runs on the canonical DEFAULT stream, NOT the per-turn
+        // `generation_stream`: the shared loop's top-of-iteration `y.eval()` is
+        // always on the default stream, so a separate queue would force a
+        // cross-queue completion-wait every token. `paged_prefill` still runs on
+        // `generation_stream`. See the `PagedBackend::paged_decode_stream` doc.
         Stream::default(crate::stream::DeviceType::Gpu)
     }
 

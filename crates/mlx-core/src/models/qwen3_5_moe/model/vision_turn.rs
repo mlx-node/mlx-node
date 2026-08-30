@@ -325,13 +325,10 @@ impl Qwen35MoeInner {
         if eager_mtp {
             // Pure-Rust eager MoE MTP — the propose/verify whole-turn loop is
             // engine-owned (`engine::run_mtp_turn`) and drives the
-            // `MoeMtpStepper` (`MtpBackend::begin_mtp_decode`). Committed-
-            // history v2 activates within-turn (persistent drafter cache
-            // across cycles) when its opt-in flag is on; the prompt-prefix seed
-            // itself stays inert here because this call site has no MoE
+            // `MoeMtpStepper` (`MtpBackend::begin_mtp_decode`). The prompt-prefix
+            // seed stays inert here because this call site has no MoE
             // hidden-emitting prefill yet, so `prompt_hidden`/`prompt_hidden_ids`
-            // stay `None`. The `profiler.set_label("moe_mtp_eager")` relabel
-            // moved into `MoeMtpStepper::profiler_relabel`.
+            // stay `None`.
             let mut rng = rand::rng();
             MxArray::async_eval_arrays(&[&y]);
 
@@ -354,8 +351,8 @@ impl Qwen35MoeInner {
                     generation_stream,
                     prompt_hidden: None,
                     prompt_hidden_ids: None,
-                    // H2: sync turns cancel through the engine loop's
-                    // ungated polls (this site has no StreamingCtx).
+                    // Sync turns cancel through the engine loop's ungated polls
+                    // (this site has no StreamingCtx).
                     cancel_flag: turn_cancel.as_deref(),
                 },
                 None,
@@ -667,9 +664,9 @@ impl Qwen35MoeInner {
                     finish_reason = String::from("stop");
                     break;
                 }
-                // H2 sync cancel poll — the SAME snapshot point as the MoE
-                // vision paged streaming twin: after the EOS check, before
-                // the repetition cutoff.
+                // Sync cancel poll — the SAME snapshot point as the MoE vision
+                // paged streaming twin: after the EOS check, before the
+                // repetition cutoff.
                 if turn_cancel
                     .as_deref()
                     .is_some_and(|flag| flag.load(Ordering::Relaxed))

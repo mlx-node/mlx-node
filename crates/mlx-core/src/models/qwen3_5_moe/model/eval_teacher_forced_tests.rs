@@ -1,9 +1,8 @@
 //! `mlx eval` over a real (tiny, randomly initialized) MoE stack.
 //!
-//! The pure-numeric reductions are covered in `crate::quality::scoring` and
-//! the driver in `crate::quality::runner`; what only this level can prove is
-//! that the MoE adapter feeds them the right thing — that its prefill, its
-//! `fa_idx`-threaded layer stack and its tied head line up position for
+//! What only this level can prove is that the MoE adapter feeds the scoring
+//! reductions the right thing — that its prefill, its `fa_idx`-threaded layer
+//! stack and its tied head line up position for
 //! position with the targets the driver derives from the cached ids.
 
 use super::*;

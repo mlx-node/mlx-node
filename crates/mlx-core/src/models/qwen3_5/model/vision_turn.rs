@@ -370,10 +370,6 @@ impl VisionCacheInner {
 
 pub(crate) type VisionCache = Arc<Mutex<VisionCacheInner>>;
 
-// ============================================================================
-// VLM helper functions (moved from vl_model.rs for unification)
-// ============================================================================
-
 /// Image token ID used by Qwen3.5-VL
 pub(crate) const IMAGE_TOKEN_ID: i32 = 248056;
 
@@ -600,10 +596,9 @@ pub(crate) fn get_rope_index(
         // `inject_image_placeholders` expands each marker in place,
         // the prompt can carry MULTIPLE separated image runs when
         // history is replayed (e.g. two image-bearing user turns
-        // joined by an assistant reply). Flattening the span from
-        // `positions[0]` to `positions[last]` the way the old
-        // single-span code did would skip every interior text token
-        // between runs and blow up the downstream shape check.
+        // joined by an assistant reply). Flattening
+        // `positions[0]`..`positions[last]` into one span would skip
+        // every interior text token and blow up the reshape below.
         let mut image_runs: Vec<(usize, usize)> = Vec::new();
         {
             let mut i = 0;
@@ -1084,7 +1079,6 @@ pub(crate) fn vlm_prepare_vision_features(
         text_model_embedding.forward(input_ids)?
     };
 
-    // === STEP 1: Compute vision features with per-image reuse ===
     let grid = pre_processed.grid_thw();
     let grid_data = grid.to_int32()?;
     let pv = pre_processed.pixel_values();
@@ -1495,7 +1489,6 @@ pub(crate) fn vlm_prepare_vision_features(
         MxArray::concatenate_many(refs, Some(0))?
     };
 
-    // === STEP 2: Get text embeddings and merge with vision features ===
     let inputs_embeds = {
         let _stream_ctx = StreamContext::new(generation_stream);
         let embed_dtype = text_embeds.dtype()?;
@@ -1507,7 +1500,6 @@ pub(crate) fn vlm_prepare_vision_features(
         merge_input_ids_with_image_features(IMAGE_TOKEN_ID, &vf_cast, &text_embeds, input_ids)?
     };
 
-    // === STEP 3: Compute M-RoPE position IDs ===
     let (position_ids, rope_deltas) =
         get_rope_index(input_ids, Some(&grid), spatial_merge_size, IMAGE_TOKEN_ID)?;
 

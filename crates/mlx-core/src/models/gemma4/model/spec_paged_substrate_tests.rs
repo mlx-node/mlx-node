@@ -1,6 +1,6 @@
-//! T-D0.3 gating tests: the committed-frontier settle, the atomic
-//! cross-group reservation, the all-rows projection, and the paged-loop
-//! tap — every one behavior-neutral for the autoregressive lane.
+//! Gating tests for the paged speculative substrate: the committed-frontier
+//! settle, the atomic cross-group reservation, the all-rows projection, and the
+//! paged-loop tap — every one behavior-neutral for the autoregressive lane.
 
 use super::flat_verify_tests::assert_bitwise_eq;
 use super::*;
@@ -265,7 +265,7 @@ fn sliding_group_id(coordinator: &Gemma4KVCacheCoordinator) -> usize {
         .expect("the tiny hybrid config must build a sliding group")
 }
 
-/// Cross-module gate (engine ↔ gemma4, T-D0.2 ↔ T-D0.3): the REAL
+/// Cross-module gate (engine ↔ gemma4): the REAL
 /// grouped coordinator driven through the facade call order the
 /// `spec_paged` mock tests verified — reserve → record D+1 →
 /// `commit_cycle(ticket, keep)` → settle at the committed frontier —
@@ -526,7 +526,7 @@ fn gemma4_coordinator_is_lawful_under_the_permissive_checker() {
     );
 }
 
-/// Cross-module gate (adapter ↔ gemma4, T-D0.1 ↔ T-D0.3): the
+/// Cross-module gate (adapter ↔ gemma4): the
 /// coordinator's committed settle must route through the ADAPTER's
 /// committed-cutoff prune — the rollback-range read-back gate
 /// (`prune_committed_cutoff_never_nulls_rollback_range`) re-run at

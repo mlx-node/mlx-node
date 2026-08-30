@@ -42,8 +42,7 @@ fn text_mtp_request(is_delta: bool) -> TurnRequest {
 }
 
 /// A paged text turn that asked for MTP resolves to NATIVE MTP on the
-/// PAGED handler — not the silent autoregressive downgrade this family
-/// took while `supports_paged_attention` was false.
+/// PAGED handler, never a silent autoregressive downgrade.
 ///
 /// Catches, verified by mutation: setting `supports_paged_attention: false`
 /// back in `qwen35_moe_speculative_plan` — the decoder then resolves to

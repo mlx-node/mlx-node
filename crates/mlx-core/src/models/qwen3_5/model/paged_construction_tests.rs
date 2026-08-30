@@ -52,9 +52,8 @@ fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
 
 fn tiny_paged_forward_cfg() -> Qwen3_5Config {
     let mut cfg = tiny_cfg(true);
-    // Paged attention's Metal kernels require head_dim=32+; keep the
-    // production-forward tests on a separate shape so construction tests
-    // preserve their smaller historical config.
+    // Paged attention's Metal kernels require head_dim=32+, so the
+    // production-forward tests use a separate, larger shape.
     cfg.hidden_size = 128;
     cfg.intermediate_size = 256;
     cfg.head_dim = 32;
@@ -972,8 +971,7 @@ fn dense_gdn_retention_follows_the_installed_cold_sidecar_policy() {
 /// The cold tier is installed for the same reason. Publisher deferral is a
 /// `GdnRetentionPolicy::Ladder` behaviour and `active_owner_id` is read on
 /// no other arm, so a turn with no GDN sidecar policy cannot express the
-/// mutation at all — this test used to run on that arm and asserted the
-/// ladder answer anyway, which only agreed while the policy was ungated.
+/// mutation at all.
 /// The persistence-OFF push below pins the other arm's shape rather than
 /// leaving it unmeasured.
 #[test]
@@ -1713,7 +1711,7 @@ fn test_dense_paged_prefill_captures_exact_gdn_block_checkpoint() {
     adapter.release_request().expect("release_request");
 }
 
-/// H1b regression: a cancel flag observed between materialized GDN
+/// A cancel flag observed between materialized GDN
 /// replay chunks must abort the replay with the distinguished error,
 /// and the staged-commit wrapper must drop the partial state (no warm
 /// publish). A one-chunk replay stays single-shot and ignores the flag.
@@ -2181,7 +2179,7 @@ fn dense_gdn_sidecar_capture_refuses_the_turns_own_media_map() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// L-KEY (I4) tripwire: a publish site that keys GDN state on a history
+/// Tripwire: a publish site that keys GDN state on a history
 /// disagreeing with the paged frontier — without first running
 /// `check_dense_paged_frontier`, which would arm the refuse-to-persist
 /// latch — must trip the debug assert inside
@@ -2327,9 +2325,7 @@ fn dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
     // The SAME claim on the planned-MTP body. `run_dense_core_paged_prefill`
     // forks on `keep_prompt_hidden_tokens` into two separate prefill
     // functions that each pick their own break set, and every arm above
-    // takes the AR fork only. Measured: hardcoding `want_ladder = true` at
-    // the MTP call site alone (`run_paged_prefill_chunk_with_hidden_with_size`)
-    // left this whole gate and its MoE twin GREEN before this arm existed.
+    // takes the AR fork only.
     // `ChatSession::mergeConfig` auto-defaults `enableMtp` to true on any
     // checkpoint carrying an MTP head, so on those checkpoints the MTP fork
     // is the one an `mlx agent` turn actually takes.
@@ -2410,10 +2406,8 @@ fn dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
         .release_request()
         .expect("release_request");
 
-    // And the MTP fork under the policy: the ladder is what the sidecar
-    // anchors on, so an MTP turn that publishes only the deep rung is the
-    // silent-zero-reuse defect `29be89e0` set out to fix, on the fork it
-    // did not cover.
+    // And the MTP fork under the policy: the ladder is what the sidecar anchors
+    // on, so an MTP turn publishing only the deep rung means silent zero reuse.
     reset_paged_request(&mut inner, &long_prompt);
     let (_, _, cold_mtp_rungs) = run_dense_paged_prefill_with_hidden_and_checkpoint(
         &mut inner,
@@ -2438,7 +2432,7 @@ fn dense_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// I6 gate: a paged speculative turn ADDRESSES the model's adapter, it
+/// A paged speculative turn ADDRESSES the model's adapter, it
 /// does not take it. Three things follow, and each is one assertion here:
 ///
 ///   * the adapter stays reachable through `inner.paged_adapter` for the
@@ -2552,7 +2546,7 @@ fn paged_mtp_turn_addresses_the_model_adapter_instead_of_taking_it() {
     );
 }
 
-/// Cross-module gate for the reserve→verify seam (T1/T2/T3 wiring) and
+/// Cross-module gate for the reserve→verify seam and
 /// for the facade cycle the dense paged commit is routed through
 /// (`engine::spec_paged`). Every cycle here is a REAL verify forward, so
 /// every row the block table holds was written by one.
@@ -2797,7 +2791,6 @@ fn paged_mtp_lookahead_reservation_covers_verify() {
     );
     let (committed_blocks, committed_cursor) = adapter_stats(&step);
 
-    // ── L-SETTLE, executable on the real stepper ──
     // The facade's own writers are REFUSED on this family — the verify
     // core records its rows itself, and a facade row a commit kept would
     // advance the adapter while the recurrent state stood still.

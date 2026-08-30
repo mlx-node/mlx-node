@@ -56,7 +56,7 @@ impl DecodeStep for Qwen35MoeDecode<'_> {
 /// (`forward_with_hidden`, `verify_step`, `rollback`, `rollback_unemitted`)
 /// branch on it.
 ///
-/// The adapter stays ON THE MODEL for the whole turn (I6): each paged touch
+/// The adapter stays ON THE MODEL for the whole turn: each paged touch
 /// borrows it back through [`SpecOwner::resolve`], which refuses once the
 /// adapter's active request is no longer this turn's.
 ///
@@ -334,9 +334,6 @@ impl MtpStepper for MoeMtpStepper<'_> {
     }
 
     fn profiler_relabel(&self) -> Option<&'static str> {
-        // The eager MoE MTP path set the turn label via
-        // `profiler.set_label("moe_mtp_eager")` at the migration site; the
-        // engine applies this relabel once at turn entry instead.
         Some("moe_mtp_eager")
     }
 

@@ -444,10 +444,7 @@ impl Gemma4Inner {
     /// lives in [`gemma4_sliding_retention_caps_for_cold_tier`], a free function
     /// of `(config, cold tier, block size)`. All this method contributes is the
     /// borrow of the adapter's cold-tier context, so the interesting half is
-    /// reachable from a unit test without a GPU or a loaded checkpoint. Before
-    /// that split, `gemma4_sliding_cold_ladder_wanted` was an untested master
-    /// switch: flipping it to `false` made the cold tier inert with every test
-    /// still green.
+    /// reachable from a unit test without a GPU or a loaded checkpoint.
     fn gemma4_sliding_retention_caps_for_turn(
         &self,
         block_size: u32,

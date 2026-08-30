@@ -249,13 +249,11 @@ pub(super) const fn gemma4_media_plan(
             audio: audio_available,
         },
         MediaCapabilities {
-            // Image input was historically admitted unconditionally so the
-            // Gemma core could distinguish missing vision from missing paged
-            // execution. Keep that family-owned diagnostic.
+            // Images are admitted unconditionally so the Gemma core — not the engine —
+            // raises the "no vision" / "no paged execution" error.
             images: true,
-            // Audio was historically admitted only when its embedder existed.
-            // With no paged adapter, the family core owns the compatibility
-            // error; with no embedder, the engine rejects it before render.
+            // Audio is admitted only when its embedder exists; without one the
+            // engine rejects it before render.
             audio: audio_embedder_loaded,
         },
     )

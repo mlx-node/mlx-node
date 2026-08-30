@@ -58,35 +58,30 @@ impl DecodeStep for Qwen35Decode<'_> {
 /// branch on it; every other method is path-identical (the drafter and the
 /// committed-history commit are paged-agnostic).
 ///
-/// The adapter stays ON THE MODEL for the whole turn (I6): each paged touch
+/// The adapter stays ON THE MODEL for the whole turn: each paged touch
 /// borrows it back through [`SpecOwner::resolve`], which refuses once the
 /// adapter's active request is no longer this turn's. That refusal is what
 /// makes the borrow-back sound, so nothing has to be moved out and restored.
 pub(crate) struct DenseMtpStepper<'a> {
     /// The model — owns layers / caches / mtp / final_norm / lm_head and the
-    /// `flat_mtp_caches_desynced` latch. == the closures'
-    /// `inner_cell.borrow_mut()`.
+    /// `flat_mtp_caches_desynced` latch.
     inner: &'a mut Qwen35Inner,
-    /// Drafter K/V caches. == the closures' `mtp_caches_cell`. v2
-    /// committed-history mode holds the persistent committed prefix; v1
-    /// cycle-history mode is reset fresh by `begin_cycle`.
+    /// Drafter K/V caches. Committed-history mode holds the persistent
+    /// committed prefix; cycle-history mode is reset fresh by `begin_cycle`.
     mtp_caches: Vec<Qwen3_5LayerCache>,
-    /// Eager analogue of `g_mtp_committed_len`: committed tokens whose exact
-    /// K/V live in `mtp_caches`. == the closures' `committed_len` cell.
+    /// Committed tokens whose exact K/V live in `mtp_caches`.
     committed_len: i32,
     /// Committed-history active iff the prompt tail's hiddens start at
-    /// absolute position 0. == the closures' `use_committed`.
+    /// absolute position 0.
     use_committed: bool,
     /// Chained verify-hidden reuse is only numerically stable when this turn
     /// seeded the drafter with the full prompt. Warm suffix-only prefills have
     /// no such seed and must retain Step A between cycles.
     chained_cycles_supported: bool,
     /// Pre-verify snapshot of the main caches, taken in
-    /// `snapshot_main_linear`, consumed by `rollback`. == the closures'
-    /// `snap_cell`.
+    /// `snapshot_main_linear`, consumed by `rollback`.
     snap: Option<Result<Vec<crate::models::qwen3_5::layer_cache::Qwen3_5LayerSnapshot>>>,
-    /// GDN tape recorded by `verify_step`, consumed by `rollback`. == the
-    /// closures' `tape_cell`.
+    /// GDN tape recorded by `verify_step`, consumed by `rollback`.
     tape: Vec<Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>>,
     /// Number of tape steps the retained snapshot + tape currently represent
     /// as the cycle's committed GDN frontier: set to the recorded step count
@@ -117,15 +112,14 @@ pub(crate) struct DenseMtpStepper<'a> {
     /// base the replay-driven rollbacks land relative to.
     recurrent_snapshot_base: Option<u64>,
     /// Error stashed by the infallible `rollback` replay, surfaced by
-    /// `take_replay_error`. == the closures' `replay_err_cell`.
+    /// `take_replay_error`.
     replay_err: Option<Error>,
     /// Mid-cycle-stop desync latch (set by `rollback_unemitted`), reported by
-    /// `into_desynced`. == the closures' `mtp_desynced` cell.
+    /// `into_desynced`.
     mtp_desynced: bool,
     /// The model's embedding lookup and tied-head projection backend.
     embedding: Embedding,
-    /// Config clone for the per-cycle drafter cache reset/fresh build. == the
-    /// closures' captured `config`.
+    /// Config clone for the per-cycle drafter cache reset/fresh build.
     config: Qwen3_5Config,
     /// The sequence this turn's paged main-forwards belong to, claimed at
     /// `begin_mtp_decode`. `None` runs the flat main path.
@@ -365,9 +359,6 @@ impl MtpStepper for DenseMtpStepper<'_> {
     }
 
     fn profiler_relabel(&self) -> Option<&'static str> {
-        // The eager dense MTP path set the turn label via
-        // `profiler.set_label("mtp_eager")` at the migration site; the engine
-        // applies this relabel once at turn entry instead.
         Some("mtp_eager")
     }
 
@@ -601,11 +592,7 @@ impl MtpStepper for DenseMtpStepper<'_> {
     // `snap`; the verify cores clear + re-record `tape` at record time), and
     // a mid-cycle stop after THIS cycle still needs them — the paged
     // `rollback_unemitted` replays the GDN state back to the emitted frontier
-    // from exactly this snapshot + tape. The accept shapes were asymmetric
-    // before this retention: full-accept cycles skip this hook entirely (the
-    // engine only replays on rejection), so their snapshot + tape always
-    // survived to the emit loop; retention merely extends that same lifetime
-    // to partial accepts.
+    // from exactly this snapshot + tape.
     fn restore_and_replay_main(&mut self, _accepted: &[u32], _embedding: &Embedding) -> Result<()> {
         if let Some(e) = self.replay_err.take() {
             return Err(e);

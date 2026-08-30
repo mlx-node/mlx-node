@@ -5,7 +5,7 @@
 use super::*;
 
 impl Qwen35MoeInner {
-    /// I4 frontier agreement for a paged MoE epilogue: the adapter's recorded
+    /// Frontier agreement for a paged MoE epilogue: the adapter's recorded
     /// tokens and the drop-last history about to be persisted must sit at ONE
     /// frontier before any GDN state is keyed on that history. STRICT equality
     /// — both sides drop the SAME unforwarded final token, so any tolerance
@@ -188,12 +188,12 @@ impl Qwen35MoeInner {
             self.gdn_last_history_checkpoint = None;
             return Ok(trace.finish(total_start));
         }
-        // L-KEY (I4): the state cloned below is keyed on
-        // `cached_token_history`, and a paged session's GDN state sits at the
-        // adapter's recorded frontier (the paged forwards and rollbacks move
-        // both together). A caller that publishes without first running
-        // `check_moe_paged_frontier` (which arms the latch consumed above)
-        // trips this in debug builds instead of storing state != its key.
+        // The state cloned below is keyed on `cached_token_history`, and a paged
+        // session's GDN state sits at the adapter's recorded frontier (the paged
+        // forwards and rollbacks move both together). A caller that publishes
+        // without first running `check_moe_paged_frontier` (which arms the latch
+        // consumed above) trips this in debug builds instead of storing state
+        // that disagrees with its key.
         #[cfg(debug_assertions)]
         if let Some(adapter) = self.paged_adapter.as_ref() {
             debug_assert_eq!(
@@ -561,8 +561,7 @@ impl Qwen35MoeInner {
     }
 
     /// Cold-tier GDN sidecar capture
-    /// ([`crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar`]);
-    /// one sidecar is ~31 MiB on the 35B-A3B.
+    /// ([`crate::models::qwen3_5::gdn_sidecar::capture_gdn_cold_sidecar`]).
     pub(super) fn capture_moe_gdn_cold_sidecar(
         &self,
         image_token_positions: &[(u32, u64)],

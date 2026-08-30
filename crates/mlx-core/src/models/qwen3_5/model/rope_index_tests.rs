@@ -1,12 +1,6 @@
-//! `get_rope_index` builds M-RoPE position IDs for VLM prefill. The
-//! pre-fix implementation collapsed every `IMAGE_TOKEN_ID` in the
-//! prompt to a single contiguous span from `positions[0]` to
-//! `positions[last]`; a multi-turn history with two image-bearing
-//! user turns joined by an assistant reply silently skipped every
-//! interior text token, leaving `all_position_ids` shorter than
-//! `seq_len` and crashing the downstream reshape with a cryptic
-//! "length mismatch". These tests pin per-run indexing against that
-//! regression.
+//! `get_rope_index` builds M-RoPE position IDs for VLM prefill. These tests
+//! pin per-run indexing: every token must get a position, or the downstream
+//! reshape fails on a length mismatch.
 use super::*;
 use crate::array::MxArray;
 use std::sync::Mutex;
@@ -95,8 +89,7 @@ fn single_image_run_preserves_baseline_shape() {
     // sequence length: `rope_deltas = max_position + 1 - seq_len` MUST be
     // negative. This is the per-session delta the paged decode/warm-
     // continuation path adds to the physical KV slot to recover the
-    // compressed rotation position; previously it was dropped, leaving
-    // image-turn decode rotating ~|delta| positions too far ahead.
+    // compressed rotation position.
     let max_position = *t.iter().max().unwrap() as i64; // temporal axis (axis 0)
     let seq_len = tokens.len() as i64;
     assert_eq!(rope_deltas, max_position + 1 - seq_len);
@@ -131,8 +124,8 @@ fn image_final_prompt_delta_uses_global_max_axis() {
     let global_max = *t.iter().chain(&h).chain(&w).max().unwrap() as i64;
     let seq_len = tokens.len() as i64;
 
-    // The spatial axes must outrun the temporal one here, else the test
-    // would not distinguish the global-max fix from the axis-0 regression.
+    // The spatial axes must outrun the temporal one here, else the test cannot
+    // distinguish a global-max delta from an axis-0-only one.
     assert!(
         global_max > t_max,
         "test grid is not asymmetric: global_max={global_max} t_max={t_max}"

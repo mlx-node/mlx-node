@@ -4,13 +4,6 @@ use super::*;
 
 /// Default prefill chunk size (tokens per chunk).
 /// Matches Python mlx-lm's `prefill_step_size` default of 2048.
-///
-/// E55: bumped 1024 → 2048 after benching against mlx-lm at 20k prompt:
-/// chunk=1024 incurred 20 chunk boundaries vs mlx-lm's 10 (mlx-lm uses
-/// 2048 by default); the doubled per-chunk overhead cost ~14% at 20k.
-/// At 1024-prompt single-chunk the value is irrelevant — the loop is
-/// guarded by `total_len - offset > PREFILL_STEP_SIZE` so any T < step
-/// goes through the single `remaining` branch unchanged.
 pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 
 /// Evaluate all cache arrays across all layers to materialize them on GPU.
@@ -92,11 +85,11 @@ pub(super) fn chunked_prefill_with_size(
     };
     let mut offset: i64 = 0;
 
-    // E28: env-var toggle for A/B. Default: async between chunks. When set,
-    // falls back to synchronous eval_layer_caches (the prior behavior).
+    // `MLX_PREFILL_SYNC_BETWEEN_CHUNKS` forces synchronous `eval_layer_caches`
+    // between chunks instead of the async default.
     let chunk_async = std::env::var("MLX_PREFILL_SYNC_BETWEEN_CHUNKS").is_err();
     while total_len - offset > chunk_size {
-        // Cooperative-cancel checkpoint (H1b): abort at the chunk
+        // Cooperative-cancel checkpoint: abort at the chunk
         // boundary. The Err rides the flat engine's
         // `fail_closed_flat_turn` arm — no `save_cache_state`, the
         // session is invalidated, so the partially-advanced caches never
@@ -204,7 +197,7 @@ pub(super) fn chunked_prefill_with_hidden_with_size(
         .unwrap_or(0);
 
     while total_len - offset > chunk_size {
-        // Cooperative-cancel checkpoint (H1b): abort at the chunk boundary,
+        // Cooperative-cancel checkpoint: abort at the chunk boundary,
         // same contract as `chunked_prefill_with_size`.
         if turn_cancel.is_some_and(|f| f.load(Ordering::Relaxed)) {
             return Err(Error::from_reason("prefill cancelled"));
@@ -325,19 +318,14 @@ pub(super) fn forward_pre_norm_inner(
     );
 
     let num_layers = layers.len();
-    // Plain layer loop. In-loop async_eval was tested (every 8 layers,
-    // including h + all cache arrays) and found neutral-to-negative at
-    // single-chunk prefill on M3 (back-to-back A/B in the same binary
-    // showed deltas inside the run-to-run noise band). The CPU/GPU
-    // overlap benefit only materializes across the inter-chunk barrier
-    // in chunked_prefill, which now uses async_eval_layer_caches.
+    // Plain layer loop.
     //
     // This is the SHARED pre-norm primitive: it MUST return the full
     // per-position hidden. The MTP prompt-hidden path
     // (`chunked_prefill_with_hidden_with_size`) keeps the result and
     // re-slices it by chunk length, so a last-token slice here would
     // corrupt it. The logits-only callers get the equivalent of the
-    // upstream E37 last-token optimization from
+    // upstream last-token optimization from
     // `project_last_logits_from_pre_norm_hidden` (which slices before
     // `final_norm` + `lm_head`), so the slice deliberately does NOT
     // live in this loop.
@@ -470,8 +458,7 @@ pub(super) fn project_logits_from_hidden(
 
 /// Eager (pure-Rust) MTP verify step.
 ///
-/// Translation of the deleted compiled `forward_mtp_verify_compiled_with_hidden`
-/// FFI: runs the `verify_ids` (`[1, K+1]` int32) through the SAME main-model
+/// Runs the `verify_ids` (`[1, K+1]` int32) through the SAME main-model
 /// stack the AR path uses (`forward_pre_norm_inner` + `final_norm` +
 /// `project_logits_from_hidden`), advancing `inner.caches` by `K+1` positions.
 ///

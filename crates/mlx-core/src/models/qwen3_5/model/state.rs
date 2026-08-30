@@ -354,7 +354,6 @@ pub(super) fn apply_qwen35_dense_planned_decoder(
 ///   - running prefill and packaging the resulting `last_logits` and
 ///     `seq_len`.
 pub(crate) struct ChatDecodeInputs {
-    // --- Prefill outputs -------------------------------------------------
     /// Logits for the last position of the prefill chunk. Penalties and
     /// sampling run against this to produce the first decoded token.
     pub last_logits: MxArray,
@@ -371,7 +370,6 @@ pub(crate) struct ChatDecodeInputs {
     /// `true` when the current turn carries images.
     pub has_images: bool,
 
-    // --- Token bookkeeping ----------------------------------------------
     /// Full pre-decode token sequence. Seeds the decode loop's running
     /// history (mutated in place) and the penalty context.
     pub token_history_init: Vec<u32>,
@@ -385,7 +383,6 @@ pub(crate) struct ChatDecodeInputs {
     /// Image cache key for the current turn. 0 for text-only.
     pub save_image_cache_key: u64,
 
-    // --- Tokenizer / reasoning state ------------------------------------
     pub tokenizer: Arc<Qwen3Tokenizer>,
     pub think_end_id: Option<u32>,
     pub think_end_str: Option<String>,
@@ -398,7 +395,6 @@ pub(crate) struct ChatDecodeInputs {
     /// `<|im_end|>` so cache boundaries stay clean.
     pub eos_id: u32,
 
-    // --- Profiler / perf metrics ----------------------------------------
     pub profiler: crate::decode_profiler::DecodeProfiler,
     pub generation_start: Option<std::time::Instant>,
     pub first_token_instant: Option<std::time::Instant>,
@@ -416,12 +412,10 @@ pub(crate) struct ChatDecodeInputs {
     /// still reporting the reused prefix accurately for observability.
     pub cached_tokens_for_result: u32,
 
-    // --- MLX state ------------------------------------------------------
     pub embedding: Embedding,
     pub generation_stream: Stream,
     pub params: crate::engine::ChatParams,
 
-    // --- prompt-prefix MTP prefill --------------------------------------
     /// Post-final-norm hidden state for every prefilled prompt token,
     /// `[1, prefill_len, hidden]`. `Some` only when MTP is active for this
     /// turn (`params.enable_mtp && has_mtp_weights`) and the prefill ran

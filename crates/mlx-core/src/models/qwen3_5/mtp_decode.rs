@@ -18,9 +18,7 @@ use crate::engine::decode::Top2;
 use crate::nn::Embedding;
 use crate::sampling::SamplingConfig;
 
-// ---------------------------------------------------------------------------
-// MTP runtime flag inventory
-// ---------------------------------------------------------------------------
+// MTP runtime flag inventory.
 //
 // Runtime knobs gating individual MTP optimizations. Boolean env flags are
 // read at most once per process and cached. The truthy vocabulary is uniform:
@@ -55,10 +53,9 @@ use crate::sampling::SamplingConfig;
 //     see `eval_step_with_chained_hidden` below). The chained 1-forward-per-
 //     cycle shape is the canonical MTPLX/vLLM design and is T=0 correctness-
 //     safe (the verify forward is ground truth; the chained seed only changes
-//     acceptance RATE, never the committed tokens). On M5+ it is net-positive
-//     (affine +16%, nvfp4 byte-identical to AR). On M1–M4 it helps only at
-//     depth 1 and REGRESSES depth-3 acceptance (a lazy-slice eval-scheduling
-//     stall), so it stays OFF there pending that fix.
+//     acceptance RATE, never the committed tokens). Net-positive on M5+; a
+//     lazy-slice eval-scheduling stall regresses depth-3 acceptance on M1–M4,
+//     so it stays OFF there.
 
 /// Break-even first-draft acceptance rate for the MTP acceptance gate.
 ///
@@ -70,10 +67,7 @@ use crate::sampling::SamplingConfig;
 /// first-draft rate is the right comparison: a head accepting its first
 /// draft at ~73% is profitable (docs' depth-3 workload: per-position
 /// [0.735, 0.471, 0.235]) even though the accepted/attempted average is
-/// only ~0.48. Measured first-draft acceptance on real checkpoints:
-/// 1.000 (qwen3.5-4b, counting prompt), 0.756 (qwen3.5-4b, complex task),
-/// 0.000 (qwen3.5-0.8b — MTP is a net loss there and the gate is what
-/// keeps it from auto-enabling).
+/// only ~0.48.
 pub(crate) const MTP_ACCEPT_GATE_THRESHOLD: f64 = 0.6;
 
 /// After this many consecutive gated (MTP-disabled) turns, the MTP
@@ -222,9 +216,8 @@ pub(crate) fn mtp_gate_allows(
 }
 
 /// Minimum GPU architecture generation for chained MTP cycles to default ON.
-/// M5+ (gen >= 17): chained is measured net-positive (affine +16%, nvfp4 byte-
-/// identical to AR). On M1–M4 (gen 13–16) a lazy-slice eval-scheduling stall makes
-/// chained regress depth-3 acceptance, so it defaults OFF there pending that fix.
+/// M5+ (gen >= 17): chained is net-positive. On M1–M4 (gen 13–16) a lazy-slice
+/// eval-scheduling stall regresses depth-3 acceptance, so it defaults OFF there.
 /// Override either way with MLX_MTP_CHAINED_CYCLES=0/1.
 const CHAINED_CYCLES_MIN_GPU_GEN: i32 = 17;
 
@@ -238,10 +231,8 @@ const CHAINED_CYCLES_MIN_GPU_GEN: i32 = 17;
 // of the next-cycle draft's first inputs rather than a late dependency
 // materialized inside the draft graph build.
 //
-// Default ON on M5+ (GPU arch gen >= 17), where chaining is measured
-// net-positive (affine +16%, nvfp4 byte-identical to AR). Default OFF on M1–M4
-// (gen 13–16), where a lazy-slice eval-scheduling stall makes chained regress
-// depth-3 acceptance — pending that fix.
+// Default ON on M5+ (gen >= 17), OFF on M1–M4 (gen 13–16) where a lazy-slice
+// eval-scheduling stall regresses depth-3 acceptance.
 //
 // Override either direction with the env var: explicit `0` / `false` / `off`
 // forces OFF even on M5+; explicit `1` / `true` / `on` forces ON even on M1–M4
@@ -574,18 +565,11 @@ pub(crate) fn trace_acceptance_dense(
     Ok(())
 }
 
-// =============================================================================
-// Eager AR decode driver (`DecodeOps` + `decode_loop!`) — the token-by-token
-// decode loop for the qwen3_5 dense/MoE MTP and vision whole-turn cores.
-//
-// The qwen3_5 dense/MoE whole-turn cores behind the engine's `mtp_turn` /
-// `vision_turn` probes (`vision_mtp_whole_turn_core` and the delta/streaming
-// twins in `models/qwen3_5/model.rs` and `models/qwen3_5_moe/model.rs`) invoke
-// `decode_loop!` for their AR arms (plain AR turns; vision turns;
-// the MTP-ineligible delta shapes). The MTP propose/verify loop
-// those cores interleave with now lives in `crate::engine::mtp_turn`, so the
-// AR macro lives HERE next to the MTP draft/verify helpers it shares.
-// =============================================================================
+// Eager AR decode driver (`DecodeOps` + `decode_loop!`): the AR arms of the
+// qwen3_5 dense/MoE whole-turn cores (plain AR turns; vision turns; the
+// MTP-ineligible delta shapes). The MTP propose/verify loop those cores
+// interleave with lives in `crate::engine::mtp_turn`, so the AR macro lives
+// HERE next to the MTP draft/verify helpers it shares.
 
 /// Closures for model-specific operations in the AR decode loop.
 ///
@@ -604,7 +588,7 @@ where
 }
 
 /// Pipelined eager decode loop for the qwen3_5 dense/MoE MTP and vision
-/// whole-turn cores (see the banner above; the engine's generic chat flow
+/// whole-turn cores (the engine's generic chat flow
 /// uses [`crate::engine::decode::run_decode_loop`]).
 ///
 /// Generates the token-by-token decode loop with:
@@ -618,7 +602,7 @@ where
 /// The optional `streaming:` block adds callback emission, cancellation,
 /// incremental detokenization, and is_reasoning tagging.
 ///
-/// The optional `cancel:` fragment (H2, MUTUALLY EXCLUSIVE with
+/// The optional `cancel:` fragment (MUTUALLY EXCLUSIVE with
 /// `streaming:` by convention — streaming already polls its own flag)
 /// takes an `Option<&AtomicBool>` and compiles in a per-step cancel poll
 /// at the SAME loop position as the streaming block's poll, breaking
@@ -763,7 +747,7 @@ macro_rules! decode_loop {
                 );
             }
 
-            // Sync-turn cancel poll (H2; conditionally compiled via the
+            // Sync-turn cancel poll (conditionally compiled via the
             // `cancel:` macro repetition). Same snapshot point as the
             // streaming block's poll below: after the sampled token is
             // pushed/observed, before EOS/repetition checks.
@@ -1020,7 +1004,7 @@ mod decode_loop_sync_cancel_tests {
         MxArray::from_float32(&row, &[1, vocab])
     }
 
-    /// H2: the `cancel:` fragment must stop the flat AR `decode_loop!`
+    /// The `cancel:` fragment must stop the flat AR `decode_loop!`
     /// (the dense/MoE SYNC whole-turn AR arm) at the per-step poll — the
     /// SAME loop position as the `streaming:` block's poll — with
     /// `finish_reason == "cancelled"`. The mock forward flips the shared

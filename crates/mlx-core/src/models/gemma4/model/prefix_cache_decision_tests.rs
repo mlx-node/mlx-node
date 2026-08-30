@@ -13,10 +13,8 @@
 //! route to `Miss`, not to `StrictExtendHit`. Treating exact-match as a
 //! shortcut would corrupt the next warm-hit turn by advancing cache
 //! state to `prompt + last_token` while the history write-back only
-//! persists `tokens + generated`. The `#[ignore]`-gated integration
-//! tests above exercise the end-to-end behaviour against a loaded
-//! Gemma4 model; this module guarantees the decision logic stays
-//! correct in every CI run without a model dependency.
+//! persists `tokens + generated`. This module guarantees the decision logic
+//! stays correct in every CI run without a model dependency.
 
 use super::{PrefixCacheDecision, classify_prefix_cache_decision};
 

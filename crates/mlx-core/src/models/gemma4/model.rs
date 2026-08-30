@@ -201,14 +201,11 @@ pub(crate) struct Gemma4Inner {
     /// `active_paged_seq`.
     active_flat_session: bool,
     /// Tokens (post image-expansion) whose KV state is currently live in
-    /// `caches`. Maintained in parallel with `caches` for prefix-reuse
-    /// verification in Step 5c. Empty when no session is active.
+    /// `caches`. Empty when no session is active.
     pub(crate) cached_token_history: Vec<u32>,
-    /// Content hash of the image set associated with the live cache. Used
-    /// in Step 5c to detect mid-session image changes (which require a
-    /// full session restart). Preserved with the ordered image-position
-    /// sidecar across successful warm text saves so subsequent registrations
-    /// retain the exact image-aware cache lineage.
+    /// Content hash of the live cache's image set; a change mid-session forces a
+    /// full restart. Preserved with the ordered image-position sidecar across
+    /// warm text saves so later registrations keep the same image-aware lineage.
     pub(crate) cached_image_key: Option<u64>,
     /// Content hash of the audio set associated with the live cache. Audio
     /// counterpart of `cached_image_key`: set after an audio prefill so a
@@ -249,11 +246,9 @@ pub(crate) struct Gemma4Inner {
     /// stepper. Always `None`
     /// outside a live draft whole-turn.
     pub(crate) draft_turn_state: Option<crate::models::gemma4::dspark_decode::Gemma4DraftTurnState>,
-    /// Cached result of `compute_layer_kinds_from_kv_cache_specs(&config)`,
-    /// computed once here in `Gemma4Inner::new` instead of re-derived
-    /// (BTreeMap/BTreeSet grouping + a sort) on every paged prefill-chunk /
-    /// decode-step call. Pure function of the immutable `config`, so it
-    /// never changes for the lifetime of this instance. Empty when
+    /// `compute_layer_kinds_from_kv_cache_specs(&config)`, computed once in
+    /// `Gemma4Inner::new`. Pure function of the immutable `config`, so it never
+    /// changes for the lifetime of this instance. Empty when
     /// `paged_adapter` is `None`: every paged-only call site that reads it
     /// errors out on a `None` adapter before consuming the value.
     pub(crate) layer_kinds: Vec<Gemma4LayerKind>,
@@ -412,21 +407,8 @@ const GEMMA4_SLIDING_ANCHOR_MAX_RUNGS: usize = 4;
 /// the pre-ladder reserve — at the same conservative 4 bytes/element
 /// [`gemma4_sliding_checkpoint_estimated_bytes`] uses.
 ///
-/// Measured against the checkpoint that found this bug
-/// (`Gemma-4-12B-IT-nvidia-mxfp-mlx`: 40 physical sliding layers, window 1024,
-/// 8 kv heads, head_dim 256, `block_size` 16):
-///
-/// ```text
-///   full window            671.1 MB    pre-ladder reserve (2 slots)  1342.2 MB
-///   rung   64   41.9 MB    rung  256   167.8 MB
-///   rung 1024  671.1 MB    rung 4096   671.1 MB   (payload capped at a window)
-///   -> anchors 1551.9 MB + reserve 1342.2 MB = 2894.1 MB  <= 3072 MB
-///   -> a fifth rung at 16384 would need 3565.2 MB and is refused
-/// ```
-///
-/// Actual bf16 residency is half of that (~1.4 GB), and only on a turn that
-/// writes a sidecar. The 4 bytes/element figure is kept because the snapshot
-/// type still promises no dtype; see the estimator's own comment.
+/// The 4 bytes/element figure is deliberately conservative: the snapshot type
+/// promises no dtype, so the estimate must not assume bf16.
 const GEMMA4_SLIDING_LADDER_MEMORY_BUDGET_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -451,18 +433,12 @@ struct Gemma4SlidingPrefixCheckpoint {
 /// Everything a publishing site honestly knows about a checkpoint it just
 /// produced. `cold_anchor_rung` is deliberately NOT among those fields.
 ///
-/// d134ab3e claimed the flag was derived "from the same caps that gate
-/// publishing, so a publishing site cannot forget to mark a rung". That was
-/// false: two of the four publish sites open-coded the deque push and hard-coded
-/// the flag `false`, and two more passed a dead `false` through the upsert. Four
-/// identical literals, two load-bearing, and a genuine rung born with the flag
-/// clear is the ladder's PREFERRED eviction victim — the exact "born then
-/// evicted" failure the ladder exists to fix.
+/// A genuine rung born with the flag clear is the ladder's PREFERRED eviction
+/// victim — the exact "born then evicted" failure the ladder exists to fix.
 ///
 /// A draft cannot be pushed into the store, and
 /// [`Gemma4SlidingPrefixCheckpointDraft::into_checkpoint`] is the only place in
-/// the file that writes the flag, so the claim is now structural rather than
-/// aspirational.
+/// the file that writes the flag, so a publish site cannot mis-mark a rung.
 #[derive(Clone)]
 struct Gemma4SlidingPrefixCheckpointDraft {
     prefix_len: u32,
@@ -502,11 +478,8 @@ impl Gemma4Model {
     /// **Prefer [`Gemma4Model::load`]** for any real usage — `new(config)`
     /// is a config-only stub that matches the OCR-model pattern
     /// (`VLModel::new(config)`, `QianfanOCRModel::new(config)`) and is
-    /// intentionally NOT runnable. It was introduced in the cache-limit
-    /// coordinator work so that the coordinator's per-model delta is
-    /// registered exclusively on the `load()` path, eliminating a
-    /// baseline-registration gap where a no-op `new(config)` would have
-    /// leaked an empty guard into the coordinator.
+    /// intentionally NOT runnable: the cache-limit coordinator's per-model delta is
+    /// registered exclusively on the `load()` path.
     ///
     /// This path does NOT spawn a model thread, NOT materialize any
     /// weights, and NOT register with the cache-limit coordinator. The
@@ -520,10 +493,8 @@ impl Gemma4Model {
     /// stub to keep `ChatSession.reset()` idempotent across both
     /// runnable and stub instances.
     ///
-    /// A runnable model requires `await Gemma4Model.load(path)`. The
-    /// constructor signature is fixed by NAPI-RS; the stub-only behavior is
-    /// covered by the regression tests in
-    /// `__test__/models/model-loader-gemma4.test.ts`.
+    /// A runnable model requires `await Gemma4Model.load(path)`. The constructor
+    /// signature is fixed by NAPI-RS.
     #[napi(constructor)]
     pub fn new(config: Gemma4Config) -> Self {
         let has_vision = config.vision_config.is_some() || config.unified_vision_config.is_some();
@@ -553,10 +524,8 @@ impl Gemma4Model {
     ///
     /// `true` iff `Gemma4Inner::paged_adapter` was successfully
     /// constructed at load time (driven by
-    /// `Gemma4Config::use_block_paged_cache`). The
-    /// `gemma4_paged_vs_flat_parity` integration test pins greedy
-    /// byte-equal at BF16 against real Gemma-4-E2B-IT weights. Stubs
-    /// constructed via `new(config)` always return `false`. Surfaced
+    /// `Gemma4Config::use_block_paged_cache`). Stubs constructed via
+    /// `new(config)` always return `false`. Surfaced
     /// through this NAPI method so server endpoints can branch on it
     /// without a model-thread roundtrip.
     #[napi]

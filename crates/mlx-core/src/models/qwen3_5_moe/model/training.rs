@@ -52,14 +52,11 @@ impl Qwen35MoeInner {
 
         let mut params: HashMap<String, MxArray> = HashMap::new();
 
-        // Embedding
         params.insert("embedding.weight".to_string(), self.embedding.get_weight());
 
-        // Transformer layers
         for (i, layer) in self.layers.iter().enumerate() {
             let prefix = format!("layers.{}", i);
 
-            // Attention weights
             match &layer.attn {
                 AttentionType::Linear(gdn) => {
                     params.insert(
@@ -130,7 +127,6 @@ impl Qwen35MoeInner {
                     );
                 }
                 MLPType::MoE(moe) => {
-                    // Router gate
                     params.insert(format!("{}.mlp.gate.weight", prefix), moe.get_gate_weight());
                     // Expert weights (3D: [num_experts, out, in])
                     let switch_mlp = moe.get_switch_mlp();
@@ -146,7 +142,6 @@ impl Qwen35MoeInner {
                         format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
                         switch_mlp.get_down_proj_weight(),
                     );
-                    // Shared expert
                     params.insert(
                         format!("{}.mlp.shared_expert.gate_proj.weight", prefix),
                         moe.get_shared_expert_gate_proj_weight(),
@@ -159,7 +154,6 @@ impl Qwen35MoeInner {
                         format!("{}.mlp.shared_expert.down_proj.weight", prefix),
                         moe.get_shared_expert_down_proj_weight(),
                     );
-                    // Shared expert gate
                     params.insert(
                         format!("{}.mlp.shared_expert_gate.weight", prefix),
                         moe.get_shared_expert_gate_weight(),
@@ -167,7 +161,6 @@ impl Qwen35MoeInner {
                 }
             }
 
-            // Layer norms
             params.insert(
                 format!("{}.input_layernorm.weight", prefix),
                 layer.get_input_layernorm_weight(),
@@ -178,13 +171,11 @@ impl Qwen35MoeInner {
             );
         }
 
-        // Final norm
         params.insert(
             "final_norm.weight".to_string(),
             self.final_norm.get_weight(),
         );
 
-        // LM head (only if not tied to the embedding)
         if !self.config.tie_word_embeddings
             && let Some(ref lm_head) = self.lm_head
         {
@@ -790,9 +781,8 @@ impl Qwen35MoeInner {
         if loss_value.is_nan() || loss_value.is_infinite() {
             warn!("Skipping step due to invalid loss: {}", loss_value);
             synchronize_and_clear_cache();
-            // Skipped steps must still advance the authoritative step counter
-            // (H1) and drop the cached generation so the next cycle starts
-            // clean.
+            // Skipped steps must still advance the authoritative step counter and
+            // drop the cached generation so the next cycle starts clean.
             let ts = self.training_state.as_mut().ok_or_else(|| {
                 Error::from_reason("Training state disappeared during GRPO loss handling")
             })?;
@@ -852,8 +842,8 @@ impl Qwen35MoeInner {
                     );
                 }
 
-                // Advance the authoritative step counter (H1) and clear the
-                // cached generation data so the next cycle starts clean.
+                // Advance the authoritative step counter and clear the cached
+                // generation data so the next cycle starts clean.
                 ts.clear_generation_cache();
                 ts.step += 1;
                 let new_step = ts.step;
@@ -1529,14 +1519,11 @@ impl Qwen35MoeInner {
 
         let mut params = HashMap::new();
 
-        // Embedding
         params.insert("embedding.weight".to_string(), self.embedding.get_weight());
 
-        // Transformer layers
         for (i, layer) in self.layers.iter().enumerate() {
             let prefix = format!("layers.{}", i);
 
-            // Attention weights
             match &layer.attn {
                 AttentionType::Linear(gdn) => {
                     params.insert(
@@ -1607,7 +1594,6 @@ impl Qwen35MoeInner {
                     );
                 }
                 MLPType::MoE(moe) => {
-                    // Router gate
                     params.insert(format!("{}.mlp.gate.weight", prefix), moe.get_gate_weight());
                     // Expert weights (3D: [num_experts, out, in])
                     let switch_mlp = moe.get_switch_mlp();
@@ -1623,7 +1609,6 @@ impl Qwen35MoeInner {
                         format!("{}.mlp.switch_mlp.down_proj.weight", prefix),
                         switch_mlp.get_down_proj_weight(),
                     );
-                    // Shared expert
                     params.insert(
                         format!("{}.mlp.shared_expert.gate_proj.weight", prefix),
                         moe.get_shared_expert_gate_proj_weight(),
@@ -1636,7 +1621,6 @@ impl Qwen35MoeInner {
                         format!("{}.mlp.shared_expert.down_proj.weight", prefix),
                         moe.get_shared_expert_down_proj_weight(),
                     );
-                    // Shared expert gate
                     params.insert(
                         format!("{}.mlp.shared_expert_gate.weight", prefix),
                         moe.get_shared_expert_gate_weight(),
@@ -1644,7 +1628,6 @@ impl Qwen35MoeInner {
                 }
             }
 
-            // Layer norms
             params.insert(
                 format!("{}.input_layernorm.weight", prefix),
                 layer.get_input_layernorm_weight(),
@@ -1655,13 +1638,11 @@ impl Qwen35MoeInner {
             );
         }
 
-        // Final norm
         params.insert(
             "final_norm.weight".to_string(),
             self.final_norm.get_weight(),
         );
 
-        // LM head (only if not tied)
         if !self.config.tie_word_embeddings
             && let Some(ref lm_head) = self.lm_head
         {

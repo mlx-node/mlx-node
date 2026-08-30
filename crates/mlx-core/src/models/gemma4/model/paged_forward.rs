@@ -116,24 +116,12 @@ impl Gemma4Inner {
     ///
     /// ## Prefill split (parity with the flat path)
     ///
-    /// The flat path's `prefill_body_gemma4` processes tokens
-    /// `[0..N-1]` through `forward_body`, then the caller runs a
-    /// SECOND, single-token `forward_inner` for the final token. That
-    /// second dispatch is load-bearing — see the doc-comment on
-    /// `prefill_body_gemma4`: "SDPA computes slightly different
-    /// numerical results for multi-token causal attention vs
-    /// single-token attention with cached K/V. These small differences
-    /// compound through layers, causing divergent logits if the last
-    /// prompt token is processed in the same batch as the rest."
-    ///
-    /// This function mirrors that split for the paged path so the
-    /// K/V-cache reduction order at the prefill→decode boundary
-    /// matches between flat and paged. Without the split, BF16 SDPA
-    /// drift on the last layer's hidden state at step 0 (~1%) flips
-    /// argmax to a nearby zero-embedding `<unused>` token, causing the
-    /// `<turn|>` stop signal to be missed and the decoder to fall into
-    /// the all-zero-input cycle (`mean(V)` attention output → `id+1`
-    /// counting cascade).
+    /// The final prompt token runs its OWN single-token forward, mirroring
+    /// the flat path's `prefill_body_gemma4` split, so the K/V reduction
+    /// order at the prefill→decode boundary matches between flat and paged.
+    /// Merging it into the body lets BF16 SDPA drift flip argmax to a
+    /// zero-embedding `<unused>` token: the `<turn|>` stop is missed and the
+    /// decoder falls into the all-zero-input `mean(V)` → `id+1` cascade.
     ///
     /// `draft_tap` is `Some` on a DSpark speculative turn: each chunk's
     /// residual hiddens are cloned, fused, and appended to the draft's
@@ -850,8 +838,7 @@ impl Gemma4Inner {
         let last_image_exclusive = image_token_positions
             .last()
             .map(|(position, _)| position.saturating_add(1));
-        // Preserve the established prefill chunk boundaries even though the
-        // retired private rotating-cache checkpoint publisher is gone.
+        // Preserve the established prefill chunk boundaries.
         let leading_text_checkpoint_boundary = if overlay_active {
             0
         } else {
@@ -868,7 +855,7 @@ impl Gemma4Inner {
         if pass1_position < pass1_end {
             let configured_chunk_size = crate::array::paged_prefill_chunk_size();
             while pass1_position < pass1_end {
-                // Cooperative-cancel checkpoint (H1b): abort at the chunk
+                // Cooperative-cancel checkpoint: abort at the chunk
                 // boundary. Both VLM cores fail closed on Err via
                 // `invalidate_gemma4_hybrid_session` — the request is
                 // released, never finalized.
@@ -1274,13 +1261,11 @@ impl Gemma4Inner {
     ///   prefix_checkpoint  -> the store holds that entry AND every shallower
     ///                         rung of the same lineage (Ladder defers them)
     ///   replay arm         -> primed == 0. The pass-1 loop crosses the whole
-    ///                         grid itself only when cached_prefix_len == 0 too;
-    ///                         see below for the case where it is not.
+    ///                         grid itself only when cached_prefix_len == 0 too.
     /// ```
     ///
-    /// This routine is retained only inside the legacy prefill diagnostic
-    /// implementation below. Production grouped text restore installs the
-    /// sliding adapters directly and never reconstructs them through this flat
+    /// The only caller is the VLM leading-text replay; grouped text restore
+    /// installs the sliding adapters directly and never goes through this flat
     /// replay path.
     pub(super) fn run_sliding_only_prefill(
         &mut self,
@@ -1427,18 +1412,13 @@ impl Gemma4Inner {
         ))
     }
 
-    // =================================================================
-    // Session-specific stop-token resolution. Conversation structure is
-    // rendered exclusively by the checkpoint-provided chat template in the
+    // Conversation structure is rendered by the checkpoint's chat template in the
     // shared engine; this family supplies only its terminal token policy.
-    // =================================================================
 
     /// Resolve the token id for Gemma4's `<turn|>` turn terminator.
     ///
     /// Used as the `eos_token_id` in the session-start path so the
-    /// decode loop stops at the model's turn boundary. Computed on demand
-    /// rather than cached — encoding a special token is O(1) and the cost is
-    /// trivial relative to a chat turn.
+    /// decode loop stops at the model's turn boundary.
     pub(crate) fn turn_end_id(&self) -> Result<u32> {
         let tokenizer = self
             .tokenizer

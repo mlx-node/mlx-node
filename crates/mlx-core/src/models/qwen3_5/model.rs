@@ -216,7 +216,7 @@ pub(crate) struct Qwen35Inner {
     /// K/V remains in `paged_adapter`; each table value contains only the
     /// corresponding request's two GDN arrays at every linear layer.
     ///
-    /// The table has the Stage-2 two-unit cap. One state may be temporarily
+    /// The table has a two-unit cap. One state may be temporarily
     /// activated in `caches` for serial prefill/finalization, so activation
     /// first parks the previous owner and then removes the next owner from the
     /// table. Batched decode parks the active owner and stacks table rows.
@@ -631,14 +631,8 @@ impl Qwen3_5Model {
         .await
     }
 
-    // ---------------------------------------------------------------
-    // Test-only helpers: streaming session entry points that bypass
-    // ThreadsafeFunction and expose the mpsc receiver directly. Used
-    // by `crates/mlx-core/tests/qwen3_5_delta_chat.rs` to exercise the
-    // streaming path from a pure-Rust integration test without a NAPI
-    // host. Marked `#[doc(hidden)]` because they're not part of the
-    // public API surface.
-    // ---------------------------------------------------------------
+    // Test-only streaming entry points that bypass ThreadsafeFunction and hand
+    // back the mpsc receiver, for `crates/mlx-core/tests/qwen3_5_delta_chat.rs`.
 
     /// Test-only entry point that dispatches `ChatStreamSessionStart`
     /// and returns the raw mpsc receiver the model thread writes into.

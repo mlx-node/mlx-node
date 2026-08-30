@@ -358,17 +358,12 @@ fn twelve_b_sliding_config() -> super::Gemma4Config {
 
 /// Geometries the byte cap must hold on besides the 12B.
 ///
-/// These are NOT claims about `Gemma-4-26B-A4B` or `Gemma-4-E2B`
-/// specifically: this repo carries no config for either and neither was
-/// available locally, so encoding one under that name would be a guess
-/// dressed as a fixture. What they do encode are the AXES a second geometry
-/// moves — KV sharing (which turns trailing sliding layers into aliases and
-/// so shrinks a checkpoint), a narrower window with fewer/smaller heads
-/// (which makes checkpoints cheap enough that the COUNT cap already fits the
-/// budget), and an all-global stack (no sliding state at all, where the byte
-/// cap must be an inert no-op rather than a divide-by-zero). Pinning the
-/// invariant across all four is the point; pinning it on one shape is how
-/// the count cap came to be treated as a byte cap in the first place.
+/// These encode the AXES a second geometry moves — KV sharing (which turns
+/// trailing sliding layers into aliases and so shrinks a checkpoint), a
+/// narrower window with fewer/smaller heads (which makes checkpoints cheap
+/// enough that the COUNT cap already fits the budget), and an all-global stack
+/// (no sliding state at all, where the byte cap must be an inert no-op rather
+/// than a divide-by-zero).
 fn kv_shared_sliding_config() -> super::Gemma4Config {
     sliding_config(48, 1024, 8, 256, Some(4))
 }
@@ -527,11 +522,9 @@ fn deepest_reachable(retained: &[u32], chain_reach_tokens: u32) -> Option<u32> {
 ///
 /// A restated COPY of the READ path, never a call into the capture-side
 /// helpers it exists to pin — the same discipline
-/// `cold_tier_parity_harness::expected_checkpoint_ladder` follows. A test
-/// that derived its expectation from
-/// `gemma4_cold_restore_reachable_boundary` would move with that function
-/// and could never fail, which is exactly how the one-block gap survived
-/// three green suites.
+/// `cold_tier_parity_harness::expected_checkpoint_ladder` follows. Deriving the
+/// expectation from `gemma4_cold_restore_reachable_boundary` would make this
+/// tautological.
 ///
 /// ```text
 ///   Gemma4Inner::prepare_gemma4_paged_turn
@@ -597,13 +590,10 @@ fn the_capture_ceiling_is_exactly_the_deepest_boundary_a_restore_can_probe() {
     }
 }
 
-/// The one-block gap, with the numbers it was measured at.
+/// The one-block gap.
 ///
-/// A 4-token A/B on Gemma-4-26B-A4B-IT-UD-Q4_K_XL-mlx, everything else held
-/// constant: the 6572-token prompt restored 6560 of 6572 tokens, the
-/// 6576-token one restored ZERO. The only difference is that 6576 is a
-/// multiple of 16, which puts the prompt-boundary checkpoint one block above
-/// `max_cache_hit_tokens`.
+/// A block-aligned prompt puts the prompt-boundary checkpoint one block above
+/// `max_cache_hit_tokens`, so the restore can never name it.
 #[test]
 fn a_block_aligned_prompt_is_the_only_case_the_prompt_boundary_outruns_the_restore() {
     const BS: u32 = 16;
@@ -661,15 +651,8 @@ fn a_block_aligned_prompt_is_the_only_case_the_prompt_boundary_outruns_the_resto
 /// candidates are real, and turn N+1 of a growing conversation, whose
 /// prompt contains them, really could name them.
 ///
-/// It is kept broad anyway, and this test is the ledger for that choice.
-/// One sidecar is written per turn, so the clamp is a PRIORITY rule: it
-/// spends the turn's single write on the deepest boundary a restore of THIS
-/// prompt can name — the replay a cold tier exists for, and the case that
-/// measured zero reuse — instead of on a deeper boundary that pays off only
-/// if the conversation continues with exactly these tokens. The give-up is
-/// bounded by one turn: turn N+1's own ceiling covers everything turn N
-/// discarded, so the deeper boundaries are lost only to a process that dies
-/// between the two finalizes.
+/// Kept broad anyway: one sidecar per turn, spent on the deepest boundary a
+/// restore of THIS prompt can name. Turn N+1's ceiling covers the rest.
 #[test]
 fn the_capture_ceiling_gives_up_this_turns_generated_region_and_the_next_turn_covers_it() {
     const BS: u32 = 16;
@@ -746,7 +729,7 @@ fn the_cold_tail_checkpoint_is_needed_exactly_when_the_prompt_is_block_aligned()
     }
 }
 
-/// THE persistence-OFF transparency claim for this change, as a test.
+/// The persistence-OFF transparency claim, as a test.
 ///
 /// Chunk length is the GEMM's `M`, and the retained checkpoint set decides
 /// which one a later warm turn resumes from, so both are observable in the
@@ -897,11 +880,8 @@ fn a_ragged_prompt_publishes_no_tail_beside_the_prompt_boundary_it_coincides_wit
 /// The descent must step PAST what is already on disk, or a poisoned root
 /// never heals.
 ///
-/// The scenario is the one users already have: a pre-fix run anchored a
-/// sidecar at the aligned prompt boundary 6576, which no restore can name.
-/// Everything shallower is still missing. A walk that stops at the first
-/// already-persisted candidate writes nothing, this turn and every turn
-/// after it, because the key it recomputes is the same key.
+/// A walk that stops at the first already-persisted candidate writes nothing,
+/// this turn and every turn after it, because it recomputes the same key.
 #[test]
 fn the_capture_descends_past_boundaries_already_on_disk() {
     // Deepest first, exactly as `find_gemma4_sliding_capture_checkpoints`
@@ -962,9 +942,6 @@ fn the_capture_descends_past_boundaries_already_on_disk() {
 /// `Underivable` and `Persisted` are opposite states of the tier — one
 /// means nothing was ever written at that boundary, the other means
 /// something was — and the capture records a different counter for each.
-/// When the walk returned `(None, 0)` for both, the all-`Underivable` turn
-/// bumped `already_persisted`, so a root holding nothing reported itself
-/// full.
 #[test]
 fn an_all_underivable_descent_is_not_an_already_persisted_one() {
     let candidates = [6576u32, 6560, 4096, 1024];
@@ -1081,20 +1058,9 @@ fn gemma4_sliding_checkpoint_bytes_scale_with_min_boundary_window() {
 
 /// The headline gate for the gemma4 cold-tier ladder.
 ///
-/// Reproduced twice on real weights before the fix
-/// (`Gemma-4-12B-IT-nvidia-mxfp-mlx`, 8140-token prompt, `mlx agent`):
-///
-/// ```text
-///   W1 cold     chain reach  576 tok (36 blk)   0 sliding_window sidecars
-///   W2 restart  chain reach 1136 tok (71 blk)   0 sliding_window sidecars
-///   trace: sliding_cold_sidecar_capture_skipped
-///          reason=no_representable_checkpoint_at_or_below_chain_reach
-/// ```
-///
-/// The store finished at `{7168, 8128}` both times: the cadence fires every
-/// window, `limit` is 2 on this geometry, and the pre-ladder victim is the
-/// oldest entry — so the rung at 1024 was born and then evicted, and
-/// nothing at or below the chain's reach was left.
+/// The cadence fires every window and the pre-ladder victim is the oldest
+/// entry, so the rung at 1024 was born and then evicted, and nothing at or
+/// below the chain's reach was left.
 #[test]
 fn gemma4_sliding_ladder_retains_a_rung_the_lagging_chain_can_reach() {
     let config = twelve_b_sliding_config();
@@ -1126,9 +1092,8 @@ fn gemma4_sliding_ladder_retains_a_rung_the_lagging_chain_can_reach() {
     );
 }
 
-/// Lesson (a) from qwen3.5's GDN ladder, which shipped broken twice: a
-/// request with no cold tier must retain exactly what it retained before
-/// the ladder existed. Which checkpoint a later warm turn lands on decides
+/// A request with no cold tier must retain exactly what it retained before the
+/// ladder existed. Which checkpoint a later warm turn lands on decides
 /// whether `prepare_gemma4_sliding_prefix` installs a snapshot or replays
 /// the whole cached prefix, and those emit different tokens.
 #[test]
@@ -1240,7 +1205,7 @@ fn gemma4_sliding_decode_publishes_the_rungs_the_cadence_skips() {
     );
 }
 
-/// Defect A: a checkpoint that genuinely sits on a rung but was born with
+/// A checkpoint that genuinely sits on a rung but was born with
 /// `cold_anchor_rung` clear is the ladder's PREFERRED eviction victim, so
 /// the rung the decode path just published is the FIRST thing thrown away.
 ///
@@ -1336,20 +1301,13 @@ fn gemma4_sliding_warm_turn_keeps_the_rungs_it_cannot_republish() {
     );
 }
 
-/// Defect C: the ladder's `limit` is a COUNT derived from a byte budget on
-/// the assumption that the extra slots hold cheap sub-window rungs —
-/// `gemma4_sliding_cold_anchor_rungs` prices a 64-token rung at 41.9 MB
-/// rather than 671.1 MB, which is the only reason a fourth rung fit. Nothing
-/// forces the retained set to BE that mix. Once the cursor is past one
-/// window every retained entry costs a full window:
+/// The ladder's `limit` is a COUNT derived from a byte budget on the
+/// assumption that the extra slots hold cheap sub-window rungs. Nothing forces
+/// the retained set to BE that mix: once the cursor is past one window every
+/// retained entry costs a full window and the set overruns the budget.
 ///
-/// ```text
-///   6 x 671.1 MB = 4026 MB   vs   budget 3072 MB    (+31%)
-/// ```
-///
-/// On unified memory that gigabyte is not taken from a spare tier; it comes
-/// out of the weights and the paged pool (see `docs/architecture.md`), and
-/// an oversized pool separately costs ~10x on long-context decode.
+/// On unified memory that overrun is not taken from a spare tier; it comes out
+/// of the weights and the paged pool (see `docs/architecture.md`).
 #[test]
 fn gemma4_sliding_ladder_bounds_the_retained_set_in_bytes_not_entries() {
     let block_size = 16u32;
@@ -1431,14 +1389,9 @@ fn gemma4_sliding_ladder_bounds_the_retained_set_in_bytes_not_entries() {
 /// refusal in `capture_gemma4_sliding_cold_sidecar` lifts, while the
 /// protected entries stay in the store.
 ///
-/// ```text
-///   store            img@2048  img@3072   256    1024   4096   deep@5120
-///   bytes (MB)          671.1     671.1  167.8   671.1  671.1      671.1
-///   total 3523.2 MB  >  3072 MB ceiling  ->  the byte loop must evict
-///
-///   shallowest-first   evicts 256 then 1024   ->  chain@544 reaches NOTHING
-///   deepest-anchor     evicts 4096            ->  chain@544 reaches 256
-/// ```
+/// Shallowest-first eviction would take the only rungs a lagging chain can
+/// reach; evicting the deepest anchor clears the overrun in one step and keeps
+/// them.
 ///
 /// Evicting the deepest anchor is the cheap answer as well as the right
 /// one: one eviction clears the overrun where the shallow rungs take two.
@@ -1512,10 +1465,9 @@ fn gemma4_sliding_ladder_byte_budget_never_evicts_the_shallowest_reachable_rung(
 /// Persistence-OFF, the byte axis. `PreLadder` carries the SAME per-entry
 /// cost model as `Ladder` (see `Gemma4SlidingRetentionCaps::bytes`), so the
 /// only thing keeping the byte cap off a persistence-OFF turn is `policy`.
-/// An override of 8 on the 12B geometry is 5120 MB — well over the ladder's
-/// 3072 MB ceiling — and it must still retain all 8, because a smaller
-/// retained set moves which checkpoint a later warm turn resumes from and
-/// that changes emitted tokens.
+/// An operator override must still retain every entry it asks for, even when
+/// that is well over the ladder's ceiling: a smaller retained set moves which
+/// checkpoint a later warm turn resumes from, and that changes emitted tokens.
 #[test]
 fn gemma4_persistence_off_is_never_trimmed_by_the_ladder_byte_budget() {
     let config = twelve_b_sliding_config();
@@ -1624,10 +1576,8 @@ fn gdn_sidecar_policy() -> mlx_paged_attn::ColdSidecarPolicy {
 /// `gemma4_sliding_cold_ladder_wanted` decides FOUR things — whether the
 /// prefill publishes rungs, whether a stored entry is FLAGGED a rung,
 /// whether decode publishes off-cadence, and whether the ladder byte cap
-/// runs — and until now nothing ran it. Every test built its caps by handing
-/// `gemma4_sliding_retention_caps_for_override` an explicit boolean, so
-/// making this predicate return `false` unconditionally left the cold tier
-/// completely inert with the whole suite green.
+/// runs — so it must be executed for real here, not stubbed with an explicit
+/// boolean.
 ///
 /// What this cannot reach is the `paged_adapter -> cold_tier()` borrow in
 /// `Gemma4Inner::gemma4_sliding_retention_caps_for_turn`, which needs a
@@ -1697,11 +1647,8 @@ fn gemma4_sliding_cold_ladder_wants_a_ladder_only_for_a_sliding_window_sidecar()
 /// The decode publisher's DECISION, driven through production's own caps
 /// derivation rather than through the free predicate.
 ///
-/// Both decode tests above call `gemma4_sliding_decode_publishes_checkpoint`
-/// directly with hand-built caps, so hard-coding `want_ladder` to `false`
-/// inside the decode publisher reverted it to cadence-only — defect B fully
-/// un-fixed in production — with both of them still green. This one starts
-/// from a `ColdTierContext`, which is what the adapter actually hands over.
+/// Starts from a `ColdTierContext` — what the adapter actually hands over —
+/// rather than hand-built caps, so a hard-coded `want_ladder` cannot hide here.
 #[test]
 fn gemma4_sliding_decode_boundary_plan_reads_the_turns_real_cold_tier() {
     let config = twelve_b_sliding_config();
@@ -1753,12 +1700,8 @@ fn gemma4_sliding_decode_boundary_plan_reads_the_turns_real_cold_tier() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The decode publisher now tests the cheap cadence/grid arithmetic BEFORE
-/// deriving caps, because HEAD returned early on every non-boundary step
-/// and deriving caps walks `num_hidden_layers` three times over (96
-/// `String == "full_attention"` compares on the 12B) plus an env `OnceLock`
-/// read — per decode token, on every gemma4 paged turn, persistence-OFF
-/// included.
+/// The decode publisher screens on cheap cadence/grid arithmetic BEFORE
+/// deriving caps.
 ///
 /// A short-circuit that changes WHICH cursors publish would change emitted
 /// tokens, so pin the two against each other on every cursor across four
@@ -1834,10 +1777,8 @@ fn gemma4_sliding_anchor_grid_pretest_is_a_superset_of_every_published_rung() {
 }
 
 /// Production text of the family: the hub plus every seam it declares, in
-/// hub-first declaration order. There is no test text to trim any more — the
-/// unit-test modules are files of their own and none of them is a member here
-/// — so `gemma4_sliding_ladder_intent_has_one_production_source` asserts that
-/// separation instead of splitting on a header literal.
+/// hub-first declaration order; the `#[cfg(test)]` children and the
+/// `#[path]`-redirected scheduler are deliberately absent.
 static SOURCE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
     [
         include_str!("../model.rs"),
@@ -1876,16 +1817,8 @@ fn production_code_lines() -> Vec<&'static str> {
 /// literal) or by a LONE `=` (an assignment). `==` and `!=` are reads, and
 /// so is a bare `checkpoint.cold_anchor_rung` in a predicate.
 ///
-/// The `=` arm is the whole reason this is not a substring count. The guard
-/// this replaces was `matches("cold_anchor_rung:").count() == 2`, which sees
-/// struct-literal syntax only — so the shortest way to restore the defect it
-/// exists to prevent slipped straight past it:
-///
-/// ```text
-///   if let Some(last) = self.sliding_prefix_checkpoints.back_mut() {
-///       last.cold_anchor_rung = false;      // no colon: count stays 2
-///   }
-/// ```
+/// The `=` arm is why this is not a substring count: `last.cold_anchor_rung =
+/// false` is a write that a `"cold_anchor_rung:"` match would miss.
 fn cold_anchor_rung_write_sites() -> Vec<&'static str> {
     production_code_lines()
         .into_iter()
@@ -1928,10 +1861,9 @@ fn cold_anchor_rung_write_sites() -> Vec<&'static str> {
         .collect()
 }
 
-/// `cold_anchor_rung` is the ladder's whole eviction ordering, and d134ab3e
-/// shipped four visually identical `cold_anchor_rung: false` literals of
-/// which two were load-bearing and two were dead. A test cannot execute the
-/// publish sites without a GPU and real caches, so what is pinned here is
+/// `cold_anchor_rung` is the ladder's whole eviction ordering. A test cannot
+/// execute the publish sites without a GPU and real caches, so what is pinned
+/// here is
 /// the structure that makes the derivation unforgeable: production WRITES
 /// the field in exactly two places — the declaration, and the single
 /// derivation in `Gemma4SlidingPrefixCheckpointDraft::into_checkpoint`.
@@ -1964,17 +1896,9 @@ fn gemma4_sliding_anchor_flag_has_exactly_one_writer() {
 /// two call sites that consume it are only reachable with a GPU and a
 /// loaded checkpoint.
 ///
-/// Both of these mutations disconnect the feature in production and neither
-/// changed a single behavioural test:
-///
-/// ```text
-///   prefill orchestrator:  self.gemma4_sliding_retention_caps_for_turn(block_size)
-///                       -> gemma4_sliding_retention_caps(&config, block_size, false)
-///   decode publisher:      the same substitution
-/// ```
-///
-/// Both work by introducing a SECOND place that picks the `want_ladder`
-/// boolean. So what is pinned is that production picks it once: the
+/// A second place picking the `want_ladder` boolean disconnects the feature
+/// without failing any behavioural test, so what is pinned is that production
+/// picks it exactly once: the
 /// bool-taking constructors are called exactly where they are defined to be
 /// called, and the only producer of the boolean is
 /// `gemma4_sliding_cold_ladder_wanted`, whose behaviour
@@ -2114,8 +2038,8 @@ fn the_flat_draft_decode_path_never_touches_the_paged_adapter() {
 /// reaches the PAGED handler, where `run_paged_turn`'s speculative branch
 /// drives `run_paged_dspark_turn`.
 ///
-/// This is the positive control for the two edits that enable D1 — the
-/// `supports_paged_attention` flip and the scheduler's narrowed flat-lane
+/// Positive control for the two edits that route DSpark to the paged handler —
+/// the `supports_paged_attention` flip and the scheduler's narrowed flat-lane
 /// predicate. Either one alone is not enough: with the pools hidden
 /// (`install_flat_owner_caches`) a DSpark request advertises no
 /// speculative plan at all and downgrades to AR, which the second half of
@@ -3197,10 +3121,8 @@ fn gemma4_shared_pool_does_not_partition_a_full_sliding_window_per_slot() {
     );
 }
 
-/// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged
-/// adapter. The previous "None means no adapter" assertion was removed
-/// when the default flipped from `unwrap_or(false)` to `unwrap_or(true)`
-/// — the explicit-false path is the new "no adapter" guarantee.
+/// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged adapter —
+/// this is the only "no adapter" guarantee, since `None` defaults to on.
 #[test]
 fn test_gemma4_inner_no_paged_adapter_when_flag_is_explicit_false() {
     let cfg = paged_tiny_config(Some(false));
@@ -3495,10 +3417,6 @@ fn test_fresh_text_save_replaces_persistent_media_context() {
 /// prefix (live caches + matching `cached_token_history`), the audio guard
 /// must override the would-be hit. A continuable audio session (warm-
 /// continue) must NOT be forced to miss by this guard.
-///
-/// Pre-fix (image-only guard) this would return `cached.len()` for the
-/// non-continuable audio case — a HIT — because the audio key was ignored,
-/// so the first assertion below would fail.
 #[test]
 fn test_verify_cache_prefix_audio_key_forces_miss() {
     let cfg = paged_tiny_config(Some(false));
@@ -3763,7 +3681,7 @@ pub(crate) fn cast_paged_tiny_weights_to_bf16(inner: &mut super::Gemma4Inner) {
     }
 }
 
-/// Smoke test for `paged_turn_sync_core` via direct helper drives.
+/// Smoke test for the paged prefill/decode helpers, driven directly.
 ///
 /// Random-init weights cast to BF16 (the paged pool's expected
 /// dtype). Validates the adapter lifecycle (reset →
@@ -3885,8 +3803,6 @@ fn tiny_exclusive_next_token(
 
 /// A real hybrid Gemma wave must execute both rows in one model forward
 /// while preserving the greedy result of two isolated serial replays.
-/// This is the regression oracle that the former rotating-cache design
-/// could not satisfy.
 #[test]
 fn gemma4_hybrid_n2_batched_decode_matches_serial_rows() {
     if !crate::engine::persistence::compiled_forward_backend_available() {
@@ -4593,11 +4509,9 @@ fn test_gemma4_inner_caches_layer_kinds_matching_fresh_compute() {
     }
 }
 
-/// Manual timing probe (not a correctness gate — `#[ignore]`d so it
-/// never runs in CI). Measures the per-call cost this task eliminates:
-/// re-deriving the routing table from scratch (BTreeMap/BTreeSet + sort)
-/// vs. the cached `Vec::clone`. Pure CPU, no GPU/model weights, immune
-/// to thermal throttling. Run with:
+/// Manual timing probe (`#[ignore]`d, not a correctness gate): re-deriving the
+/// routing table from scratch vs. the cached `Vec::clone`. Pure CPU, no
+/// GPU/model weights, immune to thermal throttling. Run with:
 /// `cargo test -p mlx-core --release --lib -- --ignored --nocapture \
 ///  bench_layer_kinds_manual`
 #[test]

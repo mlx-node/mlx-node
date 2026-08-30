@@ -219,8 +219,6 @@ fn is_greedy_sampling(config: Option<SamplingConfig>) -> bool {
 ///
 /// When `inputs_embeds` is provided, uses it directly (skipping embedding lookup).
 /// When `per_layer_inputs` is provided, uses it directly (skipping PLE computation).
-///
-/// `layer_ids` order; the compute graph is otherwise unchanged.
 pub(crate) fn forward_body(
     input_ids: Option<&MxArray>,
     inputs_embeds: Option<MxArray>,
