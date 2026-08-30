@@ -139,7 +139,6 @@ impl Drop for SpecTurnEpilogue {
 /// derives the rollback itself.
 ///
 /// Not `Clone`/`Copy`: one cycle, one close.
-#[allow(dead_code)]
 #[must_use = "an open verify cycle must be closed by SpecPagedCache::commit_cycle"]
 #[derive(Debug)]
 pub(crate) struct VerifyTicket {
@@ -152,7 +151,6 @@ pub(crate) struct VerifyTicket {
     closed: bool,
 }
 
-#[allow(dead_code)]
 impl VerifyTicket {
     /// The one mint, deliberately module-private.
     ///
@@ -472,7 +470,6 @@ pub(crate) trait SpecPagedCache {
 
 /// The attention frontier `seq_id` sits at, or the error a cycle boundary
 /// reports when the cache cannot name one.
-#[allow(dead_code)]
 fn committed_attn_tokens<C: SpecPagedCache + ?Sized>(
     cache: &C,
     seq_id: u32,

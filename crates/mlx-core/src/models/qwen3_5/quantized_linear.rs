@@ -956,10 +956,6 @@ impl QuantizedLinear {
         }
     }
 
-    pub fn set_biases(&mut self, biases: Option<MxArray>) {
-        self.biases = biases;
-    }
-
     pub fn set_bias(&mut self, bias: Option<MxArray>) {
         self.bias = bias;
     }

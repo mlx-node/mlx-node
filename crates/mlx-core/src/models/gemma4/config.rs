@@ -282,16 +282,6 @@ impl Gemma4Config {
         }
     }
 
-    /// RoPE dimensions for global attention (partial rotation).
-    /// Uses `global_head_dim * partial_rotary_factor` because vLLM computes
-    /// `rotary_dim = int(head_size * partial_rotary_factor)` where `head_size`
-    /// is the per-layer head_dim (which is `global_head_dim` for global layers).
-    /// For E2B: 512 * 0.25 = 128 rotary dims.
-    pub fn rope_dims_global(&self) -> i32 {
-        let global_hd = self.effective_head_dim(true);
-        (global_hd as f64 * self.partial_rotary_factor) as i32
-    }
-
     /// RoPE dimensions for sliding attention (full rotation).
     pub fn rope_dims_sliding(&self) -> i32 {
         self.head_dim

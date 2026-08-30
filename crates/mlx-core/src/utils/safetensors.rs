@@ -65,20 +65,6 @@ impl SafeTensorDType {
             SafeTensorDType::F8_E4M3 => 1,
         }
     }
-
-    /// Convert to MLX DType if supported
-    pub fn to_mlx_dtype(&self) -> Option<DType> {
-        match self {
-            SafeTensorDType::F32 => Some(DType::Float32),
-            SafeTensorDType::F16 => Some(DType::Float16),
-            SafeTensorDType::BF16 => Some(DType::BFloat16),
-            SafeTensorDType::I32 => Some(DType::Int32),
-            SafeTensorDType::U8 => Some(DType::Uint8),
-            SafeTensorDType::U32 => Some(DType::Uint32),
-            SafeTensorDType::I8 => Some(DType::Int8),
-            _ => None, // Unsupported dtypes
-        }
-    }
 }
 
 /// Tensor metadata from SafeTensors header

@@ -13,7 +13,6 @@ use super::unified_vision_config::UnifiedVisionConfig;
 /// `patch_dim = model_patch_size^2 * 3`. There is no transformer encoder; the
 /// projected patches feed directly into `embed_vision`.
 pub struct Gemma4UnifiedVisionEmbedder {
-    patch_dim: i32,
     eps: f64,
     pub patch_ln1: LayerNorm,
     pub patch_dense: Linear,
@@ -29,7 +28,6 @@ impl Gemma4UnifiedVisionEmbedder {
         let embed_dim = config.mm_embed_dim;
         let eps = Some(config.rms_norm_eps);
         Ok(Self {
-            patch_dim,
             eps: config.rms_norm_eps,
             patch_ln1: LayerNorm::new(patch_dim as u32, eps)?,
             patch_dense: Linear::new(patch_dim as u32, embed_dim as u32, Some(true))?,
@@ -40,10 +38,6 @@ impl Gemma4UnifiedVisionEmbedder {
             )?,
             pos_norm: LayerNorm::new(embed_dim as u32, eps)?,
         })
-    }
-
-    pub fn patch_dim(&self) -> i32 {
-        self.patch_dim
     }
 
     pub fn eps(&self) -> f64 {

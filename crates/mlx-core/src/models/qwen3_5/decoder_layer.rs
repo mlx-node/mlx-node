@@ -127,34 +127,7 @@ impl DecoderLayer {
         position_ids: Option<&MxArray>,
         use_kernel: bool,
     ) -> Result<MxArray> {
-        self.forward_inner(x, mask, cache, position_ids, use_kernel, false)
-    }
-
-    /// Like `forward`, but if `slice_to_last_before_mlp` is true, slices the
-    /// post-attention activation to just the last token before running the
-    /// MLP + final residual. Used by the LAST decoder layer during prefill
-    /// when only the last token's hidden state will be consumed downstream
-    /// (lm_head only samples from the last token).
-    ///
-    /// The attention sublayer always runs on the full T input so the
-    /// K/V (or GDN recurrent) caches are updated for every prefill token.
-    pub fn forward_with_optional_last_slice(
-        &mut self,
-        x: &MxArray,
-        mask: Option<&MxArray>,
-        cache: Option<&mut Qwen3_5LayerCache>,
-        position_ids: Option<&MxArray>,
-        use_kernel: bool,
-        slice_to_last_before_mlp: bool,
-    ) -> Result<MxArray> {
-        self.forward_inner(
-            x,
-            mask,
-            cache,
-            position_ids,
-            use_kernel,
-            slice_to_last_before_mlp,
-        )
+        self.forward_inner(x, mask, cache, position_ids, use_kernel)
     }
 
     fn forward_inner(
@@ -164,17 +137,8 @@ impl DecoderLayer {
         cache: Option<&mut Qwen3_5LayerCache>,
         position_ids: Option<&MxArray>,
         use_kernel: bool,
-        slice_to_last_before_mlp: bool,
     ) -> Result<MxArray> {
-        self.forward_inner_with_tape(
-            x,
-            mask,
-            cache,
-            position_ids,
-            use_kernel,
-            slice_to_last_before_mlp,
-            None,
-        )
+        self.forward_inner_with_tape(x, mask, cache, position_ids, use_kernel, None)
     }
 
     /// Like [`DecoderLayer::forward`], but threads an eager-MTP tape sink into
@@ -191,10 +155,9 @@ impl DecoderLayer {
         use_kernel: bool,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
     ) -> Result<MxArray> {
-        self.forward_inner_with_tape(x, mask, cache, position_ids, use_kernel, false, tape_sink)
+        self.forward_inner_with_tape(x, mask, cache, position_ids, use_kernel, tape_sink)
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn forward_inner_with_tape(
         &mut self,
         x: &MxArray,
@@ -202,7 +165,6 @@ impl DecoderLayer {
         cache: Option<&mut Qwen3_5LayerCache>,
         position_ids: Option<&MxArray>,
         use_kernel: bool,
-        slice_to_last_before_mlp: bool,
         tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
     ) -> Result<MxArray> {
         // Pre-norm + attention (always on full T for cache fidelity)
@@ -222,15 +184,6 @@ impl DecoderLayer {
 
         // Residual connection
         let h = x.add(&attn_out)?;
-
-        // E38: slice h to last token before MLP if asked (last-layer prefill
-        // optimization). Saves ~120 GFLOPs of MLP work at T=860.
-        let h = if slice_to_last_before_mlp {
-            let seq_len = h.shape_at(1)?;
-            h.slice_axis(1, seq_len - 1, seq_len)?
-        } else {
-            h
-        };
 
         // Pre-norm + MLP
         let normed = self.post_attention_layernorm.forward(&h)?;
