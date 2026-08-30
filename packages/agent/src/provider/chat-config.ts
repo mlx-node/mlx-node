@@ -17,11 +17,12 @@ import {
 } from '@mlx-node/lm';
 
 /**
- * Model types the no-preset error names, reproducing byte-for-byte the key
- * order the message has always printed (the historical server
- * `LAUNCH_PRESETS` literal, then the agent-only overlay): trainable rows,
- * server-preset loadable rows, then agent-only rows, each group in registry
- * order. Pinned by `packages/agent/__test__/chat-config.test.ts`.
+ * Model types the no-preset error names: trainable rows, then server-preset
+ * loadable rows, then any agent-only rows, each group in registry order. The
+ * grouping preserves the historical trainable-first order of the old
+ * `LAUNCH_PRESETS` literal; the third group is empty while every chat family
+ * declares a `launchPreset`. Pinned by
+ * `packages/agent/__test__/chat-config.test.ts`.
  */
 const KNOWN_PRESET_MODEL_TYPES: readonly string[] = (() => {
   const rows: readonly ModelFamilyData[] = MODEL_FAMILY_DATA;

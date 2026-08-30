@@ -29,13 +29,16 @@ describe('family-data completeness', () => {
     expect(agentLaunchPresetFor(id)!.maxOutputTokens).toBeGreaterThan(0);
   });
 
-  it('preserves the lfm2_moe preset split: agent-served, skipped by server discovery', () => {
-    expect(serverLaunchPresetFor('lfm2_moe')).toBeUndefined();
-    const agentPreset = agentLaunchPresetFor('lfm2_moe');
-    expect(agentPreset).toBeDefined();
-    // LiquidAI's MoE card values — NOT the dense lfm2 preset.
-    expect(agentPreset!.sampling.temperature).toBe(0.2);
-    expect(agentPreset!.sampling.topK).toBe(80);
+  it('serves lfm2_moe on both surfaces with the MoE card sampler', () => {
+    // lfm2_moe loads through the same wrapper and native class as dense
+    // lfm2, so neither surface may skip it.
+    for (const preset of [serverLaunchPresetFor('lfm2_moe'), agentLaunchPresetFor('lfm2_moe')]) {
+      expect(preset).toBeDefined();
+      // LiquidAI's MoE card values — NOT the dense lfm2 preset.
+      expect(preset!.sampling.temperature).toBe(0.2);
+      expect(preset!.sampling.topK).toBe(80);
+    }
+    expect(serverLaunchPresetFor('lfm2')!.sampling.temperature).toBe(0.05);
   });
 
   it('forces the paged overlay by default for every chat family', async () => {

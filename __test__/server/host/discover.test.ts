@@ -54,11 +54,14 @@ describe('discoverModels', () => {
     expect(got).toEqual([]);
   });
 
-  it('skips lfm2_moe (agent-only preset; no server launch preset)', async () => {
+  it('discovers lfm2_moe alongside dense lfm2, each with its own sampler', async () => {
     makeModel('lfm-moe', { model_type: 'lfm2_moe' });
     makeModel('lfm-dense', { model_type: 'lfm2' });
     const got = await discoverModels(root);
-    expect(got.map((e) => e.name)).toEqual(['lfm-dense']);
+    expect(got.map((e) => e.name)).toEqual(['lfm-dense', 'lfm-moe']);
+    // The MoE card's sampler, not the dense one — both families are served.
+    expect(got.find((e) => e.name === 'lfm-moe')!.preset.sampling.temperature).toBe(0.2);
+    expect(got.find((e) => e.name === 'lfm-dense')!.preset.sampling.temperature).toBe(0.05);
   });
 
   it('skips regular files in the directory', async () => {

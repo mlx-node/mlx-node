@@ -213,8 +213,8 @@ interface ModelFamilyDataBase {
  * discovery skips (`FAMILY_TRAITS` / `LAUNCH_PRESETS` misses were debug-only
  * warnings). `launchPreset` is served to BOTH `@mlx-node/server` discovery and
  * the agent; `agentLaunchPreset` is agent-only and wins over `launchPreset`
- * where both exist. A family with ONLY `agentLaunchPreset` (lfm2_moe) is
- * deliberately invisible to server discovery.
+ * where both exist. No family declares only `agentLaunchPreset` today — that
+ * arm exists for a family whose sampling must differ between the two surfaces.
  */
 type ChatFamilyData = ModelFamilyDataBase & {
   readonly kind: 'trainable' | 'loadable';
@@ -352,14 +352,15 @@ export const MODEL_FAMILY_DATA = [
     match: { rawModelTypes: ['lfm2_moe'] },
     traits: { reasoning: true, fallbackContextWindow: 128000 },
     /**
-     * Agent-only (LFM2.5-8B-A1B): LiquidAI's HF model card for the MoE
-     * checkpoint recommends temperature 0.2 / top_k 80 — deliberately NOT
-     * the dense `lfm2` preset (LFM2.5-1.2B guidance: temperature 0.05 /
-     * top_k 50). repetitionPenalty 1.05 and the 8192-token output budget
-     * match the dense family entry. No `launchPreset`: server discovery
-     * must keep skipping this family.
+     * LFM2.5-8B-A1B: LiquidAI's HF model card for the MoE checkpoint
+     * recommends temperature 0.2 / top_k 80 — deliberately NOT the dense
+     * `lfm2` preset (LFM2.5-1.2B guidance: temperature 0.05 / top_k 50).
+     * repetitionPenalty 1.05 and the 8192-token output budget match the
+     * dense family entry. It loads through the same `Lfm2Model` wrapper and
+     * `NativeLfm2Model` class as dense `lfm2`, so server discovery serves it
+     * on the same terms.
      */
-    agentLaunchPreset: {
+    launchPreset: {
       sampling: {
         temperature: 0.2,
         topP: 1.0,
@@ -491,8 +492,8 @@ export function familyTraitsFor(modelType: string): FamilyTraits | undefined {
 
 /**
  * Launch preset for `@mlx-node/server` discovery / `mlx launch claude`.
- * Deliberately blind to `agentLaunchPreset`, so an agent-only family
- * (lfm2_moe) keeps being skipped by server discovery.
+ * Deliberately blind to `agentLaunchPreset`: a family that overrides only the
+ * agent surface must not thereby change what the server serves.
  */
 export function serverLaunchPresetFor(modelType: string): LaunchPreset | undefined {
   return chatFamilyDataFor(modelType)?.launchPreset;
