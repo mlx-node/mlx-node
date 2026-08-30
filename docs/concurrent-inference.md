@@ -132,7 +132,7 @@ server admission       ✓ counting semaphore for eligible paged models
 phase-free scheduler   ✓ token budget, watermark, occupancy histogram
 recompute preemption   ✓ LIFO victim, no same-step readmit, hot-prefix resume
 Qwen3/LFM2/Qwen3.5/NemotronH adapters  ✓ per-sequence request table + shared prefix blocks
-Gemma4 grouped adapters      ✓ full + sliding pools, null-block retirement
+Gemma4/Muse-Glimmer grouped adapters   ✓ full + sliding pools, null-block retirement
 Qwen3/LFM2/Qwen3.5 executors ✓ one uniform [N,1] decode forward
 Gemma4 executor              ✓ one fused [N,1] hybrid decode forward
 NemotronH executor           ~ fused [N,1] on a DENSE checkpoint only; any
