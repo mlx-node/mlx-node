@@ -36,22 +36,22 @@ use crate::transformer::{
     LayerKVCacheRoute, LayerKVCacheSpec, group_layer_kv_cache_specs,
 };
 
-use super::image_processor::{Gemma4ImageProcessor, ProcessedGemma4Image};
-use super::vision::{Gemma4MultimodalEmbedder, Gemma4VisionModel};
-use super::vision_embedder::Gemma4UnifiedVisionEmbedder;
-use super::vision_mask::apply_bidirectional_vision_overlay;
+use crate::models::gemma4::image_processor::{Gemma4ImageProcessor, ProcessedGemma4Image};
+use crate::models::gemma4::vision::{Gemma4MultimodalEmbedder, Gemma4VisionModel};
+use crate::models::gemma4::vision_embedder::Gemma4UnifiedVisionEmbedder;
+use crate::models::gemma4::vision_mask::apply_bidirectional_vision_overlay;
 
-use super::attention::{
+use crate::engine;
+use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
+use crate::models::gemma4::attention::{
     Gemma4PagedPrefillRoutePolicy, gemma4_paged_prefill_route_policy,
     gemma4_paged_prefill_v2_layout_for_chunk,
 };
-use super::config::Gemma4Config;
-use super::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
-use super::dspark::{DsparkContextCache, DsparkTap};
-use super::layer_cache::Gemma4LayerCache;
-use super::sliding_sidecar;
-use crate::engine;
-use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
+use crate::models::gemma4::config::Gemma4Config;
+use crate::models::gemma4::decoder_layer::{Gemma4DecoderLayer, Gemma4LayerKind};
+use crate::models::gemma4::dspark::{DsparkContextCache, DsparkTap};
+use crate::models::gemma4::layer_cache::Gemma4LayerCache;
+use crate::models::gemma4::sliding_sidecar;
 use tracing::info;
 
 #[path = "scheduler.rs"]
@@ -932,10 +932,10 @@ impl Gemma4StreamDispatchState {
 
     fn dispatch_segments(
         &mut self,
-        segments: Vec<super::output_parser::StreamSegment>,
+        segments: Vec<crate::models::gemma4::output_parser::StreamSegment>,
         cb: &StreamSender<'_>,
     ) {
-        use super::output_parser::StreamSegment;
+        use crate::models::gemma4::output_parser::StreamSegment;
         for seg in segments {
             match seg {
                 StreamSegment::Text(text) => {
@@ -988,7 +988,7 @@ impl Gemma4StreamDispatchState {
 }
 
 fn promote_channel_only_output(
-    parsed: &mut super::output_parser::Gemma4ParsedOutput,
+    parsed: &mut crate::models::gemma4::output_parser::Gemma4ParsedOutput,
     starts_in_prompted_channel: bool,
 ) {
     if !starts_in_prompted_channel
@@ -1015,14 +1015,14 @@ fn promote_channel_only_output(
 /// stays disabled because Gemma4 closes reasoning with `<channel|>`, not
 /// a `</think>` token.
 struct Gemma4Emitter {
-    parser: super::output_parser::Gemma4StreamParser,
+    parser: crate::models::gemma4::output_parser::Gemma4StreamParser,
     dispatch: Gemma4StreamDispatchState,
 }
 
 impl Gemma4Emitter {
     fn new(starts_in_open_channel: bool) -> Self {
         Self {
-            parser: super::output_parser::Gemma4StreamParser::new_with_open_channel(
+            parser: crate::models::gemma4::output_parser::Gemma4StreamParser::new_with_open_channel(
                 starts_in_open_channel,
             ),
             dispatch: Gemma4StreamDispatchState::new(starts_in_open_channel),
@@ -1200,7 +1200,7 @@ pub(crate) struct Gemma4Inner {
     /// `DsparkBackend::begin_dspark_decode` TAKES it into the turn's
     /// stepper. Always `None`
     /// outside a live draft whole-turn.
-    pub(crate) draft_turn_state: Option<super::dspark_decode::Gemma4DraftTurnState>,
+    pub(crate) draft_turn_state: Option<crate::models::gemma4::dspark_decode::Gemma4DraftTurnState>,
     /// Cached result of `compute_layer_kinds_from_kv_cache_specs(&config)`,
     /// computed once here in `Gemma4Inner::new` instead of re-derived
     /// (BTreeMap/BTreeSet grouping + a sort) on every paged prefill-chunk /
@@ -1346,12 +1346,12 @@ pub(crate) struct Gemma4SchedulerOwnerState {
 pub(crate) enum Gemma4Draft {
     /// DeepSpec DSpark external draft: 5-layer cross-attending transformer
     /// drafting whole masked blocks over a fused target-hidden context
-    /// ([`super::dspark`]).
-    Dspark(super::dspark::DsparkDraftModel),
+    /// ([`crate::models::gemma4::dspark`]).
+    Dspark(crate::models::gemma4::dspark::DsparkDraftModel),
     /// Google assistant checkpoint draft: Q-only transformer drafting by
     /// chained single-token AR steps over the target's committed KV caches
-    /// ([`super::assistant`]).
-    Assistant(super::assistant::AssistantDraftModel),
+    /// ([`crate::models::gemma4::assistant`]).
+    Assistant(crate::models::gemma4::assistant::AssistantDraftModel),
 }
 
 impl Gemma4Draft {
@@ -2698,7 +2698,7 @@ impl Gemma4Inner {
     }
 
     /// The loaded DSpark draft, when the draft variant is DSpark.
-    pub(crate) fn dspark_draft(&self) -> Option<&super::dspark::DsparkDraftModel> {
+    pub(crate) fn dspark_draft(&self) -> Option<&crate::models::gemma4::dspark::DsparkDraftModel> {
         match self.draft.as_ref() {
             Some(Gemma4Draft::Dspark(draft)) => Some(draft),
             _ => None,
@@ -2706,7 +2706,9 @@ impl Gemma4Inner {
     }
 
     /// The loaded assistant draft, when the draft variant is assistant.
-    pub(crate) fn assistant_draft(&self) -> Option<&super::assistant::AssistantDraftModel> {
+    pub(crate) fn assistant_draft(
+        &self,
+    ) -> Option<&crate::models::gemma4::assistant::AssistantDraftModel> {
         match self.draft.as_ref() {
             Some(Gemma4Draft::Assistant(draft)) => Some(draft),
             _ => None,
@@ -3815,8 +3817,8 @@ impl Gemma4Inner {
         let mut per_clip_frames: Vec<MxArray> = Vec::with_capacity(raw_audio.len());
         let mut n_frames_per_clip: Vec<usize> = Vec::with_capacity(raw_audio.len());
         for bytes in raw_audio {
-            let pcm = super::audio_processor::decode_wav_to_pcm(bytes)?;
-            let frames = super::audio_processor::frames_from_pcm(&pcm, spt)?;
+            let pcm = crate::models::gemma4::audio_processor::decode_wav_to_pcm(bytes)?;
+            let frames = crate::models::gemma4::audio_processor::frames_from_pcm(&pcm, spt)?;
             let n = frames.shape_at(0)? as usize;
             n_frames_per_clip.push(n);
             per_clip_frames.push(frames);
@@ -3829,7 +3831,7 @@ impl Gemma4Inner {
             MxArray::concatenate_many(refs, Some(0))?
         };
 
-        let expanded = super::audio_processor::expand_audio_tokens(
+        let expanded = crate::models::gemma4::audio_processor::expand_audio_tokens(
             tokens,
             &n_frames_per_clip,
             audio_token_id,
@@ -4061,7 +4063,7 @@ impl Gemma4Inner {
 
         let cached_prefix_len = if image_only {
             let image_token_id = self.config.image_token_id.unwrap_or(258880) as u32;
-            let overlay_active = super::vision_mask::vision_overlay_active(
+            let overlay_active = crate::models::gemma4::vision_mask::vision_overlay_active(
                 self.config.is_unified,
                 self.config.use_bidirectional_attention.as_deref() == Some("vision"),
                 !image_token_positions.is_empty(),
@@ -4564,10 +4566,11 @@ impl Gemma4Inner {
         });
 
         let starts_in_prompted_channel = self.output_starts_in_reasoning_channel();
-        let mut parsed = super::output_parser::parse_gemma4_output_with_open_channel(
-            &raw_text,
-            starts_in_prompted_channel,
-        );
+        let mut parsed =
+            crate::models::gemma4::output_parser::parse_gemma4_output_with_open_channel(
+                &raw_text,
+                starts_in_prompted_channel,
+            );
         promote_channel_only_output(&mut parsed, starts_in_prompted_channel);
         let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
@@ -4650,9 +4653,10 @@ impl Gemma4Inner {
         let mut decode_stream = tokenizer.inner().decode_stream(false);
         let mut streamed_text_len = 0;
         let starts_in_prompted_channel = self.output_starts_in_reasoning_channel();
-        let mut stream_parser = super::output_parser::Gemma4StreamParser::new_with_open_channel(
-            starts_in_prompted_channel,
-        );
+        let mut stream_parser =
+            crate::models::gemma4::output_parser::Gemma4StreamParser::new_with_open_channel(
+                starts_in_prompted_channel,
+            );
         let mut stream_dispatch = Gemma4StreamDispatchState::new(starts_in_prompted_channel);
 
         let forward_result = (|| -> Result<(Vec<u32>, String)> {
@@ -5583,7 +5587,7 @@ impl Gemma4Inner {
                     // for this layer (the anchor wrote its part of
                     // this chunk earlier in the same loop).
                     let total_ctx = cached_prefix_len_for_chunk + chunk_len;
-                    Some(super::decoder_layer::SharedKvInputs {
+                    Some(crate::models::gemma4::decoder_layer::SharedKvInputs {
                         cache_offset: first_logical_position as i32,
                         total_ctx,
                     })
@@ -5788,7 +5792,7 @@ impl Gemma4Inner {
                 Gemma4LayerKind::SharedOnGlobal { .. }
                 | Gemma4LayerKind::SharedOnSliding { .. } => {
                     let total_ctx = cached_prefix_len_for_chunk + chunk_len;
-                    Some(super::decoder_layer::SharedKvInputs {
+                    Some(crate::models::gemma4::decoder_layer::SharedKvInputs {
                         cache_offset: first_logical_position as i32,
                         total_ctx,
                     })
@@ -5905,17 +5909,19 @@ impl Gemma4Inner {
         let has_image = expanded_tokens.contains(&image_token_id);
         let has_audio = expanded_tokens.contains(&audio_token_id);
         let overlay_full_type_ids: Option<MxArray> = if cached_prefix_len == 0
-            && super::vision_mask::vision_overlay_active(
+            && crate::models::gemma4::vision_mask::vision_overlay_active(
                 self.config.is_unified,
                 self.config.use_bidirectional_attention.as_deref() == Some("vision"),
                 has_image,
                 has_audio,
                 prompt_len as usize,
             ) {
-            Some(super::vision_mask::build_image_token_type_ids(
-                expanded_tokens,
-                image_token_id,
-            )?)
+            Some(
+                crate::models::gemma4::vision_mask::build_image_token_type_ids(
+                    expanded_tokens,
+                    image_token_id,
+                )?,
+            )
         } else {
             None
         };
@@ -6170,7 +6176,7 @@ impl Gemma4Inner {
                     // its own forward_paged earlier in this loop, which
                     // wrote K/V via update_keys_values). Read full ctx.
                     let total_ctx = first_logical_position + 1;
-                    Some(super::decoder_layer::SharedKvInputs {
+                    Some(crate::models::gemma4::decoder_layer::SharedKvInputs {
                         cache_offset: first_logical_position as i32,
                         total_ctx,
                     })
@@ -7143,8 +7149,9 @@ impl ChatBackend for Gemma4Inner {
             }
             Some(Gemma4Draft::Assistant(_)) => {
                 p.mtp_depth = match config.mtp_depth {
-                    Some(d) => (d.max(1) as usize).min(super::assistant::ASSISTANT_MAX_DEPTH),
-                    None => super::assistant::ASSISTANT_DEFAULT_DEPTH,
+                    Some(d) => (d.max(1) as usize)
+                        .min(crate::models::gemma4::assistant::ASSISTANT_MAX_DEPTH),
+                    None => crate::models::gemma4::assistant::ASSISTANT_DEFAULT_DEPTH,
                 };
             }
             None => {}
@@ -7398,10 +7405,11 @@ impl ChatBackend for Gemma4Inner {
     fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
         let raw_text = args.tokenizer.decode_sync(args.generated_tokens, false)?;
         let starts_in_prompted_channel = self.output_starts_in_reasoning_channel();
-        let mut parsed = super::output_parser::parse_gemma4_output_with_open_channel(
-            &raw_text,
-            starts_in_prompted_channel,
-        );
+        let mut parsed =
+            crate::models::gemma4::output_parser::parse_gemma4_output_with_open_channel(
+                &raw_text,
+                starts_in_prompted_channel,
+            );
         promote_channel_only_output(&mut parsed, starts_in_prompted_channel);
         let finish_reason = if parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
             "tool_calls".to_string()
@@ -10026,7 +10034,7 @@ pub(super) fn sliding_mask_offset_for_chunk(
 /// inserts a fallback span at an invented position.
 fn expand_image_tokens(
     tokens: &[u32],
-    processed_images: &[super::image_processor::ProcessedGemma4Image],
+    processed_images: &[crate::models::gemma4::image_processor::ProcessedGemma4Image],
     image_token_id: u32,
     boi_token_id: u32,
     eoi_token_id: u32,
@@ -15013,7 +15021,7 @@ mod flat_verify_tests {
             &config,
         )
         .unwrap();
-        let rollback = super::super::layer_cache::snapshot_before_verify(
+        let rollback = crate::models::gemma4::layer_cache::snapshot_before_verify(
             &caches,
             block_ids.shape_at(1).unwrap() as usize,
             &shared_slots,
@@ -15046,7 +15054,7 @@ mod flat_verify_tests {
 
         // Partial-keep commit on the real model: active caches land at
         // prefill + keep, the shared slot stays untouched.
-        super::super::layer_cache::commit_after_verify(&mut caches, &rollback, 1).unwrap();
+        crate::models::gemma4::layer_cache::commit_after_verify(&mut caches, &rollback, 1).unwrap();
         for (idx, cache) in caches.iter().enumerate().take(3) {
             assert_eq!(cache.get_offset(), 7, "cache {idx} post-commit offset");
         }
@@ -16948,7 +16956,7 @@ mod reasoning_close_tag_seam_tests {
     //! regression that no unit test of the parser would notice.
     //!
     //! Read through the trait, not from
-    //! [`super::super::output_parser::reasoning_close_tag`] directly: what has
+    //! [`crate::models::gemma4::output_parser::reasoning_close_tag`] directly: what has
     //! to hold is that the wiring resolves to that tag, and calling the free
     //! function would prove only that the free function returns itself.
 
