@@ -14,8 +14,7 @@ Two facts to carry into any batching work: only T=0 output is
 schedule-invariant — T>0 sampling draws from the thread-local PRNG in row
 order, so batch composition changes reproducibility (same as vLLM); and the
 paged decode clear-cache interval is 1024 steps
-(`PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT`, `array/memory.rs:97`), not the
-64 some older notes claim.
+(`PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT` in `array/memory.rs`).
 
 ## Current status
 
@@ -189,8 +188,8 @@ The tuned grouped D256/D512 long-context kernels remain gated to
 Cross-model residual coupling is perf-class, not correctness: the process-wide
 Metal wired limit is set/restored per turn (`crates/mlx-core/src/stream.rs:142-262`),
 and the flat decode path calls `clear_cache` every 256 steps, draining the
-process-wide Metal free pool (`engine/backend.rs:146-149`, noted as
-multi-model-hostile in `engine/cmd.rs:186-190`).
+process-wide Metal free pool (`ChatBackend::maintain_cache`; noted as
+multi-model-hostile on the chat command enum in `engine/cmd.rs`).
 
 ## Yardstick: vLLM v1
 

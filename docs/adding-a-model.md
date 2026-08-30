@@ -71,46 +71,27 @@ capability, not a recurring per-family cost. What a new family actually owes:
 
 ## Required registration sites
 
-The honest post-refactor fan-out for a minimal chat family (convert + load +
-serve + agent), one row per site with its failure mode. The old inventory of
-~12 hand-edited TS/Rust sites collapsed into this: the scattered per-family
-TS tables were deleted and now derive from one data row.
+The registration fan-out for a minimal chat family (convert + load + serve +
+agent), one row per site with its failure mode.
 
 | Site                                          | What you add                                                                                                                                                          | Failure mode if missed                                                                                                                                                                                                 |
 | --------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `crates/mlx-core/src/models/mod.rs`           | `pub mod <family>;`                                                                                                                                                   | compile error                                                                                                                                                                                                          |
 | `crates/mlx-core/src/convert.rs`              | one `ConversionRecipe` impl + one `RECIPE_REGISTRY` row (dispatch `recipe_for` and the `convertible_model_types` NAPI export both derive from the registry)           | registry-consistency test (`recipe_registry_reproduces_inline_flags`) goes red; a checkpoint of the family hits the hard "Unknown model type" convert error                                                            |
 | `packages/cli/src/commands/convert-detect.ts` | one `CONVERT_DETECT` row (row order is load-bearing and deliberately differs from the runtime loader's probe order)                                                   | the convert-detect parity test (`convert-detect.test.ts`) goes red against native `convertibleModelTypes()` — without it, `mlx convert` with `-m` omitted silently converts generically and produces unloadable output |
-| `packages/lm/src/family-data.ts`              | one `MODEL_FAMILY_DATA` row: `kind`, `match` (raw aliases + optional architecture probe), `traits`, a launch preset, optional `ggufArchitectures`/`acceptsDraftModel` | a chat-kind row without `traits` or a preset **fails to compile** (the `ChatFamilyData` type requires them — this replaced the old silent discovery skips); `family-completeness.test.ts` backstops at runtime         |
+| `packages/lm/src/family-data.ts`              | one `MODEL_FAMILY_DATA` row: `kind`, `match` (raw aliases + optional architecture probe), `traits`, a launch preset, optional `ggufArchitectures`/`acceptsDraftModel` | a chat-kind row without `traits` or a preset **fails to compile** (the `ChatFamilyData` type requires them); `family-completeness.test.ts` backstops at runtime         |
 | `packages/lm/src/models/model-loader.ts`      | one `LOADER_BINDINGS` entry (loader closure + native class)                                                                                                           | `satisfies Record<ModelType, LoaderBinding>` fails to compile — in both directions: a data row without a binding, or a binding without a row                                                                           |
 | `packages/lm/src/stream.ts`                   | one `makeStreamingModel` wrapper class + a line in each compile-time conformance block (`_assertSessionCapable`, `_assertPreservedNativeSurfaces`)                    | `ChatSession<X>` stops type-checking downstream; a drifted override signature fails the conformance block at compile time                                                                                              |
 | `packages/lm/src/index.ts`                    | export line(s) for the wrapper class and config types                                                                                                                 | the family is unreachable from `@mlx-node/lm`                                                                                                                                                                          |
 | `yarn build:native`                           | regenerates BOTH committed `index.d.cts` copies + the `index.cjs` export line                                                                                         | CI declaration-drift failure (`packages/core/build.ts` `assertDeclarationCopiesMatch` hard-fails before and after generation)                                                                                          |
 
-**What this branch deleted.** The following hand-maintained per-family tables
-no longer exist; each decision now derives from the family's
-`MODEL_FAMILY_DATA` row (native-free, also published as the
-`@mlx-node/lm/family-data` subpath and re-exported through
-`@mlx-node/agent/catalog`):
-
-- `packages/server/src/presets.ts` (the whole file): sampling constants and
-  `LaunchPreset` moved into `family-data.ts`; server discovery calls
-  `launchPresetFor`.
-- `FAMILY_TRAITS` (agent provider): now `familyTraitsFor`.
-- `AGENT_LAUNCH_PRESETS` (agent chat-config): gone. One `launchPreset` per
-  row serves every surface — server discovery, `mlx launch claude` and
-  `mlx agent` — so a chat family is reachable from all of them or none.
-- Both `NON_GENERATIVE` sets (agent + server): now
-  `NON_GENERATIVE_FAMILY_IDS`, derived from `kind`.
-- `AGENT_PAGED_MODEL_TYPES`: the `PagedConfigOverrideManager` default derives
-  from `CHAT_FAMILY_IDS`, so a new chat family can never be forgotten.
-  `QWEN35_PAGED_MODEL_TYPES` survives as the qwen3_5 cache-floor set, and the
-  server host's `DEFAULT_PAGED_MODEL_TYPES` aliases it.
-- The GGUF architecture map in `model-loader.ts`: derived from
-  `ggufArchitectures` rows.
-- The dashboard's `RAW_MODEL_TYPE_TO_LABEL`: labels go through the shared
-  `matchFamily` (via `@mlx-node/agent/catalog`) with the same raw-string
-  fallback.
+Every per-family decision above derives from one `MODEL_FAMILY_DATA` row:
+launch presets (`launchPresetFor`), agent traits (`familyTraitsFor`), the
+chat/non-generative split (`NON_GENERATIVE_FAMILY_IDS`, from `kind`), the GGUF
+architecture map (`ggufArchitectures`), and dashboard labels (`matchFamily`).
+`QWEN35_PAGED_MODEL_TYPES` remains the qwen3_5 cache-floor set and the server
+host's `DEFAULT_PAGED_MODEL_TYPES` aliases it; the `PagedConfigOverrideManager`
+default derives from `CHAT_FAMILY_IDS`.
 
 Family detection itself is the pure `matchFamily` in `family-data.ts`
 (byte-identical `MalformedModelConfigError` / `UnsupportedModelTypeError`
