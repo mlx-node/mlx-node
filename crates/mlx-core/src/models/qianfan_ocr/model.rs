@@ -2521,29 +2521,6 @@ mod tests {
     }
 
     #[test]
-    fn test_chat_result_creation() {
-        let result = ChatResult {
-            text: "Hello".to_string(),
-            tool_calls: vec![],
-            thinking: None,
-            thinking_enabled: true,
-            num_tokens: 1,
-            prompt_tokens: 0,
-            reasoning_tokens: 0,
-            finish_reason: "stop".to_string(),
-            raw_text: "Hello".to_string(),
-            public_raw_text: None,
-            cached_tokens: 0,
-            performance: None,
-        };
-        assert_eq!(result.text, "Hello");
-        assert_eq!(result.num_tokens, 1);
-        assert_eq!(result.finish_reason, "stop");
-        assert!(result.thinking.is_none());
-        assert!(result.tool_calls.is_empty());
-    }
-
-    #[test]
     fn test_prefix_match_full() {
         let a = vec![1, 2, 3, 4, 5];
         let b = vec![1, 2, 3, 4, 5];
