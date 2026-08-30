@@ -21,10 +21,15 @@ import { readdir, readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
 import type { ProviderModelConfig } from '@earendil-works/pi-coding-agent';
-import { detectModelType, familyTraitsFor, NON_GENERATIVE_FAMILY_IDS, type ModelType } from '@mlx-node/lm';
+import {
+  agentLaunchPresetFor,
+  detectModelType,
+  familyTraitsFor,
+  NON_GENERATIVE_FAMILY_IDS,
+  type ModelType,
+} from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
-import { launchPresetFor } from './chat-config.js';
 
 /** A discovered local checkpoint paired with its pi provider model entry. */
 export interface MlxModelInfo {
@@ -193,7 +198,7 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     // Fail-closed guards: dead-by-construction for chat families (the
     // family-data row type requires traits + a preset), live for any foreign
     // string that slips through detection.
-    const preset = launchPresetFor(modelType);
+    const preset = agentLaunchPresetFor(modelType);
     if (!preset) {
       if (debug) console.warn(`[mlx] skip ${path}: no launch preset for ${modelType}`);
       return;

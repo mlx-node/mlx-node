@@ -11,22 +11,10 @@ import {
   agentLaunchPresetFor,
   MODEL_FAMILY_DATA,
   type ChatConfig,
-  type LaunchPreset,
   type ModelFamilyData,
   type ModelType,
   type ToolDefinition,
 } from '@mlx-node/lm';
-
-/**
- * Preset lookup — the agent overlay wins over the server row (it exists
- * precisely where the server row is absent or wrong for the type). This is
- * the ONE preset resolution shared by discovery (`models.ts`) and per-call
- * config assembly, so a model can never be discovered without also being
- * streamable (and vice versa).
- */
-export function launchPresetFor(modelType: ModelType): LaunchPreset | undefined {
-  return agentLaunchPresetFor(modelType);
-}
 
 /**
  * Model types the no-preset error names, reproducing byte-for-byte the key
@@ -92,7 +80,7 @@ export function buildChatConfig(
   resolvedReasoning = resolveReasoningMode(options?.reasoning),
   modelMaxTokens?: unknown,
 ): ChatConfig {
-  const preset = launchPresetFor(modelType);
+  const preset = agentLaunchPresetFor(modelType);
   if (!preset) {
     const known = KNOWN_PRESET_MODEL_TYPES.join(', ');
     throw new Error(`buildChatConfig: no launch preset for model type "${modelType}" (known types: ${known})`);
