@@ -320,17 +320,6 @@ mod tests {
     }
 
     #[test]
-    fn set_training_step_overwrites_step() {
-        // Mirrors the SetTrainingStep command handler logic.
-        let mut state =
-            ModelThreadTrainingState::new(1e-4, 1, None, None, 100, 5, false, true, None);
-        state.step = 7;
-        // SetTrainingStep: ts.step = new_step
-        state.step = 42;
-        assert_eq!(state.step, 42);
-    }
-
-    #[test]
     fn new_accepts_adamw_optimizer() {
         let adamw = AdamW::new(
             Some(1e-4),

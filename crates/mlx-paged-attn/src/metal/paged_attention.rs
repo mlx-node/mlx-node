@@ -493,263 +493,6 @@ fn grouped_pipelines_supported(
     supported
 }
 
-#[cfg(test)]
-mod grouped_selection_tests {
-    use super::*;
-
-    #[test]
-    fn env_escape_hatch_is_default_on_and_zero_disables() {
-        assert!(grouped_qwen35_env_enabled_value(None));
-        assert!(grouped_qwen35_env_enabled_value(Some("1")));
-        assert!(grouped_qwen35_env_enabled_value(Some("true")));
-        assert!(!grouped_qwen35_env_enabled_value(Some("0")));
-        assert_eq!(grouped_d512_env_mode_value(None), GroupedD512Mode::Disabled);
-        assert_eq!(
-            grouped_d512_env_mode_value(Some("1")),
-            GroupedD512Mode::Auto
-        );
-        assert_eq!(
-            grouped_d512_env_mode_value(Some("force")),
-            GroupedD512Mode::Force
-        );
-        assert_eq!(grouped_d512_stripe_override_value(Some("4")), Some(4));
-        assert_eq!(grouped_d512_stripe_override_value(Some("128")), Some(128));
-        assert_eq!(grouped_d512_stripe_override_value(Some("3")), None);
-        assert_eq!(grouped_d512_stripe_override_value(Some("oops")), None);
-    }
-
-    #[test]
-    fn exact_qwen35_dense_and_moe_shapes_select_only_when_enabled() {
-        let matches = |enabled, num_heads, num_kv_heads, query_rows, max_context_len| {
-            grouped_qwen35_shape_matches(
-                enabled,
-                MetalDtype::BFloat16,
-                MetalDtype::BFloat16,
-                1,
-                num_heads,
-                num_kv_heads,
-                256,
-                16,
-                query_rows,
-                max_context_len,
-            )
-        };
-        for (num_heads, num_kv_heads, decode_min, verify_min) in
-            [(24, 4, 16_384, 8_192), (16, 2, 32_768, 16_384)]
-        {
-            assert!(matches(true, num_heads, num_kv_heads, 1, decode_min));
-            assert!(!matches(true, num_heads, num_kv_heads, 1, decode_min - 1));
-            assert!(matches(true, num_heads, num_kv_heads, 2, verify_min));
-            assert!(!matches(true, num_heads, num_kv_heads, 2, verify_min - 1));
-            assert!(!matches(false, num_heads, num_kv_heads, 1, decode_min));
-            assert!(!matches(false, num_heads, num_kv_heads, 2, verify_min));
-            assert!(!matches(true, num_heads, num_kv_heads, 3, decode_min));
-        }
-        assert!(!matches(true, 16, 4, 1, 16_384));
-        assert!(!matches(true, 24, 2, 1, 16_384));
-
-        assert!(!grouped_qwen35_shape_matches(
-            true,
-            MetalDtype::Float16,
-            MetalDtype::BFloat16,
-            1,
-            24,
-            4,
-            256,
-            16,
-            1,
-            16_384,
-        ));
-        assert!(!grouped_qwen35_shape_matches(
-            true,
-            MetalDtype::BFloat16,
-            MetalDtype::BFloat16,
-            1,
-            24,
-            4,
-            128,
-            16,
-            1,
-            16_384,
-        ));
-        assert!(!grouped_qwen35_shape_matches(
-            true,
-            MetalDtype::BFloat16,
-            MetalDtype::BFloat16,
-            1,
-            16,
-            2,
-            256,
-            32,
-            1,
-            16_384,
-        ));
-    }
-
-    #[test]
-    fn exact_d512_shapes_are_default_off_and_auto_is_bounded() {
-        let matches = |mode, num_heads, num_kv_heads, query_rows, max_context_len| {
-            grouped_d512_shape_matches(
-                mode,
-                MetalDtype::BFloat16,
-                MetalDtype::BFloat16,
-                1,
-                num_heads,
-                num_kv_heads,
-                512,
-                16,
-                query_rows,
-                max_context_len,
-            )
-        };
-        for (num_heads, num_kv_heads) in [(8, 1), (16, 1), (16, 2), (32, 4)] {
-            assert!(!matches(
-                GroupedD512Mode::Disabled,
-                num_heads,
-                num_kv_heads,
-                1,
-                3_458
-            ));
-            assert!(!matches(
-                GroupedD512Mode::Auto,
-                num_heads,
-                num_kv_heads,
-                1,
-                3_071
-            ));
-            assert_eq!(
-                matches(GroupedD512Mode::Auto, num_heads, num_kv_heads, 1, 3_072),
-                (num_heads, num_kv_heads) == (16, 1)
-            );
-            assert_eq!(
-                matches(GroupedD512Mode::Auto, num_heads, num_kv_heads, 1, 16_384),
-                (num_heads, num_kv_heads) == (16, 1)
-            );
-            assert!(!matches(
-                GroupedD512Mode::Auto,
-                num_heads,
-                num_kv_heads,
-                1,
-                16_385
-            ));
-            assert!(!matches(
-                GroupedD512Mode::Force,
-                num_heads,
-                num_kv_heads,
-                1,
-                PARTITION_SIZE
-            ));
-            assert!(matches(
-                GroupedD512Mode::Force,
-                num_heads,
-                num_kv_heads,
-                1,
-                PARTITION_SIZE + 1
-            ));
-            assert!(!matches(
-                GroupedD512Mode::Force,
-                num_heads,
-                num_kv_heads,
-                2,
-                3_458
-            ));
-        }
-        for (num_heads, num_kv_heads) in [(8, 2), (16, 4), (24, 4), (32, 2)] {
-            assert!(!matches(
-                GroupedD512Mode::Force,
-                num_heads,
-                num_kv_heads,
-                1,
-                8_193
-            ));
-        }
-    }
-
-    #[test]
-    fn d512_stripes_account_for_kv_head_parallelism() {
-        for (context, expected) in [
-            (4_096, [32, 16, 8]),
-            (4_097, [64, 32, 16]),
-            (8_193, [128, 64, 32]),
-        ] {
-            for ((q_heads, kv_heads), expected) in
-                [(16, 1), (16, 2), (32, 4)].into_iter().zip(expected)
-            {
-                assert_eq!(
-                    grouped_stripe_count(
-                        GroupedPagedAttentionKind::D512Direct,
-                        context,
-                        q_heads,
-                        kv_heads,
-                    ),
-                    expected
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn d512_wide_stripe_policy_matches_graph_and_planner_boundaries() {
-        for (context, expected) in [(90_112, 64), (90_113, 128), (91_795, 128), (112_000, 128)] {
-            assert_eq!(
-                grouped_d512_resolved_stripe_count(None, context, 16, 2),
-                expected
-            );
-        }
-        assert_eq!(
-            grouped_d512_resolved_stripe_count(None, 90_113, 8, 1),
-            128,
-            "Hq8/Hkv1 is unchanged"
-        );
-        assert_eq!(
-            grouped_d512_resolved_stripe_count(None, 90_113, 16, 1),
-            128,
-            "Hq16/Hkv1 is unchanged"
-        );
-        assert_eq!(
-            grouped_d512_resolved_stripe_count(None, 90_113, 32, 4),
-            32,
-            "Hkv4 is unchanged"
-        );
-        assert_eq!(
-            grouped_d512_resolved_stripe_count(Some(32), 91_795, 16, 2),
-            32,
-            "an explicit validated override remains authoritative"
-        );
-    }
-
-    #[test]
-    fn explicit_route_hint_bypasses_environment_and_context_only() {
-        let select = |hint, num_heads, num_kv_heads, context| {
-            select_grouped_paged_attention(
-                MetalDtype::BFloat16,
-                MetalDtype::BFloat16,
-                1,
-                num_heads,
-                num_kv_heads,
-                512,
-                16,
-                1,
-                context,
-                hint,
-            )
-        };
-        assert_eq!(
-            select(PagedAttentionRouteHint::ForceD512Staged, 16, 2, 91_765),
-            Some(GroupedPagedAttentionKind::D512Direct)
-        );
-        assert_eq!(
-            select(PagedAttentionRouteHint::ForceGeneric, 16, 2, 8_193),
-            None
-        );
-        assert_eq!(
-            select(PagedAttentionRouteHint::ForceD512Staged, 16, 4, 91_765),
-            None,
-            "a route hint must not bypass geometry validation"
-        );
-    }
-}
-
 /// Output from paged attention dispatch
 ///
 /// Contains the output buffer and metadata for creating an MLX array.
@@ -2093,49 +1836,258 @@ pub unsafe fn dispatch_paged_attention_varlen_auto(
 }
 
 #[cfg(test)]
-mod tests {
+mod grouped_selection_tests {
     use super::*;
 
     #[test]
-    fn test_params() {
-        let params = PagedAttentionParams {
-            num_seqs: 1,
-            num_heads: 12,
-            num_kv_heads: 2,
-            head_size: 128,
-            block_size: 16,
-            max_seq_len: 2048,
-            max_num_blocks_per_seq: 128,
-            scale: 0.088388, // 1/sqrt(128)
-            softcapping: 1.0,
-            q_stride: 1536, // 12 * 128
-            kv_block_stride: 32768,
-            kv_head_stride: 16384,
-            k_scale: 1.0,
-            v_scale: 1.0,
-            sliding_window: 0,
-        };
-        assert_eq!(params.num_heads / params.num_kv_heads, 6); // GQA ratio
-        assert_eq!(params.sliding_window, 0);
+    fn env_escape_hatch_is_default_on_and_zero_disables() {
+        assert!(grouped_qwen35_env_enabled_value(None));
+        assert!(grouped_qwen35_env_enabled_value(Some("1")));
+        assert!(grouped_qwen35_env_enabled_value(Some("true")));
+        assert!(!grouped_qwen35_env_enabled_value(Some("0")));
+        assert_eq!(grouped_d512_env_mode_value(None), GroupedD512Mode::Disabled);
+        assert_eq!(
+            grouped_d512_env_mode_value(Some("1")),
+            GroupedD512Mode::Auto
+        );
+        assert_eq!(
+            grouped_d512_env_mode_value(Some("force")),
+            GroupedD512Mode::Force
+        );
+        assert_eq!(grouped_d512_stripe_override_value(Some("4")), Some(4));
+        assert_eq!(grouped_d512_stripe_override_value(Some("128")), Some(128));
+        assert_eq!(grouped_d512_stripe_override_value(Some("3")), None);
+        assert_eq!(grouped_d512_stripe_override_value(Some("oops")), None);
     }
 
     #[test]
-    fn test_fp8_params() {
-        let params = PagedAttentionParams {
-            k_scale: 0.5,  // FP8 quantization scale
-            v_scale: 0.25, // FP8 quantization scale
-            ..Default::default()
+    fn exact_qwen35_dense_and_moe_shapes_select_only_when_enabled() {
+        let matches = |enabled, num_heads, num_kv_heads, query_rows, max_context_len| {
+            grouped_qwen35_shape_matches(
+                enabled,
+                MetalDtype::BFloat16,
+                MetalDtype::BFloat16,
+                1,
+                num_heads,
+                num_kv_heads,
+                256,
+                16,
+                query_rows,
+                max_context_len,
+            )
         };
-        assert_eq!(params.k_scale, 0.5);
-        assert_eq!(params.v_scale, 0.25);
+        for (num_heads, num_kv_heads, decode_min, verify_min) in
+            [(24, 4, 16_384, 8_192), (16, 2, 32_768, 16_384)]
+        {
+            assert!(matches(true, num_heads, num_kv_heads, 1, decode_min));
+            assert!(!matches(true, num_heads, num_kv_heads, 1, decode_min - 1));
+            assert!(matches(true, num_heads, num_kv_heads, 2, verify_min));
+            assert!(!matches(true, num_heads, num_kv_heads, 2, verify_min - 1));
+            assert!(!matches(false, num_heads, num_kv_heads, 1, decode_min));
+            assert!(!matches(false, num_heads, num_kv_heads, 2, verify_min));
+            assert!(!matches(true, num_heads, num_kv_heads, 3, decode_min));
+        }
+        assert!(!matches(true, 16, 4, 1, 16_384));
+        assert!(!matches(true, 24, 2, 1, 16_384));
+
+        assert!(!grouped_qwen35_shape_matches(
+            true,
+            MetalDtype::Float16,
+            MetalDtype::BFloat16,
+            1,
+            24,
+            4,
+            256,
+            16,
+            1,
+            16_384,
+        ));
+        assert!(!grouped_qwen35_shape_matches(
+            true,
+            MetalDtype::BFloat16,
+            MetalDtype::BFloat16,
+            1,
+            24,
+            4,
+            128,
+            16,
+            1,
+            16_384,
+        ));
+        assert!(!grouped_qwen35_shape_matches(
+            true,
+            MetalDtype::BFloat16,
+            MetalDtype::BFloat16,
+            1,
+            16,
+            2,
+            256,
+            32,
+            1,
+            16_384,
+        ));
     }
 
     #[test]
-    fn test_sliding_window_params() {
-        let params = PagedAttentionParams {
-            sliding_window: 1024,
-            ..Default::default()
+    fn exact_d512_shapes_are_default_off_and_auto_is_bounded() {
+        let matches = |mode, num_heads, num_kv_heads, query_rows, max_context_len| {
+            grouped_d512_shape_matches(
+                mode,
+                MetalDtype::BFloat16,
+                MetalDtype::BFloat16,
+                1,
+                num_heads,
+                num_kv_heads,
+                512,
+                16,
+                query_rows,
+                max_context_len,
+            )
         };
-        assert_eq!(params.sliding_window, 1024);
+        for (num_heads, num_kv_heads) in [(8, 1), (16, 1), (16, 2), (32, 4)] {
+            assert!(!matches(
+                GroupedD512Mode::Disabled,
+                num_heads,
+                num_kv_heads,
+                1,
+                3_458
+            ));
+            assert!(!matches(
+                GroupedD512Mode::Auto,
+                num_heads,
+                num_kv_heads,
+                1,
+                3_071
+            ));
+            assert_eq!(
+                matches(GroupedD512Mode::Auto, num_heads, num_kv_heads, 1, 3_072),
+                (num_heads, num_kv_heads) == (16, 1)
+            );
+            assert_eq!(
+                matches(GroupedD512Mode::Auto, num_heads, num_kv_heads, 1, 16_384),
+                (num_heads, num_kv_heads) == (16, 1)
+            );
+            assert!(!matches(
+                GroupedD512Mode::Auto,
+                num_heads,
+                num_kv_heads,
+                1,
+                16_385
+            ));
+            assert!(!matches(
+                GroupedD512Mode::Force,
+                num_heads,
+                num_kv_heads,
+                1,
+                PARTITION_SIZE
+            ));
+            assert!(matches(
+                GroupedD512Mode::Force,
+                num_heads,
+                num_kv_heads,
+                1,
+                PARTITION_SIZE + 1
+            ));
+            assert!(!matches(
+                GroupedD512Mode::Force,
+                num_heads,
+                num_kv_heads,
+                2,
+                3_458
+            ));
+        }
+        for (num_heads, num_kv_heads) in [(8, 2), (16, 4), (24, 4), (32, 2)] {
+            assert!(!matches(
+                GroupedD512Mode::Force,
+                num_heads,
+                num_kv_heads,
+                1,
+                8_193
+            ));
+        }
+    }
+
+    #[test]
+    fn d512_stripes_account_for_kv_head_parallelism() {
+        for (context, expected) in [
+            (4_096, [32, 16, 8]),
+            (4_097, [64, 32, 16]),
+            (8_193, [128, 64, 32]),
+        ] {
+            for ((q_heads, kv_heads), expected) in
+                [(16, 1), (16, 2), (32, 4)].into_iter().zip(expected)
+            {
+                assert_eq!(
+                    grouped_stripe_count(
+                        GroupedPagedAttentionKind::D512Direct,
+                        context,
+                        q_heads,
+                        kv_heads,
+                    ),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn d512_wide_stripe_policy_matches_graph_and_planner_boundaries() {
+        for (context, expected) in [(90_112, 64), (90_113, 128), (91_795, 128), (112_000, 128)] {
+            assert_eq!(
+                grouped_d512_resolved_stripe_count(None, context, 16, 2),
+                expected
+            );
+        }
+        assert_eq!(
+            grouped_d512_resolved_stripe_count(None, 90_113, 8, 1),
+            128,
+            "Hq8/Hkv1 is unchanged"
+        );
+        assert_eq!(
+            grouped_d512_resolved_stripe_count(None, 90_113, 16, 1),
+            128,
+            "Hq16/Hkv1 is unchanged"
+        );
+        assert_eq!(
+            grouped_d512_resolved_stripe_count(None, 90_113, 32, 4),
+            32,
+            "Hkv4 is unchanged"
+        );
+        assert_eq!(
+            grouped_d512_resolved_stripe_count(Some(32), 91_795, 16, 2),
+            32,
+            "an explicit validated override remains authoritative"
+        );
+    }
+
+    #[test]
+    fn explicit_route_hint_bypasses_environment_and_context_only() {
+        let select = |hint, num_heads, num_kv_heads, context| {
+            select_grouped_paged_attention(
+                MetalDtype::BFloat16,
+                MetalDtype::BFloat16,
+                1,
+                num_heads,
+                num_kv_heads,
+                512,
+                16,
+                1,
+                context,
+                hint,
+            )
+        };
+        assert_eq!(
+            select(PagedAttentionRouteHint::ForceD512Staged, 16, 2, 91_765),
+            Some(GroupedPagedAttentionKind::D512Direct)
+        );
+        assert_eq!(
+            select(PagedAttentionRouteHint::ForceGeneric, 16, 2, 8_193),
+            None
+        );
+        assert_eq!(
+            select(PagedAttentionRouteHint::ForceD512Staged, 16, 4, 91_765),
+            None,
+            "a route hint must not bypass geometry validation"
+        );
     }
 }
