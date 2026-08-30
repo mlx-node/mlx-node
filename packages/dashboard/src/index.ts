@@ -20,7 +20,6 @@ export {
   dispatchMain,
   dispatchWorker,
   isApiPath,
-  matchStreamRoute,
   routeThreadFor,
   type ApiRequestInput,
 } from './api/dispatch.js';

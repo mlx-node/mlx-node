@@ -188,25 +188,23 @@ export class NoParentChannelError extends Error {
  */
 
 /**
- * What the supervisor may ask the sidecar over the control channel.
+ * Answer one request the supervisor sent over the control channel. Rejects for a
+ * malformed or unknown payload — never guesses.
  *
- * Deliberately not "anything the HTTP API can do". The sidecar's HTTP port is
- * the inference surface and the Control Panel window reaches it directly; this channel
- * exists for the things a *supervisor* needs and an HTTP client cannot get —
- * what was discovered on disk, and an out-of-band model swap that runs under the
- * same drain/writer brackets the HTTP path uses.
+ * The ops are deliberately not "anything the HTTP API can do". The sidecar's HTTP
+ * port is the inference surface and the Control Panel window reaches it directly;
+ * this channel exists for the things a *supervisor* needs and an HTTP client cannot
+ * get — what was discovered on disk, and an out-of-band model swap that runs under
+ * the same drain/writer brackets the HTTP path uses.
+ *
+ * - `{ op: 'info' }` — static facts settled at startup: url, port, models dir,
+ *   bound model, log dir.
+ * - `{ op: 'health' }` — the same body `GET /health` returns, without a round trip
+ *   through the socket.
+ * - `{ op: 'models' }` — everything discovered under the models dir, alphabetical.
+ * - `{ op: 'load'; name: string }` — make `name` the resident model. Rejects for a
+ *   name that was not discovered.
  */
-export type SidecarRequest =
-  /** Static facts settled at startup: url, port, models dir, bound model, log dir. */
-  | { op: 'info' }
-  /** The same body `GET /health` returns, without a round trip through the socket. */
-  | { op: 'health' }
-  /** Everything discovered under the models dir, alphabetical. */
-  | { op: 'models' }
-  /** Make `name` the resident model. Rejects for a name that was not discovered. */
-  | { op: 'load'; name: string };
-
-/** Answer one request. Rejects for a malformed or unknown payload — never guesses. */
 export async function handleSidecarRequest(host: SidecarHost, payload: unknown): Promise<unknown> {
   if (typeof payload !== 'object' || payload === null) {
     throw new Error(`malformed request payload (${payload === null ? 'null' : typeof payload})`);
@@ -305,8 +303,7 @@ export async function runSidecar(deps: SidecarDeps): Promise<void> {
     // `close()` disposes the verbose logger, the HTTP server and the paged-config
     // temp root. The temp root is the only one of the three that outlives this
     // process, so skipping it leaves work for the next host's startup sweep.
-    const closing =
-      host === null ? Promise.resolve() : host.close({ timeoutMs: SIDECAR_HOST_CLOSE_TIMEOUT_MS });
+    const closing = host === null ? Promise.resolve() : host.close({ timeoutMs: SIDECAR_HOST_CLOSE_TIMEOUT_MS });
     void closing
       .catch((error: unknown) => {
         deps.logError(`[mlx] inference host did not close cleanly: ${describe(error)}`);

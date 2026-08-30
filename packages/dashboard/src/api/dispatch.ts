@@ -78,22 +78,6 @@ function segmentsMatch(pattern: string[], segments: string[]): boolean {
 }
 
 /**
- * The transport-owned stream route (SSE download progress) this request names,
- * if any. A transport that can stream calls this BEFORE {@link dispatch} and
- * handles the request itself; one that cannot simply dispatches and gets the
- * handler's "not available over this transport" failure.
- */
-export function matchStreamRoute(method: string, pathname: string): { params: Record<string, string> } | null {
-  const segments = splitSegments(pathname);
-  for (const r of ROUTES) {
-    if (r.stream !== true) continue;
-    const params = matchRoute(r, method, segments);
-    if (params !== null) return { params };
-  }
-  return null;
-}
-
-/**
  * The thread that owns the route this request names, or `null` when nothing
  * matches (a 404/405 needs no handler and is answered wherever it arrives).
  * Callers route by THIS, never by a hard-coded path list.
