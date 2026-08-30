@@ -1,20 +1,11 @@
 /**
- * Subprocess gate for the native-free import contract.
+ * Subprocess gate for the native-free import contract: `@mlx-node/agent/catalog`
+ * and the `@mlx-node/lm/family-data` leaf must reach nothing that dlopens the
+ * addon. A stray value import is invisible to every behavioural test, which runs
+ * in a vitest worker that already loaded it.
  *
- * `@mlx-node/agent/catalog` is the agent package's one native-free entry
- * point (dashboard viewer process, `mlx agent --help`), and it now
- * value-imports `@mlx-node/lm/family-data` — legal only while that leaf stays
- * free of runtime imports (`import type` only). Nothing enforced either
- * contract until this file: one stray value import away, the dashboard starts
- * dlopening Metal, and the symptom (slower start, more memory) is invisible
- * to every behavioural test running inside a vitest worker that already
- * loaded the addon.
- *
- * A fresh node child registers a resolve hook that throws on `@mlx-node/core`
- * or any `.node` specifier, then imports the BUILT subpaths — so the check
- * covers the real published import graph, not the source aliases. Run
- * `yarn build:ts` first; a missing dist fails the existence assertions loudly
- * instead of skipping.
+ * Imports the BUILT subpaths, so run `yarn build:ts` first; a missing dist fails
+ * the existence assertions loudly instead of skipping.
  */
 
 import { execFileSync } from 'node:child_process';

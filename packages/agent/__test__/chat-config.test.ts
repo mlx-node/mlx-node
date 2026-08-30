@@ -103,8 +103,8 @@ describe('buildChatConfig', () => {
 
   it('gives lfm2_moe the first-class MoE sampler (LFM2.5-8B-A1B card), NOT the dense lfm2 preset', () => {
     const config = buildChatConfig('lfm2_moe', undefined, undefined);
-    // Concrete card values — deliberately not compared against
-    // LAUNCH_PRESETS['lfm2'] (the dense 1.2B guidance: temp 0.05, topK 50).
+    // Concrete card values — deliberately not compared against the dense `lfm2`
+    // preset (the 1.2B guidance: temp 0.05, topK 50).
     expect(config.temperature).toBe(0.2);
     expect(config.topK).toBe(80);
     expect(config.repetitionPenalty).toBe(1.05);
@@ -119,8 +119,8 @@ describe('buildChatConfig', () => {
   });
 
   it('pins the no-preset error known-types list byte-identically', () => {
-    // The historical order: trainable rows, then loadable rows, each in
-    // registry order. The derived construction must never reorder it.
+    // Trainable rows, then loadable rows, each in registry order — the derived
+    // construction must never reorder it.
     expect(() => buildChatConfig('harrier', undefined, undefined)).toThrow(
       'buildChatConfig: no launch preset for model type "harrier" ' +
         '(known types: qwen3, qwen3_5, qwen3_5_moe, gemma4, muse_glimmer, lfm2, lfm2_moe, nemotron_h)',

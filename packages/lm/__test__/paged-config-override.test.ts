@@ -172,9 +172,8 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
     expect('persistPagedCache' in config).toBe(false);
   });
 
-  // The manager's default policy set is derived from the family-data rows
-  // (kind trainable|loadable); this pins its content to the explicit list the
-  // deleted AGENT_PAGED_MODEL_TYPES constant carried.
+  // Pins the derived default paged policy set: every chat family, and nothing
+  // else.
   it('derives the default paged policy set from the chat families', () => {
     expect([...CHAT_FAMILY_IDS].sort()).toEqual(
       ['qwen3', 'qwen3_5', 'qwen3_5_moe', 'gemma4', 'muse_glimmer', 'lfm2', 'lfm2_moe', 'nemotron_h'].sort(),

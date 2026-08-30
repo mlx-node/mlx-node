@@ -1,17 +1,8 @@
 /**
- * Plumbing coverage for per-model sampling defaults:
- *
- *   register(name, model, { samplingDefaults })
- *      → SessionRegistry.samplingDefaults
- *      → new ChatSession(model, { defaultConfig: samplingDefaults })
- *      → chatSessionStart(messages, mergedConfig) receives the defaults
- *
- * `ChatSession.defaultConfig` is a private field, so rather than
- * reflecting into the instance we observe what the first
- * `chatSessionStart` dispatch receives: it is the result of
- * `ChatSession.mergeConfig({})`, which equals
- * `{ ...defaultConfig, reuseCache: true }`. That lets us
- * byte-for-byte assert every key we care about from the spy side.
+ * Plumbing coverage for per-model sampling defaults. `ChatSession.defaultConfig`
+ * is a private field, so the assertions read what the first `chatSessionStart`
+ * dispatch receives: `ChatSession.mergeConfig({})`, i.e.
+ * `{ ...defaultConfig, reuseCache: true }`.
  */
 
 import type { ChatConfig, ChatMessage, ChatResult, ToolCallResult } from '@mlx-node/core';
@@ -19,9 +10,7 @@ import { QWEN_SAMPLING_DEFAULTS, type SessionCapableModel } from '@mlx-node/lm';
 import { ModelRegistry } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
-// ---------------------------------------------------------------------------
-// Mock model
-// ---------------------------------------------------------------------------
+// Mock model.
 
 interface CapturingModel extends SessionCapableModel {
   lastStartConfig: ChatConfig | null | undefined;
@@ -67,10 +56,6 @@ function createCapturingModel(): CapturingModel {
   };
   return model as unknown as CapturingModel;
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe('QWEN_SAMPLING_DEFAULTS', () => {
   it('exports Unsloth coding-mode values verbatim', () => {

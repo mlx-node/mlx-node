@@ -3,10 +3,9 @@
  * addon (the dashboard is a viewer process that must start without Metal).
  *
  * Model metadata (family label, quantization, context window) is parsed from
- * each checkpoint's `config.json`. The family label runs the REAL registry
- * detection — `matchFamily`, reached through the native-free
- * `@mlx-node/agent/catalog` subpath — so the dashboard can never rot behind
- * `packages/lm`'s registry rows again.
+ * each checkpoint's `config.json`; the family label runs the registry's own
+ * `matchFamily`, reached through the native-free `@mlx-node/agent/catalog`
+ * subpath.
  */
 
 import {
@@ -395,12 +394,9 @@ export function isSafeRelPath(p: string): boolean {
 }
 
 /**
- * Family label from `config.json`: the registry's own `matchFamily` decides
- * (alias or the qwen3 nullish default, refined by architecture probes in
- * registry declaration order). Where the loader fails closed (malformed
- * `architectures`, unknown `model_type`) the dashboard must not throw on a
- * foreign checkpoint, so those shapes fall back to the raw `model_type`
- * string (or `qwen3` when it is not a string).
+ * Family label from `config.json` via the registry's `matchFamily`. A viewer
+ * must label, never throw, so the shapes the loader fails closed on fall back
+ * to the raw `model_type` (or `qwen3` when it is not a string).
  */
 function detectModelTypeLabel(modelDir: string, config: Record<string, unknown>): string {
   try {

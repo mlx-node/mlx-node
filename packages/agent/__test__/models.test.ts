@@ -191,8 +191,8 @@ describe('discoverMlxModels', () => {
 
   it('sources maxTokens from the family launch preset', () => {
     const [qwen, gemma, fallback] = infos;
-    expect(qwen!.piModel.maxTokens).toBe(81920); // LAUNCH_PRESETS.qwen3_5.maxOutputTokens
-    expect(gemma!.piModel.maxTokens).toBe(16384); // LAUNCH_PRESETS.gemma4.maxOutputTokens
+    expect(qwen!.piModel.maxTokens).toBe(81920);
+    expect(gemma!.piModel.maxTokens).toBe(16384);
     expect(fallback!.piModel.maxTokens).toBe(81920);
   });
 

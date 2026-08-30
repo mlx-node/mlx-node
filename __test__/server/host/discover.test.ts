@@ -44,11 +44,10 @@ describe('discoverModels', () => {
   });
 
   it('filters out Harrier (non-generative) model entries', async () => {
-    // NOTE: two guards can produce this result — the explicit NON_GENERATIVE
-    // set and the "no LAUNCH_PRESETS entry" skip. Today `harrier` has no
-    // preset either, so this assertion cannot tell them apart; deleting the
-    // NON_GENERATIVE check leaves it green. Treat it as coverage of the
-    // OUTCOME, not of which guard fired.
+    // NOTE: two guards produce this result — the explicit NON_GENERATIVE set and
+    // the no-launch-preset skip. `harrier` trips both, so this assertion cannot
+    // tell them apart and deleting the NON_GENERATIVE check leaves it green.
+    // Treat it as coverage of the OUTCOME, not of which guard fired.
     makeModel('harrier-emb', { model_type: 'qwen3', architectures: ['Qwen3Model'] });
     const got = await discoverModels(root);
     expect(got).toEqual([]);

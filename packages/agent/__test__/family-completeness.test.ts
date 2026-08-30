@@ -1,9 +1,8 @@
 /**
- * Runtime backstop behind the family-data row type's compile-time gate: every
- * chat family must carry traits and an agent-servable preset, the paged
- * override manager's default policy must cover it, and the chat /
- * non-generative split must partition the whole registry. Survives type-level
- * erosion (an `as any` on a row) and guards the derived helpers themselves.
+ * Runtime backstop behind the row type's compile-time gate: traits + preset per
+ * chat family, the paged override manager's default policy covers them, and the
+ * chat / non-generative split partitions the whole registry. Survives type-level
+ * erosion (an `as any` on a row).
  */
 
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
@@ -29,8 +28,6 @@ describe('family-data completeness', () => {
   });
 
   it('gives lfm2_moe the MoE card sampler, not the dense lfm2 one', () => {
-    // lfm2_moe loads through the same wrapper and native class as dense
-    // lfm2, so every surface serves it — one preset, no per-surface split.
     const moe = launchPresetFor('lfm2_moe');
     expect(moe).toBeDefined();
     // LiquidAI's MoE card values.

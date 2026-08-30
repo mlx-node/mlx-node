@@ -1,7 +1,6 @@
 /**
- * Model loading utilities for Qwen3 models
- *
- * Handles loading pretrained weights from MLX format or converting from HuggingFace.
+ * Native half of the family registry: one loader binding per
+ * `MODEL_FAMILY_DATA` row, plus `detectModelType` (filesystem + GGUF).
  */
 
 import { readFile } from 'node:fs/promises';
@@ -206,9 +205,9 @@ function dispatchLoad(
  * Supports both language models (Qwen3, Qwen3.5) and vision-language models
  * (Qianfan-OCR / InternVL). Use `instanceof` to narrow the returned type.
  *
- * `options.draftModelPath` attaches an external draft checkpoint (DSpark or
- * Google gemma-4 assistant, auto-detected from the draft's config.json) for
- * speculative decoding — gemma4 only; any other detected family rejects it.
+ * `options.draftModelPath` attaches an external draft checkpoint for
+ * speculative decoding — gemma4 and dense qwen3_5 only; every other family
+ * rejects it.
  * Without the option, Gemma4 loads `<modelPath>/draft/` automatically when
  * that embedded checkpoint is present.
  */
@@ -233,9 +232,9 @@ export async function loadModel(modelPath: string, options?: LoadModelOptions): 
  *     must import `QianfanOCRModel` from `@mlx-node/vlm` and construct
  *     `new ChatSession(model)` directly.
  *
- * `options.draftModelPath` attaches an external draft checkpoint (DSpark or
- * Google gemma-4 assistant, auto-detected from the draft's config.json) for
- * speculative decoding — gemma4 only; any other detected family rejects it.
+ * `options.draftModelPath` attaches an external draft checkpoint for
+ * speculative decoding — gemma4 and dense qwen3_5 only; every other family
+ * rejects it.
  * Without the option, Gemma4 loads `<modelPath>/draft/` automatically when
  * that embedded checkpoint is present.
  * The resulting session auto-enables the speculative path when the model

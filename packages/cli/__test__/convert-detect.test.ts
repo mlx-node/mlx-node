@@ -1,15 +1,12 @@
 /**
  * Pins for the CONVERT_DETECT table.
  *
- * 1. Overlap cases: rows are ordered, and the order is a decision — a raw
- *    model_type row that precedes an architecture-probe row must win even
- *    when the probe also matches. The native parity gate cannot see this
- *    (both outcomes are convertible), so the overlaps are pinned here.
- * 2. Cross-language parity: every convertible model_type the native recipe
- *    registry accepts must be producible by some CONVERT_DETECT row —
- *    otherwise a checkpoint of that family with `-m` omitted silently
- *    converts through the generic family-less pass and produces unloadable
- *    output.
+ * 1. Row ORDER: a raw model_type row that precedes an architecture-probe row
+ *    must win even when the probe also matches.
+ * 2. Cross-language PARITY: every convertible model_type the native recipe
+ *    registry accepts must be producible by some CONVERT_DETECT row — otherwise
+ *    a checkpoint of that family with `-m` omitted silently converts through
+ *    the generic family-less pass and produces unloadable output.
  */
 import { convertibleModelTypes } from '@mlx-node/core';
 import { describe, expect, it } from 'vite-plus/test';

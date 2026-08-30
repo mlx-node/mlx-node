@@ -1,13 +1,11 @@
 /**
- * Pins the dashboard's family label against the lm registry's detection
- * decisions (`MODEL_FAMILY_REGISTRY` in
- * `packages/lm/src/models/model-loader.ts`): every raw alias labels its
- * canonical family id, the architecture probes fire in registry declaration
- * order (gemma4 unified, muse, harrier, nemotron), and shapes the loader
- * rejects (unknown model_type, malformed architectures) keep the dashboard's
- * raw-string fallback instead of throwing. The fixtures are deliberately a
- * hand-held mirror of the registry rows: the dashboard must produce these
- * labels no matter how its detector is implemented.
+ * Pins the dashboard's family label against the lm registry's own detection
+ * (`matchFamily` over `MODEL_FAMILY_DATA` in `packages/lm/src/family-data.ts`).
+ * The fixtures are a deliberate hand-held mirror of the registry rows: every
+ * raw alias labels its canonical family id, the architecture probes fire in
+ * registry declaration order (gemma4 unified, muse, harrier, nemotron), and
+ * shapes the loader rejects (unknown model_type, malformed architectures) keep
+ * the dashboard's raw-string fallback instead of throwing.
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -44,9 +42,17 @@ const LABEL_CASES = [
   ['probe-gemma-other-family-type', { model_type: 'lfm2', architectures: [UNIFIED_GEMMA] }, 'gemma4'],
   ['probe-gemma-string-arch', { architectures: UNIFIED_GEMMA }, 'gemma4'],
   ['probe-gemma-over-harrier', { model_type: 'qwen3', architectures: ['Qwen3Model', UNIFIED_GEMMA] }, 'gemma4'],
-  ['probe-muse-arch', { model_type: 'unknown', architectures: ['MuseGlimmerForConditionalGeneration'] }, 'muse_glimmer'],
+  [
+    'probe-muse-arch',
+    { model_type: 'unknown', architectures: ['MuseGlimmerForConditionalGeneration'] },
+    'muse_glimmer',
+  ],
   ['probe-harrier', { model_type: 'qwen3', architectures: ['Qwen3Model'] }, 'harrier'],
-  ['probe-harrier-causal-lm-negative', { model_type: 'qwen3', architectures: ['Qwen3Model', 'Qwen3ForCausalLM'] }, 'qwen3'],
+  [
+    'probe-harrier-causal-lm-negative',
+    { model_type: 'qwen3', architectures: ['Qwen3Model', 'Qwen3ForCausalLM'] },
+    'qwen3',
+  ],
   ['probe-harrier-default-base', { architectures: ['Qwen3Model'] }, 'harrier'],
   ['probe-harrier-non-string-entries', { model_type: 'qwen3', architectures: ['Qwen3Model', 42] }, 'harrier'],
   ['probe-nemotron-arch', { model_type: 'nemotron', architectures: ['NemotronHForCausalLM'] }, 'nemotron_h'],

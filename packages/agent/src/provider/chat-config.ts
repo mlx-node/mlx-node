@@ -17,8 +17,7 @@ import {
 
 /**
  * Model types the no-preset error names: trainable rows, then loadable rows,
- * each group in registry order. The grouping preserves the trainable-first
- * order the old `LAUNCH_PRESETS` literal printed. Pinned by
+ * each in registry order. Pinned byte-exactly by
  * `packages/agent/__test__/chat-config.test.ts`.
  */
 const KNOWN_PRESET_MODEL_TYPES: readonly string[] = (() => {

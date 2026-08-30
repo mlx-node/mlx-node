@@ -1,10 +1,9 @@
 /**
  * Curated model catalog for `mlx agent`.
  *
- * The first-run download wizard (Task 8) offers `visibleCatalog()` and
- * feeds the chosen `hfRepo` to `mlx download model`. Slugs are settled
- * with the user and verified against the Brooooooklyn HF account —
- * use them verbatim.
+ * The first-run download wizard offers `visibleCatalog()` and feeds the chosen
+ * `hfRepo` to `mlx download model`. Slugs are verified against the Brooooooklyn
+ * HF account — use them verbatim.
  */
 
 export interface CatalogEntry {
@@ -110,12 +109,9 @@ export function visibleCatalog(): CatalogEntry[] {
  * cold-tier allowlist, the cache-root canonicalizer, and the family detection
  * data through here.
  *
- * These are RE-EXPORTS. The cold-tier definitions live in `./cold-tier.ts`
- * (`packages/agent/__test__/cold-tier-families.test.ts` guards the allowlist
- * against the native side); the family rows live in `@mlx-node/lm/family-data`,
- * itself a native-free leaf (`import type` only), which is why a VALUE import
- * of it is legal here. `packages/agent/__test__/catalog-native-free.test.ts`
- * gates both contracts in a real subprocess.
+ * Every module reachable from here must therefore stay free of runtime addon
+ * imports. `packages/agent/__test__/catalog-native-free.test.ts` gates that in a
+ * real subprocess.
  */
 export { COLD_TIER_RESTORE_FAMILIES, canonicalCacheRoot, coldTierRestoreFamilyList } from './cold-tier.js';
 export {

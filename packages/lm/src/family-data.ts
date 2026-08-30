@@ -1,12 +1,6 @@
 /**
- * Native-free per-family registration data: the single source for every
- * per-family key→value row on the TypeScript side — raw config aliases and
- * architecture probes, family kind, sampling presets, agent traits, GGUF
- * import architectures — plus the pure `matchFamily` detection those rows
- * drive. The native half (loaders + native classes) stays in
- * `models/model-loader.ts` as an exhaustive `Record<ModelType, LoaderBinding>`
- * zip, so a row added here without a loader binding (or vice versa) fails to
- * compile.
+ * Native-free per-family registration rows plus the pure `matchFamily`
+ * detection they drive.
  *
  * This module must stay free of runtime imports (`import type` only): it is
  * re-exported through the native-free `@mlx-node/agent/catalog` subpath to the
@@ -67,12 +61,7 @@ export interface FamilyTraits {
   readonly thinkingLevelMap?: FamilyThinkingLevelMap;
   /**
    * Context-window fallback when `config.json` carries no
-   * `max_position_embeddings` at either nesting level. Values are the
-   * trained windows of the reference checkpoints: Qwen3 40960,
-   * Qwen3.5 (+MoE) 262144, Gemma4 131072, LFM2.5 (dense + MoE) 128000
-   * (`LFM2_CONFIGS[*].maxPositionEmbeddings` in `packages/lm`),
-   * Nemotron 3.5 Lightning 1048576
-   * (`crates/mlx-core/src/models/nemotron_h/config.rs`).
+   * `max_position_embeddings` at either nesting level.
    *
    * A family's VOCAB size is never the right value here — the two are
    * unrelated numbers that happen to collide on some checkpoints
@@ -88,16 +77,12 @@ export interface FamilyTraits {
  * All modes pin `top_k = 20` and `min_p = 0.0`; they differ in
  * `temperature`, `top_p`, and `presence_penalty`.
  *
- * The native anti-repetition cutoff is now disabled by default
- * (vLLM-aligned — vLLM ships no repetition-stop heuristic), so these
- * presets no longer pin `maxConsecutiveTokens` / `maxNgramRepeats` /
- * `ngramSize`. Repetition is shaped by the sampling penalties above and
- * bounded by the per-model `maxOutputTokens`. An operator or client can
- * still opt in by setting those fields explicitly — a per-request config
- * value wins via `ChatSession.mergeConfig`.
+ * Deliberately no `maxConsecutiveTokens` / `maxNgramRepeats` / `ngramSize`: the
+ * native anti-repetition cutoff is off by default (vLLM-aligned), and a client
+ * can still opt in per request.
  */
 export const QWEN_SAMPLING_DEFAULTS = {
-  /** Thinking mode for precise coding tasks: temp=0.6, top_p=0.95, pp=0.0 */
+  /** Thinking mode for precise coding tasks. */
   thinkingCoding: {
     temperature: 0.6,
     topP: 0.95,
@@ -107,7 +92,7 @@ export const QWEN_SAMPLING_DEFAULTS = {
     repetitionPenalty: 1.0,
   } satisfies ChatConfig,
 
-  /** Thinking mode for general tasks: temp=1.0, top_p=0.95, pp=1.5 */
+  /** Thinking mode for general tasks. */
   thinkingGeneral: {
     temperature: 1.0,
     topP: 0.95,
@@ -117,7 +102,7 @@ export const QWEN_SAMPLING_DEFAULTS = {
     repetitionPenalty: 1.0,
   } satisfies ChatConfig,
 
-  /** Instruct (non-thinking) for general tasks: temp=0.7, top_p=0.8, pp=1.5 */
+  /** Instruct (non-thinking) for general tasks. */
   instructGeneral: {
     temperature: 0.7,
     topP: 0.8,
@@ -127,7 +112,7 @@ export const QWEN_SAMPLING_DEFAULTS = {
     repetitionPenalty: 1.0,
   } satisfies ChatConfig,
 
-  /** Instruct (non-thinking) for reasoning tasks: temp=1.0, top_p=0.95, pp=1.5 */
+  /** Instruct (non-thinking) for reasoning tasks. */
   instructReasoning: {
     temperature: 1.0,
     topP: 0.95,
@@ -179,13 +164,9 @@ export const LFM2_SAMPLING_DEFAULTS: ChatConfig = {
 };
 
 /**
- * Sampling + per-model output token cap. Sampling presets are recommended by
- * third-party model authors and exposed as `ChatConfig`-shaped objects so an
- * operator can pin them at `ModelRegistry.register(name, model,
- * { samplingDefaults: ... })` time with a single import. Per-request client
- * values (OpenAI `temperature`/`top_p`, Anthropic equivalents) still override
- * these defaults where the client sends them — `ChatSession.mergeConfig`
- * treats per-call config as an overlay on top of `defaultConfig`.
+ * Sampling defaults + per-model output cap. A per-request client value still
+ * wins: `ChatSession.mergeConfig` treats per-call config as an overlay on top
+ * of `defaultConfig`.
  */
 export interface LaunchPreset {
   sampling: ChatConfig;
@@ -208,12 +189,11 @@ interface ModelFamilyDataBase {
 }
 
 /**
- * A chat-capable family MUST declare `traits` and a `launchPreset` — this is
- * the compile-time completeness gate that replaces the old silent discovery
- * skips (`FAMILY_TRAITS` / `LAUNCH_PRESETS` misses were debug-only warnings).
- * One preset serves every surface: `@mlx-node/server` discovery,
- * `mlx launch claude` and `mlx agent`. A chat family is therefore reachable
- * from all of them or from none, never from one and not another.
+ * A chat-capable family MUST declare `traits` and a `launchPreset` — the
+ * compile-time completeness gate. One preset serves every surface:
+ * `@mlx-node/server` discovery, `mlx launch claude` and `mlx agent`. A chat
+ * family is therefore reachable from all of them or from none, never from one
+ * and not another.
  */
 interface ChatFamilyData extends ModelFamilyDataBase {
   readonly kind: 'trainable' | 'loadable';
@@ -348,13 +328,8 @@ export const MODEL_FAMILY_DATA = [
     match: { rawModelTypes: ['lfm2_moe'] },
     traits: { reasoning: true, fallbackContextWindow: 128000 },
     /**
-     * LFM2.5-8B-A1B: LiquidAI's HF model card for the MoE checkpoint
-     * recommends temperature 0.2 / top_k 80 — deliberately NOT the dense
-     * `lfm2` preset (LFM2.5-1.2B guidance: temperature 0.05 / top_k 50).
-     * repetitionPenalty 1.05 and the 8192-token output budget match the
-     * dense family entry. It loads through the same `Lfm2Model` wrapper and
-     * `NativeLfm2Model` class as dense `lfm2`, so server discovery serves it
-     * on the same terms.
+     * LFM2.5-8B-A1B: LiquidAI's MoE card recommends temperature 0.2 / top_k 80
+     * — deliberately NOT the dense `lfm2` values (0.05 / 50).
      */
     launchPreset: {
       sampling: {
@@ -407,11 +382,9 @@ export type ChatFamilyId = ChatFamilyRow['id'];
 export type TrainableFamilyId = Extract<FamilyDataRow, { readonly kind: 'trainable' }>['id'];
 
 /**
- * Every chat-capable family (kind trainable | loadable), in registry order.
- * The default set the paged-config override manager forces onto the
- * block-paged path — content-identical to the deleted
- * `AGENT_PAGED_MODEL_TYPES` hand list, now derived so a new chat family can
- * never be forgotten.
+ * Every chat-capable family (kind trainable | loadable), in registry order —
+ * the default set the paged-config override manager forces onto the block-paged
+ * path. Derived, so a new chat family can never be forgotten.
  */
 export const CHAT_FAMILY_IDS: readonly ChatFamilyId[] = MODEL_FAMILY_DATA.filter(
   (row): row is ChatFamilyRow => row.kind === 'trainable' || row.kind === 'loadable',
@@ -514,9 +487,6 @@ export class UnsupportedModelTypeError extends Error {
  * or whose `architectures` is neither an array nor a string, is rejected
  * instead of coerced (coercion would fall through to the qwen3
  * nullish-model_type default and silently misroute the checkpoint).
- * Blessed lenient shapes stay accepted: `{}` root (qwen3 default),
- * missing/`null` `architectures` (empty set), bare-string `architectures`
- * (single-element set), and non-string array entries (filtered out).
  */
 function normalizeConfig(modelPath: string, config: unknown): NormalizedModelConfig {
   if (typeof config !== 'object' || config === null || Array.isArray(config)) {

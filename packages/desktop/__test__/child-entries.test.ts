@@ -203,10 +203,9 @@ describe('CONTROL PANEL never links the native addon', () => {
    * the walked `@mlx-node/lm/family-data` leaf takes `ChatConfig` off the
    * addon for its preset shapes. tsc erases both imports — the fresh-process
    * probe below confirms nothing is mapped — but "erased" is a property of the
-   * KEYWORD, not of the dependency, and deleting five characters would turn
-   * either into 61 MB in CONTROL PANEL. Asserting the exact set means another
-   * such edge, or one of these turning real, has to be argued for here rather
-   * than appearing silently.
+   * `type` KEYWORD, not of the dependency, so asserting the exact set forces
+   * another such edge, or one of these turning real, to be argued for here
+   * rather than appearing silently.
    */
   it('reaches the addon only through erased type-only imports, and only those two', () => {
     expect(reachesAddon(graph.typeOnlyPackages).sort()).toEqual(['@mlx-node/core', '@mlx-node/lm']);

@@ -1,10 +1,10 @@
 /**
  * Local model discovery for the mlx pi provider.
  *
- * Ports the discovery walk from `@mlx-node/server/host`
- * (`packages/server/src/host/discover.ts`; that copy stays untouched) and
- * pairs every discovered checkpoint with a pi `ProviderModelConfig` entry
- * ready for `pi.registerProvider('mlx', { models })`.
+ * The same discovery walk as `@mlx-node/server/host`
+ * (`packages/server/src/host/discover.ts`), pairing every discovered checkpoint
+ * with a pi `ProviderModelConfig` entry ready for
+ * `pi.registerProvider('mlx', { models })`.
  *
  * `contextWindow` starts as the checkpoint's trained window, read from the model dir's
  * `config.json` `max_position_embeddings` (root first, then the
