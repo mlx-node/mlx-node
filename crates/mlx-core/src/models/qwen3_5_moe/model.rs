@@ -53,12 +53,6 @@ use crate::transformer::paged_kv_cache_adapter::SeqId;
 pub(crate) type Qwen35MoeSchedulerState =
     crate::engine::hybrid_scheduler::HybridSchedulerState<Qwen35MoeInner>;
 
-use super::config::Qwen3_5MoeConfig;
-use super::decoder_layer::DecoderLayer;
-use super::layer_cache::Qwen3_5LayerCache;
-use super::mtp::Qwen3_5MoeMTPModule;
-use super::persistence;
-use super::quantized_linear::LinearProj;
 use crate::array::MxArray;
 use crate::engine;
 use crate::engine::backend::{MtpBackend, MtpStepper, MtpTurnSetup, SpecFrontier};
@@ -68,6 +62,12 @@ use crate::engine::{
     save_cache_state_direct, verify_cache_prefix_direct,
 };
 use crate::models::qwen3_5::mtp_decode;
+use crate::models::qwen3_5_moe::config::Qwen3_5MoeConfig;
+use crate::models::qwen3_5_moe::decoder_layer::DecoderLayer;
+use crate::models::qwen3_5_moe::layer_cache::Qwen3_5LayerCache;
+use crate::models::qwen3_5_moe::mtp::Qwen3_5MoeMTPModule;
+use crate::models::qwen3_5_moe::persistence;
+use crate::models::qwen3_5_moe::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
@@ -1297,7 +1297,7 @@ impl Qwen35MoeInner {
             let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                 Error::from_reason("Qwen3.5 MoE scalar scheduled decode has no paged adapter")
             })?;
-            return super::paged_forward::run_paged_decode_step(
+            return crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
                 *token_id,
                 &self.embedding,
                 &mut self.layers,
@@ -1757,7 +1757,7 @@ impl Qwen35MoeInner {
             })?;
         let mut recomputed = fresh_moe_layer_caches(&self.config);
         let embed = self.embedding.clone();
-        super::paged_forward::run_gdn_only_prefill_materialized(
+        crate::models::qwen3_5_moe::paged_forward::run_gdn_only_prefill_materialized(
             &tokens,
             &embed,
             &mut self.layers,
@@ -2242,7 +2242,7 @@ impl Qwen35MoeInner {
             .paged_adapter
             .as_mut()
             .ok_or_else(|| Error::from_reason(format!("{context}: paged_adapter dropped")))?;
-        super::paged_forward::run_paged_prefill_chunk_with_size_and_checkpoint(
+        crate::models::qwen3_5_moe::paged_forward::run_paged_prefill_chunk_with_size_and_checkpoint(
             tokens,
             suffix,
             cached_prefix_len,
@@ -2424,7 +2424,7 @@ impl Qwen35MoeInner {
             let turn_cancel = self.turn_cancel.clone();
             let layers = &mut self.layers;
             replay_gdn_cache_and_commit(&mut self.caches, checkpoint, |staged| {
-                super::paged_forward::run_gdn_only_prefill_materialized(
+                crate::models::qwen3_5_moe::paged_forward::run_gdn_only_prefill_materialized(
                     replay_suffix,
                     &embed,
                     layers,
@@ -2480,7 +2480,7 @@ impl Qwen35MoeInner {
         let turn_cancel = self.turn_cancel.clone();
         let layers = &mut self.layers;
         replay_gdn_cache_and_commit(&mut self.caches, fresh_caches, |staged| {
-            super::paged_forward::run_gdn_only_prefill_materialized(
+            crate::models::qwen3_5_moe::paged_forward::run_gdn_only_prefill_materialized(
                 prefix,
                 &embed,
                 layers,
@@ -2660,7 +2660,9 @@ impl Qwen35MoeInner {
     ) -> Result<()> {
         let rope_dims = self.config.rope_dims();
         for layer in self.layers.iter_mut() {
-            if let super::decoder_layer::AttentionType::Full(ref mut attn) = layer.attn {
+            if let crate::models::qwen3_5_moe::decoder_layer::AttentionType::Full(ref mut attn) =
+                layer.attn
+            {
                 attn.init_mrope(
                     mrope_section.clone(),
                     rope_theta,
@@ -3080,7 +3082,7 @@ impl Qwen35MoeInner {
     /// The paged sibling of the flat MoE VLM prefill: it processes the images,
     /// merges the vision features into the token embeddings, computes M-RoPE
     /// positions, then prefills through the paged adapter via
-    /// [`super::paged_forward::run_paged_vlm_prefill_moe`] and runs the plain
+    /// [`crate::models::qwen3_5_moe::paged_forward::run_paged_vlm_prefill_moe`] and runs the plain
     /// autoregressive decode loop.
     ///
     /// Same-image live histories continue in place; fresh histories look up
@@ -3233,7 +3235,7 @@ impl Qwen35MoeInner {
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                     Error::from_reason("vision_paged_turn_sync_core: paged_adapter dropped")
                 })?;
-                super::paged_forward::run_paged_vlm_prefill_moe(
+                crate::models::qwen3_5_moe::paged_forward::run_paged_vlm_prefill_moe(
                     &expanded_tokens,
                     &merge,
                     cached_prefix_len,
@@ -3315,7 +3317,7 @@ impl Qwen35MoeInner {
                             "vision_paged_turn_sync_core: paged_adapter dropped mid-decode",
                         )
                     })?;
-                    let logits = super::paged_forward::run_paged_decode_step(
+                    let logits = crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
                         token_id,
                         &embed,
                         &mut self.layers,
@@ -3597,7 +3599,7 @@ impl Qwen35MoeInner {
                 let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
                     Error::from_reason("vision_paged_turn_stream_core: paged_adapter dropped")
                 })?;
-                super::paged_forward::run_paged_vlm_prefill_moe(
+                crate::models::qwen3_5_moe::paged_forward::run_paged_vlm_prefill_moe(
                     &expanded_tokens,
                     &merge,
                     cached_prefix_len,
@@ -3707,7 +3709,7 @@ impl Qwen35MoeInner {
                             "vision_paged_turn_stream_core: paged_adapter dropped mid-decode",
                         )
                     })?;
-                    let logits = super::paged_forward::run_paged_decode_step(
+                    let logits = crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
                         token_id,
                         &embed,
                         &mut self.layers,
@@ -4272,7 +4274,7 @@ impl Qwen35MoeInner {
                         "MoE paged_turn_sync_core_inner: paged_adapter dropped mid-decode",
                     )
                 })?;
-                let logits = super::paged_forward::run_paged_decode_step(
+                let logits = crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
                     token_id,
                     &embed,
                     &mut self.layers,
@@ -4864,7 +4866,7 @@ impl Qwen35MoeInner {
                     )
                 })?;
                 let forward_trace_start = trace_enabled.then(std::time::Instant::now);
-                let logits = super::paged_forward::run_paged_decode_step(
+                let logits = crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
                     token_id,
                     &embed,
                     &mut self.layers,
@@ -6312,7 +6314,7 @@ impl Qwen35MoeInner {
     /// in `qwen3_5::model::Qwen35Inner::save_model_sync`, adapted for the MoE
     /// MLP variant (per-layer dense vs sparse expert routing).
     pub(crate) fn save_model_sync(&self, save_path: &str) -> Result<()> {
-        use super::decoder_layer::{AttentionType, MLPType};
+        use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
 
         if let Some(component) = self.first_quantized_save_component() {
             return Err(Error::from_reason(format!(
@@ -7692,7 +7694,7 @@ impl Qwen35MoeInner {
         learning_rate: f64,
         current_params: &HashMap<String, MxArray>,
     ) -> Result<()> {
-        use super::decoder_layer::{AttentionType, MLPType};
+        use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
 
         let updated_params =
             crate::training_model::compute_sgd_updates(&gradients, learning_rate, current_params)?;
@@ -7798,7 +7800,7 @@ impl Qwen35MoeInner {
     /// Extract all trainable parameters from the model.
     /// Direct field access — no locks needed on model thread.
     fn get_parameters_sync(&self) -> Result<HashMap<String, MxArray>> {
-        use super::decoder_layer::{AttentionType, MLPType};
+        use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
 
         let mut params = HashMap::new();
 
@@ -8174,7 +8176,7 @@ impl DecodeStep for Qwen35MoePagedDecode<'_> {
                     "Qwen35MoePagedDecode::forward: paged_adapter dropped mid-decode",
                 )
             })?;
-            super::paged_forward::run_paged_decode_step(
+            crate::models::qwen3_5_moe::paged_forward::run_paged_decode_step(
                 token_id,
                 &embed,
                 &mut self.inner.layers,
@@ -8439,7 +8441,7 @@ impl PagedBackend for Qwen35MoeInner {
                 .paged_adapter
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-            super::paged_forward::run_paged_prefill_chunk_with_size_and_checkpoint(
+            crate::models::qwen3_5_moe::paged_forward::run_paged_prefill_chunk_with_size_and_checkpoint(
                 &prefix.full_tokens,
                 suffix_tokens,
                 prefix.effective_cached_prefix_len as u32,
@@ -9142,8 +9144,8 @@ fn qwen35_moe_speculative_plan() -> SpeculativePlan {
 ///
 /// With no owner the eager pre-norm forwards run against `inner.caches`; with
 /// one, the main Step-A / verify forwards route through `inner.paged_adapter`
-/// ([`super::paged_forward::run_paged_step_with_hidden`] /
-/// [`super::paged_forward::run_paged_verify_step`]) while the GDN recurrent
+/// ([`crate::models::qwen3_5_moe::paged_forward::run_paged_step_with_hidden`] /
+/// [`crate::models::qwen3_5_moe::paged_forward::run_paged_verify_step`]) while the GDN recurrent
 /// state stays FLAT in `inner.caches` Linear slots. Only four methods
 /// (`forward_with_hidden`, `verify_step`, `rollback`, `rollback_unemitted`)
 /// branch on it.
@@ -9167,10 +9169,10 @@ pub(crate) struct MoeMtpStepper<'a> {
     /// Pre-verify snapshot of the main caches, taken in
     /// [`Self::snapshot_main_linear`], consumed by [`Self::rollback`] and the
     /// paged [`Self::rollback_unemitted`].
-    snap: Option<Result<Vec<super::layer_cache::Qwen3_5LayerSnapshot>>>,
+    snap: Option<Result<Vec<crate::models::qwen3_5_moe::layer_cache::Qwen3_5LayerSnapshot>>>,
     /// GDN tape recorded by [`Self::verify_step`], consumed by the same two
     /// rewinds.
-    tape: Vec<Option<super::gated_delta_net::GdnLayerTape>>,
+    tape: Vec<Option<crate::models::qwen3_5_moe::gated_delta_net::GdnLayerTape>>,
     /// Number of tape steps the retained snapshot + tape currently represent
     /// as the cycle's committed GDN frontier: set to the recorded step count
     /// (`depth + 1`) by `verify_step`, overwritten to `accepted_steps`
@@ -9270,7 +9272,7 @@ impl MoeMtpStepper<'_> {
             .caches
             .as_mut()
             .ok_or_else(|| Error::from_reason("eager MoE MTP replay: inner.caches is None"))?;
-        super::layer_cache::replay_mtp_snapshot_to(
+        crate::models::qwen3_5_moe::layer_cache::replay_mtp_snapshot_to(
             caches,
             snap,
             tape,
@@ -9355,7 +9357,7 @@ impl MoeMtpStepper<'_> {
             .as_mut()
             .ok_or_else(|| Error::from_reason("eager paged MoE MTP verify_step: caches is None"))?;
         let tape = &mut self.tape;
-        super::paged_forward::run_paged_verify_step(
+        crate::models::qwen3_5_moe::paged_forward::run_paged_verify_step(
             &verify_in,
             &inner.embedding,
             &mut inner.layers,
@@ -9471,17 +9473,18 @@ impl MtpStepper for MoeMtpStepper<'_> {
                 let caches = inner.caches.as_mut().ok_or_else(|| {
                     Error::from_reason("eager paged MoE MTP forward_with_hidden: caches is None")
                 })?;
-                let (logits, hidden) = super::paged_forward::run_paged_step_with_hidden(
-                    token_id,
-                    &inner.embedding,
-                    &mut inner.layers,
-                    caches,
-                    &inner.final_norm,
-                    &inner.lm_head,
-                    &self.layer_kinds,
-                    adapter,
-                    rope_deltas,
-                )?;
+                let (logits, hidden) =
+                    crate::models::qwen3_5_moe::paged_forward::run_paged_step_with_hidden(
+                        token_id,
+                        &inner.embedding,
+                        &mut inner.layers,
+                        caches,
+                        &inner.final_norm,
+                        &inner.lm_head,
+                        &self.layer_kinds,
+                        adapter,
+                        rope_deltas,
+                    )?;
                 Ok((logits, hidden, true))
             }
         };
@@ -9567,7 +9570,9 @@ impl MtpStepper for MoeMtpStepper<'_> {
         let paged = self.owner.is_some();
         let inner = &*self.inner;
         let snap = match inner.caches.as_ref() {
-            Some(caches) => super::layer_cache::snapshot_all_mtp(caches, paged),
+            Some(caches) => {
+                crate::models::qwen3_5_moe::layer_cache::snapshot_all_mtp(caches, paged)
+            }
             None => Err(Error::from_reason(
                 "eager MoE MTP snapshot_main_linear: inner.caches is None",
             )),
@@ -10388,7 +10393,7 @@ fn forward_pre_norm_inner_with_tape(
     layers: &mut [DecoderLayer],
     caches: &mut Option<Vec<Qwen3_5LayerCache>>,
     _fa_idx: usize,
-    tape: &mut [Option<super::gated_delta_net::GdnLayerTape>],
+    tape: &mut [Option<crate::models::qwen3_5_moe::gated_delta_net::GdnLayerTape>],
 ) -> Result<MxArray> {
     let hidden_states = embedding.forward(input_ids)?;
     let mut h = hidden_states.clone();
@@ -10401,7 +10406,7 @@ fn forward_pre_norm_inner_with_tape(
     );
     for i in 0..num_layers {
         let cache = caches.as_mut().map(|c| &mut c[i]);
-        let mut slot: Option<super::gated_delta_net::GdnLayerTape> = None;
+        let mut slot: Option<crate::models::qwen3_5_moe::gated_delta_net::GdnLayerTape> = None;
         h = layers[i].forward_with_tape(&h, None, cache, None, true, Some(&mut slot))?;
         tape[i] = slot;
     }
@@ -10437,7 +10442,7 @@ fn eager_verify_step(
     fa_idx: usize,
     verify_ids: &MxArray,
     embedding: &Embedding,
-    tape: Option<&mut Vec<Option<super::gated_delta_net::GdnLayerTape>>>,
+    tape: Option<&mut Vec<Option<crate::models::qwen3_5_moe::gated_delta_net::GdnLayerTape>>>,
 ) -> Result<mtp_decode::MtpVerifyOutput> {
     let pre = match tape {
         Some(tape) => {
