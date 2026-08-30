@@ -11586,10 +11586,8 @@ mod tests {
                 "{mt}: embed_quantizable mismatch vs inline match"
             );
 
-            // sym8_supported allowlist: qwen3_5 (dense + MoE), lfm2/lfm2_moe,
-            // gemma4. gemma4_unified routes to Gemma4Recipe and supports sym8
-            // like gemma4. qwen3_5_moe dispatches sym8 on its non-expert
-            // sublayers (3-D stacked experts stay convert-forced affine-8).
+            // qwen3_5_moe dispatches sym8 on its non-expert sublayers only:
+            // 3-D stacked experts stay convert-forced affine-8.
             assert_eq!(
                 r.sym8_supported(),
                 matches!(
@@ -20346,8 +20344,7 @@ mod tests {
         // mismatch (config gemma4_unified vs requested qwen3_5) before the wrong
         // sanitizer runs. Only config.json is written — the gate must fire
         // before weights load, so the error is the family-mismatch reject, not a
-        // missing-safetensors error. Restores the spirit of the gemma4-smuggle
-        // guard that ce25261a removed when it opened nvidia to gemma4.
+        // missing-safetensors error.
         let base = std::env::temp_dir().join(format!(
             "nvidia_gate_gemma4_qwen_{}_{}",
             std::process::id(),

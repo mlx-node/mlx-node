@@ -1058,9 +1058,9 @@ fn gemma4_sliding_checkpoint_bytes_scale_with_min_boundary_window() {
 
 /// The headline gate for the gemma4 cold-tier ladder.
 ///
-/// The cadence fires every window and the pre-ladder victim is the oldest
-/// entry, so the rung at 1024 was born and then evicted, and nothing at or
-/// below the chain's reach was left.
+/// Without the anchor rungs the cadence fires every window and evicts the
+/// oldest entry, so the rung at 1024 dies and a lagging chain finds nothing
+/// at or below its reach.
 #[test]
 fn gemma4_sliding_ladder_retains_a_rung_the_lagging_chain_can_reach() {
     let config = twelve_b_sliding_config();

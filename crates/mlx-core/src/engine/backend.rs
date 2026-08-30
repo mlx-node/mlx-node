@@ -822,10 +822,10 @@ pub(crate) trait ChatBackend {
     /// ChatML finalization (decode with `skip_special_tokens = true`,
     /// Hermes `<tool_call>` / `<think>` parsing via
     /// `tools::parse_tool_calls`). A family override owns the WHOLE
-    /// pipeline including the raw-text decode's skip-special flag — see
-    /// [`FinalizeArgs`] for the Gemma4 mapping (raw decode_sync(..,
-    /// false) → `output_parser::parse_gemma4_output_with_open_channel` +
-    /// `promote_channel_only_output`).
+    /// pipeline including the raw-text decode's skip-special flag — Gemma4
+    /// maps it to raw `decode_sync(.., false)` →
+    /// `output_parser::parse_gemma4_output_with_open_channel` +
+    /// `promote_channel_only_output`.
     ///
     /// The session core overwrites `result.cached_tokens` AFTER this hook
     /// returns with the full-history prefix hit, so overrides need not
@@ -1095,7 +1095,7 @@ pub(crate) trait ChatBackend {
 /// [`crate::engine::decode::run_decode_loop`], so a speculative decode and an
 /// autoregressive one land on the SAME turn prologue (prime → prefill → first
 /// sample) and the SAME epilogue (reconcile → finalize → save). That is what
-/// keeps L-EPILOGUE (I11) structural rather than a convention each family
+/// keeps L-EPILOGUE structural rather than a convention each family
 /// re-derives.
 /// The refusal both [`PagedBackend`] speculative hooks default to.
 ///

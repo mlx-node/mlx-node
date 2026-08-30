@@ -189,7 +189,7 @@ Cross-model residual coupling is perf-class, not correctness: the process-wide
 Metal wired limit is set/restored per turn (`crates/mlx-core/src/stream.rs:142-262`),
 and the flat decode path calls `clear_cache` every 256 steps, draining the
 process-wide Metal free pool (`ChatBackend::maintain_cache`; noted as
-multi-model-hostile on the chat command enum in `engine/cmd.rs`).
+multi-model-hostile on `handle_chat_cmd` in `engine/cmd.rs`).
 
 ## Yardstick: vLLM v1
 
