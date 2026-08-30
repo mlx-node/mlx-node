@@ -22,9 +22,8 @@
 //! # Not ported: vLLM's per-group metadata capture
 //!
 //! vLLM snapshots per-kv-cache-group attention metadata and swaps drafter
-//! block tables around its verify pass (`gpu_model_runner.py:2662-2670`,
-//! `gemma4.py:62-103`) because its verify runs outside the module that owns
-//! the group routing. That capture is unnecessary here **by construction**:
+//! block tables around its verify pass because its verify runs outside the
+//! module that owns the group routing. That capture is unnecessary here **by construction**:
 //! our verify forward runs inside the family's grouped layer loop
 //! (`gemma4::run_paged_prefill_layer_loop`, `muse_glimmer::run_paged_layer_loop`,
 //! the qwen3_5 paged verify cores), which routes each layer's cache group
@@ -67,7 +66,7 @@ pub(crate) fn abandoned_spec_turn_epilogues() -> u64 {
 /// type-system seal: a driver that mints none still compiles and stays
 /// green. `engine::dspark_turn::run_paged_dspark_turn` is the one driver
 /// that opts in; qwen3.5-MoE paged MTP reaches the same epilogue through
-/// `run_paged_turn`, which satisfies I11 but is not observed here.
+/// `run_paged_turn`, which satisfies the law but is not observed here.
 ///
 /// One fork is live and unobserved: qwen3.5 DENSE paged MTP runs its own
 /// `paged_turn_sync_core` / `paged_turn_stream_core`
@@ -277,35 +276,23 @@ impl Drop for VerifyTicket {
 /// (`models::gemma4::model`) at coordinator scope.
 ///
 /// Which CACHE that settle may come from is a separate question, and the
-/// answer is scope-by-scope. `PruneOnlySpecPagedCache`
-/// (`models::gemma4::model`) settles at coordinator scope — pending-write
-/// eval plus that prune, nothing else — so it declares
-/// [`SpecPagedCache::settle_captures_durable_state`] `false`, and
-/// `gemma4_coordinator_is_lawful_under_the_permissive_checker` drives the
-/// in-cycle committed-basis call through it. Every FAMILY scope layers a
-/// cold-checkpoint rung walk over that same prune and answers `true`
-/// instead: gemma4's `Gemma4SpecPagedCache`, refused in-cycle at any basis
-/// by `the_family_settle_is_refused_inside_an_open_cycle`, and muse's
-/// `MuseGlimmerInner::settle_paged_kv_step`, whose `MusePagedSettle::Cursor`
-/// and `MusePagedSettle::Committed` arms BOTH reach
-/// `remember_sliding_cold_checkpoints_at_frontier` — the committed arm's
-/// capture is what `settle_at_committed_equals_cursor_when_equal`
-/// (`models::muse_glimmer::model`) asserts. Muse therefore has NO mode that
-/// prunes without capturing: a muse-scope handle must declare `true` exactly
-/// as gemma4's does, and the one muse mode lawful inside an open cycle is
-/// `MusePagedSettle::Suppressed` — pending-write eval alone, no rung and no
-/// prune, which is not a settle through this facade at all. A DFlash driver
-/// therefore runs its per-chunk loop on `Suppressed` and defers the
-/// committed settle to post-commit, the shape
-/// `suppressed_settle_defers_prune_and_checkpoints_to_the_committed_settle`
-/// (`models::muse_glimmer::model`) pins.
+/// answer is scope-by-scope. A COORDINATOR-scope handle that settles only
+/// pending-write eval plus that prune (`PruneOnlySpecPagedCache`) declares
+/// [`SpecPagedCache::settle_captures_durable_state`] `false`. Every FAMILY
+/// scope layers a cold-checkpoint rung walk over the same prune and must
+/// declare `true` — muse included: both `MusePagedSettle::Cursor` and
+/// `MusePagedSettle::Committed` reach
+/// `remember_sliding_cold_checkpoints_at_frontier`, so muse has NO mode that
+/// prunes without capturing, and the one muse mode lawful inside an open
+/// cycle is `MusePagedSettle::Suppressed` — pending-write eval alone, no rung
+/// and no prune, which is not a settle through this facade at all.
 ///
 /// [`NoDurableSettleInCycle`] is the executable form of this law.
 /// [`NoSettleInCycle`] enforces the stricter shape — no settle of any kind
 /// in the gap — which fits a driver that settles only post-commit, but by
 /// construction cannot wrap one that settles per chunk.
 ///
-/// # L-EPILOGUE (I11) — one epilogue
+/// # L-EPILOGUE — one epilogue
 ///
 /// Every paged speculative turn exits only through the family's
 /// `finish_paged_turn` shape (reconcile → finalize → save,
@@ -313,7 +300,7 @@ impl Drop for VerifyTicket {
 /// `request_tokens.len() == num_tokens`, which keeps the
 /// never-persist-the-unverified cap (I3) single-sourced. Neither an
 /// implementation of this trait nor a caller may fork a private epilogue —
-/// forking one re-opens the GDN-seam bug class Stage A closed.
+/// a forked epilogue re-opens the GDN-seam bug class.
 ///
 /// [`SpecTurnEpilogue`] is the executable form for the drivers that TAKE a
 /// token: one handed the token at dispatch can discharge it only by
@@ -350,10 +337,9 @@ pub(crate) trait SpecPagedCache {
     /// `DenseMtpStepper` (`models::qwen3_5::model`) is that shape.
     fn record_rows(&mut self, seq_id: u32, tokens: &[u32]) -> Result<(), String>;
 
-    /// Retract the last `rows` recorded rows of `seq_id`. Cursor arithmetic
-    /// (I10): paged positions are absolute and sliding groups null-prune
-    /// instead of wrapping, so no block is freed and the next record
-    /// overwrites in place. Called only by [`Self::commit_cycle`], with a
+    /// Retract the last `rows` recorded rows of `seq_id`. Cursor arithmetic:
+    /// paged positions are absolute and sliding groups null-prune instead of
+    /// wrapping, so no block is freed and the next record overwrites in place. Called only by [`Self::commit_cycle`], with a
     /// count derived from the cycle's ticket and never zero.
     fn rollback_rows(&mut self, seq_id: u32, rows: usize) -> Result<(), String>;
 
@@ -713,9 +699,9 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    /// Reference conformer: a per-sequence recorded-row cursor per the I10
-    /// model (absolute positions, rollback = cursor subtraction), plus a
-    /// call log so ordering tests can assert what reached the cache.
+    /// Reference conformer: a per-sequence recorded-row cursor (absolute
+    /// positions, rollback = cursor subtraction), plus a call log so ordering
+    /// tests can assert what reached the cache.
     #[derive(Default)]
     struct MockCursorCache {
         cursors: HashMap<u32, u64>,

@@ -42,20 +42,10 @@ use crate::utils::safetensors::load_safetensors_lazy;
 /// CPU, leaving the process pinned to CPU for the next inference call).
 ///
 /// **Concurrent-inference limitation (intentional):** `convert_mutex`
-/// only serializes convert-vs-convert. It does NOT block inference /
-/// training entrypoints. If a Node process runs `convert_model` while
-/// also serving inference, those inference ops resolve their stream via
-/// `default_stream(default_device())` and will be silently routed to
-/// CPU until the conversion finishes — typically minutes to hours on
-/// large MoE checkpoints, with severe latency degradation. The
-/// architecturally correct fix is to plumb explicit `Stream` arguments
-/// through every convert-used MLX FFI op so the global default is never
-/// touched; that's a substantial refactor outside the scope of this
-/// change. For the supported usage today (the `mlx convert` CLI exits
-/// after conversion; no other entrypoint in this codebase invokes
-/// convert), this is a non-issue. Callers who embed convert inside a
-/// long-lived multi-tenant Node process should serialize their own
-/// inference against convert externally.
+/// serializes convert-vs-convert ONLY. Concurrent inference resolves its stream
+/// via `default_stream(default_device())` and is silently routed to CPU for the
+/// whole conversion. Callers who embed convert inside a long-lived
+/// multi-tenant Node process must serialize their own inference against it.
 pub(crate) struct CpuConvertGuard {
     saved_device: i32,
     saved_stream: mlx_sys::mlx_stream,
@@ -115,8 +105,7 @@ struct ShardedModelIndex {
 ///
 /// SCOPE: this module is the convert seam only. It does not touch the
 /// persistence weight loaders, foreign_weights, gguf, or any quant decision
-/// logic. The recipe transforms must stay byte-identical to the free
-/// `sanitize_*` functions they wrap.
+/// logic.
 pub(crate) mod recipe {
     use std::collections::{HashMap, HashSet};
 
@@ -146,10 +135,9 @@ pub(crate) mod recipe {
     /// Declarative description of one convertible model family's convert-time
     /// behavior.
     ///
-    /// The `sanitize` signature is the stable SUPERSET of every family's free
-    /// `sanitize_*` fn (weights map, config, target dtype string, tie-embeddings,
-    /// verbose). Families that have not adopted a recipe delegate to their
-    /// existing free `sanitize_*` fns from the central dispatch.
+    /// `sanitize` takes the union of what every family needs (weights map, config,
+    /// target dtype string, tie-embeddings, verbose); a family that does not need a
+    /// given param prefixes it with `_`.
     pub(crate) trait ConversionRecipe {
         /// The HuggingFace `model_type` strings this recipe handles.
         ///
@@ -160,11 +148,8 @@ pub(crate) mod recipe {
         #[allow(dead_code)]
         fn model_types(&self) -> &'static [&'static str];
 
-        /// The family weight transform. The signature is the stable SUPERSET of
-        /// every family's free `sanitize_*` fn: gemma4 reads only
-        /// `weights`/`tie_word_embeddings`/`verbose`, qwen3_5 reads
-        /// `weights`/`config`/`target_dtype_str`, and lfm2 reads all but
-        /// `verbose`. Families that don't need a given param prefix it with `_`.
+        /// The family weight transform. Params are the union across families; a
+        /// family that doesn't need one prefixes it with `_`.
         fn sanitize(
             &self,
             weights: HashMap<String, MxArray>,
@@ -176,31 +161,25 @@ pub(crate) mod recipe {
 
         /// True when the family's sanitizer owns dtype conversion (FP8 dequant
         /// and cast), so the generic dtype pass is skipped and tensors flow
-        /// into `sanitize` untouched. Replaces the inline `has_custom_sanitizer`
-        /// match (qwen3_5, qwen3_5_moe, lfm2, lfm2_moe).
+        /// into `sanitize` untouched.
         fn owns_dtype_cast(&self) -> bool {
             false
         }
 
         /// True when the family opts INTO quantizing the token embedding (its
-        /// packed-quantized embedding backend handles gather-dequant). Replaces
-        /// the inline `embed_quantizable` match (qwen3_asr, lfm2, lfm2_moe).
+        /// packed-quantized embedding backend handles gather-dequant).
         fn embed_quantizable(&self) -> bool {
             false
         }
 
-        /// True when the family's 2D-linear loaders have a sym8 (per-output-
-        /// channel symmetric int8) dispatch, so `--q-mode sym8` is accepted.
-        /// Replaces the inline sym8 allowlist (qwen3_5 dense, lfm2, lfm2_moe,
-        /// gemma4 — NOT qwen3_5_moe, whose per-expert gather path has no sym8
-        /// dispatch).
+        /// True when the family's 2D-linear loaders have a sym8 (per-output-channel
+        /// symmetric int8) dispatch, so `--q-mode sym8` is accepted.
         fn sym8_supported(&self) -> bool {
             false
         }
 
         /// True when the family's sanitize arm manages quantization itself, so
-        /// the generic quantize block must be suppressed. Replaces the inline
-        /// `is_privacy_filter` match (privacy-filter only).
+        /// the generic quantize block must be suppressed.
         fn quant_managed_by_sanitizer(&self) -> bool {
             false
         }
@@ -1035,9 +1014,10 @@ pub(crate) mod recipe {
             // B) Pre-stacked fused: experts.gate_up_proj [E, fused_out, in], experts.down_proj [E, out, in]
             //    → Split gate_up_proj along dim 1, rename → switch_mlp.{proj}.weight
             //
-            // Format B comes from HuggingFace models that already fuse gate+up into one tensor
-            // and omit the .weight suffix. Without normalization, should_quantize() skips them
-            // (requires .weight suffix), leaving 60GB of expert weights unquantized.
+            // Format B comes from HuggingFace models that already fuse gate+up into one
+            // tensor and omit the .weight suffix. Without normalization
+            // `should_quantize()` skips them (it requires a .weight suffix) and the
+            // experts stay dense.
 
             let has_individual_experts = new_weights
                 .keys()
@@ -1911,8 +1891,7 @@ pub(crate) mod recipe {
 
     /// Gemma4 (text + vision/audio towers). Thinnest family: post-cast prefix
     /// strip + expert gate_up split, no FP8/norm-shift/MTP. Its `sanitize` body
-    /// is the real transform (set via [`set_gemma4_sanitize`] to avoid a
-    /// circular reference back to the parent module's free fn).
+    /// is the real transform.
     pub(crate) struct Gemma4Recipe;
 
     impl ConversionRecipe for Gemma4Recipe {
@@ -3408,7 +3387,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     // than re-quantizing. Detected from the config; the runtime never reads
     // Google's native quant metadata.
     //
-    // Split the detection by ROLE (WB-2) — a single alias-robust predicate would
+    // Split the detection by ROLE — a single alias-robust predicate would
     // let a gemma4_unified QAT reach the E2B importer, which DROPS AUDIO:
     //   - is_gemma_qat_family: the gemma FAMILY (gemma4 / gemma4_text /
     //     gemma4_unified all collapse via `nvidia_recipe_family`). Used ONLY for
@@ -3958,8 +3937,8 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     if let Some(classes) = classes.as_ref() {
         let num_layers = infer_num_layers_from_weights(&converted_tensors);
         let outcome = apply_nvfp4_pow2_lift(&mut converted_tensors, classes, num_layers)?;
-        // Gated: the lift now runs on every quantized convert, and an affine one
-        // would otherwise print "0 rescaled, 0 left alone" and read as a fault.
+        // Log only when the lift touched something: an affine convert would
+        // otherwise print "0 rescaled, 0 left alone" and read as a fault.
         if outcome.lifted_layers > 0 || outcome.skipped_layers > 0 {
             info!(
                 "NVFP4 power-of-two lift: {} FFN layers rescaled, {} left alone",
@@ -4258,7 +4237,7 @@ async fn convert_model_inner(options: ConversionOptions) -> Result<ConversionRes
     );
     if !mtp_sidecar_tensors.is_empty() {
         let mtp_path = output_dir.join("mtp.safetensors");
-        // `save_safetensors` drains its argument (drain-on-write, #63); the
+        // `save_safetensors` drains its argument; the
         // sidecar is small and is still needed below (`is_empty()` gates the
         // config metadata), so drain a clone and keep the original intact.
         crate::utils::safetensors::save_safetensors(
@@ -4846,7 +4825,7 @@ fn write_mtp_drafter_dir(
     });
 
     // If any drafter tensor is quantized (has a `.scales` companion), mirror the
-    // source's MTP quantization block (split.py:123-129). For the default bf16
+    // source's MTP quantization block (mlx-vlm's `qwen3_5_mtp` split writer). For the default bf16
     // head there are no `.scales` keys, so this is omitted.
     let has_scales = drafter_tensors.keys().any(|k| k.ends_with(".scales"));
     if has_scales {
@@ -4870,7 +4849,7 @@ fn write_mtp_drafter_dir(
     fs::write(drafter_dir.join("config.json"), config_str)
         .map_err(|e| Error::from_reason(format!("Failed to write drafter config.json: {}", e)))?;
 
-    // Tokenizer files from the SOURCE model dir (mirror split.py:134-137).
+    // Tokenizer files from the SOURCE model dir (mirrors mlx-vlm's `qwen3_5_mtp` split writer).
     for name in ["tokenizer.json", "tokenizer_config.json", "vocab.json"] {
         let src = source_dir.join(name);
         if src.exists() {
@@ -5031,7 +5010,7 @@ fn is_router_gate(key: &str) -> bool {
 /// `Embedding::load_quantized` helpers:
 /// - `lm_head`: kept here to protect the affine-only tied/dense head loaders in
 ///   families like Gemma4. Dense Qwen3.5's own `lm_head` is now mode-aware
-///   (`LinearProj`, post-PR#85) and can load mxfp4/mxfp8/nvfp4, but this guard
+///   (`LinearProj`) and can load mxfp4/mxfp8/nvfp4, but this guard
 ///   matches key strings family-agnostically and stays conservative — the
 ///   `--q-mxfp` upgrade path must not silently emit MXFP `lm_head` weights for
 ///   a family whose head loader still hardcodes affine dequant. (The `nvidia`
@@ -5256,8 +5235,8 @@ pub(crate) fn build_qwen35_recipe(
         // o_proj / out_proj and the split low-rank GDN projections
         // (`in_proj_a` / `in_proj_b`): 8-bit affine, group_size 64.
         //
-        // `linear_attn.out_proj` "dramatically increases KLD" at low bits, so
-        // it was historically skipped. It (and `self_attn.o_proj`,
+        // `linear_attn.out_proj` "dramatically increases KLD" at low bits. It (and
+        // `self_attn.o_proj`,
         // `in_proj_a`, `in_proj_b`) must nonetheless be quantized for MTP/AR
         // T=0 bit-exactness: a bf16 `matmul` dispatches `gemv` at M=1 but a
         // split-K `steel_matmul` at M>=2, and the differing reduction order
@@ -5312,17 +5291,6 @@ pub(crate) fn build_qwen35_recipe(
 /// Based on Unsloth's per-tensor 99.9% KLD analysis for Qwen3.5's hybrid
 /// GatedDeltaNet (linear attention/SSM) + full attention architecture:
 /// (https://unsloth.ai/docs/models/qwen3.5/gguf-benchmarks)
-///
-/// ## GGUF Equivalence
-///
-/// | `--q-bits` | GGUF Equivalent    | Size (35B-A3B) |
-/// |------------|--------------------|----------------|
-/// | 3          | `UD-Q3_K_XL` 16 GB | ~17 GB         |
-/// | 4          | `UD-Q4_K_XL` 19 GB | ~20 GB         |
-///
-/// Size difference (~1 GB) is format-level: GGUF K-quants pack scales within
-/// blocks, while MLX affine stores separate scales+biases per group (~2 GB
-/// metadata overhead).
 ///
 /// ## Per-Tensor Bit Assignments (default_bits = N)
 ///
@@ -6238,7 +6206,7 @@ pub(crate) fn build_nvidia_recipe() -> Box<dyn Fn(&str) -> QuantDecision + Send 
         }
 
         // lm_head → mxfp4, handled BEFORE should_quantize (which always skips
-        // lm_head). Loads via the mode-aware LinearProj head loader (post-PR#85).
+        // lm_head). Loads via the mode-aware LinearProj head loader.
         if key.contains("lm_head") && key.ends_with(".weight") {
             return QuantDecision::Custom {
                 bits: 4,
@@ -6291,8 +6259,9 @@ pub(crate) fn build_nvidia_recipe() -> Box<dyn Fn(&str) -> QuantDecision + Send 
         // FFN gate/up/down → mxfp4. Covers dense `.mlp.gate_proj`, MoE experts
         // (`.mlp.switch_mlp.gate_proj`), and the shared expert
         // (`.mlp.shared_expert.gate_proj`). Sanitize splits/stacks all experts
-        // into the `switch_mlp.*` form BEFORE the predicate runs (convert.rs
-        // Step 3, ~:600-758), so no fused `experts.gate_up_proj` reaches here;
+        // into the `switch_mlp.*` form BEFORE the predicate runs (the
+        // expert-stacking step of `Qwen35Recipe::sanitize`), so no fused
+        // `experts.gate_up_proj` reaches here;
         // were it to, it would still match via the `up_proj` substring. The
         // router gate (`.mlp.gate`) and `shared_expert_gate` were handled above
         // and lack the `_proj` suffix, so they are not swept in here.
@@ -7552,9 +7521,8 @@ fn quant_entry_emits(array: &MxArray, mode: &str, group_size: i32) -> Result<boo
 ///   (Some(..), Some(..), Some(..))`); a partial trio drops ALL THREE members
 ///   to the dense setters, where `ensure_dense_weight_floating` rejects the
 ///   quantized members' packed non-float weights (matching the dense qwen3_5
-///   fallbacks). Reachable since qwen3_5_moe gained sym8 dispatch
-///   for its non-expert sublayers (the old blanket fail-loud-on-any-sym8-
-///   config guard is gone): under a sym8 default, 3-D switch_mlp experts and
+///   fallbacks). qwen3_5_moe dispatches sym8 on its non-expert sublayers, so
+///   under a sym8 default 3-D switch_mlp experts and
 ///   2-D members with `K % 16 != 0` are both forced to affine-8
 ///   (`sym8_eligible`; a sym8 override reaching `try_build_qsl` fails loud at
 ///   load), and a forced-affine member that ALSO fails the affine
@@ -8504,9 +8472,8 @@ fn quantize_weights_inner(
         // Materialize the triplet BEFORE releasing the dense source.
         // `mlx_quantize` returns LAZY arrays whose graph still holds `array`
         // alive, so storing them un-evaluated pins every dense input until the
-        // safetensors writer finally evaluates it. Fallible on purpose: the
-        // writer used to own this materialization and could report an OOM, so
-        // taking it over here must not swallow one.
+        // safetensors writer finally evaluates it. Fallible on purpose: an OOM
+        // here must propagate, not be swallowed.
         let mut triplet: Vec<&MxArray> = vec![&q_weight, &q_scales];
         if let Some(b) = &q_biases {
             triplet.push(b);
@@ -9227,7 +9194,7 @@ pub(crate) struct Nvfp4LiftOutcome {
 /// shared-expert gate. Neither softmax nor sigmoid is scale-invariant, so
 /// folding the inverse there would rescale routing while weight-space error
 /// improved. gemma4's router reads the raw residual instead
-/// (`models/gemma4/decoder_layer.rs:457`), so that reason does not hold for it —
+/// (`gemma4::DecoderLayer::forward` routes the router off `h`), so that reason does not hold for it —
 /// but the skip does, until a gemma4-specific absorber is measured. Its dense
 /// `mlp` reads a `pre_feedforward_layernorm` nothing else touches and IS lifted,
 /// by the loop in [`apply_nvfp4_pow2_lift`].
@@ -9270,8 +9237,7 @@ pub(crate) fn apply_nvfp4_pow2_lift(
     classes: &ResolvedClasses,
     num_layers: usize,
 ) -> Result<Nvfp4LiftOutcome> {
-    // Counted before the loop mutates anything, so the scan reads the same
-    // pre-lift map the refusal this replaced used to read.
+    // Counted before the loop mutates anything, so the scan reads the pre-lift map.
     let skipped_expert_tensors = count_nvfp4_moe_expert_tensors(weights, classes)?;
 
     let layer_prefix = if weights
@@ -9759,9 +9725,8 @@ mod tests {
     /// weights carry the `language_model.model.layers.*` prefix (e.g. the
     /// qwen3_5_moe `qwen-agentworld` checkpoint), while the imatrix is always
     /// keyed with the canonical `model.layers.*` names produced by
-    /// `gguf_name_to_hf`. Regression: that prefix mismatch silently turned AWQ
-    /// into a no-op (`modified == 0`), so the unsloth recipe's low-bit
-    /// attention/SSM projections shipped without importance correction.
+    /// `gguf_name_to_hf`. A prefix mismatch silently turns AWQ into a no-op
+    /// (`modified == 0`).
     #[test]
     fn awq_prescaling_matches_vlm_prefixed_weights() {
         use crate::utils::imatrix::ImatrixData;
@@ -9855,8 +9820,7 @@ mod tests {
         let outcome = apply_awq_prescaling(&mut weights, &imatrix, 0.5, 2, None).expect("awq");
 
         // Group D (qkv + z + a + b + norm = 5) on layer 0, Group C (q + k + v +
-        // norm = 4) on layer 1. Before the prefix-decoupling fix this was 0
-        // (silent no-op); before the a/b-compensation fix it was 7 (a/b skipped).
+        // norm = 4) on layer 1.
         assert_eq!(
             outcome.modified, 9,
             "AWQ must fire on VLM-prefixed weights and compensate in_proj_a/in_proj_b"
@@ -10205,7 +10169,7 @@ mod tests {
     /// `apply_awq_prescaling` leaves its rewritten tensors lazy, so the
     /// pre-scale multiply is executed inside `quantize_weights_inner` instead
     /// of before it. Moving where MLX runs a graph must not move a bit: one arm
-    /// materializes the whole map first (what this pass used to do), the other
+    /// materializes the whole map first, the other
     /// does not, and the packed weights, scales, biases and per-layer overrides
     /// must agree exactly. This is a guard on MLX's evaluation order, not on
     /// our own call sites — it holds today with or without the quantize loop's
@@ -10243,8 +10207,7 @@ mod tests {
             "both arms rewrite the same tensors"
         );
 
-        // The arm the quantizer must reproduce: everything resident up front,
-        // which is what this pass used to do for the whole map.
+        // The arm the quantizer must reproduce: everything resident up front.
         for w in eager.values() {
             w.eval();
         }
@@ -10362,8 +10325,8 @@ mod tests {
     /// E4M3, whose smallest normal value is 2^-6 and whose subnormal step is
     /// 2^-9; real FFN block scales are already subnormal, so a division of that
     /// size rounds them to the zero code and the whole block dequantizes to
-    /// zero. Nothing but the tensor-class map says a tensor is NVFP4-bound, and
-    /// it used to be resolved long after AWQ had already rewritten the weights.
+    /// zero. Nothing but the tensor-class map says a tensor is NVFP4-bound, so it
+    /// must be resolved BEFORE AWQ rewrites a weight.
     #[test]
     fn awq_leaves_nvfp4_block_scales_intact() {
         let (mut baseline, imatrix) = awq_nvfp4_fixture();
@@ -10761,9 +10724,9 @@ mod tests {
     /// The norm an expert FFN reads also drives the router's softmax and, on
     /// `qwen3_5_moe`, the shared-expert gate's sigmoid. Neither is
     /// scale-invariant, so the fold would rescale routing while weight-space
-    /// error improved. The pass skips those tensors — and COUNTS them, because
-    /// the lift is unconditional now and an uncounted skip ships the gap
-    /// invisibly. The dense trio in the same fixture must still be lifted: a
+    /// error improved. The pass skips those tensors — and COUNTS them, so the gap
+    /// is visible in the convert output instead of shipping invisibly. The dense
+    /// trio in the same fixture must still be lifted: a
     /// gemma4 MoE layer carries both, and killing the whole convert over the
     /// expert stack would take the dense lift with it.
     /// The real `--q-mode nvfp4 --q-recipe qwen3_5` class map, not a hand-built
@@ -10867,9 +10830,8 @@ mod tests {
         }
     }
 
-    /// Every other lift refusal became a counted skip when the lift stopped
-    /// being opt-in: a convert that used to succeed without the flag must not
-    /// start failing because the flag went away. An already-packed body is the
+    /// A lift refusal must be a counted skip, never a convert failure.
+    /// An already-packed body is the
     /// one a recipe predicate still calls `nvfp4` — `resolve_quant_entry` reads
     /// the class map, never the dtype — so re-feeding a shipped NVFP4 checkpoint
     /// through `--quantize --q-mode nvfp4` lands here.
@@ -10905,10 +10867,9 @@ mod tests {
         );
     }
 
-    /// The float16 refusal became a counted skip for the same reason the others
-    /// did, and it is the one a user reaches without asking for anything:
-    /// `--dtype float16 --q-mode nvfp4` used to need the flag to fail, and now
-    /// runs on every convert. A folded norm below float16's smallest normal
+    /// `--dtype float16 --q-mode nvfp4` is the lift refusal a user reaches without
+    /// asking for anything, so it must be a counted skip.
+    /// A folded norm below float16's smallest normal
     /// loses mantissa bits, so the fold stops being exact and the layer's
     /// output would move — that layer must come out untouched, counted, and
     /// with the rest of the model still lifted.
@@ -10979,8 +10940,7 @@ mod tests {
     /// line in `convert_model_inner` that decides whether the pass runs at all
     /// is not covered by any of them: re-gating that block, or deleting it,
     /// would ship a converter that silently emits unlifted NVFP4 with the whole
-    /// suite green. The lift becoming unconditional is the headline of this
-    /// change, so it gets the same treatment as the encoder dispatch.
+    /// suite green.
     ///
     /// The norm is the witness. Norms are never quantized, so the only thing
     /// that can touch one between input and output is the fold, and the fold is
@@ -11421,8 +11381,7 @@ mod tests {
     }
 
     /// The gate is a veto on float-scaled formats, not a switch that turns AWQ
-    /// off. Under the affine map every group must still fire, with the same
-    /// tensor count the pass produced before the gate existed.
+    /// off. Under the affine map every group must still fire.
     #[test]
     fn awq_still_fires_under_an_affine_class_map() {
         let (mut weights, imatrix) = awq_fixture();
@@ -11496,7 +11455,7 @@ mod tests {
     /// `mlx_quantize` returns lazy arrays whose graph references the source
     /// weight; if they are stored un-evaluated, every dense input stays
     /// resident until the safetensors writer finally evaluates it — the whole
-    /// checkpoint at once, which is the OOM this change exists to fix. Measured
+    /// checkpoint at once. Measured
     /// through MLX's own allocator rather than RSS so page-cache noise cannot
     /// mask it.
     #[test]
@@ -13110,11 +13069,10 @@ mod tests {
 
     #[test]
     fn apply_mtp_quant_policy_cyankiwi_quantizes_moe_mtp_linears() {
-        // Fix 2 (Task 35): a MoE-flavored MTP layer's MLP linears — experts,
-        // router gate, shared expert + its gate — must be quantized at the
-        // uniform 4-bit/gs32 affine PLQ (Option A), same as the attention
-        // projections. Before this fix they stayed bf16 (the dense-only suffix
-        // set had no `switch_mlp.*`/`mlp.gate`/`shared_expert.*` entries).
+        // A MoE-flavored MTP layer's MLP linears — experts, router gate, shared
+        // expert + its gate — must be quantized at the uniform 4-bit/gs32 affine
+        // PLQ, same as the attention projections. A dense-only suffix set with
+        // no `switch_mlp.*`/`mlp.gate`/`shared_expert.*` entries leaves them bf16.
         let wrapped = apply_mtp_quant_policy(
             const_predicate(QuantDecision::Default),
             "cyankiwi".to_string(),
@@ -15171,12 +15129,9 @@ mod tests {
 
     #[test]
     fn validate_existing_kquant_entry_accepts_every_width() {
-        // W4 gate. The old `weight_cols * (32 / bits)` derivation integer-divides
-        // 32 by the width: 32/5 = 6, 32/6 = 5. For q5k (weight_cols 80 at K=512)
-        // that gives 480, for q6k (weight_cols 96) it gives 480 — neither a
-        // super-block multiple — so the buggy path would REJECT these valid
-        // groups. The correct `weight_cols * 32 / bits` recovers K=512. Covering
-        // 4-, 5- and 6-bit proves the fix across every width the feature adds.
+        // K must come from `weight_cols * 32 / bits`, never `weight_cols * (32 /
+        // bits)`: integer-dividing 32 by 5 or 6 loses the remainder and rejects
+        // valid q5k/q6k groups. Covering 4-, 5- and 6-bit exercises every width.
         for format in [KQuantFormat::Q4K, KQuantFormat::Q5K, KQuantFormat::Q6K] {
             let prefix = "model.layers.0.mlp.gate_proj";
             let mut weights: HashMap<String, MxArray> = HashMap::new();
@@ -15837,7 +15792,7 @@ mod tests {
 
     #[test]
     fn sym8_group_coherence_forces_whole_mlp_group_dense() {
-        // Round-3 converter/loader invariant: under a sym8 default the
+        // Converter/loader invariant: under a sym8 default the
         // dense-MLP loaders are strict all-or-none (gemma4 rejects any mixed
         // quantized/dense `layers.N.mlp.*` tuple; dense qwen3_5's partial-
         // group fallback dtype-rejects the quantized members). A group where
@@ -16645,8 +16600,8 @@ mod tests {
         // lfm2_moe convert call), the token embedding must emit NO quant
         // entry at all — dense bf16, no `.scales` sidecar, no per-layer
         // override. A packed (affine) embedding's `embed_tokens.scales` bars
-        // the ENTIRE lfm2 compiled path (`quant_embed_supported`), so the old
-        // forced-affine-8 downgrade silently demoted every sym8 lfm2
+        // the ENTIRE lfm2 compiled path (`quant_embed_supported`), so a
+        // forced-affine-8 downgrade would silently demote every sym8 lfm2
         // checkpoint to eager decode.
         let hidden = 64i64;
         let w = |shape: &[i64]| {
@@ -16690,7 +16645,7 @@ mod tests {
         );
         assert!(weights.contains_key("model.layers.0.self_attn.q_proj.scales"));
 
-        // Regression for the refactor: under a NON-sym8 non-affine default
+        // Under a NON-sym8 non-affine default
         // (mxfp8), the lfm2 embedding still KEEPS the packed default mode
         // (the `lfm2_embed_keeps_default` behavior — packed Uint32, no
         // forced-affine override).
@@ -20050,8 +20005,7 @@ mod tests {
 
         // --- Dequant spot-check: layers.0.self_attn.q_proj ---
         // Load the output shard containing the q_proj triplet, dequantize, and
-        // assert that scales[0,0] equals the source weight_scale[0] golden value
-        // verified in the Task-1 unit test.
+        // assert that scales[0,0] equals the source weight_scale[0] golden value.
         let index_path = tmp.join("model.safetensors.index.json");
         let (w_arr, s_arr, b_arr) = if index_path.exists() {
             // Sharded output: find which shard holds the q_proj weight.
@@ -20331,7 +20285,7 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_real_config_model_type_despite_m_override() {
-        // Reviewer [high]: `-m qwen3_5` must NOT smuggle a real UNSUPPORTED
+        // `-m qwen3_5` must NOT smuggle a real UNSUPPORTED
         // directory past the nvidia gate. The gate reads the input config.json's
         // actual model_type (lfm2 — still unsupported now that gemma4 is
         // allowed), so the run is rejected even though --model-type claims
@@ -20386,7 +20340,7 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_gemma4_config_with_qwen_override() {
-        // Reviewer [high]: `-m qwen3_5` on a real gemma4 directory must NOT
+        // `-m qwen3_5` on a real gemma4 directory must NOT
         // sanitize as Qwen. The gate now allows gemma4, but the sanitizer
         // dispatches on --model-type; the family-agreement check rejects the
         // mismatch (config gemma4_unified vs requested qwen3_5) before the wrong
@@ -20445,7 +20399,7 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_gemma4_moe_from_text_config() {
-        // Round-2 [medium]: real gemma MoE configs carry `enable_moe_block`
+        // Real gemma MoE configs carry `enable_moe_block`
         // under `text_config` (the root key is absent), and the loader resolves
         // it nested-first (`get_config_bool`). The gate must mirror that: a
         // gemma4 config whose enable_moe_block lives in text_config=true is MoE
@@ -20505,7 +20459,7 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_nvidia_recipe_rejects_gemma_qat_via_alias_override() {
-        // Round-2 [high]: a gemma-QAT source (`quant_method: "gemma"`) with an
+        // A gemma-QAT source (`quant_method: "gemma"`) with an
         // aliased `-m gemma4_unified` must NOT slip the already-quantized
         // rejection into the generic quantizer. The FAMILY predicate
         // `is_gemma_qat_family` (gemma4/gemma4_unified collapse via
@@ -20565,11 +20519,11 @@ mod tests {
 
     #[tokio::test]
     async fn convert_model_rejects_unified_gemma_qat_before_e2b_importer() {
-        // WB-2 [high]: a gemma4_unified QAT (audio-carrying) must NOT reach the
-        // E2B prequantized importer, which is EXACT-"gemma4" only and DROPS
-        // AUDIO. This config uses the EXACT E2B language schedule, so under the
-        // pre-fix single family predicate it would PASS validate_e2b_qat_schedule
-        // and enter the importer (dropping audio). With the role split, the
+        // A gemma4_unified QAT (audio-carrying) must NOT reach the E2B
+        // prequantized importer, which is EXACT-"gemma4" only and DROPS AUDIO.
+        // The fixture uses the EXACT E2B language schedule, so
+        // `validate_e2b_qat_schedule` passes and only the unified marker can
+        // reject it. With the role split, the
         // unified marker (model_type gemma4_unified / unified architecture) trips
         // the explicit unified-QAT reject FIRST — hermetically, before the
         // convert mutex + enter_cpu, so no output directory is even created.
