@@ -41,7 +41,41 @@ const MODEL_PATH = CANDIDATES.find((p) => existsSync(join(p, 'config.json')));
 
 const TURN_TIMEOUT = 240_000;
 const OPTIONS: SimpleStreamOptions = { maxTokens: 128, temperature: 0 }; // no `reasoning` → reasoningEffort 'none'
-const SYSTEM = 'You are a concise assistant. Answer in at most two sentences.';
+
+/**
+ * Shared persona. The text turn appends a length cap; the tool turn MUST NOT —
+ * see {@link TOOL_SYSTEM}.
+ */
+const PERSONA = 'You are a concise assistant.';
+const SYSTEM = `${PERSONA} Answer in at most two sentences.`;
+/**
+ * System prompt for the tool round-trip: {@link PERSONA} WITHOUT the
+ * "Answer in at most two sentences." clause.
+ *
+ * That clause is an instruction to produce an answer, so pairing it with a turn
+ * that asserts the model produced a TOOL CALL instead of an answer makes the
+ * test contradict itself — and the clause wins. Measured on
+ * qwen3.5-0.8b-mlx-bf16 at temperature 0 (greedy, so each cell is one fixed
+ * outcome, not a sample), holding the user prompt and the tool schema fixed and
+ * varying only the system prompt:
+ *
+ *   (none)                                                    → toolUse
+ *   'You are a helpful assistant.'                            → toolUse
+ *   'You are a concise assistant.'                            → toolUse
+ *   'You are a concise assistant. Keep every response short.' → toolUse
+ *   'You are a concise assistant. Always answer directly.'    → toolUse
+ *   'You are a concise assistant. Answer in at most two sentences.' → stop
+ *   'Answer in at most two sentences.'                        → stop
+ *
+ * The clause is the only variable that flips the outcome, in both directions,
+ * and it flips it alone. Neither brevity nor an "answer the user" imperative
+ * does — so this is not a phrasing the model happens to obey today, it is the
+ * removal of a directive that countermands the behavior under test.
+ *
+ * Do NOT re-unify this with {@link SYSTEM}, and do not reintroduce a length cap
+ * here: `maxTokens` in {@link OPTIONS} already bounds the turn.
+ */
+const TOOL_SYSTEM = PERSONA;
 
 async function collect(stream: AssistantMessageEventStream): Promise<AssistantMessageEvent[]> {
   const events: AssistantMessageEvent[] = [];
@@ -130,7 +164,7 @@ describe.skipIf(!MODEL_PATH)('mlx provider live smoke', () => {
         } as unknown as TSchema,
       };
       const context: Context = {
-        systemPrompt: SYSTEM,
+        systemPrompt: TOOL_SYSTEM,
         messages: [
           {
             role: 'user',

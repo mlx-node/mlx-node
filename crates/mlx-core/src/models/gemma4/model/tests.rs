@@ -3534,6 +3534,68 @@ fn test_media_session_continuable_reset_matrix() {
     assert!(!inner.has_live_session());
 }
 
+/// A non-continuable media turn (audio, or mixed image+audio) releases every
+/// KV group but keeps the committed history and media keys so the NEXT
+/// continuation cold-replays the whole conversation
+/// (`finalize_vision_turn_media_state`). That session is still initialized:
+/// `has_live_session` must say so, or `session_continue` rejects the follow-up
+/// and the Gemma4 scheduler drops the owner registration — the shape that made
+/// every turn after an audio turn fail with "requires an initialized cache
+/// owner".
+///
+/// The pre-start guard is unchanged, and so is the invalidated-session guard:
+/// both clear the token history.
+#[test]
+fn test_dropped_media_kv_still_reports_an_initialized_session() {
+    let cfg = paged_tiny_config(Some(true));
+    let mut inner = match super::Gemma4Inner::new(cfg) {
+        Ok(i) => i,
+        Err(err) => {
+            let msg = err.reason.to_string();
+            if msg.contains("No Metal device found") {
+                eprintln!("skipping (no Metal device): {msg}");
+                return;
+            }
+            panic!("unexpected Gemma4Inner::new failure: {msg}");
+        }
+    };
+
+    // Never started: no history, no media, no live K/V.
+    assert!(
+        !inner.has_live_session(),
+        "a session that was never started must not look initialized"
+    );
+
+    // Exactly the state the audio finalizer leaves behind: history + media
+    // keys retained, every paged group released (a fresh inner owns no live
+    // request), warm continuation explicitly disabled.
+    inner.cached_token_history = vec![1, 2, 3];
+    inner.publish_media_session_context(None, Some(9));
+    inner.media_session_continuable = false;
+    assert!(
+        !inner
+            .kv_cache_coordinator
+            .as_ref()
+            .is_some_and(|coordinator| coordinator.is_live_all(inner.active_paged_seq)),
+        "fixture precondition: no paged group may be live"
+    );
+    assert!(
+        inner.has_live_session(),
+        "a media session that deliberately dropped its K/V is still initialized \
+         and must be admitted so the next turn can cold-replay"
+    );
+
+    // Same dead K/V with no media context is an ordinary text session whose
+    // cache is gone; the media exception must not widen to it.
+    inner.clear_reuse_state();
+    inner.cached_token_history = vec![1, 2, 3];
+    assert_eq!(inner.session_media(), MediaCapabilities::NONE);
+    assert!(
+        !inner.has_live_session(),
+        "the exception is media-only: a text session with no live K/V stays dead"
+    );
+}
+
 /// Only pure image turns currently publish image-aware per-block keys.
 /// Audio and mixed-media turns stay cold until their non-token identity is
 /// represented in the same cache chain.

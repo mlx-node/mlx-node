@@ -380,7 +380,16 @@ export default function Metrics() {
           </ChartBody>
         </ChartCard>
 
-        <ChartCard title="Model usage share" subtitle="Share of recorded turns by model">
+        {/*
+          Sized by the LEGEND's row count, not the donut's: the ring is a fixed 164px at any model
+          count while the legend is one row per model, and this was the only card in the grid
+          taking ChartCard's 224px default. Same rule as the three bar cards beside it.
+        */}
+        <ChartCard
+          title="Model usage share"
+          subtitle="Share of recorded turns by model"
+          heightPx={categoryChartHeight(shareData.length)}
+        >
           <ChartBody
             loading={loading}
             error={error}
@@ -396,11 +405,23 @@ export default function Metrics() {
                     return [modelShareLabel(Number(value), shareTotal), model];
                   }}
                 />
+                {/*
+                  `top` is the escape guard, not styling. Without one recharts positions this
+                  absolutely placed wrapper at `(chartHeight - measuredLegendHeight) / 2`, which goes
+                  NEGATIVE once the rows outgrow the plot and paints the model names over the card
+                  above — nothing clips them, `.recharts-wrapper` and the responsive container are
+                  both `overflow: visible`. `maxHeight`/`overflowY` bound the box to the plot as the
+                  backstop; `wrapperStyle` is spread last, so all three beat recharts' own values.
+                  `itemSorter={null}` turns off its alphabetical sort, which otherwise scatters the
+                  eight coloured rows through the grey ones: the payload arrives in turns-desc order,
+                  the same order `buildSeriesColorMap` hands out colours in.
+                */}
                 <Legend
                   layout="vertical"
                   align="right"
-                  verticalAlign="middle"
-                  wrapperStyle={{ fontSize: 12, maxWidth: '45%' }}
+                  verticalAlign="top"
+                  itemSorter={null}
+                  wrapperStyle={{ fontSize: 12, maxWidth: '45%', top: 0, maxHeight: '100%', overflowY: 'auto' }}
                   formatter={(value) => (
                     <span className="text-foreground" title={String(value)}>
                       {labelFor(String(value))}

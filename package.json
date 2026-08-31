@@ -20,7 +20,7 @@
     "mlx": "oxnode packages/cli/src/cli.ts"
   },
   "devDependencies": {
-    "@ast-grep/napi": "^0.44.0",
+    "@ast-grep/napi": "^0.45.3",
     "@mlx-node/asr": "workspace:*",
     "@mlx-node/cli": "workspace:*",
     "@mlx-node/internal-tools": "workspace:*",
@@ -29,22 +29,21 @@
     "@mlx-node/server": "workspace:*",
     "@mlx-node/trl": "workspace:*",
     "@mlx-node/vlm": "workspace:*",
-    "@napi-rs/cli": "^3.7.2",
-    "@napi-rs/simple-git": "^0.1.22",
+    "@napi-rs/cli": "^3.8.6",
+    "@napi-rs/simple-git": "^1.1.0",
     "@oxc-node/cli": "^0.1.0",
     "@oxc-node/core": "^0.1.0",
     "@std/toml": "npm:@jsr/std__toml@^1.0.11",
-    "@types/node": "^26.0.0",
+    "@types/node": "^26.4.0",
     "octokit": "^5.0.5",
-    "oxc-parser": "^0.137.0",
-    "prettier": "^3.8.4",
+    "oxc-parser": "^0.147.0",
+    "prettier": "^3.9.6",
     "typescript": "^7.0.2",
-    "vite-plus": "0.1.24",
-    "vitest": "^4.1.9"
+    "vite-plus": "0.3.0",
+    "vitest": "^4.1.11"
   },
   "resolutions": {
-    "vite": "npm:@voidzero-dev/vite-plus-core@0.1.24",
-    "vitest": "npm:@voidzero-dev/vite-plus-test@0.1.24"
+    "vite": "npm:@voidzero-dev/vite-plus-core@0.3.0"
   },
-  "packageManager": "yarn@4.17.1"
+  "packageManager": "yarn@4.18.0"
 }

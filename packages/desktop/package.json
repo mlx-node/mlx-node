@@ -34,11 +34,11 @@
   },
   "devDependencies": {
     "@electron/notarize": "3.1.1",
-    "@electron/osx-sign": "2.6.0",
-    "@electron/packager": "20.0.4",
+    "@electron/osx-sign": "2.7.0",
+    "@electron/packager": "20.3.0",
     "@napi-rs/image": "1.14.0",
     "@types/node": "catalog:",
-    "electron": "43.2.0",
+    "electron": "44.0.0",
     "vite-plus": "catalog:"
   }
 }

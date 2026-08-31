@@ -22,8 +22,8 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@huggingface/hub": "^2.13.2",
-    "@inquirer/prompts": "^8.5.2",
+    "@huggingface/hub": "^2.16.1",
+    "@inquirer/prompts": "^8.7.0",
     "@mlx-node/agent": "workspace:*",
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",
@@ -32,6 +32,6 @@
     "@napi-rs/keyring": "^1.3.0"
   },
   "devDependencies": {
-    "@types/node": "^26.0.0"
+    "@types/node": "^26.4.0"
   }
 }

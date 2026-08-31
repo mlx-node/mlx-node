@@ -112,13 +112,13 @@ describe('runtimeClosure', () => {
 /**
  * The cloud-LLM SDKs.
  *
- * `@earendil-works/pi-ai` declares seven provider SDKs as hard dependencies and
+ * `@earendil-works/pi-ai` declares five provider SDKs as hard dependencies and
  * puts every one of them behind a `*.lazy.js` shim, so the module is fetched by
  * the `stream()` call that needs it and at no other time. This app parses pi
  * session FILES; it never asks pi to talk to a model. So the SDKs are dead
- * weight — 114 MB of it, over half the shipped `node_modules`.
+ * weight — ~72 MB of it, 38% of the `node_modules` that would otherwise ship.
  *
- * The rule names seven packages. It drops 81, because the other 74 stop being
+ * The rule names five packages. It drops 76, because the other 71 stop being
  * reachable. Both halves are asserted: naming without dropping would mean the
  * walk kept a path in through something else, and dropping without naming would
  * mean the size came from somewhere this rule cannot defend.
@@ -126,25 +126,31 @@ describe('runtimeClosure', () => {
 describe('cloud provider SDK exclusion', () => {
   const closure = runtimeClosure(repoRoot, ROOTS);
 
-  // The seven `dependencies` of @earendil-works/pi-ai that are provider SDKs.
+  // The `dependencies` of @earendil-works/pi-ai that are provider SDKs, and so
+  // the ones the rule must both exclude and report. pi-ai 0.84 dropped two it
+  // used to declare — `@mistralai/mistralai`, whose provider is plain `fetch`
+  // now, and `@opentelemetry/api`, which it never imported — so neither is
+  // reachable and neither is reported any more.
+  //
+  // Hard-coded rather than read off the installed pi-ai: deriving it would make
+  // the last test in this block agree with upstream by construction, which is
+  // the one thing it exists to refuse.
   const SDK_ROOTS = [
     '@anthropic-ai/sdk',
     '@aws-sdk/client-bedrock-runtime',
     '@google/genai',
-    '@mistralai/mistralai',
-    '@opentelemetry/api',
     '@smithy/node-http-handler',
     'openai',
   ];
 
-  it('stages none of the seven provider SDKs', () => {
+  it('stages none of the five provider SDKs', () => {
     // On `external` — the list that is actually COPIED — for the same reason as
     // clipboard above: a rule that reports an exclusion it does not perform
     // would satisfy an assertion on `excludedProviderSdk` alone.
     expect(closure.external.filter((name) => SDK_ROOTS.includes(name))).toEqual([]);
   });
 
-  it('drops the subtree behind them, not just the seven names', () => {
+  it('drops the subtree behind them, not just the five names', () => {
     // These are the expensive ones, and not one of them is named by the rule:
     // they leave because nothing reachable still depends on them. If a future
     // edit hard-codes a deny-list instead, this keeps passing while the walk

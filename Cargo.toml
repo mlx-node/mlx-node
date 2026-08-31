@@ -8,40 +8,40 @@ edition = "2024"
 version = "0.0.0"
 
 [workspace.dependencies]
-cc = "1"
-criterion = "0.8"
-cmake = "0.1"
-futures = "0.3"
-half = "2.4"
-libc = "0.2"
+cc = "1.4"
+criterion = "0.8.2"
+cmake = "0.1.58"
+futures = "0.3.34"
+half = "2.7"
+libc = "0.2.189"
 mimalloc-safe = { version = "0.1" }
-parquet = { version = "59", features = ["arrow"] }
-rand = "0.10"
+parquet = { version = "59.2", features = ["arrow"] }
+rand = "0.10.2"
 rustfft = "6.4.1"
-serde_json = { version = "1", features = ["preserve_order"] }
-serde = { version = "1", features = ["derive"] }
-thiserror = "2"
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "sync"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3.19", default-features = false, features = [
+serde_json = { version = "1.0.151", features = ["preserve_order"] }
+serde = { version = "1.0.229", features = ["derive"] }
+thiserror = "2.0.20"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "sync"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", default-features = false, features = [
   "std",
   "fmt",
   "json",
 ] }
-tokenizers = "0.23"
-minijinja = { version = "2.5", features = ["json", "preserve_order"] }
-uuid = { version = "1.11", features = ["v4"] }
-regex = "1.11"
+tokenizers = "0.23.1"
+minijinja = { version = "2.24", features = ["json", "preserve_order"] }
+uuid = { version = "1.26", features = ["v4"] }
+regex = "1.13"
 sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite"] }
 unicode-width = "0.2.2"
-rust_xlsxwriter = "0.95.0"
-image = { version = "0.25", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
-zip = { version = "8", default-features = false, features = ["deflate"] }
+rust_xlsxwriter = "0.99.0"
+image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
+zip = { version = "8.6", default-features = false, features = ["deflate"] }
 
 # NAPI-RS
-napi = { version = "3", features = ["napi10", "async", "tokio_fs", "serde-json"] }
-napi-derive = "3"
-napi-build = "2"
+napi = { version = "3.12", features = ["napi10", "async", "tokio_fs", "serde-json"] }
+napi-derive = "3.6"
+napi-build = "2.4"
 
 # Workspace packages
 mlx-sys = { path = "crates/mlx-sys" }

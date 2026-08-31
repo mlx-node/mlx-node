@@ -48,12 +48,12 @@ jobs:
       github.event.label.name == 'model-e2e'
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'yarn'
@@ -125,7 +125,7 @@ jobs:
         env:
           CARGO_INCREMENTAL: 1
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: mlx-node
           path: packages/core/*.node
@@ -136,7 +136,7 @@ jobs:
       # job downloads this artifact INTO
       # `packages/core/npm/darwin-arm64/` so both files have to be
       # in the same artifact to land alongside the .node addon.
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: mlx-metallib
           path: |
@@ -156,12 +156,12 @@ jobs:
           - 'yarn build:ts && yarn test'
           - 'cargo test'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'yarn'
@@ -194,11 +194,11 @@ jobs:
       - name: Install dependencies
         run: yarn install --immutable
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: mlx-node
           path: packages/core/
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: mlx-metallib
           path: packages/core/
@@ -394,12 +394,12 @@ jobs:
             lib_tests: >-
               models::nemotron_h::mtp::mtp_turn_tests::real_mtp_t0_lossless_gate
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'yarn'
@@ -427,11 +427,11 @@ jobs:
       - name: Install dependencies
         run: yarn install --immutable
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: mlx-node
           path: packages/core/
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: mlx-metallib
           path: packages/core/
@@ -587,12 +587,12 @@ jobs:
     if: github.event.action != 'labeled'
     runs-on: macos-26
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'yarn'
@@ -662,12 +662,12 @@ jobs:
       needs.model-test.result != 'failure' &&
       needs.model-test.result != 'cancelled'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
       - name: Setup Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: '24'
           cache: 'yarn'
@@ -687,16 +687,23 @@ jobs:
       - name: Build dashboard UI
         run: yarn workspace @mlx-node/dashboard build:ui
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: mlx-node
           path: packages/core/artifacts
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v8
         with:
           name: mlx-metallib
           path: packages/core/npm/darwin-arm64/
+      # Not a bare `napi artifacts`: `napi.targets` also lists the
+      # hand-built DGX Spark target `aarch64-unknown-linux-gnu`, which this
+      # job never downloads, and @napi-rs/cli >= 3.8 fails on a configured
+      # target with no `.node`. `yarn workspace @mlx-node/core artifacts`
+      # runs the same collector over the targets this repo actually
+      # publishes, derived from its own optionalDependencies +
+      # `packages/core/npm/*` (see packages/core/publish-targets.ts).
       - name: move artifacts
-        run: yarn workspace @mlx-node/core napi artifacts
+        run: yarn workspace @mlx-node/core artifacts
       - name: List dir
         run: ls -R packages/core
       - name: Publish package
