@@ -64,16 +64,6 @@ pub struct QuantizationConfig {
     pub overrides: HashMap<String, TensorQuantParams>,
 }
 
-impl QuantizationConfig {
-    /// Resolve params for the tensor at `prefix`. Returns `None` when
-    /// the tensor is **not** in the override map (the privacy-filter
-    /// convert pipeline emits an exhaustive override list, so absence
-    /// from `overrides` = "this tensor is stored as plain bf16").
-    pub fn params_for(&self, prefix: &str) -> Option<TensorQuantParams> {
-        self.overrides.get(prefix).cloned()
-    }
-}
-
 fn parse_quantization_config(cfg_value: &serde_json::Value) -> Result<Option<QuantizationConfig>> {
     let Some(block) = cfg_value.get("quantization").and_then(|v| v.as_object()) else {
         return Ok(None);

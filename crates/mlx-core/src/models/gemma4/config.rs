@@ -282,16 +282,6 @@ impl Gemma4Config {
         }
     }
 
-    /// RoPE dimensions for global attention (partial rotation).
-    /// Uses `global_head_dim * partial_rotary_factor` because vLLM computes
-    /// `rotary_dim = int(head_size * partial_rotary_factor)` where `head_size`
-    /// is the per-layer head_dim (which is `global_head_dim` for global layers).
-    /// For E2B: 512 * 0.25 = 128 rotary dims.
-    pub fn rope_dims_global(&self) -> i32 {
-        let global_hd = self.effective_head_dim(true);
-        (global_hd as f64 * self.partial_rotary_factor) as i32
-    }
-
     /// RoPE dimensions for sliding attention (full rotation).
     pub fn rope_dims_sliding(&self) -> i32 {
         self.head_dim
@@ -375,30 +365,5 @@ mod tests {
         };
         // Physical sliding layers are 0 and 2. Layers 3/4 are shared aliases.
         assert_eq!(config.recurrent_state_bytes(), 2 * 16 * 2 * 8 * 2 * 2);
-    }
-
-    #[test]
-    fn test_default_layer_types_synthesis() {
-        // mlx-lm default: sliding_window_pattern=5 → 4 sliding + 1 full per cycle
-        // 35 layers = 7 complete cycles: indices 4,9,14,19,24,29,34 are full
-        let swp = 5usize;
-        let n = 35usize;
-        let mut pattern = Vec::with_capacity(swp);
-        for _ in 0..swp - 1 {
-            pattern.push("sliding_attention".to_string());
-        }
-        pattern.push("full_attention".to_string());
-        let types: Vec<String> = (0..n).map(|i| pattern[i % pattern.len()].clone()).collect();
-
-        assert_eq!(types[4], "full_attention");
-        assert_eq!(types[9], "full_attention");
-        assert_eq!(types[14], "full_attention");
-        assert_eq!(types[34], "full_attention");
-        assert_eq!(types[0], "sliding_attention");
-        assert_eq!(types[3], "sliding_attention");
-        assert_eq!(types[5], "sliding_attention");
-
-        let full_count = types.iter().filter(|t| *t == "full_attention").count();
-        assert_eq!(full_count, 7); // 35 / 5 = 7 full layers
     }
 }

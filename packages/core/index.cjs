@@ -794,6 +794,7 @@ module.exports.coldRestoreFamilies = nativeBinding.coldRestoreFamilies;
 module.exports.coldSidecarStats = nativeBinding.coldSidecarStats;
 module.exports.convertForeignWeights = nativeBinding.convertForeignWeights;
 module.exports.convertGgufToSafetensors = nativeBinding.convertGgufToSafetensors;
+module.exports.convertibleModelTypes = nativeBinding.convertibleModelTypes;
 module.exports.convertModel = nativeBinding.convertModel;
 module.exports.convertParquetToJsonl = nativeBinding.convertParquetToJsonl;
 module.exports.createPaddleocrVlConfig = nativeBinding.createPaddleocrVlConfig;

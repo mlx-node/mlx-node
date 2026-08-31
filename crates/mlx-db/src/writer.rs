@@ -61,18 +61,6 @@ pub async fn resume_run(pool: &SqlitePool, run_id: &str) -> Result<(), DbError> 
     Ok(())
 }
 
-/// Update run's total steps
-pub async fn update_run_steps(pool: &SqlitePool, run_id: &str, steps: i64) -> Result<(), DbError> {
-    sqlx::query("UPDATE training_runs SET total_steps = ? WHERE id = ?")
-        .bind(steps)
-        .bind(run_id)
-        .execute(pool)
-        .await
-        .map_err(|e| DbError::Write(format!("Failed to update steps: {}", e)))?;
-
-    Ok(())
-}
-
 /// Record a complete training step with all generations
 ///
 /// Uses a transaction to ensure atomicity - all inserts succeed or none do.

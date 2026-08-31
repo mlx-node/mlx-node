@@ -5,15 +5,9 @@
  * when `numExperts` is undefined, the model uses dense MLP layers.
  */
 
-import type {
-  Qwen35Config as RustQwen35Config,
-  Qwen35GenerationConfig as RustQwen35GenerationConfig,
-  Qwen35GenerationResult as RustQwen35GenerationResult,
-} from '@mlx-node/core';
+import type { Qwen35Config as RustQwen35Config } from '@mlx-node/core';
 
 export type Qwen35Config = RustQwen35Config;
-export type Qwen35GenerationConfig = RustQwen35GenerationConfig;
-export type Qwen35GenerationResult = RustQwen35GenerationResult;
 
 /**
  * Default configurations for common Qwen3.5 models

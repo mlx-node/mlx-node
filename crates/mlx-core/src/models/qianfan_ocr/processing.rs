@@ -399,40 +399,6 @@ mod tests {
         }
     }
 
-    // -- Normalization tests --
-
-    #[test]
-    fn test_normalization_range() {
-        // Create a small white image (all 255) and verify normalized values
-        let mean = [0.485f32, 0.456, 0.406];
-        let std = [0.229f32, 0.224, 0.225];
-
-        // White pixel: (255/255 - mean) / std
-        for c in 0..3 {
-            let normalized = (1.0 - mean[c]) / std[c];
-            // Should be positive and finite
-            assert!(normalized.is_finite());
-            assert!(normalized > 0.0);
-        }
-
-        // Black pixel: (0/255 - mean) / std
-        for c in 0..3 {
-            let normalized = (0.0 - mean[c]) / std[c];
-            // Should be negative and finite
-            assert!(normalized.is_finite());
-            assert!(normalized < 0.0);
-        }
-    }
-
-    #[test]
-    fn test_normalization_values() {
-        // Specific check: for channel 0 (R), mean=0.485, std=0.229
-        // pixel=128 -> val=128/255 ≈ 0.502 -> (0.502 - 0.485) / 0.229 ≈ 0.074
-        let val: f64 = 128.0 / 255.0;
-        let normalized = (val - 0.485) / 0.229;
-        assert!((normalized - 0.074).abs() < 0.01);
-    }
-
     // -- QianfanImageProcessor tests --
 
     #[test]

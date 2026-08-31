@@ -77,17 +77,8 @@ import type { ChatMessage, DatasetExample, RewardFunction } from '../types.js';
 import { createTrainingLogger, type TrainingLogger } from './training-logger.js';
 
 // Re-export native types
-export { GrpoTrainingEngine, NativeRewardRegistry, OutputStore } from '@mlx-node/core';
-export type {
-  GrpoEngineConfig,
-  EngineStepMetrics,
-  EngineEpochMetrics,
-  BuiltinRewardConfig,
-  TrainStepResult,
-  TrainStepResultWithOutputs,
-  RewardOutput,
-  OutputStoreConfig,
-} from '@mlx-node/core';
+export { GrpoTrainingEngine, NativeRewardRegistry } from '@mlx-node/core';
+export type { GrpoEngineConfig, EngineStepMetrics, EngineEpochMetrics, BuiltinRewardConfig } from '@mlx-node/core';
 
 /**
  * Configuration for GRPOTrainer

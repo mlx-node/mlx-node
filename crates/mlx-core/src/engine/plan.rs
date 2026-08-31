@@ -171,7 +171,8 @@ pub(crate) enum SpeculativeDraftWidth {
     /// Native MTP chain depth `D` — `D` chained head steps per cycle.
     Depth(usize),
     /// External draft-model block size `L` — one drafted block per cycle
-    /// (gemma4 DSpark block size, muse DFlash mask width).
+    /// (gemma4 DSpark block size, muse DFlash mask width, qwen3.8 DFlash2
+    /// block width).
     DraftBlockSize(usize),
 }
 
@@ -245,17 +246,16 @@ impl SpeculativePlan {
     /// [`Self::lookahead_rows`], per kind: the TARGET-side verify rows one
     /// cycle appends — [`SpeculativeKind::NativeMtp`] writes `depth + 1`
     /// (anchor + `D` chained drafts), [`SpeculativeKind::DraftModel`]
-    /// (DSpark, DFlash, assistant) writes `draft_block_size + 1` (anchor +
+    /// (DSpark, DFlash, DFlash2, assistant) writes `draft_block_size + 1` (anchor +
     /// `L` block drafts). The width must be the plan kind's own quantity;
     /// a mismatched pairing is a reservation-accounting bug at the call
     /// site and panics rather than sizing the pool from the wrong number.
     ///
     /// Divergence from vLLM, deliberate: vLLM's `num_lookahead_tokens`
     /// counts drafter-WRITTEN rows (DFlash reserves `K + 1` for the
-    /// drafter, `config/vllm.py:622-646`) because its drafter KV is
-    /// pool-resident; our drafter KV is off-pool (non-goal N1 — it dies
-    /// with its owner and never registers), so the reservation counts the
-    /// target's verify rows only. vLLM's harmless over-reserve for its
+    /// drafter, `config/vllm.py` `num_lookahead_tokens`) because its drafter KV is
+    /// pool-resident; our drafter KV is off-pool (it dies with its owner and
+    /// never registers), so the reservation counts the target's verify rows only. vLLM's harmless over-reserve for its
     /// read-only gemma4_mtp drafter is likewise not copied.
     ///
     /// `engine::dspark_turn::run_paged_dspark_turn` sizes its per-cycle
@@ -278,10 +278,7 @@ impl SpeculativePlan {
 
 /// Immutable inference features resolved when a model is loaded.
 ///
-/// Concrete model structs currently expose this by value from immutable
-/// load-time fields (`paged_adapter`, MTP/draft presence, vision/audio
-/// configuration). Keeping the description data-only makes it suitable for a
-/// future model registry without coupling the engine to family types.
+/// Data-only by design: no engine coupling to family types.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ExecutionPlan {
     pub media: MediaPlan,

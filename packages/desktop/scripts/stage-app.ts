@@ -148,12 +148,8 @@ const CLOUD_PROVIDER_SDKS = new Set([
   'openai',
 ]);
 
-function isCloudProviderSdk(name: string): boolean {
-  return CLOUD_PROVIDER_SDKS.has(name);
-}
-
 function isExcludedPackage(name: string): boolean {
-  return isPrebuiltAddonPackage(name) || isExcludedThirdPartyBinary(name) || isCloudProviderSdk(name);
+  return isPrebuiltAddonPackage(name) || isExcludedThirdPartyBinary(name) || CLOUD_PROVIDER_SDKS.has(name);
 }
 
 /**
@@ -206,7 +202,7 @@ export function runtimeClosure(
       continue;
     }
 
-    if (isCloudProviderSdk(name)) {
+    if (CLOUD_PROVIDER_SDKS.has(name)) {
       excludedProviderSdk.push(name);
       continue;
     }
@@ -373,7 +369,7 @@ export interface StageResult {
   excludedPrebuilt: string[];
   /** Third-party binaries dropped because they leak a build path; see isExcludedThirdPartyBinary. */
   excludedThirdParty: string[];
-  /** Cloud-LLM SDKs dropped because nothing local-inference can reach them; see isCloudProviderSdk. */
+  /** Cloud-LLM SDKs dropped because nothing local-inference can reach them; see CLOUD_PROVIDER_SDKS. */
   excludedProviderSdk: string[];
   /** Count of examples/docs/test directories removed from staged packages. */
   prunedDirs: number;

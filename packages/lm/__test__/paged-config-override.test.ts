@@ -11,7 +11,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { PagedConfigOverrideManager } from '@mlx-node/lm';
+import { CHAT_FAMILY_IDS, PagedConfigOverrideManager } from '@mlx-node/lm';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -144,13 +144,13 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
     expect(await manager.resolve(source, 'qwen3', true)).toBe(enabled);
   });
 
-  // A family missing from AGENT_PAGED_MODEL_TYPES is not "unpaged by policy" —
+  // A family missing from CHAT_FAMILY_IDS is not "unpaged by policy" —
   // `resolveInternal` returns the SOURCE path untouched, so `mlx agent` /
   // `mlx launch claude` load it with whatever `use_block_paged_cache` the
   // downloaded checkpoint carries (absent on the shipped nemotron_h build =
   // flat), silently dropping continuous batching, prefix reuse, and the cold
-  // tier for that family. Mutation caught: deleting `'nemotron_h'` from
-  // AGENT_PAGED_MODEL_TYPES makes both assertions below fail.
+  // tier for that family. Mutation caught: flipping the nemotron_h row's kind
+  // out of trainable|loadable makes both assertions below fail.
   it('forces the paged overlay for a nemotron_h checkpoint', async () => {
     const source = await makeModelDir({ model_type: 'nemotron_h' });
     const manager = new PagedConfigOverrideManager();
@@ -170,6 +170,14 @@ describe('PagedConfigOverrideManager persist-paged-cache', () => {
     const config = await readOverrideConfig(resolved);
     expect('persist_paged_cache' in config).toBe(false);
     expect('persistPagedCache' in config).toBe(false);
+  });
+
+  // Pins the derived default paged policy set: every chat family, and nothing
+  // else.
+  it('derives the default paged policy set from the chat families', () => {
+    expect([...CHAT_FAMILY_IDS].sort()).toEqual(
+      ['qwen3', 'qwen3_5', 'qwen3_5_moe', 'gemma4', 'muse_glimmer', 'lfm2', 'lfm2_moe', 'nemotron_h'].sort(),
+    );
   });
 });
 

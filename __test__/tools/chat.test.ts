@@ -101,17 +101,6 @@ describe('chat() API Types', () => {
   });
 });
 
-describe('Tool Call ID Format', () => {
-  it('follows OpenAI call_<uuid> format', () => {
-    // Tool call IDs should match the pattern call_<32-hex-chars>
-    const validIdPattern = /^call_[a-f0-9]{32}$/;
-
-    // This is a mock - actual IDs come from the Rust parser
-    const mockId = 'call_12345678901234567890123456789012';
-    expect(mockId).toMatch(validIdPattern);
-  });
-});
-
 describe('Tool Arguments as Native Objects', () => {
   it('arguments should be directly usable without JSON.parse', () => {
     // This test demonstrates the key benefit of the new API
@@ -159,32 +148,6 @@ describe('Tool Arguments as Native Objects', () => {
     expect(config.setting1).toBe(true);
     expect(config.setting2).toEqual([1, 2, 3]);
     expect(data.nested.deep).toBe('value');
-  });
-});
-
-describe('Finish Reason Handling', () => {
-  it('supports stop, length, and tool_calls values', () => {
-    type FinishReason = 'stop' | 'length' | 'tool_calls';
-
-    const validReasons: FinishReason[] = ['stop', 'length', 'tool_calls'];
-
-    validReasons.forEach((reason) => {
-      // This verifies the type system accepts these values
-      const r: FinishReason = reason;
-      expect(['stop', 'length', 'tool_calls']).toContain(r);
-    });
-  });
-});
-
-describe('Error Status Values', () => {
-  it('supports all expected status values', () => {
-    type ToolCallStatus = 'ok' | 'invalid_json' | 'missing_name';
-
-    const validStatuses: ToolCallStatus[] = ['ok', 'invalid_json', 'missing_name'];
-
-    validStatuses.forEach((status) => {
-      expect(['ok', 'invalid_json', 'missing_name']).toContain(status);
-    });
   });
 });
 
@@ -252,42 +215,5 @@ describe('ToolCallResult to ToolCall conversion', () => {
     expect(converted[0].name).toBe('get_weather');
     expect(converted[1].name).toBe('get_time');
     expect(JSON.parse(converted[0].arguments)).toEqual({ city: 'Tokyo' });
-  });
-});
-
-describe('Thinking Content Extraction', () => {
-  it('thinking field type is string | null', () => {
-    // Verify the thinking field can be string or null
-    const withThinking: { thinking: string | null } = { thinking: 'Some reasoning here' };
-    const withoutThinking: { thinking: string | null } = { thinking: null };
-
-    expect(withThinking.thinking).toBe('Some reasoning here');
-    expect(withoutThinking.thinking).toBeNull();
-  });
-
-  it('thinking content is separate from main text', () => {
-    // The thinking field should contain extracted reasoning
-    // The text field should have <think> tags stripped
-    const mockResult = {
-      text: 'The answer is 42.', // Clean text without <think> tags
-      thinking: 'Let me analyze this problem step by step...', // Extracted thinking
-      rawText: '<think>\nLet me analyze this problem step by step...\n</think>\n\nThe answer is 42.',
-    };
-
-    expect(mockResult.text).not.toContain('<think>');
-    expect(mockResult.text).not.toContain('</think>');
-    expect(mockResult.thinking).toBe('Let me analyze this problem step by step...');
-    expect(mockResult.rawText).toContain('<think>');
-  });
-
-  it('thinking is null when no think tags present', () => {
-    const mockResult = {
-      text: 'Direct response without reasoning.',
-      thinking: null as string | null,
-      rawText: 'Direct response without reasoning.',
-    };
-
-    expect(mockResult.thinking).toBeNull();
-    expect(mockResult.text).toBe(mockResult.rawText);
   });
 });

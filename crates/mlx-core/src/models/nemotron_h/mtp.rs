@@ -613,7 +613,7 @@ mod mtp_turn_tests {
             }
             if step + 1 < n {
                 let ids = MxArray::from_uint32(&[t], &[1, 1])?;
-                let (l, _) = inner.forward_with_hidden(&ids, &emb)?;
+                let (l, _) = inner.forward_with_hidden_3d(&ids, &emb)?;
                 last = l.squeeze(Some(&[1]))?;
             }
         }

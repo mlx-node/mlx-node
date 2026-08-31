@@ -12,9 +12,6 @@ use napi::bindgen_prelude::*;
 
 use crate::array::MxArray;
 
-/// Default raw samples per audio token (640 = 40 ms @ 16 kHz).
-pub const DEFAULT_AUDIO_SAMPLES_PER_TOKEN: usize = 640;
-
 /// Sample rate the unified Gemma 4 audio front-end requires (16 kHz mono).
 pub const REQUIRED_AUDIO_SAMPLE_RATE: u32 = 16_000;
 

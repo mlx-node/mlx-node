@@ -134,10 +134,6 @@ impl QuantizedSwitchLinear {
         }
     }
 
-    pub fn set_biases(&mut self, biases: Option<MxArray>) {
-        self.biases = biases;
-    }
-
     pub fn get_weight(&self) -> &MxArray {
         &self.weight
     }

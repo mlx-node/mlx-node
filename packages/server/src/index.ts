@@ -55,15 +55,6 @@ export { resolveServerTuningForUsage } from './timing.js';
 // import it from the deep path
 // `packages/server/src/session-registry.js` instead.
 
-export {
-  QWEN_SAMPLING_DEFAULTS,
-  GEMMA4_SAMPLING_DEFAULTS,
-  MUSE_GLIMMER_SAMPLING_DEFAULTS,
-  NEMOTRON_SAMPLING_DEFAULTS,
-  LFM2_SAMPLING_DEFAULTS,
-  LAUNCH_PRESETS,
-} from './presets.js';
-export type { LaunchPreset } from './presets.js';
 export type { PublicModelEntry } from './handler.js';
 
 export type {

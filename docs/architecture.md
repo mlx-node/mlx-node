@@ -63,13 +63,18 @@ runs the other way: oversizing the paged pool tanks long-context decode through
 residency thrash, and pool bytes sit **outside** the MLX cache-limit budget, so the
 pool is sized to the context, not to the machine.
 
-**Persistence, not capacity.** vLLM's filesystem tier
-(`vllm/v1/kv_offload/tiering/fs/`) buys capacity inside one process lifetime: it has no
-`fsync`, no crash-durability contract, and nothing rebuilds an index from files already
-on disk, so a fresh process cannot see what the last one wrote. Reuse *by a later
-process* is exactly our feature, which is why the cold tier carries fingerprints,
-payload checksums, version-skew rejection and a real `fsync(2)` — machinery vLLM does
-not need and does not have.
+**Durability and identity, not best-effort sharing.** vLLM's filesystem tier
+(`vllm/v1/kv_offload/tiering/fs/`) is cross-process by design: filenames are stable
+content-hash chains namespaced by a config-hash directory of model NAME + geometry +
+dtype, and lookup is a stateless per-file existence probe (`manager.py`,
+`file_mapper.py`) — no index exists, the filesystem *is* the index, which is exactly
+what makes it cross-process. What it does not have: no `fsync` and no payload
+checksums (a right-sized corrupted file loads silently), no quota or eviction
+(unbounded growth), no weight-byte fingerprint (it trusts the model NAME), and
+version skew handled by namespace separation — old files simply become invisible —
+rather than rejection. Our cold tier carries a real `fsync(2)`, SHA-256 payload
+checksums, quota plus a free-space reserve, weight-byte fingerprints, and
+version-skew rejection.
 
 **Unified memory makes the disk hop cheap, and cheaper the bigger the model.** Staging
 buffers are `StorageModeShared`, so a "readback" is a blit inside the same memory with

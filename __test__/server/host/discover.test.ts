@@ -44,14 +44,23 @@ describe('discoverModels', () => {
   });
 
   it('filters out Harrier (non-generative) model entries', async () => {
-    // NOTE: two guards can produce this result — the explicit NON_GENERATIVE
-    // set and the "no LAUNCH_PRESETS entry" skip. Today `harrier` has no
-    // preset either, so this assertion cannot tell them apart; deleting the
-    // NON_GENERATIVE check leaves it green. Treat it as coverage of the
-    // OUTCOME, not of which guard fired.
+    // NOTE: two guards produce this result — the explicit NON_GENERATIVE set and
+    // the no-launch-preset skip. `harrier` trips both, so this assertion cannot
+    // tell them apart and deleting the NON_GENERATIVE check leaves it green.
+    // Treat it as coverage of the OUTCOME, not of which guard fired.
     makeModel('harrier-emb', { model_type: 'qwen3', architectures: ['Qwen3Model'] });
     const got = await discoverModels(root);
     expect(got).toEqual([]);
+  });
+
+  it('discovers lfm2_moe alongside dense lfm2, each with its own sampler', async () => {
+    makeModel('lfm-moe', { model_type: 'lfm2_moe' });
+    makeModel('lfm-dense', { model_type: 'lfm2' });
+    const got = await discoverModels(root);
+    expect(got.map((e) => e.name)).toEqual(['lfm-dense', 'lfm-moe']);
+    // The MoE card's sampler, not the dense one — both families are served.
+    expect(got.find((e) => e.name === 'lfm-moe')!.preset.sampling.temperature).toBe(0.2);
+    expect(got.find((e) => e.name === 'lfm-dense')!.preset.sampling.temperature).toBe(0.05);
   });
 
   it('skips regular files in the directory', async () => {

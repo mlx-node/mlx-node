@@ -153,11 +153,8 @@ export declare class Gemma4Model {
    * **Prefer [`Gemma4Model::load`]** for any real usage — `new(config)`
    * is a config-only stub that matches the OCR-model pattern
    * (`VLModel::new(config)`, `QianfanOCRModel::new(config)`) and is
-   * intentionally NOT runnable. It was introduced in the cache-limit
-   * coordinator work so that the coordinator's per-model delta is
-   * registered exclusively on the `load()` path, eliminating a
-   * baseline-registration gap where a no-op `new(config)` would have
-   * leaked an empty guard into the coordinator.
+   * intentionally NOT runnable: the cache-limit coordinator's per-model delta is
+   * registered exclusively on the `load()` path.
    *
    * This path does NOT spawn a model thread, NOT materialize any
    * weights, and NOT register with the cache-limit coordinator. The
@@ -171,10 +168,8 @@ export declare class Gemma4Model {
    * stub to keep `ChatSession.reset()` idempotent across both
    * runnable and stub instances.
    *
-   * A runnable model requires `await Gemma4Model.load(path)`. The
-   * constructor signature is fixed by NAPI-RS; the stub-only behavior is
-   * covered by the regression tests in
-   * `__test__/models/model-loader-gemma4.test.ts`.
+   * A runnable model requires `await Gemma4Model.load(path)`. The constructor
+   * signature is fixed by NAPI-RS.
    */
   constructor(config: Gemma4Config);
   /** Returns true if weights have been loaded via `load()`. */
@@ -185,10 +180,8 @@ export declare class Gemma4Model {
    *
    * `true` iff `Gemma4Inner::paged_adapter` was successfully
    * constructed at load time (driven by
-   * `Gemma4Config::use_block_paged_cache`). The
-   * `gemma4_paged_vs_flat_parity` integration test pins greedy
-   * byte-equal at BF16 against real Gemma-4-E2B-IT weights. Stubs
-   * constructed via `new(config)` always return `false`. Surfaced
+   * `Gemma4Config::use_block_paged_cache`). Stubs constructed via
+   * `new(config)` always return `false`. Surfaced
    * through this NAPI method so server endpoints can branch on it
    * without a model-thread roundtrip.
    */
@@ -3216,6 +3209,15 @@ export interface ConversionResult {
 export declare function convertForeignWeights(options: ForeignConversionOptions): ForeignConversionResult;
 
 export declare function convertGgufToSafetensors(options: GgufConversionOptions): Promise<GgufConversionResult>;
+
+/**
+ * Every convertible `model_type` the converter registry accepts, in dispatch
+ * order — the native half of the CLI detect-table parity gate (same pattern
+ * as `cold_restore_families`): a family with a conversion recipe but no CLI
+ * detect row would otherwise convert generically and produce unloadable
+ * output.
+ */
+export declare function convertibleModelTypes(): Array<string>;
 
 /**
  * Convert a HuggingFace SafeTensors model to MLX format

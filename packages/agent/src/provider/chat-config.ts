@@ -1,51 +1,33 @@
 /**
  * Per-call `ChatConfig` assembly for the provider bridge.
  *
- * Base sampling + output budget come from `@mlx-node/server`'s
- * `LAUNCH_PRESETS` (the ONLY allowed server import in this package —
- * presets/preset types, nothing else) extended by the agent-local
- * {@link AGENT_LAUNCH_PRESETS}, then pi's per-call `SimpleStreamOptions`
- * overlay on top.
+ * Base sampling + output budget come from the family-data launch preset
+ * (`@mlx-node/lm`), then pi's per-call `SimpleStreamOptions` overlay on top.
  */
 
 import type { SimpleStreamOptions, ThinkingLevel } from '@earendil-works/pi-ai';
-import type { ChatConfig, ModelType, ToolDefinition } from '@mlx-node/lm';
-import { LAUNCH_PRESETS, type LaunchPreset } from '@mlx-node/server';
+import {
+  launchPresetFor,
+  MODEL_FAMILY_DATA,
+  type ChatConfig,
+  type ModelFamilyData,
+  type ModelType,
+  type ToolDefinition,
+} from '@mlx-node/lm';
 
 /**
- * Agent-local launch presets for model types `LAUNCH_PRESETS` does not
- * cover (kept here — this package must not fork `packages/server`).
- *
- * `lfm2_moe` (LFM2.5-8B-A1B): LiquidAI's HF model card for the MoE
- * checkpoint recommends temperature 0.2 / top_k 80 — deliberately NOT
- * the dense `lfm2` preset (LFM2.5-1.2B guidance: temperature 0.05 /
- * top_k 50). repetitionPenalty 1.05 and the 8192-token output budget
- * match the dense family entry.
+ * Model types the no-preset error names: trainable rows, then loadable rows,
+ * each in registry order. Pinned byte-exactly by
+ * `packages/agent/__test__/chat-config.test.ts`.
  */
-const AGENT_LAUNCH_PRESETS: Partial<Record<ModelType, LaunchPreset>> = {
-  lfm2_moe: {
-    sampling: {
-      temperature: 0.2,
-      topP: 1.0,
-      topK: 80,
-      minP: 0.0,
-      presencePenalty: 0.0,
-      repetitionPenalty: 1.05,
-    },
-    maxOutputTokens: 8192,
-  },
-};
-
-/**
- * Preset lookup — agent-local entries win over `LAUNCH_PRESETS` (they
- * exist precisely because the server table has no correct entry for the
- * type). This is the ONE preset resolution shared by discovery
- * (`models.ts`) and per-call config assembly, so a model can never be
- * discovered without also being streamable (and vice versa).
- */
-export function launchPresetFor(modelType: ModelType): LaunchPreset | undefined {
-  return AGENT_LAUNCH_PRESETS[modelType] ?? LAUNCH_PRESETS[modelType];
-}
+const KNOWN_PRESET_MODEL_TYPES: readonly string[] = (() => {
+  const rows: readonly ModelFamilyData[] = MODEL_FAMILY_DATA;
+  const chatRows = rows.filter((row) => row.kind === 'trainable' || row.kind === 'loadable');
+  return [
+    ...chatRows.filter((row) => row.kind === 'trainable'),
+    ...chatRows.filter((row) => row.kind === 'loadable'),
+  ].map((row) => row.id);
+})();
 
 /**
  * pi thinking level → native `reasoningEffort`. pi never delivers 'off'
@@ -95,7 +77,7 @@ export function buildChatConfig(
 ): ChatConfig {
   const preset = launchPresetFor(modelType);
   if (!preset) {
-    const known = [...new Set([...Object.keys(LAUNCH_PRESETS), ...Object.keys(AGENT_LAUNCH_PRESETS)])].join(', ');
+    const known = KNOWN_PRESET_MODEL_TYPES.join(', ');
     throw new Error(`buildChatConfig: no launch preset for model type "${modelType}" (known types: ${known})`);
   }
 

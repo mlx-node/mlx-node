@@ -100,11 +100,6 @@ impl SequenceBlockTable {
         self.blocks.iter().map(|b| b.block_id).collect()
     }
 
-    /// Get the last block (for appending new tokens)
-    pub fn last_block(&self) -> Option<&Arc<PhysicalBlock>> {
-        self.blocks.last()
-    }
-
     /// Check if the last block is full
     pub fn is_last_block_full(&self) -> bool {
         let tokens_in_last_block = self.num_tokens % self.block_size;

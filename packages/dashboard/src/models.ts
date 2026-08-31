@@ -3,9 +3,9 @@
  * addon (the dashboard is a viewer process that must start without Metal).
  *
  * Model metadata (family label, quantization, context window) is parsed from
- * each checkpoint's `config.json` with a small standalone parser — deliberately
- * duplicated from `packages/lm` to avoid pulling in `@mlx-node/core`, mirroring
- * the same trade-off already made in `packages/agent/src/provider/models.ts`.
+ * each checkpoint's `config.json`; the family label runs the registry's own
+ * `matchFamily`, reached through the native-free `@mlx-node/agent/catalog`
+ * subpath.
  */
 
 import {
@@ -26,6 +26,8 @@ import {
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
+import { matchFamily } from '@mlx-node/agent/catalog';
+
 export interface LocalModel {
   /** Checkpoint directory name under `modelsDir` (the model's local id). */
   name: string;
@@ -42,25 +44,6 @@ export interface LocalModel {
   /** Number of files in the checkpoint directory, recursively. */
   fileCount: number;
 }
-
-/**
- * Raw config aliases → canonical family label. Mirrors the alias rows of
- * `MODEL_FAMILY_REGISTRY` in `packages/lm/src/models/model-loader.ts`; only the
- * label mapping is duplicated (no loaders, no native classes).
- */
-const RAW_MODEL_TYPE_TO_LABEL: Record<string, string> = {
-  gemma4: 'gemma4',
-  gemma4_text: 'gemma4',
-  gemma4_unified: 'gemma4',
-  qwen3: 'qwen3',
-  qwen3_5: 'qwen3_5',
-  qwen3_5_moe: 'qwen3_5_moe',
-  lfm2: 'lfm2',
-  lfm2_moe: 'lfm2_moe',
-  harrier: 'harrier',
-  internvl_chat: 'internvl_chat',
-  'qianfan-ocr': 'qianfan-ocr',
-};
 
 /**
  * Filename of the atomic-publish completion marker the download runner writes as
@@ -410,25 +393,17 @@ export function isSafeRelPath(p: string): boolean {
   return true;
 }
 
-function collectArchitectures(config: Record<string, unknown>): string[] {
-  const raw = config.architectures;
-  if (Array.isArray(raw)) return raw.filter((entry): entry is string => typeof entry === 'string');
-  if (typeof raw === 'string') return [raw];
-  return [];
-}
-
 /**
- * Family label from `config.json`. Uses `model_type` (default `qwen3` when
- * missing, mirroring `packages/lm`'s nullish default) and refines by
- * `architectures` only where the native registry treats architecture as
- * authoritative — the gemma4 unified checkpoint, whose `model_type` may not
- * name the family.
+ * Family label from `config.json` via the registry's `matchFamily`. A viewer
+ * must label, never throw, so the shapes the loader fails closed on fall back
+ * to the raw `model_type` (or `qwen3` when it is not a string).
  */
-function detectModelTypeLabel(config: Record<string, unknown>): string {
-  if (collectArchitectures(config).includes('Gemma4UnifiedForConditionalGeneration')) return 'gemma4';
-  const raw = typeof config.model_type === 'string' ? config.model_type : undefined;
-  if (raw !== undefined) return RAW_MODEL_TYPE_TO_LABEL[raw] ?? raw;
-  return 'qwen3';
+function detectModelTypeLabel(modelDir: string, config: Record<string, unknown>): string {
+  try {
+    return matchFamily(modelDir, config);
+  } catch {
+    return typeof config.model_type === 'string' ? config.model_type : 'qwen3';
+  }
 }
 
 /**
@@ -675,7 +650,7 @@ export function discoverLocalModels(modelsDir: string): { models: LocalModel[]; 
     models.push({
       name: entry.name,
       path: full,
-      modelType: detectModelTypeLabel(config),
+      modelType: detectModelTypeLabel(full, config),
       quant: detectQuantLabel(config),
       contextWindow: detectContextWindow(config),
       sizeBytes,

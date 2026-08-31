@@ -409,11 +409,6 @@ impl Embedding {
         self.weight.clone()
     }
 
-    /// Get the embedding weight matrix (alias for `get_weight`; packed-aware).
-    pub fn weight(&self) -> MxArray {
-        self.get_weight()
-    }
-
     /// Set the embedding weight matrix (alias for load_weight for consistency)
     pub fn set_weight(&mut self, weight: &MxArray) -> Result<()> {
         self.load_weight(weight)

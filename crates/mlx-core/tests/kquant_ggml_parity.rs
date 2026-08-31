@@ -128,10 +128,6 @@ impl BlockBuf {
 struct Lcg(u64);
 
 impl Lcg {
-    fn new(seed: u64) -> Self {
-        Self(seed)
-    }
-
     fn next(&mut self) -> u32 {
         self.0 = self
             .0
@@ -774,7 +770,7 @@ fn run_format(format: KQuantFormat) -> FormatRun {
     let block_bytes = format.block_bytes();
     // One fixed seed per format. No time(), no rand().
     let mut rng =
-        Lcg::new(0x5EED_0000u64.wrapping_add((bits as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
+        Lcg(0x5EED_0000u64.wrapping_add((bits as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)));
     let mut cov = Coverage::default();
     let mut samples = Vec::new();
     let mut hard = 0u64;

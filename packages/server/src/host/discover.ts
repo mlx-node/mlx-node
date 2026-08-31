@@ -4,9 +4,13 @@ import type { Dirent } from 'node:fs';
 import { readdir } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
-import { detectModelType, type ModelType } from '@mlx-node/lm';
-
-import { LAUNCH_PRESETS, type LaunchPreset } from '../presets.js';
+import {
+  detectModelType,
+  NON_GENERATIVE_FAMILY_IDS,
+  launchPresetFor,
+  type LaunchPreset,
+  type ModelType,
+} from '@mlx-node/lm';
 
 /** A locally-downloaded model paired with its sampling preset. */
 export interface DiscoveredModel {
@@ -15,9 +19,6 @@ export interface DiscoveredModel {
   modelType: ModelType;
   preset: LaunchPreset;
 }
-
-// Non-generative detection results that cannot back a chat endpoint.
-const NON_GENERATIVE: ReadonlySet<ModelType> = new Set<ModelType>(['harrier', 'qianfan-ocr', 'internvl_chat']);
 
 /**
  * Scan `dir` for model subdirectories. Each subdirectory with a recognized
@@ -49,9 +50,9 @@ export async function discoverModels(dir: string): Promise<DiscoveredModel[]> {
       continue;
     }
 
-    if (NON_GENERATIVE.has(modelType)) continue;
+    if (NON_GENERATIVE_FAMILY_IDS.has(modelType)) continue;
 
-    const preset = LAUNCH_PRESETS[modelType];
+    const preset = launchPresetFor(modelType);
     if (!preset) {
       if (debug) console.warn(`[mlx] skip ${full}: no LAUNCH_PRESETS entry for ${modelType}`);
       continue;

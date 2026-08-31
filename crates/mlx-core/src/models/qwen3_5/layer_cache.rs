@@ -1,6 +1,5 @@
 use crate::array::MxArray;
 use crate::transformer::KVCache;
-use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 use super::arrays_cache::ArraysCache;
@@ -59,35 +58,10 @@ impl Qwen3_5LayerCache {
         }
     }
 
-    /// Export cache as 2 raw pointers for the fused C++ forward pass.
-    ///
-    /// For linear layers: (conv_state_ptr, recurrent_state_ptr)
-    /// For full attention layers: (keys_ptr, values_ptr)
-    ///
-    /// Returns null pointers if the cache slot is empty.
-    pub fn export_ptrs(&self) -> (*mut sys::mlx_array, *mut sys::mlx_array) {
-        match self {
-            Self::Linear(c) => {
-                let p0 = c.get(0).map_or(std::ptr::null_mut(), |a| a.as_raw_ptr());
-                let p1 = c.get(1).map_or(std::ptr::null_mut(), |a| a.as_raw_ptr());
-                (p0, p1)
-            }
-            Self::FullAttention(c) => {
-                let keys_ptr = c
-                    .keys_ref()
-                    .map_or(std::ptr::null_mut(), |a| a.as_raw_ptr());
-                let values_ptr = c
-                    .values_ref()
-                    .map_or(std::ptr::null_mut(), |a| a.as_raw_ptr());
-                (keys_ptr, values_ptr)
-            }
-        }
-    }
-
     /// Collect references to all stored arrays in this cache slot.
     ///
-    /// Used after import_ptrs to gather arrays for async_eval to prevent
-    /// compute graph accumulation across decode steps.
+    /// Gathers arrays for async_eval to prevent compute graph accumulation
+    /// across decode steps.
     pub fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
         match self {
             Self::Linear(c) => {
@@ -107,45 +81,6 @@ impl Qwen3_5LayerCache {
                 }
             }
         }
-    }
-
-    /// Import cache from 2 raw pointers returned by the fused C++ forward pass.
-    ///
-    /// Takes ownership of the pointers (wraps them in MxArray).
-    pub fn import_ptrs(
-        &mut self,
-        p0: *mut sys::mlx_array,
-        p1: *mut sys::mlx_array,
-        new_offset: i32,
-    ) -> Result<()> {
-        match self {
-            Self::Linear(c) => {
-                if !p0.is_null()
-                    && let Ok(arr) = MxArray::from_handle(p0, "fused_conv_state")
-                {
-                    c.set(0, arr)?;
-                }
-                if !p1.is_null()
-                    && let Ok(arr) = MxArray::from_handle(p1, "fused_recurrent_state")
-                {
-                    c.set(1, arr)?;
-                }
-            }
-            Self::FullAttention(c) => {
-                if !p0.is_null()
-                    && let Ok(keys) = MxArray::from_handle(p0, "fused_kv_keys")
-                {
-                    c.set_keys(keys);
-                }
-                if !p1.is_null()
-                    && let Ok(values) = MxArray::from_handle(p1, "fused_kv_values")
-                {
-                    c.set_values(values);
-                }
-                c.set_offset(new_offset);
-            }
-        }
-        Ok(())
     }
 
     /// Capture a restore point for speculative decoding.

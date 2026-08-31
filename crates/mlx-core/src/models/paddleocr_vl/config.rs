@@ -117,11 +117,6 @@ impl Default for ModelConfig {
 }
 
 impl ModelConfig {
-    /// Create a new default PaddleOCR-VL 1.5 configuration
-    pub fn paddleocr_vl_1_5() -> Self {
-        Self::default()
-    }
-
     /// Get the head dimension for attention
     pub fn head_dim(&self) -> i32 {
         self.text_config.head_dim

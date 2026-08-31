@@ -23,10 +23,6 @@ pub struct NemotronHLayerSnapshot {
 }
 
 impl NemotronHLayerCache {
-    pub fn new_mamba(state: Mamba2State) -> Self {
-        NemotronHLayerCache::Mamba(state)
-    }
-
     pub fn new_attention() -> Self {
         NemotronHLayerCache::Attention(KVCache::new())
     }

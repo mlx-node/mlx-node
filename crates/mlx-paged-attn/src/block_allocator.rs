@@ -100,11 +100,6 @@ impl PhysicalBlock {
     pub fn get_ref_count(&self) -> u32 {
         self.ref_count.load(Ordering::SeqCst)
     }
-
-    /// Check if this block is shared (ref_count > 1)
-    pub fn is_shared(&self) -> bool {
-        self.get_ref_count() > 1
-    }
 }
 
 // Note: PhysicalBlock intentionally does not implement Clone.

@@ -260,7 +260,7 @@ fn fresh_caches(
                 NemotronHMixer::Mamba(m) => m,
                 _ => unreachable!("kind mismatch"),
             };
-            NemotronHLayerCache::new_mamba(m.fresh_state(1)?)
+            NemotronHLayerCache::Mamba(m.fresh_state(1)?)
         } else if config.is_attention_layer(i) {
             NemotronHLayerCache::new_attention()
         } else {
@@ -446,16 +446,6 @@ impl NemotronHInner {
         } else {
             self.embedding.as_linear(&h)
         }
-    }
-
-    /// Forward with hidden: returns (logits [1, T, vocab], post-final-norm
-    /// hidden [1, T, hidden]). Used by the MTP stepper (Step A + verify).
-    pub(crate) fn forward_with_hidden(
-        &mut self,
-        input_ids: &MxArray,
-        embedding: &Embedding,
-    ) -> Result<(MxArray, MxArray)> {
-        self.forward_with_hidden_3d(input_ids, embedding)
     }
 
     /// Raw forward with hidden, hidden kept as [1, T, hidden] (3D). Used by
@@ -2278,7 +2268,7 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
             ));
         }
         let arr = MxArray::from_uint32(replay_ids, &[1, replay_ids.len() as i64])?;
-        let _ = self.inner.forward_with_hidden(&arr, embedding)?;
+        let _ = self.inner.forward_with_hidden_3d(&arr, embedding)?;
         Ok(())
     }
 

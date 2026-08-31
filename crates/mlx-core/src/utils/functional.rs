@@ -1173,16 +1173,6 @@ fn lm_head_functional(
     logits.clip(Some(-100.0), Some(100.0))
 }
 
-/// Full Qwen3.5 Dense forward pass returning logits (functional).
-pub fn qwen3_5_forward_functional(
-    config: &Qwen3_5Config,
-    params: &HashMap<String, MxArray>,
-    input_ids: &MxArray,
-) -> Result<MxArray> {
-    let hidden_states = qwen3_5_forward_hidden_states(config, params, input_ids)?;
-    lm_head_functional(&hidden_states, params, config.tie_word_embeddings)
-}
-
 /// Collect sorted parameter names that match a prefix (e.g., "layers.0.")
 fn collect_layer_param_names(params: &HashMap<String, MxArray>, prefix: &str) -> Vec<String> {
     let mut names: Vec<String> = params
@@ -1239,16 +1229,6 @@ fn qwen3_5_block_checkpointed(
     )?;
 
     Ok(outputs.into_iter().next().unwrap())
-}
-
-/// Qwen3.5 Dense forward returning hidden states before LM head.
-pub fn qwen3_5_forward_hidden_states(
-    config: &Qwen3_5Config,
-    params: &HashMap<String, MxArray>,
-    input_ids: &MxArray,
-) -> Result<MxArray> {
-    let mut ckpt = autograd::CheckpointContexts::new();
-    qwen3_5_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt)
 }
 
 /// Qwen3.5 Dense forward with optional gradient checkpointing.
@@ -1516,16 +1496,6 @@ fn qwen3_5_moe_block_functional(
     h.add(&mlp_out)
 }
 
-/// Full Qwen3.5 MoE forward pass returning logits (functional).
-pub fn qwen3_5_moe_forward_functional(
-    config: &Qwen3_5MoeConfig,
-    params: &HashMap<String, MxArray>,
-    input_ids: &MxArray,
-) -> Result<MxArray> {
-    let hidden_states = qwen3_5_moe_forward_hidden_states(config, params, input_ids)?;
-    lm_head_functional(&hidden_states, params, config.tie_word_embeddings)
-}
-
 /// Run a Qwen3.5 MoE block through gradient checkpointing.
 fn qwen3_5_moe_block_checkpointed(
     params: &HashMap<String, MxArray>,
@@ -1574,16 +1544,6 @@ fn qwen3_5_moe_block_checkpointed(
     )?;
 
     Ok(outputs.into_iter().next().unwrap())
-}
-
-/// Qwen3.5 MoE forward returning hidden states.
-pub fn qwen3_5_moe_forward_hidden_states(
-    config: &Qwen3_5MoeConfig,
-    params: &HashMap<String, MxArray>,
-    input_ids: &MxArray,
-) -> Result<MxArray> {
-    let mut ckpt = autograd::CheckpointContexts::new();
-    qwen3_5_moe_forward_hidden_states_impl(config, params, input_ids, false, &mut ckpt)
 }
 
 /// Qwen3.5 MoE forward with optional gradient checkpointing.

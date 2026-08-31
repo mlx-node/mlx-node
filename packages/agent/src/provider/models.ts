@@ -1,10 +1,10 @@
 /**
  * Local model discovery for the mlx pi provider.
  *
- * Ports the discovery walk from `@mlx-node/server/host`
- * (`packages/server/src/host/discover.ts`; that copy stays untouched) and
- * pairs every discovered checkpoint with a pi `ProviderModelConfig` entry
- * ready for `pi.registerProvider('mlx', { models })`.
+ * The same discovery walk as `@mlx-node/server/host`
+ * (`packages/server/src/host/discover.ts`), pairing every discovered checkpoint
+ * with a pi `ProviderModelConfig` entry ready for
+ * `pi.registerProvider('mlx', { models })`.
  *
  * `contextWindow` starts as the checkpoint's trained window, read from the model dir's
  * `config.json` `max_position_embeddings` (root first, then the
@@ -12,7 +12,8 @@
  * checkpoints). Once a Qwen or Muse-Glimmer model loads, the provider narrows
  * this shared model metadata to the physical paged-cache window so pi's later
  * auto-compaction thresholds match reality. When both config fields are absent
- * the documented per-family fallback below applies.
+ * the per-family fallback documented on `FamilyTraits` (`@mlx-node/lm`
+ * family-data) applies.
  */
 
 import type { Dirent } from 'node:fs';
@@ -20,50 +21,20 @@ import { readdir, readFile } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
 import type { ProviderModelConfig } from '@earendil-works/pi-coding-agent';
-import { detectModelType, type ModelType } from '@mlx-node/lm';
+import {
+  launchPresetFor,
+  detectModelType,
+  familyTraitsFor,
+  NON_GENERATIVE_FAMILY_IDS,
+  type ModelType,
+} from '@mlx-node/lm';
 
 import type { DiscoveredModelLike } from '../types.js';
-import { launchPresetFor } from './chat-config.js';
 
 /** A discovered local checkpoint paired with its pi provider model entry. */
 export interface MlxModelInfo {
   discovered: DiscoveredModelLike;
   piModel: ProviderModelConfig;
-}
-
-// Non-generative detection results that cannot back a chat endpoint
-// (mirrors the cli discover walk).
-const NON_GENERATIVE: ReadonlySet<ModelType> = new Set<ModelType>(['harrier', 'qianfan-ocr', 'internvl_chat']);
-
-interface FamilyTraits {
-  /**
-   * Whether the family emits `<think>` reasoning (drives pi's thinking
-   * levels): true for qwen3 / qwen3_5 / qwen3_5_moe / gemma4 / lfm2 /
-   * lfm2_moe. Gemma4 routes its `<|channel>thought` protocol through its
-   * family stream parser rather than the generic `<think>` tracker, but the
-   * user-facing level still controls the prompt's `<|think|>` capability.
-   */
-  reasoning: boolean;
-  /**
-   * Optional family-specific projection of Pi's thinking controls. Gemma4's
-   * prompt protocol has two modes rather than four distinct effort levels:
-   * minimal disables `<|think|>` and high enables it.
-   */
-  thinkingLevelMap?: ProviderModelConfig['thinkingLevelMap'];
-  /**
-   * Context-window fallback when `config.json` carries no
-   * `max_position_embeddings` at either nesting level. Values are the
-   * trained windows of the reference checkpoints: Qwen3 40960,
-   * Qwen3.5 (+MoE) 262144, Gemma4 131072, LFM2.5 (dense + MoE) 128000
-   * (`LFM2_CONFIGS[*].maxPositionEmbeddings` in `packages/lm`),
-   * Nemotron 3.5 Lightning 1048576
-   * (`crates/mlx-core/src/models/nemotron_h/config.rs`).
-   *
-   * A family's VOCAB size is never the right value here — the two are
-   * unrelated numbers that happen to collide on some checkpoints
-   * (nemotron_h is 131072 vocab / 1048576 context).
-   */
-  fallbackContextWindow: number;
 }
 
 interface DiscoveryMetadata {
@@ -127,38 +98,6 @@ async function modelFileInventory(modelDir: string): Promise<ModelFileInventory>
     return { xlGgufs: [], hasGguf: false, hasSafetensors: false };
   }
 }
-
-/**
- * Keyed by `ModelType`: a chat-capable family must have BOTH an entry
- * here and a launch preset via `launchPresetFor` (which serves `lfm2_moe`
- * from the agent-local MoE preset) to be served — missing either side is
- * skipped, never guessed.
- */
-const FAMILY_TRAITS: Record<string, FamilyTraits> = {
-  qwen3: { reasoning: true, fallbackContextWindow: 40960 },
-  qwen3_5: { reasoning: true, fallbackContextWindow: 262144 },
-  qwen3_5_moe: { reasoning: true, fallbackContextWindow: 262144 },
-  gemma4: {
-    reasoning: true,
-    thinkingLevelMap: {
-      minimal: 'minimal',
-      low: null,
-      medium: null,
-      high: 'high',
-    },
-    fallbackContextWindow: 131072,
-  },
-  muse_glimmer: {
-    reasoning: true,
-    fallbackContextWindow: 131072,
-  },
-  lfm2: { reasoning: true, fallbackContextWindow: 128000 },
-  lfm2_moe: { reasoning: true, fallbackContextWindow: 128000 },
-  nemotron_h: {
-    reasoning: true,
-    fallbackContextWindow: 1048576,
-  },
-};
 
 function positiveInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
@@ -254,14 +193,17 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     scopeName: string,
     draftModelPath?: string,
   ): Promise<void> => {
-    if (NON_GENERATIVE.has(modelType)) return;
+    if (NON_GENERATIVE_FAMILY_IDS.has(modelType)) return;
 
+    // Fail-closed guards: dead-by-construction for chat families (the
+    // family-data row type requires traits + a preset), live for any foreign
+    // string that slips through detection.
     const preset = launchPresetFor(modelType);
     if (!preset) {
       if (debug) console.warn(`[mlx] skip ${path}: no launch preset for ${modelType}`);
       return;
     }
-    const traits = FAMILY_TRAITS[modelType];
+    const traits = familyTraitsFor(modelType);
     if (!traits) {
       if (debug) console.warn(`[mlx] skip ${path}: no FAMILY_TRAITS entry for ${modelType}`);
       return;
@@ -292,7 +234,9 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
         id: name,
         name,
         reasoning: traits.reasoning,
-        thinkingLevelMap: traits.thinkingLevelMap,
+        // The structural FamilyThinkingLevelMap must stay assignable to the
+        // pi type (pi types are agent-only, so family-data cannot name it).
+        thinkingLevelMap: traits.thinkingLevelMap satisfies ProviderModelConfig['thinkingLevelMap'],
         input: metadata.supportsImages ? ['text', 'image'] : ['text'],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: metadata.contextWindow,

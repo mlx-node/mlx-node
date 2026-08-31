@@ -205,59 +205,6 @@ struct Lfm2ConvColdCheckpoint {
     states: Vec<MxArray>,
 }
 
-/// Classification of the prefix-cache decision made from a
-/// [`Lfm2Inner::verify_cache_prefix`] return value plus the incoming
-/// token count.
-///
-/// Test-only mirror of the inlined branch in the engine session core's
-/// verify-prefix split — separating the decision logic from the native
-/// state mutation so the "exact-match routes to miss" invariant can be
-/// pinned by pure-logic unit tests that do not require a loaded LFM2
-/// model. Production code keeps the inlined form for zero-overhead
-/// dispatch; this enum exists solely to drive
-/// `prefix_cache_decision_tests`'s four-case coverage (empty cache,
-/// strict-extend hit, divergence miss, exact-match miss). Any change to
-/// the inlined production branch MUST be mirrored here or the test
-/// ceases to guard the real code.
-#[cfg(test)]
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub(crate) enum PrefixCacheDecision {
-    /// Strict-extend hit: the new prompt begins with the cached prefix
-    /// and carries additional delta tokens. Warm-reuse safe: skip the
-    /// cached prefix and prefill only the tail.
-    StrictExtendHit,
-    /// Cache miss — covers three sub-cases that all dispatch through
-    /// the same `reset_caches_sync` + `init_caches_sync` + full-prefill
-    /// branch:
-    /// * `cached_prefix_len == 0` (no prior cache, reuse_cache disabled,
-    ///   or prefix mismatch).
-    /// * `cached_prefix_len == tokens_len` (exact-match) — routed to
-    ///   miss because LFM2's short-conv layers have non-invertible
-    ///   left-padded state and no safe "rewind by 1" primitive.
-    Miss,
-}
-
-/// Test-only helper: decide what to do given the verifier's answer and
-/// the incoming prompt length. Exact-match (`cached_prefix_len ==
-/// tokens_len`) and zero-length prefix both route to
-/// [`PrefixCacheDecision::Miss`].
-///
-/// Mirrors the inlined branch in the engine session core's
-/// verify-prefix split; lifting it out keeps the invariant pinnable
-/// without loading a real LFM2 model.
-#[cfg(test)]
-#[inline]
-pub(crate) fn classify_prefix_cache_decision(
-    cached_prefix_len: usize,
-    tokens_len: usize,
-) -> PrefixCacheDecision {
-    if cached_prefix_len > 0 && cached_prefix_len < tokens_len {
-        PrefixCacheDecision::StrictExtendHit
-    } else {
-        PrefixCacheDecision::Miss
-    }
-}
-
 /// Decide whether `self.caches`'s conv-layer state ALREADY reflects the
 /// token prefix `plan[..cached_prefix_len]` byte-for-byte, so
 /// `run_paged_prefill_chunk`'s Pass 1 (`run_conv_only_prefill`) — a full
@@ -282,7 +229,7 @@ pub(crate) fn classify_prefix_cache_decision(
 /// `cached_prefix_len == 0` and the degenerate identical-resend case
 /// (`cached_prefix_len` capped one below an exact match by
 /// `prime_prefix_state`'s `max_cache_hit_tokens`) both return `false` —
-/// mirrors [`classify_prefix_cache_decision`]'s exact-match-is-miss
+/// mirrors the engine session core's exact-match-is-miss prefix-cache
 /// invariant: LFM2 has no safe "rewind by one" primitive.
 ///
 /// Both the legacy whole-turn path and the scheduler consume this predicate
@@ -2679,124 +2626,6 @@ crate::models::chat_napi::chat_napi_surface! {
 }
 
 #[cfg(test)]
-mod prefix_cache_decision_tests {
-    //! Pure-logic coverage of the prefix-cache decision tree — no model
-    //! load required. The verifier `Lfm2Inner::verify_cache_prefix`
-    //! returns either `0` (miss) or `cached_token_history.len()` (exact
-    //! prefix relation). The engine session core (and the paged turn
-    //! path) then classify that value plus the
-    //! incoming prompt length into
-    //! [`PrefixCacheDecision::StrictExtendHit`] (warm-reuse, skip the
-    //! cached prefix, prefill only the tail) vs
-    //! [`PrefixCacheDecision::Miss`] (reset caches + re-init + full
-    //! prefill).
-    //!
-    //! The four cases covered below pin the invariant:
-    //! exact-match MUST route to `Miss`, not to `StrictExtendHit` —
-    //! LFM2's short-conv layers carry non-invertible left-padded state
-    //! and there is no safe "rewind-by-1" primitive. Reprefilling the
-    //! final cached token on top of the live caches would advance state
-    //! to `prompt + last_token` (duplicated) while `save_cache_state`
-    //! writes only `tokens`, corrupting the next warm-hit turn. The
-    //! `#[ignore]`-gated integration tests above exercise the end-to-
-    //! end behaviour against a loaded LFM2 model; this module guarantees
-    //! the decision logic stays correct in every CI run without a model
-    //! dependency.
-
-    use super::{PrefixCacheDecision, classify_prefix_cache_decision};
-
-    #[test]
-    fn empty_cache_is_miss() {
-        // verify_cache_prefix returned 0: either `cached_token_history`
-        // is empty, `reuse_cache` was false, or the prompt didn't
-        // prefix-match. All three land on the same miss branch.
-        assert_eq!(
-            classify_prefix_cache_decision(0, 0),
-            PrefixCacheDecision::Miss,
-            "empty cache + empty tokens must be Miss"
-        );
-        assert_eq!(
-            classify_prefix_cache_decision(0, 10),
-            PrefixCacheDecision::Miss,
-            "empty cache + non-empty tokens must be Miss"
-        );
-    }
-
-    #[test]
-    fn strict_extend_is_hit() {
-        // verify_cache_prefix returned cached_token_history.len() AND
-        // tokens.len() > cached_token_history.len(). The caller prefills
-        // only `tokens[cached_prefix_len..]` on top of the live caches.
-        assert_eq!(
-            classify_prefix_cache_decision(5, 8),
-            PrefixCacheDecision::StrictExtendHit,
-            "cached.len() < tokens.len() must be StrictExtendHit"
-        );
-        assert_eq!(
-            classify_prefix_cache_decision(1, 2),
-            PrefixCacheDecision::StrictExtendHit,
-            "minimum strict-extend (one cached, one delta) must be StrictExtendHit"
-        );
-    }
-
-    #[test]
-    fn divergence_is_miss() {
-        // verify_cache_prefix returned 0 because
-        // tokens[..cached.len()] != cached[..]. Same branch as empty-
-        // cache miss — both flavours dispatch to reset + re-init +
-        // full-prefill.
-        assert_eq!(
-            classify_prefix_cache_decision(0, 20),
-            PrefixCacheDecision::Miss,
-            "divergence (verifier returned 0) must be Miss"
-        );
-    }
-
-    #[test]
-    fn exact_match_is_miss() {
-        // verify_cache_prefix returned cached_token_history.len() AND
-        // tokens.len() == cached_token_history.len() — byte-equal
-        // prompt. The classifier routes to Miss because LFM2's conv
-        // state has non-invertible left-padded buffers; there is no
-        // way to sample from the already-cached final position without
-        // re-running the last forward step, which would duplicate the
-        // final token into cache state while persistence only records
-        // the prompt + generated tokens. The tests here guard this
-        // invariant against any regression.
-        assert_eq!(
-            classify_prefix_cache_decision(5, 5),
-            PrefixCacheDecision::Miss,
-            "exact-match (cached.len() == tokens.len()) must be Miss, not StrictExtendHit"
-        );
-        assert_eq!(
-            classify_prefix_cache_decision(1, 1),
-            PrefixCacheDecision::Miss,
-            "exact-match single token must be Miss"
-        );
-        assert_eq!(
-            classify_prefix_cache_decision(1000, 1000),
-            PrefixCacheDecision::Miss,
-            "exact-match long prompts must still be Miss"
-        );
-    }
-
-    #[test]
-    fn invariant_cached_len_never_exceeds_tokens_len_in_hit() {
-        // Belt-and-braces: the verifier guarantees `cached.len() <=
-        // tokens.len()` on every non-zero return (it rejects with 0
-        // when tokens.len() < cached.len()), so the classifier never
-        // sees cached_prefix_len > tokens_len in practice. But if it
-        // ever did, the branch routes to Miss (the `<` is strict),
-        // which is the safe fallthrough.
-        assert_eq!(
-            classify_prefix_cache_decision(10, 5),
-            PrefixCacheDecision::Miss,
-            "cached_prefix_len > tokens_len must be Miss (defensive fallthrough)"
-        );
-    }
-}
-
-#[cfg(test)]
 mod conv_state_reuse_tests {
     //! Pure-logic coverage of [`conv_state_reusable`] — no model load
     //! required. Guards the `prime_prefix_state` fast path that skips
@@ -2854,7 +2683,7 @@ mod conv_state_reuse_tests {
         // `plan.len() - 1` (never lets a cache hit consume the whole
         // prompt), so an identical resend with zero new tokens reports
         // `cached_prefix_len == history.len() - 1`, not `history.len()`.
-        // Mirrors `classify_prefix_cache_decision`'s exact-match-is-miss
+        // Mirrors the engine session core's exact-match-is-miss
         // invariant.
         let history = vec![1u32, 2, 3, 4, 5];
         let plan = history.clone();

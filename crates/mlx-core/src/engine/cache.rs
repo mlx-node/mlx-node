@@ -546,10 +546,6 @@ mod image_cache_identity_tests {
 
     const IMAGE_TOKEN_ID: u32 = 248_056;
 
-    fn digest(word: u64) -> ImageCacheDigest {
-        ImageCacheDigest::from_test_word(word)
-    }
-
     fn cold_key(extra_keys: &[u64]) -> ColdCacheKey {
         ColdCacheKey::chain(
             ColdGroup::Kv,
@@ -695,17 +691,20 @@ mod image_cache_identity_tests {
             &expanded_tokens,
             IMAGE_TOKEN_ID,
             &[2, 3],
-            &[digest(0xAAAA), digest(0xBBBB)],
+            &[
+                ImageCacheDigest::from_test_word(0xAAAA),
+                ImageCacheDigest::from_test_word(0xBBBB),
+            ],
         )
         .expect("valid expanded image metadata");
 
         let expected_positions = [1u32, 2, 4, 5, 6];
         let expected_digests = [
-            digest(0xAAAA),
-            digest(0xAAAA),
-            digest(0xBBBB),
-            digest(0xBBBB),
-            digest(0xBBBB),
+            ImageCacheDigest::from_test_word(0xAAAA),
+            ImageCacheDigest::from_test_word(0xAAAA),
+            ImageCacheDigest::from_test_word(0xBBBB),
+            ImageCacheDigest::from_test_word(0xBBBB),
+            ImageCacheDigest::from_test_word(0xBBBB),
         ];
         let expected = expected_positions
             .into_iter()
@@ -726,7 +725,7 @@ mod image_cache_identity_tests {
             &[1, IMAGE_TOKEN_ID],
             IMAGE_TOKEN_ID,
             &[1, 1],
-            &[digest(0xAAAA)],
+            &[ImageCacheDigest::from_test_word(0xAAAA)],
         )
         .expect_err("counts and digests must have identical cardinality");
 
@@ -739,7 +738,7 @@ mod image_cache_identity_tests {
             &[1, IMAGE_TOKEN_ID, 200],
             IMAGE_TOKEN_ID,
             &[2],
-            &[digest(0xAAAA)],
+            &[ImageCacheDigest::from_test_word(0xAAAA)],
         )
         .expect_err("metadata requiring two placeholders must reject one placeholder");
         assert!(too_few.contains("prompt contains 1, image metadata requires 2"));
@@ -748,7 +747,7 @@ mod image_cache_identity_tests {
             &[1, IMAGE_TOKEN_ID, IMAGE_TOKEN_ID, 200],
             IMAGE_TOKEN_ID,
             &[1],
-            &[digest(0xAAAA)],
+            &[ImageCacheDigest::from_test_word(0xAAAA)],
         )
         .expect_err("metadata requiring one placeholder must reject two placeholders");
         assert!(too_many.contains("prompt contains 2, image metadata requires 1"));
@@ -756,9 +755,13 @@ mod image_cache_identity_tests {
 
     #[test]
     fn expanded_placeholder_mapping_rejects_zero_count_images() {
-        let error =
-            map_expanded_image_token_positions(&[1, 200], IMAGE_TOKEN_ID, &[0], &[digest(0xAAAA)])
-                .expect_err("an image digest without an expanded token span is ambiguous");
+        let error = map_expanded_image_token_positions(
+            &[1, 200],
+            IMAGE_TOKEN_ID,
+            &[0],
+            &[ImageCacheDigest::from_test_word(0xAAAA)],
+        )
+        .expect_err("an image digest without an expanded token span is ambiguous");
 
         assert!(error.contains("zero expanded tokens for image 0"));
     }

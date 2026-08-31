@@ -173,16 +173,11 @@ impl Gemma4LayerCache {
         }
     }
 
-    /// Save K/V into the stash (replaces any previous stash).
-    pub fn stash_kv(&mut self, keys: MxArray, values: MxArray) {
-        self.stashed_kv = Some((keys, values));
-    }
-
     /// Take the stashed K/V, clearing the stash.
     ///
-    /// Returns the K/V that was saved by the last `update_and_fetch_stash` or
-    /// `stash_kv` call. Returns None if the stash is empty (already taken or
-    /// never populated).
+    /// Returns the K/V that was saved by the last `update_and_fetch_stash`
+    /// call. Returns None if the stash is empty (already taken or never
+    /// populated).
     pub fn take_stashed_kv(&mut self) -> Option<(MxArray, MxArray)> {
         self.stashed_kv.take()
     }

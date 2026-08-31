@@ -4,6 +4,8 @@ import { parseArgs } from 'node:util';
 
 import { convertModel, convertForeignWeights, convertGgufToSafetensors, preflightMuseDflashGguf } from '@mlx-node/core';
 
+import { detectConvertModelType } from './convert-detect.js';
+
 // Canonical per-mode defaults for quantization bits/group_size.
 // Mirrors crates/mlx-core/src/convert.rs and crates/mlx-core/src/utils/gguf.rs.
 const QUANT_MODE_DEFAULTS: Record<string, [number, number]> = {
@@ -828,72 +830,9 @@ export async function run(argv: string[]) {
     try {
       const configPath = resolve(inputPath, 'config.json');
       const config = JSON.parse(readFileSync(configPath, 'utf-8'));
-      if (Array.isArray(config.architectures) && config.architectures.includes('NemotronHForCausalLM')) {
-        // The Nemotron architecture is authoritative (native parser +
-        // runtime registry probe): check it BEFORE the model_type branches
-        // so a stale-but-recognized model_type (e.g. qwen3_5) cannot route
-        // a Nemotron checkpoint to another family's sanitizer.
-        modelType = 'nemotron_h';
-        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'paddleocr_vl') {
-        modelType = 'paddleocr-vl';
-        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'internvl_chat' || config.model_type === 'qianfan-ocr') {
-        // Qianfan-OCR checkpoints use InternVL's historical raw model_type.
-        // The runtime registry maps exactly both strings to QianfanOCRModel;
-        // canonicalize them to the converter recipe name so the native
-        // dense-only quantization guard cannot be bypassed when -m is omitted.
-        modelType = 'qianfan-ocr';
-        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'qwen3_asr') {
-        modelType = config.model_type;
-        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'qwen3_5_moe' || config.model_type === 'qwen3_5') {
-        modelType = config.model_type;
-        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'gemma4' || config.model_type === 'gemma4_text') {
-        modelType = 'gemma4';
-        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (
-        config.model_type === 'gemma4_unified' ||
-        (Array.isArray(config.architectures) && config.architectures.includes('Gemma4UnifiedForConditionalGeneration'))
-      ) {
-        // Pass the raw 'gemma4_unified' string through unchanged. Native
-        // recipe_for resolves it to the shared Gemma4Recipe, so every
-        // recipe-keyed code path (sym8_supported, sanitizer, embed_quantizable,
-        // mtp_policy, etc.) behaves identically to 'gemma4'. Collapsing it to
-        // 'gemma4' here would (a) make the native recipe_for("gemma4_unified")
-        // arm dead code, and (b) misroute a unified checkpoint that carries
-        // gemma-QAT metadata into the E2B-only prequantized importer, whose
-        // gate keys on the exact string "gemma4" (and which then hard-errors in
-        // validate_e2b_qat_schedule). The exact-"gemma4" gate must not match
-        // unified, so the raw string has to reach the native side.
-        //
-        // The architecture-only arm (no `model_type`, only
-        // `architectures: ['Gemma4UnifiedForConditionalGeneration']`) mirrors
-        // the runtime loader, which also flags this shape as unified
-        // (model-loader.ts maps it to gemma4; persistence.rs parse_config sets
-        // is_unified on EITHER model_type == "gemma4_unified" OR that
-        // architecture). Without this, an architecture-only config would leave
-        // modelType undefined and skip Gemma4Recipe::sanitize, producing
-        // unloadable output. It maps to 'gemma4_unified' (not 'gemma4') so the
-        // E2B-importer gate above still cannot match it.
-        modelType = 'gemma4_unified';
-        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'lfm2_moe' || config.model_type === 'lfm2') {
-        modelType = config.model_type;
-        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'openai_privacy_filter') {
-        modelType = 'privacy-filter';
-        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'muse_glimmer') {
-        modelType = config.model_type;
-        console.log(`Auto-detected model type: ${modelType} (from config.json)`);
-      } else if (config.model_type === 'nemotron_h') {
-        // The architecture-only arm is handled FIRST in this chain (the
-        // architecture is authoritative); this arm covers checkpoints that
-        // declare the plain model_type.
-        modelType = 'nemotron_h';
+      const detected = detectConvertModelType(config);
+      if (detected !== undefined) {
+        modelType = detected;
         console.log(`Auto-detected model type: ${modelType} (from config.json)`);
       }
     } catch {

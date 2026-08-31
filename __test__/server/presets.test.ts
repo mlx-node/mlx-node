@@ -1,35 +1,21 @@
 /**
- * Coverage for the launch-preset repetition handling.
- *
- * The native anti-repetition cutoff is now disabled by default
- * (vLLM-aligned — vLLM ships no repetition-stop heuristic), so the Qwen
- * launch presets no longer pin `maxConsecutiveTokens` / `maxNgramRepeats`
- * / `ngramSize`. Repetition is shaped by the sampling penalties and
- * bounded by the per-model `maxOutputTokens`. An operator or client can
- * still opt in by setting those fields explicitly; a per-request config
- * value wins via `ChatSession.mergeConfig`.
- *
- * The merge-survival tests drive the REAL `ChatSession.mergeConfig`
- * through `ModelRegistry.register({ samplingDefaults }) → getOrCreate →
- * session.send`, observing the merged ChatConfig the session forwards
- * to `chatSessionStart` (a session-capable mock — no native model).
+ * Coverage that the launch presets pin no repetition-cutoff fields, and that
+ * the real `ChatSession.mergeConfig` neither injects nor drops them.
  */
 
 import type { ChatConfig, ChatMessage, ChatResult, ToolCallResult } from '@mlx-node/core';
-import type { SessionCapableModel } from '@mlx-node/lm';
 import {
   GEMMA4_SAMPLING_DEFAULTS,
-  LAUNCH_PRESETS,
   LFM2_SAMPLING_DEFAULTS,
-  ModelRegistry,
   QWEN_SAMPLING_DEFAULTS,
-} from '@mlx-node/server';
+  launchPresetFor,
+  type SessionCapableModel,
+} from '@mlx-node/lm';
+import { ModelRegistry } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
-// ---------------------------------------------------------------------------
-// Mock model (mirrors sampling-defaults.test.ts): captures the merged
-// ChatConfig that ChatSession passes down to chatSessionStart.
-// ---------------------------------------------------------------------------
+// Mock model: captures the merged ChatConfig ChatSession passes to
+// chatSessionStart.
 
 interface CapturingModel extends SessionCapableModel {
   lastStartConfig: ChatConfig | null | undefined;
@@ -71,14 +57,10 @@ function createCapturingModel(): CapturingModel {
   return model as unknown as CapturingModel;
 }
 
-// ---------------------------------------------------------------------------
-// Static preset-value assertions
-// ---------------------------------------------------------------------------
-
 describe('QWEN launch-preset repetition cutoff is default-off', () => {
   it('injects no cutoff fields on every Qwen launch entry (qwen3 / qwen3_5 / qwen3_5_moe)', () => {
     for (const key of ['qwen3', 'qwen3_5', 'qwen3_5_moe'] as const) {
-      const sampling = LAUNCH_PRESETS[key]!.sampling;
+      const sampling = launchPresetFor(key)!.sampling;
       expect(sampling.maxConsecutiveTokens).toBeUndefined();
       expect(sampling.maxNgramRepeats).toBeUndefined();
       expect(sampling.ngramSize).toBeUndefined();
@@ -112,26 +94,22 @@ describe('scope lock: non-Qwen presets unchanged', () => {
     expect(GEMMA4_SAMPLING_DEFAULTS.maxConsecutiveTokens).toBeUndefined();
     expect(GEMMA4_SAMPLING_DEFAULTS.maxNgramRepeats).toBeUndefined();
     expect(GEMMA4_SAMPLING_DEFAULTS.ngramSize).toBeUndefined();
-    expect(LAUNCH_PRESETS.gemma4!.sampling.maxConsecutiveTokens).toBeUndefined();
+    expect(launchPresetFor('gemma4')!.sampling.maxConsecutiveTokens).toBeUndefined();
   });
 
   it('does not set the cutoff on the LFM2 preset', () => {
     expect(LFM2_SAMPLING_DEFAULTS.maxConsecutiveTokens).toBeUndefined();
     expect(LFM2_SAMPLING_DEFAULTS.maxNgramRepeats).toBeUndefined();
     expect(LFM2_SAMPLING_DEFAULTS.ngramSize).toBeUndefined();
-    expect(LAUNCH_PRESETS.lfm2!.sampling.maxConsecutiveTokens).toBeUndefined();
+    expect(launchPresetFor('lfm2')!.sampling.maxConsecutiveTokens).toBeUndefined();
   });
 });
-
-// ---------------------------------------------------------------------------
-// Merge survival (real ChatSession.mergeConfig)
-// ---------------------------------------------------------------------------
 
 describe('repetition-cutoff handling through ChatSession.mergeConfig', () => {
   it('injects no repetition-cutoff fields when the per-request overlay omits them', async () => {
     const registry = new ModelRegistry();
     const model = createCapturingModel();
-    registry.register('qwen35moe', model, { samplingDefaults: LAUNCH_PRESETS.qwen3_5_moe!.sampling });
+    registry.register('qwen35moe', model, { samplingDefaults: launchPresetFor('qwen3_5_moe')!.sampling });
 
     const sessionReg = registry.getSessionRegistry('qwen35moe')!;
     const { session } = sessionReg.getOrCreate(null, null);
@@ -142,7 +120,7 @@ describe('repetition-cutoff handling through ChatSession.mergeConfig', () => {
     // Full shape: defaults + reuseCache, nothing else injected. The
     // preset carries no cutoff fields, so none appear here.
     expect(model.lastStartConfig).toEqual({
-      ...LAUNCH_PRESETS.qwen3_5_moe!.sampling,
+      ...launchPresetFor('qwen3_5_moe')!.sampling,
       cacheOwnerId: expect.any(String),
       reuseCache: true,
     });
@@ -154,7 +132,7 @@ describe('repetition-cutoff handling through ChatSession.mergeConfig', () => {
   it('lets a per-request override reach the model on maxConsecutiveTokens (opt-in)', async () => {
     const registry = new ModelRegistry();
     const model = createCapturingModel();
-    registry.register('qwen35moe', model, { samplingDefaults: LAUNCH_PRESETS.qwen3_5_moe!.sampling });
+    registry.register('qwen35moe', model, { samplingDefaults: launchPresetFor('qwen3_5_moe')!.sampling });
 
     const sessionReg = registry.getSessionRegistry('qwen35moe')!;
     const { session } = sessionReg.getOrCreate(null, null);

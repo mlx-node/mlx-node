@@ -14,17 +14,7 @@ import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 
-/** Every chat-capable family currently discovered by `@mlx-node/agent`. */
-export const AGENT_PAGED_MODEL_TYPES = [
-  'qwen3',
-  'qwen3_5',
-  'qwen3_5_moe',
-  'gemma4',
-  'muse_glimmer',
-  'lfm2',
-  'lfm2_moe',
-  'nemotron_h',
-] as const;
+import { CHAT_FAMILY_IDS } from '../family-data.js';
 
 /** Families historically forced paged by `mlx launch claude`. */
 export const QWEN35_PAGED_MODEL_TYPES = ['qwen3_5', 'qwen3_5_moe'] as const;
@@ -67,7 +57,7 @@ export class PagedConfigOverrideManager {
   private disposed = false;
 
   constructor(options: PagedConfigOverrideManagerOptions = {}) {
-    this.modelTypes = new Set(options.modelTypes ?? AGENT_PAGED_MODEL_TYPES);
+    this.modelTypes = new Set(options.modelTypes ?? CHAT_FAMILY_IDS);
     this.tempDirPrefix = options.tempDirPrefix ?? 'mlx-paged-overrides-';
     this.preserveEmbeddedGemmaDraft = options.preserveEmbeddedGemmaDraft ?? false;
   }

@@ -270,16 +270,6 @@ impl MetalState {
         "paged_attention_grouped_bfloat16_hs512_striped_reduce"
     }
 
-    /// Compatibility alias for existing downstream diagnostics.
-    pub fn paged_attention_grouped_gemma4_kernel_name() -> &'static str {
-        Self::paged_attention_grouped_d512_kernel_name()
-    }
-
-    /// Compatibility alias for existing downstream diagnostics.
-    pub fn paged_attention_grouped_gemma4_reduce_kernel_name() -> &'static str {
-        Self::paged_attention_grouped_d512_reduce_kernel_name()
-    }
-
     /// Varlen counterparts to the V1/V2/reduce kernel name helpers above.
     /// The naming convention mirrors the single-row helpers
     /// 1:1 except for the `varlen` infix so the metallib lookup is

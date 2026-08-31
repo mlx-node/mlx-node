@@ -291,22 +291,3 @@ fn compute_reading_order(
 
     Ok(ranks)
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_layout_element_struct() {
-        let elem = LayoutElement {
-            score: 0.95,
-            label: 0,
-            label_name: "title".to_string(),
-            bbox: vec![10.0, 20.0, 300.0, 50.0],
-            order: 0,
-        };
-        assert_eq!(elem.label, 0);
-        assert_eq!(elem.label_name, "title");
-        assert_eq!(elem.bbox.len(), 4);
-    }
-}

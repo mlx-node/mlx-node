@@ -58,14 +58,3 @@ impl Default for PPLCNetConfig {
         }
     }
 }
-
-impl PPLCNetConfig {
-    /// Get the final output channels (last block's out_channels)
-    pub fn head_in_channels(&self) -> i32 {
-        self.blocks
-            .last()
-            .and_then(|(_, blocks)| blocks.last())
-            .map(|b| b.2)
-            .unwrap_or(512)
-    }
-}

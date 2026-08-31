@@ -428,8 +428,3 @@ export interface SessionRenameResponse {
   id: string;
   name: string;
 }
-
-export interface SessionDeleteResponse {
-  deleted: boolean;
-  id: string;
-}

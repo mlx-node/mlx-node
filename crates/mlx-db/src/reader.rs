@@ -323,34 +323,6 @@ pub async fn get_generations_by_reward(
     Ok(results)
 }
 
-/// Get a single generation with its tool calls by ID
-pub async fn get_generation_by_id(
-    pool: &SqlitePool,
-    gen_id: i64,
-) -> Result<Option<GenerationWithToolCalls>, DbError> {
-    let row: Option<GenerationRow> = sqlx::query_as(
-        r#"SELECT g.id, ts.step, g.batch_index, g.group_index, g.prompt, g.expected_answer,
-                  g.completion_text, g.completion_raw, g.thinking, g.num_tokens, g.finish_reason, g.reward
-           FROM generations g
-           JOIN training_steps ts ON g.step_id = ts.id
-           WHERE g.id = ?"#,
-    )
-    .bind(gen_id)
-    .fetch_optional(pool)
-    .await?;
-
-    if let Some(r) = row {
-        let generation: GenerationRecord = r.into();
-        let tool_calls = get_tool_calls_for_generation(pool, gen_id).await?;
-        Ok(Some(GenerationWithToolCalls {
-            generation,
-            tool_calls,
-        }))
-    } else {
-        Ok(None)
-    }
-}
-
 /// Get generations with specific finish reason
 pub async fn get_generations_by_finish_reason(
     pool: &SqlitePool,

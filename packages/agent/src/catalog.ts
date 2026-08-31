@@ -1,10 +1,9 @@
 /**
  * Curated model catalog for `mlx agent`.
  *
- * The first-run download wizard (Task 8) offers `visibleCatalog()` and
- * feeds the chosen `hfRepo` to `mlx download model`. Slugs are settled
- * with the user and verified against the Brooooooklyn HF account —
- * use them verbatim.
+ * The first-run download wizard offers `visibleCatalog()` and feeds the chosen
+ * `hfRepo` to `mlx download model`. Slugs are verified against the Brooooooklyn
+ * HF account — use them verbatim.
  */
 
 export interface CatalogEntry {
@@ -99,17 +98,25 @@ export function visibleCatalog(): CatalogEntry[] {
 }
 
 /**
- * Cold-tier facts, re-exported through this subpath.
+ * Cold-tier facts and family registration data, re-exported through this
+ * subpath.
  *
  * `@mlx-node/agent/catalog` is the agent package's one NATIVE-FREE entry point:
  * the package root re-exports `provider/index.ts`, which value-imports
  * `@mlx-node/core`. The dashboard is a separate viewer process that must never
  * link the addon (docs/dashboard.md: "no Metal init, instant start"), and
  * `mlx agent --help` must print without loading weights — so both reach the
- * cold-tier allowlist and the cache-root canonicalizer through here.
+ * cold-tier allowlist, the cache-root canonicalizer, and the family detection
+ * data through here.
  *
- * These are RE-EXPORTS. The definitions live in `./cold-tier.ts` and there is
- * exactly one of each; `packages/agent/__test__/cold-tier-families.test.ts`
- * guards the allowlist against the native side.
+ * Every module reachable from here must therefore stay free of runtime addon
+ * imports. `packages/agent/__test__/catalog-native-free.test.ts` gates that in a
+ * real subprocess.
  */
 export { COLD_TIER_RESTORE_FAMILIES, canonicalCacheRoot, coldTierRestoreFamilyList } from './cold-tier.js';
+export {
+  CHAT_FAMILY_IDS,
+  matchFamily,
+  NON_GENERATIVE_FAMILY_IDS,
+  rawModelTypeToCanonical,
+} from '@mlx-node/lm/family-data';

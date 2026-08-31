@@ -429,22 +429,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_embedding_weight_alias() {
-        // Test that weight() and get_weight() return the same thing
-        let embedding = Embedding::new(50, 32).unwrap();
-        let w1 = embedding.weight();
-        let w2 = embedding.get_weight();
-
-        let v1 = get_values(&w1);
-        let v2 = get_values(&w2);
-
-        assert_eq!(v1.len(), v2.len());
-        for (a, b) in v1.iter().zip(v2.iter()) {
-            assert!((a - b).abs() < 1e-10);
-        }
-    }
-
     // ========================================================================
     // Clone Tests
     // ========================================================================

@@ -1960,7 +1960,7 @@ mod tests {
     /// speculative decoder runs the FAMILY's speculative core in place of the
     /// generic autoregressive loop, and still exits through the one shared
     /// epilogue (reconcile → finalize → save → finalize_turn). That shared
-    /// exit is L-EPILOGUE (I11) made structural: a speculative turn has no
+    /// exit is L-EPILOGUE made structural: a speculative turn has no
     /// private epilogue to fork.
     ///
     /// Also pins the two things the speculative branch must NOT do: open the

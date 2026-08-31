@@ -107,47 +107,6 @@ describe('GRPO Gradient Accumulation', () => {
   });
 
   describe('Learning Rate Scaling Equivalence', () => {
-    it('lr/N with summed grads equals lr with averaged grads', () => {
-      // Mathematical proof:
-      // param = param - (lr/N) * sum(grads)
-      // is equivalent to:
-      // param = param - lr * mean(grads)
-
-      const N = 4;
-      const lr = 0.1;
-
-      // Create some gradients
-      const grads = [
-        new Float32Array([1.0, 2.0]),
-        new Float32Array([3.0, 4.0]),
-        new Float32Array([5.0, 6.0]),
-        new Float32Array([7.0, 8.0]),
-      ];
-
-      // Method 1: Sum gradients, scale lr by N
-      const sum = new Float32Array(2);
-      for (const g of grads) {
-        sum[0] += g[0];
-        sum[1] += g[1];
-      }
-      const update1 = [(lr / N) * sum[0], (lr / N) * sum[1]];
-
-      // Method 2: Average gradients, use full lr
-      const avg = [sum[0] / N, sum[1] / N];
-      const update2 = [lr * avg[0], lr * avg[1]];
-
-      // Both should be equal
-      expect(update1[0]).toBeCloseTo(update2[0], 10);
-      expect(update1[1]).toBeCloseTo(update2[1], 10);
-
-      // Verify the actual values
-      // sum = [16, 20], avg = [4, 5]
-      // update1 = (0.1/4) * [16, 20] = [0.4, 0.5]
-      // update2 = 0.1 * [4, 5] = [0.4, 0.5]
-      expect(update1[0]).toBeCloseTo(0.4, 10);
-      expect(update1[1]).toBeCloseTo(0.5, 10);
-    });
-
     it('MxArray operations verify lr scaling equivalence', () => {
       const N = 4;
       const lr = 0.01;

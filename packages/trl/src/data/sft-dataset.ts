@@ -292,13 +292,6 @@ export class SFTDataset {
   }
 
   /**
-   * Check if a token ID is a newline token
-   */
-  private isNewlineToken(tokenId: number): boolean {
-    return this.specialTokenIds.newlineTokens.includes(tokenId);
-  }
-
-  /**
    * Tokenize a conversation example
    *
    * For conversations, we train on all assistant turns.
@@ -339,7 +332,7 @@ export class SFTDataset {
         let j = i + 2;
         while (j < inputIds.length && inputIds[j] !== imEnd) {
           // Look for newline token (dynamically derived from tokenizer)
-          if (this.isNewlineToken(inputIds[j])) {
+          if (this.specialTokenIds.newlineTokens.includes(inputIds[j])) {
             inAssistant = true;
             i = j; // Skip to after header
             break;

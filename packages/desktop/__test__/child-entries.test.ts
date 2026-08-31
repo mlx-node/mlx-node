@@ -31,6 +31,15 @@ const src = (rel: string): string => resolve(ROOT, 'packages/desktop/src', rel);
 /** Packages that map the addon, directly or by re-export. */
 const ADDON_PACKAGES = ['@mlx-node/core', '@mlx-node/lm', '@mlx-node/vlm', '@mlx-node/trl'];
 
+/**
+ * Native-free leaves of otherwise addon-mapping packages — the analogue of
+ * `@mlx-node/server/host/env-policy` for the lm package. Walked INTO (their
+ * own import graphs must stay clean under this same walk) but never counted
+ * as offenders. `packages/agent/__test__/catalog-native-free.test.ts` proves
+ * the same contract against the built output in a real process.
+ */
+const ADDON_FREE_SUBPATHS = ['@mlx-node/lm/family-data'];
+
 /** Every `from '…'` and bare `import '…'` specifier, **type-only imports included**. */
 function specifiersOf(file: string): string[] {
   const source = readFileSync(file, 'utf-8');
@@ -141,7 +150,14 @@ function walk(entry: string): Walk {
       else packages.add(specifier);
       // `@mlx-node/core` is the addon itself — a published `index.cjs`, not a
       // `src` tree — so failing to resolve it is expected and not a truncation.
-      if (ADDON_PACKAGES.includes(specifier.split('/').slice(0, 2).join('/'))) continue;
+      // A sanctioned native-free subpath of an addon package IS walked, so its
+      // own graph stays under this same gate.
+      if (
+        !ADDON_FREE_SUBPATHS.includes(specifier) &&
+        ADDON_PACKAGES.includes(specifier.split('/').slice(0, 2).join('/'))
+      ) {
+        continue;
+      }
       const source = workspaceSourceFor(specifier);
       if (source === null) unresolved.add(specifier);
       else queue.push(source);
@@ -156,7 +172,9 @@ function walk(entry: string): Walk {
 }
 
 const reachesAddon = (packages: string[]): string[] =>
-  packages.filter((name) => ADDON_PACKAGES.some((p) => name === p || name.startsWith(`${p}/`)));
+  packages.filter(
+    (name) => !ADDON_FREE_SUBPATHS.includes(name) && ADDON_PACKAGES.some((p) => name === p || name.startsWith(`${p}/`)),
+  );
 
 describe('CONTROL PANEL never links the native addon', () => {
   const graph = walk(src('control-panel/index.ts'));
@@ -178,18 +196,19 @@ describe('CONTROL PANEL never links the native addon', () => {
   });
 
   /**
-   * The one erased edge, pinned by name.
+   * The erased edges, pinned by name.
    *
-   * `@mlx-node/agent/catalog` takes `ModelType` off the model registry so its
-   * cold-tier family list cannot name a family that does not exist. tsc erases
-   * that import — the fresh-process probe below confirms nothing is mapped — but
-   * "erased" is a property of the KEYWORD, not of the dependency, and deleting
-   * five characters would turn it into 61 MB in CONTROL PANEL. Asserting the exact set
-   * means a second such edge, or this one turning real, has to be argued for
-   * here rather than appearing silently.
+   * `@mlx-node/agent/catalog`'s cold-tier leaf takes `ModelType` off the model
+   * registry so its family list cannot name a family that does not exist, and
+   * the walked `@mlx-node/lm/family-data` leaf takes `ChatConfig` off the
+   * addon for its preset shapes. tsc erases both imports — the fresh-process
+   * probe below confirms nothing is mapped — but "erased" is a property of the
+   * `type` KEYWORD, not of the dependency, so asserting the exact set forces
+   * another such edge, or one of these turning real, to be argued for here
+   * rather than appearing silently.
    */
-  it('reaches the addon only through an erased type-only import, and only that one', () => {
-    expect(reachesAddon(graph.typeOnlyPackages)).toEqual(['@mlx-node/lm']);
+  it('reaches the addon only through erased type-only imports, and only those two', () => {
+    expect(reachesAddon(graph.typeOnlyPackages).sort()).toEqual(['@mlx-node/core', '@mlx-node/lm']);
   });
 
   it('imports nothing but node builtins, the dashboard, and its own module', () => {
