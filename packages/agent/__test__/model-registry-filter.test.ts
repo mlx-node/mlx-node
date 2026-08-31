@@ -209,6 +209,19 @@ describe('installMlxOnlyModelRegistryFilter', () => {
       const cloud = runtime.getModels().find((entry) => entry.provider === 'anthropic');
       expect(cloud).toBeDefined();
 
+      // Deterministically configure a REAL cloud provider's auth with a fake key,
+      // fully offline (`setRuntimeApiKey` synchronizes through
+      // `models.refresh({ allowNetwork: false })`, so the credential is written
+      // in-memory and refreshed without any fetch). This makes anthropic genuinely
+      // authenticated AND available BEFORE the filter, so the availability/auth
+      // assertions below actually exercise the wrappers instead of passing on an
+      // empty auth store. It runs BEFORE `registerProvider`: that call fires an
+      // unawaited `refresh()`, whose availability pass bumps pi 0.84's
+      // per-provider sequence and would supersede (silently drop) the snapshot
+      // update `setRuntimeApiKey` awaits.
+      await runtime.setRuntimeApiKey('anthropic', 'sk-ant-fake-key');
+      expect(runtime.hasConfiguredAuth('anthropic')).toBe(true);
+
       runtime.registerProvider('mlx', {
         api: 'mlx',
         baseUrl: 'mlx://local',
@@ -226,13 +239,6 @@ describe('installMlxOnlyModelRegistryFilter', () => {
         ],
       });
 
-      // Deterministically configure a REAL cloud provider's auth with a fake key,
-      // fully offline (`allowNetwork:false` writes the credential in-memory and
-      // refreshes without any fetch). This makes anthropic genuinely authenticated
-      // AND available BEFORE the filter, so the availability/auth assertions below
-      // actually exercise the wrappers instead of passing on an empty auth store.
-      await runtime.setRuntimeApiKey('anthropic', 'sk-ant-fake-key', { allowNetwork: false });
-      expect(runtime.hasConfiguredAuth('anthropic')).toBe(true);
       expect(runtime.getAvailableSnapshot().some((entry) => entry.provider === 'anthropic')).toBe(true);
       expect((await runtime.getAvailable()).some((entry) => entry.provider === 'anthropic')).toBe(true);
       expect(runtime.getModel('anthropic', cloud!.id)).toBeDefined();
@@ -337,7 +343,12 @@ describe('installMlxOnlyModelRegistryFilter', () => {
         restore();
       }
 
-      // Restored: radius is enumerable again.
+      // Restored: radius is enumerable again. pi 0.84's `refresh()` reloads the
+      // config and rebuilds the composed provider map, so the refresh that ran
+      // under the filter left `this.models` holding only `mlx` (the choke). The
+      // restore un-patches `recomposeProvider`, so one plain refresh re-composes
+      // the full builtin set.
+      await runtime.refresh({ allowNetwork: false });
       expect(runtime.getProviders().some((entry) => entry.id === 'radius')).toBe(true);
     } finally {
       globalThis.fetch = realFetch;
@@ -350,10 +361,15 @@ describe('installMlxOnlyModelRegistryFilter', () => {
   it('choke: cloud providers never compose, so their command-backed credentials never resolve', async () => {
     const savedOffline = process.env.PI_OFFLINE;
     process.env.PI_OFFLINE = '1';
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = (async (): Promise<never> => {
+      throw new Error('network blocked in test');
+    }) as unknown as typeof fetch;
     const dir = await mkdtemp(join(tmpdir(), 'mlx-runtime-choke-'));
-    // A cloud provider configured with a command-backed apiKey (`!<cmd>`); pi's
-    // refresh resolves it by running the command (execSync), NOT gated by
-    // allowNetwork. The command touches a sentinel file if it ever runs.
+    // A cloud provider configured with a command-backed apiKey (`!<cmd>`); an
+    // explicit-network refresh resolves it by running the command (execSync)
+    // before any catalog fetch. The command touches a sentinel file if it ever
+    // runs; outbound fetch is blocked so nothing leaves the process.
     const controlSentinel = join(dir, 'control-ran');
     const chokeSentinel = join(dir, 'choke-ran');
     const writeModels = (file: string, sentinel: string): Promise<void> =>
@@ -369,7 +385,7 @@ describe('installMlxOnlyModelRegistryFilter', () => {
         authPath: join(dir, 'control-auth.json'),
         modelsPath: controlModels,
       });
-      await control.refresh({ allowNetwork: false, force: true });
+      await control.refresh({ allowNetwork: true, force: true });
       await access(controlSentinel); // rejects (fails the test) if the command never ran
 
       // Choke: WITH the filter installed BEFORE create, anthropic never composes,
@@ -404,10 +420,21 @@ describe('installMlxOnlyModelRegistryFilter', () => {
         // mlx still composes and is the only provider.
         expect(runtime.getProviders().map((entry) => entry.id)).toEqual(['mlx']);
         expect(runtime.getModel('mlx', 'local')).toBeDefined();
+
+        // The sentinel alone no longer isolates the choke: pi 0.84 resolves a
+        // command-backed apiKey only under `allowNetwork:true`, which the
+        // filter's `refresh` wrapper also forces off, so the sentinel stays
+        // absent even with the choke removed. Read the composed map UNFILTERED
+        // instead — that is the assertion the choke actually owns. `restore()`
+        // is idempotent (the `finally` below still runs it on the failure
+        // path), so un-patching here is safe.
+        restore();
+        expect(runtime.getProviders().map((entry) => entry.id)).toEqual(['mlx']);
       } finally {
         restore();
       }
     } finally {
+      globalThis.fetch = realFetch;
       await rm(dir, { recursive: true, force: true });
       if (savedOffline === undefined) delete process.env.PI_OFFLINE;
       else process.env.PI_OFFLINE = savedOffline;

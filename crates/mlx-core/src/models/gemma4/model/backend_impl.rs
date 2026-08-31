@@ -894,15 +894,38 @@ impl ChatBackend for Gemma4Inner {
         ))
     }
 
+    /// "Is there a session to continue", which is NOT the same question as
+    /// "is K/V still resident".
+    ///
+    /// A deliberately non-continuable media turn — audio, or mixed
+    /// image+audio, whose identity the per-block keys cannot yet express —
+    /// releases every KV group in `finalize_vision_turn_media_state` while
+    /// keeping the committed token history and the media keys, precisely so
+    /// the next continuation cold-replays the whole conversation. That
+    /// session is initialized; only its K/V has to be recomputed. Answering
+    /// `false` for it made `session_continue` reject the follow-up and made
+    /// the Gemma4 scheduler drop the owner registration, so every turn after
+    /// an audio turn died on "requires an initialized cache owner" instead of
+    /// taking the cold replay the finalizer set up.
+    ///
+    /// Admitting it is safe on every downstream path: with no live request,
+    /// `prepare_gemma4_paged_turn` either raises the
+    /// `IMAGE_CHANGE_RESTART_PREFIX` lineage error (which `ChatSession`
+    /// replays through the start path) or falls through to a cold
+    /// `prepare_scheduled_text_request`, and the media executors allocate a
+    /// fresh request. The pre-start guard is unchanged: an empty token
+    /// history is still "no session".
     fn has_live_session(&self) -> bool {
-        !self.cached_token_history.is_empty()
-            && if self.active_flat_session {
-                self.caches.is_some()
-            } else {
-                self.kv_cache_coordinator
-                    .as_ref()
-                    .is_some_and(|coordinator| coordinator.is_live_all(self.active_paged_seq))
-            }
+        if self.cached_token_history.is_empty() {
+            return false;
+        }
+        if self.active_flat_session {
+            return self.caches.is_some();
+        }
+        self.kv_cache_coordinator
+            .as_ref()
+            .is_some_and(|coordinator| coordinator.is_live_all(self.active_paged_seq))
+            || !ChatBackend::session_media(self).is_empty()
     }
 
     fn session_media(&self) -> MediaCapabilities {

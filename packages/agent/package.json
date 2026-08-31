@@ -31,15 +31,15 @@
     "build": "tsc -b"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.81.1",
-    "@earendil-works/pi-coding-agent": "0.81.1",
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
     "@mlx-node/core": "workspace:*",
     "@mlx-node/lm": "workspace:*",
     "@mlx-node/server": "workspace:*",
-    "typebox": "1.3.6"
+    "typebox": "1.3.23"
   },
   "devDependencies": {
-    "@types/node": "^26.0.0"
+    "@types/node": "^26.4.0"
   },
   "engines": {
     "node": ">=22.19.0"

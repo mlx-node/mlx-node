@@ -274,7 +274,12 @@ async function bootstrap(): Promise<void> {
     // render and the click is entirely possible — and half a command on the
     // clipboard is worse than none.
     if (endpoint === undefined || endpoint === null || token === undefined || token === null) return;
-    clipboard.writeText(build(endpoint, token));
+    // Electron 44 made `clipboard.writeText` async. An unhandled rejection here
+    // is a crash dialog in a packaged app, so it gets the same treatment as
+    // every other fire-and-forget promise in this file.
+    void clipboard.writeText(build(endpoint, token)).catch((error: unknown) => {
+      console.error('[mlx] clipboard:', error);
+    });
   };
 
   tray = createTray({

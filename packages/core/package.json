@@ -27,11 +27,12 @@
     }
   },
   "scripts": {
+    "artifacts": "oxnode ./artifacts.ts",
     "build": "oxnode ./build.ts --release",
     "preversion": "oxnode ./build.ts && git add ."
   },
   "devDependencies": {
-    "@napi-rs/cli": "^3.7.2",
+    "@napi-rs/cli": "^3.8.6",
     "@oxc-node/cli": "^0.1.0",
     "vite-plus": "catalog:"
   },

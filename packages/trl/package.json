@@ -35,6 +35,6 @@
     "change-case": "^5.4.4"
   },
   "devDependencies": {
-    "@huggingface/hub": "^2.13.2"
+    "@huggingface/hub": "^2.16.1"
   }
 }

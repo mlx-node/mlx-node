@@ -19,7 +19,7 @@
 
 import { MessageChannel } from 'node:worker_threads';
 
-import { categoryLabels, truncateMiddle } from '@/lib/chart';
+import { categoryChartHeight, categoryLabels, truncateMiddle } from '@/lib/chart';
 import type {
   CacheResponse,
   CacheScope,
@@ -880,6 +880,94 @@ describe('Metrics page — per-model bar charts', () => {
 });
 
 describe('Metrics page — model usage share', () => {
+  /**
+   * Twenty-five models, the count from the bug report, and only the pie carries
+   * data — so the whole page holds exactly one legend and the queries below
+   * cannot pick up one of the other three.
+   *
+   * `qwen3-8b` holds the most turns AND sorts last alphabetically, which is what
+   * gives the ordering assertion something to fail on.
+   */
+  const SHARE_MODELS = ['qwen3-8b', ...Array.from({ length: 24 }, (_, i) => `Gemma-4-31B-IT-UD-Q4_K_XL-mlx-${i}`)];
+
+  function shareFixture(models: string[]): MetricsOverviewResponse {
+    return {
+      range: { from: null, to: null },
+      tokensByDay: [],
+      throughputByModel: [],
+      throughputTrend: [],
+      mtpByModel: [],
+      modelShare: models.map((model, i) => ({ model, turns: 100 - i, outputTokens: 1000 })),
+      totals: { turns: 0, traces: 0, inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0 },
+    };
+  }
+
+  async function mountShare(): Promise<RenderedPage> {
+    restoreMetrics = stubChartMetrics();
+    restoreApi = stubApi({ '/metrics/overview': shareFixture(SHARE_MODELS) });
+    mounted = await renderPage(createElement(Metrics), (text) => text.includes('qwen3-8b'));
+    return mounted;
+  }
+
+  /** The usage-share legend — the only one on a page whose other charts are empty. */
+  function shareLegend(page: RenderedPage): HTMLElement {
+    const wrappers = page.container.querySelectorAll<HTMLElement>('.recharts-legend-wrapper');
+    expect(wrappers).toHaveLength(1);
+    return wrappers[0];
+  }
+
+  it('anchors the usage-share legend to the top of its plot box and bounds its height', async () => {
+    // The reported defect. recharts portals the legend into `.recharts-wrapper`
+    // as an absolutely positioned div and, for `verticalAlign="middle"` with no
+    // `top` in `wrapperStyle`, computes `top: (chartHeight - measuredLegendHeight) / 2`
+    // from the wrapper's own `getBoundingClientRect`. Twenty-five two-line rows
+    // measure far taller than the plot, so that top goes NEGATIVE and the names
+    // paint above the card, over the TTFT card — nothing clips them, because
+    // `.recharts-wrapper` and the ResponsiveContainer's inner div are both
+    // `overflow: visible`.
+    //
+    // What this test can and cannot do: happy-dom performs no layout, so it
+    // cannot reproduce the negative number — the legend measures 0x0 here, and a
+    // zero-height legend is exactly the case that never escaped. It pins the
+    // style contract instead. That is still a real gate: on the unfixed page
+    // recharts computes `top: (224 - 0) / 2 = 112px`, so the first assertion
+    // fails. Whether the fix HOLDS at 25 rows in a real engine is a browser
+    // measurement, not a happy-dom one.
+    const legend = shareLegend(await mountShare());
+    expect(legend.querySelectorAll('.recharts-legend-item')).toHaveLength(SHARE_MODELS.length);
+    // An explicit `top` is the guard: recharts skips the centring branch outright
+    // when `wrapperStyle` already declares one, so no measurement can push the
+    // box above the plot.
+    expect(legend.style.top).toBe('0px');
+    // A non-negative top alone only moves the overflow to the bottom edge. These
+    // two bound the box to the plot area whatever the rows measure, and scroll
+    // the surplus inside it.
+    expect(legend.style.maxHeight).toBe('100%');
+    expect(legend.style.overflowY).toBe('auto');
+  });
+
+  it('grows the usage-share card with the model count instead of scrolling 25 rows inside 224px', async () => {
+    // The bound above must not become the reading mode: 25 rows inside the 224px
+    // default hides two thirds of them behind a hover-only overlay scrollbar,
+    // which is the silent omission `categoryChartHeight` exists to prevent. This
+    // card was the only one in its grid taking the default.
+    const page = await mountShare();
+    const plot = shareLegend(page).closest('[data-slot="card-content"]')?.firstElementChild as HTMLElement;
+    expect(plot.style.height).toBe(`${categoryChartHeight(SHARE_MODELS.length)}px`);
+  });
+
+  it('lists the legend in usage rank rather than alphabetically', async () => {
+    // Only eight models get a distinct colour and the rest share one grey, so a
+    // row's POSITION is most of what the legend still tells the reader. recharts
+    // sorts legend items by label unless told not to (`itemSorter: 'value'`),
+    // which threw that away: measured on the unfixed page, the most-used model
+    // rendered LAST of 25.
+    const items = [...shareLegend(await mountShare()).querySelectorAll('.recharts-legend-item')];
+    expect(items).toHaveLength(SHARE_MODELS.length);
+    expect(items[0].textContent).toBe('qwen3-8b');
+    expect(items.at(-1)?.textContent).toBe(categoryLabels(SHARE_MODELS).get(SHARE_MODELS.at(-1) ?? ''));
+  });
+
   it('never labels a slice 100% while another model still holds turns', async () => {
     // 9b: the last surviving copy of the F6 rounding lie. 9999 of 10000 turns
     // rounds to "100%" beside a two-model legend.
