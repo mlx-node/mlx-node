@@ -745,7 +745,7 @@ impl DsparkDraftModel {
             }
         }
         let mut out = Vec::with_capacity(9 + 13 * self.layers.len());
-        out.push(self.embed_tokens.weight());
+        out.push(self.embed_tokens.get_weight());
         push_proj(&mut out, &self.fc);
         out.push(self.hidden_norm.get_weight());
         for layer in &self.layers {

@@ -3,13 +3,6 @@ use crate::nn::Activations;
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
-/// Whether the GDN `fast::metal_kernel` kernels can run on this host. False on
-/// the CUDA/Linux build, where they throw — callers must use the ops path.
-/// Delegates to the shared, cached `mlx_metal_is_available()` probe.
-fn metal_kernel_backend_available() -> bool {
-    crate::engine::persistence::compiled_forward_backend_available()
-}
-
 /// Minimum sequence length for the chunked prefill kernel to even be *eligible*.
 /// Below this the per-step recurrence always wins, so chunked is never considered.
 /// (Chunked is opt-in only — see [`GdnKernel`] / [`should_use_chunked`].)
@@ -706,7 +699,7 @@ pub(crate) fn gated_delta_update_with_tape(
     // (`mlx_metal_is_available()` is false) route straight to the
     // device-agnostic ops path instead of paying a per-layer-per-token
     // throw/catch (which would also contaminate decode-perf numbers).
-    let use_kernel = use_kernel && metal_kernel_backend_available();
+    let use_kernel = use_kernel && crate::engine::persistence::compiled_forward_backend_available();
 
     // When use_kernel=false, use only ops-based paths for full differentiability (autograd).
     // compute_g builds a standard MLX expression graph via C++ (differentiable),
@@ -758,7 +751,7 @@ pub(crate) fn gated_delta_update_with_tape(
         // (seq < CHUNK_THRESHOLD) and masked calls always take per-step.
         let seq_len = q.shape_at(1)?;
         let choice = gdn_kernel_override();
-        if !metal_kernel_backend_available()
+        if !crate::engine::persistence::compiled_forward_backend_available()
             && seq_len >= CHUNK_THRESHOLD
             && mask.is_none()
             && choice != GdnKernel::ForcePerStep

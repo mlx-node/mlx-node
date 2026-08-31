@@ -161,7 +161,7 @@ impl VisionPositionEmbedding {
 
     /// Get the embedding weight
     pub fn weight(&self) -> MxArray {
-        self.embedding.weight()
+        self.embedding.get_weight()
     }
 }
 

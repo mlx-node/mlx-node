@@ -147,7 +147,7 @@ fn run_reducer_case(state: &MetalState, head_size: usize, num_stripes: usize) {
 
     let pipeline_name = match head_size {
         256 => MetalState::paged_attention_grouped_qwen35_reduce_kernel_name(),
-        512 => MetalState::paged_attention_grouped_gemma4_reduce_kernel_name(),
+        512 => MetalState::paged_attention_grouped_d512_reduce_kernel_name(),
         _ => panic!("unsupported grouped reducer head size {head_size}"),
     };
     let pipeline = state

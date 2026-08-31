@@ -118,7 +118,7 @@ fn run_dense_self_identity() -> Result<()> {
     );
 
     // A perturbed tied head is a different checkpoint on the same ids.
-    let weight = inner.embedding.weight();
+    let weight = inner.embedding.get_weight();
     inner.embedding = Embedding::from_weight(&weight.mul_scalar(1.35)?.add_scalar(0.01)?)?;
     let perturbed = score_self(&mut inner, &dir)?;
     assert!(

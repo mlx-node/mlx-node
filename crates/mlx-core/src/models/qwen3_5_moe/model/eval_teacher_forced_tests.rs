@@ -115,7 +115,7 @@ fn score_self(inner: &mut Qwen35MoeInner, dir: &std::path::Path) -> Result<EvalR
 /// Replace the tied lookup/head table so the model is a DIFFERENT
 /// checkpoint answering the same token ids.
 fn perturb_tied_head(inner: &mut Qwen35MoeInner) -> Result<()> {
-    let weight = inner.embedding.weight();
+    let weight = inner.embedding.get_weight();
     inner.embedding = Embedding::from_weight(&weight.mul_scalar(1.35)?.add_scalar(0.01)?)?;
     Ok(())
 }

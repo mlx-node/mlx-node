@@ -266,9 +266,9 @@ pub(crate) enum QianfanOCRCmd {
 
 /// Command handler for the dedicated model thread.
 ///
-/// Dispatches each command variant to the matching `_sync` method on
-/// [`QianfanOCRInner`] and forwards the result through the response
-/// channel.
+/// Dispatches each command variant to its `_sync` method on
+/// [`QianfanOCRInner`] — the tool variants share the non-tool continuation
+/// methods — and forwards the result through the response channel.
 pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOCRCmd) {
     match cmd {
         QianfanOCRCmd::ChatSessionStart {
@@ -300,8 +300,10 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             reply,
             cancelled,
         } => {
-            let result =
-                inner.chat_session_continue_tool_sync(messages, config, cancelled.as_ref());
+            // Tool-result continuation uses the same complete-history template
+            // path; the model template alone decides how tool messages are
+            // represented.
+            let result = inner.chat_session_continue_sync(messages, config, cancelled.as_ref());
             let _ = reply.send(qianfan_sync_turn_reply(result, cancelled.as_ref()));
         }
         QianfanOCRCmd::ChatStreamSessionStart {
@@ -326,7 +328,9 @@ pub(crate) fn handle_qianfan_ocr_cmd(inner: &mut QianfanOCRInner, cmd: QianfanOC
             stream_tx,
             cancelled,
         } => {
-            inner.chat_stream_session_continue_tool_sync(messages, config, stream_tx, cancelled);
+            // Tool continuation shares the non-tool streaming path; the model
+            // template alone decides how tool messages are represented.
+            inner.chat_stream_session_continue_sync(messages, config, stream_tx, cancelled);
         }
         QianfanOCRCmd::Generate {
             input_ids,
@@ -1333,8 +1337,7 @@ impl QianfanOCRInner {
     /// Fully resets the caches and delegates to [`Self::chat_turn_sync_core`]
     /// with `<|im_end|>` as the stop token so the decode loop leaves the
     /// caches on a clean ChatML boundary that subsequent
-    /// [`Self::chat_session_continue_sync`] /
-    /// [`Self::chat_session_continue_tool_sync`] calls can extend by
+    /// [`Self::chat_session_continue_sync`] calls can extend by
     /// re-rendering the complete structured history through the model
     /// template.
     ///
@@ -1397,17 +1400,6 @@ impl QianfanOCRInner {
         }
         let eos_id = self.session_eos_id();
         self.chat_turn_sync_core(messages, config, eos_id, cancelled)
-    }
-
-    /// Tool-result continuation uses the same complete-history template path;
-    /// the model template alone decides how tool messages are represented.
-    pub(crate) fn chat_session_continue_tool_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        cancelled: &AtomicBool,
-    ) -> Result<ChatResult> {
-        self.chat_session_continue_sync(messages, config, cancelled)
     }
 
     /// Streaming variant of [`Self::chat_session_start_sync`].
@@ -1475,17 +1467,6 @@ impl QianfanOCRInner {
 
         let eos_id = self.session_eos_id();
         self.chat_turn_stream_core(messages, config, stream_tx, cancelled, eos_id);
-    }
-
-    /// Streaming tool-result continuation over the full structured history.
-    pub(crate) fn chat_stream_session_continue_tool_sync(
-        &mut self,
-        messages: Vec<ChatMessage>,
-        config: ChatConfig,
-        stream_tx: StreamTx<ChatStreamChunk>,
-        cancelled: Arc<AtomicBool>,
-    ) {
-        self.chat_stream_session_continue_sync(messages, config, stream_tx, cancelled);
     }
 
     /// Low-level token generation given pre-tokenized input.

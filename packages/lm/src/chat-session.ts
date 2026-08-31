@@ -692,41 +692,6 @@ export interface ChatSessionOptions {
 }
 
 /**
- * Compute a stable hex-encoded identity key for a list of image
- * byte buffers.
- *
- * Returns `null` when no images are provided so `send()` can
- * distinguish "no-images" from "image set changed". The key is
- * order-sensitive: `[A, B]` and `[B, A]` produce different keys,
- * matching the positional semantics of the underlying VLM chat
- * template.
- *
- * This is a byte-identity check — callers use the key solely to
- * decide whether to restart the server-side session, so any
- * collision-resistant digest is sufficient. We use SHA-256 (native
- * `node:crypto`) with a length-prefixed framing so different image
- * counts and different byte lengths cannot collide by accident.
- *
- * Implementation note: kept fully sync + self-contained so
- * `send()` can stay synchronous in its routing decision. `node:crypto`
- * is a Node built-in, so this adds no external runtime dependency
- * beyond `@mlx-node/core` and the existing stream bridge.
- */
-function computeImagesKey(images: Uint8Array[] | undefined): string | null {
-  return computeByteListKey(images);
-}
-
-/**
- * Audio counterpart of {@link computeImagesKey}: a stable, order-sensitive
- * byte-identity key for a list of encoded audio buffers. Used by `send()` /
- * `sendStream()` to decide whether a new audio set must cold-restart the
- * server-side session. Shares the exact SHA-256 framing as the image key.
- */
-function computeAudioKey(audio: Uint8Array[] | undefined): string | null {
-  return computeByteListKey(audio);
-}
-
-/**
  * SHA-256 byte-identity key for a length-framed list of byte buffers.
  * Returns `null` for an empty/absent list so callers can distinguish
  * "no media" from "media changed". Shared by the image and audio keys.
@@ -738,6 +703,10 @@ function computeAudioKey(audio: Uint8Array[] | undefined): string | null {
  * before any `await` in `send()`/`sendStream()`, so the JS loop's cost
  * was a real head-of-line-blocking stall for every other request
  * handled by the same process.
+ *
+ * The key is order-sensitive: `[A, B]` and `[B, A]` produce different keys,
+ * matching the positional semantics of the underlying VLM chat template.
+ * Kept fully sync so `send()` can stay synchronous in its routing decision.
  */
 function computeByteListKey(buffers: Uint8Array[] | undefined): string | null {
   if (!buffers || buffers.length === 0) return null;
@@ -794,7 +763,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
 
   /**
    * Hex-encoded byte-identity key of the image set currently bound
-   * to the server's KV cache (SHA-256; see `computeImagesKey`).
+   * to the server's KV cache (SHA-256; see `computeByteListKey`).
    * `null` when no images are cached. A `send()` whose new key
    * differs triggers a full `chatSessionStart` restart.
    */
@@ -802,7 +771,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
 
   /**
    * Hex-encoded byte-identity key of the audio set currently bound to the
-   * server's KV cache (see {@link computeAudioKey}). `null` when no audio is
+   * server's KV cache (see {@link computeByteListKey}). `null` when no audio is
    * cached. A `send()` whose new key differs triggers a full
    * `chatSessionStart` restart — the audio counterpart of `lastImagesKey`.
    */
@@ -943,8 +912,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.inFlight = true;
     try {
       const mergedConfig = this.mergeConfig(opts.config);
-      const newImagesKey = computeImagesKey(opts.images);
-      const newAudioKey = computeAudioKey(opts.audio);
+      const newImagesKey = computeByteListKey(opts.images);
+      const newAudioKey = computeByteListKey(opts.audio);
       // Only an explicit NEW image/audio set can trigger a forced restart. Omitting
       // `images`/`audio` (key === null) is interpreted as "keep the current
       // media cache state" — the server-side cache already holds any prior
@@ -1034,8 +1003,8 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.inFlight = true;
     try {
       const mergedConfig = this.mergeConfig(opts.config);
-      const newImagesKey = computeImagesKey(opts.images);
-      const newAudioKey = computeAudioKey(opts.audio);
+      const newImagesKey = computeByteListKey(opts.images);
+      const newAudioKey = computeByteListKey(opts.audio);
       // Only an explicit NEW image/audio set can trigger a restart. Omitting
       // `images`/`audio` (key === null) is interpreted as "keep the current
       // media cache state" — the server-side cache already holds any prior
@@ -2313,7 +2282,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     for (let i = this.history.length - 1; i >= 0; i--) {
       const msg = this.history[i];
       if (msg?.role === 'user' && msg.images && msg.images.length > 0) {
-        return computeImagesKey(msg.images);
+        return computeByteListKey(msg.images);
       }
     }
     return null;
@@ -2328,7 +2297,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     for (let i = this.history.length - 1; i >= 0; i--) {
       const msg = this.history[i];
       if (msg?.role === 'user' && msg.audio && msg.audio.length > 0) {
-        return computeAudioKey(msg.audio);
+        return computeByteListKey(msg.audio);
       }
     }
     return null;

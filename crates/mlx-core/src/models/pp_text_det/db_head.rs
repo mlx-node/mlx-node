@@ -200,6 +200,3 @@ fn upsample_nearest_2x(input: &MxArray) -> Result<MxArray> {
     let upsampled = expanded.broadcast_to(&[batch, h, 2, w, 2, c])?;
     upsampled.reshape(&[batch, h * 2, w * 2, c])
 }
-
-// Legacy type alias for backward compatibility in persistence.rs
-pub type DBHead = Head;

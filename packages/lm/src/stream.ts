@@ -141,10 +141,6 @@ function getNativeIsReasoning(chunk: ChatStreamChunk): boolean | undefined {
   return typeof chunk.isReasoning === "boolean" ? chunk.isReasoning : undefined;
 }
 
-function rememberModelPath(model: object, modelPath: string): void {
-  modelPathsForTokenizers.set(model, modelPath);
-}
-
 async function applyChatTemplateFromModelPath(
   model: object,
   messages: ChatMessage[],
@@ -675,7 +671,7 @@ export function makeStreamingModel<
         const resolvedAssetsPath = (
           instance as { modelAssetsPath?: () => string }
         ).modelAssetsPath?.();
-        rememberModelPath(instance, resolvedAssetsPath ?? modelPath);
+        modelPathsForTokenizers.set(instance, resolvedAssetsPath ?? modelPath);
       }
       return instance as unknown as StreamingModel;
     }

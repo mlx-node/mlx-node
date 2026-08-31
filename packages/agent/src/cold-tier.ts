@@ -92,20 +92,6 @@ export function coldTierRestoreFamilyList(): string[] {
  * prefix that is part of a longer name (`~cache`) is left alone — only the
  * shell's own two spellings are expanded.
  */
-/**
- * `realpath(3)` rather than Node's JS walk.
- *
- * On a case-insensitive volume — APFS's default, i.e. essentially every Mac —
- * `MLX_COLD_CACHE_DIR=~/CacheDir` and `~/cachedir` name the SAME directory, but
- * `fs.realpathSync` hands back whichever spelling the caller typed. Two join
- * keys for one cache is the F1 symptom inverted: a populated disk scan sitting
- * beside a flat 0/0 trend. `realpathSync.native` folds each existing component
- * to its on-disk spelling, so both env spellings produce one key.
- */
-function realpathNative(path: string): string {
-  return realpathSync.native(path);
-}
-
 function expandTilde(path: string): string {
   if (path === '~') return homedir();
   if (path.startsWith('~/')) return join(homedir(), path.slice(2));
@@ -147,7 +133,12 @@ export function canonicalCacheRoot(root: string): string {
   let cursor = absolute;
   for (;;) {
     try {
-      const resolved = realpathNative(cursor);
+      // `realpathSync.native` (realpath(3)), not Node's JS walk: on a
+      // case-insensitive volume — APFS's default — `~/CacheDir` and `~/cachedir`
+      // name the SAME directory, but `fs.realpathSync` returns whichever spelling
+      // the caller typed. `.native` folds each existing component to its on-disk
+      // spelling, so both env spellings produce one join key.
+      const resolved = realpathSync.native(cursor);
       return missing.length === 0 ? resolved : join(resolved, ...missing);
     } catch {
       const parent = dirname(cursor);

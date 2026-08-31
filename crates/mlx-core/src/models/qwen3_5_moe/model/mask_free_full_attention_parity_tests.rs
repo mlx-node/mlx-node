@@ -101,7 +101,7 @@ fn mask_free_forward_matches_explicit_offset_mask_after_priming() {
         .expect("layer construction must succeed");
     let embedding = Embedding::new(cfg.vocab_size as u32, cfg.hidden_size as u32)
         .expect("embedding construction must succeed");
-    let embedding_weight = embedding.weight();
+    let embedding_weight = embedding.get_weight();
 
     let fa_idx = (0..cfg.num_layers as usize)
         .find(|&i| !cfg.is_linear_layer(i))
