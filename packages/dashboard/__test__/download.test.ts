@@ -13,7 +13,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { catalogWithState } from '../src/catalog.js';
@@ -61,6 +61,10 @@ const hub = vi.hoisted(() => ({
   sha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
   /** Every `revision` the runner threaded into a list/download call. */
   revisions: [] as string[],
+  /** Repos `modelInfo` was asked to resolve, for the catalog sha sweep. */
+  modelInfoRepos: [] as string[],
+  /** When set, every `modelInfo` call throws it — the offline case. */
+  modelInfoError: null as string | null,
   /** Paths whose `downloadFileToCacheDir` should throw, to simulate a mid-job failure. */
   failOn: [] as string[],
   /** Overrides the thrown message, so a remote-sized error body can be simulated. */
@@ -127,7 +131,9 @@ vi.mock('node:fs/promises', async (importActual) => {
 });
 
 vi.mock('@huggingface/hub', () => ({
-  modelInfo: async (params: { revision?: string }) => {
+  modelInfo: async (params: { name?: string; revision?: string }) => {
+    if (params.name !== undefined) hub.modelInfoRepos.push(params.name);
+    if (hub.modelInfoError !== null) throw new Error(hub.modelInfoError);
     if (params.revision !== undefined) hub.revisions.push(params.revision);
     return { sha: hub.sha };
   },
@@ -250,10 +256,13 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
   }
 }
 
-const REPO = MODEL_CATALOG[0]!.hfRepo;
+// Resolved through `catalogRepo`, matching the allowlist gate in `start` — the
+// catalog carries a different build per platform, so the raw `hfRepo` would be
+// refused on a CUDA host.
+const REPO = catalogRepo(MODEL_CATALOG[0]!);
 const SLUG = REPO.split('/').pop()!.toLowerCase();
 /** A SECOND catalog repo, for the cases that need two genuinely distinct jobs. */
-const REPO_OTHER = MODEL_CATALOG[1]!.hfRepo;
+const REPO_OTHER = catalogRepo(MODEL_CATALOG[1]!);
 
 let modelsDir: string;
 let cacheDir: string;
@@ -303,12 +312,65 @@ beforeEach(() => {
   renameFault.failFromPrefix = null;
   raceHook.onMarkerWrite = null;
   stagingHook.onVerifyWindow = null;
+  hub.modelInfoRepos = [];
+  hub.modelInfoError = null;
   modelsDir = mkdtempSync(join(tmpdir(), 'dash-dl-models-'));
   cacheDir = mkdtempSync(join(tmpdir(), 'dash-dl-cache-'));
 });
 
 afterEach(() => {
   for (const dir of [modelsDir, cacheDir]) rmSync(dir, { recursive: true, force: true });
+});
+
+describe('DownloadManager.checkCatalogUpdates — the read half of the staleness check', () => {
+  function manager(): DownloadManager {
+    return new DownloadManager({ modelsDir, cacheDir });
+  }
+
+  it('resolves a sha for every VISIBLE catalog repo, and skips the hidden ones', async () => {
+    // `hidden` entries are unpublished repos: Hugging Face answers 401 for them,
+    // so dialling would spend a request to learn nothing.
+    const shas = await manager().checkCatalogUpdates();
+    const visible = MODEL_CATALOG.filter((e) => !e.hidden).map((e) => catalogRepo(e));
+    expect([...shas.keys()].sort()).toEqual([...visible].sort());
+    expect(shas.get(REPO)).toBe(hub.sha);
+    for (const entry of MODEL_CATALOG.filter((e) => e.hidden)) {
+      expect(hub.modelInfoRepos).not.toContain(catalogRepo(entry));
+    }
+  });
+
+  it('maps an unreachable repo to null rather than rejecting', async () => {
+    // Offline must never break the Models page. `null` reads as "no badge",
+    // never as "up to date".
+    hub.modelInfoError = 'getaddrinfo ENOTFOUND huggingface.co';
+    const shas = await manager().checkCatalogUpdates();
+    expect(shas.size).toBeGreaterThan(0);
+    expect([...shas.values()].every((sha) => sha === null)).toBe(true);
+  });
+
+  it('reuses a resolved sweep instead of re-dialling on every mount', async () => {
+    // `useJson` refetches on every mount and every reconnect, and nothing polls
+    // to smooth the rate, so the cache is what keeps this off the network.
+    const m = manager();
+    await m.checkCatalogUpdates(1000);
+    const afterFirst = hub.modelInfoRepos.length;
+    expect(afterFirst).toBeGreaterThan(0);
+    await m.checkCatalogUpdates(1000 + 60_000);
+    expect(hub.modelInfoRepos).toHaveLength(afterFirst);
+  });
+
+  it('retries an all-failed sweep far sooner than a good one', async () => {
+    // A machine that regains its network must not stay stuck reporting nothing
+    // for the full success TTL.
+    hub.modelInfoError = 'offline';
+    const m = manager();
+    await m.checkCatalogUpdates(1000);
+    const afterFirst = hub.modelInfoRepos.length;
+    hub.modelInfoError = null;
+    await m.checkCatalogUpdates(1000 + 61_000);
+    expect(hub.modelInfoRepos.length).toBeGreaterThan(afterFirst);
+    expect((await m.checkCatalogUpdates(1000 + 61_000)).get(REPO)).toBe(hub.sha);
+  });
 });
 
 describe('DownloadManager', () => {

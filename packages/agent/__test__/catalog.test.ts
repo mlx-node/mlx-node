@@ -10,7 +10,7 @@ describe('MODEL_CATALOG', () => {
   it('has exactly one default entry', () => {
     const defaults = MODEL_CATALOG.filter((entry) => entry.isDefault);
     expect(defaults).toHaveLength(1);
-    expect(defaults[0]!.label).toBe('Qwen3.6-27B');
+    expect(defaults[0]!.label).toBe('Qwen3.8-27B');
   });
 
   it('every hfRepo is a Brooooooklyn HF slug', () => {

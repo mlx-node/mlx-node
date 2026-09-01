@@ -208,9 +208,14 @@ describe('dashboard runtime — thread split', () => {
 // later lands on the thread its table entry names — this locks WHICH entries name
 // the transport thread, since everything else is the worker by construction.
 describe('dashboard runtime — route ownership', () => {
-  it('keeps exactly the download routes on the transport thread', () => {
+  it('keeps exactly the network-owning routes on the transport thread', () => {
     const main = ROUTES.filter((r) => r.thread === 'main').map((r) => `${r.method} /${r.segments.join('/')}`);
+    // The main thread owns the routes that reach the network. That is the four
+    // download routes plus the catalog update check, which dials Hugging Face
+    // through the same `DownloadManager` fetch seam. `/api/catalog` itself stays
+    // on the worker: it is synchronous, filesystem-only and offline-safe.
     expect(main).toEqual([
+      'GET /api/catalog/updates',
       'GET /api/downloads',
       'POST /api/downloads',
       'DELETE /api/downloads/:id',

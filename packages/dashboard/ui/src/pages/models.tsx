@@ -22,10 +22,11 @@ import type {
   CancelDownloadResponse,
   CatalogItem,
   CatalogResponse,
+  CatalogUpdatesResponse,
   DeleteModelResponse,
   DownloadJob,
-  DownloadsResponse,
   DownloadStartResponse,
+  DownloadsResponse,
   LocalModel,
   ModelsResponse,
 } from '@/lib/types';
@@ -167,6 +168,10 @@ function LocalModelsSkeletonRows() {
 export default function Models() {
   const models = useJson<ModelsResponse>('/models');
   const catalog = useJson<CatalogResponse>('/catalog');
+  // Deliberately a SEPARATE request from `/catalog`: this one dials Hugging Face
+  // and is allowed to fail. Its error is never rendered — a card that cannot
+  // reach the network simply shows no update badge.
+  const updates = useJson<CatalogUpdatesResponse>('/catalog/updates');
   const downloads = useJson<DownloadsResponse>('/downloads');
   const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
 
@@ -384,6 +389,11 @@ export default function Models() {
   const modelsDir = models.data?.dir ?? '';
   const totalBytes = localModels.reduce((sum, m) => sum + m.sizeBytes, 0);
   const catalogItems = (catalog.data?.items ?? []).filter((item) => !item.hidden);
+  // Empty whenever the update check failed or has not resolved yet, which is the
+  // correct default: no badge, cards render exactly as they did before.
+  const updatable = new Set(
+    (updates.data?.items ?? []).filter((item) => item.updateAvailable).map((item) => item.hfRepo),
+  );
 
   return (
     <div className="space-y-6">
@@ -551,6 +561,7 @@ export default function Models() {
             <CatalogCard
               key={item.hfRepo}
               item={item}
+              updateAvailable={updatable.has(item.hfRepo)}
               job={active[item.hfRepo]}
               onInstall={() => install(item.hfRepo)}
               onDone={() => onDownloadDone(item.hfRepo)}
@@ -635,6 +646,8 @@ function CatalogCardSkeleton() {
 
 interface CatalogCardProps {
   item: CatalogItem;
+  /** Upstream has different bytes at this repo than the local marker records. */
+  updateAvailable: boolean;
   job: ActiveJob | undefined;
   onInstall: () => void;
   onDone: () => void;
@@ -643,11 +656,22 @@ interface CatalogCardProps {
   onCancel: (id: string) => void;
 }
 
-function CatalogCard({ item, job, onInstall, onDone, onError, onCancelled, onCancel }: CatalogCardProps) {
+function CatalogCard({
+  item,
+  updateAvailable,
+  job,
+  onInstall,
+  onDone,
+  onError,
+  onCancelled,
+  onCancel,
+}: CatalogCardProps) {
   // Gate on `present` (loadable checkpoint on disk), not `installed` (dashboard
   // marker): a model installed via the `mlx download` CLI / wizard is present but
   // unowned, so offering Install would refuse to overwrite it and fail.
-  const downloading = job !== undefined && !item.present;
+  // `updateAvailable` is part of the gate: an update re-installs a model that is
+  // already `present`, so without it the job would run with no visible progress.
+  const downloading = job !== undefined && (!item.present || updateAvailable);
 
   return (
     <Card className="gap-4">
@@ -687,6 +711,14 @@ function CatalogCard({ item, job, onInstall, onDone, onError, onCancelled, onCan
               </Button>
             )}
           </div>
+        ) : item.present && updateAvailable ? (
+          // Same job pipeline as a first install: the runner already re-downloads
+          // whenever the installed marker's revision differs from upstream, and
+          // its owned-swap replaces the stale directory.
+          <Button className="w-full" onClick={onInstall}>
+            <Download className="size-4" />
+            Update available
+          </Button>
         ) : item.present ? (
           <Button variant="outline" className="w-full" disabled>
             <Check className="size-4" />

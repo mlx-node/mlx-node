@@ -182,6 +182,7 @@ over a port.
 | `/api/models`               | GET          | Local models: name, path, family, quant, size, ctx window                  |
 | `/api/models/:name`         | DELETE       | Delete a model dir (path-checked)                                          |
 | `/api/catalog`              | GET          | Recommended catalog + installed/installable state                          |
+| `/api/catalog/updates`      | GET          | Upstream sha per catalog repo; which installed models are stale            |
 | `/api/downloads`            | GET / POST   | List active jobs / start a catalog download                                |
 | `/api/downloads/:id/events` | GET          | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503 |
 | `/api/sessions`             | GET          | Indexed session list; search + filters                                     |

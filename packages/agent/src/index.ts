@@ -1,6 +1,6 @@
 export type { DiscoveredModelLike } from './types.js';
 
-export { type CatalogEntry, MODEL_CATALOG, visibleCatalog } from './catalog.js';
+export { type CatalogEntry, catalogRepo, catalogRepoAliases, MODEL_CATALOG, visibleCatalog } from './catalog.js';
 export { createPermissionGateExtension } from './extensions/permission-gate.js';
 export {
   createSubagentExtension,

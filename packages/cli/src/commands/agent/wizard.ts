@@ -10,7 +10,7 @@
 
 import { join } from 'node:path';
 
-import { visibleCatalog } from '@mlx-node/agent';
+import { catalogRepo, visibleCatalog } from '@mlx-node/agent';
 
 export interface WizardIO {
   select: (opts: { message: string; choices: Array<{ name: string; value: string }> }) => Promise<string>;
@@ -77,7 +77,8 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
   if (!deps.io.isTTY) {
     const commands = catalog
       .map(
-        (entry) => `  mlx download model ${downloadModelArgv(entry.hfRepo, deps.modelsDir).map(shellQuote).join(' ')}`,
+        (entry) =>
+          `  mlx download model ${downloadModelArgv(catalogRepo(entry), deps.modelsDir).map(shellQuote).join(' ')}`,
       )
       .join('\n');
     throw new Error(
@@ -91,7 +92,7 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
     message: 'Model to download',
     choices: ordered.map((entry) => ({
       name: `${entry.label} (~${entry.sizeGb} GB) — ${entry.description}`,
-      value: entry.hfRepo,
+      value: catalogRepo(entry),
     })),
   });
 

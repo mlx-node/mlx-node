@@ -25,6 +25,7 @@ import type {
   CacheScope,
   CatalogItem,
   CatalogResponse,
+  CatalogUpdatesResponse,
   ColdTierHealth,
   DownloadJob,
   DownloadsResponse,
@@ -33,9 +34,9 @@ import type {
   SessionDetailResponse,
   SessionMetricsResponse,
   SessionRow,
-  SessionsResponse,
   SessionTraceMetric,
   SessionTurnMetric,
+  SessionsResponse,
 } from '@/lib/types';
 import Cache from '@/pages/cache';
 import Metrics from '@/pages/metrics';
@@ -1083,27 +1084,35 @@ describe('Session detail page', () => {
 });
 
 describe('Models page — the Install affordance', () => {
-  const REPO = 'Brooooooklyn/Qwen3.6-27B-NVFP4-mlx';
+  const REPO = 'Brooooooklyn/Qwen3.8-27B-MXFP4-mlx';
+  /** Card heading the settle predicates wait on, and the slug it installs to. */
+  const LABEL = 'Qwen3.8-27B';
+  const SLUG = 'qwen3.8-27b-mxfp4-mlx';
 
-  function catalogRoutes(item: Partial<CatalogItem>, jobs: DownloadJob[] = []): Record<string, unknown> {
+  function catalogRoutes(
+    item: Partial<CatalogItem>,
+    jobs: DownloadJob[] = [],
+    updates: CatalogUpdatesResponse = { items: [] },
+  ): Record<string, unknown> {
     const models: ModelsResponse = { models: [], warnings: [], dir: '/models' };
     const catalog: CatalogResponse = {
       items: [
         {
-          label: 'Qwen3.6-27B',
+          label: LABEL,
           hfRepo: REPO,
-          sizeGb: 22.2,
+          sizeGb: 23.3,
           description: 'Best tool use',
-          slug: 'qwen3.6-27b-nvfp4-mlx',
+          slug: SLUG,
           installed: false,
           present: false,
           blockedByForeignDir: false,
+          localRevision: null,
           ...item,
         },
       ],
     };
     const downloads: DownloadsResponse = { jobs };
-    return { '/models': models, '/catalog': catalog, '/downloads': downloads };
+    return { '/models': models, '/catalog': catalog, '/catalog/updates': updates, '/downloads': downloads };
   }
 
   /** Trimmed label of every rendered button. */
@@ -1181,7 +1190,7 @@ describe('Models page — the Install affordance', () => {
   }
 
   async function mountModels(): Promise<void> {
-    mounted = await renderPage(createElement(Models), (text) => text.includes('Qwen3.6-27B'));
+    mounted = await renderPage(createElement(Models), (text) => text.includes(LABEL));
     // The hydration effect fires once `/downloads` lands, which is after the
     // catalog text the settle condition waits on; give it and its calls room.
     await settle();
@@ -1195,7 +1204,7 @@ describe('Models page — the Install affordance', () => {
   it('offers Install for a recommended model that is simply absent', async () => {
     // The over-correction guard: the card must keep its button when the slug is
     // free, or the blocked branch below could be "fixed" by never offering Install.
-    await mount(createElement(Models), catalogRoutes({}), 'Qwen3.6-27B');
+    await mount(createElement(Models), catalogRoutes({}), LABEL);
     expect(buttonLabels()).toContain('Install');
   });
 
@@ -1203,17 +1212,58 @@ describe('Models page — the Install affordance', () => {
     // `<slug>` is occupied by an unowned directory (an interrupted `mlx download`).
     // The download's ownership preflight refuses it every time, so the button would
     // do nothing but raise a red toast.
-    const text = await mount(createElement(Models), catalogRoutes({ blockedByForeignDir: true }), 'Qwen3.6-27B');
+    const text = await mount(createElement(Models), catalogRoutes({ blockedByForeignDir: true }), LABEL);
     expect(buttonLabels()).not.toContain('Install');
     // And it says WHICH directory is in the way and what to do about it.
-    expect(text).toContain('qwen3.6-27b-nvfp4-mlx');
+    expect(text).toContain(SLUG);
     expect(text).toMatch(/remove/i);
   });
 
   it('still shows an installed model as installed', async () => {
-    await mount(createElement(Models), catalogRoutes({ present: true, installed: true }), 'Qwen3.6-27B');
+    await mount(createElement(Models), catalogRoutes({ present: true, installed: true }), LABEL);
     expect(buttonLabels()).toContain('Installed');
     expect(buttonLabels()).not.toContain('Install');
+  });
+
+  it('offers Update available when upstream holds a different revision', async () => {
+    // The whole point of the check: a re-upload lands new bytes at the SAME repo
+    // id, so an installed model must still be offered the newer weights.
+    await mount(
+      createElement(Models),
+      catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: true }],
+      }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Update available');
+    expect(buttonLabels()).not.toContain('Installed');
+  });
+
+  it('stays Installed when the revisions match', async () => {
+    await mount(
+      createElement(Models),
+      catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40), updateAvailable: false }],
+      }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
+  });
+
+  it('stays Installed when the update check could not reach Hugging Face', async () => {
+    // Offline must degrade to exactly the old behaviour — never a badge the user
+    // cannot act on, and never a blocked page. `/catalog` never touched the
+    // network, so install state is unaffected either way.
+    await mount(
+      createElement(Models),
+      catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: null, updateAvailable: false }],
+      }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
   });
 
   it('dismisses a job that settled while the page was unmounted, without a word', async () => {
@@ -1460,7 +1510,7 @@ describe('Models page — the Install affordance', () => {
       port2.close();
     };
 
-    mounted = await renderPage(createElement(Models), (text) => text.includes('Qwen3.6-27B'));
+    mounted = await renderPage(createElement(Models), (text) => text.includes(LABEL));
     const install = [...mounted.container.querySelectorAll('button')].find((button) =>
       button.textContent?.includes('Install'),
     );

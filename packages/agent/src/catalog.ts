@@ -2,15 +2,30 @@
  * Curated model catalog for `mlx agent`.
  *
  * The first-run download wizard offers `visibleCatalog()` and feeds the chosen
- * `hfRepo` to `mlx download model`. Slugs are verified against the Brooooooklyn
+ * entry's `catalogRepo()` to `mlx download model`. Slugs are verified against the Brooooooklyn
  * HF account — use them verbatim.
  */
 
 export interface CatalogEntry {
   /** Wizard display name. */
   label: string;
-  /** HF slug for `mlx download model`. */
+  /**
+   * HF slug for `mlx download model` on Apple Silicon — the MXFP4 build.
+   *
+   * Metal's block scaling is MXFP4-shaped: the scale plane must be
+   * `metal_fp8_ue8m0_format` at block 32 (MSL Spec 4.1 Table 2.28). NVFP4's
+   * E4M3 scales at block 16 cannot be declared there, so it decodes through a
+   * dequant path instead of the native one.
+   */
   hfRepo: string;
+  /**
+   * HF slug on Linux + NVIDIA CUDA — the NVFP4 build, which is what
+   * `CublasQQMM` consumes natively (`nvfp4` -> `CUDA_R_4F_E2M1`).
+   *
+   * Absent means the entry has no CUDA-specific build and {@link hfRepo}
+   * serves both. Resolve with {@link catalogRepo}, never by reading the field.
+   */
+  hfRepoCuda?: string;
   /** Approximate download size in GB, for display. */
   sizeGb: number;
   /** One line for the wizard. */
@@ -37,22 +52,25 @@ export interface CatalogEntry {
 
 export const MODEL_CATALOG: readonly CatalogEntry[] = [
   {
-    label: 'Qwen3.6-27B',
-    hfRepo: 'Brooooooklyn/Qwen3.6-27B-NVFP4-mlx',
-    sizeGb: 22.2,
+    label: 'Qwen3.8-27B',
+    hfRepo: 'Brooooooklyn/Qwen3.8-27B-MXFP4-mlx',
+    hfRepoCuda: 'Brooooooklyn/Qwen3.8-27B-NVFP4-mlx',
+    sizeGb: 23.3,
     description: 'Best tool use — recommended default',
     isDefault: true,
   },
   {
     label: 'Qwen-AgentWorld-35B',
-    hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-nvfp4-mlx',
-    sizeGb: 22.7,
+    hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-mxfp4-mlx',
+    hfRepoCuda: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-nvfp4-mlx',
+    sizeGb: 23.3,
     description: 'Agent-tuned MoE, fast decode',
   },
   {
     label: 'Gemma-4-26B-A4B',
-    hfRepo: 'Brooooooklyn/Gemma-4-26B-A4B-NVFP4-mlx',
-    sizeGb: 18.8,
+    hfRepo: 'Brooooooklyn/Gemma-4-26B-A4B-Unsloth-MXFP4-mlx',
+    hfRepoCuda: 'Brooooooklyn/Gemma-4-26B-A4B-Unsloth-NVFP4-mlx',
+    sizeGb: 16.2,
     description: 'MoE, fast decode',
   },
   {
@@ -91,6 +109,29 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     hidden: true,
   },
 ];
+
+/**
+ * The repo THIS platform installs for `entry`.
+ *
+ * The quantization format is not a preference, it is a backend fact: Metal
+ * expresses MXFP4 natively and cannot express NVFP4 at all, while CUDA's
+ * `CublasQQMM` takes NVFP4 directly. Linux is the CUDA preview target
+ * (README "Platform Support"); everything else is Apple Silicon.
+ *
+ * Every consumer that turns a catalog entry into a download, a slug, or an
+ * allowlist check must go through here. Reading `entry.hfRepo` directly
+ * installs the macOS build on a CUDA box.
+ */
+export function catalogRepo(entry: CatalogEntry): string {
+  return process.platform === 'linux' && entry.hfRepoCuda !== undefined ? entry.hfRepoCuda : entry.hfRepo;
+}
+
+/** Every repo `entry` may occupy on ANY platform, lowercased. */
+export function catalogRepoAliases(entry: CatalogEntry): string[] {
+  const repos = [entry.hfRepo];
+  if (entry.hfRepoCuda !== undefined) repos.push(entry.hfRepoCuda);
+  return repos.map((repo) => repo.toLowerCase());
+}
 
 /** Catalog entries the wizard offers (hidden entries filtered out). */
 export function visibleCatalog(): CatalogEntry[] {

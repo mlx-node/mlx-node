@@ -161,40 +161,43 @@ function modelsRoutes(): Record<string, unknown> {
   const catalog: CatalogResponse = {
     items: [
       {
-        label: 'Qwen3.6-27B',
-        hfRepo: 'Brooooooklyn/Qwen3.6-27B-NVFP4-mlx',
-        sizeGb: 22.2,
+        label: 'Qwen3.8-27B',
+        hfRepo: 'Brooooooklyn/Qwen3.8-27B-MXFP4-mlx',
+        sizeGb: 23.3,
         description: 'Best tool use — recommended default',
-        slug: 'qwen3.6-27b-nvfp4-mlx',
+        slug: 'qwen3.8-27b-mxfp4-mlx',
         isDefault: true,
         installed: false,
         present: false,
         blockedByForeignDir: false,
+        localRevision: null,
       },
       {
         label: 'Qwen-AgentWorld-35B',
-        hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-nvfp4-mlx',
-        sizeGb: 22.7,
+        hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-mxfp4-mlx',
+        sizeGb: 23.3,
         description: 'Agent-tuned MoE, fast decode',
-        slug: 'qwen-agentworld-35b-a3b-nvfp4-mlx',
+        slug: 'qwen-agentworld-35b-a3b-mxfp4-mlx',
         installed: false,
         present: false,
         blockedByForeignDir: false,
+        localRevision: null,
       },
       {
         label: 'Gemma-4-26B-A4B',
-        hfRepo: 'Brooooooklyn/Gemma-4-26B-A4B-NVFP4-mlx',
-        sizeGb: 18.8,
+        hfRepo: 'Brooooooklyn/Gemma-4-26B-A4B-Unsloth-MXFP4-mlx',
+        sizeGb: 16.2,
         description: 'MoE, fast decode',
-        slug: 'gemma-4-26b-a4b-nvfp4-mlx',
+        slug: 'gemma-4-26b-a4b-unsloth-mxfp4-mlx',
         installed: false,
         present: false,
         blockedByForeignDir: false,
+        localRevision: null,
       },
     ],
   };
   const downloads: DownloadsResponse = { jobs: [] };
-  return { '/models': models, '/catalog': catalog, '/downloads': downloads };
+  return { '/models': models, '/catalog': catalog, '/catalog/updates': { items: [] }, '/downloads': downloads };
 }
 
 function sessionRow(overrides: Partial<SessionRow>): SessionRow {

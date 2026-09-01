@@ -539,7 +539,7 @@ describe('defaultModelsDir', () => {
   });
 });
 
-/** The default recommendation (Qwen3.6-27B) and the folder a download lands in. */
+/** The default recommendation (Qwen3.8-27B) and the folder a download lands in. */
 const RECOMMENDED = MODEL_CATALOG[0]!;
 const RECOMMENDED_SLUG = catalogSlug(RECOMMENDED);
 
@@ -559,38 +559,38 @@ function writeCompletion(name: string, repo: string, files = ['config.json', 'mo
 }
 
 describe('catalogWithState — a recommended model is identified by download provenance', () => {
-  // The Qwen3.6-27B recommendation is an nvfp4 qwen3_5 checkpoint. `mlx convert`
-  // mandates bits=4 / group_size=16 for nvfp4, so that triple is a FORMAT CONSTANT
-  // shared by every nvfp4 checkpoint of the family — config shape cannot tell two
+  // The Qwen3.8-27B recommendation is an mxfp4 qwen3_5 checkpoint. MX block
+  // scaling fixes the block at 32, so bits=4 / group_size=32 is a FORMAT CONSTANT
+  // shared by every mxfp4 checkpoint of the family — config shape cannot tell two
   // different weight sets apart, only a recorded repo can.
-  const QWEN_27B_NVFP4 = JSON.stringify({
+  const QWEN_27B_MXFP4 = JSON.stringify({
     model_type: 'qwen3_5',
-    quantization: { bits: 4, mode: 'nvfp4', group_size: 16 },
+    quantization: { bits: 4, mode: 'mxfp4', group_size: 32 },
   });
 
   it('does NOT mark present for a look-alike fine-tune with no download provenance', () => {
     // A local fine-tune of the same base, same quant, under a name that starts with
     // the catalog label. Marking it present disables the ONLY Install affordance on
     // the Models page, hard-blocking the user from installing the real checkpoint.
-    writeModel(modelsDir, 'qwen3.6-27b-custom', QWEN_27B_NVFP4, 2048);
-    expect(catalogItem('Qwen3.6-27B').present).toBe(false);
-    expect(catalogItem('Qwen3.6-27B').installed).toBe(false);
+    writeModel(modelsDir, 'qwen3.8-27b-custom', QWEN_27B_MXFP4, 2048);
+    expect(catalogItem(RECOMMENDED.label).present).toBe(false);
+    expect(catalogItem(RECOMMENDED.label).installed).toBe(false);
   });
 
   it('marks present for a renamed folder carrying our completion marker for this repo', () => {
     // The capability the folder-prefix heuristic was reaching for, done exactly: a
     // dashboard install the user renamed is still recognized, because the marker
     // pins WHICH repo those bytes came from.
-    writeModel(modelsDir, 'renamed-by-hand', QWEN_27B_NVFP4, 2048);
+    writeModel(modelsDir, 'renamed-by-hand', QWEN_27B_MXFP4, 2048);
     writeCompletion('renamed-by-hand', RECOMMENDED.hfRepo);
-    expect(catalogItem('Qwen3.6-27B').present).toBe(true);
+    expect(catalogItem(RECOMMENDED.label).present).toBe(true);
   });
 
   it('marks present for a complete CLI install under the canonical slug', () => {
     // `mlx download` writes no marker, so provenance comes from the slug itself.
-    writeModel(modelsDir, RECOMMENDED_SLUG, QWEN_27B_NVFP4, 2048);
-    expect(catalogItem('Qwen3.6-27B').present).toBe(true);
-    expect(catalogItem('Qwen3.6-27B').installed).toBe(false);
+    writeModel(modelsDir, RECOMMENDED_SLUG, QWEN_27B_MXFP4, 2048);
+    expect(catalogItem(RECOMMENDED.label).present).toBe(true);
+    expect(catalogItem(RECOMMENDED.label).installed).toBe(false);
   });
 
   it('does NOT cross-match a marker that names a different repo', () => {
@@ -604,11 +604,42 @@ describe('catalogWithState — a recommended model is identified by download pro
     expect(catalogItem('Qwen-AgentWorld-35B').present).toBe(false);
   });
 
+  it('reports the marker revision as localRevision for an owned canonical install', () => {
+    // The read half of the update check: a re-upload lands new bytes at the SAME
+    // repo id, so only this recorded sha can tell the user their copy is stale.
+    writeModel(modelsDir, RECOMMENDED_SLUG, QWEN_27B_MXFP4, 2048);
+    writeCompletion(RECOMMENDED_SLUG, RECOMMENDED.hfRepo);
+    const item = catalogItem(RECOMMENDED.label);
+    expect(item.installed).toBe(true);
+    expect(item.localRevision).toBe('a'.repeat(40));
+  });
+
+  it('reports localRevision null for a markerless CLI install', () => {
+    // No marker means the sha is genuinely unknowable. Null must read as "no
+    // update badge", never as "up to date".
+    writeModel(modelsDir, RECOMMENDED_SLUG, QWEN_27B_MXFP4, 2048);
+    const item = catalogItem(RECOMMENDED.label);
+    expect(item.present).toBe(true);
+    expect(item.localRevision).toBeNull();
+  });
+
+  it('reports localRevision null for a renamed install matched only by provenance', () => {
+    // `present` comes from the marker under another folder name, but `installed`
+    // is false, and the runner would refuse to re-install over the unowned
+    // canonical slug — so an update affordance here could only ever fail.
+    writeModel(modelsDir, 'renamed-by-hand', QWEN_27B_MXFP4, 2048);
+    writeCompletion('renamed-by-hand', RECOMMENDED.hfRepo);
+    const item = catalogItem(RECOMMENDED.label);
+    expect(item.present).toBe(true);
+    expect(item.installed).toBe(false);
+    expect(item.localRevision).toBeNull();
+  });
+
   it('does NOT mark present when the marker survived but the checkpoint did not', () => {
     // The marker records what was published, not what is still there: a dir gutted
     // down to its marker is not a loadable checkpoint.
     writeCompletion('gutted', RECOMMENDED.hfRepo);
-    expect(catalogItem('Qwen3.6-27B').present).toBe(false);
+    expect(catalogItem(RECOMMENDED.label).present).toBe(false);
   });
 });
 
@@ -632,8 +663,8 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     // hit the runner's ownership preflight and error every single time, so the card
     // must state the blockage instead of offering the button.
     writePartialShardedInstall(RECOMMENDED_SLUG);
-    expect(catalogItem('Qwen3.6-27B').present).toBe(false);
-    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
+    expect(catalogItem(RECOMMENDED.label).present).toBe(false);
+    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
   });
 
   it('flags an occupant with no config.json at all as blocked', () => {
@@ -641,14 +672,14 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     // discovery folds it into the skipped-directories warning, so this state has no
     // Delete row to recover through — all the more reason not to offer Install.
     mkdirSync(join(modelsDir, RECOMMENDED_SLUG), { recursive: true });
-    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
+    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
   });
 
   it('flags a dangling symlink at the slug as blocked (no-follow occupancy)', () => {
     // `existsSync` FOLLOWS the link and reads it as absent; the runner's preflight
     // is `lstat`-based and refuses it, so catalog state must be `lstat`-based too.
     symlinkSync(join(modelsDir, 'no-such-target'), join(modelsDir, RECOMMENDED_SLUG));
-    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
+    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
   });
 
   it('flags a LIVE symlink to an external checkpoint as blocked, not installed', () => {
@@ -665,8 +696,8 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
       // The link is LIVE — without this the case would hold for the wrong reason.
       expect(existsSync(join(link, 'config.json'))).toBe(true);
       expect(isModelPresent(link)).toBe(false);
-      expect(catalogItem('Qwen3.6-27B').present).toBe(false);
-      expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
+      expect(catalogItem(RECOMMENDED.label).present).toBe(false);
+      expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
       // The same directory the catalog now calls blocked is absent from discovery.
       expect(discoverLocalModels(modelsDir).models.map((model) => model.name)).not.toContain(RECOMMENDED_SLUG);
     } finally {
@@ -689,8 +720,8 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     writeFileSync(join(victim, 'PRECIOUS.txt'), 'hand-made, not ours');
     symlinkSync(foreign, join(victim, DOWNLOAD_COMPLETE_MARKER));
 
-    expect(catalogItem('Qwen3.6-27B').present).toBe(false);
-    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(true);
+    expect(catalogItem(RECOMMENDED.label).present).toBe(false);
+    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
 
     rmSync(external, { recursive: true, force: true });
   });
@@ -700,14 +731,14 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     // genuinely works — blocking it would remove the one recovery that functions.
     writeCompletion(RECOMMENDED_SLUG, RECOMMENDED.hfRepo);
     writeFileSync(join(modelsDir, RECOMMENDED_SLUG, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
-    expect(catalogItem('Qwen3.6-27B').present).toBe(false);
-    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(false);
+    expect(catalogItem(RECOMMENDED.label).present).toBe(false);
+    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(false);
   });
 
   it('is not blocked when the slug is free, nor when a complete install occupies it', () => {
-    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(false);
+    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(false);
     writeModel(modelsDir, RECOMMENDED_SLUG, JSON.stringify({ model_type: 'qwen3_5' }), 2048);
-    expect(catalogItem('Qwen3.6-27B').present).toBe(true);
-    expect(catalogItem('Qwen3.6-27B').blockedByForeignDir).toBe(false);
+    expect(catalogItem(RECOMMENDED.label).present).toBe(true);
+    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(false);
   });
 });

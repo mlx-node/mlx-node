@@ -43,7 +43,12 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
 import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
-import { MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+
+/** How long a resolved set of catalog shas is reused before re-dialling HF. */
+const CATALOG_SHA_TTL_MS = 6 * 60 * 60 * 1000;
+/** Retry window after a sweep where every repo failed (the offline case). */
+const CATALOG_SHA_NEGATIVE_TTL_MS = 60 * 1000;
 
 import {
   type DownloadCompletion,
@@ -340,6 +345,8 @@ interface FileContext {
 export class DownloadManager {
   private readonly modelsDir: string;
   private readonly cacheDir: string;
+  /** Memoized catalog shas; see {@link DownloadManager.checkCatalogUpdates}. */
+  private catalogShaCache: { at: number; shas: Map<string, string | null>; ttlMs: number } | undefined;
   private readonly fetchImpl: typeof fetch;
   private readonly wrappedFetch: typeof fetch;
 
@@ -402,7 +409,7 @@ export class DownloadManager {
     // so admitting one here allocates a job that fails mid-download with a 401
     // instead of being refused up front. No UI reaches this for a hidden entry
     // (the Models page filters `!item.hidden`); a direct API POST does.
-    if (!MODEL_CATALOG.some((entry) => !entry.hidden && entry.hfRepo === repo)) {
+    if (!MODEL_CATALOG.some((entry) => !entry.hidden && catalogRepo(entry) === repo)) {
       throw new Error(`Repo "${repo}" is not in the model catalog`);
     }
     const active = this.activeJobFor(repo);
@@ -657,6 +664,46 @@ export class DownloadManager {
    * so a mutable value there would let a later same-shaped fine-tune restore stale
    * state and would break this job's own mid-download atomicity.
    */
+  /**
+   * Remote commit sha for every VISIBLE catalog repo, for the "update
+   * available" check on the Models page.
+   *
+   * A re-upload lands new bytes at the SAME repo id, so local presence alone
+   * can never tell a user their checkpoint is stale — only the sha can. This
+   * is the read half; the write half already works: `processJob` re-downloads
+   * whenever the installed marker's revision differs from the resolved one, so
+   * the UI's "Update" is literally the existing install.
+   *
+   * Never throws and never rejects. A repo that cannot be resolved — offline,
+   * 429, a deleted repo — maps to `null`, which the caller reads as "no badge",
+   * never as "up to date". `hidden` entries are skipped: they are unpublished
+   * repos that answer 401.
+   *
+   * Cached, because `useJson` refetches on every mount and every reconnect and
+   * there is no polling to smooth the rate. An all-`null` result (the offline
+   * case) is cached far more briefly so a machine that regains its network is
+   * not stuck reporting nothing for hours.
+   */
+  async checkCatalogUpdates(now: number = Date.now()): Promise<ReadonlyMap<string, string | null>> {
+    const cached = this.catalogShaCache;
+    if (cached !== undefined && now - cached.at < cached.ttlMs) return cached.shas;
+    const shas = new Map<string, string | null>();
+    await Promise.all(
+      MODEL_CATALOG.filter((entry) => !entry.hidden)
+        .map((entry) => catalogRepo(entry))
+        .map(async (repo) => {
+          try {
+            shas.set(repo, await this.resolveRevision(repo));
+          } catch {
+            shas.set(repo, null);
+          }
+        }),
+    );
+    const allFailed = shas.size > 0 && [...shas.values()].every((sha) => sha === null);
+    this.catalogShaCache = { at: now, shas, ttlMs: allFailed ? CATALOG_SHA_NEGATIVE_TTL_MS : CATALOG_SHA_TTL_MS };
+    return shas;
+  }
+
   private async resolveRevision(repoName: string): Promise<string> {
     const info = await modelInfo({ name: repoName, additionalFields: ['sha'], fetch: this.wrappedFetch });
     const sha: unknown = info.sha;
@@ -667,8 +714,10 @@ export class DownloadManager {
   }
 
   private async processJob(job: JobState): Promise<void> {
-    const entry = MODEL_CATALOG.find((candidate) => candidate.hfRepo === job.repo)!;
-    const slug = entry.hfRepo.split('/').pop()!.toLowerCase();
+    // Resolved per platform, matching the allowlist gate in `start` — a job can
+    // only exist for THIS platform's repo, so the lookup cannot miss.
+    const entry = MODEL_CATALOG.find((candidate) => catalogRepo(candidate) === job.repo)!;
+    const slug = catalogRepo(entry).split('/').pop()!.toLowerCase();
     const finalDir = join(this.modelsDir, slug);
     const repo = { type: 'model' as const, name: job.repo };
     this.currentJob = job;
