@@ -371,8 +371,23 @@ export class DownloadManager {
   private readonly probeTimeoutMs: number;
   /** Sweep counter, so a job can tell whether its write-through predates the sweep now committing. */
   private catalogSweepSeq = 0;
-  /** Revisions a JOB resolved, tagged with the sweep in flight when it did. */
-  private jobResolvedShas = new Map<string, { revision: string; seq: number }>();
+  /**
+   * Order in which sha reads were ISSUED — never completed. Upstream is observed
+   * as of the request, so a probe that stalls still answers with the sha it held
+   * when asked; ranking by completion would call that stale answer the newest read.
+   */
+  private resolveSeq = 0;
+  /**
+   * Revisions a JOB resolved, tagged with the sweep in flight when it did and
+   * with its place in {@link DownloadManager.resolveSeq}.
+   */
+  private jobResolvedShas = new Map<string, { revision: string; seq: number; at: number }>();
+  /**
+   * Issue stamp behind each repo's sha as currently cached. A job that asked
+   * BEFORE the sweep whose value is committed holds the older observation
+   * however late its answer lands, so its write-through must not overwrite it.
+   */
+  private catalogReadAt = new Map<string, number>();
   private readonly fetchImpl: typeof fetch;
   private readonly wrappedFetch: typeof fetch;
 
@@ -723,10 +738,12 @@ export class DownloadManager {
       return this.fetchImpl(input, { ...init, signal });
     };
     const shas = new Map<string, string | null>();
+    const reads = new Map<string, number>();
     await Promise.all(
       MODEL_CATALOG.filter((entry) => !entry.hidden)
         .map((entry) => catalogRepo(entry))
         .map(async (repo) => {
+          const at = ++this.resolveSeq;
           try {
             // RAW fetch, never `wrappedFetch`. That wrapper attributes every
             // response body to `currentFile`, so a probe running while a model
@@ -734,6 +751,9 @@ export class DownloadManager {
             // it also threads the active job's abort signal, which would make a
             // user's cancel kill an unrelated update check.
             shas.set(repo, await this.resolveRevision(repo, probeFetch));
+            // Only a SUCCESSFUL read claims the slot, so a job's real revision
+            // still beats this sweep's `null`.
+            reads.set(repo, at);
           } catch {
             shas.set(repo, null);
           }
@@ -743,12 +763,25 @@ export class DownloadManager {
     // cache is one entry for the whole sweep, so a single transient failure
     // alongside successes would otherwise pin that repo's `null` for the full
     // six hours — no mount or reconnect in that window could surface its update.
-    // A job that installed a revision WHILE this sweep ran has the newer read:
-    // the sweep may have captured its repo early, then waited on another. Since
-    // the whole map is replaced below, that job's write-through would be lost.
+    // A job that installed a revision WHILE this sweep ran has the newer read
+    // only if it asked LAST: the sweep may have captured its repo early, then
+    // waited on another, and since the whole map is replaced below that job's
+    // write-through would be lost. The opposite interleaving is just as real —
+    // the job asks, this sweep starts and asks the same repo, and the job's
+    // slower answer still lands first — and there the sweep holds the newer sha.
+    // Overlaying it would bury a genuine update for the whole success TTL, since
+    // the post-download refresh reads this very map back.
     for (const [repo, resolved] of this.jobResolvedShas) {
-      if (resolved.seq >= seq && shas.has(repo)) shas.set(repo, resolved.revision);
+      if (resolved.seq >= seq && shas.has(repo) && resolved.at > (reads.get(repo) ?? 0)) {
+        shas.set(repo, resolved.revision);
+        // Keeps `catalogReadAt` describing what was actually committed. No
+        // reachable write depends on it — one repo holds one nonterminal job,
+        // so the next stamp is always higher either way — but a reader who
+        // trusts the field's meaning should not have to derive that.
+        reads.set(repo, resolved.at);
+      }
     }
+    this.catalogReadAt = reads;
     const anyFailed = [...shas.values()].some((sha) => sha === null);
     this.catalogShaCache = { at: now, shas, ttlMs: anyFailed ? CATALOG_SHA_NEGATIVE_TTL_MS : CATALOG_SHA_TTL_MS };
     return shas;
@@ -840,13 +873,19 @@ export class DownloadManager {
       // could read the foreign marker and report a false `done` through the link.
       refuseIfUnownedFinal();
 
+      const at = ++this.resolveSeq;
       const revision = await this.resolveRevision(job.repo);
       // This IS a fresh upstream read, so fold it into the update-check cache.
       // Without it a sweep cached before upstream advanced keeps serving the
       // older sha for up to its full TTL, so the card re-offers an update for a
       // revision already installed and every click completes as a no-op.
-      this.jobResolvedShas.set(job.repo, { revision, seq: this.catalogSweepSeq });
-      this.catalogShaCache?.shas.set(job.repo, revision);
+      this.jobResolvedShas.set(job.repo, { revision, seq: this.catalogSweepSeq, at });
+      // The overlay guards a sweep that commits AFTER this. A sweep that already
+      // committed is past it, so the same ordering test has to run here too.
+      if (at > (this.catalogReadAt.get(job.repo) ?? 0)) {
+        this.catalogShaCache?.shas.set(job.repo, revision);
+        this.catalogReadAt.set(job.repo, at);
+      }
 
       // Job-private staging: keyed by the IMMUTABLE revision (a different
       // revision never reuses another's staged bytes) and unique per invocation

@@ -451,6 +451,106 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     expect(shas.get(REPO)).toBe(SHA_NEW);
   });
 
+  it('keeps a sweep read that was ISSUED after the job asked for the same repo', async () => {
+    // The overlay above assumes the job asked LAST. Reversed — the job's read
+    // goes out, this sweep starts and asks the same repo, and the job's slower
+    // answer still lands first — the sweep holds the NEWER sha, and letting the
+    // job's older one overwrite it would bury a genuine update for the whole
+    // success TTL, which the post-download refresh reads straight back.
+    let releaseJob: (() => void) | undefined;
+    const jobGate = new Promise<void>((resolve) => {
+      releaseJob = resolve;
+    });
+    let releaseSweep: (() => void) | undefined;
+    const sweepGate = new Promise<void>((resolve) => {
+      releaseSweep = resolve;
+    });
+    hub.modelInfoUsesFetch = true;
+    const inner = makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 });
+    let jobAsked = false;
+    let sweepAsked = 0;
+    const gated: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      // Only the sha reads are parked — the job's file fetches run unimpeded, so
+      // this is the real write-through path, not a stub.
+      if (url.includes('/api/models/')) {
+        if (!jobAsked) {
+          jobAsked = true;
+          await jobGate;
+        } else {
+          sweepAsked += 1;
+          await sweepGate;
+        }
+      }
+      return inner(input, init);
+    };
+    const m = new DownloadManager({ modelsDir, cacheDir, fetchImpl: gated });
+
+    // The job asks first, so its answer is the sha upstream held BEFORE it moved.
+    hub.sha = SHA_OLD;
+    const events: DownloadEvent[] = [];
+    const id = m.start(REPO);
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => jobAsked);
+
+    // Upstream advances, and only THEN does the sweep ask.
+    hub.sha = SHA_NEW;
+    const sweep = m.checkCatalogUpdates(1000);
+    await waitFor(() => sweepAsked === MODEL_CATALOG.filter((e) => !e.hidden).length);
+
+    // The job's older answer lands first and writes itself through.
+    releaseJob!();
+    await waitFor(() => events.some((event) => event.type === 'done'));
+
+    releaseSweep!();
+    const shas = await sweep;
+    // The job pinned the older revision, so the sweep's read is a real update.
+    expect(hub.revisions).toContain(SHA_OLD);
+    expect(shas.get(REPO)).toBe(SHA_NEW);
+  });
+
+  it('refuses a job write-through into a cache a LATER read already filled', async () => {
+    // The other half of the same inversion. Here the sweep commits FIRST, so the
+    // job's write-through lands on an already-published map rather than being
+    // folded in by the overlay — a path the overlay guard never sees. The job
+    // still asked first, so its answer is the older observation, and letting it
+    // overwrite the committed newer sha buries the update for the success TTL.
+    let releaseJob: (() => void) | undefined;
+    const jobGate = new Promise<void>((resolve) => {
+      releaseJob = resolve;
+    });
+    hub.modelInfoUsesFetch = true;
+    const inner = makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 });
+    let jobAsked = false;
+    const gated: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('/api/models/') && !jobAsked) {
+        jobAsked = true;
+        await jobGate;
+      }
+      return inner(input, init);
+    };
+    const m = new DownloadManager({ modelsDir, cacheDir, fetchImpl: gated });
+
+    hub.sha = SHA_OLD;
+    const events: DownloadEvent[] = [];
+    const id = m.start(REPO);
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => jobAsked);
+
+    // Upstream advances, and a whole sweep asks, answers and COMMITS while the
+    // job's own read is still out.
+    hub.sha = SHA_NEW;
+    expect((await m.checkCatalogUpdates(1000)).get(REPO)).toBe(SHA_NEW);
+
+    releaseJob!();
+    await waitFor(() => events.some((event) => event.type === 'done'));
+
+    // Inside the success TTL, so this reads the committed map back — the same
+    // map the post-download refresh gets, and the one the card compares against.
+    expect((await m.checkCatalogUpdates(1000 + 60_000)).get(REPO)).toBe(SHA_NEW);
+  });
+
   it('serves one sweep to every check that overlaps it', async () => {
     // Nothing serialises these calls: the RPC host fires each frame off with
     // `void Promise.resolve().then(...)`, and `useJson`'s `reload()` starts a
