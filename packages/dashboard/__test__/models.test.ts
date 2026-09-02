@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import { type CatalogItem, catalogSlug, catalogWithState } from '../src/catalog.js';
@@ -633,6 +633,26 @@ describe('catalogWithState — a recommended model is identified by download pro
     expect(item.present).toBe(true);
     expect(item.installed).toBe(false);
     expect(item.localRevision).toBeNull();
+  });
+
+  it("does NOT mark present for the OTHER platform's build of the same model", () => {
+    // Regression: the catalog recommended the nvfp4 builds to EVERY platform
+    // before it became platform-conditional, so an existing macOS install is
+    // exactly the CUDA alias. Counting it renders the card "Installed" with
+    // `installed` false — no Install button and no update affordance — which
+    // permanently strands the users this change exists to move onto the
+    // Metal-native build.
+    const mine = catalogRepo(RECOMMENDED);
+    const other = mine === RECOMMENDED.hfRepo ? RECOMMENDED.hfRepoCuda : RECOMMENDED.hfRepo;
+    expect(other, 'the default entry must carry both platform builds').toBeDefined();
+    expect(other).not.toBe(mine);
+    writeModel(modelsDir, 'other-platform-build', QWEN_27B_MXFP4, 2048);
+    writeCompletion('other-platform-build', other!);
+    const item = catalogItem(RECOMMENDED.label);
+    expect(item.present).toBe(false);
+    expect(item.installed).toBe(false);
+    // And the card therefore still offers the install rather than a dead button.
+    expect(item.blockedByForeignDir).toBe(false);
   });
 
   it('does NOT mark present when the marker survived but the checkpoint did not', () => {

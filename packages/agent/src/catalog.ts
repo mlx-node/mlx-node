@@ -126,13 +126,6 @@ export function catalogRepo(entry: CatalogEntry): string {
   return process.platform === 'linux' && entry.hfRepoCuda !== undefined ? entry.hfRepoCuda : entry.hfRepo;
 }
 
-/** Every repo `entry` may occupy on ANY platform, lowercased. */
-export function catalogRepoAliases(entry: CatalogEntry): string[] {
-  const repos = [entry.hfRepo];
-  if (entry.hfRepoCuda !== undefined) repos.push(entry.hfRepoCuda);
-  return repos.map((repo) => repo.toLowerCase());
-}
-
 /** Catalog entries the wizard offers (hidden entries filtered out). */
 export function visibleCatalog(): CatalogEntry[] {
   return MODEL_CATALOG.filter((entry) => !entry.hidden);

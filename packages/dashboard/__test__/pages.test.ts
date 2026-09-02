@@ -1357,6 +1357,37 @@ describe('Models page — the Install affordance', () => {
     expect(dismissed(calls)).toEqual(['job-done']);
   });
 
+  it('reloads the update check when a job settles, so it stops re-offering Update', async () => {
+    // Regression: `/catalog/updates` is a SEPARATE request, so it held the
+    // pre-download verdict. Once the job cleared, the card re-offered "Update
+    // available" for the revision just installed, and every click started
+    // another job. The reconcile effect must refresh it alongside the catalog.
+    const stale = catalogRoutes(
+      { present: true, installed: true, localRevision: 'a'.repeat(40) },
+      [downloadJob({ id: 'job-upd', state: 'done' })],
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: true }] },
+    );
+    const fresh = catalogRoutes(
+      { present: true, installed: true, localRevision: 'b'.repeat(40) },
+      [downloadJob({ id: 'job-upd', state: 'done' })],
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: false }] },
+    );
+    const calls = recordRequests({
+      ...stale,
+      '/catalog': sequence(stale['/catalog'], fresh['/catalog']),
+      '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+      '/models': sequence(stale['/models'], fresh['/models']),
+      '/downloads/job-upd': { cancelled: true, id: 'job-upd' },
+    });
+    await mountModels();
+    // Settled on the newly installed revision: Installed, not a fresh Update.
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
+    // Refetched exactly once, in step with the catalog it is compared against.
+    expect(gets(calls, '/api/catalog/updates')).toBe(2);
+    expect(gets(calls, '/api/catalog')).toBe(2);
+  });
+
   it('reloads after a FAILED job too — a failure can still leave the model installed', async () => {
     // Why the reload is not gated on `done`. `publish()` renames staging into the
     // final dir and only THEN removes the backup, and that `rm` runs inside the

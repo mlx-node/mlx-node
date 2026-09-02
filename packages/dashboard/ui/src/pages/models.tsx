@@ -195,6 +195,7 @@ export default function Models() {
   // stable for the life of the hook and the deps array stays honest.
   const { reload: reloadModels } = models;
   const { reload: reloadCatalog } = catalog;
+  const { reload: reloadUpdates } = updates;
 
   useEffect(() => {
     const snapshot = downloads.data;
@@ -271,8 +272,12 @@ export default function Models() {
     if (settled) {
       reloadModels();
       reloadCatalog();
+      // The update comparison predates the publish too, and it is the one
+      // snapshot that would otherwise keep re-offering "Update available" for
+      // the revision this job just installed.
+      reloadUpdates();
     }
-  }, [downloads.data, connection, reloadModels, reloadCatalog]);
+  }, [downloads.data, connection, reloadModels, reloadCatalog, reloadUpdates]);
 
   const install = async (repo: string): Promise<void> => {
     const startedConnection = connection;
@@ -309,6 +314,13 @@ export default function Models() {
     }
     models.reload();
     catalog.reload();
+    // The update comparison is a SEPARATE request, so it holds the pre-download
+    // verdict until told otherwise. Without this the card re-offers "Update
+    // available" the moment the job clears, and every click starts a fresh job
+    // for the revision just installed. The server re-reads the local marker per
+    // request (only the remote sha map is cached), so this reload is both
+    // correct and free of a new network call.
+    updates.reload();
   };
 
   const onDownloadError = (repo: string, message: string): void => {
@@ -377,6 +389,7 @@ export default function Models() {
       setPendingDelete(null);
       models.reload();
       catalog.reload();
+      updates.reload();
     } catch (err) {
       toast.error('Failed to delete model', { description: errMessage(err) });
     } finally {

@@ -9,7 +9,7 @@
 import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
-import { type CatalogEntry, catalogRepo, catalogRepoAliases, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { type CatalogEntry, catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 
 import { isDownloaderOwned, isModelInstalled, isModelPresent, isPathOccupied, readCompletion } from './models.js';
 
@@ -128,10 +128,16 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
     const slug = catalogSlug(entry);
     const dir = join(modelsDir, slug);
     // `present` is true for a loadable checkpoint at the canonical slug OR under any
-    // folder name whose completion marker names this entry's repo. The marker may
-    // name EITHER platform's build: a models dir shared between an Apple Silicon and
-    // a CUDA machine holds both, and either one is this model being present.
-    const present = isModelPresent(dir) || catalogRepoAliases(entry).some((repo) => downloaded.has(repo));
+    // folder name whose completion marker names THIS PLATFORM's repo.
+    //
+    // Matching the other platform's build too would be actively harmful, and not
+    // hypothetically: the catalog recommended the nvfp4 builds to every platform
+    // before this became platform-conditional, so an existing macOS install of
+    // e.g. `Qwen-AgentWorld-35B-A3B-nvfp4-mlx` is exactly the CUDA alias. Counting
+    // it would render the card "Installed" with `installed` false — no Install
+    // button, and no update affordance either — permanently stranding the very
+    // users this change exists to move onto the Metal-native mxfp4 build.
+    const present = isModelPresent(dir) || downloaded.has(catalogRepo(entry).toLowerCase());
     // Exactly the state the download runner's ownership preflight refuses, computed
     // with the SAME no-follow predicates it uses so the two cannot disagree.
     const blockedByForeignDir = !present && isPathOccupied(dir) && !isDownloaderOwned(dir);
