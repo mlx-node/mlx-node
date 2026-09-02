@@ -484,7 +484,10 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
     });
 
-    expect(() => manager.start(hidden!.hfRepo)).toThrow(/not in the model catalog/);
+    // Through the resolver, mirroring the allowlist. Hidden entries carry no
+    // CUDA build today, so this is the same string — but a raw `hfRepo` here
+    // would silently start testing the wrong thing the day one does.
+    expect(() => manager.start(catalogRepo(hidden!))).toThrow(/not in the model catalog/);
     // Rejected BEFORE any job is allocated — otherwise the SPA renders a job
     // that marches to a 401 instead of an immediate, actionable error.
     expect(manager.jobs()).toEqual([]);
