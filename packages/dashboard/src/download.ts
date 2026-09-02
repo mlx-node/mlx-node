@@ -704,8 +704,12 @@ export class DownloadManager {
           }
         }),
     );
-    const allFailed = shas.size > 0 && [...shas.values()].every((sha) => sha === null);
-    this.catalogShaCache = { at: now, shas, ttlMs: allFailed ? CATALOG_SHA_NEGATIVE_TTL_MS : CATALOG_SHA_TTL_MS };
+    // ANY unresolved repo takes the short TTL, not only an all-failed sweep. The
+    // cache is one entry for the whole sweep, so a single transient failure
+    // alongside successes would otherwise pin that repo's `null` for the full
+    // six hours — no mount or reconnect in that window could surface its update.
+    const anyFailed = [...shas.values()].some((sha) => sha === null);
+    this.catalogShaCache = { at: now, shas, ttlMs: anyFailed ? CATALOG_SHA_NEGATIVE_TTL_MS : CATALOG_SHA_TTL_MS };
     return shas;
   }
 

@@ -132,7 +132,19 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
  * installs the macOS build on a CUDA box.
  */
 export function catalogRepo(entry: CatalogEntry): string {
-  return process.platform === 'linux' && entry.hfRepoCuda !== undefined ? entry.hfRepoCuda : entry.hfRepo;
+  return catalogRepoFor(entry, process.platform);
+}
+
+/**
+ * {@link catalogRepo} with the platform passed in — the pure half.
+ *
+ * Exists so both branches can be asserted without touching `process.platform`.
+ * Mutating that global leaks across test files sharing a worker: it made
+ * `catalogRepo` disagree with a sibling suite's module-level constant and fail
+ * a download allowlist check that has nothing to do with the catalog.
+ */
+export function catalogRepoFor(entry: CatalogEntry, platform: NodeJS.Platform): string {
+  return platform === 'linux' && entry.hfRepoCuda !== undefined ? entry.hfRepoCuda : entry.hfRepo;
 }
 
 /** Catalog entries the wizard offers (hidden entries filtered out). */

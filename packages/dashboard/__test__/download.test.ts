@@ -65,6 +65,8 @@ const hub = vi.hoisted(() => ({
   modelInfoRepos: [] as string[],
   /** When set, every `modelInfo` call throws it — the offline case. */
   modelInfoError: null as string | null,
+  /** Repos whose `modelInfo` throws, for a PARTIALLY failed sweep. */
+  modelInfoFailRepos: [] as string[],
   /** Paths whose `downloadFileToCacheDir` should throw, to simulate a mid-job failure. */
   failOn: [] as string[],
   /** Overrides the thrown message, so a remote-sized error body can be simulated. */
@@ -134,6 +136,9 @@ vi.mock('@huggingface/hub', () => ({
   modelInfo: async (params: { name?: string; revision?: string }) => {
     if (params.name !== undefined) hub.modelInfoRepos.push(params.name);
     if (hub.modelInfoError !== null) throw new Error(hub.modelInfoError);
+    if (params.name !== undefined && hub.modelInfoFailRepos.includes(params.name)) {
+      throw new Error(`simulated modelInfo failure for ${params.name}`);
+    }
     if (params.revision !== undefined) hub.revisions.push(params.revision);
     return { sha: hub.sha };
   },
@@ -314,6 +319,7 @@ beforeEach(() => {
   stagingHook.onVerifyWindow = null;
   hub.modelInfoRepos = [];
   hub.modelInfoError = null;
+  hub.modelInfoFailRepos = [];
   modelsDir = mkdtempSync(join(tmpdir(), 'dash-dl-models-'));
   cacheDir = mkdtempSync(join(tmpdir(), 'dash-dl-cache-'));
 });
@@ -370,6 +376,24 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     await m.checkCatalogUpdates(1000 + 61_000);
     expect(hub.modelInfoRepos.length).toBeGreaterThan(afterFirst);
     expect((await m.checkCatalogUpdates(1000 + 61_000)).get(REPO)).toBe(hub.sha);
+  });
+
+  it('takes the short TTL when ANY repo failed, not only when all did', async () => {
+    // One cache entry covers the whole sweep, so a single transient failure
+    // beside successes would otherwise pin that repo's `null` for six hours —
+    // no mount or reconnect in that window could surface its update.
+    hub.modelInfoFailRepos = [REPO_OTHER];
+    const m = manager();
+    const first = await m.checkCatalogUpdates(1000);
+    expect(first.get(REPO)).toBe(hub.sha);
+    expect(first.get(REPO_OTHER)).toBeNull();
+    const afterFirst = hub.modelInfoRepos.length;
+
+    // Inside the SUCCESS TTL but past the negative one: must re-dial.
+    hub.modelInfoFailRepos = [];
+    const second = await m.checkCatalogUpdates(1000 + 61_000);
+    expect(hub.modelInfoRepos.length).toBeGreaterThan(afterFirst);
+    expect(second.get(REPO_OTHER)).toBe(hub.sha);
   });
 
   it("folds a job's freshly resolved revision into the cache", async () => {

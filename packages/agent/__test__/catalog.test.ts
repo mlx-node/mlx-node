@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { catalogRepo, MODEL_CATALOG, visibleCatalog } from '../src/catalog.js';
+import { catalogRepo, catalogRepoFor, MODEL_CATALOG, visibleCatalog } from '../src/catalog.js';
 
 describe('MODEL_CATALOG', () => {
   it('is non-empty', () => {
@@ -21,21 +21,18 @@ describe('MODEL_CATALOG', () => {
     // marker naming `hfRepo` instead of the resolved repo.
     const withCuda = MODEL_CATALOG.find((entry) => entry.hfRepoCuda !== undefined);
     expect(withCuda, 'at least one entry must carry a CUDA build').toBeDefined();
-    const original = process.platform;
-    try {
-      Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
-      expect(catalogRepo(withCuda!)).toBe(withCuda!.hfRepoCuda);
-      Object.defineProperty(process, 'platform', { value: 'darwin', configurable: true });
-      expect(catalogRepo(withCuda!)).toBe(withCuda!.hfRepo);
-      // An entry with no CUDA build serves both platforms from `hfRepo`.
-      const noCuda = MODEL_CATALOG.find((entry) => entry.hfRepoCuda === undefined);
-      if (noCuda !== undefined) {
-        Object.defineProperty(process, 'platform', { value: 'linux', configurable: true });
-        expect(catalogRepo(noCuda)).toBe(noCuda.hfRepo);
-      }
-    } finally {
-      Object.defineProperty(process, 'platform', { value: original, configurable: true });
+    // Via the pure helper, never by mutating `process.platform`: that global is
+    // shared with every test file on this worker, and stubbing it here made a
+    // sibling suite's download allowlist reject its own module-level repo.
+    expect(catalogRepoFor(withCuda!, 'linux')).toBe(withCuda!.hfRepoCuda);
+    expect(catalogRepoFor(withCuda!, 'darwin')).toBe(withCuda!.hfRepo);
+    // An entry with no CUDA build serves both platforms from `hfRepo`.
+    const noCuda = MODEL_CATALOG.find((entry) => entry.hfRepoCuda === undefined);
+    if (noCuda !== undefined) {
+      expect(catalogRepoFor(noCuda, 'linux')).toBe(noCuda.hfRepo);
     }
+    // And the live resolver agrees with the helper on THIS platform.
+    expect(catalogRepo(withCuda!)).toBe(catalogRepoFor(withCuda!, process.platform));
   });
 
   it('every hfRepo is a Brooooooklyn HF slug', () => {

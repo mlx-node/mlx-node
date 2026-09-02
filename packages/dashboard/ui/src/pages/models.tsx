@@ -682,9 +682,17 @@ function CatalogCard({
   // Gate on `present` (loadable checkpoint on disk), not `installed` (dashboard
   // marker): a model installed via the `mlx download` CLI / wizard is present but
   // unowned, so offering Install would refuse to overwrite it and fail.
-  // `updateAvailable` is part of the gate: an update re-installs a model that is
-  // already `present`, so without it the job would run with no visible progress.
-  const downloading = job !== undefined && (!item.present || updateAvailable);
+  // A live job is sufficient, and is the ONLY safe gate. `active` never holds a
+  // terminal job (the hydration effect skips them), so `job !== undefined` means
+  // a download is genuinely in flight right now.
+  //
+  // It must not be qualified by catalog state. Both earlier forms lost the card:
+  // `!item.present` hid an update, which by definition re-installs something
+  // already present; adding `|| updateAvailable` then hid it again whenever the
+  // update probe was still loading or could not resolve that repo — a remount
+  // mid-update would render "Installed" over a live multi-gigabyte transfer,
+  // with no progress and no Cancel.
+  const downloading = job !== undefined;
 
   return (
     <Card className="gap-4">

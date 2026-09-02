@@ -1357,6 +1357,22 @@ describe('Models page — the Install affordance', () => {
     expect(dismissed(calls)).toEqual(['job-done']);
   });
 
+  it('shows a live update job even when the update probe has not resolved', async () => {
+    // Regression: `downloading` was qualified by catalog state, so a remount
+    // mid-update — with `/catalog/updates` still loading or unable to resolve
+    // this repo — rendered "Installed" over a live multi-gigabyte transfer,
+    // with no progress and no Cancel. A live job must speak for itself.
+    await mount(
+      createElement(Models),
+      catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [downloadJob({})], {
+        items: [],
+      }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Cancel');
+    expect(buttonLabels()).not.toContain('Installed');
+  });
+
   it('reloads the update check when a job settles, so it stops re-offering Update', async () => {
     // Regression: `/catalog/updates` is a SEPARATE request, so it held the
     // pre-download verdict. Once the job cleared, the card re-offered "Update
