@@ -542,7 +542,7 @@ describe('DownloadManager', () => {
     expect(job.receivedBytes).toBe(312);
   });
 
-  it('refuses a hidden catalog entry up front instead of failing mid-download', () => {
+  it('refuses a hidden catalog entry up front instead of failing mid-download', async () => {
     // A `hidden` entry is an UNPUBLISHED repo: it stays in MODEL_CATALOG so a
     // locally converted checkpoint at the canonical slug is still recognized as
     // Installed, but Hugging Face answers 401 for it. Membership alone is
@@ -567,6 +567,12 @@ describe('DownloadManager', () => {
 
     // Non-hidden entries are unaffected.
     expect(() => manager.start(REPO)).not.toThrow();
+    // That last `start` allocated a REAL job whose `drain` runs detached. Without
+    // this the test returns while `processJob` is still writing under `modelsDir`,
+    // and the `afterEach` `rmSync` races it to an intermittent ENOTEMPTY.
+    await manager.shutdown();
+    // Deterministic proof the wait happened: an unawaited job reads `running`.
+    expect(manager.jobs().map((job) => job.state)).toEqual(['cancelled']);
   });
 
   it('pins one resolved commit sha and threads it into every list/download call', async () => {
