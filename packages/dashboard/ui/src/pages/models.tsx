@@ -165,6 +165,24 @@ function LocalModelsSkeletonRows() {
   );
 }
 
+/**
+ * Upstream holds different bytes at this repo than the local install records.
+ *
+ * Joined here rather than served ready-made: `/api/catalog/updates` runs on the
+ * transport thread, which also emits download progress, so it reads the network
+ * only and never walks the models directory.
+ *
+ * Gated on `installed`, never `present`: only a dashboard-owned install at the
+ * canonical slug carries a revision to compare AND can actually be re-installed.
+ * A `null` on either side means staleness is unknowable, never "up to date".
+ */
+function hasUpdate(item: CatalogItem, remoteRevisions: ReadonlyMap<string, string | null>): boolean {
+  const remoteRevision = remoteRevisions.get(item.hfRepo) ?? null;
+  return (
+    item.installed && item.localRevision !== null && remoteRevision !== null && remoteRevision !== item.localRevision
+  );
+}
+
 export default function Models() {
   const models = useJson<ModelsResponse>('/models');
   const catalog = useJson<CatalogResponse>('/catalog');
@@ -315,11 +333,11 @@ export default function Models() {
     models.reload();
     catalog.reload();
     // The update comparison is a SEPARATE request, so it holds the pre-download
-    // verdict until told otherwise. Without this the card re-offers "Update
-    // available" the moment the job clears, and every click starts a fresh job
-    // for the revision just installed. The server re-reads the local marker per
-    // request (only the remote sha map is cached), so this reload is both
-    // correct and free of a new network call.
+    // verdict until told otherwise: the fresh local revision would be compared
+    // against the sha the map held BEFORE the job ran, re-offering "Update
+    // available" for the revision just installed and starting a fresh job on
+    // every click. The job writes its resolved sha straight into the server's
+    // cached map, so this reload costs no new network call.
     updates.reload();
   };
 
@@ -330,6 +348,9 @@ export default function Models() {
     // run inside the job's try — so a failure there reports `error` for a model
     // whose new marker and weights are already on disk. Leaving the previous
     // verdict in place would immediately re-offer "Update available" for it.
+    // BOTH halves: the marker it must be compared against is `/catalog`'s
+    // `localRevision`, so refreshing the remote shas alone repairs nothing.
+    catalog.reload();
     updates.reload();
     const id = active[repo]?.id;
     setActive((prev) => {
@@ -416,10 +437,8 @@ export default function Models() {
   // failure of the POST-DOWNLOAD refresh keep serving the pre-install verdict —
   // re-offering "Update available" for the revision just installed, and
   // admitting repeated no-op jobs until some later probe happens to succeed.
-  const updatable = new Set(
-    updates.error !== undefined
-      ? []
-      : (updates.data?.items ?? []).filter((item) => item.updateAvailable).map((item) => item.hfRepo),
+  const remoteRevisions = new Map<string, string | null>(
+    updates.error !== undefined ? [] : (updates.data?.items ?? []).map((item) => [item.hfRepo, item.remoteRevision]),
   );
 
   return (
@@ -588,7 +607,7 @@ export default function Models() {
             <CatalogCard
               key={item.hfRepo}
               item={item}
-              updateAvailable={updatable.has(item.hfRepo)}
+              updateAvailable={hasUpdate(item, remoteRevisions)}
               job={active[item.hfRepo]}
               onInstall={() => install(item.hfRepo)}
               onDone={() => onDownloadDone(item.hfRepo)}

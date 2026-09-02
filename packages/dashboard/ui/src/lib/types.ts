@@ -63,7 +63,6 @@ export interface CatalogUpdateItem {
   hfRepo: string;
   /** Upstream commit sha, or `null` when Hugging Face could not be reached. */
   remoteRevision: string | null;
-  updateAvailable: boolean;
 }
 
 export interface CatalogUpdatesResponse {

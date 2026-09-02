@@ -1232,7 +1232,7 @@ describe('Models page — the Install affordance', () => {
     await mount(
       createElement(Models),
       catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
-        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: true }],
+        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
       }),
       LABEL,
     );
@@ -1244,7 +1244,29 @@ describe('Models page — the Install affordance', () => {
     await mount(
       createElement(Models),
       catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
-        items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40), updateAvailable: false }],
+        items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40) }],
+      }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
+  });
+
+  it('never offers Update for a checkpoint the dashboard does not own', async () => {
+    // The join is the page's now, so the ownership gate is too: an Update is a
+    // re-install, and the runner's preflight refuses every final dir it does not
+    // own. `present` without `installed` is exactly that dir (an `mlx download`
+    // install, or a dashboard one the user renamed), so the button could only
+    // ever raise a red toast — however stale the bytes are.
+    //
+    // `/catalog` pairs a revision with ownership today, so this pins the gate on
+    // the WIRE shape rather than on that invariant: the two halves of the
+    // comparison arrive from two different requests, and only `installed` says
+    // the stale one can be replaced.
+    await mount(
+      createElement(Models),
+      catalogRoutes({ present: true, installed: false, localRevision: 'a'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
       }),
       LABEL,
     );
@@ -1259,7 +1281,7 @@ describe('Models page — the Install affordance', () => {
     await mount(
       createElement(Models),
       catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
-        items: [{ hfRepo: REPO, remoteRevision: null, updateAvailable: false }],
+        items: [{ hfRepo: REPO, remoteRevision: null }],
       }),
       LABEL,
     );
@@ -1382,7 +1404,7 @@ describe('Models page — the Install affordance', () => {
     const before = catalogRoutes(
       { present: true, installed: true, localRevision: 'a'.repeat(40) },
       [downloadJob({ id: 'job-upd', state: 'done' })],
-      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: true }] },
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
     );
     recordRequests({
       ...before,
@@ -1399,19 +1421,22 @@ describe('Models page — the Install affordance', () => {
     // `error` does not mean nothing was installed: `publish()` renames staging
     // into place and only THEN fsyncs and removes the backup, inside the job's
     // try. A failure there reports `error` for a model already on disk, so the
-    // previous verdict must not survive it.
+    // previous verdict must not survive it. BOTH halves of that verdict have to
+    // move: the freshly installed `localRevision` lives on `/catalog`, and the
+    // sha it is compared against on `/catalog/updates`.
     const failed = vi.spyOn(toast, 'error');
     try {
       const stale = catalogRoutes(
         { present: true, installed: true, localRevision: 'a'.repeat(40) },
         [downloadJob({ id: 'job-run', state: 'running' })],
-        { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: true }] },
+        { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
       );
       const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
-        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: false }],
+        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
       });
       const calls = recordRequests({
         ...stale,
+        '/catalog': sequence(stale['/catalog'], fresh['/catalog']),
         '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
         '/downloads/job-run': { cancelled: true, id: 'job-run' },
       });
@@ -1421,7 +1446,9 @@ describe('Models page — the Install affordance', () => {
       emitDownload('error', { id: 'job-run', message: 'fsync failed after publish' });
       await settle();
       expect(gets(calls, '/api/catalog/updates')).toBe(2);
+      expect(gets(calls, '/api/catalog')).toBe(2);
       expect(buttonLabels()).not.toContain('Update available');
+      expect(buttonLabels()).toContain('Installed');
     } finally {
       failed.mockRestore();
     }
@@ -1435,12 +1462,12 @@ describe('Models page — the Install affordance', () => {
     const stale = catalogRoutes(
       { present: true, installed: true, localRevision: 'a'.repeat(40) },
       [downloadJob({ id: 'job-upd', state: 'done' })],
-      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: true }] },
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
     );
     const fresh = catalogRoutes(
       { present: true, installed: true, localRevision: 'b'.repeat(40) },
       [downloadJob({ id: 'job-upd', state: 'done' })],
-      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: false }] },
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
     );
     const calls = recordRequests({
       ...stale,

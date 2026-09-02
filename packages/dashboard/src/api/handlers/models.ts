@@ -27,7 +27,9 @@ export function handleCatalog(ctx: ApiPaths): unknown {
 }
 
 /**
- * Which installed catalog models have newer bytes upstream.
+ * Upstream commit sha for every visible catalog repo — the remote half of the
+ * staleness check. The comparison against the local marker is the caller's:
+ * `/api/catalog` already carries `installed` and `localRevision`.
  *
  * Split from `/api/catalog` on purpose. That route is synchronous,
  * filesystem-only and offline-safe, and the Models page cannot render without
@@ -36,26 +38,11 @@ export function handleCatalog(ctx: ApiPaths): unknown {
  *
  * Lives on the main thread because that is where the network is (the worker is
  * SQLite plus synchronous FS walks) and because `DownloadManager` already owns
- * the sha resolver and its fetch seam.
+ * the sha resolver and its fetch seam. Touches no filesystem for the same
+ * reason: this thread emits download progress and receives cancels, and a
+ * `catalogWithState` walk of the models directory blocks both.
  */
 export async function handleCatalogUpdates(ctx: MainApiContext): Promise<unknown> {
   const remote = await ctx.downloads.checkCatalogUpdates();
-  const items = catalogWithState(ctx.modelsDir)
-    .filter((item) => !item.hidden)
-    .map((item) => {
-      const remoteRevision = remote.get(item.hfRepo) ?? null;
-      return {
-        hfRepo: item.hfRepo,
-        remoteRevision,
-        // Gated on `installed`, never `present`: only a dashboard-owned install
-        // at the canonical slug carries a revision to compare AND can actually
-        // be re-installed. See `localRevision` on CatalogItem.
-        updateAvailable:
-          item.installed &&
-          item.localRevision !== null &&
-          remoteRevision !== null &&
-          remoteRevision !== item.localRevision,
-      };
-    });
-  return { items };
+  return { items: [...remote].map(([hfRepo, remoteRevision]) => ({ hfRepo, remoteRevision })) };
 }
