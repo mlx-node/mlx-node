@@ -9,18 +9,10 @@
 export interface CatalogEntry {
   /** Wizard display name. */
   label: string;
-  /**
-   * HF slug for `mlx download model` on Apple Silicon — the MXFP4 build.
-   *
-   * Metal's block scaling is MXFP4-shaped: the scale plane must be
-   * `metal_fp8_ue8m0_format` at block 32 (MSL Spec 4.1 Table 2.28). NVFP4's
-   * E4M3 scales at block 16 cannot be declared there, so it decodes through a
-   * dequant path instead of the native one.
-   */
+  /** HF slug for `mlx download model` on Apple Silicon — the MXFP4 build. */
   hfRepo: string;
   /**
-   * HF slug on Linux + NVIDIA CUDA — the NVFP4 build, which is what
-   * `CublasQQMM` consumes natively (`nvfp4` -> `CUDA_R_4F_E2M1`).
+   * HF slug on Linux + NVIDIA CUDA — the NVFP4 build.
    *
    * Absent means the entry has no CUDA-specific build and {@link hfRepo}
    * serves both. Resolve with {@link catalogRepo}, never by reading the field.
@@ -111,12 +103,29 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
 ];
 
 /**
- * The repo THIS platform installs for `entry`.
+ * The repo THIS platform installs for `entry`. Linux is the CUDA preview
+ * target (README "Platform Support"); everything else is Apple Silicon.
  *
- * The quantization format is not a preference, it is a backend fact: Metal
- * expresses MXFP4 natively and cannot express NVFP4 at all, while CUDA's
- * `CublasQQMM` takes NVFP4 directly. Linux is the CUDA preview target
- * (README "Platform Support"); everything else is Apple Silicon.
+ * NOT because Metal cannot run NVFP4 — it can. MLX ships the same 234
+ * quantized Metal kernels for `nvfp4` as for `mxfp4`, NAX variants included,
+ * and only `fp8_e4m3` reconstructs BF16 at load. The MSL 4.1 hardware
+ * block-scale format (`metal_fp8_ue8m0_format`) appears nowhere in MLX's Metal
+ * backend, so it constrains neither format here.
+ *
+ * The split is:
+ * - CUDA takes NVFP4 through `CublasQQMM` (`nvfp4` -> `CUDA_R_4F_E2M1`), a
+ *   native path with no MXFP4 equivalent.
+ * - Metal has no such native-path advantage either way, so prefer the format
+ *   that survives quantization better. NVFP4 stores a block scale as `amax/6`
+ *   in E4M3, and real FFN blocks land in its subnormal band;
+ *   `apply_nvfp4_pow2_lift` repairs that for dense SwiGLU FFNs but SKIPS MoE
+ *   experts by design (`NVFP4_LIFT_MOE_MARKERS`, `crates/mlx-core/src/
+ *   convert.rs`), because the norm there also drives the router and the
+ *   shared-expert gate, neither scale-invariant. Two of the three visible
+ *   entries are MoE. MXFP4's E8M0 block scales have no such failure.
+ *
+ * Unmeasured: whether nvfp4 or mxfp4 decodes faster on Metal. The choice above
+ * is made on quantization quality, not throughput.
  *
  * Every consumer that turns a catalog entry into a download, a slug, or an
  * allowlist check must go through here. Reading `entry.hfRepo` directly

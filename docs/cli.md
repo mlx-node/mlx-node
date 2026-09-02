@@ -644,9 +644,13 @@ When no local model exists, an interactive terminal shows a first-run wizard ove
 
 | Model                 | HuggingFace repo                                 | Size   | Notes                        |
 | --------------------- | ------------------------------------------------ | ------ | ---------------------------- |
-| Qwen3.6-27B (default) | `Brooooooklyn/Qwen3.6-27B-NVFP4-mlx`             | ~22 GB | Best tool use — recommended  |
-| Qwen-AgentWorld-35B   | `Brooooooklyn/Qwen-AgentWorld-35B-A3B-nvfp4-mlx` | ~23 GB | Agent-tuned MoE, fast decode |
-| Gemma-4-26B-A4B       | `Brooooooklyn/Gemma-4-26B-A4B-NVFP4-mlx`         | ~19 GB | MoE, fast decode             |
+| Qwen3.8-27B (default) | `Brooooooklyn/Qwen3.8-27B-MXFP4-mlx`                 | ~23 GB | Best tool use — recommended  |
+| Qwen-AgentWorld-35B   | `Brooooooklyn/Qwen-AgentWorld-35B-A3B-mxfp4-mlx`     | ~23 GB | Agent-tuned MoE, fast decode |
+| Gemma-4-26B-A4B       | `Brooooooklyn/Gemma-4-26B-A4B-Unsloth-MXFP4-mlx`     | ~16 GB | MoE, fast decode             |
+
+The slugs above are what the wizard offers on Apple Silicon. On Linux + NVIDIA
+CUDA it offers the `nvfp4` build of the same model instead — see `catalogRepo`
+in `packages/agent/src/catalog.ts` for why.
 
 A more compact Gemma-4-12B entry (mxfp4 MLP + mxfp8 attention, ~9 GB, for smaller machines) is coming and will appear in the wizard once it is published.
 

@@ -136,7 +136,7 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
     // e.g. `Qwen-AgentWorld-35B-A3B-nvfp4-mlx` is exactly the CUDA alias. Counting
     // it would render the card "Installed" with `installed` false — no Install
     // button, and no update affordance either — permanently stranding the very
-    // users this change exists to move onto the Metal-native mxfp4 build.
+    // users this change exists to move onto the mxfp4 build.
     const present = isModelPresent(dir) || downloaded.has(catalogRepo(entry).toLowerCase());
     // Exactly the state the download runner's ownership preflight refuses, computed
     // with the SAME no-follow predicates it uses so the two cannot disagree.
