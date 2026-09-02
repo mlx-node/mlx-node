@@ -451,6 +451,52 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     expect(shas.get(REPO)).toBe(SHA_NEW);
   });
 
+  it('serves one sweep to every check that overlaps it', async () => {
+    // Nothing serialises these calls: the RPC host fires each frame off with
+    // `void Promise.resolve().then(...)`, and `useJson`'s `reload()` starts a
+    // second request without cancelling the first — which the Models page does
+    // on mount, on reconcile, and at every job settle. Two independent sweeps
+    // both commit unconditionally, so the slower one lands last and pins the
+    // OLDER sha it captured for the full six-hour TTL, with no job in the
+    // interleaving for `jobResolvedShas` to repair it from. Each overlap also
+    // pays a second full fan-out, the very cost the cache exists to avoid.
+    const visible = MODEL_CATALOG.filter((e) => !e.hidden).length;
+    let releaseSweep: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseSweep = resolve;
+    });
+    hub.modelInfoUsesFetch = true;
+    const inner = makeFetchImpl({});
+    let parked = 0;
+    const slow: typeof fetch = async (input, init) => {
+      // Park exactly the first sweep's probes. A second sweep, if one is ever
+      // started, runs unimpeded and commits FIRST — the losing interleaving.
+      if (parked < visible) {
+        parked += 1;
+        await gate;
+      }
+      return inner(input, init);
+    };
+    const m = new DownloadManager({ modelsDir, cacheDir, fetchImpl: slow });
+    hub.sha = SHA_OLD;
+    const first = m.checkCatalogUpdates(1000);
+    await waitFor(() => parked === visible);
+
+    // Upstream advances while that sweep is parked, then a second check arrives.
+    hub.sha = SHA_NEW;
+    const second = m.checkCatalogUpdates(1000);
+    releaseSweep!();
+    const [firstShas, secondShas] = await Promise.all([first, second]);
+
+    // ONE fan-out for both callers, not two.
+    expect(hub.modelInfoRepos).toHaveLength(visible);
+    expect(secondShas).toBe(firstShas);
+    expect(firstShas.get(REPO)).toBe(SHA_OLD);
+    // Well inside the 6h TTL: the cache still holds that same map, so no late
+    // commit rolled it back.
+    expect(await m.checkCatalogUpdates(1000 + 60_000)).toBe(firstShas);
+  });
+
   it('takes the short TTL when ANY repo failed, not only when all did', async () => {
     // One cache entry covers the whole sweep, so a single transient failure
     // beside successes would otherwise pin that repo's `null` for six hours —

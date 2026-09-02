@@ -358,9 +358,18 @@ export class DownloadManager {
   private readonly cacheDir: string;
   /** Memoized catalog shas; see {@link DownloadManager.checkCatalogUpdates}. */
   private catalogShaCache: { at: number; shas: Map<string, string | null>; ttlMs: number } | undefined;
-  /** Sweep counter, so a job can tell whether its write-through predates the sweep now committing. */
+  /**
+   * The sweep in flight, shared by every caller that arrives while it runs.
+   * Two concurrent sweeps each commit unconditionally, so a slow one landing
+   * after a fast one pins the older sha it captured for the whole success TTL —
+   * and with no job in the interleaving, `jobResolvedShas` holds nothing that
+   * could repair it. Cleared once the sweep settles, so a failed sweep's short
+   * TTL still buys a genuinely new attempt instead of replaying the failure.
+   */
+  private catalogSweep: Promise<ReadonlyMap<string, string | null>> | undefined;
   /** Deadline for one update probe; overridable so a test need not wait it out. */
   private readonly probeTimeoutMs: number;
+  /** Sweep counter, so a job can tell whether its write-through predates the sweep now committing. */
   private catalogSweepSeq = 0;
   /** Revisions a JOB resolved, tagged with the sweep in flight when it did. */
   private jobResolvedShas = new Map<string, { revision: string; seq: number }>();
@@ -673,16 +682,6 @@ export class DownloadManager {
   }
 
   /**
-   * Resolve the repo's current commit sha so the WHOLE job reads one immutable
-   * snapshot. Threading this same sha to `listFiles` and every
-   * `downloadFileToCacheDir` means a repo update mid-download can never assemble
-   * a mixed-revision checkpoint. The sha must be an immutable 40-hex commit: a
-   * missing sha or a mutable ref (a branch like `main`) is refused, never pinned —
-   * the completion marker's `revision` is trusted downstream as a stable identity,
-   * so a mutable value there would let a later same-shaped fine-tune restore stale
-   * state and would break this job's own mid-download atomicity.
-   */
-  /**
    * Remote commit sha for every VISIBLE catalog repo, for the "update
    * available" check on the Models page.
    *
@@ -705,6 +704,15 @@ export class DownloadManager {
   async checkCatalogUpdates(now: number = Date.now()): Promise<ReadonlyMap<string, string | null>> {
     const cached = this.catalogShaCache;
     if (cached !== undefined && now - cached.at < cached.ttlMs) return cached.shas;
+    if (this.catalogSweep === undefined) {
+      this.catalogSweep = this.sweepCatalogShas(now).finally(() => {
+        this.catalogSweep = undefined;
+      });
+    }
+    return this.catalogSweep;
+  }
+
+  private async sweepCatalogShas(now: number): Promise<ReadonlyMap<string, string | null>> {
     const seq = ++this.catalogSweepSeq;
     // Every probe carries its own deadline. `AbortSignal.any` keeps whatever
     // signal the hub client supplies rather than replacing it.
@@ -746,6 +754,16 @@ export class DownloadManager {
     return shas;
   }
 
+  /**
+   * Resolve the repo's current commit sha so the WHOLE job reads one immutable
+   * snapshot. Threading this same sha to `listFiles` and every
+   * `downloadFileToCacheDir` means a repo update mid-download can never assemble
+   * a mixed-revision checkpoint. The sha must be an immutable 40-hex commit: a
+   * missing sha or a mutable ref (a branch like `main`) is refused, never pinned —
+   * the completion marker's `revision` is trusted downstream as a stable identity,
+   * so a mutable value there would let a later same-shaped fine-tune restore stale
+   * state and would break this job's own mid-download atomicity.
+   */
   private async resolveRevision(repoName: string, fetchImpl: typeof fetch = this.wrappedFetch): Promise<string> {
     const info = await modelInfo({ name: repoName, additionalFields: ['sha'], fetch: fetchImpl });
     const sha: unknown = info.sha;
