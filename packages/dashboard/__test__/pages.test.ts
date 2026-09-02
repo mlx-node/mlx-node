@@ -55,12 +55,13 @@ import { bindEventTargetPort } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
 import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.js';
 import {
+  STUB_FAILURE,
+  TICK_CHAR_PX,
+  TICK_LINE_PX,
   renderPage,
   sequence,
   stubApi,
   stubChartMetrics,
-  TICK_CHAR_PX,
-  TICK_LINE_PX,
   type RenderedPage,
 } from './render.js';
 
@@ -1371,6 +1372,59 @@ describe('Models page — the Install affordance', () => {
     );
     expect(buttonLabels()).toContain('Cancel');
     expect(buttonLabels()).not.toContain('Installed');
+  });
+
+  it('drops a stale update verdict when the post-download refresh FAILS', async () => {
+    // `useJson` keeps its previous `data` when a reload fails and only sets
+    // `error`. Consuming that blindly re-offers "Update available" for the
+    // revision just installed, and admits repeated no-op jobs, until some later
+    // probe happens to succeed.
+    const before = catalogRoutes(
+      { present: true, installed: true, localRevision: 'a'.repeat(40) },
+      [downloadJob({ id: 'job-upd', state: 'done' })],
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: true }] },
+    );
+    recordRequests({
+      ...before,
+      // First read succeeds; the post-download reload fails.
+      '/catalog/updates': sequence(before['/catalog/updates'], STUB_FAILURE),
+      '/downloads/job-upd': { cancelled: true, id: 'job-upd' },
+    });
+    await mountModels();
+    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).toContain('Installed');
+  });
+
+  it('reloads the update check when a job settles as ERROR too', async () => {
+    // `error` does not mean nothing was installed: `publish()` renames staging
+    // into place and only THEN fsyncs and removes the backup, inside the job's
+    // try. A failure there reports `error` for a model already on disk, so the
+    // previous verdict must not survive it.
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      const stale = catalogRoutes(
+        { present: true, installed: true, localRevision: 'a'.repeat(40) },
+        [downloadJob({ id: 'job-run', state: 'running' })],
+        { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: true }] },
+      );
+      const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40), updateAvailable: false }],
+      });
+      const calls = recordRequests({
+        ...stale,
+        '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+        '/downloads/job-run': { cancelled: true, id: 'job-run' },
+      });
+      await mountModels();
+      expect(buttonLabels()).toContain('Cancel');
+
+      emitDownload('error', { id: 'job-run', message: 'fsync failed after publish' });
+      await settle();
+      expect(gets(calls, '/api/catalog/updates')).toBe(2);
+      expect(buttonLabels()).not.toContain('Update available');
+    } finally {
+      failed.mockRestore();
+    }
   });
 
   it('reloads the update check when a job settles, so it stops re-offering Update', async () => {

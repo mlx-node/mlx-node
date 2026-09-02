@@ -47,8 +47,19 @@ import { catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 
 /** How long a resolved set of catalog shas is reused before re-dialling HF. */
 const CATALOG_SHA_TTL_MS = 6 * 60 * 60 * 1000;
-/** Retry window after a sweep where every repo failed (the offline case). */
+/** Retry window after a sweep where any repo failed. */
 const CATALOG_SHA_NEGATIVE_TTL_MS = 60 * 1000;
+/**
+ * Deadline for one update probe.
+ *
+ * Load-bearing, not defensive. Hugging Face connections DO stall rather than
+ * reject — one was observed here holding a socket in CLOSE_WAIT for hours at
+ * zero CPU. Without a deadline the `Promise.all` below never settles, the route
+ * never answers, and the RPC client declares the whole runtime unresponsive
+ * and restarts it, killing any download in flight. A probe must degrade to
+ * `null`, never hang the process that serves it.
+ */
+const CATALOG_SHA_PROBE_TIMEOUT_MS = 15 * 1000;
 
 import {
   type DownloadCompletion,
@@ -347,6 +358,12 @@ export class DownloadManager {
   private readonly cacheDir: string;
   /** Memoized catalog shas; see {@link DownloadManager.checkCatalogUpdates}. */
   private catalogShaCache: { at: number; shas: Map<string, string | null>; ttlMs: number } | undefined;
+  /** Sweep counter, so a job can tell whether its write-through predates the sweep now committing. */
+  /** Deadline for one update probe; overridable so a test need not wait it out. */
+  private readonly probeTimeoutMs: number;
+  private catalogSweepSeq = 0;
+  /** Revisions a JOB resolved, tagged with the sweep in flight when it did. */
+  private jobResolvedShas = new Map<string, { revision: string; seq: number }>();
   private readonly fetchImpl: typeof fetch;
   private readonly wrappedFetch: typeof fetch;
 
@@ -372,10 +389,11 @@ export class DownloadManager {
   private currentJob: JobState | null = null;
   private currentFile: FileContext | null = null;
 
-  constructor(opts: { modelsDir: string; cacheDir?: string; fetchImpl?: typeof fetch }) {
+  constructor(opts: { modelsDir: string; cacheDir?: string; fetchImpl?: typeof fetch; probeTimeoutMs?: number }) {
     this.modelsDir = opts.modelsDir;
     this.cacheDir = opts.cacheDir ?? DEFAULT_CACHE_DIR;
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch;
+    this.probeTimeoutMs = opts.probeTimeoutMs ?? CATALOG_SHA_PROBE_TIMEOUT_MS;
     this.wrappedFetch = this.makeCountingFetch();
     // Each job id can have many subscribers (SSE clients); lift the default cap.
     this.emitter.setMaxListeners(0);
@@ -687,6 +705,15 @@ export class DownloadManager {
   async checkCatalogUpdates(now: number = Date.now()): Promise<ReadonlyMap<string, string | null>> {
     const cached = this.catalogShaCache;
     if (cached !== undefined && now - cached.at < cached.ttlMs) return cached.shas;
+    const seq = ++this.catalogSweepSeq;
+    // Every probe carries its own deadline. `AbortSignal.any` keeps whatever
+    // signal the hub client supplies rather than replacing it.
+    const probeFetch: typeof fetch = (input, init) => {
+      const deadline = AbortSignal.timeout(this.probeTimeoutMs);
+      const existing = init?.signal ?? undefined;
+      const signal = existing !== undefined ? AbortSignal.any([existing, deadline]) : deadline;
+      return this.fetchImpl(input, { ...init, signal });
+    };
     const shas = new Map<string, string | null>();
     await Promise.all(
       MODEL_CATALOG.filter((entry) => !entry.hidden)
@@ -698,7 +725,7 @@ export class DownloadManager {
             // downloads would inflate that file's progress past its own total;
             // it also threads the active job's abort signal, which would make a
             // user's cancel kill an unrelated update check.
-            shas.set(repo, await this.resolveRevision(repo, this.fetchImpl));
+            shas.set(repo, await this.resolveRevision(repo, probeFetch));
           } catch {
             shas.set(repo, null);
           }
@@ -708,6 +735,12 @@ export class DownloadManager {
     // cache is one entry for the whole sweep, so a single transient failure
     // alongside successes would otherwise pin that repo's `null` for the full
     // six hours — no mount or reconnect in that window could surface its update.
+    // A job that installed a revision WHILE this sweep ran has the newer read:
+    // the sweep may have captured its repo early, then waited on another. Since
+    // the whole map is replaced below, that job's write-through would be lost.
+    for (const [repo, resolved] of this.jobResolvedShas) {
+      if (resolved.seq >= seq && shas.has(repo)) shas.set(repo, resolved.revision);
+    }
     const anyFailed = [...shas.values()].some((sha) => sha === null);
     this.catalogShaCache = { at: now, shas, ttlMs: anyFailed ? CATALOG_SHA_NEGATIVE_TTL_MS : CATALOG_SHA_TTL_MS };
     return shas;
@@ -794,6 +827,7 @@ export class DownloadManager {
       // Without it a sweep cached before upstream advanced keeps serving the
       // older sha for up to its full TTL, so the card re-offers an update for a
       // revision already installed and every click completes as a no-op.
+      this.jobResolvedShas.set(job.repo, { revision, seq: this.catalogSweepSeq });
       this.catalogShaCache?.shas.set(job.repo, revision);
 
       // Job-private staging: keyed by the IMMUTABLE revision (a different

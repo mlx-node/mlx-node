@@ -325,6 +325,12 @@ export default function Models() {
 
   const onDownloadError = (repo: string, message: string): void => {
     toast.error('Download failed', { description: message });
+    // `error` does not mean nothing was installed. `publish()` renames staging
+    // into the final dir and only THEN fsyncs and removes the backup, and those
+    // run inside the job's try — so a failure there reports `error` for a model
+    // whose new marker and weights are already on disk. Leaving the previous
+    // verdict in place would immediately re-offer "Update available" for it.
+    updates.reload();
     const id = active[repo]?.id;
     setActive((prev) => {
       const next = { ...prev };
@@ -404,8 +410,16 @@ export default function Models() {
   const catalogItems = (catalog.data?.items ?? []).filter((item) => !item.hidden);
   // Empty whenever the update check failed or has not resolved yet, which is the
   // correct default: no badge, cards render exactly as they did before.
+  //
+  // `updates.error` is part of that gate. `useJson` deliberately keeps the last
+  // `data` when a reload fails, so consuming it blindly would let a transient
+  // failure of the POST-DOWNLOAD refresh keep serving the pre-install verdict —
+  // re-offering "Update available" for the revision just installed, and
+  // admitting repeated no-op jobs until some later probe happens to succeed.
   const updatable = new Set(
-    (updates.data?.items ?? []).filter((item) => item.updateAvailable).map((item) => item.hfRepo),
+    updates.error !== undefined
+      ? []
+      : (updates.data?.items ?? []).filter((item) => item.updateAvailable).map((item) => item.hfRepo),
   );
 
   return (

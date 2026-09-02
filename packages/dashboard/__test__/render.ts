@@ -48,6 +48,15 @@ export type ApiStub = Record<string, unknown>;
 
 /** Brand for a route whose body CHANGES between calls; see {@link sequence}. */
 const SEQUENCE = Symbol('api-stub-sequence');
+/**
+ * Sequence element that makes the stub answer a FAILURE for that call.
+ *
+ * `useJson` keeps its previous `data` when a reload fails and only sets
+ * `error`, so "first call succeeds, reload fails" is the ONLY way to reach the
+ * data-and-error state a page must branch on. Without this the stub could
+ * model an always-failing route but never a route that goes bad.
+ */
+export const STUB_FAILURE = Symbol('api-stub-failure');
 
 /**
  * A route body that differs per request: `bodies[n]` answers the n-th call and
@@ -120,7 +129,9 @@ export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): () => vo
         options.onCall?.(call);
         const path = call.path.split('?')[0].replace(/^\/api/, '');
         if (!Object.hasOwn(routes, path)) return Promise.resolve(failure('E_NOT_FOUND', `no stub for ${path}`));
-        return Promise.resolve({ ok: true as const, status: 200, body: bodyFor(path) });
+        const body = bodyFor(path);
+        if (body === STUB_FAILURE) return Promise.resolve(failure('E_UNAVAILABLE', `stubbed failure for ${path}`));
+        return Promise.resolve({ ok: true as const, status: 200, body });
       },
       subscribe: options.subscribe ?? (() => () => {}),
     },

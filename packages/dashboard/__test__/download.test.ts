@@ -67,6 +67,14 @@ const hub = vi.hoisted(() => ({
   modelInfoError: null as string | null,
   /** Repos whose `modelInfo` throws, for a PARTIALLY failed sweep. */
   modelInfoFailRepos: [] as string[],
+  /**
+   * Make `modelInfo` actually CALL the fetch it is handed.
+   *
+   * Off by default so existing tests keep their cheap stub. The probe's
+   * deadline and its abort signal live in that fetch, so they are unreachable
+   * — and untestable — unless the mock exercises it.
+   */
+  modelInfoUsesFetch: false,
   /** Paths whose `downloadFileToCacheDir` should throw, to simulate a mid-job failure. */
   failOn: [] as string[],
   /** Overrides the thrown message, so a remote-sized error body can be simulated. */
@@ -133,14 +141,22 @@ vi.mock('node:fs/promises', async (importActual) => {
 });
 
 vi.mock('@huggingface/hub', () => ({
-  modelInfo: async (params: { name?: string; revision?: string }) => {
+  modelInfo: async (params: { name?: string; revision?: string; fetch?: typeof fetch }) => {
     if (params.name !== undefined) hub.modelInfoRepos.push(params.name);
     if (hub.modelInfoError !== null) throw new Error(hub.modelInfoError);
     if (params.name !== undefined && hub.modelInfoFailRepos.includes(params.name)) {
       throw new Error(`simulated modelInfo failure for ${params.name}`);
     }
+    // Snapshot BEFORE any await, the way a real server answers with the sha as
+    // of the request. Reading it afterwards would let a parked call return a
+    // value written while it waited — which silently made the sweep-race test
+    // tautological, passing with the fix removed.
+    const sha = hub.sha;
+    if (hub.modelInfoUsesFetch && params.fetch !== undefined) {
+      await params.fetch(`https://huggingface.co/api/models/${params.name ?? 'x'}`);
+    }
     if (params.revision !== undefined) hub.revisions.push(params.revision);
-    return { sha: hub.sha };
+    return { sha };
   },
   listFiles: async function* (params: { revision?: string }) {
     if (params.revision !== undefined) hub.revisions.push(params.revision);
@@ -320,6 +336,7 @@ beforeEach(() => {
   hub.modelInfoRepos = [];
   hub.modelInfoError = null;
   hub.modelInfoFailRepos = [];
+  hub.modelInfoUsesFetch = false;
   modelsDir = mkdtempSync(join(tmpdir(), 'dash-dl-models-'));
   cacheDir = mkdtempSync(join(tmpdir(), 'dash-dl-cache-'));
 });
@@ -376,6 +393,62 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     await m.checkCatalogUpdates(1000 + 61_000);
     expect(hub.modelInfoRepos.length).toBeGreaterThan(afterFirst);
     expect((await m.checkCatalogUpdates(1000 + 61_000)).get(REPO)).toBe(hub.sha);
+  });
+
+  it('degrades a STALLED probe to null instead of hanging the route', async () => {
+    // The failure mode this guards is not hypothetical: an HF socket was seen
+    // here sitting in CLOSE_WAIT for hours at zero CPU. Unbounded, the
+    // `Promise.all` never settles, the route never answers, and the RPC client
+    // declares the whole runtime unresponsive and restarts it — killing any
+    // download in flight.
+    hub.modelInfoUsesFetch = true;
+    const hang: typeof fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      });
+    const m = new DownloadManager({ modelsDir, cacheDir, fetchImpl: hang, probeTimeoutMs: 50 });
+    const shas = await m.checkCatalogUpdates();
+    expect(shas.size).toBeGreaterThan(0);
+    expect([...shas.values()].every((sha) => sha === null)).toBe(true);
+  });
+
+  it('keeps a job-resolved revision that landed while a sweep was in flight', async () => {
+    // The sweep replaces the WHOLE cache map when it commits. A job that
+    // resolved and installed a newer sha mid-sweep would have its write-through
+    // clobbered by the older value the sweep captured, so the card would
+    // re-offer an update for the revision just installed.
+    let releaseSweep: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseSweep = resolve;
+    });
+    hub.modelInfoUsesFetch = true;
+    const inner = makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 });
+    let parked = false;
+    const slow: typeof fetch = async (input, init) => {
+      // Park the sweep's FIRST request only; everything the job does afterwards
+      // proceeds normally, so this is the real write-through path, not a stub.
+      if (!parked) {
+        parked = true;
+        await gate;
+      }
+      return inner(input, init);
+    };
+    const m = new DownloadManager({ modelsDir, cacheDir, fetchImpl: slow });
+    hub.sha = SHA_OLD;
+    const sweep = m.checkCatalogUpdates(1000);
+    await waitFor(() => parked);
+
+    // With that sweep parked mid-flight, a real job resolves and installs NEW.
+    hub.sha = SHA_NEW;
+    const events: DownloadEvent[] = [];
+    const id = m.start(REPO);
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done'));
+
+    releaseSweep!();
+    const shas = await sweep;
+    // The sweep captured SHA_OLD for this repo; the job's newer read must win.
+    expect(shas.get(REPO)).toBe(SHA_NEW);
   });
 
   it('takes the short TTL when ANY repo failed, not only when all did', async () => {
