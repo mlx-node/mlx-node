@@ -693,7 +693,12 @@ export class DownloadManager {
         .map((entry) => catalogRepo(entry))
         .map(async (repo) => {
           try {
-            shas.set(repo, await this.resolveRevision(repo));
+            // RAW fetch, never `wrappedFetch`. That wrapper attributes every
+            // response body to `currentFile`, so a probe running while a model
+            // downloads would inflate that file's progress past its own total;
+            // it also threads the active job's abort signal, which would make a
+            // user's cancel kill an unrelated update check.
+            shas.set(repo, await this.resolveRevision(repo, this.fetchImpl));
           } catch {
             shas.set(repo, null);
           }
@@ -704,8 +709,8 @@ export class DownloadManager {
     return shas;
   }
 
-  private async resolveRevision(repoName: string): Promise<string> {
-    const info = await modelInfo({ name: repoName, additionalFields: ['sha'], fetch: this.wrappedFetch });
+  private async resolveRevision(repoName: string, fetchImpl: typeof fetch = this.wrappedFetch): Promise<string> {
+    const info = await modelInfo({ name: repoName, additionalFields: ['sha'], fetch: fetchImpl });
     const sha: unknown = info.sha;
     if (!(typeof sha === 'string' && /^[0-9a-f]{40}$/i.test(sha))) {
       throw new Error(`Cannot resolve an immutable commit for "${repoName}"; refusing to pin to a mutable ref`);
@@ -781,6 +786,12 @@ export class DownloadManager {
       refuseIfUnownedFinal();
 
       const revision = await this.resolveRevision(job.repo);
+      // This IS a fresh upstream read, so fold it into the update-check cache.
+      // Without it a sweep cached before upstream advanced keeps serving the
+      // older sha for up to its full TTL, so the card re-offers an update for a
+      // revision already installed and every click completes as a no-op.
+      this.catalogShaCache?.shas.set(job.repo, revision);
+
       // Job-private staging: keyed by the IMMUTABLE revision (a different
       // revision never reuses another's staged bytes) and unique per invocation
       // (`.<pid>.<uuid>`) so no two processes ever write into the same tree.

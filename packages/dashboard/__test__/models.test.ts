@@ -542,6 +542,12 @@ describe('defaultModelsDir', () => {
 /** The default recommendation (Qwen3.8-27B) and the folder a download lands in. */
 const RECOMMENDED = MODEL_CATALOG[0]!;
 const RECOMMENDED_SLUG = catalogSlug(RECOMMENDED);
+/**
+ * The repo THIS platform installs. `catalogWithState` matches provenance
+ * against `catalogRepo(entry)`, so a marker written with the raw `hfRepo`
+ * names the macOS build and silently fails every one of these tests on Linux.
+ */
+const RECOMMENDED_REPO = catalogRepo(RECOMMENDED);
 
 /** The catalog row for `label`, from a fresh scan of the temp models dir. */
 function catalogItem(label: string): CatalogItem {
@@ -582,7 +588,7 @@ describe('catalogWithState — a recommended model is identified by download pro
     // dashboard install the user renamed is still recognized, because the marker
     // pins WHICH repo those bytes came from.
     writeModel(modelsDir, 'renamed-by-hand', QWEN_27B_MXFP4, 2048);
-    writeCompletion('renamed-by-hand', RECOMMENDED.hfRepo);
+    writeCompletion('renamed-by-hand', RECOMMENDED_REPO);
     expect(catalogItem(RECOMMENDED.label).present).toBe(true);
   });
 
@@ -608,7 +614,7 @@ describe('catalogWithState — a recommended model is identified by download pro
     // The read half of the update check: a re-upload lands new bytes at the SAME
     // repo id, so only this recorded sha can tell the user their copy is stale.
     writeModel(modelsDir, RECOMMENDED_SLUG, QWEN_27B_MXFP4, 2048);
-    writeCompletion(RECOMMENDED_SLUG, RECOMMENDED.hfRepo);
+    writeCompletion(RECOMMENDED_SLUG, RECOMMENDED_REPO);
     const item = catalogItem(RECOMMENDED.label);
     expect(item.installed).toBe(true);
     expect(item.localRevision).toBe('a'.repeat(40));
@@ -628,7 +634,7 @@ describe('catalogWithState — a recommended model is identified by download pro
     // is false, and the runner would refuse to re-install over the unowned
     // canonical slug — so an update affordance here could only ever fail.
     writeModel(modelsDir, 'renamed-by-hand', QWEN_27B_MXFP4, 2048);
-    writeCompletion('renamed-by-hand', RECOMMENDED.hfRepo);
+    writeCompletion('renamed-by-hand', RECOMMENDED_REPO);
     const item = catalogItem(RECOMMENDED.label);
     expect(item.present).toBe(true);
     expect(item.installed).toBe(false);
@@ -658,7 +664,7 @@ describe('catalogWithState — a recommended model is identified by download pro
   it('does NOT mark present when the marker survived but the checkpoint did not', () => {
     // The marker records what was published, not what is still there: a dir gutted
     // down to its marker is not a loadable checkpoint.
-    writeCompletion('gutted', RECOMMENDED.hfRepo);
+    writeCompletion('gutted', RECOMMENDED_REPO);
     expect(catalogItem(RECOMMENDED.label).present).toBe(false);
   });
 });
@@ -733,7 +739,7 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     const foreign = join(external, DOWNLOAD_COMPLETE_MARKER);
     writeFileSync(
       foreign,
-      JSON.stringify({ repo: RECOMMENDED.hfRepo, revision: 'd'.repeat(40), files: ['config.json'], completedAt: 'x' }),
+      JSON.stringify({ repo: RECOMMENDED_REPO, revision: 'd'.repeat(40), files: ['config.json'], completedAt: 'x' }),
     );
     const victim = join(modelsDir, RECOMMENDED_SLUG);
     mkdirSync(victim, { recursive: true });
@@ -749,7 +755,7 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
   it('leaves an OWNED but incomplete dir installable', () => {
     // Our marker is there, so the preflight permits the owned swap and a reinstall
     // genuinely works — blocking it would remove the one recovery that functions.
-    writeCompletion(RECOMMENDED_SLUG, RECOMMENDED.hfRepo);
+    writeCompletion(RECOMMENDED_SLUG, RECOMMENDED_REPO);
     writeFileSync(join(modelsDir, RECOMMENDED_SLUG, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
     expect(catalogItem(RECOMMENDED.label).present).toBe(false);
     expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(false);

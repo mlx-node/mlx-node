@@ -371,6 +371,34 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     expect(hub.modelInfoRepos.length).toBeGreaterThan(afterFirst);
     expect((await m.checkCatalogUpdates(1000 + 61_000)).get(REPO)).toBe(hub.sha);
   });
+
+  it("folds a job's freshly resolved revision into the cache", async () => {
+    // Upstream can advance between a sweep and the user's click. `processJob`
+    // then installs the NEW sha while the cache still holds the old one, so the
+    // card re-offers an update for the revision just installed and every click
+    // completes as a no-op. The job's own resolve IS a fresh upstream read, so
+    // it is authoritative for that repo.
+    hub.sha = SHA_OLD;
+    const m = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    expect((await m.checkCatalogUpdates(1000)).get(REPO)).toBe(SHA_OLD);
+
+    hub.sha = SHA_NEW;
+    const events: DownloadEvent[] = [];
+    const id = m.start(REPO);
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done'));
+
+    // Well inside the 6h TTL, so this is the CACHE answering — and it must have
+    // been corrected by the job rather than still serving the pre-install sha.
+    const shas = await m.checkCatalogUpdates(1000 + 60_000);
+    expect(shas.get(REPO)).toBe(SHA_NEW);
+    // Untouched repos keep the cached sweep; the job speaks only for its own.
+    expect(shas.get(REPO_OTHER)).toBe(SHA_OLD);
+  });
 });
 
 describe('DownloadManager', () => {
