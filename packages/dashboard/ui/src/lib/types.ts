@@ -46,10 +46,27 @@ export interface CatalogItem {
    * names the blockage rather than offering a button that always errors.
    */
   blockedByForeignDir: boolean;
+  /**
+   * Commit sha the local bytes were pinned to, or `null` when no completion
+   * marker exists to read (hand copy, pre-marker CLI install, renamed dir).
+   * `null` means staleness is unknowable, never "up to date".
+   */
+  localRevision: string | null;
 }
 
 export interface CatalogResponse {
   items: CatalogItem[];
+}
+
+/** One row of `/catalog/updates` — the upstream half of the staleness check. */
+export interface CatalogUpdateItem {
+  hfRepo: string;
+  /** Upstream commit sha, or `null` when Hugging Face could not be reached. */
+  remoteRevision: string | null;
+}
+
+export interface CatalogUpdatesResponse {
+  items: CatalogUpdateItem[];
 }
 
 export interface DownloadJob {

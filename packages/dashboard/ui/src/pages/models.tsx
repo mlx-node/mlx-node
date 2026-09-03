@@ -22,10 +22,11 @@ import type {
   CancelDownloadResponse,
   CatalogItem,
   CatalogResponse,
+  CatalogUpdatesResponse,
   DeleteModelResponse,
   DownloadJob,
-  DownloadsResponse,
   DownloadStartResponse,
+  DownloadsResponse,
   LocalModel,
   ModelsResponse,
 } from '@/lib/types';
@@ -164,11 +165,56 @@ function LocalModelsSkeletonRows() {
   );
 }
 
+/**
+ * Upstream holds different bytes at this repo than the local install records.
+ *
+ * Joined here rather than served ready-made: `/api/catalog/updates` runs on the
+ * transport thread, which also emits download progress, so it reads the network
+ * only and never walks the models directory.
+ *
+ * Gated on `installed`, never `present`: only a dashboard-owned install at the
+ * canonical slug carries a revision to compare AND can actually be re-installed.
+ * A `null` on either side means staleness is unknowable, never "up to date".
+ */
+function hasUpdate(item: CatalogItem, remoteRevisions: ReadonlyMap<string, string | null>): boolean {
+  const remoteRevision = remoteRevisions.get(item.hfRepo) ?? null;
+  return (
+    item.installed && item.localRevision !== null && remoteRevision !== null && remoteRevision !== item.localRevision
+  );
+}
+
 export default function Models() {
   const models = useJson<ModelsResponse>('/models');
   const catalog = useJson<CatalogResponse>('/catalog');
+  // Deliberately a SEPARATE request from `/catalog`: this one dials Hugging Face
+  // and is allowed to fail. Its error is never rendered — a card that cannot
+  // reach the network simply shows no update badge.
+  const updates = useJson<CatalogUpdatesResponse>('/catalog/updates');
   const downloads = useJson<DownloadsResponse>('/downloads');
   const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
+
+  /**
+   * For a repo whose job just settled, the catalog body that was current when it
+   * did. `setActive` clears synchronously while `reload()` only marks the old
+   * body refreshing, so one committed render still carries the pre-download
+   * state — a live Install (or Update available) for work that just finished.
+   * Clicking there is not idempotent: the settled job was already dismissed, so
+   * the server allocates a second one that can only short-circuit to `done`.
+   *
+   * Holding the body rather than a flag is what makes the window self-closing.
+   * `useJson` hands back a newly deserialized object per response, so the
+   * identity no longer matching IS the refreshed catalog arriving; nothing has
+   * to remember to clear it, and a reload that never returns cannot strand it
+   * (a failed one renders the error card in place of the whole grid).
+   */
+  const [settledOn, setSettledOn] = useState<ReadonlyMap<string, unknown>>(() => new Map());
+  /**
+   * The same body, reachable from the reconcile effect below. That effect cannot
+   * depend on `catalog.data`: it calls `reloadCatalog()`, so listing the body it
+   * produces would re-run the effect on arrival and reload forever.
+   */
+  const catalogBody = useRef(catalog.data);
+  catalogBody.current = catalog.data;
 
   const [pendingDelete, setPendingDelete] = useState<LocalModel | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -190,6 +236,7 @@ export default function Models() {
   // stable for the life of the hook and the deps array stays honest.
   const { reload: reloadModels } = models;
   const { reload: reloadCatalog } = catalog;
+  const { reload: reloadUpdates } = updates;
 
   useEffect(() => {
     const snapshot = downloads.data;
@@ -264,10 +311,22 @@ export default function Models() {
     // reports a failed download for a model that is on disk. `recoverBackup`
     // likewise restores a crashed publish before the job can be cancelled.
     if (settled) {
+      // Same window as the live path: `active` never held these jobs (the
+      // hydration above skips terminal ones), so until the reload lands the
+      // stale body offers a live button for work that has already finished.
+      setSettledOn((prev) => {
+        const next = new Map(prev);
+        for (const job of jobs) if (isTerminalJob(job.state)) next.set(job.repo, catalogBody.current);
+        return next;
+      });
       reloadModels();
       reloadCatalog();
+      // The update comparison predates the publish too, and it is the one
+      // snapshot that would otherwise keep re-offering "Update available" for
+      // the revision this job just installed.
+      reloadUpdates();
     }
-  }, [downloads.data, connection, reloadModels, reloadCatalog]);
+  }, [downloads.data, connection, reloadModels, reloadCatalog, reloadUpdates]);
 
   const install = async (repo: string): Promise<void> => {
     const startedConnection = connection;
@@ -302,12 +361,30 @@ export default function Models() {
     if (id !== undefined) {
       void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`).catch(() => {});
     }
+    setSettledOn((prev) => new Map(prev).set(repo, catalog.data));
     models.reload();
     catalog.reload();
+    // The update comparison is a SEPARATE request, so it holds the pre-download
+    // verdict until told otherwise: the fresh local revision would be compared
+    // against the sha the map held BEFORE the job ran, re-offering "Update
+    // available" for the revision just installed and starting a fresh job on
+    // every click. The job writes its resolved sha straight into the server's
+    // cached map, so this reload costs no new network call.
+    updates.reload();
   };
 
   const onDownloadError = (repo: string, message: string): void => {
     toast.error('Download failed', { description: message });
+    // `error` does not mean nothing was installed. `publish()` renames staging
+    // into the final dir and only THEN fsyncs and removes the backup, and those
+    // run inside the job's try — so a failure there reports `error` for a model
+    // whose new marker and weights are already on disk. Leaving the previous
+    // verdict in place would immediately re-offer "Update available" for it.
+    // BOTH halves: the marker it must be compared against is `/catalog`'s
+    // `localRevision`, so refreshing the remote shas alone repairs nothing.
+    setSettledOn((prev) => new Map(prev).set(repo, catalog.data));
+    catalog.reload();
+    updates.reload();
     const id = active[repo]?.id;
     setActive((prev) => {
       const next = { ...prev };
@@ -372,6 +449,7 @@ export default function Models() {
       setPendingDelete(null);
       models.reload();
       catalog.reload();
+      updates.reload();
     } catch (err) {
       toast.error('Failed to delete model', { description: errMessage(err) });
     } finally {
@@ -384,6 +462,17 @@ export default function Models() {
   const modelsDir = models.data?.dir ?? '';
   const totalBytes = localModels.reduce((sum, m) => sum + m.sizeBytes, 0);
   const catalogItems = (catalog.data?.items ?? []).filter((item) => !item.hidden);
+  // Empty whenever the update check failed or has not resolved yet, which is the
+  // correct default: no badge, cards render exactly as they did before.
+  //
+  // `updates.error` is part of that gate. `useJson` deliberately keeps the last
+  // `data` when a reload fails, so consuming it blindly would let a transient
+  // failure of the POST-DOWNLOAD refresh keep serving the pre-install verdict —
+  // re-offering "Update available" for the revision just installed, and
+  // admitting repeated no-op jobs until some later probe happens to succeed.
+  const remoteRevisions = new Map<string, string | null>(
+    updates.error !== undefined ? [] : (updates.data?.items ?? []).map((item) => [item.hfRepo, item.remoteRevision]),
+  );
 
   return (
     <div className="space-y-6">
@@ -551,6 +640,8 @@ export default function Models() {
             <CatalogCard
               key={item.hfRepo}
               item={item}
+              updateAvailable={hasUpdate(item, remoteRevisions)}
+              settling={settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo) === catalog.data}
               job={active[item.hfRepo]}
               onInstall={() => install(item.hfRepo)}
               onDone={() => onDownloadDone(item.hfRepo)}
@@ -635,6 +726,13 @@ function CatalogCardSkeleton() {
 
 interface CatalogCardProps {
   item: CatalogItem;
+  /** Upstream has different bytes at this repo than the local marker records. */
+  updateAvailable: boolean;
+  /**
+   * This repo's job has settled but the catalog body it invalidated has not
+   * arrived, so every field here still describes the state before the download.
+   */
+  settling: boolean;
   job: ActiveJob | undefined;
   onInstall: () => void;
   onDone: () => void;
@@ -643,11 +741,31 @@ interface CatalogCardProps {
   onCancel: (id: string) => void;
 }
 
-function CatalogCard({ item, job, onInstall, onDone, onError, onCancelled, onCancel }: CatalogCardProps) {
+function CatalogCard({
+  item,
+  updateAvailable,
+  settling,
+  job,
+  onInstall,
+  onDone,
+  onError,
+  onCancelled,
+  onCancel,
+}: CatalogCardProps) {
   // Gate on `present` (loadable checkpoint on disk), not `installed` (dashboard
   // marker): a model installed via the `mlx download` CLI / wizard is present but
   // unowned, so offering Install would refuse to overwrite it and fail.
-  const downloading = job !== undefined && !item.present;
+  // A live job is sufficient, and is the ONLY safe gate. `active` never holds a
+  // terminal job (the hydration effect skips them), so `job !== undefined` means
+  // a download is genuinely in flight right now.
+  //
+  // It must not be qualified by catalog state. Both earlier forms lost the card:
+  // `!item.present` hid an update, which by definition re-installs something
+  // already present; adding `|| updateAvailable` then hid it again whenever the
+  // update probe was still loading or could not resolve that repo — a remount
+  // mid-update would render "Installed" over a live multi-gigabyte transfer,
+  // with no progress and no Cancel.
+  const downloading = job !== undefined;
 
   return (
     <Card className="gap-4">
@@ -687,6 +805,14 @@ function CatalogCard({ item, job, onInstall, onDone, onError, onCancelled, onCan
               </Button>
             )}
           </div>
+        ) : item.present && updateAvailable ? (
+          // Same job pipeline as a first install: the runner already re-downloads
+          // whenever the installed marker's revision differs from upstream, and
+          // its owned-swap replaces the stale directory.
+          <Button className="w-full" onClick={onInstall} disabled={settling}>
+            <Download className="size-4" />
+            Update available
+          </Button>
         ) : item.present ? (
           <Button variant="outline" className="w-full" disabled>
             <Check className="size-4" />
@@ -707,7 +833,7 @@ function CatalogCard({ item, job, onInstall, onDone, onError, onCancelled, onCan
             </p>
           </div>
         ) : (
-          <Button className="w-full" onClick={onInstall}>
+          <Button className="w-full" onClick={onInstall} disabled={settling}>
             <Download className="size-4" />
             Install
           </Button>

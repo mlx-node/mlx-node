@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
-import { MODEL_CATALOG, visibleCatalog } from '@mlx-node/agent';
+import { catalogRepo, MODEL_CATALOG, visibleCatalog } from '@mlx-node/agent';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { runFirstRunWizard, type WizardIO } from '../../packages/cli/src/commands/agent/wizard.js';
@@ -66,24 +66,24 @@ describe('runFirstRunWizard', () => {
     const choices = selectCalls[0]!.choices;
 
     const visible = visibleCatalog();
-    expect(choices.map((c) => c.value).sort()).toEqual(visible.map((e) => e.hfRepo).sort());
+    expect(choices.map((c) => c.value).sort()).toEqual(visible.map((e) => catalogRepo(e)).sort());
 
     // Default entry is preselected by coming first.
     const defaultEntry = visible.find((e) => e.isDefault)!;
     expect(defaultEntry).toBeDefined();
-    expect(choices[0]!.value).toBe(defaultEntry.hfRepo);
+    expect(choices[0]!.value).toBe(catalogRepo(defaultEntry));
 
     // Hidden entries are never offered (the catalog must actually carry one
     // for this assertion to mean anything).
     const hidden = MODEL_CATALOG.filter((e) => e.hidden);
     expect(hidden.length).toBeGreaterThan(0);
     for (const entry of hidden) {
-      expect(choices.map((c) => c.value)).not.toContain(entry.hfRepo);
+      expect(choices.map((c) => c.value)).not.toContain(catalogRepo(entry));
     }
 
     // Labels carry size and description.
     for (const entry of visible) {
-      const choice = choices.find((c) => c.value === entry.hfRepo)!;
+      const choice = choices.find((c) => c.value === catalogRepo(entry))!;
       expect(choice.name).toContain(entry.label);
       expect(choice.name).toContain(`(~${entry.sizeGb} GB)`);
       expect(choice.name).toContain(entry.description);
@@ -92,7 +92,7 @@ describe('runFirstRunWizard', () => {
 
   it('passes the chosen repo to download and returns it', async () => {
     const visible = visibleCatalog();
-    const chosen = visible[visible.length - 1]!.hfRepo;
+    const chosen = catalogRepo(visible[visible.length - 1]!);
     const { io } = makeIO({ chosen });
     const { download, calls } = makeDownload();
 
@@ -104,7 +104,7 @@ describe('runFirstRunWizard', () => {
   });
 
   it('pins the download output under modelsDir when provided', async () => {
-    const chosen = visibleCatalog()[0]!.hfRepo;
+    const chosen = catalogRepo(visibleCatalog()[0]!);
     const { io } = makeIO({ chosen });
     const { download, calls } = makeDownload();
 
@@ -127,7 +127,7 @@ describe('runFirstRunWizard', () => {
     } catch (error) {
       const message = (error as Error).message;
       for (const entry of visibleCatalog()) {
-        expect(message).toContain(entry.hfRepo);
+        expect(message).toContain(catalogRepo(entry));
       }
     }
 
@@ -145,8 +145,8 @@ describe('runFirstRunWizard', () => {
     } catch (error) {
       const message = (error as Error).message;
       for (const entry of visibleCatalog()) {
-        const slug = entry.hfRepo.split('/').pop()!.toLowerCase();
-        expect(message).toContain(`mlx download model -m ${entry.hfRepo} -o ${join('/custom/models', slug)}`);
+        const slug = catalogRepo(entry).split('/').pop()!.toLowerCase();
+        expect(message).toContain(`mlx download model -m ${catalogRepo(entry)} -o ${join('/custom/models', slug)}`);
       }
     }
     expect(calls).toHaveLength(0);
@@ -169,14 +169,14 @@ describe('runFirstRunWizard', () => {
     }
 
     for (const entry of visibleCatalog()) {
-      const slug = entry.hfRepo.split('/').pop()!.toLowerCase();
-      const line = message.split('\n').find((l) => l.includes(entry.hfRepo));
+      const slug = catalogRepo(entry).split('/').pop()!.toLowerCase();
+      const line = message.split('\n').find((l) => l.includes(catalogRepo(entry)));
       expect(line).toBeDefined();
       const renderedArgs = line!.trim().replace(/^mlx download model /, '');
       // Round-trip: a real POSIX shell parses the displayed command back
       // into EXACTLY the argv the interactive path would pass — one `-o`
       // word, `$HOME` unexpanded, `;`/`&` inert.
-      expect(shellSplit(renderedArgs)).toEqual(['-m', entry.hfRepo, '-o', join(modelsDir, slug)]);
+      expect(shellSplit(renderedArgs)).toEqual(['-m', catalogRepo(entry), '-o', join(modelsDir, slug)]);
       // Known-correct quoted form: safe words bare, unsafe -o value
       // single-quoted with the embedded quote escaped as '\''.
       expect(line).toContain(`-o '/tmp/My Models/it'\\''s;echo x&$HOME/${slug}'`);
@@ -194,13 +194,13 @@ describe('runFirstRunWizard', () => {
     } catch (error) {
       const message = (error as Error).message;
       const entry = visibleCatalog()[0]!;
-      const slug = entry.hfRepo.split('/').pop()!.toLowerCase();
+      const slug = catalogRepo(entry).split('/').pop()!.toLowerCase();
       // Unchanged readable form for the common case...
-      expect(message).toContain(`mlx download model -m ${entry.hfRepo} -o /custom/models/${slug}`);
+      expect(message).toContain(`mlx download model -m ${catalogRepo(entry)} -o /custom/models/${slug}`);
       // ...and it still parses back to the intended argv.
-      const line = message.split('\n').find((l) => l.includes(entry.hfRepo))!;
+      const line = message.split('\n').find((l) => l.includes(catalogRepo(entry)))!;
       const renderedArgs = line.trim().replace(/^mlx download model /, '');
-      expect(shellSplit(renderedArgs)).toEqual(['-m', entry.hfRepo, '-o', `/custom/models/${slug}`]);
+      expect(shellSplit(renderedArgs)).toEqual(['-m', catalogRepo(entry), '-o', `/custom/models/${slug}`]);
     }
   });
 });

@@ -25,6 +25,7 @@ import type {
   CacheScope,
   CatalogItem,
   CatalogResponse,
+  CatalogUpdatesResponse,
   ColdTierHealth,
   DownloadJob,
   DownloadsResponse,
@@ -33,9 +34,9 @@ import type {
   SessionDetailResponse,
   SessionMetricsResponse,
   SessionRow,
-  SessionsResponse,
   SessionTraceMetric,
   SessionTurnMetric,
+  SessionsResponse,
 } from '@/lib/types';
 import Cache from '@/pages/cache';
 import Metrics from '@/pages/metrics';
@@ -54,12 +55,14 @@ import { bindEventTargetPort } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
 import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.js';
 import {
+  STUB_FAILURE,
+  TICK_CHAR_PX,
+  TICK_LINE_PX,
+  deferred,
   renderPage,
   sequence,
   stubApi,
   stubChartMetrics,
-  TICK_CHAR_PX,
-  TICK_LINE_PX,
   type RenderedPage,
 } from './render.js';
 
@@ -1083,32 +1086,47 @@ describe('Session detail page', () => {
 });
 
 describe('Models page — the Install affordance', () => {
-  const REPO = 'Brooooooklyn/Qwen3.6-27B-NVFP4-mlx';
+  const REPO = 'Brooooooklyn/Qwen3.8-27B-MXFP4-mlx';
+  /** Card heading the settle predicates wait on, and the slug it installs to. */
+  const LABEL = 'Qwen3.8-27B';
+  const SLUG = 'qwen3.8-27b-mxfp4-mlx';
 
-  function catalogRoutes(item: Partial<CatalogItem>, jobs: DownloadJob[] = []): Record<string, unknown> {
+  function catalogRoutes(
+    item: Partial<CatalogItem>,
+    jobs: DownloadJob[] = [],
+    updates: CatalogUpdatesResponse = { items: [] },
+  ): Record<string, unknown> {
     const models: ModelsResponse = { models: [], warnings: [], dir: '/models' };
     const catalog: CatalogResponse = {
       items: [
         {
-          label: 'Qwen3.6-27B',
+          label: LABEL,
           hfRepo: REPO,
-          sizeGb: 22.2,
+          sizeGb: 23.3,
           description: 'Best tool use',
-          slug: 'qwen3.6-27b-nvfp4-mlx',
+          slug: SLUG,
           installed: false,
           present: false,
           blockedByForeignDir: false,
+          localRevision: null,
           ...item,
         },
       ],
     };
     const downloads: DownloadsResponse = { jobs };
-    return { '/models': models, '/catalog': catalog, '/downloads': downloads };
+    return { '/models': models, '/catalog': catalog, '/catalog/updates': updates, '/downloads': downloads };
   }
 
   /** Trimmed label of every rendered button. */
   function buttonLabels(): string[] {
     return Array.from(mounted!.container.querySelectorAll('button')).map((b) => (b.textContent ?? '').trim());
+  }
+
+  /** Labels of the buttons a user can actually press — a disabled one cannot act. */
+  function liveButtonLabels(): string[] {
+    return Array.from(mounted!.container.querySelectorAll('button'))
+      .filter((button) => !button.disabled)
+      .map((button) => (button.textContent ?? '').trim());
   }
 
   function downloadJob(overrides: Partial<DownloadJob>): DownloadJob {
@@ -1181,7 +1199,7 @@ describe('Models page — the Install affordance', () => {
   }
 
   async function mountModels(): Promise<void> {
-    mounted = await renderPage(createElement(Models), (text) => text.includes('Qwen3.6-27B'));
+    mounted = await renderPage(createElement(Models), (text) => text.includes(LABEL));
     // The hydration effect fires once `/downloads` lands, which is after the
     // catalog text the settle condition waits on; give it and its calls room.
     await settle();
@@ -1195,7 +1213,7 @@ describe('Models page — the Install affordance', () => {
   it('offers Install for a recommended model that is simply absent', async () => {
     // The over-correction guard: the card must keep its button when the slug is
     // free, or the blocked branch below could be "fixed" by never offering Install.
-    await mount(createElement(Models), catalogRoutes({}), 'Qwen3.6-27B');
+    await mount(createElement(Models), catalogRoutes({}), LABEL);
     expect(buttonLabels()).toContain('Install');
   });
 
@@ -1203,17 +1221,80 @@ describe('Models page — the Install affordance', () => {
     // `<slug>` is occupied by an unowned directory (an interrupted `mlx download`).
     // The download's ownership preflight refuses it every time, so the button would
     // do nothing but raise a red toast.
-    const text = await mount(createElement(Models), catalogRoutes({ blockedByForeignDir: true }), 'Qwen3.6-27B');
+    const text = await mount(createElement(Models), catalogRoutes({ blockedByForeignDir: true }), LABEL);
     expect(buttonLabels()).not.toContain('Install');
     // And it says WHICH directory is in the way and what to do about it.
-    expect(text).toContain('qwen3.6-27b-nvfp4-mlx');
+    expect(text).toContain(SLUG);
     expect(text).toMatch(/remove/i);
   });
 
   it('still shows an installed model as installed', async () => {
-    await mount(createElement(Models), catalogRoutes({ present: true, installed: true }), 'Qwen3.6-27B');
+    await mount(createElement(Models), catalogRoutes({ present: true, installed: true }), LABEL);
     expect(buttonLabels()).toContain('Installed');
     expect(buttonLabels()).not.toContain('Install');
+  });
+
+  it('offers Update available when upstream holds a different revision', async () => {
+    // The whole point of the check: a re-upload lands new bytes at the SAME repo
+    // id, so an installed model must still be offered the newer weights.
+    await mount(
+      createElement(Models),
+      catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
+      }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Update available');
+    expect(buttonLabels()).not.toContain('Installed');
+  });
+
+  it('stays Installed when the revisions match', async () => {
+    await mount(
+      createElement(Models),
+      catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40) }],
+      }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
+  });
+
+  it('never offers Update for a checkpoint the dashboard does not own', async () => {
+    // The join is the page's now, so the ownership gate is too: an Update is a
+    // re-install, and the runner's preflight refuses every final dir it does not
+    // own. `present` without `installed` is exactly that dir (an `mlx download`
+    // install, or a dashboard one the user renamed), so the button could only
+    // ever raise a red toast — however stale the bytes are.
+    //
+    // `/catalog` pairs a revision with ownership today, so this pins the gate on
+    // the WIRE shape rather than on that invariant: the two halves of the
+    // comparison arrive from two different requests, and only `installed` says
+    // the stale one can be replaced.
+    await mount(
+      createElement(Models),
+      catalogRoutes({ present: true, installed: false, localRevision: 'a'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
+      }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
+  });
+
+  it('stays Installed when the update check could not reach Hugging Face', async () => {
+    // Offline must degrade to exactly the old behaviour — never a badge the user
+    // cannot act on, and never a blocked page. `/catalog` never touched the
+    // network, so install state is unaffected either way.
+    await mount(
+      createElement(Models),
+      catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: null }],
+      }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
   });
 
   it('dismisses a job that settled while the page was unmounted, without a word', async () => {
@@ -1305,6 +1386,245 @@ describe('Models page — the Install affordance', () => {
     expect(gets(calls, '/api/catalog')).toBe(2);
     expect(gets(calls, '/api/models')).toBe(2);
     expect(dismissed(calls)).toEqual(['job-done']);
+  });
+
+  it('shows a live update job even when the update probe has not resolved', async () => {
+    // Regression: `downloading` was qualified by catalog state, so a remount
+    // mid-update — with `/catalog/updates` still loading or unable to resolve
+    // this repo — rendered "Installed" over a live multi-gigabyte transfer,
+    // with no progress and no Cancel. A live job must speak for itself.
+    await mount(
+      createElement(Models),
+      catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [downloadJob({})], {
+        items: [],
+      }),
+      LABEL,
+    );
+    expect(buttonLabels()).toContain('Cancel');
+    expect(buttonLabels()).not.toContain('Installed');
+  });
+
+  it('drops a stale update verdict when the post-download refresh FAILS', async () => {
+    // `useJson` keeps its previous `data` when a reload fails and only sets
+    // `error`. Consuming that blindly re-offers "Update available" for the
+    // revision just installed, and admits repeated no-op jobs, until some later
+    // probe happens to succeed.
+    const before = catalogRoutes(
+      { present: true, installed: true, localRevision: 'a'.repeat(40) },
+      [downloadJob({ id: 'job-upd', state: 'done' })],
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
+    );
+    recordRequests({
+      ...before,
+      // First read succeeds; the post-download reload fails.
+      '/catalog/updates': sequence(before['/catalog/updates'], STUB_FAILURE),
+      '/downloads/job-upd': { cancelled: true, id: 'job-upd' },
+    });
+    await mountModels();
+    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).toContain('Installed');
+  });
+
+  it('reloads the update check when a job settles as ERROR too', async () => {
+    // `error` does not mean nothing was installed: `publish()` renames staging
+    // into place and only THEN fsyncs and removes the backup, inside the job's
+    // try. A failure there reports `error` for a model already on disk, so the
+    // previous verdict must not survive it. BOTH halves of that verdict have to
+    // move: the freshly installed `localRevision` lives on `/catalog`, and the
+    // sha it is compared against on `/catalog/updates`.
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      const stale = catalogRoutes(
+        { present: true, installed: true, localRevision: 'a'.repeat(40) },
+        [downloadJob({ id: 'job-run', state: 'running' })],
+        { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
+      );
+      const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
+      });
+      const calls = recordRequests({
+        ...stale,
+        '/catalog': sequence(stale['/catalog'], fresh['/catalog']),
+        '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+        '/downloads/job-run': { cancelled: true, id: 'job-run' },
+      });
+      await mountModels();
+      expect(buttonLabels()).toContain('Cancel');
+
+      emitDownload('error', { id: 'job-run', message: 'fsync failed after publish' });
+      await settle();
+      expect(gets(calls, '/api/catalog/updates')).toBe(2);
+      expect(gets(calls, '/api/catalog')).toBe(2);
+      expect(buttonLabels()).not.toContain('Update available');
+      expect(buttonLabels()).toContain('Installed');
+    } finally {
+      failed.mockRestore();
+    }
+  });
+
+  it('cannot start a second job in the render between a settle and the refreshed catalog', async () => {
+    // `setActive` clears synchronously while `reload()` only marks the previous
+    // body refreshing, so one committed render still carries the pre-download
+    // state: no job, the old `localRevision`, and the old remote sha. Left live,
+    // that button allocates a job the server can only short-circuit to `done` —
+    // two Hugging Face round trips, a spurious card and a spurious toast.
+    const stale = catalogRoutes(
+      { present: true, installed: true, localRevision: 'a'.repeat(40) },
+      [downloadJob({ id: 'job-upd', state: 'running' })],
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
+    );
+    // Upstream moved again while that job ran, so once the refreshed bodies land
+    // there is a GENUINE update to offer. That is what proves the window closes:
+    // a suppression that never lifts would leave this button dead forever.
+    const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
+      items: [{ hfRepo: REPO, remoteRevision: 'c'.repeat(40) }],
+    });
+    // Held, so the assertions below land INSIDE the window rather than after it.
+    const held = deferred(fresh['/catalog']);
+    recordRequests({
+      ...stale,
+      '/catalog': sequence(stale['/catalog'], held.body),
+      '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+      '/downloads/job-upd': { cancelled: true, id: 'job-upd' },
+    });
+    await mountModels();
+
+    emitDownload('done', { id: 'job-upd', outputDir: '/models/x' });
+    await settle();
+    // The refreshed catalog has not landed, so the card still reads the stale
+    // comparison — but it must not be pressable while it does.
+    expect(buttonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).not.toContain('Update available');
+
+    held.release();
+    await settle();
+    expect(liveButtonLabels()).toContain('Update available');
+  });
+
+  it('closes that window on a FIRST install too, where the stale body still says absent', async () => {
+    // The same one render, reached from the other side: nothing was installed
+    // before, so the stale body says `present: false` and the branch falls
+    // through to a live Install for the model that just finished installing.
+    const stale = catalogRoutes({ present: false, installed: false, localRevision: null }, [
+      downloadJob({ id: 'job-new', state: 'running' }),
+    ]);
+    const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) });
+    const held = deferred(fresh['/catalog']);
+    recordRequests({
+      ...stale,
+      '/catalog': sequence(stale['/catalog'], held.body),
+      '/downloads/job-new': { cancelled: true, id: 'job-new' },
+    });
+    await mountModels();
+
+    emitDownload('done', { id: 'job-new', outputDir: '/models/x' });
+    await settle();
+    expect(buttonLabels()).toContain('Install');
+    expect(liveButtonLabels()).not.toContain('Install');
+
+    held.release();
+    await settle();
+    expect(buttonLabels()).toContain('Installed');
+  });
+
+  it('closes that window for a job that settled while the page was away', async () => {
+    // Reached without any live event. A job that went terminal while this page
+    // was unmounted (or across a reconnect) is skipped by the hydration above,
+    // so `active` never holds it and no `DownloadProgress` ever fires — the
+    // reconcile effect is the only thing that notices, and it reloads the same
+    // snapshots. Its window is identical, and the guard has to be set there too.
+    const stale = catalogRoutes({ present: false, installed: false, localRevision: null }, [
+      downloadJob({ id: 'job-away', state: 'done' }),
+    ]);
+    // Upstream is ahead of what that job installed, so once the body lands there
+    // is a real update to offer — a suppression that never lifts kills it.
+    const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
+      items: [{ hfRepo: REPO, remoteRevision: 'c'.repeat(40) }],
+    });
+    const held = deferred(fresh['/catalog']);
+    recordRequests({
+      ...stale,
+      '/catalog': sequence(stale['/catalog'], held.body),
+      '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+      '/downloads/job-away': { cancelled: true, id: 'job-away' },
+    });
+    await mountModels();
+
+    // The mount itself spans the publish: `/downloads` already says `done` while
+    // `/catalog` still says absent.
+    expect(buttonLabels()).toContain('Install');
+    expect(liveButtonLabels()).not.toContain('Install');
+
+    held.release();
+    await settle();
+    expect(liveButtonLabels()).toContain('Update available');
+  });
+
+  it('closes that window when the job settles as ERROR, which can still have installed', async () => {
+    // `publish()` renames staging into place and only THEN removes the backup,
+    // inside the job's try, so an `error` can name a model already on disk. That
+    // path clears `active` synchronously too, so it opens the same window.
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      const stale = catalogRoutes(
+        { present: true, installed: true, localRevision: 'a'.repeat(40) },
+        [downloadJob({ id: 'job-err', state: 'running' })],
+        { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
+      );
+      const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'c'.repeat(40) }],
+      });
+      const held = deferred(fresh['/catalog']);
+      recordRequests({
+        ...stale,
+        '/catalog': sequence(stale['/catalog'], held.body),
+        '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+        '/downloads/job-err': { cancelled: true, id: 'job-err' },
+      });
+      await mountModels();
+
+      emitDownload('error', { id: 'job-err', message: 'fsync failed after publish' });
+      await settle();
+      expect(buttonLabels()).toContain('Update available');
+      expect(liveButtonLabels()).not.toContain('Update available');
+
+      held.release();
+      await settle();
+      expect(liveButtonLabels()).toContain('Update available');
+    } finally {
+      failed.mockRestore();
+    }
+  });
+
+  it('reloads the update check when a job settles, so it stops re-offering Update', async () => {
+    // Regression: `/catalog/updates` is a SEPARATE request, so it held the
+    // pre-download verdict. Once the job cleared, the card re-offered "Update
+    // available" for the revision just installed, and every click started
+    // another job. The reconcile effect must refresh it alongside the catalog.
+    const stale = catalogRoutes(
+      { present: true, installed: true, localRevision: 'a'.repeat(40) },
+      [downloadJob({ id: 'job-upd', state: 'done' })],
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
+    );
+    const fresh = catalogRoutes(
+      { present: true, installed: true, localRevision: 'b'.repeat(40) },
+      [downloadJob({ id: 'job-upd', state: 'done' })],
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
+    );
+    const calls = recordRequests({
+      ...stale,
+      '/catalog': sequence(stale['/catalog'], fresh['/catalog']),
+      '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+      '/models': sequence(stale['/models'], fresh['/models']),
+      '/downloads/job-upd': { cancelled: true, id: 'job-upd' },
+    });
+    await mountModels();
+    // Settled on the newly installed revision: Installed, not a fresh Update.
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Update available');
+    // Refetched exactly once, in step with the catalog it is compared against.
+    expect(gets(calls, '/api/catalog/updates')).toBe(2);
+    expect(gets(calls, '/api/catalog')).toBe(2);
   });
 
   it('reloads after a FAILED job too — a failure can still leave the model installed', async () => {
@@ -1460,7 +1780,7 @@ describe('Models page — the Install affordance', () => {
       port2.close();
     };
 
-    mounted = await renderPage(createElement(Models), (text) => text.includes('Qwen3.6-27B'));
+    mounted = await renderPage(createElement(Models), (text) => text.includes(LABEL));
     const install = [...mounted.container.querySelectorAll('button')].find((button) =>
       button.textContent?.includes('Install'),
     );

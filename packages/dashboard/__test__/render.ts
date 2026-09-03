@@ -48,6 +48,16 @@ export type ApiStub = Record<string, unknown>;
 
 /** Brand for a route whose body CHANGES between calls; see {@link sequence}. */
 const SEQUENCE = Symbol('api-stub-sequence');
+const DEFERRED = Symbol('api-stub-deferred');
+/**
+ * Sequence element that makes the stub answer a FAILURE for that call.
+ *
+ * `useJson` keeps its previous `data` when a reload fails and only sets
+ * `error`, so "first call succeeds, reload fails" is the ONLY way to reach the
+ * data-and-error state a page must branch on. Without this the stub could
+ * model an always-failing route but never a route that goes bad.
+ */
+export const STUB_FAILURE = Symbol('api-stub-failure');
 
 /**
  * A route body that differs per request: `bodies[n]` answers the n-th call and
@@ -63,6 +73,23 @@ const SEQUENCE = Symbol('api-stub-sequence');
  */
 export function sequence(...bodies: unknown[]): unknown {
   return { [SEQUENCE]: bodies };
+}
+
+/**
+ * A route body whose REPLY is withheld until the returned `release` is called.
+ *
+ * The only way to assert on a render that happens WHILE a reload is in flight.
+ * `sequence` controls what a refetch answers but never when, so a page bug that
+ * lives in the gap between "reload issued" and "body arrived" — where the hook
+ * still serves the previous body — is invisible to any assertion taken after
+ * the port has drained. Composes with `sequence`: hold only the second call.
+ */
+export function deferred(body: unknown): { body: unknown; release: () => void } {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  return { body: { [DEFERRED]: { body, gate } }, release };
 }
 
 /**
@@ -120,7 +147,13 @@ export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): () => vo
         options.onCall?.(call);
         const path = call.path.split('?')[0].replace(/^\/api/, '');
         if (!Object.hasOwn(routes, path)) return Promise.resolve(failure('E_NOT_FOUND', `no stub for ${path}`));
-        return Promise.resolve({ ok: true as const, status: 200, body: bodyFor(path) });
+        const body = bodyFor(path);
+        if (body === STUB_FAILURE) return Promise.resolve(failure('E_UNAVAILABLE', `stubbed failure for ${path}`));
+        if (typeof body === 'object' && body !== null && DEFERRED in body) {
+          const held = (body as Record<symbol, unknown>)[DEFERRED] as { body: unknown; gate: Promise<void> };
+          return held.gate.then(() => ({ ok: true as const, status: 200, body: held.body }));
+        }
+        return Promise.resolve({ ok: true as const, status: 200, body });
       },
       subscribe: options.subscribe ?? (() => () => {}),
     },

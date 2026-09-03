@@ -13,7 +13,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { catalogWithState } from '../src/catalog.js';
@@ -61,6 +61,20 @@ const hub = vi.hoisted(() => ({
   sha: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
   /** Every `revision` the runner threaded into a list/download call. */
   revisions: [] as string[],
+  /** Repos `modelInfo` was asked to resolve, for the catalog sha sweep. */
+  modelInfoRepos: [] as string[],
+  /** When set, every `modelInfo` call throws it — the offline case. */
+  modelInfoError: null as string | null,
+  /** Repos whose `modelInfo` throws, for a PARTIALLY failed sweep. */
+  modelInfoFailRepos: [] as string[],
+  /**
+   * Make `modelInfo` actually CALL the fetch it is handed.
+   *
+   * Off by default so existing tests keep their cheap stub. The probe's
+   * deadline and its abort signal live in that fetch, so they are unreachable
+   * — and untestable — unless the mock exercises it.
+   */
+  modelInfoUsesFetch: false,
   /** Paths whose `downloadFileToCacheDir` should throw, to simulate a mid-job failure. */
   failOn: [] as string[],
   /** Overrides the thrown message, so a remote-sized error body can be simulated. */
@@ -127,9 +141,22 @@ vi.mock('node:fs/promises', async (importActual) => {
 });
 
 vi.mock('@huggingface/hub', () => ({
-  modelInfo: async (params: { revision?: string }) => {
+  modelInfo: async (params: { name?: string; revision?: string; fetch?: typeof fetch }) => {
+    if (params.name !== undefined) hub.modelInfoRepos.push(params.name);
+    if (hub.modelInfoError !== null) throw new Error(hub.modelInfoError);
+    if (params.name !== undefined && hub.modelInfoFailRepos.includes(params.name)) {
+      throw new Error(`simulated modelInfo failure for ${params.name}`);
+    }
+    // Snapshot BEFORE any await, the way a real server answers with the sha as
+    // of the request. Reading it afterwards would let a parked call return a
+    // value written while it waited — which silently made the sweep-race test
+    // tautological, passing with the fix removed.
+    const sha = hub.sha;
+    if (hub.modelInfoUsesFetch && params.fetch !== undefined) {
+      await params.fetch(`https://huggingface.co/api/models/${params.name ?? 'x'}`);
+    }
     if (params.revision !== undefined) hub.revisions.push(params.revision);
-    return { sha: hub.sha };
+    return { sha };
   },
   listFiles: async function* (params: { revision?: string }) {
     if (params.revision !== undefined) hub.revisions.push(params.revision);
@@ -250,10 +277,13 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
   }
 }
 
-const REPO = MODEL_CATALOG[0]!.hfRepo;
+// Resolved through `catalogRepo`, matching the allowlist gate in `start` — the
+// catalog carries a different build per platform, so the raw `hfRepo` would be
+// refused on a CUDA host.
+const REPO = catalogRepo(MODEL_CATALOG[0]!);
 const SLUG = REPO.split('/').pop()!.toLowerCase();
 /** A SECOND catalog repo, for the cases that need two genuinely distinct jobs. */
-const REPO_OTHER = MODEL_CATALOG[1]!.hfRepo;
+const REPO_OTHER = catalogRepo(MODEL_CATALOG[1]!);
 
 let modelsDir: string;
 let cacheDir: string;
@@ -303,12 +333,315 @@ beforeEach(() => {
   renameFault.failFromPrefix = null;
   raceHook.onMarkerWrite = null;
   stagingHook.onVerifyWindow = null;
+  hub.modelInfoRepos = [];
+  hub.modelInfoError = null;
+  hub.modelInfoFailRepos = [];
+  hub.modelInfoUsesFetch = false;
   modelsDir = mkdtempSync(join(tmpdir(), 'dash-dl-models-'));
   cacheDir = mkdtempSync(join(tmpdir(), 'dash-dl-cache-'));
 });
 
 afterEach(() => {
   for (const dir of [modelsDir, cacheDir]) rmSync(dir, { recursive: true, force: true });
+});
+
+describe('DownloadManager.checkCatalogUpdates — the read half of the staleness check', () => {
+  function manager(): DownloadManager {
+    return new DownloadManager({ modelsDir, cacheDir });
+  }
+
+  it('resolves a sha for every VISIBLE catalog repo, and skips the hidden ones', async () => {
+    // `hidden` entries are unpublished repos: Hugging Face answers 401 for them,
+    // so dialling would spend a request to learn nothing.
+    const shas = await manager().checkCatalogUpdates();
+    const visible = MODEL_CATALOG.filter((e) => !e.hidden).map((e) => catalogRepo(e));
+    expect([...shas.keys()].sort()).toEqual([...visible].sort());
+    expect(shas.get(REPO)).toBe(hub.sha);
+    for (const entry of MODEL_CATALOG.filter((e) => e.hidden)) {
+      expect(hub.modelInfoRepos).not.toContain(catalogRepo(entry));
+    }
+  });
+
+  it('maps an unreachable repo to null rather than rejecting', async () => {
+    // Offline must never break the Models page. `null` reads as "no badge",
+    // never as "up to date".
+    hub.modelInfoError = 'getaddrinfo ENOTFOUND huggingface.co';
+    const shas = await manager().checkCatalogUpdates();
+    expect(shas.size).toBeGreaterThan(0);
+    expect([...shas.values()].every((sha) => sha === null)).toBe(true);
+  });
+
+  it('reuses a resolved sweep instead of re-dialling on every mount', async () => {
+    // `useJson` refetches on every mount and every reconnect, and nothing polls
+    // to smooth the rate, so the cache is what keeps this off the network.
+    const m = manager();
+    await m.checkCatalogUpdates(1000);
+    const afterFirst = hub.modelInfoRepos.length;
+    expect(afterFirst).toBeGreaterThan(0);
+    await m.checkCatalogUpdates(1000 + 60_000);
+    expect(hub.modelInfoRepos).toHaveLength(afterFirst);
+  });
+
+  it('retries an all-failed sweep far sooner than a good one', async () => {
+    // A machine that regains its network must not stay stuck reporting nothing
+    // for the full success TTL.
+    hub.modelInfoError = 'offline';
+    const m = manager();
+    await m.checkCatalogUpdates(1000);
+    const afterFirst = hub.modelInfoRepos.length;
+    hub.modelInfoError = null;
+    await m.checkCatalogUpdates(1000 + 61_000);
+    expect(hub.modelInfoRepos.length).toBeGreaterThan(afterFirst);
+    expect((await m.checkCatalogUpdates(1000 + 61_000)).get(REPO)).toBe(hub.sha);
+  });
+
+  it('degrades a STALLED probe to null instead of hanging the route', async () => {
+    // The failure mode this guards is not hypothetical: an HF socket was seen
+    // here sitting in CLOSE_WAIT for hours at zero CPU. Unbounded, the
+    // `Promise.all` never settles, the route never answers, and the RPC client
+    // declares the whole runtime unresponsive and restarts it — killing any
+    // download in flight.
+    hub.modelInfoUsesFetch = true;
+    const hang: typeof fetch = (_input, init) =>
+      new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      });
+    const m = new DownloadManager({ modelsDir, cacheDir, fetchImpl: hang, probeTimeoutMs: 50 });
+    const shas = await m.checkCatalogUpdates();
+    expect(shas.size).toBeGreaterThan(0);
+    expect([...shas.values()].every((sha) => sha === null)).toBe(true);
+  });
+
+  it('keeps a job-resolved revision that landed while a sweep was in flight', async () => {
+    // The sweep replaces the WHOLE cache map when it commits. A job that
+    // resolved and installed a newer sha mid-sweep would have its write-through
+    // clobbered by the older value the sweep captured, so the card would
+    // re-offer an update for the revision just installed.
+    let releaseSweep: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseSweep = resolve;
+    });
+    hub.modelInfoUsesFetch = true;
+    const inner = makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 });
+    let parked = false;
+    const slow: typeof fetch = async (input, init) => {
+      // Park the sweep's FIRST request only; everything the job does afterwards
+      // proceeds normally, so this is the real write-through path, not a stub.
+      if (!parked) {
+        parked = true;
+        await gate;
+      }
+      return inner(input, init);
+    };
+    const m = new DownloadManager({ modelsDir, cacheDir, fetchImpl: slow });
+    hub.sha = SHA_OLD;
+    const sweep = m.checkCatalogUpdates(1000);
+    await waitFor(() => parked);
+
+    // With that sweep parked mid-flight, a real job resolves and installs NEW.
+    hub.sha = SHA_NEW;
+    const events: DownloadEvent[] = [];
+    const id = m.start(REPO);
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done'));
+
+    releaseSweep!();
+    const shas = await sweep;
+    // The sweep captured SHA_OLD for this repo; the job's newer read must win.
+    expect(shas.get(REPO)).toBe(SHA_NEW);
+  });
+
+  it('keeps a sweep read that was ISSUED after the job asked for the same repo', async () => {
+    // The overlay above assumes the job asked LAST. Reversed — the job's read
+    // goes out, this sweep starts and asks the same repo, and the job's slower
+    // answer still lands first — the sweep holds the NEWER sha, and letting the
+    // job's older one overwrite it would bury a genuine update for the whole
+    // success TTL, which the post-download refresh reads straight back.
+    let releaseJob: (() => void) | undefined;
+    const jobGate = new Promise<void>((resolve) => {
+      releaseJob = resolve;
+    });
+    let releaseSweep: (() => void) | undefined;
+    const sweepGate = new Promise<void>((resolve) => {
+      releaseSweep = resolve;
+    });
+    hub.modelInfoUsesFetch = true;
+    const inner = makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 });
+    let jobAsked = false;
+    let sweepAsked = 0;
+    const gated: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      // Only the sha reads are parked — the job's file fetches run unimpeded, so
+      // this is the real write-through path, not a stub.
+      if (url.includes('/api/models/')) {
+        if (!jobAsked) {
+          jobAsked = true;
+          await jobGate;
+        } else {
+          sweepAsked += 1;
+          await sweepGate;
+        }
+      }
+      return inner(input, init);
+    };
+    const m = new DownloadManager({ modelsDir, cacheDir, fetchImpl: gated });
+
+    // The job asks first, so its answer is the sha upstream held BEFORE it moved.
+    hub.sha = SHA_OLD;
+    const events: DownloadEvent[] = [];
+    const id = m.start(REPO);
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => jobAsked);
+
+    // Upstream advances, and only THEN does the sweep ask.
+    hub.sha = SHA_NEW;
+    const sweep = m.checkCatalogUpdates(1000);
+    await waitFor(() => sweepAsked === MODEL_CATALOG.filter((e) => !e.hidden).length);
+
+    // The job's older answer lands first and writes itself through.
+    releaseJob!();
+    await waitFor(() => events.some((event) => event.type === 'done'));
+
+    releaseSweep!();
+    const shas = await sweep;
+    // The job pinned the older revision, so the sweep's read is a real update.
+    expect(hub.revisions).toContain(SHA_OLD);
+    expect(shas.get(REPO)).toBe(SHA_NEW);
+  });
+
+  it('refuses a job write-through into a cache a LATER read already filled', async () => {
+    // The other half of the same inversion. Here the sweep commits FIRST, so the
+    // job's write-through lands on an already-published map rather than being
+    // folded in by the overlay — a path the overlay guard never sees. The job
+    // still asked first, so its answer is the older observation, and letting it
+    // overwrite the committed newer sha buries the update for the success TTL.
+    let releaseJob: (() => void) | undefined;
+    const jobGate = new Promise<void>((resolve) => {
+      releaseJob = resolve;
+    });
+    hub.modelInfoUsesFetch = true;
+    const inner = makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 });
+    let jobAsked = false;
+    const gated: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (url.includes('/api/models/') && !jobAsked) {
+        jobAsked = true;
+        await jobGate;
+      }
+      return inner(input, init);
+    };
+    const m = new DownloadManager({ modelsDir, cacheDir, fetchImpl: gated });
+
+    hub.sha = SHA_OLD;
+    const events: DownloadEvent[] = [];
+    const id = m.start(REPO);
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => jobAsked);
+
+    // Upstream advances, and a whole sweep asks, answers and COMMITS while the
+    // job's own read is still out.
+    hub.sha = SHA_NEW;
+    expect((await m.checkCatalogUpdates(1000)).get(REPO)).toBe(SHA_NEW);
+
+    releaseJob!();
+    await waitFor(() => events.some((event) => event.type === 'done'));
+
+    // Inside the success TTL, so this reads the committed map back — the same
+    // map the post-download refresh gets, and the one the card compares against.
+    expect((await m.checkCatalogUpdates(1000 + 60_000)).get(REPO)).toBe(SHA_NEW);
+  });
+
+  it('serves one sweep to every check that overlaps it', async () => {
+    // Nothing serialises these calls: the RPC host fires each frame off with
+    // `void Promise.resolve().then(...)`, and `useJson`'s `reload()` starts a
+    // second request without cancelling the first — which the Models page does
+    // on mount, on reconcile, and at every job settle. Two independent sweeps
+    // both commit unconditionally, so the slower one lands last and pins the
+    // OLDER sha it captured for the full six-hour TTL, with no job in the
+    // interleaving for `jobResolvedShas` to repair it from. Each overlap also
+    // pays a second full fan-out, the very cost the cache exists to avoid.
+    const visible = MODEL_CATALOG.filter((e) => !e.hidden).length;
+    let releaseSweep: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      releaseSweep = resolve;
+    });
+    hub.modelInfoUsesFetch = true;
+    const inner = makeFetchImpl({});
+    let parked = 0;
+    const slow: typeof fetch = async (input, init) => {
+      // Park exactly the first sweep's probes. A second sweep, if one is ever
+      // started, runs unimpeded and commits FIRST — the losing interleaving.
+      if (parked < visible) {
+        parked += 1;
+        await gate;
+      }
+      return inner(input, init);
+    };
+    const m = new DownloadManager({ modelsDir, cacheDir, fetchImpl: slow });
+    hub.sha = SHA_OLD;
+    const first = m.checkCatalogUpdates(1000);
+    await waitFor(() => parked === visible);
+
+    // Upstream advances while that sweep is parked, then a second check arrives.
+    hub.sha = SHA_NEW;
+    const second = m.checkCatalogUpdates(1000);
+    releaseSweep!();
+    const [firstShas, secondShas] = await Promise.all([first, second]);
+
+    // ONE fan-out for both callers, not two.
+    expect(hub.modelInfoRepos).toHaveLength(visible);
+    expect(secondShas).toBe(firstShas);
+    expect(firstShas.get(REPO)).toBe(SHA_OLD);
+    // Well inside the 6h TTL: the cache still holds that same map, so no late
+    // commit rolled it back.
+    expect(await m.checkCatalogUpdates(1000 + 60_000)).toBe(firstShas);
+  });
+
+  it('takes the short TTL when ANY repo failed, not only when all did', async () => {
+    // One cache entry covers the whole sweep, so a single transient failure
+    // beside successes would otherwise pin that repo's `null` for six hours —
+    // no mount or reconnect in that window could surface its update.
+    hub.modelInfoFailRepos = [REPO_OTHER];
+    const m = manager();
+    const first = await m.checkCatalogUpdates(1000);
+    expect(first.get(REPO)).toBe(hub.sha);
+    expect(first.get(REPO_OTHER)).toBeNull();
+    const afterFirst = hub.modelInfoRepos.length;
+
+    // Inside the SUCCESS TTL but past the negative one: must re-dial.
+    hub.modelInfoFailRepos = [];
+    const second = await m.checkCatalogUpdates(1000 + 61_000);
+    expect(hub.modelInfoRepos.length).toBeGreaterThan(afterFirst);
+    expect(second.get(REPO_OTHER)).toBe(hub.sha);
+  });
+
+  it("folds a job's freshly resolved revision into the cache", async () => {
+    // Upstream can advance between a sweep and the user's click. `processJob`
+    // then installs the NEW sha while the cache still holds the old one, so the
+    // card re-offers an update for the revision just installed and every click
+    // completes as a no-op. The job's own resolve IS a fresh upstream read, so
+    // it is authoritative for that repo.
+    hub.sha = SHA_OLD;
+    const m = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
+    });
+    expect((await m.checkCatalogUpdates(1000)).get(REPO)).toBe(SHA_OLD);
+
+    hub.sha = SHA_NEW;
+    const events: DownloadEvent[] = [];
+    const id = m.start(REPO);
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done'));
+
+    // Well inside the 6h TTL, so this is the CACHE answering — and it must have
+    // been corrected by the job rather than still serving the pre-install sha.
+    const shas = await m.checkCatalogUpdates(1000 + 60_000);
+    expect(shas.get(REPO)).toBe(SHA_NEW);
+    // Untouched repos keep the cached sweep; the job speaks only for its own.
+    expect(shas.get(REPO_OTHER)).toBe(SHA_OLD);
+  });
 });
 
 describe('DownloadManager', () => {
@@ -355,7 +688,7 @@ describe('DownloadManager', () => {
     expect(job.receivedBytes).toBe(312);
   });
 
-  it('refuses a hidden catalog entry up front instead of failing mid-download', () => {
+  it('refuses a hidden catalog entry up front instead of failing mid-download', async () => {
     // A `hidden` entry is an UNPUBLISHED repo: it stays in MODEL_CATALOG so a
     // locally converted checkpoint at the canonical slug is still recognized as
     // Installed, but Hugging Face answers 401 for it. Membership alone is
@@ -370,13 +703,22 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, 'model.safetensors': 300 }),
     });
 
-    expect(() => manager.start(hidden!.hfRepo)).toThrow(/not in the model catalog/);
+    // Through the resolver, mirroring the allowlist. Hidden entries carry no
+    // CUDA build today, so this is the same string — but a raw `hfRepo` here
+    // would silently start testing the wrong thing the day one does.
+    expect(() => manager.start(catalogRepo(hidden!))).toThrow(/not in the model catalog/);
     // Rejected BEFORE any job is allocated — otherwise the SPA renders a job
     // that marches to a 401 instead of an immediate, actionable error.
     expect(manager.jobs()).toEqual([]);
 
     // Non-hidden entries are unaffected.
     expect(() => manager.start(REPO)).not.toThrow();
+    // That last `start` allocated a REAL job whose `drain` runs detached. Without
+    // this the test returns while `processJob` is still writing under `modelsDir`,
+    // and the `afterEach` `rmSync` races it to an intermittent ENOTEMPTY.
+    await manager.shutdown();
+    // Deterministic proof the wait happened: an unawaited job reads `running`.
+    expect(manager.jobs().map((job) => job.state)).toEqual(['cancelled']);
   });
 
   it('pins one resolved commit sha and threads it into every list/download call', async () => {

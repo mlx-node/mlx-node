@@ -29,8 +29,10 @@ during a 1.5 s query used to wait 1449 ms. With the split, a download-progress c
 made during a heavy query returns in 0.2 ms instead of 296 ms.
 
 Route ownership is data on the route (`mainRoute` / `workerRoute`), so a new route
-cannot silently land on the wrong thread. Only the four download routes stay on the
-transport thread, because network I/O and progress events are what must never stall.
+cannot silently land on the wrong thread. Only the four download routes and the
+catalog update check stay on the transport thread, because network I/O and progress
+events are what must never stall — and for the same reason none of them touches the
+filesystem: the update check answers with upstream shas alone.
 
 ## Using it as a library
 
@@ -182,6 +184,7 @@ over a port.
 | `/api/models`               | GET          | Local models: name, path, family, quant, size, ctx window                  |
 | `/api/models/:name`         | DELETE       | Delete a model dir (path-checked)                                          |
 | `/api/catalog`              | GET          | Recommended catalog + installed/installable state                          |
+| `/api/catalog/updates`      | GET          | Upstream sha per catalog repo; the page joins it against `/api/catalog`    |
 | `/api/downloads`            | GET / POST   | List active jobs / start a catalog download                                |
 | `/api/downloads/:id/events` | GET          | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503 |
 | `/api/sessions`             | GET          | Indexed session list; search + filters                                     |

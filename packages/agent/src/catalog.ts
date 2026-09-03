@@ -2,15 +2,22 @@
  * Curated model catalog for `mlx agent`.
  *
  * The first-run download wizard offers `visibleCatalog()` and feeds the chosen
- * `hfRepo` to `mlx download model`. Slugs are verified against the Brooooooklyn
+ * entry's `catalogRepo()` to `mlx download model`. Slugs are verified against the Brooooooklyn
  * HF account — use them verbatim.
  */
 
 export interface CatalogEntry {
   /** Wizard display name. */
   label: string;
-  /** HF slug for `mlx download model`. */
+  /** HF slug for `mlx download model` on Apple Silicon — the MXFP4 build. */
   hfRepo: string;
+  /**
+   * HF slug on Linux + NVIDIA CUDA — the NVFP4 build.
+   *
+   * Absent means the entry has no CUDA-specific build and {@link hfRepo}
+   * serves both. Resolve with {@link catalogRepo}, never by reading the field.
+   */
+  hfRepoCuda?: string;
   /** Approximate download size in GB, for display. */
   sizeGb: number;
   /** One line for the wizard. */
@@ -37,22 +44,25 @@ export interface CatalogEntry {
 
 export const MODEL_CATALOG: readonly CatalogEntry[] = [
   {
-    label: 'Qwen3.6-27B',
-    hfRepo: 'Brooooooklyn/Qwen3.6-27B-NVFP4-mlx',
-    sizeGb: 22.2,
+    label: 'Qwen3.8-27B',
+    hfRepo: 'Brooooooklyn/Qwen3.8-27B-MXFP4-mlx',
+    hfRepoCuda: 'Brooooooklyn/Qwen3.8-27B-NVFP4-mlx',
+    sizeGb: 23.3,
     description: 'Best tool use — recommended default',
     isDefault: true,
   },
   {
     label: 'Qwen-AgentWorld-35B',
-    hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-nvfp4-mlx',
-    sizeGb: 22.7,
+    hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-mxfp4-mlx',
+    hfRepoCuda: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-nvfp4-mlx',
+    sizeGb: 23.3,
     description: 'Agent-tuned MoE, fast decode',
   },
   {
     label: 'Gemma-4-26B-A4B',
-    hfRepo: 'Brooooooklyn/Gemma-4-26B-A4B-NVFP4-mlx',
-    sizeGb: 18.8,
+    hfRepo: 'Brooooooklyn/Gemma-4-26B-A4B-Unsloth-MXFP4-mlx',
+    hfRepoCuda: 'Brooooooklyn/Gemma-4-26B-A4B-Unsloth-NVFP4-mlx',
+    sizeGb: 16.2,
     description: 'MoE, fast decode',
   },
   {
@@ -91,6 +101,51 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     hidden: true,
   },
 ];
+
+/**
+ * The repo THIS platform installs for `entry`. Linux is the CUDA preview
+ * target (README "Platform Support"); everything else is Apple Silicon.
+ *
+ * NOT because Metal cannot run NVFP4 — it can. MLX ships the same 234
+ * quantized Metal kernels for `nvfp4` as for `mxfp4`, NAX variants included,
+ * and only `fp8_e4m3` reconstructs BF16 at load. The MSL 4.1 hardware
+ * block-scale format (`metal_fp8_ue8m0_format`) appears nowhere in MLX's Metal
+ * backend, so it constrains neither format here.
+ *
+ * The split is:
+ * - CUDA takes NVFP4 through `CublasQQMM` (`nvfp4` -> `CUDA_R_4F_E2M1`), a
+ *   native path with no MXFP4 equivalent.
+ * - Metal has no such native-path advantage either way, so prefer the format
+ *   that survives quantization better. NVFP4 stores a block scale as `amax/6`
+ *   in E4M3, and real FFN blocks land in its subnormal band;
+ *   `apply_nvfp4_pow2_lift` repairs that for dense SwiGLU FFNs but SKIPS MoE
+ *   experts by design (`NVFP4_LIFT_MOE_MARKERS`, `crates/mlx-core/src/
+ *   convert.rs`), because the norm there also drives the router and the
+ *   shared-expert gate, neither scale-invariant. Two of the three visible
+ *   entries are MoE. MXFP4's E8M0 block scales have no such failure.
+ *
+ * Unmeasured: whether nvfp4 or mxfp4 decodes faster on Metal. The choice above
+ * is made on quantization quality, not throughput.
+ *
+ * Every consumer that turns a catalog entry into a download, a slug, or an
+ * allowlist check must go through here. Reading `entry.hfRepo` directly
+ * installs the macOS build on a CUDA box.
+ */
+export function catalogRepo(entry: CatalogEntry): string {
+  return catalogRepoFor(entry, process.platform);
+}
+
+/**
+ * {@link catalogRepo} with the platform passed in — the pure half.
+ *
+ * Exists so both branches can be asserted without touching `process.platform`.
+ * Mutating that global leaks across test files sharing a worker: it made
+ * `catalogRepo` disagree with a sibling suite's module-level constant and fail
+ * a download allowlist check that has nothing to do with the catalog.
+ */
+export function catalogRepoFor(entry: CatalogEntry, platform: NodeJS.Platform): string {
+  return platform === 'linux' && entry.hfRepoCuda !== undefined ? entry.hfRepoCuda : entry.hfRepo;
+}
 
 /** Catalog entries the wizard offers (hidden entries filtered out). */
 export function visibleCatalog(): CatalogEntry[] {

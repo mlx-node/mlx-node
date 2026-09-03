@@ -24,7 +24,7 @@ import {
 import { handleHealth } from './handlers/health.js';
 import { handleIngest } from './handlers/ingest.js';
 import { handleMetricsOverview, handleSessionMetrics } from './handlers/metrics.js';
-import { handleCatalog, handleDeleteModel, handleModels } from './handlers/models.js';
+import { handleCatalog, handleCatalogUpdates, handleDeleteModel, handleModels } from './handlers/models.js';
 import {
   handleSessionDelete,
   handleSessionDetail,
@@ -97,6 +97,7 @@ export const ROUTES: Route[] = [
   workerRoute('GET', '/api/models', handleModels),
   workerRoute('DELETE', '/api/models/:name', handleDeleteModel),
   workerRoute('GET', '/api/catalog', handleCatalog),
+  mainRoute('GET', '/api/catalog/updates', handleCatalogUpdates),
   // The download routes stay on the transport thread: network I/O and progress
   // events must never queue behind a synchronous query, and a cancel click has to
   // be RECEIVED while one is running.
