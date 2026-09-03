@@ -1,6 +1,6 @@
 {
   "name": "@mlx-node/asr",
-  "version": "0.0.9",
+  "version": "0.0.11",
   "homepage": "https://github.com/mlx-node/mlx-node",
   "bugs": {
     "url": "https://github.com/mlx-node/mlx-node/issues"

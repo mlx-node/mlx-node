@@ -1,6 +1,6 @@
 {
   "name": "@mlx-node/dashboard",
-  "version": "0.0.9",
+  "version": "0.0.11",
   "private": true,
   "description": "Local web dashboard for mlx-node: models, sessions, metrics, paged cache",
   "license": "MIT",
