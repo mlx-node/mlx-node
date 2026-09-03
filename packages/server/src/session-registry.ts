@@ -631,6 +631,22 @@ export class SessionRegistry {
   }
 
   /**
+   * Disposals started but not yet settled — each one is an in-flight
+   * native `releaseCacheOwner` round-trip — plus disposals whose initial
+   * attempt and bounded retry both failed and remain owed to the native
+   * scheduler ({@link failedDisposals}), retried by the next
+   * {@link flushPendingDisposals}. Endpoints await that flush before
+   * leaving the admission lane, but it runs after the response has
+   * finished, so an observer keyed on request completion can still beat
+   * the release. `adopt`/`drop`/`sweep` schedule synchronously, so once
+   * the request counters read zero any disposal those requests will ever
+   * cause is already counted here. Primarily for diagnostics/tests.
+   */
+  get pendingDisposalCount(): number {
+    return this.pendingDisposals.size + this.failedDisposals.size;
+  }
+
+  /**
    * Number of requests waiting for this model's selected admission lane.
    * Active dispatches are not included. Primarily for diagnostics/tests.
    */

@@ -176,6 +176,7 @@ stage1Describe('Stage-1 real-model server admission', () => {
       () =>
         instance.registry.getSessionRegistry(MODEL_NAME)?.queueDepth === 0 &&
         instance.registry.getSessionRegistry(MODEL_NAME)?.preDispatchAdmitCount === 0 &&
+        instance.registry.getSessionRegistry(MODEL_NAME)?.pendingDisposalCount === 0 &&
         instance.health().work.inFlight === 0,
       label,
       ACCOUNTING_TIMEOUT_MS,
@@ -301,6 +302,10 @@ stage1Describe('Stage-1 real-model server admission', () => {
     async () => {
       try {
         const first = await postResponse(baseUrl, 'Reply with one short word for circle.');
+        // The first request's adopt evicts test 1's surviving warm session,
+        // and that release is only recorded after the response completes.
+        // Drain before snapshotting so `afterFirst` cannot miss it.
+        await waitForAccountingDrain('first Responses request accounting did not settle');
         const afterFirst = releasedOwners().length;
         const second = await postResponse(baseUrl, 'Reply with one short word for square.');
 

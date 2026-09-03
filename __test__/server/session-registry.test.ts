@@ -223,6 +223,35 @@ describe('SessionRegistry', () => {
     expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(1);
   });
 
+  it('keeps a twice-failed disposal visible to pendingDisposalCount until a later flush settles it', async () => {
+    // Regression for the stage-1 e2e gate: flushPendingDisposals retries a
+    // failed disposal once per call and then returns with the session back
+    // in failedDisposals and pendingDisposals empty. A quiescence probe that
+    // only counted in-flight disposals would read zero while a release is
+    // still owed, and a later request's flush could land that release after
+    // the probe passed.
+    const model = makeMockModel();
+    releaseOwnerSpy(model)
+      .mockRejectedValueOnce(new Error('native release failed (1)'))
+      .mockRejectedValueOnce(new Error('native release failed (2)'));
+    const reg = new SessionRegistry({ model });
+    const warm = new ChatSession(model);
+    await warm.send('seed owner');
+
+    reg.adopt('resp_1', warm, null, null, 'tenant-a/high-entropy-secret');
+    reg.getOrCreate('resp_1', null, null, 'tenant-b/high-entropy-secret');
+
+    // First flush: initial attempt + its one bounded retry both reject.
+    await reg.flushPendingDisposals();
+    expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(2);
+    expect(reg.pendingDisposalCount).toBe(1);
+
+    // The next flush retries the owed release; the mock now resolves.
+    await reg.flushPendingDisposals();
+    expect(releaseOwnerSpy(model)).toHaveBeenCalledTimes(3);
+    expect(reg.pendingDisposalCount).toBe(0);
+  });
+
   it('leases a tier-1 warm session when cache salts are equal', () => {
     const model = makeMockModel();
     const reg = new SessionRegistry({ model });
