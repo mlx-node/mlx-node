@@ -208,6 +208,13 @@ export default function Models() {
    * (a failed one renders the error card in place of the whole grid).
    */
   const [settledOn, setSettledOn] = useState<ReadonlyMap<string, unknown>>(() => new Map());
+  /**
+   * The same body, reachable from the reconcile effect below. That effect cannot
+   * depend on `catalog.data`: it calls `reloadCatalog()`, so listing the body it
+   * produces would re-run the effect on arrival and reload forever.
+   */
+  const catalogBody = useRef(catalog.data);
+  catalogBody.current = catalog.data;
 
   const [pendingDelete, setPendingDelete] = useState<LocalModel | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -304,6 +311,14 @@ export default function Models() {
     // reports a failed download for a model that is on disk. `recoverBackup`
     // likewise restores a crashed publish before the job can be cancelled.
     if (settled) {
+      // Same window as the live path: `active` never held these jobs (the
+      // hydration above skips terminal ones), so until the reload lands the
+      // stale body offers a live button for work that has already finished.
+      setSettledOn((prev) => {
+        const next = new Map(prev);
+        for (const job of jobs) if (isTerminalJob(job.state)) next.set(job.repo, catalogBody.current);
+        return next;
+      });
       reloadModels();
       reloadCatalog();
       // The update comparison predates the publish too, and it is the one

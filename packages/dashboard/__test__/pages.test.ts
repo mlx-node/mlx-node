@@ -1527,6 +1527,39 @@ describe('Models page — the Install affordance', () => {
     expect(buttonLabels()).toContain('Installed');
   });
 
+  it('closes that window for a job that settled while the page was away', async () => {
+    // Reached without any live event. A job that went terminal while this page
+    // was unmounted (or across a reconnect) is skipped by the hydration above,
+    // so `active` never holds it and no `DownloadProgress` ever fires — the
+    // reconcile effect is the only thing that notices, and it reloads the same
+    // snapshots. Its window is identical, and the guard has to be set there too.
+    const stale = catalogRoutes({ present: false, installed: false, localRevision: null }, [
+      downloadJob({ id: 'job-away', state: 'done' }),
+    ]);
+    // Upstream is ahead of what that job installed, so once the body lands there
+    // is a real update to offer — a suppression that never lifts kills it.
+    const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
+      items: [{ hfRepo: REPO, remoteRevision: 'c'.repeat(40) }],
+    });
+    const held = deferred(fresh['/catalog']);
+    recordRequests({
+      ...stale,
+      '/catalog': sequence(stale['/catalog'], held.body),
+      '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+      '/downloads/job-away': { cancelled: true, id: 'job-away' },
+    });
+    await mountModels();
+
+    // The mount itself spans the publish: `/downloads` already says `done` while
+    // `/catalog` still says absent.
+    expect(buttonLabels()).toContain('Install');
+    expect(liveButtonLabels()).not.toContain('Install');
+
+    held.release();
+    await settle();
+    expect(liveButtonLabels()).toContain('Update available');
+  });
+
   it('closes that window when the job settles as ERROR, which can still have installed', async () => {
     // `publish()` renames staging into place and only THEN removes the backup,
     // inside the job's try, so an `error` can name a model already on disk. That
