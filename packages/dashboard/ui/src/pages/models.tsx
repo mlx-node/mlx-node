@@ -193,6 +193,22 @@ export default function Models() {
   const downloads = useJson<DownloadsResponse>('/downloads');
   const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
 
+  /**
+   * For a repo whose job just settled, the catalog body that was current when it
+   * did. `setActive` clears synchronously while `reload()` only marks the old
+   * body refreshing, so one committed render still carries the pre-download
+   * state — a live Install (or Update available) for work that just finished.
+   * Clicking there is not idempotent: the settled job was already dismissed, so
+   * the server allocates a second one that can only short-circuit to `done`.
+   *
+   * Holding the body rather than a flag is what makes the window self-closing.
+   * `useJson` hands back a newly deserialized object per response, so the
+   * identity no longer matching IS the refreshed catalog arriving; nothing has
+   * to remember to clear it, and a reload that never returns cannot strand it
+   * (a failed one renders the error card in place of the whole grid).
+   */
+  const [settledOn, setSettledOn] = useState<ReadonlyMap<string, unknown>>(() => new Map());
+
   const [pendingDelete, setPendingDelete] = useState<LocalModel | null>(null);
   const [deleting, setDeleting] = useState(false);
   /** repo → active download job (seeded from the server, added on install). */
@@ -330,6 +346,7 @@ export default function Models() {
     if (id !== undefined) {
       void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`).catch(() => {});
     }
+    setSettledOn((prev) => new Map(prev).set(repo, catalog.data));
     models.reload();
     catalog.reload();
     // The update comparison is a SEPARATE request, so it holds the pre-download
@@ -350,6 +367,7 @@ export default function Models() {
     // verdict in place would immediately re-offer "Update available" for it.
     // BOTH halves: the marker it must be compared against is `/catalog`'s
     // `localRevision`, so refreshing the remote shas alone repairs nothing.
+    setSettledOn((prev) => new Map(prev).set(repo, catalog.data));
     catalog.reload();
     updates.reload();
     const id = active[repo]?.id;
@@ -608,6 +626,7 @@ export default function Models() {
               key={item.hfRepo}
               item={item}
               updateAvailable={hasUpdate(item, remoteRevisions)}
+              settling={settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo) === catalog.data}
               job={active[item.hfRepo]}
               onInstall={() => install(item.hfRepo)}
               onDone={() => onDownloadDone(item.hfRepo)}
@@ -694,6 +713,11 @@ interface CatalogCardProps {
   item: CatalogItem;
   /** Upstream has different bytes at this repo than the local marker records. */
   updateAvailable: boolean;
+  /**
+   * This repo's job has settled but the catalog body it invalidated has not
+   * arrived, so every field here still describes the state before the download.
+   */
+  settling: boolean;
   job: ActiveJob | undefined;
   onInstall: () => void;
   onDone: () => void;
@@ -705,6 +729,7 @@ interface CatalogCardProps {
 function CatalogCard({
   item,
   updateAvailable,
+  settling,
   job,
   onInstall,
   onDone,
@@ -769,7 +794,7 @@ function CatalogCard({
           // Same job pipeline as a first install: the runner already re-downloads
           // whenever the installed marker's revision differs from upstream, and
           // its owned-swap replaces the stale directory.
-          <Button className="w-full" onClick={onInstall}>
+          <Button className="w-full" onClick={onInstall} disabled={settling}>
             <Download className="size-4" />
             Update available
           </Button>
@@ -793,7 +818,7 @@ function CatalogCard({
             </p>
           </div>
         ) : (
-          <Button className="w-full" onClick={onInstall}>
+          <Button className="w-full" onClick={onInstall} disabled={settling}>
             <Download className="size-4" />
             Install
           </Button>

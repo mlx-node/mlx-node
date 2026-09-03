@@ -58,6 +58,7 @@ import {
   STUB_FAILURE,
   TICK_CHAR_PX,
   TICK_LINE_PX,
+  deferred,
   renderPage,
   sequence,
   stubApi,
@@ -1121,6 +1122,13 @@ describe('Models page — the Install affordance', () => {
     return Array.from(mounted!.container.querySelectorAll('button')).map((b) => (b.textContent ?? '').trim());
   }
 
+  /** Labels of the buttons a user can actually press — a disabled one cannot act. */
+  function liveButtonLabels(): string[] {
+    return Array.from(mounted!.container.querySelectorAll('button'))
+      .filter((button) => !button.disabled)
+      .map((button) => (button.textContent ?? '').trim());
+  }
+
   function downloadJob(overrides: Partial<DownloadJob>): DownloadJob {
     return { id: 'job-1', repo: REPO, state: 'running', receivedBytes: 0, totalBytes: 1024, ...overrides };
   }
@@ -1449,6 +1457,107 @@ describe('Models page — the Install affordance', () => {
       expect(gets(calls, '/api/catalog')).toBe(2);
       expect(buttonLabels()).not.toContain('Update available');
       expect(buttonLabels()).toContain('Installed');
+    } finally {
+      failed.mockRestore();
+    }
+  });
+
+  it('cannot start a second job in the render between a settle and the refreshed catalog', async () => {
+    // `setActive` clears synchronously while `reload()` only marks the previous
+    // body refreshing, so one committed render still carries the pre-download
+    // state: no job, the old `localRevision`, and the old remote sha. Left live,
+    // that button allocates a job the server can only short-circuit to `done` —
+    // two Hugging Face round trips, a spurious card and a spurious toast.
+    const stale = catalogRoutes(
+      { present: true, installed: true, localRevision: 'a'.repeat(40) },
+      [downloadJob({ id: 'job-upd', state: 'running' })],
+      { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
+    );
+    // Upstream moved again while that job ran, so once the refreshed bodies land
+    // there is a GENUINE update to offer. That is what proves the window closes:
+    // a suppression that never lifts would leave this button dead forever.
+    const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
+      items: [{ hfRepo: REPO, remoteRevision: 'c'.repeat(40) }],
+    });
+    // Held, so the assertions below land INSIDE the window rather than after it.
+    const held = deferred(fresh['/catalog']);
+    recordRequests({
+      ...stale,
+      '/catalog': sequence(stale['/catalog'], held.body),
+      '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+      '/downloads/job-upd': { cancelled: true, id: 'job-upd' },
+    });
+    await mountModels();
+
+    emitDownload('done', { id: 'job-upd', outputDir: '/models/x' });
+    await settle();
+    // The refreshed catalog has not landed, so the card still reads the stale
+    // comparison — but it must not be pressable while it does.
+    expect(buttonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).not.toContain('Update available');
+
+    held.release();
+    await settle();
+    expect(liveButtonLabels()).toContain('Update available');
+  });
+
+  it('closes that window on a FIRST install too, where the stale body still says absent', async () => {
+    // The same one render, reached from the other side: nothing was installed
+    // before, so the stale body says `present: false` and the branch falls
+    // through to a live Install for the model that just finished installing.
+    const stale = catalogRoutes({ present: false, installed: false, localRevision: null }, [
+      downloadJob({ id: 'job-new', state: 'running' }),
+    ]);
+    const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) });
+    const held = deferred(fresh['/catalog']);
+    recordRequests({
+      ...stale,
+      '/catalog': sequence(stale['/catalog'], held.body),
+      '/downloads/job-new': { cancelled: true, id: 'job-new' },
+    });
+    await mountModels();
+
+    emitDownload('done', { id: 'job-new', outputDir: '/models/x' });
+    await settle();
+    expect(buttonLabels()).toContain('Install');
+    expect(liveButtonLabels()).not.toContain('Install');
+
+    held.release();
+    await settle();
+    expect(buttonLabels()).toContain('Installed');
+  });
+
+  it('closes that window when the job settles as ERROR, which can still have installed', async () => {
+    // `publish()` renames staging into place and only THEN removes the backup,
+    // inside the job's try, so an `error` can name a model already on disk. That
+    // path clears `active` synchronously too, so it opens the same window.
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      const stale = catalogRoutes(
+        { present: true, installed: true, localRevision: 'a'.repeat(40) },
+        [downloadJob({ id: 'job-err', state: 'running' })],
+        { items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }] },
+      );
+      const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'c'.repeat(40) }],
+      });
+      const held = deferred(fresh['/catalog']);
+      recordRequests({
+        ...stale,
+        '/catalog': sequence(stale['/catalog'], held.body),
+        '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+        '/downloads/job-err': { cancelled: true, id: 'job-err' },
+      });
+      await mountModels();
+
+      emitDownload('error', { id: 'job-err', message: 'fsync failed after publish' });
+      await settle();
+      expect(buttonLabels()).toContain('Update available');
+      expect(liveButtonLabels()).not.toContain('Update available');
+
+      held.release();
+      await settle();
+      expect(liveButtonLabels()).toContain('Update available');
     } finally {
       failed.mockRestore();
     }
