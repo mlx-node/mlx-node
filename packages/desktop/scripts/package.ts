@@ -206,15 +206,20 @@ console.log(`LSMinimumSystemVersion: ${minimumSystemVersion} (highest minos of $
 // Qwen3-ASR can capture both local microphone input and remote/system output.
 // These are privacy usage descriptions, not sandbox or hardened-runtime
 // entitlements. They must live in the host app's Info.plist before signing.
+//
+// `-replace`, never `-insert`: the packaged bundle already carries both keys, so
+// `-insert` exits 1 with "Value already exists at key path" and takes the whole
+// release with it. `-replace` writes the value whether or not the key is there,
+// which is also what the caller wants — ours is the description to ship.
 run('plutil', [
-  '-insert',
+  '-replace',
   'NSMicrophoneUsageDescription',
   '-string',
   'mlx-node uses your microphone to transcribe speech locally on this Mac.',
   join(appPath, 'Contents', 'Info.plist'),
 ]);
 run('plutil', [
-  '-insert',
+  '-replace',
   'NSAudioCaptureUsageDescription',
   '-string',
   'mlx-node captures app and system audio to transcribe meetings locally on this Mac.',
