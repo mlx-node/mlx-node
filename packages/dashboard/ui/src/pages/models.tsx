@@ -781,11 +781,13 @@ function CatalogCard({
         <CardDescription>{item.description}</CardDescription>
       </CardHeader>
       <CardContent className="mt-auto space-y-3">
-        <div className="text-muted-foreground flex items-center justify-between text-xs">
-          <span className="truncate font-mono" title={item.hfRepo}>
+        <div className="text-muted-foreground flex items-center justify-between gap-2 text-xs">
+          {/* `min-w-0` lets the repo shrink and ellipsize; without it the flex
+              item floors at content width and squeezes the size onto two lines. */}
+          <span className="min-w-0 truncate font-mono" title={item.hfRepo}>
             {item.hfRepo}
           </span>
-          <span className="tabular-nums">~{item.sizeGb} GB</span>
+          <span className="shrink-0 tabular-nums whitespace-nowrap">~{item.sizeGb} GB</span>
         </div>
         {downloading && job !== undefined ? (
           <div className="space-y-2">
