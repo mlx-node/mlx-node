@@ -772,22 +772,22 @@ function CatalogCard({
       <CardHeader>
         <div className="flex items-start justify-between gap-2">
           <CardTitle className="text-base">{item.label}</CardTitle>
-          {item.isDefault === true && (
-            <Badge variant="secondary" className="font-normal">
-              default
-            </Badge>
-          )}
+          <div className="flex shrink-0 items-center gap-2">
+            {item.isDefault === true && (
+              <Badge variant="secondary" className="font-normal">
+                default
+              </Badge>
+            )}
+            <span className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">~{item.sizeGb} GB</span>
+          </div>
         </div>
         <CardDescription>{item.description}</CardDescription>
       </CardHeader>
       <CardContent className="mt-auto space-y-3">
-        <div className="text-muted-foreground flex items-center justify-between gap-2 text-xs">
-          {/* `min-w-0` lets the repo shrink and ellipsize; without it the flex
-              item floors at content width and squeezes the size onto two lines. */}
-          <span className="min-w-0 truncate font-mono" title={item.hfRepo}>
-            {item.hfRepo}
-          </span>
-          <span className="shrink-0 tabular-nums whitespace-nowrap">~{item.sizeGb} GB</span>
+        {/* Full-width row of its own: the repo id truncates against the card
+            edge instead of competing with the size label for one line. */}
+        <div className="text-muted-foreground truncate font-mono text-xs" title={item.hfRepo}>
+          {item.hfRepo}
         </div>
         {downloading && job !== undefined ? (
           <div className="space-y-2">
