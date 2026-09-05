@@ -41,6 +41,13 @@ constructor. Existing inline `Chat(ChatCmd)` families use `direct`.
 Trainable families add their typed `Generate`/`Train`/`SaveModel` variants;
 those remain ordered barriers.
 
+Keep shared behavior in backend trait defaults or generic engine functions.
+The command macro only constructs and extracts enum variants: a trait default
+cannot refer to a family's `Self::Chat` or `Self::SchedulerStats` without
+family-provided conversion hooks. A common `ModelCommand<FamilyCommand>` enum
+could eliminate this adapter, but would require changing the family command
+representation and dispatch sites. Do not grow scheduling policy inside the macro.
+
 **NAPI surface.** One `chat_napi_surface!` invocation
 (`models/chat_napi.rs`) emits the shared chat/streaming methods. The macro
 varies on exactly 3 axes: `thread_cmd` (the family command type wrapped via
