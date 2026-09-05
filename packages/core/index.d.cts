@@ -187,7 +187,6 @@ export declare class Gemma4Model {
    */
   hasBlockPagedCache(): boolean;
   maxConcurrentSequences(): number;
-  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Whether this loaded instance can execute image-bearing chat turns.
    * Config-only stubs and incomplete/non-paged physical paths return false.
@@ -209,6 +208,8 @@ export declare class Gemma4Model {
   hasMtpWeights(): boolean;
   /** Load a Gemma4 model from a directory. */
   static load(modelPath: string, options?: Gemma4LoadOptions | undefined | null): Promise<Gemma4Model>;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Reset all caches and clear cached token history. Async so a reset
    * queued behind an in-flight turn parks a tokio future, never the
@@ -561,10 +562,10 @@ export declare class Lfm2Model {
   getConfig(): Lfm2Config;
   /** Native admission capacity for the server's per-model semaphore. */
   maxConcurrentSequences(): number;
-  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
-  schedulerStats(): Promise<SchedulerStats>;
   /** Estimated number of model parameters. */
   numParameters(): number;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Reset all caches and clear cached token history. Async so a reset
    * queued behind an in-flight turn parks a tokio future, never the
@@ -654,6 +655,7 @@ export declare class MuseGlimmerModel {
    * `effective_window_tokens` is min(trained, live pool).
    */
   contextLimits(): MuseGlimmerContextLimits;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
   schedulerStats(): Promise<SchedulerStats>;
   /**
    * Reset all caches and clear cached token history. Async so a reset
@@ -1043,10 +1045,10 @@ export declare class NemotronHModel {
    * models and forced-serial processes report 1.
    */
   maxConcurrentSequences(): number;
-  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
-  schedulerStats(): Promise<SchedulerStats>;
   /** Estimated number of model parameters. */
   numParameters(): number;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Reset all caches and clear cached token history. Async so a reset
    * queued behind an in-flight turn parks a tokio future, never the
@@ -1434,8 +1436,6 @@ export declare class Qwen35Model {
    * lane by the scheduler.
    */
   maxConcurrentSequences(): number;
-  /** Snapshot scheduler occupancy plus unified block/recurrent admission. */
-  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Whether this instance has an inline MTP head or external DFlash2
    * companion. Snapshotted at load time so `ChatSession` can auto-default
@@ -1491,6 +1491,8 @@ export declare class Qwen35Model {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Reset all caches and clear cached token history. Async so a reset
    * queued behind an in-flight turn parks a tokio future, never the
@@ -1598,8 +1600,6 @@ export declare class Qwen35MoeModel {
    * decode lane.
    */
   maxConcurrentSequences(): number;
-  /** Snapshot scheduler occupancy plus unified block/recurrent admission. */
-  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Whether this checkpoint shipped an MTP head (module loaded by
    * `persistence::apply_weights_moe_inner`). Snapshotted at load time from
@@ -1644,6 +1644,8 @@ export declare class Qwen35MoeModel {
    * Dispatches to model thread.
    */
   saveModel(savePath: string): Promise<undefined>;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Reset all caches and clear cached token history. Async so a reset
    * queued behind an in-flight turn parks a tokio future, never the
@@ -1782,11 +1784,6 @@ export declare class Qwen3Model {
    * report one so the server retains its exclusive dispatch lane.
    */
   maxConcurrentSequences(): number;
-  /**
-   * Snapshot continuous-batching scheduler counters after all commands
-   * already ahead of this query have drained.
-   */
-  schedulerStats(): Promise<SchedulerStats>;
   /** Get model configuration */
   getConfig(): Qwen3Config;
   /**
@@ -1880,6 +1877,8 @@ export declare class Qwen3Model {
     tools?: Array<ToolDefinition> | undefined | null,
     enableThinking?: boolean | undefined | null,
   ): Promise<Uint32Array>;
+  /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
+  schedulerStats(): Promise<SchedulerStats>;
   /**
    * Reset all caches and clear cached token history. Async so a reset
    * queued behind an in-flight turn parks a tokio future, never the

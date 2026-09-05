@@ -95,13 +95,6 @@ pub(crate) enum Qwen35Cmd {
     },
 }
 
-impl FromChatCmd for Qwen35Cmd {
-    #[inline]
-    fn from_chat(cmd: ChatCmd) -> Self {
-        Qwen35Cmd::Chat(cmd)
-    }
-}
-
 impl FromTrainCmd for Qwen35Cmd {
     #[inline]
     fn from_train(cmd: TrainCmd) -> Self {
@@ -109,30 +102,7 @@ impl FromTrainCmd for Qwen35Cmd {
     }
 }
 
-impl HybridSchedulerCommand for Qwen35Cmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            _ => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
-    }
-}
+crate::engine::command_adapter::impl_scheduler_command!(Qwen35Cmd, direct);
 
 /// Training backend the model-neutral [`handle_train_cmd`] drives. Each
 /// method forwards to the inherent `*_sync_impl` body on [`Qwen35Inner`].

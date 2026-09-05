@@ -18,7 +18,8 @@
 //! `#[napi] impl` blocks per class, so each family keeps its own
 //! hand-written block (`load`, `generate`, `save_*`, `has_mtp_weights`,
 //! `has_block_paged_cache`, …) and adds one macro invocation for the
-//! chat surface.
+//! chat surface. Scheduler telemetry forwarding is generated here too, using
+//! `HybridSchedulerCommand::scheduler_stats` and the same load-first guard.
 //!
 //! The macro is parameterised over the three axes that actually vary
 //! between families:
@@ -70,6 +71,16 @@ macro_rules! chat_napi_surface {
     ) => {
         #[napi]
         impl $Class {
+            /// Snapshot scheduler occupancy and paged-pool admission telemetry.
+            #[napi]
+            pub async fn scheduler_stats(&self) -> ::napi::Result<$crate::engine::SchedulerStatsJs> {
+                $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
+                $crate::model_thread::send_and_await(
+                    thread,
+                    <$thread_cmd as $crate::engine::hybrid_scheduler::HybridSchedulerCommand>::scheduler_stats,
+                ).await
+            }
+
             /// Reset all caches and clear cached token history. Async so a reset
             /// queued behind an in-flight turn parks a tokio future, never the
             /// Node event loop (H1: a dead prefill used to freeze all HTTP traffic).

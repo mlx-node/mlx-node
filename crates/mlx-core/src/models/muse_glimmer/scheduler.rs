@@ -5,42 +5,18 @@ use crate::array::MxArray;
 use crate::engine::backend::ChatBackend;
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
-    NoRestoreTicket, ScheduledPrefixAdmission, ScheduledReply, SchedulerOwnerContext,
+    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, NoRestoreTicket,
+    ScheduledPrefixAdmission, ScheduledReply, SchedulerOwnerContext,
 };
 use crate::engine::scheduler::PreemptionMode;
 use crate::engine::types::ChatConfig;
-use crate::model_thread::ResponseTx;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::muse_glimmer::dflash::DFlashContextCache;
 use crate::models::muse_glimmer::kv_cache::PagedWindowSlot;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
-impl HybridSchedulerCommand for MuseGlimmerCmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            Self::SchedulerStats { .. } => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(*chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<crate::engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
-    }
-}
+crate::engine::command_adapter::impl_scheduler_command!(MuseGlimmerCmd, boxed);
 
 #[derive(Default)]
 pub(crate) struct MuseOwnerState {

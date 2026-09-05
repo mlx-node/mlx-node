@@ -32,6 +32,41 @@ use crate::engine::spec_paged::SpecTurnEpilogue;
 use crate::sampling;
 use crate::stream::{DeviceType, Stream};
 
+/// Before the first rejection, row i's history is exactly `history + drafts[..i]`.
+/// Prepare every deterministic decision from that prefix, then cross the device
+/// boundary once. Decisions after the first mismatch are discarded. This must
+/// not be used for stochastic acceptance, whose residual draws are sequential.
+fn penalized_greedy_accept(
+    logits: &MxArray,
+    drafts: &[i32],
+    history: &[u32],
+    params: &ChatParams,
+) -> Result<(usize, u32)> {
+    let vocab = logits.shape_at(2)?;
+    let mut prefix = history.to_vec();
+    let mut decisions = Vec::with_capacity(drafts.len() + 1);
+    for i in 0..=drafts.len() {
+        let row = logits
+            .slice(&[0, i as i64, 0], &[1, i as i64 + 1, vocab])?
+            .squeeze(Some(&[0, 1]))?;
+        decisions.push(apply_all_penalties(row, &prefix, params)?.argmax(0, None)?);
+        if let Some(&draft) = drafts.get(i) {
+            prefix.push(draft as u32);
+        }
+    }
+    MxArray::eval_arrays_with_context(
+        &decisions.iter().collect::<Vec<_>>(),
+        "speculative_greedy_accept",
+    )?;
+    for (i, decision) in decisions.iter().enumerate() {
+        let target = decision.item_at_int32(0)?;
+        if drafts.get(i) != Some(&target) {
+            return Ok((i, target as u32));
+        }
+    }
+    unreachable!("the bonus row has no corresponding draft")
+}
+
 /// Required arguments of [`run_dspark_turn`] — the DSpark analog of
 /// [`crate::engine::mtp_turn::MtpTurnArgs`], minus the MTP-only
 /// prompt-hidden seed fields (the DSpark stepper owns its draft-context
@@ -574,50 +609,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 Ok((k, target_argmax[k] as u32))
             })()
         } else if greedy_temp {
-            // Penalized-greedy path (T=0 with active penalties): per-row
-            // `apply_all_penalties` over the sequentially extended history,
-            // then a plain argmax decides accept/boundary. No proposal
-            // dists, no RNG — behaviorally identical to `run_mtp_cycle`'s
-            // legacy dense branch at T=0, where `accept_with_residual`'s
-            // argmax shortcut reads the penalized row and the bonus
-            // `sample(penalized)` degenerates to its argmax.
-            (|| {
-                let vocab = logits.shape_at(2)?;
-                let mut hist_extended: Vec<u32> = hist.clone();
-                let mut k = 0usize;
-                let mut boundary: Option<u32> = None;
-                for i in 0..draft_len {
-                    let v_slice = logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-                    let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
-                    let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
-                    let argmax_arr = penalized.argmax(0, None)?;
-                    argmax_arr.eval();
-                    let target_id = argmax_arr.item_at_int32(0)?;
-                    if target_id == proposal.draft_ids[i] {
-                        k += 1;
-                        hist_extended.push(target_id as u32);
-                    } else {
-                        boundary = Some(target_id as u32);
-                        break;
-                    }
-                }
-                let boundary_id = match boundary {
-                    Some(b) => b,
-                    None => {
-                        // All L drafts accepted: boundary = penalized
-                        // argmax of row L.
-                        let i = draft_len;
-                        let v_slice =
-                            logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-                        let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
-                        let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
-                        let argmax_arr = penalized.argmax(0, None)?;
-                        argmax_arr.eval();
-                        argmax_arr.item_at_int32(0)? as u32
-                    }
-                };
-                Ok((k, boundary_id))
-            })()
+            penalized_greedy_accept(&logits, &proposal.draft_ids, hist, p)
         } else {
             // Sampled path: per-position Leviathan accept + residual
             // resample against the stepper's proposal densities.
@@ -1227,7 +1219,8 @@ mod tests {
 
     use super::{
         DSPARK_BREAK_EVEN_SPEC_CYCLES, DsparkBreakEvenChoice, DsparkBreakEvenPolicy,
-        DsparkMeasurementCycle, DsparkTurnArgs, run_dspark_turn,
+        DsparkMeasurementCycle, DsparkTurnArgs, apply_all_penalties, penalized_greedy_accept,
+        run_dspark_turn,
     };
 
     #[test]
@@ -2410,6 +2403,133 @@ mod tests {
             "hard error fires before verify — no target-cache slots written"
         );
         assert_eq!(raw.generated, vec![3], "only the seed was committed");
+    }
+
+    fn serial_penalized_accept(
+        logits: &MxArray,
+        drafts: &[i32],
+        history: &[u32],
+        p: &ChatParams,
+    ) -> Result<(usize, u32)> {
+        let mut history = history.to_vec();
+        let vocab = logits.shape_at(2)?;
+        for i in 0..=drafts.len() {
+            let row = logits
+                .slice(&[0, i as i64, 0], &[1, i as i64 + 1, vocab])?
+                .squeeze(Some(&[0, 1]))?;
+            let decision = apply_all_penalties(row, &history, p)?.argmax(0, None)?;
+            decision.eval();
+            let token = decision.item_at_int32(0)?;
+            if drafts.get(i) != Some(&token) {
+                return Ok((i, token as u32));
+            }
+            history.push(token as u32);
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn grouped_penalized_accept_matches_sequential_at_every_rejection_frontier() {
+        let history = [1, 2, 1, 3, 4, 1];
+        for context in [1, 2, 3, 20] {
+            let mut p = greedy_params();
+            p.repetition_penalty = 1.4;
+            p.presence_penalty = 0.3;
+            p.frequency_penalty = 0.2;
+            p.repetition_context_size = context;
+            p.presence_context_size = context;
+            p.frequency_context_size = context;
+            for len in 0..=5 {
+                let logits = MxArray::from_float32(
+                    &(0..(len + 1) * 16)
+                        .map(|i| ((i * 13) % 23) as f32 / 7.0 - 1.0)
+                        .collect::<Vec<_>>(),
+                    &[1, len as i64 + 1, 16],
+                )
+                .unwrap();
+                let mut drafts = Vec::new();
+                for _ in 0..len {
+                    let (_, next) =
+                        serial_penalized_accept(&logits, &drafts, &history, &p).unwrap();
+                    drafts.push(next as i32);
+                }
+                for rejection in 0..=len {
+                    let mut proposal = drafts.clone();
+                    if rejection < len {
+                        proposal[rejection] = (proposal[rejection] + 1) % 16;
+                    }
+                    let expected =
+                        serial_penalized_accept(&logits, &proposal, &history, &p).unwrap();
+                    assert_eq!(expected.0, rejection);
+                    assert_eq!(
+                        penalized_greedy_accept(&logits, &proposal, &history, &p).unwrap(),
+                        expected,
+                        "context={context}, len={len}, rejection={rejection}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual control-flow microbenchmark; run in release with --nocapture"]
+    fn benchmark_penalized_accept_completion() {
+        use std::time::Instant;
+        const VOCAB: i64 = 32_000;
+        let mut p = greedy_params();
+        p.repetition_penalty = 1.2;
+        p.repetition_context_size = 256;
+        let history: Vec<u32> = (0..256).collect();
+        for len in [1, 3, 7] {
+            let logits = MxArray::from_float32(
+                &(0..(len + 1) * VOCAB as usize)
+                    .map(|i| ((i * 13) % 193) as f32 / 71.0)
+                    .collect::<Vec<_>>(),
+                &[1, len as i64 + 1, VOCAB],
+            )
+            .unwrap();
+            logits.eval();
+            let mut drafts = Vec::new();
+            for _ in 0..len {
+                drafts.push(
+                    serial_penalized_accept(&logits, &drafts, &history, &p)
+                        .unwrap()
+                        .1 as i32,
+                );
+            }
+            for reject_first in [false, true] {
+                let mut proposal = drafts.clone();
+                if reject_first {
+                    proposal[0] = (proposal[0] + 1) % VOCAB as i32;
+                }
+                let mut times = [Vec::new(), Vec::new()];
+                for round in 0..8 {
+                    for mode in [round % 2, 1 - round % 2] {
+                        let start = Instant::now();
+                        for _ in 0..100 {
+                            let out = if mode == 0 {
+                                serial_penalized_accept(&logits, &proposal, &history, &p)
+                            } else {
+                                penalized_greedy_accept(&logits, &proposal, &history, &p)
+                            };
+                            std::hint::black_box(out.unwrap());
+                        }
+                        if round > 0 {
+                            times[mode].push(start.elapsed().as_secs_f64() * 10_000.0);
+                        }
+                    }
+                }
+                for t in &mut times {
+                    t.sort_by(f64::total_cmp);
+                }
+                println!(
+                    "ACCEPT_BENCH drafts={len} reject_first={reject_first} serial_us={:.2} grouped_us={:.2} speedup={:.3}",
+                    times[0][3],
+                    times[1][3],
+                    times[0][3] / times[1][3]
+                );
+            }
+        }
     }
 
     #[test]

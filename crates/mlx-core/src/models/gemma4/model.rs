@@ -542,15 +542,6 @@ impl Gemma4Model {
         }
     }
 
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        let thread = self.thread.as_ref().ok_or_else(|| {
-            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
-        })?;
-        crate::model_thread::send_and_await(thread, |reply| Gemma4Cmd::SchedulerStats { reply })
-            .await
-    }
-
     /// Whether this loaded instance can execute image-bearing chat turns.
     /// Config-only stubs and incomplete/non-paged physical paths return false.
     #[napi]

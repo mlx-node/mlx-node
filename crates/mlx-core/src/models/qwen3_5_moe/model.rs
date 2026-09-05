@@ -14,12 +14,10 @@ use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs,
     ThinkingSetup, TrainBackend, TurnOutput, TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::{
-    ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
-};
+use crate::engine::cmd::{ChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, pool_tokens_after_recurrent,
-    scheduled_turn_context, scheduler_per_seq_context_override,
+    HybridSchedulerBackend, pool_tokens_after_recurrent, scheduled_turn_context,
+    scheduler_per_seq_context_override,
 };
 use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
@@ -367,12 +365,6 @@ impl Qwen3_5MoeModel {
         } else {
             1
         }
-    }
-
-    /// Snapshot scheduler occupancy plus unified block/recurrent admission.
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        send_and_await(&self.thread, |reply| Qwen35MoeCmd::SchedulerStats { reply }).await
     }
 
     /// Test-only: snapshot the paged-MTP GDN bookkeeping between turns.

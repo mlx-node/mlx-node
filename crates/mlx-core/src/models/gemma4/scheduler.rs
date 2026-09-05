@@ -3,10 +3,10 @@ use napi::bindgen_prelude::{Error, Result};
 use super::*;
 use crate::array::MxArray;
 use crate::engine::backend::ChatBackend;
-use crate::engine::cmd::{ChatCmd, FromChatCmd, handle_chat_cmd};
+use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
-    NoRestoreTicket, ScheduledPrefixAdmission, ScheduledReply, SchedulerOwnerContext,
+    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, NoRestoreTicket,
+    ScheduledPrefixAdmission, ScheduledReply, SchedulerOwnerContext,
 };
 use crate::engine::scheduler::PreemptionMode;
 use crate::engine::{self};
@@ -28,36 +28,7 @@ pub(crate) enum Gemma4Cmd {
     },
 }
 
-impl FromChatCmd for Gemma4Cmd {
-    fn from_chat(command: ChatCmd) -> Self {
-        Self::Chat(Box::new(command))
-    }
-}
-
-impl HybridSchedulerCommand for Gemma4Cmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            Self::SchedulerStats { .. } => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(*chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
-    }
-}
+crate::engine::command_adapter::impl_scheduler_command!(Gemma4Cmd, boxed);
 
 pub(crate) type Gemma4SchedulerState = HybridSchedulerState<Gemma4Inner>;
 

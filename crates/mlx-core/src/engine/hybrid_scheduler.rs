@@ -78,6 +78,7 @@ pub(crate) struct SchedulerOwnerContext<'a, S> {
 /// barriers. The scheduler only needs model-neutral views of chat and stats
 /// commands; it never matches family variants itself.
 pub(crate) trait HybridSchedulerCommand: FromChatCmd + Sized {
+    fn scheduler_stats(reply: ResponseTx<SchedulerStatsJs>) -> Self;
     fn as_chat(&self) -> Option<&ChatCmd>;
     fn into_chat(self) -> std::result::Result<ChatCmd, Self>;
     fn into_scheduler_stats(self) -> std::result::Result<ResponseTx<SchedulerStatsJs>, Self>;
@@ -882,10 +883,10 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         }
     }
 
-    fn sample_next(
+    fn prepare_sample_next(
         turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
         mut logits: MxArray,
-    ) -> Result<u32> {
+    ) -> Result<engine::batch_sampling::PendingSample> {
         let sampled = if turn.payload.reasoning_tracker.should_force_think_end() {
             MxArray::from_int32(
                 &[turn.payload.reasoning_tracker.forced_token_id()? as i32],
@@ -904,11 +905,10 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             turn.payload.profiler.end();
             sampled
         };
-        turn.payload.profiler.begin("schedule_eval");
-        MxArray::async_eval_arrays(&[&sampled, &logits]);
-        turn.payload.profiler.end();
-        sampled.eval();
-        Ok(sampled.item_at_int32(0)? as u32)
+        Ok(engine::batch_sampling::PendingSample {
+            token: sampled,
+            logits,
+        })
     }
 
     fn prepare_decode_rows(
@@ -1061,17 +1061,42 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
-        let greedy_tokens: std::result::Result<Option<Vec<u32>>, String> = match &logits {
-            Ok(Some(logits)) if engine::batch_sampling::can_batch_greedy_wave(greedy_wave) => Ok(
-                engine::batch_sampling::batch_greedy_tokens_or_fallback(logits),
-            ),
-            _ => Ok(None),
+        let greedy_tokens = match &logits {
+            Ok(Some(logits)) if engine::batch_sampling::can_batch_greedy_wave(greedy_wave) => {
+                engine::batch_sampling::batch_greedy_tokens_or_fallback(logits)
+            }
+            _ => None,
         };
-        let executed_greedy_epilogue_batch = greedy_tokens
-            .as_ref()
-            .ok()
-            .and_then(Option::as_ref)
-            .map_or(0, Vec::len);
+        let executed_greedy_epilogue_batch = greedy_tokens.as_ref().map_or(0, Vec::len);
+        let mut sampling_eval_time = None;
+        let mut next_tokens: Vec<_> = if let Some(tokens) = greedy_tokens {
+            tokens.into_iter().map(|token| Some(Ok(token))).collect()
+        } else if let Ok(Some(logits)) = &logits {
+            let mut pending = Vec::with_capacity(batch_rows.len());
+            for row in &work {
+                let Some(index) = row.batch_index else {
+                    continue;
+                };
+                debug_assert_eq!(index, pending.len());
+                let turn = running
+                    .iter_mut()
+                    .find(|turn| turn.seq_id == row.seq_id)
+                    .ok_or_else(|| {
+                        Error::from_reason("decode sequence disappeared before sampling")
+                    })?;
+                let sample = logits
+                    .slice_axis(0, index as i64, index as i64 + 1)
+                    .and_then(|row| row.squeeze(Some(&[1])))
+                    .and_then(|logits| Self::prepare_sample_next(turn, logits));
+                pending.push(sample);
+            }
+            let started = Instant::now();
+            let sampled = engine::batch_sampling::evaluate_pending_samples(pending);
+            sampling_eval_time = Some(started.elapsed());
+            sampled.into_iter().map(Some).collect()
+        } else {
+            Vec::new()
+        };
         for row in work {
             let planned = plan.rows.get(row.plan_index).ok_or_else(|| {
                 Error::from_reason(format!(
@@ -1090,24 +1115,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                         row.seq_id
                     ))
                 })?;
-            let greedy_next = match (&greedy_tokens, row.batch_index) {
-                (Ok(Some(tokens)), Some(index)) => Some(*tokens.get(index).ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "{} greedy batch omitted row {index} of {}",
-                        B::SCHEDULER_NAME,
-                        tokens.len()
-                    ))
-                })?),
-                (Err(error), Some(_)) => {
-                    results.push((
-                        row.plan_index,
-                        Self::fail(turn, planned, Error::from_reason(error.clone())),
-                    ));
-                    continue;
-                }
-                _ => None,
-            };
-            let row_logits = match (&logits, row.batch_index) {
+            let next = match (&logits, row.batch_index) {
                 (Err(error), Some(_)) if is_paged_allocation_blocked(&error.reason) => {
                     let rolled_back = turn.payload.generated_tokens.pop();
                     debug_assert_eq!(rolled_back, Some(row.token_id));
@@ -1126,33 +1134,32 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     ));
                     continue;
                 }
-                (Ok(Some(_)), Some(_)) if greedy_next.is_some() => None,
-                (Ok(Some(logits)), Some(index)) => match logits
-                    .slice_axis(0, index as i64, index as i64 + 1)
-                    .and_then(|row| row.squeeze(Some(&[1])))
-                {
-                    Ok(logits) => Some(logits),
-                    Err(error) => {
-                        results.push((row.plan_index, Self::fail(turn, planned, error)));
-                        continue;
-                    }
-                },
-                _ => None,
-            };
-            let next = if greedy_next.is_some() {
-                greedy_next
-            } else {
-                match row_logits {
-                    Some(logits) => match Self::sample_next(turn, logits) {
-                        Ok(token) => Some(token),
-                        Err(error) => {
+                (Ok(Some(_)), Some(index)) => {
+                    match next_tokens.get_mut(index).and_then(Option::take) {
+                        Some(Ok(token)) => Some(token),
+                        Some(Err(error)) => {
                             results.push((row.plan_index, Self::fail(turn, planned, error)));
                             continue;
                         }
-                    },
-                    None => None,
+                        None => {
+                            return Err(Error::from_reason(format!(
+                                "{} sampling omitted batch row {index}",
+                                B::SCHEDULER_NAME,
+                            )));
+                        }
+                    }
                 }
+                _ => None,
             };
+            if row.batch_index.is_some()
+                && let Some(elapsed) = sampling_eval_time
+            {
+                // Each request waited on the same wave. This is per-request
+                // latency, not additive GPU time across the batch.
+                turn.payload
+                    .profiler
+                    .record_duration("sample_eval", elapsed);
+            }
             turn.payload.profiler.step();
             Self::finish_decode_row(turn, &row);
             let finished = row.terminal || row.at_length;

@@ -16,12 +16,10 @@ use crate::engine::backend::{
     PagedPrefix, ResetScope, SaveStateArgs, SpecFrontier, ThinkingSetup, TrainBackend, TurnOutput,
     TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::{
-    ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
-};
+use crate::engine::cmd::{ChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, pool_tokens_after_recurrent,
-    scheduled_turn_context, scheduler_per_seq_context_override,
+    HybridSchedulerBackend, pool_tokens_after_recurrent, scheduled_turn_context,
+    scheduler_per_seq_context_override,
 };
 use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
@@ -32,7 +30,7 @@ use crate::engine::spec_owner::SpecOwner;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::model_thread::{ResponseTx, send_and_await};
+use crate::model_thread::ResponseTx;
 use crate::models::qwen3_5::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
@@ -513,12 +511,6 @@ impl Qwen3_5Model {
         } else {
             1
         }
-    }
-
-    /// Snapshot scheduler occupancy plus unified block/recurrent admission.
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        send_and_await(&self.thread, |reply| Qwen35Cmd::SchedulerStats { reply }).await
     }
 
     /// Whether this instance has an inline MTP head or external DFlash2

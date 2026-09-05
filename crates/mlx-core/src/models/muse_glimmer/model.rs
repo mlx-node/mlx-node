@@ -12,7 +12,7 @@ use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
     SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, TurnTokenObserver, WholeTurnArgs,
 };
-use crate::engine::cmd::{ChatCmd, FromChatCmd};
+use crate::engine::cmd::ChatCmd;
 use crate::engine::params::ChatParams;
 use crate::engine::plan::{
     ExecutionPlan, MediaPlan, PagedAttentionPlan, SpeculativeKind, SpeculativePlan,
@@ -233,12 +233,6 @@ pub(crate) enum MuseGlimmerCmd {
     SchedulerStats {
         reply: ResponseTx<crate::engine::SchedulerStatsJs>,
     },
-}
-
-impl FromChatCmd for MuseGlimmerCmd {
-    fn from_chat(cmd: ChatCmd) -> Self {
-        Self::Chat(Box::new(cmd))
-    }
 }
 
 pub(crate) struct MuseGlimmerInner {
@@ -1710,14 +1704,6 @@ impl MuseGlimmerModel {
     #[napi]
     pub fn context_limits(&self) -> MuseGlimmerContextLimits {
         self.context_limits.clone()
-    }
-
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<crate::engine::SchedulerStatsJs> {
-        crate::model_thread::send_and_await(&self.thread, |reply| MuseGlimmerCmd::SchedulerStats {
-            reply,
-        })
-        .await
     }
 }
 

@@ -10,6 +10,7 @@ pub(crate) mod backend;
 pub(crate) mod batch_sampling;
 pub(crate) mod cache;
 pub(crate) mod cmd;
+pub(crate) mod command_adapter;
 pub(crate) mod compiled_lock;
 pub(crate) mod decode;
 pub(crate) mod dspark_turn;

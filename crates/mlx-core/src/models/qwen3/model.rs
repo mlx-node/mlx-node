@@ -18,13 +18,11 @@ use crate::engine::backend::{
     ChatBackend, DecodeStep, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs, TrainBackend,
     TurnOutput, TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::{
-    ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
-};
+use crate::engine::cmd::{ChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
-    ScheduledPrefixAdmission, ScheduledRestoreResult, ScheduledTurn, SchedulerOwnerContext,
-    scheduler_max_num_seqs_for, scheduler_per_seq_context,
+    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, ScheduledPrefixAdmission,
+    ScheduledRestoreResult, ScheduledTurn, SchedulerOwnerContext, scheduler_max_num_seqs_for,
+    scheduler_per_seq_context,
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::scheduler::{
@@ -166,37 +164,7 @@ pub(crate) enum Qwen3Cmd {
     },
 }
 
-impl FromChatCmd for Qwen3Cmd {
-    #[inline]
-    fn from_chat(cmd: ChatCmd) -> Self {
-        Qwen3Cmd::Chat(cmd)
-    }
-}
-
-impl HybridSchedulerCommand for Qwen3Cmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            _ => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
-    }
-}
+crate::engine::command_adapter::impl_scheduler_command!(Qwen3Cmd, direct);
 
 impl FromTrainCmd for Qwen3Cmd {
     #[inline]
@@ -4722,13 +4690,6 @@ impl Qwen3Model {
         } else {
             1
         }
-    }
-
-    /// Snapshot continuous-batching scheduler counters after all commands
-    /// already ahead of this query have drained.
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        send_and_await(&self.thread, |reply| Qwen3Cmd::SchedulerStats { reply }).await
     }
 
     // ---------------------------------------------------------------

@@ -18,11 +18,11 @@ use crate::engine::backend::{
     PagedPrefix, ResetScope, SaveStateArgs, SpecFrontier, StreamEmitter, TurnOutput, TurnSetup,
     WholeTurnArgs,
 };
-use crate::engine::cmd::{ChatCmd, FromChatCmd, handle_chat_cmd};
+use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
-    NoRestoreTicket, ScheduledPrefixAdmission, pool_tokens_after_recurrent, scheduled_turn_context,
+    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, NoRestoreTicket,
+    ScheduledPrefixAdmission, pool_tokens_after_recurrent, scheduled_turn_context,
     scheduler_max_num_seqs_for, scheduler_per_seq_context_override,
 };
 use crate::engine::plan::{
@@ -67,37 +67,7 @@ pub(crate) enum NemotronHCmd {
     },
 }
 
-impl FromChatCmd for NemotronHCmd {
-    #[inline]
-    fn from_chat(cmd: ChatCmd) -> Self {
-        NemotronHCmd::Chat(Box::new(cmd))
-    }
-}
-
-impl HybridSchedulerCommand for NemotronHCmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            Self::SchedulerStats { .. } | Self::MtpFlatStateForTest { .. } => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(*chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
-    }
-}
+crate::engine::command_adapter::impl_scheduler_command!(NemotronHCmd, boxed);
 
 /// Route a thread command to the engine's chat handler.
 pub(crate) fn handle_nemotron_h_cmd(inner: &mut NemotronHInner, cmd: NemotronHCmd) {
@@ -2990,12 +2960,6 @@ impl NemotronHModel {
         } else {
             1
         }
-    }
-
-    /// Snapshot scheduler occupancy and paged-pool admission telemetry.
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        send_and_await(&self.thread, |reply| NemotronHCmd::SchedulerStats { reply }).await
     }
 
     /// Test-only flat-MTP seam snapshot:

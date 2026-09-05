@@ -13,16 +13,16 @@ use crate::engine::backend::{
     ChatBackend, DecodeStep, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs, TurnOutput,
     TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::{ChatCmd, FromChatCmd, handle_chat_cmd};
+use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
-    ScheduledPrefixAdmission, ScheduledRestoreResult, SchedulerOwnerContext,
-    scheduler_max_num_seqs_for, scheduler_per_seq_context,
+    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, ScheduledPrefixAdmission,
+    ScheduledRestoreResult, SchedulerOwnerContext, scheduler_max_num_seqs_for,
+    scheduler_per_seq_context,
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
 use crate::engine::{self};
-use crate::model_thread::{ResponseTx, send_and_await};
+use crate::model_thread::ResponseTx;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
 use crate::stream::{Stream, StreamContext};
@@ -74,36 +74,7 @@ pub(crate) enum Lfm2Cmd {
     },
 }
 
-impl FromChatCmd for Lfm2Cmd {
-    fn from_chat(cmd: ChatCmd) -> Self {
-        Self::Chat(Box::new(cmd))
-    }
-}
-
-impl HybridSchedulerCommand for Lfm2Cmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            Self::SchedulerStats { .. } => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(*chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
-    }
-}
+crate::engine::command_adapter::impl_scheduler_command!(Lfm2Cmd, boxed);
 
 fn handle_lfm2_cmd(inner: &mut Lfm2Inner, command: Lfm2Cmd) {
     match command {
@@ -2560,12 +2531,6 @@ impl Lfm2Model {
         } else {
             1
         }
-    }
-
-    /// Snapshot scheduler occupancy and paged-pool admission telemetry.
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        send_and_await(&self.thread, |reply| Lfm2Cmd::SchedulerStats { reply }).await
     }
 
     /// Estimated number of model parameters.
