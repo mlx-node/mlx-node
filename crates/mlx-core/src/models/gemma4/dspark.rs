@@ -14,7 +14,7 @@ use std::path::Path;
 
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
-use rand::{Rng, RngExt};
+use rand::Rng;
 use serde::Deserialize;
 
 use crate::array::attention::scaled_dot_product_attention;
@@ -905,8 +905,7 @@ impl DsparkDraftModel {
                 let dist = sampling::sampling_distribution(&step_logits, Some(*cfg))?
                     .astype(DType::Float32)?;
                 dist.eval();
-                let probs = dist.to_float32()?;
-                let token = sample_index_from_probs(&probs, rng)?;
+                let token = sampling::sample_dense_distribution(&dist, rng)?;
                 dists.push(dist);
                 token
             };
@@ -1166,38 +1165,6 @@ pub(crate) fn check_2d_shape(w: &MxArray, rows: i64, cols: i64, name: &str) -> R
         )));
     }
     Ok(())
-}
-
-/// Inverse-CDF draw from a dense probability row (mirrors the sparse-slice
-/// sampler in `sampling.rs`, but over the full vocab row that
-/// `sampling_distribution` returns).
-pub(crate) fn sample_index_from_probs<R: Rng + ?Sized>(probs: &[f32], rng: &mut R) -> Result<i32> {
-    let total: f64 = probs
-        .iter()
-        .filter(|p| p.is_finite() && **p > 0.0)
-        .map(|&p| p as f64)
-        .sum();
-    if !total.is_finite() || total <= 0.0 {
-        return Err(Error::from_reason(
-            "DSpark draft distribution has no positive probability mass",
-        ));
-    }
-    let u: f64 = rng.random::<f64>() * total;
-    let mut cumulative = 0.0f64;
-    let mut last_positive: Option<usize> = None;
-    for (index, &prob) in probs.iter().enumerate() {
-        if !prob.is_finite() || prob <= 0.0 {
-            continue;
-        }
-        cumulative += prob as f64;
-        last_positive = Some(index);
-        if u < cumulative {
-            return Ok(index as i32);
-        }
-    }
-    last_positive
-        .map(|i| i as i32)
-        .ok_or_else(|| Error::from_reason("DSpark draft distribution has no sampleable token"))
 }
 
 // ============================================

@@ -30,10 +30,13 @@ performance measurements. Distinguish source facts, proposals and measurements.
    [validation.md](validation.md). The selected changes are ready for review;
    the larger staged migrations remain proposed work.
 
-5. **In progress — full inference transfer audit.** After the structural revision is
+5. **Complete — full inference transfer audit.** After the structural revision is
    validated and pushed, inspect prefill, decode, speculative verification and SSD
    restore across Rust, C++ and MLX. Inventory CPU/GPU copies, host readbacks and
    synchronization separately; measure and remove confirmed avoidable overhead.
+   The [audit](transfer-audit.md) records five implemented fixes, required
+   boundaries, fallback costs and source/measurement limits. Prefix reuse,
+   concurrent inference, sampled drafting and cache publication were validated.
 
 Success requires a reviewable implementation plus cited research and a concrete
 next-stage plan. A microbenchmark is evidence about the measured operation only;

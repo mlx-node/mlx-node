@@ -382,15 +382,16 @@ impl TransformerBlock {
                     .transpose(Some(&[0, 2, 1, 3]))?;
                 scaled_dot_product_attention_causal(&q_4d, &k_4d, &v_4d, scale)?
             } else {
-                // Cache hit: pull total_ctx K/V back from the pool. The
+                // Cache hit: gather total_ctx K/V within the MLX graph. The
                 // suffix was already written via `update_keys_values`
                 // above, so the pool's `[0, total_ctx)` covers the full
                 // attention context.
                 let total_ctx = cached_prefix_len + (num_tokens as u32);
                 let (k_4d, v_4d) = adapter
-                    .read_kv_range(layer_idx, 0, total_ctx)
+                    .gather_kv_for_prefill_sdpa(layer_idx, total_ctx)
                     .map_err(napi::Error::from_reason)?;
-                // `read_kv_range` returns `[1, n_kv_heads, total_ctx, head_dim]`.
+                // The gather retains pending KV-write dependencies and returns
+                // `[1, n_kv_heads, total_ctx, head_dim]` without host staging.
 
                 // Build an explicit causal mask of shape
                 // `[num_tokens, total_ctx]` where row i (suffix token i,

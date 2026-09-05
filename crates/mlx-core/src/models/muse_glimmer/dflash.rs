@@ -5,7 +5,7 @@
 //! It shares the target token embedding and LM head.
 
 use napi::bindgen_prelude::*;
-use rand::{Rng, RngExt};
+use rand::Rng;
 
 use crate::array::attention::scaled_dot_product_attention;
 use crate::array::{DType, MxArray};
@@ -16,35 +16,6 @@ use crate::sampling::{SamplingConfig, is_greedy_temperature, sampling_distributi
 
 use super::config::{MuseGlimmerDFlashConfig, MuseGlimmerTextConfig};
 use super::mlp::MuseGlimmerMlp;
-
-fn sample_index<R: Rng + ?Sized>(probs: &[f32], rng: &mut R) -> Result<i32> {
-    let total: f64 = probs
-        .iter()
-        .filter(|prob| prob.is_finite() && **prob > 0.0)
-        .map(|&prob| f64::from(prob))
-        .sum();
-    if !total.is_finite() || total <= 0.0 {
-        return Err(Error::from_reason(
-            "Muse-Glimmer DFlash distribution has no positive probability mass",
-        ));
-    }
-    let draw = rng.random::<f64>() * total;
-    let mut cumulative = 0.0;
-    let mut last = None;
-    for (index, &prob) in probs.iter().enumerate() {
-        if !prob.is_finite() || prob <= 0.0 {
-            continue;
-        }
-        cumulative += f64::from(prob);
-        last = Some(index);
-        if draw < cumulative {
-            return Ok(index as i32);
-        }
-    }
-    last.map(|index| index as i32).ok_or_else(|| {
-        Error::from_reason("Muse-Glimmer DFlash distribution has no sampleable token")
-    })
-}
 
 fn parallel_query_ids(anchor: u32, mask: usize, draft_len: usize) -> Vec<i32> {
     let mut ids = Vec::with_capacity(draft_len.saturating_add(1));
@@ -401,7 +372,10 @@ impl DFlashModel {
                 let distribution =
                     sampling_distribution(&row, Some(*sampling))?.astype(DType::Float32)?;
                 distribution.eval();
-                draft_ids.push(sample_index(&distribution.to_float32()?, rng)?);
+                draft_ids.push(crate::sampling::sample_dense_distribution(
+                    &distribution,
+                    rng,
+                )?);
                 distributions.push(distribution);
             }
         }

@@ -1,0 +1,744 @@
+{
+  "date": "2026-09-06",
+  "baselineRevision": "2b6cb786a94de39018e7ce9d0cab1de3e193671b",
+  "baselineBindingSha256": "39edb1f1a2eb6fa168f4bf6241c24b4ab752a4d06ce8294b7fbf64258ed4f6e7",
+  "changedBindingSha256": "14a4c1c35e70c93869a2b1ac763252d16c9da7451ec30c9636ca1568bccf5b7a",
+  "order": ["baseline-1", "changed-1", "changed-2", "baseline-2"],
+  "machine": "Apple M5 Max, 128 GiB, macOS 26.6.2",
+  "runs": {
+    "export-baseline-1": {
+      "revision": "baseline-1",
+      "runs": [
+        {
+          "size": 32,
+          "round": 0,
+          "us": 170.95374999999996
+        },
+        {
+          "size": 32,
+          "round": 1,
+          "us": 167.96520999999996
+        },
+        {
+          "size": 32,
+          "round": 2,
+          "us": 155.02041500000004
+        },
+        {
+          "size": 32,
+          "round": 3,
+          "us": 157.8725
+        },
+        {
+          "size": 32,
+          "round": 4,
+          "us": 164.49437499999988
+        },
+        {
+          "size": 32,
+          "round": 5,
+          "us": 161.38958000000002
+        },
+        {
+          "size": 32,
+          "round": 6,
+          "us": 163.66937500000006
+        },
+        {
+          "size": 32768,
+          "round": 0,
+          "us": 165.9589600000001
+        },
+        {
+          "size": 32768,
+          "round": 1,
+          "us": 177.5189549999999
+        },
+        {
+          "size": 32768,
+          "round": 2,
+          "us": 171.1389600000001
+        },
+        {
+          "size": 32768,
+          "round": 3,
+          "us": 169.99083500000012
+        },
+        {
+          "size": 32768,
+          "round": 4,
+          "us": 166.96499999999986
+        },
+        {
+          "size": 32768,
+          "round": 5,
+          "us": 166.20375000000024
+        },
+        {
+          "size": 32768,
+          "round": 6,
+          "us": 171.87041499999964
+        },
+        {
+          "size": 262144,
+          "round": 0,
+          "us": 217.59395499999985
+        },
+        {
+          "size": 262144,
+          "round": 1,
+          "us": 218.60354500000028
+        },
+        {
+          "size": 262144,
+          "round": 2,
+          "us": 217.87500000000023
+        },
+        {
+          "size": 262144,
+          "round": 3,
+          "us": 216.22416999999984
+        },
+        {
+          "size": 262144,
+          "round": 4,
+          "us": 216.88791499999977
+        },
+        {
+          "size": 262144,
+          "round": 5,
+          "us": 220.0316700000002
+        },
+        {
+          "size": 262144,
+          "round": 6,
+          "us": 216.07146
+        }
+      ]
+    },
+    "export-baseline-2": {
+      "revision": "baseline-2",
+      "runs": [
+        {
+          "size": 32,
+          "round": 0,
+          "us": 162.18833000000004
+        },
+        {
+          "size": 32,
+          "round": 1,
+          "us": 167.956875
+        },
+        {
+          "size": 32,
+          "round": 2,
+          "us": 162.63312499999998
+        },
+        {
+          "size": 32,
+          "round": 3,
+          "us": 162.4572900000001
+        },
+        {
+          "size": 32,
+          "round": 4,
+          "us": 165.21145500000017
+        },
+        {
+          "size": 32,
+          "round": 5,
+          "us": 164.7897899999998
+        },
+        {
+          "size": 32,
+          "round": 6,
+          "us": 163.768125
+        },
+        {
+          "size": 32768,
+          "round": 0,
+          "us": 163.39208499999984
+        },
+        {
+          "size": 32768,
+          "round": 1,
+          "us": 171.84749999999977
+        },
+        {
+          "size": 32768,
+          "round": 2,
+          "us": 169.3754149999998
+        },
+        {
+          "size": 32768,
+          "round": 3,
+          "us": 167.480415
+        },
+        {
+          "size": 32768,
+          "round": 4,
+          "us": 173.87749999999983
+        },
+        {
+          "size": 32768,
+          "round": 5,
+          "us": 170.00499999999988
+        },
+        {
+          "size": 32768,
+          "round": 6,
+          "us": 170.8729199999999
+        },
+        {
+          "size": 262144,
+          "round": 0,
+          "us": 216.87749999999994
+        },
+        {
+          "size": 262144,
+          "round": 1,
+          "us": 218.94791499999997
+        },
+        {
+          "size": 262144,
+          "round": 2,
+          "us": 213.9922949999999
+        },
+        {
+          "size": 262144,
+          "round": 3,
+          "us": 221.27187499999994
+        },
+        {
+          "size": 262144,
+          "round": 4,
+          "us": 224.61104000000034
+        },
+        {
+          "size": 262144,
+          "round": 5,
+          "us": 219.60958500000004
+        },
+        {
+          "size": 262144,
+          "round": 6,
+          "us": 220.139585
+        }
+      ]
+    },
+    "export-changed-1": {
+      "revision": "changed-1",
+      "runs": [
+        {
+          "size": 32,
+          "round": 0,
+          "us": 0.5356249999999818
+        },
+        {
+          "size": 32,
+          "round": 1,
+          "us": 0.5356250000000173
+        },
+        {
+          "size": 32,
+          "round": 2,
+          "us": 0.4818750000000094
+        },
+        {
+          "size": 32,
+          "round": 3,
+          "us": 0.45479499999999007
+        },
+        {
+          "size": 32,
+          "round": 4,
+          "us": 0.4391700000000043
+        },
+        {
+          "size": 32,
+          "round": 5,
+          "us": 0.43229000000000184
+        },
+        {
+          "size": 32,
+          "round": 6,
+          "us": 0.44437500000000796
+        },
+        {
+          "size": 32768,
+          "round": 0,
+          "us": 6.9464599999999885
+        },
+        {
+          "size": 32768,
+          "round": 1,
+          "us": 12.22332999999999
+        },
+        {
+          "size": 32768,
+          "round": 2,
+          "us": 6.985625000000014
+        },
+        {
+          "size": 32768,
+          "round": 3,
+          "us": 7.332705000000033
+        },
+        {
+          "size": 32768,
+          "round": 4,
+          "us": 11.424374999999998
+        },
+        {
+          "size": 32768,
+          "round": 5,
+          "us": 7.018334999999992
+        },
+        {
+          "size": 32768,
+          "round": 6,
+          "us": 10.396250000000009
+        },
+        {
+          "size": 262144,
+          "round": 0,
+          "us": 61.077914999999976
+        },
+        {
+          "size": 262144,
+          "round": 1,
+          "us": 57.728125000000006
+        },
+        {
+          "size": 262144,
+          "round": 2,
+          "us": 55.66874999999996
+        },
+        {
+          "size": 262144,
+          "round": 3,
+          "us": 57.669164999999936
+        },
+        {
+          "size": 262144,
+          "round": 4,
+          "us": 56.62541500000003
+        },
+        {
+          "size": 262144,
+          "round": 5,
+          "us": 55.38937500000003
+        },
+        {
+          "size": 262144,
+          "round": 6,
+          "us": 56.49312500000007
+        }
+      ]
+    },
+    "export-changed-2": {
+      "revision": "changed-2",
+      "runs": [
+        {
+          "size": 32,
+          "round": 0,
+          "us": 0.5087499999999778
+        },
+        {
+          "size": 32,
+          "round": 1,
+          "us": 0.47187499999999716
+        },
+        {
+          "size": 32,
+          "round": 2,
+          "us": 0.4235450000000185
+        },
+        {
+          "size": 32,
+          "round": 3,
+          "us": 0.42500000000000426
+        },
+        {
+          "size": 32,
+          "round": 4,
+          "us": 0.43207999999999913
+        },
+        {
+          "size": 32,
+          "round": 5,
+          "us": 0.5827099999999774
+        },
+        {
+          "size": 32,
+          "round": 6,
+          "us": 0.5220800000000025
+        },
+        {
+          "size": 32768,
+          "round": 0,
+          "us": 7.2941649999999925
+        },
+        {
+          "size": 32768,
+          "round": 1,
+          "us": 12.602709999999995
+        },
+        {
+          "size": 32768,
+          "round": 2,
+          "us": 7.397294999999993
+        },
+        {
+          "size": 32768,
+          "round": 3,
+          "us": 7.211039999999969
+        },
+        {
+          "size": 32768,
+          "round": 4,
+          "us": 11.42812500000005
+        },
+        {
+          "size": 32768,
+          "round": 5,
+          "us": 7.408330000000022
+        },
+        {
+          "size": 32768,
+          "round": 6,
+          "us": 10.490419999999999
+        },
+        {
+          "size": 262144,
+          "round": 0,
+          "us": 62.9175
+        },
+        {
+          "size": 262144,
+          "round": 1,
+          "us": 55.494165000000066
+        },
+        {
+          "size": 262144,
+          "round": 2,
+          "us": 61.13646000000003
+        },
+        {
+          "size": 262144,
+          "round": 3,
+          "us": 56.34146000000001
+        },
+        {
+          "size": 262144,
+          "round": 4,
+          "us": 57.62041999999994
+        },
+        {
+          "size": 262144,
+          "round": 5,
+          "us": 57.161045
+        },
+        {
+          "size": 262144,
+          "round": 6,
+          "us": 56.931040000000046
+        }
+      ]
+    },
+    "prefix-baseline-1": {
+      "revision": "baseline-1",
+      "runs": [
+        {
+          "round": 0,
+          "ms": 154.40941699999996,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 120.025542,
+            "prefillTokensPerSecond": 1308.0549138449214,
+            "decodeTokensPerSecond": 215.4011847065159
+          }
+        },
+        {
+          "round": 1,
+          "ms": 154.03433399999994,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 121.734542,
+            "prefillTokensPerSecond": 1289.691466535439,
+            "decodeTokensPerSecond": 230.3900998082825
+          }
+        },
+        {
+          "round": 2,
+          "ms": 156.241125,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 120.955292,
+            "prefillTokensPerSecond": 1298.000256160764,
+            "decodeTokensPerSecond": 222.07212261705905
+          }
+        },
+        {
+          "round": 3,
+          "ms": 155.60479099999998,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 121.988625,
+            "prefillTokensPerSecond": 1287.0052433167436,
+            "decodeTokensPerSecond": 221.54323090166008
+          }
+        }
+      ]
+    },
+    "prefix-baseline-2": {
+      "revision": "baseline-2",
+      "runs": [
+        {
+          "round": 0,
+          "ms": 152.25845800000002,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 119.65599999999999,
+            "prefillTokensPerSecond": 1312.0946713913218,
+            "decodeTokensPerSecond": 227.88312850980714
+          }
+        },
+        {
+          "round": 1,
+          "ms": 153.48587499999996,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 120.542583,
+            "prefillTokensPerSecond": 1302.4442988748633,
+            "decodeTokensPerSecond": 225.5363536410025
+          }
+        },
+        {
+          "round": 2,
+          "ms": 156.19783400000006,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 121.180333,
+            "prefillTokensPerSecond": 1295.5897719805737,
+            "decodeTokensPerSecond": 223.54783962090372
+          }
+        },
+        {
+          "round": 3,
+          "ms": 155.06674999999996,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 121.67779200000001,
+            "prefillTokensPerSecond": 1290.2929731006295,
+            "decodeTokensPerSecond": 222.92402242959602
+          }
+        }
+      ]
+    },
+    "prefix-changed-1": {
+      "revision": "changed-1",
+      "runs": [
+        {
+          "round": 0,
+          "ms": 55.987166,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 22.317791,
+            "prefillTokensPerSecond": 7034.746404785313,
+            "decodeTokensPerSecond": 220.90032661691149
+          }
+        },
+        {
+          "round": 1,
+          "ms": 55.813582999999994,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 22.391875,
+            "prefillTokensPerSecond": 7011.471795014933,
+            "decodeTokensPerSecond": 222.20546863530132
+          }
+        },
+        {
+          "round": 2,
+          "ms": 56.36400000000003,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 22.019292,
+            "prefillTokensPerSecond": 7130.111177053286,
+            "decodeTokensPerSecond": 215.8584013292437
+          }
+        },
+        {
+          "round": 3,
+          "ms": 56.39495800000009,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 23.228709,
+            "prefillTokensPerSecond": 6758.877559661193,
+            "decodeTokensPerSecond": 223.67820400973218
+          }
+        }
+      ]
+    },
+    "prefix-changed-2": {
+      "revision": "changed-2",
+      "runs": [
+        {
+          "round": 0,
+          "ms": 56.236332999999945,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 21.666125,
+            "prefillTokensPerSecond": 7246.335004528959,
+            "decodeTokensPerSecond": 214.52486573041887
+          }
+        },
+        {
+          "round": 1,
+          "ms": 56.66575,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 23.392166999999997,
+            "prefillTokensPerSecond": 6711.648390677102,
+            "decodeTokensPerSecond": 223.5175026019034
+          }
+        },
+        {
+          "round": 2,
+          "ms": 55.30754200000001,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 22.434917,
+            "prefillTokensPerSecond": 6998.020095193578,
+            "decodeTokensPerSecond": 226.37116002963134
+          }
+        },
+        {
+          "round": 3,
+          "ms": 57.45666700000004,
+          "tokens": 8,
+          "rawSha256": "a674b166031b39b822eacc705bd088e13a417b3e3214fb37adc47cd51602ea7b",
+          "performance": {
+            "ttftMs": 23.335708,
+            "prefillTokensPerSecond": 6727.886721928471,
+            "decodeTokensPerSecond": 217.12383071450458
+          }
+        }
+      ]
+    }
+  },
+  "traceCoverage": {
+    "protocol": "Separate instrumented executions of prefix.ts; excluded from timing table. Five turns per build including warmup.",
+    "readKvRange": {
+      "baseline": {
+        "calls": 140,
+        "stagedBytes": 917504000
+      },
+      "changed": {
+        "calls": 0,
+        "stagedBytes": 0
+      }
+    }
+  },
+  "denseDrawMicrobenchmark": {
+    "protocol": "Same release binary, seven measured alternating rounds, 200 draws each; copied arm already uses optimized host export.",
+    "rows": [
+      {
+        "vocab": 32768,
+        "copiedUs": 54.679,
+        "sharedUs": 45.637,
+        "bytesRemoved": 131072
+      },
+      {
+        "vocab": 262144,
+        "copiedUs": 426.235,
+        "sharedUs": 363.668,
+        "bytesRemoved": 1048576
+      }
+    ]
+  },
+  "sampledDsparkSmoke": {
+    "revision": "transfer-audit",
+    "modelPath": "/Users/brooklyn/workspace/github/mlx-node/.cache/models/gemma-4-12b-it",
+    "draftPath": "/Users/brooklyn/workspace/github/mlx-node/.cache/models/dspark_gemma4_12b_block7",
+    "temperature": 0.7,
+    "loadMs": 70399.173834,
+    "runs": [
+      {
+        "round": 0,
+        "ms": 3150.4535000000033,
+        "tokens": 200,
+        "finish": "length",
+        "performance": {
+          "ttftMs": 148.79125000000002,
+          "prefillTokensPerSecond": 154.5789822990263,
+          "decodeTokensPerSecond": 66.32515413743349,
+          "mtpMeanAcceptedTokens": 4.102564102564102,
+          "mtpMeanAcceptedTokensTotal": 5.102564102564102,
+          "mtpAcceptanceByPosition": [
+            0.9487179487179487, 0.8461538461538461, 0.6666666666666666, 0.5128205128205128, 0.46153846153846156,
+            0.38461538461538464, 0.28205128205128205
+          ],
+          "mtpCycles": 39,
+          "mtpMeanDepth": 7
+        },
+        "rawSha256": "80119765be58c020166467004f6d2f5996a07ba70c6e9cba96d4ea446b8b8fed"
+      },
+      {
+        "round": 1,
+        "ms": 3119.028792000012,
+        "tokens": 200,
+        "finish": "length",
+        "performance": {
+          "ttftMs": 145.00512500000002,
+          "prefillTokensPerSecond": 158.61508343239592,
+          "decodeTokensPerSecond": 66.92758334586124,
+          "mtpMeanAcceptedTokens": 4.102564102564102,
+          "mtpMeanAcceptedTokensTotal": 5.102564102564102,
+          "mtpAcceptanceByPosition": [
+            0.8974358974358975, 0.7692307692307693, 0.6842105263157895, 0.5789473684210527, 0.4473684210526316,
+            0.42105263157894735, 0.3684210526315789
+          ],
+          "mtpCycles": 39,
+          "mtpMeanDepth": 6.871794871794871
+        },
+        "rawSha256": "e6469d65ab17424cb90b9946cc9d210377c57625f46498ffa71d4a625f7a8801"
+      },
+      {
+        "round": 2,
+        "ms": 3394.3046250000043,
+        "tokens": 200,
+        "finish": "length",
+        "performance": {
+          "ttftMs": 145.128208,
+          "prefillTokensPerSecond": 158.4805622350136,
+          "decodeTokensPerSecond": 61.25885956564302,
+          "mtpMeanAcceptedTokens": 3.7142857142857144,
+          "mtpMeanAcceptedTokensTotal": 4.714285714285714,
+          "mtpAcceptanceByPosition": [
+            0.8809523809523809, 0.7073170731707317, 0.6341463414634146, 0.525, 0.4, 0.375, 0.3
+          ],
+          "mtpCycles": 42,
+          "mtpMeanDepth": 6.761904761904762
+        },
+        "rawSha256": "35a2e20b3f3ecf42921f4aaabba6c4c4af0444eab05995927fdb508d37bce1f2"
+      }
+    ]
+  }
+}

@@ -1196,16 +1196,9 @@ impl VLModelInner {
             // Embed current tokens and run forward pass to get next logits
             let active_batch_size = active_indices.len() as i64;
 
-            let embed_tokens: Vec<u32> = {
-                current_tokens.eval();
-                let tok_vals = current_tokens.to_int32()?;
-                active_indices
-                    .iter()
-                    .enumerate()
-                    .map(|(local_idx, _)| tok_vals[local_idx] as u32)
-                    .collect()
-            };
-            let embed_input = MxArray::from_uint32(&embed_tokens, &[active_batch_size, 1])?;
+            // Keep sampled IDs in the MLX graph for the embedding lookup.
+            // The host reads them once below for output, penalties and EOS.
+            let embed_input = current_tokens.reshape(&[active_batch_size, 1])?;
             let token_embeds = lm.get_embedding_layer().forward(&embed_input)?;
 
             // Build position_ids [3, active_batch, 1] for mRoPE decode

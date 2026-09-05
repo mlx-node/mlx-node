@@ -20,6 +20,13 @@ copy, but a CPU read still depends on GPU completion. MLX explicitly distinguish
 lazy graph construction from evaluation and host access. [MLX lazy evaluation,
 live 0.32.2 documentation](https://ml-explore.github.io/mlx/build/html/usage/lazy_evaluation.html).
 
+The subsequent [full inference transfer audit](transfer-audit.md) identified and
+removed normal-path KV staging in Qwen3 cache-hit prefill, redundant arithmetic
+before host exports, vocabulary copies in sampled drafting, per-layer metadata
+reductions and a duplicate PaddleOCR token round trip. It separately inventories
+required output reads, synchronization and SSD staging. Its paired measurements
+are in [validation.md](validation.md).
+
 ## Reference snapshot
 
 All supplied repositories were inspected locally and fetched without switching

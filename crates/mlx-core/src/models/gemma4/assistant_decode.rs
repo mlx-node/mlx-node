@@ -32,7 +32,6 @@ use crate::sampling;
 use crate::stream::{Stream, StreamContext};
 
 use super::assistant::AssistantSharedKv;
-use super::dspark::sample_index_from_probs;
 use super::layer_cache::{
     Gemma4VerifyRollback, active_cache_frontier, commit_after_verify, snapshot_before_verify,
 };
@@ -40,6 +39,7 @@ use super::model::{
     AssistantKvSources, GEMMA4_PREFILL_STEP_SIZE, Gemma4Inner, assistant_verify_forward,
     compute_ple, eval_gemma4_caches, forward_body, lm_head_logits,
 };
+use crate::sampling::sample_dense_distribution;
 
 /// Assistant payload of [`super::dspark_decode::Gemma4DraftTurnState`]: the
 /// per-turn handoff from `assistant_prefill_with_hidden` to
@@ -213,8 +213,7 @@ impl DsparkStepper for Gemma4AssistantStepper<'_> {
                 let dist = sampling::sampling_distribution(&step_logits, Some(cfg))?
                     .astype(DType::Float32)?;
                 dist.eval();
-                let probs = dist.to_float32()?;
-                let token = sample_index_from_probs(&probs, rng)?;
+                let token = sample_dense_distribution(&dist, rng)?;
                 draft_dists.push(dist);
                 token
             };

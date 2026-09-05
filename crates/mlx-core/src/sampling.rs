@@ -15,6 +15,9 @@ use napi_derive::napi;
 use rand::{Rng, RngExt};
 use std::sync::OnceLock;
 
+mod dense_draw;
+pub(crate) use dense_draw::sample_dense_distribution;
+
 /// Configuration for sampling strategies
 /// ⚡ PERFORMANCE: Made Copy to avoid cloning on every token
 #[napi(object)]

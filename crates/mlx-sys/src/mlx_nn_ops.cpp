@@ -235,6 +235,61 @@ Out read_scalar(const array& arr, size_t index) {
 
 extern "C" {
 
+// Two passes over the existing shared allocation preserve the draft sampler's
+// sequential f64 inverse-CDF arithmetic without copying a vocabulary row into
+// a host vector. Keep validation before the Rust RNG draw. Non-Apple callers
+// use the existing extraction path instead of dereferencing device memory.
+bool mlx_array_positive_probability_mass(mlx_array* handle, double* out) {
+#if defined(__APPLE__)
+  if (!handle || !out) return false;
+  try {
+    auto& arr = *reinterpret_cast<array*>(handle);
+    if (arr.ndim() != 1 || arr.dtype() != mlx::core::float32 ||
+        arr.size() > INT32_MAX || !ensure_readable(arr, "probability_mass")) return false;
+    const float* data = arr.data<float>();
+    const auto stride = arr.strides()[0];
+    double total = 0.0;
+    for (size_t i = 0; i < arr.size(); ++i) {
+      const float p = data[i * stride];
+      if (std::isfinite(p) && p > 0.0f) total += static_cast<double>(p);
+    }
+    if (!std::isfinite(total) || total <= 0.0) return false;
+    *out = total;
+    return true;
+  } catch (...) { return false; }
+#else
+  return false;
+#endif
+}
+
+bool mlx_array_probability_index(mlx_array* handle, double threshold, int32_t* out) {
+#if defined(__APPLE__)
+  if (!handle || !out || !std::isfinite(threshold) || threshold < 0.0) return false;
+  try {
+    auto& arr = *reinterpret_cast<array*>(handle);
+    if (arr.ndim() != 1 || arr.dtype() != mlx::core::float32 ||
+        arr.size() > INT32_MAX || !ensure_readable(arr, "probability_index")) return false;
+    const float* data = arr.data<float>();
+    const auto stride = arr.strides()[0];
+    double cumulative = 0.0;
+    int32_t last = -1;
+    for (size_t i = 0; i < arr.size(); ++i) {
+      const float p = data[i * stride];
+      if (!std::isfinite(p) || p <= 0.0f) continue;
+      cumulative += static_cast<double>(p);
+      last = static_cast<int32_t>(i);
+      if (threshold < cumulative) { *out = last; return true; }
+    }
+    // Preserve the original last-positive fallback at a rounded upper edge.
+    if (last < 0) return false;
+    *out = last;
+    return true;
+  } catch (...) { return false; }
+#else
+  return false;
+#endif
+}
+
 bool mlx_array_item_at_float32(mlx_array* handle, size_t index, float* out) {
   if (!handle || !out) return false;
   auto arr = reinterpret_cast<array*>(handle);

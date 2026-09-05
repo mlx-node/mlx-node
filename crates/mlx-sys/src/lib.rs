@@ -310,6 +310,14 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_item_at_int32(handle: *mut mlx_array, index: usize, out: *mut i32) -> bool;
     pub fn mlx_array_item_at_uint32(handle: *mut mlx_array, index: usize, out: *mut u32) -> bool;
     pub fn mlx_array_item_at_float32(handle: *mut mlx_array, index: usize, out: *mut f32) -> bool;
+    /// macOS shared-memory draft sampling; both functions validate rank/dtype
+    /// and wait for completion before reading. No pointer escapes the call.
+    pub fn mlx_array_positive_probability_mass(handle: *mut mlx_array, out: *mut f64) -> bool;
+    pub fn mlx_array_probability_index(
+        handle: *mut mlx_array,
+        threshold: f64,
+        out: *mut i32,
+    ) -> bool;
     pub fn mlx_array_dtype(handle: *mut mlx_array) -> i32;
     pub fn mlx_array_to_float32(handle: *mut mlx_array, out: *mut f32, len: usize) -> bool;
     pub fn mlx_array_to_int32(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;

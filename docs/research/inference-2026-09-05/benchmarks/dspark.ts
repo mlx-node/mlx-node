@@ -2,7 +2,9 @@ import { writeFile } from 'node:fs/promises';
 // Run with oxnode; see ../validation.md for arguments and measurement protocol.
 import { createRequire } from 'node:module';
 import { performance } from 'node:perf_hooks';
-const [binding, modelPath, draftPath, output, revision] = process.argv.slice(2);
+const [binding, modelPath, draftPath, output, revision, temperatureArg = '0'] = process.argv.slice(2);
+const temperature = Number(temperatureArg);
+if (!Number.isFinite(temperature) || temperature < 0) throw new Error('Invalid temperature');
 if (!binding || !modelPath || !draftPath || !output || !revision)
   throw new Error('Expected binding, checkpoint, output and revision arguments');
 const core: typeof import('../../../../packages/core/index.cjs') = createRequire(import.meta.url)(binding);
@@ -18,7 +20,7 @@ for (let round = -1; round < 3; round++) {
     [{ role: 'user', content: 'Give a simple recipe for pancakes with numbered steps.' }],
     {
       maxNewTokens: 200,
-      temperature: 0,
+      temperature,
       reasoningEffort: 'none',
       repetitionPenalty: 1.1,
       presencePenalty: 0.1,
@@ -44,5 +46,5 @@ for (let round = -1; round < 3; round++) {
     });
 }
 await model.resetCaches();
-await writeFile(output, JSON.stringify({ revision, modelPath, draftPath, loadMs, runs }, null, 2));
+await writeFile(output, JSON.stringify({ revision, modelPath, draftPath, temperature, loadMs, runs }, null, 2));
 console.log(JSON.stringify({ revision, loadMs, summary: runs.map(({ raw: _raw, ...r }) => r) }));
