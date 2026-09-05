@@ -1,8 +1,8 @@
 //! Declarative generator for the per-family chat NAPI surface.
 //!
 //! Every language-model `#[napi]` class (`Qwen3Model`, `Qwen3_5Model`,
-//! `Qwen3_5MoeModel`, `Gemma4Model`, `Lfm2Model`) exposes the same eleven
-//! chat-surface methods — `reset_caches`, `chat_session_start`,
+//! `Qwen3_5MoeModel`, `Gemma4Model`, `Lfm2Model`) exposes the same chat and telemetry
+//! methods — `reset_caches`, `chat_session_start`,
 //! `chat_session_continue`, `chat_session_continue_tool`, their
 //! three internal `begin_chat_session_*` operations (H2 — return a
 //! `ChatSessionCall` immediately, reply via `result()`),
@@ -14,23 +14,22 @@
 //! forwarding shims.
 //!
 //! [`chat_napi_surface!`] emits one dedicated `#[napi] impl $Class`
-//! block carrying those eleven methods. napi-rs allows multiple
+//! block carrying the shared methods. napi-rs allows multiple
 //! `#[napi] impl` blocks per class, so each family keeps its own
 //! hand-written block (`load`, `generate`, `save_*`, `has_mtp_weights`,
 //! `has_block_paged_cache`, …) and adds one macro invocation for the
 //! chat surface. Scheduler telemetry forwarding is generated here too, using
-//! `HybridSchedulerCommand::scheduler_stats` and the same load-first guard.
+//! `ModelCommand::scheduler_stats` and the same load-first guard.
 //!
 //! The macro is parameterised over the three axes that actually vary
 //! between families:
 //!
-//! 1. **Thread command type** (`$thread_cmd`): lfm2 + gemma4 send the
-//!    bare `ChatCmd` (`ModelThread<ChatCmd>`); qwen3 / qwen3_5 /
-//!    qwen3_5_moe nest it as `FamilyCmd::Chat(ChatCmd)`. Resolved via
-//!    the [`crate::engine::cmd::FromChatCmd`] trait — the macro always
-//!    builds `<$thread_cmd>::from_chat(ChatCmd::…)`.
+//! 1. **Thread command type** (`$thread_cmd`): every chat model uses
+//!    [`crate::engine::model_command::ModelCommand`], optionally parameterized
+//!    by its family's additional commands. Construction and extraction are
+//!    ordinary inherent methods on that shared type.
 //!
-//! 2. **Thread access** (`thread:`): four families hold
+//! 2. **Thread access** (`thread:`): most families hold
 //!    `thread: ModelThread<…>` directly (`direct`); gemma4 holds
 //!    `Option<ModelThread<…>>` because it can be constructed as an
 //!    uninitialised stub (`option`). The `option` arm threads the
@@ -55,7 +54,7 @@
 //! `ChatConfig | null`). Passing them in keeps the emitted strings
 //! byte-identical to the hand-written originals.
 
-/// Emit the eleven-method chat NAPI surface for one model class.
+/// Emit the shared chat and telemetry NAPI surface for one model class.
 ///
 /// See the module docs for the axis breakdown. `$Class` is the NAPI
 /// class, `$thread_cmd` its model-thread command type.
@@ -73,12 +72,11 @@ macro_rules! chat_napi_surface {
         impl $Class {
             /// Snapshot scheduler occupancy and paged-pool admission telemetry.
             #[napi]
-            pub async fn scheduler_stats(&self) -> ::napi::Result<$crate::engine::SchedulerStatsJs> {
+            pub async fn scheduler_stats(
+                &self,
+            ) -> ::napi::Result<$crate::engine::SchedulerStatsJs> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
-                $crate::model_thread::send_and_await(
-                    thread,
-                    <$thread_cmd as $crate::engine::hybrid_scheduler::HybridSchedulerCommand>::scheduler_stats,
-                ).await
+                $crate::model_thread::send_and_await(thread, <$thread_cmd>::scheduler_stats).await
             }
 
             /// Reset all caches and clear cached token history. Async so a reset
@@ -95,9 +93,10 @@ macro_rules! chat_napi_surface {
             pub async fn release_cache_owner(&self, owner_id: String) -> ::napi::Result<()> {
                 $crate::models::chat_napi::chat_napi_thread_bind!(self, thread, $thread_mode);
                 $crate::model_thread::send_and_await(thread, |reply| {
-                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                        $crate::engine::cmd::ChatCmd::ReleaseCacheOwner { owner_id, reply },
-                    )
+                    <$thread_cmd>::from_chat($crate::engine::cmd::ChatCmd::ReleaseCacheOwner {
+                        owner_id,
+                        reply,
+                    })
                 })
                 .await
             }
@@ -117,16 +116,14 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
                 $crate::model_thread::send_and_await(thread, |reply| {
-                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                        $crate::engine::cmd::ChatCmd::SessionStart {
-                            messages,
-                            config,
-                            reply,
-                            cancelled: ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(
-                                false,
-                            )),
-                        },
-                    )
+                    <$thread_cmd>::from_chat($crate::engine::cmd::ChatCmd::SessionStart {
+                        messages,
+                        config,
+                        reply,
+                        cancelled: ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(
+                            false,
+                        )),
+                    })
                 })
                 .await
             }
@@ -149,16 +146,14 @@ macro_rules! chat_napi_surface {
                 let config = config.unwrap_or_default();
                 let cancelled = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
                 let (reply, result_rx) = ::tokio::sync::oneshot::channel();
-                thread.send(
-                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                        $crate::engine::cmd::ChatCmd::SessionStart {
-                            messages,
-                            config,
-                            reply,
-                            cancelled: ::std::sync::Arc::clone(&cancelled),
-                        },
-                    ),
-                )?;
+                thread.send(<$thread_cmd>::from_chat(
+                    $crate::engine::cmd::ChatCmd::SessionStart {
+                        messages,
+                        config,
+                        reply,
+                        cancelled: ::std::sync::Arc::clone(&cancelled),
+                    },
+                ))?;
                 Ok($crate::engine::types::ChatSessionCall {
                     cancelled,
                     result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
@@ -181,16 +176,14 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
                 $crate::model_thread::send_and_await(thread, |reply| {
-                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                        $crate::engine::cmd::ChatCmd::SessionContinue {
-                            messages,
-                            config,
-                            reply,
-                            cancelled: ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(
-                                false,
-                            )),
-                        },
-                    )
+                    <$thread_cmd>::from_chat($crate::engine::cmd::ChatCmd::SessionContinue {
+                        messages,
+                        config,
+                        reply,
+                        cancelled: ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(
+                            false,
+                        )),
+                    })
                 })
                 .await
             }
@@ -209,16 +202,14 @@ macro_rules! chat_napi_surface {
                 let config = config.unwrap_or_default();
                 let cancelled = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
                 let (reply, result_rx) = ::tokio::sync::oneshot::channel();
-                thread.send(
-                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                        $crate::engine::cmd::ChatCmd::SessionContinue {
-                            messages,
-                            config,
-                            reply,
-                            cancelled: ::std::sync::Arc::clone(&cancelled),
-                        },
-                    ),
-                )?;
+                thread.send(<$thread_cmd>::from_chat(
+                    $crate::engine::cmd::ChatCmd::SessionContinue {
+                        messages,
+                        config,
+                        reply,
+                        cancelled: ::std::sync::Arc::clone(&cancelled),
+                    },
+                ))?;
                 Ok($crate::engine::types::ChatSessionCall {
                     cancelled,
                     result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
@@ -238,16 +229,14 @@ macro_rules! chat_napi_surface {
                 $crate::models::chat_napi::chat_napi_image_guard!(messages, self, $guard_mode);
                 let config = config.unwrap_or_default();
                 $crate::model_thread::send_and_await(thread, |reply| {
-                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                        $crate::engine::cmd::ChatCmd::SessionContinueTool {
-                            messages,
-                            config,
-                            reply,
-                            cancelled: ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(
-                                false,
-                            )),
-                        },
-                    )
+                    <$thread_cmd>::from_chat($crate::engine::cmd::ChatCmd::SessionContinueTool {
+                        messages,
+                        config,
+                        reply,
+                        cancelled: ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(
+                            false,
+                        )),
+                    })
                 })
                 .await
             }
@@ -266,16 +255,14 @@ macro_rules! chat_napi_surface {
                 let config = config.unwrap_or_default();
                 let cancelled = ::std::sync::Arc::new(::std::sync::atomic::AtomicBool::new(false));
                 let (reply, result_rx) = ::tokio::sync::oneshot::channel();
-                thread.send(
-                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                        $crate::engine::cmd::ChatCmd::SessionContinueTool {
-                            messages,
-                            config,
-                            reply,
-                            cancelled: ::std::sync::Arc::clone(&cancelled),
-                        },
-                    ),
-                )?;
+                thread.send(<$thread_cmd>::from_chat(
+                    $crate::engine::cmd::ChatCmd::SessionContinueTool {
+                        messages,
+                        config,
+                        reply,
+                        cancelled: ::std::sync::Arc::clone(&cancelled),
+                    },
+                ))?;
                 Ok($crate::engine::types::ChatSessionCall {
                     cancelled,
                     result_rx: ::std::sync::Mutex::new(::std::option::Option::Some(result_rx)),
@@ -295,16 +282,14 @@ macro_rules! chat_napi_surface {
                 let config = config.unwrap_or_default();
 
                 let plumbing = $crate::engine::napi_glue::start_chat_stream(callback);
-                thread.send(
-                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                        $crate::engine::cmd::ChatCmd::StreamSessionStart {
-                            messages,
-                            config,
-                            stream_tx: plumbing.stream_tx,
-                            cancelled: plumbing.cancelled,
-                        },
-                    ),
-                )?;
+                thread.send(<$thread_cmd>::from_chat(
+                    $crate::engine::cmd::ChatCmd::StreamSessionStart {
+                        messages,
+                        config,
+                        stream_tx: plumbing.stream_tx,
+                        cancelled: plumbing.cancelled,
+                    },
+                ))?;
 
                 Ok(plumbing.handle)
             }
@@ -323,16 +308,14 @@ macro_rules! chat_napi_surface {
                 let config = config.unwrap_or_default();
 
                 let plumbing = $crate::engine::napi_glue::start_chat_stream(callback);
-                thread.send(
-                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                        $crate::engine::cmd::ChatCmd::StreamSessionContinue {
-                            messages,
-                            config,
-                            stream_tx: plumbing.stream_tx,
-                            cancelled: plumbing.cancelled,
-                        },
-                    ),
-                )?;
+                thread.send(<$thread_cmd>::from_chat(
+                    $crate::engine::cmd::ChatCmd::StreamSessionContinue {
+                        messages,
+                        config,
+                        stream_tx: plumbing.stream_tx,
+                        cancelled: plumbing.cancelled,
+                    },
+                ))?;
 
                 Ok(plumbing.handle)
             }
@@ -351,16 +334,14 @@ macro_rules! chat_napi_surface {
                 let config = config.unwrap_or_default();
 
                 let plumbing = $crate::engine::napi_glue::start_chat_stream(callback);
-                thread.send(
-                    <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                        $crate::engine::cmd::ChatCmd::StreamSessionContinueTool {
-                            messages,
-                            stream_tx: plumbing.stream_tx,
-                            cancelled: plumbing.cancelled,
-                            config,
-                        },
-                    ),
-                )?;
+                thread.send(<$thread_cmd>::from_chat(
+                    $crate::engine::cmd::ChatCmd::StreamSessionContinueTool {
+                        messages,
+                        stream_tx: plumbing.stream_tx,
+                        cancelled: plumbing.cancelled,
+                        config,
+                    },
+                ))?;
 
                 Ok(plumbing.handle)
             }
@@ -395,9 +376,7 @@ macro_rules! chat_napi_thread_bind {
 macro_rules! chat_napi_thread_reset {
     ($self:ident, direct, $thread_cmd:ty) => {
         $crate::model_thread::send_and_await(&$self.thread, |reply| {
-            <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                $crate::engine::cmd::ChatCmd::ResetCaches { reply },
-            )
+            <$thread_cmd>::from_chat($crate::engine::cmd::ChatCmd::ResetCaches { reply })
         })
         .await
     };
@@ -406,9 +385,7 @@ macro_rules! chat_napi_thread_reset {
             return Ok(());
         };
         $crate::model_thread::send_and_await(thread, |reply| {
-            <$thread_cmd as $crate::engine::cmd::FromChatCmd>::from_chat(
-                $crate::engine::cmd::ChatCmd::ResetCaches { reply },
-            )
+            <$thread_cmd>::from_chat($crate::engine::cmd::ChatCmd::ResetCaches { reply })
         })
         .await
     }};

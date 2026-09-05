@@ -1,6 +1,6 @@
 use napi::bindgen_prelude::{Error, Result};
 
-use super::{MuseGlimmerCmd, MuseGlimmerInner, MusePrefixState};
+use super::{MuseGlimmerInner, MusePrefixState};
 use crate::array::MxArray;
 use crate::engine::backend::ChatBackend;
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
@@ -15,8 +15,6 @@ use crate::models::muse_glimmer::dflash::DFlashContextCache;
 use crate::models::muse_glimmer::kv_cache::PagedWindowSlot;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
-
-crate::engine::command_adapter::impl_scheduler_command!(MuseGlimmerCmd, boxed);
 
 #[derive(Default)]
 pub(crate) struct MuseOwnerState {
@@ -101,7 +99,7 @@ impl MuseGlimmerInner {
 }
 
 impl HybridSchedulerBackend for MuseGlimmerInner {
-    type Command = MuseGlimmerCmd;
+    type FamilyCommand = std::convert::Infallible;
     type RestoreTicket = NoRestoreTicket;
     type OwnerState = MuseOwnerState;
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
@@ -295,20 +293,16 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
         HybridStepExecutor::new(self)
     }
 
-    fn execute_barrier(
+    fn execute_chat_barrier(
         &mut self,
-        command: Self::Command,
+        command: ChatCmd,
         owners: SchedulerOwnerContext<'_, Self::OwnerState>,
     ) {
-        let MuseGlimmerCmd::Chat(command) = command else {
-            return;
-        };
-        if matches!(command.as_ref(), ChatCmd::ResetCaches { .. }) {
+        if matches!(&command, ChatCmd::ResetCaches { .. }) {
             self.select_ownerless_lane(self.paged.is_none());
-            handle_chat_cmd(self, *command);
+            handle_chat_cmd(self, command);
             return;
         }
-        let command = *command;
         let flat_lane = self.requires_flat_lane(&command);
         let Some(owner) = owner_id(&command).map(str::to_owned) else {
             self.select_ownerless_lane(flat_lane);

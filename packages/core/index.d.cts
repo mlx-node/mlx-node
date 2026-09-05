@@ -3261,7 +3261,7 @@ export declare function createQianfanOcrConfig(): QianfanOcrConfig;
  * Create a random-init Qwen3.5 model and save it to disk.
  *
  * Spawns a dedicated `ModelThread<Qwen35Cmd>` whose init builds a fresh
- * random-weight `Qwen35Inner` directly, then dispatches `Qwen35Cmd::SaveModel`
+ * random-weight `Qwen35Inner` directly, then dispatches `Qwen35FamilyCommand::SaveModel`
  * on that thread. The thread is dropped at the end of the promise, so the
  * in-memory model is released once the checkpoint has been written. Used by
  * TypeScript test fixtures that need an on-disk checkpoint without keeping a
@@ -3285,7 +3285,7 @@ export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig,
  * Create a random-init Qwen3 model and save it to disk.
  *
  * Spawns a dedicated `ModelThread<Qwen3Cmd>` whose init builds a fresh
- * random-weight `Qwen3Inner` directly, then dispatches `Qwen3Cmd::SaveModel`
+ * random-weight `Qwen3Inner` directly, then dispatches `Qwen3FamilyCommand::SaveModel`
  * on that thread. The thread is dropped at the end of the promise, so the
  * in-memory model is released once the checkpoint has been written. Used by
  * TypeScript test fixtures that need an on-disk checkpoint without keeping a

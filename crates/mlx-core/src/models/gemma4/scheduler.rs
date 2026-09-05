@@ -9,8 +9,6 @@ use crate::engine::hybrid_scheduler::{
     ScheduledPrefixAdmission, ScheduledReply, SchedulerOwnerContext,
 };
 use crate::engine::scheduler::PreemptionMode;
-use crate::engine::{self};
-use crate::model_thread::ResponseTx;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
@@ -21,14 +19,7 @@ fn scheduler_prefill_slice_tokens() -> u32 {
 /// Commands owned by the Gemma 4 scheduler thread. Optional draft and media
 /// capabilities remain ordinary chat commands; request classification decides
 /// whether they enter the scheduled or exclusive lane.
-pub(crate) enum Gemma4Cmd {
-    Chat(Box<ChatCmd>),
-    SchedulerStats {
-        reply: ResponseTx<engine::SchedulerStatsJs>,
-    },
-}
-
-crate::engine::command_adapter::impl_scheduler_command!(Gemma4Cmd, boxed);
+pub(crate) type Gemma4Cmd = crate::engine::model_command::ModelCommand;
 
 pub(crate) type Gemma4SchedulerState = HybridSchedulerState<Gemma4Inner>;
 
@@ -105,7 +96,7 @@ fn gemma4_send_error(command: ChatCmd, error: Error) {
 }
 
 impl HybridSchedulerBackend for Gemma4Inner {
-    type Command = Gemma4Cmd;
+    type FamilyCommand = std::convert::Infallible;
     type RestoreTicket = NoRestoreTicket;
     type OwnerState = Gemma4SchedulerOwnerState;
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
@@ -308,20 +299,16 @@ impl HybridSchedulerBackend for Gemma4Inner {
         HybridStepExecutor::new(self)
     }
 
-    fn execute_barrier(
+    fn execute_chat_barrier(
         &mut self,
-        command: Self::Command,
+        command: ChatCmd,
         owners: SchedulerOwnerContext<'_, Self::OwnerState>,
     ) {
-        let Gemma4Cmd::Chat(command) = command else {
-            return;
-        };
-        if matches!(command.as_ref(), ChatCmd::ResetCaches { .. }) {
+        if matches!(&command, ChatCmd::ResetCaches { .. }) {
             self.set_active_paged_owner(0);
-            handle_chat_cmd(self, *command);
+            handle_chat_cmd(self, command);
             return;
         }
-        let command = *command;
         // Only the ASSISTANT drafter needs the flat target-cache lane (its
         // Q-only attention reads `Gemma4LayerCache` K/V arrays directly).
         // DSpark verifies against the paged pools, so a DSpark command stays

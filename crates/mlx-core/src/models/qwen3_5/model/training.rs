@@ -112,7 +112,7 @@ impl Qwen35Inner {
     }
 
     /// Static FP8 activation-amax calibration prefill (runs on the model
-    /// thread). Inherent body of [`Qwen35Cmd::CalibratePrefillRaw`].
+    /// thread). Inherent body of [`Qwen35FamilyCommand::CalibratePrefillRaw`].
     ///
     /// For each raw text: tokenize WITHOUT the chat template (`encode_sync` with
     /// `add_special_tokens = false`, so no `<|im_start|>`/`<|im_end|>` control

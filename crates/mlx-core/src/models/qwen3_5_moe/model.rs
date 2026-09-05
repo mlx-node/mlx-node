@@ -14,7 +14,7 @@ use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs,
     ThinkingSetup, TrainBackend, TurnOutput, TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::{ChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd};
+use crate::engine::cmd::{ChatCmd, FromTrainCmd, TrainCmd, handle_train_cmd};
 use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, pool_tokens_after_recurrent, scheduled_turn_context,
     scheduler_per_seq_context_override,
@@ -87,7 +87,7 @@ mod vision_turn;
 
 #[cfg(test)]
 use self::chat_backend::qwen35_moe_speculative_plan;
-pub(crate) use self::commands::Qwen35MoeCmd;
+pub(crate) use self::commands::{Qwen35MoeCmd, Qwen35MoeFamilyCommand};
 pub(crate) use self::forward::PREFILL_STEP_SIZE;
 use self::forward::{
     chunked_prefill, eager_verify_step, forward_inner, forward_pre_norm_inner,
@@ -240,7 +240,7 @@ pub(crate) struct Qwen35MoeInner {
 }
 
 /// Test-only between-turn snapshot of the MoE paged-MTP GDN bookkeeping, read
-/// via [`Qwen35MoeCmd::MtpPagedGdnStateForTest`]. Serialized behind the model
+/// via [`Qwen35MoeFamilyCommand::MtpPagedGdnStateForTest`]. Serialized behind the model
 /// thread, so it observes the fully-finalized preceding turn.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
@@ -371,7 +371,7 @@ impl Qwen3_5MoeModel {
     #[doc(hidden)]
     pub async fn mtp_paged_gdn_state_for_test(&self) -> Result<MoeMtpPagedGdnStateForTest> {
         send_and_await(&self.thread, |reply| {
-            Qwen35MoeCmd::MtpPagedGdnStateForTest { reply }
+            Qwen35MoeFamilyCommand::MtpPagedGdnStateForTest { reply }
         })
         .await
     }
@@ -382,7 +382,7 @@ impl Qwen3_5MoeModel {
     #[doc(hidden)]
     pub async fn gdn_history_checkpoint_oracle_for_test(&self) -> Result<bool> {
         send_and_await(&self.thread, |reply| {
-            Qwen35MoeCmd::GdnHistoryCheckpointOracleForTest { reply }
+            Qwen35MoeFamilyCommand::GdnHistoryCheckpointOracleForTest { reply }
         })
         .await
     }
@@ -471,10 +471,12 @@ impl Qwen3_5MoeModel {
         }
         let max_output = capacity.saturating_sub(prompt_len).saturating_add(1);
         config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
-        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35MoeCmd::Generate {
-            prompt_tokens: prompt_tokens.clone(),
-            config,
-            reply,
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35MoeFamilyCommand::Generate {
+                prompt_tokens: prompt_tokens.clone(),
+                config,
+                reply,
+            }
         })
         .await
     }
@@ -502,7 +504,7 @@ impl Qwen3_5MoeModel {
             crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
         );
         self.thread
-            .send(Qwen35MoeCmd::Chat(ChatCmd::StreamSessionStart {
+            .send(Qwen35MoeCmd::from_chat(ChatCmd::StreamSessionStart {
                 messages,
                 config,
                 stream_tx,
@@ -529,7 +531,7 @@ impl Qwen3_5MoeModel {
             crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
         );
         self.thread
-            .send(Qwen35MoeCmd::Chat(ChatCmd::StreamSessionContinue {
+            .send(Qwen35MoeCmd::from_chat(ChatCmd::StreamSessionContinue {
                 messages,
                 config,
                 stream_tx,
@@ -608,7 +610,7 @@ impl Qwen3_5MoeModel {
         save_path: String,
     ) -> Result<PromiseRaw<'env, ()>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.thread.send(Qwen35MoeCmd::SaveModel {
+        self.thread.send(Qwen35MoeFamilyCommand::SaveModel {
             save_path,
             reply: tx,
         })?;

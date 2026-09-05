@@ -12,6 +12,7 @@ use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
     SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, TurnTokenObserver, WholeTurnArgs,
 };
+#[cfg(test)]
 use crate::engine::cmd::ChatCmd;
 use crate::engine::params::ChatParams;
 use crate::engine::plan::{
@@ -19,7 +20,6 @@ use crate::engine::plan::{
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::ModelThread;
-use crate::model_thread::ResponseTx;
 use crate::models::gemma4::dspark::DsparkTap;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::gemma4::model::Gemma4KVCacheCoordinator;
@@ -228,12 +228,7 @@ struct MuseSlidingColdCheckpoint {
     layer_kv: Vec<(MxArray, MxArray)>,
 }
 
-pub(crate) enum MuseGlimmerCmd {
-    Chat(Box<ChatCmd>),
-    SchedulerStats {
-        reply: ResponseTx<crate::engine::SchedulerStatsJs>,
-    },
-}
+pub(crate) type MuseGlimmerCmd = crate::engine::model_command::ModelCommand;
 
 pub(crate) struct MuseGlimmerInner {
     pub(crate) config: MuseGlimmerConfig,

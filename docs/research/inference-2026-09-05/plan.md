@@ -7,7 +7,8 @@ The task is to reduce recurring model-integration code, explain speculative
 decoding with paged KV and concurrent requests, and improve measured inference
 control-flow costs on Apple unified memory. Preserve bounded resident KV pools,
 SSD cold persistence, exact committed frontiers, request isolation, cancellation,
-and per-family tensor/cache ownership. No new dependencies or public API breaks.
+and per-family tensor/cache ownership. No new dependencies. Refactor size and API compatibility are not constraints;
+preserve inference correctness and request/cache ownership.
 
 Sources: supplied local checkouts pinned after remote refresh; primary vLLM,
 Apple Metal, MLX and reference-project documentation; local tests and alternating
@@ -19,14 +20,20 @@ performance measurements. Distinguish source facts, proposals and measurements.
    record source provenance and remaining gaps.
 2. **Complete — synthesis.** Produce the architecture comparison and choose changes
    justified by the audit. Record deferred changes with explicit prerequisites.
-3. **Complete — implementation.** Consolidate repeated native model plumbing;
+3. **Complete — structural implementation.** Replace per-family command envelopes and adapters with a shared generic type
+   and default barrier dispatch;
    reduce avoidable GPU completion waits in shared inference paths. Keep larger
    speculative scheduling or Metal backend migrations behind demonstrated need.
-4. **Complete — verification and delivery.** Native build, Rust/TS checks,
+4. **Complete — verify the structural revision and update PR #138.** Native build, Rust/TS checks,
    sampler and real-model parity gates, paired performance measurements, source
    links and final diff verified. Results and limitations are recorded in
    [validation.md](validation.md). The selected changes are ready for review;
    the larger staged migrations remain proposed work.
+
+5. **In progress — full inference transfer audit.** After the structural revision is
+   validated and pushed, inspect prefill, decode, speculative verification and SSD
+   restore across Rust, C++ and MLX. Inventory CPU/GPU copies, host readbacks and
+   synchronization separately; measure and remove confirmed avoidable overhead.
 
 Success requires a reviewable implementation plus cited research and a concrete
 next-stage plan. A microbenchmark is evidence about the measured operation only;
@@ -43,9 +50,10 @@ Discovery decisions:
 - Deterministic speculative penalties depend on the known draft prefix until the
   first mismatch. Prepare those independent argmax graphs before one evaluation;
   retain sequential stochastic acceptance and its RNG consumption.
-- Consolidate repeated `FromChatCmd`/`HybridSchedulerCommand` implementations and
-  scheduler telemetry NAPI forwarding. Keep typed family-specific commands and
-  generated declarations compatible.
+- Remove `FromChatCmd`, `HybridSchedulerCommand` and their adapter macro. Use
+  `ModelCommand<FamilyCommand>` with shared construction, extraction and dispatch.
+  Give ordinary chat barriers a trait default; retain only owner-state overrides.
+  Keep the native export macro as the concrete binding layer.
 - Scheduled speculation requires token-span results, per-owner draft/tape state,
   ragged verify and resumable drivers. A lane flag alone is unsafe. Metal 4 and
   Metal IO require allocator/storage integration and measured benefit; existing

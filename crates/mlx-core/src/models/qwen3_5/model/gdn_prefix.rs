@@ -86,7 +86,7 @@ impl Qwen35Inner {
     }
 
     /// Test-only state oracle behind
-    /// [`Qwen35Cmd::GdnHistoryCheckpointOracleForTest`]: recompute GDN over
+    /// [`Qwen35FamilyCommand::GdnHistoryCheckpointOracleForTest`]: recompute GDN over
     /// the persisted history checkpoint's OWN token key from fresh caches and
     /// bit-compare every linear layer's conv/recurrent arrays against the
     /// checkpoint. `Ok(true)` iff the persisted state equals what its key

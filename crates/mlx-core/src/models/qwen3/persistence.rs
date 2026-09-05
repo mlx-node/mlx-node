@@ -22,7 +22,8 @@ use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_s
 use crate::engine::persistence::{load_all_safetensors, prewarm_checkpoint_pages};
 use crate::tokenizer::Qwen3Tokenizer;
 
-use super::model::{Qwen3Cmd, Qwen3Inner, QwenSchedulerState, handle_qwen3_cmd};
+use super::model::Qwen3FamilyCommand;
+use super::model::{Qwen3Cmd, Qwen3Inner, QwenSchedulerState};
 use super::{Qwen3Config, Qwen3Model};
 
 /// Validate that all required parameters were loaded with correct shapes
@@ -236,7 +237,7 @@ impl Qwen3Model {
         // Dispatch to dedicated model thread so MxArray reads happen on the
         // thread that owns them.
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.thread.send(Qwen3Cmd::SaveModel {
+        self.thread.send(Qwen3FamilyCommand::SaveModel {
             save_path,
             reply: tx,
         })?;
@@ -272,7 +273,7 @@ impl Qwen3Model {
 /// Create a random-init Qwen3 model and save it to disk.
 ///
 /// Spawns a dedicated `ModelThread<Qwen3Cmd>` whose init builds a fresh
-/// random-weight `Qwen3Inner` directly, then dispatches `Qwen3Cmd::SaveModel`
+/// random-weight `Qwen3Inner` directly, then dispatches `Qwen3FamilyCommand::SaveModel`
 /// on that thread. The thread is dropped at the end of the promise, so the
 /// in-memory model is released once the checkpoint has been written. Used by
 /// TypeScript test fixtures that need an on-disk checkpoint without keeping a
@@ -283,12 +284,12 @@ pub fn create_random_qwen3_checkpoint<'env>(
     config: Qwen3Config,
     save_path: String,
 ) -> Result<PromiseRaw<'env, ()>> {
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+    let (thread, init_rx) = crate::model_thread::ModelThread::<Qwen3Cmd>::spawn_with_init(
         move || {
             let inner = Qwen3Inner::new(config)?;
             Ok((inner, ()))
         },
-        handle_qwen3_cmd,
+        crate::engine::model_command::handle_model_command,
     );
 
     env.spawn_future(async move {
@@ -297,7 +298,7 @@ pub fn create_random_qwen3_checkpoint<'env>(
             .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        thread.send(Qwen3Cmd::SaveModel {
+        thread.send(Qwen3FamilyCommand::SaveModel {
             save_path,
             reply: tx,
         })?;

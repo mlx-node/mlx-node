@@ -2,7 +2,9 @@
 
 Measured 2026-09-05 on an Apple M5 Max, 128 GiB unified memory, macOS 26.6.2.
 Baseline: `100a03ad10a14a7eab7d816773c072e39dc10206`. Changed build: the
-accompanying worktree diff. Both native addons were built with the repository's
+sampling implementation at `8bf084a9`. The later structural command revision
+is verified separately below; these archived measurements identify the algorithm
+change they measured. Both native addons were built with the repository's
 `vp run build:native` wrapper, the same Cargo.lock and vendored MLX revision.
 No checkpoint conversion, quantization or new dependency was introduced.
 
@@ -144,10 +146,37 @@ unrelated files were left alone. Changed Rust and benchmark scripts pass formatt
 and lint checks. Markdown links and structure were checked; no rendered-page
 visual review was performed. No remote CI or cross-runtime benchmark was run.
 
+## Structural command revision
+
+After the sampling measurements, all seven families moved to
+`ModelCommand<FamilyCommand>`. This removes the enum adapter macro and the
+`FromChatCmd` / `HybridSchedulerCommand` traits. Three families need no extension
+implementation; four implement only their additional operations. Normal
+chat-barrier dispatch is a trait default, with Gemma4/Muse owner-state overrides.
+
+The revised code passed 3383 debug unit tests (the same int8 module excluded),
+340 focused engine tests, 109 integration tests, Clippy, native build and
+TypeScript typecheck. The real serial/uniform/ragged/interleaved Qwen gate passed
+again. The new regression drives family commands, live telemetry, state queries
+and a global reset through the scheduler, checking FIFO replies and owner cleanup.
+The unchanged int8 kernels and paged-attention crate retain the earlier release
+and cache-suite evidence above. The broad TypeScript run passed 3276 tests; three
+files failed because the worktree checkpoint lacked config/weights. With the
+existing checkpoint linked into the ignored fixture directory, all three passed
+(18 tests). No failure remains from that run.
+
+The rebuilt structural addon also completed the real-model benchmark scripts.
+Gemma4/DSpark again produced identical outputs and acceptance counters in all
+three measured turns (42 cycles, 200 tokens; median 3342.726 ms). The Qwen workload
+completed all requested concurrency levels. These follow-up runs establish
+execution coverage; they are not another alternating performance experiment.
+
 ## Scope of the result
 
-The implementation removes duplicate command adapters and scheduler telemetry
-forwarding across seven model families. It reduces completion boundaries in
+The implementation uses one generic `ModelCommand<FamilyCommand>` across all
+seven model families, with default chat-barrier dispatch and shared scheduler
+telemetry forwarding. It removes the per-family chat/stats enums, adapter macro
+and two conversion/view traits. It reduces completion boundaries in
 mixed-row sampling and penalized greedy speculation, preserving row construction
 order, per-owner state and the existing SSD lifecycle. It does not enable
 scheduled speculative concurrency or migrate the Metal backend. Their concrete

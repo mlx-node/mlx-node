@@ -14,18 +14,19 @@ use napi::bindgen_prelude::{Error, Result};
 
 use crate::array::MxArray;
 use crate::decode_profiler::DecodeProfiler;
+use crate::engine;
 use crate::engine::backend::{
     ChunkSink, PagedBackend, PagedPrefix, StreamEmitter, ThinkingSetup, TurnOutput,
     TurnTokenObserver,
 };
-use crate::engine::cmd::{ChatCmd, FromChatCmd};
+use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
+use crate::engine::model_command::{FamilyCommand, ModelCommand, handle_model_command};
 use crate::engine::scheduler::{
     BlockTelemetry, PreemptionMode, PreemptionReplay, RowStepResult, Scheduler, SchedulerAction,
     SchedulerError, StepExecutor, StepKind, StepPlan, StepResult, TurnState,
     install_preemption_replay, is_paged_allocation_blocked,
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
-use crate::engine::{self, SchedulerStatsJs};
 use crate::model_thread::{LoopControl, ResponseTx, StreamTx};
 use crate::sampling::{check_repetition_cutoff, sample};
 use crate::stream::{DeviceType, Stream, StreamContext};
@@ -71,26 +72,13 @@ pub(crate) struct SchedulerOwnerContext<'a, S> {
     pub next_seq_id: &'a mut SeqId,
 }
 
-/// Command surface consumed by the engine-owned hybrid scheduler.
-///
-/// Families keep their complete command enum so raw generation, MTP,
-/// multimodal, persistence, and training operations remain typed ordered
-/// barriers. The scheduler only needs model-neutral views of chat and stats
-/// commands; it never matches family variants itself.
-pub(crate) trait HybridSchedulerCommand: FromChatCmd + Sized {
-    fn scheduler_stats(reply: ResponseTx<SchedulerStatsJs>) -> Self;
-    fn as_chat(&self) -> Option<&ChatCmd>;
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self>;
-    fn into_scheduler_stats(self) -> std::result::Result<ResponseTx<SchedulerStatsJs>, Self>;
-}
-
 /// Family capabilities required by the shared hybrid scheduler lifecycle.
 ///
 /// This mirrors vLLM's scheduler/cache-manager boundary: the engine owns
 /// request state and policy, while a model runner supplies cache access and
 /// executes the planned prefill/decode work.
 pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
-    type Command: HybridSchedulerCommand;
+    type FamilyCommand: FamilyCommand<Self>;
     type RestoreTicket;
     type OwnerState: Default;
     type StepExecutor<'a>: StepExecutor<ScheduledTurn<Self::PrefixState>, Error = Error>
@@ -291,11 +279,26 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         prefix.suffix_len() as u32
     }
     fn step_executor(&mut self) -> Self::StepExecutor<'_>;
+    /// Default chat barrier behavior. Override only when an exclusive turn
+    /// must install or reconcile family-specific owner state.
+    fn execute_chat_barrier(
+        &mut self,
+        command: ChatCmd,
+        _owners: SchedulerOwnerContext<'_, Self::OwnerState>,
+    ) {
+        handle_chat_cmd(self, command);
+    }
+
     fn execute_barrier(
         &mut self,
-        command: Self::Command,
+        command: ModelCommand<Self::FamilyCommand>,
         owners: SchedulerOwnerContext<'_, Self::OwnerState>,
-    );
+    ) {
+        match command {
+            ModelCommand::Chat(chat) => self.execute_chat_barrier(*chat, owners),
+            other => handle_model_command(self, other),
+        }
+    }
 }
 
 /// Engine-owned scheduler policy. Model families declare execution/cache
@@ -1260,8 +1263,12 @@ impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>>
 pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     pub(crate) inner: B,
     enabled: bool,
-    scheduler: Scheduler<ScheduledTurn<B::PrefixState>, B::Command, B::Command>,
-    pending: VecDeque<B::Command>,
+    scheduler: Scheduler<
+        ScheduledTurn<B::PrefixState>,
+        ModelCommand<B::FamilyCommand>,
+        ModelCommand<B::FamilyCommand>,
+    >,
+    pending: VecDeque<ModelCommand<B::FamilyCommand>>,
     prepared_waiting: Option<Box<PreparedTurn>>,
     pending_restores: HashMap<SeqId, B::RestoreTicket>,
     pub(crate) owner_sequences: HashMap<String, SeqId>,
@@ -1466,7 +1473,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 DeferredCleanupProgress::OwnerReleaseProcessed
             }
             Ok(chat) => {
-                self.pending.insert(index, B::Command::from_chat(chat));
+                self.pending.insert(index, ModelCommand::from_chat(chat));
                 DeferredCleanupProgress::None
             }
             Err(command) => {
@@ -1544,7 +1551,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             ),
             ChatCmd::ResetCaches { reply } => {
                 self.scheduler
-                    .enqueue_barrier(B::Command::from_chat(ChatCmd::ResetCaches { reply }));
+                    .enqueue_barrier(ModelCommand::from_chat(ChatCmd::ResetCaches { reply }));
                 return None;
             }
             ChatCmd::ReleaseCacheOwner { .. } => {
@@ -2691,7 +2698,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
 
     pub(crate) fn drive(
         &mut self,
-        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<B::Command>,
+        receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ModelCommand<B::FamilyCommand>>,
     ) -> LoopControl {
         if !self.scheduler.has_work() && self.pending.is_empty() && self.prepared_waiting.is_none()
         {
@@ -2777,7 +2784,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             match command.into_chat() {
                 Ok(ChatCmd::ReleaseCacheOwner { owner_id, reply }) => {
                     if self.cache_owner_release_blocked(&owner_id) {
-                        self.pending.push_front(B::Command::from_chat(
+                        self.pending.push_front(ModelCommand::from_chat(
                             ChatCmd::ReleaseCacheOwner { owner_id, reply },
                         ));
                         break;
@@ -2792,7 +2799,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                         || self.chat_requires_barrier(&chat)
                     {
                         self.scheduler
-                            .enqueue_exclusive(B::Command::from_chat(chat));
+                            .enqueue_exclusive(ModelCommand::from_chat(chat));
                         exclusive = true;
                     } else if let Some(prepared) = self.prepare_chat(chat) {
                         match self.admit_prepared(prepared) {
@@ -3035,6 +3042,64 @@ mod tests {
             !moe_state.enabled,
             "Qwen3.5 MoE must keep the generic scheduler opt-in"
         );
+    }
+
+    #[test]
+    fn shared_command_dispatch_orders_family_operations_stats_and_reset() {
+        use crate::models::qwen3_5::model::Qwen35FamilyCommand;
+
+        let inner = Qwen35Inner::new(tiny_config()).expect("construct tiny dense model");
+        let mut state = HybridSchedulerState::new(inner).expect("construct scheduler");
+        state.owner_sequences.insert("owner".into(), 9);
+        state.owner_states.insert("owner".into(), vec![7, 8]);
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let (force_reply, mut force_result) = tokio::sync::oneshot::channel();
+        let (stats_reply, mut stats_result) = tokio::sync::oneshot::channel();
+        let (before_reply, mut before_result) = tokio::sync::oneshot::channel();
+        let (reset_reply, mut reset_result) = tokio::sync::oneshot::channel();
+        let (after_reply, mut after_result) = tokio::sync::oneshot::channel();
+        for command in [
+            Qwen35FamilyCommand::ForceFlatMtpDesyncForTest { reply: force_reply }.into(),
+            Qwen35Cmd::scheduler_stats(stats_reply),
+            Qwen35FamilyCommand::MtpFlatStateForTest {
+                reply: before_reply,
+            }
+            .into(),
+            Qwen35Cmd::from_chat(ChatCmd::ResetCaches { reply: reset_reply }),
+            Qwen35FamilyCommand::MtpFlatStateForTest { reply: after_reply }.into(),
+        ] {
+            assert!(sender.send(command).is_ok());
+        }
+
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(matches!(force_result.try_recv(), Ok(Ok(()))));
+        assert!(matches!(
+            stats_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(matches!(stats_result.try_recv(), Ok(Ok(_))));
+        assert!(matches!(
+            before_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(before_result.try_recv().unwrap().unwrap().1);
+        assert!(state.owner_states.contains_key("owner"));
+        assert!(matches!(
+            reset_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(matches!(reset_result.try_recv(), Ok(Ok(()))));
+        assert!(state.owner_sequences.is_empty());
+        assert!(state.owner_states.is_empty());
+        assert!(matches!(
+            after_result.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(matches!(state.drive(&mut receiver), LoopControl::Continue));
+        assert!(!after_result.try_recv().unwrap().unwrap().1);
     }
 
     /// Paged adapter + a complete native MTP head whose flat core has no

@@ -1,0 +1,485 @@
+{
+  "structural-dspark": {
+    "revision": "structural-command",
+    "modelPath": "/Users/brooklyn/workspace/github/mlx-node/.cache/models/gemma-4-12b-it",
+    "draftPath": "/Users/brooklyn/workspace/github/mlx-node/.cache/models/dspark_gemma4_12b_block7",
+    "loadMs": 52896.774625,
+    "runs": [
+      {
+        "round": 0,
+        "ms": 3355.607625000004,
+        "tokens": 200,
+        "rawSha256": "6b72267cea8ce911ff078a4f72abdfa6f00e2b83fe9e941041bb552734662953",
+        "finish": "length",
+        "performance": {
+          "ttftMs": 155.473583,
+          "prefillTokensPerSecond": 147.93509968828596,
+          "decodeTokensPerSecond": 62.207413662303225,
+          "mtpMeanAcceptedTokens": 3.738095238095238,
+          "mtpMeanAcceptedTokensTotal": 4.738095238095238,
+          "mtpAcceptanceByPosition": [
+            0.8571428571428571, 0.6666666666666666, 0.6190476190476191, 0.5121951219512195, 0.3902439024390244,
+            0.36585365853658536, 0.36585365853658536
+          ],
+          "mtpCycles": 42,
+          "mtpMeanDepth": 6.904761904761905
+        }
+      },
+      {
+        "round": 1,
+        "ms": 3326.714749999999,
+        "tokens": 200,
+        "rawSha256": "6b72267cea8ce911ff078a4f72abdfa6f00e2b83fe9e941041bb552734662953",
+        "finish": "length",
+        "performance": {
+          "ttftMs": 152.050292,
+          "prefillTokensPerSecond": 151.26574041699308,
+          "decodeTokensPerSecond": 62.69666056004343,
+          "mtpMeanAcceptedTokens": 3.738095238095238,
+          "mtpMeanAcceptedTokensTotal": 4.738095238095238,
+          "mtpAcceptanceByPosition": [
+            0.8571428571428571, 0.6666666666666666, 0.6190476190476191, 0.5121951219512195, 0.3902439024390244,
+            0.36585365853658536, 0.36585365853658536
+          ],
+          "mtpCycles": 42,
+          "mtpMeanDepth": 6.904761904761905
+        }
+      },
+      {
+        "round": 2,
+        "ms": 3342.7257910000044,
+        "tokens": 200,
+        "rawSha256": "6b72267cea8ce911ff078a4f72abdfa6f00e2b83fe9e941041bb552734662953",
+        "finish": "length",
+        "performance": {
+          "ttftMs": 151.98979100000003,
+          "prefillTokensPerSecond": 151.32595320168576,
+          "decodeTokensPerSecond": 62.38131173716396,
+          "mtpMeanAcceptedTokens": 3.738095238095238,
+          "mtpMeanAcceptedTokensTotal": 4.738095238095238,
+          "mtpAcceptanceByPosition": [
+            0.8571428571428571, 0.6666666666666666, 0.6190476190476191, 0.5121951219512195, 0.3902439024390244,
+            0.36585365853658536, 0.36585365853658536
+          ],
+          "mtpCycles": 42,
+          "mtpMeanDepth": 6.904761904761905
+        }
+      }
+    ]
+  },
+  "structural-qwen": {
+    "revision": "structural-command",
+    "modelPath": "/Users/brooklyn/workspace/github/mlx-node/.cache/models/qwen3-0.6b-mlx-bf16",
+    "loadMs": 14680.4535,
+    "runs": [
+      {
+        "rows": 1,
+        "round": 0,
+        "ms": 531.5463330000002,
+        "tokens": 128,
+        "rawSha256": ["f82b225430de8988eb9373066087be157dc251196a4ea8d28f93381a709011d3"],
+        "finish": ["length"],
+        "performance": [
+          {
+            "ttftMs": 15.149332999999999,
+            "prefillTokensPerSecond": 1584.2281637085937,
+            "decodeTokensPerSecond": 246.13120601860646
+          }
+        ],
+        "maxOccupancy": 1
+      },
+      {
+        "rows": 1,
+        "round": 1,
+        "ms": 533.5326250000016,
+        "tokens": 128,
+        "rawSha256": ["f82b225430de8988eb9373066087be157dc251196a4ea8d28f93381a709011d3"],
+        "finish": ["length"],
+        "performance": [
+          {
+            "ttftMs": 15.471290999999999,
+            "prefillTokensPerSecond": 1551.260331151421,
+            "decodeTokensPerSecond": 245.33690842655008
+          }
+        ],
+        "maxOccupancy": 1
+      },
+      {
+        "rows": 1,
+        "round": 2,
+        "ms": 530.8473749999976,
+        "tokens": 128,
+        "rawSha256": ["f82b225430de8988eb9373066087be157dc251196a4ea8d28f93381a709011d3"],
+        "finish": ["length"],
+        "performance": [
+          {
+            "ttftMs": 14.280167,
+            "prefillTokensPerSecond": 1680.6526142166265,
+            "decodeTokensPerSecond": 246.0403091170626
+          }
+        ],
+        "maxOccupancy": 1
+      },
+      {
+        "rows": 2,
+        "round": 0,
+        "ms": 1083.8714590000018,
+        "tokens": 256,
+        "rawSha256": [
+          "4a05ea3c1250e7d6c6acaa2c14255dcf4c0b2083abbaf13f87f6ef917882635d",
+          "3727cd262339d54fa0cff32f3a0856c7615f81b073871b6d902b711d848715da"
+        ],
+        "finish": ["length", "length"],
+        "performance": [
+          {
+            "ttftMs": 13.601958000000002,
+            "prefillTokensPerSecond": 1764.4518531817257,
+            "decodeTokensPerSecond": 118.70782790496224
+          },
+          {
+            "ttftMs": 17.804125,
+            "prefillTokensPerSecond": 1348.0022185869848,
+            "decodeTokensPerSecond": 120.75084686895023
+          }
+        ],
+        "maxOccupancy": 2
+      },
+      {
+        "rows": 2,
+        "round": 1,
+        "ms": 1098.499917000001,
+        "tokens": 256,
+        "rawSha256": [
+          "4a05ea3c1250e7d6c6acaa2c14255dcf4c0b2083abbaf13f87f6ef917882635d",
+          "3727cd262339d54fa0cff32f3a0856c7615f81b073871b6d902b711d848715da"
+        ],
+        "finish": ["length", "length"],
+        "performance": [
+          {
+            "ttftMs": 14.153667,
+            "prefillTokensPerSecond": 1695.6736370864173,
+            "decodeTokensPerSecond": 117.16760237375105
+          },
+          {
+            "ttftMs": 18.302833,
+            "prefillTokensPerSecond": 1311.272413401794,
+            "decodeTokensPerSecond": 119.20875893996937
+          }
+        ],
+        "maxOccupancy": 2
+      },
+      {
+        "rows": 2,
+        "round": 2,
+        "ms": 1094.2012079999986,
+        "tokens": 256,
+        "rawSha256": [
+          "4a05ea3c1250e7d6c6acaa2c14255dcf4c0b2083abbaf13f87f6ef917882635d",
+          "3727cd262339d54fa0cff32f3a0856c7615f81b073871b6d902b711d848715da"
+        ],
+        "finish": ["length", "length"],
+        "performance": [
+          {
+            "ttftMs": 14.538250000000001,
+            "prefillTokensPerSecond": 1650.8176706274826,
+            "decodeTokensPerSecond": 117.67253004824342
+          },
+          {
+            "ttftMs": 17.772084,
+            "prefillTokensPerSecond": 1350.4325097720673,
+            "decodeTokensPerSecond": 119.67628977116382
+          }
+        ],
+        "maxOccupancy": 2
+      },
+      {
+        "rows": 4,
+        "round": 0,
+        "ms": 1147.2544160000034,
+        "tokens": 512,
+        "rawSha256": [
+          "4a05ea3c1250e7d6c6acaa2c14255dcf4c0b2083abbaf13f87f6ef917882635d",
+          "3727cd262339d54fa0cff32f3a0856c7615f81b073871b6d902b711d848715da",
+          "edd1a5d00abd2769f6035ad27b6da9afe37385314c42349a9e831e6d5c448b44",
+          "3727cd262339d54fa0cff32f3a0856c7615f81b073871b6d902b711d848715da"
+        ],
+        "finish": ["length", "length", "length", "length"],
+        "performance": [
+          {
+            "ttftMs": 14.368167,
+            "prefillTokensPerSecond": 1670.359204483077,
+            "decodeTokensPerSecond": 112.14617388739514
+          },
+          {
+            "ttftMs": 18.854792,
+            "prefillTokensPerSecond": 1272.8859591768503,
+            "decodeTokensPerSecond": 114.07668063806591
+          },
+          {
+            "ttftMs": 32.873042,
+            "prefillTokensPerSecond": 730.0815056908941,
+            "decodeTokensPerSecond": 115.5428306810795
+          },
+          {
+            "ttftMs": 46.922708,
+            "prefillTokensPerSecond": 511.4794312382823,
+            "decodeTokensPerSecond": 117.04748187780106
+          }
+        ],
+        "maxOccupancy": 4
+      },
+      {
+        "rows": 4,
+        "round": 1,
+        "ms": 1150.9022079999995,
+        "tokens": 512,
+        "rawSha256": [
+          "4a05ea3c1250e7d6c6acaa2c14255dcf4c0b2083abbaf13f87f6ef917882635d",
+          "3727cd262339d54fa0cff32f3a0856c7615f81b073871b6d902b711d848715da",
+          "edd1a5d00abd2769f6035ad27b6da9afe37385314c42349a9e831e6d5c448b44",
+          "3727cd262339d54fa0cff32f3a0856c7615f81b073871b6d902b711d848715da"
+        ],
+        "finish": ["length", "length", "length", "length"],
+        "performance": [
+          {
+            "ttftMs": 14.362041000000001,
+            "prefillTokensPerSecond": 1671.0716812464188,
+            "decodeTokensPerSecond": 111.7810763219405
+          },
+          {
+            "ttftMs": 18.901833,
+            "prefillTokensPerSecond": 1269.718127337174,
+            "decodeTokensPerSecond": 113.70562375032931
+          },
+          {
+            "ttftMs": 32.689083000000004,
+            "prefillTokensPerSecond": 734.1900658394119,
+            "decodeTokensPerSecond": 115.13605035525023
+          },
+          {
+            "ttftMs": 47.078416999999995,
+            "prefillTokensPerSecond": 509.7877441376162,
+            "decodeTokensPerSecond": 116.66577033059603
+          }
+        ],
+        "maxOccupancy": 4
+      },
+      {
+        "rows": 4,
+        "round": 2,
+        "ms": 1141.5535410000011,
+        "tokens": 512,
+        "rawSha256": [
+          "4a05ea3c1250e7d6c6acaa2c14255dcf4c0b2083abbaf13f87f6ef917882635d",
+          "3727cd262339d54fa0cff32f3a0856c7615f81b073871b6d902b711d848715da",
+          "edd1a5d00abd2769f6035ad27b6da9afe37385314c42349a9e831e6d5c448b44",
+          "3727cd262339d54fa0cff32f3a0856c7615f81b073871b6d902b711d848715da"
+        ],
+        "finish": ["length", "length", "length", "length"],
+        "performance": [
+          {
+            "ttftMs": 14.382416000000001,
+            "prefillTokensPerSecond": 1668.7043400774946,
+            "decodeTokensPerSecond": 112.71109750200044
+          },
+          {
+            "ttftMs": 18.797125,
+            "prefillTokensPerSecond": 1276.7909986234597,
+            "decodeTokensPerSecond": 114.65080857848369
+          },
+          {
+            "ttftMs": 32.84825,
+            "prefillTokensPerSecond": 730.6325298912423,
+            "decodeTokensPerSecond": 116.13198640565918
+          },
+          {
+            "ttftMs": 46.357833,
+            "prefillTokensPerSecond": 517.7118611217224,
+            "decodeTokensPerSecond": 117.59261066701237
+          }
+        ],
+        "maxOccupancy": 4
+      },
+      {
+        "rows": 8,
+        "round": 0,
+        "ms": 1241.284832999998,
+        "tokens": 1024,
+        "rawSha256": [
+          "051b0301c19f3415c05f9f9bcc83e4797d6a1a1200ca8239ddb7568bfd0386a8",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8",
+          "a1de82fad47a0d246d0e33a11ca82675eb8f10229a2236d9b47df9158ffd0832",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8",
+          "a1de82fad47a0d246d0e33a11ca82675eb8f10229a2236d9b47df9158ffd0832",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8",
+          "a1de82fad47a0d246d0e33a11ca82675eb8f10229a2236d9b47df9158ffd0832",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8"
+        ],
+        "finish": ["length", "length", "length", "length", "length", "length", "length", "length"],
+        "performance": [
+          {
+            "ttftMs": 16.003458000000002,
+            "prefillTokensPerSecond": 1499.6758825498837,
+            "decodeTokensPerSecond": 103.68584820840854
+          },
+          {
+            "ttftMs": 19.551583,
+            "prefillTokensPerSecond": 1227.5220886206503,
+            "decodeTokensPerSecond": 105.39119531249838
+          },
+          {
+            "ttftMs": 33.270584,
+            "prefillTokensPerSecond": 721.357941898465,
+            "decodeTokensPerSecond": 106.61241841781641
+          },
+          {
+            "ttftMs": 47.553458,
+            "prefillTokensPerSecond": 504.6951580261524,
+            "decodeTokensPerSecond": 107.91208345461015
+          },
+          {
+            "ttftMs": 62.233999999999995,
+            "prefillTokensPerSecond": 385.6412893273773,
+            "decodeTokensPerSecond": 109.28178461415405
+          },
+          {
+            "ttftMs": 76.28533399999999,
+            "prefillTokensPerSecond": 314.60830990135014,
+            "decodeTokensPerSecond": 110.62515011865536
+          },
+          {
+            "ttftMs": 90.271459,
+            "prefillTokensPerSecond": 265.864762416214,
+            "decodeTokensPerSecond": 111.99640615349597
+          },
+          {
+            "ttftMs": 103.912542,
+            "prefillTokensPerSecond": 230.963457712352,
+            "decodeTokensPerSecond": 113.36696999769917
+          }
+        ],
+        "maxOccupancy": 8
+      },
+      {
+        "rows": 8,
+        "round": 1,
+        "ms": 1244.6391660000008,
+        "tokens": 1024,
+        "rawSha256": [
+          "051b0301c19f3415c05f9f9bcc83e4797d6a1a1200ca8239ddb7568bfd0386a8",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8",
+          "a1de82fad47a0d246d0e33a11ca82675eb8f10229a2236d9b47df9158ffd0832",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8",
+          "a1de82fad47a0d246d0e33a11ca82675eb8f10229a2236d9b47df9158ffd0832",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8",
+          "a1de82fad47a0d246d0e33a11ca82675eb8f10229a2236d9b47df9158ffd0832",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8"
+        ],
+        "finish": ["length", "length", "length", "length", "length", "length", "length", "length"],
+        "performance": [
+          {
+            "ttftMs": 17.025333,
+            "prefillTokensPerSecond": 1409.6640576721759,
+            "decodeTokensPerSecond": 103.49008419822054
+          },
+          {
+            "ttftMs": 18.998084,
+            "prefillTokensPerSecond": 1263.2852870847398,
+            "decodeTokensPerSecond": 105.14767924901798
+          },
+          {
+            "ttftMs": 32.869583,
+            "prefillTokensPerSecond": 730.1583351392076,
+            "decodeTokensPerSecond": 106.37786237416323
+          },
+          {
+            "ttftMs": 46.302125,
+            "prefillTokensPerSecond": 518.3347416560255,
+            "decodeTokensPerSecond": 107.59554281719215
+          },
+          {
+            "ttftMs": 61.047292000000006,
+            "prefillTokensPerSecond": 393.13783156835194,
+            "decodeTokensPerSecond": 108.96331210086244
+          },
+          {
+            "ttftMs": 75.713583,
+            "prefillTokensPerSecond": 316.98407404652875,
+            "decodeTokensPerSecond": 110.35900675590466
+          },
+          {
+            "ttftMs": 89.237333,
+            "prefillTokensPerSecond": 268.94573373231583,
+            "decodeTokensPerSecond": 111.67838208801862
+          },
+          {
+            "ttftMs": 103.25358299999999,
+            "prefillTokensPerSecond": 232.43745449492053,
+            "decodeTokensPerSecond": 113.07943185267773
+          }
+        ],
+        "maxOccupancy": 8
+      },
+      {
+        "rows": 8,
+        "round": 2,
+        "ms": 1255.0445419999996,
+        "tokens": 1024,
+        "rawSha256": [
+          "e49bec6484622f31f6515f9fa37272b1b2bbc7a25262337ed65d12664b9cee02",
+          "49e28c439f7ce3ae14ff955411d1cca496f4319433569fbe709325d6910f8d4c",
+          "a1de82fad47a0d246d0e33a11ca82675eb8f10229a2236d9b47df9158ffd0832",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8",
+          "a1de82fad47a0d246d0e33a11ca82675eb8f10229a2236d9b47df9158ffd0832",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8",
+          "a1de82fad47a0d246d0e33a11ca82675eb8f10229a2236d9b47df9158ffd0832",
+          "a9e9a87f4a17a263b3ca11e6a46bc067dab375c66084acd7e536358fb75c0df8"
+        ],
+        "finish": ["length", "length", "length", "length", "length", "length", "length", "length"],
+        "performance": [
+          {
+            "ttftMs": 16.584958,
+            "prefillTokensPerSecond": 1447.0944092834,
+            "decodeTokensPerSecond": 102.58327430729425
+          },
+          {
+            "ttftMs": 31.163375,
+            "prefillTokensPerSecond": 770.1348137035864,
+            "decodeTokensPerSecond": 103.81204083540956
+          },
+          {
+            "ttftMs": 25.127625000000002,
+            "prefillTokensPerSecond": 955.124091512827,
+            "decodeTokensPerSecond": 106.02125229227758
+          },
+          {
+            "ttftMs": 38.605958,
+            "prefillTokensPerSecond": 621.6657024804306,
+            "decodeTokensPerSecond": 107.23654207403942
+          },
+          {
+            "ttftMs": 53.04025,
+            "prefillTokensPerSecond": 452.48655502189376,
+            "decodeTokensPerSecond": 108.56652184824443
+          },
+          {
+            "ttftMs": 66.991667,
+            "prefillTokensPerSecond": 358.25351233609393,
+            "decodeTokensPerSecond": 109.88377519553309
+          },
+          {
+            "ttftMs": 80.32870799999999,
+            "prefillTokensPerSecond": 298.77238906917313,
+            "decodeTokensPerSecond": 111.17321852082304
+          },
+          {
+            "ttftMs": 94.764042,
+            "prefillTokensPerSecond": 253.2606196768179,
+            "decodeTokensPerSecond": 112.60227855587135
+          }
+        ],
+        "maxOccupancy": 8
+      }
+    ]
+  }
+}
