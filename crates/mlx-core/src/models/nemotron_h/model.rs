@@ -18,18 +18,16 @@ use crate::engine::backend::{
     PagedPrefix, ResetScope, SaveStateArgs, SpecFrontier, StreamEmitter, TurnOutput, TurnSetup,
     WholeTurnArgs,
 };
-use crate::engine::cmd::{ChatCmd, FromChatCmd, handle_chat_cmd};
 use crate::engine::decode::{DecodeLoopArgs, StreamingCtx, run_decode_loop};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
-    NoRestoreTicket, ScheduledPrefixAdmission, pool_tokens_after_recurrent, scheduled_turn_context,
+    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, NoRestoreTicket,
+    ScheduledPrefixAdmission, pool_tokens_after_recurrent, scheduled_turn_context,
     scheduler_max_num_seqs_for, scheduler_per_seq_context_override,
 };
 use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
     SpeculativePlan,
 };
-use crate::engine::{self};
 use crate::model_thread::{ResponseTx, send_and_await};
 use crate::nn::{Embedding, RMSNorm};
 use crate::stream::{DeviceType, Stream, StreamContext};
@@ -52,11 +50,9 @@ pub(crate) const PREFILL_STEP_SIZE: i64 = 2048;
 pub(crate) const PREFILL_CANCELLED: &str = "prefill cancelled";
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
-pub(crate) enum NemotronHCmd {
-    Chat(Box<ChatCmd>),
-    SchedulerStats {
-        reply: ResponseTx<engine::SchedulerStatsJs>,
-    },
+pub(crate) type NemotronHCmd = crate::engine::model_command::ModelCommand<NemotronHFamilyCommand>;
+
+pub(crate) enum NemotronHFamilyCommand {
     /// Test-only: `(cached_token_history.len(), attention kv_offset,
     /// flat_mtp_caches_desynced, flat_mtp_last_rollback_unemitted)`. The first two
     /// are the seam invariant: the flat trunk must never sit ahead of the token
@@ -67,61 +63,27 @@ pub(crate) enum NemotronHCmd {
     },
 }
 
-impl FromChatCmd for NemotronHCmd {
-    #[inline]
-    fn from_chat(cmd: ChatCmd) -> Self {
-        NemotronHCmd::Chat(Box::new(cmd))
-    }
-}
-
-impl HybridSchedulerCommand for NemotronHCmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            Self::SchedulerStats { .. } | Self::MtpFlatStateForTest { .. } => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(*chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
-    }
-}
-
 /// Route a thread command to the engine's chat handler.
-pub(crate) fn handle_nemotron_h_cmd(inner: &mut NemotronHInner, cmd: NemotronHCmd) {
-    match cmd {
-        NemotronHCmd::Chat(chat) => handle_chat_cmd(inner, *chat),
-        NemotronHCmd::SchedulerStats { reply } => {
-            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
-        }
-        NemotronHCmd::MtpFlatStateForTest { reply } => {
-            // `as_kv_cache_mut`, not `as_kv_cache`: the shared accessor is
-            // `#[cfg(any(test, debug_assertions))]` and is gone from a release
-            // build, which an integration test links WITHOUT `cfg(test)`.
-            let kv_offset = inner
-                .caches
-                .iter_mut()
-                .find_map(|c| c.as_kv_cache_mut())
-                .map(|kv| kv.get_offset())
-                .unwrap_or(-1);
-            let _ = reply.send(Ok((
-                inner.cached_token_history.len(),
-                kv_offset,
-                inner.flat_mtp_caches_desynced,
-                inner.flat_mtp_last_rollback_unemitted,
-            )));
+impl crate::engine::model_command::FamilyCommand<NemotronHInner> for NemotronHFamilyCommand {
+    fn execute(self, inner: &mut NemotronHInner) {
+        match self {
+            NemotronHFamilyCommand::MtpFlatStateForTest { reply } => {
+                // `as_kv_cache_mut`, not `as_kv_cache`: the shared accessor is
+                // `#[cfg(any(test, debug_assertions))]` and is gone from a release
+                // build, which an integration test links WITHOUT `cfg(test)`.
+                let kv_offset = inner
+                    .caches
+                    .iter_mut()
+                    .find_map(|c| c.as_kv_cache_mut())
+                    .map(|kv| kv.get_offset())
+                    .unwrap_or(-1);
+                let _ = reply.send(Ok((
+                    inner.cached_token_history.len(),
+                    kv_offset,
+                    inner.flat_mtp_caches_desynced,
+                    inner.flat_mtp_last_rollback_unemitted,
+                )));
+            }
         }
     }
 }
@@ -1726,7 +1688,7 @@ impl PagedBackend for NemotronHInner {
 pub(crate) type NemotronHSchedulerState = HybridSchedulerState<NemotronHInner>;
 
 impl HybridSchedulerBackend for NemotronHInner {
-    type Command = NemotronHCmd;
+    type FamilyCommand = NemotronHFamilyCommand;
     type RestoreTicket = NoRestoreTicket;
     type OwnerState = Vec<u32>;
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
@@ -1894,14 +1856,6 @@ impl HybridSchedulerBackend for NemotronHInner {
 
     fn step_executor(&mut self) -> Self::StepExecutor<'_> {
         HybridStepExecutor::new(self)
-    }
-
-    fn execute_barrier(
-        &mut self,
-        command: Self::Command,
-        _owners: crate::engine::hybrid_scheduler::SchedulerOwnerContext<'_, Self::OwnerState>,
-    ) {
-        handle_nemotron_h_cmd(self, command);
     }
 }
 
@@ -2173,7 +2127,7 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
 
     fn verify_step(
         &mut self,
-        ids: &MxArray,
+        ids: &[u32],
         embedding: &Embedding,
         depth: usize,
     ) -> Result<crate::models::qwen3_5::mtp_decode::MtpVerifyOutput> {
@@ -2190,28 +2144,20 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
                  relaxing this"
             )));
         }
-        let id_window = ids.to_int32().map_err(|e| {
-            Error::from_reason(format!(
-                "NemotronH MTP verify_step: ids to_int32: {}",
-                e.reason
-            ))
-        })?;
-        if id_window.len() < depth + 1 {
-            return Err(Error::from_reason(format!(
-                "NemotronH MTP verify_step: ids has {} elements, need {}",
-                id_window.len(),
-                depth + 1
-            )));
+        if ids.len() != depth + 1 {
+            return Err(Error::from_reason(
+                "NemotronH MTP verifier token count does not match depth",
+            ));
         }
-        let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
+        let id_slice = ids;
         // Verify one token at a time through the AR DECODE path. A batched [1, depth+1]
         // forward routes every stateful mamba layer through the chunk-scan, whose
         // padded-chunk arithmetic differs from the recurrent decode_step in f32 rounding;
         // the drift flips near-tie argmaxes and breaks the T=0 lossless contract.
         let mut logits_rows: Vec<MxArray> = Vec::with_capacity(depth + 1);
         let mut hidden_rows: Vec<MxArray> = Vec::with_capacity(depth + 1);
-        for &tok in &id_slice {
-            let one = MxArray::from_int32(&[tok], &[1, 1])?;
+        for &tok in id_slice {
+            let one = MxArray::from_uint32(&[tok], &[1, 1])?;
             let (logits, hidden) = self.inner.forward_with_hidden_3d(&one, embedding)?;
             logits_rows.push(logits);
             hidden_rows.push(hidden);
@@ -2992,20 +2938,14 @@ impl NemotronHModel {
         }
     }
 
-    /// Snapshot scheduler occupancy and paged-pool admission telemetry.
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        send_and_await(&self.thread, |reply| NemotronHCmd::SchedulerStats { reply }).await
-    }
-
     /// Test-only flat-MTP seam snapshot:
     /// `(history_len, attn_kv_offset, desynced, rollback_unemitted)`.
     /// `rollback_unemitted` says whether the preceding turn stopped mid-cycle WITHOUT
     /// consulting the latch. Serialized behind the model thread.
     #[doc(hidden)]
     pub async fn mtp_flat_state_for_test(&self) -> Result<(usize, i32, bool, usize)> {
-        send_and_await(&self.thread, |reply| NemotronHCmd::MtpFlatStateForTest {
-            reply,
+        send_and_await(&self.thread, |reply| {
+            NemotronHFamilyCommand::MtpFlatStateForTest { reply }
         })
         .await
     }
@@ -3192,8 +3132,8 @@ mod scheduler_tests {
             crate::cache_limit::coordinator()
                 .registered_pool_bytes()
                 .saturating_sub(before),
-            plan.pool_bytes,
-            "configured reservation must be visible before Inner::new allocates"
+            plan.pool_bytes + mlx_paged_attn::RESTORE_STAGING_BYTES,
+            "configured KV and restore-staging reservations must be visible before Inner::new allocates"
         );
         let inner = NemotronHInner::new(config).expect("inner builds");
         let adapter = inner
@@ -3321,6 +3261,10 @@ mod scheduler_tests {
             eprintln!("skipping (no Metal backend)");
             return;
         }
+        // Weight initialization must not inherit another test's random
+        // stream: a different tiny model can put two logits across a
+        // batched/serial reduction near-tie. Keep this parity fixture fixed.
+        unsafe { mlx_sys::mlx_seed(0) };
         let cfg = tiny_paged_config();
         let mut inner = NemotronHInner::new(cfg).expect("inner builds");
         assert!(

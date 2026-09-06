@@ -769,7 +769,7 @@ impl Qwen35MoeInner {
     }
 
     /// Static FP8 activation-amax calibration prefill (runs on the model
-    /// thread). Inherent body of [`Qwen35MoeCmd::CalibratePrefillRaw`]; a
+    /// thread). Inherent body of [`Qwen35MoeFamilyCommand::CalibratePrefillRaw`]; a
     /// faithful mirror of the dense
     /// [`crate::models::qwen3_5::model::Qwen35Inner::calibrate_prefill_raw_sync`].
     ///

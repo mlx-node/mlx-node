@@ -124,6 +124,15 @@ fn bridge_dtype_code(dtype: MetalDtype) -> Result<i32, String> {
 /// `[num_kv_heads, head_size, block_size]`).
 pub type BlockLayerBytes = (Vec<u8>, Vec<u8>);
 
+/// Borrowed native-layout bytes for one destination block, in layer order.
+pub type BlockUpload<'a> = (u32, Vec<(&'a [u8], &'a [u8])>);
+
+/// Maximum retained staging allocation per pool, across both K and V buffers.
+#[cfg(target_os = "macos")]
+pub const RESTORE_STAGING_BYTES: u64 = 64 << 20;
+#[cfg(not(target_os = "macos"))]
+pub const RESTORE_STAGING_BYTES: u64 = 0;
+
 /// Ceiling on what one `LayerKVPool::new_for_test` pool may allocate.
 ///
 /// That constructor skips `config.validate()`, so nothing bounds the geometry
@@ -139,6 +148,7 @@ const TEST_POOL_MAX_BYTES: u64 = 256 << 20;
 /// On non-macOS targets this compiles to a no-op stub so the rest of the
 /// crate type-checks; the kernel dispatch APIs are macOS-only.
 pub struct LayerKVPool {
+    restore_identity: std::sync::Arc<()>,
     config: PagedAttentionConfig,
 
     /// Hard ceiling on the block count this pool can reach, fixed at
@@ -176,6 +186,11 @@ pub struct LayerKVPool {
     /// can build-then-swap through `&self`.
     #[cfg(target_os = "macos")]
     inner: RwLock<PoolInner>,
+
+    /// Reused only while holding the lock and after GPU completion. A single
+    /// block larger than the retention bound uses a temporary pair instead.
+    #[cfg(target_os = "macos")]
+    restore_staging: std::sync::Mutex<Option<(Buffer, Buffer)>>,
 
     #[cfg(not(target_os = "macos"))]
     num_layers: u32,
@@ -521,7 +536,9 @@ impl LayerKVPool {
                 max_num_blocks,
                 cache_dtype,
                 generation: AtomicU64::new(0),
+                restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner { layers, num_blocks }),
+                restore_staging: std::sync::Mutex::new(None),
             })
         }
 
@@ -538,6 +555,7 @@ impl LayerKVPool {
                 max_num_blocks,
                 cache_dtype,
                 generation: AtomicU64::new(0),
+                restore_identity: std::sync::Arc::new(()),
             })
         }
     }
@@ -651,7 +669,9 @@ impl LayerKVPool {
                 max_num_blocks: num_blocks,
                 cache_dtype,
                 generation: AtomicU64::new(0),
+                restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner { layers, num_blocks }),
+                restore_staging: std::sync::Mutex::new(None),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -663,6 +683,7 @@ impl LayerKVPool {
                 max_num_blocks: num_blocks,
                 cache_dtype,
                 generation: AtomicU64::new(0),
+                restore_identity: std::sync::Arc::new(()),
             })
         }
     }
@@ -722,10 +743,12 @@ impl LayerKVPool {
                 max_num_blocks: num_blocks,
                 cache_dtype,
                 generation: AtomicU64::new(0),
+                restore_identity: std::sync::Arc::new(()),
                 inner: RwLock::new(PoolInner {
                     layers: Vec::new(),
                     num_blocks,
                 }),
+                restore_staging: std::sync::Mutex::new(None),
             })
         }
         #[cfg(not(target_os = "macos"))]
@@ -737,6 +760,7 @@ impl LayerKVPool {
                 max_num_blocks: num_blocks,
                 cache_dtype,
                 generation: AtomicU64::new(0),
+                restore_identity: std::sync::Arc::new(()),
             })
         }
     }
@@ -913,6 +937,10 @@ impl LayerKVPool {
     /// must be rebuilt.
     pub fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn restore_identity(&self) -> std::sync::Arc<()> {
+        std::sync::Arc::clone(&self.restore_identity)
     }
 
     /// Total bytes the pool's K/V buffers currently occupy, summed over both
@@ -2036,122 +2064,165 @@ impl LayerKVPool {
         block_id: u32,
         layers: &[(&[u8], &[u8])],
     ) -> Result<(), String> {
-        use crate::metal::command_buffer::observe;
-        use crate::metal::{MetalState, is_metal_extraction_supported};
-        use metal::MTLResourceOptions;
+        self.write_blocks_all_layers(&[(block_id, layers.to_vec())])
+    }
 
-        if !is_metal_extraction_supported() {
-            return Err("Metal GPU not available".to_string());
+    /// Upload a block chain in bounded chunks. Validate the complete input
+    /// before touching the pool; publication remains the caller's transaction.
+    /// The pool generation and staging pair stay locked until all GPU writes
+    /// finish, preventing growth or reuse from racing an in-flight transfer.
+    #[cfg(target_os = "macos")]
+    pub fn write_blocks_all_layers(&self, blocks: &[BlockUpload<'_>]) -> Result<(), String> {
+        use crate::metal::MetalState;
+        use crate::metal::command_buffer::observe;
+        use metal::MTLResourceOptions;
+        if blocks.is_empty() {
+            return Ok(());
         }
-        // Clone the layer handles (Metal retains) and snapshot the block
-        // count under one read, then drop the lock before any GPU work.
-        let (pool_layers, num_blocks) = {
-            let inner = self.inner_read();
-            (inner.layers.clone(), inner.num_blocks)
-        };
-        if pool_layers.is_empty() {
-            return Err("LayerKVPool::write_block_all_layers: pool has zero layers".to_string());
+        let inner = self.inner_read();
+        let layers = &inner.layers;
+        if layers.is_empty() {
+            return Err("LayerKVPool::write_block_all_layers: pool has zero layers".into());
         }
-        if layers.len() != pool_layers.len() {
-            return Err(format!(
-                "LayerKVPool::write_block_all_layers: layer count {} != pool num_layers {}",
-                layers.len(),
-                pool_layers.len()
-            ));
-        }
-        if block_id >= num_blocks {
-            return Err(format!(
-                "LayerKVPool::write_block_all_layers: block_id {} >= num_blocks {}",
-                block_id, num_blocks
-            ));
-        }
-        let (key_block_size, value_block_size) = self.block_bytes_per_layer()?;
-        for (layer_idx, (keys, values)) in layers.iter().enumerate() {
-            if keys.len() as u64 != key_block_size || values.len() as u64 != value_block_size {
+        let (key_bytes, value_bytes) = self.block_bytes_per_layer()?;
+        let mut destinations = std::collections::HashSet::with_capacity(blocks.len());
+        for (block_id, source) in blocks {
+            if *block_id >= inner.num_blocks {
                 return Err(format!(
-                    "LayerKVPool::write_block_all_layers: layer {} byte length mismatch \
-                     (keys {} != {}, values {} != {})",
-                    layer_idx,
-                    keys.len(),
-                    key_block_size,
-                    values.len(),
-                    value_block_size
+                    "restore block id {block_id} >= num_blocks {}",
+                    inner.num_blocks
                 ));
             }
-        }
-
-        self.check_slot_fits_all_layers(
-            "LayerKVPool::write_block_all_layers",
-            block_id,
-            key_block_size,
-            value_block_size,
-        )?;
-
-        // Past this point every input is known-good and no blit has been
-        // encoded yet, so the invariant above holds for all the early returns.
-        //
-        // The staging products are checked rather than bare `*`: this is the
-        // only arithmetic here that feeds raw pointer math below.
-        let staging_overflow = |side: &str, per_layer: u64| {
-            format!(
-                "LayerKVPool::write_block_all_layers: {side} staging size overflows u64 \
-                 ({per_layer} bytes x {} layers)",
-                layers.len()
-            )
-        };
-        let key_staging_size = key_block_size
-            .checked_mul(layers.len() as u64)
-            .ok_or_else(|| staging_overflow("key", key_block_size))?;
-        let value_staging_size = value_block_size
-            .checked_mul(layers.len() as u64)
-            .ok_or_else(|| staging_overflow("value", value_block_size))?;
-
-        let state = MetalState::get()?;
-        let key_staging = state
-            .device
-            .new_buffer(key_staging_size, MTLResourceOptions::StorageModeShared);
-        let value_staging = state
-            .device
-            .new_buffer(value_staging_size, MTLResourceOptions::StorageModeShared);
-        // SAFETY: freshly created StorageModeShared buffers are CPU-visible
-        // and exclusively owned here. Every layer's slice was checked above to
-        // be exactly `block_bytes` long, so the cursors walk precisely the
-        // `layers.len() * block_bytes` the buffers were allocated at; the
-        // final advance lands one past the end, which `add` permits. Every
-        // write happens before the blit is committed below.
-        unsafe {
-            let mut key_cursor = key_staging.contents() as *mut u8;
-            let mut value_cursor = value_staging.contents() as *mut u8;
-            for (keys, values) in layers.iter() {
-                std::ptr::copy_nonoverlapping(keys.as_ptr(), key_cursor, keys.len());
-                std::ptr::copy_nonoverlapping(values.as_ptr(), value_cursor, values.len());
-                key_cursor = key_cursor.add(keys.len());
-                value_cursor = value_cursor.add(values.len());
+            if !destinations.insert(*block_id) {
+                return Err(format!("duplicate restore block id {block_id}"));
+            }
+            if source.len() != layers.len() {
+                return Err(format!(
+                    "restore layer count {} != {}",
+                    source.len(),
+                    layers.len()
+                ));
+            }
+            for (layer, ((keys, values), (key_pool, value_pool))) in
+                source.iter().zip(layers).enumerate()
+            {
+                if keys.len() as u64 != key_bytes || values.len() as u64 != value_bytes {
+                    return Err(format!("restore layer {layer} byte length mismatch"));
+                }
+                for (side, buffer, bytes) in [
+                    ("key", key_pool, key_bytes),
+                    ("value", value_pool, value_bytes),
+                ] {
+                    let end = Self::block_slot_end(*block_id, bytes)
+                        .ok_or_else(|| format!("restore layer {layer} {side} slot overflow"))?;
+                    if end > buffer.length() {
+                        return Err(format!(
+                            "restore layer {layer} {side} buffer is {} bytes but \
+                            block {block_id} requires {end} ({bytes} bytes per block)",
+                            buffer.length()
+                        ));
+                    }
+                }
             }
         }
-
-        let command_buffer = state.command_queue.new_command_buffer();
-        let blit = command_buffer.new_blit_command_encoder();
-        for (layer_idx, (key_cache, value_cache)) in pool_layers.iter().enumerate() {
-            blit.copy_from_buffer(
-                &key_staging,
-                layer_idx as u64 * key_block_size,
-                key_cache,
-                block_id as u64 * key_block_size,
-                key_block_size,
-            );
-            blit.copy_from_buffer(
-                &value_staging,
-                layer_idx as u64 * value_block_size,
-                value_cache,
-                block_id as u64 * value_block_size,
-                value_block_size,
-            );
+        let key_per_block = key_bytes
+            .checked_mul(layers.len() as u64)
+            .ok_or("restore key staging size overflow")?;
+        let value_per_block = value_bytes
+            .checked_mul(layers.len() as u64)
+            .ok_or("restore value staging size overflow")?;
+        let per_block = key_per_block
+            .checked_add(value_per_block)
+            .filter(|n| *n > 0)
+            .ok_or("restore staging size overflow")?;
+        let chunk_blocks = (RESTORE_STAGING_BYTES / per_block)
+            .max(1)
+            .min(blocks.len() as u64) as usize;
+        let key_capacity = key_per_block
+            .checked_mul(chunk_blocks as u64)
+            .ok_or("restore key staging size overflow")?;
+        let value_capacity = value_per_block
+            .checked_mul(chunk_blocks as u64)
+            .ok_or("restore value staging size overflow")?;
+        let state = MetalState::get()?;
+        let mut retained = self
+            .restore_staging
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if retained
+            .as_ref()
+            .is_some_and(|(k, v)| k.length() < key_capacity || v.length() < value_capacity)
+        {
+            // The preceding transfer completed. Drop undersized staging before
+            // allocating its replacement so two retained allowances never overlap.
+            *retained = None;
         }
-        blit.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        observe(&command_buffer, "LayerKVPool::write_block_all_layers")
+        let pair = match retained.as_ref() {
+            Some((k, v)) if k.length() >= key_capacity && v.length() >= value_capacity => {
+                (k.clone(), v.clone())
+            }
+            _ => (
+                state
+                    .device
+                    .try_new_buffer(key_capacity, MTLResourceOptions::StorageModeShared)
+                    .ok_or("allocate restore key staging")?,
+                state
+                    .device
+                    .try_new_buffer(value_capacity, MTLResourceOptions::StorageModeShared)
+                    .ok_or("allocate restore value staging")?,
+            ),
+        };
+        let (key_staging, value_staging) = &pair;
+        for chunk in blocks.chunks(chunk_blocks) {
+            // Exclusive staging lease; the preceding chunk has completed.
+            // Sizes and destination ranges were checked for the entire chain.
+            unsafe {
+                let mut k = key_staging.contents() as *mut u8;
+                let mut v = value_staging.contents() as *mut u8;
+                for (_, source) in chunk {
+                    for (keys, values) in source {
+                        std::ptr::copy_nonoverlapping(keys.as_ptr(), k, keys.len());
+                        std::ptr::copy_nonoverlapping(values.as_ptr(), v, values.len());
+                        k = k.add(keys.len());
+                        v = v.add(values.len());
+                    }
+                }
+            }
+            let command_buffer = state.command_queue.new_command_buffer();
+            let blit = command_buffer.new_blit_command_encoder();
+            for (position, (block_id, _)) in chunk.iter().enumerate() {
+                for (layer, (key_pool, value_pool)) in layers.iter().enumerate() {
+                    let source = (position * layers.len() + layer) as u64;
+                    blit.copy_from_buffer(
+                        key_staging,
+                        source * key_bytes,
+                        key_pool,
+                        u64::from(*block_id) * key_bytes,
+                        key_bytes,
+                    );
+                    blit.copy_from_buffer(
+                        value_staging,
+                        source * value_bytes,
+                        value_pool,
+                        u64::from(*block_id) * value_bytes,
+                        value_bytes,
+                    );
+                }
+            }
+            blit.end_encoding();
+            command_buffer.commit();
+            command_buffer.wait_until_completed();
+            observe(&command_buffer, "LayerKVPool::write_block_all_layers")?;
+        }
+        if key_staging.length().saturating_add(value_staging.length()) <= RESTORE_STAGING_BYTES {
+            *retained = Some(pair);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn write_blocks_all_layers(&self, _blocks: &[BlockUpload<'_>]) -> Result<(), String> {
+        Err("write_blocks_all_layers is only supported on macOS (Metal backend)".into())
     }
 
     /// Non-macOS stub.
@@ -2679,6 +2750,53 @@ mod tests {
 
         // The read side rejects an out-of-range block id too.
         assert!(pool.read_block_all_layers(pool.num_blocks()).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn multi_block_upload_validates_the_entire_chain_and_reuses_staging() {
+        let pool = LayerKVPool::new(base_config(4), 4, 4, MetalDtype::BFloat16).unwrap();
+        let payload = distinct_layer_bytes(4, 2 * 64 * 8 * 2);
+        let borrow = || {
+            payload
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect::<Vec<_>>()
+        };
+        let uploads = vec![(0, borrow()), (2, borrow())];
+        pool.write_blocks_all_layers(&uploads).unwrap();
+        assert_eq!(pool.read_block_all_layers(0).unwrap(), payload);
+        assert_eq!(pool.read_block_all_layers(2).unwrap(), payload);
+        let before = snapshot_pool(&pool);
+        let pointers = {
+            let guard = pool.restore_staging.lock().unwrap();
+            let (k, v) = guard.as_ref().unwrap();
+            (k.contents(), v.contents())
+        };
+        // A malformed later block must reject before writing the earlier one.
+        let poison = poison_layer_bytes(&payload);
+        let mut invalid = vec![
+            (
+                0,
+                poison
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect(),
+            ),
+            (2, borrow()),
+        ];
+        invalid[1].1[3].1 = &payload[3].1[..1];
+        assert!(pool.write_blocks_all_layers(&invalid).is_err());
+        assert_eq!(snapshot_pool(&pool), before);
+        assert!(
+            pool.write_blocks_all_layers(&[(0, borrow()), (0, borrow())])
+                .is_err()
+        );
+        pool.write_blocks_all_layers(&uploads).unwrap();
+        let guard = pool.restore_staging.lock().unwrap();
+        let (k, v) = guard.as_ref().unwrap();
+        assert_eq!((k.contents(), v.contents()), pointers);
+        assert!(k.length() + v.length() <= RESTORE_STAGING_BYTES);
     }
 
     /// Which side of a layer's `(key, value)` pair a mutation shrinks.
@@ -3489,6 +3607,55 @@ mod upload_batching_bench {
             use_fp8_cache: Some(false),
             max_seq_len: Some(4096),
             max_batch_size: Some(1),
+        }
+    }
+
+    #[test]
+    #[ignore = "measurement harness; run explicitly with --ignored"]
+    fn bench_restore_chain_upload_batching() {
+        let pool = LayerKVPool::new(cfg(), 32, 32, MetalDtype::BFloat16).unwrap();
+        let (key_bytes, value_bytes) = pool.block_bytes_per_layer().unwrap();
+        let keys = vec![37u8; key_bytes as usize];
+        let values = vec![83u8; value_bytes as usize];
+        let layers = (0..L)
+            .map(|_| (keys.as_slice(), values.as_slice()))
+            .collect::<Vec<_>>();
+        for count in [1u32, 4, 8, 16, 32] {
+            let uploads = (0..count)
+                .map(|id| (id, layers.clone()))
+                .collect::<Vec<_>>();
+            let mut old = Vec::new();
+            let mut batch = Vec::new();
+            for round in 0..10 {
+                for batched in if round % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    let start = Instant::now();
+                    for _ in 0..4 {
+                        if batched {
+                            pool.write_blocks_all_layers(&uploads).unwrap();
+                        } else {
+                            for id in 0..count {
+                                pool.write_block_all_layers(id, &layers).unwrap();
+                            }
+                        }
+                    }
+                    if round > 1 {
+                        (if batched { &mut batch } else { &mut old })
+                            .push(start.elapsed().as_secs_f64() * 1e3 / 4.0);
+                    }
+                }
+            }
+            old.sort_by(f64::total_cmp);
+            batch.sort_by(f64::total_cmp);
+            let bytes = u64::from(count) * u64::from(L) * (key_bytes + value_bytes);
+            eprintln!(
+                "restore_chain blocks={count} bytes={bytes} per_block_cb_ms={:.4} batched_cb_ms={:.4}",
+                old[old.len() / 2],
+                batch[batch.len() / 2]
+            );
         }
     }
 

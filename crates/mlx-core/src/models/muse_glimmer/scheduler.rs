@@ -1,46 +1,20 @@
 use napi::bindgen_prelude::{Error, Result};
 
-use super::{MuseGlimmerCmd, MuseGlimmerInner, MusePrefixState};
+use super::{MuseGlimmerInner, MusePrefixState};
 use crate::array::MxArray;
 use crate::engine::backend::ChatBackend;
 use crate::engine::cmd::{ChatCmd, handle_chat_cmd};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
-    NoRestoreTicket, ScheduledPrefixAdmission, ScheduledReply, SchedulerOwnerContext,
+    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, NoRestoreTicket,
+    ScheduledPrefixAdmission, ScheduledReply, SchedulerOwnerContext,
 };
 use crate::engine::scheduler::PreemptionMode;
 use crate::engine::types::ChatConfig;
-use crate::model_thread::ResponseTx;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::muse_glimmer::dflash::DFlashContextCache;
 use crate::models::muse_glimmer::kv_cache::PagedWindowSlot;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
-
-impl HybridSchedulerCommand for MuseGlimmerCmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            Self::SchedulerStats { .. } => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(*chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<crate::engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct MuseOwnerState {
@@ -125,7 +99,7 @@ impl MuseGlimmerInner {
 }
 
 impl HybridSchedulerBackend for MuseGlimmerInner {
-    type Command = MuseGlimmerCmd;
+    type FamilyCommand = std::convert::Infallible;
     type RestoreTicket = NoRestoreTicket;
     type OwnerState = MuseOwnerState;
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
@@ -210,6 +184,75 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
         MuseGlimmerInner::run_paged_decode_step_batched(self, rows)
     }
 
+    fn supports_scheduled_speculation(&self) -> bool {
+        // Packed verification is correct but has not yet shown a consistent
+        // end-to-end win for K-quant Muse checkpoints. Keep the measured flat
+        // route as the default while allowing isolated concurrency experiments.
+        self.paged.is_some()
+            && self.dflash.is_some()
+            && std::env::var("MLX_SCHEDULED_DFLASH").is_ok_and(|value| value.trim() == "1")
+    }
+
+    fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
+        let Some(draft) = self.dflash.as_ref() else {
+            return 0;
+        };
+        let config = &draft.config;
+        // Account for old and appended sliding context while MLX retains
+        // both graphs, plus a prefill chunk. K and V may materialize as f32.
+        (config.num_hidden_layers as u64)
+            .saturating_mul(config.num_key_value_heads as u64)
+            .saturating_mul(config.head_dim as u64)
+            .saturating_mul(8)
+            .saturating_mul(
+                u64::from(total_tokens)
+                    .min(config.sliding_window as u64)
+                    .saturating_mul(2)
+                    .saturating_add(512),
+            )
+    }
+
+    fn begin_scheduled_speculation(&mut self, seq: SeqId, position: u32) -> Result<()> {
+        self.begin_scheduled_dflash(seq, position)
+    }
+
+    fn reserve_scheduled_speculation(&mut self, seq: SeqId, queries: usize) -> Result<bool> {
+        use crate::engine::spec_paged::SpecPagedCache;
+        super::scheduled_dflash::MuseSpecPagedCache::new(self)
+            .reserve_lookahead(seq, queries)
+            .map_err(Error::from_reason)
+    }
+
+    fn propose_scheduled(
+        &mut self,
+        seq: SeqId,
+        anchor: u32,
+        max_drafts: usize,
+        params: &crate::engine::params::ChatParams,
+        rng: &mut dyn rand::Rng,
+        _confidence: bool,
+    ) -> Result<crate::engine::backend::DsparkProposal> {
+        self.propose_scheduled_dflash(seq, anchor, max_drafts, params, rng)
+    }
+
+    fn run_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyRow],
+    ) -> Result<MxArray> {
+        self.verify_scheduled_dflash(rows)
+    }
+
+    fn commit_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyCommit],
+    ) -> Result<Vec<Result<()>>> {
+        self.commit_scheduled_dflash(rows)
+    }
+
+    fn release_scheduled_speculation(&mut self, seq: SeqId) {
+        self.scheduled_dflash_states.remove(&seq);
+    }
+
     fn replace_cached_token_history(&mut self, history: Vec<u32>) {
         self.cached_token_history = history;
     }
@@ -256,6 +299,11 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
         _first_chunk: bool,
     ) -> Result<Option<MxArray>> {
         self.set_active_paged_owner(seq_id);
+        if self.scheduled_dflash_states.contains_key(&seq_id) {
+            return self
+                .prefill_scheduled_dflash(seq_id, &source[start..end], start as u32)
+                .map(Some);
+        }
         self.run_paged_prefill_slice(&source[start..end], start as u32)
             .map(Some)
     }
@@ -319,20 +367,16 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
         HybridStepExecutor::new(self)
     }
 
-    fn execute_barrier(
+    fn execute_chat_barrier(
         &mut self,
-        command: Self::Command,
+        command: ChatCmd,
         owners: SchedulerOwnerContext<'_, Self::OwnerState>,
     ) {
-        let MuseGlimmerCmd::Chat(command) = command else {
-            return;
-        };
-        if matches!(command.as_ref(), ChatCmd::ResetCaches { .. }) {
+        if matches!(&command, ChatCmd::ResetCaches { .. }) {
             self.select_ownerless_lane(self.paged.is_none());
-            handle_chat_cmd(self, *command);
+            handle_chat_cmd(self, command);
             return;
         }
-        let command = *command;
         let flat_lane = self.requires_flat_lane(&command);
         let Some(owner) = owner_id(&command).map(str::to_owned) else {
             self.select_ownerless_lane(flat_lane);

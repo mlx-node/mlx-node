@@ -73,9 +73,9 @@ pub fn stream_channel<T>(
 
 /// A dedicated OS thread that owns model state and processes commands.
 ///
-/// Generic over `Cmd` so each model picks its command enum: the shared
-/// `engine::cmd::ChatCmd` for chat-only families (gemma4), or a
-/// per-family enum carrying extra variants (e.g. `Qwen3Cmd`).
+/// Generic over the command payload. Chat models use the shared
+/// `engine::model_command::ModelCommand` envelope with typed family extensions;
+/// non-chat services may use their own command enums.
 pub struct ModelThread<Cmd: Send + 'static> {
     cmd_tx: Option<tokio::sync::mpsc::UnboundedSender<Cmd>>,
     _handle: Option<std::thread::JoinHandle<()>>,
@@ -220,11 +220,11 @@ impl<Cmd: Send + 'static> ModelThread<Cmd> {
     /// Send a command to the model thread.
     ///
     /// Returns an error if the channel is closed (thread has exited).
-    pub fn send(&self, cmd: Cmd) -> napi::Result<()> {
+    pub fn send(&self, cmd: impl Into<Cmd>) -> napi::Result<()> {
         self.cmd_tx
             .as_ref()
             .ok_or_else(|| napi::Error::from_reason("Model thread is not running"))?
-            .send(cmd)
+            .send(cmd.into())
             .map_err(|_| napi::Error::from_reason("Model thread has exited"))
     }
 
@@ -272,11 +272,12 @@ impl<Cmd: Send + 'static> Drop for ModelThread<Cmd> {
 ///
 /// Use this from `#[napi]` async methods. Creates a oneshot channel,
 /// builds the command via `make_cmd`, sends it, and awaits the reply.
-pub async fn send_and_await<Cmd, T, F>(thread: &ModelThread<Cmd>, make_cmd: F) -> napi::Result<T>
+pub async fn send_and_await<Cmd, T, F, C>(thread: &ModelThread<Cmd>, make_cmd: F) -> napi::Result<T>
 where
     Cmd: Send + 'static,
     T: Send + 'static,
-    F: FnOnce(ResponseTx<T>) -> Cmd,
+    F: FnOnce(ResponseTx<T>) -> C,
+    C: Into<Cmd>,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
     thread.send(make_cmd(tx))?;
@@ -289,11 +290,12 @@ where
 /// Use this from synchronous NAPI methods (e.g. training ops that must
 /// run sequentially). Same pattern as [`send_and_await`] but calls
 /// `blocking_recv()` instead of `.await`.
-pub fn send_and_block<Cmd, T, F>(thread: &ModelThread<Cmd>, make_cmd: F) -> napi::Result<T>
+pub fn send_and_block<Cmd, T, F, C>(thread: &ModelThread<Cmd>, make_cmd: F) -> napi::Result<T>
 where
     Cmd: Send + 'static,
     T: Send + 'static,
-    F: FnOnce(ResponseTx<T>) -> Cmd,
+    F: FnOnce(ResponseTx<T>) -> C,
+    C: Into<Cmd>,
 {
     let (tx, rx) = tokio::sync::oneshot::channel();
     thread.send(make_cmd(tx))?;

@@ -32,7 +32,8 @@ use crate::engine::persistence::{
 
 use super::config::Qwen3_5Config;
 use super::decoder_layer::AttentionType;
-use super::model::{Qwen3_5Model, Qwen35Inner, Qwen35SchedulerState, handle_qwen35_cmd};
+use super::model::Qwen35FamilyCommand;
+use super::model::{Qwen3_5Model, Qwen35Inner, Qwen35SchedulerState};
 use super::processing::Qwen35VLImageProcessor;
 use super::quantized_linear::{
     DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, LinearProj, MLPVariant, PerLayerMode,
@@ -2726,7 +2727,7 @@ pub(crate) fn load_vision_weights(
 /// Create a random-init Qwen3.5 model and save it to disk.
 ///
 /// Spawns a dedicated `ModelThread<Qwen35Cmd>` whose init builds a fresh
-/// random-weight `Qwen35Inner` directly, then dispatches `Qwen35Cmd::SaveModel`
+/// random-weight `Qwen35Inner` directly, then dispatches `Qwen35FamilyCommand::SaveModel`
 /// on that thread. The thread is dropped at the end of the promise, so the
 /// in-memory model is released once the checkpoint has been written. Used by
 /// TypeScript test fixtures that need an on-disk checkpoint without keeping a
@@ -2739,12 +2740,12 @@ pub fn create_random_qwen35_checkpoint<'env>(
 ) -> Result<PromiseRaw<'env, ()>> {
     use super::model::Qwen35Cmd;
 
-    let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_init(
+    let (thread, init_rx) = crate::model_thread::ModelThread::<Qwen35Cmd>::spawn_with_init(
         move || {
             let inner = Qwen35Inner::new(config)?;
             Ok((inner, ()))
         },
-        handle_qwen35_cmd,
+        crate::engine::model_command::handle_model_command,
     );
 
     env.spawn_future(async move {
@@ -2753,7 +2754,7 @@ pub fn create_random_qwen35_checkpoint<'env>(
             .map_err(|_| napi::Error::from_reason("Model thread exited during init"))??;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        thread.send(Qwen35Cmd::SaveModel {
+        thread.send(Qwen35FamilyCommand::SaveModel {
             save_path,
             reply: tx,
         })?;

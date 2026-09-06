@@ -12,14 +12,14 @@ use crate::engine::backend::{
     ChatBackend, ChunkSink, DecodeStep, FinalizeArgs, PagedBackend, PagedPrefix, ResetScope,
     SaveStateArgs, StreamEmitter, TurnOutput, TurnSetup, TurnTokenObserver, WholeTurnArgs,
 };
-use crate::engine::cmd::{ChatCmd, FromChatCmd};
+#[cfg(test)]
+use crate::engine::cmd::ChatCmd;
 use crate::engine::params::ChatParams;
 use crate::engine::plan::{
     ExecutionPlan, MediaPlan, PagedAttentionPlan, SpeculativeKind, SpeculativePlan,
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::ModelThread;
-use crate::model_thread::ResponseTx;
 use crate::models::gemma4::dspark::DsparkTap;
 use crate::models::gemma4::layer_cache::Gemma4LayerCache;
 use crate::models::gemma4::model::Gemma4KVCacheCoordinator;
@@ -42,6 +42,8 @@ use super::stream_guard::{GuardOutcome, StreamGuard};
 #[path = "scheduler.rs"]
 mod scheduler;
 pub(crate) use scheduler::MuseSchedulerState;
+#[path = "scheduled_dflash.rs"]
+pub(crate) mod scheduled_dflash;
 
 pub(super) const PREFILL_STEP_SIZE: i64 = 512;
 
@@ -228,18 +230,7 @@ struct MuseSlidingColdCheckpoint {
     layer_kv: Vec<(MxArray, MxArray)>,
 }
 
-pub(crate) enum MuseGlimmerCmd {
-    Chat(Box<ChatCmd>),
-    SchedulerStats {
-        reply: ResponseTx<crate::engine::SchedulerStatsJs>,
-    },
-}
-
-impl FromChatCmd for MuseGlimmerCmd {
-    fn from_chat(cmd: ChatCmd) -> Self {
-        Self::Chat(Box::new(cmd))
-    }
-}
+pub(crate) type MuseGlimmerCmd = crate::engine::model_command::ModelCommand;
 
 pub(crate) struct MuseGlimmerInner {
     pub(crate) config: MuseGlimmerConfig,
@@ -260,6 +251,9 @@ pub(crate) struct MuseGlimmerInner {
     pub(crate) dflash: Option<DFlashModel>,
     pub(crate) dflash_turn_state: Option<super::dflash_decode::DFlashTurnState>,
     pub(crate) dflash_context: Option<super::dflash::DFlashContextCache>,
+    pub(crate) scheduled_dflash_states: HashMap<SeqId, scheduled_dflash::ScheduledDFlashState>,
+    pub(crate) scheduled_dflash_verify:
+        Option<crate::engine::scheduled_verify::ScheduledVerifyBatch>,
     pub(crate) paged: Option<MusePagedRuntime>,
     /// Affine and GGML K-quant projections can select numerically distinct
     /// Metal reduction kernels for `B > 1`. Preserve each decode row's
@@ -315,6 +309,8 @@ impl MuseGlimmerInner {
             dflash,
             dflash_turn_state: None,
             dflash_context: None,
+            scheduled_dflash_states: HashMap::new(),
+            scheduled_dflash_verify: None,
             paged,
             row_exact_decode_projections: false,
             active_paged_seq: 0,
@@ -465,10 +461,12 @@ impl MuseGlimmerInner {
                 .reset_sliding_requests(seq_id)
                 .map_err(Error::from_reason)?;
             self.sliding_cold_checkpoints.remove(&seq_id);
+            self.scheduled_dflash_states.remove(&seq_id);
             return Ok(0);
         }
 
         self.sliding_cold_checkpoints.remove(&seq_id);
+        self.scheduled_dflash_states.remove(&seq_id);
         if plan.cached_prefix_len == 0 {
             self.paged
                 .as_mut()
@@ -755,6 +753,7 @@ impl MuseGlimmerInner {
         seq_id: SeqId,
     ) -> std::result::Result<u32, String> {
         self.sliding_cold_checkpoints.remove(&seq_id);
+        self.scheduled_dflash_states.remove(&seq_id);
         self.paged
             .as_mut()
             .map_or(Ok(0), |paged| paged.coordinator.release_request_all(seq_id))
@@ -1485,6 +1484,11 @@ impl ChatBackend for MuseGlimmerInner {
     }
 
     fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
+        if _scope == ResetScope::Command {
+            self.clear_scheduled_dflash()?;
+        } else {
+            self.scheduled_dflash_states.remove(&self.active_paged_seq);
+        }
         self.caches = init_caches(&self.config);
         self.cached_token_history.clear();
         self.dflash_turn_state = None;
@@ -1636,7 +1640,7 @@ impl ChatBackend for MuseGlimmerInner {
                 kind: SpeculativeKind::DraftModel,
                 supported_input_media: crate::engine::plan::MediaCapabilities::NONE,
                 supported_context_media: crate::engine::plan::MediaCapabilities::NONE,
-                supports_paged_attention: false,
+                supports_paged_attention: self.paged.is_some(),
                 supports_streaming: true,
             }),
         }
@@ -1710,14 +1714,6 @@ impl MuseGlimmerModel {
     #[napi]
     pub fn context_limits(&self) -> MuseGlimmerContextLimits {
         self.context_limits.clone()
-    }
-
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<crate::engine::SchedulerStatsJs> {
-        crate::model_thread::send_and_await(&self.thread, |reply| MuseGlimmerCmd::SchedulerStats {
-            reply,
-        })
-        .await
     }
 }
 
@@ -1796,7 +1792,7 @@ mod spec_paged_settle_tests {
             cfg,
             num_blocks,
             2,
-            mlx_paged_attn::metal::MetalDtype::Float16,
+            mlx_paged_attn::metal::MetalDtype::BFloat16,
         ) {
             Ok(pool) => Some(Arc::new(pool)),
             Err(error) if error.contains("No Metal device found") => None,
@@ -1847,7 +1843,7 @@ mod spec_paged_settle_tests {
     /// empty (the settle never runs a layer forward), everything the settle
     /// consumes — coordinator, config geometry, checkpoint map — is the
     /// production state.
-    fn maybe_tiny_inner() -> Option<MuseGlimmerInner> {
+    pub(super) fn maybe_tiny_inner() -> Option<MuseGlimmerInner> {
         if !crate::engine::persistence::compiled_forward_backend_available() {
             return None;
         }
@@ -1879,6 +1875,8 @@ mod spec_paged_settle_tests {
             dflash: None,
             dflash_turn_state: None,
             dflash_context: None,
+            scheduled_dflash_states: HashMap::new(),
+            scheduled_dflash_verify: None,
             paged: Some(paged),
             row_exact_decode_projections: false,
             active_paged_seq: 0,

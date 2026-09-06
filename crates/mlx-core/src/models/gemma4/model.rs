@@ -246,6 +246,10 @@ pub(crate) struct Gemma4Inner {
     /// stepper. Always `None`
     /// outside a live draft whole-turn.
     pub(crate) draft_turn_state: Option<crate::models::gemma4::dspark_decode::Gemma4DraftTurnState>,
+    pub(crate) scheduled_dspark_states:
+        HashMap<u32, crate::models::gemma4::dspark_decode::Gemma4DsparkState>,
+    pub(crate) scheduled_dspark_verify:
+        Option<crate::models::gemma4::scheduled_dspark::Gemma4ScheduledVerify>,
     /// `compute_layer_kinds_from_kv_cache_specs(&config)`, computed once in
     /// `Gemma4Inner::new`. Pure function of the immutable `config`, so it never
     /// changes for the lifetime of this instance. Empty when
@@ -540,15 +544,6 @@ impl Gemma4Model {
         } else {
             1
         }
-    }
-
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        let thread = self.thread.as_ref().ok_or_else(|| {
-            Error::from_reason("Model not initialized. Call Gemma4Model.load() first.")
-        })?;
-        crate::model_thread::send_and_await(thread, |reply| Gemma4Cmd::SchedulerStats { reply })
-            .await
     }
 
     /// Whether this loaded instance can execute image-bearing chat turns.

@@ -10,12 +10,14 @@
  * rather than correctness (since the weights are random).
  */
 
+import { readFileSync } from 'node:fs';
+
 import type { ChatMessage } from '@mlx-node/core';
 import { loadModel, Qwen3Model, createToolDefinition } from '@mlx-node/lm';
 import type { ToolCallResult } from '@mlx-node/lm';
 import { describe, it, expect, beforeAll, afterAll } from 'vite-plus/test';
 
-import { createTempModel, TINY_TEST_CONFIG } from '../test-model-utils';
+import { createTempModel, findTokenizerPath, TINY_TEST_CONFIG } from '../test-model-utils';
 
 describe.sequential('Qwen3 Chat Session API', () => {
   let model: Qwen3Model;
@@ -23,7 +25,17 @@ describe.sequential('Qwen3 Chat Session API', () => {
 
   beforeAll(async () => {
     // Create a tiny model with random weights for testing
-    const temp = await createTempModel(TINY_TEST_CONFIG);
+    // The real tokenizer emits chat markers and text IDs far above 1000.
+    // Out-of-range embedding lookups make greedy/reset assertions undefined.
+    const tokenizer = JSON.parse(readFileSync(findTokenizerPath(), 'utf8')) as {
+      model: { vocab: Record<string, number> };
+      added_tokens: Array<{ id: number }>;
+    };
+    const vocabSize = [...Object.values(tokenizer.model.vocab), ...tokenizer.added_tokens.map((t) => t.id)].reduce(
+      (size, id) => Math.max(size, id + 1),
+      TINY_TEST_CONFIG.vocabSize,
+    );
+    const temp = await createTempModel({ ...TINY_TEST_CONFIG, vocabSize });
     cleanup = temp.cleanup;
 
     // Load the model using loadModel

@@ -32,7 +32,6 @@ use crate::sampling;
 use crate::stream::{Stream, StreamContext};
 
 use super::assistant::AssistantSharedKv;
-use super::dspark::sample_index_from_probs;
 use super::layer_cache::{
     Gemma4VerifyRollback, active_cache_frontier, commit_after_verify, snapshot_before_verify,
 };
@@ -180,16 +179,15 @@ impl DsparkStepper for Gemma4AssistantStepper<'_> {
         // stepper's field is advanced only by `commit` — and no target state
         // (caches, cursor) is touched, so propose is repeatable.
         let embed_scale = (self.inner.config.hidden_size as f64).sqrt();
-        let mut draft_ids: Vec<i32> = Vec::with_capacity(max_len);
+        let mut draft_ids = Vec::with_capacity(max_len);
         let mut draft_dists: Vec<MxArray> = Vec::new();
         let mut h_prev = self.h_prev.clone();
-        let mut prev_token = anchor_id as i32;
+        let mut ids = MxArray::from_int32(&[anchor_id as i32], &[1, 1])?;
         for _ in 0..max_len {
             // Token embedding from the TARGET's table, scaled exactly like
             // the target's own `forward_body` step 1 (handles
             // packed-quantized tables), cast to the chained hidden's dtype
             // when the two differ.
-            let ids = MxArray::from_int32(&[prev_token], &[1, 1])?;
             let token_embed = {
                 let raw = self
                     .inner
@@ -206,27 +204,24 @@ impl DsparkStepper for Gemma4AssistantStepper<'_> {
             let step = draft.forward_step(&token_embed, &h_prev, &kv, q_pos)?;
             let step_logits = step.logits.reshape(&[vocab])?;
             let token = if greedy {
-                let idx = step_logits.argmax(0, Some(false))?.astype(DType::Int32)?;
-                idx.eval();
-                idx.item_at_int32(0)?
+                step_logits.argmax(0, Some(false))?.astype(DType::Int32)?
             } else {
                 let dist = sampling::sampling_distribution(&step_logits, Some(cfg))?
                     .astype(DType::Float32)?;
-                dist.eval();
-                let probs = dist.to_float32()?;
-                let token = sample_index_from_probs(&probs, rng)?;
+                let token = sampling::sample_dense_distribution_array(&dist, rng)?;
                 draft_dists.push(dist);
                 token
             };
+            ids = token.clip(Some(0.0), None)?.reshape(&[1, 1])?;
             draft_ids.push(token);
-            prev_token = token;
             h_prev = step.h_prev_next;
         }
 
         Ok(DsparkProposal {
-            draft_ids,
+            draft_ids: sampling::materialize_draft_tokens(&draft_ids)?,
             draft_dists,
             draft_sparse_dists: Vec::new(),
+            keep_probabilities: None,
         })
     }
 

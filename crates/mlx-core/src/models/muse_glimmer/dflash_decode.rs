@@ -145,6 +145,7 @@ impl DsparkStepper for MuseGlimmerDFlashStepper<'_> {
             draft_ids,
             draft_dists,
             draft_sparse_dists: Vec::new(),
+            keep_probabilities: None,
         })
     }
 

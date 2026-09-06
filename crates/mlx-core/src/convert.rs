@@ -20646,12 +20646,11 @@ mod tests {
         ];
         assert_eq!(decoded.len(), codes.len());
         for (i, (got, code)) in decoded.iter().zip(codes.iter()).enumerate() {
-            // MLX normalizes the sign-zero code 8 to +0.0.
-            let want = if *code == 8 {
-                0.0f32
-            } else {
-                lut[*code as usize]
-            };
+            // Code 8 is negative zero. The former array-export add-zero
+            // kernel erased its sign; compare with the native scalar too so
+            // this oracle checks dequantization independently of export.
+            assert_eq!(got.to_bits(), dequant.item_at_float32(i).unwrap().to_bits());
+            let want = lut[*code as usize];
             assert_eq!(
                 got.to_bits(),
                 want.to_bits(),

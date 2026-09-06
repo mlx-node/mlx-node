@@ -2616,7 +2616,7 @@ fn paged_mtp_lookahead_reservation_covers_verify() {
 
         step.snapshot_main_linear();
         let ids: Vec<i32> = (0..=depth as i32).map(|i| first_id + i).collect();
-        let verify_ids = MxArray::from_int32(&ids, &[1, (depth + 1) as i64]).expect("verify ids");
+        let verify_ids = ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
         step.verify_step(&verify_ids, embedding, depth)
             .expect("paged verify step")
             .hiddens
@@ -3079,8 +3079,7 @@ fn paged_mtp_lookahead_cycle2_exhaustion_falls_back_to_ar() {
     // Cycle 1 in the engine's order: snapshot → verify → partial accept.
     let embedding = step.embedding().clone();
     step.snapshot_main_linear();
-    let verify_ids =
-        MxArray::from_int32(&[21, 22, 23, 24], &[1, (depth + 1) as i64]).expect("verify ids");
+    let verify_ids = [21, 22, 23, 24];
     step.verify_step(&verify_ids, &embedding, depth)
         .expect("cycle-1 verify")
         .hiddens
@@ -3132,8 +3131,7 @@ fn paged_mtp_lookahead_cycle2_exhaustion_falls_back_to_ar() {
 
     // Cycle 2's verify then writes into pre-allocated blocks only.
     step.snapshot_main_linear();
-    let verify_ids2 =
-        MxArray::from_int32(&[25, 26, 27, 28], &[1, (depth + 1) as i64]).expect("verify ids");
+    let verify_ids2 = [25, 26, 27, 28];
     step.verify_step(&verify_ids2, &embedding, depth)
         .expect("cycle-2 verify")
         .hiddens

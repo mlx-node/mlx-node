@@ -13,16 +13,13 @@ use crate::engine::backend::{
     ChatBackend, DecodeStep, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs, TurnOutput,
     TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::{ChatCmd, FromChatCmd, handle_chat_cmd};
+use crate::engine::cmd::ChatCmd;
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
-    ScheduledPrefixAdmission, ScheduledRestoreResult, SchedulerOwnerContext,
-    scheduler_max_num_seqs_for, scheduler_per_seq_context,
+    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, ScheduledPrefixAdmission,
+    ScheduledRestoreResult, scheduler_max_num_seqs_for, scheduler_per_seq_context,
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::types::{ChatConfig, ChatStreamChunk, ChatStreamHandle};
-use crate::engine::{self};
-use crate::model_thread::{ResponseTx, send_and_await};
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::profiling::PerformanceMetrics;
 use crate::stream::{Stream, StreamContext};
@@ -67,52 +64,7 @@ fn lfm2_cold_restore_boundary(prompt_tokens: u32, block_size: u32) -> u32 {
 /// Commands owned by the LFM2 scheduler thread. Chat variants are lifted from
 /// the model-neutral API; scheduler telemetry is a barrier so it observes a
 /// coherent step boundary.
-pub(crate) enum Lfm2Cmd {
-    Chat(Box<ChatCmd>),
-    SchedulerStats {
-        reply: ResponseTx<engine::SchedulerStatsJs>,
-    },
-}
-
-impl FromChatCmd for Lfm2Cmd {
-    fn from_chat(cmd: ChatCmd) -> Self {
-        Self::Chat(Box::new(cmd))
-    }
-}
-
-impl HybridSchedulerCommand for Lfm2Cmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            Self::SchedulerStats { .. } => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(*chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
-    }
-}
-
-fn handle_lfm2_cmd(inner: &mut Lfm2Inner, command: Lfm2Cmd) {
-    match command {
-        Lfm2Cmd::Chat(command) => handle_chat_cmd(inner, *command),
-        Lfm2Cmd::SchedulerStats { reply } => {
-            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
-        }
-    }
-}
+pub(crate) type Lfm2Cmd = crate::engine::model_command::ModelCommand;
 
 /// Internal model state owned exclusively by the dedicated model thread.
 ///
@@ -1495,7 +1447,7 @@ impl Lfm2Inner {
 pub(crate) type Lfm2SchedulerState = HybridSchedulerState<Lfm2Inner>;
 
 impl HybridSchedulerBackend for Lfm2Inner {
-    type Command = Lfm2Cmd;
+    type FamilyCommand = std::convert::Infallible;
     type RestoreTicket = PagedRestoreTicket;
     type OwnerState = Vec<u32>;
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
@@ -1606,7 +1558,7 @@ impl HybridSchedulerBackend for Lfm2Inner {
             PagedTurnAdmission::Waiting {
                 provisional,
                 restore,
-            } => (provisional, Some(restore)),
+            } => (provisional, Some(*restore)),
         };
         let installed = if restore.is_none() {
             self.install_lfm2_conv_cold_sidecar(seq_id, plan.cached_prefix_len)?
@@ -1708,14 +1660,6 @@ impl HybridSchedulerBackend for Lfm2Inner {
 
     fn step_executor(&mut self) -> Self::StepExecutor<'_> {
         HybridStepExecutor::new(self)
-    }
-
-    fn execute_barrier(
-        &mut self,
-        command: Self::Command,
-        _owners: SchedulerOwnerContext<'_, Self::OwnerState>,
-    ) {
-        handle_lfm2_cmd(self, command);
     }
 }
 
@@ -2560,12 +2504,6 @@ impl Lfm2Model {
         } else {
             1
         }
-    }
-
-    /// Snapshot scheduler occupancy and paged-pool admission telemetry.
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        send_and_await(&self.thread, |reply| Lfm2Cmd::SchedulerStats { reply }).await
     }
 
     /// Estimated number of model parameters.

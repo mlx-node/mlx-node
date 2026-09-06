@@ -16,12 +16,10 @@ use crate::engine::backend::{
     PagedPrefix, ResetScope, SaveStateArgs, SpecFrontier, ThinkingSetup, TrainBackend, TurnOutput,
     TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::{
-    ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
-};
+use crate::engine::cmd::{ChatCmd, FromTrainCmd, TrainCmd, handle_train_cmd};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, pool_tokens_after_recurrent,
-    scheduled_turn_context, scheduler_per_seq_context_override,
+    HybridSchedulerBackend, pool_tokens_after_recurrent, scheduled_turn_context,
+    scheduler_per_seq_context_override,
 };
 use crate::engine::plan::{
     DecoderPlan, ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
@@ -32,7 +30,7 @@ use crate::engine::spec_owner::SpecOwner;
 use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
-use crate::model_thread::{ResponseTx, send_and_await};
+use crate::model_thread::ResponseTx;
 use crate::models::qwen3_5::quantized_linear::LinearProj;
 use crate::nn::{Embedding, Linear, RMSNorm};
 use crate::sampling::{SamplingConfig, sample};
@@ -85,7 +83,7 @@ mod vision_turn;
 // cousin seams and the `#[cfg(test)]` children keep resolving them unqualified.
 #[cfg(test)]
 use self::chat_backend::resolve_qwen35_chat_params;
-pub(crate) use self::commands::{Qwen35Cmd, handle_qwen35_cmd};
+pub(crate) use self::commands::{Qwen35Cmd, Qwen35FamilyCommand};
 pub(crate) use self::forward::{
     PREFILL_STEP_SIZE, async_eval_layer_caches, eval_layer_caches, forward_dflash2_with_taps,
     partition_prefill_chunks,
@@ -331,7 +329,7 @@ pub(crate) struct Qwen35Inner {
 }
 
 /// Test-only between-turn snapshot of the paged-MTP GDN bookkeeping, read via
-/// [`Qwen35Cmd::MtpPagedGdnStateForTest`]. Serialized behind the model thread,
+/// [`Qwen35FamilyCommand::MtpPagedGdnStateForTest`]. Serialized behind the model thread,
 /// so it observes the fully-finalized preceding turn.
 #[doc(hidden)]
 #[derive(Debug, Clone)]
@@ -515,12 +513,6 @@ impl Qwen3_5Model {
         }
     }
 
-    /// Snapshot scheduler occupancy plus unified block/recurrent admission.
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        send_and_await(&self.thread, |reply| Qwen35Cmd::SchedulerStats { reply }).await
-    }
-
     /// Whether this instance has an inline MTP head or external DFlash2
     /// companion. Snapshotted at load time so `ChatSession` can auto-default
     /// `enableMtp = true` without dispatching into the model thread.
@@ -623,7 +615,7 @@ impl Qwen3_5Model {
         }
         let max_output = capacity.saturating_sub(prompt_len).saturating_add(1);
         config.max_new_tokens = config.max_new_tokens.min(max_output as i32);
-        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::Generate {
+        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35FamilyCommand::Generate {
             prompt_tokens: prompt_tokens.clone(),
             config,
             reply,
@@ -654,7 +646,7 @@ impl Qwen3_5Model {
             crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
         );
         self.thread
-            .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionStart {
+            .send(Qwen35Cmd::from_chat(ChatCmd::StreamSessionStart {
                 messages,
                 config,
                 stream_tx,
@@ -681,7 +673,7 @@ impl Qwen3_5Model {
             crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
         );
         self.thread
-            .send(Qwen35Cmd::Chat(ChatCmd::StreamSessionContinue {
+            .send(Qwen35Cmd::from_chat(ChatCmd::StreamSessionContinue {
                 messages,
                 config,
                 stream_tx,
@@ -708,8 +700,8 @@ impl Qwen3_5Model {
     /// observes the fully-finalized preceding turn.
     #[doc(hidden)]
     pub async fn mtp_flat_state_for_test(&self) -> Result<(usize, bool, u64, usize)> {
-        crate::model_thread::send_and_await(&self.thread, |reply| Qwen35Cmd::MtpFlatStateForTest {
-            reply,
+        crate::model_thread::send_and_await(&self.thread, |reply| {
+            Qwen35FamilyCommand::MtpFlatStateForTest { reply }
         })
         .await
     }
@@ -720,7 +712,7 @@ impl Qwen3_5Model {
     #[doc(hidden)]
     pub async fn force_flat_mtp_desync_for_test(&self) -> Result<()> {
         crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35Cmd::ForceFlatMtpDesyncForTest { reply }
+            Qwen35FamilyCommand::ForceFlatMtpDesyncForTest { reply }
         })
         .await
     }
@@ -731,7 +723,7 @@ impl Qwen3_5Model {
     #[doc(hidden)]
     pub async fn mtp_paged_gdn_state_for_test(&self) -> Result<MtpPagedGdnStateForTest> {
         crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35Cmd::MtpPagedGdnStateForTest { reply }
+            Qwen35FamilyCommand::MtpPagedGdnStateForTest { reply }
         })
         .await
     }
@@ -741,7 +733,7 @@ impl Qwen3_5Model {
     #[doc(hidden)]
     pub async fn force_paged_gdn_mismatch_for_test(&self) -> Result<()> {
         crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35Cmd::ForcePagedGdnMismatchForTest { reply }
+            Qwen35FamilyCommand::ForcePagedGdnMismatchForTest { reply }
         })
         .await
     }
@@ -752,7 +744,7 @@ impl Qwen3_5Model {
     #[doc(hidden)]
     pub async fn gdn_history_checkpoint_oracle_for_test(&self) -> Result<bool> {
         crate::model_thread::send_and_await(&self.thread, |reply| {
-            Qwen35Cmd::GdnHistoryCheckpointOracleForTest { reply }
+            Qwen35FamilyCommand::GdnHistoryCheckpointOracleForTest { reply }
         })
         .await
     }
@@ -808,7 +800,7 @@ impl Qwen3_5Model {
         save_path: String,
     ) -> Result<PromiseRaw<'env, ()>> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.thread.send(Qwen35Cmd::SaveModel {
+        self.thread.send(Qwen35FamilyCommand::SaveModel {
             save_path,
             reply: tx,
         })?;

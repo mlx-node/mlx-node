@@ -322,70 +322,42 @@ int32_t from_mlx_dtype(mlx::core::Dtype dtype) {
   }
 }
 
-bool copy_to_buffer(const array& arr, float* out, size_t len) {
-  // Force materialization by adding zeros - this ensures broadcast values are
-  // expanded
-  auto zeros_arr = zeros(arr.shape(), arr.dtype());
-  auto materialized = add(arr, zeros_arr);
-  materialized.eval();
-
-  // Now flatten and copy
-  auto flat = flatten(materialized);
-  auto host = (flat.dtype() == mlx::core::float32)
-                  ? flat
-                  : astype(flat, mlx::core::float32);
-  host.eval();
-
-  if (host.size() != len) {
+// Export logical row-major values. A Contiguous primitive shares already
+// contiguous storage and expands broadcast/strided views only when necessary.
+// Adding zero here used to allocate a full tensor and dispatch an arithmetic
+// kernel on every host extraction, even for completed contiguous arrays.
+template <typename T>
+bool copy_to_buffer_as(const array& arr, T* out, size_t len, mlx::core::Dtype dtype) {
+  if (arr.size() != len) return false;
+  if (len == 0) return true;
+  try {
+    auto host = astype(flatten(arr), dtype);
+    host.eval();
+    // Calling contiguous unconditionally would also copy a small contiguous
+    // slice backed by a large parent allocation (MLX's retention heuristic).
+    if (!host.flags().row_contiguous) {
+      host = contiguous(host);
+      host.eval();
+    }
+    const T* data = host.data<T>();
+    std::copy(data, data + len, out);
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "[MLX] copy_to_buffer: " << e.what() << std::endl;
     return false;
   }
-  const float* data = host.data<float>();
-  std::copy(data, data + len, out);
-  return true;
+}
+
+bool copy_to_buffer(const array& arr, float* out, size_t len) {
+  return copy_to_buffer_as(arr, out, len, mlx::core::float32);
 }
 
 bool copy_to_buffer(const array& arr, int32_t* out, size_t len) {
-  // Force materialization by adding zeros - this ensures broadcast values are
-  // expanded
-  auto zeros_arr = zeros(arr.shape(), arr.dtype());
-  auto materialized = add(arr, zeros_arr);
-  materialized.eval();
-
-  // Now flatten and copy
-  auto flat = flatten(materialized);
-  auto host = (flat.dtype() == mlx::core::int32)
-                  ? flat
-                  : astype(flat, mlx::core::int32);
-  host.eval();
-
-  if (host.size() != len) {
-    return false;
-  }
-  const int32_t* data = host.data<int32_t>();
-  std::copy(data, data + len, out);
-  return true;
+  return copy_to_buffer_as(arr, out, len, mlx::core::int32);
 }
 
 bool copy_to_buffer(const array& arr, uint32_t* out, size_t len) {
-  // Force materialization by adding zeros - this ensures broadcast values are
-  // expanded
-  auto zeros_arr = zeros(arr.shape(), arr.dtype());
-  auto materialized = add(arr, zeros_arr);
-  materialized.eval();
-
-  // Now flatten and copy
-  auto flat = flatten(materialized);
-  auto host = (flat.dtype() == mlx::core::uint32)
-                  ? flat
-                  : astype(flat, mlx::core::uint32);
-  host.eval();
-
-  if (host.size() != len) {
-    return false;
-  }
-  const uint32_t* data = host.data<uint32_t>();
-  std::copy(data, data + len, out);
-  return true;
+  return copy_to_buffer_as(arr, out, len, mlx::core::uint32);
 }
 
 }  // namespace

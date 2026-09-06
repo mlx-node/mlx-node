@@ -15,6 +15,11 @@ use napi_derive::napi;
 use rand::{Rng, RngExt};
 use std::sync::OnceLock;
 
+mod dense_draw;
+pub(crate) use dense_draw::{
+    materialize_draft_tokens, sample_dense_distribution, sample_dense_distribution_array,
+};
+
 /// Configuration for sampling strategies
 /// ⚡ PERFORMANCE: Made Copy to avoid cloning on every token
 #[napi(object)]
@@ -682,9 +687,9 @@ pub(crate) fn sampling_distribution(
 /// 1. Sampling (with filters applied)
 /// 2. Return value (original, unfiltered)
 ///
-/// Uses mlx::core::compile for the categorical sampling step, matching
-/// mlx-lm's @partial(mx.compile, ...) approach. This avoids rebuilding
-/// the computation graph on each call.
+/// Returns the original log probabilities alongside the filtered draw. Random
+/// key acquisition stays outside C++ compiled graphs so every call advances
+/// MLX's global random state.
 ///
 /// # Returns
 /// Tuple of (sampled_token, logprobs_array)
@@ -702,7 +707,6 @@ pub(crate) fn sample_and_logprobs(
     let mut logprobs_handle: *mut sys::mlx_array = std::ptr::null_mut();
 
     unsafe {
-        // Use compiled version for better performance
         sys::mlx_compiled_sample_and_logprobs(
             logits.handle.0,
             temperature as f32,
@@ -1041,20 +1045,10 @@ pub(crate) fn accept_with_residual_dense_target_sparse_draft<R: Rng + ?Sized>(
     let sparse_dense =
         MxArray::zeros(&[vocab as i64], Some(DType::Float32))?.put_along_axis(&ids, &values, 0)?;
     let residual = target.sub(&sparse_dense)?.clip(Some(0.0), None)?;
-    let total_array = residual.sum(None, None)?;
-    total_array.eval();
-    let total = total_array.item_at_float32(0)?;
-    if !total.is_finite() || total <= 0.0 {
-        let best = target.argmax(0, None)?;
-        best.eval();
-        return Ok((false, best.item_at_int32(0)?));
-    }
-    let sampled = residual
-        .div_scalar(f64::from(total))?
-        .log()?
-        .categorical(Some(-1))?;
-    sampled.eval();
-    Ok((false, sampled.item_at_int32(0)?))
+    Ok((
+        false,
+        sample_residual_distribution(&target, &residual, rng)?,
+    ))
 }
 
 pub(crate) fn acceptance_probability_from_probs(p: f64, q: f64) -> f64 {
@@ -1084,7 +1078,7 @@ pub(crate) fn acceptance_probability_from_probs(p: f64, q: f64) -> f64 {
 /// run pick `argmax(logits)` deterministically. To preserve byte-exact
 /// parity between AR and MTP at T=0 we MUST take the same argmax-only
 /// branch here instead of running the stochastic ratio + categorical
-/// pipeline, which uses MLX's global RNG and would emit different tokens
+/// pipeline, which would emit different tokens
 /// even when both distributions agree on the argmax. Concretely:
 ///   - accept iff `argmax(p_target) == draft_id`
 ///   - on reject, emit `argmax(p_target)` (the residual `(p_target -
@@ -1094,10 +1088,9 @@ pub(crate) fn acceptance_probability_from_probs(p: f64, q: f64) -> f64 {
 ///
 /// For T > 0 the existing stochastic Leviathan-Chen logic runs unchanged.
 ///
-/// The caller-supplied `rng` is consumed for the single `u ~ Uniform(0, 1)`
-/// acceptance coin flip. The residual sample uses MLX's global random state
-/// via the same `categorical` path that `sample()` uses; this matches the
-/// existing sampling contract (one MLX RNG draw per emitted token).
+/// The caller-supplied `rng` supplies the acceptance coin and, on rejection,
+/// one explicit device key for the residual draw. No global MLX key is used.
+/// Degenerate residuals consume the same key and select argmax on device.
 ///
 /// `residual.sum() == 0` (would only happen if `p_target == p_draft`
 /// element-wise after the clip) falls back to `argmax(p_target)`. The
@@ -1217,35 +1210,29 @@ pub(crate) fn accept_with_residual<R: Rng + ?Sized>(
     let diff = p_target_f32.sub(&p_draft_f32)?;
     let residual = diff.clip(Some(0.0), None)?;
 
-    // Compute sum on CPU to detect the zero-mass degenerate case.
-    let total_arr = residual.sum(None, None)?;
-    total_arr.eval();
-    let total = total_arr.item_at_float32(0)?;
-    // NaN-safe: written so a NaN `total` takes the argmax fallback rather
-    // than dividing by NaN and emitting a garbage token.
-    if !total.is_finite() || total <= 0.0 {
-        // residual.sum() == 0 or NaN — both distributions agree element-wise
-        // after the clip, or one of them is non-finite. Fall back to argmax,
-        // which stays within the target's support.
-        let argmax_arr = p_target_f32.argmax(0, None)?;
-        argmax_arr.eval();
-        let argmax = argmax_arr.item_at_int32(0)?;
-        return Ok((false, argmax));
-    }
+    Ok((
+        false,
+        sample_residual_distribution(&p_target_f32, &residual, rng)?,
+    ))
+}
 
-    let normalized = residual.div_scalar(f64::from(total))?;
-
-    // MLX's `categorical` consumes logits and uses the MLX global RNG.
-    // Convert the normalized residual to log-space; entries where
-    // `residual == 0` map to `-inf` and are excluded from the support.
-    // `categorical` and `argmax` both return uint32 indices in MLX;
-    // `item_at_int32` performs the safe static_cast to the public i32
-    // contract (vocab sizes are far below i32::MAX).
-    let log_probs = normalized.log()?;
-    let sampled = log_probs.categorical(Some(-1))?;
-    sampled.eval();
-    let token = sampled.item_at_int32(0)?;
-    Ok((false, token))
+/// Select the correction or its degenerate argmax fallback on device. The
+/// caller consumes one request-owned key for every rejected proposal, including
+/// degenerate residuals, and waits only for the final selected token.
+fn sample_residual_distribution<R: Rng + ?Sized>(
+    target: &MxArray,
+    residual: &MxArray,
+    rng: &mut R,
+) -> Result<i32> {
+    let total = residual.sum(None, None)?;
+    let valid = total
+        .isfinite()?
+        .logical_and(&total.greater(&MxArray::scalar_float(0.0)?)?)?;
+    let normalized = residual.div(&total)?;
+    let sampled = sample_dense_distribution_array(&normalized, rng)?;
+    let fallback = target.argmax(0, None)?.astype(DType::Int32)?;
+    let selected = valid.where_(&sampled, &fallback)?;
+    Ok(materialize_draft_tokens(&[selected])?[0])
 }
 
 /// Shared context for penalty functions: validates inputs, slices to recent tokens,
@@ -2060,8 +2047,8 @@ mod accept_with_residual_tests {
     use std::convert::Infallible;
 
     /// Scripted RNG that hands out predetermined `u64` values from a queue
-    /// (smallest-first) and then panics if exhausted. Used to pin the
-    /// `u ~ Uniform(0, 1)` draw inside `accept_with_residual`:
+    /// (smallest-first) and then panics if exhausted. The first word pins
+    /// the acceptance coin; rejection consumes a second word as its device key:
     ///   - `0` ⇒ `u ≈ 0` (force accept whenever p_accept > 0).
     ///   - `u64::MAX` ⇒ `u ≈ 1 - ε` (force reject whenever p_accept < 1).
     struct ScriptedRng {
@@ -2105,11 +2092,98 @@ mod accept_with_residual_tests {
     }
 
     #[test]
+    fn residual_device_fallback_handles_zero_nan_and_infinite_mass() {
+        let target = MxArray::from_float32(&[0.1, 0.2, 0.7], &[3]).unwrap();
+        for residual in [[0.0; 3], [0.1, f32::NAN, 0.4], [0.1, f32::INFINITY, 0.4]] {
+            let residual = MxArray::from_float32(&residual, &[3]).unwrap();
+            let mut rng = ScriptedRng::new(&[910]);
+            assert_eq!(
+                sample_residual_distribution(&target, &residual, &mut rng).unwrap(),
+                2
+            );
+            assert!(
+                rng.queue.is_empty(),
+                "every rejection consumes its owner key"
+            );
+        }
+    }
+
+    fn residual_host_gate<R: Rng + ?Sized>(
+        target: &MxArray,
+        residual: &MxArray,
+        rng: &mut R,
+    ) -> Result<i32> {
+        let total = residual.sum(None, None)?;
+        total.eval();
+        let total = total.item_at_float32(0)?;
+        if !total.is_finite() || total <= 0.0 {
+            let best = target.argmax(0, None)?;
+            best.eval();
+            return best.item_at_int32(0);
+        }
+        sample_dense_distribution(&residual.div_scalar(f64::from(total))?, rng)
+    }
+
+    #[test]
+    fn residual_device_gate_matches_host_gate_for_the_same_keys() {
+        let target = MxArray::from_float32(&[0.05, 0.4, 0.3, 0.25], &[4]).unwrap();
+        let draft = MxArray::from_float32(&[0.5, 0.2, 0.15, 0.15], &[4]).unwrap();
+        for seed in 0..32 {
+            let mut a = StdRng::seed_from_u64(seed);
+            let mut b = StdRng::seed_from_u64(seed);
+            let residual = target.sub(&draft).unwrap().clip(Some(0.0), None).unwrap();
+            let expected = residual_host_gate(&target, &residual, &mut a).unwrap();
+            let residual = target.sub(&draft).unwrap().clip(Some(0.0), None).unwrap();
+            assert_eq!(
+                sample_residual_distribution(&target, &residual, &mut b).unwrap(),
+                expected
+            );
+            assert_eq!(a.random::<u64>(), b.random::<u64>());
+        }
+    }
+
+    #[test]
+    #[ignore = "release microbenchmark; run alone on the GPU"]
+    fn benchmark_residual_completion() {
+        for vocab in [32768, 262144] {
+            let mut target = vec![1.0 / (vocab - 1) as f32; vocab];
+            target[0] = 0.0;
+            let target = MxArray::from_float32(&target, &[vocab as i64]).unwrap();
+            let draft = one_hot(0, vocab);
+            target.eval();
+            draft.eval();
+            for device in [false, true, true, false] {
+                let mut rng = StdRng::seed_from_u64(871);
+                let mut micros = Vec::new();
+                for round in 0..110 {
+                    let started = std::time::Instant::now();
+                    let residual = target.sub(&draft).unwrap().clip(Some(0.0), None).unwrap();
+                    let token = if device {
+                        sample_residual_distribution(&target, &residual, &mut rng)
+                    } else {
+                        residual_host_gate(&target, &residual, &mut rng)
+                    }
+                    .unwrap();
+                    assert!(token > 0 && token < vocab as i32);
+                    if round >= 10 {
+                        micros.push(started.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+                micros.sort_by(f64::total_cmp);
+                eprintln!(
+                    "residual_completion vocab={vocab} device={device} median_us={:.3}",
+                    micros[micros.len() / 2]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dense_target_sparse_draft_rejects_and_samples_full_vocab_residual() {
         let target = MxArray::from_float32(&[0.1, 0.9, 0.0], &[3]).expect("target");
         let draft =
             SparseDistribution::from_parts(vec![0, 2], vec![0.8, 0.2], 3).expect("sparse draft");
-        let mut rng = ScriptedRng::new(&[u64::MAX]);
+        let mut rng = ScriptedRng::new(&[u64::MAX, 41]);
         let (accepted, token) =
             accept_with_residual_dense_target_sparse_draft(&target, draft.as_row(), 0, &mut rng)
                 .expect("dense/sparse correction");
@@ -2352,7 +2426,7 @@ mod accept_with_residual_tests {
         let p_target = one_hot(2, vocab);
         let p_draft = one_hot(5, vocab);
 
-        let mut rng = ScriptedRng::new(&[u64::MAX]);
+        let mut rng = ScriptedRng::new(&[u64::MAX, 42]);
         let cfg = stochastic_cfg();
         let (accepted, out) = accept_with_residual(&p_target, &p_draft, 5, &cfg, &mut rng)
             .expect("accept_with_residual");
@@ -2393,12 +2467,12 @@ mod accept_with_residual_tests {
             MxArray::from_float32(&[0.50f32, 0.20, 0.15, 0.15], &[vocab as i64]).expect("p_draft");
 
         // u ≈ 1 - ε ⇒ reject whenever p_accept < 1. Run multiple trials to
-        // verify the sample always lands in the residual support, since
-        // MLX's categorical uses its own RNG and we can't pin it.
+        // verify the sample always lands in the residual support. The
+        // second word seeds the request-owned device residual draw.
         let mut rejections = 0;
         let cfg = stochastic_cfg();
-        for _ in 0..16 {
-            let mut rng = ScriptedRng::new(&[u64::MAX]);
+        for seed in 0..16 {
+            let mut rng = ScriptedRng::new(&[u64::MAX, seed]);
             let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &cfg, &mut rng)
                 .expect("accept_with_residual");
             assert!(!accepted, "ratio = 0.1 with u → 1 must reject");
@@ -2449,7 +2523,7 @@ mod accept_with_residual_tests {
             MxArray::from_float32(&[0.40f32, 0.30, 0.20, 0.20], &[vocab as i64]).expect("p_draft");
         let draft_id = 3i32;
 
-        let mut rng = ScriptedRng::new(&[u64::MAX]);
+        let mut rng = ScriptedRng::new(&[u64::MAX, 44]);
         let cfg = stochastic_cfg();
         let (accepted, out) = accept_with_residual(&p_target, &p_draft, draft_id, &cfg, &mut rng)
             .expect("accept_with_residual");
@@ -2500,7 +2574,7 @@ mod accept_with_residual_tests {
             MxArray::from_float32(&[0.0f32, 0.5, 0.5], &[vocab as i64]).expect("p_target");
         let p_draft = MxArray::from_float32(&[1.0f32, 0.0, 0.0], &[vocab as i64]).expect("p_draft");
 
-        let mut rng = ScriptedRng::new(&[0]);
+        let mut rng = ScriptedRng::new(&[0, 43]);
         let cfg = stochastic_cfg();
         let (accepted, out) = accept_with_residual(&p_target, &p_draft, 0, &cfg, &mut rng)
             .expect("accept_with_residual");
@@ -2520,8 +2594,8 @@ mod accept_with_residual_tests {
     }
 
     /// W4 Bug #3 regression: T=0 must collapse to argmax-compare. The
-    /// stochastic Leviathan-Chen path would consume MLX's global RNG
-    /// (and the supplied `rng`) and emit non-argmax tokens, breaking
+    /// stochastic Leviathan-Chen path would consume the supplied `rng`
+    /// and emit non-argmax tokens, breaking
     /// AR/MTP parity. Compare with the AR T=0 contract in
     /// `sample_compiled` (temperature → argmax via compiled C++).
     #[test]
@@ -2581,6 +2655,50 @@ mod accept_with_residual_tests {
         assert_close(v[1], 1.0, 1e-6);
         assert_close(v[2], 0.0, 1e-6);
         assert_close(v[3], 0.0, 1e-6);
+    }
+
+    #[test]
+    fn sample_with_logprobs_advances_one_random_key_per_draw() {
+        let logits = MxArray::from_float32(&[0.0; 16], &[16]).unwrap();
+        for top_k in [0, 4] {
+            let config = SamplingConfig {
+                temperature: Some(0.7),
+                top_k: Some(top_k),
+                top_p: Some(1.0),
+                min_p: Some(0.0),
+            };
+            unsafe { sys::mlx_seed(0x10_670b) };
+            let mut actual = Vec::new();
+            for _ in 0..32 {
+                let (token, logprobs) = sample_and_logprobs(&logits, Some(config)).unwrap();
+                MxArray::eval_arrays_with_context(&[&token, &logprobs], "test draw and logprobs")
+                    .unwrap();
+                actual.push(token.item_at_int32(0).unwrap());
+                for &probability in logprobs.to_float32().unwrap().iter() {
+                    assert!((probability + 16.0f32.ln()).abs() < 1e-6);
+                }
+            }
+            assert!(
+                actual.iter().any(|&token| token != actual[0]),
+                "categorical reused a traced key"
+            );
+            // Same filtered draws and subsequent key position as the main
+            // sampler, including warm calls after compile caches exist.
+            let after = sample(&logits, Some(config)).unwrap();
+            after.eval();
+            unsafe { sys::mlx_seed(0x10_670b) };
+            for expected in actual {
+                let token = sample(&logits, Some(config)).unwrap();
+                token.eval();
+                assert_eq!(token.item_at_int32(0).unwrap(), expected);
+            }
+            let expected_after = sample(&logits, Some(config)).unwrap();
+            expected_after.eval();
+            assert_eq!(
+                after.item_at_int32(0).unwrap(),
+                expected_after.item_at_int32(0).unwrap()
+            );
+        }
     }
 
     /// T6 regression: the C++ samplers must treat the whole `[0, 1e-6]`
