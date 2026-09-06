@@ -5,6 +5,9 @@ integration, speculative decoding with paged KV, concurrent inference, SSD
 persistence and macOS inference control flow. This is an engineering Markdown
 report intended to live beside the implementation and its tests.
 
+The [2026-09-06 follow-up](followup.md) records subsequent implementation,
+measurements, rejected candidates and remaining work against PR revision `bbc3157c`.
+
 ## Decision
 
 Keep the existing registry, immutable execution plan, shared scheduler and

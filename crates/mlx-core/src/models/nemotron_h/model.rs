@@ -2127,7 +2127,7 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
 
     fn verify_step(
         &mut self,
-        ids: &MxArray,
+        ids: &[u32],
         embedding: &Embedding,
         depth: usize,
     ) -> Result<crate::models::qwen3_5::mtp_decode::MtpVerifyOutput> {
@@ -2144,28 +2144,20 @@ impl MtpStepper for NemotronHMtpStepper<'_> {
                  relaxing this"
             )));
         }
-        let id_window = ids.to_int32().map_err(|e| {
-            Error::from_reason(format!(
-                "NemotronH MTP verify_step: ids to_int32: {}",
-                e.reason
-            ))
-        })?;
-        if id_window.len() < depth + 1 {
-            return Err(Error::from_reason(format!(
-                "NemotronH MTP verify_step: ids has {} elements, need {}",
-                id_window.len(),
-                depth + 1
-            )));
+        if ids.len() != depth + 1 {
+            return Err(Error::from_reason(
+                "NemotronH MTP verifier token count does not match depth",
+            ));
         }
-        let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
+        let id_slice = ids;
         // Verify one token at a time through the AR DECODE path. A batched [1, depth+1]
         // forward routes every stateful mamba layer through the chunk-scan, whose
         // padded-chunk arithmetic differs from the recurrent decode_step in f32 rounding;
         // the drift flips near-tie argmaxes and breaks the T=0 lossless contract.
         let mut logits_rows: Vec<MxArray> = Vec::with_capacity(depth + 1);
         let mut hidden_rows: Vec<MxArray> = Vec::with_capacity(depth + 1);
-        for &tok in &id_slice {
-            let one = MxArray::from_int32(&[tok], &[1, 1])?;
+        for &tok in id_slice {
+            let one = MxArray::from_uint32(&[tok], &[1, 1])?;
             let (logits, hidden) = self.inner.forward_with_hidden_3d(&one, embedding)?;
             logits_rows.push(logits);
             hidden_rows.push(hidden);
@@ -3140,8 +3132,8 @@ mod scheduler_tests {
             crate::cache_limit::coordinator()
                 .registered_pool_bytes()
                 .saturating_sub(before),
-            plan.pool_bytes,
-            "configured reservation must be visible before Inner::new allocates"
+            plan.pool_bytes + mlx_paged_attn::RESTORE_STAGING_BYTES,
+            "configured KV and restore-staging reservations must be visible before Inner::new allocates"
         );
         let inner = NemotronHInner::new(config).expect("inner builds");
         let adapter = inner
@@ -3269,6 +3261,10 @@ mod scheduler_tests {
             eprintln!("skipping (no Metal backend)");
             return;
         }
+        // Weight initialization must not inherit another test's random
+        // stream: a different tiny model can put two logits across a
+        // batched/serial reduction near-tie. Keep this parity fixture fixed.
+        unsafe { mlx_sys::mlx_seed(0) };
         let cfg = tiny_paged_config();
         let mut inner = NemotronHInner::new(cfg).expect("inner builds");
         assert!(

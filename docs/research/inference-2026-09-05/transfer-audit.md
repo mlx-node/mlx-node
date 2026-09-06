@@ -1,5 +1,8 @@
 # Inference control-flow and transfer audit
 
+This records revision `bbc3157c`. The subsequent GPU sampling, scheduled
+verification and SSD pipeline work is recorded in [the follow-up](followup.md).
+
 Reviewed 2026-09-06, after structural revision `2b6cb786`. Scope: native request
 entry, all seven chat-family runners, flat and paged prefill/decode, MTP and
 DFlash/DSpark, batching, media inputs, output extraction and SSD cache lifecycle.

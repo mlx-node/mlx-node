@@ -1,6 +1,68 @@
 #include "mlx_common.h"
+#include "mlx_sampling.h"
+#include <limits>
+
+namespace {
+mlx::core::array sample_probabilities_with_uniforms(
+    const mlx::core::array& p, const mlx::core::array& uniforms) {
+  using namespace mlx::core;
+  auto valid = logical_and(isfinite(p), greater(p, array(0.0f)));
+  auto logits = where(valid, log(p), array(-std::numeric_limits<float>::infinity()));
+  auto token = astype(mlx_categorical_with_uniforms(logits, uniforms, -1), int32);
+  return where(any(valid), token, array(-1, int32));
+}
+}  // namespace
 
 extern "C" {
+
+mlx_array* mlx_array_categorical_uniforms_for_test(mlx_array* handle, mlx_array* uniforms,
+                                                  int32_t axis) {
+  if (!handle || !uniforms) return nullptr;
+  try {
+    auto result = mlx_categorical_with_uniforms(
+        *reinterpret_cast<mlx::core::array*>(handle),
+        *reinterpret_cast<mlx::core::array*>(uniforms), axis);
+    return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+  } catch (...) { return nullptr; }
+}
+
+// Internal deterministic endpoint regression hook; not exposed by the binding.
+mlx_array* mlx_array_sample_probabilities_uniforms_for_test(mlx_array* handle, mlx_array* uniforms) {
+  if (!handle || !uniforms) return nullptr;
+  try {
+    auto result = sample_probabilities_with_uniforms(
+        *reinterpret_cast<mlx::core::array*>(handle),
+        *reinterpret_cast<mlx::core::array*>(uniforms));
+    return reinterpret_cast<mlx_array*>(new mlx::core::array(std::move(result)));
+  } catch (...) { return nullptr; }
+}
+
+// Explicit keys keep draft draws independent of MLX's global RNG. The whole
+// probability-to-token graph stays on device; -1 reports an invalid mass after
+// the caller evaluates the token. Passing the key as a compiled input avoids
+// freezing randomness when MLX reuses the graph.
+mlx_array* mlx_array_sample_probabilities(mlx_array* handle, uint64_t seed) {
+  using namespace mlx::core;
+  if (!handle) return nullptr;
+  try {
+    const auto& probabilities = *reinterpret_cast<array*>(handle);
+    if (probabilities.ndim() != 1 || probabilities.dtype() != float32 ||
+        probabilities.size() == 0 || probabilities.size() > INT32_MAX) return nullptr;
+    static auto draw = mlx::core::compile([](const std::vector<array>& inputs) {
+      const auto& p = inputs[0];
+      return std::vector<array>{sample_probabilities_with_uniforms(
+          p, mlx::core::random::uniform(p.shape(), float32, inputs[1]))};
+    });
+    const uint32_t key_words[] = {static_cast<uint32_t>(seed >> 32),
+                                  static_cast<uint32_t>(seed)};
+    array key(key_words, {2}, uint32);
+    auto result = draw({probabilities, key});
+    return reinterpret_cast<mlx_array*>(new array(std::move(result[0])));
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("sample_probabilities", e.what());
+    return nullptr;
+  } catch (...) { return nullptr; }
+}
 
 mlx_array* mlx_array_transpose(mlx_array* handle,
                                const int32_t* axes,
@@ -526,9 +588,14 @@ mlx_array* mlx_array_randint(const int64_t* shape,
 }
 
 mlx_array* mlx_array_categorical(mlx_array* logits_handle, int32_t axis) {
-  auto logits_arr = reinterpret_cast<array*>(logits_handle);
-  array result = mlx::core::random::categorical(*logits_arr, axis);
-  return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  if (!logits_handle) return nullptr;
+  try {
+    auto logits_arr = reinterpret_cast<array*>(logits_handle);
+    array result = mlx_categorical(*logits_arr, axis);
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception&) {
+    return nullptr;
+  }
 }
 
 // Comparison operations

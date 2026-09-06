@@ -139,6 +139,7 @@ impl HybridSchedulerBackend for Gemma4Inner {
     }
 
     fn release_scheduled_cache(&mut self, seq_id: SeqId) -> Result<()> {
+        self.release_scheduled_speculation(seq_id);
         if let Some(coordinator) = self.kv_cache_coordinator.as_mut() {
             coordinator
                 .release_request_all(seq_id)
@@ -179,6 +180,64 @@ impl HybridSchedulerBackend for Gemma4Inner {
             .ok_or_else(|| Error::from_reason("Gemma4 KV coordinator is unavailable"))?
             .activate_request_all(seq_id)
             .map_err(Error::from_reason)
+    }
+
+    fn supports_scheduled_speculation(&self) -> bool {
+        self.dspark_draft().is_some()
+    }
+
+    fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
+        let Some(draft) = self.dspark_draft() else {
+            return 0;
+        };
+        // K and V for every draft layer. Charge f32 plus one cache-growth
+        // quantum even when loaded weights produce smaller bf16 arrays.
+        (draft.config.num_hidden_layers as u64)
+            .saturating_mul(draft.config.num_global_key_value_heads.max(0) as u64)
+            .saturating_mul(draft.config.global_head_dim.max(0) as u64)
+            .saturating_mul(8)
+            .saturating_mul(u64::from(total_tokens).saturating_add(256))
+    }
+
+    fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<()> {
+        self.begin_scheduled_dspark(seq_id, position)
+    }
+
+    fn reserve_scheduled_speculation(&mut self, seq_id: SeqId, queries: usize) -> Result<bool> {
+        use crate::engine::spec_paged::SpecPagedCache;
+        Gemma4SpecPagedCache::new(self)
+            .reserve_lookahead(seq_id, queries)
+            .map_err(Error::from_reason)
+    }
+
+    fn propose_scheduled(
+        &mut self,
+        seq_id: SeqId,
+        anchor: u32,
+        max_drafts: usize,
+        params: &crate::engine::params::ChatParams,
+        rng: &mut dyn rand::Rng,
+        confidence: bool,
+    ) -> Result<crate::engine::backend::DsparkProposal> {
+        self.propose_scheduled_dspark(seq_id, anchor, max_drafts, params, rng, confidence)
+    }
+
+    fn run_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyRow],
+    ) -> Result<MxArray> {
+        self.verify_scheduled_dspark(rows)
+    }
+
+    fn commit_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyCommit],
+    ) -> Result<Vec<Result<()>>> {
+        self.commit_scheduled_dspark(rows)
+    }
+
+    fn release_scheduled_speculation(&mut self, seq_id: SeqId) {
+        self.scheduled_dspark_states.remove(&seq_id);
     }
 
     fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
@@ -305,6 +364,7 @@ impl HybridSchedulerBackend for Gemma4Inner {
         owners: SchedulerOwnerContext<'_, Self::OwnerState>,
     ) {
         if matches!(&command, ChatCmd::ResetCaches { .. }) {
+            self.scheduled_dspark_states.clear();
             self.set_active_paged_owner(0);
             handle_chat_cmd(self, command);
             return;

@@ -9,7 +9,7 @@ use crate::nn::{Linear, RMSNorm, RoPE};
 use crate::transformer::paged_flags::native_kv_write_enabled;
 use crate::transformer::paged_kv_cache_adapter::{
     DenseAttentionWindow, PagedAttentionV2Layout, PagedDecodeRouteHint, PagedKVCacheAdapter,
-    PagedPrefillMemorySnapshot, SeqId, paged_attention_v2_aux_fits,
+    PagedPrefillMemorySnapshot, PagedRaggedRow, SeqId, paged_attention_v2_aux_fits,
     paged_attention_v2_partition_upper_bound,
 };
 use mlx_sys as sys;
@@ -2304,6 +2304,91 @@ impl Gemma4Attention {
             .map_err(Error::from_reason)?;
         let attended = adapter
             .gather_kv_for_decode_graph_batched(paged_idx, &queries, &seq_ids, 1.0, 1.0)
+            .map_err(Error::from_reason)?
+            .astype(x.dtype()?)?
+            .reshape(&[batch, 1, (self.num_heads * self.head_dim) as i64])?;
+        self.o_proj.forward(&attended)
+    }
+
+    /// Packed variable-length verifier queries. The caller constructs one
+    /// offset array for the complete model traversal; KV-shared layers project
+    /// only queries and read the anchor layer's already-written physical slots.
+    pub(crate) fn forward_paged_ragged(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        paged_idx: u32,
+        rows: &[PagedRaggedRow],
+        offsets: &MxArray,
+        shared_kv: bool,
+    ) -> Result<MxArray> {
+        let batch = rows
+            .iter()
+            .try_fold(0i64, |n, row| n.checked_add(i64::from(row.query_len)))
+            .ok_or_else(|| Error::from_reason("Gemma4 ragged query count overflow"))?;
+        if rows.is_empty()
+            || rows.iter().any(|r| r.query_len == 0)
+            || x.ndim()? != 3
+            || x.shape_at(0)? != batch
+            || x.shape_at(1)? != 1
+            || offsets.ndim()? != 1
+            || offsets.shape_at(0)? != batch
+        {
+            return Err(Error::from_reason(
+                "Gemma4 ragged queries/offsets do not match row lengths",
+            ));
+        }
+        if !native_kv_write_enabled() {
+            return Err(Error::from_reason(
+                "Gemma4 ragged verification requires native KV writes",
+            ));
+        }
+        let queries = self.q_proj.forward(x)?.reshape(&[
+            batch,
+            1,
+            self.num_heads as i64,
+            self.head_dim as i64,
+        ])?;
+        let queries = self
+            .q_norm
+            .forward(&queries)?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let queries = self.rope.forward_with_offsets(&queries, offsets)?;
+
+        if !shared_kv {
+            let keys = self.k_proj.forward(x)?.reshape(&[
+                batch,
+                1,
+                self.num_kv_heads as i64,
+                self.head_dim as i64,
+            ])?;
+            let values = if self.k_is_v {
+                keys.clone()
+            } else {
+                self.v_proj
+                    .as_ref()
+                    .expect("Gemma4 non-shared V projection")
+                    .forward(x)?
+                    .reshape(&[batch, 1, self.num_kv_heads as i64, self.head_dim as i64])?
+            };
+            let keys = self.k_norm.forward(&keys)?.transpose(Some(&[0, 2, 1, 3]))?;
+            let keys = self.rope.forward_with_offsets(&keys, offsets)?;
+            let values = {
+                let handle = unsafe {
+                    sys::mlx_fast_rms_norm(values.handle.0, std::ptr::null_mut(), self.v_norm_eps)
+                };
+                MxArray::from_handle(handle, "v_norm_batched")?.transpose(Some(&[0, 2, 1, 3]))?
+            };
+
+            let keys = keys.squeeze(Some(&[2]))?;
+            let values = values.squeeze(Some(&[2]))?;
+            adapter
+                .update_keys_values_native_ragged(paged_idx, &keys, &values, rows)
+                .map_err(Error::from_reason)?;
+        }
+        let queries = queries.squeeze(Some(&[2]))?;
+        let attended = adapter
+            .gather_kv_for_ragged_graph(paged_idx, &queries, rows, 1.0, 1.0)
             .map_err(Error::from_reason)?
             .astype(x.dtype()?)?
             .reshape(&[batch, 1, (self.num_heads * self.head_dim) as i64])?;

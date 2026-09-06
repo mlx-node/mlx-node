@@ -244,7 +244,64 @@ Local checks for this revision:
 - Clippy, canonical native build, TypeScript typecheck, and standalone benchmark
   typecheck passed. The existing repository formatting exceptions above remain.
 
-## Scope of the result
+## Optimization follow-up
+
+The 2026-09-06 follow-up against `bbc3157c` is described in
+[followup.md](followup.md), with per-run evidence in
+[followup-measurements.json](followup-measurements.json). The completed binding
+has SHA-256 `20e526e4a6c8aed82d1ffaac86f134e493dbe9560584fd5e20332287feac897b`.
+This measured binding precedes only the final missing-GDN-tape error guard.
+That guard changes rejection of malformed replay state, not the benchmarked
+valid-tape path. Its focused layer-cache suite is recorded separately below.
+The isolated Gemma comparison measured 42% lower four-request aggregate
+latency. Default Muse output matched the baseline in its final smoke; scheduled
+Muse remains opt-in because prior alternating measurements were inconclusive.
+
+Local checks for this follow-up:
+
+- Core debug unit suite: 3413 passed, 107 ignored, with the 18-case int8 module
+  excluded. The final broad run used `MLX_TEST_REQUIRE_METAL=1` and captured
+  output to check device-absence skips. Two finite-difference tests explicitly
+  skip under the host's default TF32 mode; both passed separately with
+  `MLX_ENABLE_TF32=0`. One pre-existing real-checkpoint repack case still returns
+  early because its separate Gemma mobile checkpoint is absent; the harness
+  counts that return as a pass, not an ignored case. No claim of complete
+  checkpoint coverage follows from the suite count.
+- The final missing-GDN-tape guard passed all 12 layer-cache tests with strict
+  Metal enabled, including both paged and flat malformed-state rejection.
+- Int8 module in release: 8 passed, 10 ignored. Core integrations: 109 passed,
+  133 ignored. Paged/cache targets: 336 passed, 17 ignored. Four additional
+  explicitly ignored paged MTP tests passed when selected.
+- The real Qwen serial/uniform/ragged/interleaved concurrency gate passed.
+  The final binding completed Gemma concurrency and sampled runs, default Muse,
+  and opt-in Muse at occupancy four. MTP alternating real-model runs retained
+  identical greedy outputs and cycle counts.
+- Full TypeScript run: 3294 passed, 38 skipped, across 182 passing files and
+  17 skipped files. This used the preceding binding; the final GPU residual
+  fallback and invalid-prefill guard were subsequently covered by Rust tests
+  and the final model runs.
+- Canonical native build, final Clippy, TypeScript typecheck and changed-file
+  formatting passed. Repository-wide pre-existing formatting exceptions remain.
+
+The full core run initially exposed an unseeded Nemotron synthetic fixture's
+near-tied greedy logits. The unchanged test passed alone. Seeding fixture
+construction made the full run independent of prior RNG consumers while keeping
+its original logit and argmax assertions; the final broad run then passed.
+Sampled multi-owner tests separately exposed real global RNG coupling in
+speculative residual/bonus draws, which was fixed in production code. Fault
+injection covers failed recording, forward, commit, rollback, draft append and
+settlement without abandoning a healthy peer's transaction.
+
+Earlier local commands used `MLX_REQUIRE_METAL`, which is not the test harness's
+strict flag. The final debug run uses the correct `MLX_TEST_REQUIRE_METAL` flag;
+earlier release/integration counts are local results, not a claim that this
+strict guard was active in those commands. All GPU workloads and measurements
+were serialized. Performance runs additionally excluded builds and trace export.
+
+Remote checks must be evaluated on the follow-up commit; green checks on
+`bbc3157c` establish only the preceding PR revision.
+
+## Scope of the structural and transfer revisions
 
 The implementation uses one generic `ModelCommand<FamilyCommand>` across all
 seven model families, with default chat-barrier dispatch and shared scheduler
@@ -252,5 +309,6 @@ telemetry forwarding. It removes the per-family chat/stats enums, adapter macro
 and two conversion/view traits. It reduces completion boundaries in
 mixed-row sampling and penalized greedy speculation, preserving row construction
 order, per-owner state and the existing SSD lifecycle. It does not enable
-scheduled speculative concurrency or migrate the Metal backend. Their concrete
-prerequisites are in the [research report](report.md#next-stage-plan-and-gates).
+scheduled speculative concurrency or migrate the Metal backend. The later
+[follow-up](followup.md) adds fixed-depth Gemma/Muse scheduled verification and
+records the remaining recurrent MTP and adaptive scheduling work.

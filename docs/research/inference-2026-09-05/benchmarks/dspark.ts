@@ -2,7 +2,8 @@ import { writeFile } from 'node:fs/promises';
 // Run with oxnode; see ../validation.md for arguments and measurement protocol.
 import { createRequire } from 'node:module';
 import { performance } from 'node:perf_hooks';
-const [binding, modelPath, draftPath, output, revision, temperatureArg = '0'] = process.argv.slice(2);
+const [binding, modelPath, draftPath, output, revision, temperatureArg = '0', adaptiveArg = 'false'] =
+  process.argv.slice(2);
 const temperature = Number(temperatureArg);
 if (!Number.isFinite(temperature) || temperature < 0) throw new Error('Invalid temperature');
 if (!binding || !modelPath || !draftPath || !output || !revision)
@@ -29,7 +30,7 @@ for (let round = -1; round < 3; round++) {
       maxNgramRepeats: 0,
       enableMtp: true,
       mtpDepth: 7,
-      mtpAdaptiveDepth: false,
+      mtpAdaptiveDepth: adaptiveArg === 'true',
       reportPerformance: true,
     },
   );

@@ -124,7 +124,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         && sampling::sparse_distribution_supported(&draft_sampling_cfg);
     let mut prev_hidden = prev_hidden_in;
     let mut prev_emb = prev_emb_in;
-    let mut draft_ids: Vec<i32> = Vec::with_capacity(depth);
+    let mut draft_tokens: Vec<MxArray> = Vec::with_capacity(depth);
     let mut draft_probs: Vec<MxArray> = if use_sparse_accept || use_sparse_stochastic_accept {
         Vec::new()
     } else {
@@ -136,12 +136,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     } else {
         Vec::new()
     };
-    // `step_input_id` is the token whose hidden/embedding seed this
-    // draft step: `last_committed_id` for step 0, then each prior
-    // drafted id. Logged per step so a debug run can reconstruct
-    // the full draft chain.
-    let mut step_input_id = last_committed_id as i32;
-    for step_idx in 0..depth {
+    for _ in 0..depth {
         let (h_next, draft_logits) = step.draft_step(&prev_hidden, &prev_emb)?;
         let logits_1d = if use_sparse_accept {
             None
@@ -195,7 +190,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
             )
         };
         let mut sparse_draft = None;
-        let tok_id = if use_sparse_stochastic_accept {
+        let token = if use_sparse_stochastic_accept {
             let sparse_rows = sampling::sparse_distributions_from_logits(
                 logits_1d.as_ref().ok_or_else(|| {
                     Error::from_reason(
@@ -212,28 +207,18 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
             let draft_dist = sparse_rows.row_owned(0)?;
             let sampled = draft_dist.as_row().sample(rng)?;
             sparse_draft = Some(draft_dist);
-            sampled
+            A::from_int32(&[sampled], &[1])?
         } else {
             // Sample the drafted token using the same sampling pipeline
             // the main path uses — drafter and verifier must agree on
             // their proposal distribution for Leviathan-Chen.
-            let tok = sampling::sample(&draft_logits, params.sampling_config)?;
-            tok.eval();
-            tok.item_at_int32(0)?
+            sampling::sample(&draft_logits, params.sampling_config)?.reshape(&[1])?
         };
         let draft_metrics = crate::models::qwen3_5::adaptive_depth::DraftMetrics {
             top1_prob_topk: sparse_draft
                 .as_ref()
                 .and_then(|dist| dist.as_row().top_entry().map(|(_, prob)| prob)),
         };
-        tracing::trace!(
-            target: "mlx_core::mtp::draft",
-            step = step_idx,
-            input_id = step_input_id,
-            drafted_id = tok_id,
-            "MTP per-step draft"
-        );
-        draft_ids.push(tok_id);
         if let Some(sparse_draft) = sparse_draft {
             draft_sparse_probs.push(sparse_draft);
         }
@@ -245,21 +230,22 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         // handles through the cycle tail; matching that lifetime matters
         // for MLX's lazy cache writes.
         prev_hidden = h_next;
-        let id_arr = A::from_int32(&[tok_id], &[1])?;
-        let emb_2d = embedding.forward(&id_arr)?; // [1, hidden]
+        // Feed the sampled device token directly to the next embedding. No
+        // per-draft completion/readback/re-upload is required for this chain.
+        let emb_2d = embedding.forward(&token)?; // [1, hidden]
         let hidden = emb_2d.shape_at(1)?;
         prev_emb = emb_2d.reshape(&[1, 1, hidden])?;
-        step_input_id = tok_id;
+        draft_tokens.push(token);
         if let Some(policy) = ev_depth_policy.as_mut()
-            && draft_ids.len() < depth
+            && draft_tokens.len() < depth
         {
             profiler.begin("mtp_draft_gate");
             let decision =
-                policy.should_continue_after_draft(draft_ids.len(), depth, draft_metrics);
+                policy.should_continue_after_draft(draft_tokens.len(), depth, draft_metrics);
             profiler.end();
             tracing::trace!(
                 target: "mlx_core::mtp::adaptive",
-                drafted_depth = draft_ids.len(),
+                drafted_depth = draft_tokens.len(),
                 next_depth = decision.next_depth,
                 expected_extra_accept = decision.expected_extra_accept,
                 required_extra_accept = decision.required_extra_accept,
@@ -270,6 +256,16 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
                 break;
             }
         }
+    }
+    let draft_ids = sampling::materialize_draft_tokens(&draft_tokens)?;
+    for (index, &token) in draft_ids.iter().enumerate() {
+        tracing::trace!(
+            target: "mlx_core::mtp::draft",
+            step = index,
+            input_id = if index == 0 { last_committed_id as i32 } else { draft_ids[index - 1] },
+            drafted_id = token,
+            "MTP per-step draft"
+        );
     }
     profiler.end();
     let effective_depth = draft_ids.len();
@@ -288,10 +284,9 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     );
 
     // Step 2: build verify input [last_committed_id, d_0, ..., d_{D-1}].
-    let mut verify_ids: Vec<i32> = Vec::with_capacity(effective_depth + 1);
-    verify_ids.push(last_committed_id as i32);
-    verify_ids.extend(draft_ids.iter().copied());
-    let verify_in = A::from_int32(&verify_ids, &[1, (effective_depth + 1) as i64])?;
+    let mut verify_ids: Vec<u32> = Vec::with_capacity(effective_depth + 1);
+    verify_ids.push(last_committed_id);
+    verify_ids.extend(draft_ids.iter().map(|&id| id as u32));
     // `trace!` not `debug!` — the full `verify_ids` vector is per-token
     // detail; keep debug to compact once-per-cycle summaries.
     tracing::trace!(
@@ -327,7 +322,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     let verify_only_t0 = std::time::Instant::now();
     profiler.begin("mtp_verify_dispatch");
     let trace_acceptance = mtp_trace_acceptance();
-    let verify_step_res = step.verify_step(&verify_in, embedding, effective_depth);
+    let verify_step_res = step.verify_step(&verify_ids, embedding, effective_depth);
     profiler.end();
     let MtpVerifyOutput {
         logits: verify_logits,
@@ -548,47 +543,46 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         profiler.end();
     } else {
         let mut hist_extended: Vec<u32> = token_history.to_vec();
-        // Per-position path. Used for T>0 (where residual
-        // sampling needs the full target distribution) and for
-        // penalty-active configurations (where `hist_extended`
-        // mutates the per-position logits inside the loop).
-        // Note: this wrap includes the full-accept bonus-token sample
-        // (sample + eval), whereas the sparse-accept branch's bonus is
-        // a CPU buffer read inside the same phase name.
+        // Before the first rejection, every target row sees the known draft
+        // prefix. Build those deterministic distributions together, then keep
+        // acceptance coins and residual/bonus draws in their original order.
         profiler.begin("mtp_accept_loop");
-        for i in 0..effective_depth {
-            // verify_logits[0, i, :] → [vocab]
+        let mut targets = Vec::with_capacity(effective_depth);
+        for (i, &draft_id) in draft_ids.iter().enumerate() {
             let v_slice = verify_logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
             let v_logits_1d = v_slice.squeeze(Some(&[0, 1]))?;
             let penalized = apply_all_penalties(v_logits_1d, &hist_extended, params)?;
-            // The target density `p` consumed by `accept_with_residual`
-            // (`min(1, p/q)` + `(p - q)+` residual) MUST match the
-            // distribution the verify/bonus token is drawn from. The
-            // bonus on full-accept (and the residual draw on rejection) is
-            // sampled via `sampling::sample(&penalized, ..)` →
-            // `mlx_compiled_sample_full`, which filters logprobs then applies
-            // temperature at the categorical draw. A raw `softmax(penalized)`
-            // (no temperature, no top_k/top_p/min_p) did NOT match that draw,
-            // biasing accept/reject and the residual resample whenever
-            // temperature != 1 and/or filters are active. Build `p` from the
-            // SAME compiled filter chain via `sampling::sampling_distribution`.
-            //
-            // At T=0 `accept_with_residual` only reads `argmax(p_target)`;
-            // `sampling_distribution` returns the one-hot argmax there, so the
-            // argmax (and thus the T=0 commit decision) matches a plain
-            // `softmax` of the same logits while never erroring at T=0.
-            let p_target = sampling::sampling_distribution(&penalized, params.sampling_config)?
-                .astype(DType::Float32)?;
-            p_target.eval();
-
-            let sampling_cfg = params.sampling_config.unwrap_or_default();
-            let (accept, out_tok) = sampling::accept_with_residual(
-                &p_target,
-                &draft_probs[i],
-                draft_ids[i],
-                &sampling_cfg,
-                rng,
-            )?;
+            targets.push(
+                sampling::sampling_distribution(&penalized, params.sampling_config)?
+                    .astype(DType::Float32)?,
+            );
+            hist_extended.push(draft_id as u32);
+        }
+        let sampling_cfg = params.sampling_config.unwrap_or_default();
+        let greedy_targets =
+            if sampling::is_greedy_temperature(sampling_cfg.temperature.unwrap_or(1.0)) {
+                let tokens = targets
+                    .iter()
+                    .map(|p| p.argmax(0, None))
+                    .collect::<Result<Vec<_>>>()?;
+                Some(sampling::materialize_draft_tokens(&tokens)?)
+            } else {
+                let roots = targets.iter().chain(draft_probs.iter()).collect::<Vec<_>>();
+                MxArray::eval_arrays_with_context(&roots, "mtp_sampled_accept")?;
+                None
+            };
+        for (i, p_target) in targets.iter().enumerate() {
+            let (accept, out_tok) = if let Some(targets) = &greedy_targets {
+                (targets[i] == draft_ids[i], targets[i])
+            } else {
+                sampling::accept_with_residual(
+                    p_target,
+                    &draft_probs[i],
+                    draft_ids[i],
+                    &sampling_cfg,
+                    rng,
+                )?
+            };
             if trace_acceptance
                 && let Err(e) = trace_acceptance_dense(
                     effective_depth,
@@ -596,7 +590,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
                     token_history.len(),
                     last_committed_id,
                     draft_ids[i],
-                    &p_target,
+                    p_target,
                     &draft_probs[i],
                     &sampling_cfg,
                     accept,
@@ -628,7 +622,6 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
             if accept {
                 let id_u = out_tok as u32;
                 accepted_tokens.push(id_u);
-                hist_extended.push(id_u);
             } else {
                 all_accepted = false;
                 rejection_residual = Some(out_tok);
@@ -2399,7 +2392,7 @@ mod tests {
 
         fn verify_step(
             &mut self,
-            _ids: &MxArray,
+            _ids: &[u32],
             _embedding: &Embedding,
             depth: usize,
         ) -> Result<MtpVerifyOutput> {
@@ -2615,7 +2608,7 @@ mod tests {
 
         step.snapshot_main_linear();
         let _verify = step
-            .verify_step(&lazy_scalar(0.0), &emb, depth)
+            .verify_step(&vec![0; depth + 1], &emb, depth)
             .expect("mock verify never fails");
 
         // Commit the K+2 committed sequence, then rollback + replay on the

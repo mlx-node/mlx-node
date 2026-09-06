@@ -184,6 +184,75 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
         MuseGlimmerInner::run_paged_decode_step_batched(self, rows)
     }
 
+    fn supports_scheduled_speculation(&self) -> bool {
+        // Packed verification is correct but has not yet shown a consistent
+        // end-to-end win for K-quant Muse checkpoints. Keep the measured flat
+        // route as the default while allowing isolated concurrency experiments.
+        self.paged.is_some()
+            && self.dflash.is_some()
+            && std::env::var("MLX_SCHEDULED_DFLASH").is_ok_and(|value| value.trim() == "1")
+    }
+
+    fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
+        let Some(draft) = self.dflash.as_ref() else {
+            return 0;
+        };
+        let config = &draft.config;
+        // Account for old and appended sliding context while MLX retains
+        // both graphs, plus a prefill chunk. K and V may materialize as f32.
+        (config.num_hidden_layers as u64)
+            .saturating_mul(config.num_key_value_heads as u64)
+            .saturating_mul(config.head_dim as u64)
+            .saturating_mul(8)
+            .saturating_mul(
+                u64::from(total_tokens)
+                    .min(config.sliding_window as u64)
+                    .saturating_mul(2)
+                    .saturating_add(512),
+            )
+    }
+
+    fn begin_scheduled_speculation(&mut self, seq: SeqId, position: u32) -> Result<()> {
+        self.begin_scheduled_dflash(seq, position)
+    }
+
+    fn reserve_scheduled_speculation(&mut self, seq: SeqId, queries: usize) -> Result<bool> {
+        use crate::engine::spec_paged::SpecPagedCache;
+        super::scheduled_dflash::MuseSpecPagedCache::new(self)
+            .reserve_lookahead(seq, queries)
+            .map_err(Error::from_reason)
+    }
+
+    fn propose_scheduled(
+        &mut self,
+        seq: SeqId,
+        anchor: u32,
+        max_drafts: usize,
+        params: &crate::engine::params::ChatParams,
+        rng: &mut dyn rand::Rng,
+        _confidence: bool,
+    ) -> Result<crate::engine::backend::DsparkProposal> {
+        self.propose_scheduled_dflash(seq, anchor, max_drafts, params, rng)
+    }
+
+    fn run_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyRow],
+    ) -> Result<MxArray> {
+        self.verify_scheduled_dflash(rows)
+    }
+
+    fn commit_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyCommit],
+    ) -> Result<Vec<Result<()>>> {
+        self.commit_scheduled_dflash(rows)
+    }
+
+    fn release_scheduled_speculation(&mut self, seq: SeqId) {
+        self.scheduled_dflash_states.remove(&seq);
+    }
+
     fn replace_cached_token_history(&mut self, history: Vec<u32>) {
         self.cached_token_history = history;
     }
@@ -230,6 +299,11 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
         _first_chunk: bool,
     ) -> Result<Option<MxArray>> {
         self.set_active_paged_owner(seq_id);
+        if self.scheduled_dflash_states.contains_key(&seq_id) {
+            return self
+                .prefill_scheduled_dflash(seq_id, &source[start..end], start as u32)
+                .map(Some);
+        }
         self.run_paged_prefill_slice(&source[start..end], start as u32)
             .map(Some)
     }

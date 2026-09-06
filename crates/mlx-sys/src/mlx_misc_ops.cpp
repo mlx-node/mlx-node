@@ -1,6 +1,7 @@
 #include <memory>
 
 #include "mlx_common.h"
+#include "mlx_sampling.h"
 
 extern "C" {
 
@@ -181,7 +182,7 @@ static auto& compiled_min_p_fn() {
 // and reuse it on every call, corrupting MLX's global random state.
 static array categorical_with_temp(const array& logprobs, const array& inv_temp) {
   auto scaled = mlx::core::multiply(logprobs, inv_temp);
-  return mlx::core::random::categorical(scaled, -1);
+  return mlx_categorical(scaled, -1);
 }
 
 // ============================================================================
@@ -414,21 +415,15 @@ void mlx_compiled_sample_and_logprobs(
     return;
   }
 
-  // No filters - use compiled categorical directly
+  // Keep random key acquisition outside compile(): C++ graph tracing does
+  // not thread MLX's global random state through compiled inputs/outputs.
   bool needs_filters = (top_k > 0) || (top_p > 0.0f && top_p < 1.0f) || (min_p > 0.0f);
   if (!needs_filters) {
-    // Inline compiled sampler: scale logprobs by 1/temp then categorical
-    static auto compiled_sampler = mlx::core::compile([](const std::vector<array>& inputs) {
-      auto lp = inputs[0];
-      auto temp_scalar = inputs[1];
-      auto scaled = mlx::core::multiply(lp, temp_scalar);
-      return std::vector<array>{mlx::core::random::categorical(scaled, -1)};
-    });
     auto temp_array = mlx::core::array(1.0f / temperature);
-    auto results = compiled_sampler({logprobs, temp_array});
+    auto result = categorical_with_temp(logprobs, temp_array);
     // Atomic publish (see greedy path): both unique_ptrs release only after
     // both allocations succeed, so a throw can't leak the token handle.
-    auto tok = std::make_unique<array>(std::move(results[0]));
+    auto tok = std::make_unique<array>(std::move(result));
     auto lp = std::make_unique<array>(std::move(logprobs));
     *out_token = reinterpret_cast<mlx_array*>(tok.release());
     *out_logprobs = reinterpret_cast<mlx_array*>(lp.release());
@@ -512,19 +507,12 @@ void mlx_compiled_sample_and_logprobs(
     logprobs = mlx::core::take_along_axis(selected_logprobs, inverse_indices, -1);
   }
 
-  // Use compiled categorical sampler at the end (reuse the same static compiled function)
-  static auto compiled_sampler_filtered = mlx::core::compile([](const std::vector<array>& inputs) {
-    auto lp = inputs[0];
-    auto temp_scalar = inputs[1];
-    auto scaled = mlx::core::multiply(lp, temp_scalar);
-    return std::vector<array>{mlx::core::random::categorical(scaled, -1)};
-  });
   auto temp_array = mlx::core::array(temperature_first ? 1.0f : (1.0f / temperature));
-  auto results = compiled_sampler_filtered({logprobs, temp_array});
+  auto result = categorical_with_temp(logprobs, temp_array);
 
   // Atomic publish (see greedy path): both unique_ptrs release only after
   // both allocations succeed, so a throw can't leak the token handle.
-  auto tok = std::make_unique<array>(std::move(results[0]));
+  auto tok = std::make_unique<array>(std::move(result));
   auto lp = std::make_unique<array>(std::move(original_logprobs));
   *out_token = reinterpret_cast<mlx_array*>(tok.release());
   *out_logprobs = reinterpret_cast<mlx_array*>(lp.release());

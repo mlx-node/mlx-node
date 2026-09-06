@@ -365,21 +365,21 @@ impl DFlashModel {
                 .slice_axis(1, query_row, query_row + 1)?
                 .reshape(&[vocab])?;
             if greedy {
-                let token = row.argmax(0, Some(false))?.astype(DType::Int32)?;
-                token.eval();
-                draft_ids.push(token.item_at_int32(0)?);
+                draft_ids.push(row.argmax(0, Some(false))?.astype(DType::Int32)?);
             } else {
                 let distribution =
                     sampling_distribution(&row, Some(*sampling))?.astype(DType::Float32)?;
-                distribution.eval();
-                draft_ids.push(crate::sampling::sample_dense_distribution(
+                draft_ids.push(crate::sampling::sample_dense_distribution_array(
                     &distribution,
                     rng,
                 )?);
                 distributions.push(distribution);
             }
         }
-        Ok((draft_ids, distributions))
+        Ok((
+            crate::sampling::materialize_draft_tokens(&draft_ids)?,
+            distributions,
+        ))
     }
 }
 

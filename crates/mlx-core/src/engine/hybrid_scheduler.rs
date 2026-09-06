@@ -5,6 +5,8 @@
 //! multimodal turns, raw generation, calibration, persistence, and training
 //! remain ordered barriers and execute through the existing command handler.
 
+mod speculative;
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -70,6 +72,20 @@ pub(crate) struct SchedulerOwnerContext<'a, S> {
     pub owner_sequences: &'a mut HashMap<String, SeqId>,
     pub owner_states: &'a mut HashMap<String, S>,
     pub next_seq_id: &'a mut SeqId,
+}
+
+/// Host scheduling metadata for one contiguous verifier slice. Proposed tokens
+/// are not visible in committed history until the matching batch commit.
+pub(crate) struct ScheduledVerifyRow {
+    pub seq_id: SeqId,
+    pub first_position: u32,
+    pub tokens: Vec<u32>,
+    pub speculative: bool,
+}
+
+pub(crate) struct ScheduledVerifyCommit {
+    pub seq_id: SeqId,
+    pub keep: usize,
 }
 
 /// Family capabilities required by the shared hybrid scheduler lifecycle.
@@ -197,6 +213,42 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     }
     fn release_scheduled_recurrent_for(&mut self, _seq_id: SeqId) {}
     fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray>;
+    fn supports_scheduled_speculation(&self) -> bool {
+        false
+    }
+    fn scheduled_draft_state_bytes(&self, _total_tokens: u32) -> u64 {
+        0
+    }
+    fn begin_scheduled_speculation(&mut self, _seq_id: SeqId, _position: u32) -> Result<()> {
+        Err(Error::from_reason("scheduled speculation is unavailable"))
+    }
+    fn reserve_scheduled_speculation(&mut self, _seq_id: SeqId, _queries: usize) -> Result<bool> {
+        Ok(false)
+    }
+    fn propose_scheduled(
+        &mut self,
+        _seq_id: SeqId,
+        _anchor: u32,
+        _max_drafts: usize,
+        _params: &engine::params::ChatParams,
+        _rng: &mut dyn rand::Rng,
+        _confidence: bool,
+    ) -> Result<engine::backend::DsparkProposal> {
+        Err(Error::from_reason("scheduled proposals are unavailable"))
+    }
+    fn run_scheduled_verify(&mut self, _rows: &[ScheduledVerifyRow]) -> Result<MxArray> {
+        Err(Error::from_reason("scheduled verification is unavailable"))
+    }
+    fn commit_scheduled_verify(
+        &mut self,
+        _rows: &[ScheduledVerifyCommit],
+    ) -> Result<Vec<Result<()>>> {
+        Err(Error::from_reason(
+            "scheduled verification commit is unavailable",
+        ))
+    }
+    fn release_scheduled_speculation(&mut self, _seq_id: SeqId) {}
+
     fn replace_cached_token_history(&mut self, history: Vec<u32>);
     fn owner_tokens(state: &Self::OwnerState) -> &[u32];
     fn install_owner_state(&mut self, seq_id: SeqId, state: &Self::OwnerState) {
@@ -549,6 +601,8 @@ impl ScheduledReply {
 
 pub(crate) struct ScheduledTurn<P> {
     pub(crate) owner_id: String,
+    pub(crate) scheduled_speculation: Option<rand::rngs::StdRng>,
+    pub(crate) pending_token_emitted: bool,
     pub(crate) tokenizer: Arc<Qwen3Tokenizer>,
     pub(crate) eos_id: u32,
     pub(crate) config: ChatConfig,
@@ -589,6 +643,7 @@ struct PreparedTurn {
     newly_assigned: bool,
     reservation_blocks: u32,
     block_size: u32,
+    reservation_state_bytes: u64,
 }
 
 struct PreparedDecodeRow {
@@ -624,6 +679,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             seq_id: row.seq_id,
             num_computed_tokens: 0,
             generated_token: None,
+            speculative: None,
             finished: false,
             allocation_blocked: true,
             prefill_micros: 0,
@@ -652,6 +708,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             seq_id: row.seq_id,
             num_computed_tokens: row.num_tokens,
             generated_token: None,
+            speculative: None,
             finished: true,
             allocation_blocked: false,
             prefill_micros: 0,
@@ -752,6 +809,14 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 turn.payload.prefix.effective_cached_prefix_len(),
                 |replay| replay.cached_prefix as usize,
             );
+        if first_chunk
+            && turn.payload.scheduled_speculation.is_some()
+            && let Err(error) = self
+                .inner
+                .begin_scheduled_speculation(row.seq_id, start as u32)
+        {
+            return Ok(Self::fail(turn, row, error));
+        }
         let source = turn
             .payload
             .preemption_replay
@@ -785,6 +850,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 seq_id: row.seq_id,
                 num_computed_tokens: row.num_tokens,
                 generated_token: None,
+                speculative: None,
                 finished: false,
                 allocation_blocked: false,
                 prefill_micros: Self::elapsed_micros(started),
@@ -802,6 +868,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 seq_id: row.seq_id,
                 num_computed_tokens: row.num_tokens,
                 generated_token: None,
+                speculative: None,
                 finished: false,
                 allocation_blocked: false,
                 prefill_micros: Self::elapsed_micros(started),
@@ -826,7 +893,20 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             Ok(logits) => logits,
             Err(error) => return Ok(Self::fail(turn, row, error)),
         };
-        let sampled = match sample(&logits, turn.payload.params.sampling_config) {
+        let config = turn.payload.params.sampling_config;
+        let sampled = if let Some(rng) = turn.payload.scheduled_speculation.as_mut()
+            && !crate::sampling::is_greedy_temperature(
+                config.and_then(|config| config.temperature).unwrap_or(1.0),
+            ) {
+            crate::sampling::sampling_distribution(&logits, config)
+                .and_then(|distribution| distribution.astype(crate::array::DType::Float32))
+                .and_then(|distribution| {
+                    crate::sampling::sample_dense_distribution_array(&distribution, rng)
+                })
+        } else {
+            sample(&logits, config)
+        };
+        let sampled = match sampled {
             Ok(sampled) => sampled,
             Err(error) => return Ok(Self::fail(turn, row, error)),
         };
@@ -842,19 +922,28 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 seq_id: row.seq_id,
                 num_computed_tokens: row.num_tokens,
                 generated_token: None,
+                speculative: None,
                 finished: true,
                 allocation_blocked: false,
                 prefill_micros: Self::elapsed_micros(started),
             });
         }
         let token = match sampled.item_at_int32(0) {
-            Ok(token) => token as u32,
+            Ok(token) if token >= 0 => token as u32,
+            Ok(_) => {
+                return Ok(Self::fail(
+                    turn,
+                    row,
+                    Error::from_reason("prefill sampling has no valid probability mass"),
+                ));
+            }
             Err(error) => return Ok(Self::fail(turn, row, error)),
         };
         Ok(RowStepResult {
             seq_id: row.seq_id,
             num_computed_tokens: row.num_tokens,
             generated_token: Some(token),
+            speculative: None,
             finished: false,
             allocation_blocked: false,
             prefill_micros: Self::elapsed_micros(started),
@@ -1000,6 +1089,11 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         plan: &StepPlan,
         running: &mut [TurnState<ScheduledTurn<B::PrefixState>>],
     ) -> Result<(Vec<(usize, RowStepResult)>, usize, usize)> {
+        if running.iter().any(|turn| {
+            turn.payload.scheduled_speculation.is_some() || turn.payload.pending_token_emitted
+        }) {
+            return self.execute_speculative_rows(plan, running);
+        }
         let (work, mut results, batch_rows) = Self::prepare_decode_rows(plan, running)?;
         let executed_decode_batch = batch_rows.len();
         crate::array::maybe_clear_cache_for_paged_step(plan.global_step as i32);
@@ -1176,6 +1270,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     seq_id: row.seq_id,
                     num_computed_tokens: planned.num_tokens,
                     generated_token: (!finished).then_some(next).flatten(),
+                    speculative: None,
                     finished,
                     allocation_blocked: false,
                     prefill_micros: 0,
@@ -1366,14 +1461,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .speculative
             .is_some_and(|speculative| {
                 speculative.admits_streaming(streaming)
-                    && speculative.lane() != engine::plan::SpeculativeLane::Scheduled
+                    && speculative.lane(self.inner.supports_scheduled_speculation())
+                        != engine::plan::SpeculativeLane::Scheduled
             })
     }
 
     fn chat_requires_barrier(&self, command: &ChatCmd) -> bool {
-        if Self::chat_config(command).is_some_and(|config| config.enable_mtp == Some(true))
-            && self.speculation_requires_exclusive_lane(Self::chat_is_streaming(command))
-        {
+        if Self::chat_config(command).is_some_and(|config| {
+            config.enable_mtp == Some(true)
+                && (self.speculation_requires_exclusive_lane(Self::chat_is_streaming(command))
+                    || (self.inner.supports_scheduled_speculation()
+                        && self.inner.resolve_params(config).mtp_adaptive_depth))
+        }) {
             return true;
         }
         let (messages, is_continue) = match command {
@@ -1640,13 +1739,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         // the exclusive lane; admission re-consults the SAME lane decision
         // against the decoder the planner actually resolved, so a routing gap
         // can never execute speculation on the scheduled lane.
-        if admitted.plan.path() != engine::plan::TurnPath::Paged
+        if !(admitted.plan.path() == engine::plan::TurnPath::Paged
+            || (admitted.plan.path() == engine::plan::TurnPath::Speculative
+                && self.inner.supports_scheduled_speculation()))
             || !admitted.images.is_empty()
             || !admitted.audio.is_empty()
             || (matches!(
                 admitted.plan.decoder,
                 engine::plan::DecoderPlan::Speculative(_)
-            ) && self.speculation_requires_exclusive_lane(streaming))
+            ) && (self.speculation_requires_exclusive_lane(streaming)
+                || admitted.params.mtp_adaptive_depth))
         {
             if newly_assigned {
                 self.owner_sequences.remove(&owner_id);
@@ -1736,7 +1838,19 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 .saturating_add(u32::from(max_new_tokens != 0))
                 .min(full_blocks)
         };
+        let reservation_state_bytes = self.inner.recurrent_state_bytes().saturating_add(
+            if matches!(
+                admitted.plan.decoder,
+                engine::plan::DecoderPlan::Speculative(_)
+            ) {
+                self.inner.scheduled_draft_state_bytes(requested_tokens)
+            } else {
+                0
+            },
+        );
+        admitted.params.extra_eos_ids = self.inner.extra_eos_ids();
         Some(Box::new(PreparedTurn {
+            reservation_state_bytes,
             admitted,
             response,
             cancelled,
@@ -1753,6 +1867,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.owner_states.remove(&prepared.owner_id);
             self.owner_sequences.remove(&prepared.owner_id);
             self.inner.release_scheduled_recurrent_for(prepared.seq_id);
+            self.inner.release_scheduled_speculation(prepared.seq_id);
         }
     }
 
@@ -1803,6 +1918,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return false;
         };
         self.inner.release_scheduled_recurrent_for(victim);
+        self.inner.release_scheduled_speculation(victim);
         self.inner.can_activate_scheduled_recurrent(seq_id)
     }
 
@@ -1828,6 +1944,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return Ok(false);
         };
         self.inner.release_scheduled_recurrent_for(victim);
+        self.inner.release_scheduled_speculation(victim);
         release_cache(&mut self.inner, victim)?;
         if !self.idle_reclaim_made_progress(seq_id, victim) {
             return Ok(false);
@@ -2006,11 +2123,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 return Ok(None);
             }
         };
-        let candidate_state_bytes = if self.inner.has_scheduled_recurrent(prepared.seq_id) {
-            0
-        } else {
-            self.inner.recurrent_state_bytes()
-        };
+        let candidate_state_bytes = prepared.reservation_state_bytes.saturating_sub(
+            if self.inner.has_scheduled_recurrent(prepared.seq_id) {
+                self.inner.recurrent_state_bytes()
+            } else {
+                0
+            },
+        );
         if cache_snapshot.as_ref().is_some_and(|snapshot| {
             exceeds_max_pool_ceiling(snapshot, prepared.reservation_blocks, candidate_state_bytes)
         }) {
@@ -2070,12 +2189,14 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             newly_assigned,
             reservation_blocks,
             block_size,
+            reservation_state_bytes,
         } = *prepared;
         if cancelled.load(Ordering::Relaxed) {
             if newly_assigned {
                 self.owner_states.remove(&owner_id);
                 self.owner_sequences.remove(&owner_id);
                 self.inner.release_scheduled_recurrent_for(seq_id);
+                self.inner.release_scheduled_speculation(seq_id);
             }
             response.send_error(
                 Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
@@ -2088,6 +2209,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.owner_states.remove(&owner_id);
                 self.owner_sequences.remove(&owner_id);
                 self.inner.release_scheduled_recurrent_for(seq_id);
+                self.inner.release_scheduled_speculation(seq_id);
             }
             response.send_error(error, cancelled.as_ref());
             return Ok(None);
@@ -2118,6 +2240,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             Err(error) => {
                 self.inner.abort_paged_turn();
                 self.inner.release_scheduled_recurrent_for(seq_id);
+                self.inner.release_scheduled_speculation(seq_id);
                 self.inner.set_turn_cancel_flag(None);
                 self.owner_states.remove(&owner_id);
                 self.owner_sequences.remove(&owner_id);
@@ -2135,6 +2258,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if prefix.suffix_len() == 0 {
             self.inner.abort_paged_turn();
             self.inner.release_scheduled_recurrent_for(seq_id);
+            self.inner.release_scheduled_speculation(seq_id);
             self.inner.set_turn_cancel_flag(None);
             self.owner_states.remove(&owner_id);
             self.owner_sequences.remove(&owner_id);
@@ -2167,6 +2291,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
         let payload = ScheduledTurn {
             owner_id,
+            scheduled_speculation: matches!(
+                admitted.plan.decoder,
+                engine::plan::DecoderPlan::Speculative(_)
+            )
+            .then(|| {
+                use rand::SeedableRng;
+                rand::rngs::StdRng::from_rng(&mut rand::rng())
+            }),
+            pending_token_emitted: false,
             tokenizer: admitted.tokenizer,
             eos_id: admitted.eos_id,
             config: admitted.config,
@@ -2224,7 +2357,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         breaks.sort_unstable();
         breaks.dedup();
         let turn_cancelled = Arc::clone(&cancelled);
-        let turn = match TurnState::try_new_recover_payload(
+        let draft_allowance = if payload.scheduled_speculation.is_some() {
+            payload.params.mtp_depth as u32
+        } else {
+            0
+        };
+        let mut turn = match TurnState::try_new_recover_payload(
             seq_id,
             admitted.tokens,
             payload.prefix.effective_cached_prefix_len() as u32,
@@ -2237,6 +2375,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 let failed_owner_id = payload.owner_id.clone();
                 self.inner.abort_paged_turn();
                 self.inner.release_scheduled_recurrent_for(seq_id);
+                self.inner.release_scheduled_speculation(seq_id);
                 self.inner.set_turn_cancel_flag(None);
                 self.owner_states.remove(&failed_owner_id);
                 self.owner_sequences.remove(&failed_owner_id);
@@ -2247,7 +2386,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
         }
         .with_block_reservation(reservation_blocks, materialized_blocks, block_size)
-        .with_recurrent_state_reservation(self.inner.recurrent_state_bytes());
+        .with_recurrent_state_reservation(reservation_state_bytes);
+        turn.decode_draft_allowance = draft_allowance;
         if let Some(restore) = restore {
             self.pending_restores.insert(seq_id, restore);
             if let Err(error) = self.scheduler.try_enqueue_turn(turn) {
@@ -2302,19 +2442,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     fn poll_restores(&mut self) {
         let seq_ids = self.pending_restores.keys().copied().collect::<Vec<_>>();
         for seq_id in seq_ids {
-            let Some((prompt_tokens, owner_history, preemption_replay)) =
-                self.scheduler.waiting_turn_mut(seq_id).map(|turn| {
-                    (
-                        turn.payload.prompt_tokens.clone(),
-                        self.owner_states
-                            .get(&turn.payload.owner_id)
-                            .map(B::owner_tokens)
-                            .unwrap_or_default()
-                            .to_vec(),
-                        turn.payload.preemption_replay.is_some(),
-                    )
-                })
-            else {
+            let Some(turn) = self.scheduler.waiting_turn_mut(seq_id) else {
                 self.pending_restores.remove(&seq_id);
                 let _ = self.inner.release_scheduled_cache(seq_id);
                 continue;
@@ -2326,9 +2454,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 self.inner.poll_scheduled_restore(
                     seq_id,
                     restore,
-                    &prompt_tokens,
-                    &owner_history,
-                    preemption_replay,
+                    &turn.payload.prompt_tokens,
+                    self.owner_states
+                        .get(&turn.payload.owner_id)
+                        .map(B::owner_tokens)
+                        .unwrap_or_default(),
+                    turn.payload.preemption_replay.is_some(),
                 )
             };
             match outcome {
@@ -2423,6 +2554,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.inner
                 .preempt_scheduled_cache(turn.seq_id, turn.payload.params.cache_salt, mode);
         self.inner.release_scheduled_recurrent_for(turn.seq_id);
+        self.inner.release_scheduled_speculation(turn.seq_id);
         if let Err(error) = lifecycle {
             let _ = self.inner.release_scheduled_cache(turn.seq_id);
             self.fail_preempted(turn, error.reason.clone());
@@ -2530,12 +2662,14 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             Err(error) if is_paged_allocation_blocked(&error.reason) => {
                 let _ = self.inner.release_scheduled_cache(turn.seq_id);
                 self.inner.release_scheduled_recurrent_for(turn.seq_id);
+                self.inner.release_scheduled_speculation(turn.seq_id);
                 self.scheduler.prepend_preempted(turn);
                 return;
             }
             Err(error) => {
                 let _ = self.inner.release_scheduled_cache(turn.seq_id);
                 self.inner.release_scheduled_recurrent_for(turn.seq_id);
+                self.inner.release_scheduled_speculation(turn.seq_id);
                 self.fail_preempted(turn, error.reason.clone());
                 return;
             }
@@ -2595,6 +2729,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             let owner_id = turn.payload.owner_id.clone();
             self.inner.abort_paged_turn();
             self.inner.release_scheduled_recurrent_for(turn.seq_id);
+            self.inner.release_scheduled_speculation(turn.seq_id);
             self.inner.set_turn_cancel_flag(None);
             self.owner_states.remove(&owner_id);
             self.owner_sequences.remove(&owner_id);
@@ -2612,6 +2747,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
         if let Err(error) = self.inner.activate_paged_seq(turn.seq_id) {
             self.inner.release_scheduled_recurrent_for(turn.seq_id);
+            self.inner.release_scheduled_speculation(turn.seq_id);
             self.owner_states.remove(&turn.payload.owner_id);
             self.owner_sequences.remove(&turn.payload.owner_id);
             turn.payload.response.send_error(error, cancelled.as_ref());
@@ -2620,6 +2756,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if let Some(error) = turn.payload.failure.take() {
             self.inner.abort_paged_turn();
             self.inner.release_scheduled_recurrent_for(turn.seq_id);
+            self.inner.release_scheduled_speculation(turn.seq_id);
             self.inner.set_turn_cancel_flag(None);
             self.owner_states.remove(&turn.payload.owner_id);
             self.owner_sequences.remove(&turn.payload.owner_id);
@@ -2653,6 +2790,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 emitter: turn.payload.emitter.take(),
             },
         );
+        self.inner.release_scheduled_speculation(turn.seq_id);
         let parked = if outcome.is_ok() && turn.payload.reuse_cache {
             self.owner_states.insert(
                 turn.payload.owner_id.clone(),
@@ -2661,6 +2799,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.inner.park_active_scheduled_recurrent()
         } else {
             self.inner.release_scheduled_recurrent_for(turn.seq_id);
+            self.inner.release_scheduled_speculation(turn.seq_id);
             Ok(())
         };
         self.inner.set_turn_cancel_flag(None);

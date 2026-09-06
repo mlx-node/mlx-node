@@ -14,6 +14,17 @@ use napi::bindgen_prelude::*;
 use std::ptr;
 use std::time::Instant;
 
+fn prefer_direct_paged_prefill(query_tokens: i64) -> bool {
+    static OVERRIDE: std::sync::OnceLock<Option<bool>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("MLX_PAGED_PREFILL_PAGED_ATTENTION")
+                .ok()
+                .map(|value| crate::inference_trace::env_flag_value_enabled(&value))
+        })
+        .unwrap_or(query_tokens <= 16)
+}
+
 /// Transformer block combining self-attention and MLP with pre-normalization.
 ///
 /// Architecture (Qwen3/Llama style):
@@ -238,12 +249,10 @@ impl TransformerBlock {
     /// - **Single-sequence only.** `gather_kv_for_decode` and the adapter's
     ///   block_table are currently scoped to one request. Continuous
     ///   batching is the legacy `forward_paged_metal` path's responsibility.
-    /// - **Cache-hit prefill via host-side gather.** When `cached_prefix_len > 0`
-    ///   we `read_kv_range` the full context K/V back to MxArrays and run
-    ///   causal SDPA over them. That gather is host-side (slow but correct).
-    ///   The on-device zero-copy fast-path (TODO in the adapter) will replace
-    ///   the read with a Metal kernel that attends in-place against the paged
-    ///   buffers.
+    /// - **Cache-hit prefill stays on device.** Short query suffixes attend
+    ///   directly to the paged pool; larger chunks gather into graph-native
+    ///   SDPA operands. `MLX_PAGED_PREFILL_PAGED_ATTENTION` selects either route
+    ///   explicitly for shape-specific profiling.
     /// - **K/V write and decode gather default to graph-native.** The write
     ///   prefers `update_keys_values_native` and the decode read prefers
     ///   `gather_kv_for_decode_graph`, both falling back to their
@@ -381,6 +390,17 @@ impl TransformerBlock {
                     .reshape(&[1, num_tokens, n_kv_heads, head_dim])?
                     .transpose(Some(&[0, 2, 1, 3]))?;
                 scaled_dot_product_attention_causal(&q_4d, &k_4d, &v_4d, scale)?
+            } else if prefer_direct_paged_prefill(num_tokens) {
+                adapter
+                    .gather_kv_for_prefill_chunk_varlen(
+                        layer_idx,
+                        &qkv.queries.reshape(&[num_tokens, n_heads, head_dim])?,
+                        cached_prefix_len,
+                        scale as f32,
+                    )
+                    .map_err(napi::Error::from_reason)?
+                    .reshape(&[1, num_tokens, n_heads, head_dim])?
+                    .transpose(Some(&[0, 2, 1, 3]))?
             } else {
                 // Cache hit: gather total_ctx K/V within the MLX graph. The
                 // suffix was already written via `update_keys_values`

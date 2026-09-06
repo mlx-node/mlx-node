@@ -81,12 +81,14 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
         Ok((logits, false))
     }
 
-    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // Single SYNCHRONOUS eval of `next_token`: the paged forward
-        // is bandwidth-bound, so an async two-wait (bottom `async_eval` +
-        // loop-top `y.eval`) would buy ZERO overlap. One `y.eval()` per sample
-        // is the cheapest correct cadence.
+    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        // Isolated sync/stream comparisons did not resolve a benefit from
+        // async scheduling here. Retain one completion boundary per token.
         next_token.eval();
+        if budget_forced {
+            // A forced host token does not depend on the target/cache writes.
+            logits.eval();
+        }
     }
 
     fn maintain_cache(&mut self, step: i32) {

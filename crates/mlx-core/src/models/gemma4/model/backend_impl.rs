@@ -320,7 +320,8 @@ impl PagedBackend for Gemma4Inner {
         // context BEFORE the anchor sample, so an abort raised in that
         // window inherits a stash nothing downstream can consume.
         self.draft_turn_state = None;
-        self.clear_reuse_state();
+        self.scheduled_dspark_states.remove(&self.active_paged_seq);
+        self.clear_active_reuse_state();
     }
 
     fn save_paged_history(

@@ -191,9 +191,9 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
 
 ## Stage 4 — speculative
 
-- Publish a `SpeculativePlan` from `execution_plan`. `SpeculativePlan::lane()`
-  is const `Barrier` today: every speculative turn serializes on the
-  exclusive lane regardless of family.
+- Publish a `SpeculativePlan` from `execution_plan`. Its lane combines the
+  decoder kind with the backend's `supports_scheduled_speculation()` capability.
+  Native recurrent MTP and flat-only companions retain the exclusive lane.
 - Choose the seam, then the engine loop follows:
   - **Native MTP**: `MtpBackend` (`type MtpDecode` GAT + `begin_mtp_decode`)
     plus an `MtpStepper`, served by `engine::mtp_turn::run_mtp_turn`.
@@ -207,6 +207,17 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
   The two loops never merge — that is permanent divergence X4 in
   [docs/vllm-speculative-alignment.md](vllm-speculative-alignment.md). Do not
   build a wrapper that threads a mode flag across both.
+
+- **Scheduled external draft:** implement the model hooks on
+  `HybridSchedulerBackend` for draft lifetime, reservation, proposal and target
+  verification. Implement `ScheduledDraftVerify` for target math and committed
+  taps; its default methods record one ticket per owner, split target taps,
+  commit each accepted prefix, and settle after all tickets close. Reuse these
+  defaults instead of copying the verification transaction. The shared executor
+  applies acceptance, stop/cancellation clamping and token-span emission.
+  Gemma4 fixed-depth DSpark is the enabled reference. Muse DFlash exercises the
+  same seam but remains opt-in (`MLX_SCHEDULED_DFLASH=1`) pending a consistent
+  performance win. Adaptive requests still use the whole-turn lane.
 
 - **Ripple warnings, measured** (Qwen3.8 DFlash2, PR #130): adding one field
   to the shared `DsparkProposal` struct touched every existing stepper

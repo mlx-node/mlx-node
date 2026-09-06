@@ -1049,7 +1049,7 @@ pub(crate) fn run_paged_step_with_hidden(
 /// (`Some` for GDN layers, `None` for full-attn).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_verify_step(
-    verify_ids: &MxArray,
+    verify_ids: &[u32],
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
@@ -1063,28 +1063,18 @@ pub(crate) fn run_paged_verify_step(
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
 
-    // Materialise the verify ids on host so the slot mapping records the exact
-    // K+1 tokens, then feed the same array back through the embedding graph.
-    let id_window = verify_ids.to_int32().map_err(|e| {
-        Error::from_reason(format!(
-            "MoE run_paged_verify_step: verify_ids to_int32: {}",
-            e.reason
-        ))
-    })?;
-    let verify_len = id_window.len();
+    // Authoritative host IDs come directly from the engine; upload once
+    // for embedding after recording the exact same span in the page table.
+    let verify_len = verify_ids.len();
     if verify_len == 0 {
-        return Err(Error::from_reason(
-            "MoE run_paged_verify_step: verify_ids must have at least one token",
-        ));
+        return Err(Error::from_reason("MTP verifier requires token IDs"));
     }
-    let verify_u32: Vec<u32> = id_window.iter().map(|&v| v as u32).collect();
-
     let chunk_first_position = paged_adapter.current_token_count();
     paged_adapter
-        .record_tokens(&verify_u32)
+        .record_tokens(verify_ids)
         .map_err(Error::from_reason)?;
 
-    let input_ids = MxArray::from_uint32(&verify_u32, &[1, verify_len as i64])?;
+    let input_ids = MxArray::from_uint32(verify_ids, &[1, verify_len as i64])?;
     let mut hidden_states = embed.forward(&input_ids)?;
 
     // The K+1 verify ids rotate at the physical context start plus the

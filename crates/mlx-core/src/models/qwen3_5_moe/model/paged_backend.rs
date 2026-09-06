@@ -86,11 +86,12 @@ impl DecodeStep for Qwen35MoePagedDecode<'_> {
         Ok((logits, false))
     }
 
-    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // Single SYNCHRONOUS eval of `next_token`: one `y.eval()` per sample
-        // is the cheapest correct cadence for the bandwidth-bound paged
-        // forward.
+    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        // Retain the measured single-completion cadence of the dense sibling.
         next_token.eval();
+        if budget_forced {
+            logits.eval();
+        }
     }
 
     fn maintain_cache(&mut self, step: i32) {

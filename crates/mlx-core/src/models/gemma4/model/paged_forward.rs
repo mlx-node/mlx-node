@@ -272,6 +272,7 @@ impl Gemma4Inner {
             return Err(Error::from_reason("prefill cancelled"));
         }
         let layer_kinds = self.compute_layer_kinds()?;
+        let tap_layers = self.scheduled_dspark_tap(seq_id);
         let body_len = if final_prompt_slice {
             tokens.len().saturating_sub(1)
         } else {
@@ -284,14 +285,23 @@ impl Gemma4Inner {
                 .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
                 .record_tokens_all(seq_id, body)
                 .map_err(Error::from_reason)?;
+            let mut tap = tap_layers.as_deref().map(DsparkTap::new);
             let hidden = self.run_paged_prefill_layer_loop(
                 body,
                 first_logical_position,
                 first_logical_position,
                 &layer_kinds,
-                None,
+                tap.as_mut(),
             )?;
             hidden.eval();
+            if let Some(tap) = tap {
+                self.append_scheduled_dspark_prefill(
+                    seq_id,
+                    first_logical_position,
+                    tap,
+                    body.len(),
+                )?;
+            }
             let coordinator = self
                 .kv_cache_coordinator
                 .as_mut()
@@ -320,13 +330,17 @@ impl Gemma4Inner {
             .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
             .record_tokens_all(seq_id, final_token)
             .map_err(Error::from_reason)?;
+        let mut tap = tap_layers.as_deref().map(DsparkTap::new);
         let hidden = self.run_paged_prefill_layer_loop(
             final_token,
             final_position,
             final_position,
             &layer_kinds,
-            None,
+            tap.as_mut(),
         )?;
+        if let Some(tap) = tap {
+            self.append_scheduled_dspark_prefill(seq_id, final_position, tap, final_token.len())?;
+        }
         self.kv_cache_coordinator
             .as_mut()
             .ok_or_else(|| Error::from_reason("Gemma4 hybrid KV coordinator missing"))?
@@ -1121,6 +1135,89 @@ impl Gemma4Inner {
             logits
         };
         Ok(logits)
+    }
+
+    /// One target traversal over packed verifier rows. Reservation and ticket
+    /// ownership stay with the caller, which commits only after acceptance.
+    pub(crate) fn run_paged_ragged_verify(
+        &mut self,
+        rows: &[(
+            crate::transformer::paged_kv_cache_adapter::PagedRaggedRow,
+            Vec<u32>,
+        )],
+        tap_layer_ids: &[usize],
+    ) -> Result<(MxArray, Vec<MxArray>)> {
+        let mut token_ids = Vec::new();
+        let mut positions = Vec::new();
+        let mut metadata = Vec::with_capacity(rows.len());
+        for (row, tokens) in rows {
+            if tokens.is_empty() || tokens.len() != row.query_len as usize {
+                return Err(Error::from_reason(
+                    "Gemma4 ragged verifier row has invalid width",
+                ));
+            }
+            metadata.push(*row);
+            token_ids.extend_from_slice(tokens);
+            for offset in 0..row.query_len {
+                positions.push(
+                    row.first_logical_position
+                        .checked_add(offset)
+                        .and_then(|p| i32::try_from(p).ok())
+                        .ok_or_else(|| {
+                            Error::from_reason("Gemma4 ragged position exceeds i32::MAX")
+                        })?,
+                );
+            }
+        }
+        if token_ids.is_empty() {
+            return Err(Error::from_reason("Gemma4 ragged verifier has no rows"));
+        }
+        let query_count = token_ids.len() as i64;
+        let input_ids = MxArray::from_uint32(&token_ids, &[query_count, 1])?;
+        let offsets = MxArray::from_int32(&positions, &[query_count])?;
+        let mut hidden = self
+            .embed_tokens
+            .forward(&input_ids)?
+            .mul_scalar((self.config.hidden_size as f64).sqrt())?;
+        let ple = self
+            .ple
+            .as_ref()
+            .map(|ple| compute_ple(&input_ids, &hidden, ple, 1))
+            .transpose()?;
+        let layer_kinds = self.compute_layer_kinds()?;
+        let mut captured = Vec::with_capacity(tap_layer_ids.len());
+        for (index, &kind) in layer_kinds.iter().enumerate() {
+            let per_layer = ple
+                .as_ref()
+                .map(|ple| {
+                    ple.slice_axis(2, index as i64, index as i64 + 1)
+                        .and_then(|p| p.squeeze(Some(&[2])))
+                })
+                .transpose()?;
+            let adapter = self
+                .kv_cache_coordinator
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Gemma4 ragged verifier lost coordinator"))?
+                .adapter_mut(kind.group_id())
+                .map_err(Error::from_reason)?;
+            hidden = self.layers[index].forward_paged_ragged(
+                &hidden,
+                kind,
+                adapter,
+                &metadata,
+                &offsets,
+                per_layer.as_ref(),
+            )?;
+            if tap_layer_ids.binary_search(&index).is_ok() {
+                captured.push(hidden.clone());
+            }
+        }
+        if captured.len() != tap_layer_ids.len() {
+            return Err(Error::from_reason(
+                "Gemma4 ragged verifier did not capture every draft layer",
+            ));
+        }
+        Ok((self.project_paged_hidden(&hidden, false)?, captured))
     }
 
     /// Run one uniform decode wave for multiple scheduler-owned sequences.

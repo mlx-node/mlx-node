@@ -206,24 +206,17 @@ impl SpeculativePlan {
 
     /// The one Barrier-vs-Scheduled decision every admission gate consults.
     ///
-    /// Always [`SpeculativeLane::Barrier`] today, and it must stay that way
-    /// until four things exist, none of which does:
-    ///   * a scheduler step contract wider than one token per decode row
-    ///     (`engine::scheduler` hard-codes `StepKind::Decode => 1` and one
-    ///     `generated_token` per row);
-    ///   * a batched ragged verify — every [`crate::engine::backend::MtpStepper`]
-    ///     signature bakes in batch 1;
-    ///   * per-owner speculative state, so two speculative rows cannot
-    ///     clobber one model-level drafter cache / tape / snapshot;
-    ///   * re-entrant speculative drivers — `run_mtp_turn` / `run_dspark_turn`
-    ///     own the whole turn plus `&mut model`.
-    ///
-    /// The gemma4/muse `execute_barrier` flat-lane owner installs are
-    /// cache-layout decisions (which cache representation a live owner
-    /// occupies), not lane decisions, and remain family-owned regardless of
-    /// this value.
-    pub const fn lane(self) -> SpeculativeLane {
-        SpeculativeLane::Barrier
+    /// A backend declares scheduled support only when it provides owned
+    /// per-request draft state, ragged target verification and transactional
+    /// span commits. Gemma DSpark implements this contract. Native MTP and
+    /// draft families that still borrow the whole model remain barriers.
+    /// Cache layout and streaming support are separate admission constraints.
+    pub const fn lane(self, supports_scheduled: bool) -> SpeculativeLane {
+        if supports_scheduled && self.supports_paged_attention {
+            SpeculativeLane::Scheduled
+        } else {
+            SpeculativeLane::Barrier
+        }
     }
 
     /// Rows one speculative verify cycle appends to attention state: the
@@ -471,7 +464,7 @@ mod tests {
                                 supports_streaming,
                             };
                             assert_eq!(
-                                plan.lane(),
+                                plan.lane(false),
                                 SpeculativeLane::Barrier,
                                 "no speculative configuration may reach the scheduled lane \
                                  before its admission accounting exists: {plan:?}"

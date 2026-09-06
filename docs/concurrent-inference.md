@@ -11,7 +11,7 @@ fixes) and `docs/superpowers/plans/2026-08-08-stage1-continuous-batching.md`
 (batched decode → ragged step → hybrids, with the design provenance).
 
 Two facts to carry into any batching work: only T=0 output is
-schedule-invariant — T>0 sampling draws from the thread-local PRNG in row
+schedule-invariant — ordinary AR T>0 sampling draws from the thread-local PRNG in row
 order, so batch composition changes reproducibility (same as vLLM); and the
 paged decode clear-cache interval is 1024 steps
 (`PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT` in `array/memory.rs`).
@@ -24,10 +24,12 @@ paged decode clear-cache interval is 1024 steps
   `ChatSession` still allows only one turn in flight.
 - Flat-cache, training, save, and reset commands stay in exclusive/barrier
   lanes. Gemma4 ordinary text rows use grouped full/sliding paged KV and fused
-  decode; media and MTP/DSpark owners use the ordered exclusive lane because
-  their residual/draft shapes remain request-specific, while reset and stats
-  commands are barriers. Loading a Gemma4 draft no longer disables ordinary
-  batched owners on that resident target.
+  decode. Fixed-depth text DSpark also shares target verification waves, with
+  request-owned draft contexts and RNG. Media, assistant drafts and adaptive
+  speculation retain ordered lanes; reset and stats commands are barriers.
+  Muse DFlash packing is experimental (`MLX_SCHEDULED_DFLASH=1`); its default
+  remains the existing flat speculative lane. Loading a draft leaves ordinary
+  batched owners available on the resident target.
 - Different loaded models continue to run in parallel, one native model thread
   per model.
 
@@ -146,7 +148,7 @@ NemotronH prefill      ~ executed slices are re-split on the config chunk grid;
 BlockAllocator         ✓ refcounts + prefix hash (vLLM-style pool)
 FFI / Metal kernels    ✓ num_seqs = q.shape(0), grid.y = sequence
 ragged mixed step      ✓ Qwen3 env-gated SEAM B executor swap; scheduler unchanged
-Gemma4 owner routing         ✓ paged text AR; media + flat MTP/DSpark exclusive per owner
+Gemma4 owner routing         ✓ paged text AR + fixed DSpark; media/assistant/adaptive exclusive
 ```
 
 - Kernels/FFI: `crates/mlx-paged-attn/metal/attention/paged_attention.metal:762-806`,
@@ -412,7 +414,8 @@ above as a cooled median-of-three 4-bit result.
   sliding blocks become null sentinels, KV-shared layers alias physical anchors,
   and ordinary rows execute one fused `[N,1]` forward. Dynamic recompute
   preemption shares the full-group pool instead of statically partitioning one
-  maximum context per request. Media and MTP/DSpark commands remain ordered
-  exclusive work, but coexist on the same loaded target through request-local
-  owner lanes rather than globally disabling batching. Reset and stats remain
-  true barriers.
+  maximum context per request. Fixed-depth text DSpark adds packed ragged target
+  verification and independent accepted-prefix commits. Media, assistant and
+  adaptive commands coexist through ordered owner lanes. Reset and stats remain
+  barriers. See the [measured follow-up](research/inference-2026-09-05/followup.md)
+  for throughput, numerical limits and remaining recurrent MTP work.

@@ -42,6 +42,54 @@ Success requires a reviewable implementation plus cited research and a concrete
 next-stage plan. A microbenchmark is evidence about the measured operation only;
 no model throughput claim follows without a real-model comparison.
 
+## Follow-up: verify and optimize every remaining opportunity
+
+Requested 2026-09-06 against PR #138 at `bbc3157c`. All existing PR checks passed
+before this follow-up. Preserve that revision as the performance baseline. The
+user authorizes substantial refactoring and changes to implementation-level RNG
+mapping; sampling distributions, cache ownership and emitted-token correctness
+remain requirements. Sources are current code, the supplied reference checkouts,
+official MLX/Metal/vLLM material, and isolated local measurements.
+
+6. **Complete — verify remaining costs and implementation seams.** GPU dense
+   draft sampling, grouped sampled acceptance, direct paged prefill, scheduled
+   speculation, adaptive DSpark verification, bounded SSD transfers, and ordinary
+   decode CPU/GPU timeline. Record any refuted premise or unsupported API path.
+7. **Implemented and measured — sampling and paged-prefill improvements.** Validate
+   numerical/sampling behavior, rejection frontiers and cache-hit parity, then
+   compare operations and complete model turns against the preserved baseline.
+   GPU draft chains and grouped acceptance are implemented. Short Qwen3 suffixes
+   use direct paged attention at up to 16 query tokens; larger chunks retain
+   gather plus SDPA, based on the context/width crossover benchmark.
+8. **Partially implemented — speculative scheduling and adaptive budgets.** Establish
+   resumable state, per-owner isolation and variable accepted spans before
+   admitting speculation to the shared scheduler. Verify cancellation, rejection,
+   owner recycling, allocation failures and real concurrent inference.
+   Gemma fixed-depth DSpark and Muse fixed-depth DFlash share the scheduler and
+   a trait with default verification transactions. Gemma real-model owner
+   content/order isolation passed; concurrency throughput improved with observed
+   batch-shape numerical differences. Muse model/scheduler tests pass and its
+   real-model throughput did not show a consistent win, so scheduled DFlash is
+   opt-in. Sampled multi-owner tests exposed and fixed residual/bonus global RNG
+   coupling; prefill and cycle draws now use each scheduled owner's RNG. MTP draft token chains stay on
+   device, and verifier IDs now remain authoritative host slices until their
+   single embedding upload. Recurrent MTP scheduling still needs a resumable
+   phase split and owner-specific tape replay; Qwen DFlash2 remains flat-only.
+   Greedy whole-turn DSpark confidence/cost budgeting is implemented; adaptive
+   scheduled speculation remains gated until its batch cost policy is validated.
+9. **Implemented and measured — SSD transfers and ordinary decode.** Preserve
+   bounded staging, completion-gated publication and resident-to-SSD storage;
+   select backend changes from measured timelines and cold-cache workloads.
+   Restore reads are bounded and overlap batched uploads; completion proofs gate
+   publication. Upload-stage benchmarks improve at multi-block sizes. A valid
+   Metal trace of the actual inference worker captured 21,732 compute intervals.
+   Ordinary decode async scheduling showed no reliable gain, so Qwen retains
+   synchronous paged completion. A guard drains pending forced-token work before
+   error cleanup, and memory sizing counts each staging allowance once.
+10. **In progress — PR handoff after local verification.** Review every opportunity
+    against evidence, run relevant native/TS/real-model gates, record paired
+    performance and limitations, then update the authorized PR and check CI.
+
 Discovery decisions:
 
 - All references were refreshed without switching their checkouts. vLLM now has

@@ -409,6 +409,12 @@ impl Gemma4Inner {
     /// Clear cached token history and media identity/context. Called from both
     /// `init_caches_sync` and `reset_caches_sync`.
     pub(super) fn clear_reuse_state(&mut self) {
+        self.clear_active_reuse_state();
+        self.scheduled_dspark_states.clear();
+        self.grouped_sliding_cold_checkpoints.clear();
+    }
+
+    pub(super) fn clear_active_reuse_state(&mut self) {
         self.cached_token_history.clear();
         self.cached_image_key = None;
         self.cached_audio_key = None;
@@ -416,7 +422,8 @@ impl Gemma4Inner {
         self.media_session_context = MediaCapabilities::NONE;
         self.paged_text_turn_context = MediaCapabilities::NONE;
         self.sliding_prefix_checkpoints.clear();
-        self.grouped_sliding_cold_checkpoints.clear();
+        self.grouped_sliding_cold_checkpoints
+            .remove(&self.active_paged_seq);
         // Covers both reset paths (init_caches_sync + reset_caches_sync): a
         // session that just dropped its media KV can no longer warm-continue.
         self.media_session_continuable = false;

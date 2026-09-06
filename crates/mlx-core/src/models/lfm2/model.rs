@@ -1558,7 +1558,7 @@ impl HybridSchedulerBackend for Lfm2Inner {
             PagedTurnAdmission::Waiting {
                 provisional,
                 restore,
-            } => (provisional, Some(restore)),
+            } => (provisional, Some(*restore)),
         };
         let installed = if restore.is_none() {
             self.install_lfm2_conv_cold_sidecar(seq_id, plan.cached_prefix_len)?

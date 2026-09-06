@@ -294,7 +294,8 @@ impl<'a> DsparkTap<'a> {
 /// is `[vocab, rank]` (the `Linear(rank -> vocab)` weight). Returns the `[vocab]`
 /// bias row added to the (already softcapped) base logits — there is NO second
 /// softcap after this addition (DeepSpec `VanillaMarkov.apply_step_logits`).
-pub(crate) fn markov_correction_logits(
+#[cfg(test)]
+fn markov_correction_logits(
     markov_w1: &MxArray,
     markov_w2: &MxArray,
     prev_token: i32,
@@ -842,12 +843,6 @@ impl DsparkDraftModel {
         }
     }
 
-    /// Markov correction row for a previous token (see
-    /// [`markov_correction_logits`]).
-    pub(crate) fn markov_correction(&self, prev_token: i32) -> Result<MxArray> {
-        markov_correction_logits(&self.markov_w1, &self.markov_w2, prev_token)
-    }
-
     /// Sample `len` draft tokens sequentially from softcapped block logits.
     ///
     /// Position k's logits are `base_logits[:, k] + markov_correction(prev)`
@@ -860,6 +855,7 @@ impl DsparkDraftModel {
     /// distribution `sampling::sampling_distribution` builds for `cfg`, and
     /// the per-position f32 `[vocab]` distribution rows are returned for
     /// later rejection sampling.
+    #[cfg(test)]
     pub(crate) fn sample_block_sequential<R: Rng + ?Sized>(
         &self,
         base_logits: &MxArray,
@@ -868,6 +864,19 @@ impl DsparkDraftModel {
         cfg: &SamplingConfig,
         rng: &mut R,
     ) -> Result<(Vec<i32>, Vec<MxArray>)> {
+        let proposal = self.sample_block_proposal(base_logits, None, anchor, len, cfg, rng)?;
+        Ok((proposal.draft_ids, proposal.draft_dists))
+    }
+
+    pub(crate) fn sample_block_proposal<R: Rng + ?Sized>(
+        &self,
+        base_logits: &MxArray,
+        confidence_hidden: Option<&MxArray>,
+        anchor: i32,
+        len: usize,
+        cfg: &SamplingConfig,
+        rng: &mut R,
+    ) -> Result<crate::engine::backend::DsparkProposal> {
         let vocab = self.config.vocab_size;
         if base_logits.ndim()? != 3 || base_logits.shape_at(0)? != 1 {
             return Err(Error::from_reason(
@@ -890,29 +899,54 @@ impl DsparkDraftModel {
 
         let mut tokens = Vec::with_capacity(len);
         let mut dists = Vec::new();
-        let mut prev = anchor;
+        let mut prev_embeddings = Vec::new();
+        let mut prev = MxArray::from_int32(&[anchor], &[1])?;
         for k in 0..len {
             let base_k = base_logits
                 .slice_axis(1, k as i64, k as i64 + 1)?
                 .reshape(&[vocab])?;
-            let correction = self.markov_correction(prev)?;
+            let prev_row = self
+                .markov_w1
+                .take(&prev, 0)?
+                .reshape(&[self.markov_w1.shape_at(1)?, 1])?;
+            if confidence_hidden.is_some() {
+                prev_embeddings.push(prev_row.reshape(&[1, self.markov_w1.shape_at(1)?])?);
+            }
+            let correction = self.markov_w2.matmul(&prev_row)?.reshape(&[vocab])?;
             let step_logits = base_k.add(&correction)?;
             let token = if greedy {
-                let idx = step_logits.argmax(0, Some(false))?.astype(DType::Int32)?;
-                idx.eval();
-                idx.item_at_int32(0)?
+                step_logits.argmax(0, Some(false))?.astype(DType::Int32)?
             } else {
                 let dist = sampling::sampling_distribution(&step_logits, Some(*cfg))?
                     .astype(DType::Float32)?;
-                dist.eval();
-                let token = sampling::sample_dense_distribution(&dist, rng)?;
+                let token = sampling::sample_dense_distribution_array(&dist, rng)?;
                 dists.push(dist);
                 token
             };
+            // Keep the Markov chain on device. Clamp only the next embedding
+            // index; materialization rejects any invalid (-1) proposal token.
+            prev = token.clip(Some(0.0), None)?.reshape(&[1])?;
             tokens.push(token);
-            prev = token;
         }
-        Ok((tokens, dists))
+        let confidence = confidence_hidden
+            .map(|hidden| {
+                let refs = prev_embeddings.iter().collect::<Vec<_>>();
+                let embeddings = MxArray::concatenate_many(refs, Some(0))?
+                    .reshape(&[1, len as i64, self.markov_w1.shape_at(1)?])?
+                    .astype(hidden.dtype()?)?;
+                self.confidence_probs_with_embeddings(hidden, &embeddings)
+            })
+            .transpose()?;
+        let roots = tokens.iter().chain(confidence.iter()).collect::<Vec<_>>();
+        MxArray::eval_arrays_with_context(&roots, "dspark_proposal_and_confidence")?;
+        Ok(crate::engine::backend::DsparkProposal {
+            draft_ids: sampling::materialize_draft_tokens(&tokens)?,
+            draft_dists: dists,
+            draft_sparse_dists: Vec::new(),
+            keep_probabilities: confidence
+                .map(|probs| probs.to_float32().map(|p| p.to_vec()))
+                .transpose()?,
+        })
     }
 
     /// Per-position keep probabilities from the confidence head:
@@ -922,14 +956,12 @@ impl DsparkDraftModel {
     /// `forward_block` (the reference feeds `_forward_backbone`'s output,
     /// which is already `norm(...)`-ed). `prev_tokens` is
     /// `[anchor, tok_0, .., tok_{T-2}]`.
+    #[cfg(test)]
     pub(crate) fn confidence_keep_probs(
         &self,
         block_hidden: &MxArray,
         prev_tokens: &[i32],
     ) -> Result<Vec<f32>> {
-        let proj = self.confidence_proj.as_ref().ok_or_else(|| {
-            Error::from_reason("DSpark confidence head is disabled for this checkpoint")
-        })?;
         let seq_len = block_hidden.shape_at(1)?;
         if block_hidden.ndim()? != 3 || block_hidden.shape_at(0)? != 1 {
             return Err(Error::from_reason(
@@ -956,15 +988,27 @@ impl DsparkDraftModel {
             .markov_w1
             .take(&idx, 0)?
             .astype(block_hidden.dtype()?)?;
-        let features = MxArray::concatenate(block_hidden, &prev_emb, 2)?;
+        Ok(self
+            .confidence_probs_with_embeddings(block_hidden, &prev_emb)?
+            .to_float32()?
+            .to_vec())
+    }
+
+    fn confidence_probs_with_embeddings(
+        &self,
+        block_hidden: &MxArray,
+        prev_emb: &MxArray,
+    ) -> Result<MxArray> {
+        let proj = self.confidence_proj.as_ref().ok_or_else(|| {
+            Error::from_reason("DSpark confidence head is disabled for this checkpoint")
+        })?;
+        let features = MxArray::concatenate(block_hidden, prev_emb, 2)?;
         let logits = proj.forward(&features)?;
         let probs = {
             let handle = unsafe { sys::mlx_array_sigmoid(logits.handle.0) };
             MxArray::from_handle(handle, "dspark_confidence_sigmoid")?
         };
-        let probs = probs.astype(DType::Float32)?;
-        probs.eval();
-        Ok(probs.to_float32()?.to_vec())
+        probs.astype(DType::Float32)
     }
 
     /// Apply checkpoint tensors, consuming entries from `tensors`.
