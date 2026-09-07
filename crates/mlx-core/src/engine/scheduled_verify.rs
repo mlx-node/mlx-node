@@ -32,6 +32,16 @@ pub(crate) trait ScheduledDraftVerify: Sized {
     ) -> Result<(MxArray, Vec<MxArray>)>;
     fn append_committed_taps(&mut self, seq_id: u32, taps: &[MxArray], keep: usize) -> Result<()>;
     fn discard_draft_owner(&mut self, seq_id: u32);
+    /// Recurrent targets verify into scratch state. Install only this owner's
+    /// accepted prefix after every attention ticket in the wave has closed.
+    /// Ordinary AR peers and zero-keep rollbacks use the same hook.
+    fn commit_target_state(&mut self, _seq_id: u32, _keep: usize) -> Result<()> {
+        Ok(())
+    }
+    fn abort_target_state(&mut self, _seq_id: u32) {}
+    fn complete_target_states(&mut self, _seq_ids: &[u32]) -> Result<()> {
+        Ok(())
+    }
 
     fn retract_verify_batch(&mut self, batch: ScheduledVerifyBatch) -> Result<()> {
         let mut failure = None;
@@ -42,6 +52,7 @@ pub(crate) trait ScheduledDraftVerify: Sized {
             {
                 failure.get_or_insert_with(|| Error::from_reason(error));
             }
+            self.abort_target_state(entry.seq_id);
         }
         failure.map_or(Ok(()), Err)
     }
@@ -162,9 +173,32 @@ pub(crate) trait ScheduledDraftVerify: Sized {
             contexts.push(entry.tapped);
             results.push(result);
         }
+        for (row, result) in rows.iter().zip(&mut results) {
+            if result.is_err() {
+                self.abort_target_state(row.seq_id);
+                self.discard_draft_owner(row.seq_id);
+                continue;
+            }
+            *result = self.commit_target_state(row.seq_id, row.keep);
+            if result.is_err() {
+                self.abort_target_state(row.seq_id);
+                self.discard_draft_owner(row.seq_id);
+            }
+        }
+        let ready = rows
+            .iter()
+            .zip(&results)
+            .filter_map(|(row, result)| result.is_ok().then_some(row.seq_id))
+            .collect::<Vec<_>>();
+        if let Err(error) = self.complete_target_states(&ready) {
+            for result in &mut results {
+                if result.is_ok() {
+                    *result = Err(Error::from_reason(error.reason.clone()));
+                }
+            }
+        }
         for ((row, tapped), result) in rows.iter().zip(contexts).zip(&mut results) {
             if result.is_err() {
-                self.discard_draft_owner(row.seq_id);
                 continue;
             }
             if row.keep == 0 {
@@ -297,6 +331,23 @@ mod tests {
             );
             Ok(())
         }
+        fn commit_target_state(&mut self, seq: u32, keep: usize) -> Result<()> {
+            self.events.push(format!("target:{seq}:{keep}"));
+            if seq == 1 && self.fault == "target" {
+                return Err(Error::from_reason("injected target commit failure"));
+            }
+            Ok(())
+        }
+        fn abort_target_state(&mut self, seq: u32) {
+            self.events.push(format!("abort:{seq}"));
+        }
+        fn complete_target_states(&mut self, seq_ids: &[u32]) -> Result<()> {
+            self.events.push(format!("complete:{seq_ids:?}"));
+            if self.fault == "complete" {
+                return Err(Error::from_reason("injected target completion failure"));
+            }
+            Ok(())
+        }
         fn discard_draft_owner(&mut self, seq: u32) {
             self.events.push(format!("discard:{seq}"));
         }
@@ -353,6 +404,9 @@ mod tests {
             [
                 "rollback:1",
                 "rollback:2",
+                "target:1:2",
+                "target:2:1",
+                "complete:[1, 2]",
                 "append:1",
                 "settle:1",
                 "append:2",
@@ -379,7 +433,7 @@ mod tests {
 
     #[test]
     fn failed_owner_does_not_block_healthy_peer_commit_or_settlement() {
-        for fault in ["rollback", "append", "settle"] {
+        for fault in ["rollback", "target", "append", "settle"] {
             let (mut model, rows) = fixture(fault);
             model.verify_scheduled_rows(&rows).unwrap().eval();
             let results = model
@@ -414,5 +468,25 @@ mod tests {
         assert!(model.events.contains(&"discard:1".into()));
         assert!(!model.events.contains(&"append:1".into()));
         assert!(!model.events.contains(&"settle:1".into()));
+    }
+    #[test]
+    fn failed_target_completion_prevents_all_publication() {
+        let (mut model, rows) = fixture("complete");
+        model.verify_scheduled_rows(&rows).unwrap().eval();
+        let results = model
+            .commit_scheduled_rows(&[
+                ScheduledVerifyCommit { seq_id: 1, keep: 2 },
+                ScheduledVerifyCommit { seq_id: 2, keep: 1 },
+            ])
+            .unwrap();
+        assert!(results.iter().all(Result::is_err));
+        assert!(
+            !model
+                .events
+                .iter()
+                .any(|event| event.starts_with("settle:") || event.starts_with("append:"))
+        );
+        assert!(model.events.contains(&"discard:1".into()));
+        assert!(model.events.contains(&"discard:2".into()));
     }
 }

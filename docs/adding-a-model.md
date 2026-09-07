@@ -193,7 +193,10 @@ child whose resolver throws on `@mlx-node/core` or any `.node` specifier.
 
 - Publish a `SpeculativePlan` from `execution_plan`. Its lane combines the
   decoder kind with the backend's `supports_scheduled_speculation()` capability.
-  Native recurrent MTP and flat-only companions retain the exclusive lane.
+  Scheduled native Qwen MTP implements `ScheduledMtpTarget`: the family provides
+  projection and decoder math; default methods own proposal/history state,
+  per-owner GDN tape replay and transactional paged commits. Flat-only companions
+  retain the exclusive lane.
 - Choose the seam, then the engine loop follows:
   - **Native MTP**: `MtpBackend` (`type MtpDecode` GAT + `begin_mtp_decode`)
     plus an `MtpStepper`, served by `engine::mtp_turn::run_mtp_turn`.

@@ -7,6 +7,8 @@ use engine::scheduler::SpeculativeRowResult;
 struct VerifyWork {
     plan_index: usize,
     turn_index: usize,
+    anchor: u32,
+    cap: usize,
     proposal: DsparkProposal,
     forced: Option<u32>,
 }
@@ -183,60 +185,158 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     continue;
                 }
             }
-            let proposal = if cap > 0 {
-                let rng = turn.payload.scheduled_speculation.as_mut().unwrap();
+            work.push(VerifyWork {
+                plan_index,
+                turn_index,
+                anchor,
+                cap,
+                proposal: empty_proposal(),
+                forced,
+            });
+        }
+        if work.is_empty() {
+            return Ok((results, 0, 0));
+        }
+        // A mixed fixed/adaptive speculative wave keeps the fixed policy.
+        // A speculative owner can temporarily have cap zero under pressure or
+        // forcing; that does not turn it into an ordinary AR peer.
+        let eligible = work.iter().any(|item| item.cap > 0)
+            && work.iter().all(|item| {
+                let params = &running[item.turn_index].payload.params;
+                running[item.turn_index]
+                    .payload
+                    .scheduled_speculation
+                    .is_none()
+                    || (params.mtp_adaptive_depth
+                        && crate::sampling::is_greedy_temperature(
+                            params
+                                .sampling_config
+                                .and_then(|c| c.temperature)
+                                .unwrap_or(1.0),
+                        ))
+            });
+        let profile_rows = work
+            .iter()
+            .map(|item| {
+                let row = &plan.rows[item.plan_index];
+                engine::verification_budget::ScheduledBudgetRow {
+                    seq_id: row.seq_id,
+                    context_band: row.token_start / 2048,
+                    cap: item.cap,
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut profiling = false;
+        let probe = self
+            .inner
+            .scheduled_verification_budget()
+            .and_then(|policy| {
+                if eligible {
+                    policy.configure(&profile_rows);
+                    profiling = true;
+                    policy.next_probe()
+                } else {
+                    policy.clear();
+                    None
+                }
+            });
+        let seq_ids = profile_rows
+            .iter()
+            .map(|row| row.seq_id)
+            .collect::<Vec<_>>();
+        if profiling {
+            self.inner.complete_scheduled_draft_state(&seq_ids)?;
+        }
+        let wave_started = Instant::now();
+        let zero_probe = probe
+            .as_ref()
+            .is_some_and(|shape| shape.iter().all(|&n| n == 0));
+        let mut proposed = Vec::with_capacity(work.len());
+        for mut item in work {
+            let turn = &mut running[item.turn_index];
+            let row = &plan.rows[item.plan_index];
+            let proposal = if item.cap > 0 && !zero_probe {
                 self.inner.propose_scheduled(
                     row.seq_id,
-                    anchor,
-                    cap,
+                    item.anchor,
+                    item.cap,
                     &turn.payload.params,
-                    rng,
-                    false,
+                    turn.payload.scheduled_speculation.as_mut().unwrap(),
+                    profiling,
                 )
             } else {
                 Ok(empty_proposal())
             };
-            let proposal = match proposal {
+            match proposal {
                 Ok(proposal)
-                    if proposal.draft_ids.len() <= cap
+                    if proposal.draft_ids.len() <= item.cap
                         && proposal.draft_ids.iter().all(|&token| token >= 0) =>
                 {
-                    proposal
+                    item.proposal = proposal;
+                    proposed.push(item);
                 }
-                Ok(_) => {
-                    results.push((
-                        plan_index,
-                        Self::speculative_failure(
-                            turn,
-                            row,
-                            Error::from_reason("invalid scheduled draft proposal"),
-                        ),
-                    ));
-                    continue;
+                outcome => {
+                    let error = outcome
+                        .err()
+                        .unwrap_or_else(|| Error::from_reason("invalid scheduled draft proposal"));
+                    results.push((item.plan_index, Self::speculative_failure(turn, row, error)));
                 }
-                Err(error) => {
-                    results.push((plan_index, Self::speculative_failure(turn, row, error)));
-                    continue;
+            }
+        }
+        let mut work = proposed;
+        if profiling
+            && (work.len() != profile_rows.len()
+                || (!zero_probe
+                    && work
+                        .iter()
+                        .any(|item| item.proposal.draft_ids.len() != item.cap)))
+        {
+            profiling = false;
+            self.inner.scheduled_verification_budget().unwrap().clear();
+        }
+        if work.is_empty() {
+            return Ok((results, 0, 0));
+        }
+        let choice = if profiling {
+            probe.map(|shape| (shape, true)).or_else(|| {
+                let confidence = work
+                    .iter()
+                    .map(|item| item.proposal.keep_probabilities.as_deref().unwrap_or(&[]))
+                    .collect::<Vec<_>>();
+                self.inner
+                    .scheduled_verification_budget()
+                    .unwrap()
+                    .choose(&confidence)
+            })
+        } else {
+            None
+        };
+        let fallback = choice
+            .as_ref()
+            .is_some_and(|(shape, calibration)| !calibration && shape.iter().all(|&n| n == 0));
+        if let Some((shape, _)) = choice {
+            for (item, keep) in work.iter_mut().zip(shape) {
+                item.proposal.truncate(keep);
+                if fallback {
+                    let turn = &mut running[item.turn_index];
+                    self.inner.release_scheduled_speculation(turn.seq_id);
+                    turn.payload.scheduled_speculation = None;
+                    turn.decode_draft_allowance = 0;
                 }
-            };
-            let mut tokens = Vec::with_capacity(proposal.draft_ids.len() + 1);
-            tokens.push(anchor);
-            tokens.extend(proposal.draft_ids.iter().map(|&token| token as u32));
+            }
+        }
+        for item in &work {
+            let turn = &running[item.turn_index];
+            let row = &plan.rows[item.plan_index];
+            let mut tokens = Vec::with_capacity(item.proposal.draft_ids.len() + 1);
+            tokens.push(item.anchor);
+            tokens.extend(item.proposal.draft_ids.iter().map(|&token| token as u32));
             verify_rows.push(ScheduledVerifyRow {
                 seq_id: row.seq_id,
                 first_position: row.token_start,
                 tokens,
                 speculative: turn.payload.scheduled_speculation.is_some(),
             });
-            work.push(VerifyWork {
-                plan_index,
-                turn_index,
-                proposal,
-                forced,
-            });
-        }
-        if work.is_empty() {
-            return Ok((results, 0, 0));
         }
         crate::array::maybe_clear_cache_for_paged_step(plan.global_step as i32);
         let logits = {
@@ -365,8 +465,15 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         }
         // This closes every ticket, including failed acceptance owners with
         // keep=0. Publication and owner reuse happen only after all commits.
+        // The zero probe must retain its draft context for later calibration.
+        // Permanent AR drops that maintenance. Use the completed target and
+        // acceptance cost as a conservative AR lower bound, excluding commit
+        // as well as calibration-only draft append/materialization. This can
+        // prefer AR too early, but cannot credit speculation for an inflated
+        // AR baseline.
+        let zero_probe_ns = wave_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
         let committed = self.inner.commit_scheduled_verify(&commits);
-        let committed = match committed {
+        let mut committed = match committed {
             Ok(results) if results.len() == work.len() => results,
             outcome => {
                 let reason = outcome.err().map_or_else(
@@ -378,6 +485,34 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     .collect()
             }
         };
+        if profiling
+            && !fallback
+            && committed.iter().all(Result::is_ok)
+            && decisions.iter().all(Result::is_ok)
+        {
+            match self.inner.complete_scheduled_draft_state(&seq_ids) {
+                Ok(()) => {
+                    let shape = verify_rows
+                        .iter()
+                        .map(|row| row.tokens.len() - 1)
+                        .collect::<Vec<_>>();
+                    self.inner.scheduled_verification_budget().unwrap().record(
+                        &shape,
+                        if zero_probe {
+                            zero_probe_ns
+                        } else {
+                            wave_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+                        },
+                    );
+                }
+                Err(error) => {
+                    for result in &mut committed {
+                        *result = Err(Error::from_reason(error.reason.clone()));
+                    }
+                    self.inner.scheduled_verification_budget().unwrap().clear();
+                }
+            }
+        }
         let occupancy = work.len();
         for (((item, verify), decision), commit) in work
             .into_iter()
@@ -543,10 +678,21 @@ mod tests {
     }
 
     fn run_with_sampling<B: HybridSchedulerBackend>(
+        inner: B,
+        speculate: bool,
+        cancel_first: bool,
+        sampled: bool,
+    ) -> (Vec<(u32, Vec<u32>)>, usize) {
+        run_modes(inner, speculate, cancel_first, sampled, false, false)
+    }
+
+    fn run_modes<B: HybridSchedulerBackend>(
         mut inner: B,
         speculate: bool,
         cancel_first: bool,
         sampled: bool,
+        adaptive: bool,
+        fixed_zero_peer: bool,
     ) -> (Vec<(u32, Vec<u32>)>, usize) {
         let mut scheduler = Scheduler::<_, (), ()>::new(2, 12).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -564,6 +710,13 @@ mod tests {
             speculate,
             Arc::new(AtomicBool::new(false)),
         );
+        for turn in [&mut first, &mut second] {
+            turn.payload.params.mtp_adaptive_depth = adaptive;
+        }
+        if fixed_zero_peer {
+            second.payload.params.mtp_adaptive_depth = false;
+            second.decode_draft_allowance = 0;
+        }
         if sampled {
             for turn in [&mut first, &mut second] {
                 turn.payload
@@ -580,6 +733,8 @@ mod tests {
         scheduler.enqueue_turn(first).unwrap();
         scheduler.enqueue_turn(second).unwrap();
         let mut completed = Vec::new();
+        let mut measured_adaptive_wave = false;
+        let mut fixed_peer_waves = 0;
         for step in 0..100 {
             if cancel_first && step == 4 {
                 cancel.store(true, Ordering::Relaxed);
@@ -587,10 +742,33 @@ mod tests {
             let action = scheduler
                 .drive_once(&mut HybridStepExecutor::new(&mut inner))
                 .unwrap();
+            measured_adaptive_wave |= inner
+                .scheduled_verification_budget()
+                .is_some_and(|policy| policy.has_measurements());
             if let SchedulerAction::Stepped {
-                completed: turns, ..
+                plan,
+                completed: turns,
+                ..
             } = action
             {
+                if fixed_zero_peer
+                    && plan
+                        .rows
+                        .iter()
+                        .filter(|row| row.kind == StepKind::Decode)
+                        .count()
+                        == 2
+                    && !turns.iter().any(|turn| turn.seq_id == 42)
+                {
+                    fixed_peer_waves += 1;
+                    assert!(
+                        !inner
+                            .scheduled_verification_budget()
+                            .unwrap()
+                            .has_measurements(),
+                        "a live zero-cap fixed speculator entered adaptive calibration"
+                    );
+                }
                 for turn in turns {
                     assert!(
                         turn.payload.failure.is_none(),
@@ -620,6 +798,12 @@ mod tests {
             }
         }
         assert_eq!(completed.len(), 2);
+        if adaptive && !fixed_zero_peer {
+            assert!(measured_adaptive_wave);
+        }
+        if fixed_zero_peer {
+            assert!(fixed_peer_waves > 0);
+        }
         completed.sort_by_key(|(seq, _)| *seq);
         (completed, scheduler.stats().max_batch_occupancy)
     }
@@ -651,6 +835,46 @@ mod tests {
             "cancellation changed the other owner"
         );
         assert!(cancelled[0].1.len() < spec[0].1.len());
+    }
+
+    #[test]
+    fn adaptive_dspark_calibration_and_fallback_preserve_owner_outputs() {
+        let (ar, _) = run(false, false);
+        let (adaptive, occupancy) = run_modes(
+            seeded_tiny_paged_inner_with_draft(1729).unwrap(),
+            true,
+            false,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(occupancy, 2);
+        assert_eq!(ar, adaptive);
+        let (cancelled, _) = run_modes(
+            seeded_tiny_paged_inner_with_draft(1729).unwrap(),
+            true,
+            true,
+            false,
+            true,
+            false,
+        );
+        assert_eq!(cancelled[1], adaptive[1]);
+        assert!(cancelled[0].1.len() < adaptive[0].1.len());
+    }
+
+    #[test]
+    fn a_zero_draft_fixed_peer_cannot_enter_adaptive_fallback() {
+        let (ar, _) = run(false, false);
+        let (mixed, occupancy) = run_modes(
+            seeded_tiny_paged_inner_with_draft(1729).unwrap(),
+            true,
+            false,
+            false,
+            true,
+            true,
+        );
+        assert_eq!(occupancy, 2);
+        assert_eq!(ar, mixed);
     }
 
     #[test]
@@ -725,5 +949,28 @@ mod tests {
         check(|| {
             crate::models::muse_glimmer::model::scheduled_dflash::tests::seeded_inner(1908).unwrap()
         });
+    }
+    #[test]
+    fn native_mtp_scheduler_commits_owner_history_and_isolates_cancellation() {
+        fn check<B: HybridSchedulerBackend>(build: impl Fn() -> B) {
+            let (ar, _) = run_with(build(), false, false);
+            let (spec, occupancy) = run_with(build(), true, false);
+            assert_eq!(occupancy, 2);
+            assert_eq!(
+                spec, ar,
+                "greedy native MTP differs from AR on tiny fixture"
+            );
+            for sampled in [false, true] {
+                let (complete, _) = run_with_sampling(build(), true, false, sampled);
+                let (cancelled, _) = run_with_sampling(build(), true, true, sampled);
+                assert_eq!(
+                    cancelled[1], complete[1],
+                    "cancellation changed native MTP peer"
+                );
+                assert!(cancelled[0].1.len() < complete[0].1.len());
+            }
+        }
+        check(|| crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8107));
+        check(|| crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(8107));
     }
 }

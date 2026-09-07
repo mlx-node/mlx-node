@@ -10,11 +10,11 @@ staged plans built on the original review:
 fixes) and `docs/superpowers/plans/2026-08-08-stage1-continuous-batching.md`
 (batched decode → ragged step → hybrids, with the design provenance).
 
-Two facts to carry into any batching work: only T=0 output is
-schedule-invariant — ordinary AR T>0 sampling draws from the thread-local PRNG in row
-order, so batch composition changes reproducibility (same as vLLM); and the
-paged decode clear-cache interval is 1024 steps
-(`PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT` in `array/memory.rs`).
+Request isolation does not imply bit-identical output across batch shapes:
+GEMV/GEMM reduction changes can flip greedy decisions. Scheduled speculative
+requests own their RNG streams; ordinary AR sampling still draws from the
+model thread's PRNG in row order. The paged decode clear-cache interval is
+1024 steps (`PAGED_DECODE_CACHE_CLEAR_INTERVAL_DEFAULT` in `array/memory.rs`).
 
 ## Current status
 
@@ -25,8 +25,11 @@ paged decode clear-cache interval is 1024 steps
 - Flat-cache, training, save, and reset commands stay in exclusive/barrier
   lanes. Gemma4 ordinary text rows use grouped full/sliding paged KV and fused
   decode. Fixed-depth text DSpark also shares target verification waves, with
-  request-owned draft contexts and RNG. Media, assistant drafts and adaptive
-  speculation retain ordered lanes; reset and stats commands are barriers.
+  request-owned draft contexts and RNG. Explicit greedy adaptive DSpark also
+  shares verification waves when no fixed confidence threshold is requested.
+  Media, assistant drafts and sampled adaptive speculation retain ordered lanes;
+  reset and stats commands are barriers. Qwen native MTP uses per-owner GDN
+  replay and draft KV history when `MLX_CONTINUOUS_BATCHING=1`.
   Muse DFlash packing is experimental (`MLX_SCHEDULED_DFLASH=1`); its default
   remains the existing flat speculative lane. Loading a draft leaves ordinary
   batched owners available on the resident target.
@@ -92,9 +95,10 @@ the resident `SessionRegistry` was created.
 
 Two reproducibility rules are deliberate:
 
-1. Only greedy `temperature = 0` output is schedule-invariant. With sampling,
-   each row draws from the model thread's PRNG in row order, so changing batch
-   composition can change output, as it does in vLLM.
+1. Floating-point reduction differences can change greedy outputs across batch
+   shapes. Ordinary AR sampling also depends on row-order PRNG consumption.
+   Scheduled speculation owns each request's RNG; peers cannot consume its
+   draws, though numerical changes can still alter the sampling distribution.
 2. Each request's legal prefill break-set is pinned at admission. The shared
    budget decides when a pinned slice runs, never where it is split; this
    preserves family-specific chunk-boundary invariants.
@@ -148,7 +152,7 @@ NemotronH prefill      ~ executed slices are re-split on the config chunk grid;
 BlockAllocator         ✓ refcounts + prefix hash (vLLM-style pool)
 FFI / Metal kernels    ✓ num_seqs = q.shape(0), grid.y = sequence
 ragged mixed step      ✓ Qwen3 env-gated SEAM B executor swap; scheduler unchanged
-Gemma4 owner routing         ✓ paged text AR + fixed DSpark; media/assistant/adaptive exclusive
+Gemma4 owner routing         ✓ paged AR + fixed/greedy-adaptive DSpark; media/assistant exclusive
 ```
 
 - Kernels/FFI: `crates/mlx-paged-attn/metal/attention/paged_attention.metal:762-806`,
@@ -244,7 +248,8 @@ Four additional mechanisms fit the single-process MLX runtime:
 Storage correctness does not imply that every family has the same scheduling
 throughput. Qwen3.5 MoE now defaults to paged K/V, has exact GDN-backed SSD
 restart parity, and admits eligible plain-text AR through the two-row hybrid
-scheduler. MTP and media turns remain whole-turn exclusive. Hybrid sidecar
+scheduler. Fixed-depth native MTP also uses this opt-in lane; adaptive MTP and
+media remain whole-turn exclusive. Hybrid sidecar
 restores also remain synchronous on the model thread, and Gemma4 still declines
 cross-owner in-process hot hits. These are latency/occupancy follow-ups, not
 holes in the paged or durable-state contract.
@@ -347,8 +352,8 @@ above as a cooled median-of-three 4-bit result.
   their `[N,1,H]` decode, and reconcile preemption through the deepest
   K/V-backed GDN checkpoint/sidecar boundary. Paged-block growth and recurrent
   state debit one byte budget. Eligible text-only paged checkpoints opt in with
-  `MLX_CONTINUOUS_BATCHING=1`; MTP and media turns remain exclusive even
-  when those modules are installed. The tiny
+  `MLX_CONTINUOUS_BATCHING=1`. Fixed-depth native MTP now shares per-owner
+  verification; adaptive MTP, DFlash2 and media retain exclusive lanes. The tiny
   random-weight dense and genuinely sparse MoE fixtures prove token identity
   but are slower than two
   scalar forwards, so no real-checkpoint throughput win is claimed.
@@ -415,7 +420,8 @@ above as a cooled median-of-three 4-bit result.
   and ordinary rows execute one fused `[N,1]` forward. Dynamic recompute
   preemption shares the full-group pool instead of statically partitioning one
   maximum context per request. Fixed-depth text DSpark adds packed ragged target
-  verification and independent accepted-prefix commits. Media, assistant and
-  adaptive commands coexist through ordered owner lanes. Reset and stats remain
+  verification and independent accepted-prefix commits. Greedy adaptive DSpark
+  measures per-owner allocation costs; sampled adaptive, media and assistant
+  commands use ordered owner lanes. Reset and stats remain
   barriers. See the [measured follow-up](research/inference-2026-09-05/followup.md)
-  for throughput, numerical limits and remaining recurrent MTP work.
+  for throughput, numerical limits and recurrent MTP validation.

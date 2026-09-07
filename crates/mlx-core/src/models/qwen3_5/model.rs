@@ -75,6 +75,7 @@ mod lifecycle;
 mod mtp;
 mod paged_backend;
 mod paged_turn;
+pub(crate) mod scheduled_mtp;
 mod state;
 mod training;
 mod vision_turn;
@@ -219,6 +220,7 @@ pub(crate) struct Qwen35Inner {
     /// first parks the previous owner and then removes the next owner from the
     /// table. Batched decode parks the active owner and stacks table rows.
     scheduled_recurrent: RecurrentStateTable<Vec<Qwen3_5LayerCache>>,
+    scheduled_mtp: crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState,
     active_scheduled_seq: Option<SeqId>,
     /// True when a paged-core turn has populated
     /// the paged adapter's `LayerKVPool` since the last flat full-attention

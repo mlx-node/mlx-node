@@ -19,6 +19,7 @@ pub mod persistence;
 pub mod processing;
 pub mod quantized_linear;
 pub mod rms_norm_gated;
+pub(crate) mod scheduled_mtp;
 pub mod vision;
 pub use config::Qwen3_5Config;
 pub use model::Qwen3_5Model;

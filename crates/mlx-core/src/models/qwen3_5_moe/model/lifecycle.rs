@@ -97,6 +97,7 @@ impl Qwen35MoeInner {
             paged_adapter,
             row_exact_decode_projections: false,
             scheduled_recurrent: RecurrentStateTable::stage2(),
+            scheduled_mtp: Default::default(),
             active_scheduled_seq: None,
             mtp,
             mtp_weights_loaded: false,
@@ -340,6 +341,7 @@ impl Qwen35MoeInner {
     }
 
     pub(super) fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
+        self.scheduled_mtp.release(seq_id);
         if self.active_scheduled_seq == Some(seq_id) {
             self.active_scheduled_seq = None;
             self.caches = Some(fresh_moe_layer_caches(&self.config));
@@ -757,6 +759,7 @@ impl Qwen35MoeInner {
         }
         self.caches = None;
         self.scheduled_recurrent = RecurrentStateTable::stage2();
+        self.scheduled_mtp = Default::default();
         self.active_scheduled_seq = None;
         self.clear_reuse_state();
         // A full session reset must also clear the MTP acceptance gate

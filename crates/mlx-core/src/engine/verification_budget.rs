@@ -144,6 +144,147 @@ pub(crate) fn choose_verification_lengths(
     Some(best)
 }
 
+/// A scheduled profile is valid only for this ordered set of owners, context
+/// bands and available draft widths. A new owner or a short tail recalibrates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ScheduledBudgetRow {
+    pub seq_id: u32,
+    pub context_band: u32,
+    pub cap: usize,
+}
+
+#[derive(Default)]
+pub(crate) struct ScheduledVerificationBudget {
+    rows: Vec<ScheduledBudgetRow>,
+    // Exact per-owner draft counts, never just their sum. Proposal work uses
+    // each owner's full cap for every nonzero shape, including calibration.
+    costs: Vec<(Vec<usize>, f64)>,
+}
+
+impl ScheduledVerificationBudget {
+    #[cfg(test)]
+    pub fn has_measurements(&self) -> bool {
+        !self.costs.is_empty()
+    }
+
+    pub fn configure(&mut self, rows: &[ScheduledBudgetRow]) {
+        if self.rows != rows {
+            self.rows = rows.to_vec();
+            self.costs.clear();
+        }
+    }
+
+    pub fn clear(&mut self) {
+        self.rows.clear();
+        self.costs.clear();
+    }
+
+    fn cost(&self, shape: &[usize]) -> Option<f64> {
+        self.costs
+            .iter()
+            .find_map(|(known, cost)| (known == shape).then_some(*cost))
+    }
+
+    pub fn next_probe(&self) -> Option<Vec<usize>> {
+        [0, 1, 2, 3].into_iter().find_map(|level| {
+            let shape = self
+                .rows
+                .iter()
+                .map(|row| match level {
+                    0 => 0,
+                    1 => row.cap.min(1),
+                    2 => row.cap.div_ceil(2),
+                    _ => row.cap,
+                })
+                .collect::<Vec<_>>();
+            self.cost(&shape).is_none().then_some(shape)
+        })
+    }
+
+    pub fn record(&mut self, shape: &[usize], elapsed_ns: u64) {
+        if shape.len() != self.rows.len()
+            || shape.iter().zip(&self.rows).any(|(&n, row)| n > row.cap)
+        {
+            return;
+        }
+        let sample = elapsed_ns.max(1) as f64;
+        if let Some((_, cost)) = self.costs.iter_mut().find(|(known, _)| known == shape) {
+            *cost = *cost * 0.8 + sample * 0.2;
+        } else if self.costs.len() < 8 {
+            self.costs.push((shape.to_vec(), sample));
+        }
+    }
+
+    /// The bool identifies an unmeasured calibration shape. Only a measured
+    /// zero allocation can trigger permanent fallback; calibration zero keeps
+    /// every owner's draft context alive for the next wave.
+    pub fn choose(&self, conditional: &[&[f32]]) -> Option<(Vec<usize>, bool)> {
+        if conditional.len() != self.rows.len() || self.next_probe().is_some() {
+            return None;
+        }
+        let survival = conditional
+            .iter()
+            .zip(&self.rows)
+            .map(|(values, row)| {
+                if values.len() != row.cap {
+                    return None;
+                }
+                let mut product = 1.0;
+                values
+                    .iter()
+                    .map(|&value| {
+                        if !value.is_finite() || !(0.0..=1.0).contains(&value) {
+                            return None;
+                        }
+                        product *= f64::from(value);
+                        Some(product)
+                    })
+                    .collect::<Option<Vec<_>>>()
+            })
+            .collect::<Option<Vec<_>>>()?;
+        let total = self.rows.iter().map(|row| row.cap).sum::<usize>();
+        // Probe a bounded number of confidence-allocated prefixes. Their cost
+        // must be observed before they can compete with any measured shape.
+        if self.costs.len() < 8 {
+            for budget in [total / 3, total * 2 / 3] {
+                let mut shape = vec![0; self.rows.len()];
+                for _ in 0..budget {
+                    let next = survival
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, row)| row.get(shape[i]).map(|&p| (i, p)))
+                        .max_by(|(a, pa), (b, pb)| pa.total_cmp(pb).then_with(|| b.cmp(a)));
+                    if let Some((i, _)) = next {
+                        shape[i] += 1;
+                    }
+                }
+                if self.cost(&shape).is_none() {
+                    return Some((shape, true));
+                }
+            }
+        }
+        let mut best = vec![0; self.rows.len()];
+        let boundaries = self.rows.len() as f64;
+        let mut rate = boundaries / self.cost(&best)? * 1.05;
+        for (shape, cost) in &self.costs {
+            if shape.iter().all(|&n| n == 0) {
+                continue;
+            }
+            let expected = boundaries
+                + survival
+                    .iter()
+                    .zip(shape)
+                    .map(|(row, &n)| row[..n].iter().sum::<f64>())
+                    .sum::<f64>();
+            if expected / cost > rate {
+                best.clone_from(shape);
+                rate = expected / cost;
+            }
+        }
+        Some((best, false))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +335,64 @@ mod tests {
             choose_verification_lengths(&[&[0.9; 7]], &[None; 9], 10.0, 100.0, 1.05),
             Some(vec![0])
         );
+    }
+
+    #[test]
+    fn scheduled_costs_distinguish_equal_total_queries_and_reset_on_owner_changes() {
+        let rows = [
+            ScheduledBudgetRow {
+                seq_id: 1,
+                context_band: 0,
+                cap: 7,
+            },
+            ScheduledBudgetRow {
+                seq_id: 2,
+                context_band: 0,
+                cap: 7,
+            },
+        ];
+        let mut policy = ScheduledVerificationBudget::default();
+        policy.configure(&rows);
+        for shape in [vec![0, 0], vec![1, 1], vec![4, 4], vec![7, 7]] {
+            assert_eq!(policy.next_probe(), Some(shape.clone()));
+            policy.record(&shape, if shape == [0, 0] { 100 } else { 1000 });
+        }
+        policy.record(&[7, 0], 100);
+        policy.record(&[4, 3], 10000);
+        assert_eq!(policy.cost(&[7, 0]), Some(100.0));
+        assert_eq!(policy.cost(&[4, 3]), Some(10000.0));
+        // Fill the bounded calibration set before selecting measured costs.
+        policy.record(&[3, 1], 1000);
+        policy.record(&[6, 3], 1000);
+        assert_eq!(
+            policy.choose(&[&[0.99; 7], &[0.01; 7]]),
+            Some((vec![7, 0], false))
+        );
+        let mut changed = rows.clone();
+        changed[1].seq_id = 3;
+        policy.configure(&changed);
+        assert_eq!(policy.next_probe(), Some(vec![0, 0]));
+        assert_eq!(policy.cost(&[7, 0]), None);
+        policy.record(&[0, 0], 10);
+        changed[0].context_band = 1;
+        policy.configure(&changed);
+        assert_eq!(policy.next_probe(), Some(vec![0, 0]));
+    }
+
+    #[test]
+    fn scheduled_zero_probe_is_temporary_and_unmeasured_shapes_are_calibration() {
+        let mut policy = ScheduledVerificationBudget::default();
+        policy.configure(&[ScheduledBudgetRow {
+            seq_id: 1,
+            context_band: 0,
+            cap: 3,
+        }]);
+        assert_eq!(policy.next_probe(), Some(vec![0]));
+        assert_eq!(policy.choose(&[&[0.1; 3]]), None);
+        for n in 0..=3 {
+            policy.record(&[n], if n == 0 { 100 } else { 1000 });
+        }
+        assert_eq!(policy.choose(&[&[0.1; 3]]), Some((vec![0], false)));
+        assert_eq!(policy.choose(&[&[f32::NAN; 3]]), None);
     }
 }

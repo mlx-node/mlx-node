@@ -216,6 +216,17 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn supports_scheduled_speculation(&self) -> bool {
         false
     }
+    fn supports_adaptive_scheduled_speculation(&self) -> bool {
+        false
+    }
+    fn scheduled_verification_budget(
+        &mut self,
+    ) -> Option<&mut engine::verification_budget::ScheduledVerificationBudget> {
+        None
+    }
+    fn complete_scheduled_draft_state(&self, _seq_ids: &[SeqId]) -> Result<()> {
+        Ok(())
+    }
     fn scheduled_draft_state_bytes(&self, _total_tokens: u32) -> u64 {
         0
     }
@@ -1466,12 +1477,22 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             })
     }
 
+    fn adaptive_requires_exclusive_lane(&self, params: &engine::params::ChatParams) -> bool {
+        params.mtp_adaptive_depth
+            && (!self.inner.supports_adaptive_scheduled_speculation()
+                || !crate::sampling::is_greedy_temperature(
+                    params
+                        .sampling_config
+                        .and_then(|config| config.temperature)
+                        .unwrap_or(1.0),
+                ))
+    }
+
     fn chat_requires_barrier(&self, command: &ChatCmd) -> bool {
         if Self::chat_config(command).is_some_and(|config| {
             config.enable_mtp == Some(true)
                 && (self.speculation_requires_exclusive_lane(Self::chat_is_streaming(command))
-                    || (self.inner.supports_scheduled_speculation()
-                        && self.inner.resolve_params(config).mtp_adaptive_depth))
+                    || self.adaptive_requires_exclusive_lane(&self.inner.resolve_params(config)))
         }) {
             return true;
         }
@@ -1748,7 +1769,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 admitted.plan.decoder,
                 engine::plan::DecoderPlan::Speculative(_)
             ) && (self.speculation_requires_exclusive_lane(streaming)
-                || admitted.params.mtp_adaptive_depth))
+                || self.adaptive_requires_exclusive_lane(&admitted.params)))
         {
             if newly_assigned {
                 self.owner_sequences.remove(&owner_id);

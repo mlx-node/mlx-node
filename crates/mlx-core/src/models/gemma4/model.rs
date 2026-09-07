@@ -250,6 +250,8 @@ pub(crate) struct Gemma4Inner {
         HashMap<u32, crate::models::gemma4::dspark_decode::Gemma4DsparkState>,
     pub(crate) scheduled_dspark_verify:
         Option<crate::models::gemma4::scheduled_dspark::Gemma4ScheduledVerify>,
+    pub(crate) scheduled_verification_budget:
+        crate::engine::verification_budget::ScheduledVerificationBudget,
     /// `compute_layer_kinds_from_kv_cache_specs(&config)`, computed once in
     /// `Gemma4Inner::new`. Pure function of the immutable `config`, so it never
     /// changes for the lifetime of this instance. Empty when

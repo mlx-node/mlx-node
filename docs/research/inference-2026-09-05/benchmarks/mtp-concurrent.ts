@@ -4,20 +4,17 @@ import { performance } from 'node:perf_hooks';
 const [
   binding,
   modelPath,
-  draftPath,
   output,
   revision,
-  widthsArg = '1,2,4',
-  roundsArg = '3',
-  family = 'Gemma4',
-  adaptiveArg = 'false',
+  family = 'Qwen35',
+  widthsArg = '1,2',
+  roundsArg = '2',
+  temperatureArg = '0',
 ] = process.argv.slice(2);
 const core: typeof import('../../../../packages/core/index.cjs') = createRequire(import.meta.url)(binding);
 const model =
-  family === 'MuseGlimmer'
-    ? await core.MuseGlimmerModel.load(modelPath)
-    : await core.Gemma4Model.load(modelPath, { draftModelPath: draftPath });
-if (!model.hasMtpWeights()) throw new Error('Missing DSpark draft');
+  family === 'Qwen35Moe' ? await core.Qwen35MoeModel.load(modelPath) : await core.Qwen35Model.load(modelPath);
+if (!model.hasMtpWeights()) throw new Error('Missing native MTP weights');
 const runs = [];
 for (const rows of widthsArg.split(',').map(Number)) {
   for (let round = -1; round < Number(roundsArg); round++) {
@@ -39,7 +36,7 @@ for (const rows of widthsArg.split(',').map(Number)) {
             cacheOwnerId: `spec-${i}`,
             cacheRootOwnerId: `spec-${i}`,
             maxNewTokens: 128,
-            temperature: 0,
+            temperature: Number(temperatureArg),
             reasoningEffort: 'none',
             repetitionPenalty: 1,
             presencePenalty: 0,
@@ -47,8 +44,8 @@ for (const rows of widthsArg.split(',').map(Number)) {
             maxConsecutiveTokens: 0,
             maxNgramRepeats: 0,
             enableMtp: true,
-            mtpDepth: 7,
-            mtpAdaptiveDepth: adaptiveArg === 'true',
+            mtpDepth: 3,
+            mtpAdaptiveDepth: false,
             reportPerformance: true,
           },
         ),
@@ -63,7 +60,10 @@ for (const rows of widthsArg.split(',').map(Number)) {
   }
 }
 await model.resetCaches();
-await writeFile(output, JSON.stringify({ revision, modelPath, draftPath, runs }, null, 2));
+await writeFile(
+  output,
+  JSON.stringify({ revision, modelPath, family, temperature: Number(temperatureArg), runs }, null, 2),
+);
 console.log(
   JSON.stringify(
     runs.map(({ rows, round, ms, tokens, stats }) => ({

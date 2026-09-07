@@ -81,6 +81,7 @@ mod lifecycle;
 mod mtp;
 mod paged_backend;
 mod paged_turn;
+pub(crate) mod scheduled_mtp;
 mod state;
 mod training;
 mod vision_turn;
@@ -191,6 +192,7 @@ pub(crate) struct Qwen35MoeInner {
     /// Full-attention K/V remains in `paged_adapter`; each entry carries only
     /// the independent recurrent arrays for one cache owner.
     scheduled_recurrent: RecurrentStateTable<Vec<Qwen3_5LayerCache>>,
+    scheduled_mtp: crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState,
     active_scheduled_seq: Option<SeqId>,
     /// Multi-Token Prediction head — `Some` when `config.n_mtp_layers > 0`
     /// (the checkpoint shipped MTP weights), `None` otherwise. Owned by

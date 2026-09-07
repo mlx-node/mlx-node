@@ -150,25 +150,73 @@ prefill and transitions between four turns; they cannot all be attributed to
 avoidable CPU encoding. The trace is evidence about control flow, not a clean
 performance baseline.
 
-## Boundaries still requiring separate work
+## Scheduled adaptive DSpark and native MTP follow-up
 
-Recurrent MTP remains on the exclusive lane. Source review established that a
-cycle-history proposal can pair the final normalized prompt hidden with the
-pending anchor; subsequent cycles must retain `verify_hidden[accepted]`. GDN
-already accepts equal-width batch rows, but its tape replay takes one accepted
-length for the whole batch. Concurrent verification therefore still requires
-owner-specific tape splitting, replay after partial and full acceptance, and
-a multi-token paged attention route. These changes are not implemented or
-claimed as a completed optimization. Interleaving serial complete cycles alone
-does not demonstrate a throughput win.
-Qwen DFlash2 remains flat-only and requires its existing cache provenance checks.
+Gemma's opt-in adaptive policy now measures the ordered per-owner draft-length
+vector, with up to eight bounded cost shapes. It resets on owner order, context
+band, cap or draft-context lifetime changes. Temporary all-zero probes retain
+contexts for calibration; an actual AR decision releases them. Zero-draft cost
+excludes calibration-only context work so speculation does not compete against
+an inflated AR baseline. Only greedy adaptive requests enter this policy.
 
-Adaptive scheduled speculation remains gated while its batch cost policy is
-validated. Equal total query counts can have different latency when per-owner
-projection shapes differ. A safe cost policy must measure the actual allocation
-vector, preserve temporary zero-draft owners, and distinguish those calibration
-waves from permanent AR fallback. Whole-turn greedy adaptive runs preserved
-output but did not establish a strong end-to-end gain.
+Isolated alternating runs reduced four-request median latency from about
+10.19 s on the prior exclusive adaptive path to 6.45 s. Fixed-depth scheduling
+was faster at about 5.65 s; adaptive calibration also regressed singleton latency
+by about 10%. Fixed depth remains the default. These measurements support
+concurrent admission of explicit adaptive requests, not a universal adaptive win.
+See `scheduled-adaptive-*` in the measurement ledger for binding and output hashes.
+
+Native Qwen dense/MoE MTP now implements the shared scheduled transaction trait.
+Equal-width target buckets keep GDN tensors in `[N,T,H]`; only full attention
+packs query rows into the paged kernel. Each owner retains a normalized target
+seed, committed draft KV history on a cold prompt, and independent tape slices. Verification uses scratch recurrent
+state, closes every attention ticket, then replays each accepted prefix,
+including full acceptance. One grouped completion covers committed recurrent
+state before settlement. Draft hidden state and tapes stay on device.
+
+The existing `MLX_CONTINUOUS_BATCHING=1` opt-in still controls Qwen scheduled
+admission. Native MTP adaptive requests and Qwen DFlash2 retain their established
+whole-turn lanes. DFlash2 remains flat-only with its existing provenance checks.
+The initial fresh-cycle prototype regressed dense latency: about 1.04 s to
+1.37 s at N=1 and 2.13 s to 2.38 s at N=2. It required 56 cycles instead of
+41 on the first prompt. MoE alternating results were variable. That strategy
+is replaced by per-owner committed draft history. Its alternating results are:
+
+| Native MTP, 128 greedy tokens | Prior exclusive | Scheduled committed history | Latency reduction |
+| ----------------------------- | --------------: | --------------------------: | ----------------: |
+| Qwen3.5 4B NVFP4, N=1         |        955.7 ms |                    921.1 ms |              3.6% |
+| Qwen3.5 4B NVFP4, N=2         |       1953.9 ms |                   1671.8 ms |             14.4% |
+| Qwen3.6 35B A3B MXFP8, N=1    |       1412.9 ms |                   1032.3 ms |             26.9% |
+| Qwen3.6 35B A3B MXFP8, N=2    |       2754.8 ms |                   2040.2 ms |             25.9% |
+
+Each family used A1/B1/B2/A2, one warm-up plus two measured rounds at each
+width, depth three and SSD persistence disabled. Singleton output hashes match
+the baseline. At N=2, the second owner's output differs between the two batch
+shapes but repeats within each arm; this is not a universal greedy-parity claim.
+Prefix-hit requests without full prompt hiddens retain cycle history. The independent numerical oracle uses the
+original whole-turn verifier, not another invocation of the new batch route.
+
+Prefill now slices the retained dense MTP tail before normalization, avoiding a
+view that keeps a full normalized prompt allocation alive. MoE projects only
+the final prefill row through normalization and the vocabulary head, and can
+capture normalized prompt rows only when committed MTP history requires them. These paths preserve the
+existing checkpoint publication and completion boundaries.
+
+Both real families also completed two warm-prefix continuations (119 and 116
+cached tokens) and two sampled MTP requests. These are correctness smoke tests,
+not seed-parity or performance claims. The draft-history cache is temporary
+request state, included in admission and rebuilt when needed; cold target K/V
+and GDN persistence still use the SSD tier.
+Separate-process SSD restart checks also passed for both families at occupancy
+two. Each restored request reused 400 tokens; both recurrent sidecars were
+installed. Dense restored 26.49 MB and MoE 16.71 MB, with no queue drops,
+write errors or corruptions. The checks use isolated cache roots and validate
+durable reuse, not latency or cross-process greedy parity.
+
+The isolated BF16 prefill vocabulary projection benchmark (H=2048, V=65536)
+measured 903.5 → 700.4 µs for 64 prompt rows and 2401.5 → 717.6 µs for 512 rows.
+It uses three warm-up and forty measured alternating rounds with completed GPU
+evaluation. This validates the last-row projection saving, not whole-model TTFT.
 
 The SSD tier remains secondary storage; no permanent second RAM cache was
 introduced. Unified memory removes a separate CPU/GPU address-space transfer

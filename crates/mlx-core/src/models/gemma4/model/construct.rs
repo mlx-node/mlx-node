@@ -442,6 +442,7 @@ impl Gemma4Inner {
             draft_turn_state: None,
             scheduled_dspark_states: HashMap::new(),
             scheduled_dspark_verify: None,
+            scheduled_verification_budget: Default::default(),
             layer_kinds,
             sliding_prefix_checkpoints: VecDeque::new(),
             grouped_sliding_cold_checkpoints: HashMap::new(),

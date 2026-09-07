@@ -570,6 +570,15 @@ impl DsparkContextCache {
     /// boundaries so each speculative timer owns its own context-append cost.
     pub(crate) fn eval(&self) -> Result<()> {
         let mut arrays: Vec<&MxArray> = Vec::with_capacity(self.caches.len() * 2);
+        self.collect_arrays(&mut arrays);
+        if arrays.is_empty() {
+            Ok(())
+        } else {
+            MxArray::eval_arrays(&arrays)
+        }
+    }
+
+    pub(crate) fn collect_arrays<'a>(&'a self, arrays: &mut Vec<&'a MxArray>) {
         for cache in &self.caches {
             if let Some(keys) = cache.keys_ref() {
                 arrays.push(keys);
@@ -577,11 +586,6 @@ impl DsparkContextCache {
             if let Some(values) = cache.values_ref() {
                 arrays.push(values);
             }
-        }
-        if arrays.is_empty() {
-            Ok(())
-        } else {
-            MxArray::eval_arrays(&arrays)
         }
     }
 

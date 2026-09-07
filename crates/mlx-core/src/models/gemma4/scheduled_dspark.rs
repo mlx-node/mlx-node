@@ -24,6 +24,7 @@ impl Gemma4Inner {
                 "cannot seed DSpark during an open verify batch",
             ));
         }
+        self.scheduled_verification_budget.clear();
         let draft = self
             .dspark_draft()
             .ok_or_else(|| Error::from_reason("no DSpark draft loaded"))?;
@@ -174,6 +175,7 @@ impl ScheduledDraftVerify for Gemma4Inner {
         })
     }
     fn discard_draft_owner(&mut self, seq_id: u32) {
+        self.scheduled_verification_budget.clear();
         self.scheduled_dspark_states.remove(&seq_id);
     }
 }

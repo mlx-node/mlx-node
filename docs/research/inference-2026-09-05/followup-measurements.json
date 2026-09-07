@@ -1,7 +1,7 @@
 {
   "baseline": "bbc3157cf03f75e36bdd0b65ea1d8a801d743d91",
   "host": "Apple M5 Max, 128 GiB, macOS 26.6.2",
-  "status": "local validation complete; PR follow-up pending",
+  "status": "Implementation, isolated measurements and final local validation complete; remote status is reported by PR #138 checks on its latest revision.",
   "experiments": {
     "gemma-concurrency": [
       {
@@ -8450,7 +8450,2766 @@
           }
         ]
       }
-    ]
+    ],
+    "scheduled-adaptive-dspark": [
+      {
+        "artifact": "scheduled-adaptive-A1.json",
+        "artifact_sha256": "f98cd536818f60c7b8105d25f8688eb85d01c885304889c5bbf217b2a170c921",
+        "revision": "replay-guard-binding",
+        "adaptive": true,
+        "runs": [
+          {
+            "rows": 1,
+            "round": 0,
+            "ms": 2148.8536669999994,
+            "tokens": 128,
+            "maxBatchOccupancy": 0,
+            "outputs": [
+              {
+                "sha256": "1aa4e75df79529698b3672ef5be860e8f8365377bbb9ae3f4a9206c0d64efa5b",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 145.30058400000001,
+                  "prefillTokensPerSecond": 158.2925502900938,
+                  "decodeTokensPerSecond": 63.42589081070586,
+                  "mtpMeanAcceptedTokens": 3.3448275862068964,
+                  "mtpMeanAcceptedTokensTotal": 4.344827586206897,
+                  "mtpAcceptanceByPosition": [
+                    0.8620689655172413, 0.6428571428571429, 0.5714285714285714, 0.5, 0.4, 0.28, 0.28
+                  ],
+                  "mtpCycles": 29,
+                  "mtpMeanDepth": 6.482758620689655
+                }
+              }
+            ]
+          },
+          {
+            "rows": 1,
+            "round": 1,
+            "ms": 2065.701083,
+            "tokens": 128,
+            "maxBatchOccupancy": 0,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 145.752209,
+                  "prefillTokensPerSecond": 157.80206802903413,
+                  "decodeTokensPerSecond": 66.17024222607115,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 0,
+            "ms": 10011.507707999997,
+            "tokens": 512,
+            "maxBatchOccupancy": 0,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 144.61450000000002,
+                  "prefillTokensPerSecond": 159.04352606412218,
+                  "decodeTokensPerSecond": 65.42961476861974,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 148.585417,
+                  "prefillTokensPerSecond": 188.44379593456335,
+                  "decodeTokensPerSecond": 45.162199416891994,
+                  "mtpMeanAcceptedTokens": 2.073170731707317,
+                  "mtpMeanAcceptedTokensTotal": 3.073170731707317,
+                  "mtpAcceptanceByPosition": [
+                    0.7073170731707317, 0.5675675675675675, 0.35135135135135137, 0.24324324324324326,
+                    0.17647058823529413, 0.11764705882352941, 0.08823529411764706
+                  ],
+                  "mtpCycles": 41,
+                  "mtpMeanDepth": 6.195121951219512
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 146.949083,
+                  "prefillTokensPerSecond": 156.5167984069693,
+                  "decodeTokensPerSecond": 65.34339991045094,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 147.266167,
+                  "prefillTokensPerSecond": 190.13192622851383,
+                  "decodeTokensPerSecond": 46.6045169134489,
+                  "mtpMeanAcceptedTokens": 2.15,
+                  "mtpMeanAcceptedTokensTotal": 3.15,
+                  "mtpAcceptanceByPosition": [
+                    0.7, 0.5555555555555556, 0.3888888888888889, 0.25, 0.2692307692307692, 0.19230769230769232,
+                    0.11538461538461539
+                  ],
+                  "mtpCycles": 40,
+                  "mtpMeanDepth": 5.65
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 1,
+            "ms": 10159.300000000003,
+            "tokens": 512,
+            "maxBatchOccupancy": 0,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 147.29187499999998,
+                  "prefillTokensPerSecond": 156.1525372665668,
+                  "decodeTokensPerSecond": 64.62979068889628,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 148.054,
+                  "prefillTokensPerSecond": 189.12018587812557,
+                  "decodeTokensPerSecond": 46.23549057539455,
+                  "mtpMeanAcceptedTokens": 2.15,
+                  "mtpMeanAcceptedTokensTotal": 3.15,
+                  "mtpAcceptanceByPosition": [
+                    0.7, 0.5555555555555556, 0.3888888888888889, 0.25, 0.2692307692307692, 0.19230769230769232,
+                    0.11538461538461539
+                  ],
+                  "mtpCycles": 40,
+                  "mtpMeanDepth": 5.65
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 148.15479200000001,
+                  "prefillTokensPerSecond": 155.24303797071914,
+                  "decodeTokensPerSecond": 64.06913816730356,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 148.53954199999998,
+                  "prefillTokensPerSecond": 188.50199497720277,
+                  "decodeTokensPerSecond": 44.2381750938234,
+                  "mtpMeanAcceptedTokens": 2.073170731707317,
+                  "mtpMeanAcceptedTokensTotal": 3.073170731707317,
+                  "mtpAcceptanceByPosition": [
+                    0.7073170731707317, 0.5675675675675675, 0.35135135135135137, 0.24324324324324326,
+                    0.17647058823529413, 0.11764705882352941, 0.08823529411764706
+                  ],
+                  "mtpCycles": 41,
+                  "mtpMeanDepth": 6.195121951219512
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "artifact": "scheduled-adaptive-B1.json",
+        "artifact_sha256": "a322572b1b1d0bd060eeb8b1c088a30067316a0d319fd2ab9ba4eeb8ab92225e",
+        "revision": "scheduled-adaptive-binding",
+        "adaptive": true,
+        "runs": [
+          {
+            "rows": 1,
+            "round": 0,
+            "ms": 2308.344666000001,
+            "tokens": 128,
+            "maxBatchOccupancy": 1,
+            "outputs": [
+              {
+                "sha256": "1aa4e75df79529698b3672ef5be860e8f8365377bbb9ae3f4a9206c0d64efa5b",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 151.4775,
+                  "prefillTokensPerSecond": 151.83773167632157,
+                  "decodeTokensPerSecond": 58.91289131771844,
+                  "mtpMeanAcceptedTokens": 3.1724137931034484,
+                  "mtpMeanAcceptedTokensTotal": 4.172413793103448,
+                  "mtpAcceptanceByPosition": [
+                    0.8275862068965517, 0.6071428571428571, 0.5185185185185185, 0.4444444444444444, 0.34615384615384615,
+                    0.3076923076923077, 0.3076923076923077
+                  ],
+                  "mtpCycles": 29,
+                  "mtpMeanDepth": 6.517241379310345
+                }
+              }
+            ]
+          },
+          {
+            "rows": 1,
+            "round": 1,
+            "ms": 2294.055875,
+            "tokens": 128,
+            "maxBatchOccupancy": 1,
+            "outputs": [
+              {
+                "sha256": "1aa4e75df79529698b3672ef5be860e8f8365377bbb9ae3f4a9206c0d64efa5b",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 150.190084,
+                  "prefillTokensPerSecond": 153.1392711651989,
+                  "decodeTokensPerSecond": 59.256222437478456,
+                  "mtpMeanAcceptedTokens": 3.1724137931034484,
+                  "mtpMeanAcceptedTokensTotal": 4.172413793103448,
+                  "mtpAcceptanceByPosition": [
+                    0.8275862068965517, 0.6071428571428571, 0.5185185185185185, 0.4444444444444444, 0.34615384615384615,
+                    0.3076923076923077, 0.3076923076923077
+                  ],
+                  "mtpCycles": 29,
+                  "mtpMeanDepth": 6.517241379310345
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 0,
+            "ms": 6310.6575840000005,
+            "tokens": 512,
+            "maxBatchOccupancy": 4,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 158.03187499999999,
+                  "prefillTokensPerSecond": 145.5402588876453,
+                  "decodeTokensPerSecond": 28.416776368140138,
+                  "mtpMeanAcceptedTokens": 3.72,
+                  "mtpMeanAcceptedTokensTotal": 4.720000000000001,
+                  "mtpAcceptanceByPosition": [
+                    0.96, 0.7727272727272727, 0.6818181818181818, 0.6363636363636364, 0.4, 0.4, 0.3684210526315789
+                  ],
+                  "mtpCycles": 25,
+                  "mtpMeanDepth": 6
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 206.86725,
+                  "prefillTokensPerSecond": 135.35250263151852,
+                  "decodeTokensPerSecond": 21.3636689196045,
+                  "mtpMeanAcceptedTokens": 1.8,
+                  "mtpMeanAcceptedTokensTotal": 2.8,
+                  "mtpAcceptanceByPosition": [
+                    0.675, 0.5555555555555556, 0.35294117647058826, 0.21212121212121213, 0.09090909090909091,
+                    0.09523809523809523, 0.09523809523809523
+                  ],
+                  "mtpCycles": 40,
+                  "mtpMeanDepth": 5.175
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 360.285833,
+                  "prefillTokensPerSecond": 63.838202597324994,
+                  "decodeTokensPerSecond": 27.946299095816197,
+                  "mtpMeanAcceptedTokens": 3.1785714285714284,
+                  "mtpMeanAcceptedTokensTotal": 4.178571428571429,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6956521739130435, 0.6363636363636364, 0.5909090909090909, 0.4, 0.35, 0.25
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 5.535714285714286
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 514.969459,
+                  "prefillTokensPerSecond": 54.37215646607889,
+                  "decodeTokensPerSecond": 22.532929572711538,
+                  "mtpMeanAcceptedTokens": 1.8,
+                  "mtpMeanAcceptedTokensTotal": 2.8,
+                  "mtpAcceptanceByPosition": [
+                    0.675, 0.5555555555555556, 0.35294117647058826, 0.21875, 0.09523809523809523, 0.09523809523809523,
+                    0.09523809523809523
+                  ],
+                  "mtpCycles": 40,
+                  "mtpMeanDepth": 5.125
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 1,
+            "ms": 6480.524375000001,
+            "tokens": 512,
+            "maxBatchOccupancy": 4,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 160.658041,
+                  "prefillTokensPerSecond": 143.1612128271874,
+                  "decodeTokensPerSecond": 28.19710695253719,
+                  "mtpMeanAcceptedTokens": 3.72,
+                  "mtpMeanAcceptedTokensTotal": 4.720000000000001,
+                  "mtpAcceptanceByPosition": [
+                    0.96, 0.7727272727272727, 0.6818181818181818, 0.6363636363636364, 0.4, 0.4, 0.3684210526315789
+                  ],
+                  "mtpCycles": 25,
+                  "mtpMeanDepth": 6
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 210.196542,
+                  "prefillTokensPerSecond": 133.20866144410692,
+                  "decodeTokensPerSecond": 20.96192427499145,
+                  "mtpMeanAcceptedTokens": 1.794871794871795,
+                  "mtpMeanAcceptedTokensTotal": 2.7948717948717947,
+                  "mtpAcceptanceByPosition": [
+                    0.6666666666666666, 0.5428571428571428, 0.3333333333333333, 0.21875, 0.13043478260869565,
+                    0.09523809523809523, 0.09523809523809523
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 5.230769230769231
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 366.490333,
+                  "prefillTokensPerSecond": 62.757453414194146,
+                  "decodeTokensPerSecond": 27.758298294807496,
+                  "mtpMeanAcceptedTokens": 3.1785714285714284,
+                  "mtpMeanAcceptedTokensTotal": 4.178571428571429,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6956521739130435, 0.6363636363636364, 0.5909090909090909, 0.4, 0.35, 0.25
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 5.535714285714286
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 523.5516660000001,
+                  "prefillTokensPerSecond": 53.48087269767183,
+                  "decodeTokensPerSecond": 21.916171575935895,
+                  "mtpMeanAcceptedTokens": 1.7692307692307692,
+                  "mtpMeanAcceptedTokensTotal": 2.769230769230769,
+                  "mtpAcceptanceByPosition": [
+                    0.6666666666666666, 0.5428571428571428, 0.3333333333333333, 0.22580645161290322,
+                    0.09523809523809523, 0.09523809523809523, 0.09523809523809523
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 5.153846153846154
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "artifact": "scheduled-adaptive-B2.json",
+        "artifact_sha256": "c88900a2e12774800e2ac3b2d4b020cc079b7f379a86deeb462f21cfc3fe609a",
+        "revision": "scheduled-adaptive-binding",
+        "adaptive": true,
+        "runs": [
+          {
+            "rows": 1,
+            "round": 0,
+            "ms": 2336.756625,
+            "tokens": 128,
+            "maxBatchOccupancy": 1,
+            "outputs": [
+              {
+                "sha256": "1aa4e75df79529698b3672ef5be860e8f8365377bbb9ae3f4a9206c0d64efa5b",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 151.592917,
+                  "prefillTokensPerSecond": 151.72212828386964,
+                  "decodeTokensPerSecond": 58.14887631808775,
+                  "mtpMeanAcceptedTokens": 3.1724137931034484,
+                  "mtpMeanAcceptedTokensTotal": 4.172413793103448,
+                  "mtpAcceptanceByPosition": [
+                    0.8275862068965517, 0.6071428571428571, 0.5185185185185185, 0.4444444444444444, 0.34615384615384615,
+                    0.3076923076923077, 0.3076923076923077
+                  ],
+                  "mtpCycles": 29,
+                  "mtpMeanDepth": 6.517241379310345
+                }
+              }
+            ]
+          },
+          {
+            "rows": 1,
+            "round": 1,
+            "ms": 2334.7452080000003,
+            "tokens": 128,
+            "maxBatchOccupancy": 1,
+            "outputs": [
+              {
+                "sha256": "1aa4e75df79529698b3672ef5be860e8f8365377bbb9ae3f4a9206c0d64efa5b",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 151.464416,
+                  "prefillTokensPerSecond": 151.85084792457127,
+                  "decodeTokensPerSecond": 58.18565777882073,
+                  "mtpMeanAcceptedTokens": 3.1724137931034484,
+                  "mtpMeanAcceptedTokensTotal": 4.172413793103448,
+                  "mtpAcceptanceByPosition": [
+                    0.8275862068965517, 0.6071428571428571, 0.5185185185185185, 0.4444444444444444, 0.34615384615384615,
+                    0.3076923076923077, 0.3076923076923077
+                  ],
+                  "mtpCycles": 29,
+                  "mtpMeanDepth": 6.517241379310345
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 0,
+            "ms": 6578.026915999999,
+            "tokens": 512,
+            "maxBatchOccupancy": 4,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 206.095583,
+                  "prefillTokensPerSecond": 111.59870417989501,
+                  "decodeTokensPerSecond": 27.528063607996327,
+                  "mtpMeanAcceptedTokens": 3.4074074074074074,
+                  "mtpMeanAcceptedTokensTotal": 4.407407407407407,
+                  "mtpAcceptanceByPosition": [
+                    0.9259259259259259, 0.64, 0.5652173913043478, 0.5909090909090909, 0.42857142857142855,
+                    0.38095238095238093, 0.38095238095238093
+                  ],
+                  "mtpCycles": 27,
+                  "mtpMeanDepth": 5.925925925925926
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 158.268833,
+                  "prefillTokensPerSecond": 176.914174883693,
+                  "decodeTokensPerSecond": 21.125229381358526,
+                  "mtpMeanAcceptedTokens": 1.9736842105263157,
+                  "mtpMeanAcceptedTokensTotal": 2.973684210526316,
+                  "mtpAcceptanceByPosition": [
+                    0.7105263157894737, 0.5714285714285714, 0.3939393939393939, 0.26666666666666666,
+                    0.13636363636363635, 0.09090909090909091, 0.09090909090909091
+                  ],
+                  "mtpCycles": 38,
+                  "mtpMeanDepth": 5.315789473684211
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 359.831875,
+                  "prefillTokensPerSecond": 63.91873982814891,
+                  "decodeTokensPerSecond": 28.478208618389562,
+                  "mtpMeanAcceptedTokens": 3.4074074074074074,
+                  "mtpMeanAcceptedTokensTotal": 4.407407407407407,
+                  "mtpAcceptanceByPosition": [
+                    0.9259259259259259, 0.64, 0.5652173913043478, 0.5909090909090909, 0.42857142857142855,
+                    0.38095238095238093, 0.38095238095238093
+                  ],
+                  "mtpCycles": 27,
+                  "mtpMeanDepth": 5.925925925925926
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 513.4915,
+                  "prefillTokensPerSecond": 54.52865334674479,
+                  "decodeTokensPerSecond": 21.50832081517731,
+                  "mtpMeanAcceptedTokens": 1.7894736842105263,
+                  "mtpMeanAcceptedTokensTotal": 2.7894736842105265,
+                  "mtpAcceptanceByPosition": [
+                    0.6842105263157895, 0.5142857142857142, 0.34375, 0.1935483870967742, 0.125, 0.08695652173913043,
+                    0.09090909090909091
+                  ],
+                  "mtpCycles": 38,
+                  "mtpMeanDepth": 5.394736842105263
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 1,
+            "ms": 6421.693457999998,
+            "tokens": 512,
+            "maxBatchOccupancy": 4,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 159.297042,
+                  "prefillTokensPerSecond": 144.38435084061385,
+                  "decodeTokensPerSecond": 27.98192922075528,
+                  "mtpMeanAcceptedTokens": 3.72,
+                  "mtpMeanAcceptedTokensTotal": 4.720000000000001,
+                  "mtpAcceptanceByPosition": [
+                    0.96, 0.7727272727272727, 0.6818181818181818, 0.6363636363636364, 0.4, 0.4, 0.3684210526315789
+                  ],
+                  "mtpCycles": 25,
+                  "mtpMeanDepth": 6
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 209.24029199999998,
+                  "prefillTokensPerSecond": 133.81743894717945,
+                  "decodeTokensPerSecond": 20.984531571781115,
+                  "mtpMeanAcceptedTokens": 1.8,
+                  "mtpMeanAcceptedTokensTotal": 2.8,
+                  "mtpAcceptanceByPosition": [
+                    0.675, 0.5555555555555556, 0.35294117647058826, 0.21212121212121213, 0.09090909090909091,
+                    0.09523809523809523, 0.09523809523809523
+                  ],
+                  "mtpCycles": 40,
+                  "mtpMeanDepth": 5.175
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 362.288333,
+                  "prefillTokensPerSecond": 63.48534552449968,
+                  "decodeTokensPerSecond": 27.46609685406975,
+                  "mtpMeanAcceptedTokens": 3.1785714285714284,
+                  "mtpMeanAcceptedTokensTotal": 4.178571428571429,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6956521739130435, 0.6363636363636364, 0.5909090909090909, 0.4, 0.35, 0.25
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 5.535714285714286
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 542.482209,
+                  "prefillTokensPerSecond": 51.614595899125604,
+                  "decodeTokensPerSecond": 22.208911125778968,
+                  "mtpMeanAcceptedTokens": 1.8,
+                  "mtpMeanAcceptedTokensTotal": 2.8,
+                  "mtpAcceptanceByPosition": [
+                    0.675, 0.5555555555555556, 0.35294117647058826, 0.21875, 0.09523809523809523, 0.09523809523809523,
+                    0.09523809523809523
+                  ],
+                  "mtpCycles": 40,
+                  "mtpMeanDepth": 5.125
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "artifact": "scheduled-adaptive-A2.json",
+        "artifact_sha256": "f0217bbe247991a8d6a3398de2fcc1a8b278b64f5846b6ba3147754c48f6fc3d",
+        "revision": "replay-guard-binding",
+        "adaptive": true,
+        "runs": [
+          {
+            "rows": 1,
+            "round": 0,
+            "ms": 2103.8195000000005,
+            "tokens": 128,
+            "maxBatchOccupancy": 0,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 149.931417,
+                  "prefillTokensPerSecond": 153.4034724690156,
+                  "decodeTokensPerSecond": 65.03579316826062,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              }
+            ]
+          },
+          {
+            "rows": 1,
+            "round": 1,
+            "ms": 2096.0090419999997,
+            "tokens": 128,
+            "maxBatchOccupancy": 0,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 148.065125,
+                  "prefillTokensPerSecond": 155.33705185471595,
+                  "decodeTokensPerSecond": 65.21940778081657,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 0,
+            "ms": 10228.249457999998,
+            "tokens": 512,
+            "maxBatchOccupancy": 0,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 151.114625,
+                  "prefillTokensPerSecond": 152.20234308889692,
+                  "decodeTokensPerSecond": 63.32600126773769,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 154.824792,
+                  "prefillTokensPerSecond": 180.84958899864048,
+                  "decodeTokensPerSecond": 45.410094270640585,
+                  "mtpMeanAcceptedTokens": 2.15,
+                  "mtpMeanAcceptedTokensTotal": 3.15,
+                  "mtpAcceptanceByPosition": [
+                    0.7, 0.5555555555555556, 0.3888888888888889, 0.25, 0.2692307692307692, 0.19230769230769232,
+                    0.11538461538461539
+                  ],
+                  "mtpCycles": 40,
+                  "mtpMeanDepth": 5.65
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 151.28212499999998,
+                  "prefillTokensPerSecond": 152.033824220806,
+                  "decodeTokensPerSecond": 63.709934874972156,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 155.319375,
+                  "prefillTokensPerSecond": 180.27371021805874,
+                  "decodeTokensPerSecond": 45.07278589477332,
+                  "mtpMeanAcceptedTokens": 2.15,
+                  "mtpMeanAcceptedTokensTotal": 3.15,
+                  "mtpAcceptanceByPosition": [
+                    0.7, 0.5555555555555556, 0.3888888888888889, 0.25, 0.22580645161290322, 0.16129032258064516,
+                    0.0967741935483871
+                  ],
+                  "mtpCycles": 40,
+                  "mtpMeanDepth": 6.025
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 1,
+            "ms": 10353.121625,
+            "tokens": 512,
+            "maxBatchOccupancy": 0,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 154.556917,
+                  "prefillTokensPerSecond": 148.8124921642944,
+                  "decodeTokensPerSecond": 63.51242992239146,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 155.959667,
+                  "prefillTokensPerSecond": 179.53359697799303,
+                  "decodeTokensPerSecond": 43.989388407275435,
+                  "mtpMeanAcceptedTokens": 2.073170731707317,
+                  "mtpMeanAcceptedTokensTotal": 3.073170731707317,
+                  "mtpAcceptanceByPosition": [
+                    0.7073170731707317, 0.5675675675675675, 0.35135135135135137, 0.24324324324324326,
+                    0.17647058823529413, 0.11764705882352941, 0.08823529411764706
+                  ],
+                  "mtpCycles": 41,
+                  "mtpMeanDepth": 6.195121951219512
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 150.771667,
+                  "prefillTokensPerSecond": 152.5485554258679,
+                  "decodeTokensPerSecond": 63.67750371606368,
+                  "mtpMeanAcceptedTokens": 3.5,
+                  "mtpMeanAcceptedTokensTotal": 4.5,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6923076923076923, 0.5769230769230769, 0.5384615384615384, 0.375,
+                    0.3333333333333333, 0.3333333333333333
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 6.357142857142857
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 154.388666,
+                  "prefillTokensPerSecond": 181.36046333867537,
+                  "decodeTokensPerSecond": 44.5006451540599,
+                  "mtpMeanAcceptedTokens": 2.073170731707317,
+                  "mtpMeanAcceptedTokensTotal": 3.073170731707317,
+                  "mtpAcceptanceByPosition": [
+                    0.7073170731707317, 0.5675675675675675, 0.35135135135135137, 0.24324324324324326,
+                    0.2608695652173913, 0.17391304347826086, 0.13043478260869565
+                  ],
+                  "mtpCycles": 41,
+                  "mtpMeanDepth": 5.390243902439025
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "artifact": "scheduled-adaptive-fixed-C1.json",
+        "artifact_sha256": "fca12e3450cfdbce5c9d2393e4295dea129e1b011e078bf20dab8f207b9244b8",
+        "revision": "scheduled-adaptive-binding",
+        "adaptive": false,
+        "runs": [
+          {
+            "rows": 4,
+            "round": 0,
+            "ms": 5653.792166000001,
+            "tokens": 512,
+            "maxBatchOccupancy": 4,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 150.690333,
+                  "prefillTokensPerSecond": 152.63089238776848,
+                  "decodeTokensPerSecond": 30.700740782283887,
+                  "mtpMeanAcceptedTokens": 3.8461538461538463,
+                  "mtpMeanAcceptedTokensTotal": 4.846153846153847,
+                  "mtpAcceptanceByPosition": [
+                    0.9615384615384616, 0.7307692307692307, 0.6153846153846154, 0.5384615384615384, 0.38461538461538464,
+                    0.3076923076923077, 0.32
+                  ],
+                  "mtpCycles": 26,
+                  "mtpMeanDepth": 6.961538461538462
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 213.00091600000002,
+                  "prefillTokensPerSecond": 131.45483374353188,
+                  "decodeTokensPerSecond": 24.01213066371065,
+                  "mtpMeanAcceptedTokens": 2.2564102564102564,
+                  "mtpMeanAcceptedTokensTotal": 3.2564102564102564,
+                  "mtpAcceptanceByPosition": [
+                    0.717948717948718, 0.5526315789473685, 0.40540540540540543, 0.25, 0.19444444444444445,
+                    0.14285714285714285, 0.08571428571428572
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 6.564102564102564
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 360.64329200000003,
+                  "prefillTokensPerSecond": 63.77492805273084,
+                  "decodeTokensPerSecond": 31.558538622360125,
+                  "mtpMeanAcceptedTokens": 3.6666666666666665,
+                  "mtpMeanAcceptedTokensTotal": 4.666666666666666,
+                  "mtpAcceptanceByPosition": [
+                    0.9629629629629629, 0.7037037037037037, 0.6296296296296297, 0.4444444444444444, 0.34615384615384615,
+                    0.3076923076923077, 0.3076923076923077
+                  ],
+                  "mtpCycles": 27,
+                  "mtpMeanDepth": 6.888888888888889
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 508.633,
+                  "prefillTokensPerSecond": 55.049515072753834,
+                  "decodeTokensPerSecond": 25.435784124321874,
+                  "mtpMeanAcceptedTokens": 2.2564102564102564,
+                  "mtpMeanAcceptedTokensTotal": 3.2564102564102564,
+                  "mtpAcceptanceByPosition": [
+                    0.717948717948718, 0.5526315789473685, 0.40540540540540543, 0.25, 0.19444444444444445,
+                    0.14285714285714285, 0.08571428571428572
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 6.564102564102564
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 1,
+            "ms": 5645.170791999999,
+            "tokens": 512,
+            "maxBatchOccupancy": 4,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 149.513,
+                  "prefillTokensPerSecond": 153.83277708292923,
+                  "decodeTokensPerSecond": 30.757489143392824,
+                  "mtpMeanAcceptedTokens": 3.8461538461538463,
+                  "mtpMeanAcceptedTokensTotal": 4.846153846153847,
+                  "mtpAcceptanceByPosition": [
+                    0.9615384615384616, 0.7307692307692307, 0.6153846153846154, 0.5384615384615384, 0.38461538461538464,
+                    0.3076923076923077, 0.32
+                  ],
+                  "mtpCycles": 26,
+                  "mtpMeanDepth": 6.961538461538462
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 212.242334,
+                  "prefillTokensPerSecond": 131.92467059846788,
+                  "decodeTokensPerSecond": 24.042274841115912,
+                  "mtpMeanAcceptedTokens": 2.2564102564102564,
+                  "mtpMeanAcceptedTokensTotal": 3.2564102564102564,
+                  "mtpAcceptanceByPosition": [
+                    0.717948717948718, 0.5526315789473685, 0.40540540540540543, 0.25, 0.19444444444444445,
+                    0.14285714285714285, 0.08571428571428572
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 6.564102564102564
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 358.832916,
+                  "prefillTokensPerSecond": 64.09668392851675,
+                  "decodeTokensPerSecond": 31.609544301691525,
+                  "mtpMeanAcceptedTokens": 3.6666666666666665,
+                  "mtpMeanAcceptedTokensTotal": 4.666666666666666,
+                  "mtpAcceptanceByPosition": [
+                    0.9629629629629629, 0.7037037037037037, 0.6296296296296297, 0.4444444444444444, 0.34615384615384615,
+                    0.3076923076923077, 0.3076923076923077
+                  ],
+                  "mtpCycles": 27,
+                  "mtpMeanDepth": 6.888888888888889
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 507.482541,
+                  "prefillTokensPerSecond": 55.1743118981506,
+                  "decodeTokensPerSecond": 25.467568643056108,
+                  "mtpMeanAcceptedTokens": 2.2564102564102564,
+                  "mtpMeanAcceptedTokensTotal": 3.2564102564102564,
+                  "mtpAcceptanceByPosition": [
+                    0.717948717948718, 0.5526315789473685, 0.40540540540540543, 0.25, 0.19444444444444445,
+                    0.14285714285714285, 0.08571428571428572
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 6.564102564102564
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "artifact": "scheduled-adaptive-adaptive-B3.json",
+        "artifact_sha256": "ce94727b4f3bb5e2ab3cc139bcb4aa9af20925ae3ac1d7b6a40a8b0a1b0b4386",
+        "revision": "scheduled-adaptive-binding",
+        "adaptive": true,
+        "runs": [
+          {
+            "rows": 4,
+            "round": 0,
+            "ms": 6287.772541,
+            "tokens": 512,
+            "maxBatchOccupancy": 4,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 153.869292,
+                  "prefillTokensPerSecond": 149.47751888011547,
+                  "decodeTokensPerSecond": 29.25794143115013,
+                  "mtpMeanAcceptedTokens": 3.72,
+                  "mtpMeanAcceptedTokensTotal": 4.720000000000001,
+                  "mtpAcceptanceByPosition": [
+                    0.96, 0.7727272727272727, 0.6818181818181818, 0.6363636363636364, 0.4, 0.4, 0.3684210526315789
+                  ],
+                  "mtpCycles": 25,
+                  "mtpMeanDepth": 6
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 196.993334,
+                  "prefillTokensPerSecond": 142.13678925805684,
+                  "decodeTokensPerSecond": 21.569461381571493,
+                  "mtpMeanAcceptedTokens": 1.794871794871795,
+                  "mtpMeanAcceptedTokensTotal": 2.7948717948717947,
+                  "mtpAcceptanceByPosition": [
+                    0.6666666666666666, 0.5428571428571428, 0.3333333333333333, 0.21875, 0.13043478260869565,
+                    0.09523809523809523, 0.09523809523809523
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 5.230769230769231
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 340.776917,
+                  "prefillTokensPerSecond": 67.49283432246087,
+                  "decodeTokensPerSecond": 28.720505167398716,
+                  "mtpMeanAcceptedTokens": 3.1785714285714284,
+                  "mtpMeanAcceptedTokensTotal": 4.178571428571429,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6956521739130435, 0.6363636363636364, 0.5909090909090909, 0.4, 0.35, 0.25
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 5.535714285714286
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 485.375167,
+                  "prefillTokensPerSecond": 57.687335289652346,
+                  "decodeTokensPerSecond": 22.489496508649545,
+                  "mtpMeanAcceptedTokens": 1.7692307692307692,
+                  "mtpMeanAcceptedTokensTotal": 2.769230769230769,
+                  "mtpAcceptanceByPosition": [
+                    0.6666666666666666, 0.5428571428571428, 0.3333333333333333, 0.22580645161290322,
+                    0.09523809523809523, 0.09523809523809523, 0.09523809523809523
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 5.153846153846154
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 1,
+            "ms": 6357.840833999999,
+            "tokens": 512,
+            "maxBatchOccupancy": 4,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 154.61783300000002,
+                  "prefillTokensPerSecond": 148.75386333994214,
+                  "decodeTokensPerSecond": 28.8382204992924,
+                  "mtpMeanAcceptedTokens": 3.72,
+                  "mtpMeanAcceptedTokensTotal": 4.720000000000001,
+                  "mtpAcceptanceByPosition": [
+                    0.96, 0.7727272727272727, 0.6818181818181818, 0.6363636363636364, 0.4, 0.4, 0.3684210526315789
+                  ],
+                  "mtpCycles": 25,
+                  "mtpMeanDepth": 6
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 201.742708,
+                  "prefillTokensPerSecond": 138.79064218767203,
+                  "decodeTokensPerSecond": 21.34103343092682,
+                  "mtpMeanAcceptedTokens": 1.794871794871795,
+                  "mtpMeanAcceptedTokensTotal": 2.7948717948717947,
+                  "mtpAcceptanceByPosition": [
+                    0.6666666666666666, 0.5428571428571428, 0.3333333333333333, 0.21875, 0.13043478260869565,
+                    0.09523809523809523, 0.09523809523809523
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 5.230769230769231
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 347.541292,
+                  "prefillTokensPerSecond": 66.17918655835578,
+                  "decodeTokensPerSecond": 28.368955392581494,
+                  "mtpMeanAcceptedTokens": 3.1785714285714284,
+                  "mtpMeanAcceptedTokensTotal": 4.178571428571429,
+                  "mtpAcceptanceByPosition": [
+                    0.9285714285714286, 0.6956521739130435, 0.6363636363636364, 0.5909090909090909, 0.4, 0.35, 0.25
+                  ],
+                  "mtpCycles": 28,
+                  "mtpMeanDepth": 5.535714285714286
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 504.507041,
+                  "prefillTokensPerSecond": 55.499720964251125,
+                  "decodeTokensPerSecond": 22.291464718831456,
+                  "mtpMeanAcceptedTokens": 1.7692307692307692,
+                  "mtpMeanAcceptedTokensTotal": 2.769230769230769,
+                  "mtpAcceptanceByPosition": [
+                    0.6666666666666666, 0.5428571428571428, 0.3333333333333333, 0.22580645161290322,
+                    0.09523809523809523, 0.09523809523809523, 0.09523809523809523
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 5.153846153846154
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "artifact": "scheduled-adaptive-fixed-C2.json",
+        "artifact_sha256": "ed35451a36586237f5d39b1b9978fc7a82218521d597fb1c2613c93892b7812b",
+        "revision": "scheduled-adaptive-binding",
+        "adaptive": false,
+        "runs": [
+          {
+            "rows": 4,
+            "round": 0,
+            "ms": 5656.386458000001,
+            "tokens": 512,
+            "maxBatchOccupancy": 4,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 148.732792,
+                  "prefillTokensPerSecond": 154.63973808815476,
+                  "decodeTokensPerSecond": 30.68415796554852,
+                  "mtpMeanAcceptedTokens": 3.8461538461538463,
+                  "mtpMeanAcceptedTokensTotal": 4.846153846153847,
+                  "mtpAcceptanceByPosition": [
+                    0.9615384615384616, 0.7307692307692307, 0.6153846153846154, 0.5384615384615384, 0.38461538461538464,
+                    0.3076923076923077, 0.32
+                  ],
+                  "mtpCycles": 26,
+                  "mtpMeanDepth": 6.961538461538462
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 213.60524999999998,
+                  "prefillTokensPerSecond": 131.08292048065297,
+                  "decodeTokensPerSecond": 23.994066284789298,
+                  "mtpMeanAcceptedTokens": 2.2564102564102564,
+                  "mtpMeanAcceptedTokensTotal": 3.2564102564102564,
+                  "mtpAcceptanceByPosition": [
+                    0.717948717948718, 0.5526315789473685, 0.40540540540540543, 0.25, 0.19444444444444445,
+                    0.14285714285714285, 0.08571428571428572
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 6.564102564102564
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 359.147542,
+                  "prefillTokensPerSecond": 64.04053295734376,
+                  "decodeTokensPerSecond": 31.54254435458319,
+                  "mtpMeanAcceptedTokens": 3.6666666666666665,
+                  "mtpMeanAcceptedTokensTotal": 4.666666666666666,
+                  "mtpAcceptanceByPosition": [
+                    0.9629629629629629, 0.7037037037037037, 0.6296296296296297, 0.4444444444444444, 0.34615384615384615,
+                    0.3076923076923077, 0.3076923076923077
+                  ],
+                  "mtpCycles": 27,
+                  "mtpMeanDepth": 6.888888888888889
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 508.56575000000004,
+                  "prefillTokensPerSecond": 55.05679452460178,
+                  "decodeTokensPerSecond": 25.41207878797085,
+                  "mtpMeanAcceptedTokens": 2.2564102564102564,
+                  "mtpMeanAcceptedTokensTotal": 3.2564102564102564,
+                  "mtpAcceptanceByPosition": [
+                    0.717948717948718, 0.5526315789473685, 0.40540540540540543, 0.25, 0.19444444444444445,
+                    0.14285714285714285, 0.08571428571428572
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 6.564102564102564
+                }
+              }
+            ]
+          },
+          {
+            "rows": 4,
+            "round": 1,
+            "ms": 5660.530790999999,
+            "tokens": 512,
+            "maxBatchOccupancy": 4,
+            "outputs": [
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 149.04204099999998,
+                  "prefillTokensPerSecond": 154.3188743637777,
+                  "decodeTokensPerSecond": 30.636192189828588,
+                  "mtpMeanAcceptedTokens": 3.8461538461538463,
+                  "mtpMeanAcceptedTokensTotal": 4.846153846153847,
+                  "mtpAcceptanceByPosition": [
+                    0.9615384615384616, 0.7307692307692307, 0.6153846153846154, 0.5384615384615384, 0.38461538461538464,
+                    0.3076923076923077, 0.32
+                  ],
+                  "mtpCycles": 26,
+                  "mtpMeanDepth": 6.961538461538462
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 212.670625,
+                  "prefillTokensPerSecond": 131.65899145685964,
+                  "decodeTokensPerSecond": 23.97244528011558,
+                  "mtpMeanAcceptedTokens": 2.2564102564102564,
+                  "mtpMeanAcceptedTokensTotal": 3.2564102564102564,
+                  "mtpAcceptanceByPosition": [
+                    0.717948717948718, 0.5526315789473685, 0.40540540540540543, 0.25, 0.19444444444444445,
+                    0.14285714285714285, 0.08571428571428572
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 6.564102564102564
+                }
+              },
+              {
+                "sha256": "fc72ccf058f4bb9f9e070da97140d6a2d96a705c1417da7e2012850cbf0492e3",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 359.615708,
+                  "prefillTokensPerSecond": 63.9571617377737,
+                  "decodeTokensPerSecond": 31.47895699627636,
+                  "mtpMeanAcceptedTokens": 3.6666666666666665,
+                  "mtpMeanAcceptedTokensTotal": 4.666666666666666,
+                  "mtpAcceptanceByPosition": [
+                    0.9629629629629629, 0.7037037037037037, 0.6296296296296297, 0.4444444444444444, 0.34615384615384615,
+                    0.3076923076923077, 0.3076923076923077
+                  ],
+                  "mtpCycles": 27,
+                  "mtpMeanDepth": 6.888888888888889
+                }
+              },
+              {
+                "sha256": "82104b4128d97471f6953f5ab26fa488597360c8284b15cafa6d9183630699a1",
+                "tokens": 128,
+                "finish": "length",
+                "performance": {
+                  "ttftMs": 507.79679200000004,
+                  "prefillTokensPerSecond": 55.14016717143813,
+                  "decodeTokensPerSecond": 25.388691242203443,
+                  "mtpMeanAcceptedTokens": 2.2564102564102564,
+                  "mtpMeanAcceptedTokensTotal": 3.2564102564102564,
+                  "mtpAcceptanceByPosition": [
+                    0.717948717948718, 0.5526315789473685, 0.40540540540540543, 0.25, 0.19444444444444445,
+                    0.14285714285714285, 0.08571428571428572
+                  ],
+                  "mtpCycles": 39,
+                  "mtpMeanDepth": 6.564102564102564
+                }
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "scheduled-native-mtp-cycle-prototype": {
+      "status": "Rejected as the final draft-cache strategy: dense regression; MoE alternating results variable. Request-owned committed history is being validated.",
+      "protocol": "A1/B1/B2/A2 per family; one warm-up plus two measured rounds at N=1 and N=2, 128 tokens, depth 3, greedy, MLX_CONTINUOUS_BATCHING=1, SSD persistence disabled. No builds/tests ran during measurement.",
+      "measurements": [
+        {
+          "artifact": "scheduled-mtp-cycle-Qwen35-A1.json",
+          "artifact_sha256": "d1e5d186657bb5adb23913d7626a290c5d028416427a6e8cfdd7a45ee654da06",
+          "revision": "replay-guard-binding",
+          "family": "Qwen35",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1030.024625,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1038.2163330000003,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 2087.7237909999985,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "e32f644226e220be5fc32890fc697c158f088ffef359f256f56f2eb73a9547e7",
+                  "mtpCycles": 43
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 2078.8034160000007,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "e32f644226e220be5fc32890fc697c158f088ffef359f256f56f2eb73a9547e7",
+                  "mtpCycles": 43
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-cycle-Qwen35-A2.json",
+          "artifact_sha256": "b997308b8805144d658714dda8269b7d0952eae7a32b3c38905897d08f0bcbba",
+          "revision": "replay-guard-binding",
+          "family": "Qwen35",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1042.007916,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1061.7635410000003,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 2176.419334000001,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "e32f644226e220be5fc32890fc697c158f088ffef359f256f56f2eb73a9547e7",
+                  "mtpCycles": 43
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 2191.1795,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "e32f644226e220be5fc32890fc697c158f088ffef359f256f56f2eb73a9547e7",
+                  "mtpCycles": 43
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-cycle-Qwen35-B1.json",
+          "artifact_sha256": "05d336422af7003fef4f7b51115e738e99d6eb3665c0a25a2fff6e00e89b8f40",
+          "revision": "scheduled-mtp-binding",
+          "family": "Qwen35",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1363.4122499999999,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 56
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1355.5674159999999,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 56
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 2393.1100829999996,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 56
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "402a1b679c09f40ad8c21ddb9e0cc1358d85fd4cb205ef209a1296d52f2881d0",
+                  "mtpCycles": 57
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 2358.264332999999,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 56
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "402a1b679c09f40ad8c21ddb9e0cc1358d85fd4cb205ef209a1296d52f2881d0",
+                  "mtpCycles": 57
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-cycle-Qwen35-B2.json",
+          "artifact_sha256": "ae80624435b70d31afd3479a0474c2e427e03f189971ff67eceeebb7f24c8e20",
+          "revision": "scheduled-mtp-binding",
+          "family": "Qwen35",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1450.9138749999997,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 56
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1312.2505,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 56
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 2384.7913750000007,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 56
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "402a1b679c09f40ad8c21ddb9e0cc1358d85fd4cb205ef209a1296d52f2881d0",
+                  "mtpCycles": 57
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 2399.484624999999,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 56
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "402a1b679c09f40ad8c21ddb9e0cc1358d85fd4cb205ef209a1296d52f2881d0",
+                  "mtpCycles": 57
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-cycle-Qwen35Moe-A1.json",
+          "artifact_sha256": "ac9a464714cad00eb1b6e37031de4d98b9149cbe91ba376982661812918a899d",
+          "revision": "replay-guard-binding",
+          "family": "Qwen35Moe",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1571.0952079999988,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1560.525999999998,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 3097.1886670000094,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "298720f89458bed9fb837afc6dec340e634b4cdc8cc69e1f237067d334276325",
+                  "mtpCycles": 52
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 3037.691332999995,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "298720f89458bed9fb837afc6dec340e634b4cdc8cc69e1f237067d334276325",
+                  "mtpCycles": 52
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-cycle-Qwen35Moe-A2.json",
+          "artifact_sha256": "30adaf61633ba327abdd775d62172f74f504e55b029e95f5c8f985c5ee464f4d",
+          "revision": "replay-guard-binding",
+          "family": "Qwen35Moe",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1426.6655419999952,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1411.1613750000033,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 2856.423790999994,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "298720f89458bed9fb837afc6dec340e634b4cdc8cc69e1f237067d334276325",
+                  "mtpCycles": 52
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 2767.3979580000014,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "298720f89458bed9fb837afc6dec340e634b4cdc8cc69e1f237067d334276325",
+                  "mtpCycles": 52
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-cycle-Qwen35Moe-B1.json",
+          "artifact_sha256": "18fda677fdbdb79025306ff15bb0d59c0ede73b520893b116b5b54c3094473f5",
+          "revision": "scheduled-mtp-binding",
+          "family": "Qwen35Moe",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1351.6011660000004,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1414.6386669999993,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 2616.1649589999943,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "957b5f409a6e566d342c5179f9867d9b3a7893c19e8c37b6329aa9cbd0fcc1e8",
+                  "mtpCycles": 52
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 2527.811249999999,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "957b5f409a6e566d342c5179f9867d9b3a7893c19e8c37b6329aa9cbd0fcc1e8",
+                  "mtpCycles": 52
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-cycle-Qwen35Moe-B2.json",
+          "artifact_sha256": "c336b1e1e5da18f225a99c707909ea10130ece7a19365dabed021162c4c82b0c",
+          "revision": "scheduled-mtp-binding",
+          "family": "Qwen35Moe",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1779.565542000004,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1852.253499999999,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 3364.2540420000005,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "957b5f409a6e566d342c5179f9867d9b3a7893c19e8c37b6329aa9cbd0fcc1e8",
+                  "mtpCycles": 52
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 3252.975915999996,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "957b5f409a6e566d342c5179f9867d9b3a7893c19e8c37b6329aa9cbd0fcc1e8",
+                  "mtpCycles": 52
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "scheduled-native-mtp-committed": {
+      "status": "Retained. Dense N1 latency -3.6%, N2 -14.4%; MoE N1 -26.9%, N2 -25.9%. Singleton hashes match baseline; second owner hashes differ across batch shapes but repeat within each arm. Qwen scheduling remains explicitly enabled through MLX_CONTINUOUS_BATCHING=1.",
+      "protocol": "A1/B1/B2/A2 per family; one warm-up plus two measured rounds at N=1 and N=2, 128 greedy tokens, depth 3, SSD persistence disabled. No builds/tests ran during performance measurement.",
+      "measurements": [
+        {
+          "artifact": "scheduled-mtp-committed-Qwen35-A1.json",
+          "artifact_sha256": "8c4941d12f856d9ae63153704827fe323368fc91382dc0ab282094e312e92849",
+          "revision": "replay-guard-binding",
+          "family": "Qwen35",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 971.9626250000001,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 972.4672499999979,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 1921.7913750000007,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "e32f644226e220be5fc32890fc697c158f088ffef359f256f56f2eb73a9547e7",
+                  "mtpCycles": 43
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 1929.6955419999977,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "e32f644226e220be5fc32890fc697c158f088ffef359f256f56f2eb73a9547e7",
+                  "mtpCycles": 43
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-committed-Qwen35-A2.json",
+          "artifact_sha256": "f39998870ff082eb44910b8930a4e785e9a9f37f332c6fc324c9b54664d8594e",
+          "revision": "replay-guard-binding",
+          "family": "Qwen35",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 939.488292,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 938.2063750000002,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 1978.048291,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "e32f644226e220be5fc32890fc697c158f088ffef359f256f56f2eb73a9547e7",
+                  "mtpCycles": 43
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 1989.6865829999997,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "e32f644226e220be5fc32890fc697c158f088ffef359f256f56f2eb73a9547e7",
+                  "mtpCycles": 43
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-committed-Qwen35-B1.json",
+          "artifact_sha256": "45d0a20652ce1985d74509bb6fe5d29c89c6764faf80871c44b4d7214cfb2e14",
+          "revision": "scheduled-mtp-committed-binding",
+          "family": "Qwen35",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 922.7276669999999,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 927.9769590000001,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 1685.6126249999998,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "2a88e8af84142889cdcbfd8c57bcbb0a4c3dc790a8a0d760e6e1f764a5de87f9",
+                  "mtpCycles": 45
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 1682.4261250000009,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "2a88e8af84142889cdcbfd8c57bcbb0a4c3dc790a8a0d760e6e1f764a5de87f9",
+                  "mtpCycles": 45
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-committed-Qwen35-B2.json",
+          "artifact_sha256": "0a47a01227dd6df4008ff4add02b180702b55c623c5b098f7a738bc311a3cfac",
+          "revision": "scheduled-mtp-committed-binding",
+          "family": "Qwen35",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 918.7889580000001,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 919.5019589999997,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 1661.094833,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "2a88e8af84142889cdcbfd8c57bcbb0a4c3dc790a8a0d760e6e1f764a5de87f9",
+                  "mtpCycles": 45
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 1653.2618340000008,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "7a9923ceadfaaa27de412fdbaa218eafd796915d08ed7d973b996fb94cc94a8a",
+                  "mtpCycles": 41
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "2a88e8af84142889cdcbfd8c57bcbb0a4c3dc790a8a0d760e6e1f764a5de87f9",
+                  "mtpCycles": 45
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-committed-Qwen35Moe-A1.json",
+          "artifact_sha256": "13233f1fdc3b49a9215b5708a8b0a39619ae42e4856e74cb8eb8cf592fcc96c0",
+          "revision": "replay-guard-binding",
+          "family": "Qwen35Moe",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1447.8605000000025,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1461.8032920000041,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 2768.847290999998,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "298720f89458bed9fb837afc6dec340e634b4cdc8cc69e1f237067d334276325",
+                  "mtpCycles": 52
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 2755.1300000000047,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "298720f89458bed9fb837afc6dec340e634b4cdc8cc69e1f237067d334276325",
+                  "mtpCycles": 52
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-committed-Qwen35Moe-A2.json",
+          "artifact_sha256": "379060cbc5178825b87927c02661c1d5afb5912fc2213c63db5c300cc766bdd1",
+          "revision": "replay-guard-binding",
+          "family": "Qwen35Moe",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1378.0379590000011,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1352.9633329999997,
+              "tokens": 128,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 2754.4588749999966,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "298720f89458bed9fb837afc6dec340e634b4cdc8cc69e1f237067d334276325",
+                  "mtpCycles": 52
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 2753.7022080000024,
+              "tokens": 256,
+              "maxBatchOccupancy": 0,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 51
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "298720f89458bed9fb837afc6dec340e634b4cdc8cc69e1f237067d334276325",
+                  "mtpCycles": 52
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-committed-Qwen35Moe-B1.json",
+          "artifact_sha256": "f47477c1c3de3e015e292582b2ed7198545787e0d7f2ab05a2011679143b1d62",
+          "revision": "scheduled-mtp-committed-binding",
+          "family": "Qwen35Moe",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1059.28125,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 37
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1059.4928750000036,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 37
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 2041.3712499999965,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 37
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "9e71ecd641af25523509096f22b2e509f4f96f2dcf9f5176d52dcd3771f7d486",
+                  "mtpCycles": 44
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 2039.7467909999978,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 37
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "9e71ecd641af25523509096f22b2e509f4f96f2dcf9f5176d52dcd3771f7d486",
+                  "mtpCycles": 44
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "artifact": "scheduled-mtp-committed-Qwen35Moe-B2.json",
+          "artifact_sha256": "8852c848d094dec645a650d3e2aaec69cc6461cea10813e9c94251729ce72d96",
+          "revision": "scheduled-mtp-committed-binding",
+          "family": "Qwen35Moe",
+          "runs": [
+            {
+              "rows": 1,
+              "round": 0,
+              "ms": 1005.2795420000039,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 37
+                }
+              ]
+            },
+            {
+              "rows": 1,
+              "round": 1,
+              "ms": 1004.585500000001,
+              "tokens": 128,
+              "maxBatchOccupancy": 1,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 37
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 0,
+              "ms": 2040.5710000000036,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 37
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "9e71ecd641af25523509096f22b2e509f4f96f2dcf9f5176d52dcd3771f7d486",
+                  "mtpCycles": 44
+                }
+              ]
+            },
+            {
+              "rows": 2,
+              "round": 1,
+              "ms": 2034.917042000001,
+              "tokens": 256,
+              "maxBatchOccupancy": 2,
+              "outputs": [
+                {
+                  "tokens": 128,
+                  "sha256": "c400b63c0dd39155c361ae0f363db117db0025949e4c0c06825991fee7bb679b",
+                  "mtpCycles": 37
+                },
+                {
+                  "tokens": 128,
+                  "sha256": "9e71ecd641af25523509096f22b2e509f4f96f2dcf9f5176d52dcd3771f7d486",
+                  "mtpCycles": 44
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    "scheduled-mtp-continuation-dense": {
+      "artifact": "scheduled-mtp-continuation-dense.json",
+      "artifact_sha256": "84a31033fa0f053def68e4050dbc44b11c0784d6d109f764f8d73ac40c337d32",
+      "family": "Qwen35",
+      "status": "Correctness smoke, not a benchmark: two warm-prefix continuations and two unseeded sampled requests completed with MTP.",
+      "cached_tokens": [119, 116],
+      "continuation_cycles": [43, 43],
+      "sampled_cycles": [33, 36]
+    },
+    "scheduled-mtp-continuation-moe": {
+      "artifact": "scheduled-mtp-continuation-moe.json",
+      "artifact_sha256": "0d9001914844557907083fe3487f71c762770409188f1a8618976ad0459cfa88",
+      "family": "Qwen35Moe",
+      "status": "Correctness smoke, not a benchmark: two warm-prefix continuations and two unseeded sampled requests completed with MTP.",
+      "cached_tokens": [119, 116],
+      "continuation_cycles": [39, 40],
+      "sampled_cycles": [36, 32]
+    },
+    "scheduled-mtp-ssd-Qwen35": {
+      "status": "Correctness smoke: separate capture and restore processes, two scheduled MTP owners, isolated SSD root. Not a timing or greedy-parity claim.",
+      "binding": "scheduled-mtp-committed-binding",
+      "runs": [
+        {
+          "artifact": "scheduled-mtp-ssd-Qwen35-capture.json",
+          "artifact_sha256": "8ff524b3a11e814db525a209a36e9ef46d135d298cc0ae1d8c2d57078ce87882",
+          "phase": "capture",
+          "cached_tokens": [0, 0],
+          "mtp_cycles": [21, 21],
+          "max_occupancy": 2,
+          "drained": true,
+          "cold": {
+            "enabled": true,
+            "root": "/tmp/mlx-node-inference-20260905/scheduled-mtp-ssd-cache-Qwen35/mlx-paged-v1",
+            "quotaBytes": 107374182400,
+            "hits": 0,
+            "misses": 0,
+            "enqueued": 60,
+            "queueDrops": 0,
+            "bytesWritten": 83207648,
+            "bytesRestored": 0,
+            "evictions": 0,
+            "corruptions": 0,
+            "writeErrors": 0,
+            "restoreDeclines": 2
+          },
+          "sidecars": {
+            "captureReached": 2,
+            "chainEmpty": 0,
+            "boundarySkips": 0,
+            "alreadyPersisted": 0,
+            "enqueued": 2,
+            "queueDrops": 0,
+            "installed": 0,
+            "restoreSuppressed": 0
+          }
+        },
+        {
+          "artifact": "scheduled-mtp-ssd-Qwen35-restore.json",
+          "artifact_sha256": "5cfc79c5820c8ebb5f64c9d8cb546ff60938169c2420613c628b8a244e80ee82",
+          "phase": "restore",
+          "cached_tokens": [400, 400],
+          "mtp_cycles": [24, 26],
+          "max_occupancy": 2,
+          "drained": true,
+          "cold": {
+            "enabled": true,
+            "root": "/tmp/mlx-node-inference-20260905/scheduled-mtp-ssd-cache-Qwen35/mlx-paged-v1",
+            "quotaBytes": 107374182400,
+            "hits": 50,
+            "misses": 0,
+            "enqueued": 0,
+            "queueDrops": 0,
+            "bytesWritten": 0,
+            "bytesRestored": 26487150,
+            "evictions": 0,
+            "corruptions": 0,
+            "writeErrors": 0,
+            "restoreDeclines": 0
+          },
+          "sidecars": {
+            "captureReached": 2,
+            "chainEmpty": 0,
+            "boundarySkips": 1,
+            "alreadyPersisted": 1,
+            "enqueued": 0,
+            "queueDrops": 0,
+            "installed": 2,
+            "restoreSuppressed": 0
+          }
+        }
+      ]
+    },
+    "scheduled-mtp-ssd-Qwen35Moe": {
+      "status": "Correctness smoke: separate capture and restore processes, two scheduled MTP owners, isolated SSD root. Not a timing or greedy-parity claim.",
+      "binding": "scheduled-mtp-committed-binding",
+      "runs": [
+        {
+          "artifact": "scheduled-mtp-ssd-Qwen35Moe-capture.json",
+          "artifact_sha256": "ac3168fe428bfa11bf423e804d7f4b12cc7d2593f6de1f440ecc06b63b234da5",
+          "phase": "capture",
+          "cached_tokens": [0, 0],
+          "mtp_cycles": [22, 22],
+          "max_occupancy": 2,
+          "drained": true,
+          "cold": {
+            "enabled": true,
+            "root": "/tmp/mlx-node-inference-20260905/scheduled-mtp-ssd-cache-Qwen35Moe/mlx-paged-v1",
+            "quotaBytes": 107374182400,
+            "hits": 0,
+            "misses": 0,
+            "enqueued": 60,
+            "queueDrops": 0,
+            "bytesWritten": 84995792,
+            "bytesRestored": 0,
+            "evictions": 0,
+            "corruptions": 0,
+            "writeErrors": 0,
+            "restoreDeclines": 2
+          },
+          "sidecars": {
+            "captureReached": 2,
+            "chainEmpty": 0,
+            "boundarySkips": 0,
+            "alreadyPersisted": 0,
+            "enqueued": 2,
+            "queueDrops": 0,
+            "installed": 0,
+            "restoreSuppressed": 0
+          }
+        },
+        {
+          "artifact": "scheduled-mtp-ssd-Qwen35Moe-restore.json",
+          "artifact_sha256": "4f2be1c1fdb31ee1a3e46424afb7e992392c1146276461bbac25aea4a681deb4",
+          "phase": "restore",
+          "cached_tokens": [400, 400],
+          "mtp_cycles": [25, 27],
+          "max_occupancy": 2,
+          "drained": true,
+          "cold": {
+            "enabled": true,
+            "root": "/tmp/mlx-node-inference-20260905/scheduled-mtp-ssd-cache-Qwen35Moe/mlx-paged-v1",
+            "quotaBytes": 107374182400,
+            "hits": 50,
+            "misses": 0,
+            "enqueued": 6,
+            "queueDrops": 0,
+            "bytesWritten": 1978560,
+            "bytesRestored": 16707950,
+            "evictions": 0,
+            "corruptions": 0,
+            "writeErrors": 0,
+            "restoreDeclines": 0
+          },
+          "sidecars": {
+            "captureReached": 2,
+            "chainEmpty": 0,
+            "boundarySkips": 1,
+            "alreadyPersisted": 1,
+            "enqueued": 0,
+            "queueDrops": 0,
+            "installed": 2,
+            "restoreSuppressed": 0
+          }
+        }
+      ]
+    }
   },
   "bindings": {
     "followup-muse-mtp-host-binding": {
@@ -8559,6 +11318,51 @@
       "new-sources/crates/mlx-core/src/models/muse_glimmer/scheduled_dflash.rs": "73f937224a6f632a33cb4cafaecb8f2b67e09ffcf1d6bc60e3f21391639e61b9",
       "new-sources/crates/mlx-core/src/engine/hybrid_scheduler/speculative.rs": "e3928068983e224f22fa3b30c9ad05afa1822946ba23f32baa379f3892f13c7e",
       "new-sources/crates/mlx-sys/src/mlx_sampling.h": "bb818b6ec745451b007af7fd0e82068427024899da89021543dc65110c3ada59"
+    },
+    "scheduled-adaptive-binding": {
+      "source.patch": "36c238383a6fe82dc37bd265ebb24f9059991231eee77536384464bad706e2a0",
+      "index.d.cts": "17842250b2b5287699891c109294d82dddcec1827d7db2602dda42998a18ad33",
+      "mlx.metallib": "5b8f50b27baa611c27e164629f2601525a6e9d822d1f3533a3d4132150027b82",
+      "index.cjs": "6f3fe1833ff1ef7bf100c23b8e8d65e77ac179e09097d4e8e71af91607c13e0e",
+      "paged_attn.metallib": "b0b639faee1d985f57cdb33837fe1e1de1aee48d2fb387896c0d7031984a2997",
+      "mlx-core.darwin-arm64.node": "42ae67ff9b678181af3ef8356eba737c6936fbdac9e90b8985a8fb3009b4cbbf",
+      "base_commit": "4bf6b8b19914c9ac65d7c04280ccc9625429f907"
+    },
+    "scheduled-mtp-binding": {
+      "source.patch": "58d4a082f5d0fbe2e55072a3414fc72bc0bbcdf5f6abcaefec710cc097764b64",
+      "index.d.cts": "17842250b2b5287699891c109294d82dddcec1827d7db2602dda42998a18ad33",
+      "mlx.metallib": "5b8f50b27baa611c27e164629f2601525a6e9d822d1f3533a3d4132150027b82",
+      "index.cjs": "6f3fe1833ff1ef7bf100c23b8e8d65e77ac179e09097d4e8e71af91607c13e0e",
+      "paged_attn.metallib": "b0b639faee1d985f57cdb33837fe1e1de1aee48d2fb387896c0d7031984a2997",
+      "mlx-core.darwin-arm64.node": "a3f1fb567414173f8ef095cf1c0057db9d23710e0aac724e9bf89d5d82e96b79",
+      "new-sources/crates/mlx-core/src/models/qwen3_5/scheduled_mtp.rs": "92240c9d7ed19217ccdf45c3bec1ee9dc8d267531ea3748db3bf45879dfca8b8",
+      "new-sources/crates/mlx-core/src/models/qwen3_5_moe/model/scheduled_mtp.rs": "92bea1c2e70becbabe07687088c7adae6cae2e45a40c2a5c7332f10a91d1dcd9",
+      "new-sources/crates/mlx-core/src/models/qwen3_5/model/scheduled_mtp.rs": "5747a453c47d7df9104e0af1cbb5bfbab0ece01605b39bda2022e17f19b731a5",
+      "base_commit": "4bf6b8b19914c9ac65d7c04280ccc9625429f907"
+    },
+    "scheduled-mtp-tail-binding": {
+      "source.patch": "7f4eca91ec58540aab8fff545d3503c5ea2792aa1d449b29dafd52b3e2478753",
+      "index.d.cts": "17842250b2b5287699891c109294d82dddcec1827d7db2602dda42998a18ad33",
+      "mlx.metallib": "5b8f50b27baa611c27e164629f2601525a6e9d822d1f3533a3d4132150027b82",
+      "index.cjs": "6f3fe1833ff1ef7bf100c23b8e8d65e77ac179e09097d4e8e71af91607c13e0e",
+      "paged_attn.metallib": "b0b639faee1d985f57cdb33837fe1e1de1aee48d2fb387896c0d7031984a2997",
+      "mlx-core.darwin-arm64.node": "40bce04e196221af9c9e7e1c4d576c9a7e287580e26f081ce28968c0354e6fec",
+      "new-sources/crates/mlx-core/src/models/qwen3_5/scheduled_mtp.rs": "8ad27fdd56c566c53672cb05833571b22d5c33733d03d3b5c6964e1133577fd6",
+      "new-sources/crates/mlx-core/src/models/qwen3_5_moe/model/scheduled_mtp.rs": "0543c2520f77de419694607178ecd771df746d3460734777c389b761f9b0a284",
+      "new-sources/crates/mlx-core/src/models/qwen3_5/model/scheduled_mtp.rs": "3b98046ed23b37128d01f62b4698aab91840c85bc465babff892c097491a24ab",
+      "base_commit": "4bf6b8b19914c9ac65d7c04280ccc9625429f907"
+    },
+    "scheduled-mtp-committed-binding": {
+      "source.patch": "1565d32b7e176b9a71dc72809f47653ccb910907cb452f1c47b64a569f2b3915",
+      "index.d.cts": "17842250b2b5287699891c109294d82dddcec1827d7db2602dda42998a18ad33",
+      "mlx.metallib": "5b8f50b27baa611c27e164629f2601525a6e9d822d1f3533a3d4132150027b82",
+      "index.cjs": "6f3fe1833ff1ef7bf100c23b8e8d65e77ac179e09097d4e8e71af91607c13e0e",
+      "paged_attn.metallib": "b0b639faee1d985f57cdb33837fe1e1de1aee48d2fb387896c0d7031984a2997",
+      "mlx-core.darwin-arm64.node": "900c7817ef1a9ade7f065de1b685715badeacc318d3c8282b4d6dc001bf93a8d",
+      "new-sources/crates/mlx-core/src/models/qwen3_5/scheduled_mtp.rs": "fdc9d3883cc0fb46e89fcaea893684196a1b2ce8081c0d40e745c0b89226d3a7",
+      "new-sources/crates/mlx-core/src/models/qwen3_5_moe/model/scheduled_mtp.rs": "44a53d50a8287847f5795a40db488186bba6d0c5b0795a49fedacf29b71139dc",
+      "new-sources/crates/mlx-core/src/models/qwen3_5/model/scheduled_mtp.rs": "60e621059c9217b4aa4a9a4b6455b2cc17456aec3685c2621eb9afd8d10aeea5",
+      "base_commit": "4bf6b8b19914c9ac65d7c04280ccc9625429f907"
     }
   },
   "microbenchmarks": {
@@ -8581,6 +11385,23 @@
     "residual-completion-micro.log": {
       "sha256": "cd395b2d74a34e1c5bc54b9ea3c03c69c7dd3dd313435aaaa357a056822eb297",
       "output": "\nrunning 1 test\ntest sampling::accept_with_residual_tests::benchmark_residual_completion ... residual_completion vocab=32768 device=false median_us=393.833\nresidual_completion vocab=32768 device=true median_us=254.584\nresidual_completion vocab=32768 device=true median_us=249.542\nresidual_completion vocab=32768 device=false median_us=349.375\nresidual_completion vocab=262144 device=false median_us=359.833\nresidual_completion vocab=262144 device=true median_us=260.833\nresidual_completion vocab=262144 device=true median_us=266.667\nresidual_completion vocab=262144 device=false median_us=356.958\nok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3535 filtered out; finished in 0.33s\n\n"
+    },
+    "moe-last-row-prefill-head": {
+      "artifact": "final-prefill-head-benchmark.log",
+      "artifact_sha256": "e296e7eba5f63d35101487bb6aa8de3696a4a750650642a483560c1c6d5a443d",
+      "protocol": "Debug Rust harness, production Metal matmul, BF16 H=2048 V=65536; 3 warm-up + 40 measured alternating rounds per arm; completed GPU evaluation; no concurrent builds/tests during timing. Measures the final projection only, not model TTFT.",
+      "results": [
+        {
+          "query_tokens": 64,
+          "baseline_p50_us": 903.542,
+          "candidate_p50_us": 700.374
+        },
+        {
+          "query_tokens": 512,
+          "baseline_p50_us": 2401.521,
+          "candidate_p50_us": 717.562
+        }
+      ]
     }
   }
 }

@@ -1073,7 +1073,7 @@ fn moe_cold_gdn_prefill_chunk_size_follows_the_installed_sidecar_policy() {
 /// * enough paged memory for two independent live sequences. The helper
 ///   casts routed and shared expert weights too, so the fixture exercises
 ///   genuine sparse MoE layers rather than substituting dense MLPs.
-fn tiny_paged_forward_moe_cfg() -> Qwen3_5MoeConfig {
+pub(super) fn tiny_paged_forward_moe_cfg() -> Qwen3_5MoeConfig {
     let mut cfg = tiny_moe_cfg(true);
     cfg.hidden_size = 128;
     cfg.intermediate_size = 256;
@@ -1140,7 +1140,7 @@ fn moe_paged_inner_or_skip(test_name: &str) -> Option<Qwen35MoeInner> {
 /// PARTIAL cast is worse than none: one f32 weight promotes the hidden state
 /// back to f32 and the failure surfaces at the K/V write, several frames
 /// from its cause. So this walks dense and genuinely sparse MLP variants.
-fn cast_moe_inner_weights_bf16(inner: &mut Qwen35MoeInner) {
+pub(super) fn cast_moe_inner_weights_bf16(inner: &mut Qwen35MoeInner) {
     let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype bf16") };
 
     let w = inner.embedding.get_weight();
@@ -1425,6 +1425,7 @@ fn run_moe_paged_prefill_with_size_and_checkpoint(
         chunk_size,
         /* cached_rope_deltas */ 0,
         None,
+        None,
     )
 }
 
@@ -1552,4 +1553,44 @@ fn moe_core_paged_prefill_publishes_ladder_rungs_under_a_cold_policy() {
     let _ = adapter.register_full_blocks_for_reuse(&[], 0);
     adapter.release_request().expect("release_request");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+#[ignore = "requires Metal GPU; run with --ignored"]
+fn scheduled_mtp_owner_replay_matches_independent() {
+    for preserve_owner_projections in [false, true] {
+        use crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget;
+        let Some(mut inner) =
+            moe_paged_inner_or_skip("scheduled_mtp_owner_replay_matches_independent")
+        else {
+            return;
+        };
+        cast_moe_inner_weights_bf16(&mut inner);
+        inner.row_exact_decode_projections = preserve_owner_projections;
+        for seq in [101, 202] {
+            inner.activate_scheduled_recurrent(seq).unwrap();
+            inner.set_cache_owner_id(&format!("mtp-owner-{seq}"), None);
+            let prompt = if seq == 101 {
+                vec![7, 11, 13, 17]
+            } else {
+                vec![7, 11, 13, 17, 19, 23]
+            };
+            let prefix = inner
+                .prime_prefix_state(&prompt, true, 16, &[], seq as u64)
+                .unwrap();
+            inner
+                .begin_scheduled_mtp(seq, prefix.effective_cached_prefix_len as u32)
+                .unwrap();
+            inner
+                .paged_prefill(
+                    &prompt[prefix.effective_cached_prefix_len..],
+                    &prefix,
+                    Stream::new(DeviceType::Gpu),
+                )
+                .unwrap()
+                .eval();
+            inner.park_active_scheduled_recurrent().unwrap();
+        }
+        crate::models::qwen3_5::scheduled_mtp::tests::owner_replay_matches_independent(&mut inner);
+    }
 }

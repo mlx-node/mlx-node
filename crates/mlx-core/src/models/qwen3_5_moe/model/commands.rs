@@ -186,6 +186,68 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
         self.paged_adapter.as_mut()
     }
 
+    fn supports_scheduled_speculation(&self) -> bool {
+        self.has_mtp_weights()
+            && self.paged_adapter.is_some()
+            && self.config.recurrent_state_bytes() > 0
+            && self.cached_rope_deltas.unwrap_or(0) == 0
+    }
+    fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::reservation_bytes(
+            &self.config.to_dense_config(),
+            total_tokens,
+        )
+    }
+    fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<()> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::begin_scheduled_mtp(
+            self, seq_id, position,
+        )
+    }
+    fn reserve_scheduled_speculation(&mut self, seq_id: SeqId, queries: usize) -> Result<bool> {
+        if queries > crate::models::qwen3_5::scheduled_mtp::MAX_DRAFTS + 1 {
+            return Err(Error::from_reason(
+                "MTP reservation exceeds its maximum verifier width",
+            ));
+        }
+        let adapter = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("MTP reservation has no paged adapter"))?;
+        match adapter.reserve_rows_for(seq_id, queries as u32) {
+            Ok(_) => Ok(true),
+            Err(error) if error.starts_with("context_length_exceeded:") => Ok(false),
+            Err(error) => Err(Error::from_reason(error)),
+        }
+    }
+    fn propose_scheduled(
+        &mut self,
+        seq_id: SeqId,
+        anchor: u32,
+        cap: usize,
+        params: &crate::engine::params::ChatParams,
+        rng: &mut dyn rand::Rng,
+        _confidence: bool,
+    ) -> Result<crate::engine::backend::DsparkProposal> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::propose_scheduled_mtp(
+            self, seq_id, anchor, cap, params, rng,
+        )
+    }
+    fn run_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyRow],
+    ) -> Result<MxArray> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::verify_scheduled_mtp(self, rows)
+    }
+    fn commit_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyCommit],
+    ) -> Result<Vec<Result<()>>> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::commit_scheduled_mtp(self, rows)
+    }
+    fn release_scheduled_speculation(&mut self, seq_id: SeqId) {
+        self.scheduled_mtp.release(seq_id);
+    }
+
     fn max_position_embeddings(&self) -> i32 {
         self.config.max_position_embeddings
     }

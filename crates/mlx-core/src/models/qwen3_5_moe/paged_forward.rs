@@ -196,6 +196,7 @@ pub(crate) fn run_paged_prefill_chunk(
         chunk_size,
         cached_rope_deltas,
         None,
+        None,
     )
     .map(|(logits, _)| logits)
 }
@@ -271,6 +272,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size(
         chunk_size,
         cached_rope_deltas,
         turn_cancel,
+        None,
     )
     .map(|(logits, _)| logits)
 }
@@ -291,6 +293,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
     chunk_size: i32,
     cached_rope_deltas: i32,
     turn_cancel: Option<&AtomicBool>,
+    retained_hidden: Option<&mut Option<MxArray>>,
 ) -> Result<(MxArray, Vec<MaterializedGdnPrefixCheckpoint>)> {
     if suffix_tokens.is_empty() {
         return Err(Error::from_reason(
@@ -314,6 +317,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
             layer_kinds,
             paged_adapter,
             cached_rope_deltas,
+            retained_hidden,
         )
         .map(|logits| (logits, Vec::new()));
     }
@@ -340,6 +344,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
             layer_kinds,
             paged_adapter,
             cached_rope_deltas,
+            retained_hidden,
         )
         .map(|logits| (logits, Vec::new()));
     }
@@ -376,6 +381,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
     let total_chunks = chunk_ranges.len();
     let mut last_logits: Option<MxArray> = None;
     let mut checkpoints = Vec::new();
+    let mut hidden_chunks = Vec::new();
     let mut chunk_start_position: u32 = cached_prefix_len;
 
     for (chunk_idx, range) in chunk_ranges.into_iter().enumerate() {
@@ -420,6 +426,11 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
             cached_rope_deltas,
         )?;
 
+        if retained_hidden.is_some() {
+            let normalized = final_norm.forward(&hidden)?;
+            normalized.eval();
+            hidden_chunks.push(normalized);
+        }
         let context_after = chunk_start_position + chunk.len() as u32;
         let capture_checkpoint = checkpoint_boundaries.contains(&context_after);
 
@@ -427,7 +438,7 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
             // Last chunk: project final_norm + lm_head and extract
             // last-token logits.
             last_logits = Some(project_last_token_logits_moe(
-                &hidden, final_norm, lm_head, embed,
+                &hidden, final_norm, lm_head, embed, None,
             )?);
             if capture_checkpoint {
                 materialize_linear_layer_caches(caches)?;
@@ -505,6 +516,12 @@ pub(crate) fn run_paged_prefill_chunk_with_size_and_checkpoint(
         chunk_start_position += chunk.len() as u32;
     }
 
+    if let Some(sink) = retained_hidden {
+        *sink = Some(MxArray::concatenate_many(
+            hidden_chunks.iter().collect(),
+            Some(1),
+        )?);
+    }
     last_logits
         .ok_or_else(|| {
             Error::from_reason(
@@ -541,6 +558,7 @@ pub(crate) fn run_paged_prefill_single_shot(
     layer_kinds: &[Qwen3_5LayerKind],
     paged_adapter: &mut PagedKVCacheAdapter,
     cached_rope_deltas: i32,
+    retained_hidden: Option<&mut Option<MxArray>>,
 ) -> Result<MxArray> {
     // The GDN pre-pass runs BEFORE `record_tokens` so the auxiliary-state
     // acknowledgement below precedes the first token recorded against the
@@ -573,7 +591,7 @@ pub(crate) fn run_paged_prefill_single_shot(
         /* position_ids */ None,
         cached_rope_deltas,
     )?;
-    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embed)
+    project_last_token_logits_moe(&hidden_states, final_norm, lm_head, embed, retained_hidden)
 }
 
 /// Image-bearing paged prefill with optional cached-prefix reuse for MoE.
@@ -718,6 +736,7 @@ pub(crate) fn run_paged_vlm_prefill_moe(
                 final_norm,
                 lm_head,
                 embed,
+                None,
             )?);
         } else {
             hidden_states.eval();
@@ -860,8 +879,9 @@ fn run_paged_prefill_one_chunk_moe(
     Ok(hidden)
 }
 
-/// Project the per-token residual stream through `final_norm` + the
-/// LM head and slice the last position's logits down to `[vocab]`.
+/// Project vocabulary logits only for the final residual row. Committed MTP
+/// optionally captures all normalized prompt rows; otherwise normalization
+/// also touches only the final row.
 /// Shared between the single-shot path and the chunked path's
 /// final-chunk return path. Hidden state shape on entry: `[1,
 /// chunk_len, hidden]`.
@@ -873,19 +893,25 @@ fn project_last_token_logits_moe(
     final_norm: &RMSNorm,
     lm_head: &Option<LinearProj>,
     embed: &Embedding,
+    retained_hidden: Option<&mut Option<MxArray>>,
 ) -> Result<MxArray> {
-    let h = final_norm.forward(hidden_states)?;
+    let width = hidden_states.shape_at(1)?;
+    let h = if retained_hidden.is_some() {
+        final_norm.forward(hidden_states)?
+    } else {
+        final_norm.forward(&hidden_states.slice_axis(1, width - 1, width)?)?
+    };
+    if let Some(sink) = retained_hidden {
+        *sink = Some(h.clone());
+    }
+    let hidden_len = h.shape_at(1)?;
+    let h = h.slice_axis(1, hidden_len - 1, hidden_len)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&h)?
     } else {
         embed.as_linear(&h)?
     };
-    // Slice last token: logits shape [1, chunk_len, vocab] -> [vocab].
-    let seq_len = logits.shape_at(1)?;
-    let last = logits
-        .slice_axis(1, seq_len - 1, seq_len)?
-        .squeeze(Some(&[0, 1]))?;
-    Ok(last)
+    logits.squeeze(Some(&[0, 1]))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1628,6 +1654,7 @@ mod tests {
                 2048,
                 0,
                 None,
+                None,
             )
             .expect("MoE checkpoint prefill")
         };
@@ -2268,6 +2295,140 @@ mod tests {
             let adapter = inner.paged_adapter.as_mut().expect("paged_adapter");
             let _ = adapter.register_full_blocks_for_reuse(&[], 0);
             adapter.release_request().expect("release_request");
+        }
+    }
+}
+
+#[cfg(test)]
+mod last_row_projection_tests {
+    use super::*;
+    #[test]
+    fn retained_prefill_seed_and_logits_match_full_projection() {
+        let input = MxArray::from_float32(
+            &(0..19 * 128)
+                .map(|i| (i as f32 * 0.017).sin())
+                .collect::<Vec<_>>(),
+            &[1, 19, 128],
+        )
+        .unwrap()
+        .astype(crate::array::DType::BFloat16)
+        .unwrap();
+        let mut norm = RMSNorm::new(128, Some(1e-6)).unwrap();
+        norm.set_weight(
+            &norm
+                .get_weight()
+                .astype(crate::array::DType::BFloat16)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut embed = Embedding::new(64, 128).unwrap();
+        embed
+            .set_weight(
+                &embed
+                    .get_weight()
+                    .astype(crate::array::DType::BFloat16)
+                    .unwrap(),
+            )
+            .unwrap();
+        let full_hidden = norm.forward(&input).unwrap();
+        let expected_hidden = full_hidden.clone();
+        let mut hidden = None;
+        let logits =
+            project_last_token_logits_moe(&input, &norm, &None, &embed, Some(&mut hidden)).unwrap();
+        let hidden = hidden.unwrap();
+        let expected_logits = embed
+            .as_linear(&full_hidden)
+            .unwrap()
+            .slice_axis(1, 18, 19)
+            .unwrap()
+            .squeeze(Some(&[0, 1]))
+            .unwrap();
+        assert_eq!(hidden.shape().unwrap().as_ref(), [1, 19, 128]);
+        assert_eq!(
+            hidden
+                .astype(crate::array::DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            expected_hidden
+                .astype(crate::array::DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref()
+        );
+        let actual = logits
+            .astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let expected = expected_logits
+            .astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let scale = expected.iter().map(|v| v.abs()).fold(1.0_f32, f32::max);
+        let error = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            error <= scale * 0.01,
+            "prefill head error {error} scale {scale}"
+        );
+    }
+    #[test]
+    #[ignore = "isolated Metal prefill-head benchmark; run explicitly"]
+    fn benchmark_last_row_prefill_head() {
+        use crate::array::DType;
+        use crate::nn::Linear;
+        use std::time::Instant;
+        let mut norm = RMSNorm::new(2048, Some(1e-6)).unwrap();
+        norm.set_weight(&norm.get_weight().astype(DType::BFloat16).unwrap())
+            .unwrap();
+        let embed = Embedding::new(1, 2048).unwrap();
+        let mut linear = Linear::new(2048, 65536, Some(false)).unwrap();
+        linear
+            .set_weight(&linear.get_weight().astype(DType::BFloat16).unwrap())
+            .unwrap();
+        linear.get_weight().eval();
+        let head = Some(LinearProj::Standard(linear));
+        for width in [64_i64, 512] {
+            let hidden =
+                MxArray::random_normal(&[1, width, 2048], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+            hidden.eval();
+            let mut times = [Vec::new(), Vec::new()];
+            for round in 0..43 {
+                for arm in if round % 2 == 0 { [0, 1] } else { [1, 0] } {
+                    let start = Instant::now();
+                    let logits = if arm == 0 {
+                        head.as_ref()
+                            .unwrap()
+                            .forward(&norm.forward(&hidden).unwrap())
+                            .unwrap()
+                            .slice_axis(1, width - 1, width)
+                            .unwrap()
+                            .squeeze(Some(&[0, 1]))
+                            .unwrap()
+                    } else {
+                        project_last_token_logits_moe(&hidden, &norm, &head, &embed, None).unwrap()
+                    };
+                    logits.eval();
+                    if round >= 3 {
+                        times[arm].push(start.elapsed().as_secs_f64() * 1e6);
+                    }
+                }
+            }
+            for values in &mut times {
+                values.sort_by(f64::total_cmp);
+            }
+            eprintln!(
+                "prefill_head width={width} hidden=2048 vocab=65536 baseline_p50_us={:.3} candidate_p50_us={:.3}",
+                (times[0][19] + times[0][20]) / 2.0,
+                (times[1][19] + times[1][20]) / 2.0
+            );
         }
     }
 }

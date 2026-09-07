@@ -311,4 +311,71 @@ mixed-row sampling and penalized greedy speculation, preserving row construction
 order, per-owner state and the existing SSD lifecycle. It does not enable
 scheduled speculative concurrency or migrate the Metal backend. The later
 [follow-up](followup.md) adds fixed-depth Gemma/Muse scheduled verification and
-records the remaining recurrent MTP and adaptive scheduling work.
+is extended by recurrent MTP and adaptive scheduling below.
+
+## Scheduled MTP and adaptive follow-up (2026-09-06)
+
+The adaptive Gemma policy passed 357 engine tests (2 ignored), 412 Gemma tests
+(6 ignored), Clippy and a native build. Its immutable binding is
+`scheduled-adaptive-binding`, SHA-256
+`42ae67ff9b678181af3ef8356eba737c6936fbdac9e90b8985a8fb3009b4cbbf`.
+Alternating real-model results, including the singleton regression and the
+faster fixed-depth control, are in `followup-measurements.json`.
+
+The final recurrent MTP candidate passed 3,422 core debug tests (110 ignored;
+18 int8 tests excluded), with `MLX_TEST_REQUIRE_METAL=1` and serial execution.
+The existing TF32 finite-difference and missing optional mobile-checkpoint
+caveats above still apply. Explicit dense/MoE tests compare batched logits and
+per-owner accepted-prefix GDN state against the original whole-turn verifier.
+They cover mixed AR/MTP rows, unequal widths, full/partial acceptance and zero
+commit, and verify that scratch verification does not mutate live GDN inputs.
+Six shared transaction tests cover ordering, rollback, target commit failure,
+GPU completion failure and publication isolation.
+
+An initial random eight-layer runtime fixture diverged from AR at a late greedy
+token; a smaller random fixture also diverged. Runtime cancellation/RNG tests
+now use a fixed non-uniform head while retaining the full recurrent/attention
+stack, so they test scheduler behavior independently of batch reduction order.
+The separate original-verifier numerical tests retain nonconstant weights.
+This is not a claim of universal token-for-token parity across batch shapes.
+The resulting greedy and sampled cancellation/history checks pass for both
+families. Dense retained-tail and MoE final-row prefill projection tests also
+pass after matching fixture norm weights to the model's BF16 dtype.
+
+The retained native MTP binding includes request-owned committed draft history:
+`scheduled-mtp-committed-binding`, SHA-256
+`900c7817ef1a9ade7f065de1b685715badeacc318d3c8282b4d6dc001bf93a8d`.
+Its build completed after the committed-history runtime, per-owner replay,
+prefill projection and Clippy gates. Later changes add tests and docs, collapse
+a nested frontier guard for Clippy, and rename a retained-hidden parameter;
+these do not change the measured inference behavior. Eight alternating real-model legs are recorded
+in the ledger. Warm continuation and sampled smoke checks completed for dense
+and MoE; both reused 119 and 116 prefix tokens in the continuation pair.
+The final-row projection operation benchmark completed separately with no
+concurrent builds/tests.
+
+Final local validation also passed:
+
+- The complete TypeScript suite: 3,294 passed, 38 skipped, across 182 passing
+  and 17 skipped files, using the retained native binding.
+- Both finite-difference cases with TF32 disabled, and both explicitly selected
+  dense/MoE original-verifier oracles with strict Metal enabled. The MoE oracle
+  covers both shared and per-owner projection graphs, unequal prompt positions,
+  mixed query widths and full/partial/zero accepted spans.
+- Clippy across all targets, Rust formatting, TypeScript typecheck, and
+  changed-file documentation/benchmark formatting.
+- A bounded independent source review of committed-history alignment, draft KV
+  frontiers, recurrent tape replay, SSD publication and memory admission found
+  no confirmed correctness defects. This is source-review evidence, separate
+  from the numerical and runtime gates above.
+
+Separate-process scheduled-MTP SSD capture/restart checks passed for dense and
+MoE, with two concurrent requests in each process. Both restored 400 tokens per
+request and installed both recurrent sidecars; dense read 26,487,150 validated
+bytes and MoE 16,707,950. Both drains completed with zero write errors, queue
+drops and corruptions. These isolated-cache checks validate persistence/reuse,
+not latency or universal greedy parity. Their artifacts and hashes are recorded
+in the ledger alongside the warm in-process continuation checks.
+
+Remote CI is reported by PR #138 checks on its latest pushed revision;
+successful checks on `4bf6b8b1` cover the preceding checkpoint only.

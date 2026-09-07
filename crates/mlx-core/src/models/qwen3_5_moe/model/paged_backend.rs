@@ -324,6 +324,10 @@ impl PagedBackend for Qwen35MoeInner {
         // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
         // can borrow `self.layers`/`self.caches` mutably at the same time.
         let turn_cancel = self.turn_cancel.clone();
+        let mtp_seq = self
+            .active_scheduled_seq
+            .filter(|seq| self.scheduled_mtp.owners.contains_key(seq));
+        let mut mtp_hidden = None;
         let (logits, gdn_checkpoint) = {
             let caches_ref = self
                 .caches
@@ -348,8 +352,18 @@ impl PagedBackend for Qwen35MoeInner {
                 chunk_size,
                 rope_deltas,
                 turn_cancel.as_deref(),
+                mtp_seq.map(|_| &mut mtp_hidden),
             )?
         };
+        if let Some(seq) = mtp_seq {
+            crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::prefill_scheduled_mtp(
+                self,
+                seq,
+                (prefix.effective_cached_prefix_len + suffix_tokens.len()) as u32,
+                mtp_hidden.ok_or_else(|| Error::from_reason("MTP prefill omitted its seed"))?,
+                suffix_tokens,
+            )?;
+        }
         self.publish_moe_gdn_materialized_prefix_checkpoint(
             &prefix.full_tokens,
             &prefix.checkpoint_extra_keys,

@@ -186,6 +186,30 @@ impl HybridSchedulerBackend for Gemma4Inner {
         self.dspark_draft().is_some()
     }
 
+    fn supports_adaptive_scheduled_speculation(&self) -> bool {
+        self.dspark_draft().is_some()
+            && crate::models::gemma4::dspark_decode::dspark_confidence_threshold_from_env() <= 0.0
+    }
+
+    fn scheduled_verification_budget(
+        &mut self,
+    ) -> Option<&mut crate::engine::verification_budget::ScheduledVerificationBudget> {
+        Some(&mut self.scheduled_verification_budget)
+    }
+
+    fn complete_scheduled_draft_state(&self, seq_ids: &[SeqId]) -> Result<()> {
+        let mut arrays = Vec::new();
+        for seq in seq_ids {
+            if let Some(state) = self.scheduled_dspark_states.get(seq) {
+                state.ctx.collect_arrays(&mut arrays);
+            }
+        }
+        if !arrays.is_empty() {
+            MxArray::eval_arrays(&arrays)?;
+        }
+        Ok(())
+    }
+
     fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
         let Some(draft) = self.dspark_draft() else {
             return 0;
@@ -237,6 +261,7 @@ impl HybridSchedulerBackend for Gemma4Inner {
     }
 
     fn release_scheduled_speculation(&mut self, seq_id: SeqId) {
+        self.scheduled_verification_budget.clear();
         self.scheduled_dspark_states.remove(&seq_id);
     }
 

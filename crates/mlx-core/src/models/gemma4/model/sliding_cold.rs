@@ -411,6 +411,7 @@ impl Gemma4Inner {
     pub(super) fn clear_reuse_state(&mut self) {
         self.clear_active_reuse_state();
         self.scheduled_dspark_states.clear();
+        self.scheduled_verification_budget.clear();
         self.grouped_sliding_cold_checkpoints.clear();
     }
 

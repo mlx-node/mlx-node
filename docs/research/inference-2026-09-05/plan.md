@@ -61,7 +61,7 @@ official MLX/Metal/vLLM material, and isolated local measurements.
    GPU draft chains and grouped acceptance are implemented. Short Qwen3 suffixes
    use direct paged attention at up to 16 query tokens; larger chunks retain
    gather plus SDPA, based on the context/width crossover benchmark.
-8. **Partially implemented — speculative scheduling and adaptive budgets.** Establish
+8. **Complete — speculative scheduling and adaptive budgets.** Establish
    resumable state, per-owner isolation and variable accepted spans before
    admitting speculation to the shared scheduler. Verify cancellation, rejection,
    owner recycling, allocation failures and real concurrent inference.
@@ -73,10 +73,16 @@ official MLX/Metal/vLLM material, and isolated local measurements.
    opt-in. Sampled multi-owner tests exposed and fixed residual/bonus global RNG
    coupling; prefill and cycle draws now use each scheduled owner's RNG. MTP draft token chains stay on
    device, and verifier IDs now remain authoritative host slices until their
-   single embedding upload. Recurrent MTP scheduling still needs a resumable
-   phase split and owner-specific tape replay; Qwen DFlash2 remains flat-only.
-   Greedy whole-turn DSpark confidence/cost budgeting is implemented; adaptive
-   scheduled speculation remains gated until its batch cost policy is validated.
+   single embedding upload. Recurrent MTP scheduling now has a shared trait,
+   equal-width GDN target buckets, packed multi-token paged attention, and
+   owner-specific tape replay. Original-verifier numerical comparisons,
+   transaction tests, warm continuations and sampled-owner checks pass. Paired
+   measurements retain committed-history MTP: dense N=2 latency falls 14.4%,
+   MoE N=2 latency falls 25.9%; the fresh-cycle prototype was rejected. Qwen DFlash2 remains flat-only.
+   Adaptive scheduled Gemma DSpark uses measured allocation vectors and bounded
+   calibration. Four-request latency improved over its former exclusive lane,
+   but fixed depth remains faster and the default. Singleton adaptive overhead
+   and batch-shape numerical differences are recorded explicitly.
 9. **Implemented and measured — SSD transfers and ordinary decode.** Preserve
    bounded staging, completion-gated publication and resident-to-SSD storage;
    select backend changes from measured timelines and cold-cache workloads.
@@ -86,9 +92,11 @@ official MLX/Metal/vLLM material, and isolated local measurements.
    Ordinary decode async scheduling showed no reliable gain, so Qwen retains
    synchronous paged completion. A guard drains pending forced-token work before
    error cleanup, and memory sizing counts each staging allowance once.
-10. **In progress — PR handoff after local verification.** Review every opportunity
-    against evidence, run relevant native/TS/real-model gates, record paired
-    performance and limitations, then update the authorized PR and check CI.
+10. **Complete — implementation, measurements and local validation.** Every
+    identified opportunity has an implementation, measured rejection, or explicit
+    prerequisite recorded in the research. Native/TS/real-model gates and paired
+    measurements are complete. PR #138 carries the changes; its checks and review
+    threads establish remote status for the latest pushed revision.
 
 Discovery decisions:
 
