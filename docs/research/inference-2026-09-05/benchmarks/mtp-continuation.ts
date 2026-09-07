@@ -28,8 +28,8 @@ const histories = messages.map((history, i) => [
   { role: 'user', content: 'Give three practical examples, with details.' },
 ]);
 const continued = await Promise.all(histories.map((history, i) => model.chatSessionContinue(history, config(i))));
-if (continued.some((result) => result.cachedTokens <= 0 || (result.performance?.mtpCycles ?? 0) === 0))
-  throw new Error('Continuation did not reuse a prefix and speculate');
+if (continued.some((result) => result.cachedTokens <= 0 || (result.performance?.mtpCycles ?? 0) !== 0))
+  throw new Error('Cached continuation must reuse its target prefix without unseeded MTP');
 await model.resetCaches();
 const sampled = await Promise.all(
   messages.map((history, i) => model.chatSessionStart(history, { ...config(i), temperature: 0.7 })),

@@ -1,6 +1,7 @@
 # Inference architecture and performance reference
 
-Design and measurements from 2026-09-05–06, implementation at `b7ff7f23`.
+Design and measurements from 2026-09-05–06, implementation introduced at
+`b7ff7f23` with admission fixes from the 2026-09-07 review.
 Local performance results use an Apple M5 Max with 128 GiB unified memory and
 macOS 26.6.2. Reference projects informed the design; they were not benchmarked
 against mlx-node. Raw results and build artifacts are kept outside the repository.
@@ -51,18 +52,23 @@ abandon a healthy peer's transaction.
 
 On a cold prompt, seed MTP history with `hidden(previous) → embedding(next)`.
 The committed draft frontier is the consumed target frontier minus one. Trim
-speculative draft KV before appending committed pairs. Prefix hits without full
-prompt hiddens use cycle history instead. Draft caches are temporary request
-state charged to admission, not a second cold RAM cache.
+speculative draft KV before appending committed pairs. Cached-prefix starts,
+including continuations and preemption replay, do not have complete draft history.
+They decline scheduled MTP, release the draft reservation, and keep their target
+prefix in the shared AR scheduler. Re-enable speculation only when complete
+draft history can be restored. Draft caches are temporary request state charged
+to admission, not a second cold RAM cache.
 
 Adaptive Gemma costs are keyed by the ordered per-owner draft-length vector,
 not total query count. Keep at most eight measured shapes and reset on owner
 order, context band, cap or draft-context lifetime changes. A zero-draft probe
 retains contexts for calibration; a measured AR decision releases them. Exclude
 calibration-only work from the AR baseline. Fixed depth remains the default:
-calibration overhead can outweigh adaptive gains. Confidence-dependent
-truncation is restricted to greedy requests because it can change a sampled
-proposal's conditional distribution.
+calibration overhead can outweigh adaptive gains. Adaptive barriers apply only
+when a loaded speculative decoder admits the requested streaming shape; an
+unsupported request that resolves to AR must not drain concurrent rows.
+Confidence-dependent truncation is restricted to greedy requests because it can
+change a sampled proposal's conditional distribution.
 [vLLM adaptive verification](https://docs.vllm.ai/en/latest/features/speculative_decoding/adaptive_verification/).
 
 The upstream algorithms share infrastructure but preserve different proposal
@@ -205,10 +211,19 @@ need an explicit `MLX_ENABLE_TF32=0` run. An optional Gemma mobile checkpoint wa
 absent; ignored/checkpoint-gated cases are not executed coverage. Remote CI status
 belongs to the [PR checks](https://github.com/mlx-node/mlx-node/pull/138/checks).
 
-Real dense/MoE continuations reused 119 and 116 tokens for two owners and completed
-sampled MTP smokes. Separate capture/restore processes each reused 400 tokens per
-owner and installed both recurrent sidecars, with no queue drops, write errors
-or corruptions. These validate cache reuse, not latency or seeded sampling parity.
+At that revision, real dense/MoE continuations reused 119 and 116 tokens for two
+owners and completed sampled MTP smokes. Separate capture/restore processes each
+reused 400 tokens per owner and installed both recurrent sidecars, with no queue
+drops, write errors or corruptions. These validate cache reuse, not latency or
+seeded sampling parity.
+
+The 2026-09-07 admission fixes passed 3,424 core tests with the same exclusions and
+both explicit dense/MoE verifier oracles. New regressions cover cached starts and
+preemption replay alongside a speculative peer, including token history and
+draft-reservation release, plus adaptive admission without a usable decoder.
+The checkpoint runs above predate the cached-prefix AR fallback; the updated
+continuation and SSD restart scripts require cached turns to reuse target state
+without MTP cycles.
 
 ```sh
 MLX_TEST_REQUIRE_METAL=1 cargo test -p mlx-core --lib -- \

@@ -973,4 +973,125 @@ mod tests {
         check(|| crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8107));
         check(|| crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(8107));
     }
+
+    #[test]
+    fn cached_native_mtp_starts_and_preemption_replay_keep_scheduled_ar() {
+        use crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget;
+
+        fn check<B: HybridSchedulerBackend + ScheduledMtpTarget>(mut inner: B, replay: bool) {
+            let source = (0..12).chain([15; 4]).collect::<Vec<u32>>();
+            let mut warm = request(
+                &mut inner,
+                41,
+                source.clone(),
+                true,
+                Arc::new(AtomicBool::new(false)),
+            );
+            // Materialize the target prefix without draft history, as after
+            // a warm/SSD hit. Keep the remaining suffix split across chunks.
+            inner
+                .run_scheduled_prefill_slice(
+                    41,
+                    &source,
+                    &warm.payload.prefix,
+                    0,
+                    8,
+                    warm.payload.generation_stream,
+                    true,
+                )
+                .unwrap()
+                .unwrap()
+                .eval();
+            warm.payload.prefix = inner.build_scheduled_prefix(
+                &warm.payload.prefix,
+                8,
+                source.len() - 8,
+                source.clone(),
+                false,
+            );
+            warm.num_computed_tokens = 8;
+            warm.pinned_prefill_breaks = vec![12, 16];
+            warm.recurrent_state_bytes =
+                inner.recurrent_state_bytes() + inner.scheduled_draft_state_bytes(36);
+            if replay {
+                // The final generated token was already emitted before
+                // preemption but has not yet been materialized into KV.
+                warm.payload.prompt_tokens.truncate(12);
+                warm.payload.generated_tokens = vec![15; 5];
+                warm.payload.pending_token_emitted = true;
+                warm.token_history.push(15);
+                warm.num_tokens += 1;
+                warm.payload.preemption_replay = Some(PreemptionReplay {
+                    tokens: source,
+                    cached_prefix: 8,
+                    suppress_sample: true,
+                });
+            }
+            let peer = request(
+                &mut inner,
+                42,
+                vec![4, 5, 6, 7, 8, 9, 10, 11, 12],
+                true,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let mut scheduler = Scheduler::<_, (), ()>::new(2, 12).unwrap();
+            scheduler.enqueue_turn(warm).unwrap();
+            scheduler.enqueue_turn(peer).unwrap();
+            let mut completed = 0;
+            for _ in 0..100 {
+                let action = scheduler
+                    .drive_once(&mut HybridStepExecutor::new(&mut inner))
+                    .unwrap();
+                assert!(
+                    !inner.mtp_state().owners.contains_key(&41),
+                    "cached target prefix must not create an unseeded draft owner"
+                );
+                if let SchedulerAction::Stepped {
+                    completed: turns, ..
+                } = action
+                {
+                    for turn in turns {
+                        assert!(turn.payload.failure.is_none(), "{:?}", turn.payload.failure);
+                        let mut expected = turn.payload.prompt_tokens.clone();
+                        let generated = &turn.payload.generated_tokens;
+                        assert_eq!(generated.len(), 20);
+                        expected.extend_from_slice(&generated[..generated.len() - 1]);
+                        assert_eq!(
+                            inner
+                                .paged_adapter()
+                                .unwrap()
+                                .request_tokens_for(turn.seq_id)
+                                .unwrap(),
+                            expected,
+                            "fallback duplicated a pending token or lost committed history"
+                        );
+                        if turn.seq_id == 41 {
+                            assert!(turn.payload.scheduled_speculation.is_none());
+                            assert_eq!(turn.decode_draft_allowance, 0);
+                            assert_eq!(turn.recurrent_state_bytes, inner.recurrent_state_bytes());
+                        } else {
+                            assert!(turn.payload.scheduled_speculation.is_some());
+                        }
+                        inner.release_scheduled_speculation(turn.seq_id);
+                        completed += 1;
+                    }
+                }
+                if completed == 2 {
+                    break;
+                }
+            }
+            assert_eq!(completed, 2);
+            assert_eq!(scheduler.stats().max_batch_occupancy, 2);
+        }
+        for replay in [false, true] {
+            check(
+                crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8107),
+                replay,
+            );
+            check(
+                crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(8107),
+                replay,
+            );
+        }
+    }
 }

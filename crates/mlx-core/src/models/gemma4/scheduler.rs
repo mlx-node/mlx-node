@@ -223,8 +223,8 @@ impl HybridSchedulerBackend for Gemma4Inner {
             .saturating_mul(u64::from(total_tokens).saturating_add(256))
     }
 
-    fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<()> {
-        self.begin_scheduled_dspark(seq_id, position)
+    fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<bool> {
+        self.begin_scheduled_dspark(seq_id, position).map(|()| true)
     }
 
     fn reserve_scheduled_speculation(&mut self, seq_id: SeqId, queries: usize) -> Result<bool> {

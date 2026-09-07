@@ -167,14 +167,22 @@ pub(crate) trait ScheduledMtpTarget: Sized {
         tape: &mut Vec<Option<GdnLayerTape>>,
     ) -> Result<MxArray>;
 
-    fn begin_scheduled_mtp(&mut self, seq_id: u32, position: u32) -> Result<()> {
+    fn begin_scheduled_mtp(&mut self, seq_id: u32, position: u32) -> Result<bool> {
         if self.mtp_state().batch.is_some() {
             return Err(Error::from_reason(
                 "cannot seed MTP during an open verifier wave",
             ));
         }
+        // Target KV/GDN prefix state does not contain the shifted hidden
+        // history needed by the drafter. An empty draft cache would discard
+        // both that prefix and every later suffix chunk. Keep the target's
+        // prefix reuse and decline speculation instead of rebuilding it cold.
+        if position != 0 {
+            self.mtp_state_mut().release(seq_id);
+            return Ok(false);
+        }
         let draft_caches = self.fresh_mtp_draft_caches();
-        let committed_frontier = (position == 0 && !draft_caches.is_empty()).then_some(0);
+        let committed_frontier = (!draft_caches.is_empty()).then_some(0);
         self.mtp_state_mut().owners.insert(
             seq_id,
             MtpOwner {
@@ -184,7 +192,7 @@ pub(crate) trait ScheduledMtpTarget: Sized {
                 committed_frontier,
             },
         );
-        Ok(())
+        Ok(true)
     }
 
     fn prefill_scheduled_mtp(
@@ -721,7 +729,9 @@ pub(crate) mod tests {
                     .unwrap();
                 target.mtp_state_mut().release(seq);
                 if !(mixed && index == 1) {
-                    target.begin_scheduled_mtp(seq, positions[index]).unwrap();
+                    // This target-only oracle injects a seed without testing
+                    // draft history. Production warm starts decline MTP.
+                    assert!(target.begin_scheduled_mtp(seq, 0).unwrap());
                     target
                         .seed_scheduled_mtp(seq, positions[index], seeds[index].clone())
                         .unwrap();

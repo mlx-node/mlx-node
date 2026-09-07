@@ -230,7 +230,9 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn scheduled_draft_state_bytes(&self, _total_tokens: u32) -> u64 {
         0
     }
-    fn begin_scheduled_speculation(&mut self, _seq_id: SeqId, _position: u32) -> Result<()> {
+    /// Return false when this prefix cannot seed complete draft state. The
+    /// request keeps its paged target cache and continues as scheduled AR.
+    fn begin_scheduled_speculation(&mut self, _seq_id: SeqId, _position: u32) -> Result<bool> {
         Err(Error::from_reason("scheduled speculation is unavailable"))
     }
     fn reserve_scheduled_speculation(&mut self, _seq_id: SeqId, _queries: usize) -> Result<bool> {
@@ -820,13 +822,20 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 turn.payload.prefix.effective_cached_prefix_len(),
                 |replay| replay.cached_prefix as usize,
             );
-        if first_chunk
-            && turn.payload.scheduled_speculation.is_some()
-            && let Err(error) = self
+        if first_chunk && turn.payload.scheduled_speculation.is_some() {
+            match self
                 .inner
                 .begin_scheduled_speculation(row.seq_id, start as u32)
-        {
-            return Ok(Self::fail(turn, row, error));
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.inner.release_scheduled_speculation(row.seq_id);
+                    turn.payload.scheduled_speculation = None;
+                    turn.decode_draft_allowance = 0;
+                    turn.recurrent_state_bytes = self.inner.recurrent_state_bytes();
+                }
+                Err(error) => return Ok(Self::fail(turn, row, error)),
+            }
         }
         let source = turn
             .payload
@@ -1477,8 +1486,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             })
     }
 
-    fn adaptive_requires_exclusive_lane(&self, params: &engine::params::ChatParams) -> bool {
-        params.mtp_adaptive_depth
+    fn adaptive_requires_exclusive_lane(
+        &self,
+        params: &engine::params::ChatParams,
+        streaming: bool,
+    ) -> bool {
+        self.inner
+            .execution_plan()
+            .speculative
+            .is_some_and(|speculative| speculative.admits_streaming(streaming))
+            && params.mtp_adaptive_depth
             && (!self.inner.supports_adaptive_scheduled_speculation()
                 || !crate::sampling::is_greedy_temperature(
                     params
@@ -1492,7 +1509,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if Self::chat_config(command).is_some_and(|config| {
             config.enable_mtp == Some(true)
                 && (self.speculation_requires_exclusive_lane(Self::chat_is_streaming(command))
-                    || self.adaptive_requires_exclusive_lane(&self.inner.resolve_params(config)))
+                    || self.adaptive_requires_exclusive_lane(
+                        &self.inner.resolve_params(config),
+                        Self::chat_is_streaming(command),
+                    ))
         }) {
             return true;
         }
@@ -1769,7 +1789,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 admitted.plan.decoder,
                 engine::plan::DecoderPlan::Speculative(_)
             ) && (self.speculation_requires_exclusive_lane(streaming)
-                || self.adaptive_requires_exclusive_lane(&admitted.params)))
+                || self.adaptive_requires_exclusive_lane(&admitted.params, streaming)))
         {
             if newly_assigned {
                 self.owner_sequences.remove(&owner_id);
@@ -3470,6 +3490,54 @@ mod tests {
 
         let (plain_start, _plain_result) = sync_start(ChatConfig::default());
         assert!(!state.chat_requires_barrier(&plain_start));
+    }
+
+    #[test]
+    fn adaptive_barrier_requires_a_decoder_that_admits_the_turn_shape() {
+        fn check<B: HybridSchedulerBackend>(inner: B, sync_speculates: bool) {
+            let state = HybridSchedulerState::new(inner).expect("construct scheduler");
+            for streaming in [false, true] {
+                for temperature in [0.0, 0.7] {
+                    let config = ChatConfig {
+                        enable_mtp: Some(true),
+                        mtp_adaptive_depth: Some(true),
+                        temperature: Some(temperature),
+                        ..ChatConfig::default()
+                    };
+                    let (command, _keepalive): (ChatCmd, Box<dyn std::any::Any>) = if streaming {
+                        let (command, rx) = streaming_start(config);
+                        (command, Box::new(rx))
+                    } else {
+                        let (command, rx) = sync_start(config);
+                        (command, Box::new(rx))
+                    };
+                    let plan = TurnPlan::resolve(
+                        state.inner.execution_plan(),
+                        TurnRequest {
+                            is_delta: false,
+                            input_media: MediaCapabilities::NONE,
+                            context_media: MediaCapabilities::NONE,
+                            speculative_requested: true,
+                            streaming,
+                        },
+                    );
+                    let expected = sync_speculates && !streaming;
+                    assert_eq!(
+                        matches!(plan.decoder, DecoderPlan::Speculative(_)),
+                        expected
+                    );
+                    assert_eq!(
+                        state.chat_requires_barrier(&command),
+                        expected,
+                        "adaptive request routed incorrectly: streaming={streaming}, temperature={temperature}"
+                    );
+                }
+            }
+        }
+        check(Qwen35Inner::new(tiny_config()).unwrap(), false);
+        let mut nemotron = NemotronHInner::new(tiny_nemotron_paged_mtp_config()).unwrap();
+        nemotron.mtp_weights_loaded = true;
+        check(nemotron, true);
     }
 
     #[test]

@@ -45,8 +45,13 @@ const stats = await model.schedulerStats();
 await writeFile(output, JSON.stringify({ binding, family, phase, results, drained, cold, sidecars, stats }, null, 2));
 if (!drained || !cold.enabled || cold.writeErrors !== 0 || cold.queueDrops !== 0)
   throw new Error('SSD persistence failed');
-if (results.some((result) => (result.performance?.mtpCycles ?? 0) === 0) || stats.maxBatchOccupancy < 2)
-  throw new Error('Requests did not exercise concurrent scheduled MTP');
+if (stats.maxBatchOccupancy < 2) throw new Error('Requests did not exercise concurrent scheduling');
+if (
+  results.some((result) =>
+    phase === 'capture' ? (result.performance?.mtpCycles ?? 0) === 0 : (result.performance?.mtpCycles ?? 0) !== 0,
+  )
+)
+  throw new Error('Cold capture must speculate; cached restore must use AR without draft history');
 if (phase === 'capture' && (cold.bytesWritten <= 0 || sidecars.enqueued < 2))
   throw new Error('Capture did not persist target blocks and both recurrent owners');
 if (
