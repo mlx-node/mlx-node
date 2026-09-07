@@ -7,8 +7,9 @@ implementation below; PR checks are recorded separately.
 This continues the [transfer audit](transfer-audit.md). Its CPU draft sampler
 and exclusive speculative lane describe the earlier revision. The follow-up
 replaces those paths where the model and cache contracts support the change.
-The [measurement ledger](followup-measurements.json) records alternating arms,
-native binding hashes and output hashes. Timings below are local measurements;
+Raw per-run outputs and immutable bindings are retained outside the repository.
+[Validation and reproduction](validation.md) records gates, binding hashes and
+benchmark entry points. Timings below are local measurements;
 they do not establish performance on other models or hardware.
 
 ## Implemented changes
@@ -135,7 +136,7 @@ performance claim). Its opt-in four-request smoke completed all 512 requested
 tokens with occupancy four. Three sampled Gemma turns at temperature 0.7 each
 completed 200 tokens. These are execution checks, not seeded sampling parity.
 
-The [validation record](validation.md#optimization-follow-up) contains suite
+The [validation record](validation.md#local-checks) contains suite
 counts, strict Metal coverage, fixture corrections and ignored/manual cases.
 
 Ordinary Qwen AR asynchronous completion did not yield a reliable improvement
@@ -164,7 +165,8 @@ Isolated alternating runs reduced four-request median latency from about
 was faster at about 5.65 s; adaptive calibration also regressed singleton latency
 by about 10%. Fixed depth remains the default. These measurements support
 concurrent admission of explicit adaptive requests, not a universal adaptive win.
-See `scheduled-adaptive-*` in the measurement ledger for binding and output hashes.
+The fixed/adaptive comparisons used the same candidate binding and repeatable
+four-request outputs; reproduction is described in the validation record.
 
 Native Qwen dense/MoE MTP now implements the shared scheduled transaction trait.
 Equal-width target buckets keep GDN tensors in `[N,T,H]`; only full attention

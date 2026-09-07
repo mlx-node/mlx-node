@@ -2,11 +2,10 @@
 
 Research date: 2026-09-05. Audience: mlx-node maintainers. Scope: model
 integration, speculative decoding with paged KV, concurrent inference, SSD
-persistence and macOS inference control flow. This is an engineering Markdown
-report intended to live beside the implementation and its tests.
+persistence and macOS inference control flow. This report records the initial baseline and the upstream design rationale.
 
 The [2026-09-06 follow-up](followup.md) records subsequent implementation,
-measurements, rejected candidates and remaining work against PR revision `bbc3157c`.
+measurements and rejected candidates, starting from PR revision `bbc3157c`.
 
 ## Decision
 
@@ -14,8 +13,8 @@ Keep the existing registry, immutable execution plan, shared scheduler and
 family-owned tensor/cache implementations. Use one generic command envelope and default barrier dispatch; generate only
 the concrete native export methods. Reduce host completion boundaries in mixed-row
 sampling and deterministic speculative acceptance. Preserve the SSD cold tier.
-Scheduled speculation and direct Metal backend migrations need separate measured
-stages; their correctness prerequisites are recorded below.
+Scheduled speculation was implemented in subsequent measured stages described
+in the follow-up. Direct Metal backend migrations retain the prerequisites below.
 
 The relevant performance constraint is synchronization as well as memory
 bandwidth. Shared memory makes CPU/GPU data accessible without a discrete-device
@@ -27,7 +26,7 @@ The subsequent [full inference transfer audit](transfer-audit.md) identified and
 removed normal-path KV staging in Qwen3 cache-hit prefill, redundant arithmetic
 before host exports, vocabulary copies in sampled drafting, per-layer metadata
 reductions and a duplicate PaddleOCR token round trip. It separately inventories
-required output reads, synchronization and SSD staging. Its paired measurements
+required output reads, synchronization and SSD staging. Its validation and reproduction entry points
 are in [validation.md](validation.md).
 
 ## Reference snapshot
@@ -101,18 +100,17 @@ placeholders until token values arrive. This is safe because ownership and
 in-flight state are explicit. [vLLM scheduler](https://github.com/vllm-project/vllm/blob/874df9373dab532543a0229fb2f144f7c14093ae/vllm/v1/core/sched/scheduler.py#L511-L520),
 [async scheduler](https://github.com/vllm-project/vllm/blob/874df9373dab532543a0229fb2f144f7c14093ae/vllm/v1/core/sched/async_scheduler.py#L19-L69).
 
-Our [speculative admission](../../../crates/mlx-core/src/engine/plan.rs)
-correctly remains a barrier. Its documented
-prerequisites are absent: multi-token row results, ragged batched verification,
-per-owner speculative state and resumable drivers. A shared paged pool does not
-make a model-owned draft cache concurrent. The dense paged-MTP epilogue is also
-still a family fork; migrating it onto the existing shared epilogue should precede
-reentrant execution.
+At the initial baseline, speculative admission was a whole-turn barrier.
+The follow-up adds per-owner draft/tape state, token spans and scheduled target
+verification for Gemma DSpark, opt-in Muse DFlash and opt-in Qwen native MTP.
+Recurrent targets replay accepted prefixes independently after closing paged
+attention tickets. Qwen DFlash2 retains its separate flat-cache provenance rules.
 
-Adaptive verification is a later optimization. vLLM ranks cumulative survival
-probabilities and uses profiled step costs to select a verify budget. Metal needs
-its own curves across batch size, context and cache pressure, measured in accepted
-output tokens per second and latency. [vLLM adaptive verification](https://docs.vllm.ai/en/latest/features/speculative_decoding/adaptive_verification/).
+vLLM ranks cumulative survival probabilities and uses profiled costs to select
+adaptive verification budgets. The implemented Gemma policy measures ordered
+per-owner allocations on Metal. It improves explicit adaptive concurrent requests
+over their former exclusive lane, but fixed depth remains faster and the default.
+[vLLM adaptive verification](https://docs.vllm.ai/en/latest/features/speculative_decoding/adaptive_verification/).
 
 ## Unified memory and SSD
 
@@ -137,11 +135,10 @@ DFlash KV. [oMLX DFlash engine](https://github.com/jundot/omlx/blob/e467261edc78
 
 ## Control-flow changes selected for implementation
 
-Mixed scheduler waves currently build, submit and wait for each sampler
-separately. Build the same row samplers in the same order, retaining each row's
-penalties, forced reasoning token and random draw. Evaluate their roots together
-before result handling. Keep the existing batched argmax for uniformly greedy
-waves. mlx-vlm groups evaluation roots after per-row processing; MTPLX packs
+The baseline submitted and waited for each mixed-row sampler separately.
+The implementation constructs row samplers in order, preserves per-row penalties,
+forced reasoning tokens and random draws, then evaluates their roots together.
+Uniform greedy waves retain their existing batched argmax. mlx-vlm groups evaluation roots after per-row processing; MTPLX packs
 token and accept decisions for one host boundary.
 [mlx-vlm batch generation](https://github.com/Blaizzy/mlx-vlm/blob/d68a25e71e842e8924a54bb3d84d3a3b4d4a2ee1/mlx_vlm/generate/ar.py#L1206-L1315),
 [MTPLX batched decisions](https://github.com/youssofal/MTPLX/blob/13297feea79b60b957a6f374f21352087ac45dd1/mtplx/batched_decode.py#L504-L519).
@@ -149,8 +146,7 @@ token and accept decisions for one host boundary.
 For greedy speculative acceptance with penalties, position i sees history plus
 the draft prefix before i until the first rejection. All those deterministic
 argmax graphs can be prepared before evaluating. Select the first mismatch or
-the bonus afterward; later hypothetical rows are unused work. This is an inference
-from the current algorithm, to be checked against a sequential oracle. Stochastic
+the bonus afterward; later hypothetical rows are unused work. The implementation is checked against a sequential oracle. Stochastic
 acceptance retains its sequential residual/RNG behavior.
 
 ## Metal API applicability
@@ -184,27 +180,14 @@ Primary Apple sources: [Discover Metal 4, WWDC25](https://developer.apple.com/vi
 Availability was checked in Apple's live API documentation; performance benefits
 for this runtime remain unmeasured hypotheses.
 
-## Next-stage plan and gates
+## Implementation boundaries
 
-1. Consolidate dense paged-MTP finalization using the existing shared epilogue.
-   Gate: mid-cycle cancellation/EOS, fresh/delta, GDN frontier and SSD restart
-   parity for dense and MoE.
-2. Introduce accepted-token spans in scheduler results, explicit committed versus
-   computed counts, and per-owner draft/tape state. Preserve one-token AR as a
-   conformance case. Gate: mixed acceptance, owner recycling, cancellation and
-   allocation exhaustion without double rollback.
-3. Make proposal/verify/commit resumable, add ragged verification, then admit
-   scheduled speculation behind an opt-in. Gate: N=1 regression bound, N=2/4
-   accepted-token throughput and p95 latency; mixed AR/speculative/prefill waves.
-4. Port DFlash context and target paging independently. Gate: rejected suffix,
-   sliding eviction, block boundaries, cold restore and exact warm provenance.
-5. Measure Metal encoding and SSD restoration. Prototype Metal 4 or Metal IO only
-   for a demonstrated bottleneck, using the same semantic gates and fallback.
+The follow-up implements scheduled speculation, accepted-prefix transactions,
+GPU draft/sampling control flow, bounded SSD transfers and measured prefill
+routes. Regression and restart gates cover request/cache ownership. Direct
+Metal 4/Metal IO migration remains contingent on a demonstrated bottleneck and
+allocator/storage integration; API availability alone is not a performance win.
 
-Research stopped when each material question had primary source support or an
-explicit prerequisite. No cross-runtime speedup percentages or unexecuted model
-gates are claimed. Validation of the selected implementation is in
-[measurements and checks](validation.md). The full Qwen3 workload improves
-aggregate throughput by 2.68%, 5.84% and 13.32% at 2, 4 and 8 concurrent requests;
-the single-request median regresses by 2.43%. Gemma4 DSpark preserves exact output
-and acceptance counters but shows no resolved end-to-end gain in this workload.
+No cross-runtime speedup is claimed: the supplied projects informed the design,
+while performance comparisons use preserved mlx-node revisions on this host.
+See [implementation and measured results](followup.md) and [validation](validation.md).
