@@ -1,5 +1,5 @@
 import { writeFile } from 'node:fs/promises';
-// Run with oxnode; see ../validation.md for arguments and measurement protocol.
+// Run with oxnode; see ../README.md#regression-gates-and-reproduction for arguments and measurement protocol.
 import { createRequire } from 'node:module';
 import { performance } from 'node:perf_hooks';
 const [binding, modelPath, draftPath, output, revision, temperatureArg = '0', adaptiveArg = 'false'] =

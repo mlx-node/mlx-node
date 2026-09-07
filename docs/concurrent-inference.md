@@ -423,5 +423,5 @@ above as a cooled median-of-three 4-bit result.
   verification and independent accepted-prefix commits. Greedy adaptive DSpark
   measures per-owner allocation costs; sampled adaptive, media and assistant
   commands use ordered owner lanes. Reset and stats remain
-  barriers. See the [measured follow-up](research/inference-2026-09-05/followup.md)
+  barriers. See the [inference reference](research/inference-2026-09-05/README.md#measurements-and-decisions)
   for throughput, numerical limits and recurrent MTP validation.

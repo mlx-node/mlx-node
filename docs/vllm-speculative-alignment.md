@@ -71,7 +71,7 @@ writes at rolled-back slots, in exchange for CPU-sync freedom — an exactness t
 byte-parity oracle (X8) deliberately does not make. Unified memory avoids a discrete-device transfer, but the model thread only knows
 an acceptance count after the relevant GPU work completes. Grouping independent acceptance
 calculations can reduce those waits without weakening the exact-prefix contract. See the
-[2026-09-05 research and measurements](research/inference-2026-09-05/report.md).
+[inference research reference](research/inference-2026-09-05/README.md).
 
 ---
 

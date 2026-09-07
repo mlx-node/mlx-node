@@ -251,17 +251,10 @@ The design intentionally does not copy vLLM's CUDA-oriented execution engine or
 MTPLX's family-specific conditional dispatch. The reusable part is the
 separation of declarations, planning, state ownership, and execution.
 
-## Control-flow research update
+## Control-flow reference
 
-The [2026-09-05 comparison](research/inference-2026-09-05/report.md) pins current
-vLLM, MTPLX, oMLX and mlx-vlm sources, explains speculative concurrency
-prerequisites, and evaluates relevant Metal APIs. Shared command adapters and
-telemetry forwarding reduce model glue; shared sampling evaluation keeps
-request-specific distributions and state while reducing host completion waits.
-
-The [2026-09-06 follow-up](research/inference-2026-09-05/followup.md) adds
-`ScheduledDraftVerify` as a shared transaction for Gemma DSpark and Muse DFlash.
-Their target math and request-owned draft contexts remain family-specific.
-Scheduled draft-model draws, residual corrections and bonus draws use explicit request keys;
-SSD restore uses bounded queued reads and batched staging with completion-gated
-publication. The follow-up records measured gains and disabled/rejected candidates.
+The [inference research reference](research/inference-2026-09-05/README.md)
+records the shared command/default-trait design, scheduled DSpark/DFlash/MTP
+transactions, GPU sampling, and bounded SSD transfers. It includes upstream
+source revisions, cache ownership rules, measured results, rejected candidates
+and regression gates.
