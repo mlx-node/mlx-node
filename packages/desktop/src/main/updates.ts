@@ -223,6 +223,8 @@ export function createDesktopUpdater(options: {
         try {
           // Wait for Squirrel to finish staging even on an ordinary quit. Only
           // an explicit restart (including Finder activation) should reopen us.
+          // MacUpdater honors this flag: false calls app.quit(), while true
+          // calls Electron's native quitAndInstall() to request a relaunch.
           options.native.autoRunAppAfterInstall = installRequested || relaunchRequested;
           options.native.quitAndInstall();
         } catch (error) {
