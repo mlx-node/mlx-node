@@ -77,23 +77,27 @@ impl MuseGlimmerInner {
         self.scheduled_dflash_states.clear();
         Ok(())
     }
-    pub(crate) fn begin_scheduled_dflash(&mut self, seq: u32, position: u32) -> Result<()> {
+    pub(crate) fn begin_scheduled_dflash(&mut self, seq: u32, position: u32) -> Result<bool> {
         if self.scheduled_dflash_verify.is_some() {
             return Err(Error::from_reason("cannot seed DFlash during verification"));
+        }
+        // A target prefix hit does not restore the drafter's live sliding
+        // context. Decline speculation until that context can be restored.
+        if position != 0 {
+            self.scheduled_dflash_states.remove(&seq);
+            return Ok(false);
         }
         let draft = self
             .dflash
             .as_ref()
             .ok_or_else(|| Error::from_reason("DFlash is not loaded"))?;
-        let position =
-            i32::try_from(position).map_err(|_| Error::from_reason("DFlash position overflow"))?;
         self.scheduled_dflash_states.insert(
             seq,
             ScheduledDFlashState {
-                context: DFlashContextCache::new_at(&draft.config, position),
+                context: DFlashContextCache::new_at(&draft.config, 0),
             },
         );
-        Ok(())
+        Ok(true)
     }
 
     pub(crate) fn propose_scheduled_dflash(
@@ -412,7 +416,7 @@ pub(crate) mod tests {
         };
         inner.activate_paged_seq(seq).unwrap();
         if draft {
-            inner.begin_scheduled_dflash(seq, 0).unwrap();
+            assert!(inner.begin_scheduled_dflash(seq, 0).unwrap());
         }
         inner
             .run_scheduled_prefill_slice(

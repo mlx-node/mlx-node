@@ -224,7 +224,7 @@ impl HybridSchedulerBackend for Gemma4Inner {
     }
 
     fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<bool> {
-        self.begin_scheduled_dspark(seq_id, position).map(|()| true)
+        self.begin_scheduled_dspark(seq_id, position)
     }
 
     fn reserve_scheduled_speculation(&mut self, seq_id: SeqId, queries: usize) -> Result<bool> {

@@ -1,7 +1,7 @@
 # Inference architecture and performance reference
 
 Design and measurements from 2026-09-05–06, implementation introduced at
-`b7ff7f23` with admission fixes from the 2026-09-07 review.
+`b7ff7f23` with admission fixes from the 2026-09-07–08 reviews.
 Local performance results use an Apple M5 Max with 128 GiB unified memory and
 macOS 26.6.2. Reference projects informed the design; they were not benchmarked
 against mlx-node. Raw results and build artifacts are kept outside the repository.
@@ -52,12 +52,16 @@ abandon a healthy peer's transaction.
 
 On a cold prompt, seed MTP history with `hidden(previous) → embedding(next)`.
 The committed draft frontier is the consumed target frontier minus one. Trim
-speculative draft KV before appending committed pairs. Cached-prefix starts,
-including continuations and preemption replay, do not have complete draft history.
-They decline scheduled MTP, release the draft reservation, and keep their target
+speculative draft KV before appending committed pairs.
+
+Cached-prefix starts, including continuations and preemption replay, lack complete
+draft context for native MTP, Gemma DSpark and Muse DFlash. Target KV does not
+restore the tapped hidden history used by these drafters. All three decline
+scheduled speculation, release the draft reservation, and keep their target
 prefix in the shared AR scheduler. Re-enable speculation only when complete
-draft history can be restored. Draft caches are temporary request state charged
-to admission, not a second cold RAM cache.
+draft history can be restored (the live sliding context window for Muse).
+Draft caches are temporary request state charged to admission, not a second
+cold RAM cache.
 
 Adaptive Gemma costs are keyed by the ordered per-owner draft-length vector,
 not total query count. Keep at most eight measured shapes and reset on owner
@@ -217,10 +221,12 @@ reused 400 tokens per owner and installed both recurrent sidecars, with no queue
 drops, write errors or corruptions. These validate cache reuse, not latency or
 seeded sampling parity.
 
-The 2026-09-07 admission fixes passed 3,424 core tests with the same exclusions and
-both explicit dense/MoE verifier oracles. New regressions cover cached starts and
-preemption replay alongside a speculative peer, including token history and
-draft-reservation release, plus adaptive admission without a usable decoder.
+The 2026-09-07–08 admission fixes passed 3,424 core tests with the same exclusions and
+both explicit dense/MoE verifier oracles. Regression coverage includes cached
+starts and preemption replay alongside a speculative peer, token history,
+draft-reservation release, and adaptive admission without a usable decoder.
+The cached-start/replay regression now covers Gemma DSpark and Muse DFlash as well
+as dense/MoE MTP, including removal of an earlier wave's draft owner.
 The checkpoint runs above predate the cached-prefix AR fallback; the updated
 continuation and SSD restart scripts require cached turns to reuse target state
 without MTP cycles.

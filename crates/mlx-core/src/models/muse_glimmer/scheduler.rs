@@ -213,7 +213,7 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
     }
 
     fn begin_scheduled_speculation(&mut self, seq: SeqId, position: u32) -> Result<bool> {
-        self.begin_scheduled_dflash(seq, position).map(|()| true)
+        self.begin_scheduled_dflash(seq, position)
     }
 
     fn reserve_scheduled_speculation(&mut self, seq: SeqId, queries: usize) -> Result<bool> {

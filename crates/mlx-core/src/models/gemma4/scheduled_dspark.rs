@@ -18,21 +18,26 @@ use napi::bindgen_prelude::{Error, Result};
 pub(crate) type Gemma4ScheduledVerify = ScheduledVerifyBatch;
 
 impl Gemma4Inner {
-    pub(crate) fn begin_scheduled_dspark(&mut self, seq_id: u32, position: u32) -> Result<()> {
+    pub(crate) fn begin_scheduled_dspark(&mut self, seq_id: u32, position: u32) -> Result<bool> {
         if self.scheduled_dspark_verify.is_some() {
             return Err(Error::from_reason(
                 "cannot seed DSpark during an open verify batch",
             ));
         }
         self.scheduled_verification_budget.clear();
+        // Reused target KV does not restore the tapped hidden history that
+        // seeds DSpark context. Keep that prefix and let the scheduler use AR.
+        if position != 0 {
+            self.scheduled_dspark_states.remove(&seq_id);
+            return Ok(false);
+        }
         let draft = self
             .dspark_draft()
             .ok_or_else(|| Error::from_reason("no DSpark draft loaded"))?;
         let state = Gemma4DsparkState {
             seq_id,
             ctx: DsparkContextCache::new(draft.num_layers()),
-            next_pos: i32::try_from(position)
-                .map_err(|_| Error::from_reason("DSpark position overflow"))?,
+            next_pos: 0,
             ar_fallback: false,
             layer_ids: draft
                 .config
@@ -48,7 +53,7 @@ impl Gemma4Inner {
             ar_probe_pending: false,
         };
         self.scheduled_dspark_states.insert(seq_id, state);
-        Ok(())
+        Ok(true)
     }
 
     /// The owned state is removed during the borrow and returned only on
@@ -89,8 +94,8 @@ impl Gemma4Inner {
     }
 
     /// Collect only freshly computed target rows, including the last-token
-    /// prefill split. Cached target prefixes remain authoritative without
-    /// requiring a second full-prefix host or drafter cache restore.
+    /// prefill split. A draft owner exists only when its context can be seeded
+    /// from position zero; cached-prefix turns keep ordinary paged prefill.
     pub(crate) fn scheduled_dspark_tap(&self, seq_id: u32) -> Option<Vec<usize>> {
         self.scheduled_dspark_states
             .get(&seq_id)
@@ -199,7 +204,7 @@ mod tests {
         };
         inner.activate_paged_seq(seq).unwrap();
         if draft {
-            inner.begin_scheduled_dspark(seq, 0).unwrap();
+            assert!(inner.begin_scheduled_dspark(seq, 0).unwrap());
         }
         let logits = inner
             .run_scheduled_prefill_slice(

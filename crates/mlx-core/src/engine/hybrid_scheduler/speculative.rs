@@ -975,10 +975,14 @@ mod tests {
     }
 
     #[test]
-    fn cached_native_mtp_starts_and_preemption_replay_keep_scheduled_ar() {
+    fn cached_speculative_starts_and_preemption_replay_keep_scheduled_ar() {
         use crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget;
 
-        fn check<B: HybridSchedulerBackend + ScheduledMtpTarget>(mut inner: B, replay: bool) {
+        fn check<B: HybridSchedulerBackend>(
+            mut inner: B,
+            replay: bool,
+            has_draft_owner: impl Fn(&B, u32) -> bool,
+        ) {
             let source = (0..12).chain([15; 4]).collect::<Vec<u32>>();
             let mut warm = request(
                 &mut inner,
@@ -987,9 +991,14 @@ mod tests {
                 true,
                 Arc::new(AtomicBool::new(false)),
             );
-            // Materialize the target prefix without draft history, as after
-            // a warm/SSD hit. Keep the remaining suffix split across chunks.
-            inner
+            // Replay must also discard a draft owner from the earlier wave.
+            if replay {
+                assert!(inner.begin_scheduled_speculation(41, 0).unwrap());
+                assert!(has_draft_owner(&inner, 41));
+            }
+            // Materialize a target prefix as after a warm/SSD hit or replay.
+            // Keep the remaining suffix split across chunks.
+            if let Some(logits) = inner
                 .run_scheduled_prefill_slice(
                     41,
                     &source,
@@ -1000,8 +1009,9 @@ mod tests {
                     true,
                 )
                 .unwrap()
-                .unwrap()
-                .eval();
+            {
+                logits.eval();
+            }
             warm.payload.prefix = inner.build_scheduled_prefix(
                 &warm.payload.prefix,
                 8,
@@ -1043,8 +1053,9 @@ mod tests {
                     .drive_once(&mut HybridStepExecutor::new(&mut inner))
                     .unwrap();
                 assert!(
-                    !inner.mtp_state().owners.contains_key(&41),
-                    "cached target prefix must not create an unseeded draft owner"
+                    !has_draft_owner(&inner, 41),
+                    "{} cached target prefix must not create an unseeded draft owner",
+                    B::SCHEDULER_NAME
                 );
                 if let SchedulerAction::Stepped {
                     completed: turns, ..
@@ -1087,10 +1098,23 @@ mod tests {
             check(
                 crate::models::qwen3_5::model::scheduled_mtp::seeded_inner(8107),
                 replay,
+                |inner, seq| inner.mtp_state().owners.contains_key(&seq),
             );
             check(
                 crate::models::qwen3_5_moe::model::scheduled_mtp::seeded_inner(8107),
                 replay,
+                |inner, seq| inner.mtp_state().owners.contains_key(&seq),
+            );
+            check(
+                seeded_tiny_paged_inner_with_draft(1729).unwrap(),
+                replay,
+                |inner, seq| inner.scheduled_dspark_states.contains_key(&seq),
+            );
+            check(
+                crate::models::muse_glimmer::model::scheduled_dflash::tests::seeded_inner(1908)
+                    .unwrap(),
+                replay,
+                |inner, seq| inner.scheduled_dflash_states.contains_key(&seq),
             );
         }
     }
