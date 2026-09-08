@@ -51,6 +51,7 @@ function harness() {
     enabled: true,
     systemVersion: '26.0',
     native: client,
+    squirrel,
     onChange: vi.fn(),
     requestQuit,
     report,
@@ -71,7 +72,7 @@ describe.each(['already staged', 'still staging'] as const)('MacUpdater with Squ
         beginShutdown: () => updater.stop(),
         shutdown: () => drain.promise,
         deadlineMs: 14_000,
-        installUpdate: (relaunchRequested) => updater.installOnQuit(relaunchRequested),
+        installUpdate: (relaunchRequested, allowQuit) => updater.installOnQuit(relaunchRequested, allowQuit),
         shouldRelaunch: () => action === 'Finder relaunch',
         relaunch: app.relaunch,
         quit: app.quit,
@@ -101,6 +102,9 @@ describe.each(['already staged', 'still staging'] as const)('MacUpdater with Squ
       if (staging === 'still staging') {
         expect(app.quit).not.toHaveBeenCalled();
         expect(squirrel.quitAndInstall).not.toHaveBeenCalled();
+        quit({ preventDefault: prevented });
+        quit({ preventDefault: prevented });
+        expect(prevented).toHaveBeenCalledTimes(3);
         squirrel.emit('update-downloaded');
       }
 
@@ -112,8 +116,83 @@ describe.each(['already staged', 'still staging'] as const)('MacUpdater with Squ
       expect(squirrel.checkForUpdates).not.toHaveBeenCalled();
       expect(report).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
+      const blockedQuits = prevented.mock.calls.length;
       quit({ preventDefault: prevented });
-      expect(prevented).toHaveBeenCalledTimes(1);
+      expect(prevented).toHaveBeenCalledTimes(blockedQuits);
     },
   );
+});
+
+it('releases a blocked quit on native staging failure and ignores late completion', async () => {
+  const { squirrel, app, client, updater, requestQuit, report } = harness();
+  const quit = createQuitHandler({
+    beginShutdown: () => updater.stop(),
+    shutdown: async () => {},
+    deadlineMs: 14_000,
+    installUpdate: (relaunchRequested, allowQuit) => updater.installOnQuit(relaunchRequested, allowQuit),
+    shouldRelaunch: () => false,
+    relaunch: app.relaunch,
+    quit: app.quit,
+    report,
+  });
+  const prevented = vi.fn();
+  requestQuit.mockImplementation(() => quit({ preventDefault: prevented }));
+  updater.start();
+  client.emit('update-downloaded', {
+    version: '0.0.14',
+    files: [],
+    path: 'update.zip',
+    sha512: '',
+    releaseDate: '2026-09-08T00:00:00Z',
+    downloadedFile: 'update.zip',
+  });
+  quit({ preventDefault: prevented });
+  await vi.advanceTimersByTimeAsync(0);
+  quit({ preventDefault: prevented });
+  expect(prevented).toHaveBeenCalledTimes(2);
+  const error = new Error('native staging failed');
+  squirrel.emit('error', error);
+  expect(report).toHaveBeenCalledWith(error);
+  expect(requestQuit).toHaveBeenCalledTimes(1);
+  expect(prevented).toHaveBeenCalledTimes(2);
+  squirrel.emit('update-downloaded');
+  expect(squirrel.quitAndInstall).not.toHaveBeenCalled();
+  expect(app.relaunch).not.toHaveBeenCalled();
+  expect(vi.getTimerCount()).toBe(0);
+});
+
+it('finishes an explicit update quit when staging fails during the resource drain', async () => {
+  const { squirrel, app, client, updater, requestQuit, report } = harness();
+  const drain = Promise.withResolvers<void>();
+  const quit = createQuitHandler({
+    beginShutdown: () => updater.stop(),
+    shutdown: () => drain.promise,
+    deadlineMs: 14_000,
+    installUpdate: (relaunchRequested, allowQuit) => updater.installOnQuit(relaunchRequested, allowQuit),
+    shouldRelaunch: () => false,
+    relaunch: app.relaunch,
+    quit: app.quit,
+    report,
+  });
+  const prevented = vi.fn();
+  requestQuit.mockImplementation(() => quit({ preventDefault: prevented }));
+  updater.start();
+  client.emit('update-downloaded', {
+    version: '0.0.14',
+    files: [],
+    path: 'update.zip',
+    sha512: '',
+    releaseDate: '2026-09-08T00:00:00Z',
+    downloadedFile: 'update.zip',
+  });
+  updater.restartAndInstall();
+  squirrel.emit('error', new Error('staging failed during shutdown'));
+  expect(app.quit).not.toHaveBeenCalled();
+  drain.resolve();
+  await vi.advanceTimersByTimeAsync(0);
+  expect(app.quit).toHaveBeenCalledTimes(1);
+  expect(squirrel.quitAndInstall).not.toHaveBeenCalled();
+  quit({ preventDefault: prevented });
+  expect(prevented).toHaveBeenCalledTimes(1);
+  expect(report).toHaveBeenCalledTimes(1);
 });

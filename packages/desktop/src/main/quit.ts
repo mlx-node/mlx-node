@@ -3,7 +3,7 @@ export function createQuitHandler(options: {
   beginShutdown(): void;
   shutdown(): Promise<void>;
   deadlineMs: number;
-  installUpdate(relaunchRequested: boolean): boolean;
+  installUpdate(relaunchRequested: boolean, allowQuit: () => void): boolean;
   shouldRelaunch(): boolean;
   relaunch(): void;
   quit(): void;
@@ -29,11 +29,11 @@ export function createQuitHandler(options: {
       options.report(error);
     } finally {
       if (timer !== undefined) clearTimeout(timer);
-      completed = true;
       // Squirrel owns the relaunch after installation. A separate app.relaunch()
       // races the old executable against replacement of its bundle.
       const relaunchRequested = options.shouldRelaunch();
-      if (!options.installUpdate(relaunchRequested)) {
+      if (!options.installUpdate(relaunchRequested, () => (completed = true))) {
+        completed = true;
         if (relaunchRequested) options.relaunch();
         options.quit();
       }
@@ -41,8 +41,8 @@ export function createQuitHandler(options: {
   }
 
   return (event): void => {
-    // Repeated Cmd+Q / tray quit requests must not bypass an in-flight drain.
-    // Only the final quit initiated below (or by Squirrel) can proceed.
+    // Repeated Cmd+Q / tray quit requests must not bypass either the resource
+    // drain or native staging. The updater releases this gate before final quit.
     if (completed) return;
     event.preventDefault();
     if (started) return;

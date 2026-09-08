@@ -56,7 +56,19 @@ not enabled in the desktop UI.
 Packaging stamps update eligibility into the staged app manifest before signing;
 the source manifest does not enable updates. The release tag, desktop manifest,
 bundle version, DMG filename, ZIP filename, and update metadata must agree. The
-workflow publishes the manifest after the ZIP, blockmap, and DMG are uploaded.
+workflow verifies that the ZIP, blockmap, DMG, and manifest are fully uploaded
+before publishing the draft release.
+
+Push the version tag to start a release. The workflow creates or resumes a draft,
+builds from the tagged commit, and publishes only after signing, notarization, and
+all uploads succeed. Keep any release notes you prepare in a draft; do not publish
+through the GitHub release editor first. A failed build leaves the draft hidden
+from updater clients, and existing published releases are never overwritten.
+
+To retry a failed release, rerun its workflow or dispatch **Desktop Release** with
+`dry_run=false` and its existing `release_tag`. The dispatch checks out that tag.
+Dry runs default to `true`, build the selected ref, and make no release changes;
+an optional tag input validates the planned version without requiring the tag yet.
 
 Before the first production rollout, verify an upgrade between signed releases,
 including normal quit without relaunch, **Restart to Update…**, active inference,

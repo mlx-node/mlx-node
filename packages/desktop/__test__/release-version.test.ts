@@ -182,11 +182,8 @@ describe('update ZIP release versions', () => {
 /**
  * The guard that runs BEFORE a tag exists.
  *
- * Everything above only fires inside `desktop-release.yml`, which on a
- * `release: published` run cannot start any earlier than the release itself. By
- * then the mismatch costs a release with no DMG attached, and re-running is
- * awkward: `workflow_dispatch` carries no tag, and the upload step is gated on
- * `github.event_name == 'release'`.
+ * The workflow checks versions before building from a pushed tag. Catch the
+ * underlying manifest drift earlier, in ordinary pull request CI.
  *
  * The drift is created by `tools bump`, in an ordinary commit, days earlier —
  * so that is where it should be caught. `tools bump` reads its current version

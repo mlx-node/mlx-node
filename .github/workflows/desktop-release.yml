@@ -29,23 +29,20 @@ name: Desktop Release
 # CSC_LINK, which nothing here can replace.
 
 on:
-  release:
-    types: [published]
+  # Published releases are already visible to updater clients. Build from the
+  # tag and keep the release in draft until every required asset is attached.
+  push:
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       dry_run:
         description: 'Build and sign, but skip notarization and publishing'
         type: boolean
         default: true
-      # Without this a dispatch run has no tag, falls back to the desktop
-      # manifest, and therefore rehearses whatever version that file happens to
-      # hold — which on a release day is the STALE one, since `tools bump` skips
-      # private workspaces. The rehearsal would pass and the real
-      # `release: published` run would then be the first thing to see the tag,
-      # and to fail, with the release already public. Pass the tag you are about
-      # to cut and the dry run checks the same thing the real run will.
+      # Dry runs can validate a planned tag before it exists. Publishing requires
+      # an existing tag and checks out that exact ref, regardless of the UI branch.
       release_tag:
-        description: 'Tag to validate against, e.g. v0.0.9 (default: the desktop manifest version)'
+        description: 'Release tag, e.g. v0.0.14 (required to publish; optional for a dry run)'
         type: string
         default: ''
       staging_percentage:
@@ -53,7 +50,12 @@ on:
         type: string
         default: '100'
 
+concurrency:
+  group: desktop-release-${{ inputs.release_tag || github.ref_name }}
+  cancel-in-progress: false
+
 env:
+  RELEASE_TAG: ${{ inputs.release_tag || (github.ref_type == 'tag' && github.ref_name) || '' }}
   # Must match ci.yml. Without it the deployment floor silently tracks the runner
   # image's macOS version and ratchets with runner updates.
   MACOSX_DEPLOYMENT_TARGET: '26.0'
@@ -72,6 +74,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ inputs.dry_run && github.ref || (inputs.release_tag && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
           submodules: recursive
 
       - name: Setup Node.js
@@ -111,15 +114,20 @@ jobs:
       # the DMG 0.0.8 and bumps the cask to 0.0.8: consistently wrong, because all
       # three read that same stale manifest.
       #
-      # `github.event.release.tag_name` is empty on workflow_dispatch, where the
-      # `release_tag` input takes over; with neither, the script treats the
-      # manifest as the source. Passed through `env` rather than interpolated
-      # into the script body — a tag name is attacker-supplied text.
+      # RELEASE_TAG comes from the pushed tag or the dispatch input. With neither,
+      # only a dry run is allowed to use the manifest as its source. Tag values
+      # are passed through env rather than interpolated into shell code.
       - name: Resolve release version
         id: version
         env:
-          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: yarn oxnode packages/desktop/scripts/check-release.ts resolve --tag "$TAG" --manifest packages/desktop/package.json
+
+      - name: Prepare draft release
+        if: inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: yarn oxnode packages/desktop/scripts/publish-release.ts prepare --tag "$RELEASE_TAG"
 
       # Deliberately a fresh build, not a `gh run download` of ci.yml's artifacts.
       # A release is rare and the ~16 min is worth it: artifact reuse is exactly how
@@ -265,7 +273,7 @@ jobs:
 
       - name: Verify archived update
         env:
-          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          TAG: ${{ env.RELEASE_TAG }}
           ZIP: ${{ steps.zip.outputs.path }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
@@ -316,7 +324,7 @@ jobs:
       # artifacts do. Runs before the DMG is notarized — the expensive step.
       - name: Validate artifact versions
         env:
-          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          TAG: ${{ env.RELEASE_TAG }}
         run: |
           yarn oxnode packages/desktop/scripts/check-release.ts verify \
             --tag "$TAG" --manifest packages/desktop/package.json \
@@ -354,19 +362,17 @@ jobs:
             ${{ steps.update.outputs.blockmap }}
             ${{ steps.update.outputs.manifest }}
 
-      - name: Attach desktop artifacts to the release
-        if: inputs.dry_run != true && github.event_name == 'release'
+      - name: Upload artifacts and publish the draft release
+        if: inputs.dry_run != true
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DMG: ${{ steps.dmg.outputs.path }}
           ZIP: ${{ steps.zip.outputs.path }}
           BLOCKMAP: ${{ steps.update.outputs.blockmap }}
           MANIFEST: ${{ steps.update.outputs.manifest }}
-          TAG: ${{ github.event.release.tag_name }}
         run: |
-          gh release upload "$TAG" "$DMG" "$ZIP" "$BLOCKMAP" --clobber
-          # Publish eligibility only after all download artifacts are available.
-          gh release upload "$TAG" "$MANIFEST" --clobber
+          yarn oxnode packages/desktop/scripts/publish-release.ts publish --tag "$RELEASE_TAG" \
+            --dmg "$DMG" --zip "$ZIP" --blockmap "$BLOCKMAP" --manifest "$MANIFEST"
 
       # The `secrets` context is NOT available in a step `if` — only github, needs,
       # strategy, matrix, job, runner, env, vars, steps and inputs are. Writing
@@ -374,7 +380,7 @@ jobs:
       # would silently stop being bumped. The token is hoisted to job-level `env`
       # (which IS in scope) and tested there instead.
       - name: Bump the Homebrew cask
-        if: inputs.dry_run != true && github.event_name == 'release' && env.HOMEBREW_TAP_TOKEN != ''
+        if: inputs.dry_run != true && !contains(steps.version.outputs.version, '-') && env.HOMEBREW_TAP_TOKEN != ''
         env:
           GH_TOKEN: ${{ env.HOMEBREW_TAP_TOKEN }}
           # From the tag, via the same validated value the DMG was named with —

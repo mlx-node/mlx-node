@@ -20,7 +20,7 @@ import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
-import { app, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
+import { app, autoUpdater, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
 import electronUpdater from 'electron-updater';
 
 import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
@@ -146,7 +146,7 @@ function wire(): void {
       },
       shutdown,
       deadlineMs: DESKTOP_QUIT_DEADLINE_MS,
-      installUpdate: (relaunchRequested) => updates?.installOnQuit(relaunchRequested) ?? false,
+      installUpdate: (relaunchRequested, allowQuit) => updates?.installOnQuit(relaunchRequested, allowQuit) ?? false,
       shouldRelaunch: () => launchVisibility.takeRelaunchRequest(),
       relaunch: () => app.relaunch(),
       quit: () => app.quit(),
@@ -232,6 +232,7 @@ async function bootstrap(): Promise<void> {
       version: app.getVersion(),
     }),
     native: new electronUpdater.MacUpdater(),
+    squirrel: autoUpdater,
     systemVersion: process.getSystemVersion(),
     onChange: refreshUpdates,
     requestQuit: () => app.quit(),

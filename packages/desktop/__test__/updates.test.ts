@@ -29,7 +29,15 @@ function harness(enabled = canAutoUpdate(release)) {
   const onChange = vi.fn();
   const requestQuit = vi.fn();
   const report = vi.fn();
-  const updater = createDesktopUpdater({ enabled, systemVersion: '26.0', native, onChange, requestQuit, report });
+  const updater = createDesktopUpdater({
+    enabled,
+    systemVersion: '26.0',
+    native,
+    squirrel: native,
+    onChange,
+    requestQuit,
+    report,
+  });
   return { native, updater, onChange, requestQuit, report };
 }
 
@@ -121,7 +129,7 @@ describe('desktop updates', () => {
     updater.start();
     native.emit('update-downloaded');
     updater.stop();
-    expect(updater.installOnQuit()).toBe(true);
+    expect(updater.installOnQuit(false, vi.fn())).toBe(true);
     expect(native.autoRunAppAfterInstall).toBe(false);
     expect(native.quitAndInstall).toHaveBeenCalledTimes(1);
   });
@@ -231,7 +239,7 @@ describe('desktop updates', () => {
       beginShutdown: () => updater.stop(),
       shutdown,
       deadlineMs: 14_000,
-      installUpdate: (relaunchRequested) => updater.installOnQuit(relaunchRequested),
+      installUpdate: (relaunchRequested, allowQuit) => updater.installOnQuit(relaunchRequested, allowQuit),
       shouldRelaunch: () => true,
       relaunch,
       quit: finalQuit,
@@ -256,7 +264,7 @@ describe('desktop updates', () => {
     expect(relaunch).not.toHaveBeenCalled();
     expect(finalQuit).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
-    updater.installOnQuit();
+    updater.installOnQuit(false, vi.fn());
     expect(native.quitAndInstall).toHaveBeenCalledTimes(1);
     quit({ preventDefault: prevented }); // Squirrel's final app.quit().
     expect(prevented).toHaveBeenCalledTimes(2);
@@ -272,7 +280,7 @@ describe('desktop updates', () => {
       native.quitAndInstall.mockImplementationOnce(() => {
         throw new Error('install failed');
       });
-    expect(updater.installOnQuit()).toBe(true);
+    expect(updater.installOnQuit(false, vi.fn())).toBe(true);
     if (failure === 'event') native.emit('error', new Error('install failed'));
     expect(report).toHaveBeenCalledTimes(1);
     expect(requestQuit).toHaveBeenCalledTimes(2);
@@ -293,7 +301,7 @@ describe('desktop updates', () => {
         beginShutdown: () => updater.stop(),
         shutdown: () => drain.promise,
         deadlineMs: 14_000,
-        installUpdate: (relaunchRequested) => updater.installOnQuit(relaunchRequested),
+        installUpdate: (relaunchRequested, allowQuit) => updater.installOnQuit(relaunchRequested, allowQuit),
         shouldRelaunch: () => activated,
         relaunch,
         quit: finalQuit,
