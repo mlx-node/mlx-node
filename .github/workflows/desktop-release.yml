@@ -68,6 +68,7 @@ jobs:
     runs-on: macos-26
     permissions:
       contents: write
+      actions: read
     env:
       # Hoisted so the cask step's `if` can test it — see the comment there.
       HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
@@ -364,6 +365,9 @@ jobs:
 
       - name: Upload artifacts and publish the draft release
         if: inputs.dry_run != true
+        # Includes up to three hours for CI on the exact tagged commit. A failed
+        # or missing CI run leaves the fully uploaded release in draft.
+        timeout-minutes: 190
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DMG: ${{ steps.dmg.outputs.path }}

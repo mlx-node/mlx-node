@@ -22,14 +22,15 @@ versionFromTag(tag);
 // the Actions UI. --verify-tag below also requires it to exist on GitHub.
 const revision = (ref: string): string =>
   execFileSync('git', ['rev-parse', '--verify', ref], { encoding: 'utf8' }).trim();
-if (revision(`refs/tags/${tag}^{commit}`) !== revision('HEAD')) {
+const commit = revision('HEAD');
+if (revision(`refs/tags/${tag}^{commit}`) !== commit) {
   throw new Error(`The checkout does not match release tag ${tag}`);
 }
 const github = (args: string[]): string => execFileSync('gh', args, { encoding: 'utf8' });
 if (positionals[0] === 'prepare') {
   prepareDraftRelease(tag, github);
 } else if (positionals[0] === 'publish' && values.dmg && values.zip && values.blockmap && values.manifest) {
-  publishDesktopRelease(tag, [values.dmg, values.zip, values.blockmap, values.manifest], github);
+  await publishDesktopRelease(tag, commit, [values.dmg, values.zip, values.blockmap, values.manifest], github);
 } else {
   throw new Error(
     'usage: publish-release.ts <prepare|publish> --tag <tag> [--dmg <dmg> --zip <zip> --blockmap <blockmap> --manifest <manifest>]',

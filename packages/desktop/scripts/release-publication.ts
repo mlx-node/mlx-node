@@ -1,6 +1,7 @@
 import { statSync } from 'node:fs';
 import { basename } from 'node:path';
 
+import { waitForReleaseCI } from './release-ci.js';
 import { dmgFileName, updateZipFileName, versionFromTag } from './release-version.js';
 
 type GitHub = (args: string[]) => string;
@@ -50,7 +51,12 @@ export function prepareDraftRelease(tag: string, github: GitHub): void {
 }
 
 /** Upload and verify the complete asset set while private, then publish once. */
-export function publishDesktopRelease(tag: string, files: string[], github: GitHub): void {
+export async function publishDesktopRelease(
+  tag: string,
+  commit: string,
+  files: string[],
+  github: GitHub,
+): Promise<void> {
   const version = versionFromTag(tag);
   const zip = updateZipFileName(version);
   const expected = [dmgFileName(version), zip, `${zip}.blockmap`, 'latest-mac.yml'];
@@ -67,6 +73,9 @@ export function publishDesktopRelease(tag: string, files: string[], github: GitH
   });
   assertDraft(tag, readRelease(tag, github));
   github(['release', 'upload', tag, ...files, '--clobber']);
+  // The tag build can overlap main CI, but the public update feed cannot.
+  // Check after uploads, then re-read the draft/assets after any CI wait.
+  await waitForReleaseCI(commit, github);
   // Re-read after upload. A failed/partial upload must never expose a release
   // lacking latest-mac.yml, and reruns may only replace files on a draft.
   const release = readRelease(tag, github);

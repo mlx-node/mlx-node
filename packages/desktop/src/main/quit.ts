@@ -1,9 +1,12 @@
+/** Finish quitting, optionally letting the updater own installation and relaunch. */
+export type CompleteQuit = (install?: (relaunchRequested: boolean) => void) => void;
+
 /** Drain app resources before either a normal exit or Squirrel's install/relaunch. */
 export function createQuitHandler(options: {
   beginShutdown(): void;
   shutdown(): Promise<void>;
   deadlineMs: number;
-  installUpdate(relaunchRequested: boolean, allowQuit: () => void): boolean;
+  installUpdate(completeQuit: CompleteQuit): boolean;
   shouldRelaunch(): boolean;
   relaunch(): void;
   quit(): void;
@@ -11,6 +14,20 @@ export function createQuitHandler(options: {
 }): (event: { preventDefault(): void }) => void {
   let started = false;
   let completed = false;
+  let relaunchRequested = false;
+
+  const completeQuit: CompleteQuit = (install) => {
+    // This runs after native staging, not just after the child/settings drain.
+    // Retain consumed intent if installation later fails and falls back to quit.
+    relaunchRequested = options.shouldRelaunch() || relaunchRequested;
+    completed = true;
+    if (install) {
+      install(relaunchRequested);
+    } else {
+      if (relaunchRequested) options.relaunch();
+      options.quit();
+    }
+  };
 
   async function finish(): Promise<void> {
     let timer: NodeJS.Timeout | undefined;
@@ -29,14 +46,8 @@ export function createQuitHandler(options: {
       options.report(error);
     } finally {
       if (timer !== undefined) clearTimeout(timer);
-      // Squirrel owns the relaunch after installation. A separate app.relaunch()
-      // races the old executable against replacement of its bundle.
-      const relaunchRequested = options.shouldRelaunch();
-      if (!options.installUpdate(relaunchRequested, () => (completed = true))) {
-        completed = true;
-        if (relaunchRequested) options.relaunch();
-        options.quit();
-      }
+      // Keep the completion decision live while the updater finishes staging.
+      if (!options.installUpdate(completeQuit)) completeQuit();
     }
   }
 

@@ -60,9 +60,11 @@ workflow verifies that the ZIP, blockmap, DMG, and manifest are fully uploaded
 before publishing the draft release.
 
 Push the version tag to start a release. The workflow creates or resumes a draft,
-builds from the tagged commit, and publishes only after signing, notarization, and
-all uploads succeed. Keep any release notes you prepare in a draft; do not publish
-through the GitHub release editor first. A failed build leaves the draft hidden
+builds from the tagged commit, and publishes only after signing, notarization,
+all uploads, and main-branch CI for that exact commit succeed. The publication
+step waits up to three hours for the latest `ci.yml` push run on `main`; failed,
+cancelled, or missing CI cannot publish an update. Keep release notes in a draft;
+do not publish through the GitHub release editor first. A failed build leaves the draft hidden
 from updater clients, and existing published releases are never overwritten.
 
 To retry a failed release, rerun its workflow or dispatch **Desktop Release** with

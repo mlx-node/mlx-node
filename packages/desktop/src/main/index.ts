@@ -146,7 +146,7 @@ function wire(): void {
       },
       shutdown,
       deadlineMs: DESKTOP_QUIT_DEADLINE_MS,
-      installUpdate: (relaunchRequested, allowQuit) => updates?.installOnQuit(relaunchRequested, allowQuit) ?? false,
+      installUpdate: (completeQuit) => updates?.installOnQuit(completeQuit) ?? false,
       shouldRelaunch: () => launchVisibility.takeRelaunchRequest(),
       relaunch: () => app.relaunch(),
       quit: () => app.quit(),

@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 import { prepareDraftRelease, publishDesktopRelease } from '../scripts/release-publication.js';
 
 const tag = 'v0.0.14';
+const commit = 'a'.repeat(40);
 const names = [
   'mlx-node-0.0.14-arm64.dmg',
   'mlx-node-0.0.14-darwin-arm64.zip',
@@ -33,9 +34,20 @@ function harness() {
     isPrerelease: false,
     assets: [] as { name: string; state: string; size: number }[],
   };
+  const ci = {
+    id: 10,
+    head_sha: commit,
+    head_branch: 'main',
+    event: 'push',
+    path: '.github/workflows/ci.yml',
+    status: 'completed',
+    conclusion: 'success',
+    html_url: 'https://github.com/mlx-node/mlx-node/actions/runs/10',
+  };
   let exists = false;
   const onUpload = vi.fn();
   const github = vi.fn((args: string[]): string => {
+    if (args[0] === 'api') return JSON.stringify({ workflow_runs: [ci] });
     if (args[1] === 'view') {
       if (!exists) throw new Error('release not found');
       return JSON.stringify(release);
@@ -59,7 +71,7 @@ function harness() {
     }
     throw new Error(`Unexpected GitHub operation: ${args.join(' ')}`);
   });
-  return { github, release, onUpload };
+  return { github, release, onUpload, ci };
 }
 
 describe('desktop release publication', () => {
@@ -79,11 +91,11 @@ describe('desktop release publication', () => {
     ]);
   });
 
-  it('publishes only after all four assets are uploaded and verified', () => {
+  it('publishes only after all four assets are uploaded and CI succeeds', async () => {
     const { github, release, onUpload } = harness();
     prepareDraftRelease(tag, github);
     onUpload.mockImplementation(() => expect(release.isDraft).toBe(true));
-    publishDesktopRelease(tag, files, github);
+    await publishDesktopRelease(tag, commit, files, github);
     expect(release.assets.map((asset) => asset.name)).toEqual(names);
     expect(release.isDraft).toBe(false);
     expect(github.mock.calls.at(-1)?.[0]).toEqual(['release', 'edit', tag, '--draft=false', '--verify-tag']);
@@ -91,7 +103,7 @@ describe('desktop release publication', () => {
 
   it.each(['upload throws', 'missing manifest', 'wrong size', 'unfinished upload'])(
     'keeps the draft hidden when %s, then allows a successful retry',
-    (failure) => {
+    async (failure) => {
       const { github, release, onUpload } = harness();
       prepareDraftRelease(tag, github);
       onUpload.mockImplementationOnce(() => {
@@ -101,34 +113,50 @@ describe('desktop release publication', () => {
         if (failure === 'wrong size') manifest.size++;
         if (failure === 'unfinished upload') manifest.state = 'starter';
       });
-      expect(() => publishDesktopRelease(tag, files, github)).toThrow();
+      await expect(publishDesktopRelease(tag, commit, files, github)).rejects.toThrow();
       expect(release.isDraft).toBe(true);
       expect(github.mock.calls.some(([args]) => args[1] === 'edit')).toBe(false);
       const creates = github.mock.calls.filter(([args]) => args[1] === 'create').length;
       prepareDraftRelease(tag, github);
       expect(github.mock.calls.filter(([args]) => args[1] === 'create')).toHaveLength(creates);
-      publishDesktopRelease(tag, files, github);
+      await publishDesktopRelease(tag, commit, files, github);
       expect(release.isDraft).toBe(false);
     },
   );
 
-  it('refuses to overwrite a published release', () => {
+  it('refuses to overwrite a published release', async () => {
     const { github, release } = harness();
     prepareDraftRelease(tag, github);
     release.isDraft = false;
     github.mockClear();
     expect(() => prepareDraftRelease(tag, github)).toThrow('must remain a draft');
-    expect(() => publishDesktopRelease(tag, files, github)).toThrow('must remain a draft');
+    await expect(publishDesktopRelease(tag, commit, files, github)).rejects.toThrow('must remain a draft');
     expect(github.mock.calls.every(([args]) => args[1] === 'view')).toBe(true);
   });
 
-  it.each(['missing file', 'empty file', 'wrong version'])('rejects %s before any release mutation', (failure) => {
-    const { github } = harness();
-    if (failure === 'missing file') files.pop();
-    if (failure === 'empty file') writeFileSync(files[0], '');
-    if (failure === 'wrong version') files[0] = files[0].replace('0.0.14', '0.0.13');
-    expect(() => publishDesktopRelease(tag, files, github)).toThrow();
-    expect(github).not.toHaveBeenCalled();
+  it.each(['missing file', 'empty file', 'wrong version'])(
+    'rejects %s before any release mutation',
+    async (failure) => {
+      const { github } = harness();
+      if (failure === 'missing file') files.pop();
+      if (failure === 'empty file') writeFileSync(files[0], '');
+      if (failure === 'wrong version') files[0] = files[0].replace('0.0.14', '0.0.13');
+      await expect(publishDesktopRelease(tag, commit, files, github)).rejects.toThrow();
+      expect(github).not.toHaveBeenCalled();
+    },
+  );
+
+  it('keeps a fully uploaded release in draft when main CI fails', async () => {
+    const { github, release, ci } = harness();
+    prepareDraftRelease(tag, github);
+    ci.conclusion = 'failure';
+    await expect(publishDesktopRelease(tag, commit, files, github)).rejects.toThrow('Release blocked');
+    expect(release.assets.map((asset) => asset.name)).toEqual(names);
+    expect(release.isDraft).toBe(true);
+    expect(github.mock.calls.some(([args]) => args[1] === 'edit')).toBe(false);
+    ci.conclusion = 'success';
+    await publishDesktopRelease(tag, commit, files, github);
+    expect(release.isDraft).toBe(false);
   });
 
   it('requires prerelease tags to remain marked as prereleases', () => {

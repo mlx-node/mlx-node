@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { createQuitHandler } from '../src/main/quit.js';
+import { createQuitHandler, type CompleteQuit } from '../src/main/quit.js';
 import {
   canAutoUpdate,
   createDesktopUpdater,
@@ -129,7 +129,7 @@ describe('desktop updates', () => {
     updater.start();
     native.emit('update-downloaded');
     updater.stop();
-    expect(updater.installOnQuit(false, vi.fn())).toBe(true);
+    expect(updater.installOnQuit((install) => install?.(false))).toBe(true);
     expect(native.autoRunAppAfterInstall).toBe(false);
     expect(native.quitAndInstall).toHaveBeenCalledTimes(1);
   });
@@ -239,7 +239,7 @@ describe('desktop updates', () => {
       beginShutdown: () => updater.stop(),
       shutdown,
       deadlineMs: 14_000,
-      installUpdate: (relaunchRequested, allowQuit) => updater.installOnQuit(relaunchRequested, allowQuit),
+      installUpdate: (completeQuit) => updater.installOnQuit(completeQuit),
       shouldRelaunch: () => true,
       relaunch,
       quit: finalQuit,
@@ -264,7 +264,7 @@ describe('desktop updates', () => {
     expect(relaunch).not.toHaveBeenCalled();
     expect(finalQuit).not.toHaveBeenCalled();
     expect(vi.getTimerCount()).toBe(0);
-    updater.installOnQuit(false, vi.fn());
+    updater.installOnQuit((install) => install?.(false));
     expect(native.quitAndInstall).toHaveBeenCalledTimes(1);
     quit({ preventDefault: prevented }); // Squirrel's final app.quit().
     expect(prevented).toHaveBeenCalledTimes(2);
@@ -280,10 +280,12 @@ describe('desktop updates', () => {
       native.quitAndInstall.mockImplementationOnce(() => {
         throw new Error('install failed');
       });
-    expect(updater.installOnQuit(false, vi.fn())).toBe(true);
+    const completeQuit = vi.fn<CompleteQuit>((install) => install?.(false));
+    expect(updater.installOnQuit(completeQuit)).toBe(true);
     if (failure === 'event') native.emit('error', new Error('install failed'));
     expect(report).toHaveBeenCalledTimes(1);
-    expect(requestQuit).toHaveBeenCalledTimes(2);
+    expect(requestQuit).toHaveBeenCalledTimes(1);
+    expect(completeQuit).toHaveBeenLastCalledWith();
   });
 
   it.each(['before quit', 'during quit'])(
@@ -301,7 +303,7 @@ describe('desktop updates', () => {
         beginShutdown: () => updater.stop(),
         shutdown: () => drain.promise,
         deadlineMs: 14_000,
-        installUpdate: (relaunchRequested, allowQuit) => updater.installOnQuit(relaunchRequested, allowQuit),
+        installUpdate: (completeQuit) => updater.installOnQuit(completeQuit),
         shouldRelaunch: () => activated,
         relaunch,
         quit: finalQuit,

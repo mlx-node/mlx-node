@@ -3,6 +3,7 @@ import { createRequire, Module } from 'node:module';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { createLaunchVisibility } from '../src/main/launch-visibility.js';
 import { createQuitHandler } from '../src/main/quit.js';
 import { createDesktopUpdater } from '../src/main/updates.js';
 
@@ -72,7 +73,7 @@ describe.each(['already staged', 'still staging'] as const)('MacUpdater with Squ
         beginShutdown: () => updater.stop(),
         shutdown: () => drain.promise,
         deadlineMs: 14_000,
-        installUpdate: (relaunchRequested, allowQuit) => updater.installOnQuit(relaunchRequested, allowQuit),
+        installUpdate: (completeQuit) => updater.installOnQuit(completeQuit),
         shouldRelaunch: () => action === 'Finder relaunch',
         relaunch: app.relaunch,
         quit: app.quit,
@@ -129,7 +130,7 @@ it('releases a blocked quit on native staging failure and ignores late completio
     beginShutdown: () => updater.stop(),
     shutdown: async () => {},
     deadlineMs: 14_000,
-    installUpdate: (relaunchRequested, allowQuit) => updater.installOnQuit(relaunchRequested, allowQuit),
+    installUpdate: (completeQuit) => updater.installOnQuit(completeQuit),
     shouldRelaunch: () => false,
     relaunch: app.relaunch,
     quit: app.quit,
@@ -153,7 +154,8 @@ it('releases a blocked quit on native staging failure and ignores late completio
   const error = new Error('native staging failed');
   squirrel.emit('error', error);
   expect(report).toHaveBeenCalledWith(error);
-  expect(requestQuit).toHaveBeenCalledTimes(1);
+  expect(app.quit).toHaveBeenCalledTimes(1);
+  quit({ preventDefault: prevented });
   expect(prevented).toHaveBeenCalledTimes(2);
   squirrel.emit('update-downloaded');
   expect(squirrel.quitAndInstall).not.toHaveBeenCalled();
@@ -168,7 +170,7 @@ it('finishes an explicit update quit when staging fails during the resource drai
     beginShutdown: () => updater.stop(),
     shutdown: () => drain.promise,
     deadlineMs: 14_000,
-    installUpdate: (relaunchRequested, allowQuit) => updater.installOnQuit(relaunchRequested, allowQuit),
+    installUpdate: (completeQuit) => updater.installOnQuit(completeQuit),
     shouldRelaunch: () => false,
     relaunch: app.relaunch,
     quit: app.quit,
@@ -196,3 +198,59 @@ it('finishes an explicit update quit when staging fails during the resource drai
   expect(prevented).toHaveBeenCalledTimes(1);
   expect(report).toHaveBeenCalledTimes(1);
 });
+
+it.each(['success', 'staging error', 'install throws', 'install error'])(
+  'honors a Finder/Dock open during native staging through %s',
+  async (outcome) => {
+    const { squirrel, app, client, updater, report } = harness();
+    const visibility = createLaunchVisibility();
+    const shouldRelaunch = vi.fn(() => visibility.takeRelaunchRequest());
+    const quit = createQuitHandler({
+      beginShutdown: () => {
+        updater.stop();
+        visibility.beginShutdown();
+      },
+      shutdown: async () => {},
+      deadlineMs: 14_000,
+      installUpdate: (completeQuit) => updater.installOnQuit(completeQuit),
+      shouldRelaunch,
+      relaunch: app.relaunch,
+      quit: app.quit,
+      report,
+    });
+    const prevented = vi.fn();
+    updater.start();
+    client.emit('update-downloaded', {
+      version: '0.0.14',
+      files: [],
+      path: 'update.zip',
+      sha512: '',
+      releaseDate: '2026-09-08T00:00:00Z',
+      downloadedFile: 'update.zip',
+    });
+    quit({ preventDefault: prevented });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(shouldRelaunch).not.toHaveBeenCalled();
+    visibility.activate(); // Finder/Dock reopens after the resource drain.
+    quit({ preventDefault: prevented });
+    expect(prevented).toHaveBeenCalledTimes(2);
+    const error = new Error('native update failed');
+    if (outcome === 'staging error') {
+      squirrel.emit('error', error);
+    } else {
+      if (outcome === 'install throws')
+        squirrel.quitAndInstall.mockImplementationOnce(() => {
+          throw error;
+        });
+      squirrel.emit('update-downloaded');
+      if (outcome === 'install error') squirrel.emit('error', error);
+      expect(client.autoRunAppAfterInstall).toBe(true);
+    }
+    expect(squirrel.quitAndInstall).toHaveBeenCalledTimes(outcome === 'staging error' ? 0 : 1);
+    expect(app.relaunch).toHaveBeenCalledTimes(outcome === 'success' ? 0 : 1);
+    expect(app.quit).toHaveBeenCalledTimes(outcome === 'success' ? 0 : 1);
+    expect(report).toHaveBeenCalledTimes(outcome === 'success' ? 0 : 1);
+    quit({ preventDefault: prevented });
+    expect(prevented).toHaveBeenCalledTimes(2);
+  },
+);

@@ -1,5 +1,7 @@
 import type { AppUpdater } from 'electron-updater';
 
+import type { CompleteQuit } from './quit.js';
+
 export const UPDATE_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const STABLE_VERSION = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 
@@ -79,7 +81,7 @@ export interface DesktopUpdater {
   /** Stop checks and UI notifications as soon as graceful shutdown starts. */
   stop(): void;
   /** Called only AFTER settings and child processes have finished shutting down. */
-  installOnQuit(relaunchRequested: boolean, allowQuit: () => void): boolean;
+  installOnQuit(completeQuit: CompleteQuit): boolean;
 }
 
 interface UpdateClient extends Pick<
@@ -122,7 +124,7 @@ export function createDesktopUpdater(options: {
   let installInvoked = false;
   let installFailed = false;
   let squirrelReady = false;
-  let allowQuit: (() => void) | undefined;
+  let completeQuit: CompleteQuit | undefined;
   let timer: NodeJS.Timeout | null = null;
 
   function change(next: UpdateStatus): void {
@@ -142,8 +144,7 @@ export function createDesktopUpdater(options: {
     if (installStarted) {
       if (installFailed) return;
       installFailed = true;
-      allowQuit?.();
-      options.requestQuit();
+      completeQuit?.();
       return;
     }
     change('error');
@@ -153,13 +154,17 @@ export function createDesktopUpdater(options: {
     if (!installStarted || installInvoked || installFailed || !squirrelReady) return;
     // Only release the quit handler once the native payload is ready. Allowing
     // user quits while MacUpdater waits would abort Squirrel's local transfer.
-    allowQuit?.();
     installInvoked = true;
-    try {
-      options.native.quitAndInstall();
-    } catch (error) {
-      failed(error);
-    }
+    completeQuit?.((relaunchRequested) => {
+      // Read Finder/Dock intent at the last moment, after native staging.
+      // MacUpdater uses app.quit() for false and Squirrel's relaunch for true.
+      options.native.autoRunAppAfterInstall = installRequested || relaunchRequested;
+      try {
+        options.native.quitAndInstall();
+      } catch (error) {
+        failed(error);
+      }
+    });
   }
 
   if (options.enabled) {
@@ -243,16 +248,13 @@ export function createDesktopUpdater(options: {
       if (timer !== null) clearInterval(timer);
       timer = null;
     },
-    installOnQuit(relaunchRequested, releaseQuit): boolean {
+    installOnQuit(finishQuit): boolean {
       // Staging may fail while the children are draining. In that case finish
       // a normal quit instead of waiting for a native event that will not arrive.
       if (status !== 'ready' && !(installRequested && status === 'installing')) return false;
       if (!installStarted) {
         installStarted = true;
-        allowQuit = releaseQuit;
-        // MacUpdater honors this flag: false calls app.quit(), while true
-        // calls Electron's native quitAndInstall() to request a relaunch.
-        options.native.autoRunAppAfterInstall = installRequested || relaunchRequested;
+        completeQuit = finishQuit;
         finishInstall();
       }
       return true;
