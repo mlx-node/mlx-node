@@ -390,6 +390,8 @@ export function stageApp(opts: {
   desktopDir: string;
   stageDir: string;
   roots: string[];
+  /** Set only by the packaging command when it will Developer ID sign the app. */
+  autoUpdates?: boolean;
 }): StageResult {
   const { repoRoot, desktopDir, stageDir } = opts;
   rmSync(stageDir, { recursive: true, force: true });
@@ -413,6 +415,7 @@ export function stageApp(opts: {
         private: true,
         type: 'module',
         main: 'dist/main/index.js',
+        autoUpdates: opts.autoUpdates === true,
       },
       null,
       2,

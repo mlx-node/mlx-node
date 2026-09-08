@@ -37,7 +37,13 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { isNonRuntimeFile, pruneExcludedNested, runtimeClosure, stageRuntimeBuildFiles } from '../scripts/stage-app.js';
+import {
+  isNonRuntimeFile,
+  pruneExcludedNested,
+  runtimeClosure,
+  stageApp,
+  stageRuntimeBuildFiles,
+} from '../scripts/stage-app.js';
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..');
 
@@ -71,7 +77,32 @@ describe('runtime build assets', () => {
 
 // The same roots packaging uses: what the three entries import, not what
 // packages/desktop/package.json happens to declare.
-const ROOTS = ['@mlx-node/dashboard', '@mlx-node/server', '@mlx-node/lm'];
+const ROOTS = ['@mlx-node/dashboard', '@mlx-node/server', '@mlx-node/lm', 'electron-updater'];
+
+describe('packaged update eligibility', () => {
+  it.each([undefined, false, true])('enables updates only when the packager explicitly signs: %s', (autoUpdates) => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-update-stage-'));
+    const desktop = join(root, 'desktop');
+    const stage = join(root, 'stage');
+    try {
+      mkdirSync(join(desktop, 'dist'), { recursive: true });
+      mkdirSync(join(desktop, 'build'), { recursive: true });
+      writeFileSync(join(desktop, 'dist', 'index.js'), 'export {};');
+      for (const name of ['iconTemplate.png', 'iconTemplate@2x.png']) {
+        writeFileSync(join(desktop, 'build', name), name);
+      }
+      // The source manifest must not be able to opt an unsigned package in.
+      writeFileSync(join(desktop, 'package.json'), JSON.stringify({ version: '0.0.13', autoUpdates: true }));
+      mkdirSync(join(root, 'node_modules', 'fixture'), { recursive: true });
+      writeFileSync(join(root, 'node_modules', 'fixture', 'package.json'), JSON.stringify({ name: 'fixture' }));
+      stageApp({ repoRoot: root, desktopDir: desktop, stageDir: stage, roots: ['fixture'], autoUpdates });
+      const manifest = JSON.parse(readFileSync(join(stage, 'package.json'), 'utf-8')) as { autoUpdates: boolean };
+      expect(manifest.autoUpdates).toBe(autoUpdates === true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
 
 describe('runtimeClosure', () => {
   const closure = runtimeClosure(repoRoot, ROOTS);
@@ -80,6 +111,8 @@ describe('runtimeClosure', () => {
     expect(closure.workspace).toContain('@mlx-node/dashboard');
     expect(closure.workspace).toContain('@mlx-node/server');
     expect(closure.external.length).toBeGreaterThan(0);
+    expect(closure.external).toContain('electron-updater');
+    expect(closure.external).not.toContain('app-builder-lib');
   });
 
   it('excludes the clipboard prebuilts that leak a build path', () => {

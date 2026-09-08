@@ -80,6 +80,17 @@ export function versionFromDmgPath(path: string): string | null {
   return SEMVER.test(match[1]) ? match[1] : null;
 }
 
+/** Include architecture for electron-updater and versions for blockmap lookup. */
+export function updateZipFileName(version: string): string {
+  return `mlx-node-${assertSemver('version', version)}-darwin-arm64.zip`;
+}
+
+export function versionFromUpdateZipPath(path: string): string | null {
+  const base = path.split('/').pop() ?? path;
+  const match = /^mlx-node-(.+)-darwin-arm64\.zip$/.exec(base);
+  return match !== null && SEMVER.test(match[1]) ? match[1] : null;
+}
+
 export interface ReleaseVersions {
   /** From the release tag. `null` on `workflow_dispatch`, where there is no tag. */
   tag: string | null;
@@ -91,13 +102,15 @@ export interface ReleaseVersions {
   bundleVersion: string;
   /** Parsed out of the DMG filename. `null` before the DMG exists. */
   dmg: string | null;
+  /** Parsed out of the Squirrel.Mac update archive filename. */
+  zip: string | null;
 }
 
 /**
- * Fail unless the tag, the manifest, the bundle's own metadata and the DMG name
+ * Fail unless the tag, manifest, bundle metadata, and DMG/update ZIP names
  * are all the same version. Returns that version.
  *
- * The tag wins when present because it is the only one of the four that reliably
+ * The tag wins when present because it is the only one that reliably
  * advances; the manifest is still required to match rather than being silently
  * overridden, since an artifact that disagrees with the repo it was built from is
  * a provenance bug even when the artifact is the correct one.
@@ -128,6 +141,7 @@ export function assertVersionsAgree(versions: ReleaseVersions): string {
       remedy: 'the packaged bundle was not stamped — check `package --app-version`',
     },
     { label: 'DMG filename', value: versions.dmg, remedy: 'the DMG was named from a different version than it holds' },
+    { label: 'ZIP filename', value: versions.zip, remedy: 'the update ZIP must match the version of the app it holds' },
   ];
 
   for (const check of checks) {

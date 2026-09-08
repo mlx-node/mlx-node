@@ -10,7 +10,7 @@ name: Desktop Release
 # notarization secrets exist — which matters, because notarization is the step with
 # the slowest feedback loop and the least reproducible failures.
 #
-# Required secrets (none of these exist in the repo yet):
+# Required secrets:
 #   CSC_LINK                     base64 of the Developer ID Application .p12
 #   CSC_KEY_PASSWORD             its export password
 #   APPLE_TEAM_ID                10-char Team ID
@@ -48,6 +48,10 @@ on:
         description: 'Tag to validate against, e.g. v0.0.9 (default: the desktop manifest version)'
         type: string
         default: ''
+      staging_percentage:
+        description: 'Percentage of installed apps offered the update (0-100)'
+        type: string
+        default: '100'
 
 env:
   # Must match ci.yml. Without it the deployment floor silently tracks the runner
@@ -245,6 +249,47 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: yarn oxnode packages/desktop/scripts/verify-bundle.ts "${{ steps.package.outputs.app }}" --notarized
 
+      # Squirrel.Mac consumes a ZIP, not a DMG. Archive the stapled app so the
+      # updater gets the same signed payload as a fresh installation. The name
+      # includes the version and architecture for differential-update lookup.
+      - name: Build update ZIP
+        id: zip
+        env:
+          APP: ${{ steps.package.outputs.app }}
+          ZIP_NAME: ${{ steps.version.outputs.zip_name }}
+        run: |
+          set -euo pipefail
+          ZIP="packages/desktop/out/$ZIP_NAME"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          echo "path=$ZIP" >> "$GITHUB_OUTPUT"
+
+      - name: Verify archived update
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.release_tag }}
+          ZIP: ${{ steps.zip.outputs.path }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          EXTRACTED="$RUNNER_TEMP/update-verification"
+          ditto -x -k "$ZIP" "$EXTRACTED"
+          APP="$EXTRACTED/mlx-node.app"
+          codesign --verify --deep --strict "$APP"
+          yarn oxnode packages/desktop/scripts/check-release.ts verify \
+            --tag "$TAG" --manifest packages/desktop/package.json --app "$APP" --zip "$ZIP"
+          if [ "$DRY_RUN" != "true" ]; then
+            xcrun stapler validate "$APP"
+          fi
+
+      - name: Generate update manifest and blockmap
+        id: update
+        env:
+          APP: ${{ steps.package.outputs.app }}
+          ZIP: ${{ steps.zip.outputs.path }}
+          STAGING_PERCENTAGE: ${{ inputs.staging_percentage || vars.DESKTOP_UPDATE_STAGING_PERCENTAGE || '100' }}
+        run: |
+          yarn oxnode packages/desktop/scripts/generate-update.ts --app "$APP" --zip "$ZIP" \
+            --staging-percentage "$STAGING_PERCENTAGE"
+
       # The filename is spelled once, by `scripts/release-version.ts`, and parsed
       # back out of it by the next step — so a DMG whose name disagrees with what
       # is inside it cannot reach a release.
@@ -275,7 +320,8 @@ jobs:
         run: |
           yarn oxnode packages/desktop/scripts/check-release.ts verify \
             --tag "$TAG" --manifest packages/desktop/package.json \
-            --app "${{ steps.package.outputs.app }}" --dmg "${{ steps.dmg.outputs.path }}"
+            --app "${{ steps.package.outputs.app }}" --dmg "${{ steps.dmg.outputs.path }}" \
+            --zip "${{ steps.zip.outputs.path }}"
 
       # The DMG is a separate distributable and Gatekeeper assesses it on its own,
       # so it needs its own signature, notarization and ticket. Skipping this is the
@@ -300,12 +346,27 @@ jobs:
           name: mlx-node-desktop-dmg
           path: ${{ steps.dmg.outputs.path }}
 
-      - name: Attach DMG to the release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mlx-node-desktop-update
+          path: |
+            ${{ steps.zip.outputs.path }}
+            ${{ steps.update.outputs.blockmap }}
+            ${{ steps.update.outputs.manifest }}
+
+      - name: Attach desktop artifacts to the release
         if: inputs.dry_run != true && github.event_name == 'release'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DMG: ${{ steps.dmg.outputs.path }}
-        run: gh release upload "${{ github.event.release.tag_name }}" "$DMG" --clobber
+          ZIP: ${{ steps.zip.outputs.path }}
+          BLOCKMAP: ${{ steps.update.outputs.blockmap }}
+          MANIFEST: ${{ steps.update.outputs.manifest }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          gh release upload "$TAG" "$DMG" "$ZIP" "$BLOCKMAP" --clobber
+          # Publish eligibility only after all download artifacts are available.
+          gh release upload "$TAG" "$MANIFEST" --clobber
 
       # The `secrets` context is NOT available in a step `if` — only github, needs,
       # strategy, matrix, job, runner, env, vars, steps and inputs are. Writing

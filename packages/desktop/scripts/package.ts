@@ -25,6 +25,7 @@ import { maxOsVersion, parseMinOs } from './min-os.js';
 import { bundledAddonPath, codesignArgs, NATIVE_FILES, PayloadError, resolvePayload } from './payload.js';
 import { assertSemver } from './release-version.js';
 import { stageApp } from './stage-app.js';
+import { writeUpdaterConfig } from './update-artifacts.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP_DIR = resolve(HERE, '..');
@@ -38,7 +39,7 @@ const STAGE_APP = join(STAGE, 'app');
  * list rather than `packages/desktop/package.json` dependencies: that manifest
  * also carries `@mlx-node/lm` for the Phase 0 spike, which MAIN must never load.
  */
-const RUNTIME_ROOTS = ['@mlx-node/server', '@mlx-node/dashboard'];
+const RUNTIME_ROOTS = ['@mlx-node/server', '@mlx-node/dashboard', 'electron-updater'];
 const BUNDLE_ID = 'ai.mlxnode.desktop';
 const PRODUCT_NAME = 'mlx-node';
 const RESULT_FILE = join(OUT, 'package-result.json');
@@ -98,7 +99,13 @@ for (const file of NATIVE_FILES) {
 const stagedAddon = join(stagedNative, 'mlx-core.darwin-arm64.node');
 run('install_name_tool', ['-id', `@rpath/${NATIVE_FILES[0]}`, stagedAddon]);
 
-const staged = stageApp({ repoRoot: REPO_ROOT, desktopDir: APP_DIR, stageDir: STAGE_APP, roots: RUNTIME_ROOTS });
+const staged = stageApp({
+  repoRoot: REPO_ROOT,
+  desktopDir: APP_DIR,
+  stageDir: STAGE_APP,
+  roots: RUNTIME_ROOTS,
+  autoUpdates: sign,
+});
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
 console.log(`  pruned ${staged.prunedDirs} examples/docs/test dirs from staged packages`);
 console.log(`  pruned ${staged.prunedFiles} .d.ts / source-map / tsbuildinfo files`);
@@ -170,6 +177,7 @@ if (!existsSync(join(appPath, 'Contents', 'Info.plist'))) {
 
 // extraResource keeps the source directory name; the app expects `www`.
 const resources = join(appPath, 'Contents', 'Resources');
+if (sign) writeUpdaterConfig(resources);
 rmSync(join(resources, 'www'), { recursive: true, force: true });
 cpSync(join(resources, 'web'), join(resources, 'www'), { recursive: true });
 rmSync(join(resources, 'web'), { recursive: true, force: true });

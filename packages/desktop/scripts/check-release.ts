@@ -2,14 +2,14 @@
  * The release gate for versions. Run from `.github/workflows/desktop-release.yml`.
  *
  *   check-release.ts resolve --tag <tag> --manifest <package.json>
- *   check-release.ts verify  --tag <tag> --manifest <package.json> --app <.app> [--dmg <dmg>]
+ *   check-release.ts verify  --tag <tag> --manifest <package.json> --app <.app> [--dmg <dmg>] [--zip <zip>]
  *
  * `resolve` runs BEFORE the ~16-minute build so a stale manifest costs a minute
- * instead of a full release cycle, and emits `version` + `dmg_name` to
+ * instead of a full release cycle, and emits `version`, `dmg_name`, and `zip_name` to
  * `$GITHUB_OUTPUT` so every later step reads one value rather than re-deriving it.
  *
  * `verify` runs after the artifacts exist and re-checks the same thing against
- * what was actually produced — the plist inside the `.app` and the DMG's filename.
+ * what was actually produced — the plist inside the `.app` and the archive filenames.
  * Two checks, because `resolve` only proves the inputs agreed.
  *
  * `--tag` may be empty (`workflow_dispatch` has no tag); the manifest is then the
@@ -27,6 +27,8 @@ import {
   ReleaseVersionError,
   versionFromDmgPath,
   versionFromTag,
+  updateZipFileName,
+  versionFromUpdateZipPath,
 } from './release-version.js';
 
 const { positionals, values } = parseArgs({
@@ -36,13 +38,14 @@ const { positionals, values } = parseArgs({
     manifest: { type: 'string' },
     app: { type: 'string' },
     dmg: { type: 'string', default: '' },
+    zip: { type: 'string', default: '' },
   },
 });
 
 const command = positionals[0];
 if (command !== 'resolve' && command !== 'verify') {
   console.error(
-    'usage: check-release.ts <resolve|verify> --tag <tag> --manifest <package.json> [--app <.app>] [--dmg <dmg>]',
+    'usage: check-release.ts <resolve|verify> --tag <tag> --manifest <package.json> [--app <.app>] [--dmg <dmg>] [--zip <zip>]',
   );
   process.exit(2);
 }
@@ -78,7 +81,7 @@ try {
 }
 
 function resolve(): string {
-  // The bundle and DMG do not exist yet; passing the expected version for both
+  // The bundle and archives do not exist yet; passing the expected version for them
   // would assert nothing, so they are declared absent and `verify` covers them.
   const version = assertVersionsAgree({
     tag,
@@ -86,10 +89,14 @@ function resolve(): string {
     bundleShort: tag ?? manifest,
     bundleVersion: tag ?? manifest,
     dmg: null,
+    zip: null,
   });
   const output = process.env.GITHUB_OUTPUT;
   if (output !== undefined && output !== '') {
-    appendFileSync(output, `version=${version}\ndmg_name=${dmgFileName(version)}\n`);
+    appendFileSync(
+      output,
+      `version=${version}\ndmg_name=${dmgFileName(version)}\nzip_name=${updateZipFileName(version)}\n`,
+    );
   }
   return version;
 }
@@ -111,12 +118,19 @@ function verify(): string {
     process.exit(1);
   }
 
+  const zip = values.zip.trim();
+  if (zip !== '' && (versionFromUpdateZipPath(zip) === null || !existsSync(zip))) {
+    console.error(`::error::update ZIP ${zip} must exist and be named mlx-node-<version>-darwin-arm64.zip`);
+    process.exit(1);
+  }
+
   return assertVersionsAgree({
     tag,
     manifest,
     bundleShort: plistString(plist, 'CFBundleShortVersionString'),
     bundleVersion: plistString(plist, 'CFBundleVersion'),
     dmg: dmg === '' ? null : versionFromDmgPath(dmg),
+    zip: zip === '' ? null : versionFromUpdateZipPath(zip),
   });
 }
 
