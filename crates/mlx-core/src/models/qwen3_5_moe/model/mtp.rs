@@ -229,24 +229,14 @@ impl MoeMtpStepper<'_> {
     /// ticket's basis is the pre-write cursor.
     fn paged_verify_step(
         &mut self,
-        ids: &MxArray,
+        ids: &[u32],
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
-        let id_window = ids.to_int32().map_err(|e| {
-            Error::from_reason(format!(
-                "eager paged MoE MTP verify_step: ids to_int32: {}",
-                e.reason
-            ))
-        })?;
-        if id_window.len() < depth + 1 {
-            return Err(Error::from_reason(format!(
-                "eager paged MoE MTP verify_step: ids has {} elements, need {}",
-                id_window.len(),
-                depth + 1
-            )));
+        if ids.len() != depth + 1 {
+            return Err(Error::from_reason(
+                "MTP verifier token count does not match depth",
+            ));
         }
-        let id_slice: Vec<i32> = id_window.iter().take(depth + 1).copied().collect();
-        let verify_in = MxArray::from_int32(&id_slice, &[1, (depth + 1) as i64])?;
         let owner = self
             .owner
             .expect("paged_verify_step is only reached on a paged turn");
@@ -264,7 +254,7 @@ impl MoeMtpStepper<'_> {
             .ok_or_else(|| Error::from_reason("eager paged MoE MTP verify_step: caches is None"))?;
         let tape = &mut self.tape;
         crate::models::qwen3_5_moe::paged_forward::run_paged_verify_step(
-            &verify_in,
+            ids,
             &inner.embedding,
             &mut inner.layers,
             caches,
@@ -428,13 +418,19 @@ impl MtpStepper for MoeMtpStepper<'_> {
     // ([`MoeMtpStepper::paged_verify_step`]); `rollback` closes it.
     fn verify_step(
         &mut self,
-        ids: &MxArray,
+        ids: &[u32],
         embedding: &Embedding,
         depth: usize,
     ) -> Result<mtp_decode::MtpVerifyOutput> {
+        if ids.len() != depth + 1 {
+            return Err(Error::from_reason(
+                "MTP verifier token count does not match depth",
+            ));
+        }
         let output = if self.owner.is_some() {
             self.paged_verify_step(ids, depth)
         } else {
+            let ids = MxArray::from_uint32(ids, &[1, ids.len() as i64])?;
             let inner = &mut *self.inner;
             let tape = &mut self.tape;
             eager_verify_step(
@@ -443,7 +439,7 @@ impl MtpStepper for MoeMtpStepper<'_> {
                 &inner.final_norm,
                 &inner.lm_head,
                 self.fa_idx,
-                ids,
+                &ids,
                 embedding,
                 Some(tape),
             )

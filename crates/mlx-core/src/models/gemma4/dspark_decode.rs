@@ -82,7 +82,7 @@ pub(crate) struct DsparkTurnState {
 /// Confidence-truncation threshold for drafted blocks, read ONCE at stepper
 /// construction. Default `0.0` = keep-all (truncation disabled); invalid
 /// values fall back to the default.
-fn dspark_confidence_threshold_from_env() -> f32 {
+pub(super) fn dspark_confidence_threshold_from_env() -> f32 {
     std::env::var("MLX_DSPARK_CONFIDENCE_THRESHOLD")
         .ok()
         .and_then(|v| v.parse::<f32>().ok())
@@ -107,36 +107,46 @@ fn dspark_confidence_threshold_from_env() -> f32 {
 /// The tapped target hiddens and the open cycle's ticket are stashed
 /// between `verify` and `commit` — they never cross the engine trait (see
 /// the invariant on [`DsparkStepper`]).
-pub(crate) struct Gemma4DsparkStepper<'a> {
-    inner: &'a mut Gemma4Inner,
+/// Per-owner state retained between scheduler cycles. Model weights and KV
+/// pools remain on Gemma4Inner and are borrowed only for the current operation.
+pub(crate) struct Gemma4DsparkState {
     /// Paged sequence this turn owns.
-    seq_id: u32,
-    ctx: DsparkContextCache,
+    pub(super) seq_id: u32,
+    pub(super) ctx: DsparkContextCache,
     /// Permanently use exact target-only AR for the rest of this turn after
     /// the measured break-even guard determines that speculation loses on
     /// the current hardware/context.
-    ar_fallback: bool,
+    pub(super) ar_fallback: bool,
     /// Absolute position of the next verify block's anchor (== the committed
     /// paged frontier: prompt + anchor-exclusive generation).
-    next_pos: i32,
+    pub(super) next_pos: i32,
     /// Draft `target_layer_ids` as decoder indices (strictly ascending).
-    layer_ids: Vec<usize>,
+    pub(super) layer_ids: Vec<usize>,
     /// Per-layer paged routing, resolved once for the turn.
-    layer_kinds: Vec<Gemma4LayerKind>,
-    confidence_threshold: f32,
+    pub(super) layer_kinds: Vec<Gemma4LayerKind>,
+    pub(super) confidence_threshold: f32,
+    pub(super) adaptive_verification: bool,
     /// The cycle `verify` opened, consumed by `commit`.
-    open_cycle: Option<VerifyTicket>,
+    pub(super) open_cycle: Option<VerifyTicket>,
     /// Tapped `[1, 1+L, hidden]` hiddens from the last `verify` (one per
     /// `layer_ids` entry), consumed by `commit`.
-    tapped: Option<Vec<MxArray>>,
+    pub(super) tapped: Option<Vec<MxArray>>,
     /// A one-token adaptive AR probe keeps every row it wrote, but still
     /// owns its cycle and its tap until `commit_ar_probe`.
-    ar_probe_pending: bool,
+    pub(super) ar_probe_pending: bool,
+}
+
+pub(crate) struct Gemma4DsparkStepper<'a> {
+    pub(super) inner: &'a mut Gemma4Inner,
+    pub(super) state: Gemma4DsparkState,
 }
 
 impl Gemma4DsparkStepper<'_> {
     fn ensure_no_pending_verify(&self, op: &str) -> Result<()> {
-        if self.open_cycle.is_some() || self.tapped.is_some() || self.ar_probe_pending {
+        if self.state.open_cycle.is_some()
+            || self.state.tapped.is_some()
+            || self.state.ar_probe_pending
+        {
             return Err(Error::from_reason(format!(
                 "gemma4 DSpark {op}: previous verify was never committed"
             )));
@@ -152,7 +162,7 @@ impl Gemma4DsparkStepper<'_> {
     /// nothing. The original error is what the caller sees unless the
     /// retraction itself fails.
     fn retract_cycle(&mut self, ticket: VerifyTicket, op: &str, error: Error) -> Error {
-        let seq_id = self.seq_id;
+        let seq_id = self.state.seq_id;
         match self.paged_cache().commit_cycle(seq_id, ticket, 0) {
             Ok(()) => error,
             Err(rollback) => Error::from_reason(format!(
@@ -172,11 +182,11 @@ impl Gemma4DsparkStepper<'_> {
         verify_ids: &[u32],
         op: &str,
     ) -> Result<(MxArray, Vec<MxArray>, VerifyTicket)> {
-        let seq_id = self.seq_id;
-        let first_position = u32::try_from(self.next_pos).map_err(|_| {
+        let seq_id = self.state.seq_id;
+        let first_position = u32::try_from(self.state.next_pos).map_err(|_| {
             Error::from_reason(format!(
                 "gemma4 DSpark {op}: verify anchor sits at negative position {}",
-                self.next_pos
+                self.state.next_pos
             ))
         })?;
         let ticket = self
@@ -186,12 +196,12 @@ impl Gemma4DsparkStepper<'_> {
 
         let captured: Vec<MxArray>;
         let forward = {
-            let mut tap = DsparkTap::new(&self.layer_ids);
+            let mut tap = DsparkTap::new(&self.state.layer_ids);
             let forward = self.inner.run_paged_prefill_layer_loop(
                 verify_ids,
                 first_position,
                 first_position,
-                &self.layer_kinds,
+                &self.state.layer_kinds,
                 Some(&mut tap),
             );
             captured = tap.captured;
@@ -201,11 +211,11 @@ impl Gemma4DsparkStepper<'_> {
             Ok(hidden) => hidden,
             Err(error) => return Err(self.retract_cycle(ticket, op, error)),
         };
-        if captured.len() != self.layer_ids.len() {
+        if captured.len() != self.state.layer_ids.len() {
             let error = Error::from_reason(format!(
                 "gemma4 DSpark {op}: tapped {} hiddens for {} configured target layers",
                 captured.len(),
-                self.layer_ids.len()
+                self.state.layer_ids.len()
             ));
             return Err(self.retract_cycle(ticket, op, error));
         }
@@ -217,7 +227,12 @@ impl Gemma4DsparkStepper<'_> {
         }
     }
 
-    fn append_tapped_prefix(&mut self, tapped: &[MxArray], keep: usize, op: &str) -> Result<()> {
+    pub(super) fn append_tapped_prefix(
+        &mut self,
+        tapped: &[MxArray],
+        keep: usize,
+        op: &str,
+    ) -> Result<()> {
         let draft = self
             .inner
             .dspark_draft()
@@ -227,8 +242,8 @@ impl Gemma4DsparkStepper<'_> {
             kept.push(hidden.slice_axis(1, 0, keep as i64)?);
         }
         let fused = draft.fuse_context(&kept)?;
-        self.ctx.append(draft, &fused, self.next_pos)?;
-        self.next_pos += keep as i32;
+        self.state.ctx.append(draft, &fused, self.state.next_pos)?;
+        self.state.next_pos += keep as i32;
         Ok(())
     }
 
@@ -237,7 +252,7 @@ impl Gemma4DsparkStepper<'_> {
     /// prune. Rungs are selected by `boundary <= frontier`, so a cycle whose
     /// accept count steps the cursor straight over a rung still captures it.
     fn settle_at_committed_frontier(&mut self, op: &str) -> Result<()> {
-        let seq_id = self.seq_id;
+        let seq_id = self.state.seq_id;
         let mut cache = self.paged_cache();
         let Some(frontier) = SpecPagedCache::frontier(&cache, seq_id) else {
             return Err(Error::from_reason(format!(
@@ -251,24 +266,37 @@ impl Gemma4DsparkStepper<'_> {
 }
 
 impl DsparkStepper for Gemma4DsparkStepper<'_> {
+    fn supports_adaptive_verification(&self) -> bool {
+        // Explicit truncation changes the widths requested for calibration.
+        // Preserve its existing whole-cycle break-even policy instead.
+        self.state.confidence_threshold <= 0.0
+    }
+
+    fn set_adaptive_verification(&mut self, enabled: bool) {
+        self.state.adaptive_verification = enabled;
+    }
+
     fn supports_adaptive_ar_fallback(&self) -> bool {
         true
     }
 
     fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
-        if self.ar_fallback {
+        if self.state.ar_fallback {
             // Target-only AR writes one row through the ordinary decode
             // path, which allocates for itself.
             return Ok(true);
         }
-        let seq_id = self.seq_id;
+        let seq_id = self.state.seq_id;
         self.paged_cache()
             .reserve_lookahead(seq_id, rows)
             .map_err(Error::from_reason)
     }
 
     fn enter_ar_fallback(&mut self) -> Result<()> {
-        if self.open_cycle.is_some() || self.tapped.is_some() || self.ar_probe_pending {
+        if self.state.open_cycle.is_some()
+            || self.state.tapped.is_some()
+            || self.state.ar_probe_pending
+        {
             return Err(Error::from_reason(
                 "gemma4 DSpark AR fallback: cannot switch with an uncommitted verify",
             ));
@@ -280,17 +308,17 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
             .num_layers();
         // Drop the now-unused context arrays/graphs instead of retaining a
         // growing draft cache during the target-only remainder of the turn.
-        self.ctx = DsparkContextCache::new(num_layers);
-        self.ar_fallback = true;
+        self.state.ctx = DsparkContextCache::new(num_layers);
+        self.state.ar_fallback = true;
         Ok(())
     }
 
     fn materialize_adaptive_state(&self) -> Result<()> {
-        self.ctx.eval()
+        self.state.ctx.eval()
     }
 
     fn verify_ar_probe(&mut self, anchor_id: u32) -> Result<DsparkVerifyOutput> {
-        if self.ar_fallback {
+        if self.state.ar_fallback {
             return Err(Error::from_reason(
                 "gemma4 DSpark AR probe: cannot calibrate after AR fallback",
             ));
@@ -303,19 +331,19 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         // The engine times this whole call; fusion happens in
         // `commit_ar_probe` afterward.
         let (logits, tapped, ticket) = self.tapped_paged_verify(&[anchor_id], "AR probe")?;
-        self.open_cycle = Some(ticket);
-        self.tapped = Some(tapped);
-        self.ar_probe_pending = true;
+        self.state.open_cycle = Some(ticket);
+        self.state.tapped = Some(tapped);
+        self.state.ar_probe_pending = true;
         Ok(DsparkVerifyOutput { logits })
     }
 
     fn commit_ar_probe(&mut self) -> Result<()> {
-        if !self.ar_probe_pending {
+        if !self.state.ar_probe_pending {
             return Err(Error::from_reason(
                 "gemma4 DSpark AR probe commit: no pending probe",
             ));
         }
-        let tapped = self.tapped.take().ok_or_else(|| {
+        let tapped = self.state.tapped.take().ok_or_else(|| {
             Error::from_reason("gemma4 DSpark AR probe commit: no stashed tapped hiddens")
         })?;
         if let Some(first) = tapped.first()
@@ -326,15 +354,15 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
                 first.shape_at(1)?
             )));
         }
-        let ticket = self.open_cycle.take().ok_or_else(|| {
+        let ticket = self.state.open_cycle.take().ok_or_else(|| {
             Error::from_reason("gemma4 DSpark AR probe commit: no pending verify cycle")
         })?;
-        let seq_id = self.seq_id;
+        let seq_id = self.state.seq_id;
         self.paged_cache()
             .commit_cycle(seq_id, ticket, 1)
             .map_err(Error::from_reason)?;
         self.append_tapped_prefix(&tapped, 1, "AR probe commit")?;
-        self.ar_probe_pending = false;
+        self.state.ar_probe_pending = false;
         self.settle_at_committed_frontier("AR probe commit")
     }
 
@@ -345,7 +373,7 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         params: &ChatParams,
         rng: &mut dyn rand::Rng,
     ) -> Result<DsparkProposal> {
-        if self.ar_fallback {
+        if self.state.ar_fallback {
             return Err(Error::from_reason(
                 "gemma4 DSpark propose: engine called propose after AR fallback",
             ));
@@ -369,7 +397,8 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         block_ids.push(anchor_id as i32);
         block_ids.resize(max_len, mask_id);
         let block = MxArray::from_int32(&block_ids, &[1, max_len as i64])?;
-        let (block_hidden, block_logits) = draft.forward_block(&block, self.next_pos, &self.ctx)?;
+        let (block_hidden, block_logits) =
+            draft.forward_block(&block, self.state.next_pos, &self.state.ctx)?;
 
         // Sequential markov-chained sampling. Greedy detection INSIDE
         // `sample_block_sequential` uses the engine's
@@ -379,28 +408,24 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         // at sampled temperature each row is the EXACT distribution the
         // draw came from.
         let cfg = params.sampling_config.unwrap_or_default();
-        let (mut draft_ids, mut draft_dists) =
-            draft.sample_block_sequential(&block_logits, anchor_id as i32, max_len, &cfg, rng)?;
-
-        // Confidence truncation (opt-in via MLX_DSPARK_CONFIDENCE_THRESHOLD,
-        // read once at stepper construction): keep the longest prefix whose
-        // keep-probability clears the threshold. Returning FEWER tokens than
-        // `max_len` is allowed by the engine contract (never more).
-        if self.confidence_threshold > 0.0 {
-            let mut prev_tokens: Vec<i32> = Vec::with_capacity(max_len);
-            prev_tokens.push(anchor_id as i32);
-            prev_tokens.extend_from_slice(&draft_ids[..max_len - 1]);
-            let keep_probs = draft.confidence_keep_probs(&block_hidden, &prev_tokens)?;
-            let keep = truncate_by_confidence(&keep_probs, self.confidence_threshold);
-            draft_ids.truncate(keep);
-            draft_dists.truncate(keep);
+        let with_confidence =
+            self.state.adaptive_verification || self.state.confidence_threshold > 0.0;
+        let mut proposal = draft.sample_block_proposal(
+            &block_logits,
+            with_confidence.then_some(&block_hidden),
+            anchor_id as i32,
+            max_len,
+            &cfg,
+            rng,
+        )?;
+        if self.state.confidence_threshold > 0.0 {
+            let keep = truncate_by_confidence(
+                proposal.keep_probabilities.as_deref().unwrap_or_default(),
+                self.state.confidence_threshold,
+            );
+            proposal.truncate(keep);
         }
-
-        Ok(DsparkProposal {
-            draft_ids,
-            draft_dists,
-            draft_sparse_dists: Vec::new(),
-        })
+        Ok(proposal)
     }
 
     fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
@@ -414,7 +439,7 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         // TWO uncommitted verify blocks).
         self.ensure_no_pending_verify("verify")?;
 
-        if self.ar_fallback {
+        if self.state.ar_fallback {
             if verify_ids.len() != 1 {
                 return Err(Error::from_reason(format!(
                     "gemma4 DSpark AR fallback verify requires one anchor token, got {}",
@@ -425,27 +450,27 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
             // records its own row and opens no cycle.
             let logits = self
                 .inner
-                .run_paged_decode_step_for(self.seq_id, verify_ids[0])?;
+                .run_paged_decode_step_for(self.state.seq_id, verify_ids[0])?;
             return Ok(DsparkVerifyOutput { logits });
         }
 
         let (logits, tapped, ticket) = self.tapped_paged_verify(verify_ids, "verify")?;
-        self.open_cycle = Some(ticket);
-        self.tapped = Some(tapped);
+        self.state.open_cycle = Some(ticket);
+        self.state.tapped = Some(tapped);
         Ok(DsparkVerifyOutput { logits })
     }
 
     fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
-        if self.ar_fallback {
+        if self.state.ar_fallback {
             if keep != 1 || total_written != 1 {
                 return Err(Error::from_reason(format!(
                     "gemma4 DSpark AR fallback commit requires keep=1,total_written=1, got keep={keep},total_written={total_written}"
                 )));
             }
-            self.next_pos += 1;
+            self.state.next_pos += 1;
             return self.settle_at_committed_frontier("AR fallback commit");
         }
-        if self.ar_probe_pending {
+        if self.state.ar_probe_pending {
             return Err(Error::from_reason(
                 "gemma4 DSpark commit: pending AR probe requires commit_ar_probe",
             ));
@@ -456,7 +481,7 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
             ));
         }
         {
-            let tapped = self.tapped.as_ref().ok_or_else(|| {
+            let tapped = self.state.tapped.as_ref().ok_or_else(|| {
                 Error::from_reason("gemma4 DSpark commit: no stashed tapped hiddens")
             })?;
             if let Some(first) = tapped.first()
@@ -469,18 +494,18 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
                 )));
             }
         }
-        let ticket = self
-            .open_cycle
-            .take()
-            .ok_or_else(|| Error::from_reason("gemma4 DSpark commit: no pending verify cycle"))?;
-        let tapped = self
-            .tapped
-            .take()
-            .ok_or_else(|| Error::from_reason("gemma4 DSpark commit: no stashed tapped hiddens"))?;
+        let ticket =
+            self.state.open_cycle.take().ok_or_else(|| {
+                Error::from_reason("gemma4 DSpark commit: no pending verify cycle")
+            })?;
+        let tapped =
+            self.state.tapped.take().ok_or_else(|| {
+                Error::from_reason("gemma4 DSpark commit: no stashed tapped hiddens")
+            })?;
 
         // Target side: the facade keeps the first `keep` rows of the cycle
         // and derives the rollback from its own ticket.
-        let seq_id = self.seq_id;
+        let seq_id = self.state.seq_id;
         self.paged_cache()
             .commit_cycle(seq_id, ticket, keep)
             .map_err(Error::from_reason)?;
@@ -507,7 +532,7 @@ impl DsparkStepper for Gemma4DsparkStepper<'_> {
         self.inner
             .kv_cache_coordinator
             .as_ref()?
-            .spec_frontier(self.seq_id)
+            .spec_frontier(self.state.seq_id)
     }
 }
 
@@ -523,6 +548,19 @@ pub(crate) enum Gemma4DraftStepper<'a> {
 }
 
 impl DsparkStepper for Gemma4DraftStepper<'_> {
+    fn set_adaptive_verification(&mut self, enabled: bool) {
+        if let Self::Dspark(stepper) = self {
+            stepper.set_adaptive_verification(enabled);
+        }
+    }
+
+    fn supports_adaptive_verification(&self) -> bool {
+        match self {
+            Self::Dspark(stepper) => stepper.supports_adaptive_verification(),
+            Self::Assistant(_) => false,
+        }
+    }
+
     fn supports_adaptive_ar_fallback(&self) -> bool {
         match self {
             Self::Dspark(stepper) => stepper.supports_adaptive_ar_fallback(),
@@ -645,16 +683,19 @@ impl DsparkBackend for Gemma4Inner {
                 let seq_id = self.active_paged_seq;
                 Ok(Gemma4DraftStepper::Dspark(Gemma4DsparkStepper {
                     inner: self,
-                    seq_id,
-                    ctx: state.ctx,
-                    ar_fallback: false,
-                    next_pos: state.next_pos,
-                    layer_ids,
-                    layer_kinds,
-                    confidence_threshold,
-                    open_cycle: None,
-                    tapped: None,
-                    ar_probe_pending: false,
+                    state: Gemma4DsparkState {
+                        seq_id,
+                        ctx: state.ctx,
+                        ar_fallback: false,
+                        next_pos: state.next_pos,
+                        layer_ids,
+                        layer_kinds,
+                        confidence_threshold,
+                        adaptive_verification: false,
+                        open_cycle: None,
+                        tapped: None,
+                        ar_probe_pending: false,
+                    },
                 }))
             }
             Gemma4DraftTurnState::Assistant(state) => {
@@ -1470,22 +1511,22 @@ pub(crate) mod tests {
                     panic!("a DSpark draft must yield the DSpark stepper")
                 }
             };
-            assert_eq!(stepper.layer_ids, vec![0, 2]);
+            assert_eq!(stepper.state.layer_ids, vec![0, 2]);
             assert_eq!(
-                stepper.layer_kinds.len(),
+                stepper.state.layer_kinds.len(),
                 num_target_layers,
                 "the stepper resolves paged routing for every decoder layer once per turn"
             );
             assert_eq!(
-                stepper.seq_id, 5,
+                stepper.state.seq_id, 5,
                 "the stepper must address the model's active paged sequence"
             );
-            assert_eq!(stepper.next_pos, 7);
-            assert!(!stepper.ar_fallback);
+            assert_eq!(stepper.state.next_pos, 7);
+            assert!(!stepper.state.ar_fallback);
             assert!(
-                stepper.open_cycle.is_none()
-                    && stepper.tapped.is_none()
-                    && !stepper.ar_probe_pending
+                stepper.state.open_cycle.is_none()
+                    && stepper.state.tapped.is_none()
+                    && !stepper.state.ar_probe_pending
             );
         }
         assert!(

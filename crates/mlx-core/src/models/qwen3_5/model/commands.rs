@@ -3,13 +3,9 @@
 use super::*;
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
-pub(crate) enum Qwen35Cmd {
-    /// All chat-session traffic (sync + streaming starts/continues/tool
-    /// turns + cache reset), routed through the model-neutral engine
-    /// dispatcher ([`crate::engine::cmd::handle_chat_cmd`]) against the
-    /// [`ChatBackend`] impl on [`Qwen35Inner`]. The per-variant
-    /// behavioural contracts live on [`crate::engine::cmd::ChatCmd`].
-    Chat(ChatCmd),
+pub(crate) type Qwen35Cmd = crate::engine::model_command::ModelCommand<Qwen35FamilyCommand>;
+
+pub(crate) enum Qwen35FamilyCommand {
     Generate {
         prompt_tokens: MxArray,
         config: Qwen3_5GenerationConfig,
@@ -90,47 +86,12 @@ pub(crate) enum Qwen35Cmd {
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
     /// [`TrainBackend`] impl on [`Qwen35Inner`].
     Train(TrainCmd),
-    SchedulerStats {
-        reply: ResponseTx<engine::SchedulerStatsJs>,
-    },
 }
 
-impl FromChatCmd for Qwen35Cmd {
-    #[inline]
-    fn from_chat(cmd: ChatCmd) -> Self {
-        Qwen35Cmd::Chat(cmd)
-    }
-}
-
-impl FromTrainCmd for Qwen35Cmd {
+impl FromTrainCmd for Qwen35FamilyCommand {
     #[inline]
     fn from_train(cmd: TrainCmd) -> Self {
-        Qwen35Cmd::Train(cmd)
-    }
-}
-
-impl HybridSchedulerCommand for Qwen35Cmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            _ => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
+        Qwen35FamilyCommand::Train(cmd)
     }
 }
 
@@ -199,77 +160,69 @@ impl TrainBackend for Qwen35Inner {
 }
 
 /// Command handler for the dedicated model thread.
-pub(crate) fn handle_qwen35_cmd(inner: &mut Qwen35Inner, cmd: Qwen35Cmd) {
-    match cmd {
-        // All chat-session traffic routes through the model-neutral
-        // engine dispatcher against `Qwen35Inner`'s `ChatBackend` impl.
-        // No per-request cache drain here — the TS idle sweeper in
-        // `@mlx-node/server` handles between-turn drains.
-        Qwen35Cmd::Chat(chat_cmd) => {
-            handle_chat_cmd(inner, chat_cmd);
-        }
-        Qwen35Cmd::Generate {
-            prompt_tokens,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.generate_sync(prompt_tokens, config));
-        }
-        Qwen35Cmd::CalibratePrefillRaw {
-            texts,
-            calib_seq,
-            reply,
-        } => {
-            let _ = reply.send(inner.calibrate_prefill_raw_sync(texts, calib_seq));
-        }
-        Qwen35Cmd::EvalTeacherForced { request, reply } => {
-            let _ = reply.send(crate::quality::runner::run(inner, request));
-        }
-        Qwen35Cmd::SaveModel { save_path, reply } => {
-            let _ = reply.send(inner.save_model_sync(&save_path));
-        }
-        Qwen35Cmd::MtpFlatStateForTest { reply } => {
-            let _ = reply.send(Ok((
-                inner.cached_token_history.len(),
-                inner.flat_mtp_caches_desynced,
-                inner.flat_full_reprefill_count,
-                inner.flat_mtp_last_rollback_unemitted,
-            )));
-        }
-        Qwen35Cmd::ForceFlatMtpDesyncForTest { reply } => {
-            inner.flat_mtp_caches_desynced = true;
-            let _ = reply.send(Ok(()));
-        }
-        Qwen35Cmd::MtpPagedGdnStateForTest { reply } => {
-            let _ = reply.send(Ok(MtpPagedGdnStateForTest {
-                paged_active: inner.paged_adapter.is_some(),
-                history_len: inner.cached_token_history.len(),
-                last_rollback_unemitted: inner.paged_mtp_last_rollback_unemitted,
-                gdn_rewinds: inner.paged_mtp_gdn_rewinds,
-                gdn_invalidations: inner.paged_mtp_gdn_invalidations,
-                state_dirty: inner.paged_gdn_state_dirty,
-                has_history_checkpoint: inner.gdn_last_history_checkpoint.is_some(),
-                last_prefix_prepare_state: inner.last_gdn_prefix_prepare_state,
-            }));
-        }
-        Qwen35Cmd::ForcePagedGdnMismatchForTest { reply } => {
-            inner.paged_gdn_force_mismatch_for_test = true;
-            let _ = reply.send(Ok(()));
-        }
-        Qwen35Cmd::GdnHistoryCheckpointOracleForTest { reply } => {
-            let _ = reply.send(inner.gdn_history_checkpoint_recompute_matches_for_test());
-        }
-        Qwen35Cmd::Train(train_cmd) => {
-            handle_train_cmd(inner, train_cmd);
-        }
-        Qwen35Cmd::SchedulerStats { reply } => {
-            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
+impl crate::engine::model_command::FamilyCommand<Qwen35Inner> for Qwen35FamilyCommand {
+    fn execute(self, inner: &mut Qwen35Inner) {
+        match self {
+            Qwen35FamilyCommand::Generate {
+                prompt_tokens,
+                config,
+                reply,
+            } => {
+                let _ = reply.send(inner.generate_sync(prompt_tokens, config));
+            }
+            Qwen35FamilyCommand::CalibratePrefillRaw {
+                texts,
+                calib_seq,
+                reply,
+            } => {
+                let _ = reply.send(inner.calibrate_prefill_raw_sync(texts, calib_seq));
+            }
+            Qwen35FamilyCommand::EvalTeacherForced { request, reply } => {
+                let _ = reply.send(crate::quality::runner::run(inner, request));
+            }
+            Qwen35FamilyCommand::SaveModel { save_path, reply } => {
+                let _ = reply.send(inner.save_model_sync(&save_path));
+            }
+            Qwen35FamilyCommand::MtpFlatStateForTest { reply } => {
+                let _ = reply.send(Ok((
+                    inner.cached_token_history.len(),
+                    inner.flat_mtp_caches_desynced,
+                    inner.flat_full_reprefill_count,
+                    inner.flat_mtp_last_rollback_unemitted,
+                )));
+            }
+            Qwen35FamilyCommand::ForceFlatMtpDesyncForTest { reply } => {
+                inner.flat_mtp_caches_desynced = true;
+                let _ = reply.send(Ok(()));
+            }
+            Qwen35FamilyCommand::MtpPagedGdnStateForTest { reply } => {
+                let _ = reply.send(Ok(MtpPagedGdnStateForTest {
+                    paged_active: inner.paged_adapter.is_some(),
+                    history_len: inner.cached_token_history.len(),
+                    last_rollback_unemitted: inner.paged_mtp_last_rollback_unemitted,
+                    gdn_rewinds: inner.paged_mtp_gdn_rewinds,
+                    gdn_invalidations: inner.paged_mtp_gdn_invalidations,
+                    state_dirty: inner.paged_gdn_state_dirty,
+                    has_history_checkpoint: inner.gdn_last_history_checkpoint.is_some(),
+                    last_prefix_prepare_state: inner.last_gdn_prefix_prepare_state,
+                }));
+            }
+            Qwen35FamilyCommand::ForcePagedGdnMismatchForTest { reply } => {
+                inner.paged_gdn_force_mismatch_for_test = true;
+                let _ = reply.send(Ok(()));
+            }
+            Qwen35FamilyCommand::GdnHistoryCheckpointOracleForTest { reply } => {
+                let _ = reply.send(inner.gdn_history_checkpoint_recompute_matches_for_test());
+            }
+            Qwen35FamilyCommand::Train(train_cmd) => {
+                handle_train_cmd(inner, train_cmd);
+            }
         }
     }
 }
 
 impl HybridSchedulerBackend for Qwen35Inner {
-    type Command = Qwen35Cmd;
+    type FamilyCommand = Qwen35FamilyCommand;
     type RestoreTicket = crate::engine::hybrid_scheduler::NoRestoreTicket;
     type OwnerState = Vec<u32>;
     type StepExecutor<'a> = crate::engine::hybrid_scheduler::HybridStepExecutor<'a, Self>;
@@ -283,6 +236,69 @@ impl HybridSchedulerBackend for Qwen35Inner {
 
     fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter> {
         self.paged_adapter.as_mut()
+    }
+
+    fn supports_scheduled_speculation(&self) -> bool {
+        self.has_mtp_weights()
+            && self.paged_adapter.is_some()
+            && self.config.recurrent_state_bytes() > 0
+            && self.cached_rope_deltas.unwrap_or(0) == 0
+            && self.dflash2.is_none()
+    }
+    fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::reservation_bytes(
+            &self.config,
+            total_tokens,
+        )
+    }
+    fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<bool> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::begin_scheduled_mtp(
+            self, seq_id, position,
+        )
+    }
+    fn reserve_scheduled_speculation(&mut self, seq_id: SeqId, queries: usize) -> Result<bool> {
+        if queries > crate::models::qwen3_5::scheduled_mtp::MAX_DRAFTS + 1 {
+            return Err(Error::from_reason(
+                "MTP reservation exceeds its maximum verifier width",
+            ));
+        }
+        let adapter = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("MTP reservation has no paged adapter"))?;
+        match adapter.reserve_rows_for(seq_id, queries as u32) {
+            Ok(_) => Ok(true),
+            Err(error) if error.starts_with("context_length_exceeded:") => Ok(false),
+            Err(error) => Err(Error::from_reason(error)),
+        }
+    }
+    fn propose_scheduled(
+        &mut self,
+        seq_id: SeqId,
+        anchor: u32,
+        cap: usize,
+        params: &crate::engine::params::ChatParams,
+        rng: &mut dyn rand::Rng,
+        _confidence: bool,
+    ) -> Result<crate::engine::backend::DsparkProposal> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::propose_scheduled_mtp(
+            self, seq_id, anchor, cap, params, rng,
+        )
+    }
+    fn run_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyRow],
+    ) -> Result<MxArray> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::verify_scheduled_mtp(self, rows)
+    }
+    fn commit_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyCommit],
+    ) -> Result<Vec<Result<()>>> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::commit_scheduled_mtp(self, rows)
+    }
+    fn release_scheduled_speculation(&mut self, seq_id: SeqId) {
+        self.scheduled_mtp.release(seq_id);
     }
 
     fn max_position_embeddings(&self) -> i32 {
@@ -356,13 +372,5 @@ impl HybridSchedulerBackend for Qwen35Inner {
 
     fn step_executor(&mut self) -> Self::StepExecutor<'_> {
         crate::engine::hybrid_scheduler::HybridStepExecutor::new(self)
-    }
-
-    fn execute_barrier(
-        &mut self,
-        command: Self::Command,
-        _owners: crate::engine::hybrid_scheduler::SchedulerOwnerContext<'_, Self::OwnerState>,
-    ) {
-        handle_qwen35_cmd(self, command);
     }
 }

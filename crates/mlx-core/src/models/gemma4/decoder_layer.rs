@@ -1,7 +1,7 @@
 use crate::array::MxArray;
 use crate::nn::activations::Activations;
 use crate::nn::{Linear, RMSNorm};
-use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
+use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRaggedRow, SeqId};
 use napi::bindgen_prelude::*;
 
 use super::attention::Gemma4Attention;
@@ -425,6 +425,32 @@ impl Gemma4DecoderLayer {
             )?,
         };
         self.apply_ffn_ple_scalar(x, &attn_out, per_layer_input)
+    }
+
+    pub(crate) fn forward_paged_ragged(
+        &self,
+        x: &MxArray,
+        kind: Gemma4LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        rows: &[PagedRaggedRow],
+        offsets: &MxArray,
+        per_layer_input: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let (paged_idx, shared) = match kind {
+            Gemma4LayerKind::SlidingPaged { paged_idx, .. }
+            | Gemma4LayerKind::GlobalPaged { paged_idx, .. } => (paged_idx, false),
+            Gemma4LayerKind::SharedOnGlobal {
+                anchor_paged_idx, ..
+            }
+            | Gemma4LayerKind::SharedOnSliding {
+                anchor_paged_idx, ..
+            } => (anchor_paged_idx, true),
+        };
+        let normed = self.input_layernorm.forward(x)?;
+        let attention = self
+            .self_attn
+            .forward_paged_ragged(&normed, adapter, paged_idx, rows, offsets, shared)?;
+        self.apply_ffn_ple_scalar(x, &attention, per_layer_input)
     }
 
     /// Shared tail after attention: post-attention norm, FFN+MoE, PLE, layer scalar.

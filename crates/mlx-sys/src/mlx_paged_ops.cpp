@@ -1142,17 +1142,21 @@ std::pair<array, array> paged_kv_write(
   //     fail. The mirrored runtime check inside `eval_gpu` covers the
   //     compile-cached path instead.
   //
-  // Autoregressive decode provides one already-materialized int64 slot per
-  // write. Read that scalar directly: building and evaluating an MLX max
-  // reduction for each layer otherwise puts five redundant reductions on the
-  // Gemma4 global-layer path. Lazy arrays and multi-token writes retain the
-  // reduction fallback, and tracing still skips this factory-only check; the
+  // Rust supplies materialized shared-memory slot metadata for both decode
+  // and prefill. Scan it directly instead of launching a max reduction and
+  // waiting once per layer. Lazy arrays retain the reduction fallback, and
+  // tracing still skips this factory-only check; the
   // runtime scan in PagedKVWrite::eval_gpu remains authoritative for every
   // evaluated call, including compile-cache replay.
   if (!mlx::core::detail::in_tracing() && slot_mapping.shape(0) > 0) {
     int64_t max_slot_v;
-    if (slot_mapping.size() == 1 && slot_mapping.is_available()) {
-      max_slot_v = slot_mapping.data<int64_t>()[0];
+    if (slot_mapping.is_available()) {
+      const auto* slots = slot_mapping.data<int64_t>();
+      const auto stride = slot_mapping.strides()[0];
+      max_slot_v = slots[0];
+      for (size_t i = 1; i < slot_mapping.size(); ++i) {
+        max_slot_v = std::max(max_slot_v, slots[i * stride]);
+      }
     } else {
       array max_slot = mlx::core::max(slot_mapping);
       mlx::core::eval(max_slot);
@@ -2725,55 +2729,41 @@ int mlx_paged_kv_write_factory_single_slot_bounds_contract() {
   try {
     using namespace mlx::core;
     using namespace mlx::core::fast;
-
     array k_pool(Shape{4, 4, 8, 16, 8}, bfloat16, nullptr, {});
     array v_pool(Shape{4, 4, 64, 16}, bfloat16, nullptr, {});
-    std::vector<uint16_t> new_kv_zeros(4 * 64, 0);
-    auto* bf16_p = reinterpret_cast<const bfloat16_t*>(new_kv_zeros.data());
-    array new_k(bf16_p, Shape{1, 4, 64}, bfloat16);
-    array new_v(bf16_p, Shape{1, 4, 64}, bfloat16);
     array k_scale(1.0f, float32);
     array v_scale(1.0f, float32);
-
-    auto call_with_slot = [&](int64_t slot) {
-      std::vector<int64_t> slot_mapping_host = {slot};
-      array slot_mapping(slot_mapping_host.data(), Shape{1}, int64);
-      if (!slot_mapping.is_available()) {
-        throw std::runtime_error(
-            "single-slot contract helper expected a materialized array");
-      }
-      return paged_kv_write(
-          k_pool,
-          v_pool,
-          new_k,
-          new_v,
-          slot_mapping,
-          k_scale,
-          v_scale,
-          /*block_size=*/16,
-          /*num_kv_heads=*/4,
-          /*head_size=*/64,
-          /*x_pack=*/8,
-          KvDtype::Bf16,
-          StreamOrDevice{});
+    auto call_with_slots = [&](const std::vector<int64_t>& slots, bool lazy) {
+      const int count = static_cast<int>(slots.size());
+      std::vector<uint16_t> kv(count * 4 * 64, 0);
+      const auto* bf16_p = reinterpret_cast<const bfloat16_t*>(kv.data());
+      array new_k(bf16_p, Shape{count, 4, 64}, bfloat16);
+      array new_v(bf16_p, Shape{count, 4, 64}, bfloat16);
+      array mapping(slots.data(), Shape{count}, int64);
+      if (!mapping.is_available()) throw std::runtime_error("expected host metadata");
+      if (lazy) mapping = add(mapping, array(int64_t{0}, int64));
+      return paged_kv_write(k_pool, v_pool, new_k, new_v, mapping,
+          k_scale, v_scale, 16, 4, 64, 8, KvDtype::Bf16, StreamOrDevice{});
     };
-
-    // Capacity is 4 * 16 = 64: slot 63 is the inclusive upper boundary.
-    call_with_slot(63);
-    // Negative values are kernel skip sentinels, not invalid indices.
-    call_with_slot(-1);
-
-    try {
-      call_with_slot(64);
-    } catch (const std::invalid_argument& error) {
-      return std::string(error.what()).find("[runtime]") != std::string::npos
-          ? 1
-          : -2;
+    // Exercise available multi-token scans and the lazy reduction fallback.
+    for (bool lazy : {false, true}) {
+      for (const auto& slots : std::vector<std::vector<int64_t>>{
+          {63}, {-1}, {-1, 63}, {63, -1}, {-1, -1}}) {
+        call_with_slots(slots, lazy);
+      }
+      for (const auto& slots : std::vector<std::vector<int64_t>>{
+          {64}, {0, 64}, {64, -1}}) {
+        bool rejected = false;
+        try { call_with_slots(slots, lazy); }
+        catch (const std::invalid_argument& error) {
+          if (std::string(error.what()).find("[runtime]") == std::string::npos) return -2;
+          rejected = true;
+        }
+        if (!rejected) return 0;
+      }
     }
-    return 0;
-  } catch (...) {
-    return -1;
-  }
+    return 1;
+  } catch (...) { return -1; }
 }
 
 /// Assert the factory-side slot_mapping bounds guard's

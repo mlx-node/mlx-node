@@ -1096,7 +1096,7 @@ fn paged_kv_write_factory_rejects_slot_mapping_length() {
 fn paged_kv_write_factory_rejects_slot_mapping_out_of_range() {
     // Safety check: slot value >= num_blocks * block_size is out-of-pool
     // and must be rejected at the factory. The two-token mapping deliberately
-    // exercises the reduction fallback rather than the single-token fast path.
+    // exercises the available multi-token metadata scan.
     let threw = unsafe { mlx_sys::mlx_paged_kv_write_factory_rejects_slot_mapping_out_of_range() };
     assert_eq!(
         threw, 1,
@@ -1108,7 +1108,7 @@ fn paged_kv_write_factory_rejects_slot_mapping_out_of_range() {
 
 #[test]
 fn paged_kv_write_factory_single_slot_bounds_contract() {
-    // Directly exercise the available size-one path at all semantic
+    // Exercise available single/multi-slot metadata and lazy fallback at all semantic
     // boundaries: capacity-1 is valid, -1 is a skip sentinel, and capacity is
     // rejected. The helper also verifies the rejection retains `[runtime]`.
     let rc = unsafe { mlx_sys::mlx_paged_kv_write_factory_single_slot_bounds_contract() };

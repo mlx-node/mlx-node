@@ -214,6 +214,7 @@ impl DsparkStepper for Qwen35DFlash2Stepper<'_> {
             draft_ids,
             draft_dists: Vec::new(),
             draft_sparse_dists,
+            keep_probabilities: None,
         })
     }
 

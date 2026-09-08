@@ -101,4 +101,33 @@ impl MuseGlimmerDecoderLayer {
         };
         h.add(&self.post_feedforward_layernorm.forward(&ffn)?)
     }
+
+    pub(crate) fn forward_paged_ragged(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        paged_idx: u32,
+        rows: &[crate::transformer::paged_kv_cache_adapter::PagedRaggedRow],
+        offsets: &MxArray,
+        window: PagedWindowSlot,
+        preserve_owner_projection_graphs: bool,
+    ) -> Result<MxArray> {
+        let attn = self.attention.forward_paged_ragged(
+            &self.input_layernorm.forward(x)?,
+            adapter,
+            paged_idx,
+            rows,
+            offsets,
+            window,
+            preserve_owner_projection_graphs,
+        )?;
+        let h = x.add(&self.post_attention_layernorm.forward(&attn)?)?;
+        let normed = self.pre_feedforward_layernorm.forward(&h)?;
+        let ffn = if preserve_owner_projection_graphs {
+            super::row_exact::forward_owner_spans(&normed, rows, |row| self.mlp.forward(row))?
+        } else {
+            self.mlp.forward(&normed)?
+        };
+        h.add(&self.post_feedforward_layernorm.forward(&ffn)?)
+    }
 }

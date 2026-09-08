@@ -28,6 +28,32 @@ pub(super) fn forward_rows_independently(
     MxArray::concatenate_many(rows.iter().collect(), Some(0))
 }
 
+/// Preserve each owner's `[1,T,H]` projection shape while attention consumes
+/// a packed ragged wave. Token rows within an owner must remain together.
+pub(super) fn forward_owner_spans(
+    x: &MxArray,
+    owners: &[crate::transformer::paged_kv_cache_adapter::PagedRaggedRow],
+    mut forward: impl FnMut(&MxArray) -> Result<MxArray>,
+) -> Result<MxArray> {
+    let mut offset = 0i64;
+    let mut outputs = Vec::with_capacity(owners.len());
+    for owner in owners {
+        let end = offset + i64::from(owner.query_len);
+        if owner.query_len == 0 || end > x.shape_at(0)? {
+            return Err(Error::from_reason("invalid ragged projection span"));
+        }
+        let span = x.slice_axis(0, offset, end)?.transpose(Some(&[1, 0, 2]))?;
+        outputs.push(forward(&span)?.transpose(Some(&[1, 0, 2]))?);
+        offset = end;
+    }
+    if outputs.is_empty() || offset != x.shape_at(0)? {
+        return Err(Error::from_reason(
+            "ragged projection spans do not cover input",
+        ));
+    }
+    MxArray::concatenate_many(outputs.iter().collect(), Some(0))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,6 +1,46 @@
 use super::*;
 
 #[test]
+fn host_export_preserves_layout_bits_and_completed_values() {
+    let values = [-0.0f32, 1.5, -2.0, 3.25, 4.5, 5.0];
+    let matrix = MxArray::from_float32(&values, &[2, 3]).unwrap();
+    let contiguous = matrix.to_float32().unwrap();
+    assert_eq!(contiguous[0].to_bits(), (-0.0f32).to_bits());
+    let transposed = matrix.transpose(Some(&[1, 0])).unwrap();
+    assert_eq!(
+        transposed.to_float32().unwrap().as_ref(),
+        &[-0.0, 3.25, 1.5, 4.5, -2.0, 5.0]
+    );
+    let column = matrix.slice(&[0, 1], &[2, 2]).unwrap();
+    assert_eq!(column.to_float32().unwrap().as_ref(), &[1.5, 4.5]);
+    let broadcast = MxArray::from_float32(&[2.5], &[1])
+        .unwrap()
+        .broadcast_to(&[2, 3])
+        .unwrap();
+    assert_eq!(broadcast.to_float32().unwrap().as_ref(), &[2.5; 6]);
+    assert_eq!(broadcast.to_int32().unwrap().as_ref(), &[2; 6]);
+    assert_eq!(broadcast.to_uint32().unwrap().as_ref(), &[2; 6]);
+    let integers = MxArray::from_uint32(&[u32::MAX, 17, 1 << 31], &[3]).unwrap();
+    assert_eq!(
+        integers.to_uint32().unwrap().as_ref(),
+        &[u32::MAX, 17, 1 << 31]
+    );
+    let lazy = matrix.mul_scalar(2.0).unwrap();
+    MxArray::async_eval_arrays(&[&lazy]);
+    assert_eq!(
+        lazy.to_float32().unwrap().as_ref(),
+        &[-0.0, 3.0, -4.0, 6.5, 9.0, 10.0]
+    );
+    assert!(
+        MxArray::from_float32(&[], &[0])
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
 fn test_basic_array_creation() {
     let data = [1.0f32, 2.0, 3.0, 4.0];
     let arr = MxArray::from_float32(&data, &[2, 2]).unwrap();

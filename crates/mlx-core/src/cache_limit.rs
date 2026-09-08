@@ -230,7 +230,10 @@ impl CacheLimitCoordinator {
 
     /// Sum of every live private paged-KV pool registered with this
     /// coordinator. Used by load-time pool sizers so a second model does
-    /// not treat another model's Metal buffers as free headroom.
+    /// not treat another model's Metal buffers as free headroom. Includes a
+    /// fixed restore-staging allowance per pool; MLX cannot see these retained
+    /// shared Metal allocations either. Pool registration/update arguments
+    /// remain KV bytes only, so growth cannot accidentally drop the allowance.
     pub fn registered_pool_bytes(&self) -> u64 {
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         state
@@ -258,7 +261,10 @@ impl CacheLimitCoordinator {
         }
         let id = state.next_id;
         state.next_id = state.next_id.saturating_add(1);
-        state.pools.insert(id, pool_bytes);
+        state.pools.insert(
+            id,
+            pool_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES),
+        );
         info!(
             "[cache_limit] register paged pool guard={} bytes={:.2} GB (live_pools={})",
             id,
@@ -270,13 +276,17 @@ impl CacheLimitCoordinator {
     }
 
     /// Register a private paged-KV pool so the MLX freelist ceiling is
-    /// debited by memory that MLX's own allocator counters cannot see.
+    /// debited by memory that MLX's own allocator counters cannot see. Reserve
+    /// restore staging up front, avoiding callbacks under the pool upload locks.
     pub fn register_pool(&self, pool_bytes: u64) -> PoolCacheLimitGuard {
         let id = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let id = state.next_id;
             state.next_id = state.next_id.saturating_add(1);
-            state.pools.insert(id, pool_bytes);
+            state.pools.insert(
+                id,
+                pool_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES),
+            );
             info!(
                 "[cache_limit] register paged pool guard={} bytes={:.2} GB (live_pools={})",
                 id,
@@ -295,6 +305,7 @@ impl CacheLimitCoordinator {
     /// the guard from `register_pool`. No-op when the id is unknown (guard
     /// already dropped) or the byte total is unchanged.
     pub fn update_pool(&self, id: u64, new_bytes: u64) {
+        let new_bytes = new_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES);
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(bytes) = state.pools.get_mut(&id) else {
             return;
@@ -850,7 +861,7 @@ mod tests {
         let _g2 = coordinator().register_pool(5 * GB);
         assert_eq!(
             coordinator().registered_pool_bytes().saturating_sub(before),
-            8 * GB
+            8 * GB + 2 * mlx_paged_attn::RESTORE_STAGING_BYTES
         );
     }
 
@@ -872,7 +883,7 @@ mod tests {
             coordinator()
                 .registered_pool_bytes()
                 .saturating_sub(current),
-            2 * GB
+            2 * GB + mlx_paged_attn::RESTORE_STAGING_BYTES
         );
     }
 
@@ -883,13 +894,13 @@ mod tests {
         let guard = coordinator().register_pool(GB);
         assert_eq!(
             coordinator().registered_pool_bytes().saturating_sub(before),
-            GB,
+            GB + mlx_paged_attn::RESTORE_STAGING_BYTES,
             "register_pool must debit the initial pool"
         );
         coordinator().update_pool(guard.id(), 3 * GB);
         assert_eq!(
             coordinator().registered_pool_bytes().saturating_sub(before),
-            3 * GB,
+            3 * GB + mlx_paged_attn::RESTORE_STAGING_BYTES,
             "update_pool must replace the entry with the grown total"
         );
         // An id nobody owns (e.g. a guard that raced a model teardown) is
@@ -897,7 +908,7 @@ mod tests {
         coordinator().update_pool(guard.id() + 1, GB);
         assert_eq!(
             coordinator().registered_pool_bytes().saturating_sub(before),
-            3 * GB,
+            3 * GB + mlx_paged_attn::RESTORE_STAGING_BYTES,
             "an unknown id must not add a new entry"
         );
         // Idempotent no-op: a repeated equal byte total must not change the
@@ -905,7 +916,7 @@ mod tests {
         coordinator().update_pool(guard.id(), 3 * GB);
         assert_eq!(
             coordinator().registered_pool_bytes().saturating_sub(before),
-            3 * GB,
+            3 * GB + mlx_paged_attn::RESTORE_STAGING_BYTES,
             "an unchanged byte total must be a no-op"
         );
         drop(guard);

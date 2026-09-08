@@ -378,4 +378,89 @@ impl MuseGlimmerAttention {
             self.o_proj.forward(&output)
         }
     }
+
+    pub(crate) fn forward_paged_ragged(
+        &self,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        paged_idx: u32,
+        rows: &[crate::transformer::paged_kv_cache_adapter::PagedRaggedRow],
+        offsets: &MxArray,
+        window: PagedWindowSlot,
+        preserve_owner_projection_graphs: bool,
+    ) -> Result<MxArray> {
+        let shape = x.shape()?;
+        if rows.is_empty()
+            || shape.as_ref().len() != 3
+            || shape[0] != rows.iter().map(|row| i64::from(row.query_len)).sum::<i64>()
+            || shape[1] != 1
+        {
+            return Err(Error::from_reason(format!(
+                "Muse-Glimmer batched paged attention expects [N,1,H] for {} rows, got {:?}",
+                rows.len(),
+                shape.as_ref()
+            )));
+        }
+        if window.carrier() != WindowCarrier::KernelArgument {
+            return Err(Error::from_reason(
+                "Muse-Glimmer batched decode requires an admitted kernel-window slot",
+            ));
+        }
+        let batch = shape[0];
+        // Keep packed affine/K-quant matmuls on their established singleton
+        // graph. Metal can choose a different reduction path for `B > 1`,
+        // changing greedy tokens near ties. K/V writes and attention below
+        // remain one genuine paged batch.
+        let (q, k, v, gate) = if preserve_owner_projection_graphs {
+            (
+                super::row_exact::forward_owner_spans(x, rows, |row| self.q_proj.forward(row))?,
+                super::row_exact::forward_owner_spans(x, rows, |row| self.k_proj.forward(row))?,
+                super::row_exact::forward_owner_spans(x, rows, |row| self.v_proj.forward(row))?,
+                super::row_exact::forward_owner_spans(x, rows, |row| self.gate_proj.forward(row))?,
+            )
+        } else {
+            (
+                self.q_proj.forward(x)?,
+                self.k_proj.forward(x)?,
+                self.v_proj.forward(x)?,
+                self.gate_proj.forward(x)?,
+            )
+        };
+        let q = q.reshape(&[batch, 1, self.num_heads, self.head_dim])?;
+        let k = k.reshape(&[batch, 1, self.num_kv_heads, self.head_dim])?;
+        let v = v.reshape(&[batch, 1, self.num_kv_heads, self.head_dim])?;
+        let q = self
+            .scaleless_rms_norm(&q)?
+            .mul_scalar(self.qk_scale_factor)?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let k = self
+            .scaleless_rms_norm(&k)?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let v = v.transpose(Some(&[0, 2, 1, 3]))?;
+        let (q, k) = match self.rope.as_ref() {
+            Some(rope) => (
+                rope.forward_with_offsets(&q, offsets)?,
+                rope.forward_with_offsets(&k, offsets)?,
+            ),
+            None => (q, k),
+        };
+        let q = q.squeeze(Some(&[2]))?;
+        let k = k.squeeze(Some(&[2]))?;
+        let v = v.squeeze(Some(&[2]))?;
+        adapter
+            .update_keys_values_native_ragged(paged_idx, &k, &v, rows)
+            .map_err(Error::from_reason)?;
+        let scale = 1.0 / (self.head_dim as f64).sqrt();
+        let attended = adapter
+            .gather_kv_for_ragged_graph(paged_idx, &q, rows, scale as f32, 1.0)
+            .map_err(Error::from_reason)?
+            .astype(x.dtype()?)?
+            .reshape(&[batch, 1, self.num_heads * self.head_dim])?;
+        let output = attended.mul(&Activations::sigmoid(&gate)?)?;
+        if preserve_owner_projection_graphs {
+            super::row_exact::forward_owner_spans(&output, rows, |row| self.o_proj.forward(row))
+        } else {
+            self.o_proj.forward(&output)
+        }
+    }
 }

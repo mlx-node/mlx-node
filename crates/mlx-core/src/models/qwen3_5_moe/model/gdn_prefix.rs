@@ -557,6 +557,7 @@ impl Qwen35MoeInner {
             chunk_size,
             rope_deltas,
             turn_cancel.as_deref(),
+            None,
         )
     }
 

@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -520,7 +520,7 @@ impl ColdSidecar {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RestorePrefixIdentity {
     pub hot_hash: u64,
     pub tokens: Vec<u32>,
@@ -533,32 +533,146 @@ pub struct RestorePrefixIdentity {
 /// Background filesystem/decode work for one ordered cold-prefix chain.
 ///
 /// The worker never touches Metal or the block allocator. Those remain on the
-/// model thread and are reached only through [`ColdCacheManager::commit_restore_batch`].
+/// model thread through chunk upload and final prefix commit.
 pub struct ColdRestoreBatchJob {
     receiver: Option<Receiver<ColdRestoreBatch>>,
     expected_blocks: usize,
     started: Instant,
+    cancelled: Arc<AtomicBool>,
+    collected: Vec<Option<ColdCacheBlock>>,
+    decoded_successes: usize,
+    uploaded: Option<UploadedRestore>,
+}
+
+impl Drop for ColdRestoreBatchJob {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
 }
 
 impl ColdRestoreBatchJob {
     /// Non-blocking completion probe. A disconnected worker is converted into
     /// a failed batch so inference can fall back to ordinary prefill.
     pub fn poll(&mut self) -> Option<ColdRestoreBatch> {
+        let mut chunk = self.poll_chunk()?;
+        if self.uploaded.is_some() {
+            return Some(self.fail());
+        }
+        self.collected.append(&mut chunk.blocks);
+        if !chunk.final_chunk && !chunk.worker_failed {
+            return None;
+        }
+        chunk.blocks = std::mem::take(&mut self.collected);
+        Some(chunk)
+    }
+
+    fn poll_chunk(&mut self) -> Option<ColdRestoreBatch> {
         let receiver = self.receiver.as_ref()?;
         match receiver.try_recv() {
-            Ok(batch) => {
-                self.receiver = None;
+            Ok(mut batch) => {
+                self.decoded_successes += batch.blocks.iter().filter(|b| b.is_some()).count();
+                batch.decoded_successes = self.decoded_successes;
+                if batch.final_chunk || batch.worker_failed {
+                    self.receiver = None;
+                }
                 Some(batch)
             }
             Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => {
-                self.receiver = None;
-                Some(ColdRestoreBatch {
-                    blocks: Vec::with_capacity(self.expected_blocks),
-                    worker_failed: true,
-                })
-            }
+            Err(TryRecvError::Disconnected) => Some(self.fail()),
         }
+    }
+
+    fn fail(&mut self) -> ColdRestoreBatch {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.receiver = None;
+        self.collected.clear();
+        self.uploaded = None;
+        ColdRestoreBatch {
+            blocks: Vec::new(),
+            worker_failed: true,
+            final_chunk: true,
+            uploaded: None,
+            decoded_successes: self.decoded_successes,
+        }
+    }
+
+    /// Upload at most one bounded reader chunk per scheduler poll. Later file
+    /// reads overlap this transfer and peer inference. Each transfer completes
+    /// before returning, so ticket cancellation can safely release its reserved
+    /// destinations. Only the final proof can publish the complete prefix.
+    pub fn poll_upload(
+        &mut self,
+        pool: &LayerKVPool,
+        reserved: &[Arc<PhysicalBlock>],
+        identities: &[RestorePrefixIdentity],
+    ) -> Option<ColdRestoreBatch> {
+        let chunk = self.poll_chunk()?;
+        if chunk.worker_failed
+            || !self.collected.is_empty()
+            || reserved.len() != self.expected_blocks
+            || identities.len() != self.expected_blocks
+        {
+            return Some(self.fail());
+        }
+        let progress = self.uploaded.get_or_insert_with(|| UploadedRestore {
+            pool_identity: pool.restore_identity(),
+            generation: pool.generation(),
+            destinations: reserved.iter().map(|block| block.block_id).collect(),
+            identities: identities.to_vec(),
+            blocks: 0,
+            bytes: 0,
+        });
+        let end = progress.blocks.saturating_add(chunk.blocks.len());
+        let valid = end <= reserved.len()
+            && Arc::ptr_eq(&progress.pool_identity, &pool.restore_identity())
+            && progress.generation == pool.generation()
+            && progress.identities == identities
+            && progress
+                .destinations
+                .iter()
+                .copied()
+                .eq(reserved.iter().map(|b| b.block_id))
+            && chunk
+                .blocks
+                .iter()
+                .zip(&identities[progress.blocks.min(identities.len())..])
+                .all(|(block, identity)| {
+                    block.as_ref().is_some_and(|block| {
+                        block.tokens == identity.tokens && layout_matches_pool(&block.layout, pool)
+                    })
+                });
+        if !valid || (chunk.final_chunk && end != self.expected_blocks) {
+            return Some(self.fail());
+        }
+        let decoded = chunk.blocks.into_iter().flatten().collect::<Vec<_>>();
+        let uploads = decoded
+            .iter()
+            .zip(&reserved[progress.blocks..end])
+            .map(|(cold, destination)| {
+                (
+                    destination.block_id,
+                    cold.layers
+                        .iter()
+                        .map(|layer| (layer.keys.as_slice(), layer.values.as_slice()))
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if pool.write_blocks_all_layers(&uploads).is_err() {
+            return Some(self.fail());
+        }
+        progress.blocks = end;
+        progress.bytes += decoded.iter().map(ColdCacheBlock::encoded_len).sum::<u64>();
+        if !chunk.final_chunk {
+            return None;
+        }
+        Some(ColdRestoreBatch {
+            blocks: Vec::new(),
+            worker_failed: false,
+            final_chunk: true,
+            uploaded: self.uploaded.take(),
+            decoded_successes: self.decoded_successes,
+        })
     }
 
     pub fn elapsed(&self) -> Duration {
@@ -571,6 +685,20 @@ impl ColdRestoreBatchJob {
 pub struct ColdRestoreBatch {
     blocks: Vec<Option<ColdCacheBlock>>,
     worker_failed: bool,
+    final_chunk: bool,
+    decoded_successes: usize,
+    uploaded: Option<UploadedRestore>,
+}
+
+/// Completion proof tied to the exact reserved slots, pool generation and
+/// prefix identities whose bytes were uploaded. Never exported to callers.
+struct UploadedRestore {
+    pool_identity: Arc<()>,
+    generation: u64,
+    destinations: Vec<u32>,
+    identities: Vec<RestorePrefixIdentity>,
+    blocks: usize,
+    bytes: u64,
 }
 
 /// Successful model-thread commit of an asynchronous restore batch.
@@ -1699,14 +1827,24 @@ impl ColdCacheManager {
     /// Start an ordered cold-prefix read on a background filesystem thread.
     ///
     /// Only file I/O, safetensors decode, checksum, and identity validation run
-    /// there. Destination blocks must already be reserved by the caller; Metal
-    /// upload and hot-prefix publication happen later, synchronously on the
-    /// model thread, in [`Self::commit_restore_batch`].
+    /// there. Destination blocks must already be reserved by the caller. The
+    /// model thread uploads bounded chunks via [`ColdRestoreBatchJob::poll_upload`]
+    /// and publishes the complete prefix via [`Self::commit_restore_batch`].
     pub fn begin_restore_batch(
         &self,
         pool: &LayerKVPool,
         keys: Vec<ColdCacheKey>,
         fingerprint: ColdCacheFingerprint,
+    ) -> Result<ColdRestoreBatchJob, String> {
+        self.begin_restore_batch_with_chunk_bytes(pool, keys, fingerprint, 16 << 20)
+    }
+
+    fn begin_restore_batch_with_chunk_bytes(
+        &self,
+        pool: &LayerKVPool,
+        keys: Vec<ColdCacheKey>,
+        fingerprint: ColdCacheFingerprint,
+        read_chunk_bytes: u64,
     ) -> Result<ColdRestoreBatchJob, String> {
         if keys.is_empty() {
             return Err("cannot start an empty cold restore batch".to_string());
@@ -1716,23 +1854,60 @@ impl ColdCacheManager {
         let manager = self.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
         let started = Instant::now();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = Arc::clone(&cancelled);
         std::thread::Builder::new()
             .name("mlx-paged-ssd-reader".to_string())
             .spawn(move || {
-                let blocks = keys
-                    .into_iter()
-                    .map(|key| manager.load_bounded(key, fingerprint, max_encoded))
-                    .collect();
-                let _ = sender.send(ColdRestoreBatch {
-                    blocks,
-                    worker_failed: false,
-                });
+                // One queued chunk plus the worker's current chunk bounds
+                // duplicate host payloads independently of prefix length.
+                let mut blocks = Vec::new();
+                let mut bytes = 0u64;
+                for (index, key) in keys.into_iter().enumerate() {
+                    if worker_cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let block = manager.load_bounded(key, fingerprint, max_encoded);
+                    let size = block.as_ref().map_or(0, ColdCacheBlock::encoded_len);
+                    if !blocks.is_empty() && bytes.saturating_add(size) > read_chunk_bytes {
+                        if sender
+                            .send(ColdRestoreBatch {
+                                blocks: std::mem::take(&mut blocks),
+                                worker_failed: false,
+                                final_chunk: false,
+                                uploaded: None,
+                                decoded_successes: 0,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        bytes = 0;
+                    }
+                    let failed = block.is_none();
+                    blocks.push(block);
+                    bytes = bytes.saturating_add(size);
+                    if failed || index + 1 == expected_blocks {
+                        let _ = sender.send(ColdRestoreBatch {
+                            blocks,
+                            worker_failed: failed,
+                            final_chunk: true,
+                            uploaded: None,
+                            decoded_successes: 0,
+                        });
+                        return;
+                    }
+                }
             })
             .map_err(|error| format!("start cold-cache restore reader: {error}"))?;
         Ok(ColdRestoreBatchJob {
             receiver: Some(receiver),
             expected_blocks,
             started,
+            cancelled,
+            collected: Vec::new(),
+            decoded_successes: 0,
+            uploaded: None,
         })
     }
 
@@ -1750,19 +1925,37 @@ impl ColdCacheManager {
         identities: &[RestorePrefixIdentity],
         wait: Duration,
     ) -> Option<ColdRestoreCommit> {
-        let decoded_successes = batch.blocks.iter().filter(|block| block.is_some()).count();
+        let decoded_successes = batch.decoded_successes;
         let valid_shape = !batch.worker_failed
-            && batch.blocks.len() == reserved.len()
+            && batch.final_chunk
             && reserved.len() == identities.len()
-            && batch
-                .blocks
-                .iter()
-                .zip(identities)
-                .all(|(block, identity)| {
-                    block.as_ref().is_some_and(|block| {
-                        block.tokens == identity.tokens && layout_matches_pool(&block.layout, pool)
-                    })
-                });
+            && match &batch.uploaded {
+                Some(proof) => {
+                    batch.blocks.is_empty()
+                        && proof.blocks == reserved.len()
+                        && Arc::ptr_eq(&proof.pool_identity, &pool.restore_identity())
+                        && proof.generation == pool.generation()
+                        && proof.identities == identities
+                        && proof
+                            .destinations
+                            .iter()
+                            .copied()
+                            .eq(reserved.iter().map(|b| b.block_id))
+                }
+                None => {
+                    batch.blocks.len() == reserved.len()
+                        && batch
+                            .blocks
+                            .iter()
+                            .zip(identities)
+                            .all(|(block, identity)| {
+                                block.as_ref().is_some_and(|block| {
+                                    block.tokens == identity.tokens
+                                        && layout_matches_pool(&block.layout, pool)
+                                })
+                            })
+                }
+            };
         if !valid_shape {
             self.shared
                 .stats
@@ -1778,28 +1971,30 @@ impl ColdCacheManager {
         }
 
         let decoded: Vec<ColdCacheBlock> = batch.blocks.into_iter().flatten().collect();
-        for (cold, destination) in decoded.iter().zip(&reserved) {
-            let layer_bytes: Vec<(&[u8], &[u8])> = cold
-                .layers
-                .iter()
-                .map(|layer| (layer.keys.as_slice(), layer.values.as_slice()))
-                .collect();
-            if pool
-                .write_block_all_layers(destination.block_id, &layer_bytes)
-                .is_err()
-            {
-                self.shared
-                    .stats
-                    .misses
-                    .fetch_add(decoded.len() as u64, Ordering::Relaxed);
-                let mut guard = allocator
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                for block in reserved {
-                    guard.free(block);
-                }
-                return None;
+        let uploads = decoded
+            .iter()
+            .zip(&reserved)
+            .map(|(cold, destination)| {
+                let layer_bytes = cold
+                    .layers
+                    .iter()
+                    .map(|layer| (layer.keys.as_slice(), layer.values.as_slice()))
+                    .collect();
+                (destination.block_id, layer_bytes)
+            })
+            .collect::<Vec<_>>();
+        if batch.uploaded.is_none() && pool.write_blocks_all_layers(&uploads).is_err() {
+            self.shared
+                .stats
+                .misses
+                .fetch_add(decoded_successes as u64, Ordering::Relaxed);
+            let mut guard = allocator
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for block in reserved {
+                guard.free(block);
             }
+            return None;
         }
 
         let published = {
@@ -1825,7 +2020,7 @@ impl ColdCacheManager {
             self.shared
                 .stats
                 .misses
-                .fetch_add(decoded.len() as u64, Ordering::Relaxed);
+                .fetch_add(decoded_successes as u64, Ordering::Relaxed);
             let mut guard = allocator
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1835,11 +2030,14 @@ impl ColdCacheManager {
             return None;
         }
 
-        let bytes_restored = decoded.iter().map(ColdCacheBlock::encoded_len).sum::<u64>();
+        let bytes_restored = batch.uploaded.as_ref().map_or_else(
+            || decoded.iter().map(ColdCacheBlock::encoded_len).sum::<u64>(),
+            |proof| proof.bytes,
+        );
         self.shared
             .stats
             .hits
-            .fetch_add(decoded.len() as u64, Ordering::Relaxed);
+            .fetch_add(decoded_successes as u64, Ordering::Relaxed);
         self.shared
             .stats
             .bytes_restored
@@ -2437,11 +2635,11 @@ fn parse_object_name(name: &str) -> Option<(ColdCacheKey, ColdGroup)> {
 
 fn encode_block(block: &ColdCacheBlock) -> Result<Vec<u8>, String> {
     let token_bytes: Vec<u8> = block.tokens.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let mut owned: Vec<(String, Vec<u8>)> = Vec::with_capacity(1 + block.layers.len() * 2);
-    owned.push(("tokens".to_string(), token_bytes));
+    let mut owned: Vec<(String, &[u8])> = Vec::with_capacity(1 + block.layers.len() * 2);
+    owned.push(("tokens".to_string(), &token_bytes));
     for (i, layer) in block.layers.iter().enumerate() {
-        owned.push((format!("layer.{i}.key"), layer.keys.clone()));
-        owned.push((format!("layer.{i}.value"), layer.values.clone()));
+        owned.push((format!("layer.{i}.key"), &layer.keys));
+        owned.push((format!("layer.{i}.value"), &layer.values));
     }
     let checksum = payload_checksum(&owned);
     let views: Result<Vec<_>, _> = owned
@@ -2569,14 +2767,11 @@ fn decode_block(
     };
     block.validate()?;
 
-    let mut owned = Vec::with_capacity(1 + block.layers.len() * 2);
-    owned.push((
-        "tokens".to_string(),
-        block.tokens.iter().flat_map(|v| v.to_le_bytes()).collect(),
-    ));
+    let mut owned: Vec<(String, &[u8])> = Vec::with_capacity(1 + block.layers.len() * 2);
+    owned.push(("tokens".to_string(), token_bytes));
     for (i, layer) in block.layers.iter().enumerate() {
-        owned.push((format!("layer.{i}.key"), layer.keys.clone()));
-        owned.push((format!("layer.{i}.value"), layer.values.clone()));
+        owned.push((format!("layer.{i}.key"), &layer.keys));
+        owned.push((format!("layer.{i}.value"), &layer.values));
     }
     if payload_checksum(&owned) != get("checksum")? {
         return Err("cold-cache payload checksum mismatch".to_string());
@@ -2596,11 +2791,11 @@ fn sidecar_tensor_name(layer: usize, slot: usize) -> String {
 fn encode_sidecar(sidecar: &ColdSidecar) -> Result<Vec<u8>, String> {
     sidecar.validate()?;
     let per_layer = sidecar.layout.tensors_per_layer as usize;
-    let mut owned: Vec<(String, Vec<u8>)> = Vec::with_capacity(sidecar.tensors.len());
+    let mut owned: Vec<(String, &[u8])> = Vec::with_capacity(sidecar.tensors.len());
     for (index, tensor) in sidecar.tensors.iter().enumerate() {
         owned.push((
             sidecar_tensor_name(index / per_layer, index % per_layer),
-            tensor.clone(),
+            tensor.as_slice(),
         ));
     }
     let checksum = payload_checksum(&owned);
@@ -2747,7 +2942,7 @@ fn decode_sidecar(
     for (index, tensor) in sidecar.tensors.iter().enumerate() {
         owned.push((
             sidecar_tensor_name(index / per_layer, index % per_layer),
-            tensor.clone(),
+            tensor.as_slice(),
         ));
     }
     if payload_checksum(&owned) != get("checksum")? {
@@ -2756,10 +2951,11 @@ fn decode_sidecar(
     Ok(sidecar)
 }
 
-fn payload_checksum(tensors: &[(String, Vec<u8>)]) -> String {
+fn payload_checksum<T: AsRef<[u8]>>(tensors: &[(String, T)]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"mlx-node:cold-cache-payload:v1\0");
     for (name, data) in tensors {
+        let data = data.as_ref();
         hasher.update((name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
         hasher.update((data.len() as u64).to_le_bytes());
@@ -7650,11 +7846,11 @@ mod tests {
             .map(|_| fresh_alloc.lock().unwrap().allocate().unwrap())
             .collect();
         let mut job = reopened
-            .begin_restore_batch(&pool_dst, keys, fp)
+            .begin_restore_batch_with_chunk_bytes(&pool_dst, keys.clone(), fp, 1)
             .expect("start asynchronous restore");
         let batch = (0..200)
             .find_map(|_| {
-                let ready = job.poll();
+                let ready = job.poll_upload(&pool_dst, &reserved, &identities);
                 if ready.is_none() {
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -7698,6 +7894,80 @@ mod tests {
             }
         }
 
+        // Chunk completion is not publication. A proof is bound to its pool,
+        // and disconnection after a completed chunk must retain miss accounting.
+        for disconnect in [false, true] {
+            let failed_alloc = Mutex::new(BlockAllocator::new(4, 4, 8));
+            let failed_reserved: Vec<_> = (0..2)
+                .map(|_| failed_alloc.lock().unwrap().allocate().unwrap())
+                .collect();
+            let misses_before = reopened.stats().misses;
+            let mut failed_job = reopened
+                .begin_restore_batch_with_chunk_bytes(&pool_dst, keys.clone(), fp, 1)
+                .unwrap();
+            for _ in 0..200 {
+                assert!(
+                    failed_job
+                        .poll_upload(&pool_dst, &failed_reserved, &identities)
+                        .is_none()
+                );
+                if failed_job.uploaded.as_ref().is_some_and(|p| p.blocks == 1) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(failed_job.uploaded.as_ref().unwrap().blocks, 1);
+            assert_eq!(
+                failed_alloc
+                    .lock()
+                    .unwrap()
+                    .find_longest_cache_hit(&tokens, 8, extra_keys, cache_salt)
+                    .1,
+                0
+            );
+            if disconnect {
+                let (sender, receiver) = mpsc::sync_channel(1);
+                drop(sender);
+                failed_job.receiver = Some(receiver);
+            }
+            let failed_batch = (0..200)
+                .find_map(|_| {
+                    let batch = failed_job.poll_upload(&pool_dst, &failed_reserved, &identities);
+                    if batch.is_none() {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    batch
+                })
+                .unwrap();
+            // pool_src has exactly the same layout and generation as pool_dst.
+            let commit_pool = if disconnect { &pool_dst } else { &pool_src };
+            assert!(
+                reopened
+                    .commit_restore_batch(
+                        commit_pool,
+                        &failed_alloc,
+                        failed_batch,
+                        failed_reserved,
+                        &identities,
+                        failed_job.elapsed(),
+                    )
+                    .is_none()
+            );
+            assert_eq!(
+                reopened.stats().misses - misses_before,
+                if disconnect { 1 } else { 2 }
+            );
+            assert_eq!(failed_alloc.lock().unwrap().num_free_blocks(), 4);
+            assert_eq!(
+                failed_alloc
+                    .lock()
+                    .unwrap()
+                    .find_longest_cache_hit(&tokens, 8, extra_keys, cache_salt)
+                    .1,
+                0
+            );
+        }
+
         // A partial background read is an all-or-nothing miss: neither the
         // successfully decoded head nor the missing tail may become hot, and
         // every destination reservation must return to the allocator.
@@ -7726,12 +7996,14 @@ mod tests {
                 block_index: 1,
             },
         ];
+        let misses_before = reopened.stats().misses;
         let mut partial_job = reopened
             .begin_restore_batch(&pool_dst, vec![key0, missing_key], fp)
             .expect("start partial asynchronous restore");
         let partial_batch = (0..200)
             .find_map(|_| {
-                let ready = partial_job.poll();
+                let ready =
+                    partial_job.poll_upload(&pool_dst, &partial_reserved, &partial_identities);
                 if ready.is_none() {
                     std::thread::sleep(Duration::from_millis(5));
                 }
@@ -7749,6 +8021,11 @@ mod tests {
                     partial_job.elapsed(),
                 )
                 .is_none()
+        );
+        assert_eq!(
+            reopened.stats().misses - misses_before,
+            2,
+            "both decoded head and missing tail count as misses"
         );
         let mut partial_guard = partial_alloc.lock().unwrap();
         assert_eq!(partial_guard.num_free_blocks(), 2);

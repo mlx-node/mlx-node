@@ -32,6 +32,179 @@ use crate::engine::spec_paged::SpecTurnEpilogue;
 use crate::sampling;
 use crate::stream::{DeviceType, Stream};
 
+/// Before the first rejection, row i's history is exactly `history + drafts[..i]`.
+/// Prepare every deterministic decision from that prefix, then cross the device
+/// boundary once. Decisions after the first mismatch are discarded. This must
+/// not be used for stochastic acceptance, whose residual draws are sequential.
+fn penalized_greedy_accept(
+    logits: &MxArray,
+    drafts: &[i32],
+    history: &[u32],
+    params: &ChatParams,
+) -> Result<(usize, u32)> {
+    let vocab = logits.shape_at(2)?;
+    let mut prefix = history.to_vec();
+    let mut decisions = Vec::with_capacity(drafts.len() + 1);
+    for i in 0..=drafts.len() {
+        let row = logits
+            .slice(&[0, i as i64, 0], &[1, i as i64 + 1, vocab])?
+            .squeeze(Some(&[0, 1]))?;
+        decisions.push(apply_all_penalties(row, &prefix, params)?.argmax(0, None)?);
+        if let Some(&draft) = drafts.get(i) {
+            prefix.push(draft as u32);
+        }
+    }
+    MxArray::eval_arrays_with_context(
+        &decisions.iter().collect::<Vec<_>>(),
+        "speculative_greedy_accept",
+    )?;
+    for (i, decision) in decisions.iter().enumerate() {
+        let target = decision.item_at_int32(0)?;
+        if drafts.get(i) != Some(&target) {
+            return Ok((i, target as u32));
+        }
+    }
+    unreachable!("the bonus row has no corresponding draft")
+}
+
+/// Shared whole-turn and scheduler acceptance. Probability/penalty work stays
+/// on device; only proposal and boundary token ids cross to the engine.
+pub(crate) fn accept_dspark_proposal(
+    logits: &MxArray,
+    proposal: &DsparkProposal,
+    hist: &[u32],
+    p: &ChatParams,
+    rng: &mut dyn rand::Rng,
+) -> Result<(usize, u32)> {
+    let draft_len = proposal.draft_ids.len();
+    if logits.ndim()? != 3
+        || logits.shape_at(0)? != 1
+        || logits.shape_at(1)? != (draft_len + 1) as i64
+    {
+        return Err(Error::from_reason(
+            "speculative verifier logits do not match proposal width",
+        ));
+    }
+    // Turn-constant accept-policy gates (params are fixed for the turn).
+    // At GREEDY temperature acceptance is ALWAYS argmax-based and never
+    // reads proposal dists or consumes RNG (the DsparkProposal contract
+    // ships empty `draft_dists` there); `penalties_no_op` only selects
+    // between the batched-argmax fast path and the per-row penalized-argmax
+    // path. This matches `run_mtp_cycle`'s T=0-with-penalties behavior: its
+    // legacy dense branch feeds the PENALIZED row into
+    // `accept_with_residual`, whose T=0 shortcut reduces to exactly
+    // "penalized argmax == draft id" with an argmax boundary.
+    let temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
+    let sampling_cfg = p.sampling_config.unwrap_or_default();
+    let penalties_no_op =
+        p.repetition_penalty == 1.0 && p.presence_penalty == 0.0 && p.frequency_penalty == 0.0;
+    let greedy_temp = sampling::is_greedy_temperature(temperature);
+    let greedy_fast = greedy_temp && penalties_no_op;
+
+    if greedy_fast {
+        // Greedy fast path (penalties no-op): ONE batched argmax over
+        // all 1+L rows, a single eval, then CPU reads. No RNG consumed
+        // (mirrors `accept_with_residual`'s T=0 shortcut).
+        (|| {
+            let argmax_arr = logits.argmax(-1, None)?;
+            argmax_arr.eval();
+            let mut target_argmax: Vec<i32> = Vec::with_capacity(draft_len + 1);
+            for i in 0..=draft_len {
+                target_argmax.push(argmax_arr.item_at_int32(i)?);
+            }
+            let mut k = 0usize;
+            while k < draft_len && target_argmax[k] == proposal.draft_ids[k] {
+                k += 1;
+            }
+            Ok((k, target_argmax[k] as u32))
+        })()
+    } else if greedy_temp {
+        penalized_greedy_accept(logits, &proposal.draft_ids, hist, p)
+    } else {
+        // Sampled path: per-position Leviathan accept + residual
+        // resample against the stepper's proposal densities.
+        (|| {
+            // A zero-draft cycle is the intentional AR-through-verify
+            // fallback: it owns no proposal rows and samples only the
+            // verifier boundary below. Enforce exclusive dense/sparse
+            // proposal ownership only when there is a drafted token.
+            let has_dense = draft_len > 0 && proposal.draft_dists.len() == draft_len;
+            let has_sparse = draft_len > 0 && proposal.draft_sparse_dists.len() == draft_len;
+            if draft_len > 0 && has_dense == has_sparse {
+                return Err(Error::from_reason(format!(
+                    "DSpark sampled accept requires exactly one dense or sparse proposal \
+                         distribution per drafted token (got {} dense, {} sparse for {} drafts)",
+                    proposal.draft_dists.len(),
+                    proposal.draft_sparse_dists.len(),
+                    draft_len
+                )));
+            }
+            let vocab = logits.shape_at(2)?;
+            let mut hist_extended: Vec<u32> = hist.to_vec();
+            // Up to the first rejection, the history is the known draft
+            // prefix. Construct deterministic target distributions together
+            // without drawing acceptance coins or residual samples early.
+            let mut targets = Vec::with_capacity(draft_len);
+            for i in 0..draft_len {
+                let v_slice = logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+                let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
+                let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
+                targets.push(
+                    sampling::sampling_distribution(&penalized, p.sampling_config)?
+                        .astype(DType::Float32)?,
+                );
+                hist_extended.push(proposal.draft_ids[i] as u32);
+            }
+            let roots = targets
+                .iter()
+                .chain(proposal.draft_dists.iter())
+                .collect::<Vec<_>>();
+            MxArray::eval_arrays_with_context(&roots, "speculative_sampled_accept")?;
+            let mut k = 0usize;
+            let mut boundary: Option<u32> = None;
+            for (i, p_target) in targets.iter().enumerate() {
+                let (accept, out_tok) = if has_sparse {
+                    sampling::accept_with_residual_dense_target_sparse_draft(
+                        p_target,
+                        proposal.draft_sparse_dists[i].as_row(),
+                        proposal.draft_ids[i],
+                        rng,
+                    )?
+                } else {
+                    sampling::accept_with_residual(
+                        p_target,
+                        &proposal.draft_dists[i],
+                        proposal.draft_ids[i],
+                        &sampling_cfg,
+                        rng,
+                    )?
+                };
+                if accept {
+                    k += 1;
+                } else {
+                    boundary = Some(out_tok as u32);
+                    break;
+                }
+            }
+            let boundary_id = match boundary {
+                Some(b) => b,
+                None => {
+                    // All L drafts accepted: bonus sample from row L.
+                    let i = draft_len;
+                    let v_slice = logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
+                    let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
+                    let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
+                    let distribution =
+                        sampling::sampling_distribution(&penalized, p.sampling_config)?
+                            .astype(DType::Float32)?;
+                    sampling::sample_dense_distribution(&distribution, rng)? as u32
+                }
+            };
+            Ok((k, boundary_id))
+        })()
+    }
+}
+
 /// Required arguments of [`run_dspark_turn`] — the DSpark analog of
 /// [`crate::engine::mtp_turn::MtpTurnArgs`], minus the MTP-only
 /// prompt-hidden seed fields (the DSpark stepper owns its draft-context
@@ -89,11 +262,106 @@ pub(crate) struct DsparkTurnOutcome {
 
 /// In-cycle stop resolved by the pre-commit stop-clamp. Reason strings
 /// byte-match `run_mtp_turn`'s.
-enum CycleStop {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CycleStop {
     Length,
     Stop,
     Cancelled,
     Repetition(&'static str),
+}
+
+pub(crate) struct DsparkCycleDecision {
+    pub emit_count: usize,
+    pub keep: usize,
+    pub stop: Option<CycleStop>,
+}
+
+/// Resolve every stop before committing any verifier row. The engine invokes
+/// observers here exactly once, then emits the already-checked prefix.
+pub(crate) fn clamp_dspark_cycle(
+    generated: &[u32],
+    accepted: &[u32],
+    accepted_drafts_k: usize,
+    p: &ChatParams,
+    max_as_usize: usize,
+    eos_id: u32,
+    mut cancelled: impl FnMut() -> bool,
+    mut observe: impl FnMut(u32) -> bool,
+) -> DsparkCycleDecision {
+    let mut emit_count: usize = 0;
+    let mut stop: Option<CycleStop> = None;
+    {
+        let mut sim: Vec<u32> = Vec::with_capacity(generated.len() + accepted.len());
+        sim.extend_from_slice(generated);
+        for (idx, &tok) in accepted.iter().enumerate() {
+            // Defensive: with the over-return check above, a cycle
+            // emits at most `l_cap + 1 <= remaining` tokens, so this
+            // budget arm is unreachable for compliant flows. Kept for
+            // byte-parity with mtp's emit-loop guard and as
+            // defense-in-depth against future L_cap-math regressions.
+            if sim.len() >= max_as_usize {
+                stop = Some(CycleStop::Length);
+                break;
+            }
+            sim.push(tok);
+            emit_count = idx + 1;
+            // H2: `turn_cancelled()` extends the SAME stop-clamp poll
+            // to sync turns; the streaming read is kept so streaming
+            // behavior never depends on `cancel_flag` also being wired.
+            if cancelled() {
+                stop = Some(CycleStop::Cancelled);
+                break;
+            }
+            if observe(tok) {
+                stop = Some(CycleStop::Stop);
+                break;
+            }
+            if tok == eos_id || p.extra_eos_ids.contains(&tok) {
+                stop = Some(CycleStop::Stop);
+                break;
+            }
+            if let Some(reason_str) = crate::sampling::check_repetition_cutoff(
+                &sim,
+                p.max_consecutive_tokens,
+                p.max_ngram_repeats,
+                p.ngram_size,
+            ) {
+                stop = Some(CycleStop::Repetition(reason_str));
+                break;
+            }
+        }
+    }
+
+    // Anchor's K/V was written at verify position 0; the boundary has
+    // NO K/V (it becomes the next cycle's anchor), so it never counts
+    // toward `keep` — hence `min(emit_count, k)` counts only kept
+    // accepted-draft slots.
+    //
+    // AR-PARITY on in-cycle stops: an in-cycle stop token (EOS /
+    // cancel-observed / repetition-tripping — always the LAST emitted
+    // token) is NEVER committed to the target cache. The AR reference
+    // never forwards its final token on a non-length stop and the
+    // family saves drop it from the persisted history, so keeping its
+    // slot here would leave the speculative session one K/V (and one
+    // history token, via `last_in_cache`) AHEAD of the AR session for
+    // the same transcript. When the clamp cut at an ACCEPTED DRAFT
+    // (`emit_count <= k` — Stop/Cancelled/Repetition always follow a
+    // push, so `emit_count >= 1` there), exclude the tripping token's
+    // slot; a boundary-stop cut changes nothing (no slot to exclude).
+    let kept_drafts = match stop {
+        Some(CycleStop::Stop) | Some(CycleStop::Cancelled) | Some(CycleStop::Repetition(_))
+            if emit_count <= accepted_drafts_k =>
+        {
+            emit_count.saturating_sub(1)
+        }
+        _ => emit_count.min(accepted_drafts_k),
+    };
+    let keep = 1 + kept_drafts;
+    DsparkCycleDecision {
+        emit_count,
+        keep,
+        stop,
+    }
 }
 
 /// Number of real speculative cycles used to compare DSpark against one
@@ -383,12 +651,24 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
     let adaptive_ar_fallback = p.mtp_adaptive_depth
         && step.supports_adaptive_ar_fallback()
         && calibration_available_remaining >= calibration_required_remaining;
-    let mut break_even = DsparkBreakEvenPolicy::new(adaptive_ar_fallback);
+    // Later Markov confidence rows depend on earlier sampled proposals. A
+    // global optimum selected from those rows would condition q on its own
+    // sample. Keep this optimizer greedy-only; stochastic turns retain the
+    // history-based break-even guard and exact rejection probabilities.
+    let mut verification_budget = (adaptive_ar_fallback
+        && step.supports_adaptive_verification()
+        && sampling::is_greedy_temperature(
+            p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0),
+        ))
+    .then(|| super::verification_budget::VerificationBudget::new(calibration_draft_cap));
+    step.set_adaptive_verification(verification_budget.is_some());
+    let mut break_even =
+        DsparkBreakEvenPolicy::new(adaptive_ar_fallback && verification_budget.is_none());
     if adaptive_ar_fallback {
         tracing::info!(
             target: "mlx_core::inference",
             event = "dspark_break_even_calibration_started",
-            speculative_probe_cycles = DSPARK_BREAK_EVEN_SPEC_CYCLES,
+            speculative_probe_cycles = if verification_budget.is_some() { 3 } else { DSPARK_BREAK_EVEN_SPEC_CYCLES },
             draft_cap = calibration_draft_cap,
             required_remaining_tokens = calibration_required_remaining,
             available_remaining_tokens = calibration_available_remaining,
@@ -396,22 +676,6 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             "DSpark break-even calibration started"
         );
     }
-
-    // Turn-constant accept-policy gates (params are fixed for the turn).
-    // At GREEDY temperature acceptance is ALWAYS argmax-based and never
-    // reads proposal dists or consumes RNG (the DsparkProposal contract
-    // ships empty `draft_dists` there); `penalties_no_op` only selects
-    // between the batched-argmax fast path and the per-row penalized-argmax
-    // path. This matches `run_mtp_cycle`'s T=0-with-penalties behavior: its
-    // legacy dense branch feeds the PENALIZED row into
-    // `accept_with_residual`, whose T=0 shortcut reduces to exactly
-    // "penalized argmax == draft id" with an argmax boundary.
-    let temperature = p.sampling_config.and_then(|c| c.temperature).unwrap_or(1.0);
-    let sampling_cfg = p.sampling_config.unwrap_or_default();
-    let penalties_no_op =
-        p.repetition_penalty == 1.0 && p.presence_penalty == 0.0 && p.frequency_penalty == 0.0;
-    let greedy_temp = sampling::is_greedy_temperature(temperature);
-    let greedy_fast = greedy_temp && penalties_no_op;
 
     // DELIBERATE DIVERGENCE from `run_mtp_turn`: cancellation is checked at
     // the cycle top and inside the pre-commit stop-clamp, NOT per emitted
@@ -480,7 +744,27 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // budget slot: a cycle emits at most `L + 1` tokens.
         let remaining: usize = max_as_usize.saturating_sub(generated.len());
         let normal_l_cap: usize = block_size.min(p.mtp_depth).min(remaining.saturating_sub(1));
-        let (mut l_cap, mut measurement_cycle) = break_even.plan_cycle(normal_l_cap);
+        if let Some(policy) = verification_budget.as_mut() {
+            policy.observe_context(hist.len());
+        }
+        let (mut l_cap, mut measurement_cycle) = if let Some(policy) = &verification_budget {
+            if policy.is_fallback() {
+                (0, DsparkMeasurementCycle::None)
+            } else if let Some(cap) = policy.calibration_cap(normal_l_cap) {
+                (
+                    cap,
+                    if cap == 0 {
+                        DsparkMeasurementCycle::ArProbe
+                    } else {
+                        DsparkMeasurementCycle::SpecProbe
+                    },
+                )
+            } else {
+                (normal_l_cap, DsparkMeasurementCycle::None)
+            }
+        } else {
+            break_even.plan_cycle(normal_l_cap)
+        };
 
         // Per-cycle speculative admission: every committed token moves the
         // frontier, so the lookahead region is re-reserved for THIS cycle (a
@@ -504,7 +788,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // `L_cap == 0` (remaining == 1): skip propose entirely — the cycle
         // degenerates to a single AR step THROUGH verify (verify_ids =
         // [anchor] only), keeping the anchor's K/V write on the one path.
-        let proposal = if l_cap >= 1 {
+        let mut proposal = if l_cap >= 1 {
             profiler.begin("dspark_propose");
             let res = step.propose(anchor, l_cap, p, rng);
             profiler.end();
@@ -514,6 +798,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 draft_ids: Vec::new(),
                 draft_dists: Vec::new(),
                 draft_sparse_dists: Vec::new(),
+                keep_probabilities: None,
             }
         };
         // Contract enforcement at the proposal boundary: `propose` may
@@ -523,14 +808,30 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // the stop-clamp runs AFTER verify so it cannot un-write those
         // slots — a hard error surfaces the stepper bug instead of masking
         // it.
-        let draft_len = proposal.draft_ids.len();
-        if draft_len > l_cap {
+        let proposed_len = proposal.draft_ids.len();
+        if proposed_len > l_cap {
             return Err(Error::from_reason(format!(
-                "DSpark propose over-returned: {draft_len} draft tokens for a cap of {l_cap} \
+                "DSpark propose over-returned: {proposed_len} draft tokens for a cap of {l_cap} \
                  (the DsparkStepper::propose contract allows fewer, never more)"
             )));
         }
 
+        let proposal_ns = cycle_started_at
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
+        if measurement_cycle == DsparkMeasurementCycle::None
+            && proposed_len > 0
+            && let (Some(policy), Some(confidence)) =
+                (&mut verification_budget, &proposal.keep_probabilities)
+            && let Some(keep) = policy.choose(confidence, proposal_ns)
+        {
+            if keep == 0 {
+                step.enter_ar_fallback()?;
+            }
+            proposal.truncate(keep);
+        }
+        let draft_len = proposal.draft_ids.len();
         let mut verify_ids: Vec<u32> = Vec::with_capacity(1 + draft_len);
         verify_ids.push(anchor);
         verify_ids.extend(proposal.draft_ids.iter().map(|&id| id as u32));
@@ -542,8 +843,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // timer immediately before that method: target graph construction and
         // dispatch, GPU force, and sampling are measured; only draft-context
         // fusion in `commit_ar_probe` remains outside it.
+        let verify_started_at = Instant::now();
         let ar_probe_started_at =
-            (measurement_cycle == DsparkMeasurementCycle::ArProbe).then(Instant::now);
+            (measurement_cycle == DsparkMeasurementCycle::ArProbe).then_some(verify_started_at);
         let verify_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
             step.verify_ar_probe(anchor)
         } else {
@@ -556,141 +858,13 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // Acceptance: `k` accepted drafts (prefix of `draft_ids`) + ONE
         // boundary token (bonus on full accept, residual on rejection).
         profiler.begin("dspark_accept");
-        let accept_res: Result<(usize, u32)> = if greedy_fast {
-            // Greedy fast path (penalties no-op): ONE batched argmax over
-            // all 1+L rows, a single eval, then CPU reads. No RNG consumed
-            // (mirrors `accept_with_residual`'s T=0 shortcut).
-            (|| {
-                let argmax_arr = logits.argmax(-1, None)?;
-                argmax_arr.eval();
-                let mut target_argmax: Vec<i32> = Vec::with_capacity(draft_len + 1);
-                for i in 0..=draft_len {
-                    target_argmax.push(argmax_arr.item_at_int32(i)?);
-                }
-                let mut k = 0usize;
-                while k < draft_len && target_argmax[k] == proposal.draft_ids[k] {
-                    k += 1;
-                }
-                Ok((k, target_argmax[k] as u32))
-            })()
-        } else if greedy_temp {
-            // Penalized-greedy path (T=0 with active penalties): per-row
-            // `apply_all_penalties` over the sequentially extended history,
-            // then a plain argmax decides accept/boundary. No proposal
-            // dists, no RNG — behaviorally identical to `run_mtp_cycle`'s
-            // legacy dense branch at T=0, where `accept_with_residual`'s
-            // argmax shortcut reads the penalized row and the bonus
-            // `sample(penalized)` degenerates to its argmax.
-            (|| {
-                let vocab = logits.shape_at(2)?;
-                let mut hist_extended: Vec<u32> = hist.clone();
-                let mut k = 0usize;
-                let mut boundary: Option<u32> = None;
-                for i in 0..draft_len {
-                    let v_slice = logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-                    let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
-                    let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
-                    let argmax_arr = penalized.argmax(0, None)?;
-                    argmax_arr.eval();
-                    let target_id = argmax_arr.item_at_int32(0)?;
-                    if target_id == proposal.draft_ids[i] {
-                        k += 1;
-                        hist_extended.push(target_id as u32);
-                    } else {
-                        boundary = Some(target_id as u32);
-                        break;
-                    }
-                }
-                let boundary_id = match boundary {
-                    Some(b) => b,
-                    None => {
-                        // All L drafts accepted: boundary = penalized
-                        // argmax of row L.
-                        let i = draft_len;
-                        let v_slice =
-                            logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-                        let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
-                        let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
-                        let argmax_arr = penalized.argmax(0, None)?;
-                        argmax_arr.eval();
-                        argmax_arr.item_at_int32(0)? as u32
-                    }
-                };
-                Ok((k, boundary_id))
-            })()
-        } else {
-            // Sampled path: per-position Leviathan accept + residual
-            // resample against the stepper's proposal densities.
-            (|| {
-                // A zero-draft cycle is the intentional AR-through-verify
-                // fallback: it owns no proposal rows and samples only the
-                // verifier boundary below. Enforce exclusive dense/sparse
-                // proposal ownership only when there is a drafted token.
-                let has_dense = draft_len > 0 && proposal.draft_dists.len() == draft_len;
-                let has_sparse = draft_len > 0 && proposal.draft_sparse_dists.len() == draft_len;
-                if draft_len > 0 && has_dense == has_sparse {
-                    return Err(Error::from_reason(format!(
-                        "DSpark sampled accept requires exactly one dense or sparse proposal \
-                         distribution per drafted token (got {} dense, {} sparse for {} drafts)",
-                        proposal.draft_dists.len(),
-                        proposal.draft_sparse_dists.len(),
-                        draft_len
-                    )));
-                }
-                let vocab = logits.shape_at(2)?;
-                let mut hist_extended: Vec<u32> = hist.clone();
-                let mut k = 0usize;
-                let mut boundary: Option<u32> = None;
-                for i in 0..draft_len {
-                    let v_slice = logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-                    let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
-                    let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
-                    let p_target = sampling::sampling_distribution(&penalized, p.sampling_config)?
-                        .astype(DType::Float32)?;
-                    p_target.eval();
-                    let (accept, out_tok) = if has_sparse {
-                        sampling::accept_with_residual_dense_target_sparse_draft(
-                            &p_target,
-                            proposal.draft_sparse_dists[i].as_row(),
-                            proposal.draft_ids[i],
-                            rng,
-                        )?
-                    } else {
-                        sampling::accept_with_residual(
-                            &p_target,
-                            &proposal.draft_dists[i],
-                            proposal.draft_ids[i],
-                            &sampling_cfg,
-                            rng,
-                        )?
-                    };
-                    if accept {
-                        k += 1;
-                        hist_extended.push(out_tok as u32);
-                    } else {
-                        boundary = Some(out_tok as u32);
-                        break;
-                    }
-                }
-                let boundary_id = match boundary {
-                    Some(b) => b,
-                    None => {
-                        // All L drafts accepted: bonus sample from row L.
-                        let i = draft_len;
-                        let v_slice =
-                            logits.slice(&[0, i as i64, 0], &[1, (i + 1) as i64, vocab])?;
-                        let v_1d = v_slice.squeeze(Some(&[0, 1]))?;
-                        let penalized = apply_all_penalties(v_1d, &hist_extended, p)?;
-                        let bonus = sampling::sample(&penalized, p.sampling_config)?;
-                        bonus.eval();
-                        bonus.item_at_int32(0)? as u32
-                    }
-                };
-                Ok((k, boundary_id))
-            })()
-        };
+        let accept_res = accept_dspark_proposal(&logits, &proposal, hist, p, rng);
         profiler.end();
         let (accepted_drafts_k, boundary_id) = accept_res?;
+        let verify_ns = verify_started_at
+            .elapsed()
+            .as_nanos()
+            .min(u128::from(u64::MAX)) as u64;
         // Acceptance's token read has now fully forced the target graph.
         // AR measures from immediately before its dedicated target forward;
         // speculative probes retain the whole-cycle propose+verify timer.
@@ -718,82 +892,30 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // EOS/repetition/cancel cuts are INCLUSIVE of the tripping token;
         // the budget cut is EXCLUSIVE (mtp checks the budget before the
         // push).
-        let mut emit_count: usize = 0;
-        let mut stop: Option<CycleStop> = None;
-        {
-            let mut sim: Vec<u32> = Vec::with_capacity(generated.len() + accepted.len());
-            sim.extend_from_slice(generated);
-            for (idx, &tok) in accepted.iter().enumerate() {
-                // Defensive: with the over-return check above, a cycle
-                // emits at most `l_cap + 1 <= remaining` tokens, so this
-                // budget arm is unreachable for compliant flows. Kept for
-                // byte-parity with mtp's emit-loop guard and as
-                // defense-in-depth against future L_cap-math regressions.
-                if sim.len() >= max_as_usize {
-                    stop = Some(CycleStop::Length);
-                    break;
-                }
-                sim.push(tok);
-                emit_count = idx + 1;
-                // H2: `turn_cancelled()` extends the SAME stop-clamp poll
-                // to sync turns; the streaming read is kept so streaming
-                // behavior never depends on `cancel_flag` also being wired.
-                if turn_cancelled()
+        let DsparkCycleDecision {
+            emit_count,
+            keep,
+            stop,
+        } = clamp_dspark_cycle(
+            generated,
+            &accepted,
+            accepted_drafts_k,
+            p,
+            max_as_usize,
+            eos_id,
+            || {
+                turn_cancelled()
                     || streaming
                         .as_ref()
                         .is_some_and(|s| s.cancelled.load(Ordering::Relaxed))
-                {
-                    stop = Some(CycleStop::Cancelled);
-                    break;
-                }
-                if turn_token_observer
+            },
+            |token| {
+                turn_token_observer
                     .as_deref_mut()
-                    .is_some_and(|observer| observer.observe_token_id(tok))
-                {
-                    stop = Some(CycleStop::Stop);
-                    break;
-                }
-                if tok == eos_id || p.extra_eos_ids.contains(&tok) {
-                    stop = Some(CycleStop::Stop);
-                    break;
-                }
-                if let Some(reason_str) = crate::sampling::check_repetition_cutoff(
-                    &sim,
-                    p.max_consecutive_tokens,
-                    p.max_ngram_repeats,
-                    p.ngram_size,
-                ) {
-                    stop = Some(CycleStop::Repetition(reason_str));
-                    break;
-                }
-            }
-        }
-
-        // Anchor's K/V was written at verify position 0; the boundary has
-        // NO K/V (it becomes the next cycle's anchor), so it never counts
-        // toward `keep` — hence `min(emit_count, k)` counts only kept
-        // accepted-draft slots.
-        //
-        // AR-PARITY on in-cycle stops: an in-cycle stop token (EOS /
-        // cancel-observed / repetition-tripping — always the LAST emitted
-        // token) is NEVER committed to the target cache. The AR reference
-        // never forwards its final token on a non-length stop and the
-        // family saves drop it from the persisted history, so keeping its
-        // slot here would leave the speculative session one K/V (and one
-        // history token, via `last_in_cache`) AHEAD of the AR session for
-        // the same transcript. When the clamp cut at an ACCEPTED DRAFT
-        // (`emit_count <= k` — Stop/Cancelled/Repetition always follow a
-        // push, so `emit_count >= 1` there), exclude the tripping token's
-        // slot; a boundary-stop cut changes nothing (no slot to exclude).
-        let kept_drafts = match stop {
-            Some(CycleStop::Stop) | Some(CycleStop::Cancelled) | Some(CycleStop::Repetition(_))
-                if emit_count <= accepted_drafts_k =>
-            {
-                emit_count.saturating_sub(1)
-            }
-            _ => emit_count.min(accepted_drafts_k),
-        };
-        let keep = 1 + kept_drafts;
+                    .is_some_and(|observer| observer.observe_token_id(token))
+            },
+        );
+        let kept_drafts = keep - 1;
         profiler.begin("dspark_commit");
         let commit_res = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
             if keep != 1 || draft_len != 0 {
@@ -819,6 +941,9 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                     // speculative probes, but deliberately exclude that
                     // draft-only calibration cost from target-AR throughput.
                     step.materialize_adaptive_state()?;
+                    if let Some(policy) = verification_budget.as_mut() {
+                        policy.record(0, verify_ns);
+                    }
                     break_even.record_cycle(
                         measurement_cycle,
                         precommit_wall_ns,
@@ -830,6 +955,18 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                     // eval, MLX would charge it to the next proposal and make
                     // the two probe timings order-dependent.
                     step.materialize_adaptive_state()?;
+                    if let Some(policy) = verification_budget.as_mut() {
+                        // Include rollback, durable settlement and this cycle's
+                        // context append. Only calibration forces this boundary;
+                        // steady-state proposals retain their asynchronous graph.
+                        policy.record(
+                            draft_len,
+                            verify_started_at
+                                .elapsed()
+                                .as_nanos()
+                                .min(u128::from(u64::MAX)) as u64,
+                        );
+                    }
                     let wall_ns = cycle_started_at
                         .elapsed()
                         .as_nanos()
@@ -1227,7 +1364,8 @@ mod tests {
 
     use super::{
         DSPARK_BREAK_EVEN_SPEC_CYCLES, DsparkBreakEvenChoice, DsparkBreakEvenPolicy,
-        DsparkMeasurementCycle, DsparkTurnArgs, run_dspark_turn,
+        DsparkMeasurementCycle, DsparkTurnArgs, apply_all_penalties, penalized_greedy_accept,
+        run_dspark_turn,
     };
 
     #[test]
@@ -1496,6 +1634,7 @@ mod tests {
                 draft_ids: script.draft_ids.clone(),
                 draft_dists,
                 draft_sparse_dists: Vec::new(),
+                keep_probabilities: None,
             })
         }
 
@@ -2410,6 +2549,133 @@ mod tests {
             "hard error fires before verify — no target-cache slots written"
         );
         assert_eq!(raw.generated, vec![3], "only the seed was committed");
+    }
+
+    fn serial_penalized_accept(
+        logits: &MxArray,
+        drafts: &[i32],
+        history: &[u32],
+        p: &ChatParams,
+    ) -> Result<(usize, u32)> {
+        let mut history = history.to_vec();
+        let vocab = logits.shape_at(2)?;
+        for i in 0..=drafts.len() {
+            let row = logits
+                .slice(&[0, i as i64, 0], &[1, i as i64 + 1, vocab])?
+                .squeeze(Some(&[0, 1]))?;
+            let decision = apply_all_penalties(row, &history, p)?.argmax(0, None)?;
+            decision.eval();
+            let token = decision.item_at_int32(0)?;
+            if drafts.get(i) != Some(&token) {
+                return Ok((i, token as u32));
+            }
+            history.push(token as u32);
+        }
+        unreachable!()
+    }
+
+    #[test]
+    fn grouped_penalized_accept_matches_sequential_at_every_rejection_frontier() {
+        let history = [1, 2, 1, 3, 4, 1];
+        for context in [1, 2, 3, 20] {
+            let mut p = greedy_params();
+            p.repetition_penalty = 1.4;
+            p.presence_penalty = 0.3;
+            p.frequency_penalty = 0.2;
+            p.repetition_context_size = context;
+            p.presence_context_size = context;
+            p.frequency_context_size = context;
+            for len in 0..=5 {
+                let logits = MxArray::from_float32(
+                    &(0..(len + 1) * 16)
+                        .map(|i| ((i * 13) % 23) as f32 / 7.0 - 1.0)
+                        .collect::<Vec<_>>(),
+                    &[1, len as i64 + 1, 16],
+                )
+                .unwrap();
+                let mut drafts = Vec::new();
+                for _ in 0..len {
+                    let (_, next) =
+                        serial_penalized_accept(&logits, &drafts, &history, &p).unwrap();
+                    drafts.push(next as i32);
+                }
+                for rejection in 0..=len {
+                    let mut proposal = drafts.clone();
+                    if rejection < len {
+                        proposal[rejection] = (proposal[rejection] + 1) % 16;
+                    }
+                    let expected =
+                        serial_penalized_accept(&logits, &proposal, &history, &p).unwrap();
+                    assert_eq!(expected.0, rejection);
+                    assert_eq!(
+                        penalized_greedy_accept(&logits, &proposal, &history, &p).unwrap(),
+                        expected,
+                        "context={context}, len={len}, rejection={rejection}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual control-flow microbenchmark; run in release with --nocapture"]
+    fn benchmark_penalized_accept_completion() {
+        use std::time::Instant;
+        const VOCAB: i64 = 32_000;
+        let mut p = greedy_params();
+        p.repetition_penalty = 1.2;
+        p.repetition_context_size = 256;
+        let history: Vec<u32> = (0..256).collect();
+        for len in [1, 3, 7] {
+            let logits = MxArray::from_float32(
+                &(0..(len + 1) * VOCAB as usize)
+                    .map(|i| ((i * 13) % 193) as f32 / 71.0)
+                    .collect::<Vec<_>>(),
+                &[1, len as i64 + 1, VOCAB],
+            )
+            .unwrap();
+            logits.eval();
+            let mut drafts = Vec::new();
+            for _ in 0..len {
+                drafts.push(
+                    serial_penalized_accept(&logits, &drafts, &history, &p)
+                        .unwrap()
+                        .1 as i32,
+                );
+            }
+            for reject_first in [false, true] {
+                let mut proposal = drafts.clone();
+                if reject_first {
+                    proposal[0] = (proposal[0] + 1) % VOCAB as i32;
+                }
+                let mut times = [Vec::new(), Vec::new()];
+                for round in 0..8 {
+                    for mode in [round % 2, 1 - round % 2] {
+                        let start = Instant::now();
+                        for _ in 0..100 {
+                            let out = if mode == 0 {
+                                serial_penalized_accept(&logits, &proposal, &history, &p)
+                            } else {
+                                penalized_greedy_accept(&logits, &proposal, &history, &p)
+                            };
+                            std::hint::black_box(out.unwrap());
+                        }
+                        if round > 0 {
+                            times[mode].push(start.elapsed().as_secs_f64() * 10_000.0);
+                        }
+                    }
+                }
+                for t in &mut times {
+                    t.sort_by(f64::total_cmp);
+                }
+                println!(
+                    "ACCEPT_BENCH drafts={len} reject_first={reject_first} serial_us={:.2} grouped_us={:.2} speedup={:.3}",
+                    times[0][3],
+                    times[1][3],
+                    times[0][3] / times[1][3]
+                );
+            }
+        }
     }
 
     #[test]

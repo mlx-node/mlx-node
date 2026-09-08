@@ -51,6 +51,8 @@ pub(crate) struct TurnState<P> {
     pub num_computed_tokens: u32,
     pub num_tokens: u32,
     pub prompt_tokens: u32,
+    /// Maximum additional hypothetical query rows; never part of token_history.
+    pub decode_draft_allowance: u32,
     pub pinned_prefill_breaks: Vec<u32>,
     pub token_history: Vec<u32>,
     pub status: TurnStatus,
@@ -177,6 +179,7 @@ impl<P> TurnState<P> {
             num_computed_tokens,
             num_tokens: prompt_tokens,
             prompt_tokens,
+            decode_draft_allowance: 0,
             pinned_prefill_breaks,
             token_history,
             status: TurnStatus::Waiting,
@@ -392,10 +395,17 @@ pub(crate) struct StepPlan {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SpeculativeRowResult {
+    pub verified_tokens: u32,
+    pub generated_tokens: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct RowStepResult {
     pub seq_id: SeqId,
     pub num_computed_tokens: u32,
     pub generated_token: Option<u32>,
+    pub speculative: Option<SpeculativeRowResult>,
     pub finished: bool,
     /// The row made no progress because its lazy block growth could not be
     /// satisfied. This is scheduler policy, not a terminal model error.
@@ -1097,13 +1107,25 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             turn.snapshot_cancel();
         }
         let mut budget = self.max_num_batched_tokens;
-        let mut rows = Vec::with_capacity(self.running.len());
+        let mut rows: Vec<StepRow> = Vec::with_capacity(self.running.len());
         // Decode-first is a priority within ONE phase-free plan, not a decode
         // queue. Every row's kind is still derived from token progress. This
         // matches vLLM v1's running-first budget shape and prevents a long
         // newly admitted prefill from consuming the step budget ahead of an
         // already interactive decode row.
         for planned_kind in [StepKind::Decode, StepKind::Prefill] {
+            if planned_kind == StepKind::Prefill {
+                for row in &mut rows {
+                    let turn = self
+                        .running
+                        .iter()
+                        .find(|turn| turn.seq_id == row.seq_id)
+                        .unwrap();
+                    let extra = turn.decode_draft_allowance.min(budget);
+                    row.num_tokens += extra;
+                    budget -= extra;
+                }
+            }
             for turn in &self.running {
                 if budget == 0 || turn.status != TurnStatus::Running {
                     continue;
@@ -1268,9 +1290,24 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                 if output.num_computed_tokens != 0
                     || output.generated_token.is_some()
                     || output.finished
+                    || output.speculative.is_some()
                 {
                     return Err(format!(
                         "blocked executor row {} must report zero progress and remain live",
+                        output.seq_id
+                    ));
+                }
+            } else if let Some(spec) = &output.speculative {
+                if planned.kind != StepKind::Decode
+                    || spec.verified_tokens > planned.num_tokens
+                    || output.num_computed_tokens > spec.verified_tokens
+                    || output.generated_token.is_some()
+                    || (!output.finished
+                        && (spec.generated_tokens.len() != output.num_computed_tokens as usize
+                            || output.num_computed_tokens == 0))
+                {
+                    return Err(format!(
+                        "invalid speculative progress for request {}",
                         output.seq_id
                     ));
                 }
@@ -1285,6 +1322,14 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                 .iter()
                 .find(|turn| turn.seq_id == output.seq_id)
                 .ok_or_else(|| format!("executor returned unknown row {}", output.seq_id))?;
+            if output.speculative.is_some()
+                && turn.num_tokens != turn.num_computed_tokens.saturating_add(1)
+            {
+                return Err(format!(
+                    "speculative request {} must have exactly one pending anchor",
+                    turn.seq_id
+                ));
+            }
             if output.generated_token.is_some()
                 && turn
                     .num_computed_tokens
@@ -1318,6 +1363,16 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
                     .num_tokens
                     .checked_add(1)
                     .ok_or_else(|| format!("request {} token-count overflow", turn.seq_id))?;
+            }
+            if let Some(spec) = output.speculative {
+                turn.num_tokens = turn
+                    .num_tokens
+                    .checked_add(
+                        u32::try_from(spec.generated_tokens.len())
+                            .map_err(|_| "speculative output length overflow")?,
+                    )
+                    .ok_or_else(|| format!("request {} token-count overflow", turn.seq_id))?;
+                turn.token_history.extend(spec.generated_tokens);
             }
             if output.finished {
                 turn.status = TurnStatus::Draining;
@@ -1394,6 +1449,7 @@ mod tests {
                         generated_token: (!self.allocation_blocked.contains(&row.seq_id))
                             .then_some(generated_token)
                             .flatten(),
+                        speculative: None,
                         finished: !self.allocation_blocked.contains(&row.seq_id)
                             && (self.finish.contains(&row.seq_id) || row.cancel_snapshot),
                         allocation_blocked: self.allocation_blocked.contains(&row.seq_id),
@@ -1477,6 +1533,80 @@ mod tests {
         assert_eq!(scheduler.running()[0].seq_id, 3);
         assert_eq!(scheduler.running()[1].seq_id, 1);
         assert_eq!(scheduler.running()[2].seq_id, 2);
+    }
+
+    #[test]
+    fn speculative_queries_share_budget_but_only_committed_rows_advance_history() {
+        let mut scheduler = Scheduler::<_, (), ()>::new(3, 7).unwrap();
+        for seq_id in 1..=3 {
+            let mut row = turn(seq_id, 4, &[4], None);
+            row.status = TurnStatus::Running;
+            row.token_history.push(8);
+            row.num_tokens += 1;
+            row.decode_draft_allowance = 4;
+            scheduler.running.push(row);
+        }
+        let plan = scheduler.build_plan();
+        assert_eq!(
+            plan.rows
+                .iter()
+                .map(|row| row.num_tokens)
+                .collect::<Vec<_>>(),
+            vec![5, 1, 1]
+        );
+        assert_eq!(plan.rows.iter().map(|row| row.num_tokens).sum::<u32>(), 7);
+        let result = StepResult {
+            rows: plan
+                .rows
+                .iter()
+                .map(|row| RowStepResult {
+                    seq_id: row.seq_id,
+                    num_computed_tokens: 1,
+                    generated_token: None,
+                    speculative: Some(SpeculativeRowResult {
+                        verified_tokens: row.num_tokens,
+                        generated_tokens: vec![9],
+                    }),
+                    finished: false,
+                    allocation_blocked: false,
+                    prefill_micros: 0,
+                })
+                .collect(),
+            executed_decode_batch: 3,
+            executed_greedy_epilogue_batch: 3,
+            rows_alloc_evicted: 0,
+        };
+        scheduler.apply_result(&plan, result).unwrap();
+        for row in scheduler.running() {
+            assert_eq!(row.num_computed_tokens, 5);
+            assert_eq!(row.num_tokens, 6);
+            assert_eq!(&row.token_history[4..], &[8, 9]);
+        }
+        let plan = scheduler.build_plan();
+        let before = scheduler.running()[0].token_history.clone();
+        let invalid = StepResult {
+            rows: plan
+                .rows
+                .iter()
+                .map(|row| RowStepResult {
+                    seq_id: row.seq_id,
+                    num_computed_tokens: 1,
+                    generated_token: None,
+                    speculative: Some(SpeculativeRowResult {
+                        verified_tokens: row.num_tokens,
+                        generated_tokens: vec![9, 10],
+                    }),
+                    finished: false,
+                    allocation_blocked: false,
+                    prefill_micros: 0,
+                })
+                .collect(),
+            executed_decode_batch: 3,
+            executed_greedy_epilogue_batch: 0,
+            rows_alloc_evicted: 0,
+        };
+        assert!(scheduler.apply_result(&plan, invalid).is_err());
+        assert_eq!(scheduler.running()[0].token_history, before);
     }
 
     #[test]

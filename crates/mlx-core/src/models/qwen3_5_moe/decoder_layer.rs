@@ -347,6 +347,28 @@ impl DecoderLayer {
         flat_cache: Option<&mut Qwen3_5LayerCache>,
         preserve_singleton_projection_graphs: bool,
     ) -> Result<MxArray> {
+        self.forward_paged_batched_with_tape(
+            x,
+            kind,
+            adapter,
+            rows,
+            flat_cache,
+            preserve_singleton_projection_graphs,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_paged_batched_with_tape(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        rows: &[(SeqId, u32)],
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+        preserve_singleton_projection_graphs: bool,
+        tape_sink: Option<&mut Option<crate::models::qwen3_5::gated_delta_net::GdnLayerTape>>,
+    ) -> Result<MxArray> {
         match kind {
             Qwen3_5LayerKind::Linear => {
                 if !matches!(self.attn, AttentionType::Linear(_)) {
@@ -365,16 +387,38 @@ impl DecoderLayer {
                                 )
                             })?;
                         if preserve_singleton_projection_graphs {
+                            let capture = tape_sink.is_some();
+                            let mut tapes = Vec::new();
                             let (output, next_cache) =
                                 crate::models::qwen3_5::arrays_cache::forward_rows_independently(
                                     &normed,
                                     cache,
-                                    |row, row_cache| gdn.forward(row, None, Some(row_cache), true),
+                                    |row, row_cache| {
+                                        let mut tape = None;
+                                        let output = gdn.forward_with_tape(
+                                            row,
+                                            None,
+                                            Some(row_cache),
+                                            true,
+                                            capture.then_some(&mut tape),
+                                        )?;
+                                        if capture {
+                                            tapes.push(tape.ok_or_else(|| {
+                                                Error::from_reason(
+                                                    "GDN verify did not record an owner tape",
+                                                )
+                                            })?);
+                                        }
+                                        Ok(output)
+                                    },
                                 )?;
+                            if let Some(sink) = tape_sink {
+                                *sink = Some(crate::models::qwen3_5::gated_delta_net::GdnLayerTape::stack_rows(&tapes)?);
+                            }
                             *cache = next_cache;
                             output
                         } else {
-                            gdn.forward(&normed, None, Some(cache), true)?
+                            gdn.forward_with_tape(&normed, None, Some(cache), true, tape_sink)?
                         }
                     }
                     AttentionType::Full(_) => {
@@ -396,6 +440,9 @@ impl DecoderLayer {
                 h.add(&mlp_out)
             }
             Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                if let Some(tape) = tape_sink {
+                    *tape = None;
+                }
                 let attn = match &self.attn {
                     AttentionType::Full(attn) => attn,
                     AttentionType::Linear(_) => {

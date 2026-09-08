@@ -56,7 +56,7 @@ pub use block_allocator::*;
 pub use block_table::*;
 pub use cold_cache::*;
 pub use config::*;
-pub use layer_kv_pool::LayerKVPool;
+pub use layer_kv_pool::{LayerKVPool, RESTORE_STAGING_BYTES};
 
 /// Path to the compiled Metal library (set at build time)
 /// Only valid on macOS; empty string on other platforms

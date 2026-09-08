@@ -50,7 +50,7 @@ fn tiny_cfg(use_block_paged: bool) -> Qwen3_5Config {
     }
 }
 
-fn tiny_paged_forward_cfg() -> Qwen3_5Config {
+pub(super) fn tiny_paged_forward_cfg() -> Qwen3_5Config {
     let mut cfg = tiny_cfg(true);
     // Paged attention's Metal kernels require head_dim=32+, so the
     // production-forward tests use a separate, larger shape.
@@ -284,7 +284,7 @@ fn paged_inner_with_cfg_or_skip(
     }
 }
 
-fn cast_qwen35_inner_weights_bf16(inner: &mut Qwen35Inner) {
+pub(super) fn cast_qwen35_inner_weights_bf16(inner: &mut Qwen35Inner) {
     let cast = |a: &MxArray| -> MxArray { a.astype(DType::BFloat16).expect("astype bf16") };
 
     let w = inner.embedding.get_weight();
@@ -2616,7 +2616,7 @@ fn paged_mtp_lookahead_reservation_covers_verify() {
 
         step.snapshot_main_linear();
         let ids: Vec<i32> = (0..=depth as i32).map(|i| first_id + i).collect();
-        let verify_ids = MxArray::from_int32(&ids, &[1, (depth + 1) as i64]).expect("verify ids");
+        let verify_ids = ids.iter().map(|&id| id as u32).collect::<Vec<_>>();
         step.verify_step(&verify_ids, embedding, depth)
             .expect("paged verify step")
             .hiddens
@@ -3079,8 +3079,7 @@ fn paged_mtp_lookahead_cycle2_exhaustion_falls_back_to_ar() {
     // Cycle 1 in the engine's order: snapshot → verify → partial accept.
     let embedding = step.embedding().clone();
     step.snapshot_main_linear();
-    let verify_ids =
-        MxArray::from_int32(&[21, 22, 23, 24], &[1, (depth + 1) as i64]).expect("verify ids");
+    let verify_ids = [21, 22, 23, 24];
     step.verify_step(&verify_ids, &embedding, depth)
         .expect("cycle-1 verify")
         .hiddens
@@ -3132,8 +3131,7 @@ fn paged_mtp_lookahead_cycle2_exhaustion_falls_back_to_ar() {
 
     // Cycle 2's verify then writes into pre-allocated blocks only.
     step.snapshot_main_linear();
-    let verify_ids2 =
-        MxArray::from_int32(&[25, 26, 27, 28], &[1, (depth + 1) as i64]).expect("verify ids");
+    let verify_ids2 = [25, 26, 27, 28];
     step.verify_step(&verify_ids2, &embedding, depth)
         .expect("cycle-2 verify")
         .hiddens
@@ -3195,4 +3193,41 @@ fn paged_mtp_lookahead_cycle2_exhaustion_falls_back_to_ar() {
         inner.paged_adapter.is_some(),
         "the adapter stays on the model for the whole speculative turn"
     );
+}
+
+#[test]
+#[ignore = "requires Metal GPU; run with --ignored"]
+fn scheduled_mtp_owner_replay_matches_independent() {
+    use crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget;
+    let Some((mut inner, _cfg)) =
+        paged_inner_or_skip("scheduled_mtp_owner_replay_matches_independent")
+    else {
+        return;
+    };
+    cast_qwen35_inner_weights_bf16(&mut inner);
+    for seq in [101, 202] {
+        inner.activate_scheduled_recurrent(seq).unwrap();
+        inner.set_cache_owner_id(&format!("mtp-owner-{seq}"), None);
+        let prompt = if seq == 101 {
+            vec![7, 11, 13, 17]
+        } else {
+            vec![7, 11, 13, 17, 19, 23]
+        };
+        let prefix = inner
+            .prime_prefix_state(&prompt, true, 16, &[], seq as u64)
+            .unwrap();
+        inner
+            .begin_scheduled_mtp(seq, prefix.effective_cached_prefix_len as u32)
+            .unwrap();
+        inner
+            .paged_prefill(
+                &prompt[prefix.effective_cached_prefix_len..],
+                &prefix,
+                Stream::new(DeviceType::Gpu),
+            )
+            .unwrap()
+            .eval();
+        inner.park_active_scheduled_recurrent().unwrap();
+    }
+    crate::models::qwen3_5::scheduled_mtp::tests::owner_replay_matches_independent(&mut inner);
 }

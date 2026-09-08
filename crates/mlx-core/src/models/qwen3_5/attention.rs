@@ -1456,8 +1456,8 @@ impl Qwen3_5Attention {
         self.o_proj.forward(&gated_output)
     }
 
-    /// Uniform hybrid decode: one text token per request, with one GDN-safe
-    /// batch row and one paged K/V row per scheduler sequence.
+    /// Uniform-width hybrid decode and MTP verification. GDN keeps [N,T,H];
+    /// only attention packs the time axis into per-request paged query rows.
     pub(crate) fn forward_paged_batched(
         &self,
         x: &MxArray,
@@ -1470,10 +1470,10 @@ impl Qwen3_5Attention {
         if rows.is_empty()
             || shape.as_ref().len() != 3
             || shape[0] != rows.len() as i64
-            || shape[1] != 1
+            || shape[1] <= 0
         {
             return Err(Error::from_reason(format!(
-                "Qwen3_5Attention::forward_paged_batched expects [N,1,H] for {} rows, got {:?}",
+                "Qwen3_5Attention::forward_paged_batched expects [N,T,H] for {} rows, got {:?}",
                 rows.len(),
                 shape.as_ref()
             )));
@@ -1485,6 +1485,7 @@ impl Qwen3_5Attention {
         }
 
         let batch = rows.len() as i64;
+        let seq_len = shape[1];
         let offsets = rows
             .iter()
             .map(|&(seq_id, position)| {
@@ -1498,7 +1499,7 @@ impl Qwen3_5Attention {
         let offsets = MxArray::from_int32(&offsets, &[batch])?;
         let seq_ids = rows.iter().map(|&(seq_id, _)| seq_id).collect::<Vec<_>>();
 
-        // K-quant projections stay on their established one-token graph.
+        // K-quant projections retain a separate graph per owner.
         // Packed kernels may select a different reduction path for `B > 1`,
         // which can change greedy tokens even though the paged attention
         // operation itself is row-independent. Projection rows are cheap to
@@ -1510,19 +1511,19 @@ impl Qwen3_5Attention {
             let mut value_rows = Vec::with_capacity(rows.len());
             for row in 0..rows.len() {
                 let x_row = x.slice_axis(0, row as i64, row as i64 + 1)?;
-                let (query, gate) = self.project_q_gate(&x_row, 1, 1)?;
+                let (query, gate) = self.project_q_gate(&x_row, 1, seq_len)?;
                 query_rows.push(self.q_norm.forward(&query)?);
                 gate_rows.push(gate);
                 let key = self.k_proj.forward(&x_row)?.reshape(&[
                     1,
-                    1,
+                    seq_len,
                     self.num_kv_heads as i64,
                     self.head_dim as i64,
                 ])?;
                 key_rows.push(self.k_norm.forward(&key)?);
                 value_rows.push(self.v_proj.forward(&x_row)?.reshape(&[
                     1,
-                    1,
+                    seq_len,
                     self.num_kv_heads as i64,
                     self.head_dim as i64,
                 ])?);
@@ -1534,17 +1535,17 @@ impl Qwen3_5Attention {
                 MxArray::concatenate_many(value_rows.iter().collect(), Some(0))?,
             )
         } else {
-            let (queries, gate) = self.project_q_gate(x, batch, 1)?;
+            let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
             let queries = self.q_norm.forward(&queries)?;
             let keys = self.k_norm.forward(&self.k_proj.forward(x)?.reshape(&[
                 batch,
-                1,
+                seq_len,
                 self.num_kv_heads as i64,
                 self.head_dim as i64,
             ])?)?;
             let values = self.v_proj.forward(x)?.reshape(&[
                 batch,
-                1,
+                seq_len,
                 self.num_kv_heads as i64,
                 self.head_dim as i64,
             ])?;
@@ -1556,17 +1557,52 @@ impl Qwen3_5Attention {
         let keys = self.rope.forward_with_offsets(&keys, &offsets)?;
         let values = values.transpose(Some(&[0, 2, 1, 3]))?;
 
-        let queries = queries.squeeze(Some(&[2]))?;
-        let keys = keys.squeeze(Some(&[2]))?;
-        let values = values.squeeze(Some(&[2]))?;
-        adapter
-            .update_keys_values_native_batched(attn_layer_idx, &keys, &values, rows)
-            .map_err(Error::from_reason)?;
-        let output = adapter
-            .gather_kv_for_decode_graph_batched(attn_layer_idx, &queries, &seq_ids, self.scale, 1.0)
-            .map_err(Error::from_reason)?
-            .astype(x.dtype()?)?
-            .reshape(&[batch, 1, (self.num_heads * self.head_dim) as i64])?;
+        let output = if seq_len == 1 {
+            let queries = queries.squeeze(Some(&[2]))?;
+            let keys = keys.squeeze(Some(&[2]))?;
+            let values = values.squeeze(Some(&[2]))?;
+            adapter
+                .update_keys_values_native_batched(attn_layer_idx, &keys, &values, rows)
+                .map_err(Error::from_reason)?;
+            adapter
+                .gather_kv_for_decode_graph_batched(
+                    attn_layer_idx,
+                    &queries,
+                    &seq_ids,
+                    self.scale,
+                    1.0,
+                )
+                .map_err(Error::from_reason)?
+        } else {
+            let packed = |array: &MxArray, heads: i32| -> Result<MxArray> {
+                array.transpose(Some(&[0, 2, 1, 3]))?.reshape(&[
+                    batch * seq_len,
+                    heads as i64,
+                    self.head_dim as i64,
+                ])
+            };
+            let queries = packed(&queries, self.num_heads)?;
+            let keys = packed(&keys, self.num_kv_heads)?;
+            let values = packed(&values, self.num_kv_heads)?;
+            let ragged = rows
+                .iter()
+                .map(|&(seq_id, position)| {
+                    crate::transformer::paged_kv_cache_adapter::PagedRaggedRow {
+                        seq_id,
+                        first_logical_position: position,
+                        query_len: seq_len as u32,
+                    }
+                })
+                .collect::<Vec<_>>();
+            adapter
+                .update_keys_values_native_ragged(attn_layer_idx, &keys, &values, &ragged)
+                .map_err(Error::from_reason)?;
+            adapter
+                .gather_kv_for_ragged_graph(attn_layer_idx, &queries, &ragged, self.scale, 1.0)
+                .map_err(Error::from_reason)?
+        }
+        .astype(x.dtype()?)?
+        .reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
         let output = output.mul(&Activations::sigmoid(&gate)?)?;
         if preserve_singleton_projection_graphs {
             let projected = (0..rows.len())

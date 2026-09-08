@@ -18,8 +18,8 @@ use napi::bindgen_prelude::*;
 use napi_derive::napi;
 
 use crate::calibration::napi::read_model_type;
-use crate::models::qwen3_5::model::Qwen35Cmd;
-use crate::models::qwen3_5_moe::model::Qwen35MoeCmd;
+use crate::models::qwen3_5::model::Qwen35FamilyCommand;
+use crate::models::qwen3_5_moe::model::Qwen35MoeFamilyCommand;
 
 use super::scoring::EvalReport;
 use super::{EvalOutcome, EvalRequest};
@@ -43,7 +43,7 @@ async fn run_on_model(model_path: &str, request: EvalRequest) -> Result<EvalOutc
             let model =
                 crate::models::qwen3_5::persistence::load_with_thread(model_path, None).await?;
             crate::model_thread::send_and_await(&model.thread, |reply| {
-                Qwen35Cmd::EvalTeacherForced { request, reply }
+                Qwen35FamilyCommand::EvalTeacherForced { request, reply }
             })
             .await
         }
@@ -51,7 +51,7 @@ async fn run_on_model(model_path: &str, request: EvalRequest) -> Result<EvalOutc
             let model =
                 crate::models::qwen3_5_moe::persistence::load_with_thread(model_path).await?;
             crate::model_thread::send_and_await(&model.thread, |reply| {
-                Qwen35MoeCmd::EvalTeacherForced { request, reply }
+                Qwen35MoeFamilyCommand::EvalTeacherForced { request, reply }
             })
             .await
         }

@@ -81,6 +81,7 @@ impl Qwen35Inner {
             paged_finalize_failed: false,
             paged_adapter,
             scheduled_recurrent: RecurrentStateTable::stage2(),
+            scheduled_mtp: Default::default(),
             active_scheduled_seq: None,
             paged_full_attn_caches_dirty: false,
             flat_mtp_caches_desynced: false,
@@ -401,6 +402,7 @@ impl Qwen35Inner {
     pub(crate) fn init_caches_sync(&mut self) -> Result<()> {
         self.caches = Some(fresh_dense_layer_caches(&self.config));
         self.scheduled_recurrent = RecurrentStateTable::stage2();
+        self.scheduled_mtp = Default::default();
         self.active_scheduled_seq = None;
         self.clear_reuse_state();
         Ok(())
@@ -417,6 +419,7 @@ impl Qwen35Inner {
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
         self.scheduled_recurrent = RecurrentStateTable::stage2();
+        self.scheduled_mtp = Default::default();
         self.active_scheduled_seq = None;
         self.clear_reuse_state();
         // No cache owner remains after a full reset. Clear both transition
@@ -517,6 +520,7 @@ impl Qwen35Inner {
     }
 
     pub(super) fn release_scheduled_recurrent_for(&mut self, seq_id: SeqId) {
+        self.scheduled_mtp.release(seq_id);
         if self.active_scheduled_seq == Some(seq_id) {
             self.active_scheduled_seq = None;
             self.caches = Some(fresh_dense_layer_caches(&self.config));

@@ -15,6 +15,7 @@ pub(crate) mod decode;
 pub(crate) mod dspark_turn;
 pub(crate) mod finalize;
 pub(crate) mod hybrid_scheduler;
+pub(crate) mod model_command;
 pub(crate) mod mtp_turn;
 pub(crate) mod napi_glue;
 pub(crate) mod paged_turn;
@@ -23,11 +24,13 @@ pub(crate) mod penalties;
 pub(crate) mod persistence;
 pub(crate) mod plan;
 pub(crate) mod recurrent_state;
+pub(crate) mod scheduled_verify;
 pub(crate) mod scheduler;
 pub(crate) mod session;
 pub(crate) mod spec_owner;
 pub(crate) mod spec_paged;
 pub mod types;
+pub(crate) mod verification_budget;
 pub(crate) mod vision;
 
 // Flat re-exports of the focused submodules' items so family code and

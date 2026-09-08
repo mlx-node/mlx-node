@@ -62,3 +62,28 @@ impl MxArray {
         MxArray::from_handle(handle, "categorical")
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn categorical_invalid_axis_returns_error_without_consuming_a_random_key() {
+        let logits = MxArray::from_float32(&[0.0; 8], &[2, 4]).unwrap();
+        unsafe { sys::mlx_seed(7001) };
+        let expected = logits.categorical(Some(-1)).unwrap().to_int32().unwrap();
+        unsafe { sys::mlx_seed(7001) };
+        assert!(logits.categorical(Some(2)).is_err());
+        assert!(logits.categorical(Some(-3)).is_err());
+        assert!(unsafe { sys::mlx_array_categorical(std::ptr::null_mut(), 0) }.is_null());
+        assert_eq!(
+            logits
+                .categorical(None)
+                .unwrap()
+                .to_int32()
+                .unwrap()
+                .as_ref(),
+            expected.as_ref()
+        );
+    }
+}

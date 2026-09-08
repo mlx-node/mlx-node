@@ -81,12 +81,14 @@ impl DecodeStep for Qwen35PagedDecode<'_> {
         Ok((logits, false))
     }
 
-    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        // Single SYNCHRONOUS eval of `next_token`: the paged forward
-        // is bandwidth-bound, so an async two-wait (bottom `async_eval` +
-        // loop-top `y.eval`) would buy ZERO overlap. One `y.eval()` per sample
-        // is the cheapest correct cadence.
+    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        // Isolated sync/stream comparisons did not resolve a benefit from
+        // async scheduling here. Retain one completion boundary per token.
         next_token.eval();
+        if budget_forced {
+            // A forced host token does not depend on the target/cache writes.
+            logits.eval();
+        }
     }
 
     fn maintain_cache(&mut self, step: i32) {
@@ -306,14 +308,8 @@ impl PagedBackend for Qwen35Inner {
         prefix: &Self::PrefixState,
         _stream: Stream,
     ) -> Result<MxArray> {
-        // The NON-hidden paged prefill. `run_paged_prefill_chunk` writes K/V
-        // into the adapter pool, populates the GDN linear caches, runs the GDN
-        // pre-pass over the cached prefix from `full_tokens` (skipped when
-        // `gdn_prefix_already_primed`), then the full forward over the suffix,
-        // folding in the last-token slice (returns `[vocab]`). The engine fires
-        // the post-prefill `synchronize_and_clear_cache` AFTER this returns
-        // (NOT here). The MTP `_with_hidden` variant is NOT used here — MTP
-        // turns route through `paged_turn_sync_core`, not the engine.
+        // Scheduled MTP also retains the final normalized prompt row as the
+        // request-owned draft seed. The ordinary path only produces logits.
         let layer_kinds = crate::models::qwen3_5::decoder_layer::compute_layer_kinds(
             self.config.num_layers as usize,
             |i| self.config.is_linear_layer(i),
@@ -327,6 +323,10 @@ impl PagedBackend for Qwen35Inner {
         // Cloned up front (cheap Option<Arc>) so the chunk-loop call below
         // can borrow `self.layers`/`self.caches` mutably at the same time.
         let turn_cancel = self.turn_cancel.clone();
+        let mtp_seq = self
+            .active_scheduled_seq
+            .filter(|seq| self.scheduled_mtp.owners.contains_key(seq));
+        let mut mtp_hidden = None;
         let (logits, checkpoint) = {
             let caches_ref = self
                 .caches
@@ -336,7 +336,8 @@ impl PagedBackend for Qwen35Inner {
                 .paged_adapter
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("paged_prefill: paged_adapter dropped"))?;
-            crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+            if mtp_seq.is_some() {
+                let (logits, hidden, checkpoint) = crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_hidden_with_size(
                 &prefix.full_tokens,
                 suffix_tokens,
                 prefix.effective_cached_prefix_len as u32,
@@ -349,10 +350,40 @@ impl PagedBackend for Qwen35Inner {
                 &layer_kinds,
                 adapter,
                 chunk_size,
+                Some(suffix_tokens.len()),
                 rope_deltas,
                 turn_cancel.as_deref(),
-            )?
+            )?;
+                mtp_hidden = Some(hidden);
+                (logits, checkpoint)
+            } else {
+                crate::models::qwen3_5::paged_forward::run_paged_prefill_chunk_with_size(
+                    &prefix.full_tokens,
+                    suffix_tokens,
+                    prefix.effective_cached_prefix_len as u32,
+                    prefix.gdn_prefix_already_primed,
+                    &embed,
+                    &mut self.layers,
+                    caches_ref,
+                    &self.final_norm,
+                    &self.lm_head,
+                    &layer_kinds,
+                    adapter,
+                    chunk_size,
+                    rope_deltas,
+                    turn_cancel.as_deref(),
+                )?
+            }
         };
+        if let Some(seq) = mtp_seq {
+            crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::prefill_scheduled_mtp(
+                self,
+                seq,
+                (prefix.effective_cached_prefix_len + suffix_tokens.len()) as u32,
+                mtp_hidden.ok_or_else(|| Error::from_reason("MTP prefill omitted its seed"))?,
+                suffix_tokens,
+            )?;
+        }
         self.publish_dense_gdn_materialized_prefix_checkpoint(
             &prefix.full_tokens,
             prefix.cache_salt,

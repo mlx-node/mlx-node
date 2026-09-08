@@ -1183,7 +1183,11 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         )?;
 
         let chunk_hidden = if overlaps_kept_tail || is_last_chunk {
-            Some(final_norm.forward(&hidden_states)?)
+            // Slice before normalization so a one-row seed cannot retain the
+            // full normalized prompt allocation through an MLX view.
+            let keep_from = keep_start.max(chunk_start) - chunk_start;
+            let kept = hidden_states.slice_axis(1, keep_from as i64, chunk.len() as i64)?;
+            Some(final_norm.forward(&kept)?)
         } else {
             None
         };
@@ -1210,16 +1214,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         if let Some(chunk_hidden) = chunk_hidden
             && overlaps_kept_tail
         {
-            let keep_from = keep_start.max(chunk_start);
-            let kept_hidden = if keep_from > chunk_start {
-                chunk_hidden.slice_axis(
-                    1,
-                    (keep_from - chunk_start) as i64,
-                    (chunk_end - chunk_start) as i64,
-                )?
-            } else {
-                chunk_hidden
-            };
+            let kept_hidden = chunk_hidden;
             // Materialize hidden BEFORE clear_cache; the hidden is a lazy
             // handle into graph nodes that the per-layer cache eviction
             // would otherwise free between chunks.
@@ -1477,21 +1472,16 @@ fn project_last_token_logits_with_full_hidden(
 ) -> Result<(MxArray, MxArray)> {
     let prompt_len = hidden_states.shape_at(1)?;
     let hidden_dim = hidden_states.shape_at(2)?;
-    let full_hidden = final_norm.forward(hidden_states)?;
-    let last_hidden = full_hidden.slice_axis(1, prompt_len - 1, prompt_len)?;
+    let keep_start = keep_last_hidden
+        .map(|keep| prompt_len.saturating_sub(keep.max(1) as i64))
+        .unwrap_or(0);
+    let kept_hidden = final_norm.forward(&hidden_states.slice_axis(1, keep_start, prompt_len)?)?;
+    let kept_len = kept_hidden.shape_at(1)?;
+    let last_hidden = kept_hidden.slice_axis(1, kept_len - 1, kept_len)?;
     let logits = if let Some(head) = lm_head {
         head.forward(&last_hidden)?
     } else {
         embed.as_linear(&last_hidden)?
-    };
-
-    let keep_start = keep_last_hidden
-        .map(|keep| prompt_len.saturating_sub(keep.max(1) as i64))
-        .unwrap_or(0);
-    let kept_hidden = if keep_start > 0 {
-        full_hidden.slice_axis(1, keep_start, prompt_len)?
-    } else {
-        full_hidden
     };
 
     // The caller runs `synchronize_and_clear_cache()` after prefill, before
@@ -1669,7 +1659,7 @@ pub(crate) fn run_paged_step_with_hidden(
 /// function to `layers.len()` (`Some` for GDN layers, `None` for full-attn).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_paged_verify_step(
-    verify_ids: &MxArray,
+    verify_ids: &[u32],
     embed: &Embedding,
     layers: &mut [DecoderLayer],
     caches: &mut [Qwen3_5LayerCache],
@@ -1683,28 +1673,18 @@ pub(crate) fn run_paged_verify_step(
     debug_assert_eq!(layers.len(), caches.len());
     debug_assert_eq!(layers.len(), layer_kinds.len());
 
-    // Materialise the verify ids on host so the slot mapping records the exact
-    // K+1 tokens, then feed the same array back through the embedding graph.
-    let id_window = verify_ids.to_int32().map_err(|e| {
-        Error::from_reason(format!(
-            "run_paged_verify_step: verify_ids to_int32: {}",
-            e.reason
-        ))
-    })?;
-    let verify_len = id_window.len();
+    // Authoritative host IDs come directly from the engine; upload once
+    // for embedding after recording the exact same span in the page table.
+    let verify_len = verify_ids.len();
     if verify_len == 0 {
-        return Err(Error::from_reason(
-            "run_paged_verify_step: verify_ids must have at least one token",
-        ));
+        return Err(Error::from_reason("MTP verifier requires token IDs"));
     }
-    let verify_u32: Vec<u32> = id_window.iter().map(|&v| v as u32).collect();
-
     let chunk_first_position = paged_adapter.current_token_count();
     paged_adapter
-        .record_tokens(&verify_u32)
+        .record_tokens(verify_ids)
         .map_err(Error::from_reason)?;
 
-    let input_ids = MxArray::from_uint32(&verify_u32, &[1, verify_len as i64])?;
+    let input_ids = MxArray::from_uint32(verify_ids, &[1, verify_len as i64])?;
     let mut hidden_states = embed.forward(&input_ids)?;
 
     // The K+1 verify ids rotate at the physical context start plus the
@@ -2047,5 +2027,84 @@ mod rope_offset_tests {
         assert_eq!(with_image_delta, 74);
         let after_reset = paged_rope_offset(physical, 0);
         assert_eq!(after_reset, physical as i32);
+    }
+}
+
+#[cfg(test)]
+mod last_row_projection_tests {
+    use super::*;
+    #[test]
+    fn retained_prefill_seed_and_logits_match_full_projection() {
+        let input = MxArray::from_float32(
+            &(0..19 * 128)
+                .map(|i| (i as f32 * 0.017).sin())
+                .collect::<Vec<_>>(),
+            &[1, 19, 128],
+        )
+        .unwrap()
+        .astype(crate::array::DType::BFloat16)
+        .unwrap();
+        let mut norm = RMSNorm::new(128, Some(1e-6)).unwrap();
+        norm.set_weight(
+            &norm
+                .get_weight()
+                .astype(crate::array::DType::BFloat16)
+                .unwrap(),
+        )
+        .unwrap();
+        let mut embed = Embedding::new(64, 128).unwrap();
+        embed
+            .set_weight(
+                &embed
+                    .get_weight()
+                    .astype(crate::array::DType::BFloat16)
+                    .unwrap(),
+            )
+            .unwrap();
+        let full_hidden = norm.forward(&input).unwrap();
+        let expected_hidden = full_hidden.slice_axis(1, 18, 19).unwrap();
+        let (logits, hidden) =
+            project_last_token_logits_with_full_hidden(&input, &norm, &None, &embed, Some(1))
+                .unwrap();
+        let expected_logits = embed
+            .as_linear(&expected_hidden)
+            .unwrap()
+            .squeeze(Some(&[0, 1]))
+            .unwrap();
+        assert_eq!(hidden.shape().unwrap().as_ref(), [1, 1, 128]);
+        assert_eq!(
+            hidden
+                .astype(crate::array::DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            expected_hidden
+                .astype(crate::array::DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref()
+        );
+        let actual = logits
+            .astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let expected = expected_logits
+            .astype(crate::array::DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let scale = expected.iter().map(|v| v.abs()).fold(1.0_f32, f32::max);
+        let error = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            error <= scale * 0.01,
+            "prefill head error {error} scale {scale}"
+        );
     }
 }

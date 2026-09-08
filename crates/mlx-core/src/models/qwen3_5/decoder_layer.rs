@@ -300,6 +300,18 @@ impl DecoderLayer {
         rows: &[(SeqId, u32)],
         flat_cache: Option<&mut Qwen3_5LayerCache>,
     ) -> Result<MxArray> {
+        self.forward_paged_batched_with_tape(x, kind, adapter, rows, flat_cache, None)
+    }
+
+    pub(crate) fn forward_paged_batched_with_tape(
+        &mut self,
+        x: &MxArray,
+        kind: Qwen3_5LayerKind,
+        adapter: &mut PagedKVCacheAdapter,
+        rows: &[(SeqId, u32)],
+        flat_cache: Option<&mut Qwen3_5LayerCache>,
+        tape_sink: Option<&mut Option<super::gated_delta_net::GdnLayerTape>>,
+    ) -> Result<MxArray> {
         match kind {
             Qwen3_5LayerKind::Linear => {
                 if !matches!(self.attn, AttentionType::Linear(_)) {
@@ -307,9 +319,12 @@ impl DecoderLayer {
                         "Qwen3_5DecoderLayer::forward_paged_batched: Linear kind/operator mismatch",
                     ));
                 }
-                self.forward(x, None, flat_cache, None, true)
+                self.forward_with_tape(x, None, flat_cache, None, true, tape_sink)
             }
             Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
+                if let Some(tape) = tape_sink {
+                    *tape = None;
+                }
                 let attn = match &self.attn {
                     AttentionType::Full(attn) => attn,
                     AttentionType::Linear(_) => {

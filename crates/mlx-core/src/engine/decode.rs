@@ -179,6 +179,22 @@ pub(crate) struct StreamingCtx<'s, 't> {
     pub emitter: &'s mut dyn StreamEmitter,
 }
 
+/// Keep submitted target work alive and completed before an error path can
+/// release its paged slots. A forced host token has no dependency on logits.
+#[derive(Default)]
+struct PendingDecodeEvaluation {
+    logits: Option<MxArray>,
+    forced: bool,
+}
+
+impl Drop for PendingDecodeEvaluation {
+    fn drop(&mut self) {
+        if let Some(logits) = self.logits.take() {
+            logits.eval();
+        }
+    }
+}
+
 /// Generic decode loop over a [`DecodeStep`].
 ///
 /// Behavior matches the `decode_loop!` macro (still used by the
@@ -238,6 +254,7 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         mut turn_token_observer,
     } = args;
 
+    let mut pending_evaluation = PendingDecodeEvaluation::default();
     for step_idx in 0..max_new_tokens {
         // vLLM-aligned penalty context. Materialize and extract the
         // CURRENT token, then push it to `token_history` HERE — at the
@@ -252,7 +269,15 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         // pushing here closes that lag (identity at default penalties:
         // repetition=1.0/presence=0.0/frequency=0.0).
         profiler.begin("eval_token");
+        if pending_evaluation.forced
+            && let Some(logits) = &pending_evaluation.logits
+        {
+            logits.eval();
+        }
         y.eval();
+        // The sampled token depends on these logits; a forced token instead
+        // used the explicit wait above. All prior target writes are complete.
+        pending_evaluation.logits = None;
         profiler.end();
 
         profiler.begin("extract");
@@ -331,12 +356,10 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
         // of emitted — but a paged-decode forward only fails OOM-class, on
         // a turn that is already aborting (the error propagates and
         // `run_paged_turn` releases the request), so the dropped chunk
-        // belongs to a turn no consumer completes. (2) No added latency:
-        // the forward is
-        // async-scheduled (non-blocking — `eval_step` schedules, the next
-        // iteration's loop-top `y.eval()` forces it), and the emit only
-        // detokenizes the ALREADY-known current token, so emitting after
-        // the scheduling call adds no wall time. This ordering is what
+        // belongs to a turn no consumer completes. (2) Evaluation can overlap
+        // streaming work when the stepper schedules asynchronously. Graph
+        // construction/encoding still costs CPU time; a synchronous eval_step
+        // also delays emission until GPU completion. This ordering is what
         // encodes the vLLM-aligned penalty context (current token pushed
         // before the next sample) and the cancel-snapshot parity (the
         // pre-forward `cancelled` read reused by the emit break) — see the
@@ -376,6 +399,8 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             // the next forward boundary, so calling this phase `eval_caches`
             // made traces look like duplicate cache work.
             profiler.begin("schedule_eval");
+            pending_evaluation.logits = Some(logits.clone());
+            pending_evaluation.forced = budget_forced;
             step.eval_step(&next_token, &logits, budget_forced);
             profiler.end();
 

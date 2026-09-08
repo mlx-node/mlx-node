@@ -582,7 +582,8 @@ pub fn load_time_pool_sizing(
 
 /// Same as [`load_time_pool_sizing`], but `extra_reserved_bytes` (sibling
 /// private Metal pools) is subtracted from the safe budget *before*
-/// `min(requested, safe)`.
+/// `min(requested, safe)`. Also reserves this pool's bounded restore staging,
+/// which uses direct Metal allocations outside MLX active memory.
 pub fn load_time_pool_sizing_with_reserved(
     requested_blocks: u32,
     num_layers: u32,
@@ -615,7 +616,7 @@ pub fn load_time_pool_sizing_with_reserved(
             util,
             safety,
             bpb,
-            extra_reserved_bytes,
+            extra_reserved_bytes.saturating_add(crate::layer_kv_pool::RESTORE_STAGING_BYTES),
         )
     }
 
@@ -627,7 +628,7 @@ pub fn load_time_pool_sizing_with_reserved(
             util,
             safety,
             bpb,
-            extra_reserved_bytes,
+            extra_reserved_bytes.saturating_add(crate::layer_kv_pool::RESTORE_STAGING_BYTES),
         );
         Err(ProfileError::TotalMemoryUnavailable)
     }

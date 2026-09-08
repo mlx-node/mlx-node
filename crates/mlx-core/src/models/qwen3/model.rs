@@ -18,13 +18,10 @@ use crate::engine::backend::{
     ChatBackend, DecodeStep, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs, TrainBackend,
     TurnOutput, TurnSetup, WholeTurnArgs,
 };
-use crate::engine::cmd::{
-    ChatCmd, FromChatCmd, FromTrainCmd, TrainCmd, handle_chat_cmd, handle_train_cmd,
-};
+use crate::engine::cmd::{ChatCmd, FromTrainCmd, TrainCmd, handle_train_cmd};
 use crate::engine::hybrid_scheduler::{
-    HybridSchedulerBackend, HybridSchedulerCommand, HybridSchedulerState, HybridStepExecutor,
-    ScheduledPrefixAdmission, ScheduledRestoreResult, ScheduledTurn, SchedulerOwnerContext,
-    scheduler_max_num_seqs_for, scheduler_per_seq_context,
+    HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor, ScheduledPrefixAdmission,
+    ScheduledRestoreResult, ScheduledTurn, scheduler_max_num_seqs_for, scheduler_per_seq_context,
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan};
 use crate::engine::scheduler::{
@@ -132,15 +129,9 @@ pub(crate) struct Qwen3Inner {
 }
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
-pub(crate) enum Qwen3Cmd {
-    /// Chat-session commands (start / continue / tool + streaming twins +
-    /// reset-caches), wrapping the model-neutral engine's [`ChatCmd`].
-    /// The thread loop routes these to
-    /// [`crate::engine::cmd::handle_chat_cmd`], which drives the
-    /// [`ChatBackend`] impl on [`Qwen3Inner`]; the per-variant
-    /// behavioural contracts live on [`ChatCmd`] and the generic session
-    /// cores in [`crate::engine::session`].
-    Chat(ChatCmd),
+pub(crate) type Qwen3Cmd = crate::engine::model_command::ModelCommand<Qwen3FamilyCommand>;
+
+pub(crate) enum Qwen3FamilyCommand {
     Generate {
         messages: Vec<ChatMessage>,
         config: Option<GenerationConfig>,
@@ -161,47 +152,12 @@ pub(crate) enum Qwen3Cmd {
         save_path: String,
         reply: ResponseTx<()>,
     },
-    SchedulerStats {
-        reply: ResponseTx<engine::SchedulerStatsJs>,
-    },
 }
 
-impl FromChatCmd for Qwen3Cmd {
-    #[inline]
-    fn from_chat(cmd: ChatCmd) -> Self {
-        Qwen3Cmd::Chat(cmd)
-    }
-}
-
-impl HybridSchedulerCommand for Qwen3Cmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            _ => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
-    }
-}
-
-impl FromTrainCmd for Qwen3Cmd {
+impl FromTrainCmd for Qwen3FamilyCommand {
     #[inline]
     fn from_train(cmd: TrainCmd) -> Self {
-        Qwen3Cmd::Train(cmd)
+        Qwen3FamilyCommand::Train(cmd)
     }
 }
 
@@ -270,40 +226,31 @@ impl TrainBackend for Qwen3Inner {
 }
 
 /// Command handler for the dedicated model thread.
-pub(crate) fn handle_qwen3_cmd(inner: &mut Qwen3Inner, cmd: Qwen3Cmd) {
-    match cmd {
-        Qwen3Cmd::Chat(chat_cmd) => {
-            // NOTE: no per-request cache drain here. On a multi-model
-            // server the MLX allocator free-pool is process-wide, so
-            // flushing after a request on model A discards blocks
-            // about to be reused by model B. Between-turn drain is
-            // handled by the TS idle sweeper in `@mlx-node/server`.
-            handle_chat_cmd(inner, chat_cmd);
-        }
-        Qwen3Cmd::Generate {
-            messages,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.generate_sync(messages, config));
-        }
-        Qwen3Cmd::GenerateBatch {
-            prompts,
-            group_size,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.generate_batch_sync(prompts, group_size, config));
-        }
-        // --- Training commands ---
-        Qwen3Cmd::Train(train_cmd) => {
-            handle_train_cmd(inner, train_cmd);
-        }
-        Qwen3Cmd::SaveModel { save_path, reply } => {
-            let _ = reply.send(inner.save_model_sync(&save_path));
-        }
-        Qwen3Cmd::SchedulerStats { reply } => {
-            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
+impl crate::engine::model_command::FamilyCommand<Qwen3Inner> for Qwen3FamilyCommand {
+    fn execute(self, inner: &mut Qwen3Inner) {
+        match self {
+            Qwen3FamilyCommand::Generate {
+                messages,
+                config,
+                reply,
+            } => {
+                let _ = reply.send(inner.generate_sync(messages, config));
+            }
+            Qwen3FamilyCommand::GenerateBatch {
+                prompts,
+                group_size,
+                config,
+                reply,
+            } => {
+                let _ = reply.send(inner.generate_batch_sync(prompts, group_size, config));
+            }
+            // --- Training commands ---
+            Qwen3FamilyCommand::Train(train_cmd) => {
+                handle_train_cmd(inner, train_cmd);
+            }
+            Qwen3FamilyCommand::SaveModel { save_path, reply } => {
+                let _ = reply.send(inner.save_model_sync(&save_path));
+            }
         }
     }
 }
@@ -347,6 +294,7 @@ impl QwenStepExecutor<'_> {
             seq_id: row.seq_id,
             num_computed_tokens: 0,
             generated_token: None,
+            speculative: None,
             finished: false,
             allocation_blocked: true,
             prefill_micros: 0,
@@ -377,6 +325,7 @@ impl QwenStepExecutor<'_> {
             seq_id: row.seq_id,
             num_computed_tokens: row.num_tokens,
             generated_token: None,
+            speculative: None,
             finished: true,
             allocation_blocked: false,
             prefill_micros: 0,
@@ -504,6 +453,7 @@ impl QwenStepExecutor<'_> {
             seq_id: row.seq_id,
             num_computed_tokens: planned.num_tokens,
             generated_token: (!finished).then_some(next_token).flatten(),
+            speculative: None,
             finished,
             allocation_blocked: false,
             prefill_micros: 0,
@@ -768,6 +718,7 @@ impl QwenStepExecutor<'_> {
                                     seq_id: row.seq_id,
                                     num_computed_tokens: planned.num_tokens,
                                     generated_token: None,
+                                    speculative: None,
                                     finished: false,
                                     allocation_blocked: false,
                                     prefill_micros: 0,
@@ -778,6 +729,7 @@ impl QwenStepExecutor<'_> {
                                     seq_id: row.seq_id,
                                     num_computed_tokens: planned.num_tokens,
                                     generated_token: None,
+                                    speculative: None,
                                     finished: false,
                                     allocation_blocked: false,
                                     prefill_micros: 0,
@@ -816,6 +768,7 @@ impl QwenStepExecutor<'_> {
                                         seq_id: row.seq_id,
                                         num_computed_tokens: planned.num_tokens,
                                         generated_token: None,
+                                        speculative: None,
                                         finished: true,
                                         allocation_blocked: false,
                                         prefill_micros: 0,
@@ -826,6 +779,7 @@ impl QwenStepExecutor<'_> {
                                             seq_id: row.seq_id,
                                             num_computed_tokens: planned.num_tokens,
                                             generated_token: Some(token as u32),
+                                            speculative: None,
                                             finished: false,
                                             allocation_blocked: false,
                                             prefill_micros: 0,
@@ -916,7 +870,7 @@ impl StepExecutor<QwenScheduledTurn> for QwenStepExecutor<'_> {
 pub(crate) type QwenSchedulerState = HybridSchedulerState<Qwen3Inner>;
 
 impl HybridSchedulerBackend for Qwen3Inner {
-    type Command = Qwen3Cmd;
+    type FamilyCommand = Qwen3FamilyCommand;
     type RestoreTicket = PagedRestoreTicket;
     type OwnerState = Vec<u32>;
     type StepExecutor<'a> = QwenStepExecutor<'a>;
@@ -1007,7 +961,7 @@ impl HybridSchedulerBackend for Qwen3Inner {
                     effective_cached_prefix_len: provisional.cached_prefix_len as usize,
                     suffix_len: provisional.suffix_len as usize,
                 },
-                restore,
+                restore: *restore,
             },
         })
     }
@@ -1060,14 +1014,6 @@ impl HybridSchedulerBackend for Qwen3Inner {
             inner: self,
             ragged_step: scheduler_ragged_step_enabled(),
         }
-    }
-
-    fn execute_barrier(
-        &mut self,
-        command: Self::Command,
-        _owners: SchedulerOwnerContext<'_, Self::OwnerState>,
-    ) {
-        handle_qwen3_cmd(self, command);
     }
 }
 
@@ -4724,13 +4670,6 @@ impl Qwen3Model {
         }
     }
 
-    /// Snapshot continuous-batching scheduler counters after all commands
-    /// already ahead of this query have drained.
-    #[napi]
-    pub async fn scheduler_stats(&self) -> Result<engine::SchedulerStatsJs> {
-        send_and_await(&self.thread, |reply| Qwen3Cmd::SchedulerStats { reply }).await
-    }
-
     // ---------------------------------------------------------------
     // Test-only helpers: streaming session entry points that bypass
     // ThreadsafeFunction and expose the mpsc receiver directly. Used
@@ -4758,7 +4697,7 @@ impl Qwen3Model {
             crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
         );
         self.thread
-            .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionStart {
+            .send(Qwen3Cmd::from_chat(ChatCmd::StreamSessionStart {
                 messages,
                 config,
                 stream_tx,
@@ -4789,7 +4728,7 @@ impl Qwen3Model {
             crate::engine::napi_glue::CHAT_STREAM_NATIVE_QUEUE_LIMIT,
         );
         self.thread
-            .send(Qwen3Cmd::Chat(ChatCmd::StreamSessionContinue {
+            .send(Qwen3Cmd::from_chat(ChatCmd::StreamSessionContinue {
                 messages,
                 config,
                 stream_tx,
@@ -5005,7 +4944,7 @@ impl Qwen3Model {
         messages: Vec<ChatMessage>,
         config: Option<GenerationConfig>,
     ) -> Result<GenerationResult> {
-        send_and_await(&self.thread, |reply| Qwen3Cmd::Generate {
+        send_and_await(&self.thread, |reply| Qwen3FamilyCommand::Generate {
             messages,
             config,
             reply,
@@ -5052,7 +4991,7 @@ impl Qwen3Model {
         group_size: u32,
         config: Option<GenerationConfig>,
     ) -> Result<BatchGenerationResult> {
-        send_and_await(&self.thread, |reply| Qwen3Cmd::GenerateBatch {
+        send_and_await(&self.thread, |reply| Qwen3FamilyCommand::GenerateBatch {
             prompts,
             group_size,
             config,

@@ -269,7 +269,10 @@ pub(crate) fn replay_mtp_snapshot_to(
     }
     for (idx, cache) in caches.iter_mut().enumerate() {
         let Some(layer_tape) = tape[idx].as_ref() else {
-            if paged {
+            if paged
+                && matches!(cache, Qwen3_5LayerCache::FullAttention(_))
+                && matches!(snap[idx], Qwen3_5LayerSnapshot::FullAttention { .. })
+            {
                 // Full-attention layer on the paged path: K/V lives in the
                 // paged pool and is rewound through the adapter. The
                 // `FullAttention` slot is unused there, so skip it.
@@ -880,5 +883,28 @@ mod tests {
             .expect_err("a short tape must be refused");
         assert!(err.reason.contains("length mismatch"), "{}", err.reason);
         assert!(err.reason.contains("ctx"), "{}", err.reason);
+    }
+
+    #[test]
+    fn replay_rejects_a_missing_linear_tape_on_both_cache_backends() {
+        for paged in [false, true] {
+            let mut caches = vec![Qwen3_5LayerCache::new_linear()];
+            let snap = vec![Qwen3_5LayerSnapshot::Linear {
+                conv_state: None,
+                recurrent_state: None,
+            }];
+            for steps in [0, 1] {
+                let err = replay_mtp_snapshot_to(
+                    &mut caches,
+                    &snap,
+                    &[None],
+                    steps,
+                    paged,
+                    "missing tape",
+                )
+                .expect_err("paged K/V ownership does not excuse a missing recurrent tape");
+                assert!(err.reason.contains("no GDN tape"), "{}", err.reason);
+            }
+        }
     }
 }

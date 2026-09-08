@@ -1,16 +1,13 @@
 //! Shared model-thread command enum + dispatcher.
 //!
-//! [`ChatCmd`] is the model-neutral chat command: an 8-variant shape with
+//! [`ChatCmd`] is the model-neutral chat command: an eight-variant shape with
 //! the per-turn payload fields. [`handle_chat_cmd`] dispatches each arm
 //! to the corresponding generic session core from
 //! [`crate::engine::session`].
 //!
-//! Families whose command enums carry MORE than the 7 chat variants
-//! (qwen3 / qwen3_5 / qwen3_5_moe ship Generate / SaveModel / training
-//! variants) keep `ModelThread<FamilyCmd>` and either nest
-//! `Chat(engine::ChatCmd)` as a variant or delegate the 7 chat arms
-//! straight to `handle_chat_cmd::<FamilyInner>`. lfm2 (and gemma4's
-//! chat-only thread) use `ModelThread<ChatCmd>` directly.
+//! All chat families carry this payload in the engine-owned
+//! [`crate::engine::model_command::ModelCommand`] envelope. Family-specific
+//! generation, save, calibration and training operations are typed extensions.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -108,26 +105,6 @@ pub(crate) enum ChatCmd {
     },
 }
 
-/// Lifts a [`ChatCmd`] into a family's thread-command type.
-///
-/// Families whose model thread is `ModelThread<ChatCmd>` (lfm2, gemma4)
-/// use the identity impl; families whose thread carries extra
-/// non-chat variants (qwen3 / qwen3_5 / qwen3_5_moe ship
-/// `Generate` / `SaveModel` / training commands) nest the chat command
-/// as a `Chat(ChatCmd)` variant. The `chat_napi_surface!` macro builds
-/// every dispatched command as `<$ThreadCmd>::from_chat(ChatCmd::…)` so
-/// one method body serves both thread shapes.
-pub(crate) trait FromChatCmd {
-    fn from_chat(cmd: ChatCmd) -> Self;
-}
-
-impl FromChatCmd for ChatCmd {
-    #[inline]
-    fn from_chat(cmd: ChatCmd) -> Self {
-        cmd
-    }
-}
-
 /// Training commands dispatched from the GRPO / SFT engines to a
 /// trainable family's dedicated model thread.
 ///
@@ -189,7 +166,7 @@ pub(crate) enum TrainCmd {
 
 /// Lifts a [`TrainCmd`] into a trainable family's thread-command type.
 ///
-/// Mirror of [`FromChatCmd`]: each trainable family nests the training
+/// Each trainable family nests the training
 /// command as a `Train(TrainCmd)` variant. No identity impl is needed —
 /// no family's thread carries a bare `TrainCmd`. The [`crate::training_model::TrainingDispatch`]
 /// fan-out builds every dispatched command as

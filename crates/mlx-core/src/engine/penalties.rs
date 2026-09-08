@@ -143,6 +143,16 @@ impl ReasoningTracker {
         })
     }
 
+    /// Largest unforced output prefix whose tokens can be emitted before the
+    /// budget requires a forced end token. A speculative cycle cannot cross it.
+    pub(crate) fn unforced_token_budget(&self) -> Option<usize> {
+        if !self.in_thinking || self.think_end_id.is_none() || self.end_scheduled {
+            return None;
+        }
+        self.budget
+            .map(|budget| budget.saturating_sub(self.thinking_token_count).max(0) as usize)
+    }
+
     /// Number of tokens generated during reasoning (inside <think>...</think>).
     pub fn reasoning_token_count(&self) -> u32 {
         self.thinking_token_count.max(0) as u32

@@ -310,6 +310,20 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_item_at_int32(handle: *mut mlx_array, index: usize, out: *mut i32) -> bool;
     pub fn mlx_array_item_at_uint32(handle: *mut mlx_array, index: usize, out: *mut u32) -> bool;
     pub fn mlx_array_item_at_float32(handle: *mut mlx_array, index: usize, out: *mut f32) -> bool;
+    /// Lazy device categorical draw with an explicit key; -1 means no valid mass.
+    pub fn mlx_array_sample_probabilities_uniforms_for_test(
+        handle: *mut mlx_array,
+        uniforms: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_array_sample_probabilities(handle: *mut mlx_array, seed: u64) -> *mut mlx_array;
+    /// macOS shared-memory draft sampling; both functions validate rank/dtype
+    /// and wait for completion before reading. No pointer escapes the call.
+    pub fn mlx_array_positive_probability_mass(handle: *mut mlx_array, out: *mut f64) -> bool;
+    pub fn mlx_array_probability_index(
+        handle: *mut mlx_array,
+        threshold: f64,
+        out: *mut i32,
+    ) -> bool;
     pub fn mlx_array_dtype(handle: *mut mlx_array) -> i32;
     pub fn mlx_array_to_float32(handle: *mut mlx_array, out: *mut f32, len: usize) -> bool;
     pub fn mlx_array_to_int32(handle: *mut mlx_array, out: *mut i32, len: usize) -> bool;
@@ -354,6 +368,11 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_randint(shape: *const i64, ndim: usize, low: i32, high: i32)
     -> *mut mlx_array;
     pub fn mlx_array_categorical(handle: *mut mlx_array, axis: i32) -> *mut mlx_array;
+    pub fn mlx_array_categorical_uniforms_for_test(
+        handle: *mut mlx_array,
+        uniforms: *mut mlx_array,
+        axis: i32,
+    ) -> *mut mlx_array;
 
     // Gradient computation (callback-based - this is the MLX-native approach)
     pub fn mlx_compute_gradients(

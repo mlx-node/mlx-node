@@ -2191,7 +2191,7 @@ mod tests {
         // scan still reaches everything" can be checked at all, since a scan
         // that silently stopped descending would otherwise just report fewer
         // files and still pass a loose floor.
-        const FAMILY_FILES: usize = 15;
+        const FAMILY_FILES: usize = 16;
         assert!(
             checked >= FAMILY_FILES,
             "the tripwire scanned only {checked} file(s), fewer than the {FAMILY_FILES} this \

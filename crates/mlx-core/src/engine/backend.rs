@@ -75,7 +75,13 @@ pub(crate) trait DecodeStep {
     /// Schedule async evaluation for this step's sampled token (and, on
     /// the budget-forced path, the untouched logits so the lazy graph
     /// stays bounded).
-    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool);
+    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        if budget_forced {
+            MxArray::async_eval_arrays(&[next_token, logits]);
+        } else {
+            MxArray::async_eval_arrays(&[next_token]);
+        }
+    }
 
     /// Cache offset for the throttled every-32-step decode trace.
     ///
@@ -1553,10 +1559,11 @@ pub(crate) trait MtpStepper {
 
     /// MTP verify step returning verify logits `[1, depth+1, vocab]` +
     /// hiddens `[1, depth+1, hidden]`. RECORDS the GDN tape (consumed by
-    /// [`Self::rollback`]).
+    /// [`Self::rollback`]). IDs are the authoritative host span the engine
+    /// already materialized for acceptance and page-table bookkeeping.
     fn verify_step(
         &mut self,
-        ids: &MxArray,
+        ids: &[u32],
         embedding: &Embedding,
         depth: usize,
     ) -> Result<MtpVerifyOutput>;
@@ -1695,6 +1702,20 @@ pub(crate) struct DsparkProposal {
     /// Sparse proposal rows for draft models with vocabulary-independent
     /// support (DFlash2 uses a conditional top-16 selector).
     pub draft_sparse_dists: Vec<crate::sampling::SparseDistribution>,
+    /// Conditional acceptance estimates, in proposal order. Only confidence
+    /// heads that support adaptive verification populate this field.
+    pub keep_probabilities: Option<Vec<f32>>,
+}
+
+impl DsparkProposal {
+    pub fn truncate(&mut self, len: usize) {
+        self.draft_ids.truncate(len);
+        self.draft_dists.truncate(len);
+        self.draft_sparse_dists.truncate(len);
+        if let Some(probs) = self.keep_probabilities.as_mut() {
+            probs.truncate(len);
+        }
+    }
 }
 
 /// Output of [`DsparkStepper::verify`] — ONE batched target forward over
@@ -1725,6 +1746,14 @@ pub(crate) struct DsparkVerifyOutput {
 /// stays a stepper-private concern and the trait stays model-agnostic.
 /// Production implementation: `Gemma4DsparkStepper`.
 pub(crate) trait DsparkStepper {
+    /// Enable confidence only when the engine will consume it this turn.
+    fn set_adaptive_verification(&mut self, _enabled: bool) {}
+
+    /// Supplies per-proposal confidence for measured verification budgeting.
+    fn supports_adaptive_verification(&self) -> bool {
+        false
+    }
+
     /// Whether this stepper can permanently switch the rest of the current
     /// turn to exact target-only autoregressive decoding. The engine uses
     /// this capability for DSpark's measured break-even guard; other draft

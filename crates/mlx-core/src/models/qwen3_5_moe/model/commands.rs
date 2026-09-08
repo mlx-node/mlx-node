@@ -4,13 +4,9 @@
 use super::*;
 
 /// Commands dispatched from NAPI methods to the dedicated model thread.
-pub(crate) enum Qwen35MoeCmd {
-    /// All chat-session traffic (sync + streaming starts/continues/tool
-    /// turns + cache reset), routed through the model-neutral engine
-    /// dispatcher ([`crate::engine::cmd::handle_chat_cmd`]) against the
-    /// [`ChatBackend`] impl on [`Qwen35MoeInner`]. The per-variant
-    /// behavioural contracts live on [`crate::engine::cmd::ChatCmd`].
-    Chat(ChatCmd),
+pub(crate) type Qwen35MoeCmd = crate::engine::model_command::ModelCommand<Qwen35MoeFamilyCommand>;
+
+pub(crate) enum Qwen35MoeFamilyCommand {
     Generate {
         prompt_tokens: MxArray,
         config: Qwen3_5MoeGenerationConfig,
@@ -24,7 +20,7 @@ pub(crate) enum Qwen35MoeCmd {
         reply: ResponseTx<u32>,
     },
     /// Teacher-forced output-quality eval (`mlx eval`). MoE counterpart of the
-    /// dense [`crate::models::qwen3_5::model::Qwen35Cmd::EvalTeacherForced`],
+    /// dense [`crate::models::qwen3_5::model::crate::models::qwen3_5::model::Qwen35FamilyCommand::EvalTeacherForced`],
     /// carrying the same request onto the model thread where the tokenizer
     /// lives; caches are re-initialized per row so each sequence is an
     /// independent turn-0 prefill.
@@ -41,9 +37,6 @@ pub(crate) enum Qwen35MoeCmd {
     /// [`crate::engine::cmd::handle_train_cmd`], which drives the
     /// [`TrainBackend`] impl on [`Qwen35MoeInner`].
     Train(TrainCmd),
-    SchedulerStats {
-        reply: ResponseTx<engine::SchedulerStatsJs>,
-    },
     /// Test-only: snapshot the paged-MTP GDN bookkeeping between turns — see
     /// [`MoeMtpPagedGdnStateForTest`].
     #[doc(hidden)]
@@ -59,42 +52,10 @@ pub(crate) enum Qwen35MoeCmd {
     GdnHistoryCheckpointOracleForTest { reply: ResponseTx<bool> },
 }
 
-impl FromChatCmd for Qwen35MoeCmd {
-    #[inline]
-    fn from_chat(cmd: ChatCmd) -> Self {
-        Qwen35MoeCmd::Chat(cmd)
-    }
-}
-
-impl FromTrainCmd for Qwen35MoeCmd {
+impl FromTrainCmd for Qwen35MoeFamilyCommand {
     #[inline]
     fn from_train(cmd: TrainCmd) -> Self {
-        Qwen35MoeCmd::Train(cmd)
-    }
-}
-
-impl HybridSchedulerCommand for Qwen35MoeCmd {
-    fn as_chat(&self) -> Option<&ChatCmd> {
-        match self {
-            Self::Chat(chat) => Some(chat),
-            _ => None,
-        }
-    }
-
-    fn into_chat(self) -> std::result::Result<ChatCmd, Self> {
-        match self {
-            Self::Chat(chat) => Ok(chat),
-            other => Err(other),
-        }
-    }
-
-    fn into_scheduler_stats(
-        self,
-    ) -> std::result::Result<ResponseTx<engine::SchedulerStatsJs>, Self> {
-        match self {
-            Self::SchedulerStats { reply } => Ok(reply),
-            other => Err(other),
-        }
+        Qwen35MoeFamilyCommand::Train(cmd)
     }
 }
 
@@ -164,58 +125,52 @@ impl TrainBackend for Qwen35MoeInner {
 }
 
 /// Command handler for the dedicated model thread.
-pub(crate) fn handle_qwen35_moe_cmd(inner: &mut Qwen35MoeInner, cmd: Qwen35MoeCmd) {
-    match cmd {
-        // No per-request cache drain here — the TS idle sweeper in
-        // `@mlx-node/server` owns between-turn drains.
-        Qwen35MoeCmd::Chat(chat_cmd) => {
-            handle_chat_cmd(inner, chat_cmd);
-        }
-        Qwen35MoeCmd::Generate {
-            prompt_tokens,
-            config,
-            reply,
-        } => {
-            let _ = reply.send(inner.generate_sync(prompt_tokens, config));
-        }
-        Qwen35MoeCmd::CalibratePrefillRaw {
-            texts,
-            calib_seq,
-            reply,
-        } => {
-            let _ = reply.send(inner.calibrate_prefill_raw_sync(texts, calib_seq));
-        }
-        Qwen35MoeCmd::EvalTeacherForced { request, reply } => {
-            let _ = reply.send(crate::quality::runner::run(inner, request));
-        }
-        Qwen35MoeCmd::SaveModel { save_path, reply } => {
-            let _ = reply.send(inner.save_model_sync(&save_path));
-        }
-        Qwen35MoeCmd::Train(train_cmd) => {
-            handle_train_cmd(inner, train_cmd);
-        }
-        Qwen35MoeCmd::SchedulerStats { reply } => {
-            let _ = reply.send(Ok(engine::scheduler::SchedulerStats::default().to_js()));
-        }
-        Qwen35MoeCmd::MtpPagedGdnStateForTest { reply } => {
-            let _ = reply.send(Ok(MoeMtpPagedGdnStateForTest {
-                paged_active: inner.paged_adapter.is_some(),
-                history_len: inner.cached_token_history.len(),
-                last_rollback_unemitted: inner.paged_mtp_last_rollback_unemitted,
-                gdn_rewinds: inner.paged_mtp_gdn_rewinds,
-                gdn_invalidations: inner.paged_mtp_gdn_invalidations,
-                state_dirty: inner.paged_gdn_state_dirty,
-                has_history_checkpoint: inner.gdn_last_history_checkpoint.is_some(),
-            }));
-        }
-        Qwen35MoeCmd::GdnHistoryCheckpointOracleForTest { reply } => {
-            let _ = reply.send(inner.moe_gdn_history_checkpoint_recompute_matches_for_test());
+impl crate::engine::model_command::FamilyCommand<Qwen35MoeInner> for Qwen35MoeFamilyCommand {
+    fn execute(self, inner: &mut Qwen35MoeInner) {
+        match self {
+            Qwen35MoeFamilyCommand::Generate {
+                prompt_tokens,
+                config,
+                reply,
+            } => {
+                let _ = reply.send(inner.generate_sync(prompt_tokens, config));
+            }
+            Qwen35MoeFamilyCommand::CalibratePrefillRaw {
+                texts,
+                calib_seq,
+                reply,
+            } => {
+                let _ = reply.send(inner.calibrate_prefill_raw_sync(texts, calib_seq));
+            }
+            Qwen35MoeFamilyCommand::EvalTeacherForced { request, reply } => {
+                let _ = reply.send(crate::quality::runner::run(inner, request));
+            }
+            Qwen35MoeFamilyCommand::SaveModel { save_path, reply } => {
+                let _ = reply.send(inner.save_model_sync(&save_path));
+            }
+            Qwen35MoeFamilyCommand::Train(train_cmd) => {
+                handle_train_cmd(inner, train_cmd);
+            }
+            Qwen35MoeFamilyCommand::MtpPagedGdnStateForTest { reply } => {
+                let _ = reply.send(Ok(MoeMtpPagedGdnStateForTest {
+                    paged_active: inner.paged_adapter.is_some(),
+                    history_len: inner.cached_token_history.len(),
+                    last_rollback_unemitted: inner.paged_mtp_last_rollback_unemitted,
+                    gdn_rewinds: inner.paged_mtp_gdn_rewinds,
+                    gdn_invalidations: inner.paged_mtp_gdn_invalidations,
+                    state_dirty: inner.paged_gdn_state_dirty,
+                    has_history_checkpoint: inner.gdn_last_history_checkpoint.is_some(),
+                }));
+            }
+            Qwen35MoeFamilyCommand::GdnHistoryCheckpointOracleForTest { reply } => {
+                let _ = reply.send(inner.moe_gdn_history_checkpoint_recompute_matches_for_test());
+            }
         }
     }
 }
 
 impl HybridSchedulerBackend for Qwen35MoeInner {
-    type Command = Qwen35MoeCmd;
+    type FamilyCommand = Qwen35MoeFamilyCommand;
     type RestoreTicket = crate::engine::hybrid_scheduler::NoRestoreTicket;
     type OwnerState = Vec<u32>;
     type StepExecutor<'a> = crate::engine::hybrid_scheduler::HybridStepExecutor<'a, Self>;
@@ -229,6 +184,68 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
 
     fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter> {
         self.paged_adapter.as_mut()
+    }
+
+    fn supports_scheduled_speculation(&self) -> bool {
+        self.has_mtp_weights()
+            && self.paged_adapter.is_some()
+            && self.config.recurrent_state_bytes() > 0
+            && self.cached_rope_deltas.unwrap_or(0) == 0
+    }
+    fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpState::reservation_bytes(
+            &self.config.to_dense_config(),
+            total_tokens,
+        )
+    }
+    fn begin_scheduled_speculation(&mut self, seq_id: SeqId, position: u32) -> Result<bool> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::begin_scheduled_mtp(
+            self, seq_id, position,
+        )
+    }
+    fn reserve_scheduled_speculation(&mut self, seq_id: SeqId, queries: usize) -> Result<bool> {
+        if queries > crate::models::qwen3_5::scheduled_mtp::MAX_DRAFTS + 1 {
+            return Err(Error::from_reason(
+                "MTP reservation exceeds its maximum verifier width",
+            ));
+        }
+        let adapter = self
+            .paged_adapter
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("MTP reservation has no paged adapter"))?;
+        match adapter.reserve_rows_for(seq_id, queries as u32) {
+            Ok(_) => Ok(true),
+            Err(error) if error.starts_with("context_length_exceeded:") => Ok(false),
+            Err(error) => Err(Error::from_reason(error)),
+        }
+    }
+    fn propose_scheduled(
+        &mut self,
+        seq_id: SeqId,
+        anchor: u32,
+        cap: usize,
+        params: &crate::engine::params::ChatParams,
+        rng: &mut dyn rand::Rng,
+        _confidence: bool,
+    ) -> Result<crate::engine::backend::DsparkProposal> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::propose_scheduled_mtp(
+            self, seq_id, anchor, cap, params, rng,
+        )
+    }
+    fn run_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyRow],
+    ) -> Result<MxArray> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::verify_scheduled_mtp(self, rows)
+    }
+    fn commit_scheduled_verify(
+        &mut self,
+        rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyCommit],
+    ) -> Result<Vec<Result<()>>> {
+        crate::models::qwen3_5::scheduled_mtp::ScheduledMtpTarget::commit_scheduled_mtp(self, rows)
+    }
+    fn release_scheduled_speculation(&mut self, seq_id: SeqId) {
+        self.scheduled_mtp.release(seq_id);
     }
 
     fn max_position_embeddings(&self) -> i32 {
@@ -303,13 +320,5 @@ impl HybridSchedulerBackend for Qwen35MoeInner {
 
     fn step_executor(&mut self) -> Self::StepExecutor<'_> {
         crate::engine::hybrid_scheduler::HybridStepExecutor::new(self)
-    }
-
-    fn execute_barrier(
-        &mut self,
-        command: Self::Command,
-        _owners: crate::engine::hybrid_scheduler::SchedulerOwnerContext<'_, Self::OwnerState>,
-    ) {
-        handle_qwen35_moe_cmd(self, command);
     }
 }

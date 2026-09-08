@@ -29,6 +29,60 @@ pub(crate) struct GdnLayerTape {
 }
 
 impl GdnLayerTape {
+    pub(crate) fn stack_rows(rows: &[Self]) -> Result<Self> {
+        let first = rows
+            .first()
+            .ok_or_else(|| Error::from_reason("empty GDN tape batch"))?;
+        let width = first.kernel.window_len()?;
+        for row in rows {
+            if row.qkv.shape_at(0)? != 1
+                || row.kernel.window_len()? != width
+                || row.conv_kernel_dim != first.conv_kernel_dim
+            {
+                return Err(Error::from_reason("incompatible GDN owner tapes"));
+            }
+        }
+        let combine = |get: fn(&Self) -> &MxArray| {
+            MxArray::concatenate_many(rows.iter().map(get).collect(), Some(0))
+        };
+        Ok(Self {
+            kernel: GdnKernelTape {
+                q: combine(|row| &row.kernel.q)?,
+                k: combine(|row| &row.kernel.k)?,
+                v: combine(|row| &row.kernel.v)?,
+                g: combine(|row| &row.kernel.g)?,
+                beta: combine(|row| &row.kernel.beta)?,
+            },
+            qkv: combine(|row| &row.qkv)?,
+            conv_kernel_dim: first.conv_kernel_dim,
+        })
+    }
+
+    /// Keep one independent owner's full time window for unequal acceptance
+    /// replay. Slicing the batch dimension retains GPU storage and graph roots.
+    pub(crate) fn row(&self, row: usize, batch: usize) -> Result<Self> {
+        if row >= batch || self.qkv.shape_at(0)? != batch as i64 {
+            return Err(Error::from_reason("GDN tape owner row is out of range"));
+        }
+        let select = |array: &MxArray| -> Result<MxArray> {
+            if array.shape_at(0)? != batch as i64 {
+                return Err(Error::from_reason("GDN tape batch dimensions disagree"));
+            }
+            array.slice_axis(0, row as i64, row as i64 + 1)
+        };
+        Ok(Self {
+            kernel: GdnKernelTape {
+                q: select(&self.kernel.q)?,
+                k: select(&self.kernel.k)?,
+                v: select(&self.kernel.v)?,
+                g: select(&self.kernel.g)?,
+                beta: select(&self.kernel.beta)?,
+            },
+            qkv: select(&self.qkv)?,
+            conv_kernel_dim: self.conv_kernel_dim,
+        })
+    }
+
     /// Replay the accepted prefix into the pre-verify snapshot caches.
     ///
     /// `accepted_steps = accepted_drafts + 1`. Rebuilds BOTH the recurrent

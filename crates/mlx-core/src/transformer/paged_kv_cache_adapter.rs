@@ -638,7 +638,7 @@ pub(crate) enum PagedTurnAdmission {
     Ready(PagedTurnPlan),
     Waiting {
         provisional: PagedTurnPlan,
-        restore: PagedRestoreTicket,
+        restore: Box<PagedRestoreTicket>,
     },
 }
 
@@ -1891,6 +1891,11 @@ pub struct PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     decode_attention_inputs_cache: Option<DecodePagedAttentionInputsCache>,
 
+    /// One immutable one-token batch shared by all layers in this cache group.
+    /// Identity/revision/frontier checks survive owner workspace rotation.
+    #[cfg(target_os = "macos")]
+    ragged_inputs_cache: Option<RaggedPagedInputsCache>,
+
     /// Per-layer MLX views of the K/V pool that carry native
     /// `paged_kv_write` dependencies. When a native write returns
     /// `(k_pool', v_pool')`, later MLX paged-attention calls must consume
@@ -1977,6 +1982,27 @@ struct DecodePagedAttentionInputsCache {
     block_count: u32,
     block_table: MxArray,
     seq_lens: MxArray,
+}
+
+#[cfg(target_os = "macos")]
+struct RaggedRowIdentity {
+    row: PagedRaggedRow,
+    table_identity: u64,
+    physical_revision: u64,
+    token_count: u32,
+}
+
+#[cfg(target_os = "macos")]
+struct RaggedPagedInputsCache {
+    rows: Vec<RaggedRowIdentity>,
+    pool_generation: u64,
+    slot_mapping: MxArray,
+    aliased_slot: Option<i64>,
+    block_tables: MxArray,
+    seq_lens: MxArray,
+    cu_seqlens_q: MxArray,
+    max_context_len: u32,
+    total_queries: u32,
 }
 
 #[cfg(target_os = "macos")]
@@ -2227,6 +2253,8 @@ impl PagedKVCacheAdapter {
             varlen_prefill_inputs_cache: None,
             #[cfg(target_os = "macos")]
             decode_attention_inputs_cache: None,
+            #[cfg(target_os = "macos")]
+            ragged_inputs_cache: None,
             #[cfg(target_os = "macos")]
             native_pool_arrays: (0..num_layers).map(|_| None).collect(),
             #[cfg(target_os = "macos")]
@@ -2829,7 +2857,7 @@ impl PagedKVCacheAdapter {
             };
             Ok(PagedTurnAdmission::Waiting {
                 provisional,
-                restore: PagedRestoreTicket {
+                restore: Box::new(PagedRestoreTicket {
                     seq_id,
                     total_budget,
                     prompt_tokens: prompt_tokens.to_vec(),
@@ -2840,7 +2868,7 @@ impl PagedKVCacheAdapter {
                     reserved: Some(pending.reserved),
                     identities: pending.identities,
                     allocator: Arc::clone(&self.allocator),
-                },
+                }),
             })
         })();
         if result.is_err() {
@@ -2854,7 +2882,11 @@ impl PagedKVCacheAdapter {
         &mut self,
         restore: &mut PagedRestoreTicket,
     ) -> Result<PagedRestorePoll, String> {
-        let Some(batch) = restore.job.poll() else {
+        let Some(batch) = restore.job.poll_upload(
+            &self.layer_kv_pool,
+            restore.reserved.as_deref().unwrap_or_default(),
+            &restore.identities,
+        ) else {
             return Ok(PagedRestorePoll::Pending);
         };
         let wait = restore.job.elapsed();
@@ -4049,7 +4081,10 @@ impl PagedKVCacheAdapter {
         let extra_reserved_bytes = own_bytes.saturating_add(
             crate::cache_limit::coordinator()
                 .registered_pool_bytes()
-                .saturating_sub(own_bytes),
+                // The sizer reserves this pool's staging pair itself. Growth
+                // keeps that same pair; only the old KV allocation overlaps
+                // the new one. Sibling reservations retain their staging.
+                .saturating_sub(own_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES)),
         );
         mlx_paged_attn::profile::load_time_pool_sizing_with_reserved(
             new_num_blocks,
@@ -5079,119 +5114,15 @@ impl PagedKVCacheAdapter {
         values: &MxArray,
         rows: &[(SeqId, u32)],
     ) -> Result<(), String> {
-        if rows.is_empty() {
-            return Err("update_keys_values_native_batched requires at least one row".to_string());
-        }
-        if layer_idx as usize >= self.layer_kv_pool.num_layers() {
-            return Err(format!(
-                "update_keys_values_native_batched: layer_idx {layer_idx} out of range (num_layers = {})",
-                self.layer_kv_pool.num_layers()
-            ));
-        }
-        let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
-        let values_meta = KvTensorMeta::from_array(values, "values")?;
-        let info = validate_kv_input(&keys_meta, &values_meta, self.layer_kv_pool.config())?;
-        if info.num_tokens as usize != rows.len() {
-            return Err(format!(
-                "update_keys_values_native_batched: keys/values contain {} rows but metadata names {} sequences",
-                info.num_tokens,
-                rows.len()
-            ));
-        }
-
-        let mut seen = HashSet::with_capacity(rows.len());
-        let mut seen_slots = HashSet::with_capacity(rows.len());
-        let mut slots = Vec::with_capacity(rows.len());
-        for &(seq_id, first_logical_position) in rows {
-            if !seen.insert(seq_id) {
-                return Err(format!(
-                    "update_keys_values_native_batched received duplicate sequence {seq_id}"
-                ));
-            }
-            if self.active_seq != Some(seq_id) && !self.requests.contains_key(&seq_id) {
-                return Err(format!(
-                    "update_keys_values_native_batched: unknown sequence {seq_id}"
-                ));
-            }
-            self.activate_request(seq_id)?;
-            let current = self.request_tokens.len() as u32;
-            let expected_first = current.checked_sub(1).ok_or_else(|| {
-                format!(
-                    "update_keys_values_native_batched: sequence {seq_id} has no recorded token"
-                )
-            })?;
-            if first_logical_position != expected_first {
-                return Err(format!(
-                    "update_keys_values_native_batched: sequence {seq_id} position {first_logical_position} does not align with its recorded suffix (expected {expected_first}, current_token_count {current})"
-                ));
-            }
-            let slot = self
-                .block_table
-                .as_ref()
-                .and_then(|table| table.absolute_slot_index(first_logical_position))
-                .ok_or_else(|| {
-                    format!(
-                        "update_keys_values_native_batched: sequence {seq_id} position {first_logical_position} has no allocated slot"
-                    )
-                })?;
-            if !seen_slots.insert(slot) {
-                return Err(format!(
-                    "update_keys_values_native_batched: sequence {seq_id} aliases physical slot {slot} with another row"
-                ));
-            }
-            slots.push(slot);
-        }
-        let slot_mapping = MxArray::from_int64(&slots, &[rows.len() as i64])
-            .map_err(|e| format!("update_keys_values_native_batched slot_mapping: {e}"))?;
-        MxArray::eval_arrays(&[&slot_mapping])
-            .map_err(|e| format!("update_keys_values_native_batched slot_mapping eval: {e}"))?;
-
-        let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
-        let k_scale = self.k_scale_array(layer_idx)?;
-        let v_scale = self.v_scale_array(layer_idx)?;
-        let kv_dtype_raw = self.kv_dtype_raw()?;
-        let mut out_k_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-        let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
-        let ok = unsafe {
-            mlx_sys::mlx_paged_kv_write_forward(
-                k_pool.as_raw_ptr(),
-                v_pool.as_raw_ptr(),
-                keys.as_raw_ptr(),
-                values.as_raw_ptr(),
-                slot_mapping.as_raw_ptr(),
-                k_scale.as_raw_ptr(),
-                v_scale.as_raw_ptr(),
-                self.block_size as i32,
-                self.layer_kv_pool.config().num_kv_heads as i32,
-                self.layer_kv_pool.config().head_size as i32,
-                kv_dtype_raw,
-                &mut out_k_pool,
-                &mut out_v_pool,
-            )
-        };
-        if !ok || out_k_pool.is_null() || out_v_pool.is_null() {
-            unsafe {
-                if !out_k_pool.is_null() {
-                    mlx_sys::mlx_array_delete(out_k_pool);
-                }
-                if !out_v_pool.is_null() {
-                    mlx_sys::mlx_array_delete(out_v_pool);
-                }
-            }
-            return Err(format!(
-                "update_keys_values_native_batched: mlx_paged_kv_write_forward returned null (layer={layer_idx}, rows={})",
-                rows.len()
-            ));
-        }
-        let k_out = MxArray::from_handle(out_k_pool, "paged_kv_write_forward batched k_pool")
-            .map_err(|e| {
-                format!("update_keys_values_native_batched: failed to wrap k_pool output: {e}")
-            })?;
-        let v_out = MxArray::from_handle(out_v_pool, "paged_kv_write_forward batched v_pool")
-            .map_err(|e| {
-                format!("update_keys_values_native_batched: failed to wrap v_pool output: {e}")
-            })?;
-        self.replace_native_pool_arrays(layer_idx, k_out, v_out)
+        let rows = rows
+            .iter()
+            .map(|&(seq_id, first_logical_position)| PagedRaggedRow {
+                seq_id,
+                first_logical_position,
+                query_len: 1,
+            })
+            .collect::<Vec<_>>();
+        self.update_keys_values_native_ragged(layer_idx, keys, values, &rows)
     }
 
     /// One graph-native K/V write for packed ragged prefill/decode slices.
@@ -5234,42 +5165,60 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        let mut seen = HashSet::with_capacity(rows.len());
-        let mut slots = Vec::with_capacity(total_queries as usize);
-        for row in rows {
-            if !seen.insert(row.seq_id) {
+        // Reusing metadata wins for ordinary one-token batches. Multi-token
+        // Muse verification regressed in paired runs, so keep its established
+        // preparation and command-buffer resource pattern until traced.
+        let slot_mapping = if rows.iter().all(|row| row.query_len == 1) {
+            self.ensure_ragged_inputs(rows)?;
+            let cache = self.ragged_inputs_cache.as_ref().unwrap();
+            if let Some(slot) = cache.aliased_slot {
                 return Err(format!(
-                    "update_keys_values_native_ragged received duplicate sequence {}",
-                    row.seq_id
+                    "ragged KV write aliases physical slot {slot} across query rows"
                 ));
             }
-            if self.active_seq != Some(row.seq_id) && !self.requests.contains_key(&row.seq_id) {
-                return Err(format!(
-                    "update_keys_values_native_ragged: unknown sequence {}",
-                    row.seq_id
-                ));
+            cache.slot_mapping.clone()
+        } else {
+            let mut seen = HashSet::with_capacity(rows.len());
+            let mut slots = Vec::with_capacity(total_queries as usize);
+            for row in rows {
+                if !seen.insert(row.seq_id) {
+                    return Err(format!(
+                        "update_keys_values_native_ragged received duplicate sequence {}",
+                        row.seq_id
+                    ));
+                }
+                if self.active_seq != Some(row.seq_id) && !self.requests.contains_key(&row.seq_id) {
+                    return Err(format!(
+                        "update_keys_values_native_ragged: unknown sequence {}",
+                        row.seq_id
+                    ));
+                }
+                self.activate_request(row.seq_id)?;
+                let current = self.request_tokens.len() as u32;
+                let expected_first = current.checked_sub(row.query_len).ok_or_else(|| {
+                    format!(
+                        "update_keys_values_native_ragged: sequence {} recorded {current} tokens for query length {}",
+                        row.seq_id, row.query_len
+                    )
+                })?;
+                if row.first_logical_position != expected_first {
+                    return Err(format!(
+                        "update_keys_values_native_ragged: sequence {} position {} does not align with its recorded suffix (expected {expected_first}, current_token_count {current}, query_len {})",
+                        row.seq_id, row.first_logical_position, row.query_len
+                    ));
+                }
+                slots.extend(self.build_slot_mapping(row.first_logical_position, row.query_len)?);
             }
-            self.activate_request(row.seq_id)?;
-            let current = self.request_tokens.len() as u32;
-            let expected_first = current.checked_sub(row.query_len).ok_or_else(|| {
-                format!(
-                    "update_keys_values_native_ragged: sequence {} recorded {current} tokens for query length {}",
-                    row.seq_id, row.query_len
-                )
+            let slot_mapping =
+                MxArray::from_int64(&slots, &[i64::from(total_queries)]).map_err(|error| {
+                    format!("update_keys_values_native_ragged slot_mapping: {error}")
+                })?;
+            MxArray::eval_arrays(&[&slot_mapping]).map_err(|error| {
+                format!("update_keys_values_native_ragged slot_mapping eval: {error}")
             })?;
-            if row.first_logical_position != expected_first {
-                return Err(format!(
-                    "update_keys_values_native_ragged: sequence {} position {} does not align with its recorded suffix (expected {expected_first}, current_token_count {current}, query_len {})",
-                    row.seq_id, row.first_logical_position, row.query_len
-                ));
-            }
-            slots.extend(self.build_slot_mapping(row.first_logical_position, row.query_len)?);
-        }
-        let slot_mapping = MxArray::from_int64(&slots, &[i64::from(total_queries)])
-            .map_err(|error| format!("update_keys_values_native_ragged slot_mapping: {error}"))?;
-        MxArray::eval_arrays(&[&slot_mapping]).map_err(|error| {
-            format!("update_keys_values_native_ragged slot_mapping eval: {error}")
-        })?;
+
+            slot_mapping
+        };
 
         let (k_pool, v_pool) = self.native_pool_arrays_for_layer(layer_idx)?;
         let k_scale = self.k_scale_array(layer_idx)?;
@@ -5507,6 +5456,36 @@ impl PagedKVCacheAdapter {
         &mut self,
         seq_ids: &[SeqId],
     ) -> Result<(MxArray, MxArray, u32), String> {
+        let rows = seq_ids
+            .iter()
+            .map(|&seq_id| {
+                let first_logical_position = self
+                    .block_table_for(seq_id)
+                    .and_then(|table| table.num_tokens().checked_sub(1))
+                    .ok_or_else(|| {
+                        format!("decode metadata: sequence {seq_id} has no recorded token")
+                    })?;
+                Ok(PagedRaggedRow {
+                    seq_id,
+                    first_logical_position,
+                    query_len: 1,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        self.ensure_ragged_inputs(&rows)?;
+        let cache = self.ragged_inputs_cache.as_ref().unwrap();
+        Ok((
+            cache.block_tables.clone(),
+            cache.seq_lens.clone(),
+            cache.max_context_len,
+        ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn build_batched_attention_inputs(
+        &mut self,
+        seq_ids: &[SeqId],
+    ) -> Result<(MxArray, MxArray, u32), String> {
         if seq_ids.is_empty() {
             return Err(
                 "decode_attention_inputs_batched requires at least one sequence".to_string(),
@@ -5571,12 +5550,23 @@ impl PagedKVCacheAdapter {
         &mut self,
         rows: &[PagedRaggedRow],
     ) -> Result<(MxArray, MxArray, MxArray, u32, u32), String> {
+        if rows.iter().all(|row| row.query_len == 1) {
+            self.ensure_ragged_inputs(rows)?;
+            let cache = self.ragged_inputs_cache.as_ref().unwrap();
+            return Ok((
+                cache.block_tables.clone(),
+                cache.seq_lens.clone(),
+                cache.cu_seqlens_q.clone(),
+                cache.max_context_len,
+                cache.total_queries,
+            ));
+        }
         if rows.is_empty() {
             return Err("ragged_attention_inputs requires at least one row".to_string());
         }
         let seq_ids = rows.iter().map(|row| row.seq_id).collect::<Vec<_>>();
         let (block_tables, seq_lens, max_context_len) =
-            self.decode_attention_inputs_batched(&seq_ids)?;
+            self.build_batched_attention_inputs(&seq_ids)?;
         let mut total_queries = 0u32;
         let mut cumulative = Vec::with_capacity(rows.len() + 1);
         cumulative.push(0i32);
@@ -5607,6 +5597,101 @@ impl PagedKVCacheAdapter {
             max_context_len,
             total_queries,
         ))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn ensure_ragged_inputs(&mut self, rows: &[PagedRaggedRow]) -> Result<(), String> {
+        if rows.is_empty() {
+            return Err("ragged metadata requires at least one row".into());
+        }
+        if let Some(cache) = self.ragged_inputs_cache.as_ref()
+            && cache.pool_generation == self.layer_kv_pool.generation()
+            && cache.rows.len() == rows.len()
+            && cache.rows.iter().zip(rows).all(|(cached, row)| {
+                let table = if self.active_seq == Some(row.seq_id) {
+                    self.block_table.as_ref()
+                } else {
+                    self.requests
+                        .get(&row.seq_id)
+                        .map(|state| &state.block_table)
+                };
+                cached.row == *row
+                    && table.is_some_and(|table| {
+                        cached.table_identity == table.metadata_identity()
+                            && cached.physical_revision == table.physical_revision()
+                            && cached.token_count == table.num_tokens()
+                    })
+            })
+        {
+            return Ok(());
+        }
+        // Invalidate before rebuilding so a failed preparation cannot leave a
+        // partially matching wave available to a later dispatch.
+        self.ragged_inputs_cache = None;
+        let mut seen = HashSet::with_capacity(rows.len());
+        let mut identities = Vec::with_capacity(rows.len());
+        let mut slots = Vec::new();
+        let mut cumulative = Vec::with_capacity(rows.len() + 1);
+        cumulative.push(0i32);
+        let mut total_queries = 0u32;
+        for row in rows {
+            if row.query_len == 0 || !seen.insert(row.seq_id) {
+                return Err("ragged metadata received an empty or duplicate row".into());
+            }
+            if self.active_seq != Some(row.seq_id) && !self.requests.contains_key(&row.seq_id) {
+                return Err(format!("ragged metadata: unknown sequence {}", row.seq_id));
+            }
+            self.activate_request(row.seq_id)?;
+            let table = self
+                .block_table
+                .as_ref()
+                .ok_or("ragged metadata: missing table")?;
+            let current = table.num_tokens();
+            if current.checked_sub(row.query_len) != Some(row.first_logical_position) {
+                return Err(format!(
+                    "ragged metadata: sequence {} position {} does not match its recorded suffix (expected {}, current {current})",
+                    row.seq_id,
+                    row.first_logical_position,
+                    current.saturating_sub(row.query_len)
+                ));
+            }
+            identities.push(RaggedRowIdentity {
+                row: *row,
+                table_identity: table.metadata_identity(),
+                physical_revision: table.physical_revision(),
+                token_count: current,
+            });
+            slots.extend(self.build_slot_mapping(row.first_logical_position, row.query_len)?);
+            total_queries = total_queries
+                .checked_add(row.query_len)
+                .ok_or("ragged metadata query count overflow")?;
+            cumulative.push(
+                i32::try_from(total_queries)
+                    .map_err(|_| "ragged metadata query count exceeds i32::MAX")?,
+            );
+        }
+        let seq_ids = rows.iter().map(|row| row.seq_id).collect::<Vec<_>>();
+        let (block_tables, seq_lens, max_context_len) =
+            self.build_batched_attention_inputs(&seq_ids)?;
+        let mut seen_slots = HashSet::with_capacity(slots.len());
+        let aliased_slot = slots.iter().copied().find(|&slot| !seen_slots.insert(slot));
+        let slot_mapping = MxArray::from_int64(&slots, &[i64::from(total_queries)])
+            .map_err(|error| error.to_string())?;
+        let cu_seqlens_q = MxArray::from_int32(&cumulative, &[cumulative.len() as i64])
+            .map_err(|error| error.to_string())?;
+        MxArray::eval_arrays(&[&slot_mapping, &cu_seqlens_q]).map_err(|error| error.to_string())?;
+        self.ragged_inputs_cache = Some(RaggedPagedInputsCache {
+            rows: identities,
+            pool_generation: self.layer_kv_pool.generation(),
+            slot_mapping,
+            aliased_slot,
+            block_tables,
+            seq_lens,
+            cu_seqlens_q,
+            max_context_len,
+            total_queries,
+        });
+        Ok(())
     }
 
     /// Graph-native decode attention. Unlike [`Self::gather_kv_for_decode`],
@@ -7769,6 +7854,10 @@ impl PagedKVCacheAdapter {
 
     /// Release every logical request owned by this adapter.
     pub fn release_all_requests(&mut self) -> Result<u32, String> {
+        #[cfg(target_os = "macos")]
+        {
+            self.ragged_inputs_cache = None;
+        }
         let mut released = 0u32;
         if self.active_seq.is_some() {
             released = released
@@ -12480,6 +12569,203 @@ mod tests {
             error.contains("sequence 2 position 6") && error.contains("expected 7"),
             "got: {error}"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "release metadata microbenchmark; run without other workloads"]
+    fn benchmark_packed_metadata_reuse() {
+        use std::hint::black_box;
+        let Some(mut adapter) = maybe_adapter(new_allocator(1100, 16), 16) else {
+            return;
+        };
+        let mut rows = Vec::new();
+        for seq in 1..=4 {
+            adapter.begin_request(seq).unwrap();
+            adapter.allocate_suffix_blocks_for(seq, 4096).unwrap();
+            adapter.record_tokens(&vec![1; 4096]).unwrap();
+            rows.push(PagedRaggedRow {
+                seq_id: seq,
+                first_logical_position: 4095,
+                query_len: 1,
+            });
+        }
+        adapter.ragged_attention_inputs(&rows).unwrap();
+        for rebuild in [true, false, false, true] {
+            let started = Instant::now();
+            for _ in 0..1000 {
+                if rebuild {
+                    adapter.ragged_inputs_cache = None;
+                }
+                black_box(adapter.ragged_attention_inputs(&rows).unwrap());
+            }
+            println!(
+                "packed_metadata rows=4 context=4096 queries=1 rebuild={rebuild} us_per_call={:.3}",
+                started.elapsed().as_secs_f64() * 1000.0
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn uniform_metadata_reuses_the_write_wave_and_keeps_shared_read_slots_safe() {
+        let allocator = new_allocator(8, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            return;
+        };
+        for seq in [1, 2] {
+            adapter.begin_request(seq).unwrap();
+            adapter.allocate_suffix_blocks_for(seq, 4).unwrap();
+            adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
+        }
+        let (tables, lens, _) = adapter.decode_attention_inputs_batched(&[1, 2]).unwrap();
+        let values = MxArray::zeros(&[2, 1, 32], Some(DType::Float16)).unwrap();
+        adapter
+            .update_keys_values_native_batched(0, &values, &values, &[(1, 3), (2, 3)])
+            .unwrap();
+        let slots = adapter
+            .ragged_inputs_cache
+            .as_ref()
+            .unwrap()
+            .slot_mapping
+            .clone();
+        adapter.activate_request(1).unwrap();
+        let (again, lens_again, _) = adapter.decode_attention_inputs_batched(&[1, 2]).unwrap();
+        assert_eq!(tables.as_raw_ptr(), again.as_raw_ptr());
+        assert_eq!(lens.as_raw_ptr(), lens_again.as_raw_ptr());
+        assert_eq!(
+            slots.as_raw_ptr(),
+            adapter
+                .ragged_inputs_cache
+                .as_ref()
+                .unwrap()
+                .slot_mapping
+                .as_raw_ptr()
+        );
+        adapter.eval_pending_pool_writes().unwrap();
+
+        // Prefix reads may share a physical slot, but a write wave must not.
+        let shared = adapter.block_table_for(1).unwrap().blocks()[0].clone();
+        shared.incref();
+        adapter.activate_request(2).unwrap();
+        let old = adapter.block_table.as_ref().unwrap().blocks()[0].clone();
+        adapter
+            .block_table
+            .as_mut()
+            .unwrap()
+            .replace_block(0, shared);
+        allocator.lock().unwrap().free(old);
+        let (shared_tables, _, _) = adapter.decode_attention_inputs_batched(&[1, 2]).unwrap();
+        assert_eq!(
+            shared_tables.item_at_int32(0).unwrap(),
+            shared_tables.item_at_int32(1).unwrap()
+        );
+        let error = adapter
+            .update_keys_values_native_batched(0, &values, &values, &[(1, 3), (2, 3)])
+            .unwrap_err();
+        assert!(error.contains("aliases physical slot"), "{error}");
+        assert!(adapter.decode_attention_inputs_batched(&[1, 1]).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ragged_metadata_reuses_arrays_and_rejects_stale_owner_layouts() {
+        let allocator = new_allocator(16, 4);
+        let Some(mut adapter) = maybe_adapter(Arc::clone(&allocator), 4) else {
+            return;
+        };
+        for seq in [1, 2] {
+            adapter.begin_request(seq).unwrap();
+            adapter.allocate_suffix_blocks_for(seq, 8).unwrap();
+            adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        }
+        let mut rows = [
+            PagedRaggedRow {
+                seq_id: 1,
+                first_logical_position: 7,
+                query_len: 1,
+            },
+            PagedRaggedRow {
+                seq_id: 2,
+                first_logical_position: 7,
+                query_len: 1,
+            },
+        ];
+        let (tables, lens, cumulative, _, _) = adapter.ragged_attention_inputs(&rows).unwrap();
+        let slots = adapter
+            .ragged_inputs_cache
+            .as_ref()
+            .unwrap()
+            .slot_mapping
+            .clone();
+        adapter.activate_request(1).unwrap();
+        let (again, lens_again, cumulative_again, _, _) =
+            adapter.ragged_attention_inputs(&rows).unwrap();
+        assert_eq!(tables.as_raw_ptr(), again.as_raw_ptr());
+        assert_eq!(lens.as_raw_ptr(), lens_again.as_raw_ptr());
+        assert_eq!(cumulative.as_raw_ptr(), cumulative_again.as_raw_ptr());
+        assert_eq!(
+            slots.as_raw_ptr(),
+            adapter
+                .ragged_inputs_cache
+                .as_ref()
+                .unwrap()
+                .slot_mapping
+                .as_raw_ptr()
+        );
+
+        // A changed physical table at the same frontier must rebuild addresses.
+        let replacement = allocator.lock().unwrap().allocate().unwrap();
+        let replacement_id = replacement.block_id;
+        let old = adapter.block_table.as_ref().unwrap().blocks()[1].clone();
+        adapter
+            .block_table
+            .as_mut()
+            .unwrap()
+            .replace_block(1, replacement);
+        allocator.lock().unwrap().free(old);
+        let (replaced, _, _, _, _) = adapter.ragged_attention_inputs(&rows).unwrap();
+        assert_ne!(tables.as_raw_ptr(), replaced.as_raw_ptr());
+        assert_eq!(replaced.item_at_int32(1).unwrap(), replacement_id as i32);
+        assert_eq!(
+            adapter
+                .ragged_inputs_cache
+                .as_ref()
+                .unwrap()
+                .slot_mapping
+                .item_at_int32(0)
+                .unwrap(),
+            (replacement_id * 4 + 3) as i32
+        );
+
+        // Cursor rollback is also a new immutable wave; old graph metadata
+        // retains its original lengths while a rejected suffix is retracted.
+        adapter.activate_request(2).unwrap();
+        adapter.rollback_last_tokens(1).unwrap();
+        assert!(adapter.ragged_attention_inputs(&rows).is_err());
+        rows[1].first_logical_position = 6;
+        let (_, rolled, _, _, _) = adapter.ragged_attention_inputs(&rows).unwrap();
+        assert_eq!(rolled.to_int32().unwrap().as_ref(), &[8, 7]);
+        assert_eq!(lens.to_int32().unwrap().as_ref(), &[8, 8]);
+
+        // A recycled sequence can repeat both the old revision and frontier.
+        let previous_identity = adapter.block_table_for(2).unwrap().metadata_identity();
+        adapter.release_request_for(2).unwrap();
+        adapter.begin_request(2).unwrap();
+        adapter.allocate_suffix_blocks_for(2, 8).unwrap();
+        adapter.record_tokens(&[9, 9, 9, 9, 9, 9, 9]).unwrap();
+        assert_ne!(
+            previous_identity,
+            adapter.block_table_for(2).unwrap().metadata_identity()
+        );
+        let (_, recycled, _, _, _) = adapter.ragged_attention_inputs(&rows).unwrap();
+        assert_ne!(rolled.as_raw_ptr(), recycled.as_raw_ptr());
+        let mut reverse = rows;
+        reverse.reverse();
+        let (_, reverse_lens, reverse_cu, _, _) =
+            adapter.ragged_attention_inputs(&reverse).unwrap();
+        assert_eq!(reverse_lens.to_int32().unwrap().as_ref(), &[7, 8]);
+        assert_eq!(reverse_cu.to_int32().unwrap().as_ref(), &[0, 1, 2]);
     }
 
     #[cfg(target_os = "macos")]

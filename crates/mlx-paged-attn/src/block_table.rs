@@ -5,10 +5,15 @@
 
 use crate::block_allocator::PhysicalBlock;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_TABLE_IDENTITY: AtomicU64 = AtomicU64::new(1);
 
 /// Block table entry for a single sequence
 #[derive(Debug)]
 pub struct SequenceBlockTable {
+    /// Distinguishes a recycled sequence ID from its previous physical table.
+    metadata_identity: u64,
     /// Sequence ID
     pub seq_id: u32,
 
@@ -34,6 +39,9 @@ impl SequenceBlockTable {
     /// Create a new block table for a sequence
     pub fn new(seq_id: u32, block_size: u32) -> Self {
         Self {
+            metadata_identity: NEXT_TABLE_IDENTITY
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("block table identity overflow"),
             seq_id,
             blocks: Vec::new(),
             num_tokens: 0,
@@ -93,6 +101,10 @@ impl SequenceBlockTable {
     /// Revision of the exact physical block-id sequence.
     pub fn physical_revision(&self) -> u64 {
         self.physical_revision
+    }
+
+    pub fn metadata_identity(&self) -> u64 {
+        self.metadata_identity
     }
 
     /// Get the block IDs as a vector (for kernel dispatch)
