@@ -55,6 +55,26 @@ fn bytes_to_mib(bytes: f64) -> f64 {
     bytes / (1024.0 * 1024.0)
 }
 
+/// Queue complete early decode layers while the host builds later layers.
+/// These callers are eager paged AR/MTP forwards; prefill and traced/training
+/// graphs keep their existing submission boundaries. Hidden-state dependencies
+/// include the layer's attention and cache writes, so no cache is published early.
+fn maybe_submit_paged_decode_layer(layer_idx: usize, num_layers: usize, hidden: &MxArray) {
+    static EARLY_LAYERS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let early_layers = *EARLY_LAYERS.get_or_init(|| {
+        std::env::var("MLX_QWEN35_DECODE_EARLY_EVAL_LAYERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(4)
+    });
+    if layer_idx < early_layers
+        && layer_idx + 1 < num_layers
+        && crate::engine::persistence::compiled_forward_backend_available()
+    {
+        MxArray::async_eval_arrays(&[hidden]);
+    }
+}
+
 /// Compute the scalar RoPE rotation offset for a paged forward step, decoupling
 /// the rotation position from the physical KV slot.
 ///
@@ -1552,6 +1572,7 @@ pub(crate) fn run_paged_decode_step(
             rope_position_offset,
             &mut None,
         )?;
+        maybe_submit_paged_decode_layer(layer_idx, num_layers, &hidden_states);
     }
 
     let h = final_norm.forward(&hidden_states)?;
@@ -1628,6 +1649,7 @@ pub(crate) fn run_paged_step_with_hidden(
             rope_position_offset,
             &mut None,
         )?;
+        maybe_submit_paged_decode_layer(layer_idx, num_layers, &hidden_states);
     }
 
     let h3 = final_norm.forward(&hidden_states)?;
@@ -1718,6 +1740,7 @@ pub(crate) fn run_paged_verify_step(
             rope_position_offset,
         )?;
         tape[layer_idx] = slot;
+        maybe_submit_paged_decode_layer(layer_idx, num_layers, &hidden_states);
     }
 
     let hiddens = final_norm.forward(&hidden_states)?;

@@ -1,0 +1,19 @@
+{
+  "addonSha256": "653b265c4e6dab6b715c88b78cf3a66ad9dc44169aa52009280137611045924b",
+  "agentMs": 600121.2917909999,
+  "agentExit": null,
+  "timeLimitMs": 600000,
+  "completed": false,
+  "toolExecutions": {
+    "read": 3
+  },
+  "completedInferenceTurns": 1,
+  "streamUpdateCount": 9131,
+  "editedImplementation": false,
+  "independentAcceptanceExit": 1,
+  "nativeStderrBytes": 0,
+  "rawResultSha256": "51361e7379ae8b85dc7c6568ef301fd8377b1f852eb3c7fc222d442444494e6d",
+  "initialImplementationSha256": "8e22c35e56288edbe49a97e5ab6f18f071d2af659ecf4ae8ef4a72c25d532ada",
+  "finalImplementationSha256": "8e22c35e56288edbe49a97e5ab6f18f071d2af659ecf4ae8ef4a72c25d532ada",
+  "limitation": "The high-thinking CLI fixture reached its 600-second cap after three reads and no edit. No completed coding-task speedup is claimed."
+}
