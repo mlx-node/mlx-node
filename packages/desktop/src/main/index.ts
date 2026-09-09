@@ -16,8 +16,12 @@
  * debounced.
  */
 
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
-import { app, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
+import { app, autoUpdater, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
+import electronUpdater from 'electron-updater';
 
 import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
 import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
@@ -26,6 +30,7 @@ import { electronBrokerDeps } from './control-panel-child.js';
 import { createLaunchVisibility } from './launch-visibility.js';
 import { resolveAppPaths, type AppPaths } from './paths.js';
 import { installAppProtocol, registerAppScheme } from './protocol.js';
+import { createQuitHandler } from './quit.js';
 import {
   DEFAULT_SETTINGS,
   loadSettings,
@@ -38,6 +43,7 @@ import { utilityChildTransport } from './supervisor/child-utility.js';
 import { createSupervisor, type Supervisor } from './supervisor/index.js';
 import { claudeConnectCommand, codexConnectCommand } from './tray-view.js';
 import { createTray, type TrayController } from './tray.js';
+import { canAutoUpdate, createDesktopUpdater, presentUpdate, type DesktopUpdater } from './updates.js';
 import { createControlPanelWindowManager, type ControlPanelWindowManager } from './window.js';
 
 /** Coalescing window for settings writes. Long enough that a drag is one write. */
@@ -54,6 +60,7 @@ let supervisor: Supervisor | null = null;
 let tray: TrayController | null = null;
 let controlPanel: ControlPanelWindowManager | null = null;
 let broker: ControlPanelBroker<WebContents> | null = null;
+let updates: DesktopUpdater | null = null;
 const launchVisibility = createLaunchVisibility();
 
 /**
@@ -63,7 +70,6 @@ const launchVisibility = createLaunchVisibility();
  * force-quit from.
  */
 let quitting = false;
-let shuttingDown = false;
 
 /**
  * MUST run before `app.whenReady()`. Chromium reads the privileged-scheme table
@@ -129,25 +135,24 @@ function wire(): void {
     launchVisibility.activate();
   });
 
-  app.on('before-quit', (event) => {
-    // The second pass, after `shutdown()` calls `app.quit()` again. Letting it
-    // through is what actually exits.
-    if (shuttingDown) return;
-    shuttingDown = true;
-    launchVisibility.beginShutdown();
-    // Set BEFORE any window is asked to close, so the Control Panel window's close
-    // handler knows this one is real.
-    quitting = true;
-    event.preventDefault();
-    void withDeadline(shutdown(), DESKTOP_QUIT_DEADLINE_MS)
-      .catch((error: unknown) => {
-        console.error('[mlx] shutdown failed:', error);
-      })
-      .finally(() => {
-        if (launchVisibility.takeRelaunchRequest()) app.relaunch();
-        app.quit();
-      });
-  });
+  app.on(
+    'before-quit',
+    createQuitHandler({
+      beginShutdown: () => {
+        // Set before closing windows so their close handler allows a real exit.
+        quitting = true;
+        updates?.stop();
+        launchVisibility.beginShutdown();
+      },
+      shutdown,
+      deadlineMs: DESKTOP_QUIT_DEADLINE_MS,
+      installUpdate: (completeQuit) => updates?.installOnQuit(completeQuit) ?? false,
+      shouldRelaunch: () => launchVisibility.takeRelaunchRequest(),
+      relaunch: () => app.relaunch(),
+      quit: () => app.quit(),
+      report: (error) => console.error('[mlx] shutdown:', error),
+    }),
+  );
 }
 
 async function bootstrap(): Promise<void> {
@@ -169,13 +174,28 @@ async function bootstrap(): Promise<void> {
   // a real application menu instead of Electron's default.
   Menu.setApplicationMenu(
     Menu.buildFromTemplate([
-      { role: 'appMenu' },
+      {
+        label: app.name,
+        submenu: [
+          { role: 'about' },
+          { id: 'app-update', ...presentUpdate('disabled'), click: updateApp },
+          { type: 'separator' },
+          { role: 'services' },
+          { type: 'separator' },
+          { role: 'hide' },
+          { role: 'hideOthers' },
+          { role: 'unhide' },
+          { type: 'separator' },
+          { role: 'quit' },
+        ],
+      },
       { role: 'editMenu' },
       { role: 'windowMenu' },
     ] as MenuItemConstructorOptions[]),
   );
 
   const loaded = await loadSettings(paths.settingsFile);
+  if (quitting) return;
   settings = loaded.settings;
   if (loaded.problem !== null) {
     console.warn(
@@ -188,6 +208,36 @@ async function bootstrap(): Promise<void> {
   }
 
   applyDockPolicy(settings.showInDock);
+
+  // Packaging stamps this flag before signing. app.isPackaged alone also
+  // accepts local unsigned bundles, which Squirrel cannot safely update.
+  let autoUpdates = false;
+  if (app.isPackaged) {
+    try {
+      const manifest = JSON.parse(await readFile(join(app.getAppPath(), 'package.json'), 'utf-8')) as {
+        autoUpdates?: unknown;
+      };
+      autoUpdates = manifest.autoUpdates === true;
+    } catch (error) {
+      console.error('[mlx] could not read update configuration:', error);
+    }
+  }
+  if (quitting) return;
+  updates = createDesktopUpdater({
+    enabled: canAutoUpdate({
+      packaged: app.isPackaged,
+      enabled: autoUpdates,
+      platform: process.platform,
+      arch: process.arch,
+      version: app.getVersion(),
+    }),
+    native: new electronUpdater.MacUpdater(),
+    squirrel: autoUpdater,
+    systemVersion: process.getSystemVersion(),
+    onChange: refreshUpdates,
+    requestQuit: () => app.quit(),
+    report: (error) => console.error('[mlx] update:', error),
+  });
 
   supervisor = createSupervisor({
     entry: paths.sidecarEntry,
@@ -285,6 +335,7 @@ async function bootstrap(): Promise<void> {
   tray = createTray({
     iconPath: paths.trayIcon,
     showInDock: () => settings.showInDock,
+    appUpdate: () => presentUpdate(updates?.status() ?? 'disabled', updates?.progress()),
     actions: {
       openControlPanel: () => controlPanel?.show(),
       startInference: () => {
@@ -307,9 +358,11 @@ async function bootstrap(): Promise<void> {
       quit: () => {
         app.quit();
       },
+      updateApp,
     },
   });
   refreshTray();
+  updates.start();
 
   if (settings.autoStartInference) {
     void supervisor.start().catch(reportInferenceFailure);
@@ -325,6 +378,22 @@ async function bootstrap(): Promise<void> {
 function refreshTray(): void {
   if (supervisor === null) return;
   tray?.update(supervisor.snapshot());
+}
+
+function updateApp(): void {
+  if (quitting) return;
+  if (updates?.status() === 'ready') updates.restartAndInstall();
+  else updates?.check();
+}
+
+function refreshUpdates(): void {
+  const item = Menu.getApplicationMenu()?.getMenuItemById('app-update');
+  if (item !== null && item !== undefined) {
+    const presentation = presentUpdate(updates?.status() ?? 'disabled', updates?.progress());
+    item.label = presentation.label;
+    item.enabled = presentation.enabled;
+  }
+  refreshTray();
 }
 
 /**
@@ -402,20 +471,4 @@ async function shutdown(): Promise<void> {
   // its temp root. Serialising them would spend two kill-grace periods against
   // one whole-app quit deadline.
   await Promise.all([broker?.dispose(), supervisor?.dispose()]);
-}
-
-async function withDeadline(work: Promise<void>, ms: number): Promise<void> {
-  let timer: NodeJS.Timeout | undefined;
-  const capped = new Promise<void>((resolve) => {
-    timer = setTimeout(() => {
-      console.error(`[mlx] shutdown did not finish within ${ms}ms; exiting anyway`);
-      resolve();
-    }, ms);
-    timer.unref();
-  });
-  try {
-    await Promise.race([work, capped]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
 }

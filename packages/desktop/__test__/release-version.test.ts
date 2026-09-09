@@ -20,6 +20,8 @@ import {
   type ReleaseVersions,
   versionFromDmgPath,
   versionFromTag,
+  updateZipFileName,
+  versionFromUpdateZipPath,
 } from '../scripts/release-version.js';
 
 /** Everything agreeing on 0.0.9 — the shape a good release has. */
@@ -29,6 +31,7 @@ const AGREED: ReleaseVersions = {
   bundleShort: '0.0.9',
   bundleVersion: '0.0.9',
   dmg: '0.0.9',
+  zip: '0.0.9',
 };
 
 describe('versionFromTag', () => {
@@ -141,19 +144,46 @@ describe('assertVersionsAgree, untagged path', () => {
     // trivially. The manifest's own semver check is the only thing standing
     // between a typo and a stamped, signed, published bundle -- and nothing
     // else in this module can cover it.
-    const junk = { tag: null, manifest: 'nightly', bundleShort: 'nightly', bundleVersion: 'nightly', dmg: 'nightly' };
+    const junk = {
+      tag: null,
+      manifest: 'nightly',
+      bundleShort: 'nightly',
+      bundleVersion: 'nightly',
+      dmg: 'nightly',
+      zip: 'nightly',
+    };
     expect(() => assertVersionsAgree(junk)).toThrow(/packages\/desktop\/package\.json version/);
+  });
+});
+
+describe('update ZIP release versions', () => {
+  it('names the archive for Apple Silicon discovery by update.electronjs.org', () => {
+    expect(updateZipFileName('0.0.14')).toBe('mlx-node-0.0.14-darwin-arm64.zip');
+    expect(versionFromUpdateZipPath('/out/mlx-node-0.0.14-darwin-arm64.zip')).toBe('0.0.14');
+  });
+
+  it('rejects archives for a different app, platform, architecture or version scheme', () => {
+    for (const path of [
+      'mlx-node-0.0.14-arm64.zip',
+      'mlx-node-0.0.14-darwin-x64.zip',
+      'other-0.0.14-darwin-arm64.zip',
+      'mlx-node-nightly-darwin-arm64.zip',
+    ]) {
+      expect(versionFromUpdateZipPath(path)).toBeNull();
+    }
+    expect(() => updateZipFileName('nightly')).toThrow();
+  });
+
+  it('blocks a ZIP that advertises a different version from its bundle', () => {
+    expect(() => assertVersionsAgree({ ...AGREED, zip: '0.0.8' })).toThrow(/ZIP filename/);
   });
 });
 
 /**
  * The guard that runs BEFORE a tag exists.
  *
- * Everything above only fires inside `desktop-release.yml`, which on a
- * `release: published` run cannot start any earlier than the release itself. By
- * then the mismatch costs a release with no DMG attached, and re-running is
- * awkward: `workflow_dispatch` carries no tag, and the upload step is gated on
- * `github.event_name == 'release'`.
+ * The workflow checks versions before building from a pushed tag. Catch the
+ * underlying manifest drift earlier, in ordinary pull request CI.
  *
  * The drift is created by `tools bump`, in an ordinary commit, days earlier —
  * so that is where it should be caught. `tools bump` reads its current version

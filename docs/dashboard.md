@@ -13,6 +13,10 @@ put an unauthenticated control panel API on a LAN.
 The dashboard still never links the native addon (no Metal init, instant start), and
 all data still comes from disk under `~/.mlx-node`.
 
+The [macOS desktop app](../packages/desktop/README.md) downloads app updates in the
+background. Use **Restart to Update…** from the tray when ready, or **Check for Updates…**
+to check manually.
+
 ## Where it runs
 
 ```

@@ -12,6 +12,7 @@ import { Menu, nativeImage, Tray, type MenuItemConstructorOptions } from 'electr
 
 import type { SupervisorSnapshot } from './supervisor/types.js';
 import { presentTray, type TrayPresentation } from './tray-view.js';
+import type { UpdatePresentation } from './updates.js';
 
 export interface TrayActions {
   openControlPanel(): void;
@@ -23,6 +24,7 @@ export interface TrayActions {
   /** Put a ready-to-paste Codex command carrying the URL and token on the clipboard. */
   copyCodexConnectCommand(): void;
   setShowInDock(next: boolean): void;
+  updateApp(): void;
   quit(): void;
 }
 
@@ -37,6 +39,7 @@ export interface TrayOptions {
    */
   iconPath: string;
   showInDock(): boolean;
+  appUpdate(): UpdatePresentation;
   actions: TrayActions;
 }
 
@@ -131,6 +134,12 @@ export function createTray(options: TrayOptions): TrayController {
         },
       },
       { type: 'separator' },
+      {
+        ...options.appUpdate(),
+        click: () => {
+          options.actions.updateApp();
+        },
+      },
       // The accelerator is display-only on a tray menu, which is why an
       // application menu with the standard roles is also installed — see
       // `index.ts`.
@@ -153,7 +162,7 @@ export function createTray(options: TrayOptions): TrayController {
       // The supervisor emits a state event for every health poll and every
       // trace line. Rebuilding the menu closes it if it happens to be open, so
       // an unchanged presentation is not re-rendered.
-      const key = `${JSON.stringify(presentation)}|${String(options.showInDock())}`;
+      const key = `${JSON.stringify(presentation)}|${String(options.showInDock())}|${JSON.stringify(options.appUpdate())}`;
       if (key === rendered) return;
       rendered = key;
       render(presentation);
