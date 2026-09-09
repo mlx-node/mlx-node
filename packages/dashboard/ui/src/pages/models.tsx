@@ -69,6 +69,13 @@ function isTerminalJob(state: DownloadJob['state']): boolean {
 interface ActiveJob {
   id: string;
   committing: boolean;
+  /**
+   * This page's own cancel has been accepted, but the job has not emitted its
+   * terminal frame yet. Carried for the same reason as `committing`: the card
+   * drops its Cancel (a second one answers 404) while staying subscribed, so the
+   * frame still arrives and `onDownloadCancelled` can refresh the snapshots.
+   */
+  cancelling: boolean;
   /** Runtime generation that produced this id; ids do not survive a reconnect. */
   connection: number;
   /**
@@ -77,6 +84,16 @@ interface ActiveJob {
    * against the next authoritative snapshot.
    */
   source: 'local' | 'server';
+}
+
+/**
+ * The two response bodies a card's verdict is joined from, captured at the
+ * instant a job settled. Identity is the whole point: a reload replaces the
+ * object, so `!==` is "the refreshed body arrived".
+ */
+interface SettledBodies {
+  catalog: unknown;
+  updates: unknown;
 }
 
 function QuantBadge({ quant }: { quant: string | null }) {
@@ -206,15 +223,27 @@ export default function Models() {
    * identity no longer matching IS the refreshed catalog arriving; nothing has
    * to remember to clear it, and a reload that never returns cannot strand it
    * (a failed one renders the error card in place of the whole grid).
+   *
+   * BOTH bodies, because the verdict is a join of both and they arrive
+   * independently. `/catalog` is a worker route reading only the filesystem
+   * while `/catalog/updates` may have to dial Hugging Face on a cold sha cache,
+   * so the catalog routinely wins — and on its own it lifts the guard over a
+   * remote sha from before the job ran, which is the pre-download "Update
+   * available" this whole mechanism exists to withhold.
    */
-  const [settledOn, setSettledOn] = useState<ReadonlyMap<string, unknown>>(() => new Map());
+  const [settledOn, setSettledOn] = useState<ReadonlyMap<string, SettledBodies>>(() => new Map());
   /**
-   * The same body, reachable from the reconcile effect below. That effect cannot
-   * depend on `catalog.data`: it calls `reloadCatalog()`, so listing the body it
-   * produces would re-run the effect on arrival and reload forever.
+   * The same bodies, reachable from the reconcile effect below. That effect
+   * cannot depend on `catalog.data` or `updates.data`: it calls `reloadCatalog()`
+   * and `reloadUpdates()`, so listing the bodies they produce would re-run the
+   * effect on arrival and reload forever.
    */
   const catalogBody = useRef(catalog.data);
   catalogBody.current = catalog.data;
+  const updatesBody = useRef(updates.data);
+  updatesBody.current = updates.data;
+  /** The pair as it stands right now, for the three live settle handlers. */
+  const settledBodies = (): SettledBodies => ({ catalog: catalog.data, updates: updates.data });
 
   const [pendingDelete, setPendingDelete] = useState<LocalModel | null>(null);
   const [deleting, setDeleting] = useState(false);
@@ -258,6 +287,7 @@ export default function Models() {
         next[job.repo] = {
           id: job.id,
           committing: job.state === 'committing',
+          cancelling: false,
           connection,
           source: 'server',
         };
@@ -316,7 +346,10 @@ export default function Models() {
       // stale body offers a live button for work that has already finished.
       setSettledOn((prev) => {
         const next = new Map(prev);
-        for (const job of jobs) if (isTerminalJob(job.state)) next.set(job.repo, catalogBody.current);
+        for (const job of jobs) {
+          if (isTerminalJob(job.state))
+            next.set(job.repo, { catalog: catalogBody.current, updates: updatesBody.current });
+        }
         return next;
       });
       reloadModels();
@@ -338,7 +371,7 @@ export default function Models() {
       if (getConnectionGeneration() !== startedConnection) return;
       setActive((prev) => ({
         ...prev,
-        [repo]: { id: res.id, committing: false, connection: startedConnection, source: 'local' },
+        [repo]: { id: res.id, committing: false, cancelling: false, connection: startedConnection, source: 'local' },
       }));
     } catch (err) {
       toast.error('Failed to start download', { description: errMessage(err) });
@@ -361,7 +394,7 @@ export default function Models() {
     if (id !== undefined) {
       void mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`).catch(() => {});
     }
-    setSettledOn((prev) => new Map(prev).set(repo, catalog.data));
+    setSettledOn((prev) => new Map(prev).set(repo, settledBodies()));
     models.reload();
     catalog.reload();
     // The update comparison is a SEPARATE request, so it holds the pre-download
@@ -382,7 +415,7 @@ export default function Models() {
     // verdict in place would immediately re-offer "Update available" for it.
     // BOTH halves: the marker it must be compared against is `/catalog`'s
     // `localRevision`, so refreshing the remote shas alone repairs nothing.
-    setSettledOn((prev) => new Map(prev).set(repo, catalog.data));
+    setSettledOn((prev) => new Map(prev).set(repo, settledBodies()));
     catalog.reload();
     updates.reload();
     const id = active[repo]?.id;
@@ -412,6 +445,18 @@ export default function Models() {
    *
    * Silent, unlike `onDownloadError`. A cancel is not a failure, and whoever
    * issued it already got their own confirmation.
+   *
+   * It still refreshes, because `cancelled` does not mean nothing reached disk.
+   * `processJob` runs `recoverBackup` BEFORE its first cancel boundary: a
+   * crashed publish leaves an owned backup under `.staging/<slug>.backup-<pid>-…`
+   * and recovery renames it onto the final dir. Every cancel check comes after
+   * that, so a job cancelled anywhere in the fetch loop settles `cancelled` with
+   * a model installed that these snapshots have never seen — and nothing else
+   * repairs it, because the reconcile effect above runs only on mount and
+   * reconnect. All three move for the same reasons the other two settle paths
+   * give: `/models` lists the recovered checkpoint, `/catalog` carries the
+   * marker its verdict is computed from, and the job resolved a fresh upstream
+   * sha into the server's cached map before it was cancelled.
    */
   const onDownloadCancelled = (repo: string): void => {
     setActive((prev) => {
@@ -420,19 +465,41 @@ export default function Models() {
       delete next[repo];
       return next;
     });
+    setSettledOn((prev) => new Map(prev).set(repo, settledBodies()));
+    models.reload();
+    catalog.reload();
+    updates.reload();
   };
 
   const cancel = async (repo: string, id: string): Promise<void> => {
     try {
       await mutate<CancelDownloadResponse>('DELETE', `/downloads/${encodeURIComponent(id)}`);
       toast.success('Download cancelled', { description: repo });
-      // Mirror onDownloadError's reset: drop the active job so the card reverts to
-      // the Install state. Cancel only aborts the job (its staging cleans up); the
-      // shared HF cache is deliberately left intact for `mlx download` to resume.
+      // Keep following the job rather than dropping it here. The server accepts a
+      // cancel while the in-flight job is still `running` and lets `processJob`
+      // emit the terminal frame as it unwinds, so clearing `active` at this
+      // acknowledgement unmounts `DownloadProgress` and closes its subscription
+      // BEFORE that frame lands — and `onDownloadCancelled`, the one path that
+      // refreshes the snapshots, never runs at all.
+      //
+      // Refreshing here instead would not do: the unwind can still install.
+      // `recoverBackup` renames a crashed publish onto the final dir at
+      // download.ts:868 and every cancel boundary comes after it, so a reload
+      // issued now can read the disk before that rename. Only the terminal frame
+      // proves the job is done touching it.
+      //
+      // Marking rather than deleting is what keeps the stream open. It drops the
+      // Cancel button (a second cancel answers 404) and leaves the progress bar
+      // standing for the unwind, which is honest — the job is still running.
+      // Cancel only aborts the job (its staging cleans up); the shared HF cache
+      // is deliberately left intact for `mlx download` to resume.
       setActive((prev) => {
-        const next = { ...prev };
-        delete next[repo];
-        return next;
+        const job = prev[repo];
+        // A QUEUED job is settled inside `cancel()` itself, so its terminal frame
+        // can beat this acknowledgement and clear the entry first. Never put one
+        // back, and never mark a job this cancel did not name.
+        if (job === undefined || job.id !== id) return prev;
+        return { ...prev, [repo]: { ...job, cancelling: true } };
       });
     } catch (err) {
       toast.error('Failed to cancel download', { description: errMessage(err) });
@@ -641,7 +708,8 @@ export default function Models() {
               key={item.hfRepo}
               item={item}
               updateAvailable={hasUpdate(item, remoteRevisions)}
-              settling={settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo) === catalog.data}
+              settling={settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo)?.catalog === catalog.data}
+              updateSettling={settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo)?.updates === updates.data}
               job={active[item.hfRepo]}
               onInstall={() => install(item.hfRepo)}
               onDone={() => onDownloadDone(item.hfRepo)}
@@ -733,6 +801,13 @@ interface CatalogCardProps {
    * arrived, so every field here still describes the state before the download.
    */
   settling: boolean;
+  /**
+   * The same, for the separately fetched remote shas {@link updateAvailable} is
+   * computed against. Gates only the update action: a failed `/catalog/updates`
+   * empties the sha map, so that branch is not rendered at all and this can
+   * never strand a button.
+   */
+  updateSettling: boolean;
   job: ActiveJob | undefined;
   onInstall: () => void;
   onDone: () => void;
@@ -745,6 +820,7 @@ function CatalogCard({
   item,
   updateAvailable,
   settling,
+  updateSettling,
   job,
   onInstall,
   onDone,
@@ -794,8 +870,11 @@ function CatalogCard({
             <DownloadProgress id={job.id} onDone={onDone} onError={onError} onCancelled={onCancelled} />
             {/* No Cancel while publishing: `cancel()` refuses a `committing` job
                 and the route 404s, so the button could only report a failure for
-                an install that then succeeds anyway. The progress bar stays. */}
-            {!job.committing && (
+                an install that then succeeds anyway. The progress bar stays.
+                Nor while `cancelling`: this page's cancel was already accepted
+                and the job is unwinding toward its terminal frame, so a second
+                one answers 404 too. */}
+            {!job.committing && !job.cancelling && (
               <Button
                 variant="ghost"
                 size="sm"
@@ -811,7 +890,7 @@ function CatalogCard({
           // Same job pipeline as a first install: the runner already re-downloads
           // whenever the installed marker's revision differs from upstream, and
           // its owned-swap replaces the stale directory.
-          <Button className="w-full" onClick={onInstall} disabled={settling}>
+          <Button className="w-full" onClick={onInstall} disabled={settling || updateSettling}>
             <Download className="size-4" />
             Update available
           </Button>
