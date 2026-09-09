@@ -28,7 +28,6 @@ import {
   NON_GENERATIVE_FAMILY_IDS,
   type ModelType,
 } from '@mlx-node/lm';
-import { findDFlash2Draft } from '@mlx-node/lm/draft-companion';
 
 import type { DiscoveredModelLike } from '../types.js';
 
@@ -203,12 +202,13 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
       while (usedNames.has(name)) name = `${scopeName}-${preferredName}-${suffix++}`;
     }
     usedNames.add(name);
-    const draftModelPath = findDFlash2Draft(path, modelType, modelsDir);
+    // Automatic companions can be installed or removed after this startup
+    // scan. The host resolves them on each load; draftModelPath is reserved
+    // for caller-supplied paths that the loader must treat as authoritative.
     const discovered: DiscoveredModelLike = {
       name,
       path,
       modelType,
-      ...(draftModelPath === undefined ? {} : { draftModelPath }),
     };
     out.push({
       discovered,

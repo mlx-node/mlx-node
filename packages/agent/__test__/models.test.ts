@@ -2,8 +2,10 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterAll, beforeAll, describe, expect, it } from 'vite-plus/test';
+import type { LoadableModel } from '@mlx-node/lm';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vite-plus/test';
 
+import { MlxModelHost } from '../src/provider/model-host.js';
 import { discoverMlxModels, type MlxModelInfo } from '../src/provider/models.js';
 
 let modelsDir: string;
@@ -200,7 +202,7 @@ describe('discoverMlxModels', () => {
     expect(await discoverMlxModels(join(modelsDir, 'does-not-exist'))).toEqual([]);
   });
 
-  it('pairs shared draft weights with Qwen3.8 variants without exposing a draft model', async () => {
+  it('discovers Qwen3.8 variants without persisting automatic draft paths or exposing a draft model', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-shared-dflash-'));
     try {
       const target = join(root, 'qwen3.8-27b-mxfp4-mlx');
@@ -216,12 +218,71 @@ describe('discoverMlxModels', () => {
       await writeFile(join(root, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'), minimalGguf('qwen35'));
       const models = await discoverMlxModels(root);
       expect(models).toHaveLength(2);
-      expect(models.every((model) => model.discovered.draftModelPath === draft)).toBe(true);
+      expect(models.every((model) => model.discovered.draftModelPath === undefined)).toBe(true);
       expect(models.some((model) => model.discovered.path === draft)).toBe(false);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it.each(['safetensors', 'top-level GGUF', 'nested GGUF', 'embedded draft'] as const)(
+    'rechecks the %s companion after discovery and on each model swap',
+    async (layout) => {
+      const root = await mkdtemp(join(tmpdir(), 'mlx-agent-draft-lifecycle-'));
+      const repo = join(root, 'qwen3.8-27b');
+      const filename = 'Qwen3.8-27B-UD-Q4_K_XL.gguf';
+      const target = layout === 'safetensors' ? repo : join(layout === 'top-level GGUF' ? root : repo, filename);
+      const draft = layout === 'embedded draft' ? join(repo, 'draft') : join(root, 'qwen3.8-27b-dflash2');
+      try {
+        if (layout !== 'top-level GGUF') {
+          await mkdir(repo);
+          await writeFile(join(repo, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+        }
+        if (layout === 'safetensors') {
+          await writeFile(join(repo, 'model.safetensors'), 'target weights');
+        } else {
+          await writeFile(target, minimalGguf('qwen35'));
+        }
+        await mkdir(draft);
+        await writeFile(
+          join(draft, 'config.json'),
+          JSON.stringify({ model_type: 'qwen3', architectures: ['DFlash2DraftModel'] }),
+        );
+        await writeFile(join(draft, 'model.safetensors'), 'draft weights');
+        // Use the real startup discovery record: hand-built records would miss
+        // the stale automatic path that previously became authoritative here.
+        const models = await discoverMlxModels(root);
+        expect(models).toHaveLength(1);
+        const model = models[0]!.discovered;
+        const loader = vi.fn(async (path: string) => ({ fakeModelFor: path }) as unknown as LoadableModel);
+        const host = new MlxModelHost(
+          [...models.map((info) => info.discovered), { name: 'other', path: '/models/other', modelType: 'qwen3' }],
+          { loadModelFn: loader, resolveModelPathFn: async (entry) => `/paged/${entry.name}` },
+        );
+        const loadTarget = () => host.runWithResident(model.name, async () => undefined);
+        const swapAway = () => host.runWithResident('other', async () => undefined);
+
+        // A partial companion before the first load must not prevent target use.
+        await rm(join(draft, 'model.safetensors'));
+        await loadTarget();
+        expect(loader).toHaveBeenLastCalledWith(`/paged/${model.name}`);
+
+        // Restoring it is picked up from the original target, not the overlay.
+        await writeFile(join(draft, 'model.safetensors'), 'draft weights');
+        await swapAway();
+        await loadTarget();
+        expect(loader).toHaveBeenLastCalledWith(`/paged/${model.name}`, { draftModelPath: draft });
+
+        // Deleting a previously loaded companion must not poison a later swap.
+        await swapAway();
+        await rm(draft, { recursive: true });
+        await loadTarget();
+        expect(loader).toHaveBeenLastCalledWith(`/paged/${model.name}`);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('discovers every nested Q<number>_K_XL target by its direct GGUF path', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-agent-xl-gguf-'));
@@ -258,13 +319,11 @@ describe('discoverMlxModels', () => {
           name: 'Qwen3.8-27B-UD-Q3_K_XL',
           path: join(repo, 'Qwen3.8-27B-UD-Q3_K_XL.gguf'),
           modelType: 'qwen3_5',
-          draftModelPath: draft,
         },
         {
           name: 'Qwen3.8-27B-UD-Q4_K_XL',
           path: join(repo, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'),
           modelType: 'qwen3_5',
-          draftModelPath: draft,
         },
       ]);
       expect(discovered.map((model) => model.piModel.contextWindow)).toEqual([65536, 65536]);
