@@ -5,6 +5,10 @@
 @custom-variant dark (@media (prefers-color-scheme: dark));
 
 :root {
+  /* Match native controls to the app theme, including the persistent scrollbars
+     macOS shows when a mouse is connected. Keep the track on its own surface. */
+  color-scheme: light dark;
+  scrollbar-color: var(--muted-foreground) transparent;
   --radius: 0.8rem;
   --background: oklch(0.99 0 0);
   --foreground: oklch(0.205 0 0);
@@ -163,6 +167,7 @@
 @layer base {
   * {
     @apply border-border outline-ring/50;
+    scrollbar-width: thin;
   }
   body {
     @apply bg-background text-foreground antialiased;
