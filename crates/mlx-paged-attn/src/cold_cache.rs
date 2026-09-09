@@ -1379,8 +1379,8 @@ impl ColdCacheManager {
     }
 
     /// Capture one pinned physical block from Metal, then enqueue only the
-    /// owned host bytes. The writer thread never calls MLX/Metal and never
-    /// holds the allocator lock.
+    /// owned host bytes. The caller must complete prior GPU writes before
+    /// capture. The writer never calls MLX/Metal or holds the allocator lock.
     ///
     /// Non-blocking admission: a full queue drops the write. Callers that
     /// would rather wait a bounded time for a slot than lose the block use
@@ -1398,10 +1398,10 @@ impl ColdCacheManager {
 
     /// [`Self::capture_and_enqueue`] with a bounded wait for a queue slot.
     ///
-    /// The Metal blit happens first and unconditionally — it is the expensive
-    /// half and it must run while the block is pinned — then the owned host
-    /// bytes are offered to the writer until `deadline`. A caller walking a
-    /// chain of blocks passes the SAME deadline for every block, so the wait
+    /// The snapshot copy happens first while the block is pinned, using CPU
+    /// access to shared storage or a completed Metal blit for private storage.
+    /// The owned bytes are then offered to the writer until `deadline`. A caller
+    /// walking a chain passes the SAME deadline for every block, so the wait
     /// is a budget over the whole walk, not per block.
     pub fn capture_and_enqueue_before(
         &self,
@@ -1416,14 +1416,11 @@ impl ColdCacheManager {
             return Err("cold cache captures full blocks only".to_string());
         }
 
-        // Logical pin prevents allocator eviction/reuse while Metal blits run.
+        // Logical pin prevents allocator eviction/reuse during the snapshot.
         block.incref();
         let captured: Result<ColdCacheBlock, String> = (|| {
-            // One command buffer for the whole block. Reading layer by layer
-            // cost one blocking GPU round-trip per layer, all of them on the
-            // inference thread and all of them inside the pin above. A failure
-            // still returns here with `layers` dropped, so the `decref` below
-            // runs and no half-populated block can reach `enqueue`.
+            // Capture every layer before admission. On failure the `decref`
+            // below still runs; no partial snapshot can reach the writer.
             let layers: Vec<ColdLayerBlock> = pool
                 .read_block_all_layers(block.block_id)?
                 .into_iter()
@@ -2084,12 +2081,9 @@ impl ColdCacheManager {
             }
         };
 
-        // One command buffer for the whole block instead of one per layer.
-        // Two different failures land here. Validation (layout, block id, per
-        // layer byte lengths) rejects before the first blit is encoded, so
-        // nothing was written. A command-buffer abort is reported after the
-        // blits were submitted, so some layers of this block may have been
-        // applied and others not.
+        // Validate every layer before the first CPU copy or fallback GPU blit.
+        // Validation failure leaves the destination untouched; a GPU command
+        // abort may leave partial bytes, but is still reported before publish.
         //
         // Both are safe for the same reason, and it is not "nothing was
         // written": `BlockAllocator::allocate` never zeroes, so every freshly
@@ -7408,7 +7402,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new_private_for_test(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(
@@ -7492,7 +7486,7 @@ mod tests {
             max_seq_len: Some(32),
             max_batch_size: Some(1),
         };
-        let pool = match LayerKVPool::new(config, 2, 2, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new_private_for_test(config, 2, 2, MetalDtype::BFloat16) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!(

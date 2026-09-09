@@ -41,6 +41,15 @@ use metal::Buffer;
 use std::sync::RwLock;
 
 #[cfg(target_os = "macos")]
+fn pool_storage_options(device: &metal::Device, cpu_access: bool) -> metal::MTLResourceOptions {
+    if cpu_access && device.has_unified_memory() {
+        metal::MTLResourceOptions::StorageModeShared
+    } else {
+        metal::MTLResourceOptions::StorageModePrivate
+    }
+}
+
+#[cfg(target_os = "macos")]
 fn inference_trace_file() -> Option<&'static str> {
     static TRACE_FILE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     TRACE_FILE
@@ -187,8 +196,8 @@ pub struct LayerKVPool {
     #[cfg(target_os = "macos")]
     inner: RwLock<PoolInner>,
 
-    /// Reused only while holding the lock and after GPU completion. A single
-    /// block larger than the retention bound uses a temporary pair instead.
+    /// Serializes host transfers. The private fallback retains staging only
+    /// after GPU completion; a block over the bound uses a temporary pair.
     #[cfg(target_os = "macos")]
     restore_staging: std::sync::Mutex<Option<(Buffer, Buffer)>>,
 
@@ -429,6 +438,11 @@ impl LayerKVPool {
 
     /// Allocate one (K, V) `metal::Buffer` pair per layer.
     ///
+    /// Unified-memory devices use shared storage so completed SSD capture and
+    /// restore transfers can access the pool directly on the CPU. Other devices
+    /// retain private storage and GPU staging. `MLX_PAGED_CPU_TRANSFER=0` selects
+    /// the private fallback for comparison; it is read once per process.
+    ///
     /// Buffer shapes mirror `CacheEngine::initialize` exactly (vLLM
     /// convention):
     /// - Key cache:   `[num_blocks, num_kv_heads, head_size/x, block_size, x]`
@@ -464,6 +478,30 @@ impl LayerKVPool {
         max_num_blocks: u32,
         cache_dtype: MetalDtype,
     ) -> Result<Self, String> {
+        static CPU_ACCESS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let cpu_access = *CPU_ACCESS
+            .get_or_init(|| std::env::var("MLX_PAGED_CPU_TRANSFER").as_deref() != Ok("0"));
+        Self::new_inner(config, num_blocks, max_num_blocks, cache_dtype, cpu_access)
+    }
+
+    /// Exercise the GPU-staging fallback, including command failure injection.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn new_private_for_test(
+        config: PagedAttentionConfig,
+        num_blocks: u32,
+        max_num_blocks: u32,
+        cache_dtype: MetalDtype,
+    ) -> Result<Self, String> {
+        Self::new_inner(config, num_blocks, max_num_blocks, cache_dtype, false)
+    }
+
+    fn new_inner(
+        config: PagedAttentionConfig,
+        num_blocks: u32,
+        max_num_blocks: u32,
+        cache_dtype: MetalDtype,
+        _cpu_access: bool,
+    ) -> Result<Self, String> {
         config.validate()?;
         if num_blocks == 0 {
             return Err("LayerKVPool::new: num_blocks must be > 0".to_string());
@@ -487,7 +525,6 @@ impl LayerKVPool {
         #[cfg(target_os = "macos")]
         {
             use crate::metal::MetalState;
-            use metal::MTLResourceOptions;
 
             let state = MetalState::get()?;
 
@@ -522,12 +559,14 @@ impl LayerKVPool {
 
             let mut layers = Vec::with_capacity(config.num_layers as usize);
             for _ in 0..config.num_layers {
-                let key_cache = state
-                    .device
-                    .new_buffer(key_cache_size, MTLResourceOptions::StorageModePrivate);
-                let value_cache = state
-                    .device
-                    .new_buffer(value_cache_size, MTLResourceOptions::StorageModePrivate);
+                let key_cache = state.device.new_buffer(
+                    key_cache_size,
+                    pool_storage_options(&state.device, _cpu_access),
+                );
+                let value_cache = state.device.new_buffer(
+                    value_cache_size,
+                    pool_storage_options(&state.device, _cpu_access),
+                );
                 layers.push((key_cache, value_cache));
             }
 
@@ -853,6 +892,15 @@ impl LayerKVPool {
         // completed before `inner` is touched, so any failure leaves the old
         // state untouched.
         let state = MetalState::get()?;
+        // Preserve the original allocation's CPU accessibility across growth.
+        let storage = if inner.layers.iter().all(|(k, v)| {
+            k.storage_mode() == metal::MTLStorageMode::Shared
+                && v.storage_mode() == metal::MTLStorageMode::Shared
+        }) {
+            MTLResourceOptions::StorageModeShared
+        } else {
+            MTLResourceOptions::StorageModePrivate
+        };
         let mut new_layers = Vec::with_capacity(inner.layers.len());
         for _ in 0..inner.layers.len() {
             // Metal hands out nil buffers when an allocation cannot be
@@ -860,12 +908,8 @@ impl LayerKVPool {
             // bail before any blit and the build-then-swap guarantee holds
             // (old generation untouched on error). `new_buffer` would panic
             // here instead — while the caller holds the pool write lock.
-            let key_cache = state
-                .device
-                .try_new_buffer(new_key_size, MTLResourceOptions::StorageModePrivate);
-            let value_cache = state
-                .device
-                .try_new_buffer(new_value_size, MTLResourceOptions::StorageModePrivate);
+            let key_cache = state.device.try_new_buffer(new_key_size, storage);
+            let value_cache = state.device.try_new_buffer(new_value_size, storage);
             let (Some(key_cache), Some(value_cache)) = (key_cache, value_cache) else {
                 return Err(
                     "LayerKVPool::grow_to: Metal returned a nil buffer for the new generation"
@@ -1769,19 +1813,17 @@ impl LayerKVPool {
         Err("read_blocks_to_host is only supported on macOS (Metal backend)".to_string())
     }
 
-    /// Read one physical block back to host for **every** layer in a single
-    /// Metal submission. Returns `(keys, values)` per layer, indexed by
-    /// `layer_idx`, in the same native packed layouts
-    /// [`Self::read_blocks_to_host`] returns.
+    /// Capture one physical block's native packed bytes for every layer.
+    /// Returns `(keys, values)` by layer, byte-identical to
+    /// [`Self::read_blocks_to_host`]. Shared buffers are copied on the CPU;
+    /// private buffers use one completed staging blit for the whole block.
     ///
-    /// Byte for byte this equals calling `read_blocks_to_host(l, &[block_id])`
-    /// for `l in 0..num_layers()`. Only the dispatch differs: the per-layer
-    /// entry point allocates a staging pair and then commits and *blocks* on
-    /// its own command buffer each time, so capturing one block of a 28-layer
-    /// model cost 28 serialized GPU round-trips — paid on the inference
-    /// thread, on every turn that captures, while the block is pinned. Here
-    /// the whole block is copied by one blit encoder under a single commit +
-    /// `wait_until_completed`.
+    /// The caller must complete prior GPU writes and keep the captured block
+    /// pinned and immutable until this call returns. The adapter already flushes
+    /// pending pool writes before publishing full blocks. Shared storage then
+    /// needs one CPU copy into the writer's owned snapshot; private storage uses
+    /// the staging blit below. Neither path lends mutable pool bytes to the SSD
+    /// writer.
     ///
     /// Validation (non-empty pool, block-id range, dtype geometry, and that
     /// every layer's buffer is actually long enough to hold the slot) runs
@@ -1820,6 +1862,41 @@ impl LayerKVPool {
             key_block_size,
             value_block_size,
         )?;
+
+        if layers.iter().all(|(k, v)| {
+            k.storage_mode() == metal::MTLStorageMode::Shared
+                && v.storage_mode() == metal::MTLStorageMode::Shared
+        }) {
+            let _copy_guard = self
+                .restore_staging
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let mut result = Vec::with_capacity(num_layers);
+            for (k, v) in &layers {
+                // SAFETY: the shared buffers are retained, their complete slots
+                // were checked above, and the completed-write/pin contract plus
+                // this transfer lease excludes mutation. The borrowed slices
+                // live only through the copy into independent writer snapshots.
+                let (keys, values) = unsafe {
+                    (
+                        std::slice::from_raw_parts(
+                            (k.contents() as *const u8)
+                                .add(block_id as usize * key_block_size as usize),
+                            key_block_size as usize,
+                        )
+                        .to_vec(),
+                        std::slice::from_raw_parts(
+                            (v.contents() as *const u8)
+                                .add(block_id as usize * value_block_size as usize),
+                            value_block_size as usize,
+                        )
+                        .to_vec(),
+                    )
+                };
+                result.push((keys, values));
+            }
+            return Ok(result);
+        }
 
         // Exactly two staging buffers for the whole block; layer `i` owns the
         // window at `i * block_bytes` in each.
@@ -2026,32 +2103,24 @@ impl LayerKVPool {
         Err("write_blocks_from_host is only supported on macOS (Metal backend)".to_string())
     }
 
-    /// Restore one physical block's raw cache-layout bytes for **every** layer
-    /// in a single Metal submission. `layers[i]` supplies `(keys, values)` for
-    /// layer `i` and must have exactly `num_layers()` entries, each in the
-    /// native packed layouts [`Self::read_block_all_layers`] produces.
-    ///
-    /// Byte for byte this equals calling
-    /// `write_blocks_from_host(l, &[block_id], keys, values)` for
-    /// `l in 0..num_layers()`. Only the dispatch differs: the per-layer entry
-    /// point allocates two staging buffers and commits and *blocks* on its own
-    /// command buffer each time, so restoring one block of a 28-layer model
-    /// cost 56 allocations and 28 serialized GPU round-trips. Here the block
-    /// is staged into one buffer pair and copied by one blit encoder under a
-    /// single commit + `wait_until_completed`.
+    /// Restore one physical block's native packed bytes for every layer.
+    /// `layers[i]` supplies `(keys, values)` for layer `i` and must cover the
+    /// complete pool geometry. Uses the same CPU/shared or GPU/private path as
+    /// [`Self::write_blocks_all_layers`].
     ///
     /// # Partial-overwrite invariant
     ///
     /// Every check — layer count, block-id range, *each* layer's key and
     /// value byte length, and *each* layer's buffer being long enough to hold
-    /// the slot — completes before the first blit is encoded. A call
+    /// the slot — completes before the first CPU copy or blit. A call
     /// rejected by *validation* therefore leaves the pool bit-for-bit
     /// unmodified rather than half-written. This is the whole safety story for
     /// corrupt cold-cache data: a pool holding the first `k` layers of one
     /// prefix and the remaining layers of another decodes to wrong tokens with
     /// no error anywhere.
     ///
-    /// A command-buffer failure carries no such guarantee — the blits were
+    /// On the private-buffer fallback, a command-buffer failure carries no
+    /// such guarantee — the blits were
     /// already submitted, and an aborted buffer may have applied some layers
     /// and not others. What every `Err` from this function does guarantee is
     /// that the caller was told, so the caller must treat the target block as
@@ -2069,8 +2138,11 @@ impl LayerKVPool {
 
     /// Upload a block chain in bounded chunks. Validate the complete input
     /// before touching the pool; publication remains the caller's transaction.
-    /// The pool generation and staging pair stay locked until all GPU writes
-    /// finish, preventing growth or reuse from racing an in-flight transfer.
+    /// The caller owns the reserved destinations and must keep GPU accesses to
+    /// those slots idle until this call returns. The pool generation and transfer
+    /// lease stay locked through completion, preventing growth and other host
+    /// transfers from racing the copy. Shared buffers need no staging allocation
+    /// or GPU submission; private buffers retain the bounded blit fallback.
     #[cfg(target_os = "macos")]
     pub fn write_blocks_all_layers(&self, blocks: &[BlockUpload<'_>]) -> Result<(), String> {
         use crate::metal::MetalState;
@@ -2125,6 +2197,38 @@ impl LayerKVPool {
                 }
             }
         }
+        if layers.iter().all(|(k, v)| {
+            k.storage_mode() == metal::MTLStorageMode::Shared
+                && v.storage_mode() == metal::MTLStorageMode::Shared
+        }) {
+            let _copy_guard = self
+                .restore_staging
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for (block_id, source) in blocks {
+                for ((keys, values), (k, v)) in source.iter().zip(layers) {
+                    // SAFETY: all source lengths and destination slots were
+                    // checked before any write. Shared buffers remain retained
+                    // under the generation lock; the transfer lease serializes
+                    // host access and reserved slots exclude live GPU users.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            keys.as_ptr(),
+                            (k.contents() as *mut u8).add(*block_id as usize * key_bytes as usize),
+                            keys.len(),
+                        );
+                        std::ptr::copy_nonoverlapping(
+                            values.as_ptr(),
+                            (v.contents() as *mut u8)
+                                .add(*block_id as usize * value_bytes as usize),
+                            values.len(),
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
+
         let key_per_block = key_bytes
             .checked_mul(layers.len() as u64)
             .ok_or("restore key staging size overflow")?;
@@ -2755,7 +2859,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn multi_block_upload_validates_the_entire_chain_and_reuses_staging() {
-        let pool = LayerKVPool::new(base_config(4), 4, 4, MetalDtype::BFloat16).unwrap();
+        let pool =
+            LayerKVPool::new_inner(base_config(4), 4, 4, MetalDtype::BFloat16, false).unwrap();
         let payload = distinct_layer_bytes(4, 2 * 64 * 8 * 2);
         let borrow = || {
             payload
@@ -2797,6 +2902,99 @@ mod tests {
         let (k, v) = guard.as_ref().unwrap();
         assert_eq!((k.contents(), v.contents()), pointers);
         assert!(k.length() + v.length() <= RESTORE_STAGING_BYTES);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn shared_transfers_match_gpu_bytes_and_preserve_storage_on_growth() {
+        let Ok(state) = crate::metal::MetalState::get() else {
+            return;
+        };
+        if !state.device.has_unified_memory() {
+            return;
+        }
+        for (dtype, fp8) in [
+            (MetalDtype::Float16, false),
+            (MetalDtype::BFloat16, false),
+            (MetalDtype::UChar, true),
+        ] {
+            let mut config = base_config(3);
+            config.use_fp8_cache = Some(fp8);
+            if fp8 {
+                config.block_size = 16;
+            }
+            let pool = LayerKVPool::new_inner(config, 4, 8, dtype, true).unwrap();
+            let (key_bytes, _) = pool.block_bytes_per_layer().unwrap();
+            let payload = distinct_layer_bytes(3, key_bytes as usize);
+            let borrow = || {
+                payload
+                    .iter()
+                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                    .collect::<Vec<_>>()
+            };
+            pool.write_blocks_all_layers(&[(0, borrow()), (2, borrow())])
+                .unwrap();
+            // This API always uses a GPU staging blit, independently of the
+            // optimized all-layer transfer. It sees exactly the CPU-written bits.
+            for (layer, expected) in payload.iter().enumerate() {
+                assert_eq!(
+                    pool.read_blocks_to_host(layer as u32, &[2]).unwrap(),
+                    *expected
+                );
+            }
+            let before = pool.read_block_all_layers(0).unwrap();
+            let poison = poison_layer_bytes(&payload);
+            let mut malformed = vec![
+                (
+                    0,
+                    poison
+                        .iter()
+                        .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                        .collect::<Vec<_>>(),
+                ),
+                (2, borrow()),
+            ];
+            malformed[1].1[2].1 = &payload[2].1[..1];
+            assert!(pool.write_blocks_all_layers(&malformed).is_err());
+            assert!(
+                pool.write_blocks_all_layers(&[(0, borrow()), (0, borrow())])
+                    .is_err()
+            );
+            assert_eq!(pool.read_block_all_layers(0).unwrap(), before);
+            // Conversely, complete GPU writes must be visible to CPU capture.
+            for (layer, (k, v)) in poison.iter().enumerate() {
+                pool.write_blocks_from_host(layer as u32, &[2], k, v)
+                    .unwrap();
+            }
+            assert_eq!(pool.read_block_all_layers(2).unwrap(), poison);
+            assert!(pool.grow_to(8).unwrap());
+            assert_eq!(pool.read_block_all_layers(0).unwrap(), payload);
+            assert_eq!(pool.read_block_all_layers(2).unwrap(), poison);
+            pool.write_blocks_all_layers(&[(7, borrow())]).unwrap();
+            assert_eq!(pool.read_block_all_layers(7).unwrap(), payload);
+            assert!(
+                pool.inner_read()
+                    .layers
+                    .iter()
+                    .all(|(k, v)| k.storage_mode() == metal::MTLStorageMode::Shared
+                        && v.storage_mode() == metal::MTLStorageMode::Shared)
+            );
+            assert!(
+                pool.restore_staging.lock().unwrap().is_none(),
+                "CPU transfers must not allocate staging"
+            );
+        }
+        let private =
+            LayerKVPool::new_inner(base_config(2), 4, 8, MetalDtype::BFloat16, false).unwrap();
+        assert!(private.grow_to(8).unwrap());
+        assert!(
+            private
+                .inner_read()
+                .layers
+                .iter()
+                .all(|(k, v)| k.storage_mode() == metal::MTLStorageMode::Private
+                    && v.storage_mode() == metal::MTLStorageMode::Private)
+        );
     }
 
     /// Which side of a layer's `(key, value)` pair a mutation shrinks.
@@ -3278,7 +3476,13 @@ mod tests {
         use crate::metal::command_buffer::arm_failure;
 
         const LAYERS: usize = 4;
-        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new_inner(
+            base_config(LAYERS as u32),
+            4,
+            4,
+            MetalDtype::BFloat16,
+            false,
+        ) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_batched_write_reports_a_failed_command_buffer: {e}");
@@ -3329,7 +3533,13 @@ mod tests {
         use crate::metal::command_buffer::arm_failure;
 
         const LAYERS: usize = 4;
-        let pool = match LayerKVPool::new(base_config(LAYERS as u32), 4, 4, MetalDtype::BFloat16) {
+        let pool = match LayerKVPool::new_inner(
+            base_config(LAYERS as u32),
+            4,
+            4,
+            MetalDtype::BFloat16,
+            false,
+        ) {
             Ok(pool) => pool,
             Err(e) if e.contains("No Metal device found") => {
                 eprintln!("skipping test_batched_read_reports_a_failed_command_buffer: {e}");
@@ -3676,6 +3886,7 @@ mod upload_batching_bench {
             ("qwen3-0.6b-mlx-bf16", 28u32, 8u32, 128u32),
             ("gemma-4-e2b-it-mlx", 35, 1, 256),
             ("Qwen3.5-0.8B (24L/2H/256)", 24, 2, 256),
+            ("Qwen dense 27B (16L/4H/256)", 16, 4, 256),
         ];
         let f = |d: std::time::Duration| d.as_secs_f64() * 1e3 / REPS as f64;
         eprintln!(
@@ -3793,6 +4004,7 @@ mod upload_batching_bench {
             ("qwen3-0.6b-mlx-bf16", 28u32, 8u32, 128u32),
             ("gemma-4-e2b-it-mlx", 35, 1, 256),
             ("Qwen3.5-0.8B (24L/2H/256)", 24, 2, 256),
+            ("Qwen dense 27B (16L/4H/256)", 16, 4, 256),
         ];
         eprintln!("\n=== per-block upload cost by family (block_size {BS}, bf16) ===");
         for (label, l, kvh, hs) in families {
