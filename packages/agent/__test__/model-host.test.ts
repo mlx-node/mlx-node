@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { LoadableModel } from '@mlx-node/lm';
+import type { LoadableModel, LoadModelOptions } from '@mlx-node/lm';
 import { ChatSession } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
@@ -59,7 +59,7 @@ describe('MlxModelHost', () => {
     expect(host.residentId).toBe('qwen-small');
   });
 
-  it('loads an auto-discovered DFlash2 companion with its Qwen target', async () => {
+  it('forwards a supplied DFlash2 companion with its Qwen target', async () => {
     const root = mkdtempSync(join(tmpdir(), 'mlx-host-draft-'));
     const draft = join(root, 'draft');
     mkdirSync(draft);
@@ -77,10 +77,6 @@ describe('MlxModelHost', () => {
     try {
       await getSession(host, model.name);
       expect(loader).toHaveBeenCalledWith(model.path, { draftModelPath: draft });
-      rmSync(draft, { recursive: true });
-      host.invalidateResident(model.name);
-      await getSession(host, model.name);
-      expect(loader).toHaveBeenLastCalledWith(model.path);
     } finally {
       host.invalidateResident(model.name);
       rmSync(root, { recursive: true, force: true });
@@ -109,6 +105,38 @@ describe('MlxModelHost', () => {
       host.invalidateResident(model.name);
       await getSession(host, model.name);
       expect(loader).toHaveBeenLastCalledWith('/paged/overlay', { draftModelPath: draft });
+      rmSync(draft, { recursive: true });
+      host.invalidateResident(model.name);
+      await getSession(host, model.name);
+      expect(loader).toHaveBeenLastCalledWith('/paged/overlay');
+    } finally {
+      host.invalidateResident(model.name);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves native validation errors for an explicit Qwen draft even when a shared companion exists', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-host-explicit-draft-'));
+    const shared = join(root, 'qwen3.8-27b-dflash2');
+    mkdirSync(shared);
+    writeFileSync(join(shared, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
+    writeFileSync(join(shared, 'model.safetensors'), 'weights');
+    const model: DiscoveredModelLike = {
+      name: 'qwen',
+      path: join(root, 'qwen3.8-27b-mxfp4-mlx'),
+      modelType: 'qwen3_5',
+      draftModelPath: join(root, 'missing-explicit-draft'),
+    };
+    const failure = new Error('native draft validation failed');
+    const loader = vi.fn(async (_path: string, options?: LoadModelOptions) => {
+      if (options?.draftModelPath === model.draftModelPath) throw failure;
+      return {} as LoadableModel;
+    });
+    const host = new MlxModelHost([model], { loadModelFn: loader });
+    try {
+      await expect(getSession(host, model.name)).rejects.toBe(failure);
+      expect(loader).toHaveBeenCalledExactlyOnceWith(model.path, { draftModelPath: model.draftModelPath });
+      expect(host.residentId).toBeNull();
     } finally {
       host.invalidateResident(model.name);
       rmSync(root, { recursive: true, force: true });
@@ -160,22 +188,27 @@ describe('MlxModelHost', () => {
     expect(host.residentId).toBe('qwen-small');
   });
 
-  it('allows Gemma4 with an attached draft to use its flat speculative executor', async () => {
-    const loader = vi.fn(
-      async () =>
-        ({
-          hasBlockPagedCache: () => false,
-          hasMtpWeights: () => true,
-        }) as unknown as LoadableModel,
-    );
-    const host = new MlxModelHost(MODELS, {
-      loadModelFn: loader,
-      requirePagedCache: true,
-    });
+  it.each(['dspark', 'assistant'])(
+    'forwards an explicit Gemma4 %s draft to its flat speculative executor',
+    async (kind) => {
+      const loader = vi.fn(
+        async () =>
+          ({
+            hasBlockPagedCache: () => false,
+            hasMtpWeights: () => true,
+          }) as unknown as LoadableModel,
+      );
+      const model = { ...MODELS[1], draftModelPath: `/drafts/gemma4-${kind}` };
+      const host = new MlxModelHost([model], {
+        loadModelFn: loader,
+        requirePagedCache: true,
+      });
 
-    await expect(getSession(host, 'gemma-mid')).resolves.toBeInstanceOf(ChatSession);
-    expect(host.residentId).toBe('gemma-mid');
-  });
+      await expect(getSession(host, 'gemma-mid')).resolves.toBeInstanceOf(ChatSession);
+      expect(loader).toHaveBeenCalledExactlyOnceWith(model.path, { draftModelPath: model.draftModelPath });
+      expect(host.residentId).toBe('gemma-mid');
+    },
+  );
 
   it('rejects Qwen3.5 MoE MTP rather than silently routing a paged session through AR', async () => {
     const loader = vi.fn(
