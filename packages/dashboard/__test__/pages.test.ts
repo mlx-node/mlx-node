@@ -1501,6 +1501,48 @@ describe('Models page — the Install affordance', () => {
     expect(liveButtonLabels()).toContain('Update available');
   });
 
+  it('closes that window on the updates half too, when the catalog lands first', async () => {
+    // The verdict is a join of two independent responses, and the guard has to
+    // hold until BOTH have moved. `/catalog` is a worker route reading only the
+    // filesystem, while `/catalog/updates` may dial Hugging Face on a cold sha
+    // cache — so the catalog routinely wins, and on its own it lifts the guard
+    // over a remote sha resolved BEFORE the job ran. The card then offers
+    // "Update available" for the revision the job just installed, which is the
+    // pre-download verdict this mechanism exists to withhold.
+    const stale = catalogRoutes(
+      { present: false, installed: false, localRevision: null },
+      [downloadJob({ id: 'job-join', state: 'running' })],
+      { items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40) }] },
+    );
+    // Upstream moved past what the job installed, so once BOTH bodies land there
+    // is a genuine update to offer — a suppression that never lifts fails here.
+    const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
+      items: [{ hfRepo: REPO, remoteRevision: 'c'.repeat(40) }],
+    });
+    // Only the remote shas are held: the catalog arrives first, which is the
+    // whole point of the ordering under test.
+    const held = deferred(fresh['/catalog/updates']);
+    recordRequests({
+      ...stale,
+      '/models': sequence(stale['/models'], fresh['/models']),
+      '/catalog': sequence(stale['/catalog'], fresh['/catalog']),
+      '/catalog/updates': sequence(stale['/catalog/updates'], held.body),
+      '/downloads/job-join': { cancelled: true, id: 'job-join' },
+    });
+    await mountModels();
+
+    emitDownload('done', { id: 'job-join', outputDir: '/models/x' });
+    await settle();
+    // The fresh catalog HAS landed — `localRevision` is the installed one — but
+    // it is being compared against the sha from before the job.
+    expect(buttonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).not.toContain('Update available');
+
+    held.release();
+    await settle();
+    expect(liveButtonLabels()).toContain('Update available');
+  });
+
   it('closes that window on a FIRST install too, where the stale body still says absent', async () => {
     // The same one render, reached from the other side: nothing was installed
     // before, so the stale body says `present: false` and the branch falls
@@ -1560,6 +1602,38 @@ describe('Models page — the Install affordance', () => {
     expect(liveButtonLabels()).toContain('Update available');
   });
 
+  it('closes the updates half for a job that settled while the page was away too', async () => {
+    // The reconcile effect records the pair from refs, not from the render, so
+    // its updates half needs its own gate. Same ordering as the live case: the
+    // filesystem catalog lands while the remote shas are still in flight.
+    const stale = catalogRoutes(
+      { present: false, installed: false, localRevision: null },
+      [downloadJob({ id: 'job-away2', state: 'done' })],
+      { items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40) }] },
+    );
+    const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'b'.repeat(40) }, [], {
+      items: [{ hfRepo: REPO, remoteRevision: 'c'.repeat(40) }],
+    });
+    const held = deferred(fresh['/catalog/updates']);
+    recordRequests({
+      ...stale,
+      '/models': sequence(stale['/models'], fresh['/models']),
+      '/catalog': sequence(stale['/catalog'], fresh['/catalog']),
+      '/catalog/updates': sequence(stale['/catalog/updates'], held.body),
+      '/downloads/job-away2': { cancelled: true, id: 'job-away2' },
+    });
+    await mountModels();
+
+    // The installed revision is on screen, compared against the sha from before
+    // the job. That verdict must not be actionable.
+    expect(buttonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).not.toContain('Update available');
+
+    held.release();
+    await settle();
+    expect(liveButtonLabels()).toContain('Update available');
+  });
+
   it('closes that window when the job settles as ERROR, which can still have installed', async () => {
     // `publish()` renames staging into place and only THEN removes the backup,
     // inside the job's try, so an `error` can name a model already on disk. That
@@ -1587,6 +1661,261 @@ describe('Models page — the Install affordance', () => {
       await settle();
       expect(buttonLabels()).toContain('Update available');
       expect(liveButtonLabels()).not.toContain('Update available');
+
+      held.release();
+      await settle();
+      expect(liveButtonLabels()).toContain('Update available');
+    } finally {
+      failed.mockRestore();
+    }
+  });
+
+  it('keeps following a job this page cancelled, so its terminal frame still lands', async () => {
+    // The server accepts a cancel while the in-flight job is still `running` and
+    // lets `processJob` emit the terminal frame as it unwinds, so the DELETE is
+    // acknowledged FIRST. Clearing `active` there unmounted `DownloadProgress`
+    // and closed its subscription before that frame arrived, so
+    // `onDownloadCancelled` never ran and nothing refreshed the snapshots — the
+    // card offered a live Install for whatever `recoverBackup` had restored,
+    // until the page was remounted.
+    //
+    // Refreshing at the acknowledgement instead does not fix it: recovery renames
+    // the crashed publish onto the final dir at `download.ts:868` and every
+    // cancel boundary comes after it, so a reload issued there can read the disk
+    // before the rename. Only the terminal frame proves the job is done with it.
+    const stale = catalogRoutes({ present: false, installed: false, localRevision: null }, [
+      downloadJob({ id: 'job-run', state: 'running' }),
+    ]);
+    const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
+      items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40) }],
+    });
+    const calls = recordRequests({
+      ...stale,
+      '/models': sequence(stale['/models'], fresh['/models']),
+      '/catalog': sequence(stale['/catalog'], fresh['/catalog']),
+      '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+      '/downloads/job-run': { cancelled: true, id: 'job-run' },
+    });
+    await mountModels();
+    const cancelButton = [...mounted!.container.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Cancel'),
+    );
+    expect(cancelButton).toBeDefined();
+    await act(async () => {
+      cancelButton!.click();
+    });
+    await settle();
+    // Acknowledged: the Cancel is gone, because a second one answers 404 — but
+    // the card is still following the job, so nothing offers Install yet.
+    expect(dismissed(calls)).toEqual(['job-run']);
+    expect(buttonLabels()).not.toContain('Cancel');
+    expect(buttonLabels()).not.toContain('Install');
+    expect(gets(calls, '/api/catalog')).toBe(1);
+
+    // Only now does the unwinding job settle.
+    emitDownload('cancelled', { id: 'job-run' });
+    await settle();
+    expect(gets(calls, '/api/catalog')).toBe(2);
+    expect(gets(calls, '/api/models')).toBe(2);
+    expect(gets(calls, '/api/catalog/updates')).toBe(2);
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Install');
+  });
+
+  it('does not resurrect a cancelled job whose terminal frame beat the acknowledgement', async () => {
+    // The other order, and the server produces it: `cancel()` settles a QUEUED
+    // job inside itself, emitting the terminal frame BEFORE the route replies.
+    // `onDownloadCancelled` therefore clears the entry first, and the mark that
+    // follows must not put a half-built job back on the card.
+    const stale = catalogRoutes({ present: false, installed: false, localRevision: null }, [
+      downloadJob({ id: 'job-queued', state: 'running' }),
+    ]);
+    const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
+      items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40) }],
+    });
+    const heldDelete = deferred({ cancelled: true, id: 'job-queued' });
+    recordRequests({
+      ...stale,
+      '/models': sequence(stale['/models'], fresh['/models']),
+      '/catalog': sequence(stale['/catalog'], fresh['/catalog']),
+      '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+      '/downloads/job-queued': heldDelete.body,
+    });
+    await mountModels();
+    const cancelButton = [...mounted!.container.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Cancel'),
+    );
+    await act(async () => {
+      cancelButton!.click();
+    });
+    // The frame lands while the DELETE is still in flight.
+    emitDownload('cancelled', { id: 'job-queued' });
+    await settle();
+    expect(buttonLabels()).toContain('Installed');
+
+    heldDelete.release();
+    await settle();
+    // Still settled: no progress card, no Cancel, no orphaned job.
+    expect(buttonLabels()).toContain('Installed');
+    expect(buttonLabels()).not.toContain('Cancel');
+  });
+
+  it('never marks a job the cancel did not name, when a new install beat the acknowledgement', async () => {
+    // The third order this page can produce, and the one the id guard is for.
+    // The terminal frame clears the entry, the user installs again, and only THEN
+    // does the DELETE for the FIRST job resolve. Marking whatever sits under the
+    // repo would put `cancelling` on the SECOND job — dropping the Cancel button
+    // for a job nobody cancelled, with no terminal frame coming to undo it.
+    //
+    // Hand-rolled rather than `recordRequests`, because the stub resolves a route
+    // by path alone: the POST that mints the second id and the GET that lists
+    // jobs share the `/downloads` key.
+    let releaseDelete!: () => void;
+    const heldDelete = new Promise<void>((resolve) => {
+      releaseDelete = resolve;
+    });
+    const routes = catalogRoutes({}, [downloadJob({ id: 'job-a', state: 'running' })]);
+    const subscribe = downloadSubscribeStub();
+    const { port1, port2 } = new MessageChannel();
+    port1.unref();
+    port2.unref();
+    const dispose = serveRuntimeOverPort(
+      {
+        call: async (call: ApiCall) => {
+          const path = call.path.replace(/^\/api/u, '');
+          if (call.method === 'POST' && path === '/downloads') {
+            return { ok: true as const, status: 202, body: { id: 'job-b', repo: REPO } };
+          }
+          if (call.method === 'DELETE' && path === '/downloads/job-a') {
+            await heldDelete;
+            return { ok: true as const, status: 200, body: { cancelled: true, id: 'job-a' } };
+          }
+          if (call.method === 'GET' && Object.hasOwn(routes, path)) {
+            return { ok: true as const, status: 200, body: routes[path] };
+          }
+          return { ok: false as const, status: 404, code: 'E_NOT_FOUND', message: `no stub for ${path}` };
+        },
+        subscribe,
+      },
+      bindEventTargetPort(port2),
+    );
+    connectDashboardApi(bindEventTargetPort(port1), { onUnresponsive: () => port2.close() });
+    restoreApi = () => {
+      disconnectDashboardApi();
+      dispose();
+      port1.close();
+      port2.close();
+    };
+
+    mounted = await renderPage(createElement(Models), (text) => text.includes(LABEL));
+    await settle();
+    const cancelButton = [...mounted.container.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Cancel'),
+    );
+    expect(cancelButton).toBeDefined();
+    await act(async () => {
+      cancelButton!.click();
+    });
+    await settle();
+
+    // The first job settles while its own DELETE is still held.
+    emitDownload('cancelled', { id: 'job-a' });
+    await settle();
+    const install = [...mounted.container.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Install'),
+    );
+    expect(install).toBeDefined();
+    // The refreshed bodies have landed, so the settle guard has already lifted.
+    expect(install!.disabled).toBe(false);
+    await act(async () => {
+      install!.click();
+    });
+    await settle();
+    expect(openedStreams.at(-1)).toBe('job-b');
+    expect(buttonLabels()).toContain('Cancel');
+
+    releaseDelete();
+    await settle();
+    // `job-b` was never cancelled, so it keeps its Cancel button.
+    expect(buttonLabels()).toContain('Cancel');
+  });
+
+  it('reloads the snapshots when a job settles as CANCELLED, which can still have installed', async () => {
+    // `cancelled` does not mean nothing reached disk. `processJob` runs
+    // `recoverBackup` BEFORE its first cancel boundary: a crashed publish left an
+    // owned backup under `.staging/<slug>.backup-<dead pid>-…`, and recovery
+    // renames it onto the final dir. Every cancel check comes after that, so a
+    // job cancelled anywhere in the fetch loop settles `cancelled` with a model
+    // installed the page's catalog body has never seen.
+    //
+    // Nothing else repairs it. No query polls, `downloads.reload` has no call
+    // site, and the reconcile effect runs only on mount and reconnect — so
+    // without a reload here the card offers Install for an installed model until
+    // the page is remounted.
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      const stale = catalogRoutes({ present: false, installed: false, localRevision: null }, [
+        downloadJob({ id: 'job-run', state: 'running' }),
+      ]);
+      const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'a'.repeat(40) }],
+      });
+      const calls = recordRequests({
+        ...stale,
+        '/models': sequence(stale['/models'], fresh['/models']),
+        '/catalog': sequence(stale['/catalog'], fresh['/catalog']),
+        '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+        '/downloads/job-run': { cancelled: true, id: 'job-run' },
+      });
+      await mountModels();
+      expect(buttonLabels()).toContain('Cancel');
+
+      emitDownload('cancelled', { id: 'job-run' });
+      await settle();
+      expect(gets(calls, '/api/catalog')).toBe(2);
+      expect(gets(calls, '/api/models')).toBe(2);
+      // The job resolved a fresh upstream sha at `processJob:877` and folded it
+      // into the server's cached map before it was cancelled, so this half is
+      // stale too — and it costs no new network call to move it.
+      expect(gets(calls, '/api/catalog/updates')).toBe(2);
+      expect(buttonLabels()).toContain('Installed');
+      expect(buttonLabels()).not.toContain('Install');
+      // Still silent: a cancel is not a failure, and whoever issued it already
+      // saw their own confirmation.
+      expect(failed.mock.calls).toEqual([]);
+    } finally {
+      failed.mockRestore();
+    }
+  });
+
+  it('closes that window when the job settles as CANCELLED too', async () => {
+    // The reload above opens the very window this suite exists for: `setActive`
+    // clears synchronously while the refreshed catalog is still in flight, so
+    // one committed render carries a live Install for the model `recoverBackup`
+    // just restored.
+    const failed = vi.spyOn(toast, 'error');
+    try {
+      const stale = catalogRoutes({ present: false, installed: false, localRevision: null }, [
+        downloadJob({ id: 'job-run', state: 'running' }),
+      ]);
+      // Upstream is ahead of the recovered bytes, so once the body lands there is
+      // a genuine update to offer — a suppression that never lifts kills it.
+      const fresh = catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [], {
+        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
+      });
+      const held = deferred(fresh['/catalog']);
+      recordRequests({
+        ...stale,
+        '/catalog': sequence(stale['/catalog'], held.body),
+        '/catalog/updates': sequence(stale['/catalog/updates'], fresh['/catalog/updates']),
+        '/downloads/job-run': { cancelled: true, id: 'job-run' },
+      });
+      await mountModels();
+
+      emitDownload('cancelled', { id: 'job-run' });
+      await settle();
+      expect(buttonLabels()).toContain('Install');
+      expect(liveButtonLabels()).not.toContain('Install');
 
       held.release();
       await settle();
