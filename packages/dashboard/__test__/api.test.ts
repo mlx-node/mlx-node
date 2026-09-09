@@ -100,6 +100,28 @@ afterEach(async () => {
 });
 
 describe('dashboard api — models & catalog', () => {
+  it('returns draft weights separately and allows their deletion without deleting the target', async () => {
+    const name = 'qwen3.8-27b-dflash2';
+    const config = JSON.stringify({ model_type: 'qwen3', architectures: ['DFlash2DraftModel'] });
+    mkdirSync(join(modelsDir, name));
+    writeFileSync(join(modelsDir, name, 'config.json'), config);
+    writeFileSync(join(modelsDir, name, 'model.safetensors'), Buffer.alloc(128));
+    const res = await api.fetch('/api/models');
+    const body = (await res.json()) as {
+      models: Array<{ name: string }>;
+      companions: Array<{ name: string; sizeBytes: number }>;
+    };
+    expect(body.models.map((model) => model.name)).toEqual(['model-a']);
+    expect(body.companions).toMatchObject([{ name, sizeBytes: Buffer.byteLength(config) + 128 }]);
+    const removed = await api.fetch(`/api/models/${name}`, { method: 'DELETE' });
+    expect(removed.status).toBe(200);
+    expect(existsSync(join(modelsDir, name))).toBe(false);
+    expect(existsSync(join(modelsDir, 'model-a', 'model.safetensors'))).toBe(true);
+    const after = (await (await api.fetch('/api/models')).json()) as typeof body;
+    expect(after.models).toHaveLength(1);
+    expect(after.companions).toEqual([]);
+  });
+
   it('lists local models', async () => {
     const res = await api.fetch('/api/models');
     expect(res.status).toBe(200);

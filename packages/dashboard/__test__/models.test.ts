@@ -53,6 +53,32 @@ afterEach(() => {
 });
 
 describe('discoverLocalModels', () => {
+  it('keeps draft-only checkpoints out of models while retaining their storage inventory', () => {
+    const config = JSON.stringify({ model_type: 'qwen3', architectures: ['DFlash2DraftModel'] });
+    writeModel(modelsDir, 'renamed-companion', config, 128);
+    writeModel(modelsDir, 'qwen3.8-27b-dflash2', config, 256);
+    // An incomplete draft still needs to be accounted for and removable.
+    rmSync(join(modelsDir, 'renamed-companion', 'model.safetensors'));
+    const inventory = discoverLocalModels(modelsDir);
+    expect(inventory.models.map((model) => model.name)).toEqual(['model-a', 'model-b']);
+    expect(inventory.companions).toEqual([
+      {
+        name: 'qwen3.8-27b-dflash2',
+        path: join(modelsDir, 'qwen3.8-27b-dflash2'),
+        sizeBytes: Buffer.byteLength(config) + 256,
+        fileCount: 2,
+      },
+      {
+        name: 'renamed-companion',
+        path: join(modelsDir, 'renamed-companion'),
+        sizeBytes: Buffer.byteLength(config),
+        fileCount: 1,
+      },
+    ]);
+    expect(inventory.warnings).toHaveLength(1);
+    expect(inventory.warnings[0]).toContain('junk');
+  });
+
   it('discovers models with correct type/quant/ctx/size and warns on junk', () => {
     const { models, warnings } = discoverLocalModels(modelsDir);
 

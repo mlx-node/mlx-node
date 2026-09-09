@@ -40,6 +40,7 @@ export {
   type DownloadCompletion,
   DOWNLOAD_COMPLETE_MARKER,
   isModelInstalled,
+  type LocalCompanion,
   type LocalModel,
 } from './models.js';
 export { agentSessionsRoot, dashboardDbPath, metricsTraceDir, mlxNodeHome } from './paths.js';

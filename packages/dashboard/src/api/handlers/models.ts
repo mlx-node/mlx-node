@@ -4,10 +4,10 @@ import type { ApiPaths, ApiRequest, MainApiContext } from '../context.js';
 import { ApiError } from '../errors.js';
 
 export function handleModels(ctx: ApiPaths): unknown {
-  const { models, warnings } = discoverLocalModels(ctx.modelsDir);
+  const { models, companions, warnings } = discoverLocalModels(ctx.modelsDir);
   // `dir` lets the UI show WHERE these checkpoints live — the directory is
   // configurable (`--models-dir`), so the count alone is ambiguous.
-  return { models, warnings, dir: ctx.modelsDir };
+  return { models, companions, warnings, dir: ctx.modelsDir };
 }
 
 export function handleDeleteModel(ctx: ApiPaths, req: ApiRequest): unknown {

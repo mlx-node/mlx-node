@@ -594,6 +594,24 @@ describe('Overview page', () => {
     };
   }
 
+  it('counts zero models when only companion weights are installed while retaining their disk usage', async () => {
+    const routes = overviewRoutes(cacheFixture());
+    routes['/models'] = {
+      models: [],
+      warnings: [],
+      dir: '/models',
+      companions: [
+        { name: 'qwen3.8-27b-dflash2', path: '/models/qwen3.8-27b-dflash2', sizeBytes: 2 * MIB, fileCount: 2 },
+      ],
+    };
+    await mount(createElement(MemoryRouter, null, createElement(Overview)), routes, 'including companions');
+    const tile = [...mounted!.container.querySelectorAll('[data-slot="card"]')].find((el) =>
+      el.textContent?.startsWith('Local models'),
+    )!;
+    expect(tile.textContent).toContain('Local models0');
+    expect(tile.textContent).toContain('2.0 MB on disk, including companions');
+  });
+
   it('never rounds the cold-cache hit rate up to 100% on the landing page', async () => {
     // F6 at its second call site. Reverting overview.tsx restores
     // `formatPercent(hits / lookups)`, which is 100% for 16189/16238.
@@ -1229,6 +1247,46 @@ describe('Models page — the Install affordance', () => {
       localRevision: null,
     };
   }
+
+  it('keeps companion storage out of the model table and count, with a separate confirmed delete action', async () => {
+    const draft = draftItem(true);
+    const companion = { name: draft.slug, path: `/models/${draft.slug}`, sizeBytes: 2 * MIB, fileCount: 2 };
+    const routes = catalogRoutes({ draft });
+    const catalog = routes['/catalog'] as CatalogResponse;
+    routes['/catalog'] = sequence(catalog, { items: [{ ...catalog.items[0], draft: draftItem(false) }] });
+    const initial: ModelsResponse = { models: [], companions: [companion], warnings: [], dir: '/models' };
+    routes['/models'] = sequence(initial, { ...initial, companions: [] });
+    routes[`/models/${draft.slug}`] = { deleted: true, name: draft.slug };
+    const calls = recordRequests(routes);
+    await mountModels();
+    const tile = [...mounted!.container.querySelectorAll('[data-slot="card"]')].find((el) =>
+      el.textContent?.startsWith('Installed'),
+    )!;
+    expect(tile.textContent).toContain('Installed0');
+    expect(tile.textContent).toContain('2.0 MB on disk, including companions');
+    expect(mounted!.container.querySelector('tbody')?.textContent ?? '').not.toContain(draft.slug);
+    const toggle = [...mounted!.container.querySelectorAll('button')].find((button) =>
+      button.textContent?.includes('Companion weights (1)'),
+    )!;
+    await act(async () => toggle.click());
+    const remove = mounted!.container.querySelector<HTMLButtonElement>(
+      `button[aria-label="Delete companion ${draft.slug}"]`,
+    )!;
+    await act(async () => remove.click());
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
+    const dialog = document.querySelector('[role="dialog"]')!;
+    expect(dialog.textContent).toContain('Delete companion weights?');
+    expect(dialog.textContent).toContain(draft.slug);
+    const confirm = [...dialog.querySelectorAll('button')].find((button) => button.textContent?.trim() === 'Delete')!;
+    await act(async () => confirm.click());
+    await settle();
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
+      { method: 'DELETE', url: `/api/models/${draft.slug}` },
+    ]);
+    expect(mounted!.container.textContent).not.toContain('Companion weights (1)');
+    expect(tile.textContent).toContain('0 B on disk');
+    expect(buttonLabels()).toContain('Install DFlash2');
+  });
 
   it.each([false, true])(
     'groups the companion download inside its installed target card (draft present: %s)',

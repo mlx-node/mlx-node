@@ -17,6 +17,8 @@ export interface LocalModel {
 
 export interface ModelsResponse {
   models: LocalModel[];
+  /** Draft-only disk inventory, excluded from model counts and the model table. */
+  companions?: Array<Pick<LocalModel, 'name' | 'path' | 'sizeBytes' | 'fileCount'>>;
   warnings: string[];
   /** Absolute path of the models directory these checkpoints were discovered in. */
   dir: string;

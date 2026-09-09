@@ -40,7 +40,8 @@ export default function Overview() {
   const downloads = useJson<DownloadsResponse>('/downloads');
 
   const modelCount = models.data?.models.length ?? 0;
-  const modelBytes = models.data?.models.reduce((sum, m) => sum + m.sizeBytes, 0) ?? 0;
+  const companions = models.data?.companions ?? [];
+  const modelBytes = [...(models.data?.models ?? []), ...companions].reduce((sum, m) => sum + m.sizeBytes, 0);
 
   // Both halves of the Sessions tile come from ONE response, so they describe
   // ONE set of sessions. `total` is the true match total (not the capped page
@@ -108,7 +109,7 @@ export default function Overview() {
             ) : models.loading ? (
               <Skeleton className="h-[1lh] w-24" />
             ) : (
-              `${formatBytes(modelBytes)} on disk`
+              `${formatBytes(modelBytes)} on disk${companions.length > 0 ? ', including companions' : ''}`
             )
           }
         />

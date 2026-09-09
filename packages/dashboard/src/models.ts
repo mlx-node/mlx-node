@@ -45,6 +45,9 @@ export interface LocalModel {
   fileCount: number;
 }
 
+/** Draft-only storage, managed on disk but excluded from standalone model lists. */
+export type LocalCompanion = Pick<LocalModel, 'name' | 'path' | 'sizeBytes' | 'fileCount'>;
+
 /**
  * Filename of the atomic-publish completion marker the download runner writes as
  * the LAST step of a download (inside the staging dir, before it is renamed onto
@@ -600,17 +603,23 @@ export function walkDirStats(
  * Scan `modelsDir` for checkpoint subdirectories. A subdirectory is a model
  * only when it carries a readable `config.json`; anything else is reported as
  * a warning and skipped (never guessed). A missing `modelsDir` yields empty
- * results with no warning.
+ * results with no warning. Draft-only checkpoints have a separate inventory
+ * for storage accounting and deletion, never contributing to model counts.
  */
-export function discoverLocalModels(modelsDir: string): { models: LocalModel[]; warnings: string[] } {
+export function discoverLocalModels(modelsDir: string): {
+  models: LocalModel[];
+  companions: LocalCompanion[];
+  warnings: string[];
+} {
   const models: LocalModel[] = [];
+  const companions: LocalCompanion[] = [];
   const warnings: string[] = [];
 
   let entries: Dirent[];
   try {
     entries = readdirSync(modelsDir, { withFileTypes: true });
   } catch {
-    return { models, warnings };
+    return { models, companions, warnings };
   }
 
   for (const entry of entries) {
@@ -647,6 +656,10 @@ export function discoverLocalModels(modelsDir: string): { models: LocalModel[]; 
     if (truncated) {
       warnings.push(`${entry.name}: directory too large to size fully; reported size is a lower bound`);
     }
+    if (Array.isArray(config.architectures) && config.architectures.includes('DFlash2DraftModel')) {
+      companions.push({ name: entry.name, path: full, sizeBytes, fileCount });
+      continue;
+    }
     models.push({
       name: entry.name,
       path: full,
@@ -659,7 +672,8 @@ export function discoverLocalModels(modelsDir: string): { models: LocalModel[]; 
   }
 
   models.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  return { models, warnings };
+  companions.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  return { models, companions, warnings };
 }
 
 /**
@@ -702,7 +716,7 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
   if (stat.isSymbolicLink()) {
     throw new Error(`Refusing to delete "${name}": target is a symlink, not a model directory`);
   }
-  // Only delete a real checkpoint directory — one discovery would list (a dir
+  // Only delete a real checkpoint directory — a model or companion (a dir
   // carrying a `config.json`). The route takes an arbitrary name, so without
   // this a typo or hand-crafted request could `rmSync` an unrelated regular file
   // or non-model directory that merely happens to sit under `modelsDir`.

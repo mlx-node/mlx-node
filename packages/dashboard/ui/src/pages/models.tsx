@@ -252,7 +252,9 @@ export default function Models() {
   /** The pair as it stands right now, for the three live settle handlers. */
   const settledBodies = (): SettledBodies => ({ catalog: catalog.data, updates: updates.data });
 
-  const [pendingDelete, setPendingDelete] = useState<LocalModel | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<
+    (Pick<LocalModel, 'name' | 'path' | 'sizeBytes'> & { companion?: boolean }) | null
+  >(null);
   const [deleting, setDeleting] = useState(false);
   /** repo → active download job (seeded from the server, added on install). */
   const [active, setActive] = useState<Record<string, ActiveJob>>({});
@@ -515,11 +517,11 @@ export default function Models() {
 
   const confirmDelete = async (): Promise<void> => {
     if (pendingDelete === null) return;
-    const { name } = pendingDelete;
+    const { name, companion } = pendingDelete;
     setDeleting(true);
     try {
       await mutate<DeleteModelResponse>('DELETE', `/models/${encodeURIComponent(name)}`);
-      toast.success('Model deleted', { description: name });
+      toast.success(companion ? 'Companion deleted' : 'Model deleted', { description: name });
       setPendingDelete(null);
       models.reload();
       catalog.reload();
@@ -532,9 +534,10 @@ export default function Models() {
   };
 
   const localModels = models.data?.models ?? [];
+  const companions = models.data?.companions ?? [];
   const warnings = models.data?.warnings ?? [];
   const modelsDir = models.data?.dir ?? '';
-  const totalBytes = localModels.reduce((sum, m) => sum + m.sizeBytes, 0);
+  const totalBytes = [...localModels, ...companions].reduce((sum, m) => sum + m.sizeBytes, 0);
   const catalogItems = (catalog.data?.items ?? []).filter((item) => !item.hidden);
   // Empty whenever the update check failed or has not resolved yet, which is the
   // correct default: no badge, cards render exactly as they did before.
@@ -589,7 +592,9 @@ export default function Models() {
               </>
             ) : (
               <>
-                <span className="block">{formatBytes(totalBytes)} on disk</span>
+                <span className="block">
+                  {formatBytes(totalBytes)} on disk{companions.length > 0 ? ', including companions' : ''}
+                </span>
                 {modelsDir !== '' && (
                   // The models directory is configurable (`--models-dir`), so name
                   // it — a bare count doesn't say where these checkpoints live.
@@ -697,6 +702,42 @@ export default function Models() {
               </TableBody>
             </Table>
           )}
+          {!models.loading && models.error === undefined && companions.length > 0 && (
+            <Collapsible className="mt-4 border-t pt-4">
+              <CollapsibleTrigger className="text-muted-foreground group flex w-full items-center gap-2 text-sm">
+                <Package className="size-4 shrink-0" aria-hidden />
+                <span className="font-medium">Companion weights ({formatCount(companions.length)})</span>
+                <ChevronRight
+                  className="ml-auto size-4 shrink-0 transition-transform group-data-[state=open]:rotate-90"
+                  aria-hidden
+                />
+              </CollapsibleTrigger>
+              <CollapsibleContent className="mt-3">
+                <p className="text-muted-foreground mb-2 text-xs">Optional weights used with a model.</p>
+                <ul className="space-y-2">
+                  {companions.map((companion) => (
+                    <li key={companion.name} className="flex items-center gap-3 text-sm">
+                      <span className="min-w-0 flex-1 truncate" title={companion.path}>
+                        {companion.name}
+                      </span>
+                      <span className="text-muted-foreground shrink-0 text-xs tabular-nums">
+                        {formatBytes(companion.sizeBytes)}
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="text-muted-foreground hover:text-destructive shrink-0"
+                        aria-label={`Delete companion ${companion.name}`}
+                        onClick={() => setPendingDelete({ ...companion, companion: true })}
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </CollapsibleContent>
+            </Collapsible>
+          )}
         </CardContent>
       </Card>
 
@@ -736,7 +777,7 @@ export default function Models() {
       <Dialog open={pendingDelete !== null} onOpenChange={(open) => !open && setPendingDelete(null)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete model?</DialogTitle>
+            <DialogTitle>{pendingDelete?.companion ? 'Delete companion weights?' : 'Delete model?'}</DialogTitle>
             <DialogDescription>
               This permanently removes <span className="text-foreground font-medium">{pendingDelete?.name}</span> (
               {pendingDelete !== null ? formatBytes(pendingDelete.sizeBytes) : ''}) from disk. This cannot be undone.
