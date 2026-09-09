@@ -19,10 +19,10 @@ use objc2_foundation::{NSError, NSString};
 use objc2_metal::{
     MTLBlitCommandEncoder, MTLBuffer, MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder,
     MTLCommandQueue, MTLComputeCommandEncoder, MTLComputePipelineState, MTLDevice, MTLFunction,
-    MTLLibrary,
+    MTLLibrary, MTLResource,
 };
 
-pub use objc2_metal::MTLResourceOptions;
+pub use objc2_metal::{MTLResourceOptions, MTLStorageMode};
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {}
@@ -106,6 +106,11 @@ impl BufferRef {
     }
 
     #[inline]
+    pub fn storage_mode(&self) -> MTLStorageMode {
+        self.0.storageMode()
+    }
+
+    #[inline]
     pub fn length(&self) -> u64 {
         self.0.length() as u64
     }
@@ -162,6 +167,10 @@ impl Device {
     #[inline]
     pub fn system_default() -> Option<Self> {
         objc2_metal::MTLCreateSystemDefaultDevice().map(Self)
+    }
+
+    pub fn has_unified_memory(&self) -> bool {
+        self.0.hasUnifiedMemory()
     }
 
     pub fn new_library_with_file(&self, path: &Path) -> Result<Library, String> {
