@@ -12,6 +12,18 @@ on:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
 
+# Replace active PR checks when a newer run covers the same PR. Unrelated
+# label events are no-ops and must not cancel useful checks. Main pushes and
+# manual runs keep independent groups so publishing is not interrupted.
+concurrency:
+  group: >-
+    ${{ github.workflow }}-${{
+      github.event_name == 'pull_request' &&
+      (github.event.action != 'labeled' || github.event.label.name == 'model-e2e') &&
+      format('pr-{0}', github.event.pull_request.number) ||
+      format('run-{0}', github.run_id) }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: 1
@@ -144,9 +156,11 @@ jobs:
             packages/core/paged_attn.metallib
   test:
     name: ${{ matrix.test }}
-    # Unit/integration tests don't depend on the label; skip the redundant re-run
-    # a `labeled` event would otherwise spawn (build artifacts are unchanged).
-    if: github.event.action != 'labeled'
+    # A model-e2e opt-in can replace an active PR run, so it must also finish
+    # the required unit/integration checks. Unrelated label events stay idle.
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
     runs-on: macos-26
     needs: build
     strategy:
@@ -582,9 +596,10 @@ jobs:
 
   lint:
     name: Rust Lint
-    # Lint doesn't depend on the label; skip the redundant re-run a `labeled`
-    # event would otherwise spawn.
-    if: github.event.action != 'labeled'
+    # Keep required lint checks in a replacement model-e2e run too.
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
     runs-on: macos-26
     steps:
       - uses: actions/checkout@v7
@@ -651,12 +666,11 @@ jobs:
       - test
       - lint
       - model-test
-    # Don't publish a release when the e2e model-test matrix fails. `always()`
-    # keeps publish running when model-test is SKIPPED (on PRs without the
-    # `model-e2e` label) instead of cascading the skip onto publish; test + lint
-    # must still have succeeded.
+    # Allow skipped model tests, but stop on workflow cancellation or failed
+    # checks. Label-only opt-ins do not republish unchanged artifacts.
     if: >-
-      always() &&
+      !cancelled() &&
+      github.event.action != 'labeled' &&
       needs.test.result == 'success' &&
       needs.lint.result == 'success' &&
       needs.model-test.result != 'failure' &&
