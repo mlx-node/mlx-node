@@ -1,3 +1,7 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import type { LoadableModel } from '@mlx-node/lm';
 import { ChatSession } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
@@ -56,18 +60,59 @@ describe('MlxModelHost', () => {
   });
 
   it('loads an auto-discovered DFlash2 companion with its Qwen target', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-host-draft-'));
+    const draft = join(root, 'draft');
+    mkdirSync(draft);
+    writeFileSync(join(draft, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
+    writeFileSync(join(draft, 'model.safetensors'), 'weights');
     const loader = vi.fn(async () => ({ hasBlockPagedCache: () => true }) as unknown as LoadableModel);
     const model: DiscoveredModelLike = {
       name: 'qwen38-q4xl',
       path: '/models/qwen38-q4xl/Qwen3.8-27B-UD-Q4_K_XL.gguf',
       modelType: 'qwen3_5',
-      draftModelPath: '/models/qwen38-q4xl/draft',
+      draftModelPath: draft,
     };
     const host = new MlxModelHost([model], { loadModelFn: loader, requirePagedCache: true });
 
-    await getSession(host, model.name);
+    try {
+      await getSession(host, model.name);
+      expect(loader).toHaveBeenCalledWith(model.path, { draftModelPath: draft });
+      rmSync(draft, { recursive: true });
+      host.invalidateResident(model.name);
+      await getSession(host, model.name);
+      expect(loader).toHaveBeenLastCalledWith(model.path);
+    } finally {
+      host.invalidateResident(model.name);
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
 
-    expect(loader).toHaveBeenCalledWith(model.path, { draftModelPath: model.draftModelPath });
+  it('finds a newly downloaded shared draft before resolving a paged overlay', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-host-shared-draft-'));
+    const model: DiscoveredModelLike = {
+      name: 'qwen',
+      path: join(root, 'qwen3.8-27b-mxfp4-mlx'),
+      modelType: 'qwen3_5',
+    };
+    const loader = makeLoader();
+    const host = new MlxModelHost([model], {
+      loadModelFn: loader,
+      resolveModelPathFn: async () => '/paged/overlay',
+    });
+    try {
+      await getSession(host, model.name);
+      expect(loader).toHaveBeenLastCalledWith('/paged/overlay');
+      const draft = join(root, 'qwen3.8-27b-dflash2');
+      mkdirSync(draft);
+      writeFileSync(join(draft, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
+      writeFileSync(join(draft, 'model.safetensors'), 'weights');
+      host.invalidateResident(model.name);
+      await getSession(host, model.name);
+      expect(loader).toHaveBeenLastCalledWith('/paged/overlay', { draftModelPath: draft });
+    } finally {
+      host.invalidateResident(model.name);
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 
   it('forwards the loaded model image capability through ChatSession', async () => {

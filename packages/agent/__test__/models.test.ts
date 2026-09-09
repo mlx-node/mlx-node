@@ -200,6 +200,29 @@ describe('discoverMlxModels', () => {
     expect(await discoverMlxModels(join(modelsDir, 'does-not-exist'))).toEqual([]);
   });
 
+  it('pairs shared draft weights with Qwen3.8 variants without exposing a draft model', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-shared-dflash-'));
+    try {
+      const target = join(root, 'qwen3.8-27b-mxfp4-mlx');
+      const draft = join(root, 'qwen3.8-27b-dflash2');
+      await mkdir(target);
+      await mkdir(draft);
+      await writeFile(join(target, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+      await writeFile(
+        join(draft, 'config.json'),
+        JSON.stringify({ model_type: 'qwen3', architectures: ['DFlash2DraftModel'] }),
+      );
+      await writeFile(join(draft, 'model.safetensors'), 'weights');
+      await writeFile(join(root, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'), minimalGguf('qwen35'));
+      const models = await discoverMlxModels(root);
+      expect(models).toHaveLength(2);
+      expect(models.every((model) => model.discovered.draftModelPath === draft)).toBe(true);
+      expect(models.some((model) => model.discovered.path === draft)).toBe(false);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('discovers every nested Q<number>_K_XL target by its direct GGUF path', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-agent-xl-gguf-'));
     try {

@@ -1217,6 +1217,49 @@ describe('Models page — the Install affordance', () => {
     expect(buttonLabels()).toContain('Install');
   });
 
+  function draftItem(present = false): NonNullable<CatalogItem['draft']> {
+    return {
+      label: 'DFlash2',
+      hfRepo: 'z-lab/Qwen3.8-27B-DFlash2',
+      sizeGb: 3.85,
+      slug: 'qwen3.8-27b-dflash2',
+      present,
+      installed: present,
+      blockedByForeignDir: false,
+      localRevision: null,
+    };
+  }
+
+  it.each([false, true])(
+    'shows the companion download independently of the installed target (draft present: %s)',
+    async (present) => {
+      const draft = draftItem(present);
+      await mount(createElement(Models), catalogRoutes({ present: true, installed: true, draft }), LABEL);
+      const link = mounted!.container.querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!;
+      const card = link.closest('[data-slot="card"]')!;
+      expect(link.textContent).toContain('DFlash2 for Qwen3.8-27B');
+      expect(card.textContent).toContain('used automatically');
+      expect(card.textContent).toContain('3.85 GB');
+      const button = card.querySelector('button')!;
+      expect(button.textContent?.trim()).toBe(present ? 'Installed' : 'Install');
+      expect(button.disabled).toBe(present);
+    },
+  );
+
+  it('resumes a companion download and subscribes to its own progress', async () => {
+    const draft = draftItem();
+    recordRequests(
+      catalogRoutes({ present: true, installed: true, draft }, [downloadJob({ id: 'draft-job', repo: draft.hfRepo })]),
+    );
+    await mountModels();
+    expect(openedStreams).toContain('draft-job');
+    const card = mounted!.container
+      .querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!
+      .closest('[data-slot="card"]')!;
+    expect(card.textContent).toContain('Cancel');
+    expect(card.textContent).not.toContain('Installed');
+  });
+
   it('states the blockage instead of an Install that the runner always refuses', async () => {
     // `<slug>` is occupied by an unowned directory (an interrupted `mlx download`).
     // The download's ownership preflight refuses it every time, so the button would

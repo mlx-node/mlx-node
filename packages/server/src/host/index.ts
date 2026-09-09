@@ -45,7 +45,9 @@ import {
   PagedConfigOverrideManager,
   QWEN35_PAGED_MODEL_TYPES,
   type LoadableModel,
+  type LoadModelOptions,
 } from '@mlx-node/lm';
+import { findDFlash2Draft } from '@mlx-node/lm/draft-companion';
 
 import type { ServerHealth } from '../health.js';
 import { createServer, resolveAuthToken, type CloseOptions, type ServerInstance } from '../server.js';
@@ -167,7 +169,7 @@ export interface InferenceHostOptions {
   sweepOrphanTempRoots?: boolean;
 
   /** Test seam: replaces the native model loader. */
-  loadModel?: (path: string) => Promise<LoadableModel>;
+  loadModel?: (path: string, options?: LoadModelOptions) => Promise<LoadableModel>;
   /** Test seam: replaces the verbose request logger. */
   attachLogger?: (server: Server, logDir: string) => Logger;
 }
@@ -317,8 +319,13 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     tempDirPrefix: hostTempDirPrefix(),
   });
   const loadModelFn = opts.loadModel ?? loadModelNative;
-  const loadModelPagedAware = async (path: string): Promise<LoadableModel> =>
-    loadModelFn(await pagedConfigOverrides.resolve(path));
+  const loadModelPagedAware = async (path: string): Promise<LoadableModel> => {
+    const entry = models.find((model) => model.path === path)!;
+    // Resolve against the source directory before creating the paged config overlay.
+    const draftModelPath = findDFlash2Draft(path, entry.modelType, modelsDir);
+    const resolvedPath = await pagedConfigOverrides.resolve(path);
+    return draftModelPath === undefined ? loadModelFn(resolvedPath) : loadModelFn(resolvedPath, { draftModelPath });
+  };
   const controller = makeSwapController(models, server.registry, loadModelPagedAware, boundEntry.name);
   ctrlRef.current = controller;
 

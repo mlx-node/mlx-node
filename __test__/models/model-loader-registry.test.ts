@@ -201,6 +201,23 @@ describe.sequential('declarative model loader registry', () => {
     expect(loadSpy).toHaveBeenCalledWith(tempDir, { draftModelPath: '/tmp/dflash2' });
   });
 
+  it('auto-loads a Qwen draft unless discovery is disabled or an explicit path wins', async () => {
+    await writeConfig({ model_type: 'qwen3_5' });
+    const draft = join(tempDir, 'draft');
+    await mkdir(draft);
+    await writeFile(join(draft, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
+    await writeFile(join(draft, 'model.safetensors'), 'weights');
+    const loadSpy = vi.spyOn(Qwen35Model, 'load').mockResolvedValue({} as never);
+    await loadModel(tempDir);
+    expect(loadSpy).toHaveBeenLastCalledWith(tempDir, { draftModelPath: draft });
+    await loadSession(tempDir);
+    expect(loadSpy).toHaveBeenLastCalledWith(tempDir, { draftModelPath: draft });
+    await loadModel(tempDir, { autoLoadDraft: false });
+    expect(loadSpy).toHaveBeenLastCalledWith(tempDir, null);
+    await loadModel(tempDir, { draftModelPath: '/explicit/draft', autoLoadDraft: false });
+    expect(loadSpy).toHaveBeenLastCalledWith(tempDir, { draftModelPath: '/explicit/draft' });
+  });
+
   it('loads Muse-Glimmer through its streaming wrapper', async () => {
     await writeConfig({ model_type: 'muse_glimmer' });
     const loadedModel = { model: 'muse_glimmer' };

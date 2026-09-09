@@ -28,6 +28,7 @@ import {
   NON_GENERATIVE_FAMILY_IDS,
   type ModelType,
 } from '@mlx-node/lm';
+import { findDFlash2Draft } from '@mlx-node/lm/draft-companion';
 
 import type { DiscoveredModelLike } from '../types.js';
 
@@ -57,25 +58,6 @@ function isQwen35XlGguf(name: string): boolean {
 
 function ggufModelName(name: string): string {
   return name.slice(0, -'.gguf'.length);
-}
-
-/**
- * Agent-local convention for pairing a dense Qwen3.5/Qwen3.8 target with an
- * external DFlash2 checkpoint. mlx-vlm accepts an explicit `--draft-model`
- * path and does not define a combined directory layout; the agent needs a
- * deterministic relationship it can discover without another CLI flag.
- */
-async function embeddedDFlash2Path(modelDir: string): Promise<string | undefined> {
-  const draftPath = join(modelDir, 'draft');
-  try {
-    const raw = await readFile(join(draftPath, 'config.json'), 'utf-8');
-    const config = JSON.parse(raw) as Record<string, unknown>;
-    return Array.isArray(config.architectures) && config.architectures.includes('DFlash2DraftModel')
-      ? draftPath
-      : undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 interface ModelFileInventory {
@@ -191,7 +173,6 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     metadataRoot: string,
     modelType: ModelType,
     scopeName: string,
-    draftModelPath?: string,
   ): Promise<void> => {
     if (NON_GENERATIVE_FAMILY_IDS.has(modelType)) return;
 
@@ -222,6 +203,7 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
       while (usedNames.has(name)) name = `${scopeName}-${preferredName}-${suffix++}`;
     }
     usedNames.add(name);
+    const draftModelPath = findDFlash2Draft(path, modelType, modelsDir);
     const discovered: DiscoveredModelLike = {
       name,
       path,
@@ -280,9 +262,8 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
         }
         continue;
       }
-      const draftModelPath = await embeddedDFlash2Path(full);
       for (const gguf of xlGgufs) {
-        await append(ggufModelName(gguf), join(full, gguf), full, modelType, entry.name, draftModelPath);
+        await append(ggufModelName(gguf), join(full, gguf), full, modelType, entry.name);
       }
       continue;
     }
@@ -296,8 +277,7 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
       continue;
     }
 
-    const draftModelPath = modelType === 'qwen3_5' ? await embeddedDFlash2Path(full) : undefined;
-    await append(basename(full), full, full, modelType, entry.name, draftModelPath);
+    await append(basename(full), full, full, modelType, entry.name);
   }
 
   out.sort((a, b) => (a.discovered.name < b.discovered.name ? -1 : a.discovered.name > b.discovered.name ? 1 : 0));

@@ -52,7 +52,14 @@ export interface CatalogItem {
    * `null` means staleness is unknowable, never "up to date".
    */
   localRevision: string | null;
+  /** Separate optional draft weights, never a standalone chat-model entry. */
+  draft?: CatalogDraftItem;
 }
+
+export type CatalogDraftItem = Pick<
+  CatalogItem,
+  'label' | 'hfRepo' | 'sizeGb' | 'slug' | 'installed' | 'present' | 'blockedByForeignDir' | 'localRevision'
+>;
 
 export interface CatalogResponse {
   items: CatalogItem[];

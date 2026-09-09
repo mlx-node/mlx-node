@@ -525,6 +525,30 @@ describe('isDownloaderOwned', () => {
   });
 });
 
+describe('catalog companion state', () => {
+  it('recognizes a manual shared companion without claiming ownership or installing the target', () => {
+    writeModel(modelsDir, 'qwen3.8-27b-dflash2', JSON.stringify({ architectures: ['DFlash2DraftModel'] }), 32);
+    const target = catalogWithState(modelsDir).find((item) => item.label === 'Qwen3.8-27B')!;
+    expect(target.present).toBe(false);
+    expect(target.draft).toMatchObject({
+      present: true,
+      installed: false,
+      blockedByForeignDir: false,
+      localRevision: null,
+    });
+  });
+
+  it('blocks an incomplete manual companion directory and recognizes its completed weights', () => {
+    const draft = join(modelsDir, 'qwen3.8-27b-dflash2');
+    mkdirSync(draft);
+    writeFileSync(join(draft, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
+    const state = () => catalogWithState(modelsDir).find((item) => item.label === 'Qwen3.8-27B')!.draft;
+    expect(state()).toMatchObject({ present: false, blockedByForeignDir: true });
+    writeFileSync(join(draft, 'model.safetensors'), 'weights');
+    expect(state()).toMatchObject({ present: true, installed: false, blockedByForeignDir: false });
+  });
+});
+
 describe('defaultModelsDir', () => {
   const savedEnv = process.env.MLX_MODELS_DIR;
 

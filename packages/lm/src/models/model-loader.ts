@@ -20,6 +20,7 @@ import {
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
+import { findDFlash2Draft } from '../draft-companion.js';
 import {
   familyDataFor,
   MalformedModelConfigError,
@@ -41,6 +42,8 @@ import {
 
 /** Optional settings for {@link loadModel} / {@link loadSession}. */
 export interface LoadModelOptions {
+  /** Discover a Qwen DFlash2 companion on disk (default true). Explicit draftModelPath wins. */
+  autoLoadDraft?: boolean;
   /**
    * Directory of an external draft checkpoint (config.json +
    * model.safetensors) loaded alongside the target for speculative decoding.
@@ -194,7 +197,9 @@ function dispatchLoad(
     );
   }
   const binding: LoaderBinding = LOADER_BINDINGS[modelType];
-  return binding.load(modelPath, options);
+  const draftModelPath =
+    options?.draftModelPath ?? (options?.autoLoadDraft === false ? undefined : findDFlash2Draft(modelPath, modelType));
+  return binding.load(modelPath, draftModelPath === undefined ? options : { ...options, draftModelPath });
 }
 
 /**
@@ -208,6 +213,8 @@ function dispatchLoad(
  * rejects it.
  * Without the option, Gemma4 loads `<modelPath>/draft/` automatically when
  * that embedded checkpoint is present.
+ * Qwen also discovers `draft/` or a shared `qwen3.8-27b-dflash2` directory
+ * beside a Qwen3.8-27B target. Set `autoLoadDraft: false` to disable discovery.
  */
 export async function loadModel(modelPath: string, options?: LoadModelOptions): Promise<LoadableModel> {
   const modelType = await detectModelType(modelPath);
@@ -235,6 +242,8 @@ export async function loadModel(modelPath: string, options?: LoadModelOptions): 
  * rejects it.
  * Without the option, Gemma4 loads `<modelPath>/draft/` automatically when
  * that embedded checkpoint is present.
+ * Qwen uses the same companion discovery as `loadModel()` unless
+ * `autoLoadDraft: false` is passed.
  * The resulting session auto-enables the speculative path when the model
  * reports `hasMtpWeights()` AND does not opt out of the auto-default; pass
  * `enableMtp: false` per call to suppress it, or `enableMtp: true` to force

@@ -10,10 +10,12 @@ import { readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { type CatalogEntry, catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { findDFlash2Draft, isDFlash2Companion } from '@mlx-node/lm/draft-companion';
 
 import { isDownloaderOwned, isModelInstalled, isModelPresent, isPathOccupied, readCompletion } from './models.js';
 
 export interface CatalogItem extends CatalogEntry {
+  draft?: CatalogDraftItem;
   /**
    * The repo THIS platform installs, already resolved by
    * {@link catalogRepo} — MXFP4 on Apple Silicon, NVFP4 on CUDA. It shadows
@@ -62,6 +64,17 @@ export interface CatalogItem extends CatalogEntry {
    *
    * A `null` here means "no update badge", never "up to date".
    */
+  localRevision: string | null;
+}
+
+export interface CatalogDraftItem {
+  label: string;
+  hfRepo: string;
+  sizeGb: number;
+  slug: string;
+  installed: boolean;
+  present: boolean;
+  blockedByForeignDir: boolean;
   localRevision: string | null;
 }
 
@@ -145,8 +158,26 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
     // Read from the canonical slug ONLY — see `localRevision` on CatalogItem for why
     // a provenance-matched renamed dir deliberately reports null.
     const completion = installed ? readCompletion(dir) : undefined;
+    let draft: CatalogDraftItem | undefined;
+    if (entry.draft !== undefined) {
+      const draftSlug = entry.draft.hfRepo.split('/')[1].toLowerCase();
+      const canonicalDraftDir = join(modelsDir, draftSlug);
+      const draftDir = findDFlash2Draft(dir, 'qwen3_5', modelsDir) ?? canonicalDraftDir;
+      const draftPresent = isModelPresent(draftDir) && isDFlash2Companion(draftDir);
+      const draftInstalled = draftPresent && draftDir === canonicalDraftDir && isModelInstalled(draftDir);
+      draft = {
+        ...entry.draft,
+        slug: draftSlug,
+        present: draftPresent,
+        installed: draftInstalled,
+        blockedByForeignDir:
+          !draftPresent && isPathOccupied(canonicalDraftDir) && !isDownloaderOwned(canonicalDraftDir),
+        localRevision: draftInstalled ? (readCompletion(draftDir)?.revision ?? null) : null,
+      };
+    }
     return {
       ...entry,
+      draft,
       hfRepo,
       slug,
       installed,
