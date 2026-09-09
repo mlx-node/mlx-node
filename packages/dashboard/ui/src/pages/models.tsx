@@ -52,7 +52,7 @@ function errMessage(err: unknown): string {
 
 // Size columns from the content area: viewport breakpoints include the sidebar
 // and can force two cards into a space too narrow for their titles and sizes.
-const CATALOG_GRID_CLASS_NAME = 'grid grid-cols-[repeat(auto-fit,minmax(min(100%,19rem),1fr))] gap-4';
+const CATALOG_GRID_CLASS_NAME = 'grid grid-cols-[repeat(auto-fit,minmax(min(100%,19rem),1fr))] items-start gap-4';
 
 /**
  * A settled job — it holds no in-flight work and the server will never move it
@@ -717,49 +717,20 @@ export default function Models() {
       ) : catalog.loading ? (
         <div className={CATALOG_GRID_CLASS_NAME}>
           {Array.from({ length: 3 }).map((_, i) => (
-            <CatalogCardSkeleton key={i} />
+            <CatalogCardSkeleton key={i} withDraft={i === 0} />
           ))}
         </div>
       ) : (
         <div className={CATALOG_GRID_CLASS_NAME}>
           {catalogItems.map((item) => (
-            <CatalogCard key={item.hfRepo} {...downloadProps(item)} item={item} />
+            <CatalogCard
+              key={item.hfRepo}
+              {...downloadProps(item)}
+              item={item}
+              draftDownload={item.draft === undefined ? undefined : downloadProps(item.draft)}
+            />
           ))}
         </div>
-      )}
-
-      {(catalog.error === undefined ? catalogItems : []).map((item) =>
-        item.draft === undefined ? null : (
-          <Card key={item.draft.hfRepo} className="gap-4">
-            <CardHeader>
-              <CardTitle className="flex flex-wrap items-center gap-2 text-base">
-                <a
-                  href={`https://huggingface.co/${item.draft.hfRepo}`}
-                  target="_blank"
-                  rel="noreferrer"
-                  className="rounded-sm underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:ring-ring focus-visible:outline-none"
-                >
-                  {item.draft.label} for {item.label}
-                </a>
-                <Badge variant="secondary" className="font-normal">
-                  Optional
-                </Badge>
-              </CardTitle>
-              <CardDescription>
-                Recommended companion weights that can speed up replies. Download separately; used automatically the
-                next time {item.label} loads.
-              </CardDescription>
-            </CardHeader>
-            <CardContent className="flex flex-wrap items-center justify-between gap-3">
-              <span className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
-                ~{item.draft.sizeGb} GB
-              </span>
-              <div className="w-full sm:w-56">
-                <CatalogDownloadAction {...downloadProps(item.draft)} />
-              </div>
-            </CardContent>
-          </Card>
-        ),
       )}
 
       <Dialog open={pendingDelete !== null} onOpenChange={(open) => !open && setPendingDelete(null)}>
@@ -789,25 +760,11 @@ export default function Models() {
 }
 
 /**
- * A placeholder that is a real {@link CatalogCard} with its text taken out:
- * same `Card`/`CardHeader`/`CardContent` wrappers, same `gap-4`, same padding,
- * same install button box — only the leaves are grey.
- *
- * It replaces one fixed 176px block, a height that stood for nothing in
- * particular. The card these stand in for measures 170px (24px of `py-6`, a 16px
- * `leading-none` title, `gap-1.5`, a 20px description line, `gap-4`, a 16px
- * `text-xs` meta row, `space-y-3`, the 36px button, 24px of `py-6`) and grows
- * another 20px the moment a description wraps to a second line, so no constant
- * was ever going to be right. Built from the same wrappers there is no constant
- * to get wrong: the height is whatever the loaded card computes to.
- *
- * Three of them because the served catalog holds exactly three visible entries.
- * One residual is left standing: the single `isDefault` entry carries a badge
- * that makes its title row 6px taller, and grid items stretch, so the row it
- * lands in grows by that much. Painting a badge on all three to absorb it would
- * claim a default on cards that have none.
+ * Reserve the catalog's header, metadata, and download controls while loading.
+ * The first curated entry also reserves its companion section, keeping the
+ * optional download grouped with the same target before and after data arrives.
  */
-function CatalogCardSkeleton() {
+function CatalogCardSkeleton({ withDraft = false }: { withDraft?: boolean }) {
   return (
     <Card className="gap-4">
       <CardHeader>
@@ -829,11 +786,22 @@ function CatalogCardSkeleton() {
             resolves to, and it is the tallest thing in the card's content. */}
         <Skeleton className="h-9 w-full" />
       </CardContent>
+      {withDraft && (
+        <div className="mx-6 space-y-3 border-t pt-4">
+          <div className="flex items-center justify-between gap-2">
+            <Skeleton className="h-5 w-28" />
+            <Skeleton className="h-4 w-12" />
+          </div>
+          <Skeleton className="h-8 w-full" />
+          <Skeleton className="h-9 w-full" />
+        </div>
+      )}
     </Card>
   );
 }
 
 interface CatalogDownloadProps {
+  installLabel?: string;
   item: Pick<CatalogItem, 'hfRepo' | 'installed' | 'localRevision' | 'present' | 'blockedByForeignDir' | 'slug'>;
   /** Upstream has different bytes at this repo than the local marker records. */
   updateAvailable: boolean;
@@ -859,9 +827,10 @@ interface CatalogDownloadProps {
 
 interface CatalogCardProps extends Omit<CatalogDownloadProps, 'item'> {
   item: CatalogItem;
+  draftDownload?: CatalogDownloadProps;
 }
 
-function CatalogCard({ item, ...download }: CatalogCardProps) {
+function CatalogCard({ item, draftDownload, ...download }: CatalogCardProps) {
   // The resolved catalog repo names the build for this platform (MXFP4 or NVFP4).
   const quantization = item.hfRepo
     .split('/')
@@ -898,12 +867,39 @@ function CatalogCard({ item, ...download }: CatalogCardProps) {
         <div className="text-muted-foreground font-mono text-xs">{quantization ?? '—'}</div>
         <CatalogDownloadAction item={item} {...download} />
       </CardContent>
+      {item.draft !== undefined && draftDownload !== undefined && (
+        <div role="group" aria-label={`${item.draft.label} companion`} className="mx-6 space-y-3 border-t pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <a
+                href={`https://huggingface.co/${item.draft.hfRepo}`}
+                target="_blank"
+                rel="noreferrer"
+                className="focus-visible:ring-ring rounded-sm text-sm font-medium underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:outline-none"
+              >
+                {item.draft.label}
+              </a>
+              <Badge variant="secondary" className="font-normal">
+                Optional
+              </Badge>
+            </div>
+            <span className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
+              ~{item.draft.sizeGb} GB
+            </span>
+          </div>
+          <p className="text-muted-foreground text-xs leading-relaxed">
+            Can speed up replies. Used automatically the next time this model loads.
+          </p>
+          <CatalogDownloadAction {...draftDownload} installLabel={`Install ${item.draft.label}`} />
+        </div>
+      )}
     </Card>
   );
 }
 
 function CatalogDownloadAction({
   item,
+  installLabel = 'Install',
   updateAvailable,
   settling,
   updateSettling,
@@ -981,7 +977,7 @@ function CatalogDownloadAction({
       ) : (
         <Button className="w-full" onClick={onInstall} disabled={settling}>
           <Download className="size-4" />
-          Install
+          {installLabel}
         </Button>
       )}
     </>

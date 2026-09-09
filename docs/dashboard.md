@@ -60,8 +60,9 @@ const runtime = createDashboardRuntime({ modelsDir, dbPath });
 | Metrics        | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share                         | date range                                                               |
 | Cache          | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend                              | clear all, evict older-than-N-days                                       |
 
-The Models page recommends an optional **DFlash2 for Qwen3.8-27B** download
-separately from the target. Its roughly 3.85 GB of weights install once as
+The Qwen3.8-27B download card groups an optional **DFlash2** companion beneath
+the target download, with a divider and its own install button. The roughly
+3.85 GB checkpoint is installed once as
 `qwen3.8-27b-dflash2` in the configured models directory. Compatible Qwen3.8-27B
 targets find it automatically on their next load. The companion has its own
 download progress, cancel, and update controls; it is not another chat model.

@@ -1231,17 +1231,20 @@ describe('Models page — the Install affordance', () => {
   }
 
   it.each([false, true])(
-    'shows the companion download independently of the installed target (draft present: %s)',
+    'groups the companion download inside its installed target card (draft present: %s)',
     async (present) => {
       const draft = draftItem(present);
       await mount(createElement(Models), catalogRoutes({ present: true, installed: true, draft }), LABEL);
       const link = mounted!.container.querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!;
       const card = link.closest('[data-slot="card"]')!;
-      expect(link.textContent).toContain('DFlash2 for Qwen3.8-27B');
-      expect(card.textContent).toContain('used automatically');
-      expect(card.textContent).toContain('3.85 GB');
-      const button = card.querySelector('button')!;
-      expect(button.textContent?.trim()).toBe(present ? 'Installed' : 'Install');
+      const target = mounted!.container.querySelector(`a[href="https://huggingface.co/${REPO}"]`)!;
+      expect(card).toBe(target.closest('[data-slot="card"]'));
+      expect(link.textContent).toBe('DFlash2');
+      const companion = link.closest('[role="group"]')!;
+      expect(companion.textContent).toContain('Used automatically');
+      expect(companion.textContent).toContain('3.85 GB');
+      const button = companion.querySelector('button')!;
+      expect(button.textContent?.trim()).toBe(present ? 'Installed' : 'Install DFlash2');
       expect(button.disabled).toBe(present);
     },
   );
@@ -1256,8 +1259,10 @@ describe('Models page — the Install affordance', () => {
     const card = mounted!.container
       .querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!
       .closest('[data-slot="card"]')!;
-    expect(card.textContent).toContain('Cancel');
-    expect(card.textContent).not.toContain('Installed');
+    const companion = card.querySelector('[role="group"]')!;
+    expect(companion.textContent).toContain('Cancel');
+    expect(companion.textContent).not.toContain('Installed');
+    expect(card.textContent).toContain('Installed');
   });
 
   it('states the blockage instead of an Install that the runner always refuses', async () => {
