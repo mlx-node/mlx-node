@@ -350,6 +350,31 @@ describe('discoverMlxModels', () => {
     }
   });
 
+  it('does not attach a companion outside the store when loading a discovered top-level GGUF', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-companion-boundary-'));
+    try {
+      const store = join(root, 'models');
+      await mkdir(store);
+      const gguf = join(store, 'Qwen3.8-27B-UD-Q4_K_XL.gguf');
+      await writeFile(gguf, minimalGguf('qwen35'));
+      const outside = join(root, 'qwen3.8-27b-dflash2');
+      await mkdir(outside);
+      await writeFile(join(outside, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
+      await writeFile(join(outside, 'model.safetensors'), 'draft weights');
+      const models = await discoverMlxModels(store);
+      expect(models).toHaveLength(1);
+      const loader = vi.fn(async () => ({}) as LoadableModel);
+      const host = new MlxModelHost(
+        models.map((model) => model.discovered),
+        { loadModelFn: loader },
+      );
+      await host.runWithResident(models[0]!.discovered.name, async () => undefined);
+      expect(loader).toHaveBeenCalledExactlyOnceWith(gguf);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('does not advertise DFlash2 companions or XL files from unsupported direct-GGUF families', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-agent-nontarget-gguf-'));
     try {

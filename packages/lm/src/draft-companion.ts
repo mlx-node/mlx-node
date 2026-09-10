@@ -49,7 +49,14 @@ export function findDFlash2Draft(modelPath: string, modelType: string, modelsDir
   const targetName = /(?:^|[-_.])qwen3[._-]8[-_.]27b(?:[-_.]|$)/i;
   if (!targetName.test(basename(modelPath)) && !(isGguf && targetName.test(basename(modelDir)))) return undefined;
   const slug = QWEN38_DFLASH2.hfRepo.split('/')[1].toLowerCase();
-  const roots = modelsDir === undefined ? (isGguf ? [modelDir, dirname(modelDir)] : [dirname(modelDir)]) : [modelsDir];
+  const roots = modelsDir === undefined ? [isGguf ? modelDir : dirname(modelDir)] : [modelsDir];
+  // A sibling config identifies a downloaded model repository. Its parent
+  // can hold the shared companion; a standalone GGUF's containing directory
+  // is already the model store, so do not search above it. An explicit store
+  // always takes precedence over this repository inference.
+  if (modelsDir === undefined && isGguf && regularFile(join(modelDir, 'config.json'))) {
+    roots.push(dirname(modelDir));
+  }
   for (const root of roots) {
     try {
       const candidates = readdirSync(root, { withFileTypes: true })
