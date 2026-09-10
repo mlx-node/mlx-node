@@ -26,6 +26,7 @@
     "@earendil-works/pi-coding-agent": "^0.84.4",
     "@huggingface/hub": "^2.16.1",
     "@mlx-node/agent": "workspace:*",
+    "@mlx-node/lm": "workspace:*",
     "drizzle-orm": "1.0.0-rc.4"
   },
   "devDependencies": {

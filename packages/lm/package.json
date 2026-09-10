@@ -22,6 +22,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./draft-companion": {
+      "types": "./dist/draft-companion.d.ts",
+      "import": "./dist/draft-companion.js"
+    },
     "./family-data": {
       "types": "./dist/family-data.d.ts",
       "import": "./dist/family-data.js"

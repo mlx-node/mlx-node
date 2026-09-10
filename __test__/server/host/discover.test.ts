@@ -43,6 +43,12 @@ describe('discoverModels', () => {
     expect(got[0].path.endsWith('qwen3.5-demo')).toBe(true);
   });
 
+  it('keeps draft companions out of the server model picker', async () => {
+    makeModel('qwen3.8-27b-dflash2', { model_type: 'qwen3', architectures: ['DFlash2DraftModel'] });
+    makeModel('qwen3.8-27b-mxfp4-mlx', { model_type: 'qwen3_5' });
+    expect((await discoverModels(root)).map((model) => model.name)).toEqual(['qwen3.8-27b-mxfp4-mlx']);
+  });
+
   it('filters out Harrier (non-generative) model entries', async () => {
     // NOTE: two guards produce this result — the explicit NON_GENERATIVE set and
     // the no-launch-preset skip. `harrier` trips both, so this assertion cannot

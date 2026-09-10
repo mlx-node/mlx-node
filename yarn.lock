@@ -1588,6 +1588,7 @@ __metadata:
     "@earendil-works/pi-coding-agent": "npm:^0.84.4"
     "@huggingface/hub": "npm:^2.16.1"
     "@mlx-node/agent": "workspace:*"
+    "@mlx-node/lm": "workspace:*"
     "@radix-ui/react-dialog": "npm:^1.1.23"
     "@radix-ui/react-select": "npm:^2.3.7"
     "@radix-ui/react-slot": "npm:^1.3.3"

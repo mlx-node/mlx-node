@@ -9,8 +9,8 @@
  * Nothing enforces it but this file, and the regression is one stray `import`
  * away in a package nobody was editing: `@mlx-node/dashboard` depends on
  * `@mlx-node/agent`, whose MAIN entry pulls `@mlx-node/lm`. Today the dashboard
- * only reaches `@mlx-node/agent/catalog`, a leaf whose sole non-builtin edge is
- * an `import type`. Nothing but the walk below keeps it that way.
+ * only reaches native-free metadata leaves. Nothing but the walk below keeps
+ * those leaves from pulling the addon into the control panel.
  *
  * Same two halves as `__test__/server/host/addon-free-subpaths.test.ts` at the
  * repo root, which is the pattern this follows: a static import-graph walk that
@@ -38,7 +38,7 @@ const ADDON_PACKAGES = ['@mlx-node/core', '@mlx-node/lm', '@mlx-node/vlm', '@mlx
  * as offenders. `packages/agent/__test__/catalog-native-free.test.ts` proves
  * the same contract against the built output in a real process.
  */
-const ADDON_FREE_SUBPATHS = ['@mlx-node/lm/family-data'];
+const ADDON_FREE_SUBPATHS = ['@mlx-node/lm/family-data', '@mlx-node/lm/draft-companion'];
 
 /** Every `from '…'` and bare `import '…'` specifier, **type-only imports included**. */
 function specifiersOf(file: string): string[] {
@@ -187,6 +187,7 @@ describe('CONTROL PANEL never links the native addon', () => {
     // the package boundary and calling it clean.
     expect(graph.files).toContain('packages/dashboard/src/runtime.ts');
     expect(graph.files).toContain('packages/dashboard/src/download.ts');
+    expect(graph.files).toContain('packages/lm/src/draft-companion.ts');
   });
 
   it('reaches no package that maps the addon', () => {

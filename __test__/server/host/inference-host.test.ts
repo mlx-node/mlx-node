@@ -5,7 +5,7 @@ import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import type { LoadableModel } from '@mlx-node/lm';
+import type { LoadableModel, LoadModelOptions } from '@mlx-node/lm';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import { isServingStatus } from '../../../packages/desktop/src/main/supervisor/state.js';
@@ -502,6 +502,28 @@ describe('createInferenceHost — a tokenized host still answers the supervisor'
 });
 
 describe('createInferenceHost — out-of-band loadModel', () => {
+  it('finds a newly downloaded shared draft before applying the target config overlay', async () => {
+    const name = 'qwen3.8-27b-mxfp4-mlx';
+    const modelsDir = await makeModelsDir([name]);
+    const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
+    const host = await start({
+      modelsDir,
+      loadModel: async (path, options) => {
+        calls.push({ path, options });
+        return fakeModel();
+      },
+    });
+    const draft = join(modelsDir, 'qwen3.8-27b-dflash2');
+    await mkdir(draft);
+    await writeFile(join(draft, 'config.json'), JSON.stringify({ architectures: ['DFlash2DraftModel'] }));
+    await writeFile(join(draft, 'model.safetensors'), 'weights');
+    await host.loadModel(name);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].options).toEqual({ draftModelPath: draft });
+    expect(calls[0].path).not.toBe(join(modelsDir, name));
+    expect(host.health().models.resident).toEqual([name]);
+  });
+
   it('makes the model resident and records the load on /health', async () => {
     const modelsDir = await makeModelsDir(['alpha', 'beta']);
     const host = await start({ modelsDir });

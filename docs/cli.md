@@ -623,7 +623,21 @@ Almost every flag belongs to pi and is forwarded verbatim; `mlx agent` only hand
 
 `mlx agent` discovers local models under the resolved models directory (`--models-dir <dir>`, else `MLX_MODELS_DIR`, else `modelsDir` in `~/.mlx-node/config.json`, else `~/.mlx-node/models`). A dash-leading path must use the `--models-dir=<dir>` form so it is not mistaken for another flag. Dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` targets are also discovered when placed directly in that directory or one level inside a downloaded GGUF repository; each appears under its filename stem. Other GGUF variants and companion files such as imatrix, mmproj, draft, or DFlash2-only checkpoints are not advertised as agent models.
 
-To pair an XL GGUF target with DFlash2 automatically, use the mlx-node agent's embedded `draft/` convention:
+Qwen3.8-27B can use the separate [DFlash2 companion](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
+(about 3.85 GB). Install it from the desktop Models page, or download it separately:
+
+```bash
+mlx download model -m z-lab/Qwen3.8-27B-DFlash2 -o ~/.mlx-node/models/qwen3.8-27b-dflash2
+```
+
+Keep this directory beside your `Qwen3.8-27B*` target directory or GGUF repository.
+The agent, desktop server, and `loadModel` / `loadSession` detect it automatically on
+the next model load. One companion serves multiple Qwen3.8-27B quantizations;
+it is never listed as a standalone chat model. Detection checks the draft config
+and weight file before pairing; the native loader validates the tensors against
+the target. It does not attach this shared draft to Qwen3.5 or MoE targets.
+
+An embedded `draft/` takes precedence over the shared companion:
 
 ```text
 ~/.mlx-node/models/qwen38-q4xl/
@@ -637,6 +651,11 @@ To pair an XL GGUF target with DFlash2 automatically, use the mlx-node agent's e
 ```
 
 The root config and tokenizer files belong to the Qwen3.8 target. `draft/config.json` must declare `DFlash2DraftModel` in `architectures`; the draft weights stay in that directory exactly as published by z-lab. `draft/` may be a symlink to an existing local Hugging Face checkout. The agent advertises only `mlx/Qwen3.8-27B-UD-Q4_K_XL`, then passes `draft/` to the loader when that target becomes resident. mlx-vlm itself has no equivalent combined layout: it receives the same two paths explicitly through `--model` and `--draft-model`.
+
+For SDK callers, an explicit `draftModelPath` wins over discovery. Set
+`autoLoadDraft: false` to load without an automatically discovered Qwen draft.
+DFlash2 uses the flat speculative cache lane; downloading it does not promise
+a speedup for every workload, and an already resident model is not changed mid-session.
 
 On a fresh run (no explicit `--model`/`--provider`/session flag), it injects the first discovered local model — honoring a persisted `/model` pick when that model is still present — so ambient cloud credentials (e.g. a stray `GROQ_API_KEY`) never win over the local model this command promises.
 

@@ -14,6 +14,7 @@
  */
 
 import { ChatSession, loadModel, type SessionCapableModel } from '@mlx-node/lm';
+import { findDFlash2Draft } from '@mlx-node/lm/draft-companion';
 
 import { COLD_TIER_RESTORE_FAMILIES } from '../cold-tier.js';
 import type { DiscoveredModelLike } from '../types.js';
@@ -169,13 +170,14 @@ export class MlxModelHost {
           ? await this.resolveModelPathFn(entry, { persistPagedCache: this.persistPagedCache })
           : await this.resolveModelPathFn(entry);
         // Preserve the ordinary one-argument call for unpaired checkpoints.
-        // A discovered DFlash2 companion is an explicit load option rather
-        // than a second advertised model: target and draft become one
-        // resident session and the native loader validates their compatibility.
+        // Supplied paths are authoritative across draft families. Let the
+        // loader validate them and report errors; only absent paths opt into
+        // Qwen DFlash2 discovery, resolved against the original target path.
+        const draftModelPath = entry.draftModelPath ?? findDFlash2Draft(entry.path, entry.modelType);
         const model =
-          entry.draftModelPath === undefined
+          draftModelPath === undefined
             ? await this.loadModelFn(resolvedPath)
-            : await this.loadModelFn(resolvedPath, { draftModelPath: entry.draftModelPath });
+            : await this.loadModelFn(resolvedPath, { draftModelPath });
         const sessionModel = model as unknown as SessionCapableModel;
         const gemmaDraftActive = entry.modelType === 'gemma4' && sessionModel.hasMtpWeights?.() === true;
         if (this.requirePagedCache && sessionModel.hasBlockPagedCache?.() !== true && !gemmaDraftActive) {

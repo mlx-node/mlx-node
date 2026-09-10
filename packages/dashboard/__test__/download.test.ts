@@ -13,7 +13,8 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { catalogDownloadRepos, catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { findDFlash2Draft, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { catalogWithState } from '../src/catalog.js';
@@ -354,7 +355,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     // `hidden` entries are unpublished repos: Hugging Face answers 401 for them,
     // so dialling would spend a request to learn nothing.
     const shas = await manager().checkCatalogUpdates();
-    const visible = MODEL_CATALOG.filter((e) => !e.hidden).map((e) => catalogRepo(e));
+    const visible = catalogDownloadRepos();
     expect([...shas.keys()].sort()).toEqual([...visible].sort());
     expect(shas.get(REPO)).toBe(hub.sha);
     for (const entry of MODEL_CATALOG.filter((e) => e.hidden)) {
@@ -496,7 +497,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     // Upstream advances, and only THEN does the sweep ask.
     hub.sha = SHA_NEW;
     const sweep = m.checkCatalogUpdates(1000);
-    await waitFor(() => sweepAsked === MODEL_CATALOG.filter((e) => !e.hidden).length);
+    await waitFor(() => sweepAsked === catalogDownloadRepos().length);
 
     // The job's older answer lands first and writes itself through.
     releaseJob!();
@@ -560,7 +561,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     // OLDER sha it captured for the full six-hour TTL, with no job in the
     // interleaving for `jobResolvedShas` to repair it from. Each overlap also
     // pays a second full fan-out, the very cost the cache exists to avoid.
-    const visible = MODEL_CATALOG.filter((e) => !e.hidden).length;
+    const visible = catalogDownloadRepos().length;
     let releaseSweep: (() => void) | undefined;
     const gate = new Promise<void>((resolve) => {
       releaseSweep = resolve;
@@ -686,6 +687,37 @@ describe('DownloadManager', () => {
     expect(job.state).toBe('done');
     expect(job.totalBytes).toBe(312);
     expect(job.receivedBytes).toBe(312);
+  });
+
+  it.each([true, false])('publishes only a complete DFlash2 companion (valid architecture: %s)', async (valid) => {
+    const config = JSON.stringify({
+      model_type: 'qwen3',
+      architectures: [valid ? 'DFlash2DraftModel' : 'Qwen3ForCausalLM'],
+    });
+    hub.manifest = [
+      { type: 'file', path: 'config.json', size: Buffer.byteLength(config) },
+      { type: 'file', path: 'model.safetensors', size: 16 },
+    ];
+    const weightsFetch = makeFetchImpl({ 'model.safetensors': 16 });
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: (input, init) => {
+        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+        return url.endsWith('/config.json') ? Promise.resolve(new Response(config)) : weightsFetch(input, init);
+      },
+    });
+    const id = manager.start(QWEN38_DFLASH2.hfRepo);
+    await waitFor(() => manager.jobs().some((job) => job.id === id && ['done', 'error'].includes(job.state)));
+    expect(manager.jobs().find((job) => job.id === id)?.state).toBe(valid ? 'done' : 'error');
+    const draftPath = join(modelsDir, 'qwen3.8-27b-dflash2');
+    expect(existsSync(draftPath)).toBe(valid);
+    expect(findDFlash2Draft(join(modelsDir, 'qwen3.8-27b-mxfp4-mlx'), 'qwen3_5')).toBe(valid ? draftPath : undefined);
+    const target = catalogWithState(modelsDir).find((item) => item.label === 'Qwen3.8-27B')!;
+    expect(target.present).toBe(false);
+    expect(target.draft?.present).toBe(valid);
+    expect(target.draft?.installed).toBe(valid);
+    await manager.shutdown();
   });
 
   it('refuses a hidden catalog entry up front instead of failing mid-download', async () => {

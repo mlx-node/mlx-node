@@ -6,6 +6,8 @@
  * HF account — use them verbatim.
  */
 
+import { QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
+
 export interface CatalogEntry {
   /** Wizard display name. */
   label: string;
@@ -20,6 +22,8 @@ export interface CatalogEntry {
   hfRepoCuda?: string;
   /** Approximate download size in GB, for display. */
   sizeGb: number;
+  /** Optional companion, downloaded separately and never offered as a chat model. */
+  draft?: { label: string; hfRepo: string; sizeGb: number };
   /** One line for the wizard. */
   description: string;
   /** Exactly one entry carries this. */
@@ -50,6 +54,7 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     sizeGb: 23.3,
     description: 'Best tool use — recommended default',
     isDefault: true,
+    draft: QWEN38_DFLASH2,
   },
   {
     label: 'Qwen-AgentWorld-35B',
@@ -101,6 +106,17 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     hidden: true,
   },
 ];
+
+/** Visible target repos plus their optional companion downloads. */
+export function catalogDownloadRepos(): string[] {
+  return [
+    ...new Set(
+      MODEL_CATALOG.filter((entry) => !entry.hidden).flatMap((entry) =>
+        entry.draft === undefined ? [catalogRepo(entry)] : [catalogRepo(entry), entry.draft.hfRepo],
+      ),
+    ),
+  ];
+}
 
 /**
  * The repo THIS platform installs for `entry`. Linux is the CUDA preview

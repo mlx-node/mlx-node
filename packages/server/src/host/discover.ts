@@ -11,6 +11,7 @@ import {
   type LaunchPreset,
   type ModelType,
 } from '@mlx-node/lm';
+import { isDFlash2DraftDirectory } from '@mlx-node/lm/draft-companion';
 
 /** A locally-downloaded model paired with its sampling preset. */
 export interface DiscoveredModel {
@@ -41,6 +42,7 @@ export async function discoverModels(dir: string): Promise<DiscoveredModel[]> {
   for (const entry of entries) {
     if (!entry.isDirectory()) continue;
     const full = join(dir, entry.name);
+    if (isDFlash2DraftDirectory(full)) continue;
 
     let modelType: ModelType;
     try {

@@ -43,7 +43,8 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
 import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
-import { catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { catalogDownloadRepos } from '@mlx-node/agent/catalog';
+import { isDFlash2Companion, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 
 /** How long a resolved set of catalog shas is reused before re-dialling HF. */
 const CATALOG_SHA_TTL_MS = 6 * 60 * 60 * 1000;
@@ -451,7 +452,7 @@ export class DownloadManager {
     // so admitting one here allocates a job that fails mid-download with a 401
     // instead of being refused up front. No UI reaches this for a hidden entry
     // (the Models page filters `!item.hidden`); a direct API POST does.
-    if (!MODEL_CATALOG.some((entry) => !entry.hidden && catalogRepo(entry) === repo)) {
+    if (!catalogDownloadRepos().includes(repo)) {
       throw new Error(`Repo "${repo}" is not in the model catalog`);
     }
     const active = this.activeJobFor(repo);
@@ -740,24 +741,22 @@ export class DownloadManager {
     const shas = new Map<string, string | null>();
     const reads = new Map<string, number>();
     await Promise.all(
-      MODEL_CATALOG.filter((entry) => !entry.hidden)
-        .map((entry) => catalogRepo(entry))
-        .map(async (repo) => {
-          const at = ++this.resolveSeq;
-          try {
-            // RAW fetch, never `wrappedFetch`. That wrapper attributes every
-            // response body to `currentFile`, so a probe running while a model
-            // downloads would inflate that file's progress past its own total;
-            // it also threads the active job's abort signal, which would make a
-            // user's cancel kill an unrelated update check.
-            shas.set(repo, await this.resolveRevision(repo, probeFetch));
-            // Only a SUCCESSFUL read claims the slot, so a job's real revision
-            // still beats this sweep's `null`.
-            reads.set(repo, at);
-          } catch {
-            shas.set(repo, null);
-          }
-        }),
+      catalogDownloadRepos().map(async (repo) => {
+        const at = ++this.resolveSeq;
+        try {
+          // RAW fetch, never `wrappedFetch`. That wrapper attributes every
+          // response body to `currentFile`, so a probe running while a model
+          // downloads would inflate that file's progress past its own total;
+          // it also threads the active job's abort signal, which would make a
+          // user's cancel kill an unrelated update check.
+          shas.set(repo, await this.resolveRevision(repo, probeFetch));
+          // Only a SUCCESSFUL read claims the slot, so a job's real revision
+          // still beats this sweep's `null`.
+          reads.set(repo, at);
+        } catch {
+          shas.set(repo, null);
+        }
+      }),
     );
     // ANY unresolved repo takes the short TTL, not only an all-failed sweep. The
     // cache is one entry for the whole sweep, so a single transient failure
@@ -809,8 +808,7 @@ export class DownloadManager {
   private async processJob(job: JobState): Promise<void> {
     // Resolved per platform, matching the allowlist gate in `start` — a job can
     // only exist for THIS platform's repo, so the lookup cannot miss.
-    const entry = MODEL_CATALOG.find((candidate) => catalogRepo(candidate) === job.repo)!;
-    const slug = catalogRepo(entry).split('/').pop()!.toLowerCase();
+    const slug = job.repo.split('/').pop()!.toLowerCase();
     const finalDir = join(this.modelsDir, slug);
     const repo = { type: 'model' as const, name: job.repo };
     this.currentJob = job;
@@ -931,7 +929,8 @@ export class DownloadManager {
         installed !== undefined &&
         installed.repo === job.repo &&
         installed.revision === revision &&
-        isModelInstalled(finalDir)
+        isModelInstalled(finalDir) &&
+        (job.repo !== QWEN38_DFLASH2.hfRepo || isDFlash2Companion(finalDir))
       ) {
         job.receivedBytes = totalBytes;
         job.state = 'done';
@@ -1013,6 +1012,9 @@ export class DownloadManager {
       // `committing`, `cancel()`'s `state !== 'running'` gate rejects it (the route
       // 404s) and publish runs to completion.
       if (job.cancelled) throw new Error('Download cancelled');
+      if (job.repo === QWEN38_DFLASH2.hfRepo && !isDFlash2Companion(stagingDir)) {
+        throw new Error('DFlash2 download requires a DFlash2DraftModel config and model.safetensors');
+      }
       job.state = 'committing';
 
       await this.publish(stagingDir, finalDir, job.repo, revision, files, job.overwrite);

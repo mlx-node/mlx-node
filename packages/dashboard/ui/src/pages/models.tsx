@@ -50,6 +50,10 @@ function errMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+// Size columns from the content area: viewport breakpoints include the sidebar
+// and can force two cards into a space too narrow for their titles and sizes.
+const CATALOG_GRID_CLASS_NAME = 'grid grid-cols-[repeat(auto-fit,minmax(min(100%,19rem),1fr))] items-start gap-4';
+
 /**
  * A settled job — it holds no in-flight work and the server will never move it
  * out of this state again. Mirrors `isTerminal` in `src/download.ts`, and is
@@ -193,7 +197,10 @@ function LocalModelsSkeletonRows() {
  * canonical slug carries a revision to compare AND can actually be re-installed.
  * A `null` on either side means staleness is unknowable, never "up to date".
  */
-function hasUpdate(item: CatalogItem, remoteRevisions: ReadonlyMap<string, string | null>): boolean {
+function hasUpdate(
+  item: Pick<CatalogItem, 'hfRepo' | 'installed' | 'localRevision'>,
+  remoteRevisions: ReadonlyMap<string, string | null>,
+): boolean {
   const remoteRevision = remoteRevisions.get(item.hfRepo) ?? null;
   return (
     item.installed && item.localRevision !== null && remoteRevision !== null && remoteRevision !== item.localRevision
@@ -245,7 +252,9 @@ export default function Models() {
   /** The pair as it stands right now, for the three live settle handlers. */
   const settledBodies = (): SettledBodies => ({ catalog: catalog.data, updates: updates.data });
 
-  const [pendingDelete, setPendingDelete] = useState<LocalModel | null>(null);
+  const [pendingDelete, setPendingDelete] = useState<
+    (Pick<LocalModel, 'name' | 'path' | 'sizeBytes'> & { companion?: boolean }) | null
+  >(null);
   const [deleting, setDeleting] = useState(false);
   /** repo → active download job (seeded from the server, added on install). */
   const [active, setActive] = useState<Record<string, ActiveJob>>({});
@@ -508,11 +517,11 @@ export default function Models() {
 
   const confirmDelete = async (): Promise<void> => {
     if (pendingDelete === null) return;
-    const { name } = pendingDelete;
+    const { name, companion } = pendingDelete;
     setDeleting(true);
     try {
       await mutate<DeleteModelResponse>('DELETE', `/models/${encodeURIComponent(name)}`);
-      toast.success('Model deleted', { description: name });
+      toast.success(companion ? 'Companion deleted' : 'Model deleted', { description: name });
       setPendingDelete(null);
       models.reload();
       catalog.reload();
@@ -525,9 +534,10 @@ export default function Models() {
   };
 
   const localModels = models.data?.models ?? [];
+  const companions = models.data?.companions ?? [];
   const warnings = models.data?.warnings ?? [];
   const modelsDir = models.data?.dir ?? '';
-  const totalBytes = localModels.reduce((sum, m) => sum + m.sizeBytes, 0);
+  const totalBytes = [...localModels, ...companions].reduce((sum, m) => sum + m.sizeBytes, 0);
   const catalogItems = (catalog.data?.items ?? []).filter((item) => !item.hidden);
   // Empty whenever the update check failed or has not resolved yet, which is the
   // correct default: no badge, cards render exactly as they did before.
@@ -540,6 +550,18 @@ export default function Models() {
   const remoteRevisions = new Map<string, string | null>(
     updates.error !== undefined ? [] : (updates.data?.items ?? []).map((item) => [item.hfRepo, item.remoteRevision]),
   );
+  const downloadProps = (item: CatalogDownloadProps['item']): CatalogDownloadProps => ({
+    item,
+    updateAvailable: hasUpdate(item, remoteRevisions),
+    settling: settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo)?.catalog === catalog.data,
+    updateSettling: settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo)?.updates === updates.data,
+    job: active[item.hfRepo],
+    onInstall: () => install(item.hfRepo),
+    onDone: () => onDownloadDone(item.hfRepo),
+    onError: (message) => onDownloadError(item.hfRepo, message),
+    onCancelled: () => onDownloadCancelled(item.hfRepo),
+    onCancel: (id) => void cancel(item.hfRepo, id),
+  });
 
   return (
     <div className="space-y-6">
@@ -570,7 +592,9 @@ export default function Models() {
               </>
             ) : (
               <>
-                <span className="block">{formatBytes(totalBytes)} on disk</span>
+                <span className="block">
+                  {formatBytes(totalBytes)} on disk{companions.length > 0 ? ', including companions' : ''}
+                </span>
                 {modelsDir !== '' && (
                   // The models directory is configurable (`--models-dir`), so name
                   // it — a bare count doesn't say where these checkpoints live.
@@ -678,6 +702,42 @@ export default function Models() {
               </TableBody>
             </Table>
           )}
+          {!models.loading && models.error === undefined && companions.length > 0 && (
+            <Collapsible className="mt-4 border-t pt-4">
+              <CollapsibleTrigger className="text-muted-foreground group flex w-full items-center gap-2 text-sm">
+                <Package className="size-4 shrink-0" aria-hidden />
+                <span className="font-medium">Companion weights ({formatCount(companions.length)})</span>
+                <ChevronRight
+                  className="ml-auto size-4 shrink-0 transition-transform group-data-[state=open]:rotate-90"
+                  aria-hidden
+                />
+              </CollapsibleTrigger>
+              <CollapsibleContent className="mt-3">
+                <p className="text-muted-foreground mb-2 text-xs">Optional weights used with a model.</p>
+                <ul className="space-y-2">
+                  {companions.map((companion) => (
+                    <li key={companion.name} className="flex items-center gap-3 text-sm">
+                      <span className="min-w-0 flex-1 truncate" title={companion.path}>
+                        {companion.name}
+                      </span>
+                      <span className="text-muted-foreground shrink-0 text-xs tabular-nums">
+                        {formatBytes(companion.sizeBytes)}
+                      </span>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="text-muted-foreground hover:text-destructive shrink-0"
+                        aria-label={`Delete companion ${companion.name}`}
+                        onClick={() => setPendingDelete({ ...companion, companion: true })}
+                      >
+                        <Trash2 className="size-4" />
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              </CollapsibleContent>
+            </Collapsible>
+          )}
         </CardContent>
       </Card>
 
@@ -696,26 +756,19 @@ export default function Models() {
           </CardContent>
         </Card>
       ) : catalog.loading ? (
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        <div className={CATALOG_GRID_CLASS_NAME}>
           {Array.from({ length: 3 }).map((_, i) => (
-            <CatalogCardSkeleton key={i} />
+            <CatalogCardSkeleton key={i} withDraft={i === 0} />
           ))}
         </div>
       ) : (
-        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+        <div className={CATALOG_GRID_CLASS_NAME}>
           {catalogItems.map((item) => (
             <CatalogCard
               key={item.hfRepo}
+              {...downloadProps(item)}
               item={item}
-              updateAvailable={hasUpdate(item, remoteRevisions)}
-              settling={settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo)?.catalog === catalog.data}
-              updateSettling={settledOn.has(item.hfRepo) && settledOn.get(item.hfRepo)?.updates === updates.data}
-              job={active[item.hfRepo]}
-              onInstall={() => install(item.hfRepo)}
-              onDone={() => onDownloadDone(item.hfRepo)}
-              onError={(message) => onDownloadError(item.hfRepo, message)}
-              onCancelled={() => onDownloadCancelled(item.hfRepo)}
-              onCancel={(id) => void cancel(item.hfRepo, id)}
+              draftDownload={item.draft === undefined ? undefined : downloadProps(item.draft)}
             />
           ))}
         </div>
@@ -724,7 +777,7 @@ export default function Models() {
       <Dialog open={pendingDelete !== null} onOpenChange={(open) => !open && setPendingDelete(null)}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete model?</DialogTitle>
+            <DialogTitle>{pendingDelete?.companion ? 'Delete companion weights?' : 'Delete model?'}</DialogTitle>
             <DialogDescription>
               This permanently removes <span className="text-foreground font-medium">{pendingDelete?.name}</span> (
               {pendingDelete !== null ? formatBytes(pendingDelete.sizeBytes) : ''}) from disk. This cannot be undone.
@@ -748,25 +801,11 @@ export default function Models() {
 }
 
 /**
- * A placeholder that is a real {@link CatalogCard} with its text taken out:
- * same `Card`/`CardHeader`/`CardContent` wrappers, same `gap-4`, same padding,
- * same install button box — only the leaves are grey.
- *
- * It replaces one fixed 176px block, a height that stood for nothing in
- * particular. The card these stand in for measures 170px (24px of `py-6`, a 16px
- * `leading-none` title, `gap-1.5`, a 20px description line, `gap-4`, a 16px
- * `text-xs` meta row, `space-y-3`, the 36px button, 24px of `py-6`) and grows
- * another 20px the moment a description wraps to a second line, so no constant
- * was ever going to be right. Built from the same wrappers there is no constant
- * to get wrong: the height is whatever the loaded card computes to.
- *
- * Three of them because the served catalog holds exactly three visible entries.
- * One residual is left standing: the single `isDefault` entry carries a badge
- * that makes its title row 6px taller, and grid items stretch, so the row it
- * lands in grows by that much. Painting a badge on all three to absorb it would
- * claim a default on cards that have none.
+ * Reserve the catalog's header, metadata, and download controls while loading.
+ * The first curated entry also reserves its companion section, keeping the
+ * optional download grouped with the same target before and after data arrives.
  */
-function CatalogCardSkeleton() {
+function CatalogCardSkeleton({ withDraft = false }: { withDraft?: boolean }) {
   return (
     <Card className="gap-4">
       <CardHeader>
@@ -774,26 +813,37 @@ function CatalogCardSkeleton() {
           <CardTitle className="text-base">
             <Skeleton className="h-[1lh] w-40" />
           </CardTitle>
+          <Skeleton className="h-4 w-12 shrink-0" />
         </div>
         <CardDescription>
           <Skeleton className="h-[1lh] w-full" />
         </CardDescription>
       </CardHeader>
       <CardContent className="mt-auto space-y-3">
-        <div className="flex items-center justify-between gap-2 text-xs">
-          <Skeleton className="h-[1lh] w-48" />
+        <div className="text-xs">
           <Skeleton className="h-[1lh] w-12" />
         </div>
         {/* The button box, not a button: `h-9` is what `Button`'s default size
             resolves to, and it is the tallest thing in the card's content. */}
         <Skeleton className="h-9 w-full" />
       </CardContent>
+      {withDraft && (
+        <div className="mx-6 space-y-3 border-t pt-4">
+          <div className="flex items-center justify-between gap-2">
+            <Skeleton className="h-5 w-28" />
+            <Skeleton className="h-4 w-12" />
+          </div>
+          <Skeleton className="h-8 w-full" />
+          <Skeleton className="h-9 w-full" />
+        </div>
+      )}
     </Card>
   );
 }
 
-interface CatalogCardProps {
-  item: CatalogItem;
+interface CatalogDownloadProps {
+  installLabel?: string;
+  item: Pick<CatalogItem, 'hfRepo' | 'installed' | 'localRevision' | 'present' | 'blockedByForeignDir' | 'slug'>;
   /** Upstream has different bytes at this repo than the local marker records. */
   updateAvailable: boolean;
   /**
@@ -816,8 +866,81 @@ interface CatalogCardProps {
   onCancel: (id: string) => void;
 }
 
-function CatalogCard({
+interface CatalogCardProps extends Omit<CatalogDownloadProps, 'item'> {
+  item: CatalogItem;
+  draftDownload?: CatalogDownloadProps;
+}
+
+function CatalogCard({ item, draftDownload, ...download }: CatalogCardProps) {
+  // The resolved catalog repo names the build for this platform (MXFP4 or NVFP4).
+  const quantization = item.hfRepo
+    .split('/')
+    .at(-1)
+    ?.match(/(?:^|-)((?:mx|nv)fp[48]?)(?:-|$)/i)?.[1]
+    ?.toUpperCase();
+
+  return (
+    <Card className="gap-4">
+      <CardHeader>
+        <div className="flex items-start justify-between gap-2">
+          <CardTitle className="text-base">
+            <a
+              href={`https://huggingface.co/${item.hfRepo}`}
+              target="_blank"
+              rel="noreferrer"
+              className="focus-visible:ring-ring rounded-sm underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:outline-none"
+            >
+              {item.label}
+            </a>
+          </CardTitle>
+          <div className="flex shrink-0 items-center gap-2">
+            {item.isDefault === true && (
+              <Badge variant="secondary" className="font-normal">
+                default
+              </Badge>
+            )}
+            <span className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">~{item.sizeGb} GB</span>
+          </div>
+        </div>
+        <CardDescription>{item.description}</CardDescription>
+      </CardHeader>
+      <CardContent className="mt-auto space-y-3">
+        <div className="text-muted-foreground font-mono text-xs">{quantization ?? '—'}</div>
+        <CatalogDownloadAction item={item} {...download} />
+      </CardContent>
+      {item.draft !== undefined && draftDownload !== undefined && (
+        <div role="group" aria-label={`${item.draft.label} companion`} className="mx-6 space-y-3 border-t pt-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <a
+                href={`https://huggingface.co/${item.draft.hfRepo}`}
+                target="_blank"
+                rel="noreferrer"
+                className="focus-visible:ring-ring rounded-sm text-sm font-medium underline-offset-4 hover:underline focus-visible:ring-2 focus-visible:outline-none"
+              >
+                {item.draft.label}
+              </a>
+              <Badge variant="secondary" className="font-normal">
+                Optional
+              </Badge>
+            </div>
+            <span className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">
+              ~{item.draft.sizeGb} GB
+            </span>
+          </div>
+          <p className="text-muted-foreground text-xs leading-relaxed">
+            Can speed up replies. Used automatically the next time this model loads.
+          </p>
+          <CatalogDownloadAction {...draftDownload} installLabel={`Install ${item.draft.label}`} />
+        </div>
+      )}
+    </Card>
+  );
+}
+
+function CatalogDownloadAction({
   item,
+  installLabel = 'Install',
   updateAvailable,
   settling,
   updateSettling,
@@ -827,7 +950,7 @@ function CatalogCard({
   onError,
   onCancelled,
   onCancel,
-}: CatalogCardProps) {
+}: CatalogDownloadProps) {
   // Gate on `present` (loadable checkpoint on disk), not `installed` (dashboard
   // marker): a model installed via the `mlx download` CLI / wizard is present but
   // unowned, so offering Install would refuse to overwrite it and fail.
@@ -842,84 +965,62 @@ function CatalogCard({
   // mid-update would render "Installed" over a live multi-gigabyte transfer,
   // with no progress and no Cancel.
   const downloading = job !== undefined;
-
   return (
-    <Card className="gap-4">
-      <CardHeader>
-        <div className="flex items-start justify-between gap-2">
-          <CardTitle className="text-base">{item.label}</CardTitle>
-          <div className="flex shrink-0 items-center gap-2">
-            {item.isDefault === true && (
-              <Badge variant="secondary" className="font-normal">
-                default
-              </Badge>
-            )}
-            <span className="text-muted-foreground text-xs tabular-nums whitespace-nowrap">~{item.sizeGb} GB</span>
-          </div>
-        </div>
-        <CardDescription>{item.description}</CardDescription>
-      </CardHeader>
-      <CardContent className="mt-auto space-y-3">
-        {/* Full-width row of its own: the repo id truncates against the card
-            edge instead of competing with the size label for one line. */}
-        <div className="text-muted-foreground truncate font-mono text-xs" title={item.hfRepo}>
-          {item.hfRepo}
-        </div>
-        {downloading && job !== undefined ? (
-          <div className="space-y-2">
-            <DownloadProgress id={job.id} onDone={onDone} onError={onError} onCancelled={onCancelled} />
-            {/* No Cancel while publishing: `cancel()` refuses a `committing` job
+    <>
+      {downloading && job !== undefined ? (
+        <div className="space-y-2">
+          <DownloadProgress id={job.id} onDone={onDone} onError={onError} onCancelled={onCancelled} />
+          {/* No Cancel while publishing: `cancel()` refuses a `committing` job
                 and the route 404s, so the button could only report a failure for
                 an install that then succeeds anyway. The progress bar stays.
                 Nor while `cancelling`: this page's cancel was already accepted
                 and the job is unwinding toward its terminal frame, so a second
                 one answers 404 too. */}
-            {!job.committing && !job.cancelling && (
-              <Button
-                variant="ghost"
-                size="sm"
-                className="text-muted-foreground hover:text-destructive w-full"
-                onClick={() => onCancel(job.id)}
-              >
-                <X className="size-4" />
-                Cancel
-              </Button>
-            )}
-          </div>
-        ) : item.present && updateAvailable ? (
-          // Same job pipeline as a first install: the runner already re-downloads
-          // whenever the installed marker's revision differs from upstream, and
-          // its owned-swap replaces the stale directory.
-          <Button className="w-full" onClick={onInstall} disabled={settling || updateSettling}>
-            <Download className="size-4" />
-            Update available
-          </Button>
-        ) : item.present ? (
-          <Button variant="outline" className="w-full" disabled>
-            <Check className="size-4" />
-            Installed
-          </Button>
-        ) : item.blockedByForeignDir ? (
-          // The download's ownership preflight refuses an occupied directory it
-          // did not write, so an Install here can only ever raise a red toast.
-          // Name the directory in the way and the one step that clears it.
-          <div className="space-y-2">
-            <Button variant="outline" className="w-full" disabled>
-              <AlertCircle className="size-4" />
-              Needs cleanup
+          {!job.committing && !job.cancelling && (
+            <Button
+              variant="ghost"
+              size="sm"
+              className="text-muted-foreground hover:text-destructive w-full"
+              onClick={() => onCancel(job.id)}
+            >
+              <X className="size-4" />
+              Cancel
             </Button>
-            <p className="text-muted-foreground text-xs">
-              <span className="font-mono">{item.slug}</span> already exists and was not created by the dashboard. Remove
-              it (or delete it below, if it is listed) to install.
-            </p>
-          </div>
-        ) : (
-          <Button className="w-full" onClick={onInstall} disabled={settling}>
-            <Download className="size-4" />
-            Install
+          )}
+        </div>
+      ) : item.present && updateAvailable ? (
+        // Same job pipeline as a first install: the runner already re-downloads
+        // whenever the installed marker's revision differs from upstream, and
+        // its owned-swap replaces the stale directory.
+        <Button className="w-full" onClick={onInstall} disabled={settling || updateSettling}>
+          <Download className="size-4" />
+          Update available
+        </Button>
+      ) : item.present ? (
+        <Button variant="outline" className="w-full" disabled>
+          <Check className="size-4" />
+          Installed
+        </Button>
+      ) : item.blockedByForeignDir ? (
+        // The download's ownership preflight refuses an occupied directory it
+        // did not write, so an Install here can only ever raise a red toast.
+        // Name the directory in the way and the one step that clears it.
+        <div className="space-y-2">
+          <Button variant="outline" className="w-full" disabled>
+            <AlertCircle className="size-4" />
+            Needs cleanup
           </Button>
-        )}
-      </CardContent>
-    </Card>
+          <p className="text-muted-foreground text-xs">
+            <span className="font-mono">{item.slug}</span> already exists and was not created by the dashboard. Remove
+            it (or delete it below, if it is listed) to install.
+          </p>
+        </div>
+      ) : (
+        <Button className="w-full" onClick={onInstall} disabled={settling}>
+          <Download className="size-4" />
+          {installLabel}
+        </Button>
+      )}
+    </>
   );
 }

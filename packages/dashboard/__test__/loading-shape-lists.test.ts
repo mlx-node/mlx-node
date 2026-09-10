@@ -127,14 +127,15 @@ function shapeOf(container: HTMLElement): ShapeSnapshot {
 }
 
 /**
- * Cards in the recommended-models grid, found by the grid's own column class.
+ * Cards after the recommended-models heading, independent of responsive classes.
  *
  * `-1` rather than `0` when the grid is missing: two zeroes compare equal, and a
  * grid that stopped rendering would then read as a match.
  */
 function catalogCardCount(container: HTMLElement): number {
-  const grid = [...container.querySelectorAll('div')].find((div) => div.className.includes('xl:grid-cols-3'));
-  return grid === undefined ? -1 : grid.querySelectorAll('[data-slot="card"]').length;
+  const heading = [...container.querySelectorAll('h2')].find((h2) => h2.textContent === 'Recommended models');
+  const grid = heading?.parentElement?.nextElementSibling;
+  return grid == null ? -1 : grid.querySelectorAll('[data-slot="card"]').length;
 }
 
 function localModel(overrides: Partial<LocalModel>): LocalModel {
