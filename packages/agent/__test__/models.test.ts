@@ -332,6 +332,46 @@ describe('discoverMlxModels', () => {
     }
   });
 
+  it('discovers Gemma4 QAT and K-quant targets while excluding their media projectors', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-gemma-gguf-'));
+    try {
+      const repo = join(root, 'gemma4-gguf');
+      await mkdir(repo);
+      await writeFile(
+        join(repo, 'config.json'),
+        JSON.stringify({
+          model_type: 'gemma4_unified',
+          text_config: { max_position_embeddings: 262144 },
+          vision_config: { model_type: 'gemma4_unified_vision' },
+        }),
+      );
+      for (const name of ['gemma-4-12b-it-qat-q4_0.gguf', 'gemma-4-12b-Q6_K.gguf']) {
+        await writeFile(join(repo, name), minimalGguf('gemma4'));
+      }
+      await writeFile(join(repo, 'mmproj-gemma-4-12b-it-qat-q4_0.gguf'), minimalGguf('clip'));
+      await writeFile(join(root, 'gemma-4-Q4_K_M.gguf'), minimalGguf('gemma4'));
+      const found = await discoverMlxModels(root);
+      expect(found.map((entry) => entry.discovered.name)).toEqual([
+        'gemma-4-12b-Q6_K',
+        'gemma-4-12b-it-qat-q4_0',
+        'gemma-4-Q4_K_M',
+      ]);
+      expect(found.every((entry) => entry.discovered.modelType === 'gemma4')).toBe(true);
+      expect(found[0].piModel.input).toEqual(['text', 'image']);
+      expect(found[0].piModel.contextWindow).toBe(262144);
+
+      // A converted checkpoint remains selectable even when its source XL
+      // GGUF is retained beside the SafeTensors weights.
+      await writeFile(join(repo, 'model.safetensors'), '');
+      await writeFile(join(repo, 'gemma-4-Q4_K_XL.gguf'), minimalGguf('gemma4'));
+      const converted = await discoverMlxModels(root);
+      expect(converted.map((entry) => entry.discovered.name)).toEqual(['gemma-4-Q4_K_M', 'gemma4-gguf']);
+      expect(converted[1].discovered.path).toBe(repo);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it('discovers a standalone top-level XL GGUF from its qwen35 header', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-agent-standalone-gguf-'));
     try {

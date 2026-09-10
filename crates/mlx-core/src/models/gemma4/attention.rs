@@ -217,7 +217,7 @@ fn grouped_d512_measured_crossover(num_heads: i32, num_kv_heads: i32) -> Option<
         // Two-run raw-Metal operator A/Bs at 91,765 and 112K cleared the
         // >=10% gate for these shipped geometries. Hq8/Hkv1 was unstable
         // (0.991x in one repeat) and therefore remains force-only.
-        (16, 1) | (16, 2) | (32, 4) => Some(92 * 1024),
+        (16, 2) | (32, 4) => Some(92 * 1024),
         _ => None,
     }
 }
@@ -250,6 +250,15 @@ fn grouped_d512_planned_stripes(
     num_heads: i32,
     num_kv_heads: i32,
 ) -> Option<u32> {
+    // Production eager decode can override the conservative initial policy
+    // with a measured device-local plan. Explicit diagnostics always win.
+    if selector == "auto"
+        && override_stripes.is_none()
+        && let Some(choice) =
+            super::decode_tuning::current_plan().and_then(|plan| plan.grouped_stripes)
+    {
+        return (actual_context > 512 && choice != 0).then_some(choice);
+    }
     let policy_context = decode_context_bucket_end(actual_context);
     let eligible = actual_context > 512
         && (selector == "force"
@@ -1512,12 +1521,13 @@ impl Gemma4Attention {
         let paged_route_hint = paged_decode_route_hint(requested_paged_kernel);
         let mut graph_native_route = true;
         let mut raw_used_grouped_d512 = false;
-        let attn_3d = match adapter.gather_kv_for_decode_graph_with_route(
+        let attn_3d = match adapter.gather_kv_for_decode_graph_with_plan(
             paged_idx,
             &queries_3d,
             1.0,
             1.0,
             paged_route_hint,
+            requested_grouped_stripes.unwrap_or(0),
         ) {
             Ok(output) => output,
             Err(err) => {
@@ -1769,7 +1779,12 @@ impl Gemma4Attention {
         let mut attention = None;
         if plan.path == CacheHitPrefillPath::PagedPoolSdpa && graph_backend_available {
             let started = std::time::Instant::now();
-            match DenseCacheHitKv::gather_through_paged_pool(adapter, paged_idx, total_ctx) {
+            match DenseCacheHitKv::gather_through_paged_pool(
+                adapter,
+                paged_idx,
+                total_ctx,
+                seq_len as u32,
+            ) {
                 Ok(kv) => {
                     // Dense route: no kernel-side window, and the gather has
                     // the retired null placeholders in it, so the window is
@@ -2694,6 +2709,29 @@ mod tests {
         assert_eq!(parse_grouped_d512_selector(Some("force")), "force");
         assert_eq!(parse_grouped_d512_selector(Some("auto")), "auto");
         assert_eq!(parse_grouped_d512_selector(None), "auto");
+        // An unmeasured geometry starts on the conservative policy. A
+        // measured choice uses actual capabilities at the final dispatch gate.
+        assert_eq!(
+            grouped_d512_planned_stripes("auto", None, 20_000, 16, 1),
+            None
+        );
+        {
+            let _scope = super::super::decode_tuning::PlanScope::enter(
+                super::super::decode_tuning::DecodePlan {
+                    early_layers: 0,
+                    grouped_stripes: Some(32),
+                },
+            );
+            assert_eq!(
+                grouped_d512_planned_stripes("auto", None, 20_000, 16, 1),
+                Some(32)
+            );
+            assert_eq!(grouped_d512_planned_stripes("auto", None, 512, 16, 1), None);
+            assert_eq!(
+                grouped_d512_planned_stripes("off", None, 20_000, 16, 1),
+                None
+            );
+        }
         assert_eq!(
             parse_grouped_d512_selector(Some(" FORCE ")),
             "off",
@@ -2829,7 +2867,7 @@ mod tests {
             ("grouped_d512_direct", Some(32)),
             "an explicit validated override remains authoritative"
         );
-        for (query_heads, kv_heads, expected_stripes) in [(16, 1, 128), (16, 2, 128), (32, 4, 32)] {
+        for (query_heads, kv_heads, expected_stripes) in [(16, 2, 128), (32, 4, 32)] {
             assert_eq!(
                 grouped_d512_kernel_candidate(
                     "auto",
@@ -2861,7 +2899,7 @@ mod tests {
                 true,
             ),
             ("generic_v2", None),
-            "unstable Hq8/Hkv1 remains force-only"
+            "unmeasured Hq8/Hkv1 retains the conservative initial route"
         );
         assert_eq!(
             paged_decode_route_hint("generic_v2"),

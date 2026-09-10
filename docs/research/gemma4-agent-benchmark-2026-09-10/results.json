@@ -1,0 +1,660 @@
+{
+  "environment": {
+    "measuredAt": "2026-09-10T08:56:45.321Z",
+    "modelFile": "/Users/brooklyn/workspace/github/mlx-node/.cache/models/gemma-4-12b-it-qat-q4_0-gguf/gemma-4-12b-it-qat-q4_0.gguf",
+    "modelSha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+    "mlxCommit": "185bc1b0a19e70e3a522452d4cbe69f2f24b47a9",
+    "mlxWorkingDiffSha256": "ad04eeb7ea9564f8fb4bf06bad28d5c86a0d06bd2bd6765630cd70974adc412e",
+    "mlxLibraryCommit": "6d45ab90cfec5e7fe0cfe25bc635a23ac8a351bb",
+    "llamaCommit": "a14dba686aaafba3a2d6b5eb8820b0df5c5d2d92",
+    "llamaVersion": "version: 0.2.0-dev (build 10610, commit a14dba686)\nbuilt with AppleClang 21.0.0.21000101 for Darwin arm64",
+    "hardware": "Hardware:\n\n    Hardware Overview:\n\n      Model Name: MacBook Pro\n      Model Identifier: Mac17,6\n      Model Number: Z1MY000UBCH/A\n      Chip: Apple M5 Max\n      Total Number of Cores: 18 (6 Super and 12 Performance)\n      Memory: 128 GB\n      System Firmware Version: 18000.161.10\n      OS Loader Version: 18000.161.10\n      Activation Lock Status: Disabled\n\nGraphics/Displays:\n\n    Apple M5 Max:\n\n      Chipset Model: Apple M5 Max\n      Type: GPU\n      Bus: Built-In\n      Total Number of Cores: 40\n      Vendor: Apple (0x106b)\n      Metal Support: Metal 4\n      Displays:\n        Color LCD:\n          Display Type: Built-in Liquid Retina XDR Display\n          Resolution: 3456 x 2234 Retina\n          Main Display: Yes\n          Mirror: Off\n          Online: Yes\n          Automatically Adjust Brightness: Yes\n          Connection Type: Internal",
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83",
+    "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "outputTokens": 256,
+    "measuredRepeats": 3,
+    "warmupTokens": 32,
+    "cooldownSeconds": 20,
+    "scope": "Recorded agent-context replay through native Gemma4Model.chatSessionStart and llama.cpp /completion; high thinking, historical tool results, greedy AR without speculation; cold prompt cache.",
+    "envOverrides": {
+      "MLX_AGENT_METRICS": "0",
+      "MLX_PERSIST_PAGED_CACHE": "0",
+      "MLX_PAGED_PREFILL_CHUNK_SIZE": "512"
+    },
+    "mlxCachePolicy": "Session API requires reuseCache=true; resetCaches() immediately before every measured request; assert cachedTokens == 0.",
+    "kvCache": "BF16 in both runtimes; MLX paged cache, llama.cpp standard KV cache.",
+    "prefillBatching": "MLX_PAGED_PREFILL_CHUNK_SIZE=512; llama.cpp logical batch 2048, physical ubatch 512.",
+    "loadTiming": "Excluded: both use an existing disk artifact and a fresh process; main GGUF plus prepared MLX cache already page-cache warm. MLX also loads the media companion, while this text-only llama server does not.",
+    "workstation": "Interactive desktop session. No other inference benchmark was running. Normal desktop applications remain active.",
+    "cases": [
+      {
+        "name": "diff-review",
+        "promptTokens": 7733
+      },
+      {
+        "name": "test-review",
+        "promptTokens": 40528
+      },
+      {
+        "name": "final-review",
+        "promptTokens": 66904
+      }
+    ],
+    "warmup": "32 generated tokens using the first real diff-review fixture before every sample, followed by a full cache reset.",
+    "inputPolicy": "Whole recorded turn boundaries. No synthetic input. Actual generated token count is retained if the model stops before the cap.",
+    "llamaContextCapacity": 73728,
+    "reasoningEffort": "high",
+    "piVersion": "0.84.4",
+    "mlxAddonSha256": "152c04e75260d2d86d584d861508cda567150d2c5515343ff61fc187672660e2",
+    "nativeTimingSources": {
+      "mlx": "crates/mlx-core/src/engine/finalize.rs:38-64",
+      "llama": "tools/server/server-common.h:379-421"
+    },
+    "firstMeasuredAt": "2026-09-10T09:00:59.660Z",
+    "completedAt": "2026-09-10T09:40:11.720468+00:00",
+    "thermalAfter": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "benchmarkScriptSha256": "3aaeea7dce580ff38b814f8720eaf688695dd4170d861a02a370150c144a7cd0",
+    "consistencyChecks": "All 18 samples passed exact prompt count, identical tokenized input, empty prompt cache, 256 generated tokens, no truncation, and matching timing accounting. Native addon, tracked source patch, and source session stayed unchanged."
+  },
+  "fixture": {
+    "source": "/Users/brooklyn/.mlx-node/agent/sessions/--Users-brooklyn-workspace-github-oxc-node--/2026-09-03T15-07-41-314Z_01a067cf-b782-7b58-855e-8158dcb283ab.jsonl",
+    "sourceSha256": "cdf4938c2ce1f37acbe87659b38782bc48dd95cabb98723c7328819d8cbc2988",
+    "sessionId": "01a067cf-b782-7b58-855e-8158dcb283ab",
+    "recordedAt": "2026-09-03T15:07:41.314Z",
+    "cwd": "/Users/brooklyn/workspace/github/oxc-node",
+    "originalRequest": "Deepreview https://github.com/oxc-project/oxc-node/pull/745",
+    "systemPromptSource": "Reconstructed with the installed Pi buildSystemPrompt and createCodingTools; original system prompt is absent from session JSONL.",
+    "historicalContent": "Pi parent-chain and compaction reconstruction, then production contextToChatMessages. No padding, repetition, truncation inside a message, or invented user/tool content. Tools are never executed.",
+    "cases": [
+      {
+        "name": "diff-review",
+        "assistantEntryId": "3de6f891",
+        "parentEntryId": "4ac7116a",
+        "historicalMessages": 8,
+        "toolResults": 4,
+        "recordedThinkingLevel": "high",
+        "promptTokens": 7733,
+        "sha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f"
+      },
+      {
+        "name": "test-review",
+        "assistantEntryId": "48096389",
+        "parentEntryId": "282ff390",
+        "historicalMessages": 56,
+        "toolResults": 30,
+        "recordedThinkingLevel": "high",
+        "promptTokens": 40528,
+        "sha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa"
+      },
+      {
+        "name": "final-review",
+        "assistantEntryId": "86bd44d6",
+        "parentEntryId": "261480e3",
+        "historicalMessages": 133,
+        "toolResults": 71,
+        "recordedThinkingLevel": "high",
+        "promptTokens": 66904,
+        "sha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3"
+      }
+    ]
+  },
+  "rows": [
+    {
+      "name": "diff-review",
+      "mlx": {
+        "prefillMs": {
+          "median": 8220.167167,
+          "min": 8150.510083,
+          "max": 8590.349584
+        },
+        "prefillTps": {
+          "median": 940.7351265366304,
+          "min": 900.1961939247664,
+          "max": 948.7749749710971
+        },
+        "decodeTps": {
+          "median": 28.214331814923266,
+          "min": 27.02442674441922,
+          "max": 29.381026035837795
+        },
+        "wallMs": {
+          "median": 17274.486916,
+          "min": 17262.327667,
+          "max": 17593.377333
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": ["length"]
+      },
+      "llama": {
+        "prefillMs": {
+          "median": 6976.729,
+          "min": 6689.147,
+          "max": 9421.485
+        },
+        "prefillTps": {
+          "median": 1108.399079281996,
+          "min": 820.7835601287907,
+          "max": 1156.0517357444828
+        },
+        "decodeTps": {
+          "median": 43.73652636274869,
+          "min": 37.797611724552354,
+          "max": 48.674600181107685
+        },
+        "wallMs": {
+          "median": 12522.914625,
+          "min": 12218.160957999999,
+          "max": 16171.147792
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": ["limit"]
+      },
+      "llamaOverMlxPrefill": 1.1782265252097366,
+      "llamaOverMlxDecode": 1.550152831888627,
+      "mlxOverLlamaLatency": 1.3794302231777773,
+      "matchingOutputPairs": 0
+    },
+    {
+      "name": "test-review",
+      "mlx": {
+        "prefillMs": {
+          "median": 84534.032042,
+          "min": 73162.166083,
+          "max": 89418.067958
+        },
+        "prefillTps": {
+          "median": 479.4282139513233,
+          "min": 453.24173207406085,
+          "max": 553.9475137193499
+        },
+        "decodeTps": {
+          "median": 16.148959522537965,
+          "min": 15.734920884007911,
+          "max": 17.342450826479574
+        },
+        "wallMs": {
+          "median": 100346.71,
+          "min": 87884.791708,
+          "max": 105647.167
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": ["length"]
+      },
+      "llama": {
+        "prefillMs": {
+          "median": 57702.646,
+          "min": 55202.211,
+          "max": 65922.889
+        },
+        "prefillTps": {
+          "median": 702.3594723888398,
+          "min": 614.7788820359497,
+          "max": 734.1734917103229
+        },
+        "decodeTps": {
+          "median": 35.60941747601287,
+          "min": 32.14729968355711,
+          "max": 36.226855123976115
+        },
+        "wallMs": {
+          "median": 64870.939625,
+          "min": 62248.147709,
+          "max": 73862.4405
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": ["limit"]
+      },
+      "llamaOverMlxPrefill": 1.4649940323707167,
+      "llamaOverMlxDecode": 2.2050595536087214,
+      "mlxOverLlamaLatency": 1.546866911132706,
+      "matchingOutputPairs": 0
+    },
+    {
+      "name": "final-review",
+      "mlx": {
+        "prefillMs": {
+          "median": 175901.623917,
+          "min": 168158.338125,
+          "max": 179594.383292
+        },
+        "prefillTps": {
+          "median": 380.34896159667613,
+          "min": 372.5283540255361,
+          "max": 397.8631136938753
+        },
+        "decodeTps": {
+          "median": 12.216143459921424,
+          "min": 11.180035726900247,
+          "max": 12.260241487444718
+        },
+        "wallMs": {
+          "median": 196805.590375,
+          "min": 188987.796916,
+          "max": 202431.861041
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": ["length"]
+      },
+      "llama": {
+        "prefillMs": {
+          "median": 134485.601,
+          "min": 129795.116,
+          "max": 135084.206
+        },
+        "prefillTps": {
+          "median": 497.4807674763635,
+          "min": 495.27625753672487,
+          "max": 515.4585323534054
+        },
+        "decodeTps": {
+          "median": 28.399244825100748,
+          "min": 27.919672365382016,
+          "max": 28.83646883755897
+        },
+        "wallMs": {
+          "median": 143472.604416,
+          "min": 138649.138458,
+          "max": 144228.274041
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": ["limit"]
+      },
+      "llamaOverMlxPrefill": 1.3079587897071598,
+      "llamaOverMlxDecode": 2.3247307890802564,
+      "mlxOverLlamaLatency": 1.371729405596908,
+      "matchingOutputPairs": 0
+    }
+  ],
+  "samples": [
+    {
+      "runtime": "mlx",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "1",
+      "loadMs": 978.964291,
+      "wallMs": 17593.377333,
+      "prefillMs": 8150.510083,
+      "prefillTps": 948.7749749710971,
+      "decodeMs": 9435.907833,
+      "decodeTps": 27.02442674441922,
+      "accountedMs": 17586.417916,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "3dfac98afba9d24ce840e1c9eb7d70b5fc62348e592c095eb81e8f1925ccd0af",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "length",
+      "timingOverheadMs": 6.959417000001849
+    },
+    {
+      "runtime": "mlx",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "2",
+      "loadMs": 1178.822625,
+      "wallMs": 17274.486916,
+      "prefillMs": 8590.349584,
+      "prefillTps": 900.1961939247664,
+      "decodeMs": 8679.070625,
+      "decodeTps": 29.381026035837795,
+      "accountedMs": 17269.420209,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "3dfac98afba9d24ce840e1c9eb7d70b5fc62348e592c095eb81e8f1925ccd0af",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "length",
+      "timingOverheadMs": 5.06670700000177
+    },
+    {
+      "runtime": "mlx",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "3",
+      "loadMs": 955.306708,
+      "wallMs": 17262.327667,
+      "prefillMs": 8220.167167,
+      "prefillTps": 940.7351265366304,
+      "decodeMs": 9037.959916,
+      "decodeTps": 28.214331814923266,
+      "accountedMs": 17258.127083,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "3dfac98afba9d24ce840e1c9eb7d70b5fc62348e592c095eb81e8f1925ccd0af",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "length",
+      "timingOverheadMs": 4.200584000001982
+    },
+    {
+      "runtime": "llama",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "1",
+      "loadMs": 1276.561916,
+      "wallMs": 16171.147792,
+      "prefillMs": 9421.485,
+      "prefillTps": 820.7835601287907,
+      "decodeMs": 6746.458,
+      "decodeTps": 37.797611724552354,
+      "accountedMs": 16167.943,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "41461e7ba4ff82608a5cf7c8a7159cabbda2a86309284ac68c0a0adecf2baa09",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "limit",
+      "timingOverheadMs": 3.2047920000004524
+    },
+    {
+      "runtime": "llama",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "2",
+      "loadMs": 1274.9927089999999,
+      "wallMs": 12218.160957999999,
+      "prefillMs": 6976.729,
+      "prefillTps": 1108.399079281996,
+      "decodeMs": 5238.872,
+      "decodeTps": 48.674600181107685,
+      "accountedMs": 12215.601,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "41461e7ba4ff82608a5cf7c8a7159cabbda2a86309284ac68c0a0adecf2baa09",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "limit",
+      "timingOverheadMs": 2.559957999998005
+    },
+    {
+      "runtime": "llama",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "3",
+      "loadMs": 1019.638416,
+      "wallMs": 12522.914625,
+      "prefillMs": 6689.147,
+      "prefillTps": 1156.0517357444828,
+      "decodeMs": 5830.367,
+      "decodeTps": 43.73652636274869,
+      "accountedMs": 12519.514,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "41461e7ba4ff82608a5cf7c8a7159cabbda2a86309284ac68c0a0adecf2baa09",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "limit",
+      "timingOverheadMs": 3.4006250000002183
+    },
+    {
+      "runtime": "mlx",
+      "name": "test-review",
+      "n": 40528,
+      "run": "1",
+      "loadMs": 962.509542,
+      "wallMs": 105647.167,
+      "prefillMs": 89418.067958,
+      "prefillTps": 453.24173207406085,
+      "decodeMs": 16205.991874999998,
+      "decodeTps": 15.734920884007911,
+      "accountedMs": 105624.05983299999,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "55e23ec2b112b8fe461bd94546befa2e829ccd414947faa3428d03acf948008d",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "length",
+      "timingOverheadMs": 23.107167000009213
+    },
+    {
+      "runtime": "mlx",
+      "name": "test-review",
+      "n": 40528,
+      "run": "2",
+      "loadMs": 931.369666,
+      "wallMs": 100346.71,
+      "prefillMs": 84534.032042,
+      "prefillTps": 479.4282139513233,
+      "decodeMs": 15790.490999999998,
+      "decodeTps": 16.148959522537965,
+      "accountedMs": 100324.523042,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "55e23ec2b112b8fe461bd94546befa2e829ccd414947faa3428d03acf948008d",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "length",
+      "timingOverheadMs": 22.18695800000569
+    },
+    {
+      "runtime": "mlx",
+      "name": "test-review",
+      "n": 40528,
+      "run": "3",
+      "loadMs": 951.559,
+      "wallMs": 87884.791708,
+      "prefillMs": 73162.166083,
+      "prefillTps": 553.9475137193499,
+      "decodeMs": 14703.804124999999,
+      "decodeTps": 17.342450826479574,
+      "accountedMs": 87865.970208,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "55e23ec2b112b8fe461bd94546befa2e829ccd414947faa3428d03acf948008d",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "length",
+      "timingOverheadMs": 18.82150000000547
+    },
+    {
+      "runtime": "llama",
+      "name": "test-review",
+      "n": 40528,
+      "run": "1",
+      "loadMs": 1019.52325,
+      "wallMs": 73862.4405,
+      "prefillMs": 65922.889,
+      "prefillTps": 614.7788820359497,
+      "decodeMs": 7932.237,
+      "decodeTps": 32.14729968355711,
+      "accountedMs": 73855.12599999999,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "bd536ccf7c313d3bcd50c54087d231c5236d719ad4047c2fd476a043fbe9514c",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "limit",
+      "timingOverheadMs": 7.314500000007683
+    },
+    {
+      "runtime": "llama",
+      "name": "test-review",
+      "n": 40528,
+      "run": "2",
+      "loadMs": 1273.3414579999999,
+      "wallMs": 62248.147709,
+      "prefillMs": 55202.211,
+      "prefillTps": 734.1734917103229,
+      "decodeMs": 7038.977,
+      "decodeTps": 36.226855123976115,
+      "accountedMs": 62241.188,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "bd536ccf7c313d3bcd50c54087d231c5236d719ad4047c2fd476a043fbe9514c",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "limit",
+      "timingOverheadMs": 6.9597089999952
+    },
+    {
+      "runtime": "llama",
+      "name": "test-review",
+      "n": 40528,
+      "run": "3",
+      "loadMs": 1020.3753750000001,
+      "wallMs": 64870.939625,
+      "prefillMs": 57702.646,
+      "prefillTps": 702.3594723888398,
+      "decodeMs": 7161.027,
+      "decodeTps": 35.60941747601287,
+      "accountedMs": 64863.673,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "bd536ccf7c313d3bcd50c54087d231c5236d719ad4047c2fd476a043fbe9514c",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "limit",
+      "timingOverheadMs": 7.266624999996566
+    },
+    {
+      "runtime": "mlx",
+      "name": "final-review",
+      "n": 66904,
+      "run": "1",
+      "loadMs": 996.557875,
+      "wallMs": 202431.861041,
+      "prefillMs": 179594.383292,
+      "prefillTps": 372.5283540255361,
+      "decodeMs": 22808.513875,
+      "decodeTps": 11.180035726900247,
+      "accountedMs": 202402.89716700002,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "0670bf154206f3c3df1fc7542d391835d5633727fc093b66e914a6398045e40a",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "length",
+      "timingOverheadMs": 28.963873999979114
+    },
+    {
+      "runtime": "mlx",
+      "name": "final-review",
+      "n": 66904,
+      "run": "2",
+      "loadMs": 1004.8855840000001,
+      "wallMs": 188987.796916,
+      "prefillMs": 168158.338125,
+      "prefillTps": 397.8631136938753,
+      "decodeMs": 20798.937791,
+      "decodeTps": 12.260241487444718,
+      "accountedMs": 188957.275916,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "0670bf154206f3c3df1fc7542d391835d5633727fc093b66e914a6398045e40a",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "length",
+      "timingOverheadMs": 30.520999999978812
+    },
+    {
+      "runtime": "mlx",
+      "name": "final-review",
+      "n": 66904,
+      "run": "3",
+      "loadMs": 969.508875,
+      "wallMs": 196805.590375,
+      "prefillMs": 175901.623917,
+      "prefillTps": 380.34896159667613,
+      "decodeMs": 20874.018125,
+      "decodeTps": 12.216143459921424,
+      "accountedMs": 196775.642042,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "0670bf154206f3c3df1fc7542d391835d5633727fc093b66e914a6398045e40a",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "length",
+      "timingOverheadMs": 29.94833300000755
+    },
+    {
+      "runtime": "llama",
+      "name": "final-review",
+      "n": 66904,
+      "run": "1",
+      "loadMs": 1020.5647500000001,
+      "wallMs": 143472.604416,
+      "prefillMs": 134485.601,
+      "prefillTps": 497.4807674763635,
+      "decodeMs": 8979.112,
+      "decodeTps": 28.399244825100748,
+      "accountedMs": 143464.713,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "f9cc007595544a4c6baa33b9964953f797177ac3fbb38eaa196d938a0c2bb9fa",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "limit",
+      "timingOverheadMs": 7.891415999998571
+    },
+    {
+      "runtime": "llama",
+      "name": "final-review",
+      "n": 66904,
+      "run": "2",
+      "loadMs": 1019.64325,
+      "wallMs": 144228.274041,
+      "prefillMs": 135084.206,
+      "prefillTps": 495.27625753672487,
+      "decodeMs": 9133.345,
+      "decodeTps": 27.919672365382016,
+      "accountedMs": 144217.551,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "f9cc007595544a4c6baa33b9964953f797177ac3fbb38eaa196d938a0c2bb9fa",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "limit",
+      "timingOverheadMs": 10.72304099999019
+    },
+    {
+      "runtime": "llama",
+      "name": "final-review",
+      "n": 66904,
+      "run": "3",
+      "loadMs": 1274.1588749999999,
+      "wallMs": 138649.138458,
+      "prefillMs": 129795.116,
+      "prefillTps": 515.4585323534054,
+      "decodeMs": 8842.969,
+      "decodeTps": 28.83646883755897,
+      "accountedMs": 138638.085,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "f9cc007595544a4c6baa33b9964953f797177ac3fbb38eaa196d938a0c2bb9fa",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "limit",
+      "timingOverheadMs": 11.053458000009414
+    }
+  ]
+}

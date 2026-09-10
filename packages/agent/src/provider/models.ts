@@ -44,7 +44,8 @@ interface DiscoveryMetadata {
 }
 
 /**
- * Native direct-GGUF loading currently exists for dense Qwen3.5/Qwen3.8.
+ * The Qwen3.5/Qwen3.8 discovery filter retains its XL policy. Gemma4
+ * accepts all supported tensor formats, including Q4_0 QAT checkpoints.
  * Match the Unsloth Dynamic XL target names users download, while excluding
  * ordinary Q4_K_M files and companion artifacts such as imatrix/mmproj/draft.
  */
@@ -61,6 +62,7 @@ function ggufModelName(name: string): string {
 
 interface ModelFileInventory {
   xlGgufs: string[];
+  targetGgufs: string[];
   hasGguf: boolean;
   hasSafetensors: boolean;
 }
@@ -72,11 +74,14 @@ async function modelFileInventory(modelDir: string): Promise<ModelFileInventory>
       .map((entry) => entry.name);
     return {
       xlGgufs: files.filter(isQwen35XlGguf).sort(),
+      targetGgufs: files
+        .filter((name) => name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(name))
+        .sort(),
       hasGguf: files.some((name) => name.toLowerCase().endsWith('.gguf')),
       hasSafetensors: files.some((name) => name.toLowerCase().endsWith('.safetensors')),
     };
   } catch {
-    return { xlGgufs: [], hasGguf: false, hasSafetensors: false };
+    return { xlGgufs: [], targetGgufs: [], hasGguf: false, hasSafetensors: false };
   }
 }
 
@@ -138,9 +143,9 @@ async function readDiscoveryMetadata(
 }
 
 /**
- * Scan `modelsDir` for chat-capable model subdirectories and native dense
- * Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` files, then build their pi provider
- * entries. XL files may live directly under `modelsDir` or one level inside a
+ * Scan `modelsDir` for chat-capable model subdirectories, Gemma4 GGUFs, and
+ * dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` files, then build their pi provider
+ * entries. GGUF files may live directly under `modelsDir` or one level inside a
  * downloaded GGUF repository. Each is registered by filename stem so multiple
  * quant variants in one repository remain independently selectable.
  *
@@ -228,14 +233,14 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
   };
 
   for (const entry of entries) {
-    if (entry.isFile() && isQwen35XlGguf(entry.name)) {
+    if (entry.isFile() && entry.name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(entry.name)) {
       const full = join(modelsDir, entry.name);
       try {
         const modelType = await detectModelType(full);
-        if (modelType === 'qwen3_5') {
+        if (modelType === 'gemma4' || (modelType === 'qwen3_5' && isQwen35XlGguf(entry.name))) {
           await append(ggufModelName(entry.name), full, modelsDir, modelType, basename(modelsDir));
         } else if (debug) {
-          console.warn(`[mlx] skip ${full}: direct XL GGUF loading is not supported for ${modelType}`);
+          console.warn(`[mlx] skip ${full}: no supported direct GGUF target for ${modelType}`);
         }
       } catch (err) {
         if (debug) console.warn(`[mlx] skip ${full}: ${(err as Error).message}`);
@@ -254,8 +259,14 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     }
 
     const inventory = await modelFileInventory(full);
+    if (modelType === 'gemma4' && !inventory.hasSafetensors && inventory.targetGgufs.length > 0) {
+      for (const gguf of inventory.targetGgufs) {
+        await append(ggufModelName(gguf), join(full, gguf), full, modelType, entry.name);
+      }
+      continue;
+    }
     const { xlGgufs } = inventory;
-    if (xlGgufs.length > 0) {
+    if (xlGgufs.length > 0 && !(modelType === 'gemma4' && inventory.hasSafetensors)) {
       if (modelType !== 'qwen3_5') {
         if (debug) {
           console.warn(`[mlx] skip ${full}: direct XL GGUF loading is not supported for ${modelType}`);
@@ -268,9 +279,8 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
       continue;
     }
 
-    // A raw GGUF repository is not itself a loadable model path. Only the
-    // selected native Qwen3.5 XL files above may be handed directly to the
-    // loader. Keep converted model directories discoverable when they retain
+    // Present each supported GGUF variant separately in the picker. Keep
+    // converted model directories discoverable when they retain
     // an imatrix/source GGUF beside their actual SafeTensors weights.
     if (inventory.hasGguf && !inventory.hasSafetensors) {
       if (debug) console.warn(`[mlx] skip ${full}: no supported direct GGUF target`);

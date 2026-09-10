@@ -438,6 +438,7 @@ impl Gemma4Inner {
             cached_paged_image_token_positions: Vec::new(),
             kv_cache_coordinator,
             active_paged_seq: 0,
+            decode_tuning: super::super::decode_tuning::DecodeTuning::default(),
             draft: None,
             draft_turn_state: None,
             scheduled_dspark_states: HashMap::new(),

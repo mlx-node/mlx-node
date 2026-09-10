@@ -206,6 +206,8 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MLX_DISABLE_METAL");
     // Watch all C++ source files, headers, and Metal kernel includes
     let src_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap()).join("src");
+    // Track added bridge translation units as well as edits to existing files.
+    println!("cargo:rerun-if-changed={}", src_dir.display());
     if let Ok(entries) = std::fs::read_dir(&src_dir) {
         for entry in entries.flatten() {
             let path = entry.path();

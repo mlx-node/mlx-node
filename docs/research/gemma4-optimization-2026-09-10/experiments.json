@@ -1,0 +1,1362 @@
+{
+  "scope": "Exploratory and pilot measurements, not the final matched matrix. Runtime defaults, source versions and background conditions differ. No confidence intervals or cross-variant causal claim is implied. Explicit machine/model tuning sweeps are diagnostic evidence only; production uses device-local calibration. Instrumented capture/trace requests excluded. No prompt or generated text is exported.",
+  "samples": [
+    {
+      "runtime": "early-grouped-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e16-r1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "3cc77f9526927fe2abed45401d7f2b976faf68752a8ac68eff02c13223622712",
+      "prefillMs": 7817.3705,
+      "prefillTps": 989.2073044254458,
+      "decodeTps": 51.39469110149847,
+      "wallMs": 12785.721833,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 9189874
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 9258874
+      },
+      "file": "early-grouped-sweep-diff-review-e16-r1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "16",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "early-grouped-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e16-r2",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "3cc77f9526927fe2abed45401d7f2b976faf68752a8ac68eff02c13223622712",
+      "prefillMs": 8726.945958,
+      "prefillTps": 886.1060945279661,
+      "decodeTps": 50.90934191664839,
+      "wallMs": 13740.610458000001,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 9185090
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 8032276
+      },
+      "file": "early-grouped-sweep-diff-review-e16-r2.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "16",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "early-grouped-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e4-r1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "3cc77f9526927fe2abed45401d7f2b976faf68752a8ac68eff02c13223622712",
+      "prefillMs": 7820.3859170000005,
+      "prefillTps": 988.825881749641,
+      "decodeTps": 49.143922903793886,
+      "wallMs": 13013.740167000002,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 5612894
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 5644938
+      },
+      "file": "early-grouped-sweep-diff-review-e4-r1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "early-grouped-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e4-r2",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "3cc77f9526927fe2abed45401d7f2b976faf68752a8ac68eff02c13223622712",
+      "prefillMs": 8017.536249999999,
+      "prefillTps": 964.510762268147,
+      "decodeTps": 47.67762261002637,
+      "wallMs": 13372.707917,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 5609118
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 5826786
+      },
+      "file": "early-grouped-sweep-diff-review-e4-r2.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "early-grouped-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e8-r1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "3cc77f9526927fe2abed45401d7f2b976faf68752a8ac68eff02c13223622712",
+      "prefillMs": 7484.7210000000005,
+      "prefillTps": 1033.1714435314288,
+      "decodeTps": 50.6402512399414,
+      "wallMs": 12527.007917,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 6846248
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 7239562
+      },
+      "file": "early-grouped-sweep-diff-review-e8-r1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "8",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "early-grouped-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e8-r2",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "3cc77f9526927fe2abed45401d7f2b976faf68752a8ac68eff02c13223622712",
+      "prefillMs": 8439.009375,
+      "prefillTps": 916.3397806984899,
+      "decodeTps": 48.752373385983475,
+      "wallMs": 13676.371458999998,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 6832032
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 7051470
+      },
+      "file": "early-grouped-sweep-diff-review-e8-r2.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "8",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "early-long-pair",
+      "name": "final-review",
+      "n": 66904,
+      "run": "e16-r1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "textSha256": "0670bf154206f3c3df1fc7542d391835d5633727fc093b66e914a6398045e40a",
+      "prefillMs": 82152.099083,
+      "prefillTps": 814.3918505649561,
+      "decodeTps": 36.63303982890105,
+      "wallMs": 89146.022667,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 17528188
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 12103400090,
+        "cacheBytes": 21816028
+      },
+      "file": "early-long-pair-final-review-e16-r1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "16",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force",
+        "MLX_PAGED_GROUPED_D512_STRIPES": "256"
+      }
+    },
+    {
+      "runtime": "early-long-pair",
+      "name": "final-review",
+      "n": 66904,
+      "run": "e4-r1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "textSha256": "0670bf154206f3c3df1fc7542d391835d5633727fc093b66e914a6398045e40a",
+      "prefillMs": 90988.310042,
+      "prefillTps": 735.30324905603,
+      "decodeTps": 33.63393479215907,
+      "wallMs": 98601.639833,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 12013654
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 12103400090,
+        "cacheBytes": 12186998
+      },
+      "file": "early-long-pair-final-review-e4-r1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force",
+        "MLX_PAGED_GROUPED_D512_STRIPES": "256"
+      }
+    },
+    {
+      "runtime": "early-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e16-r1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "76abe473df0e6db156cae9c4ca1a0db723aa8f28fbc6354e1e4012e0cfd3fed8",
+      "prefillMs": 9482.18775,
+      "prefillTps": 815.5290955929448,
+      "decodeTps": 39.89901585373829,
+      "wallMs": 15878.666041999999,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876946550,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 5892210
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 6276476
+      },
+      "file": "early-sweep-diff-review-e16-r1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "16",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "auto"
+      }
+    },
+    {
+      "runtime": "early-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e16-r2",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "76abe473df0e6db156cae9c4ca1a0db723aa8f28fbc6354e1e4012e0cfd3fed8",
+      "prefillMs": 8421.123625,
+      "prefillTps": 918.2860084185024,
+      "decodeTps": 44.25920152340408,
+      "wallMs": 14186.926875000001,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 5902450
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 5964544
+      },
+      "file": "early-sweep-diff-review-e16-r2.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "16",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "auto"
+      }
+    },
+    {
+      "runtime": "early-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e32-r1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "76abe473df0e6db156cae9c4ca1a0db723aa8f28fbc6354e1e4012e0cfd3fed8",
+      "prefillMs": 9394.242125,
+      "prefillTps": 823.1637951315844,
+      "decodeTps": 40.046284081743416,
+      "wallMs": 15766.661209000002,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 8264468
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 8384826
+      },
+      "file": "early-sweep-diff-review-e32-r1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "32",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "auto"
+      }
+    },
+    {
+      "runtime": "early-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e32-r2",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "76abe473df0e6db156cae9c4ca1a0db723aa8f28fbc6354e1e4012e0cfd3fed8",
+      "prefillMs": 9257.025833,
+      "prefillTps": 835.3654985419764,
+      "decodeTps": 42.52666333193697,
+      "wallMs": 15257.604667,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 8239884
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 8278600
+      },
+      "file": "early-sweep-diff-review-e32-r2.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "32",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "auto"
+      }
+    },
+    {
+      "runtime": "early-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e4-r1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "76abe473df0e6db156cae9c4ca1a0db723aa8f28fbc6354e1e4012e0cfd3fed8",
+      "prefillMs": 7219.873375,
+      "prefillTps": 1071.0714161243861,
+      "decodeTps": 43.11506119661667,
+      "wallMs": 13141.365374999998,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 3956810
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 4249346
+      },
+      "file": "early-sweep-diff-review-e4-r1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "auto"
+      }
+    },
+    {
+      "runtime": "early-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e4-r2",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "76abe473df0e6db156cae9c4ca1a0db723aa8f28fbc6354e1e4012e0cfd3fed8",
+      "prefillMs": 9298.479208,
+      "prefillTps": 831.641371348862,
+      "decodeTps": 42.422512629275595,
+      "wallMs": 15316.556708,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 3958750
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 4262466
+      },
+      "file": "early-sweep-diff-review-e4-r2.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "auto"
+      }
+    },
+    {
+      "runtime": "early-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e8-r1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "76abe473df0e6db156cae9c4ca1a0db723aa8f28fbc6354e1e4012e0cfd3fed8",
+      "prefillMs": 7437.04975,
+      "prefillTps": 1039.7940392962948,
+      "decodeTps": 43.14927036490841,
+      "wallMs": 13355.847958000002,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 4456848
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 4837566
+      },
+      "file": "early-sweep-diff-review-e8-r1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "8",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "auto"
+      }
+    },
+    {
+      "runtime": "early-sweep",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "e8-r2",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "76abe473df0e6db156cae9c4ca1a0db723aa8f28fbc6354e1e4012e0cfd3fed8",
+      "prefillMs": 8261.091,
+      "prefillTps": 936.0749082657484,
+      "decodeTps": 45.39798443752037,
+      "wallMs": 13884.884791999999,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 4807720
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015458190,
+        "cacheBytes": 4688010
+      },
+      "file": "early-sweep-diff-review-e8-r2.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "8",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "auto"
+      }
+    },
+    {
+      "runtime": "mixed-fast",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "screen1",
+      "addonSha256": "9e5c6fa903629f107c25ae327d9429435daf2e53cfeda1ec7ef5f741e39e2b63",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "79721a559f6c066e220c5d797594e7bd3f54a8688907b4d81eb2c12d2f91844f",
+      "prefillMs": 6475.278333,
+      "prefillTps": 1194.2343791756819,
+      "decodeTps": 39.69284354569556,
+      "wallMs": 12904.630667,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "mixed-fast-diff-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_MIXED_QMV": "1"
+      }
+    },
+    {
+      "runtime": "mixed-wide",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "screen1",
+      "addonSha256": "892ee20dc4d5a49bda691676650a680869625abdab62fac15440aa60f3b03921",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "197029fdf47ef10b1eb29532100e35e817af43e78e33f212f06f13708a66a737",
+      "prefillMs": 6948.503374999999,
+      "prefillTps": 1112.9015246394697,
+      "decodeTps": 37.883544897287905,
+      "wallMs": 13687.042417,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "mixed-wide-diff-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_MIXED_QMV": "wide"
+      }
+    },
+    {
+      "runtime": "optimized",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "adaptive-pilot",
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "09f3ee413624fe02044883678aea70686df4f4732c890f60eb7186d856946522",
+      "prefillMs": 6858.616458,
+      "prefillTps": 1127.4868695974542,
+      "decodeTps": 50.72450169798121,
+      "wallMs": 11892.979457999998,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20141290
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015457358,
+        "cacheBytes": 14583842
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 8192,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 32,
+          "samples": [
+            [
+              0.022224542,
+              0.022229292,
+              0.022950584
+            ],
+            [
+              0.030112667,
+              0.03036925,
+              0.028992834
+            ],
+            [
+              0.025407375,
+              0.02540025,
+              0.026031875
+            ],
+            [
+              0.023960875,
+              0.023514667,
+              0.023353209
+            ],
+            [
+              0.020572833,
+              0.021358917,
+              0.021297709
+            ],
+            [
+              0.020825541,
+              0.020235375,
+              0.021580458
+            ],
+            [
+              0.020669583,
+              0.021685041,
+              0.019998541
+            ],
+            [
+              0.020757792,
+              0.021058834,
+              0.02171825
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 8192,
+          "stage": "submission",
+          "earlyLayers": 16,
+          "groupedStripes": 32,
+          "samples": [
+            [
+              0.02052925,
+              0.021365375,
+              0.021580042
+            ],
+            [
+              0.021916834,
+              0.020331625,
+              0.020639125
+            ],
+            [
+              0.020082084,
+              0.02016025,
+              0.021890333
+            ],
+            [
+              0.020556542,
+              0.020521916,
+              0.02067275
+            ],
+            [
+              0.020720167,
+              0.019944583,
+              0.018963959
+            ],
+            [
+              0.018996417,
+              0.019801416,
+              0.019940584
+            ],
+            [
+              0.019871416,
+              0.020332084,
+              0.019163917
+            ],
+            [
+              0.018447125,
+              0.019197625,
+              0.019983625
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            32,
+            32,
+            32,
+            32,
+            32,
+            32,
+            32,
+            32
+          ]
+        },
+        {
+          "contextBucket": 8192,
+          "stage": "attention_refinement",
+          "earlyLayers": 16,
+          "groupedStripes": 32,
+          "samples": [
+            [
+              0.019167875,
+              0.020043583,
+              0.019689334
+            ],
+            [
+              0.021205917,
+              0.022076333,
+              0.021901291
+            ],
+            [
+              0.017859291,
+              0.019491125,
+              0.018568542
+            ]
+          ],
+          "candidateEarlyLayers": [
+            16,
+            16,
+            16
+          ],
+          "candidateStripes": [
+            32,
+            16,
+            64
+          ]
+        }
+      ],
+      "file": "optimized-diff-review-adaptive-pilot.json",
+      "performanceOverrides": {}
+    },
+    {
+      "runtime": "optimized",
+      "name": "final-review",
+      "n": 66904,
+      "run": "adaptive-pilot",
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "textSha256": "16752bcdaf119b95e9e0c2254bd49399194b10b51bbc8dc241993a899f8f32fc",
+      "prefillMs": 85566.654167,
+      "prefillTps": 781.8933748352929,
+      "decodeTps": 31.423472846696704,
+      "wallMs": 93712.619875,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20137322
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 12103400090,
+        "cacheBytes": 54425910
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 131072,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.061773625,
+              0.060856583,
+              0.060644708
+            ],
+            [
+              0.114791708,
+              0.114438333,
+              0.113988208
+            ],
+            [
+              0.069604833,
+              0.06793425,
+              0.067253833
+            ],
+            [
+              0.044565667,
+              0.044807,
+              0.043590791
+            ],
+            [
+              0.031997542,
+              0.03277925,
+              0.032263042
+            ],
+            [
+              0.032375917,
+              0.030651792,
+              0.030609792
+            ],
+            [
+              0.029408333,
+              0.029960875,
+              0.030803167
+            ],
+            [
+              0.028998,
+              0.02875175,
+              0.028009416
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 131072,
+          "stage": "submission",
+          "earlyLayers": 16,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.027765667,
+              0.028102792,
+              0.030121417
+            ],
+            [
+              0.028319542,
+              0.027998,
+              0.029939916
+            ],
+            [
+              0.02859775,
+              0.027706917,
+              0.02923525
+            ],
+            [
+              0.026025208,
+              0.027038917,
+              0.027970625
+            ],
+            [
+              0.025840375,
+              0.027741667,
+              0.029187042
+            ],
+            [
+              0.026675042,
+              0.026712458,
+              0.028087333
+            ],
+            [
+              0.025812833,
+              0.028284417,
+              0.027930792
+            ],
+            [
+              0.026647667,
+              0.028041708,
+              0.026966458
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            256,
+            256,
+            256,
+            256,
+            256,
+            256,
+            256,
+            256
+          ]
+        },
+        {
+          "contextBucket": 131072,
+          "stage": "attention_refinement",
+          "earlyLayers": 16,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.027970625,
+              0.028631708,
+              0.028797583
+            ],
+            [
+              0.0295305,
+              0.029750208,
+              0.028595
+            ]
+          ],
+          "candidateEarlyLayers": [
+            16,
+            16
+          ],
+          "candidateStripes": [
+            256,
+            128
+          ]
+        }
+      ],
+      "file": "optimized-final-review-adaptive-pilot.json",
+      "performanceOverrides": {}
+    },
+    {
+      "runtime": "sym-fast",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "3cc77f9526927fe2abed45401d7f2b976faf68752a8ac68eff02c13223622712",
+      "prefillMs": 7447.533417,
+      "prefillTps": 1038.3303527512055,
+      "decodeTps": 50.52976745755165,
+      "wallMs": 12499.384041,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-fast-diff-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "sym-fast-early4",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "3cc77f9526927fe2abed45401d7f2b976faf68752a8ac68eff02c13223622712",
+      "prefillMs": 6030.955959,
+      "prefillTps": 1282.2179522733934,
+      "decodeTps": 54.46347536508883,
+      "wallMs": 10719.816375000002,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-fast-early4-diff-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "sym-fast-early4-fused4",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "f35b08ea248d5ecf70cc1edc8a28388e418b2fad12b67a7e54545d95948dfd99",
+      "prefillMs": 6942.3825,
+      "prefillTps": 1113.8827340613975,
+      "decodeTps": 53.701418541039715,
+      "wallMs": 11697.654708,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-fast-early4-fused4-diff-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_FUSED_PREFILL": "1",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "sym-fast-early4-stripes256",
+      "name": "final-review",
+      "n": 66904,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "textSha256": "0670bf154206f3c3df1fc7542d391835d5633727fc093b66e914a6398045e40a",
+      "prefillMs": 77851.22666700001,
+      "prefillTps": 859.3827337644202,
+      "decodeTps": 38.69235274294033,
+      "wallMs": 84471.89275,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-fast-early4-stripes256-final-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force",
+        "MLX_PAGED_GROUPED_D512_STRIPES": "256"
+      }
+    },
+    {
+      "runtime": "sym-fast-early4-stripes256-fused4",
+      "name": "final-review",
+      "n": 66904,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "textSha256": "0670bf154206f3c3df1fc7542d391835d5633727fc093b66e914a6398045e40a",
+      "prefillMs": 79942.750292,
+      "prefillTps": 836.8989027225798,
+      "decodeTps": 38.38335071930034,
+      "wallMs": 86617.81783300001,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-fast-early4-stripes256-fused4-final-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_FUSED_PREFILL": "1",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force",
+        "MLX_PAGED_GROUPED_D512_STRIPES": "256"
+      }
+    },
+    {
+      "runtime": "sym-fast-early4",
+      "name": "test-review",
+      "n": 40528,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "textSha256": "17dd2dc11cfd72cd8ab41eb80be19db305318119baf7955e5bee7884685ad15c",
+      "prefillMs": 40912.9625,
+      "prefillTps": 990.5906960416274,
+      "decodeTps": 43.41086546761917,
+      "wallMs": 46806.978666999996,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-fast-early4-test-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_MIXED_QMV": "1",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "sym-wide",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "f9eca9987f8a3e83645834bc81020d59cae461409dc60fc646a58be95b0e6870",
+      "prefillMs": 7404.50375,
+      "prefillTps": 1044.3643843113728,
+      "decodeTps": 49.103826285682594,
+      "wallMs": 12604.510292,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-wide-diff-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_MIXED_QMV": "wide",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "sym-wide-early4-stripes256",
+      "name": "final-review",
+      "n": 66904,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "textSha256": "16752bcdaf119b95e9e0c2254bd49399194b10b51bbc8dc241993a899f8f32fc",
+      "prefillMs": 84425.35370800001,
+      "prefillTps": 792.4633662939607,
+      "decodeTps": 37.13151611693457,
+      "wallMs": 91324.007167,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-wide-early4-stripes256-final-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS": "4",
+        "MLX_GEMMA4_MIXED_QMV": "wide",
+        "MLX_PAGED_GROUPED_D512": "force",
+        "MLX_PAGED_GROUPED_D512_STRIPES": "256"
+      }
+    },
+    {
+      "runtime": "sym-wide",
+      "name": "final-review",
+      "n": 66904,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "textSha256": "16752bcdaf119b95e9e0c2254bd49399194b10b51bbc8dc241993a899f8f32fc",
+      "prefillMs": 88458.836041,
+      "prefillTps": 756.3291921339605,
+      "decodeTps": 34.722357163779385,
+      "wallMs": 95834.687042,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-wide-final-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_MIXED_QMV": "wide",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "sym-wide-fused4",
+      "name": "final-review",
+      "n": 66904,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "textSha256": "c135f8827724a88e09995107b3a03bf35c8e66e3c963c4024da59925bb61aef3",
+      "prefillMs": 83133.390875,
+      "prefillTps": 804.7789136930234,
+      "decodeTps": 35.192691253866705,
+      "wallMs": 90409.555333,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-wide-fused4-final-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_FUSED_PREFILL": "1",
+        "MLX_GEMMA4_MIXED_QMV": "wide",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "sym-wide",
+      "name": "test-review",
+      "n": 40528,
+      "run": "screen1",
+      "addonSha256": "b3a2b5e86cc6b1a92afb49482f2ac42857a1936f87e941d853fb4883ee5dc6a1",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "textSha256": "9ea0f4b72e2f97cb6cab4eb2661616b6a1409f7d2125f9ce8fdf8918b0e1c678",
+      "prefillMs": 46015.014166,
+      "prefillTps": 880.7560039815374,
+      "decodeTps": 34.15799896280241,
+      "wallMs": 53499.608667,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "sym-wide-test-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_MIXED_QMV": "wide",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "tail-wide-fused",
+      "name": "final-review",
+      "n": 66904,
+      "run": "screen1",
+      "addonSha256": "8842885cc06c542a9f81098e1fb0aeb61dab05e1d35c8350acdf32e50f600890",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "textSha256": "0670bf154206f3c3df1fc7542d391835d5633727fc093b66e914a6398045e40a",
+      "prefillMs": 135227.705459,
+      "prefillTps": 494.7506856890712,
+      "decodeTps": 29.09922396727716,
+      "wallMs": 144022.053083,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "tail-wide-fused-final-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_GEMMA4_FUSED_PREFILL": "1",
+        "MLX_GEMMA4_MIXED_QMV": "wide",
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "window-grouped",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "screen1",
+      "addonSha256": "b104261046a52f2859b308fae901249fc83aeef0d6e8d548431d81f907a4e97b",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "197029fdf47ef10b1eb29532100e35e817af43e78e33f212f06f13708a66a737",
+      "prefillMs": 6453.542665999999,
+      "prefillTps": 1198.2565856023118,
+      "decodeTps": 40.72017650512137,
+      "wallMs": 12720.638208,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "window-grouped-diff-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "window-grouped",
+      "name": "test-review",
+      "n": 40528,
+      "run": "screen1",
+      "addonSha256": "b104261046a52f2859b308fae901249fc83aeef0d6e8d548431d81f907a4e97b",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "textSha256": "17dd2dc11cfd72cd8ab41eb80be19db305318119baf7955e5bee7884685ad15c",
+      "prefillMs": 41201.398959000006,
+      "prefillTps": 983.6559200412075,
+      "decodeTps": 34.22268243155782,
+      "wallMs": 48672.847583,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "window-grouped-test-review-screen1.json",
+      "performanceOverrides": {
+        "MLX_PAGED_GROUPED_D512": "force"
+      }
+    },
+    {
+      "runtime": "window-v1",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "screen1",
+      "addonSha256": "b104261046a52f2859b308fae901249fc83aeef0d6e8d548431d81f907a4e97b",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "textSha256": "79721a559f6c066e220c5d797594e7bd3f54a8688907b4d81eb2c12d2f91844f",
+      "prefillMs": 6259.139042,
+      "prefillTps": 1235.473433024912,
+      "decodeTps": 39.412238334615004,
+      "wallMs": 12739.643499999998,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "window-v1-diff-review-screen1.json",
+      "performanceOverrides": {}
+    },
+    {
+      "runtime": "window-v1",
+      "name": "final-review",
+      "n": 66904,
+      "run": "screen1",
+      "addonSha256": "b104261046a52f2859b308fae901249fc83aeef0d6e8d548431d81f907a4e97b",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "textSha256": "0670bf154206f3c3df1fc7542d391835d5633727fc093b66e914a6398045e40a",
+      "prefillMs": 100467.44750000001,
+      "prefillTps": 665.9271402311679,
+      "decodeTps": 24.254639952476612,
+      "wallMs": 111016.563666,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "window-v1-final-review-screen1.json",
+      "performanceOverrides": {}
+    },
+    {
+      "runtime": "window-v1",
+      "name": "test-review",
+      "n": 40528,
+      "run": "screen1",
+      "addonSha256": "b104261046a52f2859b308fae901249fc83aeef0d6e8d548431d81f907a4e97b",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "textSha256": "8b08d2c4b27862d8823e395b86ffeb470106e84298a93ae7d06d4083c89c3989",
+      "prefillMs": 41808.12125,
+      "prefillTps": 969.3810386181848,
+      "decodeTps": 21.739597243056743,
+      "wallMs": 53563.662249999994,
+      "cachedTokens": 0,
+      "generatedTokens": 256,
+      "file": "window-v1-test-review-screen1.json",
+      "performanceOverrides": {}
+    }
+  ]
+}

@@ -32,6 +32,18 @@
 namespace mlx::core::fast {
 
 namespace {
+void validate_paged_attention_plan(uint8_t route_hint, uint32_t grouped_stripes) {
+  if (grouped_stripes != 0 &&
+      (grouped_stripes < 4 || grouped_stripes > 256 ||
+       (grouped_stripes & (grouped_stripes - 1)) != 0 || route_hint != 1)) {
+    throw std::invalid_argument("paged attention stripes require grouped route and a power of two in [4,256]");
+  }
+  if (route_hint > 2) {
+    throw std::invalid_argument(
+        "paged_attention_with_route_hint: route_hint must be 0, 1, or 2");
+  }
+}
+
 
 // The runtime validators establish `value >= 0` and `divisor > 0` before
 // either caller reaches this helper. Widen before arithmetic so INT32_MAX is
@@ -866,6 +878,7 @@ bool PagedKVWrite::is_equivalent(const Primitive& other) const {
 void PagedAttention::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
+  validate_paged_attention_plan(route_hint_, grouped_stripes_);
   if (inputs.size() != 7) {
     throw std::runtime_error(
         "PagedAttention: expected 7 inputs (q, k_pool, v_pool, block_table, "
@@ -1042,7 +1055,8 @@ void PagedAttention::eval_gpu(
       sliding_window_,
       to_paged_dtype(kv_dtype_),
       static_cast<mlx::core::fast::paged::PagedAttentionRouteHint>(
-          route_hint_));
+          route_hint_),
+      grouped_stripes_);
 }
 
 std::vector<array> PagedAttention::vjp(
@@ -1079,7 +1093,7 @@ bool PagedAttention::is_equivalent(const Primitive& other) const {
       block_size_ == o.block_size_ && num_q_heads_ == o.num_q_heads_ &&
       num_kv_heads_ == o.num_kv_heads_ && head_size_ == o.head_size_ &&
       sliding_window_ == o.sliding_window_ && kv_dtype_ == o.kv_dtype_ &&
-      route_hint_ == o.route_hint_;
+      route_hint_ == o.route_hint_ && grouped_stripes_ == o.grouped_stripes_;
 }
 
 // =============================================================================
@@ -1255,11 +1269,9 @@ array paged_attention_with_route_hint(
     int head_size,
     KvDtype kv_dtype,
     uint8_t route_hint,
-    StreamOrDevice s_) {
-  if (route_hint > 2) {
-    throw std::invalid_argument(
-        "paged_attention_with_route_hint: route_hint must be 0, 1, or 2");
-  }
+    StreamOrDevice s_,
+    uint32_t grouped_stripes) {
+  validate_paged_attention_plan(route_hint, grouped_stripes);
   auto s = to_stream(s_);
 
   auto fallback = [](std::vector<array> /*inputs*/) -> std::vector<array> {
@@ -1311,7 +1323,8 @@ array paged_attention_with_route_hint(
       head_size,
       sliding_window,
       kv_dtype,
-      route_hint);
+      route_hint,
+      grouped_stripes);
 
   return array(std::move(out_shape), out_dtype, primitive, std::move(inputs));
 }
@@ -1821,7 +1834,7 @@ extern "C" {
 /// Returns nullptr on bridge/factory validation errors; Rust callers keep the
 /// existing read_kv_range + SDPA path as fallback. The returned array is still
 /// lazy, so GPU dispatch errors surface later when MLX evaluates the graph.
-mlx_array* mlx_paged_attention_forward_with_route(
+mlx_array* mlx_paged_attention_forward_with_plan(
     mlx_array* q_ptr,
     mlx_array* k_pool_ptr,
     mlx_array* v_pool_ptr,
@@ -1837,7 +1850,8 @@ mlx_array* mlx_paged_attention_forward_with_route(
     int num_kv_heads,
     int head_size,
     uint8_t kv_dtype_raw,
-    uint8_t route_hint) {
+    uint8_t route_hint,
+    uint32_t grouped_stripes) {
   if (!q_ptr || !k_pool_ptr || !v_pool_ptr || !block_table_ptr ||
       !seq_lens_ptr || !k_scale_ptr || !v_scale_ptr) {
     return nullptr;
@@ -1885,7 +1899,7 @@ mlx_array* mlx_paged_attention_forward_with_route(
         num_kv_heads,
         head_size,
         kv_dtype,
-        route_hint);
+        route_hint, {}, grouped_stripes);
 
     return reinterpret_cast<mlx_array*>(new array(std::move(out)));
   } catch (const std::exception& e) {
@@ -1896,6 +1910,29 @@ mlx_array* mlx_paged_attention_forward_with_route(
         "paged_attention_forward_with_route", "unknown exception");
     return nullptr;
   }
+}
+
+mlx_array* mlx_paged_attention_forward_with_route(
+    mlx_array* q_ptr,
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* block_table_ptr,
+    mlx_array* seq_lens_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    float scale,
+    float softcap,
+    int sliding_window,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    uint8_t kv_dtype_raw,
+    uint8_t route_hint) {
+  return mlx_paged_attention_forward_with_plan(
+      q_ptr, k_pool_ptr, v_pool_ptr, block_table_ptr, seq_lens_ptr,
+      k_scale_ptr, v_scale_ptr, scale, softcap, sliding_window, block_size,
+      num_q_heads, num_kv_heads, head_size, kv_dtype_raw, route_hint, 0);
 }
 
 mlx_array* mlx_paged_attention_forward(
@@ -2239,6 +2276,20 @@ bool mlx_paged_attention_is_equivalent(
       static_cast<KvDtype>(kv_dtype_rhs));
 
   return lhs.is_equivalent(rhs);
+}
+
+// A compiled graph must not merge operations with different partition plans.
+int mlx_paged_attention_plan_identity_test() {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  auto fallback = [](std::vector<array>) -> std::vector<array> {
+    throw std::runtime_error("identity test should not execute");
+  };
+  auto stream = default_stream(default_device());
+  PagedAttention a(stream, fallback, 1.0f, 0.0f, 16, 16, 1, 512, 0, KvDtype::Bf16, 1, 32);
+  PagedAttention b(stream, fallback, 1.0f, 0.0f, 16, 16, 1, 512, 0, KvDtype::Bf16, 1, 64);
+  PagedAttention c(stream, fallback, 1.0f, 0.0f, 16, 16, 1, 512, 0, KvDtype::Bf16, 1, 32);
+  return !a.is_equivalent(b) && a.state() != b.state() && a.is_equivalent(c) && a.state() == c.state();
 }
 
 /// Same idea for `PagedAttention`.

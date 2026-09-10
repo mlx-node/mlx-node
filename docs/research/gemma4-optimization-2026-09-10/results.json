@@ -1,0 +1,2751 @@
+{
+  "environment": {
+    "measuredAt": "2026-09-10T14:51:57.725103+00:00",
+    "modelFile": "/Users/brooklyn/workspace/github/mlx-node/.cache/models/gemma-4-12b-it-qat-q4_0-gguf/gemma-4-12b-it-qat-q4_0.gguf",
+    "modelSha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+    "mlxCommit": "185bc1b0a19e70e3a522452d4cbe69f2f24b47a9",
+    "mlxLibraryCommit": "6d45ab90cfec5e7fe0cfe25bc635a23ac8a351bb",
+    "llamaCommit": "a14dba686aaafba3a2d6b5eb8820b0df5c5d2d92",
+    "llamaVersion": "version: 0.2.0-dev (build 10610, commit a14dba686)\nbuilt with AppleClang 21.0.0.21000101 for Darwin arm64",
+    "hardware": "Hardware:\n\n    Hardware Overview:\n\n      Model Name: MacBook Pro\n      Model Identifier: Mac17,6\n      Model Number: Z1MY000UBCH/A\n      Chip: Apple M5 Max\n      Total Number of Cores: 18 (6 Super and 12 Performance)\n      Memory: 128 GB\n      System Firmware Version: 18000.161.10\n      OS Loader Version: 18000.161.10\n      Activation Lock Status: Disabled\n\nGraphics/Displays:\n\n    Apple M5 Max:\n\n      Chipset Model: Apple M5 Max\n      Type: GPU\n      Bus: Built-In\n      Total Number of Cores: 40\n      Vendor: Apple (0x106b)\n      Metal Support: Metal 4\n      Displays:\n        Color LCD:\n          Display Type: Built-in Liquid Retina XDR Display\n          Resolution: 3456 x 2234 Retina\n          Main Display: Yes\n          Mirror: Off\n          Online: Yes\n          Automatically Adjust Brightness: Yes\n          Connection Type: Internal",
+    "os": "ProductName:\t\tmacOS\nProductVersion:\t\t26.6.2\nBuildVersion:\t\t25G83",
+    "thermal": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "outputTokens": 256,
+    "measuredRepeats": 3,
+    "warmupTokens": 32,
+    "cooldownSeconds": 20,
+    "scope": "Recorded agent-context replay through native Gemma4Model.chatSessionStart and llama.cpp /completion; high thinking, historical tool results, greedy AR without speculation; cold prompt cache.",
+    "envOverrides": {
+      "MLX_AGENT_METRICS": "0",
+      "MLX_PERSIST_PAGED_CACHE": "0",
+      "MLX_PAGED_PREFILL_CHUNK_SIZE": "512"
+    },
+    "mlxCachePolicy": "Session API requires reuseCache=true; resetCaches() immediately before every measured request; assert cachedTokens == 0.",
+    "kvCache": "BF16 in both runtimes; MLX paged cache, llama.cpp standard KV cache.",
+    "prefillBatching": "MLX_PAGED_PREFILL_CHUNK_SIZE=512; llama.cpp logical batch 2048, physical ubatch 512.",
+    "loadTiming": "Excluded: both use an existing disk artifact and a fresh process; main GGUF plus prepared MLX cache already page-cache warm. MLX also loads the media companion, while this text-only llama server does not.",
+    "workstation": "Interactive desktop session. No other inference benchmark was running. Normal desktop applications remain active.",
+    "cases": [
+      {
+        "name": "diff-review",
+        "promptTokens": 7733
+      },
+      {
+        "name": "test-review",
+        "promptTokens": 40528
+      },
+      {
+        "name": "final-review",
+        "promptTokens": 66904
+      }
+    ],
+    "warmup": "32 generated tokens using the first real diff-review fixture before every sample, followed by a full cache reset.",
+    "inputPolicy": "Whole recorded turn boundaries. No synthetic input. Actual generated token count is retained if the model stops before the cap.",
+    "llamaContextCapacity": 73728,
+    "reasoningEffort": "high",
+    "piVersion": "0.84.4",
+    "nativeTimingSources": {
+      "mlx": "crates/mlx-core/src/engine/finalize.rs:38-64",
+      "llama": "tools/server/server-common.h:379-421"
+    },
+    "benchmarkScriptSha256": "caaa5774984a2639c906b47d731733d815f78f3476ac2918a65e9ae4061b3e96",
+    "mlxLibraryDirty": false,
+    "llamaDirty": false,
+    "sourcePatchSha256": "df19f7b76b8b1e02067012667bb464725bb55048f91447cb87251568ba75f6f4",
+    "sourcePatchIncludes": "Tracked changes and every new source file under crates/, packages/, and __test__/.",
+    "sourceFileSha256": {
+      "__test__/models/gemma4-native-gguf-e2e.test.ts": "e32f00ce137ed7823a3e0595b035eeec89ede80902080d7a9df78b7138aa5b41",
+      "crates/mlx-core/src/models/gemma4/attention.rs": "b80c97fa44d47dd539229a1d7af3b32ff4df314f8a6e597c520698964c13d518",
+      "crates/mlx-core/src/models/gemma4/attention/dense_cache_hit.rs": "a9e0522faa064ee51f6952f0dd1d95e3585c5db2d3428add03ec2c0999222c99",
+      "crates/mlx-core/src/models/gemma4/decode_tuning.rs": "677b777c4aa58840820aa4795fbe4e0aa1e1079a451526b131e6329c4e379828",
+      "crates/mlx-core/src/models/gemma4/mod.rs": "da5f6e75da1a68540a5187363cde3052d441138eb20284aa0074ab678c56e0cc",
+      "crates/mlx-core/src/models/gemma4/model.rs": "8cc09a9950b9fff813ea7ae3b410e5c035dd4b65273f0d4a329b40fae034309b",
+      "crates/mlx-core/src/models/gemma4/model/backend_impl.rs": "348741008216c6794ce5e86bd56f4ae14422e049bb523d01fa223a348856e177",
+      "crates/mlx-core/src/models/gemma4/model/construct.rs": "c9067a74fb6df8256588247d147735c27c7f58633295c9dd8387e2520d727a4c",
+      "crates/mlx-core/src/models/gemma4/model/paged_forward.rs": "f7c9039342b70d1efa39ba00813b65f3ea9a8c25d4c6d732e2fd2abec8303442",
+      "crates/mlx-core/src/models/gemma4/persistence.rs": "014ad55c553f3aece685023223e441d4867e5971182ddeea37af988a566a5f2c",
+      "crates/mlx-core/src/models/gemma4/quantized_linear.rs": "4eeed01a5b4f7f21def9606f3f4ae03c8564e44aa06d0a42e3a187270acc504f",
+      "crates/mlx-core/src/models/gemma4/recorded_qmv.rs": "d6bdc5dc626a7de1614c52834503a3d92c5b4c2fa0d63ab5b9d9667dbec7b359",
+      "crates/mlx-core/src/transformer/paged_kv_cache_adapter.rs": "125dc1880aa8a78b24a96d703ac57f40b39f5465eebe0ff7eaffa388f2b5a3c9",
+      "crates/mlx-core/src/utils/gguf.rs": "82603ab02bcc759dc592e2a6496c331c7c891c7213ee1f070e8e0ee3db889081",
+      "crates/mlx-sys/build.rs": "8d2e7400c5d064968c73a327d72ba9b8c9b9590e7ecb4f664b449e45ce536983",
+      "crates/mlx-sys/src/lib.rs": "70a78ae729d07fe6f5918136cb85fe9d8e09a856dd7da0ec0b65501ee67c928e",
+      "crates/mlx-sys/src/metal/affine_qmv_bf16.metal.inc": "e4d8a11f885af57f92a4655ffd99d7011f99e218e8c413ffa7c80db8697fbb63",
+      "crates/mlx-sys/src/mlx_affine_qmv.cpp": "5ce11acf7c4030279bdc71c143141b037a2ee4081f3a08e9d274efb4d153ea02",
+      "crates/mlx-sys/src/mlx_paged_dispatch.cpp": "4be687399ec5007a3a5ba9d48b7753d235592c5082125dbbc57b2e92ca140c0f",
+      "crates/mlx-sys/src/mlx_paged_dispatch.h": "7cfab884e3b336b4875007e56e83295fcd1df46cd43fb399b75ffcf9dc11ac50",
+      "crates/mlx-sys/src/mlx_paged_ops.cpp": "63d3604f85abfc8e099947f15836afe1e29814efb4233a479e1e408eccc2b9ce",
+      "crates/mlx-sys/src/mlx_paged_ops.h": "c6e09373671dd52674b1e2455c3c5d0ee429c1c680c83ac5945a3f44f8abe246",
+      "crates/mlx-sys/src/mlx_paged_stubs_linux.cpp": "6687725f0645cac253cf4ef33276eed63f442f65592ec2fdfd72d9d8743a7adc",
+      "packages/agent/__test__/models.test.ts": "fb5bb2b34561515cb2a5b238cea9a027bda5062ccd76f5043493e6076a2569cf",
+      "packages/agent/src/provider/models.ts": "eeba2c3be8560527a211a1cdb63a22dd1a3fb30c69250bd5b706a5794ba4dd4e",
+      "packages/lm/__test__/model-loader-gguf.test.ts": "c9580bb4f71a456cfad016f850219f93f023dba8dbf6597e9d76cddbdb554838",
+      "packages/lm/src/family-data.ts": "93f232052678fc578d10c5ee7d3228afb15a8c52943c0fac07f34702ea2f9f28"
+    },
+    "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+    "metallibSha256": {
+      "mlx.metallib": "5b8f50b27baa611c27e164629f2601525a6e9d822d1f3533a3d4132150027b82",
+      "paged_attn.metallib": "b0b639faee1d985f57cdb33837fe1e1de1aee48d2fb387896c0d7031984a2997"
+    },
+    "power": "Now drawing from 'AC Power'\n -InternalBattery-0 (id=7471203)\t100%; charged; 0:00 remaining present: true",
+    "decodePolicy": "Device-local bounded calibration on completed real tokens; no machine-specific early-eval/stripe/route overrides. Runtime capability and tensor-shape gates. Calibration is included in timing and model-local state survives prompt-cache reset.",
+    "logging": "Only mlx_core::decode_tuning selection events enabled, written to a local JSON file; no per-token logging.",
+    "advertisedPeakBandwidthGBps": 614,
+    "bandwidthSource": "https://www.apple.com/macbook-pro/specs/",
+    "validation": [
+      {
+        "name": "clippy",
+        "args": [
+          "cargo",
+          "clippy",
+          "-p",
+          "mlx-core",
+          "--all-targets",
+          "--",
+          "-D",
+          "warnings"
+        ],
+        "exitCode": 0,
+        "elapsedSeconds": 7.226809416999458
+      },
+      {
+        "name": "gemma-tests",
+        "args": [
+          "cargo",
+          "test",
+          "-p",
+          "mlx-core",
+          "--lib",
+          "models::gemma4",
+          "--",
+          "--test-threads=1"
+        ],
+        "exitCode": 0,
+        "elapsedSeconds": 11.365447290998418
+      },
+      {
+        "name": "gguf-tests",
+        "args": [
+          "cargo",
+          "test",
+          "-p",
+          "mlx-core",
+          "--lib",
+          "utils::gguf",
+          "--",
+          "--test-threads=1"
+        ],
+        "exitCode": 0,
+        "elapsedSeconds": 0.5392695829941658
+      },
+      {
+        "name": "native-build",
+        "args": [
+          "yarn",
+          "build:native"
+        ],
+        "exitCode": 0,
+        "elapsedSeconds": 178.58640591600852
+      },
+      {
+        "name": "native-e2e",
+        "args": [
+          "yarn",
+          "test",
+          "packages/agent/__test__/models.test.ts",
+          "packages/lm/__test__/model-loader-gguf.test.ts",
+          "__test__/models/gemma4-native-gguf-e2e.test.ts",
+          "--maxWorkers=1",
+          "--no-file-parallelism"
+        ],
+        "exitCode": 0,
+        "elapsedSeconds": 5.231188417004887
+      },
+      {
+        "name": "rust-lib",
+        "args": [
+          "cargo",
+          "test",
+          "-p",
+          "mlx-core",
+          "--lib",
+          "--",
+          "--test-threads=1",
+          "--skip",
+          "models::qwen3_5::int8_gemm"
+        ],
+        "exitCode": 0,
+        "elapsedSeconds": 65.03603524999926
+      },
+      {
+        "name": "paged-ops",
+        "args": [
+          "cargo",
+          "test",
+          "-p",
+          "mlx-paged-attn",
+          "--test",
+          "paged_ops_smoke",
+          "--",
+          "--test-threads=1"
+        ],
+        "exitCode": 0,
+        "elapsedSeconds": 91.4103395830025
+      },
+      {
+        "name": "operators",
+        "args": [
+          "python3",
+          "docs/research/gemma4-optimization-2026-09-10/operators.py"
+        ],
+        "exitCode": 0,
+        "elapsedSeconds": 232.9160409999895
+      },
+      {
+        "name": "pilot-short",
+        "args": [
+          "oxnode",
+          "docs/research/gemma4-optimization-2026-09-10/benchmark.ts",
+          "mlx",
+          "diff-review",
+          "adaptive-pilot"
+        ],
+        "exitCode": 0,
+        "elapsedSeconds": 20.045433209001203
+      },
+      {
+        "name": "pilot-long",
+        "args": [
+          "oxnode",
+          "docs/research/gemma4-optimization-2026-09-10/benchmark.ts",
+          "mlx",
+          "final-review",
+          "adaptive-pilot"
+        ],
+        "exitCode": 0,
+        "elapsedSeconds": 102.30816654200316
+      }
+    ],
+    "priorTypecheckLog": "final-typecheck.log; TypeScript runtime sources unchanged since that passing check.",
+    "completedAt": "2026-09-10T15:23:57.516427+00:00",
+    "thermalAfter": "Note: No thermal warning level has been recorded\nNote: No performance warning level has been recorded\nNote: No CPU power status has been recorded",
+    "consistencyChecks": "All 18 final samples preserve the frozen addon, source files, model and benchmark script. Source and metallib hashes were verified again after the matrix; the MLX submodule remains unchanged. Summarizer separately checks prompt/input hashes, 256 outputs, zero prompt-cache reuse and timing accounting."
+  },
+  "fixture": {
+    "source": "/Users/brooklyn/.mlx-node/agent/sessions/--Users-brooklyn-workspace-github-oxc-node--/2026-09-03T15-07-41-314Z_01a067cf-b782-7b58-855e-8158dcb283ab.jsonl",
+    "sourceSha256": "cdf4938c2ce1f37acbe87659b38782bc48dd95cabb98723c7328819d8cbc2988",
+    "sessionId": "01a067cf-b782-7b58-855e-8158dcb283ab",
+    "recordedAt": "2026-09-03T15:07:41.314Z",
+    "cwd": "/Users/brooklyn/workspace/github/oxc-node",
+    "originalRequest": "Deepreview https://github.com/oxc-project/oxc-node/pull/745",
+    "systemPromptSource": "Reconstructed with the installed Pi buildSystemPrompt and createCodingTools; original system prompt is absent from session JSONL.",
+    "historicalContent": "Pi parent-chain and compaction reconstruction, then production contextToChatMessages. No padding, repetition, truncation inside a message, or invented user/tool content. Tools are never executed.",
+    "cases": [
+      {
+        "name": "diff-review",
+        "assistantEntryId": "3de6f891",
+        "parentEntryId": "4ac7116a",
+        "historicalMessages": 8,
+        "toolResults": 4,
+        "recordedThinkingLevel": "high",
+        "promptTokens": 7733,
+        "sha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f"
+      },
+      {
+        "name": "test-review",
+        "assistantEntryId": "48096389",
+        "parentEntryId": "282ff390",
+        "historicalMessages": 56,
+        "toolResults": 30,
+        "recordedThinkingLevel": "high",
+        "promptTokens": 40528,
+        "sha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa"
+      },
+      {
+        "name": "final-review",
+        "assistantEntryId": "86bd44d6",
+        "parentEntryId": "261480e3",
+        "historicalMessages": 133,
+        "toolResults": 71,
+        "recordedThinkingLevel": "high",
+        "promptTokens": 66904,
+        "sha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3"
+      }
+    ]
+  },
+  "rows": [
+    {
+      "name": "diff-review",
+      "optimized": {
+        "prefillMs": {
+          "median": 6705.652875,
+          "min": 6668.5470000000005,
+          "max": 6712.108125000001
+        },
+        "prefillTps": {
+          "median": 1153.2061298356425,
+          "min": 1152.0970544555998,
+          "max": 1159.622928353058
+        },
+        "decodeTps": {
+          "median": 50.53215270305043,
+          "min": 49.92307156168541,
+          "max": 52.14750230476316
+        },
+        "wallMs": {
+          "median": 11758.675082999998,
+          "min": 11608.692374999999,
+          "max": 11783.387250000002
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 2,
+        "finishReasons": [
+          "length"
+        ]
+      },
+      "llama": {
+        "prefillMs": {
+          "median": 6176.594,
+          "min": 5906.562,
+          "max": 6401.686
+        },
+        "prefillTps": {
+          "median": 1251.9845079666884,
+          "min": 1207.9630272400116,
+          "max": 1309.2218451275041
+        },
+        "decodeTps": {
+          "median": 48.69509556364764,
+          "min": 48.66085331672376,
+          "max": 50.34669126480958
+        },
+        "wallMs": {
+          "median": 11243.726084000002,
+          "min": 11149.179625,
+          "max": 11641.953709000001
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": [
+          "limit"
+        ]
+      },
+      "llamaOverMlxPrefill": 1.085655439713214,
+      "llamaOverMlxDecode": 0.9636457771708608,
+      "mlxOverLlamaLatency": 1.0457987854873818,
+      "matchingOutputPairs": 0,
+      "original": {
+        "prefillMs": {
+          "median": 8220.167167,
+          "min": 8150.510083,
+          "max": 8590.349584
+        },
+        "prefillTps": {
+          "median": 940.7351265366304,
+          "min": 900.1961939247664,
+          "max": 948.7749749710971
+        },
+        "decodeTps": {
+          "median": 28.214331814923266,
+          "min": 27.02442674441922,
+          "max": 29.381026035837795
+        },
+        "wallMs": {
+          "median": 17274.486916,
+          "min": 17262.327667,
+          "max": 17593.377333
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": [
+          "length"
+        ]
+      },
+      "decodeSpeedupOverOriginal": 1.791010080781807,
+      "requestSpeedupOverOriginal": 1.4690844669204646,
+      "matchesOriginalOutputHashes": false
+    },
+    {
+      "name": "test-review",
+      "optimized": {
+        "prefillMs": {
+          "median": 40513.106,
+          "min": 40076.7395,
+          "max": 42398.829917
+        },
+        "prefillTps": {
+          "median": 1000.3676341182036,
+          "min": 955.8754352263414,
+          "max": 1011.2599105024499
+        },
+        "decodeTps": {
+          "median": 39.83966461669209,
+          "min": 39.47594088385216,
+          "max": 41.824118755566815
+        },
+        "wallMs": {
+          "median": 46993.807333000004,
+          "min": 46194.233375,
+          "max": 48817.877
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 2,
+        "finishReasons": [
+          "length"
+        ]
+      },
+      "llama": {
+        "prefillMs": {
+          "median": 54701.037,
+          "min": 53887.766,
+          "max": 56224.583
+        },
+        "prefillTps": {
+          "median": 740.9000308348817,
+          "min": 720.8234874769992,
+          "max": 752.0816505920843
+        },
+        "decodeTps": {
+          "median": 35.28873031563486,
+          "min": 35.045674133777446,
+          "max": 36.31326126124073
+        },
+        "wallMs": {
+          "median": 61933.872209,
+          "min": 60916.648792,
+          "max": 63507.475542
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": [
+          "limit"
+        ]
+      },
+      "llamaOverMlxPrefill": 0.7406277508047975,
+      "llamaOverMlxDecode": 0.8857687597312134,
+      "mlxOverLlamaLatency": 0.7587739254283383,
+      "matchingOutputPairs": 0,
+      "original": {
+        "prefillMs": {
+          "median": 84534.032042,
+          "min": 73162.166083,
+          "max": 89418.067958
+        },
+        "prefillTps": {
+          "median": 479.4282139513233,
+          "min": 453.24173207406085,
+          "max": 553.9475137193499
+        },
+        "decodeTps": {
+          "median": 16.148959522537965,
+          "min": 15.734920884007911,
+          "max": 17.342450826479574
+        },
+        "wallMs": {
+          "median": 100346.71,
+          "min": 87884.791708,
+          "max": 105647.167
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": [
+          "length"
+        ]
+      },
+      "decodeSpeedupOverOriginal": 2.4670112375407642,
+      "requestSpeedupOverOriginal": 2.135317730034921,
+      "matchesOriginalOutputHashes": false
+    },
+    {
+      "name": "final-review",
+      "optimized": {
+        "prefillMs": {
+          "median": 76717.1295,
+          "min": 75244.464958,
+          "max": 77013.61837499999
+        },
+        "prefillTps": {
+          "median": 872.086852519684,
+          "min": 868.7294716400215,
+          "max": 889.1551031340913
+        },
+        "decodeTps": {
+          "median": 34.049298085557105,
+          "min": 31.862329247786164,
+          "max": 34.658590235096625
+        },
+        "wallMs": {
+          "median": 84401.784875,
+          "min": 82764.038042,
+          "max": 84750.45841600001
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 2,
+        "finishReasons": [
+          "length"
+        ]
+      },
+      "llama": {
+        "prefillMs": {
+          "median": 127062.815,
+          "min": 122266.487,
+          "max": 129767.184
+        },
+        "prefillTps": {
+          "median": 526.5427182610428,
+          "min": 515.5694832678191,
+          "max": 547.1981868588406
+        },
+        "decodeTps": {
+          "median": 28.798242561837448,
+          "min": 28.788111932243396,
+          "max": 29.556523489844203
+        },
+        "wallMs": {
+          "median": 135927.43679100001,
+          "min": 130904.22808400002,
+          "max": 138635.21125000002
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": [
+          "limit"
+        ]
+      },
+      "llamaOverMlxPrefill": 0.6037732557711711,
+      "llamaOverMlxDecode": 0.8457807996357191,
+      "mlxOverLlamaLatency": 0.6209326598630335,
+      "matchingOutputPairs": 0,
+      "original": {
+        "prefillMs": {
+          "median": 175901.623917,
+          "min": 168158.338125,
+          "max": 179594.383292
+        },
+        "prefillTps": {
+          "median": 380.34896159667613,
+          "min": 372.5283540255361,
+          "max": 397.8631136938753
+        },
+        "decodeTps": {
+          "median": 12.216143459921424,
+          "min": 11.180035726900247,
+          "max": 12.260241487444718
+        },
+        "wallMs": {
+          "median": 196805.590375,
+          "min": 188987.796916,
+          "max": 202431.861041
+        },
+        "generatedTokens": {
+          "median": 256,
+          "min": 256,
+          "max": 256
+        },
+        "distinctOutputHashes": 1,
+        "finishReasons": [
+          "length"
+        ]
+      },
+      "decodeSpeedupOverOriginal": 2.787237903456654,
+      "requestSpeedupOverOriginal": 2.331770479338456,
+      "matchesOriginalOutputHashes": false
+    }
+  ],
+  "samples": [
+    {
+      "runtime": "optimized",
+      "env": {
+        "MLX_AGENT_METRICS": "0",
+        "MLX_PERSIST_PAGED_CACHE": "0",
+        "MLX_PAGED_PREFILL_CHUNK_SIZE": "512",
+        "MLX_NODE_LOG": "mlx_core::decode_tuning=info",
+        "MLX_NODE_LOG_FILE": "/Users/brooklyn/workspace/github/mlx-node/.cache/benchmarks/gemma4-optimization-2026-09-10/raw/optimized-diff-review-1.plans.jsonl"
+      },
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "1",
+      "loadMs": 867.0955,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20129962
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015457358,
+        "cacheBytes": 27170042
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 8192,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 64,
+          "samples": [
+            [
+              0.020615917,
+              0.021498041,
+              0.021817042
+            ],
+            [
+              0.030623083,
+              0.031677542,
+              0.031457584
+            ],
+            [
+              0.024617541,
+              0.025015333,
+              0.024363416
+            ],
+            [
+              0.022319542,
+              0.022903791,
+              0.023342333
+            ],
+            [
+              0.020953625,
+              0.021270292,
+              0.021309375
+            ],
+            [
+              0.020615125,
+              0.021823875,
+              0.020802875
+            ],
+            [
+              0.020508333,
+              0.020016334,
+              0.020789667
+            ],
+            [
+              0.020541792,
+              0.021513209,
+              0.02085875
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 8192,
+          "stage": "submission",
+          "earlyLayers": 32,
+          "groupedStripes": 64,
+          "samples": [
+            [
+              0.019735417,
+              0.02059,
+              0.020619583
+            ],
+            [
+              0.019724125,
+              0.01958075,
+              0.019638166
+            ],
+            [
+              0.019883125,
+              0.01921575,
+              0.02019925
+            ],
+            [
+              0.019822166,
+              0.019410083,
+              0.0192395
+            ],
+            [
+              0.019262708,
+              0.0188225,
+              0.020012625
+            ],
+            [
+              0.0199915,
+              0.018463792,
+              0.019227208
+            ],
+            [
+              0.018594917,
+              0.019366708,
+              0.018605041
+            ],
+            [
+              0.019321792,
+              0.019502459,
+              0.018499542
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            64,
+            64,
+            64,
+            64,
+            64,
+            64,
+            64,
+            64
+          ]
+        },
+        {
+          "contextBucket": 8192,
+          "stage": "attention_refinement",
+          "earlyLayers": 32,
+          "groupedStripes": 64,
+          "samples": [
+            [
+              0.020070334,
+              0.019389,
+              0.018399375
+            ],
+            [
+              0.018991666,
+              0.019084291,
+              0.018962334
+            ],
+            [
+              0.020073709,
+              0.018399541,
+              0.018494
+            ]
+          ],
+          "candidateEarlyLayers": [
+            32,
+            32,
+            32
+          ],
+          "candidateStripes": [
+            64,
+            32,
+            128
+          ]
+        }
+      ],
+      "wallMs": 11608.692374999999,
+      "prefillMs": 6712.108125000001,
+      "prefillTps": 1152.0970544555998,
+      "decodeMs": 4889.975334,
+      "decodeTps": 52.14750230476316,
+      "accountedMs": 11602.083459000001,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "3cc77f9526927fe2abed45401d7f2b976faf68752a8ac68eff02c13223622712",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "length",
+      "timingOverheadMs": 6.608915999997407
+    },
+    {
+      "runtime": "optimized",
+      "env": {
+        "MLX_AGENT_METRICS": "0",
+        "MLX_PERSIST_PAGED_CACHE": "0",
+        "MLX_PAGED_PREFILL_CHUNK_SIZE": "512",
+        "MLX_NODE_LOG": "mlx_core::decode_tuning=info",
+        "MLX_NODE_LOG_FILE": "/Users/brooklyn/workspace/github/mlx-node/.cache/benchmarks/gemma4-optimization-2026-09-10/raw/optimized-diff-review-2.plans.jsonl"
+      },
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "2",
+      "loadMs": 890.401084,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20128618
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015457358,
+        "cacheBytes": 30995022
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 8192,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 0,
+          "samples": [
+            [
+              0.020296584,
+              0.021427333,
+              0.023538667
+            ],
+            [
+              0.029701083,
+              0.030745375,
+              0.029334542
+            ],
+            [
+              0.025045417,
+              0.024327584,
+              0.025246792
+            ],
+            [
+              0.0207635,
+              0.022137417,
+              0.020862125
+            ],
+            [
+              0.02115475,
+              0.020284375,
+              0.020212166
+            ],
+            [
+              0.019921708,
+              0.019719292,
+              0.021434125
+            ],
+            [
+              0.018966125,
+              0.019693958,
+              0.019701583
+            ],
+            [
+              0.019796292,
+              0.019003625,
+              0.020308625
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 8192,
+          "stage": "submission",
+          "earlyLayers": 8,
+          "groupedStripes": 0,
+          "samples": [
+            [
+              0.021412125,
+              0.02187625,
+              0.022305875
+            ],
+            [
+              0.022676083,
+              0.021884708,
+              0.0227525
+            ],
+            [
+              0.021757292,
+              0.02182325,
+              0.020967833
+            ],
+            [
+              0.021221416,
+              0.020552667,
+              0.022395875
+            ],
+            [
+              0.019762458,
+              0.020792917,
+              0.019965417
+            ],
+            [
+              0.021509959,
+              0.020528667,
+              0.020846
+            ],
+            [
+              0.019933375,
+              0.020694584,
+              0.020854917
+            ],
+            [
+              0.020784208,
+              0.021469584,
+              0.020672291
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "contextBucket": 8192,
+          "stage": "attention_refinement",
+          "earlyLayers": 8,
+          "groupedStripes": 64,
+          "samples": [
+            [
+              0.021542334,
+              0.0206765,
+              0.022429541
+            ],
+            [
+              0.030161167,
+              0.029997625,
+              0.029922042
+            ],
+            [
+              0.023859167,
+              0.024178958,
+              0.023717459
+            ],
+            [
+              0.021155958,
+              0.020974125,
+              0.020148542
+            ],
+            [
+              0.020598458,
+              0.019879542,
+              0.020680084
+            ],
+            [
+              0.019529625,
+              0.018512583,
+              0.019345042
+            ],
+            [
+              0.01942025,
+              0.020183542,
+              0.018631625
+            ],
+            [
+              0.020292375,
+              0.020246875,
+              0.018661834
+            ]
+          ],
+          "candidateEarlyLayers": [
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8,
+            8
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        }
+      ],
+      "wallMs": 11758.675082999998,
+      "prefillMs": 6705.652875,
+      "prefillTps": 1153.2061298356425,
+      "decodeMs": 5046.292041,
+      "decodeTps": 50.53215270305043,
+      "accountedMs": 11751.944916,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "013ba7e539edc6d4d6d8ff03455e5822b75a19183d91234c4e0d57725b0fade9",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "length",
+      "timingOverheadMs": 6.730166999997891
+    },
+    {
+      "runtime": "optimized",
+      "env": {
+        "MLX_AGENT_METRICS": "0",
+        "MLX_PERSIST_PAGED_CACHE": "0",
+        "MLX_PAGED_PREFILL_CHUNK_SIZE": "512",
+        "MLX_NODE_LOG": "mlx_core::decode_tuning=info",
+        "MLX_NODE_LOG_FILE": "/Users/brooklyn/workspace/github/mlx-node/.cache/benchmarks/gemma4-optimization-2026-09-10/raw/optimized-diff-review-3.plans.jsonl"
+      },
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "3",
+      "loadMs": 871.117625,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20135082
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11015457358,
+        "cacheBytes": 25392206
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 8192,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 0,
+          "samples": [
+            [
+              0.020049292,
+              0.020876375,
+              0.023712333
+            ],
+            [
+              0.029126834,
+              0.029298917,
+              0.030191958
+            ],
+            [
+              0.023839208,
+              0.023137917,
+              0.023938667
+            ],
+            [
+              0.021529834,
+              0.021478167,
+              0.021454708
+            ],
+            [
+              0.020047708,
+              0.019984292,
+              0.020004042
+            ],
+            [
+              0.019700083,
+              0.019635208,
+              0.019731583
+            ],
+            [
+              0.018695167,
+              0.019406416,
+              0.019589958
+            ],
+            [
+              0.019459792,
+              0.0196935,
+              0.019708125
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 8192,
+          "stage": "submission",
+          "earlyLayers": 0,
+          "groupedStripes": 0,
+          "samples": [
+            [
+              0.020308417,
+              0.022717916,
+              0.020965
+            ],
+            [
+              0.020954667,
+              0.021072667,
+              0.020967875
+            ],
+            [
+              0.020904084,
+              0.020831917,
+              0.020713167
+            ],
+            [
+              0.0204145,
+              0.0204915,
+              0.021233917
+            ],
+            [
+              0.018947083,
+              0.019867,
+              0.019760916
+            ],
+            [
+              0.020641375,
+              0.020618208,
+              0.019679834
+            ],
+            [
+              0.019986875,
+              0.019789208,
+              0.019003958
+            ],
+            [
+              0.019786875,
+              0.019683417,
+              0.019770166
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "contextBucket": 8192,
+          "stage": "attention_refinement",
+          "earlyLayers": 0,
+          "groupedStripes": 64,
+          "samples": [
+            [
+              0.021121459,
+              0.021011125,
+              0.021014208
+            ],
+            [
+              0.030202917,
+              0.029386542,
+              0.029884375
+            ],
+            [
+              0.0240565,
+              0.024079166,
+              0.024194458
+            ],
+            [
+              0.02139925,
+              0.021480291,
+              0.021721125
+            ],
+            [
+              0.020280625,
+              0.020132333,
+              0.019279167
+            ],
+            [
+              0.020391583,
+              0.019705292,
+              0.019606084
+            ],
+            [
+              0.019613291,
+              0.018946666,
+              0.019697667
+            ],
+            [
+              0.019667,
+              0.019693417,
+              0.019167
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        }
+      ],
+      "wallMs": 11783.387250000002,
+      "prefillMs": 6668.5470000000005,
+      "prefillTps": 1159.622928353058,
+      "decodeMs": 5107.858792,
+      "decodeTps": 49.92307156168541,
+      "accountedMs": 11776.405792000001,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "013ba7e539edc6d4d6d8ff03455e5822b75a19183d91234c4e0d57725b0fade9",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "length",
+      "timingOverheadMs": 6.9814580000002024
+    },
+    {
+      "runtime": "llama",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "1",
+      "loadMs": 1035.349708,
+      "wallMs": 11149.179625,
+      "prefillMs": 5906.562,
+      "prefillTps": 1309.2218451275041,
+      "decodeMs": 5240.352,
+      "decodeTps": 48.66085331672376,
+      "accountedMs": 11146.914,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "41461e7ba4ff82608a5cf7c8a7159cabbda2a86309284ac68c0a0adecf2baa09",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "limit",
+      "timingOverheadMs": 2.265625
+    },
+    {
+      "runtime": "llama",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "2",
+      "loadMs": 1019.8947079999999,
+      "wallMs": 11641.953709000001,
+      "prefillMs": 6401.686,
+      "prefillTps": 1207.9630272400116,
+      "decodeMs": 5236.667,
+      "decodeTps": 48.69509556364764,
+      "accountedMs": 11638.353,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "41461e7ba4ff82608a5cf7c8a7159cabbda2a86309284ac68c0a0adecf2baa09",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "limit",
+      "timingOverheadMs": 3.600709000002098
+    },
+    {
+      "runtime": "llama",
+      "name": "diff-review",
+      "n": 7733,
+      "run": "3",
+      "loadMs": 1020.3912500000001,
+      "wallMs": 11243.726084000002,
+      "prefillMs": 6176.594,
+      "prefillTps": 1251.9845079666884,
+      "decodeMs": 5064.881,
+      "decodeTps": 50.34669126480958,
+      "accountedMs": 11241.475,
+      "promptTokens": 7733,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "41461e7ba4ff82608a5cf7c8a7159cabbda2a86309284ac68c0a0adecf2baa09",
+      "inputSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "finishReason": "limit",
+      "timingOverheadMs": 2.251084000001356
+    },
+    {
+      "runtime": "optimized",
+      "env": {
+        "MLX_AGENT_METRICS": "0",
+        "MLX_PERSIST_PAGED_CACHE": "0",
+        "MLX_PAGED_PREFILL_CHUNK_SIZE": "512",
+        "MLX_NODE_LOG": "mlx_core::decode_tuning=info",
+        "MLX_NODE_LOG_FILE": "/Users/brooklyn/workspace/github/mlx-node/.cache/benchmarks/gemma4-optimization-2026-09-10/raw/optimized-test-review-1.plans.jsonl"
+      },
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "name": "test-review",
+      "n": 40528,
+      "run": "1",
+      "loadMs": 878.193542,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954742,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20148586
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11531379226,
+        "cacheBytes": 43803634
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 65536,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.042878209,
+              0.041675458,
+              0.042225583
+            ],
+            [
+              0.076921125,
+              0.076091292,
+              0.077092
+            ],
+            [
+              0.0502235,
+              0.047887875,
+              0.048668125
+            ],
+            [
+              0.035076292,
+              0.034599042,
+              0.035458334
+            ],
+            [
+              0.02815775,
+              0.027998042,
+              0.028488166
+            ],
+            [
+              0.027361042,
+              0.025274333,
+              0.025382042
+            ],
+            [
+              0.0257095,
+              0.025843625,
+              0.025861875
+            ],
+            [
+              0.02441525,
+              0.023299917,
+              0.024311666
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 65536,
+          "stage": "submission",
+          "earlyLayers": 4,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.023679708,
+              0.02481225,
+              0.023473125
+            ],
+            [
+              0.024114833,
+              0.023989042,
+              0.024002292
+            ],
+            [
+              0.024035,
+              0.023856542,
+              0.023839041
+            ],
+            [
+              0.022767209,
+              0.022628917,
+              0.023430125
+            ],
+            [
+              0.021973625,
+              0.022591125,
+              0.022722125
+            ],
+            [
+              0.021861916,
+              0.022702208,
+              0.022727542
+            ],
+            [
+              0.022864166,
+              0.022767958,
+              0.022891334
+            ],
+            [
+              0.023629667,
+              0.023468625,
+              0.022627375
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            256,
+            256,
+            256,
+            256,
+            256,
+            256,
+            256,
+            256
+          ]
+        },
+        {
+          "contextBucket": 65536,
+          "stage": "attention_refinement",
+          "earlyLayers": 4,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.023451417,
+              0.022519375,
+              0.023610083
+            ],
+            [
+              0.02328375,
+              0.024296625,
+              0.023795084
+            ]
+          ],
+          "candidateEarlyLayers": [
+            4,
+            4
+          ],
+          "candidateStripes": [
+            256,
+            128
+          ]
+        }
+      ],
+      "wallMs": 46993.807333000004,
+      "prefillMs": 40513.106,
+      "prefillTps": 1000.3676341182036,
+      "decodeMs": 6459.630709,
+      "decodeTps": 39.47594088385216,
+      "accountedMs": 46972.736709,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "8b08d2c4b27862d8823e395b86ffeb470106e84298a93ae7d06d4083c89c3989",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "length",
+      "timingOverheadMs": 21.07062400000723
+    },
+    {
+      "runtime": "optimized",
+      "env": {
+        "MLX_AGENT_METRICS": "0",
+        "MLX_PERSIST_PAGED_CACHE": "0",
+        "MLX_PAGED_PREFILL_CHUNK_SIZE": "512",
+        "MLX_NODE_LOG": "mlx_core::decode_tuning=info",
+        "MLX_NODE_LOG_FILE": "/Users/brooklyn/workspace/github/mlx-node/.cache/benchmarks/gemma4-optimization-2026-09-10/raw/optimized-test-review-2.plans.jsonl"
+      },
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "name": "test-review",
+      "n": 40528,
+      "run": "2",
+      "loadMs": 1133.315459,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20152170
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11531379226,
+        "cacheBytes": 39658482
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 65536,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 128,
+          "samples": [
+            [
+              0.042470125,
+              0.04142275,
+              0.041004375
+            ],
+            [
+              0.077946084,
+              0.076794875,
+              0.075875583
+            ],
+            [
+              0.049656333,
+              0.048932583,
+              0.048943708
+            ],
+            [
+              0.034542542,
+              0.033755666,
+              0.034034959
+            ],
+            [
+              0.027208959,
+              0.025985375,
+              0.0277235
+            ],
+            [
+              0.026422542,
+              0.02538075,
+              0.026288583
+            ],
+            [
+              0.025124708,
+              0.02509125,
+              0.025540333
+            ],
+            [
+              0.025000791,
+              0.02423075,
+              0.024823958
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 65536,
+          "stage": "submission",
+          "earlyLayers": 8,
+          "groupedStripes": 128,
+          "samples": [
+            [
+              0.025768083,
+              0.025532375,
+              0.0251075
+            ],
+            [
+              0.025816375,
+              0.024995417,
+              0.025367167
+            ],
+            [
+              0.024411541,
+              0.025138166,
+              0.0242615
+            ],
+            [
+              0.023972,
+              0.024416292,
+              0.024467833
+            ],
+            [
+              0.023979458,
+              0.023748,
+              0.022941583
+            ],
+            [
+              0.023749917,
+              0.023385333,
+              0.024543584
+            ],
+            [
+              0.024827375,
+              0.024503792,
+              0.024577708
+            ],
+            [
+              0.024443125,
+              0.023696459,
+              0.02382775
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            128,
+            128,
+            128,
+            128,
+            128,
+            128,
+            128,
+            128
+          ]
+        },
+        {
+          "contextBucket": 65536,
+          "stage": "attention_refinement",
+          "earlyLayers": 8,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.025250125,
+              0.024276041,
+              0.024302625
+            ],
+            [
+              0.024079791,
+              0.023784875,
+              0.023664083
+            ],
+            [
+              0.023553791,
+              0.022634291,
+              0.023503458
+            ]
+          ],
+          "candidateEarlyLayers": [
+            8,
+            8,
+            8
+          ],
+          "candidateStripes": [
+            128,
+            64,
+            256
+          ]
+        }
+      ],
+      "wallMs": 48817.877,
+      "prefillMs": 42398.829917,
+      "prefillTps": 955.8754352263414,
+      "decodeMs": 6400.656292,
+      "decodeTps": 39.83966461669209,
+      "accountedMs": 48799.486209,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "17dd2dc11cfd72cd8ab41eb80be19db305318119baf7955e5bee7884685ad15c",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "length",
+      "timingOverheadMs": 18.39079099999799
+    },
+    {
+      "runtime": "optimized",
+      "env": {
+        "MLX_AGENT_METRICS": "0",
+        "MLX_PERSIST_PAGED_CACHE": "0",
+        "MLX_PAGED_PREFILL_CHUNK_SIZE": "512",
+        "MLX_NODE_LOG": "mlx_core::decode_tuning=info",
+        "MLX_NODE_LOG_FILE": "/Users/brooklyn/workspace/github/mlx-node/.cache/benchmarks/gemma4-optimization-2026-09-10/raw/optimized-test-review-3.plans.jsonl"
+      },
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "name": "test-review",
+      "n": 40528,
+      "run": "3",
+      "loadMs": 872.2033749999999,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20159722
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 11531379226,
+        "cacheBytes": 45851122
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 65536,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.03914725,
+              0.039461666,
+              0.039752625
+            ],
+            [
+              0.075300875,
+              0.074707333,
+              0.075039916
+            ],
+            [
+              0.04931575,
+              0.048071166,
+              0.04741225
+            ],
+            [
+              0.033517834,
+              0.033408209,
+              0.034074917
+            ],
+            [
+              0.026211417,
+              0.026027667,
+              0.026299083
+            ],
+            [
+              0.025065375,
+              0.026122291,
+              0.025093791
+            ],
+            [
+              0.023826875,
+              0.023250667,
+              0.023959083
+            ],
+            [
+              0.023188875,
+              0.023174625,
+              0.024079125
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 65536,
+          "stage": "submission",
+          "earlyLayers": 16,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.023523959,
+              0.0232765,
+              0.0237575
+            ],
+            [
+              0.024171625,
+              0.022947375,
+              0.023070166
+            ],
+            [
+              0.022127625,
+              0.022806875,
+              0.022881209
+            ],
+            [
+              0.022536,
+              0.022447208,
+              0.023250459
+            ],
+            [
+              0.023524958,
+              0.021745584,
+              0.022022708
+            ],
+            [
+              0.021981375,
+              0.021720667,
+              0.021703917
+            ],
+            [
+              0.02194025,
+              0.021823584,
+              0.021701792
+            ],
+            [
+              0.022873083,
+              0.022082208,
+              0.021832708
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            256,
+            256,
+            256,
+            256,
+            256,
+            256,
+            256,
+            256
+          ]
+        },
+        {
+          "contextBucket": 65536,
+          "stage": "attention_refinement",
+          "earlyLayers": 16,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.021739708,
+              0.021805333,
+              0.022426542
+            ],
+            [
+              0.022577125,
+              0.023126125,
+              0.023388667
+            ]
+          ],
+          "candidateEarlyLayers": [
+            16,
+            16
+          ],
+          "candidateStripes": [
+            256,
+            128
+          ]
+        }
+      ],
+      "wallMs": 46194.233375,
+      "prefillMs": 40076.7395,
+      "prefillTps": 1011.2599105024499,
+      "decodeMs": 6096.9605,
+      "decodeTps": 41.824118755566815,
+      "accountedMs": 46173.700000000004,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "8b08d2c4b27862d8823e395b86ffeb470106e84298a93ae7d06d4083c89c3989",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "length",
+      "timingOverheadMs": 20.53337499999907
+    },
+    {
+      "runtime": "llama",
+      "name": "test-review",
+      "n": 40528,
+      "run": "1",
+      "loadMs": 1021.1558749999999,
+      "wallMs": 61933.872209,
+      "prefillMs": 54701.037,
+      "prefillTps": 740.9000308348817,
+      "decodeMs": 7226.103,
+      "decodeTps": 35.28873031563486,
+      "accountedMs": 61927.14,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "bd536ccf7c313d3bcd50c54087d231c5236d719ad4047c2fd476a043fbe9514c",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "limit",
+      "timingOverheadMs": 6.732209000001603
+    },
+    {
+      "runtime": "llama",
+      "name": "test-review",
+      "n": 40528,
+      "run": "2",
+      "loadMs": 1021.0950419999999,
+      "wallMs": 63507.475542,
+      "prefillMs": 56224.583,
+      "prefillTps": 720.8234874769992,
+      "decodeMs": 7276.219,
+      "decodeTps": 35.045674133777446,
+      "accountedMs": 63500.801999999996,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "bd536ccf7c313d3bcd50c54087d231c5236d719ad4047c2fd476a043fbe9514c",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "limit",
+      "timingOverheadMs": 6.67354200000409
+    },
+    {
+      "runtime": "llama",
+      "name": "test-review",
+      "n": 40528,
+      "run": "3",
+      "loadMs": 1020.985208,
+      "wallMs": 60916.648792,
+      "prefillMs": 53887.766,
+      "prefillTps": 752.0816505920843,
+      "decodeMs": 7022.228,
+      "decodeTps": 36.31326126124073,
+      "accountedMs": 60909.994000000006,
+      "promptTokens": 40528,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "bd536ccf7c313d3bcd50c54087d231c5236d719ad4047c2fd476a043fbe9514c",
+      "inputSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "finishReason": "limit",
+      "timingOverheadMs": 6.654791999993904
+    },
+    {
+      "runtime": "optimized",
+      "env": {
+        "MLX_AGENT_METRICS": "0",
+        "MLX_PERSIST_PAGED_CACHE": "0",
+        "MLX_PAGED_PREFILL_CHUNK_SIZE": "512",
+        "MLX_NODE_LOG": "mlx_core::decode_tuning=info",
+        "MLX_NODE_LOG_FILE": "/Users/brooklyn/workspace/github/mlx-node/.cache/benchmarks/gemma4-optimization-2026-09-10/raw/optimized-final-review-1.plans.jsonl"
+      },
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "name": "final-review",
+      "n": 66904,
+      "run": "1",
+      "loadMs": 872.053583,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20144810
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 12103400090,
+        "cacheBytes": 41649398
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 131072,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 128,
+          "samples": [
+            [
+              0.059117833,
+              0.059892417,
+              0.060884958
+            ],
+            [
+              0.114679334,
+              0.113528125,
+              0.11471225
+            ],
+            [
+              0.068060292,
+              0.069491708,
+              0.068618791
+            ],
+            [
+              0.044095583,
+              0.044666125,
+              0.043937334
+            ],
+            [
+              0.031021875,
+              0.033433708,
+              0.032177084
+            ],
+            [
+              0.031196708,
+              0.031439,
+              0.031560625
+            ],
+            [
+              0.02903775,
+              0.028046875,
+              0.028269042
+            ],
+            [
+              0.027077375,
+              0.027923208,
+              0.028039625
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 131072,
+          "stage": "submission",
+          "earlyLayers": 2,
+          "groupedStripes": 128,
+          "samples": [
+            [
+              0.029549291,
+              0.0285695,
+              0.029400541
+            ],
+            [
+              0.028626083,
+              0.030102584,
+              0.028949834
+            ],
+            [
+              0.028148333,
+              0.028411209,
+              0.0281715
+            ],
+            [
+              0.028437458,
+              0.028811417,
+              0.028571417
+            ],
+            [
+              0.026340834,
+              0.027808292,
+              0.028071167
+            ],
+            [
+              0.028060333,
+              0.02745875,
+              0.028053292
+            ],
+            [
+              0.027524791,
+              0.0295755,
+              0.028290709
+            ],
+            [
+              0.028049875,
+              0.028048958,
+              0.027905167
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            128,
+            128,
+            128,
+            128,
+            128,
+            128,
+            128,
+            128
+          ]
+        },
+        {
+          "contextBucket": 131072,
+          "stage": "attention_refinement",
+          "earlyLayers": 2,
+          "groupedStripes": 128,
+          "samples": [
+            [
+              0.029305875,
+              0.027467291,
+              0.028281042
+            ],
+            [
+              0.0304675,
+              0.031521333,
+              0.029394125
+            ],
+            [
+              0.027092583,
+              0.028366209,
+              0.026854084
+            ]
+          ],
+          "candidateEarlyLayers": [
+            2,
+            2,
+            2
+          ],
+          "candidateStripes": [
+            128,
+            64,
+            256
+          ]
+        }
+      ],
+      "wallMs": 84750.45841600001,
+      "prefillMs": 76717.1295,
+      "prefillTps": 872.086852519684,
+      "decodeMs": 8003.181375,
+      "decodeTps": 31.862329247786164,
+      "accountedMs": 84720.310875,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "16752bcdaf119b95e9e0c2254bd49399194b10b51bbc8dc241993a899f8f32fc",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "length",
+      "timingOverheadMs": 30.147541000013007
+    },
+    {
+      "runtime": "optimized",
+      "env": {
+        "MLX_AGENT_METRICS": "0",
+        "MLX_PERSIST_PAGED_CACHE": "0",
+        "MLX_PAGED_PREFILL_CHUNK_SIZE": "512",
+        "MLX_NODE_LOG": "mlx_core::decode_tuning=info",
+        "MLX_NODE_LOG_FILE": "/Users/brooklyn/workspace/github/mlx-node/.cache/benchmarks/gemma4-optimization-2026-09-10/raw/optimized-final-review-2.plans.jsonl"
+      },
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "name": "final-review",
+      "n": 66904,
+      "run": "2",
+      "loadMs": 892.022708,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20129962
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 12103400090,
+        "cacheBytes": 41769270
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 131072,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 128,
+          "samples": [
+            [
+              0.056733042,
+              0.0577225,
+              0.057333958
+            ],
+            [
+              0.11180975,
+              0.113019084,
+              0.112063416
+            ],
+            [
+              0.0657685,
+              0.065152292,
+              0.065844666
+            ],
+            [
+              0.042695,
+              0.042179625,
+              0.042395459
+            ],
+            [
+              0.03073375,
+              0.030453209,
+              0.03065425
+            ],
+            [
+              0.02961775,
+              0.028807209,
+              0.029511292
+            ],
+            [
+              0.027806875,
+              0.028348041,
+              0.027258083
+            ],
+            [
+              0.027691334,
+              0.026097166,
+              0.026796209
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 131072,
+          "stage": "submission",
+          "earlyLayers": 4,
+          "groupedStripes": 128,
+          "samples": [
+            [
+              0.027613375,
+              0.027952917,
+              0.027743333
+            ],
+            [
+              0.027001042,
+              0.027497917,
+              0.027464291
+            ],
+            [
+              0.0270785,
+              0.026825334,
+              0.027150917
+            ],
+            [
+              0.027655042,
+              0.025914208,
+              0.02597275
+            ],
+            [
+              0.025238875,
+              0.026996833,
+              0.0262035
+            ],
+            [
+              0.026872875,
+              0.026262,
+              0.025997209
+            ],
+            [
+              0.027108084,
+              0.026560083,
+              0.025950583
+            ],
+            [
+              0.025788084,
+              0.025304791,
+              0.027207041
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            128,
+            128,
+            128,
+            128,
+            128,
+            128,
+            128,
+            128
+          ]
+        },
+        {
+          "contextBucket": 131072,
+          "stage": "attention_refinement",
+          "earlyLayers": 4,
+          "groupedStripes": 256,
+          "samples": [
+            [
+              0.026418,
+              0.026669166,
+              0.026784541
+            ],
+            [
+              0.028283709,
+              0.029151792,
+              0.028462166
+            ],
+            [
+              0.026214875,
+              0.025450292,
+              0.0253845
+            ]
+          ],
+          "candidateEarlyLayers": [
+            4,
+            4,
+            4
+          ],
+          "candidateStripes": [
+            128,
+            64,
+            256
+          ]
+        }
+      ],
+      "wallMs": 84401.784875,
+      "prefillMs": 77013.61837499999,
+      "prefillTps": 868.7294716400215,
+      "decodeMs": 7357.483333000001,
+      "decodeTps": 34.658590235096625,
+      "accountedMs": 84371.10170799999,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "0670bf154206f3c3df1fc7542d391835d5633727fc093b66e914a6398045e40a",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "length",
+      "timingOverheadMs": 30.683167000010144
+    },
+    {
+      "runtime": "optimized",
+      "env": {
+        "MLX_AGENT_METRICS": "0",
+        "MLX_PERSIST_PAGED_CACHE": "0",
+        "MLX_PAGED_PREFILL_CHUNK_SIZE": "512",
+        "MLX_NODE_LOG": "mlx_core::decode_tuning=info",
+        "MLX_NODE_LOG_FILE": "/Users/brooklyn/workspace/github/mlx-node/.cache/benchmarks/gemma4-optimization-2026-09-10/raw/optimized-final-review-3.plans.jsonl"
+      },
+      "addonSha256": "2f380276a3fa2e3dc39f3e5ff377bc213152554d34d2ba3d819db733d3adface",
+      "name": "final-review",
+      "n": 66904,
+      "run": "3",
+      "loadMs": 862.2877080000001,
+      "memoryAfterLoad": {
+        "activeBytes": 9788334194,
+        "peakBytes": 9876954230,
+        "cacheBytes": 0
+      },
+      "memoryBeforeRequest": {
+        "activeBytes": 9788334202,
+        "peakBytes": 0,
+        "cacheBytes": 20135082
+      },
+      "memoryAfterRequest": {
+        "activeBytes": 9788334218,
+        "peakBytes": 12103400090,
+        "cacheBytes": 46856630
+      },
+      "decodePlans": [
+        {
+          "contextBucket": 131072,
+          "stage": "attention",
+          "earlyLayers": 0,
+          "groupedStripes": 128,
+          "samples": [
+            [
+              0.057888708,
+              0.057098208,
+              0.058642458
+            ],
+            [
+              0.112312041,
+              0.111864,
+              0.111972834
+            ],
+            [
+              0.065785167,
+              0.066299041,
+              0.066343458
+            ],
+            [
+              0.042482542,
+              0.042181167,
+              0.041810958
+            ],
+            [
+              0.030618166,
+              0.031441667,
+              0.03137275
+            ],
+            [
+              0.031104166,
+              0.029055,
+              0.03123575
+            ],
+            [
+              0.027211125,
+              0.027416292,
+              0.027352042
+            ],
+            [
+              0.025233541,
+              0.026828458,
+              0.026012
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "candidateStripes": [
+            0,
+            4,
+            8,
+            16,
+            32,
+            64,
+            128,
+            256
+          ]
+        },
+        {
+          "contextBucket": 131072,
+          "stage": "submission",
+          "earlyLayers": 8,
+          "groupedStripes": 128,
+          "samples": [
+            [
+              0.027414125,
+              0.028129208,
+              0.02897725
+            ],
+            [
+              0.027441292,
+              0.027460208,
+              0.027388458
+            ],
+            [
+              0.02706375,
+              0.026813208,
+              0.027949666
+            ],
+            [
+              0.027650667,
+              0.027721875,
+              0.026826167
+            ],
+            [
+              0.025759083,
+              0.026183417,
+              0.026541625
+            ],
+            [
+              0.025902625,
+              0.026108708,
+              0.026285667
+            ],
+            [
+              0.026603417,
+              0.026100542,
+              0.026937208
+            ],
+            [
+              0.025397375,
+              0.026995,
+              0.026210958
+            ]
+          ],
+          "candidateEarlyLayers": [
+            0,
+            1,
+            2,
+            4,
+            8,
+            16,
+            32,
+            47
+          ],
+          "candidateStripes": [
+            128,
+            128,
+            128,
+            128,
+            128,
+            128,
+            128,
+            128
+          ]
+        },
+        {
+          "contextBucket": 131072,
+          "stage": "attention_refinement",
+          "earlyLayers": 8,
+          "groupedStripes": 128,
+          "samples": [
+            [
+              0.025993083,
+              0.02595575,
+              0.025802291
+            ],
+            [
+              0.028757,
+              0.028325833,
+              0.027798667
+            ],
+            [
+              0.023897625,
+              0.025410208,
+              0.024752791
+            ]
+          ],
+          "candidateEarlyLayers": [
+            8,
+            8,
+            8
+          ],
+          "candidateStripes": [
+            128,
+            64,
+            256
+          ]
+        }
+      ],
+      "wallMs": 82764.038042,
+      "prefillMs": 75244.464958,
+      "prefillTps": 889.1551031340913,
+      "decodeMs": 7489.141167,
+      "decodeTps": 34.049298085557105,
+      "accountedMs": 82733.60612499999,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "16752bcdaf119b95e9e0c2254bd49399194b10b51bbc8dc241993a899f8f32fc",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "length",
+      "timingOverheadMs": 30.43191700000898
+    },
+    {
+      "runtime": "llama",
+      "name": "final-review",
+      "n": 66904,
+      "run": "1",
+      "loadMs": 1019.7316669999999,
+      "wallMs": 135927.43679100001,
+      "prefillMs": 127062.815,
+      "prefillTps": 526.5427182610428,
+      "decodeMs": 8854.707,
+      "decodeTps": 28.798242561837448,
+      "accountedMs": 135917.522,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "f9cc007595544a4c6baa33b9964953f797177ac3fbb38eaa196d938a0c2bb9fa",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "limit",
+      "timingOverheadMs": 9.91479100001743
+    },
+    {
+      "runtime": "llama",
+      "name": "final-review",
+      "n": 66904,
+      "run": "2",
+      "loadMs": 1022.4929579999999,
+      "wallMs": 138635.21125000002,
+      "prefillMs": 129767.184,
+      "prefillTps": 515.5694832678191,
+      "decodeMs": 8857.823,
+      "decodeTps": 28.788111932243396,
+      "accountedMs": 138625.00699999998,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "f9cc007595544a4c6baa33b9964953f797177ac3fbb38eaa196d938a0c2bb9fa",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "limit",
+      "timingOverheadMs": 10.204250000038883
+    },
+    {
+      "runtime": "llama",
+      "name": "final-review",
+      "n": 66904,
+      "run": "3",
+      "loadMs": 1020.3269580000001,
+      "wallMs": 130904.22808400002,
+      "prefillMs": 122266.487,
+      "prefillTps": 547.1981868588406,
+      "decodeMs": 8627.537,
+      "decodeTps": 29.556523489844203,
+      "accountedMs": 130894.02399999999,
+      "promptTokens": 66904,
+      "generatedTokens": 256,
+      "cachedTokens": 0,
+      "textSha256": "f9cc007595544a4c6baa33b9964953f797177ac3fbb38eaa196d938a0c2bb9fa",
+      "inputSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "finishReason": "limit",
+      "timingOverheadMs": 10.204084000026342
+    }
+  ]
+}

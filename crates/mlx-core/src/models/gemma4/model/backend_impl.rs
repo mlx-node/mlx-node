@@ -85,6 +85,9 @@ pub(crate) struct Gemma4PagedDecode<'a> {
     /// forward. The engine loop has no step index in the `DecodeStep`
     /// seam, so the stepper carries its own.
     step: i32,
+    pending_timing: Option<std::time::Instant>,
+    tune_grouped: bool,
+    tune_submission: bool,
     pending_cache_error: Option<String>,
     inner: &'a mut Gemma4Inner,
 }
@@ -108,13 +111,31 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
         self.step += 1;
         // `run_paged_decode_step` records the token in the adapter at its
         // top (BEFORE the forward), then returns `[1, 1, vocab]`.
+        let context = self
+            .inner
+            .kv_cache_coordinator
+            .as_ref()
+            .map_or(0, |c| c.full_adapter().current_token_count())
+            .saturating_add(1);
+        let plan = self.inner.decode_tuning.begin(
+            context,
+            self.inner.layers.len(),
+            self.tune_grouped,
+            self.tune_submission,
+        );
+        let _scope = super::super::decode_tuning::PlanScope::enter(plan);
+        self.pending_timing = Some(std::time::Instant::now());
         let logits = self.inner.run_paged_decode_step(token_id)?;
         // `run_paged_decode_step` returns `[1, 1, vocab]`; `true` requests
         // the engine's squeeze of axis 1 (the eager convention).
         Ok((logits, true))
     }
 
-    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
+    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, budget_forced: bool) {
+        if budget_forced {
+            // The forced token is independent of the forward graph.
+            self.pending_timing = None;
+        }
         // Async-eval the sampled token only (gemma4 never async-evals the
         // logits); the loop-top `y.eval()` forces materialization next
         // iteration.
@@ -122,6 +143,12 @@ impl DecodeStep for Gemma4PagedDecode<'_> {
     }
 
     fn maintain_cache(&mut self, step: i32) {
+        if let Some(started) = self.pending_timing.take() {
+            self.inner
+                .decode_tuning
+                .observe(started.elapsed().as_secs_f64(), self.inner.layers.len());
+        }
+
         // The loop has materialized the preceding sample before this hook.
         // That evaluation also completes the preceding KV writes, so blocks
         // wholly outside the sliding window can now be returned to the pool
@@ -250,9 +277,39 @@ impl PagedBackend for Gemma4Inner {
     }
 
     fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
+        let adaptive = std::env::var("MLX_GEMMA4_DECODE_TUNING").as_deref() != Ok("0")
+            && crate::engine::persistence::compiled_forward_backend_available();
+        let tune_submission =
+            adaptive && std::env::var_os("MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS").is_none();
+        let grouped_defaults = [
+            "MLX_PAGED_GROUPED_D512",
+            "MLX_PAGED_GROUPED_D512_STRIPES",
+            "MLX_GEMMA4_PAGED_DECODE_ROUTE",
+        ]
+        .iter()
+        .all(|key| std::env::var_os(key).is_none());
+        let tune_grouped = adaptive
+            && grouped_defaults
+            && self.config.global_head_dim.unwrap_or(self.config.head_dim) == 512
+            && self
+                .kv_cache_coordinator
+                .as_mut()
+                .is_some_and(|coordinator| {
+                    let adapter = coordinator.full_adapter_mut();
+                    adapter.prefill_sdpa_cache_dtype() == Some(crate::array::DType::BFloat16)
+                        && adapter
+                            .grouped_d512_decode_capability(
+                                crate::array::DType::BFloat16,
+                                self.config.num_attention_heads,
+                            )
+                            .unwrap_or(false)
+                });
         Ok(Gemma4PagedDecode {
             step: 0,
             pending_cache_error: None,
+            pending_timing: None,
+            tune_grouped,
+            tune_submission,
             inner: self,
         })
     }

@@ -1181,7 +1181,8 @@ void dispatch_paged_attention_v2_inner(
     int sliding_window,
     KvDtype io_dtype,
     KvDtype cache_dtype,
-    PagedAttentionRouteHint route_hint) {
+    PagedAttentionRouteHint route_hint,
+    uint32_t planned_stripes) {
   const GroupedPagedAttentionKind grouped_kind = select_grouped_paged_attention(
       io_dtype,
       cache_dtype,
@@ -1200,8 +1201,10 @@ void dispatch_paged_attention_v2_inner(
   // Generic V2 uses contiguous 512-token partitions. The grouped path uses
   // MLX-style strided stripes and its dedicated second pass.
   const uint32_t max_num_partitions = use_grouped
-      ? grouped_stripe_count(
-            grouped_kind, max_context_len, num_q_heads, num_kv_heads)
+      ? ((grouped_kind == GroupedPagedAttentionKind::D512Direct && planned_stripes)
+             ? planned_stripes
+             : grouped_stripe_count(
+                   grouped_kind, max_context_len, num_q_heads, num_kv_heads))
       : (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
           kPartitionSize;
 
@@ -1408,7 +1411,8 @@ void dispatch_paged_attention_auto(
     float softcap,
     int sliding_window,
     KvDtype kv_dtype,
-    PagedAttentionRouteHint route_hint) {
+    PagedAttentionRouteHint route_hint,
+    uint32_t grouped_stripes) {
   // The Metal kernel masks K positions older than
   // `context_len - sliding_window` when sliding_window > 0. Negative
   // values are illegal (only 0 is a valid "no mask" sentinel).
@@ -1487,7 +1491,8 @@ void dispatch_paged_attention_auto(
         sliding_window,
         io_dtype,
         cache_dtype,
-        route_hint);
+        route_hint,
+        grouped_stripes);
   }
 
   // Reference unused parameter so the compiler doesn't warn.

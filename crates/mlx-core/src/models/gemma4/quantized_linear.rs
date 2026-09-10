@@ -448,7 +448,7 @@ pub fn try_build_quantized_linear(
     let weight = params.get(&format!("{}.weight", key_prefix))?;
     let scales = params.get(&format!("{}.scales", key_prefix))?;
     let biases = params.get(&format!("{}.biases", key_prefix)).cloned();
-    Some(QuantizedLinear::new(
+    let mut linear = QuantizedLinear::new(
         weight.clone(),
         scales.clone(),
         biases,
@@ -456,7 +456,20 @@ pub fn try_build_quantized_linear(
         group_size,
         bits,
         DEFAULT_QUANT_MODE.to_string(),
-    ))
+    );
+    if let Some(scales) = params.get(&format!("{key_prefix}.decode_q4_0_scales")) {
+        linear.decode_sidecars = Some((scales.clone(), None));
+    } else if let (Some(scales), Some(biases)) = (
+        params.get(&format!("{key_prefix}.decode_scales")),
+        params.get(&format!("{key_prefix}.decode_biases")),
+    ) {
+        linear.decode_sidecars = Some((scales.clone(), Some(biases.clone())));
+    }
+    if let Ok(directory) = std::env::var("MLX_GEMMA4_CAPTURE_QMV_INPUTS") {
+        linear.capture_input_path =
+            Some(std::path::Path::new(&directory).join(format!("{key_prefix}.safetensors")));
+    }
+    Some(linear)
 }
 
 /// sym8 quantization parameters (per-output-channel symmetric int8 weights
@@ -628,6 +641,9 @@ impl PlainFp8Weight {
 pub struct QuantizedLinear {
     weight: MxArray,
     scales: MxArray,
+    decode_sidecars: Option<(MxArray, Option<MxArray>)>,
+    capture_input_path: Option<std::path::PathBuf>,
+    captured_input: std::sync::OnceLock<()>,
     biases: Option<MxArray>,
     bias: Option<MxArray>,
     group_size: i32,
@@ -662,6 +678,20 @@ fn sym8_debug_enabled() -> bool {
     })
 }
 
+pub(super) fn mixed_affine_qmv_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| match std::env::var("MLX_GEMMA4_MIXED_QMV").as_deref() {
+        Ok("1") => true,
+        Ok(_) => false,
+        // Portable SIMD arithmetic; no architecture-specific instructions.
+        // Dtype, pack, and shape guards below retain the general QMM fallback.
+        #[cfg(target_os = "macos")]
+        Err(_) => unsafe { sys::mlx_metal_is_available() },
+        #[cfg(not(target_os = "macos"))]
+        Err(_) => false,
+    })
+}
+
 impl QuantizedLinear {
     pub fn new(
         weight: MxArray,
@@ -680,6 +710,9 @@ impl QuantizedLinear {
             group_size,
             bits,
             mode,
+            decode_sidecars: None,
+            capture_input_path: None,
+            captured_input: std::sync::OnceLock::new(),
             fp8_dequant_weight: None,
             s_w: None,
         }
@@ -714,6 +747,9 @@ impl QuantizedLinear {
             group_size: crate::quant::fp8_weight::FP8_E4M3_GROUP_SIZE,
             bits: crate::quant::fp8_weight::FP8_E4M3_BITS,
             mode: crate::quant::fp8_weight::FP8_E4M3_MODE.to_string(),
+            decode_sidecars: None,
+            capture_input_path: None,
+            captured_input: std::sync::OnceLock::new(),
             fp8_dequant_weight: Some(fp8_dequant_weight),
             s_w: None,
         }
@@ -735,6 +771,9 @@ impl QuantizedLinear {
             group_size: SYM8_GROUP_SIZE,
             bits: SYM8_BITS,
             mode: SYM8_MODE.to_string(),
+            decode_sidecars: None,
+            capture_input_path: None,
+            captured_input: std::sync::OnceLock::new(),
             fp8_dequant_weight: None,
             s_w: Some(s_w),
         }
@@ -785,6 +824,53 @@ impl QuantizedLinear {
         Ok(result)
     }
 
+    #[cfg(target_os = "macos")]
+    fn try_mixed_affine_qmv(&self, x: &MxArray) -> Result<Option<MxArray>> {
+        // BF16 activation/output and FP16 sidecars stay in their stored types;
+        // unpacking and accumulation happen in FP32 registers inside the QMV.
+        if !mixed_affine_qmv_enabled()
+            || self.bias.is_some()
+            || self.mode != DEFAULT_QUANT_MODE
+            || self.bits != 4
+            || self.group_size != 32
+            || x.dtype()? != DType::BFloat16
+            || self.weight.ndim()? != 2
+            || !unsafe { sys::mlx_metal_is_available() }
+        {
+            return Ok(None);
+        }
+        let Some(biases) = self.biases.as_ref() else {
+            return Ok(None);
+        };
+        let (scales, biases) = self
+            .decode_sidecars
+            .as_ref()
+            .map(|(s, b)| (s, b.as_ref()))
+            .unwrap_or((&self.scales, Some(biases)));
+        let shape = x.shape()?;
+        let Some(&k) = shape.last() else {
+            return Ok(None);
+        };
+        if k == 0
+            || k % 32 != 0
+            || shape[..shape.len() - 1].iter().product::<i64>() != 1
+            || self.weight.shape_at(0)? % 8 != 0
+            || !matches!(scales.dtype()?, DType::Float16 | DType::Float32)
+            || biases.is_some_and(|b| b.dtype().ok() != scales.dtype().ok())
+        {
+            return Ok(None);
+        }
+        let raw = unsafe {
+            sys::mlx_affine_qmv_bf16(
+                x.handle.0,
+                self.weight.handle.0,
+                scales.handle.0,
+                biases.map_or(std::ptr::null_mut(), |b| b.handle.0),
+            )
+        };
+        Ok(Some(MxArray::from_handle(raw, "mixed affine qmv")?))
+    }
+
     fn forward_qmm(&self, x: &MxArray, activation_dtype: DType) -> Result<MxArray> {
         let mode_c = CString::new(self.mode.as_str())
             .map_err(|e| Error::from_reason(format!("Invalid mode string: {}", e)))?;
@@ -823,6 +909,25 @@ impl QuantizedLinear {
     /// kernels instead — `mlx_quantized_matmul` has no sym8 pack and its
     /// legacy no-biases heuristic would misread sym8 as MXFP8).
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
+        // Optional research capture uses actual post-normalization activations
+        // from a real session, once per projection. Never enabled in benchmarks.
+        if let Some(path) = &self.capture_input_path
+            && self.captured_input.get().is_none()
+        {
+            let shape = x.shape()?;
+            if !shape.is_empty() && shape[..shape.len() - 1].iter().product::<i64>() == 1 {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| Error::from_reason(e.to_string()))?;
+                }
+                crate::utils::safetensors::save_safetensors(
+                    path,
+                    &mut HashMap::from([("x".to_string(), x.clone())]),
+                    None,
+                )?;
+                let _ = self.captured_input.set(());
+            }
+        }
         if self.mode == SYM8_MODE {
             return self.forward_sym8(x);
         }
@@ -855,6 +960,10 @@ impl QuantizedLinear {
         // and is rejected, while residual/MLP paths drift to FP32 too.
         let activation_dtype = x.dtype()?;
 
+        #[cfg(target_os = "macos")]
+        if let Some(output) = self.try_mixed_affine_qmv(x)? {
+            return Ok(output);
+        }
         self.forward_qmm(x, activation_dtype)
     }
 
@@ -1294,6 +1403,68 @@ mod quantized_mlp_tests {
 mod affine_dtype_tests {
     use super::*;
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mixed_affine_qmv_matches_promoted_qmm_with_unrounded_sidecars() {
+        if !unsafe { sys::mlx_metal_is_available() } {
+            return;
+        }
+        // FP16 scales deliberately include values BF16 cannot represent.
+        // Performance measurements use the recorded agent session, separately.
+        for k in [32, 256, 512, 1024, 3840, 4096, 15360] {
+            let n = 24;
+            let x: Vec<u16> = (0..k)
+                .map(|i| half::bf16::from_f32(((i * 17 % 101) as f32 - 50.0) / 32.0).to_bits())
+                .collect();
+            let x = MxArray::from_bfloat16(&x, &[1, 1, k]).unwrap();
+            let w: Vec<u32> = (0..n * k / 8)
+                .map(|i| (i as u32).wrapping_mul(0x9e3779b9))
+                .collect();
+            let w = MxArray::from_uint32(&w, &[n, k / 8]).unwrap();
+            let scales: Vec<u16> = (0..n * k / 32)
+                .map(|i| half::f16::from_f32(((i * 7 % 23) as f32 - 11.0) * 0.001003).to_bits())
+                .collect();
+            let scales = MxArray::from_float16(&scales, &[n, k / 32]).unwrap();
+            let biases = scales.mul_scalar(-8.0).unwrap();
+            for dtype in [DType::Float16, DType::Float32] {
+                let s = scales.astype(dtype).unwrap();
+                let b = biases.astype(dtype).unwrap();
+                let linear = QuantizedLinear::new(
+                    w.clone(),
+                    s.clone(),
+                    Some(b.clone()),
+                    None,
+                    32,
+                    4,
+                    DEFAULT_QUANT_MODE.to_string(),
+                );
+                let expected = linear.forward_qmm(&x, DType::BFloat16).unwrap();
+                for symmetric in [false, true] {
+                    let handle = unsafe {
+                        sys::mlx_affine_qmv_bf16(
+                            x.handle.0,
+                            w.handle.0,
+                            s.handle.0,
+                            if symmetric {
+                                std::ptr::null_mut()
+                            } else {
+                                b.handle.0
+                            },
+                        )
+                    };
+                    let got = MxArray::from_handle(handle, "mixed qmv test").unwrap();
+                    assert_eq!(got.dtype().unwrap(), DType::BFloat16);
+                    assert_eq!(got.shape().unwrap().to_vec(), vec![1, 1, n]);
+                    let expected = expected.to_float32().unwrap();
+                    let got = got.to_float32().unwrap();
+                    for (index, (&a, &b)) in got.iter().zip(expected.iter()).enumerate() {
+                        assert_eq!(a, b, "K={k} dtype={dtype:?} row={index}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn affine_q4_forward_preserves_bfloat16_activation_dtype() {
         let input =
@@ -1341,3 +1512,7 @@ mod affine_dtype_tests {
         assert_eq!(actual.dtype().unwrap(), DType::BFloat16);
     }
 }
+
+#[cfg(test)]
+#[path = "recorded_qmv.rs"]
+mod recorded_qmv_tests;

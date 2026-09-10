@@ -123,6 +123,7 @@ struct ParsedGemma4Config {
     /// top-level dtype is deliberately insufficient: unified checkpoints may
     /// give their text and media towers different activation dtypes.
     text_config_explicitly_bfloat16: bool,
+    symmetric_zero_points: crate::models::quant_dispatch::SymmetricZeroPoints,
 }
 
 /// Parse config.json into Gemma4Config plus load-only metadata.
@@ -378,6 +379,14 @@ fn parse_config_with_load_metadata(model_path: &Path) -> Result<ParsedGemma4Conf
     Ok(ParsedGemma4Config {
         config,
         text_config_explicitly_bfloat16,
+        symmetric_zero_points: if raw_str.contains("symmetric_zero_point") {
+            crate::models::quant_dispatch::parse_symmetric_zero_points(
+                crate::models::quant_dispatch::select_quantization_block(&raw)?,
+                32,
+            )?
+        } else {
+            Default::default()
+        },
     })
 }
 
@@ -1014,6 +1023,7 @@ struct AffineSidecarWidenStats {
     arrays: usize,
     source_bytes: usize,
     resident_bytes: usize,
+    decode_bytes: usize,
 }
 
 /// Whether `prefix` names a text projection that `apply_weights` installs on
@@ -1067,9 +1077,10 @@ fn is_gemma4_text_qmm_prefix(prefix: &str) -> bool {
 ///
 /// The speed/memory tradeoff is deliberate: Gemma-4-12B Q4_0 has about 1.269
 /// GiB of FP16 affine sidecars, which become about 2.538 GiB resident (+1.269
-/// GiB steady state). The final chunked materialization evaluates and detaches
-/// these `astype` nodes, allowing their original mmap-backed FP16 graph inputs
-/// to be released rather than retaining both copies.
+/// GiB steady state). Direct decode additionally retains the original FP16
+/// scales (0.634 GiB for Q4_0), deriving its zero-point bias in registers.
+/// Asymmetric affine groups retain both FP16 arrays. Chunked materialization
+/// detaches the `astype` nodes; only explicitly retained decode arrays survive.
 fn widen_bf16_affine_text_qmm_sidecars(
     params: &mut HashMap<String, MxArray>,
     text_config_explicitly_bfloat16: bool,
@@ -1077,6 +1088,7 @@ fn widen_bf16_affine_text_qmm_sidecars(
     quant_group_size: i32,
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
+    zero_points: &crate::models::quant_dispatch::SymmetricZeroPoints,
 ) -> Result<AffineSidecarWidenStats> {
     if !text_config_explicitly_bfloat16 {
         return Ok(AffineSidecarWidenStats::default());
@@ -1122,6 +1134,8 @@ fn widen_bf16_affine_text_qmm_sidecars(
             continue;
         }
 
+        let packed_matrix = weight.ndim()? == 2;
+        let symmetric_q4_0 = zero_points.for_key(&prefix) == Some(8);
         let mut widened_projection = false;
         for suffix in ["scales", "biases"] {
             let sidecar_key = format!("{prefix}.{suffix}");
@@ -1134,6 +1148,22 @@ fn widen_bf16_affine_text_qmm_sidecars(
 
             let source_bytes = sidecar.nbytes();
             let widened = sidecar.astype(DType::Float32)?;
+            let decode_sidecar = (super::quantized_linear::mixed_affine_qmv_enabled()
+                && plq.bits == 4
+                && plq.group_size == 32
+                && packed_matrix)
+                .then(|| sidecar.clone());
+            if let Some(decode_sidecar) = decode_sidecar {
+                if symmetric_q4_0 {
+                    if suffix == "scales" {
+                        stats.decode_bytes += source_bytes;
+                        params.insert(format!("{prefix}.decode_q4_0_scales"), decode_sidecar);
+                    }
+                } else {
+                    stats.decode_bytes += source_bytes;
+                    params.insert(format!("{prefix}.decode_{suffix}"), decode_sidecar);
+                }
+            }
             let resident_bytes = widened.nbytes();
             params.insert(sidecar_key, widened);
 
@@ -1149,14 +1179,16 @@ fn widen_bf16_affine_text_qmm_sidecars(
 
     if stats.arrays > 0 {
         let gib = (1u64 << 30) as f64;
-        let delta_bytes = stats.resident_bytes.saturating_sub(stats.source_bytes);
+        let resident_bytes = stats.resident_bytes.saturating_add(stats.decode_bytes);
+        let delta_bytes = resident_bytes.saturating_sub(stats.source_bytes);
         info!(
             target: "mlx_core::inference",
             event = "gemma4_affine_sidecar_widen",
             arrays = stats.arrays,
             projections = stats.projections,
             source_gib = stats.source_bytes as f64 / gib,
-            resident_gib = stats.resident_bytes as f64 / gib,
+            resident_gib = resident_bytes as f64 / gib,
+            retained_decode_gib = stats.decode_bytes as f64 / gib,
             steady_delta_gib = delta_bytes as f64 / gib,
             serialized_weights_unchanged = true,
             "Gemma4 affine FP16 QMM sidecars widened to FP32 once at load"
@@ -2634,6 +2666,7 @@ impl Gemma4Inner {
             quant_group_size,
             top_level_mode,
             &per_layer_quant,
+            &parsed_config.symmetric_zero_points,
         )?;
 
         // gemma-4-E2B's `embed_tokens_per_layer.weight` is a single ~4GB tensor
@@ -2909,7 +2942,8 @@ fn load_draft_variant(draft_path: &Path, target: &Gemma4Config) -> Result<Gemma4
 }
 
 impl Gemma4Model {
-    /// Load a Gemma4 model from a directory containing safetensors and config.json.
+    /// Load a Gemma4 SafeTensors directory or GGUF file/directory with its
+    /// config, tokenizer assets, and optional unified media companion.
     ///
     /// Spawns a dedicated model thread. The init_fn runs all weight loading on
     /// that thread, then the thread enters its command loop.
@@ -2917,8 +2951,24 @@ impl Gemma4Model {
         model_path: &str,
         options: Option<super::model::Gemma4LoadOptions>,
     ) -> Result<Self> {
-        let model_path = model_path.to_string();
-        let draft_model_path = options.and_then(|o| o.draft_model_path);
+        let source = Path::new(model_path);
+        let mut draft_model_path = options.and_then(|o| o.draft_model_path);
+        let model_path = if let Some(gguf) = crate::utils::gguf::resolve_gemma4_gguf_source(source)?
+        {
+            // Preserve sibling draft discovery when the target moves into its
+            // native cache directory. An explicit draft option still wins.
+            if draft_model_path.is_none() {
+                draft_model_path =
+                    resolve_draft_model_path(gguf.parent().unwrap_or(Path::new(".")), None)?
+                        .map(|path| path.to_string_lossy().into_owned());
+            }
+            crate::utils::gguf::prepare_gemma4_native_gguf(&gguf)
+                .await?
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            model_path.to_string()
+        };
 
         let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
             move || {
@@ -3688,6 +3738,7 @@ mod tests {
                 32,
                 Some(PerLayerMode::Affine),
                 &HashMap::new(),
+                &Default::default(),
             )
             .expect("widen");
 
@@ -3701,6 +3752,95 @@ mod tests {
                 "{label}: the float16 .biases is the guard's signature and must survive"
             );
         }
+    }
+
+    #[test]
+    fn affine_decode_retention_respects_symmetry_overrides_and_storage() {
+        use crate::models::quant_dispatch::SymmetricZeroPoints;
+        let q = "layers.0.self_attn.q_proj";
+        let k = "layers.0.self_attn.k_proj";
+        let v = "layers.0.self_attn.v_proj";
+        let media = "embed_vision.embedding_projection";
+        let mut params = HashMap::new();
+        for prefix in [q, k, v, media] {
+            let scales = MxArray::from_float32(&[0.0371; 8], &[8, 1])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap();
+            let biases = scales
+                .mul_scalar(if prefix == k { -3.0 } else { -8.0 })
+                .unwrap();
+            params.insert(
+                format!("{prefix}.weight"),
+                MxArray::zeros(&[8, 4], Some(DType::Uint32)).unwrap(),
+            );
+            params.insert(format!("{prefix}.scales"), scales);
+            params.insert(format!("{prefix}.biases"), biases);
+        }
+        let original = params[&format!("{q}.scales")]
+            .to_float32()
+            .unwrap()
+            .to_vec();
+        let zero_points = SymmetricZeroPoints {
+            default: Some(8),
+            per_layer: HashMap::from([(k.to_string(), None), (v.to_string(), None)]),
+        };
+        let per_layer = HashMap::from([(
+            v.to_string(),
+            PerLayerQuant {
+                bits: 4,
+                group_size: 32,
+                mode: PerLayerMode::Mxfp4,
+                input_amax: None,
+            },
+        )]);
+        let stats = widen_bf16_affine_text_qmm_sidecars(
+            &mut params,
+            true,
+            4,
+            32,
+            Some(PerLayerMode::Affine),
+            &per_layer,
+            &zero_points,
+        )
+        .unwrap();
+        let enabled = super::super::quantized_linear::mixed_affine_qmv_enabled();
+        assert_eq!(stats.decode_bytes, if enabled { 48 } else { 0 });
+        assert!(!params.contains_key(&format!("{q}.decode_biases")));
+        for prefix in [v, media] {
+            assert!(
+                !params
+                    .keys()
+                    .any(|key| key.starts_with(&format!("{prefix}.decode_")))
+            );
+            assert_eq!(
+                params[&format!("{prefix}.scales")].dtype().unwrap(),
+                DType::Float16
+            );
+        }
+        assert!(
+            !params.contains_key(&format!("{k}.decode_q4_0_scales")),
+            "asymmetric override must shadow Q4_0"
+        );
+        if enabled {
+            let retained = &params[&format!("{q}.decode_q4_0_scales")];
+            assert_eq!(retained.dtype().unwrap(), DType::Float16);
+            assert_eq!(retained.to_float32().unwrap().to_vec(), original);
+            assert_eq!(
+                params[&format!("{k}.decode_biases")].dtype().unwrap(),
+                DType::Float16
+            );
+        } else {
+            assert!(!params.keys().any(|key| key.contains(".decode_")));
+        }
+        assert_eq!(
+            params[&format!("{q}.scales")].dtype().unwrap(),
+            DType::Float32
+        );
+        assert_eq!(
+            params[&format!("{k}.biases")].dtype().unwrap(),
+            DType::Float32
+        );
     }
 
     #[test]
@@ -3822,6 +3962,7 @@ mod tests {
             32,
             Some(PerLayerMode::Affine),
             &per_layer_quant,
+            &Default::default(),
         )
         .expect("widen selected sidecars");
         assert_eq!(stats.projections, 2);
@@ -3938,6 +4079,7 @@ mod tests {
             32,
             Some(PerLayerMode::Affine),
             &HashMap::new(),
+            &Default::default(),
         )
         .expect("non-bf16 gate");
         assert_eq!(gated_off, AffineSidecarWidenStats::default());
@@ -3953,6 +4095,7 @@ mod tests {
             32,
             Some(PerLayerMode::Affine),
             &HashMap::new(),
+            &Default::default(),
         )
         .expect("bf16 affine widening");
         assert_eq!(stats.projections, 1);

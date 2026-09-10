@@ -1,56 +1,12 @@
-//! Dense (gathered-K/V) cache-hit attention, and the only way to reach it.
+//! Dense cache-hit attention keeps K/V, its absolute origin, and the group's
+//! sliding window together. The paged-pool reader gathers only positions that
+//! at least one query can attend; the host fallback retains the full context.
+//! Both still need a per-query causal/window mask. In particular, the host
+//! gather can contain retired null blocks whose contents are undefined.
 //!
-//! # Why this is its own module
-//!
-//! A cache-hit prefill chunk on a **sliding** group is gathered over the full
-//! `0..total_ctx` width, which includes the positions
-//! `prune_sliding_window_for` retired onto the reserved null block. That block
-//! is `StorageModePrivate` and is never zeroed (`layer_kv_pool.rs`), so its
-//! contents are UNDEFINED -- today's all-zero readback is a driver accident,
-//! not a guarantee. The explicit keep-mask built here is therefore the only
-//! thing standing between the kernel and never-written pool memory, and it is
-//! mandatory rather than an optimization. Dropping it was measured at
-//! max|delta| 0.1245 against a windowed reference whose own RMS is 0.0356.
-//!
-//! Both dense arms of `Gemma4Attention::forward_paged_cache_hit_prefill`
-//! previously held raw `keys`/`values` locals next to the window, so either arm
-//! could be edited to hand those arrays straight to a window-blind kernel --
-//! restoring exactly that defect -- and it compiled. Measured: with each arm so
-//! reverted the whole crate stayed byte-identically green, and the only
-//! complaint was an incidental dead-code lint that a second live
-//! `GlobalDenseKernel` construction site makes go away.
-//!
-//! So the K/V never becomes a pair of loose arrays in the caller's scope.
-//! [`DenseCacheHitKv`] owns them with the window, its fields are private to
-//! THIS module, and its only exit to numbers is [`DenseCacheHitKv::attention`].
-//! Rust privacy is module-scoped, which is the whole point of the separate
-//! file: a struct declared inside `attention.rs` would still be destructurable
-//! by the very call sites being protected.
-//!
-//! ## What this seals, and what it does NOT — measured, not assumed
-//!
-//! An adversarial recheck ran the bypasses. Be precise about the result,
-//! because the load-bearing gate is not the one you would guess:
-//!
-//! * Bypassing while still holding a [`DenseCacheHitKv`] — reaching for
-//!   `kv.keys` / `kv.values` — is a compile error (E0616, private field).
-//! * Reverting an arm ALL THE WAY BACK to the adapter reader, which is the
-//!   actual historical spelling, still **compiles**. Both readers remain `pub`
-//!   and still return `(MxArray, MxArray, DenseAttentionWindow)`, so an arm can
-//!   destructure that tuple and call a window-blind kernel without ever
-//!   mentioning this module. Sealing the readers' own return type would close
-//!   it; that was not done.
-//!
-//! So the seal removes the cheapest bypass, and the REAL gate is the
-//! behavioural test `both_dense_cache_hit_arms_apply_the_window_through_the_dispatcher`,
-//! which drives the production dispatcher once per dense route and fails red on
-//! either reversion. Do not treat this module as the gate, and do not delete
-//! that test believing the type system has it covered.
-//!
-//! The two constructors are the two adapter readers that hand back a window
-//! with the data. The window-blind spellings (`gather_kv_for_prefill_sdpa`,
-//! `read_kv_range`) are not called from this module, and they fail closed on a
-//! sliding group in the adapter itself — by width and by age.
+//! Private fields prevent callers from accidentally discarding the window.
+//! The production dispatcher regression test covers both dense routes; adapter
+//! readers also remain public, so privacy alone is not a complete guard.
 
 use napi::bindgen_prelude::*;
 
@@ -119,7 +75,7 @@ pub(super) enum GlobalDenseKernel {
     ExplicitCausalMask,
 }
 
-/// A dense cache-hit gather: K/V for `0..total_ctx` **sealed to its window**.
+/// A dense cache-hit gather with its window and absolute key origin.
 ///
 /// There is no way to read `keys`/`values` out of this type in production code
 /// -- the fields are private to this module and there is no accessor. The only
@@ -133,6 +89,7 @@ pub(super) struct DenseCacheHitKv {
     /// `keys`/`values`. [`DenseAttentionWindow`] has no public constructor, so
     /// a literal `0` cannot be written here either.
     window: DenseAttentionWindow,
+    key_start: u32,
 }
 
 impl DenseCacheHitKv {
@@ -142,13 +99,15 @@ impl DenseCacheHitKv {
         adapter: &mut PagedKVCacheAdapter,
         paged_idx: u32,
         total_ctx: u32,
+        query_len: u32,
     ) -> std::result::Result<Self, String> {
-        let (keys, values, window) =
-            adapter.gather_kv_for_dense_cache_hit_prefill(paged_idx, total_ctx)?;
+        let (keys, values, window, key_start) =
+            adapter.gather_kv_for_windowed_prefill(paged_idx, total_ctx, query_len)?;
         Ok(Self {
             keys,
             values,
             window,
+            key_start,
         })
     }
 
@@ -166,6 +125,7 @@ impl DenseCacheHitKv {
             keys,
             values,
             window,
+            key_start: 0,
         })
     }
 
@@ -189,43 +149,23 @@ impl DenseCacheHitKv {
             &self.keys,
             &self.values,
             seq_len,
-            cached_prefix_len,
+            cached_prefix_len
+                .checked_sub(self.key_start)
+                .ok_or_else(|| {
+                    Error::from_reason("dense attention origin exceeds query position")
+                })?,
             self.window,
             global_kernel,
         )
     }
 }
 
-/// Attention for a DENSE (gathered-K/V) cache-hit prefill chunk.
-///
-/// The single implementation of dense cache-hit attention, shared by the
-/// paged-pool SDPA route and the host-read fallback. Neither has a
-/// kernel-side window, and both are fed a gather covering `0..total_ctx` --
-/// which includes the positions `prune_sliding_window_for` retired onto the
-/// reserved null block. So for a windowed group the explicit keep-mask built
-/// here is the ONLY thing standing between the kernel and never-written pool
-/// memory, and it is mandatory rather than an optimization.
-///
-/// `cached_prefix_len` is the mask offset, i.e. the absolute position of this
-/// chunk's first query row. That makes the mask
-/// `causal & (q_abs - kv < window)` over the full `cached_prefix_len +
-/// seq_len` gather width -- the same predicate the Metal kernel derives per
-/// row from its bottom-right alignment, and the same one vLLM's reference
-/// mask uses.
-///
-/// Do NOT substitute the `sliding_mask` that `run_paged_prefill_layer_loop`
-/// builds for the flat rotating cache: that one is only
-/// `seq_len + min(cache_offset, window)` wide, while this gather is
-/// `cached_prefix_len + seq_len` wide.
-///
-/// `window` is a [`DenseAttentionWindow`], which has no public constructor, so
-/// the mutation this function exists to prevent -- passing a literal `0` --
-/// does not type-check.
-///
-/// Production reaches this only through [`DenseCacheHitKv::attention`], which
-/// supplies the window off the same gather that produced `keys`/`values`. It
-/// stays a free function so the numerics tests can drive it over raw arrays
-/// they built themselves.
+/// Apply causal/window attention to gathered K/V. `cached_prefix_len` is
+/// relative to the gather's first key, not necessarily absolute position zero.
+/// Its sum with `seq_len` must equal the gather width. The mask excludes both
+/// keys beyond each query and keys that have aged out of that query's window.
+/// Tests can call this helper directly; production uses `DenseCacheHitKv` so
+/// the data, origin and window come from the same adapter read.
 pub(super) fn dense_cache_hit_attention(
     queries_bhtd: &MxArray,
     keys: &MxArray,
