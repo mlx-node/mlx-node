@@ -82,7 +82,7 @@ The shortest-history warmup does not calibrate the separate long-context bucket.
 
 ## Original full-suite baseline
 
-The earlier 36-sample implementation and its [original chart](muse-glimmer-q4-k-xl-benchmark.svg) are historical evidence, not the latest result. Its AR decode medians (MLX/llama.cpp) were 22.96/23.59, 17.32/19.18, and 13.61/20.00 tok/s at 7k/36k/60k. DFlash medians were 24.06/18.22, 25.61/27.34, and 10.39/8.31. Different activity and generated outputs prevent causal before/after claims from comparing the two full matrices; use the separately labeled A/B studies below for the individual optimization evidence. The original matrix replaced one observer-overlapped long llama.cpp AR sample; the fresh rerun above has no exclusions or replacements.
+The earlier 36-sample matrix is historical evidence, not the latest result. Its AR decode medians (MLX/llama.cpp) were 22.96/23.59, 17.32/19.18, and 13.61/20.00 tok/s at 7k/36k/60k. DFlash medians were 24.06/18.22, 25.61/27.34, and 10.39/8.31. Different activity and generated outputs prevent causal before/after claims from comparing the two full matrices; use the separately labeled A/B studies below for the individual optimization evidence. The original matrix replaced one observer-overlapped long llama.cpp AR sample; the fresh rerun above has no exclusions or replacements.
 
 ## Decode optimization: compact sliding reads
 
