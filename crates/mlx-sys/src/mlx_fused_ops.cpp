@@ -1,7 +1,23 @@
 #include "mlx_common.h"
 #include "mlx_qwen35_common.h"
 
+namespace {
+
+std::vector<array> sigmoid_mul_impl(const std::vector<array>& inputs) {
+  return {inputs[1] * sigmoid(inputs[0])};
+}
+
+}  // namespace
+
 extern "C" {
+
+mlx_array* mlx_sigmoid_mul_compiled(mlx_array* gate_handle, mlx_array* value_handle) {
+  const auto& gate = *reinterpret_cast<array*>(gate_handle);
+  const auto& value = *reinterpret_cast<array*>(value_handle);
+  static auto fn = mlx::core::compile(sigmoid_mul_impl, /*shapeless=*/true);
+  auto output = fn({gate, value})[0];
+  return reinterpret_cast<mlx_array*>(new array(std::move(output)));
+}
 
 // Fuse the activation independently of the projections, which may use
 // different native K-quant formats for gate and up.

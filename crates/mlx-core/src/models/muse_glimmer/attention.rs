@@ -139,8 +139,9 @@ impl MuseGlimmerAttention {
         .transpose(Some(&[0, 2, 1, 3]))?
         .reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;
 
-        let gate = Activations::sigmoid(&self.gate_proj.forward(x)?)?;
-        self.o_proj.forward(&attended.mul(&gate)?)
+        let gate = self.gate_proj.forward(x)?;
+        self.o_proj
+            .forward(&Activations::sigmoid_mul_compiled(&gate, &attended)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -279,8 +280,9 @@ impl MuseGlimmerAttention {
             seq_len,
             self.num_heads * self.head_dim,
         ])?;
-        let gate = Activations::sigmoid(&self.gate_proj.forward(x)?)?;
-        self.o_proj.forward(&attended.mul(&gate)?)
+        let gate = self.gate_proj.forward(x)?;
+        self.o_proj
+            .forward(&Activations::sigmoid_mul_compiled(&gate, &attended)?)
     }
 
     pub(crate) fn forward_paged_batched(
@@ -392,7 +394,7 @@ impl MuseGlimmerAttention {
             .map_err(Error::from_reason)?
             .astype(x.dtype()?)?
             .reshape(&[batch, 1, self.num_heads * self.head_dim])?;
-        let output = attended.mul(&Activations::sigmoid(&gate)?)?;
+        let output = Activations::sigmoid_mul_compiled(&gate, &attended)?;
         if preserve_singleton_projection_graphs {
             super::row_exact::forward_rows_independently(&output, |row| self.o_proj.forward(row))
         } else {
@@ -477,7 +479,7 @@ impl MuseGlimmerAttention {
             .map_err(Error::from_reason)?
             .astype(x.dtype()?)?
             .reshape(&[batch, 1, self.num_heads * self.head_dim])?;
-        let output = attended.mul(&Activations::sigmoid(&gate)?)?;
+        let output = Activations::sigmoid_mul_compiled(&gate, &attended)?;
         if preserve_owner_projection_graphs {
             super::row_exact::forward_owner_spans(&output, rows, |row| self.o_proj.forward(row))
         } else {

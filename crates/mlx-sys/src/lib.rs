@@ -111,6 +111,7 @@ unsafe extern "C-unwind" {
 
     // Shape-independent activation fusion; projection formats remain independent.
     pub fn mlx_swiglu_compiled(gate: *mut mlx_array, up: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_sigmoid_mul_compiled(gate: *mut mlx_array, value: *mut mlx_array) -> *mut mlx_array;
 
     // Fused SwiGLU MLP forward: output = down(silu(gate(x)) * up(x))
     // Weights are [out_features, in_features], transposed internally
