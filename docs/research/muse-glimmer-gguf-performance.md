@@ -205,6 +205,41 @@ Local validation passed 495 focused Rust tests (18 ignored), including resource-
 
 Evidence is split by purpose: `.cache/benchmarks/muse-attention-2026-09-11/` holds the bounded capture, replay logs, numerical references, exploratory runs, builds, and validation; `.cache/benchmarks/muse-adaptive-2026-09-11/` holds the fresh serial comparison. The measured adaptive addon is `2a63aa9b2f6deac6ac348dbc7c0007d641f99d7ffd0cb1ea2e624bbcd04fcce8`, with paged-attention metallib `88153586471b2c16031885ed1bb5cbf2737240137aa1e555bbe3614eff4e3b10`. Original inputs and worker are unchanged. Exploratory forced-route and profiling/capture runs are excluded from the fresh comparison.
 
+## Further source audit: fusion, quantized layout, and calibration
+
+The SwiGLU change below is a **numerically tested optimization candidate; its performance is unvalidated**. Five pilot requests were excluded after unrelated builds/tests and heavy host activity overlapped the comparison. Further timing was deferred at the user's request. The preceding accepted benchmark tables remain the latest performance evidence.
+
+Source inspection found another model-path difference: Muse's MLP evaluated sigmoid, gate multiplication, and up multiplication as separate primitives. Reuse the existing shape-independent compiled SwiGLU helper for `sigmoid(gate) * gate * up`. MLX's compiler explicitly admits these primitives to fusion, replacing the three activation nodes with one compiled node per layer. Gate, up, and down projections keep their individual native quantization formats; the change adds no hardware parameters. It applies to the shared Muse MLP, including prefill, paged/flat target decode, and the DFlash draft.
+
+The current **quantized Qwen3.8** `MLPVariant::Quantized` also calls the unfused `Activations::swiglu`; the shared compiled helper comes from other existing paths. Do not attribute Qwen's benchmark advantage to MLP fusion.
+
+This candidate follows the inspected references: vLLM's `MuseGlimmerMLP` uses `SiluAndMul` (`vllm/model_executor/models/muse_glimmer.py:1090–1117`); llama.cpp's Muse `LLM_FFN_SILU`/`LLM_FFN_PAR` graph selects `ggml_swiglu_split`, dispatched to `kernel_swiglu` in its Metal backend. Reference commits are recorded above. [MLX compilation documentation](https://ml-explore.github.io/mlx/build/html/usage/compile.html) describes explicit graph fusion and first-call compilation; use of MLX alone does not apply that transformation to every Rust-created graph.
+
+The inspected checkpoint configurations and runtime routes differ materially:
+
+| Checkpoint       | Attention layout                           | Full-attention Q/KV heads and head dimension | Relevant implementation difference                                                                                         |
+| :--------------- | :----------------------------------------- | :------------------------------------------- | :------------------------------------------------------------------------------------------------------------------------- |
+| Qwen3.8 27B      | 48 recurrent linear + 16 full layers       | 24 / 4, D256                                 | GatedDeltaNet state updates and existing D256 paged specialization; dense MLP does not mean all layers use full attention. |
+| Gemma4 12B       | 40 sliding (1,024 window) + 8 full layers  | 16 / 1, D512                                 | Earlier gains included fixing affine Q4_0 metadata/activation promotion and bounded sliding reads.                         |
+| Muse Glimmer 30B | 39 sliding (2,048 window) + 13 full layers | 32 / 2, D128                                 | Native K-quants avoid that affine cast path; its D128 grouped specialization was added in this PR.                         |
+
+These differences select different work and kernels; they do not predict either engine's relative speed without measurement. llama.cpp also has Apple Metal kernels, including format-specific Q4_K/Q5_K/Q6_K matvecs. A backend's name is not an efficiency guarantee.
+
+Two additional source/header checks narrow the remaining search:
+
+- **No projection shape fallback:** all 417 target matmul matrices, including the LM head, satisfy MLX QMV-fast's `N % 8 == 0 && K % 512 == 0` condition for singleton decode. The 418th matrix is the input embedding, which gathers rows instead. Native K weights already enter the fast vector route; changing a generic edge-path threshold is not supported by this evidence.
+- **Small packed-metadata overhead exists:** Q4_K/Q5_K preparation expands packed six-bit scale/min fields into byte sidecars, adding four bytes per 256-weight block. The target has 291,599,360 extra packed-storage bytes versus its GGUF blocks, of which 270,586,368 belong to matrices read in decode rather than the row-gathered embedding. This is approximately 1.4% of the 19.152 GB projection-weight footprint. It is integer metadata expansion, not BF16 weight expansion. Keeping metadata bit-packed might trade bandwidth for more unpacking instructions; storage arithmetic alone cannot establish a speedup or explain the observed latency gap.
+
+Remaining candidates, in order of increasing scope: fuse Muse's separate attention sigmoid/multiply; investigate reuse of the per-token graph (`run_paged_decode_step_batched` rebuilds the layer graph, whereas llama.cpp reuses eligible graphs in `llama-context.cpp`); then compare the K-quant projection kernels on captured real activations. Preserve owner-specific cache writes, absolute positions, rollback, and settlement barriers when changing graph execution. No chip presets or tensor-format conversions are justified by this audit. Individual time shares remain unmeasured.
+
+The existing first-use protocol includes most calibration inside its 95 measured decode steps. At 60k, the ten attention candidates need 40 observations, eight submission candidates need 32, and typical three-way refinement needs 12: 84 steps total. If generic attention wins initially, refinement can require another 40 instead. A short-history warmup does not calibrate the separate long-context bucket. This cost matters for short responses and must remain visible.
+
+The runner now supports `--warmup-case measured --warmup-tokens 128` to investigate performance after calibration using the same real history in each engine. Prompt state is reset, measured cache hits must still be zero, and warmup's actual generated count and timing are recorded with the measurement start timestamp. Natural EOS remains enabled: the requested warmup cap does not guarantee calibration completed. Verify the final selection event precedes measurement before calling a result calibrated. The original default remains 32 tokens on the shortest history; results from the two protocols must be labeled separately.
+
+Local validation for the fusion candidate: native release build; **228 focused Rust tests passed, 12 ignored**, including an independent FP64 activation reference for BF16/FP16/FP32, changing decode/verifier/prefill shapes, non-contiguous inputs, and finite extremes; all-target Clippy with warnings denied; repository typecheck; JavaScript lint with warnings in unchanged files; Rust formatting and whitespace checks. These establish functional/numerical coverage, not model-quality equivalence or performance. DFlash's shared MLP changes, but no accepted new DFlash timing exists.
+
+Local evidence: `.cache/benchmarks/muse-fusion-2026-09-11/` retains `architecture-audit.json`, `projection-layout-audit.json`, the candidate source patch, isolated addon, validation logs, all five excluded pilot samples with exclusion reasons, and bounded activity records. Candidate addon SHA-256: `e2a52a6fac576f594f6d83f1dd427ab77f9de5c5da0063810c5a086ddf3c1cfd`. The installed addon is unchanged. Next measurement: compare first-use and same-history-warmed protocols separately, run old/new/llama in forward and reverse order without other builds or inference, verify zero prompt-cache hits and exact token IDs, and confirm calibration completion timestamps for the warmed cohort.
+
 ## Reproduce
 
 Build the current native addon and LM package before running. Fetch the already public fixture, prepare model-specific token IDs and provenance, then run the serial matrix:
@@ -214,6 +249,8 @@ oxnode scripts/benchmark-fixture.ts fetch --fixture gemma4
 oxnode scripts/benchmark-muse-gguf.ts prepare --llama-server /path/to/llama-server --output .cache/benchmarks/muse-local
 oxnode scripts/benchmark-muse-gguf.ts run --llama-server /path/to/llama-server --output .cache/benchmarks/muse-local
 ```
+
+To measure after a same-history warmup, add `--warmup-case measured --warmup-tokens 128` to **both** prepare and run and use a separate output directory.
 
 The default model path is `~/.mlx-node/models/muse-glimmer-30b-gguf/Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf`; use `--model` to relocate the same checkpoint and companion. Use a new output directory for a different protocol or build. The runner records hashes and rejects changed inputs or stale resumed samples. Hardware-specific thread/draft presets are not baked in.
 

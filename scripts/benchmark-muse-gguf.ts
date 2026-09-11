@@ -27,6 +27,8 @@ const { values, positionals } = parseArgs({
     output: { type: 'string', default: '.cache/benchmarks/muse-gguf-2026-09-11' },
     repetitions: { type: 'string', default: '3' },
     tokens: { type: 'string', default: '96' },
+    'warmup-tokens': { type: 'string', default: '32' },
+    'warmup-case': { type: 'string', default: 'shortest' },
     cooldown: { type: 'string', default: '20' },
     runtime: { type: 'string' },
     spec: { type: 'boolean', default: false },
@@ -44,9 +46,12 @@ const modelFile = await realpath(resolve(values.model));
 const llamaServer = await realpath(resolve(values['llama-server']));
 const dataDir = resolve(values.output);
 const outputTokens = Number(values.tokens);
+const warmupTokens = Number(values['warmup-tokens']);
+const warmupPolicy = { case: values['warmup-case'], maxTokens: warmupTokens };
 const repetitions = Number(values.repetitions);
 const cooldown = Number(values.cooldown);
 assert(Number.isInteger(outputTokens) && outputTokens > 1);
+assert(Number.isInteger(warmupTokens) && warmupTokens > 0);
 assert(Number.isInteger(repetitions) && repetitions > 0);
 assert(Number.isFinite(cooldown) && cooldown >= 0);
 await mkdir(join(dataDir, 'raw'), { recursive: true });
@@ -78,6 +83,19 @@ type Input = {
 };
 async function readInputs(): Promise<Input[]> {
   return JSON.parse(await readFile(join(dataDir, 'inputs.json'), 'utf8'));
+}
+function warmupInput(inputs: Input[], measured: Input): Input {
+  const input =
+    warmupPolicy.case === 'measured'
+      ? measured
+      : warmupPolicy.case === 'shortest'
+        ? inputs.reduce((a, b) => (a.promptTokens <= b.promptTokens ? a : b))
+        : inputs.find((x) => x.name === warmupPolicy.case);
+  assert(input, `Unknown warmup case: ${warmupPolicy.case}`);
+  return input;
+}
+function checkWarmupPolicy(setup: any) {
+  assert.deepEqual(setup.warmup ?? { case: 'shortest', maxTokens: 32 }, warmupPolicy, 'Warmup protocol changed');
 }
 async function draftPath() {
   const parent = dirname(modelFile);
@@ -125,13 +143,16 @@ async function prepare() {
     });
   }
   await save(join(dataDir, 'inputs.json'), inputs);
+  for (const input of inputs) warmupInput(inputs, input);
   const draft = await draftPath();
   // llama.cpp's DFlash block includes the anchor; use the common supported
   // width in both engines, derived from model metadata rather than hardware.
   const draftTokens = config.dflash_config.block_size - 1;
   assert(Number.isInteger(draftTokens) && draftTokens > 0);
   const contextCapacity =
-    Math.ceil((Math.max(...inputs.map((x) => x.promptTokens)) + outputTokens + draftTokens + 512) / 512) * 512;
+    Math.ceil(
+      (Math.max(...inputs.map((x) => x.promptTokens)) + Math.max(outputTokens, warmupTokens) + draftTokens + 512) / 512,
+    ) * 512;
   const patch = command('git', ['diff', '--binary']);
   await writeFile(join(dataDir, 'mlx-runtime.patch'), patch);
   const files = [
@@ -169,6 +190,7 @@ async function prepare() {
     draftTokens,
     contextCapacity,
     outputTokens,
+    warmup: warmupPolicy,
     repetitions,
     cooldown,
     fixture: { id: manifest.id, sha256: manifest.payload.sha256, source: manifest.source },
@@ -183,7 +205,7 @@ async function prepare() {
       .join('\n'),
     os: command('sw_vers', []),
     thermal: command('pmset', ['-g', 'therm']),
-    protocol: `Three real review boundaries; identical Muse input token IDs; greedy, high thinking; exactly ${outputTokens} generated tokens, natural EOS retained and short completions rejected. Fresh process per sample; 32-token shortest-case warmup, reset prompt cache, zero cache hits; serial runs with cooldown. Production mlx-node LM ChatSession with owner-scoped cache lifecycle versus llama.cpp completion server. BF16 target/draft KV, 512-token physical prefill; llama.cpp chooses CPU thread count. DFlash fixed common width, MLX adaptive fallback disabled. Loading/warmup excluded. Native prefill through first token; decode excludes first token; request wall time separately. Historical tool calls are never executed.`,
+    protocol: `Three real review boundaries; identical Muse input token IDs; greedy, high thinking; exactly ${outputTokens} generated tokens, natural EOS retained and short completions rejected. Fresh process per sample; up to ${warmupTokens} warmup tokens on ${warmupPolicy.case} history, natural EOS retained and actual count recorded, reset prompt cache, zero cache hits; serial runs with cooldown. Production mlx-node LM ChatSession with owner-scoped cache lifecycle versus llama.cpp completion server. BF16 target/draft KV, 512-token physical prefill; llama.cpp chooses CPU thread count. DFlash fixed common width, MLX adaptive fallback disabled. Loading/warmup excluded. Native prefill through first token; decode excludes first token; request wall time separately. Historical tool calls are never executed.`,
   });
   console.log(
     JSON.stringify({
@@ -220,6 +242,8 @@ async function worker() {
   const setup = JSON.parse(await readFile(join(dataDir, 'environment.json'), 'utf8'));
   assert.equal(setup.modelFile, modelFile);
   assert.equal(setup.outputTokens, outputTokens);
+  checkWarmupPolicy(setup);
+  const warmupData = warmupInput(inputs, data);
   const id = `${values.runtime}-${values.spec ? 'dflash' : 'ar'}-${data.name}-${values.run}`;
   const thermalBefore = command('pmset', ['-g', 'therm']);
   const start = performance.now();
@@ -246,11 +270,22 @@ async function worker() {
       reuseCache: true,
       reportPerformance: true,
     };
-    session.primeHistory(inputs[0]!.messages);
-    await session.startFromHistory({ ...config, tools: inputs[0]!.tools, maxNewTokens: 32 });
+    session.primeHistory(warmupData.messages);
+    const warmupStart = performance.now();
+    const warmed = await session.startFromHistory({ ...config, tools: warmupData.tools, maxNewTokens: warmupTokens });
+    assert.equal(warmed.promptTokens, warmupData.promptTokens);
+    assert.equal(warmed.cachedTokens, 0);
+    const warmup = {
+      case: warmupData.name,
+      maxTokens: warmupTokens,
+      generatedTokens: warmed.numTokens,
+      wallMs: performance.now() - warmupStart,
+      completedAt: new Date().toISOString(),
+    };
     await session.reset();
     session.primeHistory(data.messages);
     resetPeakMemory();
+    const measuredAt = new Date().toISOString();
     const measured = performance.now();
     const result = await session.startFromHistory({
       ...config,
@@ -264,6 +299,8 @@ async function worker() {
     if (values.spec) assert(result.performance.mtpCycles > 0, 'DFlash must actually run');
     const p = result.performance;
     sample = {
+      warmup,
+      measuredAt,
       loadMs,
       wallMs,
       prefillMs: p.ttftMs,
@@ -365,7 +402,23 @@ async function worker() {
         return_tokens: true,
         ignore_eos: false,
       };
-      await post(base, 'completion', { ...request, prompt: inputs[0]!.tokenIds, n_predict: 32 });
+      const warmupStart = performance.now();
+      const warmed = await post(base, 'completion', {
+        ...request,
+        prompt: warmupData.tokenIds,
+        n_predict: warmupTokens,
+      });
+      assert.equal(warmed.timings.prompt_n, warmupData.promptTokens);
+      assert.equal(warmed.timings.cache_n, 0);
+      assert(!warmed.truncated);
+      const warmup = {
+        case: warmupData.name,
+        maxTokens: warmupTokens,
+        generatedTokens: warmed.timings.predicted_n,
+        wallMs: performance.now() - warmupStart,
+        completedAt: new Date().toISOString(),
+      };
+      const measuredAt = new Date().toISOString();
       const measured = performance.now();
       const result = await post(base, 'completion', { ...request, prompt: data.tokenIds, n_predict: outputTokens });
       const wallMs = performance.now() - measured;
@@ -376,6 +429,8 @@ async function worker() {
       assert.equal(t.predicted_n, outputTokens, 'Natural completion ended before the fixed output length');
       if (values.spec) assert(t.draft_n > 0, 'DFlash must actually run');
       sample = {
+        warmup,
+        measuredAt,
         loadMs,
         wallMs,
         args,
@@ -423,6 +478,7 @@ async function run() {
   assert.equal(setup.outputTokens, outputTokens);
   assert.equal(setup.repetitions, repetitions);
   assert.equal(setup.cooldown, cooldown);
+  checkWarmupPolicy(setup);
   const setupSha256 = sha(JSON.stringify(setup));
   for (const identity of setup.identities) {
     const current = await stat(identity.path);
@@ -465,6 +521,10 @@ async function run() {
           dataDir,
           '--tokens',
           String(outputTokens),
+          '--warmup-tokens',
+          String(warmupTokens),
+          '--warmup-case',
+          warmupPolicy.case,
           '--runtime',
           variant.runtime,
           '--case',

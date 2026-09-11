@@ -3,6 +3,15 @@
 
 extern "C" {
 
+// Fuse the activation independently of the projections, which may use
+// different native K-quant formats for gate and up.
+mlx_array* mlx_swiglu_compiled(mlx_array* gate_handle, mlx_array* up_handle) {
+  const auto& gate = *reinterpret_cast<array*>(gate_handle);
+  const auto& up = *reinterpret_cast<array*>(up_handle);
+  auto output = qwen35_common::swiglu(gate, up);
+  return reinterpret_cast<mlx_array*>(new array(std::move(output)));
+}
+
 // Fused SwiGLU MLP forward pass
 // Combines 5 operations into 1 FFI call:
 // 1. gate = x @ w_gate.T

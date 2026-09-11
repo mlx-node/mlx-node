@@ -19,8 +19,9 @@ impl MuseGlimmerMlp {
     }
 
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
-        let gate = Activations::silu(&self.gate_proj.forward(x)?)?;
+        let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        self.down_proj.forward(&gate.mul(&up)?)
+        self.down_proj
+            .forward(&Activations::swiglu_compiled(&gate, &up)?)
     }
 }
