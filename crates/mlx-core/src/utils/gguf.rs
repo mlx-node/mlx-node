@@ -4724,7 +4724,8 @@ fn resolve_native_gguf_source(
         matches!(
             name.as_ref(),
             "model.safetensors" | "weights.safetensors" | "model.safetensors.index.json"
-        ) || (name.starts_with("model-") && name.ends_with(".safetensors"))
+        ) || ((name.starts_with("model-") || name.starts_with("model.safetensors-"))
+            && name.ends_with(".safetensors"))
     }) {
         return Ok(None);
     }
@@ -5396,12 +5397,26 @@ mod tests {
             resolve_muse_glimmer_gguf_source(&second).unwrap(),
             Some(second)
         );
-        fs::write(root.path().join("model.safetensors"), []).unwrap();
-        assert!(
-            resolve_muse_glimmer_gguf_source(root.path())
-                .unwrap()
-                .is_none()
-        );
+        for name in [
+            "model.safetensors",
+            "weights.safetensors",
+            "model-00001-of-00002.safetensors",
+            "model.safetensors-00001-of-00002.safetensors",
+        ] {
+            let primary = root.path().join(name);
+            fs::write(&primary, []).unwrap();
+            assert!(
+                resolve_muse_glimmer_gguf_source(root.path())
+                    .unwrap()
+                    .is_none(),
+                "{name} must take precedence over retained GGUF variants"
+            );
+            assert_eq!(
+                resolve_muse_glimmer_gguf_source(&input).unwrap(),
+                Some(input.clone())
+            );
+            fs::remove_file(primary).unwrap();
+        }
     }
 
     #[test]
