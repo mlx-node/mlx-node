@@ -1,0 +1,80 @@
+[
+  {
+    "mlx-node": {
+      "prefillTokensPerSecond": {
+        "median": 1153.2061298356425,
+        "min": 1152.0970544555998,
+        "max": 1159.622928353058
+      },
+      "decodeTokensPerSecond": {
+        "median": 50.53215270305043,
+        "min": 49.92307156168541,
+        "max": 52.14750230476316
+      }
+    },
+    "llama.cpp": {
+      "prefillTokensPerSecond": {
+        "median": 1251.9845079666884,
+        "min": 1207.9630272400116,
+        "max": 1309.2218451275041
+      },
+      "decodeTokensPerSecond": {
+        "median": 48.69509556364764,
+        "min": 48.66085331672376,
+        "max": 50.34669126480958
+      }
+    }
+  },
+  {
+    "mlx-node": {
+      "prefillTokensPerSecond": {
+        "median": 1000.3676341182036,
+        "min": 955.8754352263414,
+        "max": 1011.2599105024499
+      },
+      "decodeTokensPerSecond": {
+        "median": 39.83966461669209,
+        "min": 39.47594088385216,
+        "max": 41.824118755566815
+      }
+    },
+    "llama.cpp": {
+      "prefillTokensPerSecond": {
+        "median": 740.9000308348817,
+        "min": 720.8234874769992,
+        "max": 752.0816505920843
+      },
+      "decodeTokensPerSecond": {
+        "median": 35.28873031563486,
+        "min": 35.045674133777446,
+        "max": 36.31326126124073
+      }
+    }
+  },
+  {
+    "mlx-node": {
+      "prefillTokensPerSecond": {
+        "median": 872.086852519684,
+        "min": 868.7294716400215,
+        "max": 889.1551031340913
+      },
+      "decodeTokensPerSecond": {
+        "median": 34.049298085557105,
+        "min": 31.862329247786164,
+        "max": 34.658590235096625
+      }
+    },
+    "llama.cpp": {
+      "prefillTokensPerSecond": {
+        "median": 526.5427182610428,
+        "min": 515.5694832678191,
+        "max": 547.1981868588406
+      },
+      "decodeTokensPerSecond": {
+        "median": 28.798242561837448,
+        "min": 28.788111932243396,
+        "max": 29.556523489844203
+      }
+    }
+  }
+]
