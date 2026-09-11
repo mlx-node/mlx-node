@@ -1,6 +1,6 @@
 # Muse Glimmer Q4_K_XL: mlx-node versus llama.cpp
 
-September 11, 2026. Completed **36 accepted measurements**: three real review histories × two runtimes × DFlash off/on × three repetitions. These tables and the chart describe the original implementation. The later [compact-read A/B](#decode-optimization-compact-sliding-reads) adds eight samples and improves measured AR decode by 15.7% at 36k and 17.8% at 60k context.
+September 11, 2026. Completed **36 accepted measurements**: three real review histories × two runtimes × DFlash off/on × three repetitions. The opening tables and chart describe the original implementation. The subsequent [adaptive decode study](#decode-optimization-resource-bounded-global-attention) records 12 fresh samples: +14.3% over compact at 60k and about 1.2% behind llama.cpp in that comparison. The later [compact-read A/B](#decode-optimization-compact-sliding-reads) adds eight samples and improves measured AR decode by 15.7% at 36k and 17.8% at 60k context.
 
 **Observed medians:** mlx-node processed prompts faster in all six matched comparisons, and mlx-node with DFlash had the lowest request time at all three lengths. llama.cpp had faster AR decode at every length. DFlash slowed decode on the longest continuation in both runtimes. The ranges below capture substantial variability on this active desktop; these are not peak-performance claims.
 
@@ -136,7 +136,74 @@ Relevant source: `crates/mlx-core/src/{utils/gguf.rs,nn/embedding.rs,models/muse
 
 Two other-format paths must not be confused with this result. Affine Q4_0 with FP16 sidecars can promote BF16 activations/output to FP32 in generic QMM and narrow the output afterward; the mixed affine decode QMV avoids that for eligible shapes, while generic prefill remains a separate optimization opportunity. Plain E4M3 weights have an explicit one-time BF16 reconstruction fallback. Neither path is selected by these target/draft K-quant tensors. Do not remove precision guards globally based on the K-quant result.
 
-Remaining decode opportunities have unmeasured contributions: Muse's BF16 32-Q/2-KV/head-128 geometry misses the existing grouped paged-attention routes; per-token graph construction and cache-write synchronization may also cost time. vLLM groups queries by KV head, but llama.cpp's vector path here also uses one Q head per workgroup, so grouping alone does not explain its lead. llama.cpp reuses eligible graphs; Muse does not inherit Qwen's early submission or Gemma's completed-token tuning. [MLX compilation can fuse operations](https://ml-explore.github.io/mlx/build/html/usage/compile.html), but this is not automatically applied to every model. Any further policy should derive from workload/geometry and completed-token measurements, not a named-machine preset.
+The second optimization pass below addresses the previously missing grouped D128 route and early submission. Per-token graph construction, projection kernels, and cache-write settlement still contribute to latency; their individual costs have not been isolated. [MLX compilation can fuse operations](https://ml-explore.github.io/mlx/build/html/usage/compile.html), but that capability does not automatically optimize every model graph. Equal hardware does not imply equal performance between two different kernel and execution stacks.
+
+## Decode optimization: resource-bounded global attention
+
+The [Qwen baseline in #142](https://github.com/mlx-node/mlx-node/issues/142) does not establish a backend-wide speed guarantee: it uses another checkpoint and token history, 512 generated tokens, a 2,048-token prefill chunk, and F16 llama.cpp KV. This Muse study uses 96 generated tokens, 512-token chunks, and BF16 KV in both engines. Existing grouped fast paths were guarded for other head sizes, so Muse could not enter them.
+
+After compacting sliding reads, the 13 global layers still used generic attention: at context 60,548, each dispatched 119 partitions × 32 query heads = 3,808 first-stage workgroups. Instantiate the existing grouped BF16 template for head size 128, grouping the 16 query heads belonging to each KV head in one threadgroup. The implementation uses direct reads with GPU-cache reuse; it does **not** stage one shared KV copy in threadgroup memory. Partition count remains a runtime decision. At 256 partitions the first stage has 512 workgroups, with a different thread layout; this ratio is not a predicted speedup or measured DRAM-traffic reduction.
+
+A bounded 157 MB capture of the first global layer's actual 60,548-token attention inputs isolates this opportunity. Alternating generic/grouped/grouped/generic replay gives **1.196 ms versus 0.531 ms** per completed call at 256 partitions, a 55.6% reduction. This includes dispatch and evaluation synchronization, not isolated GPU timestamps. Too little parallelism is worse: four partitions take 2.767 ms. These forced settings establish the performance curve only; none becomes a production machine preset.
+
+The local vLLM reference groups queries by KV head and dispatches split softmax according to request geometry and available intermediate buffers (`triton_unified_attention.py:1040–1090`, commit recorded above). The inspected llama.cpp vector path instead retains query-head groups with 32 partitions and adapts SIMD groups; it also reuses eligible graphs (`ggml-metal-ops.cpp:3350–3450`, `llama-context.cpp:1334–1376`). Thus fewer repeated reads alone cannot explain the whole-engine difference. The new Muse path also submits completed layer prefixes while the CPU builds the remaining graph, retaining the existing cache-write and retirement barriers.
+
+### Fresh comparison after adaptive tuning
+
+Twelve accepted fresh-process samples use the unchanged pinned history, exact token IDs, 32 short-history warmup tokens, 96 measured generated tokens, zero cached prompt tokens, greedy sampling, BF16 KV, and 512-token physical prefill chunks. The loaded model retains any tuning observations from normal warmup. No forced plan, capture, profiler, build, or competing inference overlaps these samples. A few plan-selection events are logged for audit; calibration remains inside measured latency. Order is compact/adaptive/llama/llama/adaptive/compact at 60k, adaptive/llama/compact at 36k, and compact/llama/adaptive at 7k, with 20-second cooldowns.
+
+**AR decode, tokens/s.** Two-sample cells show median [minimum–maximum]; the shorter rows are single samples.
+
+| Input tokens | Samples per engine |         Compact MLX |        Adaptive MLX |           llama.cpp | Adaptive vs compact |
+| -----------: | -----------------: | ------------------: | ------------------: | ------------------: | ------------------: |
+|        7,254 |                  1 |               22.57 |               23.43 |               23.67 |               +3.8% |
+|       36,325 |                  1 |               20.04 |               20.74 |               20.65 |               +3.5% |
+|       60,547 |                  2 | 17.08 [16.33–17.82] | 19.51 [18.97–20.06] | 19.76 [19.59–19.92] |              +14.3% |
+
+Adaptive/llama.cpp decode ratios are 0.990×, 1.004×, and 0.988×. The 60k gain over compact is present in both adjacent MLX pairs (+16.2% and +12.5%). The small remaining llama.cpp differences and overlapping long-context ranges do not establish a stable winner or statistical equivalence. Short/middle rows provide no repeatability estimate.
+
+**Prefill, tokens/s**, through the first token:
+
+| Input tokens | Compact MLX | Adaptive MLX | llama.cpp |
+| -----------: | ----------: | -----------: | --------: |
+|        7,254 |       620.8 |        676.3 |     544.4 |
+|       36,325 |       496.1 |        516.8 |     463.5 |
+|       60,547 |       417.7 |        419.8 |     406.8 |
+
+At 60k, prefill ranges are 395.6–439.9 compact, 400.3–439.3 adaptive, and 405.6–408.1 llama.cpp. The code change targets decode; prefill differences on this active desktop are not established effects. Request-time medians (compact/adaptive/llama.cpp seconds) are 15.90/14.79/17.34, 77.99/74.93/82.97, and 150.97/149.46/153.63. These are prompt-dominated, capped continuations, not completed agent tasks.
+
+The adaptive/compact greedy text matches at 7k and 36k. At 60k, compact and llama.cpp each reproduce their own text, while the two adaptive runs differ from each other and from compact. Both adaptive runs end at 256 partitions and two early layers, but their earlier calibration choices differ. The 7k and 36k runs finish at 64 partitions, with eight and two early layers respectively. These observations illustrate runtime selection, not settings to copy to other devices. DFlash was not re-benchmarked: its flat path is unchanged.
+
+All accepted jobs report no thermal/performance warning; this does not prove stable clocks or an idle desktop. Peak observed process-tree RSS is 21.24 GB. Raw results, plan choices, binary/fixture identities, resource logs, and the exact serial order are retained in the fresh-comparison directory.
+
+### Device and workload policy
+
+No chip names, assumed GPU-core counts, or saved winning constants enter the policy. Metal pipeline limits gate support; the D128 stage requires 512 threads and its reducer 1,024. [Apple documents these limits as pipeline-specific](https://developer.apple.com/documentation/metal/calculating-threadgroup-and-grid-sizes), including resource usage. Unsupported devices and other query geometries retain generic attention.
+
+For the supported 32-Q/2-KV/head-128, BF16, block-16 singleton route, the maximum partition count is the largest supported power of two satisfying all of:
+
+- The validated kernel/ABI limit: 1,024.
+- Available work: `ceil(context_tokens / 16)`.
+- Temporary-memory headroom: `available_bytes / global_layer_count / 8448`, where 8,448 bytes accounts for FP32 sum/max and BF16 partial outputs across 32 heads. `available_bytes` is the positive difference between `min(MLX memory limit, Metal recommended working set)` and MLX active memory; it is an allocation budget, not a claim about free system RAM.
+- Metal's maximum buffer length divided by the per-partition output size, 8,192 bytes.
+
+Within that bound, reuse Gemma's completed-token tuner for generic/grouped attention and early-submission depth. The depth candidates derive from the model's layer count. Each candidate's first observation is discarded; three completed-token observations, alternating sweep order, and a median/MAD noise margin determine selection. Recheck neighboring attention choices after selecting submission depth. There are no synthetic prompts, extra forward passes, or added GPU synchronization calls for measurement. Forced or failed samples cannot qualify a selection.
+
+Decisions belong to the loaded model and context bucket, with an eight-entry bound. A changed partition budget triggers a separate calibration; decisions are never exported as another machine's defaults. Device specifications constrain legality and memory usage, while completed-token timings capture effects that specifications alone cannot predict, including occupancy, cache behavior, bandwidth, and CPU/GPU overlap. This selects among tested candidates, not a proof of a global optimum. Calibration runs on real tokens and its cost is included in the request benchmark.
+
+`MLX_MUSE_DECODE_TUNING=0` disables automatic selection. `MLX_MUSE_GROUPED_STRIPES` and `MLX_MUSE_DECODE_EARLY_EVAL_LAYERS` are process-local diagnostic overrides; use them with automatic tuning disabled. Production benchmarking uses neither override. Sliding layers, multiple-owner batches, prefill, and DFlash keep their existing routes.
+
+### Interpreting the remaining limit
+
+The prepared tensor headers contain 19.152 GB outside the row-gathered input embedding. A one-read estimate adds 0.888 GB for global plus sliding KV at this context. Dividing that approximately 20.04 GB by [Apple's published 614 GB/s bandwidth for this 40-core configuration](https://www.apple.com/macbook-pro/specs/) gives **about 30.6 tokens/s**. This is an optimistic storage-only reference: it assumes sustained peak bandwidth, reads each tensor once, and makes arithmetic, intermediate traffic, dispatch, and synchronization free. It is neither measured DRAM traffic/utilization nor a demonstrated attainable rate. No bandwidth constant enters the runtime policy. Near-parity with llama.cpp therefore does not establish the theoretical limit; projection/dequantization throughput and graph execution remain separate optimization targets. Header accounting is retained in `bandwidth-bound.json`.
+
+### Correctness and evidence
+
+All nine power-of-two choices from 4 through 1,024 passed captured-input replay. Against an independent FP64 softmax reference for four actual query heads, both generic and grouped maximum absolute error were 0.005624. Across all 4,096 output components, generic/grouped maximum difference was 0.015625 and RMS difference was 0.000709–0.001125. The separate nonuniform-input regression covers full attention, 513/2,048-token windows, partial pages, empty trailing partitions, and one/17 query rows, with absolute error below 0.003. Changing partition reductions can change BF16 rounding and subsequent greedy tokens; numerical checks do not establish model-quality or exact-output equivalence.
+
+Local validation passed 495 focused Rust tests (18 ignored), including resource-limit changes and different device timing curves, plus the nine captured-input replay configurations. The native release build, repository typecheck, Clippy with warnings denied, Rust formatting, and whitespace checks pass. JavaScript lint passes with warnings in unchanged files. The repository-wide formatter reports 29 unchanged files; those unrelated files were not reformatted.
+
+Evidence is split by purpose: `.cache/benchmarks/muse-attention-2026-09-11/` holds the bounded capture, replay logs, numerical references, exploratory runs, builds, and validation; `.cache/benchmarks/muse-adaptive-2026-09-11/` holds the fresh serial comparison. The measured adaptive addon is `2a63aa9b2f6deac6ac348dbc7c0007d641f99d7ffd0cb1ea2e624bbcd04fcce8`, with paged-attention metallib `88153586471b2c16031885ed1bb5cbf2737240137aa1e555bbe3614eff4e3b10`. Original inputs and worker are unchanged. Exploratory forced-route and profiling/capture runs are excluded from the fresh comparison.
 
 ## Reproduce
 

@@ -259,6 +259,8 @@ pub(crate) struct MuseGlimmerInner {
     /// Metal reduction kernels for `B > 1`. Preserve each decode row's
     /// singleton projection graph while paged attention remains batched.
     pub(crate) row_exact_decode_projections: bool,
+    pub(crate) decode_tuning: crate::engine::decode_tuning::DecodeTuning,
+    pub(crate) decode_timing: Option<std::time::Instant>,
     pub(crate) active_paged_seq: u32,
     pub(crate) active_flat_session: bool,
     sliding_cold_checkpoints: HashMap<SeqId, VecDeque<MuseSlidingColdCheckpoint>>,
@@ -313,6 +315,8 @@ impl MuseGlimmerInner {
             scheduled_dflash_verify: None,
             paged,
             row_exact_decode_projections: false,
+            decode_tuning: crate::engine::decode_tuning::DecodeTuning::default(),
+            decode_timing: None,
             active_paged_seq: 0,
             active_flat_session: false,
             sliding_cold_checkpoints: HashMap::new(),
@@ -1047,9 +1051,44 @@ impl MuseGlimmerInner {
             }
             recorded.push(seq_id);
         }
+        self.decode_timing = None;
         let ids = rows.iter().map(|&(_, token)| token).collect::<Vec<_>>();
         let input = MxArray::from_uint32(&ids, &[rows.len() as i64, 1])?;
         let mut hidden = self.scaleless_rms_norm(&self.embed_tokens.forward(&input)?)?;
+        let text = &self.config.text_config;
+        let eligible = rows.len() == 1
+            && text.head_dim == 128
+            && text.num_attention_heads == 32
+            && text.num_key_value_heads == 2
+            && hidden.dtype()? == crate::array::DType::BFloat16
+            && crate::engine::persistence::compiled_forward_backend_available()
+            && self
+                .paged
+                .as_ref()
+                .is_some_and(|p| p.coordinator.adapter(0).is_ok_and(|a| a.block_size() == 16));
+        let mut plan = crate::engine::decode_tuning::DecodePlan::default();
+        if eligible {
+            if super::decode_tuning::enabled() {
+                let context = planned[0].1.saturating_add(1);
+                let global_layers = text
+                    .layer_kinds
+                    .iter()
+                    .filter(|&&kind| kind == LayerKind::Full)
+                    .count() as u32;
+                let limit =
+                    unsafe { mlx_sys::mlx_paged_grouped_d128_max_stripes(context, global_layers) };
+                plan = self
+                    .decode_tuning
+                    .begin_with_limit(context, self.layers.len(), limit, true);
+                self.decode_timing = Some(std::time::Instant::now());
+            }
+            let overridden = super::decode_tuning::override_plan(plan);
+            if overridden != plan {
+                self.decode_timing = None;
+            }
+            plan = overridden;
+        }
+        let _plan_scope = crate::engine::decode_tuning::PlanScope::enter(plan);
         for index in 0..self.layers.len() {
             let layer: &MuseGlimmerDecoderLayer = unsafe { &*self.layers.as_ptr().add(index) };
             let (route, window) = {
@@ -1074,14 +1113,25 @@ impl MuseGlimmerInner {
                 window,
                 self.row_exact_decode_projections,
             )?;
+            // Submit ready prefixes while the CPU constructs the remaining
+            // layers. The depth is learned from completed production tokens.
+            if index < plan.early_layers && index + 1 < self.layers.len() {
+                MxArray::async_eval_arrays(&[&hidden]);
+            }
         }
-        if self.row_exact_decode_projections && rows.len() > 1 {
+        let logits = if self.row_exact_decode_projections && rows.len() > 1 {
             super::row_exact::forward_rows_independently(&hidden, |row| {
                 self.project_logits(row, false)
             })
         } else {
             self.project_logits(&hidden, false)
+        }?;
+        if plan.early_layers > 0 {
+            // Include the tail before the scheduler settles pool writes;
+            // retain all existing ownership/retirement synchronization.
+            MxArray::async_eval_arrays(&[&logits]);
         }
+        Ok(logits)
     }
 }
 
@@ -1886,6 +1936,8 @@ mod spec_paged_settle_tests {
             scheduled_dflash_verify: None,
             paged: Some(paged),
             row_exact_decode_projections: false,
+            decode_tuning: crate::engine::decode_tuning::DecodeTuning::default(),
+            decode_timing: None,
             active_paged_seq: 0,
             active_flat_session: false,
             sliding_cold_checkpoints: HashMap::new(),

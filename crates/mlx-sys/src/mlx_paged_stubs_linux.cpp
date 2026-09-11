@@ -163,6 +163,8 @@ mlx_array* mlx_paged_attention_forward_with_plan(
   return nullptr;
 }
 
+uint32_t mlx_paged_grouped_d128_max_stripes(uint32_t, uint32_t) { return 0; }
+
 int mlx_paged_grouped_d512_capability(int, int) {
   return 0;
 }

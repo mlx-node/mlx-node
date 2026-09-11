@@ -34,13 +34,13 @@ namespace mlx::core::fast {
 namespace {
 void validate_paged_attention_plan(uint8_t route_hint, uint32_t grouped_stripes) {
   if (grouped_stripes != 0 &&
-      (grouped_stripes < 4 || grouped_stripes > 256 ||
-       (grouped_stripes & (grouped_stripes - 1)) != 0 || route_hint != 1)) {
-    throw std::invalid_argument("paged attention stripes require grouped route and a power of two in [4,256]");
+      (grouped_stripes < 4 || grouped_stripes > (route_hint == 3 ? 1024u : 256u) ||
+       (grouped_stripes & (grouped_stripes - 1)) != 0 || (route_hint != 1 && route_hint != 3))) {
+    throw std::invalid_argument("paged attention stripes require grouped route and a supported power of two");
   }
-  if (route_hint > 2) {
+  if (route_hint > 3) {
     throw std::invalid_argument(
-        "paged_attention_with_route_hint: route_hint must be 0, 1, or 2");
+        "paged_attention_with_route_hint: route_hint must be 0, 1, 2, or 3");
   }
 }
 

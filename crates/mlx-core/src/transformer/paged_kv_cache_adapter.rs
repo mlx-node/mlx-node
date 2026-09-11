@@ -118,6 +118,7 @@ pub(crate) enum PagedDecodeRouteHint {
     // which now uses direct K/V reads.
     ForceD512Staged = 1,
     ForceGeneric = 2,
+    ForceD128 = 3,
 }
 
 pub(crate) fn paged_attention_v2_aux_fits(
@@ -5791,6 +5792,29 @@ impl PagedKVCacheAdapter {
         scale: f32,
         softcap: f32,
     ) -> Result<MxArray, String> {
+        self.gather_kv_for_decode_graph_batched_with_plan(
+            layer_idx,
+            queries,
+            seq_ids,
+            scale,
+            softcap,
+            PagedDecodeRouteHint::Auto,
+            0,
+        )
+    }
+
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gather_kv_for_decode_graph_batched_with_plan(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        seq_ids: &[SeqId],
+        scale: f32,
+        softcap: f32,
+        route_hint: PagedDecodeRouteHint,
+        grouped_stripes: u32,
+    ) -> Result<MxArray, String> {
         if seq_ids.is_empty() {
             return Err(
                 "gather_kv_for_decode_graph_batched requires at least one sequence".to_string(),
@@ -5852,7 +5876,7 @@ impl PagedKVCacheAdapter {
         let v_scale = self.v_scale_array(layer_idx)?;
         let graph_softcap = if softcap == 1.0 { 0.0 } else { softcap };
         let raw = unsafe {
-            mlx_sys::mlx_paged_attention_forward(
+            mlx_sys::mlx_paged_attention_forward_with_plan(
                 queries.as_raw_ptr(),
                 k_pool.as_raw_ptr(),
                 v_pool.as_raw_ptr(),
@@ -5868,6 +5892,8 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.config().num_kv_heads as i32,
                 self.layer_kv_pool.config().head_size as i32,
                 self.kv_dtype_raw()?,
+                route_hint as u8,
+                grouped_stripes,
             )
         };
         if raw.is_null() {
@@ -6005,6 +6031,21 @@ impl PagedKVCacheAdapter {
             "gather_kv_for_decode_graph_batched is only supported on macOS (Metal backend)"
                 .to_string(),
         )
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gather_kv_for_decode_graph_batched_with_plan(
+        &mut self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _seq_ids: &[SeqId],
+        _scale: f32,
+        _softcap: f32,
+        _route_hint: PagedDecodeRouteHint,
+        _grouped_stripes: u32,
+    ) -> Result<MxArray, String> {
+        Err("graph-native paged attention requires Metal".to_string())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -6253,7 +6294,9 @@ impl PagedKVCacheAdapter {
             PagedDecodeRouteHint::ForceD512Staged => {
                 mlx_paged_attn::metal::PagedAttentionRouteHint::ForceD512Staged
             }
-            PagedDecodeRouteHint::ForceGeneric => {
+            // D128 is a graph-native specialization. The independent eager
+            // Metal bridge conservatively retains its generic implementation.
+            PagedDecodeRouteHint::ForceGeneric | PagedDecodeRouteHint::ForceD128 => {
                 mlx_paged_attn::metal::PagedAttentionRouteHint::ForceGeneric
             }
         };
@@ -15656,6 +15699,135 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a bounded capture from the pinned real Muse fixture"]
+    fn replay_captured_muse_attention() {
+        let path = std::env::var("MLX_CAPTURE_MUSE_ATTENTION").unwrap();
+        let meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(format!("{path}.json")).unwrap()).unwrap();
+        let tensors = crate::utils::safetensors::load_safetensors_lazy(&path).unwrap();
+        for t in tensors.values() {
+            t.eval();
+        }
+        let stripes: u32 = std::env::var("MLX_MUSE_GROUPED_STRIPES")
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!(
+            unsafe {
+                mlx_sys::mlx_paged_grouped_d128_max_stripes(
+                    meta["context"].as_u64().unwrap() as u32,
+                    1,
+                )
+            } >= stripes
+        );
+        let run = |route| {
+            let ptr = unsafe {
+                mlx_sys::mlx_paged_attention_forward_with_plan(
+                    tensors["q"].as_raw_ptr(),
+                    tensors["k"].as_raw_ptr(),
+                    tensors["v"].as_raw_ptr(),
+                    tensors["table"].as_raw_ptr(),
+                    tensors["lens"].as_raw_ptr(),
+                    tensors["ks"].as_raw_ptr(),
+                    tensors["vs"].as_raw_ptr(),
+                    meta["scale"].as_f64().unwrap() as f32,
+                    meta["softcap"].as_f64().unwrap() as f32,
+                    meta["window"].as_i64().unwrap() as i32,
+                    16,
+                    32,
+                    2,
+                    128,
+                    meta["kv_dtype"].as_u64().unwrap() as u8,
+                    route,
+                    if route == 3 { stripes } else { 0 },
+                )
+            };
+            MxArray::from_handle(ptr, "capture_replay").unwrap()
+        };
+        let reference = run(2).to_float32().unwrap().to_vec();
+        let candidate = run(3).to_float32().unwrap().to_vec();
+        let max_error = reference
+            .iter()
+            .zip(&candidate)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let rms = (reference
+            .iter()
+            .zip(&candidate)
+            .map(|(a, b)| f64::from(a - b).powi(2))
+            .sum::<f64>()
+            / reference.len() as f64)
+            .sqrt();
+        for route in [2, 3, 3, 2] {
+            for _ in 0..8 {
+                run(route).eval();
+            }
+            let start = std::time::Instant::now();
+            for _ in 0..64 {
+                run(route).eval();
+            }
+            println!(
+                "MUSE_REPLAY {}",
+                serde_json::json!({"route":route,"stripes":stripes, "context":meta["context"],"us":start.elapsed().as_secs_f64()*1e6/64.0,"max_error":max_error,"rms_error":rms})
+            );
+        }
+        let q = tensors["q"].to_float32().unwrap().to_vec();
+        let k = tensors["k"].to_float32().unwrap().to_vec();
+        let v = tensors["v"].to_float32().unwrap().to_vec();
+        let table = tensors["table"].to_uint32().unwrap().to_vec();
+        let context = meta["context"].as_u64().unwrap() as usize;
+        let scale = meta["scale"].as_f64().unwrap();
+        let mut dense_errors = [0.0f64; 2];
+        for head in [0usize, 15, 16, 31] {
+            let kv = head / 16;
+            let mut scores = Vec::with_capacity(context);
+            for pos in 0..context {
+                let block = table[pos / 16] as usize;
+                let mut dot = 0.0;
+                for d in 0..128 {
+                    let ki = (((block * 2 + kv) * 16 + d / 8) * 16 + pos % 16) * 8 + d % 8;
+                    dot += f64::from(q[head * 128 + d]) * f64::from(k[ki]);
+                }
+                scores.push(dot * scale);
+            }
+            let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let sum: f64 = scores
+                .iter_mut()
+                .map(|value| {
+                    *value = (*value - max).exp();
+                    *value
+                })
+                .sum();
+            for d in 0..128 {
+                let expected: f64 = scores
+                    .iter()
+                    .enumerate()
+                    .map(|(pos, weight)| {
+                        let block = table[pos / 16] as usize;
+                        weight * f64::from(v[((block * 2 + kv) * 128 + d) * 16 + pos % 16])
+                    })
+                    .sum::<f64>()
+                    / sum;
+                for (index, values) in [&reference, &candidate].into_iter().enumerate() {
+                    let error = (f64::from(values[head * 128 + d]) - expected).abs();
+                    dense_errors[index] = dense_errors[index].max(error);
+                    assert!(
+                        error <= 0.008 * expected.abs().max(1.0),
+                        "head={head}, dim={d}, variant={index}, got={}, expected={expected}",
+                        values[head * 128 + d]
+                    );
+                }
+            }
+        }
+        println!(
+            "MUSE_DENSE_REFERENCE {}",
+            serde_json::json!({"stripes":stripes,"generic_max_abs_error":dense_errors[0],"grouped_max_abs_error":dense_errors[1]})
+        );
+        assert!(max_error < 0.03, "captured attention error: {max_error}");
+    }
+
     /// Rebasing changes partition boundaries and therefore BF16 rounding.
     /// Check nonuniform Q/K/V against an independent FP64 softmax reference,
     /// across the generic kernel's 512-token partition and 16-token pages.
@@ -15686,7 +15858,7 @@ mod tests {
             .astype(DType::BFloat16)
             .unwrap();
         let scale = 1.0 / (D as f32).sqrt();
-        for window in [513, 2048] {
+        for window in [0, 513, 2048] {
             let config = mlx_paged_attn::PagedAttentionConfig {
                 block_size: 16,
                 num_kv_heads: HKV as u32,
@@ -15707,8 +15879,11 @@ mod tests {
                 .unwrap(),
             );
             let allocator = Arc::new(Mutex::new(BlockAllocator::new(512, 512, 16)));
-            let mut adapter =
-                PagedKVCacheAdapter::new_sliding(allocator, pool, 16, window, 8192).unwrap();
+            let mut adapter = if window == 0 {
+                PagedKVCacheAdapter::new(allocator, pool, 16).unwrap()
+            } else {
+                PagedKVCacheAdapter::new_sliding(allocator, pool, 16, window, 8192).unwrap()
+            };
             adapter.reset_for_new_request(7).unwrap();
             adapter.record_tokens(&(0..N).collect::<Vec<_>>()).unwrap();
             adapter.update_keys_values(0, &k, &v, 0).unwrap();
@@ -15730,10 +15905,36 @@ mod tests {
                 }
                 .unwrap();
                 assert_eq!(output.dtype().unwrap(), DType::BFloat16);
-                let output = output.to_float32().unwrap();
+                let output = output.to_float32().unwrap().to_vec();
+                let mut outputs = vec![(0u32, output)];
+                if query_len == 1
+                    && unsafe { mlx_sys::mlx_paged_grouped_d128_max_stripes(N, 1) } > 0
+                {
+                    // Include empty trailing stripes and a partially filled
+                    // boundary page, then compare each route with FP64.
+                    for stripes in [4, 16, 128, 256, 512, 1024] {
+                        let grouped = adapter
+                            .gather_kv_for_decode_graph_batched_with_plan(
+                                0,
+                                &q,
+                                &[7],
+                                scale,
+                                0.0,
+                                PagedDecodeRouteHint::ForceD128,
+                                stripes,
+                            )
+                            .unwrap();
+                        assert_eq!(grouped.dtype().unwrap(), DType::BFloat16);
+                        outputs.push((stripes, grouped.to_float32().unwrap().to_vec()));
+                    }
+                }
                 for row in 0..query_len as usize {
                     let end = (N - query_len) as usize + row + 1;
-                    let start = end.saturating_sub(window as usize);
+                    let start = if window == 0 {
+                        0
+                    } else {
+                        end.saturating_sub(window as usize)
+                    };
                     for head in 0..HQ {
                         let kv_head = head / (HQ / HKV);
                         let q_base = (row * HQ + head) * D;
@@ -15761,11 +15962,13 @@ mod tests {
                                 })
                                 .sum::<f64>()
                                 / total;
-                            let got = f64::from(output[q_base + d]);
-                            assert!(
-                                got.is_finite() && (got - expected).abs() < 0.003,
-                                "window={window} queries={query_len} row={row} head={head} d={d}: {got} != {expected}"
-                            );
+                            for (stripes, output) in &outputs {
+                                let got = f64::from(output[q_base + d]);
+                                assert!(
+                                    got.is_finite() && (got - expected).abs() < 0.003,
+                                    "stripes={stripes} window={window} queries={query_len} row={row} head={head} d={d}: {got} != {expected}"
+                                );
+                            }
                         }
                     }
                 }

@@ -366,8 +366,29 @@ impl MuseGlimmerAttention {
             .update_keys_values_native_batched(paged_idx, &k, &v, rows)
             .map_err(Error::from_reason)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // Only global singleton decode participates. Compact sliding reads,
+        // prefill, verification and multi-owner batches keep their own route.
+        let choice = self
+            .sliding_window
+            .is_none()
+            .then(|| super::decode_tuning::current_plan().grouped_stripes)
+            .flatten();
+        use crate::transformer::paged_kv_cache_adapter::PagedDecodeRouteHint;
+        let (route, stripes) = match choice {
+            Some(0) => (PagedDecodeRouteHint::ForceGeneric, 0),
+            Some(stripes) => (PagedDecodeRouteHint::ForceD128, stripes),
+            None => (PagedDecodeRouteHint::Auto, 0),
+        };
         let attended = adapter
-            .gather_kv_for_decode_graph_batched(paged_idx, &q, &seq_ids, scale as f32, 1.0)
+            .gather_kv_for_decode_graph_batched_with_plan(
+                paged_idx,
+                &q,
+                &seq_ids,
+                scale as f32,
+                1.0,
+                route,
+                stripes,
+            )
             .map_err(Error::from_reason)?
             .astype(x.dtype()?)?
             .reshape(&[batch, 1, self.num_heads * self.head_dim])?;
