@@ -4803,10 +4803,7 @@ async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<Path
         }
     }
     let companion = gemma4_native_mmproj(&input)?;
-    let config: serde_json::Value = serde_json::from_slice(&fs::read(parent.join("config.json"))?)?;
-    let needs_media = ["vision_config", "audio_config"]
-        .iter()
-        .any(|key| config.get(key).is_some_and(|v| !v.is_null()));
+    let needs_media = crate::models::gemma4::persistence::native_gguf_requires_media(parent)?;
     if needs_media && companion.is_none() {
         return Err(Error::from_reason(format!(
             "Gemma4 config declares media inputs but no matching mmproj GGUF was found beside '{}'",
@@ -5286,6 +5283,71 @@ mod tests {
             prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
             changed
         );
+    }
+
+    #[tokio::test]
+    async fn gemma_native_configs_without_unified_media_do_not_require_companion() {
+        let root = GemmaNativeTestDir::new();
+        for (index, mut config) in [
+            // E2B's legacy mel settings must not enable unified audio.
+            serde_json::json!({
+                "model_type": "gemma4",
+                "audio_config": {"model_type": "gemma4_unified_audio", "audio_embed_dim": 1536}
+            }),
+            serde_json::json!({"model_type": "gemma4", "audio_config": null}),
+            // Plain Gemma's SigLIP tower belongs to the main checkpoint.
+            serde_json::json!({"model_type": "gemma4", "vision_config": {}}),
+            serde_json::json!({"model_type": "gemma4_unified", "audio_config": null}),
+            serde_json::json!({"architectures": ["Gemma4UnifiedForConditionalGeneration"]}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = root.path().join(format!("source-{index}"));
+            let input = gemma_native_fixture(&source);
+            fs::remove_file(source.join("mmproj-gemma.gguf")).unwrap();
+            config["text_config"] = serde_json::json!({"num_hidden_layers": 0});
+            fs::write(source.join("config.json"), config.to_string()).unwrap();
+            let cache = root.path().join(format!("cache-{index}"));
+            let output = prepare_gemma4_native_gguf_in(&input, &cache)
+                .await
+                .unwrap_or_else(|error| panic!("config {config}: {error}"));
+            assert!(output.join("model.safetensors").is_file());
+            assert!(!output.join("vision.safetensors").exists());
+            assert_eq!(
+                prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+                output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gemma_native_unified_media_requires_companion_for_both_family_markers() {
+        let root = GemmaNativeTestDir::new();
+        for mut config in [
+            serde_json::json!({"model_type": "gemma4_unified"}),
+            serde_json::json!({"architectures": ["Gemma4UnifiedForConditionalGeneration"]}),
+        ] {
+            for media in ["vision_config", "audio_config"] {
+                let source = root.path().join("source");
+                let input = gemma_native_fixture(&source);
+                fs::remove_file(source.join("mmproj-gemma.gguf")).unwrap();
+                config.as_object_mut().unwrap().remove("vision_config");
+                config.as_object_mut().unwrap().remove("audio_config");
+                config[media] = serde_json::json!({});
+                config["text_config"] = serde_json::json!({"num_hidden_layers": 0});
+                fs::write(source.join("config.json"), config.to_string()).unwrap();
+                let cache = root.path().join("cache");
+                let error = prepare_gemma4_native_gguf_in(&input, &cache)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.reason.contains("no matching mmproj"),
+                    "{config}: {error}"
+                );
+                assert!(!cache.exists());
+            }
+        }
     }
 
     #[tokio::test]

@@ -405,6 +405,14 @@ fn should_load_media_sidecar(config: &Gemma4Config) -> bool {
     config.is_unified && (config.unified_vision_config.is_some() || config.has_audio)
 }
 
+/// Use the runtime's parsed capabilities for GGUF companion preflight too.
+/// Plain Gemma's legacy audio settings and SigLIP config do not require the
+/// unified media sidecar; either unified family marker enables its media gate.
+pub(crate) fn native_gguf_requires_media(model_path: &Path) -> Result<bool> {
+    let parsed = parse_config_with_load_metadata(model_path)?;
+    Ok(should_load_media_sidecar(&parsed.config))
+}
+
 /// Parse `layer_types` array from config.
 /// Returns a Vec of "sliding_attention" or "full_attention" strings.
 ///
