@@ -70,8 +70,8 @@ context scales); batched and speculative paths keep their existing scheduling.
 Calibration that occurs during a request contributes to that request's latency.
 The native Gemma GGUF loader also records the nested text dtype so prefill metadata
 can be prepared once, while Q4 decode consumes the original scale precision.
-See the [real-agent comparison and bandwidth analysis](./research/gemma4-optimization-2026-09-10/README.md)
-for the numerical checks, memory tradeoff, selected plans, and measured limits.
+See the [Gemma GGUF performance reference](./research/gemma4-gguf-performance.md)
+for the numerical checks, memory tradeoff, and measured limits.
 
 ### Memory pool
 
