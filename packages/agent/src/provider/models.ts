@@ -52,6 +52,9 @@ interface DiscoveryMetadata {
  */
 const QWEN35_XL_GGUF = /(?:^|[-_.])Q\d+_K_XL\.gguf$/i;
 const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft)(?:[-_.]|$)/i;
+// Match the native loaders' primary files/shards. A draft or projector
+// SafeTensors file beside a GGUF is not a converted target checkpoint.
+const PRIMARY_SAFETENSORS = /^(?:model|weights)\.safetensors$|^model(?:-|\.safetensors-).+-of-.+\.safetensors$/;
 
 function isQwen35XlGguf(name: string): boolean {
   return QWEN35_XL_GGUF.test(name) && !GGUF_COMPANION_NAME.test(name);
@@ -79,6 +82,7 @@ interface ModelFileInventory {
   targetGgufs: string[];
   hasGguf: boolean;
   hasSafetensors: boolean;
+  hasPrimarySafetensors: boolean;
 }
 
 async function modelFileInventory(modelDir: string): Promise<ModelFileInventory> {
@@ -93,9 +97,10 @@ async function modelFileInventory(modelDir: string): Promise<ModelFileInventory>
         .sort(),
       hasGguf: files.some((name) => name.toLowerCase().endsWith('.gguf')),
       hasSafetensors: files.some((name) => name.toLowerCase().endsWith('.safetensors')),
+      hasPrimarySafetensors: files.some((name) => PRIMARY_SAFETENSORS.test(name)),
     };
   } catch {
-    return { xlGgufs: [], targetGgufs: [], hasGguf: false, hasSafetensors: false };
+    return { xlGgufs: [], targetGgufs: [], hasGguf: false, hasSafetensors: false, hasPrimarySafetensors: false };
   }
 }
 
@@ -284,7 +289,8 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     }
 
     const inventory = await modelFileInventory(full);
-    if (requiresGgufAssets(modelType) && !inventory.hasSafetensors && inventory.targetGgufs.length > 0) {
+    const hasModelWeights = requiresGgufAssets(modelType) ? inventory.hasPrimarySafetensors : inventory.hasSafetensors;
+    if (requiresGgufAssets(modelType) && !hasModelWeights && inventory.targetGgufs.length > 0) {
       if (!(await hasGgufAssets(full))) {
         if (debug)
           console.warn(`[mlx] skip ${full}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`);
@@ -304,7 +310,7 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
       continue;
     }
     const { xlGgufs } = inventory;
-    if (xlGgufs.length > 0 && !(requiresGgufAssets(modelType) && inventory.hasSafetensors)) {
+    if (xlGgufs.length > 0 && !(requiresGgufAssets(modelType) && hasModelWeights)) {
       if (modelType !== 'qwen3_5') {
         if (debug) {
           console.warn(`[mlx] skip ${full}: direct XL GGUF loading is not supported for ${modelType}`);
@@ -320,7 +326,7 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     // Present each supported GGUF variant separately in the picker. Keep
     // converted model directories discoverable when they retain
     // an imatrix/source GGUF beside their actual SafeTensors weights.
-    if (inventory.hasGguf && !inventory.hasSafetensors) {
+    if (inventory.hasGguf && !hasModelWeights) {
       if (debug) console.warn(`[mlx] skip ${full}: no supported direct GGUF target`);
       continue;
     }

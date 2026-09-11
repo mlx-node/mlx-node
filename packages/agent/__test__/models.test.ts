@@ -420,6 +420,30 @@ describe('discoverMlxModels', () => {
     }
   });
 
+  it.each([1, 2])('keeps %i Muse GGUF targets selectable beside companion SafeTensors', async (count) => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-muse-companion-'));
+    try {
+      const repo = join(root, 'muse-gguf');
+      await mkdir(repo);
+      await writeFile(join(repo, 'config.json'), JSON.stringify({ model_type: 'muse_glimmer' }));
+      await writeFile(join(repo, 'tokenizer.json'), '{}');
+      for (const name of ['draft.safetensors', 'vision.safetensors', 'mmproj.safetensors']) {
+        await writeFile(join(repo, name), 'companion');
+      }
+      const targets = ['Muse-Q4_K_XL.gguf', 'Muse-Q6_K.gguf'].slice(0, count).map((name) => join(repo, name));
+      for (const target of targets) await writeFile(target, minimalGguf('muse-glimmer'));
+      expect((await discoverMlxModels(root)).map((entry) => entry.discovered.path)).toEqual(targets);
+
+      for (const primary of ['model.safetensors', 'weights.safetensors', 'model-00001-of-00002.safetensors']) {
+        await writeFile(join(repo, primary), 'primary weights');
+        expect((await discoverMlxModels(root)).map((entry) => entry.discovered.path)).toEqual([repo]);
+        await rm(join(repo, primary));
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(
     ['gemma4', 'muse_glimmer'].flatMap((family) => ['top-level', 'nested'].map((layout) => ({ family, layout }))),
   )('requires sibling config and tokenizer files for $layout $family GGUFs', async ({ family, layout }) => {
