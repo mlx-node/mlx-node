@@ -76,9 +76,9 @@ Archived `gemma4-optimization-2026-09-10/results.json` holds all 18 samples, sou
 
 ## Pinned fixture
 
-[`gemma4-oxc-review-v1`](../../scripts/fixtures/gemma4-oxc-review-v1.json) pins the exact messages, tool definitions, rendered prompts, and token IDs used above. The 362 KB compressed object is stored in the private Cloudflare R2 bucket `mlx-node-benchmarks`, under a versioned key containing the payload SHA-256. The manifest records the object and payload hashes, model/tokenizer identities, protocol, and archived runner identity. Public access is disabled; no completed-object expiration rule is configured. Private messages, outputs, and activations stay outside Git.
+[`gemma4-oxc-review-v1`](../../scripts/fixtures/gemma4-oxc-review-v1.json) pins the exact messages, tool definitions, rendered prompts, and token IDs used above. The 362 KB compressed object is publicly hosted in the Cloudflare R2 bucket `mlx-node-benchmarks`, under a versioned key containing the payload SHA-256. The manifest records its HTTPS URL, object and payload hashes, model/tokenizer identities, protocol, and archived runner identity. No completed-object expiration rule is configured. Fixture payloads live in R2 rather than Git; generated outputs and activations remain local.
 
-With Wrangler authenticated to the account in the manifest, restore and verify the fixture:
+Restore over public HTTPS and verify the fixture without Cloudflare credentials:
 
 ```sh
 oxnode scripts/benchmark-fixture.ts fetch

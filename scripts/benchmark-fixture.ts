@@ -2,7 +2,6 @@
 
 /// <reference types="node" />
 
-import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -24,9 +23,7 @@ interface FixtureCase {
 interface Manifest {
   id: string;
   storage: {
-    accountId: string;
-    bucket: string;
-    key: string;
+    url: string;
     bytes: number;
     sha256: string;
   };
@@ -70,38 +67,32 @@ function verifyPayload(data: Buffer, manifest: Manifest): FixtureCase[] {
 }
 
 async function fetchPayload(manifest: Manifest): Promise<Buffer> {
-  const temporary = await mkdtemp(join(tmpdir(), 'mlx-benchmark-fixture-'));
-  const compressed = join(temporary, 'inputs.json.gz');
-  try {
-    await new Promise<void>((done, reject) => {
-      const child = spawn(
-        'wrangler',
-        ['r2', 'object', 'get', `${manifest.storage.bucket}/${manifest.storage.key}`, '--remote', '--file', compressed],
-        {
-          cwd: temporary,
-          env: {
-            ...process.env,
-            CLOUDFLARE_ACCOUNT_ID: manifest.storage.accountId,
-          },
-          stdio: ['ignore', 'inherit', 'inherit'],
-        },
-      );
-      child.once('error', reject);
-      child.once('exit', (code, signal) => {
-        if (code === 0) done();
-        else reject(new Error(`Wrangler download failed: ${signal ?? code}`));
-      });
-    });
-    const archive = await readFile(compressed);
-    verifyBytes(archive, manifest.storage, 'Downloaded archive');
-    const data = gunzipSync(archive, {
-      maxOutputLength: manifest.payload.bytes,
-    });
-    verifyPayload(data, manifest);
-    return data;
-  } finally {
-    await rm(temporary, { recursive: true, force: true });
+  const url = new URL(manifest.storage.url);
+  if (url.protocol !== 'https:') throw new Error('Fixture URL must use HTTPS');
+  const response = await fetch(url, { signal: AbortSignal.timeout(60_000) });
+  if (!response.ok || !response.body) {
+    await response.body?.cancel();
+    throw new Error(`Fixture download failed: HTTP ${response.status}`);
   }
+  const reader = response.body.getReader();
+  const chunks: Buffer[] = [];
+  let bytes = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytes += value.byteLength;
+      if (bytes > manifest.storage.bytes) throw new Error('Downloaded archive exceeds pinned byte length');
+      chunks.push(Buffer.from(value));
+    }
+  } finally {
+    await reader.cancel();
+  }
+  const archive = Buffer.concat(chunks, bytes);
+  verifyBytes(archive, manifest.storage, 'Downloaded archive');
+  const data = gunzipSync(archive, { maxOutputLength: manifest.payload.bytes });
+  verifyPayload(data, manifest);
+  return data;
 }
 
 async function main() {
@@ -118,7 +109,7 @@ async function main() {
     console.log(
       'Usage: oxnode scripts/benchmark-fixture.ts fetch|verify [--fixture gemma4|qwen38] [--output inputs.json] [--tokenizer tokenizer.json]\n' +
         'The default fixture is gemma4. Qwen verification retains historical reasoning, as its session benchmark did.\n' +
-        'fetch: authenticated R2 download, or verify an existing copy; never overwrite a different fixture.\n' +
+        'fetch: public HTTPS download, or verify an existing copy; never overwrite a different fixture.\n' +
         'verify: offline hashes; optionally check the current native chat template against every pinned token ID.',
     );
     return;

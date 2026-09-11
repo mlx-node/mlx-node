@@ -7,7 +7,8 @@
     "accountId": "6db7cbc0423b5d56af93d13e4e2b469b",
     "bucket": "mlx-node-benchmarks",
     "key": "fixtures/qwen38-oxc-review/v1/c6c1373328614919617deca668fe67301fe0df853f7780143d9690464148bf5b/inputs.json.gz",
-    "access": "private",
+    "access": "public",
+    "url": "https://pub-7dbe2ab7080540a39fad0219f8b247ad.r2.dev/fixtures/qwen38-oxc-review/v1/c6c1373328614919617deca668fe67301fe0df853f7780143d9690464148bf5b/inputs.json.gz",
     "bytes": 192794,
     "sha256": "f6232c9150080cdb18ea077f86078b34c13209f481a2ca4707932a51bcd07c1b"
   },
