@@ -846,6 +846,28 @@ unsafe extern "C-unwind" {
         route_hint: u8,
     ) -> *mut mlx_array;
 
+    /// Per-call grouped partition count, captured in the lazy primitive.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_paged_attention_forward_with_plan(
+        q: *mut mlx_array,
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        block_table: *mut mlx_array,
+        seq_lens: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        scale: f32,
+        softcap: f32,
+        sliding_window: i32,
+        block_size: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+        kv_dtype: u8,
+        route_hint: u8,
+        grouped_stripes: u32,
+    ) -> *mut mlx_array;
+
     /// Emit the MLX C++ `paged_attention_varlen(...)` Custom primitive and
     /// return its lazy on-device output. `q` is flat over all query tokens;
     /// `cu_seqlens_q` maps those rows to the compact per-sequence rows in
@@ -913,6 +935,9 @@ unsafe extern "C-unwind" {
     /// Returns 1 iff `PagedAttention::vjp` throws `std::runtime_error`,
     /// 0 otherwise.
     pub fn mlx_paged_attention_vjp_throws() -> i32;
+
+    /// Compile identity regression for per-call attention partition plans.
+    pub fn mlx_paged_attention_plan_identity_test() -> i32;
 
     /// Compare two `PagedAttention` primitives via `is_equivalent`.
     #[allow(clippy::too_many_arguments)]
@@ -1600,6 +1625,15 @@ unsafe extern "C-unwind" {
     // ============================================
     // Quantized Matmul (for QuantizedLinear)
     // ============================================
+    /// Inference-only Q4/group32 matvec with exact FP16/FP32 sidecars and
+    /// BF16 activations/output. Requires M=1, K divisible by 32, N by 8.
+    pub fn mlx_affine_qmv_bf16(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
     pub fn mlx_quantized_matmul(
         x: *mut mlx_array,
         w: *mut mlx_array,

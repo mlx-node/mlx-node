@@ -345,6 +345,26 @@ split). `--q-mtp split` (alias `drafter`) emits a body checkpoint with **no
 | `--mmproj`         | Vision-encoder conversion path                                                                |
 | `-v`, `--verbose`  | Verbose logging                                                                               |
 
+### Load Gemma 4 GGUF directly
+
+Gemma 4 accepts a `.gguf` file or a directory containing one text GGUF.
+Keep the base model's `config.json` and tokenizer assets beside it. For a
+unified vision/audio checkpoint, also keep its matching `mmproj-*.gguf` there.
+For example, `Gemma4Model.load('.cache/models/gemma-4-12b-it-qat-q4_0-gguf')`
+loads Google's QAT checkpoint without a separate conversion command.
+
+The first load creates an application cache, preserving supported quantized weights
+in packed form and preparing the media companion in the same transaction.
+Supported K formats are Q3_K, Q4_K, Q5_K, and Q6_K.
+Later loads reuse it. `MLX_NATIVE_GGUF_CACHE_DIR` overrides the cache directory;
+source files are not modified. Changes to the source, companion, or tokenizer
+assets invalidate the cache. A directory with multiple text GGUFs requires an
+explicit filename. Existing SafeTensors directories keep their usual load path.
+
+The agent model picker lists Gemma GGUF variants by filename stem and excludes
+media projectors and draft files. The QAT 12B checkpoint mixes Q4_0 projections
+with a Q6_K embedding; both formats retain their source quantization.
+
 ### GGUF → SafeTensors
 
 ```bash
@@ -621,7 +641,7 @@ Almost every flag belongs to pi and is forwarded verbatim; `mlx agent` only hand
 
 ### Model selection and first-run wizard
 
-`mlx agent` discovers local models under the resolved models directory (`--models-dir <dir>`, else `MLX_MODELS_DIR`, else `modelsDir` in `~/.mlx-node/config.json`, else `~/.mlx-node/models`). A dash-leading path must use the `--models-dir=<dir>` form so it is not mistaken for another flag. Dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` targets are also discovered when placed directly in that directory or one level inside a downloaded GGUF repository; each appears under its filename stem. Other GGUF variants and companion files such as imatrix, mmproj, draft, or DFlash2-only checkpoints are not advertised as agent models.
+`mlx agent` discovers local models under the resolved models directory (`--models-dir <dir>`, else `MLX_MODELS_DIR`, else `modelsDir` in `~/.mlx-node/config.json`, else `~/.mlx-node/models`). A dash-leading path must use the `--models-dir=<dir>` form so it is not mistaken for another flag. Dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` targets are also discovered when placed directly in that directory or one level inside a downloaded GGUF repository; each appears under its filename stem. Gemma 4 GGUF variants, including Q4_0 QAT and K-quant targets, are also discovered by filename stem. Companion files such as imatrix, mmproj, draft, or DFlash2-only checkpoints are not advertised as agent models.
 
 Qwen3.8-27B can use the separate [DFlash2 companion](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
 (about 3.85 GB). Install it from the desktop Models page, or download it separately:

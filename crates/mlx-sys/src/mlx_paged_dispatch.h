@@ -145,7 +145,8 @@ void dispatch_paged_attention_auto(
     float softcap,
     int sliding_window,
     KvDtype kv_dtype,
-    PagedAttentionRouteHint route_hint);
+    PagedAttentionRouteHint route_hint,
+    uint32_t grouped_stripes = 0);
 
 /// Ragged-Q dispatcher. Writes `[total_queries, num_q_heads,
 /// head_size]` attention output to `out`. `cu_seqlens_q` carries the

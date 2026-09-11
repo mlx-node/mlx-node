@@ -234,6 +234,7 @@ export const MODEL_FAMILY_DATA = [
   {
     id: 'gemma4',
     kind: 'loadable',
+    ggufArchitectures: ['gemma4'],
     match: {
       rawModelTypes: ['gemma4', 'gemma4_text', 'gemma4_unified'],
       architectureProbe: ({ architectures }) => architectures.has('Gemma4UnifiedForConditionalGeneration'),

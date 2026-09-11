@@ -234,6 +234,7 @@ pub(crate) struct Gemma4Inner {
     /// Sequence selected by the scheduler while model-neutral paged and media
     /// hooks run. Ownerless legacy turns use sequence zero.
     pub(crate) active_paged_seq: u32,
+    decode_tuning: super::decode_tuning::DecodeTuning,
     /// Draft model for speculative decoding (`Gemma4LoadOptions::
     /// draft_model_path`), either [`Gemma4Draft`] variant. An assistant draft's
     /// target caches use a per-owner flat lane; DSpark verifies against the

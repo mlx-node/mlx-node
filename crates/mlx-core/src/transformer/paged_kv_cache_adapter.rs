@@ -187,7 +187,10 @@ pub(crate) fn paged_attention_v2_partition_upper_bound(
     let grouped_gemma4_candidate = head_size == 512
         && layout == PagedAttentionV2Layout::SingleRowBatch
         && num_new_tokens == 1
-        && (num_query_heads, num_kv_heads) == (16, 1)
+        && matches!(
+            (num_query_heads, num_kv_heads),
+            (8, 1) | (16, 1) | (16, 2) | (32, 4)
+        )
         && max_context_len > PAGED_ATTENTION_V2_PARTITION_SIZE as u32;
     let grouped = if grouped_qwen35_candidate {
         Some(match max_context_len {
@@ -1957,6 +1960,7 @@ struct PrefillPagedAttentionInputsCache {
 
 #[cfg(target_os = "macos")]
 struct CompactPrefillInputsCache {
+    first_block: u32,
     token_count: u32,
     required_tokens: u32,
     block_count: u32,
@@ -1977,6 +1981,7 @@ struct VarlenPrefillInputsCache {
 
 #[cfg(target_os = "macos")]
 struct DecodePagedAttentionInputsCache {
+    first_block: u32,
     physical_revision: u64,
     token_count: u32,
     block_count: u32,
@@ -5334,7 +5339,8 @@ impl PagedKVCacheAdapter {
     /// paged attention for the active request.
     /// Always emits `num_seqs = 1`: this helper operates on the selected
     /// request, so the block table contains exactly that sequence and
-    /// `seq_lens[0]` is its recorded token count.
+    /// `seq_lens[0]` is the recorded count relative to the first retained block.
+    /// Sliding groups omit whole blocks before their live window.
     #[cfg(target_os = "macos")]
     fn decode_attention_inputs(&mut self) -> Result<(MxArray, MxArray, u32), String> {
         let block_table = self.block_table.as_ref().ok_or_else(|| {
@@ -5344,11 +5350,25 @@ impl PagedKVCacheAdapter {
         if recorded == 0 {
             return Err("gather_kv_for_decode_graph called before any tokens recorded".to_string());
         }
-        let recorded_i32 = i32::try_from(recorded).map_err(|_| {
+        // Rebase only dispatch metadata. Cache ownership and RoPE positions
+        // stay absolute; the kernel sees at most window + block_size - 1
+        // positions and applies its existing lower mask to the partial page.
+        let first_block = if self.sliding_window == 0 {
+            0
+        } else {
+            recorded.saturating_sub(self.sliding_window) / self.block_size
+        };
+        let visible_tokens = recorded - first_block * self.block_size;
+        let recorded_i32 = i32::try_from(visible_tokens).map_err(|_| {
             format!("gather_kv_for_decode_graph: recorded token count {recorded} exceeds i32::MAX")
         })?;
         let physical_revision = block_table.physical_revision();
-        let block_count = u32::try_from(block_table.num_blocks()).map_err(|_| {
+        let block_count = u32::try_from(
+            block_table
+                .num_blocks()
+                .saturating_sub(first_block as usize),
+        )
+        .map_err(|_| {
             format!(
                 "gather_kv_for_decode_graph: too many blocks for i32 shape: {}",
                 block_table.num_blocks()
@@ -5368,6 +5388,7 @@ impl PagedKVCacheAdapter {
             && cache.token_count == recorded
             && cache.physical_revision == physical_revision
             && cache.block_count == block_count
+            && cache.first_block == first_block
         {
             return Ok((
                 cache.block_table.clone(),
@@ -5379,7 +5400,7 @@ impl PagedKVCacheAdapter {
         let max_seq_len = block_count
             .checked_mul(self.block_size)
             .ok_or_else(|| "gather_kv_for_decode_graph: max seq len overflow".to_string())?;
-        if recorded > max_seq_len {
+        if visible_tokens > max_seq_len {
             return Err(format!(
                 "gather_kv_for_decode_graph: recorded token count {recorded} exceeds \
                  block table capacity {block_count} * {} = {max_seq_len}",
@@ -5394,13 +5415,18 @@ impl PagedKVCacheAdapter {
             .decode_attention_inputs_cache
             .as_ref()
             .filter(|cache| {
-                cache.physical_revision == physical_revision && cache.block_count == block_count
+                cache.physical_revision == physical_revision
+                    && cache.block_count == block_count
+                    && cache.first_block == first_block
             })
             .map(|cache| cache.block_table.clone());
         let (block_table_arr, rebuilt_block_table) = match cached_block_table {
             Some(block_table_arr) => (block_table_arr, false),
             None => {
-                let block_ids = build_decode_block_ids(block_table);
+                let block_ids: Vec<i32> = block_table.blocks()[first_block as usize..]
+                    .iter()
+                    .map(|block| block.block_id as i32)
+                    .collect();
                 debug_assert_eq!(block_ids.len(), block_count as usize);
                 let pool_block_count = self.layer_kv_pool.num_blocks();
                 for (idx, &block_id) in block_ids.iter().enumerate() {
@@ -5429,6 +5455,7 @@ impl PagedKVCacheAdapter {
         }
 
         self.decode_attention_inputs_cache = Some(DecodePagedAttentionInputsCache {
+            first_block,
             physical_revision,
             token_count: recorded,
             block_count,
@@ -5969,6 +5996,19 @@ impl PagedKVCacheAdapter {
         softcap: f32,
         route_hint: PagedDecodeRouteHint,
     ) -> Result<MxArray, String> {
+        self.gather_kv_for_decode_graph_with_plan(layer_idx, queries, scale, softcap, route_hint, 0)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn gather_kv_for_decode_graph_with_plan(
+        &mut self,
+        layer_idx: u32,
+        queries: &MxArray,
+        scale: f32,
+        softcap: f32,
+        route_hint: PagedDecodeRouteHint,
+        grouped_stripes: u32,
+    ) -> Result<MxArray, String> {
         if self.block_table.is_none() {
             return Err(
                 "gather_kv_for_decode_graph called before reset_for_new_request".to_string(),
@@ -6010,7 +6050,7 @@ impl PagedKVCacheAdapter {
         let graph_softcap = if softcap == 1.0 { 0.0 } else { softcap };
 
         let raw = unsafe {
-            mlx_sys::mlx_paged_attention_forward_with_route(
+            mlx_sys::mlx_paged_attention_forward_with_plan(
                 queries.as_raw_ptr(),
                 k_pool.as_raw_ptr(),
                 v_pool.as_raw_ptr(),
@@ -6027,6 +6067,7 @@ impl PagedKVCacheAdapter {
                 self.layer_kv_pool.config().head_size as i32,
                 kv_dtype_raw,
                 route_hint as u8,
+                grouped_stripes,
             )
         };
         if raw.is_null() {
@@ -6218,6 +6259,15 @@ impl PagedKVCacheAdapter {
         &mut self,
         required_tokens: u32,
     ) -> Result<(MxArray, u32), String> {
+        self.compact_prefill_block_ids_from(required_tokens, 0)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn compact_prefill_block_ids_from(
+        &mut self,
+        required_tokens: u32,
+        first_block: u32,
+    ) -> Result<(MxArray, u32), String> {
         if required_tokens == 0 {
             return Err("compact prefill block IDs require at least one token".to_string());
         }
@@ -6240,13 +6290,17 @@ impl PagedKVCacheAdapter {
         if let Some(cache) = self.compact_prefill_inputs_cache.as_ref()
             && cache.token_count == recorded
             && cache.required_tokens == required_tokens
+            && cache.first_block == first_block
         {
             return Ok((cache.block_ids.clone(), cache.block_count));
         }
 
-        let block_ids =
-            build_prefill_block_ids_for_total(block_table, required_tokens, self.block_size)
-                .map_err(|e| format!("compact prefill: {e}"))?;
+        let end_block = required_tokens.div_ceil(self.block_size) as usize;
+        let blocks = block_table
+            .blocks()
+            .get(first_block as usize..end_block)
+            .ok_or_else(|| "compact prefill: block range exceeds recorded capacity".to_string())?;
+        let block_ids: Vec<i32> = blocks.iter().map(|block| block.block_id as i32).collect();
         if block_ids.is_empty() {
             return Err("compact prefill: active request has no allocated blocks".to_string());
         }
@@ -6268,7 +6322,7 @@ impl PagedKVCacheAdapter {
         let capacity = block_count
             .checked_mul(self.block_size)
             .ok_or_else(|| "compact prefill block capacity overflow".to_string())?;
-        if required_tokens > capacity {
+        if required_tokens.saturating_sub(first_block * self.block_size) > capacity {
             return Err(format!(
                 "compact prefill: required token count {required_tokens} exceeds block \
                  table capacity {block_count} * {} = {capacity}",
@@ -6281,6 +6335,7 @@ impl PagedKVCacheAdapter {
         MxArray::eval_arrays(&[&block_ids_arr])
             .map_err(|e| format!("compact prefill block ID eval: {e}"))?;
         self.compact_prefill_inputs_cache = Some(CompactPrefillInputsCache {
+            first_block,
             token_count: recorded,
             required_tokens,
             block_count,
@@ -6572,12 +6627,64 @@ impl PagedKVCacheAdapter {
         Ok((keys, values, window))
     }
 
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn gather_kv_for_windowed_prefill(
+        &mut self,
+        _layer_idx: u32,
+        _total_context: u32,
+        _query_len: u32,
+    ) -> Result<(MxArray, MxArray, DenseAttentionWindow, u32), String> {
+        Err("windowed paged prefill requires Metal".to_string())
+    }
+
+    /// Gather a window-plus-chunk span, retaining one masked boundary key so
+    /// the usual 1024-token window plus 512-token chunk stays tile-aligned.
+    /// The existing mask excludes that extra key. Subtract the returned origin
+    /// from the causal-mask offset, never from RoPE or the cache cursor.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn gather_kv_for_windowed_prefill(
+        &mut self,
+        layer_idx: u32,
+        total_context: u32,
+        query_len: u32,
+    ) -> Result<(MxArray, MxArray, DenseAttentionWindow, u32), String> {
+        if query_len == 0 || query_len > total_context {
+            return Err("windowed prefill requires 0 < query_len <= context".to_string());
+        }
+        let first_token = if self.sliding_window == 0 {
+            0
+        } else {
+            (total_context - query_len).saturating_sub(self.sliding_window)
+        };
+        let (keys, values) = self.gather_kv_dense_range(layer_idx, first_token, total_context)?;
+        Ok((
+            keys,
+            values,
+            DenseAttentionWindow(self.sliding_window),
+            first_token,
+        ))
+    }
+
     #[cfg(target_os = "macos")]
     fn gather_kv_dense_unchecked(
         &mut self,
         layer_idx: u32,
         total_context: u32,
     ) -> Result<(MxArray, MxArray), String> {
+        self.gather_kv_dense_range(layer_idx, 0, total_context)
+    }
+
+    /// Gather a bounded logical range while retaining graph-native pool writes.
+    #[cfg(target_os = "macos")]
+    fn gather_kv_dense_range(
+        &mut self,
+        layer_idx: u32,
+        first_token: u32,
+        total_context: u32,
+    ) -> Result<(MxArray, MxArray), String> {
+        if first_token >= total_context {
+            return Err("dense K/V range must contain at least one token".to_string());
+        }
         if (layer_idx as usize) >= self.layer_kv_pool.num_layers() {
             return Err(format!(
                 "gather_kv_for_prefill_sdpa: layer_idx {layer_idx} out of range \
@@ -6610,7 +6717,11 @@ impl PagedKVCacheAdapter {
             ));
         }
 
-        let (block_ids, block_count) = self.compact_prefill_block_ids(total_context)?;
+        let first_block = first_token / self.block_size;
+        let local_start = (first_token % self.block_size) as i64;
+        let local_end = (total_context - first_block * self.block_size) as i64;
+        let (block_ids, block_count) =
+            self.compact_prefill_block_ids_from(total_context, first_block)?;
         let padded_tokens = block_count
             .checked_mul(self.block_size)
             .ok_or_else(|| "gather_kv_for_prefill_sdpa: padded token count overflow".to_string())?;
@@ -6630,13 +6741,8 @@ impl PagedKVCacheAdapter {
             ])
             .map_err(|e| format!("gather_kv_for_prefill_sdpa: K reshape failed: {e}"))?
             .slice(
-                &[0, 0, 0, 0],
-                &[
-                    1,
-                    num_kv_heads as i64,
-                    total_context as i64,
-                    head_size as i64,
-                ],
+                &[0, 0, local_start, 0],
+                &[1, num_kv_heads as i64, local_end, head_size as i64],
             )
             .map_err(|e| format!("gather_kv_for_prefill_sdpa: K slice failed: {e}"))?
             .copy()
@@ -6656,13 +6762,8 @@ impl PagedKVCacheAdapter {
             ])
             .map_err(|e| format!("gather_kv_for_prefill_sdpa: V reshape failed: {e}"))?
             .slice(
-                &[0, 0, 0, 0],
-                &[
-                    1,
-                    num_kv_heads as i64,
-                    total_context as i64,
-                    head_size as i64,
-                ],
+                &[0, 0, local_start, 0],
+                &[1, num_kv_heads as i64, local_end, head_size as i64],
             )
             .map_err(|e| format!("gather_kv_for_prefill_sdpa: V slice failed: {e}"))?
             .copy()
@@ -6995,6 +7096,19 @@ impl PagedKVCacheAdapter {
         _scale: f32,
         _softcap: f32,
         _route_hint: PagedDecodeRouteHint,
+    ) -> Result<MxArray, String> {
+        Err("gather_kv_for_decode_graph is only supported on macOS (Metal backend)".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub(crate) fn gather_kv_for_decode_graph_with_plan(
+        &mut self,
+        _layer_idx: u32,
+        _queries: &MxArray,
+        _scale: f32,
+        _softcap: f32,
+        _route_hint: PagedDecodeRouteHint,
+        _grouped_stripes: u32,
     ) -> Result<MxArray, String> {
         Err("gather_kv_for_decode_graph is only supported on macOS (Metal backend)".to_string())
     }
@@ -9347,7 +9461,7 @@ mod tests {
             "Gemma grouped decode is single-row only"
         );
         assert_eq!(
-            bound(PagedAttentionV2Layout::SingleRowBatch, 1, 16, 2, 3_458, 512),
+            bound(PagedAttentionV2Layout::SingleRowBatch, 1, 8, 2, 3_458, 512),
             7,
             "nearby head shapes retain the generic bound"
         );
@@ -15278,6 +15392,218 @@ mod tests {
         (0..FIX_CHUNK_LEN as usize)
             .map(|t| values[t * FIX_HEAD_SIZE as usize])
             .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn per_call_grouped_stripes_preserve_attention_and_cache() {
+        assert_eq!(
+            unsafe { mlx_sys::mlx_paged_attention_plan_identity_test() },
+            1
+        );
+        use mlx_paged_attn::metal::MetalDtype;
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        for (q_heads, kv_heads) in [(8, 1), (16, 1), (16, 2), (32, 4)] {
+            let config = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 16,
+                num_kv_heads: kv_heads,
+                head_size: 512,
+                num_layers: 1,
+                gpu_memory_mb: 256,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(1024),
+                max_batch_size: Some(1),
+            };
+            let pool = Arc::new(
+                mlx_paged_attn::LayerKVPool::new(config, 64, 64, MetalDtype::BFloat16).unwrap(),
+            );
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(64, 64, 16)));
+            let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 16).unwrap();
+            if !adapter
+                .grouped_d512_decode_capability(DType::BFloat16, q_heads)
+                .unwrap()
+            {
+                continue;
+            }
+            adapter.reset_for_new_request(7).unwrap();
+            // Partial final page and nonuniform scores/values exercise stripe
+            // reduction, masking, and per-KV-head addressing independently.
+            let n = 529;
+            adapter.record_tokens(&(0..n).collect::<Vec<_>>()).unwrap();
+            let len = (n * kv_heads * 512) as usize;
+            let k = MxArray::from_float32(
+                &(0..len)
+                    .map(|i| (i as f32 * 0.017).sin())
+                    .collect::<Vec<_>>(),
+                &[n as i64, kv_heads as i64, 512],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let v = MxArray::from_float32(
+                &(0..len)
+                    .map(|i| (i as f32 * 0.013).cos())
+                    .collect::<Vec<_>>(),
+                &[n as i64, kv_heads as i64, 512],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            k.eval();
+            v.eval();
+            adapter.update_keys_values(0, &k, &v, 0).unwrap();
+            let q = MxArray::from_float32(
+                &(0..q_heads * 512)
+                    .map(|i| (i as f32 * 0.021).cos())
+                    .collect::<Vec<_>>(),
+                &[1, q_heads as i64, 512],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let reference = adapter
+                .gather_kv_for_decode_graph_with_plan(
+                    0,
+                    &q,
+                    0.04,
+                    0.0,
+                    PagedDecodeRouteHint::ForceGeneric,
+                    0,
+                )
+                .unwrap()
+                .to_float32()
+                .unwrap();
+            for stripes in [4, 8, 16, 32, 64, 128, 256] {
+                let result = adapter
+                    .gather_kv_for_decode_graph_with_plan(
+                        0,
+                        &q,
+                        0.04,
+                        0.0,
+                        PagedDecodeRouteHint::ForceD512Staged,
+                        stripes,
+                    )
+                    .unwrap()
+                    .to_float32()
+                    .unwrap();
+                for (&got, &expected) in result.iter().zip(reference.iter()) {
+                    assert!(
+                        got.is_finite() && (got - expected).abs() < 0.002,
+                        "Hq={q_heads} Hkv={kv_heads} stripes={stripes}: {got} != {expected}"
+                    );
+                }
+                assert_eq!(adapter.current_token_count(), n);
+            }
+            assert!(
+                adapter
+                    .gather_kv_for_decode_graph_with_plan(
+                        0,
+                        &q,
+                        0.04,
+                        0.0,
+                        PagedDecodeRouteHint::ForceD512Staged,
+                        3
+                    )
+                    .is_err()
+            );
+            assert!(
+                adapter
+                    .gather_kv_for_decode_graph_with_plan(
+                        0,
+                        &q,
+                        0.04,
+                        0.0,
+                        PagedDecodeRouteHint::ForceGeneric,
+                        32
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    /// Exercise compact GPU reads at aligned, partial-page, one-token and
+    /// nonbinding windows. Absolute cache positions must survive rebasing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sliding_window_compact_reads_preserve_prefill_and_decode_positions() {
+        for window in [0, 1, 16, 17, 64] {
+            let Some(fixture) = build_sliding_prefill_fixture(window).expect("fixture") else {
+                return;
+            };
+            let mut adapter = fixture.adapter;
+            let (keys, values, dense_window, origin) = adapter
+                .gather_kv_for_windowed_prefill(0, FIX_TOTAL, FIX_CHUNK_LEN)
+                .expect("compact gather");
+            let expected_origin = if window == 0 {
+                0
+            } else {
+                FIX_PREFIX_LEN.saturating_sub(window)
+            };
+            assert_eq!(origin, expected_origin);
+            assert_eq!(keys.shape_at(2).unwrap(), (FIX_TOTAL - origin) as i64);
+            let q = MxArray::zeros(
+                &[1, FIX_NUM_Q_HEADS, FIX_CHUNK_LEN as i64, FIX_HEAD_SIZE],
+                Some(DType::Float16),
+            )
+            .unwrap();
+            let mask = crate::array::mask::create_causal_mask(
+                FIX_CHUNK_LEN as i32,
+                Some((FIX_PREFIX_LEN - origin) as i32),
+                dense_window.is_windowed().then_some(window as i32),
+            )
+            .unwrap();
+            let out = crate::array::attention::scaled_dot_product_attention(
+                &q,
+                &keys,
+                &values,
+                1.0,
+                Some(&mask),
+            )
+            .unwrap();
+            for (got, expected) in read_bhtd_head0(&out).iter().zip(windowed_reference(window)) {
+                assert!(
+                    (got - expected).abs() < 0.05,
+                    "window {window}: {got} != {expected}"
+                );
+            }
+
+            adapter.prune_sliding_window_for(7).unwrap();
+            let (table, lens, count) = adapter.decode_attention_inputs().unwrap();
+            let first_block = if window == 0 {
+                0
+            } else {
+                FIX_TOTAL.saturating_sub(window) / FIX_BLOCK_SIZE
+            };
+            let visible = FIX_TOTAL - first_block * FIX_BLOCK_SIZE;
+            assert_eq!(lens.to_int32().unwrap().to_vec(), vec![visible as i32]);
+            assert_eq!(count, visible.div_ceil(FIX_BLOCK_SIZE));
+            assert_eq!(table.shape_at(1).unwrap(), count as i64);
+            let (_, cached_lens, cached_count) = adapter.decode_attention_inputs().unwrap();
+            assert_eq!(
+                cached_lens.to_int32().unwrap().to_vec(),
+                vec![visible as i32]
+            );
+            assert_eq!(cached_count, count);
+            assert_eq!(adapter.current_token_count(), FIX_TOTAL);
+
+            let q =
+                MxArray::zeros(&[1, FIX_NUM_Q_HEADS, FIX_HEAD_SIZE], Some(DType::Float16)).unwrap();
+            let decoded = adapter.gather_kv_for_decode_graph(0, &q, 1.0, 0.0).unwrap();
+            let lower = if window == 0 {
+                0
+            } else {
+                FIX_TOTAL.saturating_sub(window)
+            };
+            let expected = (lower + 1 + FIX_TOTAL) as f32 / 2.0;
+            for &value in decoded.to_float32().unwrap().iter() {
+                assert!(
+                    (value - expected).abs() < 0.05,
+                    "window {window}: {value} != {expected}"
+                );
+            }
+        }
     }
 
     /// The two DENSE cache-hit prefill routes must respect the window.

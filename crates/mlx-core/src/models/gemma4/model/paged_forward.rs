@@ -2,6 +2,30 @@
 
 use super::*;
 
+/// Submit a ready prefix while the host builds later layers. The depth is
+/// learned from completed tokens; overrides are reserved for diagnostics.
+fn decode_early_eval_layers() -> usize {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::var("MLX_GEMMA4_DECODE_EARLY_EVAL_LAYERS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or_else(|| {
+            super::super::decode_tuning::current_plan().map_or(0, |plan| plan.early_layers)
+        })
+}
+
+fn maybe_submit_decode_layer(layer: usize, layers: usize, early: usize, hidden: &MxArray) {
+    if layer < early
+        && layer + 1 < layers
+        && crate::engine::persistence::compiled_forward_backend_available()
+    {
+        MxArray::async_eval_arrays(&[hidden]);
+    }
+}
+
 impl Gemma4Inner {
     pub(super) fn prepare_gemma4_paged_turn(
         &mut self,
@@ -1049,6 +1073,7 @@ impl Gemma4Inner {
         };
 
         let num_layers = self.layers.len();
+        let early_eval_layers = decode_early_eval_layers();
         crate::models::gemma4::diagnostic::set_path("paged");
         #[allow(clippy::needless_range_loop)]
         for layer_idx in 0..num_layers {
@@ -1106,6 +1131,7 @@ impl Gemma4Inner {
                 false,
                 shared_inputs,
             )?;
+            maybe_submit_decode_layer(layer_idx, num_layers, early_eval_layers, &hidden_states);
         }
 
         hidden_states = self.final_norm.forward(&hidden_states)?;

@@ -4,6 +4,7 @@ pub mod attention;
 pub mod audio_processor;
 pub mod clippable_linear;
 pub mod config;
+mod decode_tuning;
 pub mod decoder_layer;
 pub(crate) mod diagnostic;
 pub(crate) mod dspark;

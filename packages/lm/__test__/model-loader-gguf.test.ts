@@ -83,6 +83,11 @@ describe('standalone GGUF model detection', () => {
     await expect(detectModelType(modelPath)).resolves.toBe('qwen3_5');
   });
 
+  it('recognizes a Gemma4 GGUF file without guessing from its filename', async () => {
+    const { modelPath } = await writeStandaloneGguf('gemma4');
+    await expect(detectModelType(modelPath)).resolves.toBe('gemma4');
+  });
+
   it('keeps an existing sibling config.json authoritative', async () => {
     const { root, modelPath } = await writeStandaloneGguf('qwen35');
     await writeFile(join(root, 'config.json'), JSON.stringify({ model_type: 'qwen3' }), 'utf8');

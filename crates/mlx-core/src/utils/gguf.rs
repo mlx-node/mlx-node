@@ -4331,6 +4331,25 @@ pub async fn convert_gguf_to_safetensors(
         // source and keeps it — writing over an explicit statement would make
         // `--config-dir` unable to correct a mislabelled checkpoint.
         if is_gemma4_main_gguf(&gguf.metadata) {
+            // An explicit conversion dtype is the text tensor contract, not
+            // an inference from a multimodal top-level config. Record it where
+            // Gemma's loader can safely enable affine sidecar hoisting.
+            if let Some(dtype) = options.dtype.as_deref()
+                && let Some(text) = config_json
+                    .get_mut("text_config")
+                    .and_then(serde_json::Value::as_object_mut)
+            {
+                let dtype = match dtype {
+                    "bf16" => "bfloat16",
+                    "f16" => "float16",
+                    "f32" => "float32",
+                    dtype => dtype,
+                };
+                text.insert(
+                    "dtype".to_string(),
+                    serde_json::Value::String(dtype.to_string()),
+                );
+            }
             if let Some(types) = &gemma4_layer_types {
                 if !gemma4_config_states(&config_json, "attention_k_eq_v") {
                     config_json["attention_k_eq_v"] = serde_json::Value::Bool(true);
@@ -4675,6 +4694,140 @@ fn qwen35_native_cache_is_current(
     })
 }
 
+/// Resolve a Gemma GGUF directory without overriding an existing SafeTensors
+/// checkpoint. Multiple targets require an explicit filename.
+pub(crate) fn resolve_gemma4_gguf_source(path: &Path) -> Result<Option<PathBuf>> {
+    let is_gguf = |p: &Path| {
+        p.extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(|s| s.eq_ignore_ascii_case("gguf"))
+    };
+    if !path.is_dir() {
+        return Ok(is_gguf(path).then(|| path.to_path_buf()));
+    }
+    let entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+    if entries.iter().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        matches!(
+            name.as_ref(),
+            "model.safetensors" | "weights.safetensors" | "model.safetensors.index.json"
+        ) || (name.starts_with("model-") && name.ends_with(".safetensors"))
+    }) {
+        return Ok(None);
+    }
+    let mut targets = Vec::new();
+    for entry in entries {
+        let candidate = entry.path();
+        if candidate.is_file()
+            && is_gguf(&candidate)
+            && is_gemma4_main_gguf(&parse_gguf(&candidate)?.metadata)
+        {
+            targets.push(candidate);
+        }
+    }
+    targets.sort();
+    match targets.len() {
+        0 => Ok(None),
+        1 => Ok(targets.pop()),
+        _ => Err(Error::from_reason(format!(
+            "Multiple Gemma4 GGUF targets in '{}'; pass the desired .gguf file explicitly",
+            path.display()
+        ))),
+    }
+}
+
+fn gemma4_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
+    let parent = input.parent().unwrap_or(Path::new("."));
+    let exact = parent.join(format!(
+        "mmproj-{}",
+        input.file_name().unwrap().to_string_lossy()
+    ));
+    if exact.is_file() {
+        if !is_gemma4_mmproj_gguf(&parse_gguf(&exact)?.metadata) {
+            return Err(Error::from_reason(format!(
+                "Matching media companion '{}' is not a Gemma4 projector",
+                exact.display()
+            )));
+        }
+        return Ok(Some(exact));
+    }
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let path = entry?.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if path.is_file()
+            && name.starts_with("mmproj-")
+            && name.to_ascii_lowercase().ends_with(".gguf")
+        {
+            if !is_gemma4_mmproj_gguf(&parse_gguf(&path)?.metadata) {
+                continue;
+            }
+            candidates.push(path);
+        }
+    }
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.pop()),
+        _ => Err(Error::from_reason(format!(
+            "Ambiguous Gemma4 media projectors beside '{}'; name the matching companion '{}'",
+            input.display(),
+            exact.display()
+        ))),
+    }
+}
+
+/// Prepare a complete, losslessly packed Gemma checkpoint in the application
+/// cache. The source directory remains read-only; the matching unified media
+/// projector is converted in the same transaction as the text model.
+pub(crate) async fn prepare_gemma4_native_gguf(input: &Path) -> Result<PathBuf> {
+    let root = qwen35_native_cache_root()?;
+    prepare_gemma4_native_gguf_in(input, &root).await
+}
+
+async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<PathBuf> {
+    let input = input.canonicalize()?;
+    let header = parse_gguf(&input)?;
+    if !is_gemma4_main_gguf(&header.metadata) {
+        return Err(Error::from_reason(
+            "Gemma4Model.load requires a Gemma4 text GGUF, not a media projector or another architecture",
+        ));
+    }
+    let parent = input.parent().unwrap();
+    for asset in ["config.json", "tokenizer.json"] {
+        if !parent.join(asset).is_file() {
+            return Err(Error::from_reason(format!(
+                "Native Gemma4 GGUF loading requires {asset} beside '{}'; use the base model's config and tokenizer assets",
+                input.display()
+            )));
+        }
+    }
+    let needs_media = crate::models::gemma4::persistence::native_gguf_requires_media(parent)?;
+    let companion = if needs_media {
+        gemma4_native_mmproj(&input)?
+    } else {
+        None
+    };
+    if needs_media && companion.is_none() {
+        return Err(Error::from_reason(format!(
+            "Gemma4 config declares media inputs but no matching mmproj GGUF was found beside '{}'",
+            input.display()
+        )));
+    }
+    let root = initialize_qwen35_native_cache_root(root)?;
+    prepare_native_gguf_inner(&input, &root, false, companion.as_deref()).await
+}
+
+fn native_gguf_companion_digest(companion: Option<&Path>) -> Result<String> {
+    companion
+        .map(|path| {
+            fs::metadata(path).map(|metadata| qwen35_native_source_identity_digest(path, &metadata))
+        })
+        .transpose()
+        .map(|digest| digest.unwrap_or_else(|| "none".to_string()))
+        .map_err(Into::into)
+}
+
 pub async fn prepare_qwen35_native_gguf(input_path: &Path) -> Result<PathBuf> {
     let cache_root = qwen35_native_cache_root()?;
     prepare_qwen35_native_gguf_inner(input_path, &cache_root).await
@@ -4692,6 +4845,15 @@ async fn prepare_qwen35_native_gguf_in(input_path: &Path, cache_root: &Path) -> 
 }
 
 async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) -> Result<PathBuf> {
+    prepare_native_gguf_inner(input_path, cache_root, true, None).await
+}
+
+async fn prepare_native_gguf_inner(
+    input_path: &Path,
+    cache_root: &Path,
+    native_qwen35_layout: bool,
+    companion: Option<&Path>,
+) -> Result<PathBuf> {
     let input_path = input_path.canonicalize().map_err(|error| {
         Error::from_reason(format!(
             "Failed to canonicalize GGUF path '{}': {error}",
@@ -4727,8 +4889,25 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
     let parent = input_path.parent().unwrap_or(Path::new("."));
     let source_identity_digest = qwen35_native_source_identity_digest(&input_path, &metadata);
     let asset_digest = qwen35_native_asset_digest(parent)?;
+    let companion_digest = native_gguf_companion_digest(companion)?;
+    let layout = if native_qwen35_layout {
+        "tiled"
+    } else {
+        "gemma4-text-dtype-v2"
+    };
+    // Bound the filename even when the main and companion both have long
+    // names/identities. Keep the two source fingerprints in the marker too.
+    let preparation_digest = if native_qwen35_layout {
+        // Preserve existing Qwen cache keys and avoid an unrelated reimport.
+        asset_digest.clone()
+    } else {
+        Sha256::digest(format!("{asset_digest}:{layout}:{companion_digest}"))
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    };
     let cache_key = format!(
-        "{stem}-{}-{modified}-v{QWEN35_NATIVE_CACHE_FORMAT}-{source_identity_digest}-{asset_digest}",
+        "{stem}-{}-{modified}-v{QWEN35_NATIVE_CACHE_FORMAT}-{source_identity_digest}-{preparation_digest}",
         metadata.len(),
     );
     let output_dir = cache_root.join(&cache_key);
@@ -4757,9 +4936,11 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
             })?;
 
     let locked_asset_digest = qwen35_native_asset_digest(parent)?;
-    if locked_asset_digest != asset_digest {
+    if locked_asset_digest != asset_digest
+        || native_gguf_companion_digest(companion)? != companion_digest
+    {
         return Err(Error::from_reason(
-            "Qwen3.5 sibling config/tokenizer assets changed while acquiring the native GGUF \
+            "GGUF sibling config/tokenizer assets changed while acquiring the native GGUF \
              cache lock; retry the load"
                 .to_string(),
         ));
@@ -4773,11 +4954,12 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
     if qwen35_native_source_identity_digest(&input_path, &locked_metadata) != source_identity_digest
     {
         return Err(Error::from_reason(
-            "Qwen3.5 GGUF source changed while acquiring the native cache lock; retry the load"
-                .to_string(),
+            "GGUF source changed while acquiring the native cache lock; retry the load".to_string(),
         ));
     }
-    if qwen35_native_cache_is_current(&output_dir, &source_identity_digest, &asset_digest) {
+    if qwen35_native_cache_is_current(&output_dir, &source_identity_digest, &asset_digest)
+        && (companion.is_none() || output_dir.join("vision.safetensors").is_file())
+    {
         return Ok(output_dir);
     }
 
@@ -4808,12 +4990,38 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
         vlm_key_prefix: None,
         quant_mxfp: None,
         import_k_quants: Some(true),
-        native_qwen35_layout: Some(true),
+        native_qwen35_layout: Some(native_qwen35_layout),
     })
     .await;
     if let Err(error) = conversion {
         fs::remove_dir_all(&staging_dir).ok();
         return Err(error);
+    }
+
+    if let Some(companion) = companion {
+        let result = convert_gguf_to_safetensors(GgufConversionOptions {
+            input_path: companion.to_string_lossy().into_owned(),
+            output_dir: staging_dir.to_string_lossy().into_owned(),
+            config_source_dir: Some(parent.to_string_lossy().into_owned()),
+            dtype: Some("bfloat16".to_string()),
+            verbose: Some(true),
+            quantize: Some(false),
+            quant_bits: None,
+            quant_group_size: None,
+            quant_mode: None,
+            quant_recipe: None,
+            imatrix_path: None,
+            output_filename: Some("vision.safetensors".to_string()),
+            vlm_key_prefix: None,
+            quant_mxfp: None,
+            import_k_quants: Some(true),
+            native_qwen35_layout: None,
+        })
+        .await;
+        if let Err(error) = result {
+            fs::remove_dir_all(&staging_dir).ok();
+            return Err(error);
+        }
     }
 
     let final_asset_digest = match qwen35_native_asset_digest(parent) {
@@ -4823,10 +5031,12 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
             return Err(error);
         }
     };
-    if final_asset_digest != asset_digest {
+    if final_asset_digest != asset_digest
+        || native_gguf_companion_digest(companion).as_ref().ok() != Some(&companion_digest)
+    {
         fs::remove_dir_all(&staging_dir).ok();
         return Err(Error::from_reason(
-            "Qwen3.5 sibling config/tokenizer assets changed during native GGUF preparation; \
+            "GGUF sibling config/tokenizer assets changed during native GGUF preparation; \
              discarded the staged cache, retry the load"
                 .to_string(),
         ));
@@ -4845,7 +5055,7 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
     {
         fs::remove_dir_all(&staging_dir).ok();
         return Err(Error::from_reason(
-            "Qwen3.5 GGUF source changed during native preparation; discarded the staged cache, \
+            "GGUF source changed during native preparation; discarded the staged cache, \
              retry the load"
                 .to_string(),
         ));
@@ -4854,7 +5064,7 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
     if let Err(error) = fs::write(
         marker,
         format!(
-            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout=tiled\ndtype=bf16\n",
+            "format={QWEN35_NATIVE_CACHE_FORMAT}\nsource={}\nsource_identity_sha256={}\nsize={}\nmodified_ns={}\nassets_sha256={}\nlayout={layout}\ncompanion_sha256={companion_digest}\ndtype=bf16\n",
             input_path.display(),
             source_identity_digest,
             metadata.len(),
@@ -4898,6 +5108,320 @@ async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) 
 mod tests {
     use super::*;
     use crate::utils::gguf_kquant::{QK_K, repack_kquant};
+
+    struct GemmaNativeTestDir(PathBuf);
+
+    impl GemmaNativeTestDir {
+        fn new() -> Self {
+            let path =
+                std::env::temp_dir().join(format!("mlx-gemma-native-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for GemmaNativeTestDir {
+        fn drop(&mut self) {
+            fs::remove_dir_all(&self.0).ok();
+        }
+    }
+
+    fn gemma_native_fixture(source: &Path) -> PathBuf {
+        fs::create_dir_all(source).unwrap();
+        fs::write(source.join("config.json"), r#"{"model_type":"gemma4_unified","text_config":{"num_hidden_layers":0},"vision_config":{}}"#).unwrap();
+        fs::write(source.join("tokenizer.json"), "{}").unwrap();
+        let input = source.join("gemma-with-a-long-enough-name-to-exercise-cache-key-length.gguf");
+        fs::write(
+            &input,
+            build_minimal_gguf(
+                &[(
+                    "general.architecture",
+                    GgufMetaValue::String("gemma4".into()),
+                )],
+                &[
+                    (
+                        "token_embd.weight",
+                        &[256, 2],
+                        GgufTensorType::Q6K,
+                        &[0; 420],
+                    ),
+                    ("output.weight", &[256, 2], GgufTensorType::Q4_0, &[0; 288]),
+                ],
+            ),
+        )
+        .unwrap();
+        fs::write(
+            source.join("mmproj-gemma.gguf"),
+            build_minimal_gguf(
+                &[
+                    ("general.architecture", GgufMetaValue::String("clip".into())),
+                    (
+                        "clip.vision.projector_type",
+                        GgufMetaValue::String("gemma4uv".into()),
+                    ),
+                ],
+                &[(
+                    "mm.input_projection.weight",
+                    &[2, 2],
+                    GgufTensorType::BF16,
+                    &[0; 8],
+                )],
+            ),
+        )
+        .unwrap();
+        input
+    }
+
+    #[test]
+    fn gemma_native_directory_resolution_is_unambiguous_and_preserves_safetensors() {
+        let root = GemmaNativeTestDir::new();
+        let input = gemma_native_fixture(root.path());
+        assert_eq!(
+            resolve_gemma4_gguf_source(root.path()).unwrap(),
+            Some(input.clone())
+        );
+        assert_eq!(
+            resolve_gemma4_gguf_source(&input).unwrap(),
+            Some(input.clone())
+        );
+        let second = root.path().join("another.gguf");
+        fs::copy(&input, &second).unwrap();
+        assert!(
+            resolve_gemma4_gguf_source(root.path())
+                .unwrap_err()
+                .reason
+                .contains("Multiple Gemma4")
+        );
+        fs::write(root.path().join("model.safetensors"), []).unwrap();
+        assert!(resolve_gemma4_gguf_source(root.path()).unwrap().is_none());
+        // Explicit GGUF paths remain usable next to an existing conversion.
+        assert_eq!(resolve_gemma4_gguf_source(&input).unwrap(), Some(input));
+    }
+
+    #[test]
+    fn gemma_native_projector_selection_prefers_exact_match_and_rejects_ambiguity() {
+        let root = GemmaNativeTestDir::new();
+        let input = gemma_native_fixture(root.path());
+        let first = root.path().join("mmproj-gemma.gguf");
+        assert_eq!(gemma4_native_mmproj(&input).unwrap(), Some(first.clone()));
+        fs::copy(&first, root.path().join("mmproj-other.gguf")).unwrap();
+        assert!(
+            gemma4_native_mmproj(&input)
+                .unwrap_err()
+                .reason
+                .contains("Ambiguous")
+        );
+        let exact = root.path().join(format!(
+            "mmproj-{}",
+            input.file_name().unwrap().to_string_lossy()
+        ));
+        fs::copy(first, &exact).unwrap();
+        assert_eq!(gemma4_native_mmproj(&input).unwrap(), Some(exact));
+    }
+
+    #[tokio::test]
+    async fn gemma_native_cache_keeps_mixed_packs_and_tracks_media_and_assets() {
+        let root = GemmaNativeTestDir::new();
+        let source = root.path().join("source");
+        let input = gemma_native_fixture(&source);
+        let original = fs::read(&input).unwrap();
+        let cache = root.path().join("cache");
+        let output = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
+        let params =
+            crate::utils::safetensors::load_safetensors_lazy(output.join("model.safetensors"))
+                .unwrap();
+        assert_eq!(
+            params["model.embed_tokens.weight"].dtype().unwrap(),
+            DType::Uint32
+        );
+        assert_eq!(
+            params["model.embed_tokens.scales"].dtype().unwrap(),
+            DType::Int8
+        );
+        assert_eq!(
+            params["model.embed_tokens.biases"].dtype().unwrap(),
+            DType::Float16
+        );
+        assert_eq!(params["lm_head.weight"].dtype().unwrap(), DType::Uint32);
+        assert!(!params.contains_key("lm_head.biases"));
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
+        assert_eq!(
+            config["quantization"]["language_model.model.embed_tokens"]["mode"],
+            "q6k"
+        );
+        assert_eq!(
+            config["quantization"]["language_model.model.lm_head"]["symmetric_zero_point"],
+            8
+        );
+        assert!(config.get("qwen35_gguf_gdn_layout").is_none());
+        assert_eq!(config["text_config"]["dtype"], "bfloat16");
+        let media =
+            crate::utils::safetensors::load_safetensors_lazy(output.join("vision.safetensors"))
+                .unwrap();
+        assert!(media.contains_key("model.embed_vision.embedding_projection.weight"));
+        assert_eq!(fs::read(&input).unwrap(), original);
+        assert!(!source.join("model.safetensors").exists());
+        assert_eq!(
+            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            output
+        );
+        fs::remove_file(output.join("vision.safetensors")).unwrap();
+        assert_eq!(
+            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            output
+        );
+        assert!(output.join("vision.safetensors").is_file());
+        // Same-length media mutation invalidates the cache by source identity.
+        let companion = source.join("mmproj-gemma.gguf");
+        let mut bytes = fs::read(&companion).unwrap();
+        *bytes.last_mut().unwrap() = 1;
+        fs::write(&companion, bytes).unwrap();
+        let changed = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
+        assert_ne!(changed, output);
+        fs::write(source.join("tokenizer.json"), "[]").unwrap();
+        assert_ne!(
+            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            changed
+        );
+    }
+
+    #[tokio::test]
+    async fn gemma_native_configs_without_unified_media_do_not_require_companion() {
+        let root = GemmaNativeTestDir::new();
+        for (index, mut config) in [
+            // E2B's legacy mel settings must not enable unified audio.
+            serde_json::json!({
+                "model_type": "gemma4",
+                "audio_config": {"model_type": "gemma4_unified_audio", "audio_embed_dim": 1536}
+            }),
+            serde_json::json!({"model_type": "gemma4", "audio_config": null}),
+            // Plain Gemma's SigLIP tower belongs to the main checkpoint.
+            serde_json::json!({"model_type": "gemma4", "vision_config": {}}),
+            serde_json::json!({"model_type": "gemma4_unified", "audio_config": null}),
+            serde_json::json!({"architectures": ["Gemma4UnifiedForConditionalGeneration"]}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = root.path().join(format!("source-{index}"));
+            let input = gemma_native_fixture(&source);
+            fs::remove_file(source.join("mmproj-gemma.gguf")).unwrap();
+            config["text_config"] = serde_json::json!({"num_hidden_layers": 0});
+            fs::write(source.join("config.json"), config.to_string()).unwrap();
+            let cache = root.path().join(format!("cache-{index}"));
+            let output = prepare_gemma4_native_gguf_in(&input, &cache)
+                .await
+                .unwrap_or_else(|error| panic!("config {config}: {error}"));
+            assert!(output.join("model.safetensors").is_file());
+            assert!(!output.join("vision.safetensors").exists());
+            assert_eq!(
+                prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+                output
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn gemma_native_ignores_unused_projectors_for_plain_and_text_only_unified_configs() {
+        let root = GemmaNativeTestDir::new();
+        for (index, mut config) in [
+            serde_json::json!({"model_type": "gemma4", "audio_config": {"audio_embed_dim": 1536}}),
+            serde_json::json!({"model_type": "gemma4_unified"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = root.path().join(format!("source-{index}"));
+            let input = gemma_native_fixture(&source);
+            config["text_config"] = serde_json::json!({"num_hidden_layers": 0});
+            fs::write(source.join("config.json"), config.to_string()).unwrap();
+            let cache = root.path().join(format!("cache-{index}"));
+
+            // Even a valid unused projector must not be converted or affect
+            // the cache identity of the text checkpoint.
+            let output = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
+            assert!(!output.join("vision.safetensors").exists());
+            fs::copy(
+                source.join("mmproj-gemma.gguf"),
+                source.join("mmproj-other.gguf"),
+            )
+            .unwrap();
+            assert_eq!(
+                prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+                output
+            );
+
+            // Exact-name precedence must not parse an irrelevant file either.
+            let exact = source.join(format!(
+                "mmproj-{}",
+                input.file_name().unwrap().to_string_lossy()
+            ));
+            fs::write(exact, b"not a GGUF").unwrap();
+            assert_eq!(
+                prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+                output
+            );
+            assert!(!output.join("vision.safetensors").exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn gemma_native_unified_media_requires_companion_for_both_family_markers() {
+        let root = GemmaNativeTestDir::new();
+        for mut config in [
+            serde_json::json!({"model_type": "gemma4_unified"}),
+            serde_json::json!({"architectures": ["Gemma4UnifiedForConditionalGeneration"]}),
+        ] {
+            for media in ["vision_config", "audio_config"] {
+                let source = root.path().join("source");
+                let input = gemma_native_fixture(&source);
+                fs::remove_file(source.join("mmproj-gemma.gguf")).unwrap();
+                config.as_object_mut().unwrap().remove("vision_config");
+                config.as_object_mut().unwrap().remove("audio_config");
+                config[media] = serde_json::json!({});
+                config["text_config"] = serde_json::json!({"num_hidden_layers": 0});
+                fs::write(source.join("config.json"), config.to_string()).unwrap();
+                let cache = root.path().join("cache");
+                let error = prepare_gemma4_native_gguf_in(&input, &cache)
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error.reason.contains("no matching mmproj"),
+                    "{config}: {error}"
+                );
+                assert!(!cache.exists());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gemma_native_preflight_requires_assets_and_declared_media() {
+        let root = GemmaNativeTestDir::new();
+        let source = root.path().join("source");
+        let input = gemma_native_fixture(&source);
+        let cache = root.path().join("cache");
+        fs::remove_file(source.join("mmproj-gemma.gguf")).unwrap();
+        assert!(
+            prepare_gemma4_native_gguf_in(&input, &cache)
+                .await
+                .unwrap_err()
+                .reason
+                .contains("no matching mmproj")
+        );
+        fs::remove_file(source.join("tokenizer.json")).unwrap();
+        assert!(
+            prepare_gemma4_native_gguf_in(&input, &cache)
+                .await
+                .unwrap_err()
+                .reason
+                .contains("tokenizer.json")
+        );
+        assert!(!cache.exists());
+    }
 
     fn build_minimal_gguf(
         metadata: &[(&str, GgufMetaValue)],

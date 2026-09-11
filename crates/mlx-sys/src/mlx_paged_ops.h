@@ -133,7 +133,8 @@ class PagedAttention : public Custom {
       int head_size,
       int sliding_window,
       KvDtype kv_dtype,
-      uint8_t route_hint = 0)
+      uint8_t route_hint = 0,
+      uint32_t grouped_stripes = 0)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         softcap_(softcap),
@@ -143,7 +144,8 @@ class PagedAttention : public Custom {
         head_size_(head_size),
         sliding_window_(sliding_window),
         kv_dtype_(kv_dtype),
-        route_hint_(route_hint) {}
+        route_hint_(route_hint),
+        grouped_stripes_(grouped_stripes) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -176,7 +178,8 @@ class PagedAttention : public Custom {
         head_size_,
         sliding_window_,
         static_cast<uint8_t>(kv_dtype_),
-        route_hint_);
+        route_hint_,
+        grouped_stripes_);
   }
 
  private:
@@ -189,6 +192,8 @@ class PagedAttention : public Custom {
   int sliding_window_;
   KvDtype kv_dtype_;
   uint8_t route_hint_;
+  // Captured per primitive, never a mutable process-wide dispatch override.
+  uint32_t grouped_stripes_;
 };
 
 // =============================================================================
@@ -300,7 +305,8 @@ array paged_attention_with_route_hint(
     int head_size,
     KvDtype kv_dtype,
     uint8_t route_hint,
-    StreamOrDevice s = {});
+    StreamOrDevice s = {},
+    uint32_t grouped_stripes = 0);
 
 /// Ragged-Q sibling of `PagedAttention`. Accepts a flat
 /// `[total_queries, num_q_heads, head_size]` Q tensor and a
