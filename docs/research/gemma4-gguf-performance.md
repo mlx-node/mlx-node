@@ -74,4 +74,17 @@ Projection differences stayed within one BF16 ULP (relative L2 approximately `9.
 
 Archived `gemma4-optimization-2026-09-10/results.json` holds all 18 samples, source/output hashes, and plans; runners and baseline/audit evidence share the Git-history link above. Later formatting/preflight/discovery changes leave the timed inference path unchanged; the matrix was not rerun.
 
-For reproduction, restore archived runners and use `oxnode` for TypeScript. Preserve private `.cache/benchmarks/gemma4-agent-2026-09-10/inputs.json`: rebuilding its wrapper can change dates/tools. Original llama-server flags: `-ngl 999 -fa on -ctk bf16 -ctv bf16 -c 73728 -b 2048 -ub 512 -t 6 -np 1 --no-context-shift`. Verify matching token IDs, caches, output lengths, contention, and source/binary hashes before comparing new results. Private messages, outputs, and activations stay outside Git.
+## Pinned fixture
+
+[`gemma4-oxc-review-v1`](../../scripts/fixtures/gemma4-oxc-review-v1.json) pins the exact messages, tool definitions, rendered prompts, and token IDs used above. The 362 KB compressed object is stored in the private Cloudflare R2 bucket `mlx-node-benchmarks`, under a versioned key containing the payload SHA-256. The manifest records the object and payload hashes, model/tokenizer identities, protocol, and archived runner identity. Public access is disabled; no completed-object expiration rule is configured. Private messages, outputs, and activations stay outside Git.
+
+With Wrangler authenticated to the account in the manifest, restore and verify the fixture:
+
+```sh
+oxnode scripts/benchmark-fixture.ts fetch
+oxnode scripts/benchmark-fixture.ts verify --tokenizer .cache/models/gemma-4-12b-it-qat-q4_0-gguf/tokenizer.json
+```
+
+`fetch` verifies the compressed object, decoded file, and all three token-ID hashes before saving to `.cache/benchmarks/gemma4-agent-2026-09-10/inputs.json`. An existing differing file is rejected. `verify` is offline; its optional tokenizer check detects current template/tokenizer drift. The manifest and hashes are the pin; storage administrators can still replace objects, so never bypass verification or overwrite this version. New messages, tools, or templates require a new fixture version.
+
+For inference replay, retrieve the archived runner identified by the manifest and adapt its local repository/model/llama-server paths; use `oxnode` for TypeScript. Do not rebuild the fixture wrapper, whose dates/tools can change. Keep model and token IDs, caches, output lengths, and timing policy matched; record contention and source/binary hashes. The recorded llama.cpp six-thread setting is a comparison parameter, not an optimum for every machine. A fixture pins the workload, not expected speed or generated answers.
