@@ -5511,20 +5511,21 @@ impl PagedKVCacheAdapter {
     #[cfg(target_os = "macos")]
     fn build_batched_attention_inputs(
         &mut self,
-        seq_ids: &[SeqId],
+        query_rows: &[PagedRaggedRow],
     ) -> Result<(MxArray, MxArray, u32), String> {
-        if seq_ids.is_empty() {
+        if query_rows.is_empty() {
             return Err(
                 "decode_attention_inputs_batched requires at least one sequence".to_string(),
             );
         }
-        let mut seen = HashSet::with_capacity(seq_ids.len());
-        let mut rows = Vec::with_capacity(seq_ids.len());
-        let mut seq_lens = Vec::with_capacity(seq_ids.len());
+        let mut seen = HashSet::with_capacity(query_rows.len());
+        let mut rows = Vec::with_capacity(query_rows.len());
+        let mut seq_lens = Vec::with_capacity(query_rows.len());
         let mut max_blocks = 0usize;
         let mut max_context_len = 0u32;
 
-        for &seq_id in seq_ids {
+        for row in query_rows {
+            let seq_id = row.seq_id;
             if !seen.insert(seq_id) {
                 return Err(format!(
                     "decode_attention_inputs_batched received duplicate sequence {seq_id}"
@@ -5536,33 +5537,69 @@ impl PagedKVCacheAdapter {
                 ));
             }
             self.activate_request(seq_id)?;
-            // Populate/validate this entry's own metadata cache before
-            // building the batch-shaped arrays.
-            let _ = self.decode_attention_inputs()?;
             let table = self
                 .block_table
                 .as_ref()
-                .expect("decode_attention_inputs validated the active table");
-            let ids = build_decode_block_ids(table);
-            max_blocks = max_blocks.max(ids.len());
+                .ok_or("batched attention metadata: missing block table")?;
             let recorded = table.num_tokens();
-            max_context_len = max_context_len.max(recorded);
-            seq_lens.push(i32::try_from(recorded).map_err(|_| {
+            if row.query_len == 0
+                || recorded.checked_sub(row.query_len) != Some(row.first_logical_position)
+            {
+                return Err(format!(
+                    "batched attention metadata: sequence {seq_id} query span does not match its recorded suffix"
+                ));
+            }
+            // Keep the union of keys visible to every query in this row. In
+            // particular, a verifier's first query needs an older window than
+            // its last query. Only read metadata is rebased; writes and RoPE
+            // continue to use absolute logical positions.
+            let first_block = if self.sliding_window == 0 {
+                0
+            } else {
+                (row.first_logical_position + 1).saturating_sub(self.sliding_window)
+                    / self.block_size
+            };
+            let visible = recorded - first_block * self.block_size;
+            if query_rows.len() == 1 && row.query_len == 1 {
+                let (tables, lens, _) = self.decode_attention_inputs()?;
+                return Ok((tables, lens, visible));
+            }
+            let required_blocks = recorded.div_ceil(self.block_size) as usize;
+            let blocks = table
+                .blocks()
+                .get(first_block as usize..required_blocks)
+                .ok_or("batched attention metadata: query span exceeds allocated blocks")?;
+            let pool_blocks = self.layer_kv_pool.num_blocks();
+            let ids = blocks
+                .iter()
+                .map(|block| {
+                    if block.block_id >= pool_blocks {
+                        return Err("batched attention metadata: block id exceeds pool".to_string());
+                    }
+                    i32::try_from(block.block_id).map_err(|_| {
+                        "batched attention metadata: block id exceeds i32::MAX".to_string()
+                    })
+                })
+                .collect::<Result<Vec<_>, String>>()?;
+            max_blocks = max_blocks.max(ids.len());
+            max_context_len = max_context_len.max(visible);
+            seq_lens.push(i32::try_from(visible).map_err(|_| {
                 format!(
-                    "decode_attention_inputs_batched: sequence {seq_id} length {recorded} exceeds i32::MAX"
+                    "decode_attention_inputs_batched: sequence {seq_id} visible length {visible} exceeds i32::MAX"
                 )
             })?);
             rows.push(ids);
         }
 
-        let mut padded = vec![0i32; seq_ids.len() * max_blocks];
+        let mut padded = vec![0i32; query_rows.len() * max_blocks];
         for (row_idx, ids) in rows.iter().enumerate() {
             let offset = row_idx * max_blocks;
             padded[offset..offset + ids.len()].copy_from_slice(ids);
         }
-        let block_tables = MxArray::from_int32(&padded, &[seq_ids.len() as i64, max_blocks as i64])
-            .map_err(|e| format!("decode_attention_inputs_batched block_tables: {e}"))?;
-        let seq_lens = MxArray::from_int32(&seq_lens, &[seq_ids.len() as i64])
+        let block_tables =
+            MxArray::from_int32(&padded, &[query_rows.len() as i64, max_blocks as i64])
+                .map_err(|e| format!("decode_attention_inputs_batched block_tables: {e}"))?;
+        let seq_lens = MxArray::from_int32(&seq_lens, &[query_rows.len() as i64])
             .map_err(|e| format!("decode_attention_inputs_batched seq_lens: {e}"))?;
         MxArray::eval_arrays(&[&block_tables, &seq_lens])
             .map_err(|e| format!("decode_attention_inputs_batched metadata eval: {e}"))?;
@@ -5591,9 +5628,8 @@ impl PagedKVCacheAdapter {
         if rows.is_empty() {
             return Err("ragged_attention_inputs requires at least one row".to_string());
         }
-        let seq_ids = rows.iter().map(|row| row.seq_id).collect::<Vec<_>>();
         let (block_tables, seq_lens, max_context_len) =
-            self.build_batched_attention_inputs(&seq_ids)?;
+            self.build_batched_attention_inputs(rows)?;
         let mut total_queries = 0u32;
         let mut cumulative = Vec::with_capacity(rows.len() + 1);
         cumulative.push(0i32);
@@ -5697,9 +5733,8 @@ impl PagedKVCacheAdapter {
                     .map_err(|_| "ragged metadata query count exceeds i32::MAX")?,
             );
         }
-        let seq_ids = rows.iter().map(|row| row.seq_id).collect::<Vec<_>>();
         let (block_tables, seq_lens, max_context_len) =
-            self.build_batched_attention_inputs(&seq_ids)?;
+            self.build_batched_attention_inputs(rows)?;
         let mut seen_slots = HashSet::with_capacity(slots.len());
         let aliased_slot = slots.iter().copied().find(|&slot| !seen_slots.insert(slot));
         let slot_mapping = MxArray::from_int64(&slots, &[i64::from(total_queries)])
@@ -15591,6 +15626,15 @@ mod tests {
             let q =
                 MxArray::zeros(&[1, FIX_NUM_Q_HEADS, FIX_HEAD_SIZE], Some(DType::Float16)).unwrap();
             let decoded = adapter.gather_kv_for_decode_graph(0, &q, 1.0, 0.0).unwrap();
+            let (batch_table, batch_lens, max_context) =
+                adapter.decode_attention_inputs_batched(&[7]).unwrap();
+            assert_eq!(batch_table.shape_at(1).unwrap(), count as i64);
+            assert_eq!(batch_lens.to_int32().unwrap().as_ref(), &[visible as i32]);
+            assert_eq!(max_context, visible);
+            let batched = adapter
+                .gather_kv_for_decode_graph_batched(0, &q, &[7], 1.0, 0.0)
+                .unwrap();
+            assert_eq!(adapter.current_token_count(), FIX_TOTAL);
             let lower = if window == 0 {
                 0
             } else {
@@ -15603,6 +15647,211 @@ mod tests {
                     "window {window}: {value} != {expected}"
                 );
             }
+            for &value in batched.to_float32().unwrap().iter() {
+                assert!(
+                    (value - expected).abs() < 0.05,
+                    "batched window {window}: {value} != {expected}"
+                );
+            }
+        }
+    }
+
+    /// Rebasing changes partition boundaries and therefore BF16 rounding.
+    /// Check nonuniform Q/K/V against an independent FP64 softmax reference,
+    /// across the generic kernel's 512-token partition and 16-token pages.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compact_bf16_attention_matches_dense_window_reference() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        const N: u32 = 2579;
+        const HQ: usize = 32;
+        const HKV: usize = 2;
+        const D: usize = 128;
+        let data = |len: usize, stride: usize, period: usize| {
+            (0..len)
+                .map(|i| ((i * stride % period) as f32 - (period / 2) as f32) / 64.0)
+                .collect::<Vec<_>>()
+        };
+        // These binary fractions are exactly representable in BF16.
+        let k_data = data(N as usize * HKV * D, 13, 113);
+        let v_data = data(N as usize * HKV * D, 17, 127);
+        let k = MxArray::from_float32(&k_data, &[N as i64, HKV as i64, D as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let v = MxArray::from_float32(&v_data, &[N as i64, HKV as i64, D as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let scale = 1.0 / (D as f32).sqrt();
+        for window in [513, 2048] {
+            let config = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 16,
+                num_kv_heads: HKV as u32,
+                head_size: D as u32,
+                num_layers: 1,
+                gpu_memory_mb: 256,
+                use_fp8_cache: Some(false),
+                max_seq_len: Some(8192),
+                max_batch_size: Some(1),
+            };
+            let pool = Arc::new(
+                mlx_paged_attn::LayerKVPool::new(
+                    config,
+                    512,
+                    512,
+                    mlx_paged_attn::metal::MetalDtype::BFloat16,
+                )
+                .unwrap(),
+            );
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(512, 512, 16)));
+            let mut adapter =
+                PagedKVCacheAdapter::new_sliding(allocator, pool, 16, window, 8192).unwrap();
+            adapter.reset_for_new_request(7).unwrap();
+            adapter.record_tokens(&(0..N).collect::<Vec<_>>()).unwrap();
+            adapter.update_keys_values(0, &k, &v, 0).unwrap();
+            for query_len in [1u32, 17] {
+                let q_data = data(query_len as usize * HQ * D, 19, 109);
+                let q = MxArray::from_float32(&q_data, &[query_len as i64, HQ as i64, D as i64])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                let rows = [PagedRaggedRow {
+                    seq_id: 7,
+                    first_logical_position: N - query_len,
+                    query_len,
+                }];
+                let output = if query_len == 1 {
+                    adapter.gather_kv_for_decode_graph_batched(0, &q, &[7], scale, 0.0)
+                } else {
+                    adapter.gather_kv_for_ragged_graph(0, &q, &rows, scale, 0.0)
+                }
+                .unwrap();
+                assert_eq!(output.dtype().unwrap(), DType::BFloat16);
+                let output = output.to_float32().unwrap();
+                for row in 0..query_len as usize {
+                    let end = (N - query_len) as usize + row + 1;
+                    let start = end.saturating_sub(window as usize);
+                    for head in 0..HQ {
+                        let kv_head = head / (HQ / HKV);
+                        let q_base = (row * HQ + head) * D;
+                        let scores: Vec<f64> = (start..end)
+                            .map(|pos| {
+                                let k_base = (pos * HKV + kv_head) * D;
+                                (0..D)
+                                    .map(|d| {
+                                        f64::from(q_data[q_base + d])
+                                            * f64::from(k_data[k_base + d])
+                                    })
+                                    .sum::<f64>()
+                                    * f64::from(scale)
+                            })
+                            .collect();
+                        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                        let probs: Vec<f64> = scores.iter().map(|x| (x - max).exp()).collect();
+                        let total: f64 = probs.iter().sum();
+                        for d in 0..D {
+                            let expected = probs
+                                .iter()
+                                .enumerate()
+                                .map(|(i, p)| {
+                                    p * f64::from(v_data[((start + i) * HKV + kv_head) * D + d])
+                                })
+                                .sum::<f64>()
+                                / total;
+                            let got = f64::from(output[q_base + d]);
+                            assert!(
+                                got.is_finite() && (got - expected).abs() < 0.003,
+                                "window={window} queries={query_len} row={row} head={head} d={d}: {got} != {expected}"
+                            );
+                        }
+                    }
+                }
+                assert_eq!(adapter.current_token_count(), N);
+            }
+        }
+    }
+
+    /// The first verifier query must retain its whole window, even when a
+    /// later query or another owner starts on a different physical page.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn compact_ragged_reads_preserve_each_owners_first_query_window() {
+        for window in [0, 1, 16, 17, 64] {
+            let Some(fixture) = build_sliding_prefill_fixture(window).unwrap() else {
+                return;
+            };
+            let mut adapter = fixture.adapter;
+            adapter.begin_request(8).unwrap();
+            adapter.record_tokens(&(0..19).collect::<Vec<_>>()).unwrap();
+            let k = MxArray::zeros(&[19, 1, FIX_HEAD_SIZE], Some(DType::Float16)).unwrap();
+            let bits = (0..19)
+                .flat_map(|p| {
+                    std::iter::repeat_n(
+                        f16::from_f32(101.0 + p as f32).to_bits(),
+                        FIX_HEAD_SIZE as usize,
+                    )
+                })
+                .collect::<Vec<_>>();
+            let v = MxArray::from_float16(&bits, &[19, 1, FIX_HEAD_SIZE]).unwrap();
+            adapter.update_keys_values_native(0, &k, &v, 0).unwrap();
+            let rows = [
+                PagedRaggedRow {
+                    seq_id: 7,
+                    first_logical_position: FIX_PREFIX_LEN,
+                    query_len: FIX_CHUNK_LEN,
+                },
+                PagedRaggedRow {
+                    seq_id: 8,
+                    first_logical_position: 16,
+                    query_len: 3,
+                },
+            ];
+            let (_, lens, cu, max_context, queries) =
+                adapter.ragged_attention_inputs(&rows).unwrap();
+            let visible = rows.map(|row| {
+                let first = if window == 0 {
+                    0
+                } else {
+                    (row.first_logical_position + 1).saturating_sub(window) / FIX_BLOCK_SIZE
+                        * FIX_BLOCK_SIZE
+                };
+                (row.first_logical_position + row.query_len - first) as i32
+            });
+            assert_eq!(lens.to_int32().unwrap().as_ref(), &visible);
+            assert_eq!(cu.to_int32().unwrap().as_ref(), &[0, 16, 19]);
+            assert_eq!(max_context, *visible.iter().max().unwrap() as u32);
+            assert_eq!(queries, 19);
+            let q = MxArray::zeros(&[19, FIX_NUM_Q_HEADS, FIX_HEAD_SIZE], Some(DType::Float16))
+                .unwrap();
+            let out = adapter
+                .gather_kv_for_ragged_graph(0, &q, &rows, 1.0, 0.0)
+                .unwrap();
+            let mut expected = windowed_reference(window);
+            expected.extend((17u32..=19).map(|end| {
+                let start = if window == 0 {
+                    0
+                } else {
+                    end.saturating_sub(window)
+                };
+                100.0 + (start + 1 + end) as f32 / 2.0
+            }));
+            let values = out.to_float32().unwrap();
+            for (row, expected) in expected.into_iter().enumerate() {
+                for &value in &values[row * 128..(row + 1) * 128] {
+                    assert!(
+                        (value - expected).abs() < 0.1,
+                        "window {window}, query {row}: {value} != {expected}"
+                    );
+                }
+            }
+            assert_eq!(adapter.block_table_for(7).unwrap().num_tokens(), FIX_TOTAL);
+            assert_eq!(adapter.block_table_for(8).unwrap().num_tokens(), 19);
+            let mut stale = rows;
+            stale[1].first_logical_position -= 1;
+            assert!(adapter.ragged_attention_inputs(&stale).is_err());
         }
     }
 

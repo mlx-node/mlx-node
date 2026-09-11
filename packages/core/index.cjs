@@ -919,6 +919,7 @@ module.exports.parsePaddleResponse = nativeBinding.parsePaddleResponse;
 module.exports.parseToolCallsFromText = nativeBinding.parseToolCallsFromText;
 module.exports.parseVlmOutput = nativeBinding.parseVlmOutput;
 module.exports.preflightMuseDflashGguf = nativeBinding.preflightMuseDflashGguf;
+module.exports.prepareMuseGlimmerGguf = nativeBinding.prepareMuseGlimmerGguf;
 module.exports.quantizedQmvMicrobench = nativeBinding.quantizedQmvMicrobench;
 module.exports.qwen3AsrAudioDevices = nativeBinding.qwen3AsrAudioDevices;
 module.exports.Qwen3AsrCaptureSource = nativeBinding.Qwen3AsrCaptureSource;

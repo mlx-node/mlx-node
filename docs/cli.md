@@ -365,6 +365,52 @@ The agent model picker lists Gemma GGUF variants by filename stem and excludes
 media projectors and draft files. The QAT 12B checkpoint mixes Q4_0 projections
 with a Q6_K embedding; both formats retain their source quantization.
 
+### Load Muse-Glimmer GGUF directly
+
+Muse-Glimmer accepts primary `.gguf` checkpoints, including Q4_K_M and mixed
+Dynamic Q4_K_XL variants. Keep the original model's `config.json`,
+`tokenizer.json`, and tokenizer/template assets beside the GGUF files. The
+agent lists each target by its filename stem, so select an exact variant with:
+
+```bash
+mlx agent --model Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL
+```
+
+The SDK also accepts the exact file path:
+
+```typescript
+import { MuseGlimmerModel } from '@mlx-node/lm';
+
+const model = await MuseGlimmerModel.load(
+  '/path/to/muse-glimmer-30b-gguf/Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf',
+);
+```
+
+A directory containing one primary GGUF also works; multiple targets require
+an explicit filename. Existing SafeTensors directories retain their normal
+load path. The first load prepares a native cache with packed quantized
+weights, preserving each tensor's source K format. Later loads reuse it;
+`MLX_NATIVE_GGUF_CACHE_DIR` overrides its location.
+
+An optional DFlash companion is validated and cached with the target. Selection
+prefers `dflash-<target-filename>`, then the shared `dflash-kquant.gguf`, then
+a single remaining `dflash-*.gguf`. Ambiguous companions produce an error.
+Changes to the source, companion, or tokenizer assets invalidate the cache.
+Agent paging and persistence settings apply to an isolated config over this
+cache; downloaded files are not modified. Muse's runtime currently supports
+text input, and neither draft files nor `mmproj` projectors appear as models.
+
+To rerun the optional inference regression against a downloaded checkpoint:
+
+```bash
+oxnode scripts/benchmark-fixture.ts fetch
+MUSE_GLIMMER_GGUF_MODEL_PATH=/path/to/model.gguf \
+  yarn exec vp test run __test__/models/muse-glimmer-native-gguf-e2e.test.ts
+```
+
+This replays the pinned review conversation through ordinary decoding and,
+when present, DFlash. It checks loading and generation, not performance targets.
+
 ### GGUF → SafeTensors
 
 ```bash
@@ -641,7 +687,7 @@ Almost every flag belongs to pi and is forwarded verbatim; `mlx agent` only hand
 
 ### Model selection and first-run wizard
 
-`mlx agent` discovers local models under the resolved models directory (`--models-dir <dir>`, else `MLX_MODELS_DIR`, else `modelsDir` in `~/.mlx-node/config.json`, else `~/.mlx-node/models`). A dash-leading path must use the `--models-dir=<dir>` form so it is not mistaken for another flag. Dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` targets are also discovered when placed directly in that directory or one level inside a downloaded GGUF repository; each appears under its filename stem. Gemma 4 GGUF variants, including Q4_0 QAT and K-quant targets, are also discovered by filename stem. Companion files such as imatrix, mmproj, draft, or DFlash2-only checkpoints are not advertised as agent models.
+`mlx agent` discovers local models under the resolved models directory (`--models-dir <dir>`, else `MLX_MODELS_DIR`, else `modelsDir` in `~/.mlx-node/config.json`, else `~/.mlx-node/models`). A dash-leading path must use the `--models-dir=<dir>` form so it is not mistaken for another flag. Dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` targets are also discovered when placed directly in that directory or one level inside a downloaded GGUF repository; each appears under its filename stem. Gemma 4 GGUF variants, including Q4_0 QAT and K-quant targets, and Muse-Glimmer primary GGUF variants are also discovered by filename stem. Companion files such as imatrix, mmproj, draft, or DFlash2-only checkpoints are not advertised as agent models.
 
 Qwen3.8-27B can use the separate [DFlash2 companion](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2)
 (about 3.85 GB). Install it from the desktop Models page, or download it separately:

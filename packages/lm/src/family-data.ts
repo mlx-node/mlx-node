@@ -258,6 +258,7 @@ export const MODEL_FAMILY_DATA = [
   {
     id: 'muse_glimmer',
     kind: 'loadable',
+    ggufArchitectures: ['muse-glimmer'],
     match: {
       rawModelTypes: ['muse_glimmer', 'muse_glimmer_text'],
       architectureProbe: ({ architectures }) => architectures.has('MuseGlimmerForConditionalGeneration'),

@@ -1670,6 +1670,7 @@ impl ChatBackend for MuseGlimmerInner {
 #[napi]
 pub struct MuseGlimmerModel {
     pub(crate) thread: ModelThread<MuseGlimmerCmd>,
+    pub(crate) model_assets_path: String,
     pub(crate) has_dflash: bool,
     pub(crate) paged_active: bool,
     pub(crate) max_concurrent_sequences: u32,
@@ -1683,6 +1684,12 @@ impl MuseGlimmerModel {
     #[napi]
     pub async fn load(model_path: String) -> Result<Self> {
         super::persistence::load_with_thread(&model_path).await
+    }
+
+    /// Resolved tokenizer/config directory, including the native cache after a GGUF load.
+    #[napi]
+    pub fn model_assets_path(&self) -> String {
+        self.model_assets_path.clone()
     }
 
     #[napi]

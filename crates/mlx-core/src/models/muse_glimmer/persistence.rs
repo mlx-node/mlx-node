@@ -692,7 +692,17 @@ fn load_inner(path: &Path) -> Result<(MuseGlimmerInner, u64)> {
 }
 
 pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerModel> {
-    let model_path = model_path.to_string();
+    let model_path = if let Some(gguf) =
+        crate::utils::gguf::resolve_muse_glimmer_gguf_source(Path::new(model_path))?
+    {
+        crate::utils::gguf::prepare_muse_glimmer_native_gguf(&gguf)
+            .await?
+            .to_string_lossy()
+            .into_owned()
+    } else {
+        model_path.to_string()
+    };
+    let model_assets_path = model_path.clone();
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
             let (inner, weight_bytes) = load_inner(Path::new(&model_path))?;
@@ -741,6 +751,7 @@ pub(crate) async fn load_with_thread(model_path: &str) -> Result<MuseGlimmerMode
         .map_err(|_| Error::from_reason("Muse-Glimmer model thread exited during load"))??;
     Ok(MuseGlimmerModel {
         thread,
+        model_assets_path,
         has_dflash,
         paged_active,
         max_concurrent_sequences,

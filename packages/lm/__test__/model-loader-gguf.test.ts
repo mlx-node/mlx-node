@@ -1,8 +1,10 @@
+/// <reference types="node" />
+
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { detectModelType, loadModel, Qwen35Model } from '@mlx-node/lm';
+import { detectModelType, loadModel, MuseGlimmerModel, Qwen35Model } from '@mlx-node/lm';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -86,6 +88,15 @@ describe('standalone GGUF model detection', () => {
   it('recognizes a Gemma4 GGUF file without guessing from its filename', async () => {
     const { modelPath } = await writeStandaloneGguf('gemma4');
     await expect(detectModelType(modelPath)).resolves.toBe('gemma4');
+  });
+
+  it('detects Muse from its GGUF header and passes the exact file to its loader', async () => {
+    const { modelPath } = await writeStandaloneGguf('muse-glimmer');
+    await expect(detectModelType(modelPath)).resolves.toBe('muse_glimmer');
+    const loaded = {} as MuseGlimmerModel;
+    const loadSpy = vi.spyOn(MuseGlimmerModel, 'load').mockResolvedValue(loaded);
+    await expect(loadModel(modelPath)).resolves.toBe(loaded);
+    expect(loadSpy).toHaveBeenCalledWith(modelPath);
   });
 
   it('keeps an existing sibling config.json authoritative', async () => {

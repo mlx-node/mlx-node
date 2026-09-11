@@ -21,6 +21,7 @@ import { readdir, readFile, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
 import type { ProviderModelConfig } from '@earendil-works/pi-coding-agent';
+import { ggufArchitecture } from '@mlx-node/core';
 import {
   launchPresetFor,
   detectModelType,
@@ -44,8 +45,8 @@ interface DiscoveryMetadata {
 }
 
 /**
- * The Qwen3.5/Qwen3.8 discovery filter retains its XL policy. Gemma4
- * accepts all supported tensor formats, including Q4_0 QAT checkpoints.
+ * The Qwen3.5/Qwen3.8 discovery filter retains its XL policy. Gemma4 and Muse
+ * accept all supported tensor formats, including Q4_0 QAT checkpoints.
  * Match the Unsloth Dynamic XL target names users download, while excluding
  * ordinary Q4_K_M files and companion artifacts such as imatrix/mmproj/draft.
  */
@@ -60,7 +61,11 @@ function ggufModelName(name: string): string {
   return name.slice(0, -'.gguf'.length);
 }
 
-async function hasGemmaGgufAssets(modelDir: string): Promise<boolean> {
+function requiresGgufAssets(modelType: ModelType): boolean {
+  return modelType === 'gemma4' || modelType === 'muse_glimmer';
+}
+
+async function hasGgufAssets(modelDir: string): Promise<boolean> {
   try {
     const assets = await Promise.all(['config.json', 'tokenizer.json'].map((name) => stat(join(modelDir, name))));
     return assets.every((asset) => asset.isFile());
@@ -152,7 +157,7 @@ async function readDiscoveryMetadata(
 }
 
 /**
- * Scan `modelsDir` for chat-capable model subdirectories, Gemma4 GGUFs, and
+ * Scan `modelsDir` for chat-capable model subdirectories, Gemma4/Muse GGUFs, and
  * dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` files, then build their pi provider
  * entries. GGUF files may live directly under `modelsDir` or one level inside a
  * downloaded GGUF repository. Each is registered by filename stem so multiple
@@ -246,11 +251,18 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
       const full = join(modelsDir, entry.name);
       try {
         const modelType = await detectModelType(full);
-        if (modelType === 'gemma4' && !(await hasGemmaGgufAssets(modelsDir))) {
-          if (debug) console.warn(`[mlx] skip ${full}: native Gemma GGUF requires sibling config.json and tokenizer.json`);
+        if (requiresGgufAssets(modelType) && !(await hasGgufAssets(modelsDir))) {
+          if (debug)
+            console.warn(
+              `[mlx] skip ${full}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`,
+            );
           continue;
         }
-        if (modelType === 'gemma4' || (modelType === 'qwen3_5' && isQwen35XlGguf(entry.name))) {
+        if (
+          modelType === 'gemma4' ||
+          (modelType === 'muse_glimmer' && ggufArchitecture(full) === 'muse-glimmer') ||
+          (modelType === 'qwen3_5' && isQwen35XlGguf(entry.name))
+        ) {
           await append(ggufModelName(entry.name), full, modelsDir, modelType, basename(modelsDir));
         } else if (debug) {
           console.warn(`[mlx] skip ${full}: no supported direct GGUF target for ${modelType}`);
@@ -272,18 +284,27 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
     }
 
     const inventory = await modelFileInventory(full);
-    if (modelType === 'gemma4' && !inventory.hasSafetensors && inventory.targetGgufs.length > 0) {
-      if (!(await hasGemmaGgufAssets(full))) {
-        if (debug) console.warn(`[mlx] skip ${full}: native Gemma GGUF requires sibling config.json and tokenizer.json`);
+    if (requiresGgufAssets(modelType) && !inventory.hasSafetensors && inventory.targetGgufs.length > 0) {
+      if (!(await hasGgufAssets(full))) {
+        if (debug)
+          console.warn(`[mlx] skip ${full}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`);
         continue;
       }
       for (const gguf of inventory.targetGgufs) {
-        await append(ggufModelName(gguf), join(full, gguf), full, modelType, entry.name);
+        const path = join(full, gguf);
+        try {
+          // A sibling Muse config also describes its draft/projector files.
+          // Check the GGUF header so renamed companions cannot become targets.
+          if (modelType === 'muse_glimmer' && ggufArchitecture(path) !== 'muse-glimmer') continue;
+          await append(ggufModelName(gguf), path, full, modelType, entry.name);
+        } catch (err) {
+          if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
+        }
       }
       continue;
     }
     const { xlGgufs } = inventory;
-    if (xlGgufs.length > 0 && !(modelType === 'gemma4' && inventory.hasSafetensors)) {
+    if (xlGgufs.length > 0 && !(requiresGgufAssets(modelType) && inventory.hasSafetensors)) {
       if (modelType !== 'qwen3_5') {
         if (debug) {
           console.warn(`[mlx] skip ${full}: direct XL GGUF loading is not supported for ${modelType}`);

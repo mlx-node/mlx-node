@@ -646,6 +646,8 @@ export declare class Lfm2Model {
 
 export declare class MuseGlimmerModel {
   static load(modelPath: string): Promise<MuseGlimmerModel>;
+  /** Resolved tokenizer/config directory, including the native cache after a GGUF load. */
+  modelAssetsPath(): string;
   hasMtpWeights(): boolean;
   autoEnablesMtp(): boolean;
   hasBlockPagedCache(): boolean;
@@ -4586,6 +4588,13 @@ export interface PhaseProfile {
  * runs before the primary conversion touches its output directory.
  */
 export declare function preflightMuseDflashGguf(inputPath: string, targetConfigDir: string): void;
+
+/**
+ * Prepare a Muse-Glimmer GGUF target and its optional DFlash companion in the
+ * native cache without loading the model. Hosts can apply per-session config
+ * overrides to this directory without modifying sources or repacking weights.
+ */
+export declare function prepareMuseGlimmerGguf(modelPath: string): Promise<string>;
 
 /**
  * Per-call Viterbi calibration overrides.
