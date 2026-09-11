@@ -4,7 +4,7 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -17,7 +17,7 @@ interface FixtureCase {
   sha256: string;
   tokenIds: number[];
   messages: unknown[];
-  tools: unknown[];
+  tools: unknown[] | null;
   rendered: string;
 }
 
@@ -32,9 +32,14 @@ interface Manifest {
   };
   payload: { path: string; bytes: number; sha256: string };
   cases: { name: string; promptTokens: number; tokenIdsSha256: string }[];
+  tokenizerOptions?: { preserveThinking: boolean };
 }
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const fixtures = new Map([
+  ['gemma4', 'gemma4-oxc-review-v1'],
+  ['qwen38', 'qwen38-oxc-review-v1'],
+]);
 const hash = (data: Buffer | string) => createHash('sha256').update(data).digest('hex');
 
 function verifyBytes(data: Buffer, expected: { bytes: number; sha256: string }, label: string) {
@@ -103,6 +108,7 @@ async function main() {
   const { values, positionals } = parseArgs({
     allowPositionals: true,
     options: {
+      fixture: { type: 'string', default: 'gemma4' },
       output: { type: 'string' },
       tokenizer: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
@@ -110,7 +116,8 @@ async function main() {
   });
   if (values.help) {
     console.log(
-      'Usage: oxnode scripts/benchmark-fixture.ts fetch|verify [--output inputs.json] [--tokenizer tokenizer.json]\n' +
+      'Usage: oxnode scripts/benchmark-fixture.ts fetch|verify [--fixture gemma4|qwen38] [--output inputs.json] [--tokenizer tokenizer.json]\n' +
+        'The default fixture is gemma4. Qwen verification retains historical reasoning, as its session benchmark did.\n' +
         'fetch: authenticated R2 download, or verify an existing copy; never overwrite a different fixture.\n' +
         'verify: offline hashes; optionally check the current native chat template against every pinned token ID.',
     );
@@ -120,9 +127,9 @@ async function main() {
   if (positionals.length !== 1 || !['fetch', 'verify'].includes(mode)) {
     throw new Error('Expected fetch or verify; use --help for usage');
   }
-  const manifest: Manifest = JSON.parse(
-    await readFile(resolve(root, 'scripts/fixtures/gemma4-oxc-review-v1.json'), 'utf8'),
-  );
+  const fixture = fixtures.get(values.fixture);
+  if (!fixture) throw new Error(`Unknown fixture: ${values.fixture}; expected gemma4 or qwen38`);
+  const manifest: Manifest = JSON.parse(await readFile(resolve(root, `scripts/fixtures/${fixture}.json`), 'utf8'));
   const output = values.output ? resolve(values.output) : resolve(root, manifest.payload.path);
   let data: Buffer;
   try {
@@ -137,17 +144,40 @@ async function main() {
   }
   const cases = verifyPayload(data, manifest);
   if (values.tokenizer) {
-    const coreUrl = pathToFileURL(resolve(root, 'packages/core/index.cjs'));
-    const { Qwen3Tokenizer } = await import(coreUrl.href);
-    const tokenizer = await Qwen3Tokenizer.fromPretrained(resolve(values.tokenizer));
-    for (const item of cases) {
-      const ids = await tokenizer.applyChatTemplate(item.messages, true, item.tools, true);
-      if (
-        hash(JSON.stringify(Array.from(ids))) !== item.sha256 ||
-        (await tokenizer.decode(ids, false)) !== item.rendered
-      ) {
-        throw new Error(`${item.name}: current tokenizer/template drifted`);
+    const temporary = manifest.tokenizerOptions?.preserveThinking
+      ? await mkdtemp(join(tmpdir(), 'mlx-benchmark-tokenizer-'))
+      : undefined;
+    try {
+      let tokenizerPath = resolve(values.tokenizer);
+      if (temporary) {
+        const config: { chat_template?: string } = JSON.parse(
+          await readFile(join(dirname(tokenizerPath), 'tokenizer_config.json'), 'utf8'),
+        );
+        const template =
+          typeof config.chat_template === 'string'
+            ? config.chat_template
+            : await readFile(join(dirname(tokenizerPath), 'chat_template.jinja'), 'utf8');
+        // The standalone API defaults this session-only flag to false. Match
+        // the recorded Qwen session without changing the supplied model files.
+        config.chat_template = '{% set preserve_thinking = true %}' + template;
+        await copyFile(tokenizerPath, join(temporary, 'tokenizer.json'));
+        await writeFile(join(temporary, 'tokenizer_config.json'), JSON.stringify(config));
+        tokenizerPath = join(temporary, 'tokenizer.json');
       }
+      const coreUrl = pathToFileURL(resolve(root, 'packages/core/index.cjs'));
+      const { Qwen3Tokenizer } = await import(coreUrl.href);
+      const tokenizer = await Qwen3Tokenizer.fromPretrained(tokenizerPath);
+      for (const item of cases) {
+        const ids = await tokenizer.applyChatTemplate(item.messages, true, item.tools, true);
+        if (
+          hash(JSON.stringify(Array.from(ids))) !== item.sha256 ||
+          (await tokenizer.decode(ids, false)) !== item.rendered
+        ) {
+          throw new Error(`${item.name}: current tokenizer/template drifted`);
+        }
+      }
+    } finally {
+      if (temporary) await rm(temporary, { recursive: true, force: true });
     }
     console.log('Current native tokenizer/template matches all pinned inputs.');
   }

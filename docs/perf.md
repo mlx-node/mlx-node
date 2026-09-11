@@ -1,5 +1,24 @@
 # Performance & profiling
 
+## Pinned benchmark fixtures
+
+The real review inputs used in [issue #142](https://github.com/mlx-node/mlx-node/issues/142) are stored in the private R2 bucket `mlx-node-benchmarks`. Each manifest pins a versioned object, SHA-256 hashes, model identity, and the measured protocol. With Wrangler authenticated to the account in the manifest:
+
+```sh
+oxnode scripts/benchmark-fixture.ts fetch --fixture gemma4
+oxnode scripts/benchmark-fixture.ts fetch --fixture qwen38
+oxnode scripts/benchmark-fixture.ts verify --fixture qwen38 --tokenizer /path/to/prepared-model/tokenizer.json
+```
+
+| Fixture | Measured input tokens | Recorded protocol |
+| --- | --- | --- |
+| [Gemma 4 QAT Q4_0](../scripts/fixtures/gemma4-oxc-review-v1.json) | 7,733 / 40,528 / 66,904 | 256 output tokens; BF16 KV in both runtimes; 512-token prefill chunks; fresh process per sample. |
+| [Qwen3.8 UD-Q4_K_XL](../scripts/fixtures/qwen38-oxc-review-v1.json) | 6,219 / 18,754 / 32,488 | 512 output tokens; BF16 MLX / F16 llama.cpp KV; 2,048-token chunks; three requests per runtime/context process. |
+
+The default selection is `gemma4`. Downloads and existing files must match the manifest before use. `verify` is offline; the optional tokenizer check compares current rendering against every pinned token ID and prompt. Qwen verification sets `preserve_thinking=true` in a temporary tokenizer copy to match its native session; the model files are untouched. Its package contains only measured cases, with the original messages and saved rendered prompts; warmup used each same context for 16 output tokens. The unused synthetic warmup in the historical preparation file is excluded.
+
+Keep each fixture version unchanged and record runtime, cache, timing, and load conditions for new measurements. Historical messages contain tool results, but replay must not execute tools. These fixtures do not assert generated-answer parity or universal speed thresholds. See the [Gemma research reference](./research/gemma4-gguf-performance.md#pinned-fixture) and each manifest for restoration and protocol details.
+
 ## Profiling
 
 Per-generation profiling is exposed from `@mlx-node/lm`:
