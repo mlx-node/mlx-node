@@ -1,0 +1,110 @@
+{
+  "schemaVersion": 1,
+  "id": "gemma4-oxc-review-v1",
+  "measuredAt": "2026-09-10",
+  "storage": {
+    "provider": "cloudflare-r2",
+    "accountId": "6db7cbc0423b5d56af93d13e4e2b469b",
+    "bucket": "mlx-node-benchmarks",
+    "key": "fixtures/gemma4-oxc-review/v1/812bd4adb5b10688a2c7ced9ccabf0cc43159d3b80541eb2009960ced347b697/inputs.json.gz",
+    "access": "public",
+    "url": "https://pub-7dbe2ab7080540a39fad0219f8b247ad.r2.dev/fixtures/gemma4-oxc-review/v1/812bd4adb5b10688a2c7ced9ccabf0cc43159d3b80541eb2009960ced347b697/inputs.json.gz",
+    "bytes": 361773,
+    "sha256": "2caaca143a231807a574eddaef35beba7a52a4e7afea2b525eb16f49f0546fc6"
+  },
+  "payload": {
+    "path": ".cache/benchmarks/gemma4-agent-2026-09-10/inputs.json",
+    "bytes": 2289801,
+    "sha256": "812bd4adb5b10688a2c7ced9ccabf0cc43159d3b80541eb2009960ced347b697"
+  },
+  "contents": [
+    "frozen system and historical messages",
+    "tool definitions",
+    "rendered prompts",
+    "exact input token IDs"
+  ],
+  "source": {
+    "sessionId": "01a067cf-b782-7b58-855e-8158dcb283ab",
+    "sessionSha256": "cdf4938c2ce1f37acbe87659b38782bc48dd95cabb98723c7328819d8cbc2988",
+    "originalTask": "https://github.com/oxc-project/oxc-node/pull/745",
+    "wrapper": "Pi 0.84.4; reconstructed at measurement time because the historical system prompt was absent. Use the frozen messages; do not regenerate the wrapper."
+  },
+  "model": {
+    "file": "gemma-4-12b-it-qat-q4_0.gguf",
+    "sha256": "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b",
+    "tokenizerSha256": "cc8d3a0ce36466ccc1278bf987df5f71db1719b9ca6b4118264f45cb627bfe0f",
+    "configSha256": "478c46e8d2c52d5c2d85bf67e3b3e8c90e7c9d91086cee27e3c267907e936bd9"
+  },
+  "cases": [
+    {
+      "name": "diff-review",
+      "promptTokens": 7733,
+      "tokenIdsSha256": "d4eec44e531cefe0f8c18c6e0bd74c2067d389bf6d1cedb01ac9e1635f92844f",
+      "historicalMessages": 8,
+      "toolResults": 4
+    },
+    {
+      "name": "test-review",
+      "promptTokens": 40528,
+      "tokenIdsSha256": "ff79c8e3f979cd26f6ff29f801f3a6110481275291a789461883a0c6c99e3efa",
+      "historicalMessages": 56,
+      "toolResults": 30
+    },
+    {
+      "name": "final-review",
+      "promptTokens": 66904,
+      "tokenIdsSha256": "806d7f48ef0224d92d8e8a575180451e0e1250c6d40df025d43ed7f459b95be3",
+      "historicalMessages": 133,
+      "toolResults": 71
+    }
+  ],
+  "protocol": {
+    "repetitions": 3,
+    "outputTokens": 256,
+    "warmupTokens": 32,
+    "warmupCase": "diff-review",
+    "freshProcessPerSample": true,
+    "cooldownSeconds": 20,
+    "runtimeOrder": "Alternate mlx-node/llama.cpp per repetition.",
+    "sampling": "Greedy autoregressive, high thinking; no speculation.",
+    "kvCache": "BF16 in both runtimes.",
+    "promptCache": "Reset before each request; assert zero cached tokens. Adaptive model-local state survives reset.",
+    "prefillChunkTokens": 512,
+    "timing": "Exclude loading and warmup; include calibration during the measured request. Native prefill-to-first-token; decode covers the subsequent 255 tokens. Record request wall time separately.",
+    "llamaServerArgs": [
+      "-ngl",
+      "999",
+      "-fa",
+      "on",
+      "-ctk",
+      "bf16",
+      "-ctv",
+      "bf16",
+      "-c",
+      "73728",
+      "-b",
+      "2048",
+      "-ub",
+      "512",
+      "-t",
+      "6",
+      "-np",
+      "1",
+      "--no-context-shift"
+    ],
+    "mlxEnv": {
+      "MLX_AGENT_METRICS": "0",
+      "MLX_PERSIST_PAGED_CACHE": "0",
+      "MLX_PAGED_PREFILL_CHUNK_SIZE": "512"
+    },
+    "llamaThreadsNote": "Six CPU threads records this matrix; record any change when benchmarking another machine, rather than treating it as a universal optimum."
+  },
+  "runner": {
+    "commit": "f193ade24e02c3ab0abba5aab74e1c916e74f454",
+    "path": "docs/research/gemma4-optimization-2026-09-10/benchmark.ts",
+    "sha256": "caaa5774984a2639c906b47d731733d815f78f3476ac2918a65e9ae4061b3e96",
+    "portability": "Historical runner has local repository/model/llama-server paths. Adapt only paths for an exact protocol replay; record any other changes."
+  },
+  "resultsUrl": "https://github.com/mlx-node/mlx-node/issues/142#issuecomment-5629164002",
+  "reuse": "Keep this version unchanged. New messages, tool definitions, tokenizer or template require a new fixture version; token IDs are model-specific. Outputs may differ and do not establish quality parity."
+}

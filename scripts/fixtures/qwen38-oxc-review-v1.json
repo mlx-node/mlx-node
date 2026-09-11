@@ -1,0 +1,124 @@
+{
+  "schemaVersion": 1,
+  "id": "qwen38-oxc-review-v1",
+  "measuredAt": "2026-09-09",
+  "storage": {
+    "provider": "cloudflare-r2",
+    "accountId": "6db7cbc0423b5d56af93d13e4e2b469b",
+    "bucket": "mlx-node-benchmarks",
+    "key": "fixtures/qwen38-oxc-review/v1/c6c1373328614919617deca668fe67301fe0df853f7780143d9690464148bf5b/inputs.json.gz",
+    "access": "public",
+    "url": "https://pub-7dbe2ab7080540a39fad0219f8b247ad.r2.dev/fixtures/qwen38-oxc-review/v1/c6c1373328614919617deca668fe67301fe0df853f7780143d9690464148bf5b/inputs.json.gz",
+    "bytes": 192794,
+    "sha256": "f6232c9150080cdb18ea077f86078b34c13209f481a2ca4707932a51bcd07c1b"
+  },
+  "payload": {
+    "path": ".cache/benchmarks/qwen38-oxc-review-v1/inputs.json",
+    "bytes": 1116207,
+    "sha256": "c6c1373328614919617deca668fe67301fe0df853f7780143d9690464148bf5b"
+  },
+  "contents": [
+    "frozen system and historical messages, including reasoning and tool results",
+    "recorded review-continuation instruction",
+    "rendered prompts",
+    "exact input token IDs"
+  ],
+  "source": {
+    "sessionId": "01a067cf-b782-7b58-855e-8158dcb283ab",
+    "originalTask": "https://github.com/oxc-project/oxc-node/pull/745",
+    "workloadSha256": "a20719fd8705b0851825320840835e6c1baf12191581dea2134d3d7a341b7426",
+    "wrapper": "Recorded system/tool definitions were absent. The measured replay used a common review system prompt and a final instruction to continue without tools; both are frozen in messages. No tool definitions were passed.",
+    "normalization": "Preserve all three measured cases with messages unchanged, rename tokens to tokenIds, and include each saved prompt text as rendered. The unused synthetic warmup entry from workload.json is excluded; actual warmup used each measured context."
+  },
+  "model": {
+    "file": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+    "bytes": 17559178144,
+    "sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e",
+    "tokenizerSha256": "eb497acada9c9bbf43bf3fba7ec911094fe4a959d929ac045f347221c30f7bd4",
+    "tokenizerConfigSha256": "52dacff44261824657e05d5176e320a8f380f3006fabbb5d87a03ccf5c208573"
+  },
+  "tokenizerOptions": {
+    "preserveThinking": true,
+    "reason": "Native Qwen sessions retain historical reasoning. For standalone-tokenizer verification only, set preserve_thinking=true in a temporary copy of the supplied chat template; do not modify model assets."
+  },
+  "cases": [
+    {
+      "name": "6k",
+      "promptTokens": 6219,
+      "tokenIdsSha256": "c301418ba1449c6fc0d252798fd5c780ef700c1b4bdbaa01b7ec570481e123ce",
+      "sourceLine": 14,
+      "renderedSha256": "268ba489100dd634215e8ef58b19e01425080c78d71e5aab83850cd4f786a153"
+    },
+    {
+      "name": "16k",
+      "promptTokens": 18754,
+      "tokenIdsSha256": "550302ea93f957e3f4a36c2f87a841d45067ecbea66e8af10e02ae3a4991ff42",
+      "sourceLine": 21,
+      "renderedSha256": "b7c3356eb087856695cef62d3c523ee1ee3ab36d1159b22a51e41a03c7fd6690"
+    },
+    {
+      "name": "32k",
+      "promptTokens": 32488,
+      "tokenIdsSha256": "9f2e3726af32c6f24cc3043b136cfd8f12f96d53262f3a108c095d02ea144e77",
+      "sourceLine": 50,
+      "renderedSha256": "fddb246ab92342628443a6b9052a7b144f068cb37f4a6c7677d41c152d3ed278"
+    }
+  ],
+  "protocol": {
+    "repetitions": 3,
+    "outputTokens": 512,
+    "warmupTokens": 16,
+    "warmup": "One excluded 16-output-token warmup from the same measured context, once per runtime/context process.",
+    "processPolicy": "Fresh process per runtime/context; three measured requests within that process, resetting prompt caches between requests.",
+    "cooldownSeconds": 60,
+    "runtimeOrder": "mlx-node then llama.cpp at 6,219 tokens; llama.cpp then mlx-node at 18,754; mlx-node then llama.cpp at 32,488.",
+    "sampling": "Greedy autoregressive, high thinking, retain historical reasoning; no MTP/DFlash/speculation.",
+    "kvCache": {
+      "mlx-node": "BF16",
+      "llama.cpp": "F16"
+    },
+    "promptCache": "Zero cached tokens. mlx-node resets caches and uses a fresh cache salt per request; llama.cpp cache_prompt=false.",
+    "prefillChunkTokens": 2048,
+    "activeRequests": 1,
+    "timing": "Exclude loading, warmup and HTTP/client overhead from native rates. Prefill-to-first-token; decode covers the subsequent 511 tokens. Record request wall time separately.",
+    "llamaServerArgs": [
+      "-ngl",
+      "99",
+      "-fa",
+      "on",
+      "-ctk",
+      "f16",
+      "-ctv",
+      "f16",
+      "-c",
+      "40960",
+      "-b",
+      "2048",
+      "-ub",
+      "2048",
+      "-t",
+      "8",
+      "-tb",
+      "8",
+      "-np",
+      "1",
+      "--no-warmup",
+      "--perf"
+    ],
+    "mlxEnv": {
+      "MLX_PAGED_PREFILL_CHUNK_SIZE": "2048"
+    },
+    "admissionPolicyByPromptTokens": {
+      "6219": "60-second cooldown plus 20 seconds at <=5% GPU utilization",
+      "18754": "60-second cooldown plus 20 seconds at <=5% GPU utilization",
+      "32488": "60-second interval; no other active local LLM; desktop graphics allowed"
+    },
+    "hardwareNote": "Recorded on M5 Max, 40 GPU cores, 128 GiB, AC power. Settings record this comparison, not universal hardware-optimal defaults. Qwen and Gemma use different workloads/protocols."
+  },
+  "measuredRevisions": {
+    "mlx-node": "c14e55847c8fa44dbb7a965b1f47af7c1d819826",
+    "llama.cpp": "a14dba686aaafba3a2d6b5eb8820b0df5c5d2d92"
+  },
+  "resultsUrl": "https://github.com/mlx-node/mlx-node/issues/142#initial-benchmark",
+  "reuse": "Use frozen messages for mlx-node session inference and frozen tokenIds for llama.cpp /completion. Same-case warmup, cache and timing rules are required for a comparable run. Keep this version unchanged; create a new version for changed messages/tools/templates. Outputs are not golden correctness assertions."
+}
