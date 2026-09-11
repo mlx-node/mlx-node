@@ -17,7 +17,7 @@
  */
 
 import type { Dirent } from 'node:fs';
-import { readdir, readFile } from 'node:fs/promises';
+import { readdir, readFile, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
 import type { ProviderModelConfig } from '@earendil-works/pi-coding-agent';
@@ -58,6 +58,15 @@ function isQwen35XlGguf(name: string): boolean {
 
 function ggufModelName(name: string): string {
   return name.slice(0, -'.gguf'.length);
+}
+
+async function hasGemmaGgufAssets(modelDir: string): Promise<boolean> {
+  try {
+    const assets = await Promise.all(['config.json', 'tokenizer.json'].map((name) => stat(join(modelDir, name))));
+    return assets.every((asset) => asset.isFile());
+  } catch {
+    return false;
+  }
 }
 
 interface ModelFileInventory {
@@ -237,6 +246,10 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
       const full = join(modelsDir, entry.name);
       try {
         const modelType = await detectModelType(full);
+        if (modelType === 'gemma4' && !(await hasGemmaGgufAssets(modelsDir))) {
+          if (debug) console.warn(`[mlx] skip ${full}: native Gemma GGUF requires sibling config.json and tokenizer.json`);
+          continue;
+        }
         if (modelType === 'gemma4' || (modelType === 'qwen3_5' && isQwen35XlGguf(entry.name))) {
           await append(ggufModelName(entry.name), full, modelsDir, modelType, basename(modelsDir));
         } else if (debug) {
@@ -260,6 +273,10 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
 
     const inventory = await modelFileInventory(full);
     if (modelType === 'gemma4' && !inventory.hasSafetensors && inventory.targetGgufs.length > 0) {
+      if (!(await hasGemmaGgufAssets(full))) {
+        if (debug) console.warn(`[mlx] skip ${full}: native Gemma GGUF requires sibling config.json and tokenizer.json`);
+        continue;
+      }
       for (const gguf of inventory.targetGgufs) {
         await append(ggufModelName(gguf), join(full, gguf), full, modelType, entry.name);
       }

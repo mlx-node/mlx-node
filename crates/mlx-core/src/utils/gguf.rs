@@ -4802,8 +4802,12 @@ async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<Path
             )));
         }
     }
-    let companion = gemma4_native_mmproj(&input)?;
     let needs_media = crate::models::gemma4::persistence::native_gguf_requires_media(parent)?;
+    let companion = if needs_media {
+        gemma4_native_mmproj(&input)?
+    } else {
+        None
+    };
     if needs_media && companion.is_none() {
         return Err(Error::from_reason(format!(
             "Gemma4 config declares media inputs but no matching mmproj GGUF was found beside '{}'",
@@ -5318,6 +5322,50 @@ mod tests {
                 prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
                 output
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn gemma_native_ignores_unused_projectors_for_plain_and_text_only_unified_configs() {
+        let root = GemmaNativeTestDir::new();
+        for (index, mut config) in [
+            serde_json::json!({"model_type": "gemma4", "audio_config": {"audio_embed_dim": 1536}}),
+            serde_json::json!({"model_type": "gemma4_unified"}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let source = root.path().join(format!("source-{index}"));
+            let input = gemma_native_fixture(&source);
+            config["text_config"] = serde_json::json!({"num_hidden_layers": 0});
+            fs::write(source.join("config.json"), config.to_string()).unwrap();
+            let cache = root.path().join(format!("cache-{index}"));
+
+            // Even a valid unused projector must not be converted or affect
+            // the cache identity of the text checkpoint.
+            let output = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
+            assert!(!output.join("vision.safetensors").exists());
+            fs::copy(
+                source.join("mmproj-gemma.gguf"),
+                source.join("mmproj-other.gguf"),
+            )
+            .unwrap();
+            assert_eq!(
+                prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+                output
+            );
+
+            // Exact-name precedence must not parse an irrelevant file either.
+            let exact = source.join(format!(
+                "mmproj-{}",
+                input.file_name().unwrap().to_string_lossy()
+            ));
+            fs::write(exact, b"not a GGUF").unwrap();
+            assert_eq!(
+                prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+                output
+            );
+            assert!(!output.join("vision.safetensors").exists());
         }
     }
 

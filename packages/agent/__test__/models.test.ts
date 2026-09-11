@@ -350,6 +350,9 @@ describe('discoverMlxModels', () => {
       }
       await writeFile(join(repo, 'mmproj-gemma-4-12b-it-qat-q4_0.gguf'), minimalGguf('clip'));
       await writeFile(join(root, 'gemma-4-Q4_K_M.gguf'), minimalGguf('gemma4'));
+      await writeFile(join(root, 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+      await writeFile(join(root, 'tokenizer.json'), '{}');
+      await writeFile(join(repo, 'tokenizer.json'), '{}');
       const found = await discoverMlxModels(root);
       expect(found.map((entry) => entry.discovered.name)).toEqual([
         'gemma-4-12b-Q6_K',
@@ -367,6 +370,35 @@ describe('discoverMlxModels', () => {
       const converted = await discoverMlxModels(root);
       expect(converted.map((entry) => entry.discovered.name)).toEqual(['gemma-4-Q4_K_M', 'gemma4-gguf']);
       expect(converted[1].discovered.path).toBe(repo);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['top-level', 'nested'] as const)('requires sibling config and tokenizer files for %s Gemma GGUFs', async (layout) => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-gemma-assets-'));
+    try {
+      const repo = layout === 'top-level' ? root : join(root, 'gemma-gguf');
+      await mkdir(repo, { recursive: true });
+      const gguf = join(repo, 'gemma-4-Q4_K_M.gguf');
+      await writeFile(gguf, minimalGguf('gemma4'));
+      const configPath = join(repo, 'config.json');
+      const tokenizerPath = join(repo, 'tokenizer.json');
+      const config = JSON.stringify({ model_type: 'gemma4' });
+
+      expect(await discoverMlxModels(root)).toEqual([]);
+      await writeFile(configPath, config);
+      expect(await discoverMlxModels(root)).toEqual([]);
+      await rm(configPath);
+      await writeFile(tokenizerPath, '{}');
+      expect(await discoverMlxModels(root)).toEqual([]);
+      await writeFile(configPath, config);
+      expect((await discoverMlxModels(root)).map((entry) => entry.discovered.path)).toEqual([gguf]);
+
+      // A directory with the required name is not a usable tokenizer file.
+      await rm(tokenizerPath);
+      await mkdir(tokenizerPath);
+      expect(await discoverMlxModels(root)).toEqual([]);
     } finally {
       await rm(root, { recursive: true, force: true });
     }
