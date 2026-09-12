@@ -9,6 +9,20 @@ use napi::bindgen_prelude::*;
 pub struct Activations;
 
 impl Activations {
+    /// Inference attention gate: value * sigmoid(gate), fused without widening
+    /// the activation dtype or changing the projection's quantization format.
+    pub fn sigmoid_mul_compiled(gate: &MxArray, value: &MxArray) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_sigmoid_mul_compiled(gate.handle.0, value.handle.0) };
+        MxArray::from_handle(handle, "sigmoid_mul_compiled")
+    }
+
+    /// Inference SwiGLU fused by MLX compilation, preserving the input dtype.
+    /// Projections remain separate so mixed native quantization formats are kept.
+    pub fn swiglu_compiled(gate: &MxArray, up: &MxArray) -> Result<MxArray> {
+        let handle = unsafe { sys::mlx_swiglu_compiled(gate.handle.0, up.handle.0) };
+        MxArray::from_handle(handle, "swiglu_compiled")
+    }
+
     /// Sigmoid Linear Unit (SiLU): x * sigmoid(x)
     /// This is the most common activation in modern LLMs (Llama, Qwen, Phi)
     ///
@@ -231,6 +245,115 @@ impl Activations {
 mod tests {
     use super::*;
     use crate::array::MxArray;
+
+    #[test]
+    fn compiled_sigmoid_mul_preserves_dtype_and_handles_changing_layouts() {
+        use crate::array::DType;
+
+        for (dtype, tolerance) in [
+            (DType::Float32, 2e-6_f64),
+            (DType::Float16, 0.002),
+            (DType::BFloat16, 0.016),
+        ] {
+            // Singleton decode, batched verifier, and prefill. Only the gate
+            // is transposed, exercising independently strided inputs.
+            for (shape, transposed) in [
+                ([1, 1, 4096], false),
+                ([2, 17, 33], true),
+                ([1, 512, 33], false),
+            ] {
+                let n = shape.iter().product::<i64>() as usize;
+                let gates: Vec<f32> = (0..n)
+                    .map(|i| [-100.0, -20.0, -2.0, -0.1, 0.0, 0.1, 2.0, 20.0, 100.0][i % 9])
+                    .collect();
+                let values: Vec<f32> = (0..n).map(|i| ((i % 31) as f32 - 15.0) / 7.0).collect();
+                let gate_shape = if transposed {
+                    [shape[0], shape[2], shape[1]]
+                } else {
+                    shape
+                };
+                let mut gate = MxArray::from_float32(&gates, &gate_shape)
+                    .unwrap()
+                    .astype(dtype)
+                    .unwrap();
+                if transposed {
+                    gate = gate.transpose(Some(&[0, 2, 1])).unwrap();
+                }
+                let value = MxArray::from_float32(&values, &shape)
+                    .unwrap()
+                    .astype(dtype)
+                    .unwrap();
+                let result = Activations::sigmoid_mul_compiled(&gate, &value).unwrap();
+                assert_eq!(result.dtype().unwrap(), dtype);
+                assert_eq!(result.shape().unwrap().to_vec(), shape);
+                let actual = result.astype(DType::Float32).unwrap().to_float32().unwrap();
+                let g = gate.astype(DType::Float32).unwrap().to_float32().unwrap();
+                let v = value.astype(DType::Float32).unwrap().to_float32().unwrap();
+                for i in 0..n {
+                    let expected = f64::from(v[i]) / (1.0 + (-f64::from(g[i])).exp());
+                    let error = (f64::from(actual[i]) - expected).abs();
+                    assert!(
+                        actual[i].is_finite() && error <= tolerance * (1.0 + expected.abs()),
+                        "{dtype:?} shape={shape:?} transposed={transposed} index={i}: actual={} expected={expected}",
+                        actual[i]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn compiled_swiglu_preserves_dtype_and_handles_changing_shapes() {
+        use crate::array::DType;
+
+        // Decode, verifier, and prefill shapes share the shapeless compiled
+        // function. Transposed inputs also exercise non-contiguous layouts.
+        for (dtype, tolerance) in [
+            (DType::Float32, 2e-6_f64),
+            (DType::Float16, 0.002),
+            (DType::BFloat16, 0.016),
+        ] {
+            for (rows, width, transposed) in [(1, 19968, false), (17, 33, true), (512, 33, false)] {
+                let n = rows * width;
+                let gates: Vec<f32> = (0..n)
+                    .map(|i| [-100.0, -20.0, -2.0, -0.1, 0.0, 0.1, 2.0, 20.0, 100.0][i % 9])
+                    .collect();
+                let ups: Vec<f32> = (0..n).map(|i| ((i % 31) as f32 - 15.0) / 7.0).collect();
+                let shape = [1, rows as i64, width as i64];
+                let mut gate = MxArray::from_float32(&gates, &shape)
+                    .unwrap()
+                    .astype(dtype)
+                    .unwrap();
+                let mut up = MxArray::from_float32(&ups, &shape)
+                    .unwrap()
+                    .astype(dtype)
+                    .unwrap();
+                if transposed {
+                    gate = gate.transpose(Some(&[0, 2, 1])).unwrap();
+                    up = up.transpose(Some(&[0, 2, 1])).unwrap();
+                }
+                let result = Activations::swiglu_compiled(&gate, &up).unwrap();
+                assert_eq!(result.dtype().unwrap(), dtype);
+                assert_eq!(
+                    result.shape().unwrap().to_vec(),
+                    gate.shape().unwrap().to_vec()
+                );
+                let actual = result.astype(DType::Float32).unwrap().to_float32().unwrap();
+                let g = gate.astype(DType::Float32).unwrap().to_float32().unwrap();
+                let u = up.astype(DType::Float32).unwrap().to_float32().unwrap();
+                for i in 0..n {
+                    let expected =
+                        f64::from(g[i]) / (1.0 + (-f64::from(g[i])).exp()) * f64::from(u[i]);
+                    let error = (f64::from(actual[i]) - expected).abs();
+                    assert!(
+                        actual[i].is_finite() && error <= tolerance * (1.0 + expected.abs()),
+                        "{dtype:?} shape={shape:?} transposed={transposed} index={i}: actual={} expected={expected}",
+                        actual[i]
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_hard_swish() {

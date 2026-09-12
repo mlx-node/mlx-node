@@ -4,6 +4,7 @@
 pub mod attention;
 pub(crate) mod cold_sidecar;
 pub mod config;
+mod decode_tuning;
 pub mod decoder_layer;
 pub(crate) mod dflash;
 pub(crate) mod dflash_decode;

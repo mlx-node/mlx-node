@@ -109,6 +109,10 @@ unsafe extern "C-unwind" {
         beta: f32,
     ) -> *mut mlx_array;
 
+    // Shape-independent activation fusion; projection formats remain independent.
+    pub fn mlx_swiglu_compiled(gate: *mut mlx_array, up: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_sigmoid_mul_compiled(gate: *mut mlx_array, value: *mut mlx_array) -> *mut mlx_array;
+
     // Fused SwiGLU MLP forward: output = down(silu(gate(x)) * up(x))
     // Weights are [out_features, in_features], transposed internally
     pub fn mlx_swiglu_mlp_forward(
@@ -822,9 +826,10 @@ unsafe extern "C-unwind" {
     ) -> *mut mlx_array;
 
     /// Route-hinted sibling of `mlx_paged_attention_forward`. Route 0 keeps
-    /// automatic selection, 1 requests the validated grouped D512 kernel, and
-    /// 2 forces the generic V1/V2 implementation. Route 1 retains its legacy
-    /// "staged" identifier but selects the canonical direct-read pipeline.
+    /// automatic selection, 1 requests the validated grouped D512 kernel,
+    /// 2 forces generic V1/V2, and 3 requests grouped BF16 D128 decode.
+    /// Route 1 retains its legacy "staged" identifier but selects the
+    /// canonical direct-read pipeline.
     /// The cache layout is unchanged for every route.
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_paged_attention_forward_with_route(
@@ -1442,6 +1447,9 @@ unsafe extern "C-unwind" {
     /// Reset/read the geometry-based grouped D512 route probe.
     pub fn mlx_paged_grouped_d512_test_probe_reset();
     pub fn mlx_paged_grouped_d512_test_probe_count() -> u64;
+
+    /// Maximum legal D128 partitions under live pipeline, storage and context limits.
+    pub fn mlx_paged_grouped_d128_max_stripes(context: u32, attention_layers: u32) -> u32;
 
     /// Return 1 when the canonical direct-read D512 Metal pipeline, reducer,
     /// and threadgroup limits

@@ -66,6 +66,7 @@ enum class PagedAttentionRouteHint : uint8_t {
   // Legacy ABI name for the canonical grouped D512 production route.
   ForceD512Staged = 1,
   ForceGeneric = 2,
+  ForceD128 = 3,
 };
 
 /// Dispatch the `reshape_and_cache` kernel onto the MLX command

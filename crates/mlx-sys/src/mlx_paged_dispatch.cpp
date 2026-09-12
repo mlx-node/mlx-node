@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "mlx/allocator.h"
+#include "mlx/memory.h"
 #include "mlx/dtype.h"
 #include "mlx/transforms.h"
 
@@ -312,6 +313,7 @@ const std::string& paged_attention_v2_reduce_kernel_name(
 enum class GroupedPagedAttentionKind {
   None,
   Qwen35D256,
+  D128Direct,
   D512Direct,
 };
 
@@ -328,6 +330,10 @@ const std::string& paged_attention_grouped_kernel_name(
   static const std::string gemma4 =
       "paged_attention_grouped_bfloat16_hs512_bs16_striped";
   switch (kind) {
+    case GroupedPagedAttentionKind::D128Direct: {
+      static const std::string name = "paged_attention_grouped_bfloat16_hs128_bs16_striped";
+      return name;
+    }
     case GroupedPagedAttentionKind::Qwen35D256:
       return qwen35;
     case GroupedPagedAttentionKind::D512Direct:
@@ -345,6 +351,10 @@ const std::string& paged_attention_grouped_reduce_kernel_name(
   static const std::string gemma4 =
       "paged_attention_grouped_bfloat16_hs512_striped_reduce";
   switch (kind) {
+    case GroupedPagedAttentionKind::D128Direct: {
+      static const std::string name = "paged_attention_grouped_bfloat16_hs128_striped_reduce";
+      return name;
+    }
     case GroupedPagedAttentionKind::Qwen35D256:
       return qwen35;
     case GroupedPagedAttentionKind::D512Direct:
@@ -600,6 +610,14 @@ GroupedPagedAttentionKind select_grouped_paged_attention(
         ? GroupedPagedAttentionKind::D512Direct
         : GroupedPagedAttentionKind::None;
   }
+  if (route_hint == PagedAttentionRouteHint::ForceD128) {
+    return io_dtype == KvDtype::Bf16 && cache_dtype == KvDtype::Bf16 &&
+        num_seqs == 1 && num_q_heads == 32 && num_kv_heads == 2 &&
+        head_size == 128 && block_size == 16 && query_rows == 1 &&
+        max_context_len > static_cast<int>(kPartitionSize)
+        ? GroupedPagedAttentionKind::D128Direct
+        : GroupedPagedAttentionKind::None;
+  }
   if (use_grouped_qwen35_paged_attention(
           io_dtype,
           cache_dtype,
@@ -756,13 +774,17 @@ bool grouped_pipelines_supported(
     int num_q_heads,
     int num_kv_heads) {
   // There is one active Metal device. Cache capability independently for the
-  // two concrete instantiations so an unavailable experimental Gemma pipeline
-  // cannot disable the established Qwen path (or vice versa).
+  // concrete instantiations so an unavailable pipeline cannot disable the
+  // supported paths for other head sizes.
   const GroupedPipelineLimits* limits_ptr = nullptr;
   if (kind == GroupedPagedAttentionKind::Qwen35D256) {
     static const GroupedPipelineLimits qwen35_limits =
         load_grouped_pipeline_limits(device, kind);
     limits_ptr = &qwen35_limits;
+  } else if (kind == GroupedPagedAttentionKind::D128Direct) {
+    static const GroupedPipelineLimits d128_limits =
+        load_grouped_pipeline_limits(device, kind);
+    limits_ptr = &d128_limits;
   } else if (kind == GroupedPagedAttentionKind::D512Direct) {
     static const GroupedPipelineLimits d512_limits =
         load_grouped_pipeline_limits(device, kind);
@@ -870,6 +892,36 @@ extern "C" void mlx_paged_grouped_gemma4_test_probe_reset() {
 
 extern "C" uint64_t mlx_paged_grouped_gemma4_test_probe_count() {
   return mlx_paged_grouped_d512_test_probe_count();
+}
+
+extern "C" uint32_t mlx_paged_grouped_d128_max_stripes(
+    uint32_t context, uint32_t attention_layers) {
+  if (context <= kPartitionSize || attention_layers == 0) return 0;
+  try {
+    auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
+    auto& device = mlx::core::metal::device(stream.device);
+    if (!grouped_pipelines_supported(device, GroupedPagedAttentionKind::D128Direct, 32, 2))
+      return 0;
+    const size_t memory_limit = std::min(
+        mlx::core::get_memory_limit(),
+        static_cast<size_t>(device.mtl_device()->recommendedMaxWorkingSetSize()));
+    const size_t active = mlx::core::get_active_memory();
+    const size_t available = memory_limit > active ? memory_limit - active : 0;
+    // FP32 sum/max plus BF16 partial output per Q head. Account for all
+    // global layers retaining temporaries in an in-flight command buffer.
+    constexpr size_t bytes_per_stripe = 32 * (2 * sizeof(float) + 128 * sizeof(uint16_t));
+    const size_t memory_stripes = available / attention_layers / bytes_per_stripe;
+    const size_t buffer_stripes = device.mtl_device()->maxBufferLength() / (32 * 128 * sizeof(uint16_t));
+    const size_t tiles = (static_cast<size_t>(context) + 15) / 16;
+    // 1024 is the tested kernel/ABI limit, shared with the existing D256
+    // reducer. No device name, core-count guess, or fixed chosen plan.
+    const size_t limit = std::min({size_t{1024}, memory_stripes, buffer_stripes, tiles});
+    uint32_t stripes = 0;
+    for (uint32_t candidate = 4; candidate <= limit; candidate *= 2) stripes = candidate;
+    return stripes;
+  } catch (...) {
+    return 0;
+  }
 }
 
 extern "C" int mlx_paged_grouped_d512_capability(
@@ -1196,12 +1248,13 @@ void dispatch_paged_attention_v2_inner(
       route_hint);
   const bool use_grouped =
       grouped_kind != GroupedPagedAttentionKind::None &&
+      (grouped_kind != GroupedPagedAttentionKind::D128Direct || planned_stripes != 0) &&
       grouped_pipelines_supported(
           device, grouped_kind, num_q_heads, num_kv_heads);
   // Generic V2 uses contiguous 512-token partitions. The grouped path uses
   // MLX-style strided stripes and its dedicated second pass.
   const uint32_t max_num_partitions = use_grouped
-      ? ((grouped_kind == GroupedPagedAttentionKind::D512Direct && planned_stripes)
+      ? ((planned_stripes != 0)
              ? planned_stripes
              : grouped_stripe_count(
                    grouped_kind, max_context_len, num_q_heads, num_kv_heads))

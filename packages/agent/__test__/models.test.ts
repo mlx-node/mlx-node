@@ -375,16 +375,87 @@ describe('discoverMlxModels', () => {
     }
   });
 
-  it.each(['top-level', 'nested'] as const)('requires sibling config and tokenizer files for %s Gemma GGUFs', async (layout) => {
+  it('lists all Muse GGUF variants by filename and ignores renamed companions and broken files', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-muse-gguf-'));
+    try {
+      const repo = join(root, 'muse-glimmer-30b-gguf');
+      await mkdir(repo);
+      await writeFile(
+        join(repo, 'config.json'),
+        JSON.stringify({ model_type: 'muse_glimmer', vision_config: { hidden_size: 1536 } }),
+      );
+      await writeFile(join(repo, 'tokenizer.json'), '{}');
+      const names = [
+        'Muse-Glimmer-30B-KQuant-17GB-Q4_K_M.gguf',
+        'Muse-Glimmer-30B-KQuant-Dynamic-Q4_K_XL.gguf',
+        'muse-glimmer-30B-kquant-17gb.gguf',
+        'muse-glimmer-30B-kquant-dynamic.gguf',
+      ];
+      for (const name of names) await writeFile(join(repo, name), minimalGguf('muse-glimmer'));
+      for (const [name, arch] of [
+        ['dflash-kquant.gguf', 'dflash'],
+        ['mmproj-kquant.gguf', 'clip'],
+        ['renamed-companion.gguf', 'dflash'],
+        ['renamed-projector.gguf', 'clip'],
+        ['unrelated-Q4_K_XL.gguf', 'llama'],
+      ])
+        await writeFile(join(repo, name), minimalGguf(arch));
+      await writeFile(join(repo, 'broken.gguf'), 'incomplete download');
+      const found = await discoverMlxModels(root);
+      expect(found.map((entry) => entry.discovered)).toEqual(
+        names.map((name) => ({
+          name: name.slice(0, -5),
+          path: join(repo, name),
+          modelType: 'muse_glimmer',
+        })),
+      );
+      expect(found.every((entry) => entry.piModel.input.join() === 'text')).toBe(true);
+
+      // Retaining the downloaded XL alongside an imported model must not
+      // hide the usable SafeTensors directory or switch it to another variant.
+      await writeFile(join(repo, 'model.safetensors'), 'weights');
+      expect((await discoverMlxModels(root)).map((entry) => entry.discovered.path)).toEqual([repo]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each([1, 2])('keeps %i Muse GGUF targets selectable beside companion SafeTensors', async (count) => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-agent-muse-companion-'));
+    try {
+      const repo = join(root, 'muse-gguf');
+      await mkdir(repo);
+      await writeFile(join(repo, 'config.json'), JSON.stringify({ model_type: 'muse_glimmer' }));
+      await writeFile(join(repo, 'tokenizer.json'), '{}');
+      for (const name of ['draft.safetensors', 'vision.safetensors', 'mmproj.safetensors']) {
+        await writeFile(join(repo, name), 'companion');
+      }
+      const targets = ['Muse-Q4_K_XL.gguf', 'Muse-Q6_K.gguf'].slice(0, count).map((name) => join(repo, name));
+      for (const target of targets) await writeFile(target, minimalGguf('muse-glimmer'));
+      expect((await discoverMlxModels(root)).map((entry) => entry.discovered.path)).toEqual(targets);
+
+      for (const primary of ['model.safetensors', 'weights.safetensors', 'model-00001-of-00002.safetensors']) {
+        await writeFile(join(repo, primary), 'primary weights');
+        expect((await discoverMlxModels(root)).map((entry) => entry.discovered.path)).toEqual([repo]);
+        await rm(join(repo, primary));
+      }
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(
+    ['gemma4', 'muse_glimmer'].flatMap((family) => ['top-level', 'nested'].map((layout) => ({ family, layout }))),
+  )('requires sibling config and tokenizer files for $layout $family GGUFs', async ({ family, layout }) => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-agent-gemma-assets-'));
     try {
       const repo = layout === 'top-level' ? root : join(root, 'gemma-gguf');
       await mkdir(repo, { recursive: true });
       const gguf = join(repo, 'gemma-4-Q4_K_M.gguf');
-      await writeFile(gguf, minimalGguf('gemma4'));
+      await writeFile(gguf, minimalGguf(family === 'muse_glimmer' ? 'muse-glimmer' : 'gemma4'));
       const configPath = join(repo, 'config.json');
       const tokenizerPath = join(repo, 'tokenizer.json');
-      const config = JSON.stringify({ model_type: 'gemma4' });
+      const config = JSON.stringify({ model_type: family });
 
       expect(await discoverMlxModels(root)).toEqual([]);
       await writeFile(configPath, config);
@@ -394,6 +465,11 @@ describe('discoverMlxModels', () => {
       expect(await discoverMlxModels(root)).toEqual([]);
       await writeFile(configPath, config);
       expect((await discoverMlxModels(root)).map((entry) => entry.discovered.path)).toEqual([gguf]);
+
+      if (family === 'muse_glimmer') {
+        await writeFile(join(repo, 'renamed-companion.gguf'), minimalGguf('dflash'));
+        expect((await discoverMlxModels(root)).map((entry) => entry.discovered.path)).toEqual([gguf]);
+      }
 
       // A directory with the required name is not a usable tokenizer file.
       await rm(tokenizerPath);

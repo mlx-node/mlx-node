@@ -308,6 +308,10 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         self.paged_prefill(&source[start..end], &prefix, generation_stream)
             .map(Some)
     }
+    /// Called after the sampled GPU values have materialized, before host
+    /// result handling. Forced tokens and failed samples do not qualify.
+    fn observe_scheduled_decode_batch(&mut self, _completed: bool) {}
+
     fn finish_scheduled_decode_batch(&mut self, _rows: &[(SeqId, u32)]) -> Result<()> {
         Ok(())
     }
@@ -1178,6 +1182,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 ))
             })
             .collect::<Result<Vec<_>>>()?;
+        let sampled_forward = greedy_wave.iter().all(|(_, forced)| !forced);
         let greedy_tokens = match &logits {
             Ok(Some(logits)) if engine::batch_sampling::can_batch_greedy_wave(greedy_wave) => {
                 engine::batch_sampling::batch_greedy_tokens_or_fallback(logits)
@@ -1214,6 +1219,11 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         } else {
             Vec::new()
         };
+        self.inner.observe_scheduled_decode_batch(
+            sampled_forward
+                && !next_tokens.is_empty()
+                && next_tokens.iter().all(|token| matches!(token, Some(Ok(_)))),
+        );
         for row in work {
             let planned = plan.rows.get(row.plan_index).ok_or_else(|| {
                 Error::from_reason(format!(

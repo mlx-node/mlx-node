@@ -3,8 +3,7 @@
 // =============================================================================
 // Shared compiled SwiGLU activation.
 //
-// The only surviving consumer is the fused MLP forward in mlx_fused_ops.cpp,
-// which calls qwen35_common::swiglu for the sigmoid(gate)*gate*up fusion.
+// Used by the fused MLP and standalone activation in mlx_fused_ops.cpp.
 // All functions are inline to avoid ODR violations across translation units.
 // =============================================================================
 

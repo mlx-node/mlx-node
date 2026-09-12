@@ -12,6 +12,7 @@ pub(crate) mod cache;
 pub(crate) mod cmd;
 pub(crate) mod compiled_lock;
 pub(crate) mod decode;
+pub(crate) mod decode_tuning;
 pub(crate) mod dspark_turn;
 pub(crate) mod finalize;
 pub(crate) mod hybrid_scheduler;

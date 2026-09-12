@@ -139,8 +139,9 @@ impl MuseGlimmerAttention {
         .transpose(Some(&[0, 2, 1, 3]))?
         .reshape(&[batch, seq_len, self.num_heads * self.head_dim])?;
 
-        let gate = Activations::sigmoid(&self.gate_proj.forward(x)?)?;
-        self.o_proj.forward(&attended.mul(&gate)?)
+        let gate = self.gate_proj.forward(x)?;
+        self.o_proj
+            .forward(&Activations::sigmoid_mul_compiled(&gate, &attended)?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -279,8 +280,9 @@ impl MuseGlimmerAttention {
             seq_len,
             self.num_heads * self.head_dim,
         ])?;
-        let gate = Activations::sigmoid(&self.gate_proj.forward(x)?)?;
-        self.o_proj.forward(&attended.mul(&gate)?)
+        let gate = self.gate_proj.forward(x)?;
+        self.o_proj
+            .forward(&Activations::sigmoid_mul_compiled(&gate, &attended)?)
     }
 
     pub(crate) fn forward_paged_batched(
@@ -366,12 +368,33 @@ impl MuseGlimmerAttention {
             .update_keys_values_native_batched(paged_idx, &k, &v, rows)
             .map_err(Error::from_reason)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
+        // Only global singleton decode participates. Compact sliding reads,
+        // prefill, verification and multi-owner batches keep their own route.
+        let choice = self
+            .sliding_window
+            .is_none()
+            .then(|| super::decode_tuning::current_plan().grouped_stripes)
+            .flatten();
+        use crate::transformer::paged_kv_cache_adapter::PagedDecodeRouteHint;
+        let (route, stripes) = match choice {
+            Some(0) => (PagedDecodeRouteHint::ForceGeneric, 0),
+            Some(stripes) => (PagedDecodeRouteHint::ForceD128, stripes),
+            None => (PagedDecodeRouteHint::Auto, 0),
+        };
         let attended = adapter
-            .gather_kv_for_decode_graph_batched(paged_idx, &q, &seq_ids, scale as f32, 1.0)
+            .gather_kv_for_decode_graph_batched_with_plan(
+                paged_idx,
+                &q,
+                &seq_ids,
+                scale as f32,
+                1.0,
+                route,
+                stripes,
+            )
             .map_err(Error::from_reason)?
             .astype(x.dtype()?)?
             .reshape(&[batch, 1, self.num_heads * self.head_dim])?;
-        let output = attended.mul(&Activations::sigmoid(&gate)?)?;
+        let output = Activations::sigmoid_mul_compiled(&gate, &attended)?;
         if preserve_singleton_projection_graphs {
             super::row_exact::forward_rows_independently(&output, |row| self.o_proj.forward(row))
         } else {
@@ -456,7 +479,7 @@ impl MuseGlimmerAttention {
             .map_err(Error::from_reason)?
             .astype(x.dtype()?)?
             .reshape(&[batch, 1, self.num_heads * self.head_dim])?;
-        let output = attended.mul(&Activations::sigmoid(&gate)?)?;
+        let output = Activations::sigmoid_mul_compiled(&gate, &attended)?;
         if preserve_owner_projection_graphs {
             super::row_exact::forward_owner_spans(&output, rows, |row| self.o_proj.forward(row))
         } else {

@@ -308,6 +308,15 @@ impl HybridSchedulerBackend for MuseGlimmerInner {
             .map(Some)
     }
 
+    fn observe_scheduled_decode_batch(&mut self, completed: bool) {
+        if let Some(started) = self.decode_timing.take()
+            && completed
+        {
+            self.decode_tuning
+                .observe(started.elapsed().as_secs_f64(), self.layers.len());
+        }
+    }
+
     fn finish_scheduled_decode_batch(&mut self, rows: &[(SeqId, u32)]) -> Result<()> {
         let paged = self
             .paged

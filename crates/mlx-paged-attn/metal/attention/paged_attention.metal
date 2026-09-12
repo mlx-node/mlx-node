@@ -1189,7 +1189,7 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 
 // ========================================== Grouped GQA paged attention
 //
-// Long-context D256 and D512 GQA decode use block_size=16. The generic kernel
+// Long-context D128, D256 and D512 GQA decode use block_size=16. The generic kernel
 // above launches one 256-thread threadgroup per *query* head. Consequently
 // every query head mapped to one KV head traverses the same paged K/V range in
 // independent threadgroups.
@@ -1205,9 +1205,9 @@ template <typename T, typename CACHE_T, int HEAD_SIZE, int BLOCK_SIZE, int NUM_T
 // instantiations use no threadgroup staging or barriers; a distinctly named
 // staged D512 variant remains available only for manual comparisons.
 //
-// The host dispatcher only selects the explicit BF16 D256 or D512, BS16
-// instantiations for their exact head layouts. Keeping this as a two-entry
-// template avoids copying the kernel while leaving every other
+// The host dispatcher only selects the explicit BF16 D128, D256 or D512, BS16
+// instantiations for their exact head layouts. Sharing this template avoids
+// copying the kernel while leaving every other
 // model/configuration on the proven fallback.
 
 template <int HEAD_SIZE, bool STAGE_KV>
@@ -1243,7 +1243,7 @@ template <int HEAD_SIZE, bool STAGE_KV>
 
   // A D512 KV page is 16 KiB. The retained staged comparison variant lets
   // every query-head SIMD group attached to one KV head reuse a global read.
-  // The production D256 and D512 instantiations set STAGE_KV=false; their
+  // The production instantiations set STAGE_KV=false; their
   // one-element dead tile and all related control flow compile away.
   threadgroup bfloat16_t kv_tile[STAGE_KV ? PAGE_ELEMENTS : 1];
 
@@ -1589,6 +1589,7 @@ template <int HEAD_SIZE>
       uint simd_gid [[simdgroup_index_in_threadgroup]],                      \
       uint simd_lid [[thread_index_in_simdgroup]]);
 
+instantiate_grouped_bfloat16_attention(128, false);
 instantiate_grouped_bfloat16_attention(256, false);
 instantiate_grouped_bfloat16_attention(512, false);
 

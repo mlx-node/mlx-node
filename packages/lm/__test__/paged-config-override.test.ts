@@ -1,3 +1,5 @@
+/// <reference types="node" />
+
 /**
  * `PagedConfigOverrideManager` persist-paged-cache injection.
  *
@@ -11,12 +13,14 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import * as core from '@mlx-node/core';
 import { CHAT_FAMILY_IDS, PagedConfigOverrideManager } from '@mlx-node/lm';
-import { afterEach, describe, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 const cleanups: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   while (cleanups.length > 0) await cleanups.pop()!();
 });
 
@@ -35,6 +39,38 @@ async function readOverrideConfig(overridePath: string): Promise<Record<string, 
 }
 
 describe('PagedConfigOverrideManager persist-paged-cache', () => {
+  it.each([true, false])(
+    'applies persistence=%s to a prepared Muse GGUF without changing its cache',
+    async (persist) => {
+      const sourceConfig = { model_type: 'muse_glimmer', use_block_paged_cache: false, persist_paged_cache: !persist };
+      const prepared = await makeModelDir(sourceConfig);
+      await writeFile(join(prepared, 'draft.safetensors'), 'draft weights');
+      const input = join(prepared, 'Muse-Glimmer-Q4_K_M.gguf');
+      const prepare = vi.spyOn(core, 'prepareMuseGlimmerGguf').mockResolvedValue(prepared);
+      const manager = new PagedConfigOverrideManager();
+      cleanups.push(() => manager.cleanup());
+
+      const resolved = await manager.resolve(input, 'muse_glimmer', persist);
+      expect(prepare).toHaveBeenCalledWith(input);
+      expect(resolved).not.toBe(prepared);
+      expect(await readOverrideConfig(resolved)).toMatchObject({
+        use_block_paged_cache: true,
+        persist_paged_cache: persist,
+      });
+      expect(await readFile(join(resolved, 'draft.safetensors'), 'utf8')).toBe('draft weights');
+      expect(await readOverrideConfig(prepared)).toEqual(sourceConfig);
+      expect(await manager.resolve(input, 'muse_glimmer', persist)).toBe(resolved);
+    },
+  );
+
+  it('does not prepare GGUF weights for an unmanaged family', async () => {
+    const prepare = vi.spyOn(core, 'prepareMuseGlimmerGguf');
+    const manager = new PagedConfigOverrideManager({ modelTypes: ['qwen3_5'] });
+    cleanups.push(() => manager.cleanup());
+    expect(await manager.resolve('/models/muse.gguf', 'muse_glimmer', true)).toBe('/models/muse.gguf');
+    expect(prepare).not.toHaveBeenCalled();
+  });
+
   it('injects persist_paged_cache into a qwen3 overlay when requested', async () => {
     const source = await makeModelDir({ model_type: 'qwen3' });
     const manager = new PagedConfigOverrideManager();

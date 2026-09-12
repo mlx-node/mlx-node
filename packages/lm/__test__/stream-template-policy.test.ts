@@ -118,6 +118,22 @@ describe('makeStreamingModel template content policy', () => {
     expect(tokenizerMocks.applyChatTemplate).toHaveBeenCalledWith(messages, true, null, false);
   });
 
+  it('uses the native asset directory after a direct GGUF load', async () => {
+    class CachedNativeModel extends NativeStreamingStub {
+      static override async load(_modelPath: string): Promise<CachedNativeModel> {
+        return new CachedNativeModel();
+      }
+
+      modelAssetsPath(): string {
+        return '/cache/native-gguf/muse';
+      }
+    }
+    const Model = makeStreamingModel(CachedNativeModel, { recordModelPath: true });
+    const model = await Model.load('/models/muse-Q4_K_M.gguf');
+    await model.applyChatTemplate(messages, true, null, false);
+    expect(tokenizerMocks.fromPretrained).toHaveBeenCalledWith('/cache/native-gguf/muse/tokenizer.json');
+  });
+
   it('exposes raw assistant replay only for checkpoint templates that require it', async () => {
     const DefaultModel = makeStreamingModel(NativeStreamingStub, {
       recordModelPath: true,

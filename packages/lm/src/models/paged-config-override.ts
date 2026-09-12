@@ -12,7 +12,9 @@
 
 import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+
+import { ggufArchitecture, prepareMuseGlimmerGguf } from '@mlx-node/core';
 
 import { CHAT_FAMILY_IDS } from '../family-data.js';
 
@@ -100,6 +102,22 @@ export class PagedConfigOverrideManager {
     persistPagedCache?: boolean,
   ): Promise<string> {
     const sourcePath = isAbsolute(modelPath) ? modelPath : resolve(modelPath);
+    if (extname(sourcePath).toLowerCase() === '.gguf') {
+      let modelType = canonicalModelType;
+      if (modelType === undefined) {
+        try {
+          if (ggufArchitecture(sourcePath) === 'muse-glimmer') modelType = 'muse_glimmer';
+        } catch {
+          return modelPath;
+        }
+      }
+      if (modelType !== 'muse_glimmer' || !this.modelTypes.has(modelType)) return modelPath;
+      // A symlink to the GGUF would canonicalize back to the original config.
+      // Prepare once, then overlay the packed cache so paging/persistence
+      // directives reach the loader and the DFlash sidecar stays attached.
+      const prepared = await prepareMuseGlimmerGguf(sourcePath);
+      return this.resolveInternal(prepared, modelType, persistPagedCache);
+    }
     let config: Record<string, unknown>;
     try {
       config = JSON.parse(await readFile(join(sourcePath, 'config.json'), 'utf-8')) as Record<string, unknown>;

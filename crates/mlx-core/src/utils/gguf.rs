@@ -4697,6 +4697,18 @@ fn qwen35_native_cache_is_current(
 /// Resolve a Gemma GGUF directory without overriding an existing SafeTensors
 /// checkpoint. Multiple targets require an explicit filename.
 pub(crate) fn resolve_gemma4_gguf_source(path: &Path) -> Result<Option<PathBuf>> {
+    resolve_native_gguf_source(path, "gemma4", "Gemma4")
+}
+
+pub(crate) fn resolve_muse_glimmer_gguf_source(path: &Path) -> Result<Option<PathBuf>> {
+    resolve_native_gguf_source(path, "muse-glimmer", "Muse-Glimmer")
+}
+
+fn resolve_native_gguf_source(
+    path: &Path,
+    architecture: &str,
+    family: &str,
+) -> Result<Option<PathBuf>> {
     let is_gguf = |p: &Path| {
         p.extension()
             .and_then(|s| s.to_str())
@@ -4712,7 +4724,8 @@ pub(crate) fn resolve_gemma4_gguf_source(path: &Path) -> Result<Option<PathBuf>>
         matches!(
             name.as_ref(),
             "model.safetensors" | "weights.safetensors" | "model.safetensors.index.json"
-        ) || (name.starts_with("model-") && name.ends_with(".safetensors"))
+        ) || ((name.starts_with("model-") || name.starts_with("model.safetensors-"))
+            && name.ends_with(".safetensors"))
     }) {
         return Ok(None);
     }
@@ -4721,7 +4734,11 @@ pub(crate) fn resolve_gemma4_gguf_source(path: &Path) -> Result<Option<PathBuf>>
         let candidate = entry.path();
         if candidate.is_file()
             && is_gguf(&candidate)
-            && is_gemma4_main_gguf(&parse_gguf(&candidate)?.metadata)
+            && parse_gguf(&candidate)?
+                .metadata
+                .get("general.architecture")
+                .and_then(GgufMetaValue::as_str)
+                == Some(architecture)
         {
             targets.push(candidate);
         }
@@ -4731,7 +4748,7 @@ pub(crate) fn resolve_gemma4_gguf_source(path: &Path) -> Result<Option<PathBuf>>
         0 => Ok(None),
         1 => Ok(targets.pop()),
         _ => Err(Error::from_reason(format!(
-            "Multiple Gemma4 GGUF targets in '{}'; pass the desired .gguf file explicitly",
+            "Multiple {family} GGUF targets in '{}'; pass the desired .gguf file explicitly",
             path.display()
         ))),
     }
@@ -4815,7 +4832,130 @@ async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<Path
         )));
     }
     let root = initialize_qwen35_native_cache_root(root)?;
-    prepare_native_gguf_inner(&input, &root, false, companion.as_deref()).await
+    prepare_native_gguf_inner(
+        &input,
+        &root,
+        NativeGgufFamily::Gemma4,
+        companion.as_deref(),
+    )
+    .await
+}
+
+/// Prefer an explicitly paired draft, then the publisher's shared K-quant
+/// draft. Otherwise a single DFlash artifact is unambiguous. Draft geometry
+/// and the complete tensor inventory are validated before any target import.
+fn muse_glimmer_native_draft(input: &Path) -> Result<Option<PathBuf>> {
+    let parent = input.parent().unwrap_or(Path::new("."));
+    let exact = parent.join(format!(
+        "dflash-{}",
+        input.file_name().unwrap().to_string_lossy()
+    ));
+    for preferred in [&exact, &parent.join("dflash-kquant.gguf")] {
+        if preferred.is_file() {
+            if !is_muse_glimmer_dflash_gguf(&parse_gguf(preferred)?.metadata) {
+                return Err(Error::from_reason(format!(
+                    "Muse-Glimmer draft companion '{}' is not a DFlash GGUF",
+                    preferred.display()
+                )));
+            }
+            return Ok(Some(preferred.canonicalize()?));
+        }
+    }
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(parent)? {
+        let path = entry?.path();
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        if path.is_file()
+            && name.to_ascii_lowercase().starts_with("dflash-")
+            && name.to_ascii_lowercase().ends_with(".gguf")
+            && is_muse_glimmer_dflash_gguf(&parse_gguf(&path)?.metadata)
+        {
+            candidates.push(path.canonicalize()?);
+        }
+    }
+    match candidates.len() {
+        0 => Ok(None),
+        1 => Ok(candidates.pop()),
+        _ => Err(Error::from_reason(format!(
+            "Ambiguous Muse-Glimmer DFlash companions beside '{}'; name the matching companion '{}'",
+            input.display(),
+            exact.display()
+        ))),
+    }
+}
+
+pub(crate) async fn prepare_muse_glimmer_native_gguf(input: &Path) -> Result<PathBuf> {
+    let root = qwen35_native_cache_root()?;
+    prepare_muse_glimmer_native_gguf_in(input, &root).await
+}
+
+async fn prepare_muse_glimmer_native_gguf_in(input: &Path, root: &Path) -> Result<PathBuf> {
+    let input = input.canonicalize()?;
+    if !is_muse_glimmer_main_gguf(&parse_gguf(&input)?.metadata) {
+        return Err(Error::from_reason(
+            "MuseGlimmerModel.load requires a Muse-Glimmer text GGUF, not a projector, draft or another architecture",
+        ));
+    }
+    let parent = input.parent().unwrap();
+    for asset in ["config.json", "tokenizer.json"] {
+        if !parent.join(asset).is_file() {
+            return Err(Error::from_reason(format!(
+                "Native Muse-Glimmer GGUF loading requires {asset} beside '{}'; use the base model's config and tokenizer assets",
+                input.display()
+            )));
+        }
+    }
+    crate::models::muse_glimmer::config::MuseGlimmerConfig::from_path(parent)?;
+    let draft = muse_glimmer_native_draft(&input)?;
+    if let Some(draft) = &draft {
+        preflight_muse_dflash_gguf(
+            draft.to_string_lossy().into_owned(),
+            parent.to_string_lossy().into_owned(),
+        )?;
+    }
+    let root = initialize_qwen35_native_cache_root(root)?;
+    prepare_native_gguf_inner(
+        &input,
+        &root,
+        NativeGgufFamily::MuseGlimmer,
+        draft.as_deref(),
+    )
+    .await
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeGgufFamily {
+    Qwen35,
+    Gemma4,
+    MuseGlimmer,
+}
+
+/// Prepare a Muse-Glimmer GGUF target and its optional DFlash companion in the
+/// native cache without loading the model. Hosts can apply per-session config
+/// overrides to this directory without modifying sources or repacking weights.
+#[napi]
+pub async fn prepare_muse_glimmer_gguf(model_path: String) -> Result<String> {
+    Ok(prepare_muse_glimmer_native_gguf(Path::new(&model_path))
+        .await?
+        .to_string_lossy()
+        .into_owned())
+}
+
+impl NativeGgufFamily {
+    fn layout(self) -> &'static str {
+        match self {
+            Self::Qwen35 => "tiled",
+            Self::Gemma4 => "gemma4-text-dtype-v2",
+            Self::MuseGlimmer => "muse-glimmer-packed-v1",
+        }
+    }
+
+    fn companion_filename(self) -> &'static str {
+        match self {
+            Self::MuseGlimmer => "draft.safetensors",
+            Self::Qwen35 | Self::Gemma4 => "vision.safetensors",
+        }
+    }
 }
 
 fn native_gguf_companion_digest(companion: Option<&Path>) -> Result<String> {
@@ -4845,13 +4985,13 @@ async fn prepare_qwen35_native_gguf_in(input_path: &Path, cache_root: &Path) -> 
 }
 
 async fn prepare_qwen35_native_gguf_inner(input_path: &Path, cache_root: &Path) -> Result<PathBuf> {
-    prepare_native_gguf_inner(input_path, cache_root, true, None).await
+    prepare_native_gguf_inner(input_path, cache_root, NativeGgufFamily::Qwen35, None).await
 }
 
 async fn prepare_native_gguf_inner(
     input_path: &Path,
     cache_root: &Path,
-    native_qwen35_layout: bool,
+    family: NativeGgufFamily,
     companion: Option<&Path>,
 ) -> Result<PathBuf> {
     let input_path = input_path.canonicalize().map_err(|error| {
@@ -4890,11 +5030,8 @@ async fn prepare_native_gguf_inner(
     let source_identity_digest = qwen35_native_source_identity_digest(&input_path, &metadata);
     let asset_digest = qwen35_native_asset_digest(parent)?;
     let companion_digest = native_gguf_companion_digest(companion)?;
-    let layout = if native_qwen35_layout {
-        "tiled"
-    } else {
-        "gemma4-text-dtype-v2"
-    };
+    let native_qwen35_layout = family == NativeGgufFamily::Qwen35;
+    let layout = family.layout();
     // Bound the filename even when the main and companion both have long
     // names/identities. Keep the two source fingerprints in the marker too.
     let preparation_digest = if native_qwen35_layout {
@@ -4958,7 +5095,7 @@ async fn prepare_native_gguf_inner(
         ));
     }
     if qwen35_native_cache_is_current(&output_dir, &source_identity_digest, &asset_digest)
-        && (companion.is_none() || output_dir.join("vision.safetensors").is_file())
+        && (companion.is_none() || output_dir.join(family.companion_filename()).is_file())
     {
         return Ok(output_dir);
     }
@@ -5011,7 +5148,7 @@ async fn prepare_native_gguf_inner(
             quant_mode: None,
             quant_recipe: None,
             imatrix_path: None,
-            output_filename: Some("vision.safetensors".to_string()),
+            output_filename: Some(family.companion_filename().to_string()),
             vlm_key_prefix: None,
             quant_mxfp: None,
             import_k_quants: Some(true),
@@ -5127,6 +5264,328 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).ok();
         }
+    }
+
+    fn muse_native_fixture(source: &Path) -> PathBuf {
+        use crate::models::muse_glimmer::config::fixtures::{config_json, text_config_json};
+        fs::create_dir_all(source).unwrap();
+        let text = text_config_json(2)
+            .replace("6656", "256")
+            .replace("19968", "512")
+            .replace("\"num_attention_heads\": 32", "\"num_attention_heads\": 2");
+        fs::write(source.join("config.json"), config_json(&text)).unwrap();
+        fs::write(source.join("tokenizer.json"), "{}").unwrap();
+        let input = source.join("muse-Q4_K_M.gguf");
+        fs::write(
+            &input,
+            build_minimal_gguf(
+                &[(
+                    "general.architecture",
+                    GgufMetaValue::String("muse-glimmer".into()),
+                )],
+                &[
+                    (
+                        "blk.0.ffn_up.weight",
+                        &[256, 2],
+                        GgufTensorType::Q4K,
+                        &[0; 288],
+                    ),
+                    ("blk.0.attn_norm.weight", &[2], GgufTensorType::F32, &[0; 8]),
+                ],
+            ),
+        )
+        .unwrap();
+        input
+    }
+
+    fn muse_native_draft_fixture(path: &Path) {
+        let mut metadata = complete_muse_glimmer_dflash_metadata();
+        for (key, value) in [
+            ("dflash.block_count", 1),
+            ("dflash.block_size", 2),
+            ("dflash.embedding_length", 256),
+            ("dflash.feed_forward_length", 512),
+            ("dflash.attention.head_count", 2),
+            ("dflash.attention.head_count_kv", 1),
+            ("dflash.attention.key_length", 128),
+        ] {
+            metadata.insert(key.into(), GgufMetaValue::Uint32(value));
+        }
+        metadata.insert(
+            "dflash.target_layers".into(),
+            GgufMetaValue::ArrayI32(vec![1]),
+        );
+        let metadata: Vec<_> = metadata
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.clone()))
+            .collect();
+        let descriptors: [(&str, &[u64]); 14] = [
+            ("fc.weight", &[256, 256]),
+            ("enc.output_norm.weight", &[256]),
+            ("output_norm.weight", &[256]),
+            ("blk.0.attn_norm.weight", &[256]),
+            ("blk.0.ffn_norm.weight", &[256]),
+            ("blk.0.attn_q_norm.weight", &[128]),
+            ("blk.0.attn_k_norm.weight", &[128]),
+            ("blk.0.attn_q.weight", &[256, 256]),
+            ("blk.0.attn_k.weight", &[256, 128]),
+            ("blk.0.attn_v.weight", &[256, 128]),
+            ("blk.0.attn_output.weight", &[256, 256]),
+            ("blk.0.ffn_gate.weight", &[256, 512]),
+            ("blk.0.ffn_up.weight", &[256, 512]),
+            ("blk.0.ffn_down.weight", &[512, 256]),
+        ];
+        let data: Vec<_> = descriptors
+            .iter()
+            .map(|(_, dims)| {
+                let elements = dims.iter().product::<u64>() as usize;
+                vec![
+                    0_u8;
+                    if dims.len() == 2 {
+                        elements / 256 * 144
+                    } else {
+                        elements * 4
+                    }
+                ]
+            })
+            .collect();
+        let tensors: Vec<_> = descriptors
+            .iter()
+            .zip(&data)
+            .map(|((name, dims), data)| {
+                (
+                    *name,
+                    *dims,
+                    if dims.len() == 2 {
+                        GgufTensorType::Q4K
+                    } else {
+                        GgufTensorType::F32
+                    },
+                    data.as_slice(),
+                )
+            })
+            .collect();
+        fs::write(path, build_minimal_gguf(&metadata, &tensors)).unwrap();
+    }
+
+    #[test]
+    fn muse_native_directory_resolution_requires_an_exact_variant_and_preserves_safetensors() {
+        let root = GemmaNativeTestDir::new();
+        let input = muse_native_fixture(root.path());
+        muse_native_draft_fixture(&root.path().join("dflash-kquant.gguf"));
+        fs::write(
+            root.path().join("mmproj.gguf"),
+            build_minimal_gguf(
+                &[("general.architecture", GgufMetaValue::String("clip".into()))],
+                &[],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            resolve_muse_glimmer_gguf_source(root.path()).unwrap(),
+            Some(input.clone())
+        );
+        let second = root.path().join("muse-Q4_K_XL.gguf");
+        fs::copy(&input, &second).unwrap();
+        assert!(
+            resolve_muse_glimmer_gguf_source(root.path())
+                .unwrap_err()
+                .reason
+                .contains("Multiple Muse-Glimmer")
+        );
+        assert_eq!(
+            resolve_muse_glimmer_gguf_source(&second).unwrap(),
+            Some(second)
+        );
+        for name in [
+            "model.safetensors",
+            "weights.safetensors",
+            "model-00001-of-00002.safetensors",
+            "model.safetensors-00001-of-00002.safetensors",
+        ] {
+            let primary = root.path().join(name);
+            fs::write(&primary, []).unwrap();
+            assert!(
+                resolve_muse_glimmer_gguf_source(root.path())
+                    .unwrap()
+                    .is_none(),
+                "{name} must take precedence over retained GGUF variants"
+            );
+            assert_eq!(
+                resolve_muse_glimmer_gguf_source(&input).unwrap(),
+                Some(input.clone())
+            );
+            fs::remove_file(primary).unwrap();
+        }
+    }
+
+    #[test]
+    fn muse_native_draft_selection_handles_aliases_and_rejects_ambiguity() {
+        let root = GemmaNativeTestDir::new();
+        let input = muse_native_fixture(root.path());
+        assert!(muse_glimmer_native_draft(&input).unwrap().is_none());
+        let first = root.path().join("dflash-first.gguf");
+        muse_native_draft_fixture(&first);
+        assert_eq!(
+            muse_glimmer_native_draft(&input).unwrap(),
+            Some(first.canonicalize().unwrap())
+        );
+        fs::copy(&first, root.path().join("dflash-second.gguf")).unwrap();
+        assert!(
+            muse_glimmer_native_draft(&input)
+                .unwrap_err()
+                .reason
+                .contains("Ambiguous")
+        );
+        let shared = root.path().join("dflash-kquant.gguf");
+        fs::copy(&first, &shared).unwrap();
+        assert_eq!(
+            muse_glimmer_native_draft(&input).unwrap(),
+            Some(shared.canonicalize().unwrap())
+        );
+        let exact = root.path().join("dflash-muse-Q4_K_M.gguf");
+        fs::copy(&first, &exact).unwrap();
+        assert_eq!(
+            muse_glimmer_native_draft(&input).unwrap(),
+            Some(exact.canonicalize().unwrap())
+        );
+        fs::copy(&input, &exact).unwrap();
+        assert!(
+            muse_glimmer_native_draft(&input)
+                .unwrap_err()
+                .reason
+                .contains("not a DFlash")
+        );
+    }
+
+    #[tokio::test]
+    async fn muse_native_preparation_preserves_packed_weights_and_tracks_draft_lifecycle() {
+        let root = GemmaNativeTestDir::new();
+        let source = root.path().join("source");
+        let input = muse_native_fixture(&source);
+        let source_config = fs::read(source.join("config.json")).unwrap();
+        let cache = root.path().join("cache");
+        let plain = prepare_muse_glimmer_native_gguf_in(&input, &cache)
+            .await
+            .unwrap();
+        let params =
+            super::super::safetensors::load_safetensors_lazy(plain.join("model.safetensors"))
+                .unwrap();
+        let prefix = "model.language_model.layers.0.mlp.up_proj";
+        assert_eq!(
+            params[&format!("{prefix}.weight")].dtype().unwrap(),
+            DType::Uint32
+        );
+        assert_eq!(
+            params[&format!("{prefix}.scales")].dtype().unwrap(),
+            DType::Uint8
+        );
+        assert_eq!(
+            params["model.language_model.layers.0.input_layernorm.weight"]
+                .dtype()
+                .unwrap(),
+            DType::BFloat16
+        );
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(plain.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["quantization"]["mode"], "q4k");
+        assert_eq!(config["muse_glimmer_gguf_rope_layout"], "interleaved");
+        assert!(!plain.join("draft.safetensors").exists());
+        assert_eq!(
+            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+                .await
+                .unwrap(),
+            plain
+        );
+
+        let draft = source.join("dflash-kquant.gguf");
+        muse_native_draft_fixture(&draft);
+        let with_draft = prepare_muse_glimmer_native_gguf_in(&input, &cache)
+            .await
+            .unwrap();
+        assert_ne!(with_draft, plain);
+        assert!(with_draft.join("draft.safetensors").is_file());
+        let config: serde_json::Value =
+            serde_json::from_slice(&fs::read(with_draft.join("config.json")).unwrap()).unwrap();
+        assert_eq!(config["dflash_config"]["num_hidden_layers"], 1);
+        assert!(!with_draft.join("vision.safetensors").exists());
+        fs::remove_file(with_draft.join("draft.safetensors")).unwrap();
+        assert_eq!(
+            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+                .await
+                .unwrap(),
+            with_draft
+        );
+        assert!(with_draft.join("draft.safetensors").is_file());
+
+        // Missing or changed companions never select the previously prepared
+        // target-plus-draft cache. Source assets remain untouched throughout.
+        fs::write(&draft, fs::read(&draft).unwrap()).unwrap();
+        assert_ne!(
+            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+                .await
+                .unwrap(),
+            with_draft
+        );
+        fs::remove_file(&draft).unwrap();
+        assert_eq!(
+            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+                .await
+                .unwrap(),
+            plain
+        );
+        fs::write(source.join("tokenizer.json"), "[]").unwrap();
+        assert_ne!(
+            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+                .await
+                .unwrap(),
+            plain
+        );
+        assert_eq!(fs::read(source.join("config.json")).unwrap(), source_config);
+    }
+
+    #[tokio::test]
+    async fn muse_native_preflight_rejects_missing_assets_and_invalid_companions_before_import() {
+        let root = GemmaNativeTestDir::new();
+        let input = muse_native_fixture(root.path());
+        let cache = root.path().join("cache");
+        fs::remove_file(root.path().join("tokenizer.json")).unwrap();
+        assert!(
+            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+                .await
+                .unwrap_err()
+                .reason
+                .contains("tokenizer.json")
+        );
+        assert!(!cache.exists());
+        fs::write(root.path().join("tokenizer.json"), "{}").unwrap();
+        let draft = root.path().join("dflash-kquant.gguf");
+        fs::write(
+            &draft,
+            build_minimal_gguf(
+                &[(
+                    "general.architecture",
+                    GgufMetaValue::String("dflash".into()),
+                )],
+                &[],
+            ),
+        )
+        .unwrap();
+        assert!(
+            prepare_muse_glimmer_native_gguf_in(&input, &cache)
+                .await
+                .unwrap_err()
+                .reason
+                .contains("DFlash")
+        );
+        assert!(!cache.exists());
+        assert!(
+            prepare_muse_glimmer_native_gguf_in(&draft, &cache)
+                .await
+                .unwrap_err()
+                .reason
+                .contains("text GGUF")
+        );
     }
 
     fn gemma_native_fixture(source: &Path) -> PathBuf {
