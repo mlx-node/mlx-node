@@ -5971,12 +5971,50 @@ mod tests {
             .expect("release serial rows");
     }
 
+    fn assert_mixed_step_logits_parity(label: &str, reference: &MxArray, candidate: &MxArray) {
+        let shape = reference.shape().expect("serial logits shape");
+        assert_eq!(
+            candidate.shape().expect("ragged logits shape").as_ref(),
+            shape.as_ref()
+        );
+        let vocab_size = shape[2] as usize;
+        let reference =
+            logits_to_f32_vec(&reference.reshape(&[-1]).expect("flatten serial logits"));
+        let candidate =
+            logits_to_f32_vec(&candidate.reshape(&[-1]).expect("flatten ragged logits"));
+        for (row, (reference, candidate)) in reference
+            .chunks_exact(vocab_size)
+            .zip(candidate.chunks_exact(vocab_size))
+            .enumerate()
+        {
+            let label = format!("{label} row {row}");
+            assert_logits_parity(&label, reference, candidate);
+
+            // Keep the pinned fixture clear of near-ties: its exact token
+            // checks must survive any rounding allowed by the logit budget.
+            let scale = crate::test_support::max_abs(reference);
+            let tolerance = crate::test_support::bf16_scaled_tolerance(scale, 3.0, 5e-3);
+            let (_, first, second) = top_two(reference);
+            assert!(
+                first - second > 2.0 * tolerance,
+                "{label}: pinned fixture has an ambiguous argmax: gap={} <= {}",
+                first - second,
+                2.0 * tolerance
+            );
+        }
+    }
+
     #[test]
     fn ragged_mixed_prefill_and_decode_matches_serial_row_tokens() {
         if !crate::engine::persistence::compiled_forward_backend_available() {
             eprintln!("skipping (paged backend unavailable without Metal)");
             return;
         }
+        // Unseeded BF16 weights can put the leading logits within one grid
+        // step, so the ragged attention and serial SDPA paths can legitimately
+        // pick different tokens. Pin a fixture with well-separated winners;
+        // assert_mixed_step_logits_parity checks every logit and that margin.
+        unsafe { mlx_sys::mlx_seed(0) };
         let config = paged_tiny_config(Some(true));
         let mut ragged = match super::Qwen3Inner::new(config.clone()) {
             Ok(inner) => inner,
@@ -6052,6 +6090,7 @@ mod tests {
             .expect("concatenate serial rows");
         serial_logits.eval();
         let serial_elapsed = serial_started.elapsed();
+        assert_mixed_step_logits_parity("cold mixed step", &serial_logits, &ragged_logits);
         eprintln!(
             "mixed-step cold wall: ragged_one_forward={:.2}ms serial_two_forwards={:.2}ms speedup={:.2}x",
             ragged_elapsed.as_secs_f64() * 1_000.0,
@@ -6129,6 +6168,7 @@ mod tests {
             .expect("concatenate steady serial rows");
         serial_steady.eval();
         let serial_steady_elapsed = serial_steady_started.elapsed();
+        assert_mixed_step_logits_parity("warm mixed step", &serial_steady, &ragged_steady);
         assert_eq!(
             ragged_steady
                 .argmax(-1, Some(false))
@@ -6555,7 +6595,7 @@ mod tests {
         (best_idx, best, second)
     }
 
-    /// Assert that two `[vocab]` logit vectors, produced by two prefill
+    /// Assert that two `[vocab]` logit vectors, produced by two execution
     /// paths from the same tokens and the same weights, agree.
     ///
     /// Both vectors are bf16 values read back as f32. The paths reduce the
@@ -6605,7 +6645,7 @@ mod tests {
             }
             assert!(
                 abs_diff <= tol,
-                "{label} logits diverge at index {i}: single={a}, chunked={b}, \
+                "{label} logits diverge at index {i}: reference={a}, candidate={b}, \
                  abs_diff={abs_diff} > tol={tol} (3 bf16 grid steps of the \
                  reference scale {scale})"
             );
