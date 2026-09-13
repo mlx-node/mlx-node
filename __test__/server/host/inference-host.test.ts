@@ -8,6 +8,8 @@ import { join } from 'node:path';
 import type { LoadableModel, LoadModelOptions } from '@mlx-node/lm';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
+import { discoverMlxModels } from '../../../packages/agent/src/provider/models.js';
+import { handleCodingAgentModels } from '../../../packages/dashboard/src/api/handlers/models.js';
 import { isServingStatus } from '../../../packages/desktop/src/main/supervisor/state.js';
 import {
   createInferenceHost,
@@ -73,6 +75,23 @@ function fakeModel(): LoadableModel {
   return {} as unknown as LoadableModel;
 }
 
+/** Metadata-only checkpoint: discovery is real, while the injected loader replaces weights. */
+function ggufHeader(architecture: string): Buffer {
+  const string = (text: string): Buffer => {
+    const bytes = Buffer.from(text);
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64LE(BigInt(bytes.length));
+    return Buffer.concat([length, bytes]);
+  };
+  const header = Buffer.alloc(24);
+  header.write('GGUF');
+  header.writeUInt32LE(3, 4);
+  header.writeBigUInt64LE(1n, 16);
+  const stringType = Buffer.alloc(4);
+  stringType.writeUInt32LE(8);
+  return Buffer.concat([header, string('general.architecture'), stringType, string(architecture)]);
+}
+
 /** Manually-controlled promise for lifecycle tests; resolving twice is harmless. */
 function deferred(): { promise: Promise<void>; resolve: () => void } {
   let resolve!: () => void;
@@ -133,6 +152,53 @@ async function newTempRoots(before: string[]): Promise<string[]> {
 }
 
 describe('createInferenceHost — discovery and model binding', () => {
+  it.each(
+    ['qwen35', 'gemma4', 'muse-glimmer'].flatMap((family) =>
+      ['top-level', 'nested'].map((layout) => ({ family, layout })),
+    ),
+  )('serves the same $layout $family GGUF IDs used by agent setup', async ({ family, layout }) => {
+    const modelsDir = await makeModelsDir([]);
+    const repo = layout === 'top-level' ? modelsDir : join(modelsDir, 'downloaded-repo');
+    await mkdir(repo, { recursive: true });
+    if (family !== 'qwen35' || layout === 'nested') {
+      await writeFile(
+        join(repo, 'config.json'),
+        JSON.stringify({ model_type: family === 'qwen35' ? 'qwen3_5' : family.replace('-', '_') }),
+      );
+      await writeFile(join(repo, 'tokenizer.json'), '{}');
+    }
+    const names = [`${family}-Q4_K_XL`, `${family}-Q6_K_XL`];
+    for (const name of [...names, `${family}-mmproj-Q4_K_XL`, `${family}-draft-Q4_K_XL`]) {
+      await writeFile(join(repo, `${name}.gguf`), ggufHeader(family));
+    }
+    const agentModels = await discoverMlxModels(modelsDir);
+    expect(agentModels.map(({ discovered }) => discovered.name)).toEqual(names);
+    expect(await handleCodingAgentModels({ modelsDir, sessionsRoot: '', tracesDir: '', cacheRoot: '' })).toEqual({
+      models: names.map((name) => ({ name })),
+    });
+
+    const loadedPaths: string[] = [];
+    const host = await start({
+      modelsDir,
+      model: names[1],
+      // Muse's paged override converts real tensors before the loader seam.
+      // Keep this fixture focused on inventory and ID-to-file routing.
+      pagedModelTypes: [],
+      loadModel: async (path) => {
+        loadedPaths.push(path);
+        return fakeModel();
+      },
+    });
+    expect(host.boundModel).toBe(names[1]);
+    const response = await fetch(`${host.url}/v1/models`);
+    expect(response.status).toBe(200);
+    const body = (await response.json()) as { data: { id: string }[] };
+    expect(body.data.map(({ id }) => id).sort()).toEqual(names);
+    for (const name of names) await host.loadModel(name);
+    expect(loadedPaths).toEqual(names.map((name) => join(repo, `${name}.gguf`)));
+    expect(host.health().models.resident).toEqual([names[1]]);
+  });
+
   it('binds the alphabetically-first model by default', async () => {
     const modelsDir = await makeModelsDir(['zeta', 'alpha', 'mid']);
     delete process.env.ANTHROPIC_MODEL;

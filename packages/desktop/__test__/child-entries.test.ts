@@ -38,7 +38,12 @@ const ADDON_PACKAGES = ['@mlx-node/core', '@mlx-node/lm', '@mlx-node/vlm', '@mlx
  * as offenders. `packages/agent/__test__/catalog-native-free.test.ts` proves
  * the same contract against the built output in a real process.
  */
-const ADDON_FREE_SUBPATHS = ['@mlx-node/lm/family-data', '@mlx-node/lm/draft-companion'];
+const ADDON_FREE_SUBPATHS = [
+  '@mlx-node/lm/family-data',
+  '@mlx-node/lm/draft-companion',
+  '@mlx-node/lm/model-detection',
+  '@mlx-node/lm/model-discovery',
+];
 
 /** Every `from '…'` and bare `import '…'` specifier, **type-only imports included**. */
 function specifiersOf(file: string): string[] {
@@ -94,7 +99,23 @@ function workspaceSourceFor(specifier: string): string | null {
   const match = /^@mlx-node\/([^/]+)(?:\/(.+))?$/.exec(specifier);
   if (match === null) return null;
   const [, pkg, subpath] = match;
-  const base = resolve(ROOT, 'packages', pkg, 'src');
+  const packageDir = resolve(ROOT, 'packages', pkg);
+  const manifestPath = resolve(packageDir, 'package.json');
+  if (!existsSync(manifestPath)) return null;
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as {
+    exports?: Record<string, string | { import?: string; default?: string }>;
+  };
+  // Published subpaths can alias a nested source file (agent/models is
+  // dist/provider/models.js). Follow the actual runtime export so the walk
+  // covers that file's entire graph instead of guessing from the public name.
+  if (manifest.exports !== undefined) {
+    const entry = manifest.exports[subpath === undefined ? '.' : `./${subpath}`];
+    const target = typeof entry === 'string' ? entry : (entry?.import ?? entry?.default);
+    if (target === undefined || !target.startsWith('./dist/')) return null;
+    const source = resolve(packageDir, target.replace(/^\.\/dist\//, 'src/').replace(/\.(c|m)?js$/, '.$1ts'));
+    return existsSync(source) ? source : null;
+  }
+  const base = resolve(packageDir, 'src');
   for (const candidate of subpath === undefined
     ? [resolve(base, 'index.ts')]
     : [resolve(base, `${subpath}.ts`), resolve(base, subpath, 'index.ts')]) {
@@ -188,6 +209,15 @@ describe('CONTROL PANEL never links the native addon', () => {
     expect(graph.files).toContain('packages/dashboard/src/runtime.ts');
     expect(graph.files).toContain('packages/dashboard/src/download.ts');
     expect(graph.files).toContain('packages/lm/src/draft-companion.ts');
+    expect(graph.files).toContain('packages/agent/src/provider/models.ts');
+    expect(graph.files).toContain('packages/lm/src/model-discovery.ts');
+    expect(graph.files).toContain('packages/lm/src/model-detection.ts');
+    expect(graph.files).toContain('packages/lm/src/gguf-metadata.ts');
+  });
+
+  it('rejects unknown exports instead of silently truncating the workspace graph', () => {
+    expect(workspaceSourceFor('@mlx-node/agent/not-an-export')).toBeNull();
+    expect(workspaceSourceFor('@mlx-node/not-a-package')).toBeNull();
   });
 
   it('reaches no package that maps the addon', () => {

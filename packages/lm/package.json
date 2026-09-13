@@ -33,6 +33,10 @@
     "./model-detection": {
       "types": "./dist/model-detection.d.ts",
       "import": "./dist/model-detection.js"
+    },
+    "./model-discovery": {
+      "types": "./dist/model-discovery.d.ts",
+      "import": "./dist/model-discovery.js"
     }
   },
   "scripts": {

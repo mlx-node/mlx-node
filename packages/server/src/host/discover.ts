@@ -1,17 +1,7 @@
 /** Discover locally-downloaded generative models under a given directory. */
 
-import type { Dirent } from 'node:fs';
-import { readdir } from 'node:fs/promises';
-import { basename, join } from 'node:path';
-
-import {
-  detectModelType,
-  NON_GENERATIVE_FAMILY_IDS,
-  launchPresetFor,
-  type LaunchPreset,
-  type ModelType,
-} from '@mlx-node/lm';
-import { isDFlash2DraftDirectory } from '@mlx-node/lm/draft-companion';
+import type { LaunchPreset, ModelType } from '@mlx-node/lm/family-data';
+import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 
 /** A locally-downloaded model paired with its sampling preset. */
 export interface DiscoveredModel {
@@ -22,47 +12,14 @@ export interface DiscoveredModel {
 }
 
 /**
- * Scan `dir` for model subdirectories. Each subdirectory with a recognized
- * `config.json` is returned with its inferred `ModelType` and `LaunchPreset`.
- * Non-generative types are silently skipped. Entries with no preset or an
- * undetectable config are skipped (warnings only emitted when `MLX_DEBUG`
- * is set). Must stay cheap — do not load weights here.
+ * Use the same checkpoint IDs and paths as the agent and setup UI, including
+ * supported GGUF files and their quant variants. No weights are loaded here.
  */
 export async function discoverModels(dir: string): Promise<DiscoveredModel[]> {
-  const debug = Boolean(process.env.MLX_DEBUG);
-
-  let entries: Dirent[];
-  try {
-    entries = await readdir(dir, { withFileTypes: true });
-  } catch {
-    return [];
-  }
-
-  const out: DiscoveredModel[] = [];
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const full = join(dir, entry.name);
-    if (isDFlash2DraftDirectory(full)) continue;
-
-    let modelType: ModelType;
-    try {
-      modelType = await detectModelType(full);
-    } catch (err) {
-      if (debug) console.warn(`[mlx] skip ${full}: ${(err as Error).message}`);
-      continue;
-    }
-
-    if (NON_GENERATIVE_FAMILY_IDS.has(modelType)) continue;
-
-    const preset = launchPresetFor(modelType);
-    if (!preset) {
-      if (debug) console.warn(`[mlx] skip ${full}: no LAUNCH_PRESETS entry for ${modelType}`);
-      continue;
-    }
-
-    out.push({ name: basename(full), path: full, modelType, preset });
-  }
-
-  out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  return out;
+  return (await discoverLocalChatModels(dir)).map(({ name, path, modelType, preset }) => ({
+    name,
+    path,
+    modelType,
+    preset,
+  }));
 }

@@ -71,6 +71,7 @@ export default defineConfig({
       '@mlx-node/lm/draft-companion': resolve(__dirname, './packages/lm/src/draft-companion.ts'),
       '@mlx-node/lm/family-data': resolve(__dirname, './packages/lm/src/family-data.ts'),
       '@mlx-node/lm/model-detection': resolve(__dirname, './packages/lm/src/model-detection.ts'),
+      '@mlx-node/lm/model-discovery': resolve(__dirname, './packages/lm/src/model-discovery.ts'),
       '@mlx-node/lm': resolve(__dirname, './packages/lm/src/index.ts'),
       '@mlx-node/agent/catalog': resolve(__dirname, './packages/agent/src/catalog.ts'),
       '@mlx-node/agent/delegate': resolve(__dirname, './packages/agent/src/delegate.ts'),
