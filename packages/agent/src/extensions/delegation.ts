@@ -2,7 +2,7 @@ import type { ExtensionAPI, ExtensionContext, InlineExtension } from '@earendil-
 
 export interface DelegateCallerPermissions {
   source: 'codex';
-  /** Opaque active profile supplied by Codex, not a profile guessed from config.toml. */
+  /** Opaque Codex profile/backend when supplied; otherwise just inherited process permissions. */
   profile: string;
   networkDisabled: boolean;
 }
@@ -11,12 +11,12 @@ export interface DelegateCallerPermissions {
 export function delegateCallerPermissions(env: NodeJS.ProcessEnv = process.env): DelegateCallerPermissions | undefined {
   if (!env.CODEX_THREAD_ID?.trim()) return undefined;
   const profile = env.CODEX_PERMISSION_PROFILE?.trim();
-  // Older Codex versions expose the sandbox backend instead of a named profile.
+  // Permission metadata is optional in Codex launches. The thread identifies
+  // the caller; subprocesses inherit its real sandbox regardless of these labels.
   const sandbox = env.CODEX_SANDBOX;
-  if (!profile && sandbox !== 'seatbelt' && sandbox !== 'landlock') return undefined;
   return {
     source: 'codex',
-    profile: profile || `sandbox:${sandbox}`,
+    profile: profile || (sandbox === 'seatbelt' || sandbox === 'landlock' ? `sandbox:${sandbox}` : 'inherited'),
     networkDisabled: env.CODEX_SANDBOX_NETWORK_DISABLED === '1',
   };
 }

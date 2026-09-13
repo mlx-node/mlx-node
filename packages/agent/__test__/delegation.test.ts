@@ -88,10 +88,19 @@ describe('delegate caller permissions', () => {
     },
   );
 
-  it('does not infer permission from a thread id, profile alone, or unrelated sandbox backend', () => {
-    expect(delegateCallerPermissions({ CODEX_THREAD_ID: 'thread' })).toBeUndefined();
+  it.each([undefined, 'unknown'])('recognizes a Codex thread without a known profile or sandbox (%s)', (sandbox) => {
+    expect(delegateCallerPermissions({ CODEX_THREAD_ID: 'thread', CODEX_SANDBOX: sandbox })).toEqual({
+      source: 'codex',
+      profile: 'inherited',
+      networkDisabled: false,
+    });
+  });
+
+  it('requires a nonempty Codex thread id even when permission metadata is present', () => {
+    expect(delegateCallerPermissions({})).toBeUndefined();
+    expect(delegateCallerPermissions({ CODEX_THREAD_ID: ' ' })).toBeUndefined();
     expect(delegateCallerPermissions({ CODEX_PERMISSION_PROFILE: ':danger-full-access' })).toBeUndefined();
-    expect(delegateCallerPermissions({ CODEX_THREAD_ID: 'thread', CODEX_SANDBOX: 'unknown' })).toBeUndefined();
+    expect(delegateCallerPermissions({ CODEX_SANDBOX: 'seatbelt' })).toBeUndefined();
   });
 
   it.each(['seatbelt', 'landlock'])('recognizes the older %s child sandbox marker', (sandbox) => {
@@ -108,6 +117,18 @@ describe('delegate caller permissions', () => {
     expect(gate.toolCall('bash')).toBeUndefined();
     expect(process.env.MLX_AGENT_AUTO_APPROVE).toBeUndefined();
     expect(process.env.CODEX_PERMISSION_PROFILE).toBe(':read-only');
+    expect(process.env.CODEX_SANDBOX_NETWORK_DISABLED).toBe('1');
+    expect(gate.start()).toMatchObject({ systemPrompt: expect.stringContaining('caller disables network access') });
+  });
+
+  it('allows thread-id-only callers without inventing a profile or clearing the network restriction', () => {
+    vi.stubEnv('CODEX_THREAD_ID', 'thread');
+    vi.stubEnv('CODEX_SANDBOX_NETWORK_DISABLED', '1');
+    const gate = fixture();
+    expect(gate.toolCall('bash')).toBeUndefined();
+    expect(process.env.MLX_AGENT_AUTO_APPROVE).toBeUndefined();
+    expect(process.env.CODEX_PERMISSION_PROFILE).toBeUndefined();
+    expect(process.env.CODEX_SANDBOX).toBeUndefined();
     expect(process.env.CODEX_SANDBOX_NETWORK_DISABLED).toBe('1');
     expect(gate.start()).toMatchObject({ systemPrompt: expect.stringContaining('caller disables network access') });
   });

@@ -59,10 +59,10 @@ task; it does not grant sandbox access. GitHub access uses the normal bash tool
 and an authenticated [GitHub CLI](https://cli.github.com/).
 
 When Codex launches the command, delegation inherits the caller's process sandbox,
-filesystem restrictions, network environment and credentials. It recognizes the
-active `CODEX_PERMISSION_PROFILE` together with `CODEX_THREAD_ID` (or older
-`CODEX_SANDBOX` markers), without reading a possibly different global config or
-setting `MLX_AGENT_AUTO_APPROVE`. Codex authorizes the outer command; the worker
+filesystem restrictions, network environment and credentials. `CODEX_THREAD_ID`
+identifies the caller; `CODEX_PERMISSION_PROFILE` and older `CODEX_SANDBOX` markers
+provide optional metadata. Delegation does not read a possibly different global
+config or set `MLX_AGENT_AUTO_APPROVE`. Codex authorizes the outer command; the worker
 does not open a second approval UI. This is process permission inheritance, not a
 bridge to Codex's per-command approval dialogs or exec-policy rules. Additional
 access must be requested by the calling agent. A sandbox, network or authentication
