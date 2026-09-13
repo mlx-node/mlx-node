@@ -6,8 +6,16 @@ by dragging mlx-node to Applications. The app requires Apple Silicon and macOS 2
 ## Coding Agents
 
 Open **Coding Agents** in the control panel to let other agents delegate GitHub
-work to `mlx delegate github`. Install the current `@mlx-node/cli` and authenticate
-the [GitHub CLI](https://cli.github.com/) before using delegation from a terminal.
+work to `mlx delegate github`. The app includes the CLI and runs it with Electron's
+bundled Node runtime; users do not need npm or a separate Node installation. At
+launch it creates `~/.mlx-node/bin/mlx`, verifies delegation support, and repairs
+its target after the app moves or updates. It never overwrites a foreign command
+at that location or changes shell startup files or an existing global `mlx`.
+
+Setup writes the launcher's quoted absolute path into the routing prompt, so
+coding agents can invoke it regardless of their terminal/editor `PATH`. The
+launcher executes in the caller's process tree and preserves its permissions.
+Authenticate the [GitHub CLI](https://cli.github.com/) before delegating GitHub work.
 
 `mlx delegate` uses the same prompt-and-exit runtime as `mlx agent --print`,
 including its model settings, inference cache, metrics, and saved sessions.
@@ -42,7 +50,12 @@ Supported native global files:
 | Codex       | `~/.codex/AGENTS.md`, or a nonempty `AGENTS.override.md` (`CODEX_HOME` supported) |
 | Grok        | `~/.grok/AGENTS.md` (`GROK_HOME` supported)                                       |
 
-**Installed** means the prompt in the listed file has been verified. Project
+**Installed** requires both a working app command and a model-verified prompt
+that uses it. Older prompts using bare `mlx` show **Update…**; the exact previous
+template is upgraded in place without duplicate instructions. Custom wording is
+preserved, with the current routing instruction appended when needed. If command
+setup fails, the page shows the reason and **Retry setup**; it cannot install or
+report a working integration until the command is available. Project
 instructions, imported files and Grok's optional Claude compatibility sources
 are outside this check. Grok may already read a Claude installation through that
 compatibility layer; in that case a second native installation is unnecessary.

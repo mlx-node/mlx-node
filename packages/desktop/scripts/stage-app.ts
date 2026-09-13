@@ -100,43 +100,10 @@ function isExcludedThirdPartyBinary(name: string): boolean {
 }
 
 /**
- * The cloud-LLM provider SDKs, ~114 MB of an app whose entire premise is that
- * inference happens locally. They are `dependencies` of `@earendil-works/pi-ai`,
- * which arrives under `@earendil-works/pi-coding-agent`. Our entire value-import
- * surface on that package is four session-file parsing symbols —
- * `SessionManager`, `parseSessionEntries`, `buildContextEntries`,
- * `migrateSessionEntries` — plus erased `type` imports. Nothing else.
- *
- * Only these SEVEN names are listed. Everything else that goes with them —
- * `zod`, `protobufjs`, `web-streams-polyfill`, `@opentelemetry/*`, the rest of
- * `@aws-sdk/*` and `@smithy/*`, 81 packages in all — disappears because the walk
- * below can no longer reach it, not because it was named. That distinction is
- * the safety property: the day something in the app legitimately needs `zod`,
- * `zod` comes back on its own.
- *
- * Unreachability is a property of pi-ai's design rather than an accident of our
- * import graph, which is why this is safe against a code path nobody exercised:
- *
- *  1. Every provider SDK is behind a `*.lazy.js` shim. `api/lazy.js` calls
- *     `load()` only from inside `stream()`/`streamSimple()` — the module is
- *     fetched when a request is issued to that provider, not when the api object
- *     is constructed. `bedrock-converse-stream.lazy.js` goes further and hides
- *     the specifier in a variable so no bundler can follow it either.
- *  2. So reaching any of them requires calling `stream()` on a pi-ai model. This
- *     app never does: nothing under `packages/desktop`, `packages/dashboard` or
- *     `packages/server` constructs an `AgentSession`, a `ModelRuntime`, or spawns
- *     the `pi` binary. `@mlx-node/agent` is in the graph only through
- *     `@mlx-node/agent/catalog`, a subpath whose built module has no imports at
- *     all.
- *  3. Measured, not reasoned: importing the whole `@mlx-node/dashboard` entry
- *     under a `module.registerHooks` resolve hook loads 2330 modules and not one
- *     file from any of these packages.
- *  4. `@opentelemetry/api` is a declared dependency that pi-ai never imports —
- *     the string does not appear in any `.js` it ships.
- *
- * The failure mode if this is ever wrong is loud rather than silent: an
- * ERR_MODULE_NOT_FOUND out of a `lazyApi` load, surfaced by `lazyStream` as an
- * error event on the very request that needed it.
+ * Dashboard-only payloads can omit pi-ai's lazy cloud providers. The desktop
+ * bundle now also includes the full CLI, whose agent options may reach those
+ * providers, so any closure rooted at @mlx-node/cli retains them. Nested package
+ * pruning uses the same rule. Native clipboard binaries remain optional fallbacks.
  */
 const CLOUD_PROVIDER_SDKS = new Set([
   '@anthropic-ai/sdk',
@@ -148,8 +115,12 @@ const CLOUD_PROVIDER_SDKS = new Set([
   'openai',
 ]);
 
-function isExcludedPackage(name: string): boolean {
-  return isPrebuiltAddonPackage(name) || isExcludedThirdPartyBinary(name) || CLOUD_PROVIDER_SDKS.has(name);
+function isExcludedPackage(name: string, includeCloudProviders = false): boolean {
+  return (
+    isPrebuiltAddonPackage(name) ||
+    isExcludedThirdPartyBinary(name) ||
+    (!includeCloudProviders && CLOUD_PROVIDER_SDKS.has(name))
+  );
 }
 
 /**
@@ -202,7 +173,7 @@ export function runtimeClosure(
       continue;
     }
 
-    if (CLOUD_PROVIDER_SDKS.has(name)) {
+    if (!roots.includes('@mlx-node/cli') && CLOUD_PROVIDER_SDKS.has(name)) {
       excludedProviderSdk.push(name);
       continue;
     }
@@ -339,7 +310,7 @@ function packageNamesIn(nodeModules: string): string[] {
  * a resolution outcome, so the same version bump that moves a provider SDK down
  * one level would put the whole 114 MB back with no diff to explain it.
  */
-export function pruneExcludedNested(modules: string): string[] {
+export function pruneExcludedNested(modules: string, includeCloudProviders = false): string[] {
   const removed: string[] = [];
   const visit = (dir: string): void => {
     for (const entry of readdirSync(dir, { withFileTypes: true })) {
@@ -347,7 +318,7 @@ export function pruneExcludedNested(modules: string): string[] {
       const child = join(dir, entry.name);
       if (entry.name === 'node_modules') {
         for (const name of packageNamesIn(child)) {
-          if (!isExcludedPackage(name)) continue;
+          if (!isExcludedPackage(name, includeCloudProviders)) continue;
           rmSync(join(child, name), { recursive: true, force: true });
           removed.push(name);
         }
@@ -453,7 +424,8 @@ export function stageApp(opts: {
   // beside every entry, and none of it is reachable once the app is running.
   const pruned = pruneNonRuntime(modules);
   pruneNonRuntime(join(stageDir, 'dist'), pruned);
-  const prunedNested = pruneExcludedNested(modules);
+  // The bundled CLI supports normal agent options too; its lazy providers must exist.
+  const prunedNested = pruneExcludedNested(modules, opts.roots.includes('@mlx-node/cli'));
 
   return {
     appDir: stageDir,

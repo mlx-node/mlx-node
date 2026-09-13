@@ -6,6 +6,16 @@ import { join } from 'node:path';
 export const DELEGATION_PROMPT =
   'Delegate GitHub investigation to `mlx delegate github --repo OWNER/REPO "TASK"`. Include the PR, issue, or run number. Use its findings and evidence for implementation; request more detail when needed. Add `--allow-write` only for GitHub changes already authorized by the user. If delegation fails or reports incomplete work, continue from its handoff.';
 
+/** Absolute paths avoid dependence on each coding agent's shell startup/PATH. */
+export function delegationCommand(path: string): string {
+  if (/[\0\r\n`]/.test(path)) throw new Error('The delegation command path cannot be represented in instructions.');
+  return `'${path.replaceAll("'", "'\\''")}'`;
+}
+
+export function delegationPrompt(path: string): string {
+  return DELEGATION_PROMPT.replace('`mlx delegate', `\`${delegationCommand(path)} delegate`);
+}
+
 export interface LocalInferenceConnection {
   url: string;
   token?: string;

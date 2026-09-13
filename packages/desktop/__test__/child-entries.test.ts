@@ -249,6 +249,7 @@ describe('CONTROL PANEL never links the native addon', () => {
     // Electron one to the walk above for a type that is erased anyway.
     const specifiers = specifiersOf(src('control-panel/index.ts')).sort();
     expect(specifiers).toEqual([
+      '../cli-launcher.js',
       './inference-connection.js',
       './session.js',
       './shutdown-timings.js',

@@ -19,6 +19,7 @@ afterEach(() => {
 function fixture(available: boolean): CodingAgentsState {
   return {
     available,
+    command: available ? '/test/.mlx-node/bin/mlx' : null,
     model: available ? 'qwen3-local' : null,
     unavailableReason: available ? null : 'Install a local model first to check and set up coding agents.',
     agents: [
@@ -72,6 +73,38 @@ it('renders installed, installable and failed checks as distinct states', async 
   expect(page.container.querySelector('[role="alert"]')?.textContent).toContain('unclear result');
   const install = [...page.container.querySelectorAll('button')].find((button) => button.textContent === 'Install…')!;
   expect(install.disabled).toBe(false);
+});
+
+it('offers command repair rather than a model download when the launcher is unavailable', async () => {
+  const state = fixture(false);
+  state.model = 'qwen3-local';
+  state.unavailableReason = 'The app command is unavailable.';
+  dispose = stubApi({ '/coding-agents': state });
+  page = await renderPage(createElement(MemoryRouter, null, createElement(CodingAgents)), (text) =>
+    text.includes('Retry setup'),
+  );
+  expect(page.text()).toContain('Command setup needs attention');
+  expect(page.text()).not.toContain('Install a model');
+  expect(page.text()).not.toContain('Installed');
+  const enabled = [...page.container.querySelectorAll('button')].filter((button) => !button.disabled);
+  expect(enabled.map((button) => button.textContent)).toEqual(['Retry setup']);
+});
+
+it('updates an older prompt through the install action', async () => {
+  const state = fixture(true);
+  state.agents[0].status = 'needs-update';
+  const call = vi.fn();
+  dispose = stubApi({ '/coding-agents': state }, { onCall: call });
+  page = await renderPage(createElement(MemoryRouter, null, createElement(CodingAgents)), (text) =>
+    text.includes('Update…'),
+  );
+  const update = [...page.container.querySelectorAll('button')].find((button) => button.textContent === 'Update…')!;
+  await act(async () => {
+    update.click();
+  });
+  expect(
+    call.mock.calls.some(([request]) => request.body?.action === 'install' && request.body?.agent === 'claude'),
+  ).toBe(true);
 });
 
 it('does not automatically retry a failed model check on each render', async () => {

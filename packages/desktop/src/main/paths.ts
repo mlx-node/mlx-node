@@ -39,6 +39,8 @@ export interface AppLayout {
 }
 
 export interface AppPaths {
+  /** The bundled CLI entry, run with the app executable in Node mode. */
+  cliEntry: string;
   /** Root the `app://` scheme serves. The dashboard SPA build output. */
   wwwRoot: string;
   /**
@@ -91,6 +93,9 @@ export interface AppPaths {
 export function resolveAppPaths(layout: AppLayout): AppPaths {
   const { appPath, resourcesPath, packaged, userData } = layout;
   return {
+    cliEntry: packaged
+      ? join(appPath, 'node_modules', '@mlx-node', 'cli', 'dist', 'cli.js')
+      : join(appPath, '..', 'cli', 'dist', 'cli.js'),
     // Packaged, the SPA is copied next to the app as an extra resource so it can
     // be replaced without rebuilding the archive. In dev it is read straight out
     // of the dashboard workspace, so `vp build` in `packages/dashboard/ui` is

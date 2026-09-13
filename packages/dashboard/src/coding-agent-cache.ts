@@ -5,6 +5,7 @@ import { dirname } from 'node:path';
 
 export interface DetectionResult {
   installed: boolean;
+  needsUpdate?: boolean;
   checkedAt: string;
 }
 
@@ -40,7 +41,11 @@ export class CodingAgentCache {
             typeof item.checkedAt === 'string' &&
             Number.isFinite(Date.parse(item.checkedAt))
           ) {
-            this.entries.set(item.key, { installed: item.installed, checkedAt: item.checkedAt });
+            this.entries.set(item.key, {
+              installed: item.installed,
+              needsUpdate: item.needsUpdate === true,
+              checkedAt: item.checkedAt,
+            });
           }
         }
       } catch {

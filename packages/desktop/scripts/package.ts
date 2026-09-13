@@ -26,6 +26,7 @@ import { bundledAddonPath, codesignArgs, NATIVE_FILES, PayloadError, resolvePayl
 import { assertSemver } from './release-version.js';
 import { stageApp } from './stage-app.js';
 import { writeUpdaterConfig } from './update-artifacts.js';
+import { verifyBundledCli } from './verify-cli.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP_DIR = resolve(HERE, '..');
@@ -39,7 +40,7 @@ const STAGE_APP = join(STAGE, 'app');
  * list rather than `packages/desktop/package.json` dependencies: that manifest
  * also carries `@mlx-node/lm` for the Phase 0 spike, which MAIN must never load.
  */
-const RUNTIME_ROOTS = ['@mlx-node/server', '@mlx-node/dashboard', 'electron-updater'];
+const RUNTIME_ROOTS = ['@mlx-node/server', '@mlx-node/dashboard', '@mlx-node/cli', 'electron-updater'];
 const BUNDLE_ID = 'ai.mlxnode.desktop';
 const PRODUCT_NAME = 'mlx-node';
 const RESULT_FILE = join(OUT, 'package-result.json');
@@ -106,6 +107,15 @@ const staged = stageApp({
   roots: RUNTIME_ROOTS,
   autoUpdates: sign,
 });
+// The CLI adds keyring's NAPI binary. Like mlx-core, its upstream LC_ID_DYLIB
+// contains the builder's home directory. Rewrite only the staged copy, before
+// packager/codesign, and retain the binding needed by CLI credential commands.
+const keyringBinary = 'keyring.darwin-arm64.node';
+run('install_name_tool', [
+  '-id',
+  `@rpath/${keyringBinary}`,
+  join(STAGE_APP, 'node_modules', '@napi-rs', 'keyring-darwin-arm64', keyringBinary),
+]);
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
 console.log(`  pruned ${staged.prunedDirs} examples/docs/test dirs from staged packages`);
 console.log(`  pruned ${staged.prunedFiles} .d.ts / source-map / tsbuildinfo files`);
@@ -289,6 +299,9 @@ if (sign) {
 }
 
 rmSync(STAGE, { recursive: true, force: true });
+
+// Validate the final (including signed) artifact before advertising its path.
+await verifyBundledCli(appPath);
 
 // One canonical path for everything downstream. The release workflow used to
 // spell `out/mlx-node.app` in four places; packager puts the bundle inside a

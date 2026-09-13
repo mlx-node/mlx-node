@@ -150,6 +150,7 @@ describe('dashboard api — models & catalog', () => {
       JSON.stringify({ defaultProvider: 'mlx', defaultModel: names[1] }),
     );
     const service = new CodingAgentsService({
+      prepareCommand: async () => join(home, '.mlx-node', 'bin', 'mlx'),
       home,
       env: {},
       listModels,

@@ -27,6 +27,12 @@ const PACKAGED: AppLayout = {
 };
 
 describe('resolveAppPaths', () => {
+  it('points the launcher at the packaged CLI rather than a developer checkout', () => {
+    expect(resolveAppPaths(PACKAGED).cliEntry).toBe(
+      '/Applications/mlx-node.app/Contents/Resources/app/node_modules/@mlx-node/cli/dist/cli.js',
+    );
+    expect(resolveAppPaths(DEV).cliEntry).toBe('/repo/packages/cli/dist/cli.js');
+  });
   it('serves the dashboard workspace build in dev', () => {
     // `vp build` in packages/dashboard/ui writes here, so a UI rebuild is live on
     // the next window load with no copy step.

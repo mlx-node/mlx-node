@@ -2,7 +2,7 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, symlink, stat } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DELEGATION_PROMPT } from '@mlx-node/agent/delegate';
+import { DELEGATION_PROMPT, delegationPrompt } from '@mlx-node/agent/delegate';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { CodingAgentsService } from '../src/coding-agents.js';
@@ -15,19 +15,22 @@ afterEach(async () => {
 async function setup(models = ['local-model']) {
   const home = await mkdtemp(join(tmpdir(), 'mlx-coding-agents-'));
   cleanup.push(() => rm(home, { recursive: true, force: true }));
+  const command = join(home, '.mlx-node', 'bin', 'mlx');
+  const prompt = delegationPrompt(command);
+  const prepareCommand = vi.fn(async () => command);
   const complete = vi.fn(async (_connection, _system, messages) => {
     const text = JSON.parse(messages[0].content).instructions as string;
-    const evidence = text.includes(DELEGATION_PROMPT) ? DELEGATION_PROMPT : '';
+    const evidence = text.includes(prompt) ? prompt : text.includes(DELEGATION_PROMPT) ? DELEGATION_PROMPT : '';
     return JSON.stringify({ installed: !!evidence, evidence });
   });
   const connect = vi.fn(async () => ({ url: 'http://127.0.0.1:8080', model: 'host-default', token: 'secret' }));
   const listModels = vi.fn(async () => [...models]);
   const restart = () => {
-    const service = new CodingAgentsService({ home, env: {}, listModels, connect, complete });
+    const service = new CodingAgentsService({ home, env: {}, listModels, connect, complete, prepareCommand });
     cleanup.push(() => service.close());
     return service;
   };
-  return { home, complete, connect, service: restart(), models, listModels, restart };
+  return { home, command, prompt, prepareCommand, complete, connect, service: restart(), models, listModels, restart };
 }
 
 async function settled(service: CodingAgentsService, id = 'claude') {
@@ -39,6 +42,55 @@ async function settled(service: CodingAgentsService, id = 'claude') {
 }
 
 describe('local model coding-agent setup', () => {
+  it('blocks setup without a working app command and invalidates an installed verdict', async () => {
+    const { service, home, prepareCommand, complete } = await setup();
+    await service.start('install', 'claude');
+    expect((await settled(service)).status).toBe('installed');
+    const before = await readFile(join(home, '.claude', 'CLAUDE.md'), 'utf8');
+    prepareCommand.mockRejectedValue(new Error('The app command is missing.'));
+    expect(await service.refresh()).toMatchObject({
+      available: false,
+      command: null,
+      unavailableReason: 'The app command is missing.',
+    });
+    expect((await service.state()).agents[0].status).toBe('unchecked');
+    const calls = complete.mock.calls.length;
+    await expect(service.start('install', 'claude')).rejects.toThrow('command is missing');
+    expect(complete).toHaveBeenCalledTimes(calls);
+    expect(await readFile(join(home, '.claude', 'CLAUDE.md'), 'utf8')).toBe(before);
+  });
+
+  it('upgrades the old exact prompt in place and keeps its inode and unrelated text', async () => {
+    const { service, home, prompt, restart, complete } = await setup();
+    await mkdir(join(home, '.claude'));
+    const path = join(home, '.claude', 'CLAUDE.md');
+    await writeFile(path, `Before.\n${DELEGATION_PROMPT}\nAfter.\n`);
+    const inode = (await stat(path)).ino;
+    await service.start('detect', 'claude');
+    expect((await settled(service)).status).toBe('needs-update');
+    const restored = restart();
+    expect((await restored.state()).agents[0].status).toBe('needs-update');
+    complete.mockClear();
+    await restored.start('install', 'claude');
+    expect((await settled(restored)).status).toBe('installed');
+    expect(await readFile(path, 'utf8')).toBe(`Before.\n${prompt}\nAfter.\n`);
+    expect((await stat(path)).ino).toBe(inode);
+    await restored.start('install', 'claude');
+    await settled(restored);
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not trust a cached verdict for a different command path', async () => {
+    const { service, prepareCommand, command, complete } = await setup();
+    await service.start('install', 'claude');
+    await settled(service);
+    prepareCommand.mockResolvedValue(command + '-new');
+    expect((await service.refresh()).agents[0].status).toBe('unchecked');
+    await service.start('detect', 'claude');
+    expect((await settled(service)).status).toBe('needs-update');
+    expect(complete).toHaveBeenCalledTimes(2);
+  });
+
   it('blocks both detection and installation without a model, before inference or file writes', async () => {
     const { service, complete, connect, home } = await setup([]);
     expect((await service.state()).available).toBe(false);
@@ -64,8 +116,8 @@ describe('local model coding-agent setup', () => {
   });
 
   it('recognizes a manually worded installation through the model without markers', async () => {
-    const { service, home, complete } = await setup();
-    const custom = 'For GitHub work, call mlx delegate github with the repository and task.';
+    const { service, home, complete, command } = await setup();
+    const custom = `For GitHub work, call '${command}' delegate github with the repository and task.`;
     await mkdir(join(home, '.claude'));
     await writeFile(join(home, '.claude', 'CLAUDE.md'), custom);
     complete.mockResolvedValueOnce(JSON.stringify({ installed: true, evidence: custom }));
@@ -75,17 +127,17 @@ describe('local model coding-agent setup', () => {
   });
 
   it('appends only the short prompt, preserves existing text, and does not duplicate installation', async () => {
-    const { service, home, complete } = await setup();
+    const { service, home, complete, prompt } = await setup();
     await mkdir(join(home, '.claude'));
     const path = join(home, '.claude', 'CLAUDE.md');
     await writeFile(path, '# Preferences\nUse yarn.');
     await service.start('install', 'claude');
     expect((await settled(service)).status).toBe('installed');
-    expect(await readFile(path, 'utf8')).toBe(`# Preferences\nUse yarn.\n\n${DELEGATION_PROMPT}\n`);
+    expect(await readFile(path, 'utf8')).toBe(`# Preferences\nUse yarn.\n\n${prompt}\n`);
     expect(complete).toHaveBeenCalledTimes(2);
     await service.start('install', 'claude');
     await settled(service);
-    expect((await readFile(path, 'utf8')).split(DELEGATION_PROMPT)).toHaveLength(2);
+    expect((await readFile(path, 'utf8')).split(prompt)).toHaveLength(2);
   });
 
   it('selects the active Codex override and follows an existing file symlink', async () => {
@@ -96,7 +148,7 @@ describe('local model coding-agent setup', () => {
     await symlink(target, join(home, '.codex', 'AGENTS.override.md'));
     await service.start('install', 'codex');
     expect((await settled(service, 'codex')).path).toContain('AGENTS.override.md');
-    expect(await readFile(target, 'utf8')).toContain(DELEGATION_PROMPT);
+    expect(await readFile(target, 'utf8')).toContain(delegationPrompt(join(home, '.mlx-node', 'bin', 'mlx')));
     await expect(readFile(join(home, '.codex', 'AGENTS.md'))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 

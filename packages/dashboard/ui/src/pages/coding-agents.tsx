@@ -130,14 +130,20 @@ export default function CodingAgents() {
           role="status"
         >
           <div>
-            <p className="font-medium">A local model is required</p>
+            <p className="font-medium">{data.model ? 'Command setup needs attention' : 'A local model is required'}</p>
             <p className="text-muted-foreground mt-1 text-sm">{data.unavailableReason}</p>
           </div>
-          <Button asChild>
-            <Link to="/models">
-              <Download className="size-4" aria-hidden /> Install a model
-            </Link>
-          </Button>
+          {data.model ? (
+            <Button disabled={busy} onClick={() => void refreshMetadata()}>
+              Retry setup
+            </Button>
+          ) : (
+            <Button asChild>
+              <Link to="/models">
+                <Download className="size-4" aria-hidden /> Install a model
+              </Link>
+            </Button>
+          )}
         </div>
       )}
 
@@ -167,9 +173,11 @@ export default function CodingAgents() {
                     ? 'Waiting…'
                     : agent.status === 'error'
                       ? 'Check again'
-                      : agent.status === 'unchecked' && data.available
-                        ? 'Check status'
-                        : 'Install…';
+                      : agent.status === 'needs-update'
+                        ? 'Update…'
+                        : agent.status === 'unchecked' && data.available
+                          ? 'Check status'
+                          : 'Install…';
             return (
               <div key={agent.id} className="flex items-center gap-4 border-b py-6 last:border-b-0 sm:gap-5">
                 <div className="flex w-10 shrink-0 justify-center">
@@ -213,7 +221,12 @@ export default function CodingAgents() {
                       variant="secondary"
                       className="min-w-28 rounded-xl bg-black/[0.06] text-base shadow-none hover:bg-black/10 dark:bg-white/10"
                       disabled={!data.available || busy}
-                      onClick={() => void run(agent.status === 'not-installed' ? 'install' : 'detect', agent.id)}
+                      onClick={() =>
+                        void run(
+                          ['not-installed', 'needs-update'].includes(agent.status) ? 'install' : 'detect',
+                          agent.id,
+                        )
+                      }
                     >
                       {working && <LoaderCircle className="size-4 animate-spin" aria-hidden />}
                       {label}
@@ -229,8 +242,8 @@ export default function CodingAgents() {
       {data?.model && (
         <p className="text-muted-foreground px-1 text-sm">
           Check status uses {prettyModelName(data.model)} on this Mac for new or changed files. It may need to load the
-          model. Opening this page uses cached results. Start a new agent session after installation. Requires the mlx
-          and GitHub command-line tools.
+          model. Opening this page uses cached results. The app includes the mlx command. Start a new agent session
+          after installation. GitHub work requires an authenticated GitHub CLI.
         </p>
       )}
     </section>

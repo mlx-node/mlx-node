@@ -39,6 +39,7 @@ export type RuntimeLifecycleEvent = DbWorkerLifecycle;
 
 export interface DashboardRuntimeOptions {
   connectInference?: CodingAgentsOptions['connect'];
+  prepareDelegation?: CodingAgentsOptions['prepareCommand'];
   dbPath?: string;
   modelsDir?: string;
   sessionsRoot?: string;
@@ -147,6 +148,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   const downloads = new DownloadManager({ modelsDir });
 
   const codingAgents = new CodingAgentsService({
+    prepareCommand: opts.prepareDelegation,
     listModels: async () => {
       const response = await worker.call({ method: 'GET', path: '/api/coding-agents/models' });
       if (!response.ok) throw new Error(response.message);
