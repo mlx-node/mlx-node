@@ -29,6 +29,10 @@
     "./family-data": {
       "types": "./dist/family-data.d.ts",
       "import": "./dist/family-data.js"
+    },
+    "./model-detection": {
+      "types": "./dist/model-detection.d.ts",
+      "import": "./dist/model-detection.js"
     }
   },
   "scripts": {

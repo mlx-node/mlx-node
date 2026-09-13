@@ -3,9 +3,6 @@
  * `MODEL_FAMILY_DATA` row, plus `detectModelType` (filesystem + GGUF).
  */
 
-import { readFile } from 'node:fs/promises';
-import { dirname, extname, join } from 'node:path';
-
 import {
   Gemma4Model as NativeGemma4Model,
   ggufArchitecture,
@@ -21,15 +18,8 @@ import {
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
 import { findDFlash2Draft } from '../draft-companion.js';
-import {
-  familyDataFor,
-  MalformedModelConfigError,
-  matchFamily,
-  MODEL_FAMILY_DATA,
-  UnsupportedModelTypeError,
-  type ModelType,
-  type TrainableFamilyId,
-} from '../family-data.js';
+import { familyDataFor, type ModelType, type TrainableFamilyId } from '../family-data.js';
+import { detectModelType as detectLocalModelType } from '../model-detection.js';
 import {
   Gemma4Model,
   Lfm2Model,
@@ -164,14 +154,6 @@ export type TrainableModel =
   | Awaited<ReturnType<LoaderBindings[TrainableFamilyId]['load']>>
   | InstanceType<LoaderBindings[TrainableFamilyId]['nativeModelClass']>;
 
-// Only families whose native `load(path)` accepts a GGUF file carry a
-// `ggufArchitectures` row entry (see family-data.ts).
-const GGUF_ARCHITECTURE_MODEL_TYPES = new Map<string, ModelType>(
-  MODEL_FAMILY_DATA.flatMap((row) =>
-    'ggufArchitectures' in row ? row.ggufArchitectures.map((architecture) => [architecture, row.id] as const) : [],
-  ),
-);
-
 function requireFamilyData(modelType: ModelType) {
   const family = familyDataFor(modelType);
   if (family === undefined) {
@@ -270,27 +252,5 @@ export async function loadSession(
 }
 
 export async function detectModelType(modelPath: string): Promise<ModelType> {
-  const isGguf = extname(modelPath).toLowerCase() === '.gguf';
-  const configPath = isGguf ? join(dirname(modelPath), 'config.json') : join(modelPath, 'config.json');
-  let raw: string;
-  try {
-    raw = await readFile(configPath, 'utf-8');
-  } catch (e) {
-    if (isGguf && typeof e === 'object' && e !== null && 'code' in e && e.code === 'ENOENT') {
-      const architecture = ggufArchitecture(modelPath);
-      const modelType = GGUF_ARCHITECTURE_MODEL_TYPES.get(architecture);
-      if (modelType === undefined) {
-        throw new Error(`Unsupported GGUF architecture "${architecture}" in ${modelPath}`);
-      }
-      return modelType;
-    }
-    throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`);
-  }
-
-  try {
-    return matchFamily(modelPath, JSON.parse(raw));
-  } catch (e) {
-    if (e instanceof UnsupportedModelTypeError || e instanceof MalformedModelConfigError) throw e;
-    throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`);
-  }
+  return detectLocalModelType(modelPath, ggufArchitecture);
 }

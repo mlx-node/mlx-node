@@ -17,18 +17,12 @@
  */
 
 import type { Dirent } from 'node:fs';
-import { readdir, readFile, stat } from 'node:fs/promises';
+import { readdir, stat } from 'node:fs/promises';
 import { basename, join } from 'node:path';
 
 import type { ProviderModelConfig } from '@earendil-works/pi-coding-agent';
-import { ggufArchitecture } from '@mlx-node/core';
-import {
-  launchPresetFor,
-  detectModelType,
-  familyTraitsFor,
-  NON_GENERATIVE_FAMILY_IDS,
-  type ModelType,
-} from '@mlx-node/lm';
+import { launchPresetFor, familyTraitsFor, NON_GENERATIVE_FAMILY_IDS, type ModelType } from '@mlx-node/lm/family-data';
+import { detectModelType, readGgufArchitecture, readModelConfig } from '@mlx-node/lm/model-detection';
 
 import type { DiscoveredModelLike } from '../types.js';
 
@@ -139,8 +133,7 @@ async function readDiscoveryMetadata(
   fallbackContextWindow: number,
 ): Promise<DiscoveryMetadata> {
   try {
-    const raw = await readFile(join(modelPath, 'config.json'), 'utf-8');
-    const config = JSON.parse(raw) as Record<string, unknown>;
+    const config = (await readModelConfig(modelPath)) as Record<string, unknown>;
     const root = positiveInteger(config.max_position_embeddings);
     const textConfig = config.text_config;
     const nested = nonEmptyRecord(textConfig) ? positiveInteger(textConfig.max_position_embeddings) : undefined;
@@ -265,7 +258,7 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
         }
         if (
           modelType === 'gemma4' ||
-          (modelType === 'muse_glimmer' && ggufArchitecture(full) === 'muse-glimmer') ||
+          (modelType === 'muse_glimmer' && readGgufArchitecture(full) === 'muse-glimmer') ||
           (modelType === 'qwen3_5' && isQwen35XlGguf(entry.name))
         ) {
           await append(ggufModelName(entry.name), full, modelsDir, modelType, basename(modelsDir));
@@ -301,7 +294,7 @@ export async function discoverMlxModels(modelsDir: string): Promise<MlxModelInfo
         try {
           // A sibling Muse config also describes its draft/projector files.
           // Check the GGUF header so renamed companions cannot become targets.
-          if (modelType === 'muse_glimmer' && ggufArchitecture(path) !== 'muse-glimmer') continue;
+          if (modelType === 'muse_glimmer' && readGgufArchitecture(path) !== 'muse-glimmer') continue;
           await append(ggufModelName(gguf), path, full, modelType, entry.name);
         } catch (err) {
           if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);

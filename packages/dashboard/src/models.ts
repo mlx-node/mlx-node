@@ -330,7 +330,7 @@ function readMarkerFile(dir: string): unknown {
  * byte size". A no-follow test here would call a symlinked weight missing and hide
  * a checkpoint that loads perfectly, which is the regression this shape avoids.
  */
-function isRegularFile(path: string): boolean {
+export function isRegularFile(path: string): boolean {
   try {
     return statSync(path).isFile();
   } catch {

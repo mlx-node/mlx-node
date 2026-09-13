@@ -20,6 +20,8 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const CATALOG_DIST = resolve(ROOT, 'packages/agent/dist/catalog.js');
 const FAMILY_DATA_DIST = resolve(ROOT, 'packages/lm/dist/family-data.js');
 const LM_ROOT_DIST = resolve(ROOT, 'packages/lm/dist/index.js');
+const MODELS_DIST = resolve(ROOT, 'packages/agent/dist/provider/models.js');
+const MODEL_HANDLER_DIST = resolve(ROOT, 'packages/dashboard/dist/api/handlers/models.js');
 
 const RESOLVE_HOOK = `
   const { registerHooks } = await import('node:module');
@@ -58,6 +60,44 @@ describe('native-free catalog + family-data subpaths', () => {
       exports: Record<string, unknown>;
     };
     expect(Object.keys(agentPkg.exports)).toContain('./catalog');
+    expect(Object.keys(agentPkg.exports)).toContain('./models');
+    expect(Object.keys(lmPkg.exports)).toContain('./model-detection');
+    expect(existsSync(MODELS_DIST)).toBe(true);
+  });
+
+  it('discovers a standalone GGUF through the built dashboard handler without the addon', () => {
+    const probe = `
+      ${RESOLVE_HOOK}
+      const fs = await import('node:fs/promises');
+      const { tmpdir } = await import('node:os');
+      const { join } = await import('node:path');
+      const { discoverMlxModels } = await import(${JSON.stringify(MODELS_DIST)});
+      const { handleCodingAgentModels } = await import(${JSON.stringify(MODEL_HANDLER_DIST)});
+      const dir = await fs.mkdtemp(join(tmpdir(), 'native-free-gguf-'));
+      try {
+        const str = text => {
+          const bytes = Buffer.from(text);
+          const length = Buffer.alloc(8);
+          length.writeBigUInt64LE(BigInt(bytes.length));
+          return Buffer.concat([length, bytes]);
+        };
+        const header = Buffer.alloc(24);
+        header.write('GGUF'); header.writeUInt32LE(3, 4); header.writeBigUInt64LE(1n, 16);
+        await fs.writeFile(join(dir, 'Qwen3.8-Q4_K_XL.gguf'), Buffer.concat([
+          header, str('general.architecture'), Buffer.from([8,0,0,0]), str('qwen35')
+        ]));
+        const agentNames = (await discoverMlxModels(dir)).map(model => model.discovered.name);
+        const uiNames = (await handleCodingAgentModels({ modelsDir: dir })).models.map(model => model.name);
+        if (JSON.stringify(agentNames) !== JSON.stringify(['Qwen3.8-Q4_K_XL'])) throw new Error('Missing GGUF');
+        if (JSON.stringify(agentNames) !== JSON.stringify(uiNames)) throw new Error('Inventories differ');
+        console.log('NATIVE-FREE-GGUF-OK');
+      } finally {
+        await fs.rm(dir, { recursive: true, force: true });
+      }
+    `;
+    const { status, output } = runNodeChild(probe);
+    expect(output, output).toContain('NATIVE-FREE-GGUF-OK');
+    expect(status).toBe(0);
   });
 
   it('imports both built subpaths in a child whose resolver bans the addon', () => {

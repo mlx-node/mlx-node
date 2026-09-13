@@ -172,7 +172,8 @@ export function visibleCatalog(): CatalogEntry[] {
  * Cold-tier facts and family registration data, re-exported through this
  * subpath.
  *
- * `@mlx-node/agent/catalog` is the agent package's one NATIVE-FREE entry point:
+ * `@mlx-node/agent/catalog` is a NATIVE-FREE entry point, alongside the
+ * `delegate` client and `models` discovery subpaths:
  * the package root re-exports `provider/index.ts`, which value-imports
  * `@mlx-node/core`. The dashboard is a separate viewer process that must never
  * link the addon (docs/dashboard.md: "no Metal init, instant start"), and
