@@ -17,6 +17,12 @@ coding agents can invoke it regardless of their terminal/editor `PATH`. The
 launcher executes in the caller's process tree and preserves its permissions.
 Authenticate the [GitHub CLI](https://cli.github.com/) before delegating GitHub work.
 
+Successful command checks persist in `~/.mlx-node/cli-verification.json` across
+app restarts. Unchanged runtime files use a cheap metadata check; changed metadata
+triggers a content hash, and only different content or permissions require another
+command probe. Failed probes remain retryable. The cache stores hashes in an
+owner-only file and never skips checking that the launcher and runtime still exist.
+
 `mlx delegate` uses the same prompt-and-exit runtime as `mlx agent --print`,
 including its model settings, inference cache, metrics, and saved sessions.
 It has a focused worker prompt, read/bash tools, and inherits Codex's process
@@ -37,8 +43,9 @@ the model. Checks run sequentially, with **Waiting…** shown for queued rows.
 The Installed menu offers **Recheck with model** to bypass a cached result.
 
 Semantic results persist in the owner-only `~/.mlx-node/coding-agents.json` file,
-keyed by the instruction content, path, selected model and detection prompt.
+keyed by the instruction content, path, selected model, app command and detection prompt.
 Only hashes, verdicts and check times are stored there, not instruction text.
+Both installed and not-installed results survive restarts and identical file rewrites.
 Active checks poll in-memory status. Idle pages refresh metadata every 30 seconds
 and when focused; model discovery for this page skips recursive directory sizing.
 

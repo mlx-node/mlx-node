@@ -267,6 +267,31 @@ describe('local model coding-agent setup', () => {
     expect(complete.mock.calls[1][0].model).toBe('new-default');
   });
 
+  it('reuses positive and negative verdicts for identical content across refreshes and restarts', async () => {
+    const { service, home, complete, connect, restart } = await setup();
+    await service.start('install', 'claude');
+    const installed = await settled(service);
+    await mkdir(join(home, '.codex'));
+    const codexPath = join(home, '.codex', 'AGENTS.md');
+    await writeFile(codexPath, 'Use oxnode for TypeScript.');
+    await service.start('detect', 'codex');
+    const absent = await settled(service, 'codex');
+    expect(absent.status).toBe('not-installed');
+    const claudePath = join(home, '.claude', 'CLAUDE.md');
+    for (const path of [claudePath, codexPath]) await writeFile(path, await readFile(path));
+    complete.mockClear();
+    connect.mockClear();
+    for (const next of [service, restart()]) {
+      await next.refresh();
+      await next.start('detect');
+      const rows = (await next.state()).agents;
+      expect(rows[0]).toMatchObject({ status: 'installed', checkedAt: installed.checkedAt });
+      expect(rows[1]).toMatchObject({ status: 'not-installed', checkedAt: absent.checkedAt });
+    }
+    expect(complete).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
+  });
+
   it('polls only snapshots and labels queued checks as waiting', async () => {
     const { service, home, complete, listModels } = await setup();
     for (const dir of ['.claude', '.codex']) await mkdir(join(home, dir));

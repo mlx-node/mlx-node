@@ -1,10 +1,12 @@
 /** The app-owned CLI runs in the caller's process tree, using Electron's bundled Node. */
 import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmod, lstat, mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
+
+import { CliVerificationCache } from './cli-verification-cache.js';
 
 const execute = promisify(execFile);
 const HEADER = '#!/bin/sh\n# Managed by mlx-node.\n';
@@ -31,7 +33,7 @@ export function launcherScript(config: DesktopCliConfig): string {
 export function createCliLauncher(config: DesktopCliConfig, home = homedir()) {
   const path = join(home, '.mlx-node', 'bin', 'mlx');
   const script = launcherScript(config);
-  let verified: string | undefined;
+  const cache = new CliVerificationCache(join(home, '.mlx-node', 'cli-verification.json'));
   let pending: Promise<string> | undefined;
   const prepare = async (): Promise<string> => {
     let previous: string | undefined;
@@ -55,11 +57,7 @@ export function createCliLauncher(config: DesktopCliConfig, home = homedir()) {
         await rm(temp, { force: true });
       }
     }
-    const files = await Promise.all(
-      [path, config.executable, config.entry, config.nativeAddon].map((file) => stat(file)),
-    );
-    const key = JSON.stringify(files.map((file) => [file.dev, file.ino, file.size, file.mtimeMs, file.mode]));
-    if (verified !== key) {
+    await cache.verify([path, config.executable, config.entry, config.nativeAddon], async () => {
       // No user-installed Node/mlx, shell startup files, model load, or permission overrides.
       const { stdout } = await execute(path, ['delegate', '--help'], {
         env: { ...process.env, PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
@@ -69,8 +67,7 @@ export function createCliLauncher(config: DesktopCliConfig, home = homedir()) {
       if (!stdout.includes('Usage: mlx delegate') || !stdout.includes('mlx delegate github')) {
         throw new Error('The bundled command does not support delegation. Reinstall or update mlx-node.');
       }
-      verified = key;
-    }
+    });
     return path;
   };
   return {

@@ -1,5 +1,17 @@
 import { execFile } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  utimes,
+  writeFile,
+} from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
@@ -70,6 +82,75 @@ describe('app-owned command', () => {
     expect(await readFile(join(root, 'probes'), 'utf8')).toBe('1');
     await writeFile(config.entry, (await readFile(config.entry, 'utf8')) + '\n// updated\n');
     await launcher.prepare();
+    expect(await readFile(join(root, 'probes'), 'utf8')).toBe('11');
+  });
+
+  it('restores verification after restart and ignores identical rewrites and timestamp changes', async () => {
+    const { root, config, launcher } = await fixture();
+    await launcher.prepare();
+    const cachePath = join(root, '.mlx-node', 'cli-verification.json');
+    const cache = await readFile(cachePath, 'utf8');
+    expect(cache).not.toContain(root);
+    expect(cache).not.toContain(await readFile(config.entry, 'utf8'));
+    expect((await stat(cachePath)).mode & 0o777).toBe(0o600);
+    const saved = await stat(cachePath);
+    await createCliLauncher(config, root).prepare();
+    expect((await stat(cachePath)).mtimeMs).toBe(saved.mtimeMs);
+
+    await utimes(config.nativeAddon, new Date(0), new Date(0));
+    await writeFile(config.entry, await readFile(config.entry));
+    const replacement = launcher.path + '.replacement';
+    await writeFile(replacement, await readFile(launcher.path), { mode: 0o755 });
+    await rename(replacement, launcher.path);
+    await createCliLauncher(config, root).prepare();
+    await createCliLauncher(config, root).prepare();
+    expect(await readFile(join(root, 'probes'), 'utf8')).toBe('1');
+
+    await writeFile(config.nativeAddon, 'changed');
+    await createCliLauncher(config, root).prepare();
+    expect(await readFile(join(root, 'probes'), 'utf8')).toBe('11');
+  });
+
+  it('does not trust restored cache entries when bytes change even with the old modification time', async () => {
+    const { root, config, launcher } = await fixture();
+    await launcher.prepare();
+    const before = await stat(config.nativeAddon);
+    await writeFile(config.nativeAddon, 'changed'); // Same byte length as the original fixture.
+    await utimes(config.nativeAddon, before.atime, before.mtime);
+    await createCliLauncher(config, root).prepare();
+    expect(await readFile(join(root, 'probes'), 'utf8')).toBe('11');
+    await rm(config.nativeAddon);
+    await expect(createCliLauncher(config, root).prepare()).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('rechecks a damaged cache and can still prepare when cache writes are unavailable', async () => {
+    const { root, config, launcher } = await fixture();
+    await launcher.prepare();
+    const cachePath = join(root, '.mlx-node', 'cli-verification.json');
+    await writeFile(cachePath, '{broken');
+    await createCliLauncher(config, root).prepare();
+    expect(await readFile(join(root, 'probes'), 'utf8')).toBe('11');
+    await rm(cachePath);
+    await mkdir(cachePath);
+    const next = createCliLauncher(config, root);
+    await next.prepare();
+    await next.prepare();
+    expect(await readFile(join(root, 'probes'), 'utf8')).toBe('111');
+  });
+
+  it('does not persist a transient failed probe', async () => {
+    const { root, config, launcher } = await fixture();
+    const recovery = join(root, 'recovered');
+    await writeFile(
+      config.entry,
+      `import { existsSync, appendFileSync } from 'node:fs';
+       appendFileSync(${JSON.stringify(join(root, 'probes'))}, '1');
+       if (!existsSync(${JSON.stringify(recovery)})) process.exit(1);
+       console.log('Usage: mlx delegate\\nmlx delegate github');`,
+    );
+    await expect(launcher.prepare()).rejects.toThrow();
+    await writeFile(recovery, 'ready');
+    await createCliLauncher(config, root).prepare();
     expect(await readFile(join(root, 'probes'), 'utf8')).toBe('11');
   });
 
