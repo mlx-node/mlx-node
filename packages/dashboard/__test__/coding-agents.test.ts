@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { DELEGATION_PROMPT, delegationPrompt } from '@mlx-node/agent/delegate';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { DETECTION_INPUT_PREFIX } from '../src/coding-agent-detection.js';
 import { CodingAgentsService } from '../src/coding-agents.js';
 
 const cleanup: (() => Promise<void>)[] = [];
@@ -19,9 +20,12 @@ async function setup(models = ['local-model']) {
   const prompt = delegationPrompt(command);
   const prepareCommand = vi.fn(async () => command);
   const complete = vi.fn(async (_connection, _system, messages) => {
-    const text = JSON.parse(messages[0].content).instructions as string;
-    const evidence = text.includes(prompt) ? prompt : text.includes(DELEGATION_PROMPT) ? DELEGATION_PROMPT : '';
-    return JSON.stringify({ installed: !!evidence, evidence });
+    const lines = (messages[0].content as string)
+      .slice(DETECTION_INPUT_PREFIX.length)
+      .split('\n')
+      .map((line) => line.replace(/^\d+ \| /, ''));
+    const index = lines.findIndex((line) => line.includes(prompt) || line.includes(DELEGATION_PROMPT));
+    return JSON.stringify({ installed: index >= 0, startLine: index + 1, endLine: index + 1 });
   });
   const connect = vi.fn(async () => ({ url: 'http://127.0.0.1:8080', model: 'host-default', token: 'secret' }));
   const listModels = vi.fn(async () => [...models]);
@@ -120,7 +124,7 @@ describe('local model coding-agent setup', () => {
     const custom = `For GitHub work, call '${command}' delegate github with the repository and task.`;
     await mkdir(join(home, '.claude'));
     await writeFile(join(home, '.claude', 'CLAUDE.md'), custom);
-    complete.mockResolvedValueOnce(JSON.stringify({ installed: true, evidence: custom }));
+    complete.mockResolvedValueOnce(JSON.stringify({ installed: true, startLine: 1, endLine: 1 }));
     await service.start('detect', 'claude');
     expect((await settled(service)).status).toBe('installed');
     expect(complete).toHaveBeenCalledTimes(1);
@@ -156,7 +160,7 @@ describe('local model coding-agent setup', () => {
     const { service, complete, home } = await setup();
     await mkdir(join(home, '.claude'));
     await writeFile(join(home, '.claude', 'CLAUDE.md'), 'Use yarn.');
-    complete.mockResolvedValueOnce(JSON.stringify({ installed: true, evidence: 'invented text' }));
+    complete.mockResolvedValueOnce(JSON.stringify({ installed: true, startLine: 99, endLine: 99 }));
     await service.start('detect', 'claude');
     expect((await settled(service)).status).toBe('error');
   });
@@ -168,7 +172,7 @@ describe('local model coding-agent setup', () => {
     await writeFile(path, 'Before.');
     complete.mockImplementationOnce(async () => {
       await writeFile(path, 'User edit.');
-      return JSON.stringify({ installed: false, evidence: '' });
+      return JSON.stringify({ installed: false, startLine: 0, endLine: 0 });
     });
     await service.start('install', 'claude');
     expect((await settled(service)).status).toBe('error');
@@ -212,7 +216,7 @@ describe('local model coding-agent setup', () => {
     const { service, home, complete, models } = await setup();
     complete.mockImplementationOnce(async () => {
       models.splice(0);
-      return JSON.stringify({ installed: false, evidence: '' });
+      return JSON.stringify({ installed: false, startLine: 0, endLine: 0 });
     });
     await service.start('install', 'claude');
     expect((await settled(service)).status).toBe('error');
@@ -303,7 +307,7 @@ describe('local model coding-agent setup', () => {
     });
     complete.mockImplementationOnce(async () => {
       await gate;
-      return JSON.stringify({ installed: false, evidence: '' });
+      return JSON.stringify({ installed: false, startLine: 0, endLine: 0 });
     });
     await service.start('detect');
     try {
