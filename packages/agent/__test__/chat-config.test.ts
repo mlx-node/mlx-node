@@ -2,7 +2,7 @@ import type { ThinkingLevel } from '@earendil-works/pi-ai';
 import { createToolDefinition, launchPresetFor } from '@mlx-node/lm';
 import { describe, expect, it } from 'vite-plus/test';
 
-import { buildChatConfig } from '../src/provider/chat-config.js';
+import { buildChatConfig, parseThinkingBudget } from '../src/provider/chat-config.js';
 
 describe('buildChatConfig', () => {
   it('maps every pi thinking level (and undefined) to the native reasoningEffort', () => {
@@ -12,8 +12,8 @@ describe('buildChatConfig', () => {
       ['low', 'low'],
       ['medium', 'medium'],
       ['high', 'high'],
-      ['xhigh', 'high'],
-      ['max', 'high'],
+      ['xhigh', 'xhigh'],
+      ['max', 'max'],
     ];
     for (const [reasoning, expected] of table) {
       const config = buildChatConfig('qwen3_5', reasoning === undefined ? undefined : { reasoning }, undefined);
@@ -132,5 +132,31 @@ describe('buildChatConfig', () => {
     const config = buildChatConfig('qwen3_5', { temperature: 0.99 }, undefined);
     expect(config.temperature).toBe(0.99);
     expect(launchPresetFor('qwen3_5')!.sampling).toEqual(before);
+  });
+});
+
+describe('thinking token budgets', () => {
+  it('keeps an omitted cap independent of every effort level', () => {
+    for (const reasoning of ['low', 'medium', 'high', 'xhigh', 'max'] as const) {
+      expect(buildChatConfig('qwen3_5', { reasoning }, undefined).thinkingTokenBudget).toBeUndefined();
+    }
+  });
+  it('forwards configured caps and preserves an explicit zero override', () => {
+    const options = { reasoning: 'low' as const, thinkingBudgets: { low: 123 } };
+    expect(buildChatConfig('qwen3_5', options, undefined).thinkingTokenBudget).toBe(123);
+    expect(buildChatConfig('qwen3_5', options, undefined, undefined, undefined, undefined, 0).thinkingTokenBudget).toBe(
+      0,
+    );
+    expect(
+      buildChatConfig('qwen3_5', { reasoning: 'xhigh', thinkingBudgets: { high: 456 } }, undefined).thinkingTokenBudget,
+    ).toBe(456);
+  });
+  it('accepts zero and rejects malformed, negative and overflowing caps', () => {
+    expect(parseThinkingBudget('0')).toBe(0);
+    expect(parseThinkingBudget('2048')).toBe(2048);
+    expect(parseThinkingBudget(undefined)).toBeUndefined();
+    for (const value of [-1, 1.5, NaN, Infinity, 2147483648, '', '2k', '-1', true, null]) {
+      expect(() => parseThinkingBudget(value)).toThrow('Thinking budget must be an integer');
+    }
   });
 });

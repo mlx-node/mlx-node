@@ -284,6 +284,15 @@ async function bootstrap(): Promise<void> {
 
   broker = createControlPanelBroker<WebContents>({
     ...electronBrokerDeps({
+      getInferenceConnection: async () => {
+        if (!supervisor || quitting) throw new Error('The local model service is unavailable.');
+        await supervisor.start();
+        const info = await supervisor.request<{ boundModel: string }>({ op: 'info' });
+        const url = supervisor.snapshot().url;
+        const token = supervisor.connectionToken();
+        if (!url || !token) throw new Error('The local model service is unavailable.');
+        return { url, token, model: info.boundModel };
+      },
       entry: paths.controlPanelEntry,
       env: { ...process.env, ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir }) } as Record<string, string>,
       onLog: (stream, line) => {

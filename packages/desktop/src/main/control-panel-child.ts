@@ -9,10 +9,16 @@
 
 import { MessageChannelMain, utilityProcess, type WebContents } from 'electron';
 
+import {
+  CONNECTION_REQUEST,
+  CONNECTION_REPLY,
+  type InferenceConnection,
+} from '../control-panel/inference-connection.js';
 import type { ControlPanelChild, BrokerDeps, BrokerPort } from './broker.js';
 import { CONTROL_PANEL_PORT_CHANNEL } from './window-policy.js';
 
 export interface ControlPanelChildOptions {
+  getInferenceConnection?(): Promise<InferenceConnection>;
   /** Absolute path to `dist/control-panel/index.js`. */
   entry: string;
   /** The child's complete environment. See `supervisor/env.ts` for why complete. */
@@ -37,6 +43,27 @@ export function electronBrokerDeps(options: ControlPanelChildOptions): BrokerDep
       };
       attachLineReader(child.stdout, 'stdout', log);
       attachLineReader(child.stderr, 'stderr', log);
+      child.on('message', (message: unknown) => {
+        if (typeof message !== 'object' || message === null) return;
+        const request = message as { type?: unknown; id?: unknown };
+        if (request.type !== CONNECTION_REQUEST || typeof request.id !== 'number') return;
+        const reply = (payload: object): void => {
+          try {
+            child.postMessage({ type: CONNECTION_REPLY, id: request.id, ...payload });
+          } catch {
+            /* The requesting process has exited. */
+          }
+        };
+        if (!options.getInferenceConnection) {
+          reply({ error: 'The local model service is unavailable.' });
+          return;
+        }
+        void options.getInferenceConnection().then(
+          (connection) => reply({ connection }),
+          (error: unknown) =>
+            reply({ error: error instanceof Error ? error.message : 'The local model service is unavailable.' }),
+        );
+      });
 
       child.on('exit', (code: number) => {
         events.onExit(code);

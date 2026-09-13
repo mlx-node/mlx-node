@@ -375,6 +375,7 @@ export interface SessionCapableModel {
     addGenerationPrompt?: boolean | null,
     tools?: ToolDefinition[] | null,
     enableThinking?: boolean | null,
+    reasoningEffort?: string | null,
   ): Promise<Uint32Array> | Uint32Array;
   /**
    * Optional model-native planner for prompt formats whose media placeholders
@@ -1950,9 +1951,14 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     }
 
     const effort = config.reasoningEffort;
-    const enableThinking =
-      effort === 'none' || effort === 'low' ? false : effort === 'medium' || effort === 'high' ? true : null;
-    const tokens = await this.model.applyChatTemplate(messages, true, config.tools ?? null, enableThinking);
+    const enableThinking = effort === undefined ? null : effort !== 'none';
+    const tokens = await this.model.applyChatTemplate(
+      messages,
+      true,
+      config.tools ?? null,
+      enableThinking,
+      effort ?? null,
+    );
     const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
     let promptTokens = tokens.length;
     if (hasImages && typeof this.model.expandedPromptTokenCount === 'function') {

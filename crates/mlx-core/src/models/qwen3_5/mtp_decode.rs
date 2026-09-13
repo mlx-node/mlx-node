@@ -637,6 +637,7 @@ macro_rules! decode_loop {
         })?
     ) => {{
         for step in 0..$max {
+            $tracker.enforce_next_token(&mut $y)?;
             let next_y = if step + 1 < $max {
                 let _stream_ctx = $crate::stream::StreamContext::new($stream);
 

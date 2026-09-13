@@ -100,6 +100,21 @@ afterEach(async () => {
 });
 
 describe('dashboard api — models & catalog', () => {
+  it('only offers complete generative models for local prompt detection', async () => {
+    for (const [name, type, weights] of [
+      ['partial', 'qwen3', false],
+      ['embedding', 'harrier', true],
+      ['unknown', 'unsupported-type', true],
+    ] as const) {
+      mkdirSync(join(modelsDir, name));
+      writeFileSync(join(modelsDir, name, 'config.json'), JSON.stringify({ model_type: type }));
+      if (weights) writeFileSync(join(modelsDir, name, 'model.safetensors'), Buffer.alloc(2048));
+    }
+    const response = await api.fetch('/api/coding-agents/models');
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ models: [{ name: 'model-a' }] });
+  });
+
   it('returns draft weights separately and allows their deletion without deleting the target', async () => {
     const name = 'qwen3.8-27b-dflash2';
     const config = JSON.stringify({ model_type: 'qwen3', architectures: ['DFlash2DraftModel'] });

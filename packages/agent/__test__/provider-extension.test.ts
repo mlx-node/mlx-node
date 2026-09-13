@@ -128,6 +128,8 @@ async function buildOneTurnHarness(
   if (typeof extension === 'function') throw new Error('expected a named extension');
   let provider: ProviderConfig | undefined;
   const pi = {
+    registerFlag: vi.fn(),
+    getFlag: vi.fn(),
     registerProvider(_name: string, config: ProviderConfig): void {
       provider = config;
     },
@@ -156,6 +158,8 @@ function loadExtension(): {
   const handlers = new Map<string, (event: never, ctx: ExtensionContext) => void>();
   const registerProvider = vi.fn();
   const pi = {
+    registerFlag: vi.fn(),
+    getFlag: vi.fn(),
     registerProvider,
     on(event: string, handler: (event: never, ctx: ExtensionContext) => void): void {
       handlers.set(event, handler);
@@ -262,6 +266,8 @@ describe('createMlxProviderExtension', () => {
       const handlers = new Map<string, (event: SessionStartEvent, ctx: ExtensionContext) => void>();
       let provider: ProviderConfig | undefined;
       const pi = {
+        registerFlag: vi.fn(),
+        getFlag: vi.fn(),
         registerProvider(_name: string, config: ProviderConfig): void {
           provider = config;
         },
@@ -389,6 +395,8 @@ describe('createMlxProviderExtension', () => {
     if (typeof extension === 'function') throw new Error('expected a named extension');
     let provider: ProviderConfig | undefined;
     const pi = {
+      registerFlag: vi.fn(),
+      getFlag: vi.fn(),
       registerProvider(_name: string, config: ProviderConfig): void {
         provider = config;
       },

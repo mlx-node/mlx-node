@@ -685,6 +685,14 @@ mlx agent --models-dir ./models # use a specific local models directory
 
 Almost every flag belongs to pi and is forwarded verbatim; `mlx agent` only handles the options below before handing off.
 
+For local Qwen3.8 models, `--thinking low`, `medium`, and `xhigh` select the
+checkpoint's reasoning effort. `minimal` aliases `low`; `high` and `max` alias
+`xhigh`. Only `--thinking off` disables reasoning. Independently,
+`--thinking-budget 2048` limits generated reasoning to 2,048 tokens per model
+turn, including when speculative decoding is enabled. `0` closes the thinking
+block immediately. An omitted cap leaves Qwen's reasoning uncapped within the
+overall output limit. These options also work with `mlx delegate`.
+
 ### Model selection and first-run wizard
 
 `mlx agent` discovers local models under the resolved models directory (`--models-dir <dir>`, else `MLX_MODELS_DIR`, else `modelsDir` in `~/.mlx-node/config.json`, else `~/.mlx-node/models`). A dash-leading path must use the `--models-dir=<dir>` form so it is not mistaken for another flag. Dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` targets are also discovered when placed directly in that directory or one level inside a downloaded GGUF repository; each appears under its filename stem. Gemma 4 GGUF variants, including Q4_0 QAT and K-quant targets, and Muse-Glimmer primary GGUF variants are also discovered by filename stem. Companion files such as imatrix, mmproj, draft, or DFlash2-only checkpoints are not advertised as agent models.

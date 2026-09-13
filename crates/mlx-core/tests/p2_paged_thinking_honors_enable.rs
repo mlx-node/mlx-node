@@ -9,7 +9,7 @@
 //! .enabled = resolve_enable_thinking(config).unwrap_or(true)`.
 //!
 //! `resolve_enable_thinking` (engine/params.rs): reasoning_effort
-//! "none"/"low" => Some(false); "medium"/"high" => Some(true); unset => None.
+//! "none" => Some(false); "low"/"medium"/"high"/"xhigh" => Some(true); unset => None.
 //! So on the PAGED path:
 //!   - reasoning_effort "medium"  => thinking ON  => reasoning_tokens > 0
 //!   - reasoning_effort "none"    => thinking OFF => reasoning_tokens == 0

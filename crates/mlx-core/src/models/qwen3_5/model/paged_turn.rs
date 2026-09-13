@@ -520,6 +520,7 @@ impl Qwen35Inner {
         }
 
         for step in 0..max_new_tokens {
+            reasoning_tracker.enforce_next_token(&mut y)?;
             let token_id = y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
             token_history.push(token_id);
@@ -802,6 +803,7 @@ impl Qwen35Inner {
             let mut finish_reason = String::from("length");
 
             for step in 0..max_new_tokens {
+                reasoning_tracker.enforce_next_token(&mut y)?;
                 let token_id = y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
                 token_history.push(token_id);
@@ -1176,6 +1178,7 @@ impl Qwen35Inner {
             let mut finish_reason = String::from("length");
 
             for step in 0..max_new_tokens {
+                reasoning_tracker.enforce_next_token(&mut y)?;
                 let token_id = y.item_at_int32(0)? as u32;
                 generated_tokens.push(token_id);
                 token_history.push(token_id);
@@ -2153,6 +2156,7 @@ impl Qwen35Inner {
         }
 
         for step in 0..max_new_tokens {
+            reasoning_tracker.enforce_next_token(&mut y)?;
             let token_id = y.item_at_int32(0)? as u32;
             generated_tokens.push(token_id);
             token_history.push(token_id);

@@ -579,7 +579,11 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
 
     // Materialize the prefill-sampled seed once; it is the first anchor.
     y.eval();
-    let mut anchor: u32 = y.item_at_int32(0)? as u32;
+    let mut anchor: u32 = if tracker.should_force_think_end() {
+        tracker.forced_token_id()?
+    } else {
+        y.item_at_int32(0)? as u32
+    };
 
     // `last_in_cache` default `true`: a zero-budget exit emits nothing, so
     // the last cached token is the prompt's last token, which IS in cache.
@@ -785,6 +789,18 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
             measurement_cycle = DsparkMeasurementCycle::None;
         }
 
+        // Reserve the boundary token too: no verified/committed speculative
+        // prefix may cross the remaining reasoning budget. At zero, verify only
+        // the existing anchor and replace the uncommitted boundary with </think>.
+        if let Some(remaining_thinking) = tracker.unforced_token_budget() {
+            let capped = l_cap.min(remaining_thinking.saturating_sub(1));
+            if capped != l_cap {
+                measurement_cycle = DsparkMeasurementCycle::None;
+            }
+            l_cap = capped;
+        }
+        let force_think_end = tracker.should_force_think_end();
+
         // `L_cap == 0` (remaining == 1): skip propose entirely — the cycle
         // degenerates to a single AR step THROUGH verify (verify_ids =
         // [anchor] only), keeping the anchor's K/V write on the one path.
@@ -858,7 +874,13 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         // Acceptance: `k` accepted drafts (prefix of `draft_ids`) + ONE
         // boundary token (bonus on full accept, residual on rejection).
         profiler.begin("dspark_accept");
-        let accept_res = accept_dspark_proposal(&logits, &proposal, hist, p, rng);
+        let accept_res = if force_think_end {
+            // Force the verify graph before retaining its anchor's cache state.
+            logits.eval();
+            Ok((0, tracker.forced_token_id()?))
+        } else {
+            accept_dspark_proposal(&logits, &proposal, hist, p, rng)
+        };
         profiler.end();
         let (accepted_drafts_k, boundary_id) = accept_res?;
         let verify_ns = verify_started_at
@@ -1961,7 +1983,31 @@ mod tests {
         cancel_flag: Option<&AtomicBool>,
         turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
     ) -> RawTurnOut {
-        let mut tracker = ReasoningTracker::new(false, None, None);
+        drive_turn_with_tracker(
+            backend,
+            params,
+            first_token,
+            eos_id,
+            block_size,
+            rng,
+            cancel_flag,
+            turn_token_observer,
+            ReasoningTracker::new(false, None, None),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drive_turn_with_tracker<R: rand::Rng>(
+        backend: &mut MockDsparkBackend,
+        params: ChatParams,
+        first_token: u32,
+        eos_id: u32,
+        block_size: usize,
+        rng: &mut R,
+        cancel_flag: Option<&AtomicBool>,
+        turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
+        mut tracker: ReasoningTracker,
+    ) -> RawTurnOut {
         let mut profiler = DecodeProfiler::new("dspark_turn_test", "test");
         let mut generated: Vec<u32> = Vec::new();
         let mut token_history: Vec<u32> = Vec::new();
@@ -2300,6 +2346,82 @@ mod tests {
             "exhaustion must degrade the cycle, never fail the turn"
         );
         assert_eq!(out.generated.len(), 6, "the turn still fills its budget");
+    }
+
+    #[test]
+    fn thinking_budget_caps_speculative_prefix_and_commits_forced_boundary_once() {
+        for budget in [0, 1, 2, 3, 16] {
+            for sampled in [false, true] {
+                let mut cycles = Vec::new();
+                let mut remaining = (budget as usize).saturating_sub(1);
+                while remaining > 0 {
+                    let depth = 2.min(remaining - 1);
+                    let mut script = CycleScript::greedy(vec![5; depth], vec![5; depth + 1]);
+                    if sampled {
+                        script.draft_dists = vec![one_hot(16, 5); depth];
+                    }
+                    cycles.push(script);
+                    remaining -= depth + 1;
+                }
+                if budget > 0 {
+                    cycles.push(CycleScript::greedy(vec![], vec![5]));
+                }
+                let mut backend = if sampled {
+                    MockDsparkBackend::sampled(16, cycles)
+                } else {
+                    MockDsparkBackend::greedy(16, cycles)
+                };
+                let mut params = if sampled {
+                    dense_params()
+                } else {
+                    greedy_params()
+                };
+                params.max_new_tokens = budget + 4;
+                let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::seed_from_u64(42);
+                let out = drive_turn_with_tracker(
+                    &mut backend,
+                    params,
+                    4,
+                    15,
+                    2,
+                    &mut rng,
+                    None,
+                    None,
+                    ReasoningTracker::new(true, Some(budget), Some(9)),
+                );
+                assert!(
+                    out.result.is_ok(),
+                    "budget={budget}: {:?}",
+                    out.result.err()
+                );
+                let mut expected = vec![5; budget as usize];
+                if budget > 0 {
+                    expected[0] = 4;
+                }
+                expected.extend([9, 0, 0, 0]);
+                assert_eq!(
+                    out.generated, expected,
+                    "budget={budget}, sampled={sampled}"
+                );
+                let ledger = backend.ledger_snapshot();
+                assert_eq!(
+                    commits(&ledger).iter().map(|(keep, _)| keep).sum::<usize>(),
+                    out.generated.len() - 1,
+                    "every token except the final boundary is cached exactly once"
+                );
+                let cached_closers = ledger
+                    .iter()
+                    .filter(|call| {
+                        matches!(call,
+                    Call::Verify { ids } if ids.contains(&9))
+                    })
+                    .count();
+                assert_eq!(
+                    cached_closers, 1,
+                    "the forced closer enters the target cache exactly once"
+                );
+            }
+        }
     }
 
     #[test]

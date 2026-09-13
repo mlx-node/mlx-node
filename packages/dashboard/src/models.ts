@@ -606,7 +606,10 @@ export function walkDirStats(
  * results with no warning. Draft-only checkpoints have a separate inventory
  * for storage accounting and deletion, never contributing to model counts.
  */
-export function discoverLocalModels(modelsDir: string): {
+export function discoverLocalModels(
+  modelsDir: string,
+  options: { includeStats?: boolean } = {},
+): {
   models: LocalModel[];
   companions: LocalCompanion[];
   warnings: string[];
@@ -652,7 +655,8 @@ export function discoverLocalModels(modelsDir: string): {
       continue;
     }
 
-    const { sizeBytes, fileCount, truncated } = walkDirStats(full);
+    const { sizeBytes, fileCount, truncated } =
+      options.includeStats === false ? { sizeBytes: 0, fileCount: 0, truncated: false } : walkDirStats(full);
     if (truncated) {
       warnings.push(`${entry.name}: directory too large to size fully; reported size is a lower bound`);
     }

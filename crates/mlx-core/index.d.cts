@@ -1878,6 +1878,7 @@ export declare class Qwen3Model {
     addGenerationPrompt?: boolean | undefined | null,
     tools?: Array<ToolDefinition> | undefined | null,
     enableThinking?: boolean | undefined | null,
+    reasoningEffort?: string | undefined | null,
   ): Promise<Uint32Array>;
   /** Snapshot scheduler occupancy and paged-pool admission telemetry. */
   schedulerStats(): Promise<SchedulerStats>;
@@ -2120,6 +2121,7 @@ export declare class Qwen3Tokenizer {
     enableThinking?: boolean | undefined | null,
     contentOrder?: MultimodalContentOrder | undefined | null,
     existingImagePlaceholder?: string | undefined | null,
+    reasoningEffort?: string | undefined | null,
   ): Promise<Uint32Array>;
   /** Get vocabulary size */
   vocabSize(): number;
@@ -2687,9 +2689,10 @@ export interface ChatConfig {
   tools?: Array<ToolDefinition>;
   /**
    * Reasoning effort level. Controls whether the model thinks before answering.
-   * - "none" / "low": thinking disabled (template injects closed think block).
+   * - "none": thinking disabled (template injects closed think block).
    *   "none" also sets includeReasoning to false by default.
-   * - "medium" / "high": thinking enabled (default behavior).
+   * - "minimal" / "low" / "medium" / "high" / "xhigh" / "max": thinking enabled.
+   *   The checkpoint template receives the effort independently from the token cap.
    * - Not set: thinking enabled (model thinks naturally).
    */
   reasoningEffort?: string | undefined;

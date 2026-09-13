@@ -5021,6 +5021,7 @@ impl Qwen3Model {
         add_generation_prompt: Option<bool>,
         tools: Option<Vec<ToolDefinition>>,
         enable_thinking: Option<bool>,
+        reasoning_effort: Option<String>,
     ) -> Result<PromiseRaw<'env, Uint32ArraySlice<'env>>> {
         let tokenizer = self.tokenizer.clone().ok_or_else(|| {
             Error::new(
@@ -5038,6 +5039,7 @@ impl Qwen3Model {
             enable_thinking,
             None,
             None,
+            reasoning_effort,
         )
     }
 }

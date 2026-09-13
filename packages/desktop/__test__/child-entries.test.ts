@@ -218,7 +218,13 @@ describe('CONTROL PANEL never links the native addon', () => {
     // import of that specifier would make an addon-free entry look like an
     // Electron one to the walk above for a type that is erased anyway.
     const specifiers = specifiersOf(src('control-panel/index.ts')).sort();
-    expect(specifiers).toEqual(['./session.js', './shutdown-timings.js', '@mlx-node/dashboard', 'node:fs']);
+    expect(specifiers).toEqual([
+      './inference-connection.js',
+      './session.js',
+      './shutdown-timings.js',
+      '@mlx-node/dashboard',
+      'node:fs',
+    ]);
   });
 });
 

@@ -296,6 +296,8 @@ describe('cold-tier counters end to end', () => {
     if (typeof extension === 'function') throw new Error('expected a named extension');
     let provider: ProviderConfig | undefined;
     const pi = {
+      registerFlag: () => undefined,
+      getFlag: () => undefined,
       registerProvider(_name: string, config: ProviderConfig): void {
         provider = config;
       },

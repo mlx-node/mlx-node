@@ -1,12 +1,13 @@
 import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
 import Cache from '@/pages/cache';
+import CodingAgents from '@/pages/coding-agents';
 import Metrics from '@/pages/metrics';
 import Models from '@/pages/models';
 import Overview from '@/pages/overview';
 import SessionDetail from '@/pages/session-detail';
 import Sessions from '@/pages/sessions';
-import { Boxes, HardDrive, LayoutDashboard, type LucideIcon, MessagesSquare, TrendingUp } from 'lucide-react';
+import { Boxes, Bot, HardDrive, LayoutDashboard, type LucideIcon, MessagesSquare, TrendingUp } from 'lucide-react';
 import { type CSSProperties, useLayoutEffect, useRef, useState } from 'react';
 import { BrowserRouter, NavLink, Outlet, Route, Routes, useLocation } from 'react-router-dom';
 
@@ -20,6 +21,7 @@ interface NavItem {
 const NAV_ITEMS: NavItem[] = [
   { to: '/', label: 'Overview', icon: LayoutDashboard, end: true },
   { to: '/models', label: 'Models', icon: Boxes },
+  { to: '/coding-agents', label: 'Coding Agents', icon: Bot },
   { to: '/sessions', label: 'Sessions', icon: MessagesSquare },
   { to: '/metrics', label: 'Metrics', icon: TrendingUp },
   { to: '/cache', label: 'Cache', icon: HardDrive },
@@ -69,9 +71,7 @@ function Sidebar() {
         </span>
         <div className="leading-tight">
           <div className="text-foreground text-sm font-semibold">mlx-node</div>
-          <div className="text-muted-foreground text-[11px] font-medium tracking-[0.14em] uppercase">
-            Control Panel
-          </div>
+          <div className="text-muted-foreground text-[11px] font-medium tracking-[0.14em] uppercase">Control Panel</div>
         </div>
       </div>
 
@@ -172,6 +172,7 @@ export default function App() {
           <Route element={<Layout />}>
             <Route index element={<Overview />} />
             <Route path="models" element={<Models />} />
+            <Route path="coding-agents" element={<CodingAgents />} />
             <Route path="sessions" element={<Sessions />} />
             <Route path="sessions/:id" element={<SessionDetail />} />
             <Route path="metrics" element={<Metrics />} />

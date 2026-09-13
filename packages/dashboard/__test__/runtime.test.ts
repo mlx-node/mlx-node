@@ -210,11 +210,12 @@ describe('dashboard runtime — thread split', () => {
 describe('dashboard runtime — route ownership', () => {
   it('keeps exactly the network-owning routes on the transport thread', () => {
     const main = ROUTES.filter((r) => r.thread === 'main').map((r) => `${r.method} /${r.segments.join('/')}`);
-    // The main thread owns the routes that reach the network. That is the four
-    // download routes plus the catalog update check, which dials Hugging Face
-    // through the same `DownloadManager` fetch seam. `/api/catalog` itself stays
-    // on the worker: it is synchronous, filesystem-only and offline-safe.
+    // The transport thread owns local inference jobs and their cached status,
+    // plus downloads and remote catalog updates. Model inventory stays on the
+    // worker along with the other synchronous filesystem/database operations.
     expect(main).toEqual([
+      'GET /api/coding-agents',
+      'POST /api/coding-agents',
       'GET /api/catalog/updates',
       'GET /api/downloads',
       'POST /api/downloads',
@@ -225,6 +226,7 @@ describe('dashboard runtime — route ownership', () => {
 
   it('reports the owning thread per request, and none for an unmatched one', () => {
     expect(routeThreadFor('GET', '/api/sessions')).toBe('worker');
+    expect(routeThreadFor('GET', '/api/coding-agents/models')).toBe('worker');
     expect(routeThreadFor('DELETE', '/api/downloads/job-1')).toBe('main');
     // Wrong method on a known path, and an unknown path: no owner, answered
     // wherever the request landed (405/404 needs no context).

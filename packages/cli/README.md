@@ -2,7 +2,7 @@
 
 Command-line tool for downloading models and datasets from HuggingFace Hub, converting model weights, redacting PII, serving local models, launching Claude Code, and running the fully-local `mlx agent`, for use with `@mlx-node/*` packages.
 
-Top-level commands: `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, `agent`. See [docs/cli.md](https://github.com/mlx-node/mlx-node/blob/main/docs/cli.md) for the CLI guide.
+Top-level commands: `download`, `convert`, `calibrate`, `redact`, `serve`, `launch`, `agent`, `delegate`. See [docs/cli.md](https://github.com/mlx-node/mlx-node/blob/main/docs/cli.md) for the CLI guide.
 
 ## Requirements
 
@@ -22,6 +22,63 @@ npx @mlx-node/cli download model --model Qwen/Qwen3-0.6B
 ```
 
 ## Commands
+
+### Delegate Work
+
+```bash
+mlx delegate 'Review this project and explain the next steps'
+mlx delegate --mode json 'Investigate the failing tests'
+mlx delegate github --repo owner/repo --pr 123 'Explain the failed checks with evidence'
+```
+
+Runs the same runtime as `mlx agent --print`, with the same local model selection,
+settings, sampling and thinking defaults, cache policy, session storage, and metrics.
+The worker uses a focused task prompt and `read`/`bash` tools, without built-in
+subagents or the local agent's project instructions and skills. The calling agent
+supplies the relevant task context. Agent options pass through, including explicit
+`--system-prompt`/`--tools` overrides, `--thinking`, `--thinking-budget`, `--model`, `--session`, and `--trace`.
+
+`--thinking low` enables brief reasoning. For Qwen3.8, `medium` and `xhigh` use
+the checkpoint's corresponding modes; `minimal` aliases `low`, and `high`/`max`
+alias `xhigh`. `--thinking off` disables reasoning. An optional
+`--thinking-budget 2048` caps reasoning tokens per model turn, independently of
+effort, across ordinary and speculative decoding. A cap of `0` closes reasoning
+immediately; omitting it adds no explicit cap for Qwen models. The overall output
+limit still includes reasoning and answer tokens.
+
+The default output is the agent's text answer. `--mode json` emits its JSON event
+stream. Sessions appear in the desktop Sessions page and can be resumed with
+`--session`; `--no-session` opts out as it does for `mlx agent`. Each process owns
+its model, just like `mlx agent`; it does not reuse the desktop inference host.
+There is no separate 16-step limit, 120-second request timeout, or JSON action loop.
+
+The `github` form remains compatible with installed global instructions. It adds
+repository, PR, and read-only task context to the worker system prompt.
+`--allow-write` expresses authorization only for GitHub changes requested by the
+task; it does not grant sandbox access. GitHub access uses the normal bash tool
+and an authenticated [GitHub CLI](https://cli.github.com/).
+
+When Codex launches the command, delegation inherits the caller's process sandbox,
+filesystem restrictions, network environment and credentials. It recognizes the
+active `CODEX_PERMISSION_PROFILE` together with `CODEX_THREAD_ID` (or older
+`CODEX_SANDBOX` markers), without reading a possibly different global config or
+setting `MLX_AGENT_AUTO_APPROVE`. Codex authorizes the outer command; the worker
+does not open a second approval UI. This is process permission inheritance, not a
+bridge to Codex's per-command approval dialogs or exec-policy rules. Additional
+access must be requested by the calling agent. A sandbox, network or authentication
+block ends the worker with a saved handoff, its evidence-session path, a diagnostic on stderr and a nonzero
+exit status instead of repeated inference or recursive delegation.
+Worker bash scripts use `set -e -o pipefail` so later commands or output pipelines
+cannot silently turn ordinary command failures into success.
+
+Outside a recognized Codex invocation, approval-requiring tools still need an
+explicit caller opt-in (`MLX_AGENT_AUTO_APPROVE=1`); otherwise they return an
+immediate handoff. Normal `mlx agent` permissions remain unchanged.
+
+The desktop **Coding Agents** page can add the short routing instruction to a
+global agent file. Setup detects the prompt using the installed default model and
+preserves existing content; it adds no HTML comments or other markers. This is
+command-line integration and does not register an MCP server.
 
 ### Download Model
 

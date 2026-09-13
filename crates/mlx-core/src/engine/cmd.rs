@@ -370,7 +370,6 @@ mod mock_backend_tests {
     };
     use crate::engine::params::{
         ChatParams, ModelGenerationDefaults, apply_generation_defaults, extract_chat_params,
-        resolve_enable_thinking,
     };
     use crate::engine::plan::{
         ExecutionPlan, MediaCapabilities, MediaPlan, PagedAttentionPlan, SpeculativeKind,
@@ -693,13 +692,7 @@ mod mock_backend_tests {
                 // content: admission must reach the family handler.
                 return Ok(vec![TOK_HELLO]);
             }
-            tok.apply_chat_template_sync(
-                messages,
-                Some(true),
-                config.tools.as_deref(),
-                resolve_enable_thinking(config),
-                preserve_thinking,
-            )
+            tok.apply_chat_template_with_config(messages, true, config, preserve_thinking)
         }
 
         fn cached_token_history(&self) -> &[u32] {

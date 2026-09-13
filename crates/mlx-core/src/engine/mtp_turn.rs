@@ -1089,6 +1089,7 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
     // here and hands the id through the setup. `y.eval()` is idempotent —
     // the loop's initial-emit re-evals the same materialized value, so the
     // sampled token (and every downstream commit) is byte-identical.
+    tracker.enforce_next_token(&mut y)?;
     y.eval();
     let first_sampled_token = y.item_at_int32(0)? as u32;
 
@@ -1644,7 +1645,9 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // broke the loop otherwise). With `effective_depth =
         // remaining - 1` the verify writes exactly `remaining`
         // slots and the cycle emits at most `remaining` tokens.
-        let remaining: usize = max_as_usize.saturating_sub(generated.len());
+        let remaining: usize = max_as_usize
+            .saturating_sub(generated.len())
+            .min(tracker.unforced_token_budget().unwrap_or(usize::MAX));
         let cycle_depth: usize = cycle_depth.min(remaining.saturating_sub(1));
         if cycle_depth < 1 {
             // Only 1 token of budget left — an MTP cycle would
@@ -3972,6 +3975,26 @@ mod tests {
         depth: usize,
         cancel_flag: Option<&AtomicBool>,
     ) -> TurnOut {
+        drive_turn_with_tracker(
+            backend,
+            first_token,
+            max_new_tokens,
+            eos_id,
+            depth,
+            cancel_flag,
+            ReasoningTracker::new(false, None, None),
+        )
+    }
+
+    fn drive_turn_with_tracker(
+        backend: &mut MockMtpBackend,
+        first_token: u32,
+        max_new_tokens: i32,
+        eos_id: u32,
+        depth: usize,
+        cancel_flag: Option<&AtomicBool>,
+        mut tracker: ReasoningTracker,
+    ) -> TurnOut {
         let _force_sparse = ForceSparseAcceptGuard::force(true);
         let params = {
             let mut p = greedy_params();
@@ -3979,7 +4002,6 @@ mod tests {
             p.mtp_depth = depth;
             p
         };
-        let mut tracker = ReasoningTracker::new(false, None, None);
         let mut profiler = crate::decode_profiler::DecodeProfiler::new("mtp_turn_test", "test");
         // The production profiler is enabled by tracing/profiling config. Force
         // it on here so `mark_first_token` participates in the test-only total
@@ -4033,6 +4055,40 @@ mod tests {
             desynced: outcome.desynced,
             rollback_unemitted: outcome.rollback_unemitted,
             ledger: backend.ledger_snapshot(),
+        }
+    }
+
+    #[test]
+    fn thinking_budget_is_exact_across_mtp_cycles() {
+        for budget in [0, 1, 2, 3, 16] {
+            for depth in [1, 3] {
+                let cycle = CycleArgmax {
+                    draft_argmax: vec![5; 4],
+                    verify_argmax: vec![5; 5],
+                };
+                let mut backend = MockMtpBackend::new(16, 4, vec![5; 40], vec![cycle; 40], false);
+                let out = drive_turn_with_tracker(
+                    &mut backend,
+                    4,
+                    budget + 4,
+                    15,
+                    depth,
+                    None,
+                    ReasoningTracker::new(true, Some(budget), Some(9)),
+                );
+                assert_eq!(
+                    out.generated.iter().position(|&id| id == 9),
+                    Some(budget as usize),
+                    "budget={budget}, depth={depth}, output={:?}",
+                    out.generated
+                );
+                assert_eq!(out.generated.iter().filter(|&&id| id == 9).count(), 1);
+                assert_eq!(out.generated.len(), budget as usize + 4);
+                assert!(
+                    !out.desynced,
+                    "forced reasoning boundary must retain cache synchronization"
+                );
+            }
         }
     }
 

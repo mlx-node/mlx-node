@@ -134,6 +134,7 @@ interface PolicyAwareTokenizer {
     enableThinking?: boolean | null,
     contentOrder?: TemplateContentOrder | null,
     existingImagePlaceholder?: string | null,
+    reasoningEffort?: string | null,
   ): Promise<Uint32Array>;
 }
 
@@ -148,6 +149,7 @@ async function applyChatTemplateFromModelPath(
   tools?: ToolDefinition[] | null,
   enableThinking?: boolean | null,
   contentPolicy?: TemplateContentPolicy,
+  reasoningEffort?: string | null,
 ): Promise<Uint32Array> {
   const modelPath = modelPathsForTokenizers.get(model);
   if (modelPath == null) {
@@ -169,6 +171,9 @@ async function applyChatTemplateFromModelPath(
       addGenerationPrompt,
       tools,
       enableThinking,
+      undefined,
+      undefined,
+      reasoningEffort,
     );
   }
   return (tokenizer as PolicyAwareTokenizer).applyChatTemplate(
@@ -178,6 +183,7 @@ async function applyChatTemplateFromModelPath(
     enableThinking,
     contentPolicy.order,
     contentPolicy.existingImagePlaceholder,
+    reasoningEffort,
   );
 }
 
@@ -803,6 +809,7 @@ export function makeStreamingModel<
         addGenerationPrompt?: boolean | null,
         tools?: ToolDefinition[] | null,
         enableThinking?: boolean | null,
+        reasoningEffort?: string | null,
       ): Promise<Uint32Array> {
         return applyChatTemplateFromModelPath(
           this,
@@ -811,6 +818,7 @@ export function makeStreamingModel<
           tools,
           enableThinking,
           templateContentPolicy,
+          reasoningEffort,
         );
       },
     });

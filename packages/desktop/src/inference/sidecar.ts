@@ -70,13 +70,10 @@ export function newSidecarAuthToken(): string {
  * what makes that request a 401; the server's own CORS default then follows the
  * auth posture and stops sending the wildcard at all.
  *
- * A NEW token per call, per process. It is never persisted and never leaves
- * this process: the Control Panel window talks to CONTROL PANEL over a transferred
- * `MessagePort` and the supervisor polls `/health`, which is deliberately
- * carved out of the gate, so nothing outside needs it. Adding it to the `info`
- * reply would put a live secret into the supervisor's per-generation trace file
- * on disk — if a consumer ever genuinely needs it, that is the hazard to solve
- * first.
+ * A NEW token per call, per process. The startup handshake gives it to MAIN,
+ * which can pass it privately to CONTROL PANEL for local prompt detection.
+ * The token must never enter renderer RPC, public snapshots, the `info`
+ * reply, or supervisor traces. The supervisor polls unauthenticated `/health`.
  */
 export function sidecarHostOptions(): { port: number; host: string; authToken: string } {
   return { ...SIDECAR_HOST_OPTIONS, authToken: newSidecarAuthToken() };

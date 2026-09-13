@@ -62,3 +62,4 @@ export {
   type DashboardRuntimeOptions,
   type RuntimeLifecycleEvent,
 } from './runtime.js';
+export type { CodingAgentsState, CodingAgentRow, CodingAgentId } from './coding-agents.js';

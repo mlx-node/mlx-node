@@ -602,11 +602,10 @@ fn structured_reasoning_boundary_ordinals(
     close_tag: &str,
     preserve_thinking: bool,
 ) -> Result<Option<Vec<StructuredReasoningBoundary>>> {
-    let completed_template = tokenizer.render_chat_template_sync(
+    let completed_template = tokenizer.render_chat_template_with_config(
         completed_history,
-        Some(false),
-        config.tools.as_deref(),
-        crate::engine::params::resolve_enable_thinking(config),
+        false,
+        config,
         preserve_thinking,
     )?;
     let salt = (0usize..)
@@ -636,11 +635,10 @@ fn structured_reasoning_boundary_ordinals(
         return Ok(Some(Vec::new()));
     }
 
-    let shadow_template = tokenizer.render_chat_template_sync(
+    let shadow_template = tokenizer.render_chat_template_with_config(
         &shadow_history,
-        Some(false),
-        config.tools.as_deref(),
-        crate::engine::params::resolve_enable_thinking(config),
+        false,
+        config,
         preserve_thinking,
     )?;
     let mut rendered_replacements = Vec::new();
@@ -880,11 +878,10 @@ fn render_live_continuation<B: ChatBackend>(
         return Ok(None);
     }
 
-    let completed_tokens = tokenizer.apply_chat_template_sync(
+    let completed_tokens = tokenizer.apply_chat_template_with_config(
         completed_history,
-        Some(false),
-        config.tools.as_deref(),
-        crate::engine::params::resolve_enable_thinking(config),
+        false,
+        config,
         preserve_thinking,
     )?;
     let cached_comparison_tokens = backend.template_history_comparison_tokens(cached_tokens);

@@ -218,9 +218,11 @@ export function makeMlxStreamSimple(
   onTurnRecord?: TurnRecorder,
   onTurnStart?: () => void,
   resolveRootSessionFile?: RootSessionFileResolver,
+  resolveThinkingBudget?: () => number | undefined,
 ): (model: Model<Api>, context: Context, options?: SimpleStreamOptions) => AssistantMessageEventStream {
   return (model, context, options) => {
     const stream = createAssistantMessageEventStream();
+    let thinkingTokenBudget: number | undefined;
 
     /**
      * Exactly-one-terminal guard for the WHOLE turn. `TurnEmitter` has its
@@ -309,7 +311,8 @@ export function makeMlxStreamSimple(
       rootSessionFile = resolveRootSessionFile?.();
       // Snapshot once: the native config and the replay provenance must describe
       // the same resolved template mode. Presence alone is wrong for Pi's
-      // minimal/low levels, both of which resolve to disabled thinking.
+      // off is disabled; low remains enabled thinking.
+      thinkingTokenBudget = resolveThinkingBudget?.();
       resolvedReasoning = resolveReasoningMode(options?.reasoning);
       emitter = new TurnEmitter(stream, model, onPerformance, resolvedReasoning.thinkingEnabled);
     } catch (err) {
@@ -400,6 +403,7 @@ export function makeMlxStreamSimple(
             rootCacheOwnerId,
             resolvedReasoning,
             configuredModelMaxTokens,
+            thinkingTokenBudget,
           );
           for await (const event of session.startFromHistoryStream(config, signal)) {
             if (event.done) {

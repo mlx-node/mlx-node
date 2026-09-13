@@ -167,6 +167,7 @@ fn msg(role: &str, content: &str) -> ChatMessage {
 
 fn pinned_ctx() -> RenderContextOptions {
     RenderContextOptions {
+        reasoning_effort: None,
         current_date: Some(PINNED_DATE.to_string()),
         reasoning_strength: None,
         preserve_thinking: false,
@@ -324,6 +325,7 @@ fn a_pinned_reasoning_strength_replaces_the_templates_high_default() {
         &[msg("user", "hi")],
         None,
         RenderContextOptions {
+            reasoning_effort: None,
             current_date: Some(PINNED_DATE.to_string()),
             reasoning_strength: Some("low".to_string()),
             preserve_thinking: false,

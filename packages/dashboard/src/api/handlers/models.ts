@@ -1,5 +1,7 @@
+import { CHAT_FAMILY_IDS } from '@mlx-node/agent/catalog';
+
 import { catalogWithState } from '../../catalog.js';
-import { discoverLocalModels, deleteLocalModel } from '../../models.js';
+import { discoverLocalModels, deleteLocalModel, isModelPresent } from '../../models.js';
 import type { ApiPaths, ApiRequest, MainApiContext } from '../context.js';
 import { ApiError } from '../errors.js';
 
@@ -8,6 +10,14 @@ export function handleModels(ctx: ApiPaths): unknown {
   // `dir` lets the UI show WHERE these checkpoints live — the directory is
   // configurable (`--models-dir`), so the count alone is ambiguous.
   return { models, companions, warnings, dir: ctx.modelsDir };
+}
+
+export function handleCodingAgentModels(ctx: ApiPaths): unknown {
+  return {
+    models: discoverLocalModels(ctx.modelsDir, { includeStats: false })
+      .models.filter((model) => CHAT_FAMILY_IDS.some((id) => id === model.modelType) && isModelPresent(model.path))
+      .map((model) => ({ name: model.name })),
+  };
 }
 
 export function handleDeleteModel(ctx: ApiPaths, req: ApiRequest): unknown {

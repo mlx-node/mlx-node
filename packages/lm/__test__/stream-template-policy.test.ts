@@ -104,18 +104,27 @@ describe('makeStreamingModel template content policy', () => {
       false,
       'imagesThenText',
       '<image>',
+      undefined,
     );
   });
 
-  it('keeps the existing four-argument tokenizer call for default families', async () => {
+  it('forwards effort independently of the thinking flag for default families', async () => {
     const DefaultModel = makeStreamingModel(NativeStreamingStub, {
       recordModelPath: true,
     });
     const model = await DefaultModel.load('/models/default');
 
-    await model.applyChatTemplate(messages, true, null, false);
+    await model.applyChatTemplate(messages, true, null, true, 'low');
 
-    expect(tokenizerMocks.applyChatTemplate).toHaveBeenCalledWith(messages, true, null, false);
+    expect(tokenizerMocks.applyChatTemplate).toHaveBeenCalledWith(
+      messages,
+      true,
+      null,
+      true,
+      undefined,
+      undefined,
+      'low',
+    );
   });
 
   it('uses the native asset directory after a direct GGUF load', async () => {

@@ -23,6 +23,7 @@ Commands:
   serve              Serve local models over an Anthropic/OpenAI-compatible API
   launch claude      Start a local server and spawn Claude Code pointed at it
   agent              Start the local coding agent (pi-based, fully offline)
+  delegate           Run the local agent with a prompt and exit
 
 Options:
   -h, --help         Show this help message
@@ -54,6 +55,11 @@ async function main() {
   }
 
   switch (command) {
+    case 'delegate': {
+      const { run } = await import('./commands/delegate.js');
+      await run(args.slice(1));
+      break;
+    }
     case 'download': {
       // Delegate the whole arg list to the download dispatcher; the token is a
       // download-wide credential, so flags like `--set-token` are handled

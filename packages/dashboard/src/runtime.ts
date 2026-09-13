@@ -23,6 +23,8 @@ import { fileURLToPath } from 'node:url';
 import type { IngestSummary, MainApiContext } from './api/context.js';
 import { dispatchMain, isApiPath, routeThreadFor } from './api/dispatch.js';
 import { failure, toFailure, type ApiResponse } from './api/errors.js';
+import { CodingAgentsService } from './coding-agents.js';
+import type { CodingAgentsOptions } from './coding-agents.js';
 import { DownloadManager, type DownloadEvent } from './download.js';
 import { defaultModelsDir } from './models.js';
 import { agentSessionsRoot, dashboardDbPath, metricsTraceDir } from './paths.js';
@@ -36,6 +38,7 @@ const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5_000;
 export type RuntimeLifecycleEvent = DbWorkerLifecycle;
 
 export interface DashboardRuntimeOptions {
+  connectInference?: CodingAgentsOptions['connect'];
   dbPath?: string;
   modelsDir?: string;
   sessionsRoot?: string;
@@ -143,7 +146,19 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   });
   const downloads = new DownloadManager({ modelsDir });
 
-  const context: MainApiContext = { modelsDir, sessionsRoot, tracesDir, cacheRoot, downloads };
+  const codingAgents = new CodingAgentsService({
+    listModels: async () => {
+      const response = await worker.call({ method: 'GET', path: '/api/coding-agents/models' });
+      if (!response.ok) throw new Error(response.message);
+      return (response.body as { models: { name: string }[] }).models.map((model) => model.name);
+    },
+    connect:
+      opts.connectInference ??
+      (async () => {
+        throw new Error('Open the mlx-node desktop app to connect to your local model.');
+      }),
+  });
+  const context: MainApiContext = { modelsDir, sessionsRoot, tracesDir, cacheRoot, downloads, codingAgents };
 
   // The boot ingest runs inside the worker; only the periodic rescan is driven
   // from here.
@@ -161,7 +176,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
       // (SIGINT/SIGTERM → `process.exit`) can't kill the process mid-write and
       // orphan a partial, potentially multi-GB `.staging` tree, nor let a
       // background job publish a model after the runtime is considered closed.
-      await downloads.shutdown();
+      await Promise.all([downloads.shutdown(), codingAgents.close()]);
       // `clearInterval` only stops FUTURE ticks: a rescan already in flight kept
       // running while the database closed underneath it, which only ever looked
       // harmless because the ingest catch swallowed the resulting "database is

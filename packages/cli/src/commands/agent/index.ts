@@ -77,7 +77,7 @@ const PI_PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set(['install', 'remove
 
 /**
  * Options that UNCONDITIONALLY consume the FOLLOWING token as their value —
- * mirrors pi 0.80.6 `cli/args.js` (`arg === X && i + 1 < len` → `args[++i]`).
+ * mirrors pi's `cli/args.js` (`arg === X && i + 1 < len` → `args[++i]`).
  * re-verify on a pi bump (same bounded coupling as the {@link expandPiAgentDir}
  * / {@link readPersistedDefaultModel} shims). Shared by BOTH argv walks — the
  * {@link scanAgentArgs} option-name lift and the {@link withDefaultModel} model
@@ -86,13 +86,14 @@ const PI_PASSTHROUGH_COMMANDS: ReadonlySet<string> = new Set(['install', 'remove
  * systemPrompt="--models-dir" in pi, so mlx must forward that value verbatim,
  * not strip it as its own flag (the R3-2 / WB-5 sibling leaks). Both walks skip
  * the token after any of these. Deliberately EXCLUDES the conditional consumers
- * `-p`/`--print` and `--list-models` (pi only consumes a NON-dash next token for
- * those, so a `--`-leading sentinel is never swallowed) and the flag-only
+ * `-p`/`--print`, `--list-models`, and theme/TUI selectors (handled by
+ * `agentOptionConsumesNext` using pi's conditional rules) and the flag-only
  * carriers `-c`/`--continue`/`-r`/`--resume` (no value). The inline
  * `--opt=value` form is not modeled either — pi's exact-match parser does not
  * accept it.
  */
 const VALUE_CONSUMING_ARGS: ReadonlySet<string> = new Set([
+  '--thinking-budget',
   '--mode',
   '--provider',
   '--model',
@@ -118,6 +119,20 @@ const VALUE_CONSUMING_ARGS: ReadonlySet<string> = new Set([
   '--prompt-template',
   '--theme',
 ]);
+
+/** Match pi 0.84.4 value consumption; shared with delegate so option values remain opaque. */
+export function agentOptionConsumesNext(argv: readonly string[], index: number): boolean {
+  const arg = argv[index];
+  const next = argv[index + 1];
+  if (next === undefined) return false;
+  if (VALUE_CONSUMING_ARGS.has(arg!)) return true;
+  if (arg === '--print' || arg === '-p') {
+    return !next.startsWith('@') && (!next.startsWith('-') || next.startsWith('---'));
+  }
+  if (arg === '--list-models') return !next.startsWith('-') && !next.startsWith('@');
+  if (arg === '--use-theme' || arg === '--tui-mode') return !next.startsWith('-');
+  return false;
+}
 
 /**
  * Pure manual scan of `mlx agent`'s argv — see {@link AgentArgScan}.
@@ -145,12 +160,17 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]!;
 
+    if (arg === '--') {
+      passthrough.push(...argv.slice(i));
+      break;
+    }
+
     // pi value-consumer in an option-NAME position: the following token is its
     // VALUE (pi does `args[++i]`), never an option name. Forward BOTH verbatim
     // and skip the value so it is never interpreted as mlx's --models-dir/help.
     // This is checked FIRST, so a `--models-dir` (or `--help`) sitting in a
     // pi-consumer's value slot passes through untouched.
-    if (VALUE_CONSUMING_ARGS.has(arg) && i + 1 < argv.length) {
+    if (agentOptionConsumesNext(argv, i)) {
       if (arg === '--export' && argv[i + 1]!.length > 0) {
         piOneShot = true;
       }
@@ -367,13 +387,14 @@ const SESSION_PROVIDER_CARRIER_ARGS: ReadonlySet<string> = new Set([
   '--fork',
 ]);
 
-/** Collect real option names with the same unconditional value consumption as pi. */
+/** Collect real option names, respecting pi's option values and end-of-options delimiter. */
 function collectPiOptionNames(argv: readonly string[]): Set<string> {
   const optionNames = new Set<string>();
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i]!;
+    if (token === '--') break;
     optionNames.add(token);
-    if (VALUE_CONSUMING_ARGS.has(token) && i + 1 < argv.length) {
+    if (agentOptionConsumesNext(argv, i)) {
       i++;
     }
   }
@@ -614,6 +635,12 @@ mlx agent — local coding agent (pi) running fully offline on MLX
 Usage:
   mlx agent [options] [@file ...]
 
+Thinking controls (shared with mlx delegate):
+  --thinking <level>    off, minimal, low, medium, high, xhigh, max.
+                       Qwen3.8: minimal=low, high/max=xhigh.
+  --thinking-budget <n> Optional hard cap on reasoning tokens per model turn.
+                       0 closes thinking immediately; omitted means no cap.
+
 mlx options (handled before pi sees the args):
   --models-dir <dir>        Local models directory (default: ~/.mlx-node/models;
                             also via MLX_MODELS_DIR or ~/.mlx-node/config.json).
@@ -692,7 +719,7 @@ async function runProductionWizard(modelsDir: string): Promise<void> {
   });
 }
 
-export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void> {
+export async function run(argv: string[], deps: AgentRunDeps = {}, mode?: 'delegate'): Promise<void> {
   const scan = scanAgentArgs(argv);
 
   if (scan.update) {
@@ -792,5 +819,12 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
     console.error(notice);
   }
 
-  await runAgent({ modelsDir, models, argv: agentArgv, traceLogFile, persistPagedCache: scan.persistPagedCache });
+  await runAgent({
+    modelsDir,
+    models,
+    argv: agentArgv,
+    traceLogFile,
+    persistPagedCache: scan.persistPagedCache,
+    ...(mode ? { mode } : {}),
+  });
 }

@@ -215,8 +215,8 @@ pub(crate) struct ChatParams {
 /// drives it. This function maps the user-facing API to the template parameter.
 pub(crate) fn resolve_enable_thinking(config: &ChatConfig) -> Option<bool> {
     match config.reasoning_effort.as_deref() {
-        Some("none") | Some("low") => Some(false),
-        Some("medium") | Some("high") => Some(true),
+        Some("none") => Some(false),
+        Some("minimal" | "low" | "medium" | "high" | "xhigh" | "max") => Some(true),
         _ => None, // not set → default (template decides, typically true)
     }
 }

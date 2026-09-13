@@ -128,6 +128,16 @@ impl ReasoningTracker {
         }
     }
 
+    /// Replace a not-yet-committed sample at the reasoning boundary. Finish its
+    /// dependency graph before discarding it so lazy cache writes are retained.
+    pub(crate) fn enforce_next_token(&mut self, token: &mut MxArray) -> Result<()> {
+        if self.should_force_think_end() {
+            token.eval();
+            *token = MxArray::from_int32(&[self.forced_token_id()? as i32], &[1])?;
+        }
+        Ok(())
+    }
+
     /// Non-consuming peek: whether a think-end force is currently pending.
     /// Unlike `should_force_think_end`, this does NOT clear the flag or set
     /// `end_scheduled`, so it is safe to call during routing/defer decisions.

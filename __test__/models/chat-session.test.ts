@@ -89,8 +89,8 @@ function finalChunk(text: string, finishReason: string = 'stop'): ChatStreamFina
  * handles to each spy for assertions.
  */
 function makeMockModel() {
-  const chatSessionStart = vi.fn(
-    async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> => makeChatResult('start-reply'),
+  const chatSessionStart = vi.fn(async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
+    makeChatResult('start-reply'),
   );
   const chatSessionContinue = vi.fn(
     async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
@@ -333,9 +333,8 @@ describe('ChatSession', () => {
     it('delivers (messages, config) to a Qianfan-shaped continue without dropping config', async () => {
       const continueArgs: unknown[][] = [];
       const qianfanShaped: SessionCapableModel = {
-        chatSessionStart: vi.fn(
-          async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
-            makeChatResult('start-reply'),
+        chatSessionStart: vi.fn(async (_messages: ChatMessage[], _config?: ChatConfig | null): Promise<ChatResult> =>
+          makeChatResult('start-reply'),
         ),
         // Positional recorder: a native NAPI binding sees its arguments by
         // index only, so capturing `arguments` here detects any slot shift.
@@ -343,8 +342,8 @@ describe('ChatSession', () => {
           continueArgs.push(args);
           return makeChatResult('continue-reply');
         }) as unknown as SessionCapableModel['chatSessionContinue'],
-        chatSessionContinueTool: vi.fn(
-          async (): Promise<ChatResult> => makeChatResult('tool-reply'),
+        chatSessionContinueTool: vi.fn(async (): Promise<ChatResult> =>
+          makeChatResult('tool-reply'),
         ) as unknown as SessionCapableModel['chatSessionContinueTool'],
         chatStreamSessionStart: vi.fn(async function* (): AsyncGenerator<ChatStreamEvent> {
           yield finalChunk('start-reply');
@@ -3482,11 +3481,30 @@ describe('ChatSession', () => {
       const config = await session.preflightContextCapacity(messages, { maxNewTokens: 64 });
 
       expect(config.maxNewTokens).toBe(29);
-      expect((model.applyChatTemplate as ReturnType<typeof vi.fn>).mock.calls).toEqual([[messages, true, null, null]]);
+      expect((model.applyChatTemplate as ReturnType<typeof vi.fn>).mock.calls).toEqual([
+        [messages, true, null, null, null],
+      ]);
       expect(mock.chatSessionStart).not.toHaveBeenCalled();
       expect(mock.chatStreamSessionStart).not.toHaveBeenCalled();
       expect(mock.resetCaches).not.toHaveBeenCalled();
       expect(session.turns).toBe(0);
+    });
+
+    it('uses the requested effort when counting prompt tokens', async () => {
+      const mock = makeMockModel();
+      const model = withCapacity(mock.model, 128, 100);
+      const session = new ChatSession(model);
+      const messages: ChatMessage[] = [{ role: 'user', content: 'hello' }];
+      for (const reasoningEffort of ['none', 'low', 'medium', 'xhigh']) {
+        await session.preflightContextCapacity(messages, { reasoningEffort, maxNewTokens: 16 });
+        expect((model.applyChatTemplate as ReturnType<typeof vi.fn>).mock.calls.at(-1)).toEqual([
+          messages,
+          true,
+          null,
+          reasoningEffort !== 'none',
+          reasoningEffort,
+        ]);
+      }
     });
 
     it('clamps the omitted native output default when the remaining window is smaller', async () => {

@@ -34,17 +34,17 @@ const KNOWN_PRESET_MODEL_TYPES: readonly string[] = (() => {
  * here (the agent loop converts it to `undefined` before the provider
  * sees it), so `undefined` is the "thinking disabled" signal → 'none'.
  */
-const THINKING_LEVEL_TO_EFFORT: Record<ThinkingLevel, 'low' | 'medium' | 'high'> = {
+const THINKING_LEVEL_TO_EFFORT: Record<ThinkingLevel, 'low' | 'medium' | 'high' | 'xhigh' | 'max'> = {
   minimal: 'low',
   low: 'low',
   medium: 'medium',
   high: 'high',
-  xhigh: 'high',
-  max: 'high',
+  xhigh: 'xhigh',
+  max: 'max',
 };
 
 export interface ResolvedReasoningMode {
-  reasoningEffort: 'none' | 'low' | 'medium' | 'high';
+  reasoningEffort: 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
   /** The `enable_thinking` value implied by `reasoningEffort` for templates. */
   thinkingEnabled: boolean;
 }
@@ -55,16 +55,25 @@ function isPositiveSafeInteger(value: unknown): value is number {
 
 /**
  * Resolve Pi's thinking level once for both native config and persisted replay
- * provenance. Keeping these values together prevents a low/minimal turn from
- * being replayed later as an enabled-thinking turn merely because the Pi
- * option was present.
+ * provenance. Keeping these values together gives generation and replay the same
+ * enabled-thinking state, including low/minimal turns.
  */
 export function resolveReasoningMode(reasoning: ThinkingLevel | undefined): ResolvedReasoningMode {
   const reasoningEffort = reasoning === undefined ? 'none' : THINKING_LEVEL_TO_EFFORT[reasoning];
   return {
     reasoningEffort,
-    thinkingEnabled: reasoningEffort === 'medium' || reasoningEffort === 'high',
+    thinkingEnabled: reasoningEffort !== 'none',
   };
+}
+
+/** An explicit hard cap, independent from the model's reasoning effort. */
+export function parseThinkingBudget(value: unknown): number | undefined {
+  if (value === undefined) return undefined;
+  const budget = typeof value === 'string' && /^\d+$/.test(value) ? Number(value) : value;
+  if (typeof budget !== 'number' || !Number.isSafeInteger(budget) || budget < 0 || budget > 2_147_483_647) {
+    throw new Error('Thinking budget must be an integer between 0 and 2147483647.');
+  }
+  return budget;
 }
 
 export function buildChatConfig(
@@ -74,6 +83,7 @@ export function buildChatConfig(
   rootCacheOwnerId?: string,
   resolvedReasoning = resolveReasoningMode(options?.reasoning),
   modelMaxTokens?: unknown,
+  thinkingTokenBudget?: number,
 ): ChatConfig {
   const preset = launchPresetFor(modelType);
   if (!preset) {
@@ -81,7 +91,14 @@ export function buildChatConfig(
     throw new Error(`buildChatConfig: no launch preset for model type "${modelType}" (known types: ${known})`);
   }
 
+  // Pi's numeric budget settings currently stop at high. Preserve effort
+  // itself while using that highest configured cap for xhigh/max.
+  const budgetLevel = options?.reasoning === 'xhigh' || options?.reasoning === 'max' ? 'high' : options?.reasoning;
+  const budget = parseThinkingBudget(
+    thinkingTokenBudget ?? (budgetLevel === undefined ? undefined : options?.thinkingBudgets?.[budgetLevel]),
+  );
   const config: ChatConfig = {
+    ...(budget === undefined ? {} : { thinkingTokenBudget: budget }),
     ...preset.sampling,
     maxNewTokens: preset.maxOutputTokens,
     reasoningEffort: resolvedReasoning.reasoningEffort,

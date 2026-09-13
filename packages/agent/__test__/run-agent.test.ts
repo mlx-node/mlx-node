@@ -150,6 +150,24 @@ describe('runAgent', () => {
     ]);
   });
 
+  it('uses the delegate permission profile without an interactive gate or subagent tools', async () => {
+    const { main, calls } = makeSeam();
+    await runAgent({
+      modelsDir: '/models',
+      models: [FAKE_MODEL],
+      argv: ['--print', 'Task'],
+      mode: 'delegate',
+      piImpl: piImpl(main),
+    });
+    const names = calls[0]!.extensionFactories.map((entry) =>
+      typeof entry === 'function' ? '<anonymous>' : entry.name,
+    );
+    expect(names).toContain('mlx-provider');
+    expect(names).toContain('mlx-delegation');
+    expect(names).not.toContain('mlx-permission-gate');
+    expect(names).not.toContain('mlx-subagent');
+  });
+
   it('adds a TUI trace notice only when the CLI supplies a log path', async () => {
     const { main, calls } = makeSeam();
     await runAgent({

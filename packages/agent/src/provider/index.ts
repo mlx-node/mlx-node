@@ -19,6 +19,7 @@ import type { ExtensionAPI, InlineExtension } from '@earendil-works/pi-coding-ag
 import { coldCacheStats, coldSidecarStats, type ColdCacheStats, type ColdSidecarStats } from '@mlx-node/core';
 
 import { canonicalCacheRoot } from '../cold-tier.js';
+import { parseThinkingBudget } from './chat-config.js';
 import { MetricsTrace, type MetricsTraceRecord } from './metrics-trace.js';
 import { MLX_API, MLX_API_KEY, MLX_BASE_URL, MLX_PROVIDER_ID } from './mlx-identity.js';
 import { MlxModelHost } from './model-host.js';
@@ -203,6 +204,7 @@ export function createMlxProviderExtension(
     metricsTrace.record(rec);
   };
 
+  let getThinkingBudget = (): number | undefined => undefined;
   const streamSimple = makeMlxStreamSimple(
     resolvedHost,
     performanceStatus.record,
@@ -210,10 +212,16 @@ export function createMlxProviderExtension(
     onTurnRecord,
     onTurnStart,
     () => rootSessionFile,
+    () => getThinkingBudget(),
   );
   return {
     name: 'mlx-provider',
     factory: (pi: ExtensionAPI) => {
+      pi.registerFlag('thinking-budget', {
+        type: 'string',
+        description: 'Maximum reasoning tokens per model turn; 0 closes thinking immediately.',
+      });
+      getThinkingBudget = () => parseThinkingBudget(pi.getFlag('thinking-budget'));
       pi.registerProvider(MLX_PROVIDER_ID, {
         api: MLX_API,
         baseUrl: MLX_BASE_URL,

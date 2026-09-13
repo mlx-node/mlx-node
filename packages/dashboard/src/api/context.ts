@@ -14,6 +14,7 @@
  * pins it to a thread — `routes.ts` cannot put it on the other one.
  */
 
+import type { CodingAgentsService } from '../coding-agents.js';
 import type { DashboardDb } from '../db/open.js';
 import type { DownloadManager } from '../download.js';
 import { ApiError } from './errors.js';
@@ -42,6 +43,7 @@ export interface WorkerApiContext extends ApiPaths {
 /** The transport thread's context: it alone holds the download manager. */
 export interface MainApiContext extends ApiPaths {
   downloads: DownloadManager;
+  codingAgents?: CodingAgentsService;
 }
 
 /**

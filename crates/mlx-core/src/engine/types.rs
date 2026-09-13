@@ -78,9 +78,10 @@ pub struct ChatConfig {
     #[napi(ts_type = "Array<ToolDefinition>")]
     pub tools: Option<Vec<ToolDefinition>>,
     /// Reasoning effort level. Controls whether the model thinks before answering.
-    /// - "none" / "low": thinking disabled (template injects closed think block).
+    /// - "none": thinking disabled (template injects closed think block).
     ///   "none" also sets includeReasoning to false by default.
-    /// - "medium" / "high": thinking enabled (default behavior).
+    /// - "minimal" / "low" / "medium" / "high" / "xhigh" / "max": thinking enabled.
+    ///   The checkpoint template receives the effort independently from the token cap.
     /// - Not set: thinking enabled (model thinks naturally).
     #[napi(ts_type = "string | undefined")]
     pub reasoning_effort: Option<String>,

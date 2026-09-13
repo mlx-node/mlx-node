@@ -256,6 +256,7 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
 
     let mut pending_evaluation = PendingDecodeEvaluation::default();
     for step_idx in 0..max_new_tokens {
+        reasoning_tracker.enforce_next_token(&mut y)?;
         // vLLM-aligned penalty context. Materialize and extract the
         // CURRENT token, then push it to `token_history` HERE — at the
         // loop TOP, BEFORE the next_y block samples the next token. vLLM
@@ -460,12 +461,8 @@ pub(crate) fn run_decode_loop<S: DecodeStep>(
             *first_token_instant = Some(Instant::now());
         }
 
-        // `token_history.push` / `generated_tokens.push` already happened
-        // at the loop TOP. The reasoning observation stays HERE — it must
-        // run AFTER the next_y block's `should_force_think_end()` check so
-        // the budget-forcing timing is correct; `should_force_think_end`
-        // is a non-consuming peek, so skipping it on a terminal step (no
-        // forward) is safe.
+        // A budget reached here replaces the next in-flight sample at the
+        // loop boundary, before it can be forwarded or committed.
         let is_reasoning = reasoning_tracker.observe_token(token_id);
 
         // Throttled per-step decode trace (AR / single-token loop).
@@ -806,27 +803,39 @@ mod run_decode_loop_tests {
     }
 
     #[test]
-    fn budget_forcing_injects_think_end_token() {
+    fn thinking_budget_is_exact_including_initial_sample() {
         const THINK_END: u32 = 9;
+        for budget in [0, 1, 2, 3, 16] {
+            let params = greedy_params(|cfg| {
+                cfg.max_consecutive_tokens = Some(0);
+                cfg.max_ngram_repeats = Some(0);
+            });
+            let mut tracker = ReasoningTracker::new(true, Some(budget), Some(THINK_END));
+            let mut step = MockStep::new(vec![5], 16);
+            let out = drive(&mut step, 4, &params, &mut tracker, budget + 4, 7, &[])
+                .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
+            assert_eq!(
+                out.generated.iter().position(|&id| id == THINK_END),
+                Some(budget as usize)
+            );
+            assert_eq!(
+                out.generated.iter().filter(|&&id| id == THINK_END).count(),
+                1
+            );
+            assert_eq!(out.generated.len(), budget as usize + 4);
+            assert_eq!(out.finish_reason, "length");
+            assert_eq!(tracker.reasoning_token_count(), budget as u32);
+        }
+    }
+
+    #[test]
+    fn thinking_budget_preserves_natural_close() {
         let params = greedy_params(|_| {});
-        // Budget 2: after two observed thinking tokens the tracker
-        // forces `</think>` as the NEXT pipelined token.
-        let mut tracker = ReasoningTracker::new(true, Some(2), Some(THINK_END));
-        let mut step = MockStep::new(vec![5], 16);
-
-        let out = drive(&mut step, 4, &params, &mut tracker, 6, 7, &[])
-            .unwrap_or_else(|e| panic!("loop failed: {}", e.reason));
-
-        // Pipeline timeline: commits [4, 5] trip the budget; the step
-        // building the 3rd pipelined token consumes the force flag, so
-        // one over-budget token (5) is already in flight and the forced
-        // `</think>` lands at index 3.
-        assert_eq!(out.generated, vec![4, 5, 5, THINK_END, 5, 5]);
-        assert_eq!(out.finish_reason, "length");
-        // 3 reasoning tokens observed (incl. the in-flight over-budget
-        // one); the forced `</think>` exits thinking, trailing 5s are
-        // content.
-        assert_eq!(tracker.reasoning_token_count(), 3);
+        let mut tracker = ReasoningTracker::new(true, Some(16), Some(9));
+        let mut step = MockStep::new(vec![9, 5], 16);
+        let out = drive(&mut step, 4, &params, &mut tracker, 6, 7, &[]).unwrap();
+        assert_eq!(out.generated, vec![4, 9, 5, 5, 5, 5]);
+        assert_eq!(tracker.reasoning_token_count(), 1);
     }
 
     #[test]

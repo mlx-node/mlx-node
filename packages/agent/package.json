@@ -22,6 +22,10 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
+    "./delegate": {
+      "types": "./dist/delegate.d.ts",
+      "default": "./dist/delegate.js"
+    },
     "./catalog": {
       "types": "./dist/catalog.d.ts",
       "default": "./dist/catalog.js"

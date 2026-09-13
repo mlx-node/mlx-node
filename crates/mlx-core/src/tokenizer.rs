@@ -1327,6 +1327,7 @@ impl Qwen3Tokenizer {
         enable_thinking: Option<bool>,
         content_order: Option<MultimodalContentOrder>,
         existing_image_placeholder: Option<String>,
+        reasoning_effort: Option<String>,
     ) -> Result<PromiseRaw<'env, Uint32ArraySlice<'env>>> {
         let add_prompt = add_generation_prompt.unwrap_or(true);
         let content_order = content_order.unwrap_or(MultimodalContentOrder::TextThenMedia);
@@ -1354,32 +1355,21 @@ impl Qwen3Tokenizer {
 
                     let chat_template = chat_template
                         .ok_or_else(|| Error::from_reason(MISSING_CHAT_TEMPLATE_ERROR))?;
-                    let formatted = if content_order == MultimodalContentOrder::TextThenMedia
-                        && existing_image_placeholder.is_none()
-                    {
-                        Self::render_chat_template_jinja2(
-                            &chat_template,
-                            &sanitized,
-                            tools.as_deref(),
-                            add_prompt,
-                            enable_thinking,
-                            &bos_str,
-                            &eos_str,
-                        )
-                    } else {
-                        Self::render_chat_template_jinja2_with_content_order(
-                            &chat_template,
-                            &sanitized,
-                            tools.as_deref(),
-                            add_prompt,
-                            enable_thinking,
-                            &bos_str,
-                            &eos_str,
-                            content_order,
-                            existing_image_placeholder.as_deref(),
-                            RenderContextOptions::default(),
-                        )
-                    }
+                    let formatted = Self::render_chat_template_jinja2_with_content_order(
+                        &chat_template,
+                        &sanitized,
+                        tools.as_deref(),
+                        add_prompt,
+                        enable_thinking,
+                        &bos_str,
+                        &eos_str,
+                        content_order,
+                        existing_image_placeholder.as_deref(),
+                        RenderContextOptions {
+                            reasoning_effort,
+                            ..Default::default()
+                        },
+                    )
                     .map_err(Error::from_reason)?;
 
                     Self::encode_internal(&tokenizer, formatted, Some(false)) // Don't add extra special tokens
@@ -2073,6 +2063,7 @@ impl Qwen3Tokenizer {
     ///
     /// # Returns
     /// Rendered template string ready for tokenization, or an error description.
+    #[cfg(test)]
     fn render_chat_template_jinja2(
         template_str: &str,
         messages: &[ChatMessage],
@@ -2440,9 +2431,33 @@ impl Qwen3Tokenizer {
             "add_generation_prompt".to_string(),
             minijinja::Value::from(add_generation_prompt),
         );
+        if let Some(effort) = render_ctx.reasoning_effort.as_deref() {
+            if !matches!(
+                effort,
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            ) {
+                return Err(format!("Unsupported reasoning effort: {effort}"));
+            }
+            // Qwen3.8 templates accept low/medium/xhigh. Preserve legacy UI
+            // high/max and minimal as explicit aliases only for that template.
+            let qwen38 = template_str.contains("resolved_reasoning_effort")
+                && template_str.contains("xhigh");
+            let effort = if qwen38 {
+                match effort {
+                    "minimal" => "low",
+                    "high" | "max" => "xhigh",
+                    value => value,
+                }
+            } else {
+                effort
+            };
+            ctx_map.insert("reasoning_effort".into(), minijinja::Value::from(effort));
+        }
         ctx_map.insert(
             "enable_thinking".to_string(),
-            minijinja::Value::from(enable_thinking.unwrap_or(true)),
+            minijinja::Value::from(
+                enable_thinking.unwrap_or(render_ctx.reasoning_effort.as_deref() != Some("none")),
+            ),
         );
         ctx_map.insert(
             "preserve_thinking".to_string(),
@@ -2678,6 +2693,55 @@ impl Qwen3Tokenizer {
         }
     }
 
+    /// Render the same request controls used by native inference and replay.
+    pub(crate) fn render_chat_template_with_config(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        config: &crate::engine::types::ChatConfig,
+        preserve_thinking: bool,
+    ) -> Result<String> {
+        if config
+            .thinking_token_budget
+            .is_some_and(|budget| budget < 0)
+        {
+            return Err(Error::from_reason(
+                "thinkingTokenBudget must be non-negative",
+            ));
+        }
+        self.render_chat_template_sync_with_content_order(
+            messages,
+            Some(add_generation_prompt),
+            config.tools.as_deref(),
+            crate::engine::params::resolve_enable_thinking(config),
+            MultimodalContentOrder::TextThenMedia,
+            None,
+            RenderContextOptions {
+                reasoning_effort: config.reasoning_effort.clone(),
+                preserve_thinking,
+                ..Default::default()
+            },
+        )
+    }
+
+    pub(crate) fn apply_chat_template_with_config(
+        &self,
+        messages: &[ChatMessage],
+        add_generation_prompt: bool,
+        config: &crate::engine::types::ChatConfig,
+        preserve_thinking: bool,
+    ) -> Result<Vec<u32>> {
+        let text = self.render_chat_template_with_config(
+            messages,
+            add_generation_prompt,
+            config,
+            preserve_thinking,
+        )?;
+        Ok(Self::encode_internal(&self.tokenizer, text, Some(false))?
+            .get_ids()
+            .to_vec())
+    }
+
     /// Apply chat template synchronously (for internal use by chat())
     ///
     /// This is a synchronous version of apply_chat_template for use in blocking tasks.
@@ -2746,6 +2810,7 @@ impl Qwen3Tokenizer {
     /// Internal continuation verification uses this to locate structure that
     /// came from typed message fields before an unknown-token fallback can
     /// erase a provenance sentinel.
+    #[cfg(test)]
     pub(crate) fn render_chat_template_sync(
         &self,
         messages: &[ChatMessage],
@@ -2942,6 +3007,8 @@ pub enum MultimodalContentOrder {
 /// the prefix is simply a place no untrusted string reaches today.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct RenderContextOptions {
+    /// Validated effort forwarded separately from enable_thinking and the numeric cap.
+    pub reasoning_effort: Option<String>,
     /// The date the template prints as `Current date: {{ current_date }}.` at the
     /// very front of the system message.
     ///
@@ -3483,6 +3550,46 @@ mod tests {
             images,
             audio: None,
         }
+    }
+
+    #[test]
+    fn qwen38_thinking_effort_matches_checkpoint_template() {
+        // Actual Qwen/Qwen3.8-27B template from the installed MXFP4 checkpoint.
+        let template = include_str!("tokenizer/fixtures/qwen3.8-27b/chat_template.jinja");
+        let render = |effort: Option<&str>, enabled: Option<bool>| {
+            Qwen3Tokenizer::render_chat_template_jinja2_with_content_order(
+                template,
+                &[user_msg("Hello", 0)],
+                None,
+                true,
+                enabled,
+                "",
+                "<|im_end|>",
+                MultimodalContentOrder::TextThenMedia,
+                None,
+                RenderContextOptions {
+                    reasoning_effort: effort.map(str::to_owned),
+                    ..Default::default()
+                },
+            )
+        };
+        let low = render(Some("low"), None).unwrap();
+        let medium = render(Some("medium"), None).unwrap();
+        let xhigh = render(Some("xhigh"), None).unwrap();
+        let off = render(Some("none"), None).unwrap();
+        assert!(low.contains("Reasoning effort is set to low."));
+        assert!(low.ends_with("<think>\n"));
+        assert!(!medium.contains("Reasoning effort is set to"));
+        assert!(medium.ends_with("<think>\n"));
+        assert!(xhigh.contains("Reasoning effort is set to xhigh."));
+        assert!(off.ends_with("<think>\n\n</think>\n\n"));
+        assert!(!off.contains("Reasoning effort is set to"));
+        assert_eq!(render(None, None).unwrap(), xhigh);
+        assert_eq!(render(Some("minimal"), None).unwrap(), low);
+        assert_eq!(render(Some("high"), None).unwrap(), xhigh);
+        assert_eq!(render(Some("max"), None).unwrap(), xhigh);
+        assert_eq!(render(Some("low"), Some(false)).unwrap(), off);
+        assert!(render(Some("invalid"), None).is_err());
     }
 
     #[test]
@@ -4193,6 +4300,7 @@ mod tests {
             MultimodalContentOrder::TextThenMedia,
             None,
             RenderContextOptions {
+                reasoning_effort: None,
                 current_date: Some(PROBE_DATE.to_string()),
                 reasoning_strength: None,
                 // The one-shot default. The Nemotron gate this test pins reads
@@ -4815,6 +4923,7 @@ mod tests {
             MultimodalContentOrder::TextThenMedia,
             None,
             RenderContextOptions {
+                reasoning_effort: None,
                 current_date: Some(PROBE_DATE.to_string()),
                 reasoning_strength: None,
                 preserve_thinking: false,
@@ -8502,6 +8611,7 @@ mod tests {
         super::Qwen3Tokenizer::install_template_helpers(&mut env);
         env.add_template("t", DEFINEDNESS_PROBE_TEMPLATE).unwrap();
         let ctx = super::Qwen3Tokenizer::build_render_context(super::RenderContextOptions {
+            reasoning_effort: None,
             current_date: Some("2026-08-10".to_string()),
             reasoning_strength: Some("low".to_string()),
             preserve_thinking: false,
@@ -8524,6 +8634,7 @@ mod tests {
         super::Qwen3Tokenizer::install_template_helpers(&mut env);
         env.add_template("t", DEFINEDNESS_PROBE_TEMPLATE).unwrap();
         let ctx = super::Qwen3Tokenizer::build_render_context(super::RenderContextOptions {
+            reasoning_effort: None,
             current_date: None,
             reasoning_strength: None,
             preserve_thinking: false,
@@ -8564,6 +8675,7 @@ mod tests {
             MultimodalContentOrder::TextThenMedia,
             None,
             super::RenderContextOptions {
+                reasoning_effort: None,
                 current_date: Some("2026-08-10".to_string()),
                 reasoning_strength: Some("low".to_string()),
                 preserve_thinking: false,

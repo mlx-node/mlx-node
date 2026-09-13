@@ -15,6 +15,7 @@
 
 import type { Handler, MainApiContext, WorkerApiContext } from './context.js';
 import { handleCacheDelete, handleCacheGet } from './handlers/cache.js';
+import { handleCodingAgents, handleCodingAgentAction } from './handlers/coding-agents.js';
 import {
   handleDownloadCancel,
   handleDownloadEventsUnsupported,
@@ -24,7 +25,13 @@ import {
 import { handleHealth } from './handlers/health.js';
 import { handleIngest } from './handlers/ingest.js';
 import { handleMetricsOverview, handleSessionMetrics } from './handlers/metrics.js';
-import { handleCatalog, handleCatalogUpdates, handleDeleteModel, handleModels } from './handlers/models.js';
+import {
+  handleCatalog,
+  handleCatalogUpdates,
+  handleDeleteModel,
+  handleModels,
+  handleCodingAgentModels,
+} from './handlers/models.js';
 import {
   handleSessionDelete,
   handleSessionDetail,
@@ -95,6 +102,9 @@ export const ROUTES: Route[] = [
   // server's `/api` proxy (which does not forward the bare `/health`).
   workerRoute('GET', '/api/health', handleHealth),
   workerRoute('GET', '/api/models', handleModels),
+  mainRoute('GET', '/api/coding-agents', handleCodingAgents),
+  workerRoute('GET', '/api/coding-agents/models', handleCodingAgentModels),
+  mainRoute('POST', '/api/coding-agents', handleCodingAgentAction, { successStatus: 202 }),
   workerRoute('DELETE', '/api/models/:name', handleDeleteModel),
   workerRoute('GET', '/api/catalog', handleCatalog),
   mainRoute('GET', '/api/catalog/updates', handleCatalogUpdates),

@@ -72,6 +72,7 @@ export default defineConfig({
       '@mlx-node/lm/family-data': resolve(__dirname, './packages/lm/src/family-data.ts'),
       '@mlx-node/lm': resolve(__dirname, './packages/lm/src/index.ts'),
       '@mlx-node/agent/catalog': resolve(__dirname, './packages/agent/src/catalog.ts'),
+      '@mlx-node/agent/delegate': resolve(__dirname, './packages/agent/src/delegate.ts'),
       '@mlx-node/agent': resolve(__dirname, './packages/agent/src/index.ts'),
       '@mlx-node/privacy': resolve(__dirname, './packages/privacy/src/index.ts'),
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),

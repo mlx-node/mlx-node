@@ -18,7 +18,7 @@ use crate::decode_profiler::DecodeProfiler;
 use crate::engine::finalize::finalize_chat_result;
 use crate::engine::params::{
     ChatParams, ModelGenerationDefaults, ThinkingPolicy, apply_generation_defaults,
-    extract_chat_params, resolve_enable_thinking,
+    extract_chat_params,
 };
 use crate::engine::plan::{ExecutionPlan, MediaCapabilities, MediaInputs, TurnPlan};
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
@@ -684,13 +684,7 @@ pub(crate) trait ChatBackend {
         config: &ChatConfig,
         preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
-        tok.apply_chat_template_sync(
-            messages,
-            Some(true),
-            config.tools.as_deref(),
-            resolve_enable_thinking(config),
-            preserve_thinking,
-        )
+        tok.apply_chat_template_with_config(messages, true, config, preserve_thinking)
     }
 
     /// The session's committed token history.

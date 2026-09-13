@@ -526,15 +526,35 @@ describe('makeMlxStreamSimple', () => {
     expect(session.configSeen?.tools).toBeUndefined();
   });
 
+  it('forwards an explicit CLI thinking cap on each model turn', async () => {
+    const session = new FakeChatSession([
+      async function* () {
+        yield finalEvent();
+      },
+    ]);
+    const streamSimple = makeMlxStreamSimple(
+      makeFakeHost(session),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      () => 2,
+    );
+    await collect(streamSimple(MODEL, CONTEXT, { reasoning: 'low' }));
+    expect(session.configSeen?.reasoningEffort).toBe('low');
+    expect(session.configSeen?.thinkingTokenBudget).toBe(2);
+  });
+
   it('persists the resolved native thinking mode for exact history replay', async () => {
     const cases = [
       [undefined, 'none', false],
-      ['minimal', 'low', false],
-      ['low', 'low', false],
+      ['minimal', 'low', true],
+      ['low', 'low', true],
       ['medium', 'medium', true],
       ['high', 'high', true],
-      ['xhigh', 'high', true],
-      ['max', 'high', true],
+      ['xhigh', 'xhigh', true],
+      ['max', 'max', true],
     ] as const;
 
     for (const [reasoning, expectedEffort, expectedEnabled] of cases) {

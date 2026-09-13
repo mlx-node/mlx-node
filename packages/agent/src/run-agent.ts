@@ -24,6 +24,7 @@ import type { InlineExtension } from '@earendil-works/pi-coding-agent';
 import { coldCacheDrain } from '@mlx-node/core';
 import { PagedConfigOverrideManager } from '@mlx-node/lm';
 
+import { createDelegationExtension } from './extensions/delegation.js';
 import { createLocalImageInputExtension } from './extensions/local-image-input.js';
 import { createPermissionGateExtension } from './extensions/permission-gate.js';
 import { createSubagentExtension } from './extensions/subagent.js';
@@ -52,6 +53,8 @@ export interface AgentPagedConfigOverrides {
 }
 
 export interface RunAgentOptions {
+  /** Focused worker tools/permissions; inference and session defaults remain shared. */
+  mode?: 'delegate';
   /** Resolved models directory (context for callers/diagnostics — discovery already ran). */
   modelsDir: string;
   /** Discovered models to serve through the in-process `mlx` provider. */
@@ -136,13 +139,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
     opts.models.map((model) => model.discovered.name),
   );
   const subagentsEnabled =
-    opts.models.length > 0 && !opts.argv.includes('--no-extensions') && !opts.argv.includes('-ne');
+    opts.mode !== 'delegate' &&
+    opts.models.length > 0 &&
+    !opts.argv.includes('--no-extensions') &&
+    !opts.argv.includes('-ne');
   try {
     await pi.main(opts.argv, {
       extensionFactories: [
         createMlxProviderExtension(opts.models, modelHost),
         createLocalImageInputExtension(),
-        createPermissionGateExtension(),
+        opts.mode === 'delegate' ? createDelegationExtension() : createPermissionGateExtension(),
         ...(subagentsEnabled ? [createSubagentExtension()] : []),
         ...(opts.traceLogFile !== undefined ? [createTraceNoticeExtension(opts.traceLogFile)] : []),
         createTerminalTitleExtension(),
