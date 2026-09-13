@@ -387,6 +387,8 @@ impl QwenStepExecutor<'_> {
         turn: &mut TurnState<QwenScheduledTurn>,
         mut logits: Option<MxArray>,
     ) -> RowStepResult {
+        let is_reasoning = turn.payload.reasoning_tracker.observe_token(row.token_id);
+        turn.payload.last_is_reasoning = is_reasoning;
         let next_token = if let Some(mut logits) = logits.take() {
             let sampled = if turn.payload.reasoning_tracker.should_force_think_end() {
                 let forced = match turn.payload.reasoning_tracker.forced_token_id() {
@@ -430,8 +432,6 @@ impl QwenStepExecutor<'_> {
 
         turn.payload.profiler.step();
         turn.payload.profiler.mark_first_token();
-        let is_reasoning = turn.payload.reasoning_tracker.observe_token(row.token_id);
-        turn.payload.last_is_reasoning = is_reasoning;
         if row.cancelled {
             turn.payload.finish_reason = String::from("cancelled");
         } else {
@@ -748,7 +748,7 @@ impl QwenStepExecutor<'_> {
                                         continue;
                                     }
                                 };
-                                let sampled =
+                                let mut sampled =
                                     match sample(&penalized, turn.payload.params.sampling_config) {
                                         Ok(sampled) => sampled,
                                         Err(error) => {
@@ -757,6 +757,15 @@ impl QwenStepExecutor<'_> {
                                             continue;
                                         }
                                     };
+                                if let Err(error) = turn
+                                    .payload
+                                    .reasoning_tracker
+                                    .enforce_next_token(&mut sampled)
+                                {
+                                    results[row.plan_index] =
+                                        Some(Self::fail(turn, planned, error));
+                                    continue;
+                                }
                                 sampled.eval();
                                 if turn.payload.params.report_performance {
                                     turn.payload.first_token_instant = Some(Instant::now());
@@ -5493,6 +5502,175 @@ mod tests {
         let positions = MxArray::from_int32(&[0], &[1])?;
         let _ = inner.run_paged_prefill_chunk(prompt, 0, inner.layers.len(), &positions)?;
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn scheduled_thinking_budget_turn(
+        inner: &mut super::Qwen3Inner,
+        seq: u32,
+        budget: Option<i32>,
+        enabled: bool,
+    ) -> TurnState<QwenScheduledTurn> {
+        use crate::engine::types::ChatConfig;
+
+        let config = ChatConfig {
+            max_new_tokens: Some(5),
+            temperature: Some(0.0),
+            reasoning_effort: Some(if enabled { "high" } else { "none" }.into()),
+            thinking_token_budget: budget,
+            ..ChatConfig::default()
+        };
+        let params = inner.resolve_params(&config);
+        let thinking = inner.thinking_setup(&config);
+        let prompt = vec![2, 3, 4, 5, 6, 7, 8];
+        let prefix = match inner
+            .prepare_scheduled_prefix(seq, &prompt, &[], false, 0, 8)
+            .expect("prepare scheduled prefix")
+        {
+            ScheduledPrefixAdmission::Ready(prefix) => prefix,
+            _ => panic!("tiny request must be admitted"),
+        };
+        let (reply, _) = tokio::sync::oneshot::channel();
+        let payload = ScheduledTurn {
+            owner_id: format!("thinking-budget-{seq}"),
+            scheduled_speculation: None,
+            pending_token_emitted: false,
+            tokenizer: crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer(),
+            eos_id: 99,
+            config,
+            params,
+            thinking,
+            prompt_tokens: prompt.clone(),
+            prefix,
+            is_delta: false,
+            reuse_cache: false,
+            response: engine::hybrid_scheduler::ScheduledReply::Sync(reply),
+            generated_tokens: Vec::new(),
+            finish_reason: "length".into(),
+            reasoning_tracker: engine::ReasoningTracker::from_setup(&thinking, Some(1)),
+            extra_eos_ids: Vec::new(),
+            generation_start: None,
+            first_token_instant: None,
+            generation_stream: Stream::default(DeviceType::Gpu),
+            profiler: crate::decode_profiler::DecodeProfiler::new("thinking-budget", "Qwen3"),
+            emitter: None,
+            turn_token_observer: None,
+            stream_skip_special: false,
+            decode_ids: Vec::new(),
+            decode_prefix: String::new(),
+            decode_prefix_index: 0,
+            streamed_text_len: 0,
+            last_is_reasoning: enabled,
+            failure: None,
+            allocation_failed: false,
+            preemption_replay: None,
+        };
+        // Splitting the prefill also verifies that non-final slices leave the
+        // pending zero-budget close intact until a token can actually be emitted.
+        TurnState::new(seq, prompt, 0, vec![3, 7], None, payload).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_scheduled_thinking_budgets(ragged_step: bool) {
+        use crate::array::DType;
+        use crate::engine::scheduler::{Scheduler, SchedulerAction};
+
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            assert!(!crate::test_support::metal_required());
+            return;
+        }
+        let mut inner = match super::Qwen3Inner::new(paged_tiny_config(Some(true))) {
+            Ok(inner) => inner,
+            Err(error) if crate::test_support::metal_device_absent(&error.reason) => return,
+            Err(error) => panic!("construct scheduled thinking fixture: {error}"),
+        };
+        cast_paged_inner_to_bf16(&mut inner);
+        // Every unforced greedy sample is token 0. Token 1 can only come from
+        // reasoning enforcement, so no random early close can hide an overshoot.
+        inner
+            .lm_head
+            .set_weight(&MxArray::zeros(&[100, 64], Some(DType::BFloat16)).unwrap())
+            .unwrap();
+        let cases = [
+            (Some(0), true),
+            (Some(1), true),
+            (Some(2), true),
+            (None, true),
+            (Some(0), false),
+        ];
+        let mut scheduler = Scheduler::<_, (), ()>::new(cases.len(), 12).unwrap();
+        for (index, &(budget, enabled)) in cases.iter().enumerate() {
+            let turn =
+                scheduled_thinking_budget_turn(&mut inner, index as u32 + 10, budget, enabled);
+            scheduler.enqueue_turn(turn).unwrap();
+        }
+        let mut completed = 0;
+        for _ in 0..100 {
+            let action = scheduler
+                .drive_once(&mut QwenStepExecutor {
+                    inner: &mut inner,
+                    ragged_step,
+                })
+                .unwrap();
+            if let SchedulerAction::Stepped {
+                completed: turns, ..
+            } = action
+            {
+                for turn in turns {
+                    assert!(turn.payload.failure.is_none(), "{:?}", turn.payload.failure);
+                    let (budget, enabled) = cases[(turn.seq_id - 10) as usize];
+                    let mut expected = vec![0; 5];
+                    if enabled && let Some(budget) = budget {
+                        expected[budget as usize] = 1;
+                    }
+                    assert_eq!(
+                        turn.payload.generated_tokens, expected,
+                        "ragged={ragged_step}, budget={budget:?}, thinking={enabled}"
+                    );
+                    assert_eq!(
+                        turn.payload.reasoning_tracker.reasoning_token_count(),
+                        if enabled {
+                            budget.unwrap_or(5) as u32
+                        } else {
+                            0
+                        }
+                    );
+                    let mut cached = turn.payload.prompt_tokens;
+                    cached.extend_from_slice(&expected[..4]);
+                    assert_eq!(
+                        inner
+                            .paged_adapter
+                            .as_ref()
+                            .unwrap()
+                            .request_tokens_for(turn.seq_id)
+                            .unwrap(),
+                        cached,
+                        "cache must contain the emitted close and exclude the final sample"
+                    );
+                    completed += 1;
+                }
+            }
+            if completed == cases.len() {
+                break;
+            }
+        }
+        assert_eq!(completed, cases.len());
+        assert!(
+            scheduler.stats().max_batch_occupancy > 1,
+            "requests must share scheduler steps"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn scheduled_thinking_budgets_apply_before_prefill_and_decode_tokens() {
+        assert_scheduled_thinking_budgets(false);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn ragged_scheduled_thinking_budgets_apply_before_prefill_and_decode_tokens() {
+        assert_scheduled_thinking_budgets(true);
     }
 
     /// Explicit opt-out (`Some(false)`) must NOT allocate the block-paged

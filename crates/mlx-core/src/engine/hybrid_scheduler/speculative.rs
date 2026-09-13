@@ -100,7 +100,8 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     observer_stopped: observed,
                     batch_index: None,
                 };
-                Self::finish_decode_row(turn, &seed);
+                let is_reasoning = turn.payload.reasoning_tracker.observe_token(anchor);
+                Self::finish_decode_row(turn, &seed, is_reasoning);
                 turn.payload.pending_token_emitted = true;
                 if seed.terminal || seed.at_length {
                     turn.payload.profiler.snapshot_memory_after();

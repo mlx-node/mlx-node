@@ -930,10 +930,17 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         } else {
             sample(&logits, config)
         };
-        let sampled = match sampled {
+        let mut sampled = match sampled {
             Ok(sampled) => sampled,
             Err(error) => return Ok(Self::fail(turn, row, error)),
         };
+        if let Err(error) = turn
+            .payload
+            .reasoning_tracker
+            .enforce_next_token(&mut sampled)
+        {
+            return Ok(Self::fail(turn, row, error));
+        }
         sampled.eval();
         if turn.payload.params.report_performance {
             turn.payload.first_token_instant = Some(Instant::now());
@@ -977,9 +984,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
     fn finish_decode_row(
         turn: &mut TurnState<ScheduledTurn<B::PrefixState>>,
         row: &PreparedDecodeRow,
+        is_reasoning: bool,
     ) {
         turn.payload.profiler.mark_first_token();
-        let is_reasoning = turn.payload.reasoning_tracker.observe_token(row.token_id);
         turn.payload.last_is_reasoning = is_reasoning;
         if B::CANCEL_PRECEDES_EOS && row.cancelled {
             turn.payload.finish_reason = String::from("cancelled");
@@ -1148,18 +1155,25 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 })
         };
         for row in &work {
+            let turn = running
+                .iter_mut()
+                .find(|turn| turn.seq_id == row.seq_id)
+                .ok_or_else(|| {
+                    Error::from_reason(format!(
+                        "{} decode sequence {} disappeared after forward",
+                        B::SCHEDULER_NAME,
+                        row.seq_id
+                    ))
+                })?;
             if row.batch_index.is_some() {
-                let turn = running
-                    .iter_mut()
-                    .find(|turn| turn.seq_id == row.seq_id)
-                    .ok_or_else(|| {
-                        Error::from_reason(format!(
-                            "{} decode sequence {} disappeared after forward",
-                            B::SCHEDULER_NAME,
-                            row.seq_id
-                        ))
-                    })?;
                 turn.payload.profiler.end();
+            }
+            // Count the current token before either sampling path chooses the
+            // next one. Blocked forwards retry this token, so leave their
+            // reasoning state untouched until the forward succeeds.
+            if row.batch_index.is_none() || logits.is_ok() {
+                turn.payload.last_is_reasoning =
+                    turn.payload.reasoning_tracker.observe_token(row.token_id);
             }
         }
         let greedy_wave = work
@@ -1288,7 +1302,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     .record_duration("sample_eval", elapsed);
             }
             turn.payload.profiler.step();
-            Self::finish_decode_row(turn, &row);
+            Self::finish_decode_row(turn, &row, turn.payload.last_is_reasoning);
             let finished = row.terminal || row.at_length;
             if finished {
                 turn.payload.profiler.snapshot_memory_after();
