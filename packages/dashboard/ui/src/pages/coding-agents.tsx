@@ -120,7 +120,8 @@ export default function CodingAgents() {
       <div className="bg-muted/70 rounded-3xl px-6 py-5">
         <p className="text-muted-foreground text-base leading-relaxed">
           Let your coding agents hand GitHub work to a local model. Review comments, investigate failed checks, and
-          gather context while using fewer cloud tokens.
+          gather context while using fewer cloud tokens. Your coding agent approves each delegated task before the local
+          worker runs it.
         </p>
       </div>
 

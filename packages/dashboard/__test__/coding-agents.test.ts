@@ -2,10 +2,10 @@ import { mkdtemp, mkdir, readFile, writeFile, rm, symlink, stat } from 'node:fs/
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { DELEGATION_PROMPT, delegationPrompt } from '@mlx-node/agent/delegate';
+import { DELEGATION_PROMPT, delegationCommand, delegationPrompt } from '@mlx-node/agent/delegate';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { DETECTION_INPUT_PREFIX } from '../src/coding-agent-detection.js';
+import { COMMAND_SELECTION_SYSTEM, DETECTION_INPUT_PREFIX } from '../src/coding-agent-detection.js';
 import { CodingAgentsService } from '../src/coding-agents.js';
 
 const cleanup: (() => Promise<void>)[] = [];
@@ -21,6 +21,17 @@ async function setup(models = ['local-model']) {
   const prepareCommand = vi.fn(async () => command);
   const complete = vi.fn(async (_connection, _system, messages) => {
     const content = messages[0].content as string;
+    if (_system === COMMAND_SELECTION_SYSTEM) {
+      const { source } = JSON.parse(content);
+      const known = ['mlx', delegationCommand(command)];
+      const executable = known.find((item) => source.includes(`${item} delegate github`));
+      if (!executable) throw new Error('Test fixture requires an explicit selection for this command.');
+      const prefix = `${executable} delegate github`;
+      return JSON.stringify({
+        text: source.includes(`${prefix} --caller-approved`) ? `${prefix} --caller-approved` : prefix,
+        occurrence: 1,
+      });
+    }
     const currentCommand = JSON.parse(content.slice('Current app executable: '.length, content.indexOf('\n')));
     const currentPrompt = delegationPrompt(currentCommand);
     const lines = content
@@ -101,27 +112,59 @@ describe('local model coding-agent setup', () => {
     expect(complete).toHaveBeenCalledTimes(2);
   });
 
+  const verdict = (status: string, startLine: number, endLine = startLine) =>
+    JSON.stringify({ status, startLine, endLine });
+  const selected = (text: string, occurrence = 1) => JSON.stringify({ text, occurrence });
+
   it.each([
-    delegationPrompt('/Applications/Old App.app/bin/mlx'),
-    "For PR reviews, invoke '/old/mlx' delegate github with the repository and task.",
-    "For GitHub issues, use '/old/mlx'\nwith the delegate github subcommands.",
-  ])('replaces a model-selected obsolete directive after a cached check: %s', async (obsolete) => {
-    const { service, home, prompt, restart, complete } = await setup();
+    ['Keep patches small; for GitHub use mlx delegate github --repo org/repo; keep tests fast.', 'mlx delegate github'],
+    [
+      "For CI, invoke `'/old app/mlx' delegate github --caller-approved` with the task. Keep comments.",
+      "'/old app/mlx' delegate github --caller-approved",
+    ],
+    [
+      "Keep preferences. For GitHub use '/old/mlx'\n delegate github --repo org/repo. Keep formatting.",
+      "'/old/mlx'\n delegate github",
+    ],
+  ])('preserves surrounding text and arguments when updating a cached directive: %s', async (obsolete, prefix) => {
+    const { service, home, command, restart, complete } = await setup();
     await mkdir(join(home, '.claude'));
     const path = join(home, '.claude', 'CLAUDE.md');
-    await writeFile(path, `Before.\n${obsolete}\nAfter.\n`);
-    complete.mockResolvedValueOnce(
-      JSON.stringify({ status: 'needs-update', startLine: 2, endLine: 1 + obsolete.split('\n').length }),
-    );
+    const before = `Before.\n${obsolete}\nAfter.\n`;
+    await writeFile(path, before);
+    const inode = (await stat(path)).ino;
+    complete.mockResolvedValueOnce(verdict('needs-update', 2, 1 + obsolete.split('\n').length));
     await service.start('detect', 'claude');
     expect((await settled(service)).status).toBe('needs-update');
     const restored = restart();
-    expect((await restored.state()).agents[0].status).toBe('needs-update');
     complete.mockClear();
+    complete.mockResolvedValueOnce(selected(prefix)).mockResolvedValueOnce(verdict('installed', 2));
     await restored.start('install', 'claude');
     expect((await settled(restored)).status).toBe('installed');
-    expect(await readFile(path, 'utf8')).toBe(`Before.\n${prompt}\nAfter.\n`);
+    expect(await readFile(path, 'utf8')).toBe(
+      before.replace(prefix, `${delegationCommand(command)} delegate github --caller-approved`),
+    );
+    expect((await stat(path)).ino).toBe(inode);
     expect(complete).toHaveBeenCalledTimes(2);
+    await restored.start('install', 'claude');
+    await settled(restored);
+    expect(complete).toHaveBeenCalledTimes(2);
+  });
+
+  it('adds caller approval to an existing current executable without rewriting the directive', async () => {
+    const { service, home, command, complete } = await setup();
+    await mkdir(join(home, '.grok'));
+    const path = join(home, '.grok', 'AGENTS.md');
+    const prefix = `${delegationCommand(command)} delegate github`;
+    const before = `Keep patches small; for PRs use ${prefix} --repo org/repo.\n`;
+    await writeFile(path, before);
+    complete
+      .mockResolvedValueOnce(verdict('needs-update', 1))
+      .mockResolvedValueOnce(selected(prefix))
+      .mockResolvedValueOnce(verdict('installed', 1));
+    await service.start('install', 'grok');
+    expect((await settled(service, 'grok')).status).toBe('installed');
+    expect(await readFile(path, 'utf8')).toBe(before.replace(prefix, `${prefix} --caller-approved`));
   });
 
   it('rechecks an older cached update without source lines before replacing anything', async () => {
@@ -144,25 +187,23 @@ describe('local model coding-agent setup', () => {
     expect(await readFile(path, 'utf8')).toBe(`Keep my preferences.\n${prompt}\n`);
   });
 
-  it.each([false, true])('updates all stale paths with shifted line ranges (cached: %s)', async (cached) => {
-    const { service, home, prompt, restart, complete } = await setup();
+  it.each([false, true])('updates every stale command in any selection order (cached: %s)', async (cached) => {
+    const { service, home, prompt, command, restart, complete } = await setup();
     await mkdir(join(home, '.claude'));
     const path = join(home, '.claude', 'CLAUDE.md');
-    const before =
-      "Before.\nFor PRs use '/old/mlx'\nwith the delegate github subcommands.\nKeep formatting.\nFor CI use '/other/mlx' delegate github.\nAfter.\n";
+    const first = "'/old/mlx'\n delegate github";
+    const second = "'/other/mlx' delegate github";
+    const before = `Before; for PRs use ${first}. Keep formatting.\n${prompt}\nFor CI use ${second}; keep tests fast.\nAfter.\n`;
     await writeFile(path, before);
-    const inode = (await stat(path)).ino;
     complete
-      .mockResolvedValueOnce(JSON.stringify({ status: 'needs-update', startLine: 2, endLine: 3 }))
+      .mockResolvedValueOnce(verdict('needs-update', 4))
+      .mockResolvedValueOnce(selected(second))
       .mockImplementationOnce(async () => {
         expect(await readFile(path, 'utf8')).toBe(before);
-        return JSON.stringify({ status: 'needs-update', startLine: 3, endLine: 3 });
+        return verdict('needs-update', 1, 2);
       })
-      .mockResolvedValueOnce(JSON.stringify({ status: 'not-installed', startLine: 0, endLine: 0 }))
-      .mockImplementationOnce(async () => {
-        expect(await readFile(path, 'utf8')).toBe(before);
-        return JSON.stringify({ status: 'installed', startLine: 2, endLine: 2 });
-      });
+      .mockResolvedValueOnce(selected(first))
+      .mockResolvedValueOnce(verdict('installed', 1));
     if (cached) {
       await service.start('detect', 'claude');
       expect((await settled(service)).status).toBe('needs-update');
@@ -171,92 +212,79 @@ describe('local model coding-agent setup', () => {
     const active = cached ? restart() : service;
     await active.start('install', 'claude');
     expect((await settled(active)).status).toBe('installed');
-    expect(await readFile(path, 'utf8')).toBe(`Before.\n${prompt}\nKeep formatting.\nAfter.\n`);
-    expect((await stat(path)).ino).toBe(inode);
-    expect(complete).toHaveBeenCalledTimes(4);
+    const prefix = `${delegationCommand(command)} delegate github --caller-approved`;
+    expect(await readFile(path, 'utf8')).toBe(before.replace(first, prefix).replace(second, prefix));
+    expect(complete).toHaveBeenCalledTimes(5);
     complete.mockClear();
-    await restart().start('detect', 'claude');
-    await active.start('install', 'claude');
-    await settled(active);
+    const restored = restart();
+    await restored.start('detect', 'claude');
+    await settled(restored);
     expect(complete).not.toHaveBeenCalled();
   });
 
-  it('removes obsolete paths in any order while keeping an existing current prompt once', async () => {
-    const { service, home, prompt, complete } = await setup();
+  it('stops without writing when the model selects generated replacement text as obsolete', async () => {
+    const { service, home, command, complete } = await setup();
     await mkdir(join(home, '.claude'));
     const path = join(home, '.claude', 'CLAUDE.md');
-    await writeFile(
-      path,
-      `For PRs use '/old/mlx' delegate github.\nKeep formatting.\n${prompt}\nFor CI use '/other/mlx' delegate github.\nAfter.\n`,
-    );
-    complete
-      .mockResolvedValueOnce(JSON.stringify({ status: 'needs-update', startLine: 4, endLine: 4 }))
-      .mockResolvedValueOnce(JSON.stringify({ status: 'needs-update', startLine: 1, endLine: 1 }));
-    await service.start('install', 'claude');
-    expect((await settled(service)).status).toBe('installed');
-    expect(await readFile(path, 'utf8')).toBe(`Keep formatting.\n${prompt}\nAfter.\n`);
-    expect(complete).toHaveBeenCalledTimes(3);
-  });
-
-  it('adjusts the insertion point when an earlier multiline directive is removed later', async () => {
-    const { service, home, prompt, complete } = await setup();
-    await mkdir(join(home, '.claude'));
-    const path = join(home, '.claude', 'CLAUDE.md');
-    await writeFile(
-      path,
-      "Before.\nFor PRs use '/old/mlx'\nwith delegate github.\nKeep formatting.\nFor CI use '/other/mlx' delegate github.\nAfter.\n",
-    );
-    complete
-      .mockResolvedValueOnce(JSON.stringify({ status: 'needs-update', startLine: 5, endLine: 5 }))
-      .mockResolvedValueOnce(JSON.stringify({ status: 'needs-update', startLine: 2, endLine: 3 }))
-      .mockResolvedValueOnce(JSON.stringify({ status: 'not-installed', startLine: 0, endLine: 0 }));
-    await service.start('install', 'claude');
-    expect((await settled(service)).status).toBe('installed');
-    expect(await readFile(path, 'utf8')).toBe(`Before.\nKeep formatting.\n${prompt}\nAfter.\n`);
-  });
-
-  it('stops without writing when the model selects the replacement as obsolete', async () => {
-    const { service, home, complete } = await setup();
-    await mkdir(join(home, '.claude'));
-    const path = join(home, '.claude', 'CLAUDE.md');
-    const before = "For PRs use '/old/mlx' delegate github.\nFor CI use '/other/mlx' delegate github.\n";
+    const before = "For PRs use '/old/mlx' delegate github.\n";
     await writeFile(path, before);
-    complete.mockResolvedValue(JSON.stringify({ status: 'needs-update', startLine: 1, endLine: 1 }));
+    complete
+      .mockResolvedValueOnce(verdict('needs-update', 1))
+      .mockResolvedValueOnce(selected("'/old/mlx' delegate github"))
+      .mockResolvedValueOnce(verdict('needs-update', 1))
+      // Even selecting just part of an earlier replacement must stop.
+      .mockResolvedValueOnce(selected(delegationCommand(command)));
     await service.start('install', 'claude');
     expect((await settled(service)).detail).toContain('No changes were made');
     expect(await readFile(path, 'utf8')).toBe(before);
-    expect(complete).toHaveBeenCalledTimes(3);
+    expect(complete).toHaveBeenCalledTimes(4);
   });
 
-  it('keeps the original file if verification fails after processing multiple obsolete paths', async () => {
+  it('keeps the original file when the model invents selection text', async () => {
+    const { service, home, complete } = await setup();
+    await mkdir(join(home, '.claude'));
+    const path = join(home, '.claude', 'CLAUDE.md');
+    const before = "Keep patches small; use '/old/mlx' delegate github for PRs.\n";
+    await writeFile(path, before);
+    complete.mockResolvedValueOnce(verdict('needs-update', 1)).mockResolvedValueOnce(selected('invented'));
+    await service.start('install', 'claude');
+    expect((await settled(service)).detail).toContain('No changes were made');
+    expect(await readFile(path, 'utf8')).toBe(before);
+  });
+
+  it('keeps the original file if verification fails after multiple obsolete commands', async () => {
     const { service, home, complete } = await setup();
     await mkdir(join(home, '.claude'));
     const path = join(home, '.claude', 'CLAUDE.md');
     const before = "For PRs use '/old/mlx' delegate github.\nFor CI use '/other/mlx' delegate github.\n";
     await writeFile(path, before);
     complete
-      .mockResolvedValueOnce(JSON.stringify({ status: 'needs-update', startLine: 1, endLine: 1 }))
-      .mockResolvedValueOnce(JSON.stringify({ status: 'needs-update', startLine: 1, endLine: 1 }))
-      .mockResolvedValueOnce(JSON.stringify({ status: 'not-installed', startLine: 0, endLine: 0 }));
+      .mockResolvedValueOnce(verdict('needs-update', 1))
+      .mockResolvedValueOnce(selected("'/old/mlx' delegate github"))
+      .mockResolvedValueOnce(verdict('needs-update', 2))
+      .mockResolvedValueOnce(selected("'/other/mlx' delegate github"))
+      .mockResolvedValueOnce(verdict('not-installed', 0));
     await service.start('install', 'claude');
     expect((await settled(service)).detail).toContain('No changes were made');
     expect(await readFile(path, 'utf8')).toBe(before);
-    expect(complete).toHaveBeenCalledTimes(3);
+    expect(complete).toHaveBeenCalledTimes(5);
   });
 
-  it('preserves a current prompt example and installs an active directive after removing stale paths', async () => {
-    const { service, home, prompt, complete } = await setup();
+  it('preserves a current prompt example while updating the active directive', async () => {
+    const { service, home, prompt, command, complete } = await setup();
     await mkdir(join(home, '.claude'));
     const path = join(home, '.claude', 'CLAUDE.md');
     const example = `\x60\x60\x60markdown\n${prompt}\n\x60\x60\x60\n`;
     await writeFile(path, `${example}For PRs use '/old/mlx' delegate github.\n`);
     complete
-      .mockResolvedValueOnce(JSON.stringify({ status: 'needs-update', startLine: 4, endLine: 4 }))
-      .mockResolvedValueOnce(JSON.stringify({ status: 'not-installed', startLine: 0, endLine: 0 }))
-      .mockResolvedValueOnce(JSON.stringify({ status: 'installed', startLine: 4, endLine: 4 }));
+      .mockResolvedValueOnce(verdict('needs-update', 4))
+      .mockResolvedValueOnce(selected("'/old/mlx' delegate github"))
+      .mockResolvedValueOnce(verdict('installed', 4));
     await service.start('install', 'claude');
     expect((await settled(service)).status).toBe('installed');
-    expect(await readFile(path, 'utf8')).toBe(`${example}${prompt}\n`);
+    expect(await readFile(path, 'utf8')).toBe(
+      `${example}For PRs use ${delegationCommand(command)} delegate github --caller-approved.\n`,
+    );
   });
 
   it('blocks both detection and installation without a model, before inference or file writes', async () => {

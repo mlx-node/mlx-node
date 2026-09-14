@@ -30,10 +30,10 @@ export function delegationBlocker(text: string): boolean {
   );
 }
 
-export function createDelegationExtension(): InlineExtension {
+export function createDelegationExtension(options: { callerApproved?: boolean } = {}): InlineExtension {
   // Capture before any model/tool code runs. Never consult model-written settings.
   const caller = delegateCallerPermissions();
-  const explicitlyApproved = process.env.MLX_AGENT_AUTO_APPROVE === '1';
+  const explicitlyApproved = options.callerApproved === true || process.env.MLX_AGENT_AUTO_APPROVE === '1';
   return {
     name: 'mlx-delegation',
     factory: (pi: ExtensionAPI) => {
@@ -58,7 +58,7 @@ export function createDelegationExtension(): InlineExtension {
         const permissions = caller
           ? `Tool execution inherits the calling Codex process's permissions (${caller.profile}).${caller.networkDisabled ? ' The caller disables network access.' : ''} Additional approval must be handled by the calling agent; this worker cannot request escalation.`
           : explicitlyApproved
-            ? 'The caller explicitly approved this worker tool execution. Stay within the task authorization.'
+            ? "The caller explicitly approved tool execution for this bounded task. Child processes inherit its OS sandbox, environment and credentials; this does not copy the calling agent's tool approval rules or grant additional access. Stay within the task authorization."
             : 'No inherited caller permission context is available. Tools requiring approval will stop this task and return a handoff.';
         return { systemPrompt: `${event.systemPrompt}\n\n${permissions}` };
       });
@@ -73,7 +73,10 @@ export function createDelegationExtension(): InlineExtension {
           return {
             block: true,
             terminate: true,
-            reason: stop(`No caller permission context is available to authorize ${event.toolName}.`, ctx),
+            reason: stop(
+              `No caller permission context is available to authorize ${event.toolName}. The calling agent can use --caller-approved after approving this bounded task.`,
+              ctx,
+            ),
           };
         }
         if (event.toolName === 'bash') {

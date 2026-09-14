@@ -36,7 +36,11 @@ describe('delegate shares agent startup', () => {
     await runAgent([...DELEGATE_DEFAULT_ARGS, ...args], agent.deps);
     await runDelegate(args, delegate.deps);
     expect(delegate.run).toHaveBeenCalledTimes(1);
-    expect(delegate.run.mock.calls[0]![0]).toEqual({ ...agent.run.mock.calls[0]![0], mode: 'delegate' });
+    expect(delegate.run.mock.calls[0]![0]).toEqual({
+      ...agent.run.mock.calls[0]![0],
+      mode: 'delegate',
+      delegateCallerApproved: false,
+    });
     expect(process.env.MLX_AGENT_AUTO_APPROVE).toBe(priorAutoApprove);
   });
 

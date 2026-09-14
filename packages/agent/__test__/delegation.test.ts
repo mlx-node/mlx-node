@@ -35,10 +35,10 @@ afterEach(() => {
   process.exitCode = previousExitCode;
 });
 
-function fixture() {
+function fixture(callerApproved = false) {
   const handlers = new Map<string, (event: never, ctx: ExtensionContext) => unknown>();
   const appendEntry = vi.fn();
-  const extension = createDelegationExtension();
+  const extension = createDelegationExtension({ callerApproved });
   if (typeof extension === 'function') throw new Error('Expected named extension');
   void extension.factory({
     on: (name: string, handler: (event: never, ctx: ExtensionContext) => unknown) => handlers.set(name, handler),
@@ -156,6 +156,15 @@ describe('delegate caller permissions', () => {
     vi.stubEnv('CODEX_PERMISSION_PROFILE', ':danger-full-access');
     vi.stubEnv('MLX_AGENT_AUTO_APPROVE', '1');
     expect(gate.toolCall('bash')).toMatchObject({ block: true });
+  });
+
+  it('accepts explicit caller approval without Codex metadata or changing the environment', () => {
+    const gate = fixture(true);
+    expect(gate.toolCall('bash')).toBeUndefined();
+    expect(process.env.CODEX_THREAD_ID).toBeUndefined();
+    expect(process.env.MLX_AGENT_AUTO_APPROVE).toBeUndefined();
+    expect(gate.start()).toMatchObject({ systemPrompt: expect.stringContaining('does not copy') });
+    expect(gate.toolCall('subagent')).toMatchObject({ block: true, terminate: true });
   });
 
   it('retains explicit caller approval but never enables recursive subagents', () => {

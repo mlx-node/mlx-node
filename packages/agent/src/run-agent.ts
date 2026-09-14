@@ -55,6 +55,8 @@ export interface AgentPagedConfigOverrides {
 export interface RunAgentOptions {
   /** Focused worker tools/permissions; inference and session defaults remain shared. */
   mode?: 'delegate';
+  /** Explicit approval supplied by the outer caller, captured before the worker starts. */
+  delegateCallerApproved?: boolean;
   /** Resolved models directory (context for callers/diagnostics — discovery already ran). */
   modelsDir: string;
   /** Discovered models to serve through the in-process `mlx` provider. */
@@ -148,7 +150,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
       extensionFactories: [
         createMlxProviderExtension(opts.models, modelHost),
         createLocalImageInputExtension(),
-        opts.mode === 'delegate' ? createDelegationExtension() : createPermissionGateExtension(),
+        opts.mode === 'delegate'
+          ? createDelegationExtension({ callerApproved: opts.delegateCallerApproved })
+          : createPermissionGateExtension(),
         ...(subagentsEnabled ? [createSubagentExtension()] : []),
         ...(opts.traceLogFile !== undefined ? [createTraceNoticeExtension(opts.traceLogFile)] : []),
         createTerminalTitleExtension(),

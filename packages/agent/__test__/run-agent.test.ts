@@ -74,6 +74,7 @@ describe('runAgent', () => {
   });
 
   afterEach(() => {
+    vi.unstubAllEnvs();
     for (const key of ENV_KEYS) {
       if (savedEnv[key] === undefined) delete process.env[key];
       else process.env[key] = savedEnv[key];
@@ -150,13 +151,16 @@ describe('runAgent', () => {
     ]);
   });
 
-  it('uses the delegate permission profile without an interactive gate or subagent tools', async () => {
+  it.each([false, true])('wires delegate caller approval into its permission profile (%s)', async (approved) => {
     const { main, calls } = makeSeam();
+    vi.stubEnv('CODEX_THREAD_ID', undefined);
+    vi.stubEnv('MLX_AGENT_AUTO_APPROVE', undefined);
     await runAgent({
       modelsDir: '/models',
       models: [FAKE_MODEL],
       argv: ['--print', 'Task'],
       mode: 'delegate',
+      delegateCallerApproved: approved,
       piImpl: piImpl(main),
     });
     const names = calls[0]!.extensionFactories.map((entry) =>
@@ -166,6 +170,16 @@ describe('runAgent', () => {
     expect(names).toContain('mlx-delegation');
     expect(names).not.toContain('mlx-permission-gate');
     expect(names).not.toContain('mlx-subagent');
+    const delegation = calls[0]!.extensionFactories.find(
+      (entry) => typeof entry !== 'function' && entry.name === 'mlx-delegation',
+    );
+    if (!delegation || typeof delegation === 'function') throw new Error('Missing delegate extension');
+    const on = vi.fn();
+    await delegation.factory({ on } as never);
+    const beforeStart = on.mock.calls.find(([name]) => name === 'before_agent_start')![1];
+    const prompt = beforeStart({ systemPrompt: 'Worker' }).systemPrompt;
+    // The explicit path must reach the worker even when no Codex metadata exists.
+    expect(prompt).toContain(approved ? 'caller explicitly approved' : 'No inherited caller');
   });
 
   it('adds a TUI trace notice only when the CLI supplies a log path', async () => {

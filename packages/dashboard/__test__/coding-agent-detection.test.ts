@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { DETECTION_INPUT_PREFIX, detectionMessage, detectionResult } from '../src/coding-agent-detection.js';
+import {
+  DETECTION_INPUT_PREFIX,
+  detectionMessage,
+  detectionResult,
+  commandSelectionSource,
+  commandSelectionResult,
+} from '../src/coding-agent-detection.js';
 
 const command = '/Users/test/.mlx-node/bin/mlx';
 
@@ -60,5 +66,60 @@ describe('model installation verdicts with source references', () => {
     expect(() => detectionResult({ status, startLine: 2, endLine: 2 }, 'First line.\n   \nThird line.')).toThrow(
       'verify its answer',
     );
+  });
+});
+
+describe('exact model-selected command spans', () => {
+  it('keeps inline preferences, CRLF and Unicode outside the selected command', () => {
+    const text =
+      "# Preferences\r\nKeep 🌲 patches small; for PRs use '/old mlx' delegate github --repo org/repo; keep tests fast.\r\n";
+    const source = { startLine: 2, endLine: 2 };
+    const selected = "'/old mlx' delegate github";
+    const span = commandSelectionResult({ text: selected, occurrence: 1 }, text, source);
+    expect(text.slice(span.start, span.end)).toBe(selected);
+    expect(text.slice(0, span.start)).toBe('# Preferences\r\nKeep 🌲 patches small; for PRs use ');
+    expect(text.slice(span.end)).toBe(' --repo org/repo; keep tests fast.\r\n');
+  });
+
+  it('selects a later occurrence without touching the earlier example', () => {
+    const text = 'Example: mlx delegate github. For CI, use mlx delegate github.';
+    const span = commandSelectionResult({ text: 'mlx delegate github', occurrence: 2 }, text, {
+      startLine: 1,
+      endLine: 1,
+    });
+    expect(span.start).toBe(text.lastIndexOf('mlx delegate github'));
+  });
+
+  it('selects an exact multiline command using original coordinates', () => {
+    const text = "Before.\nFor CI use '/old/mlx'\n delegate github. Keep tests.\nAfter.";
+    const source = { startLine: 2, endLine: 3 };
+    expect(commandSelectionSource(text, source)).toBe("For CI use '/old/mlx'\n delegate github. Keep tests.");
+    const selected = "'/old/mlx'\n delegate github";
+    const span = commandSelectionResult({ text: selected, occurrence: 1 }, text, source);
+    expect(text.slice(span.start, span.end)).toBe(selected);
+  });
+
+  it.each([
+    null,
+    {},
+    { text: '', occurrence: 0 },
+    { text: 'invented', occurrence: 1 },
+    { text: 'mlx delegate github', occurrence: 2 },
+    { text: 'mlx delegate github', occurrence: Number.MAX_SAFE_INTEGER },
+    { text: 'mlx delegate github', occurrence: '1' },
+    { text: 'mlx delegate github', occurrence: 0.5 },
+  ])('rejects unverifiable selections without editing: %j', (answer) => {
+    expect(() => commandSelectionResult(answer, 'Use mlx delegate github.', { startLine: 1, endLine: 1 })).toThrow(
+      'No changes were made',
+    );
+  });
+
+  it('cannot select matching text outside the model-selected lines', () => {
+    expect(() =>
+      commandSelectionResult({ text: 'mlx delegate github', occurrence: 1 }, 'Use mlx delegate github.\nKeep tests.', {
+        startLine: 2,
+        endLine: 2,
+      }),
+    ).toThrow('No changes were made');
   });
 });

@@ -12,7 +12,7 @@ describe('local delegation inference client', () => {
     const fetch = vi
       .fn()
       .mockResolvedValueOnce(Response.json({ data: [{ id: 'chosen' }] }))
-      .mockResolvedValueOnce(Response.json({ content: [{ type: 'text', text: '{"installed":false}' }] }));
+      .mockResolvedValueOnce(Response.json({ status: 'completed', output_text: '{"installed":false}' }));
     vi.stubGlobal('fetch', fetch);
     expect(await localCompletion(connection, 'Check', [{ role: 'user', content: 'Instructions' }])).toBe(
       '{"installed":false}',
@@ -20,7 +20,17 @@ describe('local delegation inference client', () => {
     const options = fetch.mock.calls[1][1];
     expect(options.headers['x-api-key']).toBe('private');
     expect(options.redirect).toBe('error');
-    expect(JSON.parse(options.body)).toMatchObject({ model: 'chosen', temperature: 0, stream: false });
+    expect(fetch.mock.calls[1][0].pathname).toBe('/v1/responses');
+    expect(JSON.parse(options.body)).toEqual({
+      model: 'chosen',
+      instructions: 'Check',
+      input: [{ role: 'user', content: 'Instructions' }],
+      max_output_tokens: 1024,
+      temperature: 0,
+      stream: false,
+      reasoning: { effort: 'none' },
+      store: false,
+    });
   });
 
   it('does not let an unknown model name fall back to a different loaded model', async () => {
@@ -45,10 +55,30 @@ describe('local delegation inference client', () => {
       vi
         .fn()
         .mockResolvedValueOnce(Response.json({ data: [{ id: 'chosen' }] }))
-        .mockResolvedValueOnce(Response.json({ content: [{ type: 'text', text: '{}' }], stop_reason: 'max_tokens' })),
+        .mockResolvedValueOnce(
+          Response.json({
+            status: 'incomplete',
+            output_text: '{}',
+            incomplete_details: { reason: 'max_output_tokens' },
+          }),
+        ),
     );
     await expect(localCompletion(connection, 'Check', [])).rejects.toThrow('output space');
   });
+
+  it.each(['incomplete', 'failed', undefined])(
+    'rejects a non-completed response even with usable-looking output: %s',
+    async (status) => {
+      vi.stubGlobal(
+        'fetch',
+        vi
+          .fn()
+          .mockResolvedValueOnce(Response.json({ data: [{ id: 'chosen' }] }))
+          .mockResolvedValueOnce(Response.json({ status, output_text: '{}' })),
+      );
+      await expect(localCompletion(connection, 'Check', [])).rejects.toThrow('did not complete');
+    },
+  );
 
   it('propagates cancellation while waiting for the model service', async () => {
     const controller = new AbortController();

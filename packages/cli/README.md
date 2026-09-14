@@ -28,7 +28,7 @@ npx @mlx-node/cli download model --model Qwen/Qwen3-0.6B
 ```bash
 mlx delegate 'Review this project and explain the next steps'
 mlx delegate --mode json 'Investigate the failing tests'
-mlx delegate github --repo owner/repo --pr 123 'Explain the failed checks with evidence'
+mlx delegate github --caller-approved --repo owner/repo --pr 123 'Explain the failed checks with evidence'
 ```
 
 Runs the same runtime as `mlx agent --print`, with the same local model selection,
@@ -72,8 +72,15 @@ Worker bash scripts use `set -e -o pipefail` so later commands or output pipelin
 cannot silently turn ordinary command failures into success.
 
 Outside a recognized Codex invocation, approval-requiring tools still need an
-explicit caller opt-in (`MLX_AGENT_AUTO_APPROVE=1`); otherwise they return an
-immediate handoff. Normal `mlx agent` permissions remain unchanged.
+explicit caller opt-in: pass `--caller-approved` after the calling agent approves
+this bounded task and its tool execution. The desktop installs this invocation for
+Claude Code, Codex, and Grok; existing directives without the flag are offered an
+update. This flag applies only to the current worker, does not set global approval
+variables, and does not copy another agent's tool approval rules or grant OS access.
+`--allow-write` is still required for authorized GitHub changes. Without a recognized
+caller or opt-in, the worker returns an immediate handoff. The existing explicit
+`MLX_AGENT_AUTO_APPROVE=1` opt-in remains supported. Normal `mlx agent` permissions
+remain unchanged.
 
 The desktop **Coding Agents** page can add the short routing instruction to a
 global agent file. Setup detects the prompt using the installed default model and

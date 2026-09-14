@@ -1,7 +1,13 @@
-import { describe, expect, it } from 'vite-plus/test';
+import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { scanAgentArgs, withDefaultModel } from '../src/commands/agent/index.js';
-import { DELEGATE_DEFAULT_ARGS, DELEGATE_SYSTEM_PROMPT, delegateAgentArgs } from '../src/commands/delegate.js';
+import {
+  DELEGATE_DEFAULT_ARGS,
+  DELEGATE_SYSTEM_PROMPT,
+  delegateAgentArgs,
+  parseDelegateArgs,
+  run,
+} from '../src/commands/delegate.js';
 
 describe('delegate agent arguments', () => {
   it('accepts a general prompt with normal agent options and stdin/file inputs', () => {
@@ -19,6 +25,50 @@ describe('delegate agent arguments', () => {
     ]) {
       expect(delegateAgentArgs(args)).toEqual(args);
     }
+  });
+
+  it.each([[], ['github', '--repo', 'owner/repo']])(
+    'captures approval separately from model arguments: %j',
+    (...prefix) => {
+      const { args, callerApproved } = parseDelegateArgs([...prefix, '--caller-approved', 'Check PR #148']);
+      expect(callerApproved).toBe(true);
+      expect(args).not.toContain('--caller-approved');
+      expect(args.at(-1)).toBe('Check PR #148');
+    },
+  );
+
+  it.each([
+    ['--system-prompt', '--caller-approved'],
+    ['github', '--append-system-prompt', '--caller-approved'],
+    ['github', '--', '--caller-approved'],
+    ['--models-dir', '--caller-approved'],
+    ['github', '--repo=owner/repo', 'The prompt contains --caller-approved'],
+  ])('does not authorize from an option value or prompt: %j', (...args) => {
+    expect(parseDelegateArgs(args).callerApproved).toBe(false);
+  });
+
+  it('rejects ambiguous approval values', () => {
+    expect(() => parseDelegateArgs(['github', '--caller-approved=false', 'Task'])).toThrow('takes no value');
+  });
+
+  it.each([false, true])('forwards approval only to the delegate runtime (%s)', async (approved) => {
+    const runAgent = vi.fn<NonNullable<import('../src/commands/agent/index.js').AgentRunDeps['runAgent']>>(
+      async () => {},
+    );
+    await run(['github', ...(approved ? ['--caller-approved'] : []), '--repo', 'owner/repo', 'Check PR #148'], {
+      resolveModelsDir: () => '/models',
+      discoverMlxModels: async () => [
+        { discovered: { name: 'local', path: '/models/local', modelType: 'qwen3' }, piModel: {} } as never,
+      ],
+      readPersistedDefault: () => ({ provider: 'mlx', modelId: 'local' }),
+      runAgent,
+    });
+    expect(runAgent).toHaveBeenCalledWith(
+      expect.objectContaining({ mode: 'delegate', delegateCallerApproved: approved }),
+    );
+    expect(runAgent.mock.calls[0]?.[0]).not.toEqual(
+      expect.objectContaining({ argv: expect.arrayContaining(['--caller-approved']) }),
+    );
   });
 
   it('uses a focused worker prompt with the installed GitHub context', () => {

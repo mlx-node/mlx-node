@@ -22,6 +22,9 @@ import {
   DETECTION_SYSTEM,
   detectionMessage,
   detectionResult,
+  COMMAND_SELECTION_SYSTEM,
+  commandSelectionSource,
+  commandSelectionResult,
 } from './coding-agent-detection.js';
 
 export type CodingAgentId = 'claude' | 'codex' | 'grok';
@@ -319,31 +322,51 @@ export class CodingAgentsService {
       // Older cached verdicts do not have a source reference. Recheck only when
       // an update needs that reference; ordinary cached status checks stay free.
       if (result.needsUpdate && !result.source) result = await classify(before);
-      let insertionLine: number | undefined;
+      const replacements: { start: number; end: number }[] = [];
       while (result.needsUpdate) {
-        // Remove every model-selected obsolete directive before inserting a
-        // replacement. Each pass removes nonempty source lines, so it must end.
-        const { source } = detectionResult({ status: 'needs-update', ...result.source }, after);
-        const start = source!.startLine - 1;
-        const count = source!.endLine - source!.startLine + 1;
-        insertionLine ??= start;
-        if (start < insertionLine) insertionLine -= Math.min(count, insertionLine - start);
-        const lines = after.split('\n');
-        lines.splice(start, count);
-        after = lines.join('\n');
-        // Edits shift line numbers; classify the reduced candidate afresh.
-        result = await classify(after);
-      }
-      if (!result.installed) {
-        // The model decides whether a current directive remains. Literal prompt
-        // presence could be a quoted example and cannot establish installation.
-        if (insertionLine !== undefined) {
-          const lines = after.split('\n');
-          lines.splice(insertionLine, 0, prompt);
-          after = lines.join('\n');
-        } else {
-          after = `${before}${before && !before.endsWith('\n') ? '\n' : ''}${before ? '\n' : ''}${prompt}\n`;
+        if (!result.source || replacements.length >= 64)
+          throw new Error('The local model could not finish updating the commands. No changes were made.');
+        connection ??= { ...(await this.options.connect()), model: state.model };
+        const replacement = `${delegationCommand(state.command)} delegate github --caller-approved`;
+        const answer = parseLocalJson(
+          await this.complete(
+            connection,
+            COMMAND_SELECTION_SYSTEM,
+            [
+              {
+                role: 'user',
+                content: JSON.stringify({
+                  currentCommand: replacement,
+                  source: commandSelectionSource(after, result.source),
+                }),
+              },
+            ],
+            this.abort.signal,
+            768,
+          ),
+        );
+        const span = commandSelectionResult(answer, after, result.source);
+        // Never re-edit generated text. A contradictory verdict must leave the
+        // original file untouched instead of causing a retry loop or duplication.
+        if (
+          after.slice(span.start, span.end) === replacement ||
+          replacements.some((old) => span.start < old.end && span.end > old.start)
+        )
+          throw new Error('The local model could not verify the updated command. No changes were made.');
+        after = after.slice(0, span.start) + replacement + after.slice(span.end);
+        const delta = replacement.length - (span.end - span.start);
+        for (const old of replacements) {
+          if (old.start >= span.end) {
+            old.start += delta;
+            old.end += delta;
+          }
         }
+        replacements.push({ start: span.start, end: span.start + replacement.length });
+        // Reclassify the complete candidate, including any remaining old routes.
+        result = await verify();
+      }
+      if (!result.installed && replacements.length === 0) {
+        after = `${before}${before && !before.endsWith('\n') ? '\n' : ''}${before ? '\n' : ''}${prompt}\n`;
         result = await verify();
       }
       // Every obsolete directive must be gone before touching user files.

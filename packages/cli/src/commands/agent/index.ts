@@ -719,7 +719,12 @@ async function runProductionWizard(modelsDir: string): Promise<void> {
   });
 }
 
-export async function run(argv: string[], deps: AgentRunDeps = {}, mode?: 'delegate'): Promise<void> {
+export async function run(
+  argv: string[],
+  deps: AgentRunDeps = {},
+  mode?: 'delegate',
+  delegateCallerApproved?: boolean,
+): Promise<void> {
   const scan = scanAgentArgs(argv);
 
   if (scan.update) {
@@ -825,6 +830,6 @@ export async function run(argv: string[], deps: AgentRunDeps = {}, mode?: 'deleg
     argv: agentArgv,
     traceLogFile,
     persistPagedCache: scan.persistPagedCache,
-    ...(mode ? { mode } : {}),
+    ...(mode ? { mode, delegateCallerApproved } : {}),
   });
 }

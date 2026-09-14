@@ -4,7 +4,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 export const DELEGATION_PROMPT =
-  'Delegate GitHub investigation to `mlx delegate github --repo OWNER/REPO "TASK"`. Include the PR, issue, or run number. Use its findings and evidence for implementation; request more detail when needed. Add `--allow-write` only for GitHub changes already authorized by the user. If delegation fails or reports incomplete work, continue from its handoff.';
+  'Delegate GitHub investigation to `mlx delegate github --caller-approved --repo OWNER/REPO "TASK"`. Approve the bounded task and its tool execution before invoking. Include the PR, issue, or run number. Use its findings and evidence for implementation; request more detail when needed. Add `--allow-write` only for GitHub changes already authorized by the user. If delegation fails or reports incomplete work, continue from its handoff.';
 
 /** Absolute paths avoid dependence on each coding agent's shell startup/PATH. */
 export function delegationCommand(path: string): string {
@@ -77,14 +77,17 @@ export async function localCompletion(
         'The default model is not available in the running service. Restart the local model service and try again.',
       );
     }
-    const response = await fetch(new URL('/v1/messages', url), {
+    const response = await fetch(new URL('/v1/responses', url), {
       method: 'POST',
       headers,
       body: JSON.stringify({
         model: connection.model,
-        system,
-        messages,
-        max_tokens: maxTokens,
+        instructions: system,
+        input: messages,
+        max_output_tokens: maxTokens,
+        // Setup checks need a short structured answer, not an agent reasoning turn.
+        reasoning: { effort: 'none' },
+        store: false,
         temperature: 0,
         stream: false,
       }),
@@ -92,14 +95,16 @@ export async function localCompletion(
       redirect: 'error',
     });
     if (!response.ok) throw new Error(`The local model could not complete the request (HTTP ${response.status}).`);
-    const body = (await response.json()) as { content?: { type: string; text?: string }[]; stop_reason?: string };
-    if (body.stop_reason === 'max_tokens')
+    const body = (await response.json()) as {
+      status?: string;
+      output_text?: string;
+      incomplete_details?: { reason?: string } | null;
+    };
+    if (body.incomplete_details?.reason === 'max_output_tokens')
       throw new Error('The local model ran out of output space. Try checking again.');
-    const text = body.content
-      ?.filter((block) => block.type === 'text')
-      .map((block) => block.text ?? '')
-      .join('\n')
-      .trim();
+    if (body.status !== 'completed')
+      throw new Error('The local model did not complete its answer. Try checking again.');
+    const text = body.output_text?.trim();
     if (!text) throw new Error('The local model returned no answer. Try checking again.');
     return text;
   } finally {

@@ -26,6 +26,8 @@ afterEach(() => {
 describe('delegate runtime permission handoff', () => {
   it.each([
     'missing-caller',
+    'caller-approved',
+    'caller-denied',
     'sandbox-denied',
     'pipeline-denied',
     'authorized',
@@ -34,11 +36,12 @@ describe('delegate runtime permission handoff', () => {
   ] as const)('handles %s in the real agent loop without permission retry turns', async (scenario) => {
     for (const name of ['CODEX_THREAD_ID', 'CODEX_PERMISSION_PROFILE', 'CODEX_SANDBOX', 'MLX_AGENT_AUTO_APPROVE'])
       vi.stubEnv(name, undefined);
-    if (scenario !== 'missing-caller') vi.stubEnv('CODEX_THREAD_ID', 'test-thread');
-    if (scenario !== 'missing-caller' && !scenario.startsWith('thread-id-')) {
+    const callerApproved = scenario.startsWith('caller-');
+    if (scenario !== 'missing-caller' && !callerApproved) vi.stubEnv('CODEX_THREAD_ID', 'test-thread');
+    if (scenario !== 'missing-caller' && !callerApproved && !scenario.startsWith('thread-id-')) {
       vi.stubEnv('CODEX_PERMISSION_PROFILE', ':workspace-write');
     }
-    const authorized = scenario === 'authorized' || scenario === 'thread-id-only';
+    const authorized = scenario === 'authorized' || scenario === 'thread-id-only' || scenario === 'caller-approved';
     vi.spyOn(process.stderr, 'write').mockImplementation(() => true);
     const root = await mkdtemp(join(tmpdir(), 'mlx-delegate-runtime-'));
     const command =
@@ -53,7 +56,7 @@ describe('delegate runtime permission handoff', () => {
       noContextFiles: true,
       noThemes: true,
       noPromptTemplates: true,
-      extensionFactories: [createDelegationExtension()],
+      extensionFactories: [createDelegationExtension({ callerApproved })],
     });
     let session: Awaited<ReturnType<typeof createAgentSession>>['session'] | undefined;
     try {
@@ -113,7 +116,7 @@ describe('delegate runtime permission handoff', () => {
       });
       const execute = vi.fn(async (id: string, args: { command: string }) => {
         if (scenario === 'pipeline-denied') return createBashTool(root).execute(id, args);
-        if (scenario === 'sandbox-denied' || scenario === 'thread-id-denied')
+        if (scenario === 'sandbox-denied' || scenario === 'thread-id-denied' || scenario === 'caller-denied')
           throw new Error('Network access was denied by the Codex sandbox network proxy.');
         return { content: [{ type: 'text' as const, text: 'All checks passed' }], details: {} };
       });

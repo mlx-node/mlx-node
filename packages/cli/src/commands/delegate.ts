@@ -23,8 +23,27 @@ export const DELEGATE_DEFAULT_ARGS = [
 ];
 
 /** Preserve the installed `delegate github` instruction without a second agent implementation. */
-export function delegateAgentArgs(argv: string[]): string[] {
-  let args = argv;
+export function parseDelegateArgs(argv: string[]): { args: string[]; callerApproved: boolean } {
+  let callerApproved = false;
+  let args: string[] = [];
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]!;
+    if (arg === '--') {
+      args.push(...argv.slice(i));
+      break;
+    }
+    // Consume values before recognizing the opt-in: prompt text cannot grant approval.
+    if (agentOptionConsumesNext(argv, i) || ['--models-dir', '--trace-dir', '--repo', '--pr'].includes(arg)) {
+      args.push(arg);
+      if (i + 1 < argv.length) args.push(argv[++i]!);
+    } else if (arg === '--caller-approved') {
+      callerApproved = true;
+    } else if (arg.startsWith('--caller-approved=')) {
+      throw new Error('--caller-approved takes no value. Omit it unless the caller approved this task.');
+    } else {
+      args.push(arg);
+    }
+  }
   if (args[0] === 'github') {
     const forwarded: string[] = [];
     let repository: string | undefined;
@@ -74,25 +93,32 @@ export function delegateAgentArgs(argv: string[]): string[] {
 
   const scan = scanAgentArgs(args);
   // Keep agent metadata and package commands working, including their normal exit/help behavior.
-  if (scan.help || scan.piOneShot || AGENT_COMMANDS.has(scan.passthrough[0] ?? '')) return args;
-  return [...DELEGATE_DEFAULT_ARGS, ...args];
+  if (scan.help || scan.piOneShot || AGENT_COMMANDS.has(scan.passthrough[0] ?? '')) return { args, callerApproved };
+  return { args: [...DELEGATE_DEFAULT_ARGS, ...args], callerApproved };
+}
+
+export function delegateAgentArgs(argv: string[]): string[] {
+  return parseDelegateArgs(argv).args;
 }
 
 export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void> {
-  const args = delegateAgentArgs(argv);
+  const { args, callerApproved } = parseDelegateArgs(argv);
   if (scanAgentArgs(args).help) {
-    console.log(`Usage: mlx delegate [agent options] 'PROMPT'
-       mlx delegate github [--repo OWNER/REPO] [--pr NUMBER] [--allow-write] [agent options] 'TASK'
+    console.log(`Usage: mlx delegate [--caller-approved] [agent options] 'PROMPT'
+       mlx delegate github [--repo OWNER/REPO] [--pr NUMBER] [--caller-approved] [--allow-write] [agent options] 'TASK'
 
 Uses the mlx agent runtime, model settings, session storage, cache and metrics.
 The worker has a focused prompt and read/bash tools, without local subagents,
 project instruction files or skills. Explicit agent prompt/tool options still apply.
 When launched by Codex, tools run inside the caller's inherited process sandbox
-without a second approval UI. Blocked operations return a handoff to the caller.
+without a second approval UI. For Claude Code, Grok, or another caller, pass
+--caller-approved only after approving the bounded task and its tool execution.
+This opt-in inherits OS restrictions; it does not copy the caller's tool approval
+rules or grant extra access. Blocked operations return a handoff to the caller.
 Use --mode json for the agent event stream, or --session to continue a saved task.
 The github form supplies task context; --allow-write does not grant sandbox access.
 
 All mlx agent options follow:`);
   }
-  await runAgent(args, deps, 'delegate');
+  await runAgent(args, deps, 'delegate', callerApproved);
 }
