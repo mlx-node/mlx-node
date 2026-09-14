@@ -17,6 +17,7 @@ describe('agent-installed eval oracle and execution', () => {
     expect(grade(current, 'installed')).toMatchObject({ evidence: false });
     const multiple = detectionCases.find((c) => c.id === 'two-obsolete-routes')!;
     expect(grade(multiple, 'needs-update', [2, 2])).toEqual({ verdict: true, evidence: true });
+    expect(grade(multiple, 'needs-update', [1, 2])).toEqual({ verdict: true, evidence: false });
   });
 
   it('keeps fixture IDs unique and source labels in the selected file, including overrides', () => {

@@ -69,6 +69,45 @@ export const detectionCases: readonly DetectionCase[] = [
       [2, 2],
     ],
   ),
+  // Source-selection regressions. Existing cases/labels above remain unchanged.
+  fixture(
+    'separated-obsolete-routes',
+    'source-selection',
+    `# GitHub\nFor PRs, invoke ${old}.\nKeep commits small.\nFor CI, run mlx delegate github.`,
+    'needs-update',
+    [[2, 2]],
+  ),
+  fixture(
+    'multiline-obsolete-before-single',
+    'source-selection',
+    `For GitHub PRs, invoke '/old app/mlx'\n  delegate github --caller-approved.\nFor CI, run mlx delegate github.`,
+    'needs-update',
+    [[1, 2]],
+  ),
+  fixture(
+    'single-obsolete-before-multiline',
+    'source-selection',
+    `For GitHub CI, run mlx delegate github.\nFor PRs, invoke '/old app/mlx'\n  delegate github --caller-approved.`,
+    'needs-update',
+    [[1, 1]],
+  ),
+  fixture('adjacent-current-directives', 'source-selection', `${route}\nFor GitHub CI, run ${current}.`, 'installed', [
+    [1, 1],
+  ]),
+  fixture(
+    'revoked-obsolete-before-two-active',
+    'source-selection',
+    `For GitHub issues, use mlx delegate github.\nThe preceding rule is revoked.\nFor PRs, invoke ${old}.\nFor CI, run '${command}' delegate github.`,
+    'needs-update',
+    [[3, 3]],
+  ),
+  fixture(
+    'current-before-two-obsolete',
+    'source-selection',
+    `${route}\nFor GitHub CI, run mlx delegate github.\nFor GitHub issues, invoke ${old}.`,
+    'needs-update',
+    [[2, 2]],
+  ),
   fixture('capability', 'negative', `The command ${current} can inspect GitHub CI failures.`, 'not-installed'),
   fixture(
     'tool-inventory',

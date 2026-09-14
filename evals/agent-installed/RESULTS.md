@@ -1,6 +1,26 @@
 # Recorded installation evaluations — 2026-09-14
 
-## App detector: medium thinking, 16,384 output tokens
+## App detector: one directive per source range
+
+The detector now assesses the complete file before choosing exactly one source directive. For `needs-update`, it selects the first active obsolete invocation; for `installed`, the first active current invocation. A range spans multiple lines only when that single directive spans multiple lines. A mixed-current/obsolete example reinforces the selection rule. The parser and strict grader are unchanged; prompt hashing invalidates earlier cached verdicts automatically.
+
+The final App eval passed **56/56 strict checks**: all original 50 cases with unchanged contents/labels, plus six source-selection regressions covering separated or adjacent directives, current/obsolete mixtures, revoked rules, and genuine multiline commands. The previously failing `two-obsolete-routes` returned `{"status":"needs-update","startLine":1,"endLine":1}`. Zero false installed answers, invalid source spans, JSON errors, or incomplete responses occurred.
+
+| Check                                    |              Result |
+| ---------------------------------------- | ------------------: |
+| Strict verdict + source + service checks |               56/56 |
+| Original cases / added regressions       |         50/50 / 6/6 |
+| Memory and disk verdict-cache reuse      |          56/56 each |
+| Content invalidation / forced recheck    |     Passed / passed |
+| Model calls                              |                  55 |
+| Model-call latency p50 / p95             |     12.1 s / 26.2 s |
+| Observed peak physical footprint / RSS   | 47.8 GiB / 22.2 GiB |
+
+This uses the same production App detector, local completion client and desktop sidecar as the initial run below, with the installed default Qwen3.8-27B MXFP4 model. All 55 HTTP calls confirmed medium thinking, the 16,384-token limit, nonzero reasoning tokens and 2,048-token prefill chunks. Calls used 12,135 reasoning tokens in total, with a maximum of 512 combined output tokens per response. The run was sequential, used fresh case state without conversation continuation, and stopped its sidecar on completion. No inference settings or allocator limits were changed.
+
+An initial targeted probe of the original failure and six new cases, repeated twice, passed 14/14 before final full-suite validation. Raw reports are retained in `.cache/agent-installed-eval/app-single-source-probe/` and `app-single-source-full/`, with per-run prompt/source hashes. The earlier failed run remains below. These reused synthetic cases are regression evidence, not an unseen production-accuracy estimate. The App eval tests detection/file/cache behavior through the Node sidecar transport, not Electron UI/IPC, installation writes, or live coding-agent instruction loading.
+
+## Initial App detector: medium thinking, 16,384 output tokens
 
 Actual `CodingAgentsService` → `localCompletion` → built desktop inference sidecar, supervised through the production Node fallback transport. Installed default `qwen3.8-27b-mxfp4-mlx`, Apple M5 Max with 128 GiB. The App policy uses medium thinking, a 16,384-token combined reasoning/output limit, temperature zero, and a ten-minute timeout. No allocator/cache overrides. The detector prompt and fixed labels were unchanged from the CLI evaluation below.
 
@@ -15,7 +35,7 @@ Actual `CodingAgentsService` → `localCompletion` → built desktop inference s
 | Model-call latency p50 / p95             |     12.4 s / 25.5 s |
 | Observed peak physical footprint / RSS   | 45.5 GiB / 22.1 GiB |
 
-The one strict failure is `two-obsolete-routes`. Both lines contain separate obsolete directives. The model correctly returned `needs-update`, but selected lines 1–2 instead of the smallest complete directive, line 1 or line 2. The original oracle rejects that broader span; the failed case remains in the denominator. There was no prompt retuning or label relaxation after this result.
+The one strict failure is `two-obsolete-routes`. Both lines contain separate obsolete directives. The model correctly returned `needs-update`, but selected lines 1–2 instead of the smallest complete directive, line 1 or line 2. The original oracle rejects that broader span; this historical result remains 49/50. The subsequent prompt fix and rerun are reported separately above; the case and its accepted ranges were not relaxed.
 
 All 49 HTTP requests completed with medium thinking, the 16,384-token cap, nonzero reasoning tokens, and the App's 2,048-token prefill chunks confirmed in usage. They generated 10,326 reasoning tokens in total; the largest response used 661 combined output tokens. Three empty/missing fixtures skipped inference, and the generated-prompt case added two calls for content invalidation and forced rechecking. Unchanged memory/disk cache checks made no additional model calls.
 

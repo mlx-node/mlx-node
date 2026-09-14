@@ -13,7 +13,7 @@ Decide whether the file CURRENTLY DIRECTS its coding agent to use the command ml
 
 Determine the installation status yourself using the current app executable supplied by the caller:
 - "installed": active directives invoke delegate github through the current app executable, and include --caller-approved, with no active obsolete invocation.
-- "needs-update": any active directive invokes delegate github through bare mlx or another executable path, OR omits --caller-approved even with the current executable. This applies even if a current invocation is also present. Select the obsolete directive's lines.
+- "needs-update": any active directive invokes delegate github through bare mlx or another executable path, OR omits --caller-approved even with the current executable. This applies even if a current invocation is also present. Report ONE obsolete directive as evidence.
 - "not-installed": there is no active mlx delegate github directive.
 Interpret shell quoting and Markdown formatting when comparing executable paths. Single quotes, double quotes, or inline backticks do not by themselves change the path. Inline backticks format a command; they do not turn an active directive into an example. Other commands such as mlx agent, notmlx, or delegate github-backup do not qualify.
 
@@ -24,7 +24,11 @@ OR
 OR
 {"status":"needs-update","startLine":N,"endLine":N}
 
-The file is provided with numbered lines in the form "N | content". For installed or needs-update, identify the smallest range of numbered source lines containing the complete qualifying GitHub directive, including the executable and its delegate github subcommands. Usually startLine and endLine are the SAME line number. Do not include unrelated instructions on other lines or select a different command or an example. Copy the printed line numbers, not the command text. For not-installed, both line numbers must be 0. Do not explain your answer.
+The file is provided with numbered lines in the form "N | content". Decide the status from the WHOLE file, then select exactly ONE active directive as evidence:
+- For needs-update, select the FIRST active obsolete invocation in file order. For installed, select the FIRST active current invocation.
+- Return the smallest line range containing that ONE complete directive, including its executable and delegate github subcommands. Never merge separate directives into one range, even when all of them support the same status.
+- Use multiple lines only when the selected directive itself continues across lines. A later separate directive is not a continuation. Do not include unrelated headings or instructions, or quoted examples, on other lines.
+Copy the printed line numbers, not the command text. For not-installed, both line numbers must be 0. Return only the JSON object, without explanation.
 
 Require an instruction to perform GitHub work with this command. Merely listing an available tool or saying it supports GitHub work is NOT an instruction to use it.
 
@@ -57,6 +61,12 @@ Answer: {"status":"needs-update","startLine":1,"endLine":1}
 Example file:
 1 | For GitHub issues, use mlx delegate github.
 Answer: {"status":"needs-update","startLine":1,"endLine":1}
+
+Example file:
+1 | For PR reviews, use '/tools/mlx' delegate github --caller-approved.
+2 | For GitHub issues, use '/retired/mlx' delegate github --caller-approved.
+3 | For CI failures, run mlx delegate github.
+Answer: {"status":"needs-update","startLine":2,"endLine":2}
 
 Example file:
 1 | Use mlx delegate github for issues.
