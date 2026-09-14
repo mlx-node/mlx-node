@@ -671,6 +671,36 @@ Like `mlx launch claude`, it applies the launcher engine policy (`MLX_PAGED_PREF
 
 Launches the same inference host as `mlx serve` and spawns Claude Code against it — the entry point for using MLX-Node as a Claude Code backend. Use `mlx serve` when you want the server without a Claude Code child (for example to point another client at it, or to reproduce a wedged sidecar in a terminal).
 
+## `mlx delegate`
+
+A focused local worker for bounded investigations. It shares the `mlx agent`
+model, session, cache and thinking settings, defaults to print mode, and uses
+read/bash tools without project instructions, skills or nested agents.
+
+```bash
+mlx delegate github --repo owner/repo 'Inspect PR #42. Return failed checks, exact head SHA and evidence URLs.'
+mlx delegate --session SESSION 'Which failure applies to the current head? Return its evidence only.'
+```
+
+Supply the PR, issue or run number, the requested fields, and any query budget
+or conditional steps. For a small status check, ask for only the exact values
+or compact JSON. The worker is instructed to return an already sufficient tool
+result directly, avoid repeated facts, and skip conditional comparisons when
+the SHAs match. These are model instructions, not enforced output limits;
+requested evidence, uncertainty and incomplete work still belong in the answer.
+
+Consume the final print-mode handoff once. While waiting, check process
+completion rather than loading the worker's transcript. `--mode json` exposes
+the full event stream for debugging; returning its reasoning and raw tool
+results to the caller can erase any token savings. Resolve a specific gap with
+a focused follow-up or the relevant evidence excerpt.
+
+Codex delegates inherit the caller's process sandbox. Other callers use
+`--caller-approved` after approving the bounded task and tool execution.
+`--allow-write` supplies authorization context for GitHub changes already
+approved in the task; neither flag grants extra sandbox access. Failed or
+incomplete work returns a handoff for the caller to continue.
+
 ## `mlx agent`
 
 A fully-local coding agent — MLX-Node's first all-in-one local agent. It embeds the [pi coding agent](https://www.npmjs.com/org/earendil-works) (`@earendil-works/*`) and serves every model turn through in-process `@mlx-node/lm` inference. There is no HTTP server, no external process, and no API keys: prompts, tools, and weights all stay on the machine. Requires Node.js ≥ 22.19.
