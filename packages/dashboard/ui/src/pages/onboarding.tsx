@@ -68,13 +68,18 @@ export default function Onboarding({
   const downloading = activeRepo !== undefined;
   const ready = selected?.present === true && !downloading;
   const error = catalog.error ?? models.error ?? downloadsError;
+  const modelsDir = models.data?.dir;
+  const canFinish = Boolean(modelsDir) && !models.loading && !models.refreshing && !models.error;
 
   useEffect(() => {
     if (activeRepo) setSelectedRepo(activeRepo);
   }, [activeRepo]);
 
   const finish = (to: string): void => {
-    if (models.data?.dir) dismissOnboarding(models.data.dir);
+    // The root route checks dismissal for this library. Leaving before its
+    // identity is known would lose the skip and immediately reopen onboarding.
+    if (!canFinish || !modelsDir) return;
+    dismissOnboarding(modelsDir);
     void navigate(to, { replace: true });
   };
 
@@ -84,21 +89,19 @@ export default function Onboarding({
       <main className="onboarding-scroll overflow-y-auto">
         <div className="onboarding-wrap">
           <header className="onboarding-header">
-            <a
-              href="/"
-              onClick={(event) => {
-                event.preventDefault();
-                finish('/');
-              }}
-              className="onboarding-brand"
+            <button
+              type="button"
+              disabled={!canFinish}
+              onClick={() => finish('/')}
+              className="onboarding-brand disabled:cursor-default disabled:opacity-60"
               aria-label="mlx-node home"
             >
               <span className="bg-brand-gradient text-primary-foreground flex size-9 items-center justify-center rounded-xl">
                 <Boxes className="size-5" aria-hidden />
               </span>
               mlx-node
-            </a>
-            <Button variant="ghost" className="text-muted-foreground" onClick={() => finish('/')}>
+            </button>
+            <Button variant="ghost" className="text-muted-foreground" disabled={!canFinish} onClick={() => finish('/')}>
               {downloading ? 'Explore while downloading' : 'Set up later'} <ArrowRight className="size-4" aria-hidden />
             </Button>
           </header>
@@ -285,14 +288,14 @@ export default function Onboarding({
             </div>
             <div className="onboarding-download-action">
               {ready ? (
-                <Button className="w-full" onClick={() => finish('/coding-agents')}>
+                <Button className="w-full" disabled={!canFinish} onClick={() => finish('/coding-agents')}>
                   Set up coding agents <ArrowRight className="size-4" aria-hidden />
                 </Button>
               ) : (
                 renderDownload(selected)
               )}
               {ready ? (
-                <button className="onboarding-text-link" onClick={() => finish('/')}>
+                <button className="onboarding-text-link" disabled={!canFinish} onClick={() => finish('/')}>
                   Go to overview
                 </button>
               ) : (

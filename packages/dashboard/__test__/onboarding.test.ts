@@ -113,6 +113,64 @@ describe('first model onboarding', () => {
     expect(window.location.pathname).toBe('/welcome');
   });
 
+  it.each(['Set up later', 'Explore while downloading', 'mlx-node home'])(
+    'waits for the library before allowing %s from a direct welcome visit',
+    async (action) => {
+      const dir = `/test/delayed-library/${action}`;
+      const library = deferred(routes(dir)['/models']);
+      window.history.replaceState({}, '', '/welcome');
+      dispose = stubApi({
+        ...routes(dir),
+        '/models': library.body,
+        ...(action === 'Explore while downloading'
+          ? { '/downloads': { jobs: [{ id: 'ongoing', repo: visible[0].hfRepo, state: 'running' }] } }
+          : {}),
+      });
+      page = await renderPage(createElement(App), (text) => text.includes('YOUR LOCAL AI STARTS HERE'));
+      const control = () =>
+        action === 'mlx-node home'
+          ? page!.container.querySelector<HTMLButtonElement>('[aria-label="mlx-node home"]')!
+          : button(action);
+      await waitFor(() => expect(control().disabled).toBe(true));
+      await act(async () => control().click());
+      expect(window.location.pathname).toBe('/welcome');
+
+      await act(async () => library.release());
+      await waitFor(() => expect(control().disabled).toBe(false));
+      await act(async () => control().click());
+      await waitFor(() => expect(window.location.pathname).toBe('/'));
+      expect(localStorage.getItem(`mlx-node:onboarding:v1:${dir}`)).toBe('done');
+
+      page.unmount();
+      page = await renderPage(createElement(App), (text) => text.includes('Overview'));
+      expect(window.location.pathname).toBe('/');
+    },
+  );
+
+  it('keeps exits disabled after a library failure until retry identifies the library', async () => {
+    const dir = '/test/retry-library';
+    const library = deferred(routes(dir)['/models']);
+    window.history.replaceState({}, '', '/welcome');
+    dispose = stubApi({ ...routes(dir), '/models': sequence(STUB_FAILURE, library.body) });
+    page = await renderPage(createElement(App), (text) => text.includes('Try again'));
+    const home = page.container.querySelector<HTMLButtonElement>('[aria-label="mlx-node home"]')!;
+    expect(button('Set up later').disabled).toBe(true);
+    expect(home.disabled).toBe(true);
+    await act(async () => {
+      button('Set up later').click();
+      home.click();
+    });
+    expect(window.location.pathname).toBe('/welcome');
+
+    await act(async () => button('Try again').click());
+    expect(button('Set up later').disabled).toBe(true);
+    await act(async () => library.release());
+    await waitFor(() => expect(button('Set up later').disabled).toBe(false));
+    await act(async () => button('Set up later').click());
+    await waitFor(() => expect(window.location.pathname).toBe('/'));
+    expect(localStorage.getItem(`mlx-node:onboarding:v1:${dir}`)).toBe('done');
+  });
+
   it('keeps deliberate workspace navigation out of the first-launch redirect', async () => {
     window.history.replaceState({}, '', '/models');
     dispose = stubApi(routes('/test/direct-models'));
