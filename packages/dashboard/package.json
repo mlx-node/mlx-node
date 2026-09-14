@@ -27,7 +27,8 @@
     "@huggingface/hub": "^2.16.1",
     "@mlx-node/agent": "workspace:*",
     "@mlx-node/lm": "workspace:*",
-    "drizzle-orm": "1.0.0-rc.4"
+    "drizzle-orm": "1.0.0-rc.4",
+    "gpt-tokenizer": "4.0.0"
   },
   "devDependencies": {
     "@radix-ui/react-dialog": "^1.1.23",

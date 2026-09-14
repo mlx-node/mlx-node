@@ -210,7 +210,7 @@ describe('dashboard db', () => {
     const seed = openDashboardDb(file);
     seed.close();
     const bump = new DatabaseSync(file);
-    bump.exec('PRAGMA user_version = 6;'); // > SCHEMA_VERSION (5)
+    bump.exec('PRAGMA user_version = 7;'); // > SCHEMA_VERSION (6)
     bump.close();
 
     const dash = openDashboardDb(file);
@@ -254,7 +254,7 @@ describe('dashboard db', () => {
         fixtureTable('trace_files', traceFiles),
       ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 5;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 6;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces.source_file']);
 
@@ -291,7 +291,7 @@ describe('dashboard db', () => {
         fixtureTable('trace_files', traceFiles),
       ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 5;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 6;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['turns']);
 
@@ -324,7 +324,7 @@ describe('dashboard db', () => {
         fixtureTable('trace_files', traceFiles),
       ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 5;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 6;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['sessions.name']);
 
@@ -375,7 +375,7 @@ describe('dashboard db', () => {
         `CREATE VIEW turns AS SELECT ${columnNames(turns).join(', ')} FROM turns_backing;`,
       ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 5;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 6;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['turns']);
 
@@ -413,7 +413,7 @@ describe('dashboard db', () => {
         `CREATE VIRTUAL TABLE turns USING fts5(${columnNames(turns).join(', ')});`,
       ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 5;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 6;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['turns']);
 
@@ -449,7 +449,7 @@ describe('dashboard db', () => {
         fixtureTable('trace_files', traceFiles),
       ].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 5;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 6;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['traces.queue_ms', 'traces.resident']);
 
@@ -495,7 +495,7 @@ describe('dashboard db', () => {
     raw.exec(
       [fixtureTable('sessions', sessions), fixtureTable('turns', turns), fixtureTable('traces', traces)].join('\n'),
     );
-    raw.exec('PRAGMA user_version = 5;'); // matches SCHEMA_VERSION → version check passes
+    raw.exec('PRAGMA user_version = 6;'); // matches SCHEMA_VERSION → version check passes
     raw.close();
     expectFixtureGaps(file, ['trace_files']);
 
@@ -558,7 +558,7 @@ describe('dashboard db', () => {
       );`,
     );
     raw.exec("INSERT INTO traces (trace_id, ts, cold_hits) VALUES ('legacy-1', 1, 7);");
-    raw.exec('PRAGMA user_version = 2;'); // three SCHEMA_VERSIONs back
+    raw.exec('PRAGMA user_version = 2;'); // four SCHEMA_VERSIONs back
     raw.close();
 
     // Opening does not throw and does not wedge: quarantine + rebuild.
@@ -633,7 +633,7 @@ describe('dashboard db', () => {
     // live schema via `fixtureTable`, so a new column lands in all of them at
     // once and each keeps exactly the one gap `expectFixtureGaps` pins.
     const uv = first.sqlite.prepare('PRAGMA user_version').get() as { user_version: number };
-    expect(uv.user_version).toBe(5);
+    expect(uv.user_version).toBe(6);
     first.close();
 
     // Reopening the rebuilt file validates in place: no second quarantine.

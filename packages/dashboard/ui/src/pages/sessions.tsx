@@ -1,3 +1,4 @@
+import { DelegationIndicator } from '@/components/delegation-summary';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -404,6 +405,7 @@ function SessionTableRow({ session, onRename, onDelete }: SessionTableRowProps) 
         >
           {sessionTitle(session)}
         </Link>
+        {session.delegation && <DelegationIndicator summary={session.delegation} />}
       </TableCell>
       <TableCell className="text-muted-foreground hidden xl:table-cell">
         <span className="block truncate font-mono text-xs" title={session.cwd}>

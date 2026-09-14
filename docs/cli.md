@@ -701,6 +701,16 @@ Codex delegates inherit the caller's process sandbox. Other callers use
 approved in the task; neither flag grants extra sandbox access. Failed or
 incomplete work returns a handoff for the caller to continue.
 
+The dashboard labels recorded delegate invocations with a **Delegate** badge.
+Session rows show estimated tokens saved, or extra tokens when the handoff is
+larger. The detail page shows the evidence and handoff counts and their ratio.
+These compare unique successful tool-result text with the final handoff using
+the fixed `o200k_base` tokenizer. They exclude tool errors, caller invocation
+costs, reasoning, and transcript rereads, so they measure evidence compression
+and do not establish total coding-agent savings. Incomplete or non-text runs
+show an unavailable estimate. Older sessions without delegate metadata remain
+unclassified; titles are not used to infer their origin.
+
 ## `mlx agent`
 
 A fully-local coding agent — MLX-Node's first all-in-one local agent. It embeds the [pi coding agent](https://www.npmjs.com/org/earendil-works) (`@earendil-works/*`) and serves every model turn through in-process `@mlx-node/lm` inference. There is no HTTP server, no external process, and no API keys: prompts, tools, and weights all stay on the machine. Requires Node.js ≥ 22.19.

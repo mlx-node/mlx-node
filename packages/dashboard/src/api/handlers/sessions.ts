@@ -5,6 +5,7 @@ import { SessionManager, parseSessionEntries, type FileEntry } from '@earendil-w
 import { eq } from 'drizzle-orm';
 
 import { sessions, turns } from '../../db/schema.js';
+import { deriveDelegation, type DelegationSummary } from '../../ingest/delegation.js';
 import {
   activeBranchEntries,
   classifySessionFile,
@@ -12,7 +13,7 @@ import {
   findSessionHeader,
   isValidSessionTopology,
   lastLineParses,
-  readSessionEntries,
+  readSessionSnapshot,
   verifySessionFileId,
 } from '../../ingest/sessions.js';
 import type { ApiPaths, ApiRequest, WorkerApiContext } from '../context.js';
@@ -77,7 +78,7 @@ export function handleSessionsList(ctx: WorkerApiContext, req: ApiRequest): unkn
   const matchedIds = `SELECT s.id FROM sessions s ${whereSql}`;
   const sql = `
     SELECT s.id, s.path, s.cwd, s.name, s.created, s.modified,
-           s.message_count AS messageCount, s.first_message AS firstMessage,
+           s.message_count AS messageCount, s.first_message AS firstMessage, s.delegation,
            (SELECT group_concat(DISTINCT t.model) FROM turns t
               WHERE t.session_id = s.id AND t.model IS NOT NULL) AS models,
            (SELECT COALESCE(SUM(t.input_tokens), 0) FROM turns t WHERE t.session_id = s.id) AS inputTokens,
@@ -179,6 +180,7 @@ export function handleSessionsList(ctx: WorkerApiContext, req: ApiRequest): unkn
     models: typeof row.models === 'string' && row.models !== '' ? row.models.split(',') : [],
     inputTokens: toInt(row.inputTokens),
     outputTokens: toInt(row.outputTokens),
+    delegation: typeof row.delegation === 'string' ? JSON.parse(row.delegation) : null,
   }));
   return { sessions: list, total, tokens, cwds };
 }
@@ -246,13 +248,19 @@ export async function handleSessionDetail(ctx: WorkerApiContext, req: ApiRequest
   let entries: FileEntry[] | null = null;
   let transcript: TranscriptEntry[] = [];
   let transcriptError: string | undefined;
+  let completeFile = false;
+  let delegation: DelegationSummary | null = row.delegation
+    ? { status: 'unavailable', reason: 'partial-record' }
+    : null;
   try {
     // Read-only, byte-for-byte the way ingest reads a session (parse + in-memory
     // v1→v3 migrate, never a rewrite). `SessionManager.open` opens the file for
     // write and migrates on construction, so a plain GET of a v1 or partially
     // corrupt session would persist the migration and permanently drop malformed
     // lines — a read must never mutate the source of truth.
-    entries = readSessionEntries(row.path);
+    const snapshot = readSessionSnapshot(row.path);
+    entries = snapshot.entries;
+    completeFile = snapshot.complete;
   } catch (err) {
     transcriptError = err instanceof Error ? err.message : String(err);
   }
@@ -301,6 +309,7 @@ export async function handleSessionDetail(ctx: WorkerApiContext, req: ApiRequest
       // which the index derives from this same chain without sorting. `ts` is for
       // display only.
       const branch = activeBranchEntries(entries);
+      delegation = deriveDelegation(entries, branch.at(-1)?.id, row.id, completeFile);
       const callArgs = collectCallArgs(branch);
       transcript = branch.map((entry) => mapTranscriptEntry(entry, callArgs)).filter(isMessage);
     }
@@ -315,6 +324,7 @@ export async function handleSessionDetail(ctx: WorkerApiContext, req: ApiRequest
       modified: row.modified,
       messageCount: row.messageCount,
       firstMessage: row.firstMessage,
+      delegation,
     },
     transcript,
     ...(transcriptError !== undefined ? { transcriptError } : {}),

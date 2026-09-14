@@ -18,7 +18,7 @@ export interface DashboardDb {
  * rather than migrated in place. The index is disposable and repopulated from
  * JSONL on boot, so a rebuild never loses source-of-truth data.
  */
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS sessions (
@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   modified INTEGER NOT NULL,
   message_count INTEGER NOT NULL DEFAULT 0,
   first_message TEXT,
+  delegation TEXT,
   last_ingested_mtime INTEGER NOT NULL DEFAULT 0,
   last_ingested_size INTEGER NOT NULL DEFAULT 0
 );

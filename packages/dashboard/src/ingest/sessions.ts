@@ -16,6 +16,7 @@ import { and, eq, ne } from 'drizzle-orm';
 import type { DashboardDb } from '../db/open.js';
 import { sessions, turns } from '../db/schema.js';
 import { agentSessionsRoot } from '../paths.js';
+import { deriveDelegation, type DelegationSummary } from './delegation.js';
 
 export interface SessionIngestResult {
   scanned: number;
@@ -81,6 +82,7 @@ interface DerivedSession {
   messageCount: number;
   firstMessage: string | null;
   turnRows: TurnRow[];
+  delegation: DelegationSummary | null;
 }
 
 /**
@@ -206,7 +208,7 @@ export function isValidSessionTopology(entries: FileEntry[]): boolean {
 }
 
 /** Fold parsed file entries into the row shapes the index stores. Returns null when unusable. */
-function deriveSession(entries: FileEntry[]): DerivedSession | null {
+function deriveSession(entries: FileEntry[], completeFile: boolean): DerivedSession | null {
   const header = entries.find((e) => e.type === 'session') as SessionHeader | undefined;
   if (!header || typeof header.id !== 'string') return null;
 
@@ -226,7 +228,8 @@ function deriveSession(entries: FileEntry[]): DerivedSession | null {
   let firstMessage: string | null = null;
   let messageCount = 0;
   const turnRows: TurnRow[] = [];
-  for (const entry of activeBranchEntries(entries)) {
+  const branch = activeBranchEntries(entries);
+  for (const entry of branch) {
     if (entry.type !== 'message') continue;
     messageCount++;
     const msg = (entry as SessionMessageEntry).message as unknown as ParsedMessage;
@@ -256,6 +259,7 @@ function deriveSession(entries: FileEntry[]): DerivedSession | null {
     messageCount,
     firstMessage,
     turnRows,
+    delegation: deriveDelegation(entries, branch.at(-1)?.id, header.id, completeFile),
   };
 }
 
@@ -299,10 +303,15 @@ export function lastLineParses(raw: string): boolean {
  * surfacing a raw TypeError as the transcript error.
  */
 export function readSessionEntries(path: string): FileEntry[] {
+  return readSessionSnapshot(path).entries;
+}
+
+/** Parse one read, so completeness and metrics describe the same file snapshot. */
+export function readSessionSnapshot(path: string): { entries: FileEntry[]; complete: boolean } {
   const raw = readFileSync(path, 'utf8');
   const entries = parseSessionEntries(raw);
   if (hasOnlyObjectRecords(entries)) migrateSessionEntries(entries);
-  return entries;
+  return { entries, complete: countJsonlLines(raw) === entries.length };
 }
 
 /**
@@ -532,7 +541,7 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
         continue;
       }
 
-      const derived = deriveSession(entries);
+      const derived = deriveSession(entries, countJsonlLines(raw) === entries.length);
       if (!derived) {
         warnings.push(`${filePath}: no valid session header`);
         if (quarantinePath(filePath)) removed++;
@@ -594,6 +603,7 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
             modified: mtime,
             messageCount: derived.messageCount,
             firstMessage: derived.firstMessage,
+            delegation: derived.delegation,
             lastIngestedMtime: complete ? mtime : 0,
             lastIngestedSize: complete ? size : 0,
           })

@@ -118,6 +118,7 @@ export interface SessionRow {
   models: string[];
   inputTokens: number;
   outputTokens: number;
+  delegation?: DelegationSummary | null;
 }
 
 export interface SessionsResponse {
@@ -381,6 +382,21 @@ export interface TranscriptEntry {
   title?: string;
 }
 
+/** Fixed-tokenizer evidence compression, not measured caller/account savings. */
+export type DelegationSummary =
+  | {
+      status: 'complete';
+      tokenizer: 'o200k_base';
+      evidenceTokens: number;
+      handoffTokens: number;
+      savedTokens: number;
+      savingsRatio: number;
+    }
+  | {
+      status: 'incomplete' | 'unavailable';
+      reason: 'no-final-handoff' | 'no-evidence' | 'unsupported-content' | 'legacy' | 'partial-record';
+    };
+
 export interface SessionSummary {
   id: string;
   path: string;
@@ -390,6 +406,7 @@ export interface SessionSummary {
   modified: number;
   messageCount: number;
   firstMessage: string | null;
+  delegation?: DelegationSummary | null;
 }
 
 export interface SessionDetailResponse {

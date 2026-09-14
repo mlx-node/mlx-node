@@ -53,8 +53,11 @@ export function createDelegationExtension(options: { callerApproved?: boolean } 
         return handoff;
       };
 
-      pi.on('before_agent_start', (event) => {
+      pi.on('before_agent_start', (event, ctx) => {
         handoff = undefined;
+        // A boundary per invocation keeps ordinary history/resumes out of the
+        // delegate estimate. Custom entries are persisted, never model context.
+        pi.appendEntry('mlx-delegate-session', { version: 1, sessionId: ctx.sessionManager.getSessionId() });
         const permissions = caller
           ? `Tool execution inherits the calling Codex process's permissions (${caller.profile}).${caller.networkDisabled ? ' The caller disables network access.' : ''} Additional approval must be handled by the calling agent; this worker cannot request escalation.`
           : explicitlyApproved

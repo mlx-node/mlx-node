@@ -1601,6 +1601,7 @@ __metadata:
     class-variance-authority: "npm:^0.7.1"
     clsx: "npm:^2.1.1"
     drizzle-orm: "npm:1.0.0-rc.4"
+    gpt-tokenizer: "npm:4.0.0"
     happy-dom: "npm:20.12.0"
     lucide-react: "npm:^1.38.0"
     react: "npm:^19.2.8"
@@ -7593,6 +7594,13 @@ __metadata:
     p-cancelable: "npm:^2.0.0"
     responselike: "npm:^2.0.0"
   checksum: 10c0/754dd44877e5cf6183f1e989ff01c648d9a4719e357457bd4c78943911168881f1cfb7b2cb15d885e2105b3ad313adb8f017a67265dd7ade771afdb261ee8cb1
+  languageName: node
+  linkType: hard
+
+"gpt-tokenizer@npm:4.0.0":
+  version: 4.0.0
+  resolution: "gpt-tokenizer@npm:4.0.0"
+  checksum: 10c0/2a58a17237f6e4b1f65d28920c975d17e7e7faf0bf3e3f97abe59fcfa9b8362462a9587d4eb45d68227b945726e0efbdf81f2c3e1d5b2927afe22fc0b67cc469
   languageName: node
   linkType: hard
 

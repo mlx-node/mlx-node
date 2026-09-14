@@ -1,5 +1,7 @@
 import { integer, real, sqliteTable, text } from 'drizzle-orm/sqlite-core';
 
+import type { DelegationSummary } from '../ingest/delegation.js';
+
 export const sessions = sqliteTable('sessions', {
   id: text('id').primaryKey(),
   path: text('path').notNull(),
@@ -9,6 +11,7 @@ export const sessions = sqliteTable('sessions', {
   modified: integer('modified').notNull(),
   messageCount: integer('message_count').notNull().default(0),
   firstMessage: text('first_message'),
+  delegation: text('delegation', { mode: 'json' }).$type<DelegationSummary>(),
   lastIngestedMtime: integer('last_ingested_mtime').notNull().default(0),
   lastIngestedSize: integer('last_ingested_size').notNull().default(0),
 });

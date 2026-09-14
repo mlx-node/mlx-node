@@ -47,7 +47,7 @@ function fixture(callerApproved = false) {
   const abort = vi.fn();
   const ctx = {
     abort,
-    sessionManager: { getSessionFile: () => '/sessions/delegated-task.jsonl' },
+    sessionManager: { getSessionFile: () => '/sessions/delegated-task.jsonl', getSessionId: () => 'delegated-task' },
   } as unknown as ExtensionContext;
   return {
     abort,
@@ -75,6 +75,16 @@ function fixture(callerApproved = false) {
 }
 
 describe('delegate caller permissions', () => {
+  it('persists a delegate boundary for each invocation without adding it to the model prompt', () => {
+    const gate = fixture();
+    const result = gate.start();
+    gate.start();
+    expect(gate.appendEntry.mock.calls).toEqual([
+      ['mlx-delegate-session', { version: 1, sessionId: 'delegated-task' }],
+      ['mlx-delegate-session', { version: 1, sessionId: 'delegated-task' }],
+    ]);
+    expect(JSON.stringify(result)).not.toContain('mlx-delegate-session');
+  });
   it.each([':danger-full-access', ':workspace-write', ':read-only', 'custom-network-policy'])(
     'preserves the opaque active Codex profile %s without elevating it',
     (profile) => {

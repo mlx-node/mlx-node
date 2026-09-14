@@ -1,3 +1,4 @@
+import { DelegateBadge, DelegationSavingsCard } from '@/components/delegation-summary';
 import { Transcript } from '@/components/transcript';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
@@ -190,8 +191,9 @@ export default function SessionDetail() {
                 <span aria-hidden>·</span>
                 <span>Created {formatDateTime(session.created)}</span>
               </div>
-              {models.length > 0 && (
+              {(models.length > 0 || session.delegation) && (
                 <div className="flex flex-wrap items-center gap-1">
+                  {session.delegation && <DelegateBadge />}
                   {models.map((model) => (
                     <Badge key={model} variant="secondary" className="font-normal">
                       {model}
@@ -205,6 +207,8 @@ export default function SessionDetail() {
               Copy resume command
             </Button>
           </div>
+
+          {session.delegation && <DelegationSavingsCard summary={session.delegation} />}
 
           {!metrics.loading && !metrics.error && turns.length > 0 && (
             <div className="flex flex-wrap gap-2">
