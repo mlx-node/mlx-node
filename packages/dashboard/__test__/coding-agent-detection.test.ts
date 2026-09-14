@@ -1,90 +1,61 @@
-import { delegationCommand } from '@mlx-node/agent/delegate';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { DETECTION_INPUT_PREFIX, detectionMessage, detectionResult } from '../src/coding-agent-detection.js';
 
 const command = '/Users/test/.mlx-node/bin/mlx';
-const yes = { installed: true, startLine: 1, endLine: 1 };
 
-describe('installation evidence selected by source line', () => {
-  it('numbers the original text without JSON escaping quotes or treating embedded line numbers as metadata', () => {
+describe('model installation verdicts with source references', () => {
+  it('supplies the current executable separately from the numbered original file', () => {
     const text = `# Preferences\n\n99 | Run '${command}' delegate github --repo org/repo "TASK".\n`;
-    expect(detectionMessage(text)).toBe(
-      DETECTION_INPUT_PREFIX +
+    expect(detectionMessage(text, command)).toBe(
+      `Current app executable: ${JSON.stringify(command)}\n` +
+        DETECTION_INPUT_PREFIX +
         `1 | # Preferences\n2 | \n3 | 99 | Run '${command}' delegate github --repo org/repo "TASK".\n4 | `,
     );
   });
 
+  it('keeps spaces and quotes in the caller-provided executable', () => {
+    const path = '/Users/Test "Work"/bin/mlx';
+    expect(detectionMessage('Use the delegation tool.', path).split('\n')[0]).toBe(
+      `Current app executable: ${JSON.stringify(path)}`,
+    );
+  });
+
   it.each([
-    [command, `'${command}'`],
-    [command, `"${command}"`],
-    [command, command],
-    ['/Users/Test User/bin/mlx', "'/Users/Test User/bin/mlx'"],
-    ["/Users/O'Brien/bin/mlx", delegationCommand("/Users/O'Brien/bin/mlx")],
-  ])('uses the original command quoting for %s', (path, spelling) => {
-    expect(detectionResult(yes, `For CI, run ${spelling} delegate github.`, path)).toEqual({
-      installed: true,
+    ['installed', { installed: true, needsUpdate: false }],
+    ['needs-update', { installed: false, needsUpdate: true }],
+  ] as const)('honors the model status %s without reclassifying command formatting', (status, expected) => {
+    // Markdown emphasis and line breaks used to be rejected by the command regex.
+    const text = `# Routing\nFor GitHub work, use **${command}**\nwith the delegate github subcommands.`;
+    expect(detectionResult({ status, startLine: 2, endLine: 3 }, text)).toEqual(expected);
+  });
+
+  it('accepts an explicit negative verdict without evidence', () => {
+    expect(detectionResult({ status: 'not-installed', startLine: 0, endLine: 0 }, 'Use gh directly.')).toEqual({
+      installed: false,
       needsUpdate: false,
     });
-  });
-
-  it.each(['.', ',', ';', ':', '!', '?', '', '`', ' --repo org/repo'])(
-    'accepts a complete command followed by %j',
-    (suffix) => {
-      expect(detectionResult(yes, `Use '${command}' delegate github${suffix}`, command).installed).toBe(true);
-    },
-  );
-
-  it('reads a range from the original file and ignores a different command elsewhere in the file', () => {
-    const text = `Old example: '${command}' delegate github.\nUse '/old/bin/mlx'\n  delegate github for CI.`;
-    expect(detectionResult({ installed: true, startLine: 2, endLine: 3 }, text, command)).toEqual({
-      installed: false,
-      needsUpdate: true,
-    });
-  });
-
-  it.each([
-    'mlx',
-    '/old/bin/mlx',
-    "'/old path/bin/mlx'",
-    '"/old path/bin/mlx"',
-    delegationCommand("/Users/O'Brien/bin/mlx"),
-  ])('recognizes an active older executable %s', (spelling) => {
-    expect(detectionResult(yes, `Use ${spelling} delegate github.`, command)).toEqual({
-      installed: false,
-      needsUpdate: true,
-    });
-  });
-
-  it.each([
-    `Use '${command}' agent --print.`,
-    `Use '${command}' delegate github-backup.`,
-    `Use '${command}' delegate github.json.`,
-    `Use '${command}' delegate github/repo.`,
-    `Use '/tools/notmlx' delegate github.`,
-    'There is no command here.',
-  ])('refuses a positive answer pointing to a different command: %s', (text) => {
-    expect(() => detectionResult(yes, text, command)).toThrow('verify its answer');
   });
 
   it.each([
     null,
-    { installed: 'true', startLine: 1, endLine: 1 },
-    { installed: true, evidence: 'invented text' },
-    { installed: true, startLine: '1', endLine: 1 },
-    { installed: true, startLine: 0, endLine: 1 },
-    { installed: true, startLine: 1, endLine: 99 },
-    { installed: true, startLine: 2, endLine: 1 },
-    { installed: true, startLine: 1.5, endLine: 1.5 },
-    { installed: false, startLine: 1, endLine: 1 },
-  ])('rejects malformed or invented source ranges: %j', (answer) => {
-    expect(() => detectionResult(answer, `Use '${command}' delegate github.`, command)).toThrow('verify its answer');
+    { installed: true, startLine: 1, endLine: 1 },
+    { status: 'unknown', startLine: 1, endLine: 1 },
+    { status: 'installed', startLine: '1', endLine: 1 },
+    { status: 'installed', startLine: 0, endLine: 1 },
+    { status: 'installed', startLine: 1, endLine: 99 },
+    { status: 'installed', startLine: 2, endLine: 1 },
+    { status: 'installed', startLine: 1.5, endLine: 1.5 },
+    { status: 'needs-update', startLine: 0, endLine: 0 },
+    { status: 'needs-update', startLine: 1, endLine: 99 },
+    { status: 'not-installed', startLine: 1, endLine: 1 },
+  ])('rejects malformed responses and invalid source ranges: %j', (answer) => {
+    expect(() => detectionResult(answer, `Use '${command}' delegate github.`)).toThrow('verify its answer');
   });
 
-  it('accepts an explicit negative verdict without evidence', () => {
-    expect(detectionResult({ installed: false, startLine: 0, endLine: 0 }, 'Use gh directly.', command)).toEqual({
-      installed: false,
-      needsUpdate: false,
-    });
+  it.each(['installed', 'needs-update'])('requires nonempty source evidence for %s', (status) => {
+    expect(() => detectionResult({ status, startLine: 2, endLine: 2 }, 'First line.\n   \nThird line.')).toThrow(
+      'verify its answer',
+    );
   });
 });

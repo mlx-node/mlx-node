@@ -283,12 +283,12 @@ export class CodingAgentsService {
       await this.complete(
         connection,
         DETECTION_SYSTEM,
-        [{ role: 'user', content: detectionMessage(text) }],
+        [{ role: 'user', content: detectionMessage(text, command) }],
         this.abort.signal,
         768,
       ),
     );
-    return detectionResult(answer, text, command);
+    return detectionResult(answer, text);
   }
 
   private async perform(row: CodingAgentRow, action: 'detect' | 'install', force: boolean): Promise<void> {
