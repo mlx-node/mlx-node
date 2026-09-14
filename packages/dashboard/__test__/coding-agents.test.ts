@@ -299,6 +299,26 @@ describe('local model coding-agent setup', () => {
     expect(await readFile(path, 'utf8')).toBe(before);
   });
 
+  it('rejects unrelated source text even if later model answers would approve both replacements', async () => {
+    const { service, home, complete } = await setup();
+    await mkdir(join(home, '.claude'));
+    const path = join(home, '.claude', 'CLAUDE.md');
+    const before = "Keep patches small; use '/old/mlx' delegate github for PRs.\n";
+    await writeFile(path, before);
+    const inode = (await stat(path)).ino;
+    complete
+      .mockResolvedValueOnce(verdict('needs-update', 1))
+      .mockResolvedValueOnce(selected('Keep patches small'))
+      .mockResolvedValueOnce(verdict('needs-update', 1))
+      .mockResolvedValueOnce(selected("'/old/mlx' delegate github"))
+      .mockResolvedValueOnce(verdict('installed', 1));
+    await service.start('install', 'claude');
+    expect((await settled(service)).detail).toContain('No changes were made');
+    expect(await readFile(path, 'utf8')).toBe(before);
+    expect((await stat(path)).ino).toBe(inode);
+    expect(complete).toHaveBeenCalledTimes(2);
+  });
+
   it('keeps the original file if verification fails after multiple obsolete commands', async () => {
     const { service, home, complete } = await setup();
     await mkdir(join(home, '.claude'));

@@ -139,7 +139,63 @@ export function commandSelectionSource(text: string, source: NonNullable<Detecti
     .join('\n');
 }
 
-/** The model selects semantics; only exact original source text may be replaced. */
+const commandSpace = (char: string): boolean => char === ' ' || char === '\t' || char === '\r' || char === '\n';
+
+/** Read literal shell words only. Expansions, operators and incomplete quotes cannot be edited safely. */
+function commandPrefixWords(text: string): string[] | undefined {
+  if (text.trim() !== text) return;
+  const words: string[] = [];
+  let word = '';
+  let started = false;
+  let quote: "'" | '"' | undefined;
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i]!;
+    if (quote === "'") {
+      if (char === quote) quote = undefined;
+      else word += char;
+    } else if (char === '\\') {
+      const next = text[++i];
+      if (next === undefined) return;
+      if (next === '\n') continue;
+      if (quote === '"' && !'\\"$`'.includes(next)) word += '\\';
+      word += next;
+      started = true;
+    } else if (quote === '"') {
+      if (char === quote) quote = undefined;
+      else if (char === '$' || char === '`') return;
+      else word += char;
+    } else if (char === "'" || char === '"') {
+      quote = char;
+      started = true;
+    } else if (commandSpace(char)) {
+      if (started) words.push(word);
+      word = '';
+      started = false;
+    } else {
+      if (';&|<>(){}$`#\0'.includes(char)) return;
+      word += char;
+      started = true;
+    }
+  }
+  if (quote) return;
+  if (started) words.push(word);
+  return words;
+}
+
+function isCommandPrefix(text: string): boolean {
+  const words = commandPrefixWords(text);
+  if (!words || (words.length !== 3 && words.length !== 4)) return false;
+  const [executable, delegate, github, approval] = words;
+  return (
+    !!executable &&
+    (executable === 'mlx' || executable.includes('/')) &&
+    delegate === 'delegate' &&
+    github === 'github' &&
+    (approval === undefined || approval === '--caller-approved')
+  );
+}
+
+/** The model selects semantics; edits require an exact, complete literal command prefix. */
 export function commandSelectionResult(
   answer: unknown,
   text: string,
@@ -152,7 +208,7 @@ export function commandSelectionResult(
   const { text: selected, occurrence } = answer as Record<string, unknown>;
   if (
     typeof selected !== 'string' ||
-    !selected.trim() ||
+    !isCommandPrefix(selected) ||
     !Number.isSafeInteger(occurrence) ||
     (occurrence as number) < 1
   )
@@ -164,6 +220,12 @@ export function commandSelectionResult(
     offset = sourceText.indexOf(selected, offset + selected.length);
     if (offset === -1) return invalid();
   }
+  // A selected substring must not cut into a longer executable, subcommand or flag.
+  const preceding = sourceText[offset - 1];
+  if (preceding !== undefined && !commandSpace(preceding) && !'`([{;:>'.includes(preceding)) return invalid();
+  let following = offset + selected.length;
+  while (following < sourceText.length && '.,;:!?)]}`'.includes(sourceText[following]!)) following++;
+  if (following < sourceText.length && !commandSpace(sourceText[following]!)) return invalid();
   const before = text.split('\n').slice(0, source.startLine - 1);
   const start = (before.length ? before.join('\n').length + 1 : 0) + offset;
   return { start, end: start + selected.length };

@@ -100,6 +100,72 @@ describe('exact model-selected command spans', () => {
   });
 
   it.each([
+    'mlx\tdelegate\tgithub',
+    '"/old app/mlx" delegate github --caller-approved',
+    '/old\\ app/mlx delegate github',
+    "'/old'\"'\"'/mlx' delegate github",
+    '"/old \\"app\\"/mlx" delegate github',
+    "'/old/mlx' \\\n delegate github",
+    "'/old/mlx'\r\n delegate github",
+    'mlx \'delegate\' "github"',
+  ])('accepts complete literal shell prefixes and preserves adjacent Markdown: %s', (selected) => {
+    const text = `Keep 🌲 patches small; use \`${selected}\` for CI.`;
+    const span = commandSelectionResult({ text: selected, occurrence: 1 }, text, {
+      startLine: 1,
+      endLine: text.split('\n').length,
+    });
+    expect(text.slice(span.start, span.end)).toBe(selected);
+    expect(text.slice(0, span.start)).toBe('Keep 🌲 patches small; use `');
+    expect(text.slice(span.end)).toBe('` for CI.');
+  });
+
+  it.each([
+    'Keep patches small',
+    "'Keep patches small' delegate github",
+    'mlx',
+    'mlx agent',
+    'notmlx delegate github',
+    'mlx delegate github-backup',
+    'mlx delegate github --repo org/repo',
+    'mlx delegate github --caller-approved=false',
+    'mlx delegate github --caller-approved --allow-write',
+    'mlx delegate github; keep tests fast',
+    'mlx delegate github\nKeep tests fast',
+    '`mlx delegate github`',
+    '"mlx delegate github"',
+    "'/old/mlx delegate github",
+    '"$HOME/mlx" delegate github',
+    '$(echo mlx) delegate github',
+    '"`echo mlx`" delegate github',
+    'mlx delegate github ',
+    ' mlx delegate github',
+    'mlx delegate github\\',
+  ])('rejects exact source matches that are not a command prefix: %s', (selected) => {
+    const text = `Use ${selected} for CI.`;
+    expect(() =>
+      commandSelectionResult({ text: selected, occurrence: 1 }, text, {
+        startLine: 1,
+        endLine: text.split('\n').length,
+      }),
+    ).toThrow('No changes were made');
+  });
+
+  it.each([
+    ['notmlx delegate github', 'mlx delegate github'],
+    ['/other/old/mlx delegate github', '/old/mlx delegate github'],
+    ['mlx delegate github-backup', 'mlx delegate github'],
+    ['mlx delegate github.com', 'mlx delegate github'],
+    ['mlx delegate github --caller-approved=false', 'mlx delegate github --caller-approved'],
+  ])('rejects selections that cut into another command token: %s', (invocation, selected) => {
+    expect(() =>
+      commandSelectionResult({ text: selected, occurrence: 1 }, `Use ${invocation} for CI.`, {
+        startLine: 1,
+        endLine: 1,
+      }),
+    ).toThrow('No changes were made');
+  });
+
+  it.each([
     null,
     {},
     { text: '', occurrence: 0 },
