@@ -1312,7 +1312,9 @@ describe('makeMlxStreamSimple', () => {
       },
     ]);
     let currentRoot = 'root-0';
-    const streamSimple = makeMlxStreamSimple(makeFakeHost(session), undefined, () => currentRoot);
+    const host = makeFakeHost(session);
+    const acquire = vi.spyOn(host, 'runWithResident');
+    const streamSimple = makeMlxStreamSimple(host, undefined, () => currentRoot);
 
     const first = collect(streamSimple(MODEL, CONTEXT, { sessionId: 'root-0' }));
     await firstStartedPromise;
@@ -1323,6 +1325,7 @@ describe('makeMlxStreamSimple', () => {
     await Promise.all([first, second]);
 
     expect(seenRoots).toEqual(['root-0', 'root-1']);
+    expect(acquire.mock.calls.map((call) => call[2])).toEqual(['root-0', 'child-1']);
   });
 
   it('attributes a completed turn to the root it was SUBMITTED under, not a root that switched mid-flight (Finding 8)', async () => {

@@ -44,6 +44,53 @@ async function flushMicrotasks(rounds = 8): Promise<void> {
 }
 
 describe('MlxModelHost', () => {
+  it('rotates immutable session owners without reloading weights and awaits disposal behind the active turn', async () => {
+    const loader = makeLoader();
+    const host = new MlxModelHost(MODELS, { loadModelFn: loader });
+    const first = await host.runWithResident('qwen-small', async (session) => session, 'root-1');
+    const dispose = vi.spyOn(first, 'dispose');
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const running = host.runWithResident(
+      'qwen-small',
+      async (session) => {
+        expect(session).toBe(first);
+        await gate;
+      },
+      'root-1',
+    );
+    const next = host.runWithResident(
+      'qwen-small',
+      async (session, warm) => {
+        expect(warm).toBe(true);
+        return session;
+      },
+      'root-2',
+    );
+    await flushMicrotasks();
+    expect(dispose).not.toHaveBeenCalled();
+    release();
+    await running;
+    const second = await next;
+    expect(dispose).toHaveBeenCalledOnce();
+    expect(second).not.toBe(first);
+    expect(await host.runWithResident('qwen-small', async (session) => session, 'root-2')).toBe(second);
+    expect(loader).toHaveBeenCalledOnce();
+  });
+
+  it('drops a resident if its previous owner cannot be released', async () => {
+    const loader = makeLoader();
+    const host = new MlxModelHost(MODELS, { loadModelFn: loader });
+    const first = await host.runWithResident('qwen-small', async (session) => session, 'root-1');
+    vi.spyOn(first, 'dispose').mockRejectedValue(new Error('release failed'));
+    const fn = vi.fn(async () => undefined);
+    await expect(host.runWithResident('qwen-small', fn, 'root-2')).rejects.toThrow('release failed');
+    expect(fn).not.toHaveBeenCalled();
+    expect(host.residentId).toBeNull();
+  });
+
   it('lazily loads a model once and reuses the resident session', async () => {
     const loader = makeLoader();
     const host = new MlxModelHost(MODELS, { loadModelFn: loader });

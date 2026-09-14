@@ -78,6 +78,8 @@ export interface MlxModelHostOptions {
 interface ResidentModel {
   id: string;
   session: ChatSession;
+  /** A ChatSession's native owner is immutable, including across /new and subagent turns. */
+  ownerId?: string;
   /** Kept solely so a swap can explicitly drop the native ref before loading. */
   model: object;
   /**
@@ -143,7 +145,12 @@ export class MlxModelHost {
    * retries); a failure thrown by `fn` rejects only this call's promise
    * and keeps the resident loaded for later callers.
    */
-  runWithResident<T>(modelId: string, fn: (session: ChatSession, resident: boolean) => Promise<T>): Promise<T> {
+  runWithResident<T>(
+    modelId: string,
+    fn: (session: ChatSession, resident: boolean) => Promise<T>,
+    ownerId?: string,
+  ): Promise<T> {
+    ownerId = ownerId || undefined;
     const entry = this.byName.get(modelId);
     if (!entry) {
       const known = [...this.byName.keys()].join(', ');
@@ -155,6 +162,20 @@ export class MlxModelHost {
       // it loaded/swapped the checkpoint first (cold).
       let resident: boolean;
       if (this.resident?.id === modelId) {
+        if (this.resident.ownerId !== ownerId) {
+          // Stay on the same serialization chain: the preceding native turn must
+          // finish before its owner is released. Keep weights loaded, but never
+          // reassign the immutable owner of the old ChatSession.
+          try {
+            await this.resident.session.dispose();
+          } catch (error) {
+            this.resident = null;
+            throw error;
+          }
+          this.resident.session = new ChatSession(this.resident.model as SessionCapableModel);
+          this.resident.ownerId = ownerId;
+          this.resident.dirty = false;
+        }
         session = this.resident.session;
         resident = true;
       } else {
@@ -195,7 +216,7 @@ export class MlxModelHost {
           );
         }
         session = new ChatSession(sessionModel);
-        this.resident = { id: modelId, session, model, dirty: false };
+        this.resident = { id: modelId, session, model, ownerId, dirty: false };
       }
       return await fn(session, resident);
     });
