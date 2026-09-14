@@ -311,22 +311,43 @@ export class CodingAgentsService {
     let after = before;
     if (action === 'install' && !result.installed) {
       const prompt = delegationPrompt(state.command);
+      const verify = async (): Promise<Omit<DetectionResult, 'checkedAt'>> => {
+        if (Buffer.byteLength(after) > MAX_FILE_BYTES)
+          throw new Error('There is not enough room to add and verify the prompt. Shorten the instruction file first.');
+        return classify(after);
+      };
       // Older cached verdicts do not have a source reference. Recheck only when
       // an update needs that reference; ordinary cached status checks stay free.
       if (result.needsUpdate && !result.source) result = await classify(before);
-      if (result.needsUpdate) {
-        // Revalidate cached bounds against the exact content hashed by the key.
-        const { source } = detectionResult({ status: 'needs-update', ...result.source }, before);
-        const lines = before.split('\n');
-        lines.splice(source!.startLine - 1, source!.endLine - source!.startLine + 1, prompt);
+      let insertionLine: number | undefined;
+      while (result.needsUpdate) {
+        // Remove every model-selected obsolete directive before inserting a
+        // replacement. Each pass removes nonempty source lines, so it must end.
+        const { source } = detectionResult({ status: 'needs-update', ...result.source }, after);
+        const start = source!.startLine - 1;
+        const count = source!.endLine - source!.startLine + 1;
+        insertionLine ??= start;
+        if (start < insertionLine) insertionLine -= Math.min(count, insertionLine - start);
+        const lines = after.split('\n');
+        lines.splice(start, count);
         after = lines.join('\n');
-      } else if (!result.installed) {
-        after = `${before}${before && !before.endsWith('\n') ? '\n' : ''}${before ? '\n' : ''}${prompt}\n`;
+        // Edits shift line numbers; classify the reduced candidate afresh.
+        result = await classify(after);
       }
-      if (Buffer.byteLength(after) > MAX_FILE_BYTES)
-        throw new Error('There is not enough room to add and verify the prompt. Shorten the instruction file first.');
-      // Validate the actual proposed prompt with the selected model before touching user files.
-      if (!(await classify(after)).installed)
+      if (!result.installed) {
+        // The model decides whether a current directive remains. Literal prompt
+        // presence could be a quoted example and cannot establish installation.
+        if (insertionLine !== undefined) {
+          const lines = after.split('\n');
+          lines.splice(insertionLine, 0, prompt);
+          after = lines.join('\n');
+        } else {
+          after = `${before}${before && !before.endsWith('\n') ? '\n' : ''}${before ? '\n' : ''}${prompt}\n`;
+        }
+        result = await verify();
+      }
+      // Every obsolete directive must be gone before touching user files.
+      if (!result.installed)
         throw new Error('The local model could not verify the delegation prompt. No changes were made.');
       const fresh = await this.refresh();
       if (fresh.model !== state.model || fresh.command !== state.command || row.path !== path)
