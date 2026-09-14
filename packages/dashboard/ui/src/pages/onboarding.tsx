@@ -22,11 +22,16 @@ import {
 import { type CSSProperties, type ReactNode, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
+export interface ModelDownloadError {
+  repo: string;
+  message: string;
+}
+
 interface OnboardingProps {
   catalog: AsyncState<CatalogResponse>;
   models: AsyncState<ModelsResponse>;
   activeRepos: string[];
-  downloadError: string | null;
+  downloadError: ModelDownloadError | null;
   downloadsLoading: boolean;
   downloadsError: Error | undefined;
   reloadDownloads: () => void;
@@ -311,9 +316,9 @@ export default function Onboarding({
                 )
               )}
             </div>
-            {downloadError && (
+            {downloadError?.repo === selected.hfRepo && (
               <p className="onboarding-download-error text-destructive" role="alert">
-                {downloadError} Please try again.
+                {downloadError.message} Please try again.
               </p>
             )}
           </section>

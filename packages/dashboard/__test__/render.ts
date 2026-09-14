@@ -83,6 +83,7 @@ export function sequence(...bodies: unknown[]): unknown {
  * lives in the gap between "reload issued" and "body arrived" — where the hook
  * still serves the previous body — is invisible to any assertion taken after
  * the port has drained. Composes with `sequence`: hold only the second call.
+ * Pass `STUB_FAILURE` to delay an API failure instead of a successful body.
  */
 export function deferred(body: unknown): { body: unknown; release: () => void } {
   let release!: () => void;
@@ -151,7 +152,11 @@ export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): () => vo
         if (body === STUB_FAILURE) return Promise.resolve(failure('E_UNAVAILABLE', `stubbed failure for ${path}`));
         if (typeof body === 'object' && body !== null && DEFERRED in body) {
           const held = (body as Record<symbol, unknown>)[DEFERRED] as { body: unknown; gate: Promise<void> };
-          return held.gate.then(() => ({ ok: true as const, status: 200, body: held.body }));
+          return held.gate.then(() =>
+            held.body === STUB_FAILURE
+              ? failure('E_UNAVAILABLE', `stubbed failure for ${path}`)
+              : { ok: true as const, status: 200, body: held.body },
+          );
         }
         return Promise.resolve({ ok: true as const, status: 200, body });
       },

@@ -265,7 +265,7 @@ describe('first model onboarding', () => {
     expect(page.container.querySelector('fieldset')?.disabled).toBe(false);
   });
 
-  it('shows a failed download and makes retry available', async () => {
+  it('shows a failed download only for its model and makes retry available', async () => {
     let listener: ((event: DownloadEvent) => void) | undefined;
     dispose = stubApi(
       {
@@ -290,6 +290,38 @@ describe('first model onboarding', () => {
     await waitFor(() => expect(page!.text()).toContain('Download model'));
     expect(page.container.querySelector('[role=alert]')?.textContent).toContain('Connection lost');
     expect(button('Download model').disabled).toBe(false);
+
+    await act(async () =>
+      page!.container.querySelector<HTMLInputElement>(`input[value="${visible[1].hfRepo}"]`)!.click(),
+    );
+    expect(page.container.querySelector('[role=alert]')).toBeNull();
+    expect(button('Download model').disabled).toBe(false);
+    await act(async () =>
+      page!.container.querySelector<HTMLInputElement>(`input[value="${visible[0].hfRepo}"]`)!.click(),
+    );
+    expect(page.container.querySelector('[role=alert]')?.textContent).toContain('Connection lost');
+  });
+
+  it('keeps a late start failure with the requested model after selection changes', async () => {
+    const failedStart = deferred(STUB_FAILURE);
+    const calls: ApiCall[] = [];
+    dispose = stubApi(
+      { ...routes(), '/downloads': sequence({ jobs: [] }, failedStart.body) },
+      { onCall: (call) => calls.push(call) },
+    );
+    await mount();
+    const requested = page!.container.querySelector<HTMLInputElement>('input:checked')!.value;
+    const other = visible.find((item) => item.hfRepo !== requested)!;
+    await act(async () => button('Download model').click());
+    await waitFor(() => expect(calls.some((call) => call.method === 'POST')).toBe(true));
+    await act(async () => page!.container.querySelector<HTMLInputElement>(`input[value="${other.hfRepo}"]`)!.click());
+    await act(async () => failedStart.release());
+    await waitFor(() => expect(button('Download model').disabled).toBe(false));
+    expect(page!.container.querySelector('[role=alert]')).toBeNull();
+
+    await act(async () => page!.container.querySelector<HTMLInputElement>(`input[value="${requested}"]`)!.click());
+    expect(page!.container.querySelector('[role=alert]')?.textContent).toContain('stubbed failure for /downloads');
+    expect(calls.filter((call) => call.method === 'POST')).toHaveLength(1);
   });
 
   it('offers a retry when library loading fails instead of offering a download', async () => {

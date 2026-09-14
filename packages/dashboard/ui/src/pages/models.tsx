@@ -31,7 +31,7 @@ import type {
   ModelsResponse,
 } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
-import Onboarding from '@/pages/onboarding';
+import Onboarding, { type ModelDownloadError } from '@/pages/onboarding';
 import {
   AlertCircle,
   Check,
@@ -259,7 +259,7 @@ export default function Models({ onboarding = false }: { onboarding?: boolean })
   const [deleting, setDeleting] = useState(false);
   /** repo → active download job (seeded from the server, added on install). */
   const [active, setActive] = useState<Record<string, ActiveJob>>({});
-  const [downloadError, setDownloadError] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<ModelDownloadError | null>(null);
   // `useJson` is stale-while-revalidate: on a connection bump it intentionally
   // keeps the old body on screen until the replacement runtime answers. Remember
   // that exact object so the reconciliation effect below does not mistake it for
@@ -386,7 +386,7 @@ export default function Models({ onboarding = false }: { onboarding?: boolean })
         [repo]: { id: res.id, committing: false, cancelling: false, connection: startedConnection, source: 'local' },
       }));
     } catch (err) {
-      setDownloadError(errMessage(err));
+      setDownloadError({ repo, message: errMessage(err) });
       toast.error('Failed to start download', { description: errMessage(err) });
     }
   };
@@ -420,7 +420,7 @@ export default function Models({ onboarding = false }: { onboarding?: boolean })
   };
 
   const onDownloadError = (repo: string, message: string): void => {
-    setDownloadError(message);
+    setDownloadError({ repo, message });
     toast.error('Download failed', { description: message });
     // `error` does not mean nothing was installed. `publish()` renames staging
     // into the final dir and only THEN fsyncs and removes the backup, and those
