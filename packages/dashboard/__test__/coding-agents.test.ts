@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,7 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { DELEGATION_PROMPT, delegationCommand, delegationPrompt } from '@mlx-node/agent/delegate';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { COMMAND_SELECTION_SYSTEM, DETECTION_INPUT_PREFIX } from '../src/coding-agent-detection.js';
+import { COMMAND_SELECTION_SYSTEM, DETECTION_INPUT_PREFIX, DETECTION_SYSTEM } from '../src/coding-agent-detection.js';
 import { CodingAgentsService } from '../src/coding-agents.js';
 
 const cleanup: (() => Promise<void>)[] = [];
@@ -77,6 +78,38 @@ async function settled(service: CodingAgentsService, id = 'claude') {
 }
 
 describe('local model coding-agent setup', () => {
+  it('rechecks verdicts saved before the medium-thinking generation policy', async () => {
+    const { home, service, restart, complete, command, prompt } = await setup();
+    const path = join(home, '.claude', 'CLAUDE.md');
+    await mkdir(join(home, '.claude'));
+    await writeFile(path, prompt);
+    await service.start('detect', 'claude');
+    expect((await settled(service)).status).toBe('installed');
+    await service.close();
+    const hash = (text: string) => createHash('sha256').update(text).digest('hex');
+    const oldKey = hash(
+      JSON.stringify([
+        DETECTION_SYSTEM,
+        DETECTION_INPUT_PREFIX,
+        DELEGATION_PROMPT,
+        'local-model',
+        path,
+        hash(prompt),
+        command,
+      ]),
+    );
+    const cachePath = join(home, '.mlx-node', 'coding-agents.json');
+    const cache = JSON.parse(await readFile(cachePath, 'utf8'));
+    cache.entries[0].key = oldKey;
+    cache.entries[0].installed = false;
+    await writeFile(cachePath, JSON.stringify(cache));
+    complete.mockClear();
+    const restored = restart();
+    await restored.start('detect', 'claude');
+    expect((await settled(restored)).status).toBe('installed');
+    expect(complete).toHaveBeenCalledTimes(1);
+  });
+
   it('blocks setup without a working app command and invalidates an installed verdict', async () => {
     const { service, home, prepareCommand, complete } = await setup();
     await service.start('install', 'claude');

@@ -58,7 +58,7 @@ describe('agent-installed eval oracle and execution', () => {
       DETECTION_SYSTEM,
       [{ role: 'user', content: detectionMessage(current.text, current.command) }],
       expect.any(AbortSignal),
-      768,
+      16384,
     ]);
   });
 
@@ -107,6 +107,7 @@ describe('agent-installed eval oracle and execution', () => {
   });
 
   it('uses the real CLI without overriding runtime defaults', () => {
+    expect(evalOptions(['--entrypoint', 'app']).entrypoint).toBe('app');
     expect(cliInvocation('/repo', 'agent')).toEqual(['/repo/packages/cli/dist/cli.js', 'agent', '--mode', 'rpc']);
     expect(cliInvocation('/repo', 'delegate')).toEqual(['/repo/packages/cli/dist/cli.js', 'delegate', '--mode', 'rpc']);
     expect(() => evalOptions(['--model', 'replacement'])).toThrow();

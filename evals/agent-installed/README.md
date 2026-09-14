@@ -1,4 +1,23 @@
-# Agent installation CLI eval
+# Agent installation eval
+
+## App installed check
+
+```sh
+vp run build:ts
+vp exec oxnode scripts/eval-agent-installed.ts --entrypoint app
+```
+
+This runs the actual `CodingAgentsService` and `localCompletion` against the built desktop inference sidecar. It uses the production supervisor, desktop model-directory setting, installed default local model, and launcher engine policy (2,048-token prefill chunks unless the inherited environment overrides it). The supervisor uses its existing Node child transport rather than Electron's utility process. The harness does not construct a custom inference host or tune allocator/cache settings.
+
+The detector rubric is the **system prompt**. Requests use the App's shared setup policy: medium thinking, a 16,384-token combined reasoning/output limit, temperature zero, and a ten-minute timeout. Classification and command selection during an update share this policy. Verdict cache keys include the generation policy, so results from the former no-thinking/768-token check are invalidated.
+
+Cases use disposable Claude/Codex/Grok instruction files and executable paths. The real service selects the file, checks the model response with the normal strict parser, and reuses unchanged verdicts both in memory and after a service restart. The generated-prompt case also checks content invalidation and forced rechecks. Empty/missing files must skip inference. No real global instructions or settings are modified. This mode tests detection and verdict caching, not installation writes, Electron UI/IPC, or whether another coding agent loaded its instructions.
+
+App reports include `summary.json`, `samples.jsonl`, `cases.json`, source hashes and policies in `metadata.json`, discovered models in `runtime.json`, unmodified HTTP bodies in `http.jsonl` (without credential headers), sidecar diagnostics/traces, and external memory observations. Calls run sequentially with one resident model, lazy loading and the normal HTTP session/cache lifecycle. Interrupted or failed runs retain evidence and cannot report success.
+
+Start with `--entrypoint app --case generated-prompt --case unlabelled-fence --case long-document` before the full corpus. The other selection/repetition options below also apply.
+
+## CLI classification
 
 Run installation-classification tasks through the **real `mlx agent` or `mlx delegate` CLI**. The runner only sends tasks, observes events, and grades results. It never creates an inference host or sets model, thinking, output, sampling, cache, system-prompt, tool, or permission overrides.
 
@@ -24,7 +43,7 @@ Each task asks the agent to read a synthetic evidence file and apply the product
 
 The 50 hand-labelled cases cover active and obsolete commands, missing caller approval, mixed rules, shell quoting, multiline commands, examples, revocation, prompt injection, Unicode, long documents, and selected Claude/Codex/Grok instruction contents. Both the status and exact accepted source span must match. Invalid output, tool errors, timeouts, and incomplete turns fail. False installed answers are counted separately.
 
-This CLI eval does **not** run the dashboard's HTTP completion backend, which has a different prompt placement and generation policy. It also does not prove Codex/Claude loaded or obeyed a global instruction. File selection, missing-file short circuits, verdict-cache reuse across service restarts, content invalidation, and forced rechecks are separately tested through the real setup service with mocked completions in `coding-agent-eval.test.ts`. Do not present those unit tests as live model accuracy.
+This CLI eval does **not** run the dashboard's HTTP completion backend, which has a different prompt placement and generation policy; use `--entrypoint app` for that path. It also does not prove Codex/Claude loaded or obeyed a global instruction. Service unit tests use mocked completions for fast regressions; do not present those unit tests as live model accuracy.
 
 Fixtures contain no real user instructions. The user agent configuration remains loaded normally; the disposable evidence directory sits in this checkout, so `mlx agent` retains its ordinary project-context discovery. Delegate retains its normal no-context-files behavior. The eval changes no global instruction or settings file. Permission dialogs are cancelled; no new approval is granted by the harness.
 

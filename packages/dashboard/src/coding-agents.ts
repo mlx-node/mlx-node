@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 
 import {
   DELEGATION_PROMPT,
+  INSTALL_CHECK_GENERATION,
   delegationCommand,
   delegationPrompt,
   expandHome,
@@ -73,6 +74,7 @@ function detectionKey(model: string, path: string, text: string, command: string
       DETECTION_SYSTEM,
       DETECTION_INPUT_PREFIX,
       DELEGATION_PROMPT,
+      INSTALL_CHECK_GENERATION,
       model,
       path,
       fingerprint(text),
@@ -288,7 +290,7 @@ export class CodingAgentsService {
         DETECTION_SYSTEM,
         [{ role: 'user', content: detectionMessage(text, command) }],
         this.abort.signal,
-        768,
+        INSTALL_CHECK_GENERATION.max_output_tokens,
       ),
     );
     return detectionResult(answer, text);
@@ -342,7 +344,7 @@ export class CodingAgentsService {
               },
             ],
             this.abort.signal,
-            768,
+            INSTALL_CHECK_GENERATION.max_output_tokens,
           ),
         );
         const span = commandSelectionResult(answer, after, result.source);

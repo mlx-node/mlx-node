@@ -4,10 +4,35 @@ import { localCompletion } from '../src/delegate.js';
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  vi.useRealTimers();
 });
 const connection = { url: 'http://127.0.0.1:1234', token: 'private', model: 'chosen' };
 
 describe('local delegation inference client', () => {
+  it('allows a larger thinking budget while keeping a bounded request timeout', async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(
+        (_url, options) =>
+          new Promise((_resolve, reject) => {
+            options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
+          }),
+      ),
+    );
+    let completed = false;
+    const completion = localCompletion(connection, 'Check', []);
+    const result = expect(
+      completion.finally(() => {
+        completed = true;
+      }),
+    ).rejects.toThrow('timed out');
+    await vi.advanceTimersByTimeAsync(120_000);
+    expect(completed).toBe(false);
+    await vi.advanceTimersByTimeAsync(480_000);
+    await result;
+  });
+
   it('verifies the exact default model and sends authenticated local inference', async () => {
     const fetch = vi
       .fn()
@@ -25,10 +50,10 @@ describe('local delegation inference client', () => {
       model: 'chosen',
       instructions: 'Check',
       input: [{ role: 'user', content: 'Instructions' }],
-      max_output_tokens: 1024,
+      max_output_tokens: 16384,
       temperature: 0,
       stream: false,
-      reasoning: { effort: 'none' },
+      reasoning: { effort: 'medium' },
       store: false,
     });
   });
@@ -38,6 +63,19 @@ describe('local delegation inference client', () => {
     vi.stubGlobal('fetch', fetch);
     await expect(localCompletion(connection, 'Check', [])).rejects.toThrow('default model is not available');
     expect(fetch).toHaveBeenCalledTimes(1);
+  });
+
+  it('preserves an explicit caller output budget while enabling thinking', async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(Response.json({ data: [{ id: 'chosen' }] }))
+      .mockResolvedValueOnce(Response.json({ status: 'completed', output_text: '{}' }));
+    vi.stubGlobal('fetch', fetch);
+    await localCompletion(connection, 'Check', [], undefined, 2048);
+    expect(JSON.parse(fetch.mock.calls[1][1].body)).toMatchObject({
+      max_output_tokens: 2048,
+      reasoning: { effort: 'medium' },
+    });
   });
 
   it('rejects cloud endpoints before sending instructions or credentials', async () => {

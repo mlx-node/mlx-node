@@ -4,6 +4,7 @@ import { dirname, join } from 'node:path';
 import { setTimeout } from 'node:timers/promises';
 
 import {
+  INSTALL_CHECK_TIMEOUT_MS,
   parseLocalJson,
   type localCompletion,
   type LocalInferenceConnection,
@@ -53,17 +54,17 @@ async function settled(
   agent: DetectionCase['agent'],
   signal?: AbortSignal,
 ): Promise<CodingAgentRow> {
-  const deadline = performance.now() + 130_000;
+  const deadline = performance.now() + INSTALL_CHECK_TIMEOUT_MS + 10_000;
   while (true) {
     signal?.throwIfAborted();
     const row = (await service.state()).agents.find((row) => row.id === agent)!;
     if (!['waiting', 'checking', 'installing'].includes(row.status)) return row;
-    if (performance.now() > deadline) throw new Error('The setup service did not settle within 130 seconds.');
+    if (performance.now() > deadline) throw new Error('The setup service did not settle after its request timeout.');
     await setTimeout(20, undefined, { signal });
   }
 }
 
-/** Unit-test the service's file/cache behavior. The live eval uses the CLI in cli.ts. */
+/** Exercise the actual App detection and cache path, with real localCompletion in the App eval. */
 export async function evaluateCase(
   fixture: DetectionCase,
   connection: LocalInferenceConnection,

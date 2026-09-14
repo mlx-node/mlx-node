@@ -20,6 +20,9 @@ import type { ChildEvents, ChildHandle, ChildSpec, ChildTransport } from './type
 
 export const nodeChildTransport: ChildTransport = (spec: ChildSpec, events: ChildEvents): ChildHandle => {
   const child = fork(spec.modulePath, [...spec.args], {
+    // The sidecar entry is built JavaScript. Parent test/TS loaders and debugger
+    // flags must not leak into it, especially under its native-addon override.
+    execArgv: [],
     env: { ...spec.env },
     ...(spec.cwd !== undefined ? { cwd: spec.cwd } : {}),
     // stdin closed, stdout/stderr piped, IPC on fd 3. The pipes are not

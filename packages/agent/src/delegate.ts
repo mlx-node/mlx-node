@@ -29,6 +29,14 @@ export interface LocalMessage {
   content: string;
 }
 
+/** Shared by setup requests and their verdict cache key. Includes thinking and final output. */
+export const INSTALL_CHECK_GENERATION = Object.freeze({
+  reasoning: Object.freeze({ effort: 'medium' as const }),
+  max_output_tokens: 16384,
+  temperature: 0,
+});
+export const INSTALL_CHECK_TIMEOUT_MS = 600_000;
+
 export function expandHome(path: string, home = homedir()): string {
   return path === '~' ? home : path.startsWith('~/') ? join(home, path.slice(2)) : path;
 }
@@ -57,7 +65,7 @@ export async function localCompletion(
   system: string,
   messages: LocalMessage[],
   signal?: AbortSignal,
-  maxTokens = 1024,
+  maxTokens: number = INSTALL_CHECK_GENERATION.max_output_tokens,
 ): Promise<string> {
   const url = new URL(connection.url);
   if (url.protocol !== 'http:' || !['127.0.0.1', '[::1]', 'localhost'].includes(url.hostname)) {
@@ -67,7 +75,10 @@ export async function localCompletion(
   const cancel = (): void => controller.abort(signal?.reason);
   if (signal?.aborted) cancel();
   else signal?.addEventListener('abort', cancel, { once: true });
-  const timer = setTimeout(() => controller.abort(new Error('The local model request timed out.')), 120_000);
+  const timer = setTimeout(
+    () => controller.abort(new Error('The local model request timed out.')),
+    INSTALL_CHECK_TIMEOUT_MS,
+  );
   try {
     const headers = {
       'content-type': 'application/json',
@@ -88,11 +99,9 @@ export async function localCompletion(
         model: connection.model,
         instructions: system,
         input: messages,
+        ...INSTALL_CHECK_GENERATION,
         max_output_tokens: maxTokens,
-        // Setup checks need a short structured answer, not an agent reasoning turn.
-        reasoning: { effort: 'none' },
         store: false,
-        temperature: 0,
         stream: false,
       }),
       signal: controller.signal,

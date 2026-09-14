@@ -745,6 +745,18 @@ describe('lying', () => {
 });
 
 describe('fork-time environment', () => {
+  it('starts built JavaScript without inheriting the parent loader flags', async () => {
+    const before = [...process.execArgv];
+    process.execArgv.push('--import', 'data:text/javascript,throw new Error("parent loader reached child")');
+    try {
+      const { supervisor } = makeSupervisor();
+      await supervisor.start();
+      expect(await supervisor.request({ op: 'echo', value: 'ready' })).toBe('ready');
+    } finally {
+      process.execArgv.splice(0, process.execArgv.length, ...before);
+    }
+  });
+
   // These latch through a Rust OnceLock on first read. A value absent at fork
   // time can never be supplied afterwards, and writing it later succeeds
   // silently while changing nothing.

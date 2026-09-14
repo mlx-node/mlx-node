@@ -9,6 +9,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
+import { runAppEval } from '../evals/agent-installed/app.js';
 import { detectionCases } from '../evals/agent-installed/cases.js';
 import {
   AgentCli,
@@ -42,15 +43,15 @@ export function evalOptions(args: string[]) {
   if (!Number.isSafeInteger(repeat) || repeat < 1 || repeat > 20)
     throw new Error('--repeat must be an integer from 1 to 20.');
   if (!['all', 'development', 'holdout'].includes(values.split)) throw new Error('Invalid --split.');
-  if (values.entrypoint !== 'agent' && values.entrypoint !== 'delegate')
-    throw new Error('--entrypoint must be agent or delegate.');
+  if (values.entrypoint !== 'agent' && values.entrypoint !== 'delegate' && values.entrypoint !== 'app')
+    throw new Error('--entrypoint must be agent, delegate or app.');
   for (const id of values.case ?? [])
     if (!detectionCases.some((c) => c.id === id)) throw new Error(`Unknown case: ${id}`);
   const cases = detectionCases.filter(
     (c) => (values.split === 'all' || c.split === values.split) && (!values.case || values.case.includes(c.id)),
   );
   if (!cases.length) throw new Error('No cases selected.');
-  const entrypoint: 'agent' | 'delegate' = values.entrypoint;
+  const entrypoint: 'agent' | 'delegate' | 'app' = values.entrypoint;
   return { ...values, entrypoint, repeat, cases };
 }
 
@@ -58,7 +59,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
   const options = evalOptions(args);
   if (options.help) {
     console.log(
-      'Usage: vp exec oxnode scripts/eval-agent-installed.ts [--entrypoint agent|delegate] [--case ID] [--split all|development|holdout] [--repeat 1..20] [--seed VALUE] [--output NEW_DIR] [--list]\nStarts the real built mlx CLI with --mode rpc. No inference, model, tools, prompt, cache, permission or environment overrides.',
+      'Usage: vp exec oxnode scripts/eval-agent-installed.ts [--entrypoint agent|delegate|app] [--case ID] [--split all|development|holdout] [--repeat 1..20] [--seed VALUE] [--output NEW_DIR] [--list]\nRuns the real built mlx CLI with --mode rpc, or the App detector and production desktop sidecar. Uses entrypoint defaults, without inference tuning overrides.',
     );
     return 0;
   }
@@ -66,6 +67,7 @@ export async function main(args = process.argv.slice(2)): Promise<number> {
     for (const c of options.cases) console.log(`${c.id}\t${c.split}\t${c.expected}\t${c.category}`);
     return 0;
   }
+  if (options.entrypoint === 'app') return runAppEval(options, root);
   const output = resolve(
     options.output ?? join(root, '.cache/agent-installed-eval', new Date().toISOString().replaceAll(':', '-')),
   );
