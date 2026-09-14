@@ -76,6 +76,7 @@ export default defineConfig({
       '@mlx-node/agent/catalog': resolve(__dirname, './packages/agent/src/catalog.ts'),
       '@mlx-node/agent/delegate': resolve(__dirname, './packages/agent/src/delegate.ts'),
       '@mlx-node/agent/models': resolve(__dirname, './packages/agent/src/provider/models.ts'),
+      '@mlx-node/agent/paths': resolve(__dirname, './packages/agent/src/paths.ts'),
       '@mlx-node/agent': resolve(__dirname, './packages/agent/src/index.ts'),
       '@mlx-node/privacy': resolve(__dirname, './packages/privacy/src/index.ts'),
       '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),

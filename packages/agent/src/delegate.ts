@@ -3,6 +3,8 @@ import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
+import { expandPiAgentDir } from './paths.js';
+
 export const DELEGATION_PROMPT =
   'Delegate GitHub investigation to `mlx delegate github --caller-approved --repo OWNER/REPO "TASK"`. Approve the bounded task and its tool execution before invoking. Include the PR, issue, or run number. Use its findings and evidence for implementation; request more detail when needed. Add `--allow-write` only for GitHub changes already authorized by the user. If delegation fails or reports incomplete work, continue from its handoff.';
 
@@ -33,8 +35,10 @@ export function expandHome(path: string, home = homedir()): string {
 
 /** Match the persisted default used by `mlx agent`; never select a cloud provider. */
 export async function preferredLocalModel(home = homedir(), env = process.env): Promise<string | undefined> {
-  const dir = env.PI_CODING_AGENT_DIR ? expandHome(env.PI_CODING_AGENT_DIR, home) : join(home, '.mlx-node', 'agent');
   try {
+    const dir = env.PI_CODING_AGENT_DIR
+      ? expandPiAgentDir(env.PI_CODING_AGENT_DIR, home)
+      : join(home, '.mlx-node', 'agent');
     const value = JSON.parse(await readFile(join(dir, 'settings.json'), 'utf8'));
     if (value.defaultProvider === 'mlx' && typeof value.defaultModel === 'string') {
       return value.defaultModel.replace(/^mlx\//, '');

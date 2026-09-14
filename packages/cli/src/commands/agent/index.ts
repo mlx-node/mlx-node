@@ -14,12 +14,14 @@
 import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
-import { fileURLToPath } from 'node:url';
 
 import type { MlxModelInfo } from '@mlx-node/agent';
 // Native-free subpath: the help path must print without loading the addon, and
 // the family list must have exactly ONE definition (the drift guard's).
 import { coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
+import { expandPiAgentDir } from '@mlx-node/agent/paths';
+
+export { expandPiAgentDir } from '@mlx-node/agent/paths';
 
 export interface AgentArgScan {
   /** Value of `--models-dir` (the flag pair is removed from `passthrough`). */
@@ -456,29 +458,6 @@ export function withDefaultModel(passthrough: string[], defaultModelId: string):
 export interface PersistedPiDefault {
   provider: string;
   modelId: string;
-}
-
-/**
- * Expand a `PI_CODING_AGENT_DIR` value exactly like pi 0.80.6 does
- * (`getAgentDir` → `expandTildePath` → `normalizePath` with default
- * options): a lone `~` or a leading `~/` (`~\` on Windows) becomes the
- * home directory, a `file://` URL becomes its path, and everything
- * else — including `~user` — passes through verbatim (no trim). Looser
- * or tighter rules would desync this reader from the settings.json pi
- * actually opens. `home` is a test seam (pi's `homeDir` option).
- */
-export function expandPiAgentDir(dir: string, home: string = homedir()): string {
-  if (dir === '~') {
-    return home;
-  }
-  if (dir.startsWith('~/') || (process.platform === 'win32' && dir.startsWith('~\\'))) {
-    return join(home, dir.slice(2));
-  }
-  // pi tests /^file:\/\//; startsWith is the identical predicate.
-  if (dir.startsWith('file://')) {
-    return fileURLToPath(dir);
-  }
-  return dir;
 }
 
 /**

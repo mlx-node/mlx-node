@@ -1,6 +1,7 @@
 import { mkdtemp, mkdir, readFile, writeFile, rm, symlink, stat } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 
 import { DELEGATION_PROMPT, delegationCommand, delegationPrompt } from '@mlx-node/agent/delegate';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
@@ -46,12 +47,25 @@ async function setup(models = ['local-model']) {
   });
   const connect = vi.fn(async () => ({ url: 'http://127.0.0.1:8080', model: 'host-default', token: 'secret' }));
   const listModels = vi.fn(async () => [...models]);
+  const env: NodeJS.ProcessEnv = {};
   const restart = () => {
-    const service = new CodingAgentsService({ home, env: {}, listModels, connect, complete, prepareCommand });
+    const service = new CodingAgentsService({ home, env, listModels, connect, complete, prepareCommand });
     cleanup.push(() => service.close());
     return service;
   };
-  return { home, command, prompt, prepareCommand, complete, connect, service: restart(), models, listModels, restart };
+  return {
+    home,
+    env,
+    command,
+    prompt,
+    prepareCommand,
+    complete,
+    connect,
+    service: restart(),
+    models,
+    listModels,
+    restart,
+  };
 }
 
 async function settled(service: CodingAgentsService, id = 'claude') {
@@ -312,6 +326,32 @@ describe('local model coding-agent setup', () => {
     expect(complete.mock.calls[0][2][0].content).toContain(
       `Current app executable: ${JSON.stringify(join(home, '.mlx-node', 'bin', 'mlx'))}`,
     );
+  });
+
+  it.each(['path', 'file-url', 'tilde'])('uses the persisted default from a %s agent directory', async (kind) => {
+    const { service, home, env, complete } = await setup(['alpha', 'chosen']);
+    const dir = join(home, 'custom agent #配置');
+    await mkdir(dir);
+    await writeFile(join(dir, 'settings.json'), JSON.stringify({ defaultProvider: 'mlx', defaultModel: 'chosen' }));
+    env.PI_CODING_AGENT_DIR =
+      kind === 'file-url' ? pathToFileURL(dir).href : kind === 'tilde' ? '~/custom agent #配置' : dir;
+    await mkdir(join(home, '.claude'));
+    await writeFile(join(home, '.claude', 'CLAUDE.md'), 'Use yarn.');
+    await service.start('detect', 'claude');
+    expect((await settled(service)).status).toBe('not-installed');
+    expect(complete.mock.calls[0][0].model).toBe('chosen');
+    await service.start('install', 'claude');
+    expect((await settled(service)).status).toBe('installed');
+    expect(complete.mock.calls.every(([connection]) => connection.model === 'chosen')).toBe(true);
+  });
+
+  it('blocks setup for an invalid agent directory URL instead of choosing another model', async () => {
+    const { service, env, complete, connect } = await setup(['alpha', 'chosen']);
+    env.PI_CODING_AGENT_DIR = 'file:///%ZZ';
+    await expect(service.start('detect', 'claude')).rejects.toThrow('Could not read the default local model');
+    await expect(service.start('install', 'claude')).rejects.toThrow('Could not read the default local model');
+    expect(complete).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
   });
 
   it('recognizes a manually worded installation through the model without markers', async () => {

@@ -275,18 +275,21 @@ describe('isModelInstalled', () => {
 });
 
 describe('isModelPresent', () => {
-  it('is present for a markerless config + weight dir (CLI/wizard install)', () => {
-    // Exactly what `mlx download model` leaves on disk: a loadable checkpoint with
-    // NO dashboard completion marker. `isModelInstalled` rejects it (unowned), but
-    // it must read as PRESENT so the UI does not offer an Install that would then
-    // refuse to overwrite the unowned directory.
-    const dir = join(modelsDir, 'cli-installed');
-    mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
-    writeFileSync(join(dir, 'model.safetensors'), Buffer.alloc(8));
-    expect(isModelInstalled(dir)).toBe(false);
-    expect(isModelPresent(dir)).toBe(true);
-  });
+  it.each(['model.safetensors', 'weights.safetensors'])(
+    'is present for a markerless config + %s (CLI/wizard install)',
+    (weight) => {
+      // Exactly what `mlx download model` leaves on disk: a loadable checkpoint with
+      // NO dashboard completion marker. `isModelInstalled` rejects it (unowned), but
+      // it must read as PRESENT so the UI does not offer an Install that would then
+      // refuse to overwrite the unowned directory.
+      const dir = join(modelsDir, 'cli-installed');
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
+      writeFileSync(join(dir, weight), Buffer.alloc(8));
+      expect(isModelInstalled(dir)).toBe(false);
+      expect(isModelPresent(dir)).toBe(true);
+    },
+  );
 
   it('is NOT present without a config.json, without a weight, or for a missing dir', () => {
     const weightOnly = join(modelsDir, 'weight-only');
@@ -355,7 +358,7 @@ describe('a payload must be a REGULAR FILE, not merely a name on disk', () => {
     );
   }
 
-  it('is NOT present when the weight is a directory — the shape a download can really leave', () => {
+  it.each(['model.safetensors', 'weights.safetensors'])('is NOT present when %s is a directory', (weight) => {
     // Reachable without touching the disk by hand. `POST /api/downloads` takes an
     // arbitrary repo, a repo file at `model.safetensors/x.safetensors` passes the
     // runner's path filter, and publishing it runs `mkdir(dirname(dest))` — which
@@ -363,9 +366,9 @@ describe('a payload must be a REGULAR FILE, not merely a name on disk', () => {
     // present, so the card showed a disabled "Installed" and a retry short-circuited
     // to `done`: nothing the user could do from the dashboard, forever.
     const dir = join(modelsDir, 'weight-is-a-dir');
-    mkdirSync(join(dir, 'model.safetensors'), { recursive: true });
+    mkdirSync(join(dir, weight), { recursive: true });
     writeFileSync(join(dir, 'config.json'), Buffer.alloc(4));
-    writeFileSync(join(dir, 'model.safetensors', 'x.safetensors'), Buffer.alloc(8));
+    writeFileSync(join(dir, weight, 'x.safetensors'), Buffer.alloc(8));
     expect(isModelPresent(dir)).toBe(false);
   });
 

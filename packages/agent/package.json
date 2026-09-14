@@ -30,6 +30,10 @@
       "types": "./dist/catalog.d.ts",
       "default": "./dist/catalog.js"
     },
+    "./paths": {
+      "types": "./dist/paths.d.ts",
+      "default": "./dist/paths.js"
+    },
     "./models": {
       "types": "./dist/provider/models.d.ts",
       "default": "./dist/provider/models.js"

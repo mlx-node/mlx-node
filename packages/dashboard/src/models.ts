@@ -145,6 +145,7 @@ export function isModelPresent(modelDir: string): boolean {
   // the card AND short-circuits a re-download to `done` — self-locking, with the
   // "needs cleanup" notice suppressed because `present` short-circuits it.
   if (isRegularFile(join(modelDir, 'model.safetensors'))) return true;
+  if (isRegularFile(join(modelDir, 'weights.safetensors'))) return true;
   if (isRegularFile(join(modelDir, 'inference.pdiparams'))) return true;
   if (entries.some((file) => file.endsWith('.gguf') && isRegularFile(join(modelDir, file)))) return true;
   // Sharded safetensors: every shard the index references must exist on disk —

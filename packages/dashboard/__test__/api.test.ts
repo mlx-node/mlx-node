@@ -166,6 +166,43 @@ describe('dashboard api — models & catalog', () => {
     }
   });
 
+  it.each(['qwen3_5', 'muse_glimmer'])('keeps a %s weights.safetensors default available for setup', async (family) => {
+    const name = 'native-saved-model';
+    const dir = join(modelsDir, name);
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ model_type: family }));
+    writeFileSync(join(dir, 'tokenizer.json'), '{}');
+    writeFileSync(join(dir, 'weights.safetensors'), Buffer.alloc(128));
+    const listModels = async (): Promise<string[]> => {
+      const response = await api.fetch('/api/coding-agents/models');
+      expect(response.status).toBe(200);
+      const body = (await response.json()) as { models: { name: string }[] };
+      return body.models.map((model) => model.name);
+    };
+    expect(await listModels()).toContain(name);
+    const home = join(base, 'native-home');
+    mkdirSync(join(home, '.mlx-node', 'agent'), { recursive: true });
+    writeFileSync(
+      join(home, '.mlx-node', 'agent', 'settings.json'),
+      JSON.stringify({ defaultProvider: 'mlx', defaultModel: name }),
+    );
+    const service = new CodingAgentsService({
+      home,
+      env: {},
+      listModels,
+      prepareCommand: async () => join(home, '.mlx-node', 'bin', 'mlx'),
+      connect: async () => {
+        throw new Error('Discovery must not start inference');
+      },
+    });
+    try {
+      expect(await service.state()).toMatchObject({ model: name, available: true, unavailableReason: null });
+      expect(await service.start('detect')).toMatchObject({ available: true });
+    } finally {
+      await service.close();
+    }
+  });
+
   it('only offers complete generative models for local prompt detection', async () => {
     for (const [name, type, weights] of [
       ['partial', 'qwen3', false],

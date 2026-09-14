@@ -18,6 +18,7 @@ import { describe, expect, it } from 'vite-plus/test';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 
 const CATALOG_DIST = resolve(ROOT, 'packages/agent/dist/catalog.js');
+const PATHS_DIST = resolve(ROOT, 'packages/agent/dist/paths.js');
 const FAMILY_DATA_DIST = resolve(ROOT, 'packages/lm/dist/family-data.js');
 const LM_ROOT_DIST = resolve(ROOT, 'packages/lm/dist/index.js');
 const MODELS_DIST = resolve(ROOT, 'packages/agent/dist/provider/models.js');
@@ -60,6 +61,8 @@ describe('native-free catalog + family-data subpaths', () => {
       exports: Record<string, unknown>;
     };
     expect(Object.keys(agentPkg.exports)).toContain('./catalog');
+    expect(Object.keys(agentPkg.exports)).toContain('./paths');
+    expect(existsSync(PATHS_DIST)).toBe(true);
     expect(Object.keys(agentPkg.exports)).toContain('./models');
     expect(Object.keys(lmPkg.exports)).toContain('./model-detection');
     expect(existsSync(MODELS_DIST)).toBe(true);
@@ -100,11 +103,15 @@ describe('native-free catalog + family-data subpaths', () => {
     expect(status).toBe(0);
   });
 
-  it('imports both built subpaths in a child whose resolver bans the addon', () => {
+  it('imports built catalog and path subpaths in a child whose resolver bans the addon', () => {
     const probe = `
       ${RESOLVE_HOOK}
       const catalog = await import(${JSON.stringify(CATALOG_DIST)});
       const familyData = await import(${JSON.stringify(FAMILY_DATA_DIST)});
+      const paths = await import(${JSON.stringify(PATHS_DIST)});
+      const { pathToFileURL } = await import('node:url');
+      const dir = ${JSON.stringify(resolve(ROOT, '.cache/agent #配置'))};
+      if (paths.expandPiAgentDir(pathToFileURL(dir).href) !== dir) throw new Error('File URL expansion differs');
       if (typeof catalog.matchFamily !== 'function') throw new Error('catalog.matchFamily missing');
       if (typeof catalog.rawModelTypeToCanonical !== 'function') throw new Error('catalog.rawModelTypeToCanonical missing');
       if (!(catalog.NON_GENERATIVE_FAMILY_IDS instanceof Set)) throw new Error('catalog.NON_GENERATIVE_FAMILY_IDS missing');
