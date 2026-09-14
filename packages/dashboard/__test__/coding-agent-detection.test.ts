@@ -27,7 +27,10 @@ describe('model installation verdicts with source references', () => {
   ] as const)('honors the model status %s without reclassifying command formatting', (status, expected) => {
     // Markdown emphasis and line breaks used to be rejected by the command regex.
     const text = `# Routing\nFor GitHub work, use **${command}**\nwith the delegate github subcommands.`;
-    expect(detectionResult({ status, startLine: 2, endLine: 3 }, text)).toEqual(expected);
+    expect(detectionResult({ status, startLine: 2, endLine: 3 }, text)).toEqual({
+      ...expected,
+      source: { startLine: 2, endLine: 3 },
+    });
   });
 
   it('accepts an explicit negative verdict without evidence', () => {

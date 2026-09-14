@@ -12,12 +12,14 @@ import {
   utimes,
   writeFile,
 } from 'node:fs/promises';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
+import { scopeCoreNativeOverride } from '../scripts/stage-app.js';
 import { createCliLauncher, type DesktopCliConfig } from '../src/cli-launcher.js';
 
 const execute = promisify(execFile);
@@ -42,7 +44,7 @@ async function fixture() {
       console.log('Usage: mlx delegate\\nmlx delegate github');
     } else console.log(JSON.stringify({ args:process.argv.slice(2), cwd:process.cwd(),
       caller:process.env.CODEX_THREAD_ID, approval:process.env.MLX_AGENT_AUTO_APPROVE,
-      models:process.env.MLX_MODELS_DIR, addon:process.env.NAPI_RS_NATIVE_LIBRARY_PATH,
+      models:process.env.MLX_MODELS_DIR, addon:process.env.MLX_CORE_NATIVE_LIBRARY_PATH,
       nodeMode:process.env.ELECTRON_RUN_AS_NODE }));
   `,
   );
@@ -56,6 +58,35 @@ async function fixture() {
 }
 
 describe('app-owned command', () => {
+  it('loads core and Keyring independently, even with a stale inherited generic override', async () => {
+    const { root, config } = await fixture();
+    const binding = join(root, 'core.cjs');
+    await writeFile(
+      binding,
+      scopeCoreNativeOverride(await readFile(new URL('../../core/index.cjs', import.meta.url), 'utf8')),
+    );
+    config.nativeAddon = join(root, 'native.cjs');
+    await writeFile(config.nativeAddon, 'module.exports = { coreProbe: true };');
+    const keyring = createRequire(import.meta.url).resolve('@napi-rs/keyring');
+    await writeFile(
+      config.entry,
+      `import { createRequire } from 'node:module';
+      const require = createRequire(import.meta.url);
+      if (!require(${JSON.stringify(binding)}).coreProbe) throw new Error('Core override was not loaded');
+      const { AsyncEntry } = require(${JSON.stringify(keyring)});
+      const entry = new AsyncEntry('mlx-cli-regression', 'unused');
+      if (typeof entry.getPassword !== 'function') throw new Error('Keyring did not load');
+      if (process.env.NAPI_RS_NATIVE_LIBRARY_PATH) throw new Error('Generic override leaked');
+      console.log('Usage: mlx delegate\\nmlx delegate github');`,
+    );
+    const path = await createCliLauncher(config, root).prepare();
+    await expect(
+      execute(path, ['download', '--help'], {
+        env: { PATH: '/usr/bin:/bin', NAPI_RS_NATIVE_LIBRARY_PATH: config.nativeAddon },
+      }),
+    ).resolves.toMatchObject({ stdout: expect.stringContaining('Usage: mlx delegate') });
+  });
+
   it('runs without Node or mlx on PATH, quotes paths/arguments, and preserves caller permissions', async () => {
     const { root, config, launcher } = await fixture();
     const path = await launcher.prepare();

@@ -8,6 +8,7 @@ import {
   launchPresetFor,
   familyTraitsFor,
   NON_GENERATIVE_FAMILY_IDS,
+  MODEL_FAMILY_DATA,
   type FamilyTraits,
   type LaunchPreset,
   type ModelType,
@@ -53,6 +54,16 @@ function ggufModelName(name: string): string {
 
 function requiresGgufAssets(modelType: ModelType): boolean {
   return modelType === 'gemma4' || modelType === 'muse_glimmer';
+}
+
+function matchesGgufFamily(path: string, modelType: ModelType): boolean {
+  const architecture = readGgufArchitecture(path);
+  return MODEL_FAMILY_DATA.some(
+    (family) =>
+      family.id === modelType &&
+      'ggufArchitectures' in family &&
+      family.ggufArchitectures.some((supported) => supported === architecture),
+  );
 }
 
 async function hasGgufAssets(modelDir: string): Promise<boolean> {
@@ -229,6 +240,9 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
       const full = join(modelsDir, entry.name);
       try {
         const modelType = await detectModelType(full);
+        // A shared sibling config can describe another target or a projector.
+        // Never advertise a file under a loader that disagrees with its header.
+        if (!matchesGgufFamily(full, modelType)) continue;
         if (requiresGgufAssets(modelType) && !(await hasGgufAssets(modelsDir))) {
           if (debug)
             console.warn(
@@ -238,7 +252,7 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
         }
         if (
           modelType === 'gemma4' ||
-          (modelType === 'muse_glimmer' && readGgufArchitecture(full) === 'muse-glimmer') ||
+          modelType === 'muse_glimmer' ||
           (modelType === 'qwen3_5' && isQwen35XlGguf(entry.name))
         ) {
           await append(ggufModelName(entry.name), full, modelsDir, modelType, basename(modelsDir));
@@ -272,9 +286,7 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
       for (const gguf of inventory.targetGgufs) {
         const path = join(full, gguf);
         try {
-          // A sibling Muse config also describes its draft/projector files.
-          // Check the GGUF header so renamed companions cannot become targets.
-          if (modelType === 'muse_glimmer' && readGgufArchitecture(path) !== 'muse-glimmer') continue;
+          if (!matchesGgufFamily(path, modelType)) continue;
           await append(ggufModelName(gguf), path, full, modelType, entry.name);
         } catch (err) {
           if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
@@ -283,7 +295,7 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
       continue;
     }
     const { xlGgufs } = inventory;
-    if (xlGgufs.length > 0 && !(requiresGgufAssets(modelType) && hasModelWeights)) {
+    if (xlGgufs.length > 0 && !inventory.hasPrimarySafetensors) {
       if (modelType !== 'qwen3_5') {
         if (debug) {
           console.warn(`[mlx] skip ${full}: direct XL GGUF loading is not supported for ${modelType}`);
@@ -291,7 +303,12 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
         continue;
       }
       for (const gguf of xlGgufs) {
-        await append(ggufModelName(gguf), join(full, gguf), full, modelType, entry.name);
+        const path = join(full, gguf);
+        try {
+          if (matchesGgufFamily(path, modelType)) await append(ggufModelName(gguf), path, full, modelType, entry.name);
+        } catch (err) {
+          if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
+        }
       }
       continue;
     }

@@ -72,6 +72,17 @@ function isPrebuiltAddonPackage(name: string): boolean {
   return /^@mlx-node\/core-/.test(name);
 }
 
+/** Give only the bundled core loader an app-specific override. Other napi-rs
+ * packages (notably Keyring) must still resolve their own native libraries.
+ * Keep the generic fallback for existing inference-sidecar environments.
+ */
+export function scopeCoreNativeOverride(binding: string): string {
+  const generic = 'process.env.NAPI_RS_NATIVE_LIBRARY_PATH';
+  // Fail packaging if napi-rs changes the generated loader contract.
+  if (binding.split(generic).length !== 3) throw new Error('Unrecognized core native binding override');
+  return binding.replaceAll(generic, `(process.env.MLX_CORE_NATIVE_LIBRARY_PATH || ${generic})`);
+}
+
 /**
  * `@mariozechner/clipboard` and its per-platform prebuilts, which arrive
  * transitively via `@earendil-works/pi-coding-agent` and must not ship.
@@ -417,6 +428,10 @@ export function stageApp(opts: {
     }
     for (const file of ['index.cjs', 'index.d.cts', 'index.js', 'index.d.ts']) {
       if (existsSync(join(from, file))) cpSync(join(from, file), join(to, file));
+    }
+    if (name === '@mlx-node/core') {
+      const binding = join(to, 'index.cjs');
+      writeFileSync(binding, scopeCoreNativeOverride(readFileSync(binding, 'utf8')));
     }
   }
 

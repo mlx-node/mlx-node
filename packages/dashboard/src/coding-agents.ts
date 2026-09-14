@@ -311,10 +311,18 @@ export class CodingAgentsService {
     let after = before;
     if (action === 'install' && !result.installed) {
       const prompt = delegationPrompt(state.command);
-      // Upgrade our exact previous template in place. Preserve custom instructions.
-      after = before.includes(DELEGATION_PROMPT)
-        ? before.replaceAll(DELEGATION_PROMPT, prompt)
-        : `${before}${before && !before.endsWith('\n') ? '\n' : ''}${before ? '\n' : ''}${prompt}\n`;
+      // Older cached verdicts do not have a source reference. Recheck only when
+      // an update needs that reference; ordinary cached status checks stay free.
+      if (result.needsUpdate && !result.source) result = await classify(before);
+      if (result.needsUpdate) {
+        // Revalidate cached bounds against the exact content hashed by the key.
+        const { source } = detectionResult({ status: 'needs-update', ...result.source }, before);
+        const lines = before.split('\n');
+        lines.splice(source!.startLine - 1, source!.endLine - source!.startLine + 1, prompt);
+        after = lines.join('\n');
+      } else if (!result.installed) {
+        after = `${before}${before && !before.endsWith('\n') ? '\n' : ''}${before ? '\n' : ''}${prompt}\n`;
+      }
       if (Buffer.byteLength(after) > MAX_FILE_BYTES)
         throw new Error('There is not enough room to add and verify the prompt. Shorten the instruction file first.');
       // Validate the actual proposed prompt with the selected model before touching user files.

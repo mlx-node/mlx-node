@@ -6,10 +6,11 @@ import { dirname } from 'node:path';
 export interface DetectionResult {
   installed: boolean;
   needsUpdate?: boolean;
+  source?: { startLine: number; endLine: number };
   checkedAt: string;
 }
 
-/** Only hashes and verdicts are persisted. Instruction text never enters this file. */
+/** Only hashes, verdicts and line references are persisted. Instruction text never enters this file. */
 export class CodingAgentCache {
   private readonly entries = new Map<string, DetectionResult>();
   private loading?: Promise<void>;
@@ -44,6 +45,12 @@ export class CodingAgentCache {
             this.entries.set(item.key, {
               installed: item.installed,
               needsUpdate: item.needsUpdate === true,
+              ...(Number.isSafeInteger(item.source?.startLine) &&
+              Number.isSafeInteger(item.source?.endLine) &&
+              item.source.startLine >= 1 &&
+              item.source.endLine >= item.source.startLine
+                ? { source: { startLine: item.source.startLine, endLine: item.source.endLine } }
+                : {}),
               checkedAt: item.checkedAt,
             });
           }

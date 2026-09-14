@@ -24,7 +24,7 @@ export function launcherScript(config: DesktopCliConfig): string {
   for (const path of [config.executable, config.entry, config.nativeAddon]) {
     if (!isAbsolute(path) || /[\0\r\n]/.test(path)) throw new Error('The app command has an invalid runtime path.');
   }
-  return `${HEADER}export ELECTRON_RUN_AS_NODE=1\nexport NAPI_RS_NATIVE_LIBRARY_PATH=${quote(config.nativeAddon)}\n${
+  return `${HEADER}export ELECTRON_RUN_AS_NODE=1\nunset NAPI_RS_NATIVE_LIBRARY_PATH\nexport MLX_CORE_NATIVE_LIBRARY_PATH=${quote(config.nativeAddon)}\n${
     config.modelsDir ? `export MLX_MODELS_DIR=${quote(config.modelsDir)}\n` : ''
   }exec ${quote(config.executable)} ${quote(config.entry)} "$@"\n`;
 }

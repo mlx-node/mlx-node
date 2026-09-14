@@ -199,6 +199,30 @@ describe('createInferenceHost — discovery and model binding', () => {
     expect(host.health().models.resident).toEqual([names[1]]);
   });
 
+  it('preserves a converted Qwen directory ID when a source XL GGUF remains beside the weights', async () => {
+    const modelsDir = await makeModelsDir([]);
+    const name = 'qwen3.8-mxfp4-mlx';
+    const repo = join(modelsDir, name);
+    await mkdir(repo);
+    await writeFile(join(repo, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+    await writeFile(join(repo, 'model.safetensors'), 'converted weights');
+    await writeFile(join(repo, 'source-Q4_K_XL.gguf'), ggufHeader('qwen35'));
+    const loadedPaths: string[] = [];
+    const host = await start({
+      modelsDir,
+      model: name,
+      pagedModelTypes: [],
+      loadModel: async (path) => {
+        loadedPaths.push(path);
+        return fakeModel();
+      },
+    });
+    expect(host.boundModel).toBe(name);
+    expect(await (await fetch(`${host.url}/v1/models`)).json()).toMatchObject({ data: [{ id: name }] });
+    await host.loadModel(name);
+    expect(loadedPaths).toEqual([repo]);
+  });
+
   it('binds the alphabetically-first model by default', async () => {
     const modelsDir = await makeModelsDir(['zeta', 'alpha', 'mid']);
     delete process.env.ANTHROPIC_MODEL;

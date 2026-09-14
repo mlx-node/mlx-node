@@ -29,7 +29,18 @@ export async function verifyBundledCli(appPath: string): Promise<void> {
       maxBuffer: 256 * 1024,
     }).trim();
     if (!/^\d+\.\d+\.\d+/.test(version)) throw new Error(`The packaged agent did not report its version: ${version}`);
-    console.log(`packaged CLI verified without global Node/mlx (agent ${version})`);
+    // These enter the download modules and instantiate Keyring without reading
+    // credentials or downloading anything. delegate --help never imports it.
+    for (const args of [['download'], ['download', 'model'], ['download', 'dataset']]) {
+      const help = execFileSync(path, [...args, '--help'], {
+        env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: home },
+        encoding: 'utf8',
+        timeout: 30_000,
+        maxBuffer: 256 * 1024,
+      });
+      if (!help.includes('Usage:')) throw new Error(`The packaged ${args.join(' ')} did not report its usage`);
+    }
+    console.log(`packaged CLI verified without global Node/mlx (agent ${version}, download commands with Keyring)`);
   } finally {
     await rm(home, { recursive: true, force: true });
   }

@@ -305,8 +305,8 @@ describe('discoverMlxModels', () => {
       );
       await writeFile(join(draft, 'model.safetensors'), 'draft weights');
       await Promise.all([
-        writeFile(join(repo, 'Qwen3.8-27B-UD-Q3_K_XL.gguf'), 'q3'),
-        writeFile(join(repo, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'), 'q4'),
+        writeFile(join(repo, 'Qwen3.8-27B-UD-Q3_K_XL.gguf'), minimalGguf('qwen35')),
+        writeFile(join(repo, 'Qwen3.8-27B-UD-Q4_K_XL.gguf'), minimalGguf('qwen35')),
         writeFile(join(repo, 'Qwen3.8-27B-Q4_K_M.gguf'), 'ordinary variant'),
         writeFile(join(repo, 'imatrix_unsloth.gguf'), 'imatrix'),
         writeFile(join(repo, 'mmproj-Q4_K_XL.gguf'), 'mmproj'),
@@ -374,6 +374,44 @@ describe('discoverMlxModels', () => {
       await rm(root, { recursive: true, force: true });
     }
   });
+
+  it.each(['top-level', 'nested'])('rejects %s GGUF headers that disagree with sibling assets', async (layout) => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-mixed-gguf-'));
+    try {
+      const repo = layout === 'top-level' ? root : join(root, 'gemma-assets');
+      await mkdir(repo, { recursive: true });
+      await writeFile(join(repo, 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+      await writeFile(join(repo, 'tokenizer.json'), '{}');
+      await writeFile(join(repo, 'gemma-Q4_K_XL.gguf'), minimalGguf('gemma4'));
+      await writeFile(join(repo, 'qwen-Q4_K_XL.gguf'), minimalGguf('qwen35'));
+      await writeFile(join(repo, 'renamed-projector.gguf'), minimalGguf('clip'));
+      await writeFile(join(repo, 'broken.gguf'), 'broken');
+      expect((await discoverMlxModels(root)).map((model) => model.discovered)).toEqual([
+        { name: 'gemma-Q4_K_XL', path: join(repo, 'gemma-Q4_K_XL.gguf'), modelType: 'gemma4' },
+      ]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it.each(['model.safetensors', 'weights.safetensors', 'model-00001-of-00002.safetensors'])(
+    'keeps a converted Qwen directory with %s and a retained XL GGUF selectable',
+    async (weights) => {
+      const root = await mkdtemp(join(tmpdir(), 'mlx-converted-qwen-'));
+      try {
+        const repo = join(root, 'qwen3.8-mxfp4-mlx');
+        await mkdir(repo);
+        await writeFile(join(repo, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+        await writeFile(join(repo, weights), 'converted weights');
+        await writeFile(join(repo, 'source-Q4_K_XL.gguf'), minimalGguf('qwen35'));
+        expect((await discoverMlxModels(root)).map((model) => model.discovered)).toEqual([
+          { name: 'qwen3.8-mxfp4-mlx', path: repo, modelType: 'qwen3_5' },
+        ]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
 
   it('lists all Muse GGUF variants by filename and ignores renamed companions and broken files', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-agent-muse-gguf-'));
@@ -574,7 +612,7 @@ describe('discoverMlxModels', () => {
       for (const repo of [zeta, alpha]) {
         await mkdir(repo, { recursive: true });
         await writeFile(join(repo, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
-        await writeFile(join(repo, 'Shared-Qwen3.8-UD-Q4_K_XL.gguf'), 'target');
+        await writeFile(join(repo, 'Shared-Qwen3.8-UD-Q4_K_XL.gguf'), minimalGguf('qwen35'));
       }
 
       expect((await discoverMlxModels(root)).map((model) => model.discovered)).toEqual([
