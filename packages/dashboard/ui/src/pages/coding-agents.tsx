@@ -140,7 +140,7 @@ export default function CodingAgents() {
             </Button>
           ) : (
             <Button asChild>
-              <Link to="/models">
+              <Link to="/welcome">
                 <Download className="size-4" aria-hidden /> Install a model
               </Link>
             </Button>

@@ -1,5 +1,8 @@
 import { Toaster } from '@/components/ui/sonner';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { hasDismissedOnboarding } from '@/lib/onboarding';
+import type { ModelsResponse } from '@/lib/types';
+import { useJson } from '@/lib/use-api';
 import Cache from '@/pages/cache';
 import CodingAgents from '@/pages/coding-agents';
 import Metrics from '@/pages/metrics';
@@ -9,7 +12,7 @@ import SessionDetail from '@/pages/session-detail';
 import Sessions from '@/pages/sessions';
 import { Boxes, Bot, HardDrive, LayoutDashboard, type LucideIcon, MessagesSquare, TrendingUp } from 'lucide-react';
 import { type CSSProperties, useLayoutEffect, useRef, useState } from 'react';
-import { BrowserRouter, NavLink, Outlet, Route, Routes, useLocation } from 'react-router-dom';
+import { BrowserRouter, Navigate, NavLink, Outlet, Route, Routes, useLocation } from 'react-router-dom';
 
 interface NavItem {
   to: string;
@@ -139,6 +142,30 @@ function Sidebar() {
 }
 
 function Layout() {
+  const { pathname } = useLocation();
+  // Only decide on entry. A user already navigating the workspace may install
+  // a model in Models, while this hook still holds its first empty snapshot.
+  const [checkFirstRun, setCheckFirstRun] = useState(pathname === '/');
+  const models = useJson<ModelsResponse>('/models');
+  if (checkFirstRun) {
+    if (models.loading || models.refreshing) {
+      return (
+        <div className="mlx-boot" role="status">
+          <span className="mlx-boot__spinner" aria-hidden />
+          Opening your workspace…
+        </div>
+      );
+    }
+    if (
+      !models.error &&
+      models.data?.dir &&
+      models.data.models.length === 0 &&
+      !hasDismissedOnboarding(models.data.dir)
+    ) {
+      return <Navigate to="/welcome" replace />;
+    }
+    setCheckFirstRun(false);
+  }
   return (
     // The shell is exactly the viewport and never scrolls; `main` is the only
     // scroll container in the app.
@@ -169,6 +196,7 @@ export default function App() {
     <TooltipProvider>
       <BrowserRouter>
         <Routes>
+          <Route path="welcome" element={<Models onboarding />} />
           <Route element={<Layout />}>
             <Route index element={<Overview />} />
             <Route path="models" element={<Models />} />

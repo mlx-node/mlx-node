@@ -58,7 +58,7 @@ it('disables every setup action and links to models when no local model is insta
   );
   expect(page.text()).toContain('Install a local model first');
   expect([...page.container.querySelectorAll('button')].every((button) => button.disabled)).toBe(true);
-  expect(page.container.querySelector('a')?.getAttribute('href')).toBe('/models');
+  expect(page.container.querySelector('a')?.getAttribute('href')).toBe('/welcome');
   expect(page.text()).not.toContain('Installed');
 });
 

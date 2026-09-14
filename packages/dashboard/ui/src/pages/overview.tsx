@@ -1,5 +1,6 @@
 import { StatTile } from '@/components/stat-tile';
 import { Badge } from '@/components/ui/badge';
+import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Skeleton } from '@/components/ui/skeleton';
 import { formatBytes, formatCount, formatPercent, formatRate, formatRelativeTime, percentInt } from '@/lib/format';
@@ -82,9 +83,18 @@ export default function Overview() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
-        <p className="text-muted-foreground text-sm">Models, sessions, tokens, and cache at a glance.</p>
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <div>
+          <h1 className="text-2xl font-semibold tracking-tight">Overview</h1>
+          <p className="text-muted-foreground text-sm">Models, sessions, tokens, and cache at a glance.</p>
+        </div>
+        {!models.loading && !models.error && models.data && modelCount === 0 && (
+          <Button asChild>
+            <Link to="/welcome">
+              Choose your first model <ArrowRight className="size-4" aria-hidden />
+            </Link>
+          </Button>
+        )}
       </div>
 
       {/*

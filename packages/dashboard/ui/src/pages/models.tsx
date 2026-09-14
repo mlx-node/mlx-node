@@ -31,6 +31,7 @@ import type {
   ModelsResponse,
 } from '@/lib/types';
 import { useJson } from '@/lib/use-api';
+import Onboarding from '@/pages/onboarding';
 import {
   AlertCircle,
   Check,
@@ -207,7 +208,7 @@ function hasUpdate(
   );
 }
 
-export default function Models() {
+export default function Models({ onboarding = false }: { onboarding?: boolean }) {
   const models = useJson<ModelsResponse>('/models');
   const catalog = useJson<CatalogResponse>('/catalog');
   // Deliberately a SEPARATE request from `/catalog`: this one dials Hugging Face
@@ -258,6 +259,7 @@ export default function Models() {
   const [deleting, setDeleting] = useState(false);
   /** repo → active download job (seeded from the server, added on install). */
   const [active, setActive] = useState<Record<string, ActiveJob>>({});
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   // `useJson` is stale-while-revalidate: on a connection bump it intentionally
   // keeps the old body on screen until the replacement runtime answers. Remember
   // that exact object so the reconciliation effect below does not mistake it for
@@ -371,6 +373,7 @@ export default function Models() {
   }, [downloads.data, connection, reloadModels, reloadCatalog, reloadUpdates]);
 
   const install = async (repo: string): Promise<void> => {
+    setDownloadError(null);
     const startedConnection = connection;
     try {
       const res = await mutate<DownloadStartResponse>('POST', '/downloads', { repo });
@@ -383,6 +386,7 @@ export default function Models() {
         [repo]: { id: res.id, committing: false, cancelling: false, connection: startedConnection, source: 'local' },
       }));
     } catch (err) {
+      setDownloadError(errMessage(err));
       toast.error('Failed to start download', { description: errMessage(err) });
     }
   };
@@ -416,6 +420,7 @@ export default function Models() {
   };
 
   const onDownloadError = (repo: string, message: string): void => {
+    setDownloadError(message);
     toast.error('Download failed', { description: message });
     // `error` does not mean nothing was installed. `publish()` renames staging
     // into the final dir and only THEN fsyncs and removes the backup, and those
@@ -562,6 +567,27 @@ export default function Models() {
     onCancelled: () => onDownloadCancelled(item.hfRepo),
     onCancel: (id) => void cancel(item.hfRepo, id),
   });
+
+  if (onboarding) {
+    return (
+      <Onboarding
+        catalog={catalog}
+        models={models}
+        activeRepos={Object.keys(active)}
+        downloadError={downloadError}
+        downloadsLoading={downloads.loading}
+        downloadsError={downloads.error}
+        reloadDownloads={downloads.reload}
+        renderDownload={(item) => (
+          <CatalogDownloadAction
+            {...downloadProps(item)}
+            installLabel="Download model"
+            settlingLabel="Checking download…"
+          />
+        )}
+      />
+    );
+  }
 
   return (
     <div className="space-y-6">
@@ -843,6 +869,7 @@ function CatalogCardSkeleton({ withDraft = false }: { withDraft?: boolean }) {
 
 interface CatalogDownloadProps {
   installLabel?: string;
+  settlingLabel?: string;
   item: Pick<CatalogItem, 'hfRepo' | 'installed' | 'localRevision' | 'present' | 'blockedByForeignDir' | 'slug'>;
   /** Upstream has different bytes at this repo than the local marker records. */
   updateAvailable: boolean;
@@ -859,7 +886,7 @@ interface CatalogDownloadProps {
    */
   updateSettling: boolean;
   job: ActiveJob | undefined;
-  onInstall: () => void;
+  onInstall: () => Promise<void>;
   onDone: () => void;
   onError: (message: string) => void;
   onCancelled: () => void;
@@ -941,6 +968,7 @@ function CatalogCard({ item, draftDownload, ...download }: CatalogCardProps) {
 function CatalogDownloadAction({
   item,
   installLabel = 'Install',
+  settlingLabel = installLabel,
   updateAvailable,
   settling,
   updateSettling,
@@ -951,6 +979,16 @@ function CatalogDownloadAction({
   onCancelled,
   onCancel,
 }: CatalogDownloadProps) {
+  const [starting, setStarting] = useState(false);
+  const start = async (): Promise<void> => {
+    if (starting) return;
+    setStarting(true);
+    try {
+      await onInstall();
+    } finally {
+      setStarting(false);
+    }
+  };
   // Gate on `present` (loadable checkpoint on disk), not `installed` (dashboard
   // marker): a model installed via the `mlx download` CLI / wizard is present but
   // unowned, so offering Install would refuse to overwrite it and fail.
@@ -992,7 +1030,7 @@ function CatalogDownloadAction({
         // Same job pipeline as a first install: the runner already re-downloads
         // whenever the installed marker's revision differs from upstream, and
         // its owned-swap replaces the stale directory.
-        <Button className="w-full" onClick={onInstall} disabled={settling || updateSettling}>
+        <Button className="w-full" onClick={() => void start()} disabled={starting || settling || updateSettling}>
           <Download className="size-4" />
           Update available
         </Button>
@@ -1016,9 +1054,13 @@ function CatalogDownloadAction({
           </p>
         </div>
       ) : (
-        <Button className="w-full" onClick={onInstall} disabled={settling}>
-          <Download className="size-4" />
-          {installLabel}
+        <Button className="w-full" onClick={() => void start()} disabled={starting || settling}>
+          {starting ? (
+            <Loader2 className="size-4 animate-spin" aria-hidden />
+          ) : (
+            <Download className="size-4" aria-hidden />
+          )}
+          {starting ? 'Starting download…' : settling ? settlingLabel : installLabel}
         </Button>
       )}
     </>

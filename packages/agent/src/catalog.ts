@@ -57,7 +57,7 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     draft: QWEN38_DFLASH2,
   },
   {
-    label: 'Qwen-AgentWorld-35B',
+    label: 'Qwen-AgentWorld-35B-A3B',
     hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-mxfp4-mlx',
     hfRepoCuda: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-nvfp4-mlx',
     sizeGb: 23.3,

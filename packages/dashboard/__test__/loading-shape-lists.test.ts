@@ -174,7 +174,7 @@ function modelsRoutes(): Record<string, unknown> {
         localRevision: null,
       },
       {
-        label: 'Qwen-AgentWorld-35B',
+        label: 'Qwen-AgentWorld-35B-A3B',
         hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-mxfp4-mlx',
         sizeGb: 23.3,
         description: 'Agent-tuned MoE, fast decode',
@@ -263,7 +263,7 @@ describe('Models page — the loading tree holds the loaded page’s box', () =>
    */
   it('builds the recommended-models placeholders out of real cards', async () => {
     const { loading, loaded } = await shapesAcrossLoad(createElement(Models), modelsRoutes(), (text) =>
-      text.includes('Qwen-AgentWorld-35B'),
+      text.includes('Qwen-AgentWorld-35B-A3B'),
     );
     expect(loading.skeletons).toBeGreaterThan(0);
     expect(loaded.catalogCards).toBe(3);

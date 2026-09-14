@@ -87,7 +87,7 @@ describe('decideWww', () => {
 
   // BrowserRouter only works if an unknown path returns the document.
   it('falls back to index.html for a deep link', () => {
-    for (const path of ['/', '/sessions', '/sessions/abc-123', '/metrics']) {
+    for (const path of ['/', '/welcome', '/sessions', '/sessions/abc-123', '/metrics']) {
       expect(decideWww(root, path)).toMatchObject({
         kind: 'file',
         file: join(root, 'index.html'),

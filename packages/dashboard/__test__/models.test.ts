@@ -660,7 +660,7 @@ describe('catalogWithState — a recommended model is identified by download pro
     });
     writeModel(modelsDir, 'qwen3.6-35b-a3b-nvfp4-mlx', MOE_NVFP4, 2048);
     writeCompletion('qwen3.6-35b-a3b-nvfp4-mlx', 'Brooooooklyn/Qwen3.6-35B-A3B-nvfp4-mlx');
-    expect(catalogItem('Qwen-AgentWorld-35B').present).toBe(false);
+    expect(catalogItem('Qwen-AgentWorld-35B-A3B').present).toBe(false);
   });
 
   it('reports the marker revision as localRevision for an owned canonical install', () => {

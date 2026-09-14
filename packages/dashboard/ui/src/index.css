@@ -1,5 +1,6 @@
 @import 'tailwindcss';
 @import 'tw-animate-css';
+@import './pages/onboarding.css';
 
 /* No dark-mode toggle in v1: `dark:` utilities follow the OS color scheme. */
 @custom-variant dark (@media (prefers-color-scheme: dark));
