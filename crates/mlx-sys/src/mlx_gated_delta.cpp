@@ -103,7 +103,7 @@ extern "C" {
 ///   state_out: [B, Hv, Dv, Dk] - updated state
 ///
 /// Returns true on success.
-bool mlx_gated_delta_kernel(
+static bool gated_delta_kernel_impl(
     mlx_array* q_handle,
     mlx_array* k_handle,
     mlx_array* v_handle,
@@ -112,7 +112,9 @@ bool mlx_gated_delta_kernel(
     mlx_array* state_handle,
     mlx_array* mask_handle,  // nullptr if no mask
     mlx_array** out_y,
-    mlx_array** out_state
+    mlx_array** out_state,
+    bool prefer_four,
+    bool float_output = false
 ) {
     try {
         auto& q_arr = *reinterpret_cast<array*>(q_handle);
@@ -132,7 +134,9 @@ bool mlx_gated_delta_kernel(
         int Hv = v_arr.shape(2);
         int Dv = v_arr.shape(3);
 
-        auto input_type = q_arr.dtype();
+        // Qwen's BF16 prompt storage is widened only in registers. Its output
+        // and persistent recurrence remain FP32, independent of input storage.
+        auto input_type = float_output ? mlx::core::float32 : q_arr.dtype();
 
         // T as a scalar array (int32)
         auto T_arr = array(T, mlx::core::int32);
@@ -158,7 +162,7 @@ bool mlx_gated_delta_kernel(
         int per_step_variant = 0;
         bool elig = !has_mask && !vectorized;
         if (elig && std::getenv("MLX_DISABLE_E47_GDN_2VCOL") == nullptr) {
-            if (std::getenv("MLX_ENABLE_E48_GDN_4VCOL") != nullptr && Dv % 4 == 0) {
+            if ((prefer_four || std::getenv("MLX_ENABLE_E48_GDN_4VCOL") != nullptr) && Dv % 4 == 0) {
                 per_step_variant = 2;
             } else if (Dv % 2 == 0) {
                 per_step_variant = 1;
@@ -426,6 +430,27 @@ int32_t mlx_gpu_architecture_gen() {
     } catch (...) {
         return 0;
     }
+}
+
+bool mlx_gated_delta_kernel(mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g,
+    mlx_array* beta, mlx_array* state, mlx_array* mask, mlx_array** out_y, mlx_array** out_state) {
+    return gated_delta_kernel_impl(q,k,v,g,beta,state,mask,out_y,out_state,false);
+}
+
+// Qwen4's measured M5 shape benefits from four value rows per SIMD group.
+// Other model families retain the existing default and environment controls.
+bool mlx_qwen4_gated_delta_kernel(mlx_array* q, mlx_array* k, mlx_array* v, mlx_array* g,
+    mlx_array* beta, mlx_array* state, mlx_array* mask, mlx_array** out_y, mlx_array** out_state) {
+    if (!q || !v) return false;
+    auto& query = *reinterpret_cast<array*>(q);
+    auto& value = *reinterpret_cast<array*>(v);
+    static const int arch = mlx_gpu_architecture_gen();
+    auto setting = std::getenv("MLX_QWEN4_GDN_4ROWS");
+    bool measured_shape = arch >= 17 && (!setting || std::string(setting) != "0")
+        && query.ndim() == 4 && value.ndim() == 4 && query.shape(0) == 1
+        && query.shape(3) == 128 && value.shape(2) == 48 && value.shape(3) == 128
+        && (query.dtype() == mlx::core::float32 || query.dtype() == mlx::core::bfloat16);
+    return gated_delta_kernel_impl(q,k,v,g,beta,state,mask,out_y,out_state,measured_shape,true);
 }
 
 }  // extern "C"

@@ -31,7 +31,7 @@ use crate::engine::scheduler::{
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::model_thread::{LoopControl, ResponseTx, StreamTx};
 use crate::sampling::{check_repetition_cutoff, sample};
-use crate::stream::{DeviceType, Stream, StreamContext};
+use crate::stream::{DeviceType, Stream, StreamContext, WiredLimitContext};
 use crate::tokenizer::Qwen3Tokenizer;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 
@@ -105,6 +105,12 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     const ENABLED_BY_DEFAULT: bool = true;
     const CANCEL_PRECEDES_EOS: bool = false;
     const STREAM_EOS_TOKEN: bool = false;
+
+    /// Optional independently admitted residency bound for scheduled turns.
+    /// Families opt in explicitly; ordinary turn policies remain unchanged.
+    fn scheduler_wired_bytes(&self) -> Option<usize> {
+        None
+    }
 
     fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter>;
     fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter>;
@@ -637,6 +643,7 @@ pub(crate) struct ScheduledTurn<P> {
     pub(crate) generation_start: Option<Instant>,
     pub(crate) first_token_instant: Option<Instant>,
     pub(crate) generation_stream: Stream,
+    pub(crate) _wired_context: Option<WiredLimitContext>,
     pub(crate) profiler: crate::decode_profiler::DecodeProfiler,
     pub(crate) emitter: Option<Box<dyn StreamEmitter>>,
     pub(crate) turn_token_observer: Option<Box<dyn TurnTokenObserver>>,
@@ -2353,6 +2360,10 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         );
         profiler.snapshot_memory_before();
         let generation_start = admitted.params.report_performance.then(Instant::now);
+        let wired_context = self
+            .inner
+            .scheduler_wired_bytes()
+            .map(|bytes| WiredLimitContext::bounded(bytes, vec![generation_stream]));
         let reuse_cache = admitted.plan.is_delta || admitted.params.reuse_cache;
         let payload = ScheduledTurn {
             owner_id,
@@ -2385,6 +2396,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             generation_start,
             first_token_instant: None,
             generation_stream,
+            _wired_context: wired_context,
             profiler,
             emitter: is_streaming.then(|| self.inner.stream_emitter()),
             turn_token_observer: self.inner.turn_token_observer(),

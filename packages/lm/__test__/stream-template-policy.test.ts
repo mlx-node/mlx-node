@@ -16,6 +16,7 @@ vi.mock('@mlx-node/core', () => {
     Qwen3Model: UnusedNativeModel,
     Qwen35Model: UnusedNativeModel,
     Qwen35MoeModel: UnusedNativeModel,
+    Qwen4ExpModel: UnusedNativeModel,
     Qwen3Tokenizer: {
       fromPretrained: tokenizerMocks.fromPretrained,
     },

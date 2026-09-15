@@ -225,6 +225,8 @@ class PagedAttention : public Custom {
 ///   - `slot_mapping`'s max value MUST be `< num_blocks * block_size`.
 ///     The factory eval-checks this (skipped during MLX tracing).
 ///   - `k_scale`/`v_scale` rank 0/1 of size 1, dtype `float32`.
+///   - All inputs are row-contiguous. Read-only `new_k`/`new_v` may
+///     have nonzero byte offsets; pools and metadata require offset zero.
 std::pair<array, array> paged_kv_write(
     const array& k_pool,
     const array& v_pool,

@@ -538,12 +538,54 @@ fn main() {
         .include(&include_source)
         .include(&mlx_dir);
 
+    if build_metal || target_os == "linux" {
+        bridge.define("MLX_NODE_GPU_ENABLED", None);
+    }
+
     // `__APPLE__` alone does not mean this build contains MLX's Metal backend:
     // `MLX_DISABLE_METAL=1` is a supported CPU-only macOS configuration.  Keep
     // bridge translation units from including/calling Metal-only APIs unless
     // the CMake build above actually enabled them.
     if build_metal {
         bridge.define("MLX_NODE_METAL_ENABLED", None);
+        // Direct Qwen4 expert GEMVs reuse the vendored K-quant arithmetic even
+        // in the normal precompiled-metallib build, where MLX does not export
+        // its optional JIT preambles. Generate private copies from source so
+        // the helper kernels cannot drift from the linked quantization code.
+        let preambles = PathBuf::from(env::var("OUT_DIR").unwrap()).join("qwen4-preambles");
+        let script = mlx_dir.join("mlx/backend/metal/make_compiled_preamble.sh");
+        for (source_name, name) in [
+            ("steel/gemm/gemm", "gemm"),
+            ("quantized_utils", "quantized_utils"),
+            ("kquant", "kquant"),
+            ("steel/gemm/nax", "nax"),
+            ("kquant_nax", "kquant_nax"),
+        ] {
+            let status = Command::new("bash")
+                .arg(&script)
+                .arg(&preambles)
+                .arg("clang")
+                .arg(&mlx_dir)
+                .arg(source_name)
+                .status()
+                .expect("generate Qwen4 Metal preamble");
+            assert!(status.success(), "Qwen4 {name} Metal preamble failed");
+            let path = preambles.join(format!("{name}.cpp"));
+            let source = std::fs::read_to_string(&path)
+                .expect("read Qwen4 Metal preamble")
+                .replace(
+                    "namespace mlx::core::metal",
+                    "namespace mlx::core::qwen4_preamble",
+                );
+            std::fs::write(&path, source).expect("write private Qwen4 Metal preamble");
+            bridge.file(path);
+            println!(
+                "cargo:rerun-if-changed={}",
+                mlx_dir
+                    .join(format!("mlx/backend/metal/kernels/{source_name}.h"))
+                    .display()
+            );
+        }
     }
 
     if is_macos {

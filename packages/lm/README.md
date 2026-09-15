@@ -174,6 +174,7 @@ Or set `MLX_PROFILE_DECODE=1` to auto-enable and write a report on exit.
 | `Qwen3Model`     | Qwen3 inference — `generate()` and paged attention                                |
 | `Qwen35Model`    | Qwen3.5 Dense — compiled forward, VLM, paged attention, native MTP                |
 | `Qwen35MoeModel` | Qwen3.5 MoE — compiled forward, expert routing, paged attention, native MTP       |
+| `Qwen4ExpModel`  | Qwen3.8-Flash-Next — bounded SSD loading, images, native MTP and paged sessions   |
 | `Gemma4Model`    | Gemma4 inference — multimodal generation and optional external-draft speculation  |
 | `Lfm2Model`      | LFM2.5 hybrid conv+attention inference — `generate()`                             |
 
@@ -241,6 +242,7 @@ Every generative model wrapper exposes the same `ChatSession<M>` surface — `se
 | Qwen3         |     Yes      |      Yes      | GRPO/SFT | Paged attention                      |
 | Qwen3.5 Dense |     Yes      |      Yes      | GRPO/SFT | Compiled forward, VLM, native MTP    |
 | Qwen3.5 MoE   |     Yes      |      Yes      | GRPO/SFT | Expert routing, paged cache, MTP     |
+| Qwen3.8-Flash-Next | No | Yes | No | Images, MTP, paged QSA; see [memory and loading](../../docs/qwen38-flash-next.md) |
 | Gemma4        |     Yes      |      Yes      |    No    | Multimodal, optional external draft  |
 | LFM2.5        |     Yes      |      Yes      |    No    | Hybrid conv + attention architecture |
 
