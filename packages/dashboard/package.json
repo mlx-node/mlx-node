@@ -13,6 +13,7 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "@mlx-node/source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "default": "./dist/index.js"
     }

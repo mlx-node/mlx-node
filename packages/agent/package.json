@@ -12,29 +12,35 @@
     "directory": "packages/agent"
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "@mlx-node/source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./delegate": {
+      "@mlx-node/source": "./src/delegate.ts",
       "types": "./dist/delegate.d.ts",
       "default": "./dist/delegate.js"
     },
     "./catalog": {
+      "@mlx-node/source": "./src/catalog.ts",
       "types": "./dist/catalog.d.ts",
       "default": "./dist/catalog.js"
     },
     "./paths": {
+      "@mlx-node/source": "./src/paths.ts",
       "types": "./dist/paths.d.ts",
       "default": "./dist/paths.js"
     },
     "./models": {
+      "@mlx-node/source": "./src/provider/models.ts",
       "types": "./dist/provider/models.d.ts",
       "default": "./dist/provider/models.js"
     }

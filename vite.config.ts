@@ -5,6 +5,13 @@ import { defineConfig } from 'vite-plus';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
+/**
+ * Condition that resolves a workspace package to its TypeScript source instead
+ * of its published `dist` output. Each package declares it in its own `exports`
+ * map, so the subpath list lives in exactly one place: the package that owns it.
+ */
+const SOURCE_CONDITION = '@mlx-node/source';
+
 export default defineConfig({
   fmt: {
     printWidth: 120,
@@ -65,33 +72,27 @@ export default defineConfig({
       'packages/*/__test__/**/*.{test,spec}.ts',
     ],
   },
+  // The test/Vitest environment resolves server-side, where `ssr.resolve`
+  // replaces Vite's defaults rather than extending them — so the defaults are
+  // repeated here on purpose. Dropping 'node'/'module' would change how
+  // third-party packages resolve inside the test environment, and this is the
+  // only key that reaches the test resolver: `resolve.conditions` configures the
+  // client environment, which tests do not use.
+  //
+  // Vitest also mirrors this list onto its Node processes as real `--conditions`
+  // flags, so the condition must stay out of anything Node loads as JavaScript:
+  // a spawn that inherits those flags would resolve workspace packages to
+  // TypeScript, which Node can only strip when the source happens to be
+  // erasable. Spawns pass `execArgv: []` for that reason (see
+  // `packages/dashboard/src/worker/client.ts`).
+  ssr: {
+    resolve: {
+      conditions: ['module', 'node', 'development|production', SOURCE_CONDITION],
+    },
+  },
   resolve: {
     alias: {
-      '@mlx-node/core': resolve(__dirname, './packages/core/index.cjs'),
-      '@mlx-node/lm/draft-companion': resolve(__dirname, './packages/lm/src/draft-companion.ts'),
-      '@mlx-node/lm/family-data': resolve(__dirname, './packages/lm/src/family-data.ts'),
-      '@mlx-node/lm/model-detection': resolve(__dirname, './packages/lm/src/model-detection.ts'),
-      '@mlx-node/lm/model-discovery': resolve(__dirname, './packages/lm/src/model-discovery.ts'),
-      '@mlx-node/lm': resolve(__dirname, './packages/lm/src/index.ts'),
-      '@mlx-node/agent/catalog': resolve(__dirname, './packages/agent/src/catalog.ts'),
-      '@mlx-node/agent/delegate': resolve(__dirname, './packages/agent/src/delegate.ts'),
-      '@mlx-node/agent/models': resolve(__dirname, './packages/agent/src/provider/models.ts'),
-      '@mlx-node/agent/paths': resolve(__dirname, './packages/agent/src/paths.ts'),
-      '@mlx-node/agent': resolve(__dirname, './packages/agent/src/index.ts'),
-      '@mlx-node/privacy': resolve(__dirname, './packages/privacy/src/index.ts'),
-      '@mlx-node/trl': resolve(__dirname, './packages/trl/src/index.ts'),
-      // Subpaths MUST precede the bare '@mlx-node/server' entry, longest
-      // first: alias matching is prefix-based and first-match-wins, so the
-      // bare key would otherwise rewrite `@mlx-node/server/host` to
-      // `.../src/index.ts/host`.
-      '@mlx-node/server/host/env-policy': resolve(__dirname, './packages/server/src/host/env-policy.ts'),
-      '@mlx-node/server/host/paths': resolve(__dirname, './packages/server/src/host/paths.ts'),
-      '@mlx-node/server/host': resolve(__dirname, './packages/server/src/host/index.ts'),
-      '@mlx-node/server': resolve(__dirname, './packages/server/src/index.ts'),
-      '@mlx-node/dashboard': resolve(__dirname, './packages/dashboard/src/index.ts'),
-      // The dashboard SPA's own `@/…` alias (packages/dashboard/ui/vite.config.ts),
-      // repeated here so a test can import a page component. Keyed with the
-      // trailing slash so it can never swallow an `@mlx-node/…` specifier.
+      // Dashboard SPA's own `@/` alias (packages/dashboard/ui), repeated for tests; no package boundary to cross.
       '@/': `${resolve(__dirname, './packages/dashboard/ui/src')}/`,
     },
   },

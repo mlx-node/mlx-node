@@ -12,29 +12,35 @@
     "directory": "packages/lm"
   },
   "files": [
-    "dist"
+    "dist",
+    "src"
   ],
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
+      "@mlx-node/source": "./src/index.ts",
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
     },
     "./draft-companion": {
+      "@mlx-node/source": "./src/draft-companion.ts",
       "types": "./dist/draft-companion.d.ts",
       "import": "./dist/draft-companion.js"
     },
     "./family-data": {
+      "@mlx-node/source": "./src/family-data.ts",
       "types": "./dist/family-data.d.ts",
       "import": "./dist/family-data.js"
     },
     "./model-detection": {
+      "@mlx-node/source": "./src/model-detection.ts",
       "types": "./dist/model-detection.d.ts",
       "import": "./dist/model-detection.js"
     },
     "./model-discovery": {
+      "@mlx-node/source": "./src/model-discovery.ts",
       "types": "./dist/model-discovery.d.ts",
       "import": "./dist/model-discovery.js"
     }

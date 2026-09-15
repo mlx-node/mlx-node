@@ -115,6 +115,14 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
   withdrawals.port1.unref();
 
   const worker = new Worker(opts.workerUrl, {
+    // The worker loads built JavaScript (or its own source bootstrap), so parent
+    // loader and debugger flags must not leak into it. A test runner is the case
+    // that bites: Vitest mirrors the Vite `ssr.resolve.conditions` config onto its
+    // Node processes as `--conditions`, and `new Worker()` inherits them, which
+    // would resolve `@mlx-node/*` to workspace TypeScript — source Node cannot
+    // always strip (a parameter property is enough to kill the worker at startup).
+    // Same rule as the desktop sidecar's fork in `supervisor/child-node.ts`.
+    execArgv: [],
     workerData: {
       dbPath: opts.dbPath,
       modelsDir: opts.modelsDir,

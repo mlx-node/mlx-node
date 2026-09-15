@@ -33,9 +33,9 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 // Intentionally read through `require` as well as ESM `import` so the
-// test catches both consumption patterns. The `vite.config.ts` alias
-// points `@mlx-node/core` at `packages/core/index.cjs`, so both
-// resolutions land on the same module instance in the test runtime.
+// test catches both consumption patterns. Neither goes through a bundler
+// alias: `@mlx-node/core`'s own `exports` map points `import` and `require`
+// at the same `packages/core/index.cjs`, so both land on one module instance.
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const coreRequire: Record<string, unknown> = require('@mlx-node/core');
 
