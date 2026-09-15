@@ -1,16 +1,63 @@
-import { resolve, dirname } from 'node:path';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import type { Plugin } from 'vite';
 import { defineConfig } from 'vite-plus';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
-/**
- * Condition that resolves a workspace package to its TypeScript source instead
- * of its published `dist` output. Each package declares it in its own `exports`
- * map, so the subpath list lives in exactly one place: the package that owns it.
- */
+/** Condition a workspace package declares for its own TypeScript source. */
 const SOURCE_CONDITION = '@mlx-node/source';
+
+/**
+ * Resolve `@mlx-node/*` specifiers to the TypeScript source each package declares,
+ * so a dev server and the test run exercise `src` while `tsc`, `oxnode` and
+ * published consumers keep reading `dist`.
+ *
+ * The mapping is not a list: it is read from each package's own `exports` map,
+ * where a subpath and its `@mlx-node/source` target sit together, so a new subpath
+ * needs no change here. That is what replaced the hand-maintained
+ * `resolve.alias` table, whose subpath list was a second copy of `exports` that
+ * nothing validated.
+ *
+ * Deliberately not `resolve.conditions` / `ssr.resolve.conditions`: Vitest mirrors
+ * those onto its Node processes as real `--conditions` flags, which makes Node
+ * itself resolve workspace packages to TypeScript. Node can only run the
+ * TypeScript it can strip, so every Node-side load dies on the first parameter
+ * property (`packages/server/src/host/index.ts` has one) — measured on a worker
+ * thread and on the forked desktop sidecar. Keeping the mapping inside Vite
+ * leaves Node, `oxnode` and the published map untouched.
+ */
+function workspaceSource(): Plugin {
+  const packages = new Map<string, { dir: string; exports: Record<string, string | Record<string, string>> }>();
+  const packagesRoot = resolve(__dirname, 'packages');
+
+  for (const entry of readdirSync(packagesRoot)) {
+    const manifestPath = join(packagesRoot, entry, 'package.json');
+    if (!existsSync(manifestPath)) continue;
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf-8')) as {
+      name?: string;
+      exports?: Record<string, string | Record<string, string>>;
+    };
+    if (manifest.name === undefined || manifest.exports === undefined) continue;
+    packages.set(manifest.name, { dir: dirname(manifestPath), exports: manifest.exports });
+  }
+
+  return {
+    name: 'mlx-node:workspace-source',
+    enforce: 'pre',
+    resolveId(source) {
+      const parts = source.split('/');
+      if (parts.length < 2 || parts[0] !== '@mlx-node') return null;
+      const pkg = packages.get(`${parts[0]}/${parts[1]}`);
+      if (pkg === undefined) return null;
+      const entry = pkg.exports[parts.length > 2 ? `./${parts.slice(2).join('/')}` : '.'];
+      const target = typeof entry === 'string' ? undefined : entry?.[SOURCE_CONDITION];
+      return target === undefined ? null : resolve(pkg.dir, target);
+    },
+  };
+}
 
 export default defineConfig({
   fmt: {
@@ -72,24 +119,7 @@ export default defineConfig({
       'packages/*/__test__/**/*.{test,spec}.ts',
     ],
   },
-  // The test/Vitest environment resolves server-side, where `ssr.resolve`
-  // replaces Vite's defaults rather than extending them — so the defaults are
-  // repeated here on purpose. Dropping 'node'/'module' would change how
-  // third-party packages resolve inside the test environment, and this is the
-  // only key that reaches the test resolver: `resolve.conditions` configures the
-  // client environment, which tests do not use.
-  //
-  // Vitest also mirrors this list onto its Node processes as real `--conditions`
-  // flags, so the condition must stay out of anything Node loads as JavaScript:
-  // a spawn that inherits those flags would resolve workspace packages to
-  // TypeScript, which Node can only strip when the source happens to be
-  // erasable. Spawns pass `execArgv: []` for that reason (see
-  // `packages/dashboard/src/worker/client.ts`).
-  ssr: {
-    resolve: {
-      conditions: ['module', 'node', 'development|production', SOURCE_CONDITION],
-    },
-  },
+  plugins: [workspaceSource()],
   resolve: {
     alias: {
       // Dashboard SPA's own `@/` alias (packages/dashboard/ui), repeated for tests; no package boundary to cross.

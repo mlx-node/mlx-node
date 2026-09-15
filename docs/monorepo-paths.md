@@ -1,43 +1,43 @@
 # Workspace paths: how `@mlx-node/*` specifiers resolve
 
 Every cross-package import in this repo (`@mlx-node/lm`, `@mlx-node/server/host/env-policy`, …)
-resolves through the `exports` map of the package that owns it. No `resolve.alias` entry names a
-workspace package, no `tsconfig` `paths` entry names one, and there is no per-consumer list of
-subpaths to keep in sync.
+resolves through the `exports` map of the package that owns it. No alias entry names a workspace
+package, no `tsconfig` `paths` entry names one, and there is no per-consumer list of subpaths to keep
+in sync.
 
 The short version:
 
-| Surface                         | Mechanism | Condition that matches | Lands on                    |
-| ------------------------------- | --------- | ---------------------- | --------------------------- |
-| `tsc` (all projects)            | `exports` | `types`                | `packages/*/dist/**/*.d.ts` |
-| Vitest / Vite dev-server        | `exports` | `@mlx-node/source`     | `packages/*/src/**/*.ts`    |
-| `oxnode` (`yarn mlx`, examples) | `exports` | `import`               | `packages/*/dist/**/*.js`   |
-| Node, published consumers       | `exports` | `import` / `default`   | `packages/*/dist/**/*.js`   |
+| Surface | Mechanism | Lands on |
+| --- | --- | --- |
+| `tsc` (all projects) | `exports` → `types` | `packages/*/dist/**/*.d.ts` |
+| Vitest / Vite dev-server | `workspaceSource()` plugin, reading the `@mlx-node/source` entry in `exports` | `packages/*/src/**/*.ts` |
+| `oxnode` (`yarn mlx`, examples) | `exports` → `import` | `packages/*/dist/**/*.js` |
+| Node, published consumers | `exports` → `import` / `default` | `packages/*/dist/**/*.js` |
 
 ## What was there before, and what it cost
 
 The root `vite.config.ts` carried a hand-maintained `resolve.alias` table that rewrote each
 specifier — including every subpath — to that package's TypeScript source. Tests therefore ran
-against `src` while Node ran against `dist`, and the alias list was a second copy of each
-package's `exports` map that nothing validated. It had already drifted:
+against `src` while Node ran against `dist`, and the alias list was a second copy of each package's
+`exports` map that nothing validated. It had already drifted:
 
-- `@mlx-node/lm/model-discovery` and `./model-detection` were declared in `exports` and imported
-  by `packages/agent/src/provider/models.ts` and `packages/server/src/host/discover.ts`, but no
-  corresponding `dist` file existed. Every test passed, because the alias table sent those imports
-  to `src`. Only a runtime that went through `exports` — `yarn mlx`, a published install, and CI
-  before its `yarn build:ts` step — could see the gap.
-- `@mlx-node/vlm` was imported by `examples/` and two test files but had no alias entry at all, so
-  it silently resolved to `dist` while its siblings resolved to `src`.
+- `@mlx-node/lm/model-discovery` and `./model-detection` were declared in `exports` and imported by
+  `packages/agent/src/provider/models.ts` and `packages/server/src/host/discover.ts`, but no
+  corresponding `dist` file existed. Every test passed, because the alias table sent those imports to
+  `src`. Only a runtime that went through `exports` — `yarn mlx`, a published install, and CI before
+  its `yarn build:ts` step — could see the gap.
+- `@mlx-node/vlm` was imported by `examples/` and two test files but had no alias entry at all, so it
+  silently resolved to `dist` while its siblings resolved to `src`.
 - Alias matching is prefix-based and first-match-wins (`matches(pattern, importee)` returns true for
   `importee === pattern` or `importee.startsWith(pattern + '/')`, the first entry wins, and the
   rewrite is a plain string replace). A bare `@mlx-node/server` key placed above its subpaths would
-  rewrite `@mlx-node/server/host` to `<abs>/packages/server/src/index.ts/host`. The table was
-  ordered correctly, with a comment explaining the hazard; the constraint is gone with it.
+  rewrite `@mlx-node/server/host` to `<abs>/packages/server/src/index.ts/host`. The table was ordered
+  correctly, with a comment explaining the hazard; the constraint is gone with it.
 
 ## The replacement
 
-Each package declares the condition itself, so the subpath list lives in exactly one place — next
-to the subpath it names:
+Each package declares its source entry next to the subpath it belongs to, as the first key of that
+`exports` entry:
 
 ```jsonc
 // packages/lm/package.json
@@ -55,70 +55,74 @@ to the subpath it names:
 }
 ```
 
-The root config opts the dev/test resolver into that condition:
+The root config reads those entries and resolves to them for the dev/test pipeline only:
 
 ```ts
-const SOURCE_CONDITION = '@mlx-node/source';
-
-ssr: {
-  resolve: {
-    conditions: ['module', 'node', 'development|production', SOURCE_CONDITION],
-  },
-},
+function workspaceSource(): Plugin {
+  // one map built at config load: package name -> { dir, exports }
+  return {
+    name: 'mlx-node:workspace-source',
+    enforce: 'pre',
+    resolveId(source) {
+      // `@mlx-node/lm/model-discovery` -> pkg.exports['./model-discovery']['@mlx-node/source']
+      return /* absolute path to ./src/model-discovery.ts */;
+    },
+  };
+}
 ```
 
-Four properties of that block are load-bearing, each verified against the pinned toolchain
-(`@voidzero-dev/vite-plus-core` 0.3.0, Vitest 4.1.11) rather than assumed:
+So the subpath list exists exactly once — in the package that owns it — and adding a subpath needs no
+config change at all.
 
-1. **`ssr.resolve` replaces Vite's defaults, it does not extend them.** With no user conditions the
-   environments resolve as client `['module','browser','development|production']` and ssr
-   `['module','node','development|production']`. Hence the defaults are repeated above on purpose:
-   dropping `node` or `module` would change how third-party packages resolve inside the test
-   environment.
-2. **It has to be `ssr.resolve.conditions`.** The root `resolve.conditions` key configures the
-   client environment only and does not reach the resolver Vitest uses — measured: with the
-   condition there, `@mlx-node/lm` resolved to `dist/index.js`. `environments.ssr.resolve` is not an
-   alternative either: Vite mirrors it back into `ssr.resolve`, so it behaves the same as (3).
-3. **Vitest mirrors this list onto its Node processes as real `--conditions` flags**
-   (`resolveConditions()` → `execArgv`). So the condition is not merely a bundler setting: any
-   in-process module that Node itself loads is resolved with it too. Node can only run TypeScript it
-   can strip, and `packages/server/src/host/index.ts` uses a parameter property — enough to kill a
-   worker thread at startup with _"TypeScript parameter property is not supported in strip-only
-   mode"_.
-4. **Therefore spawns pass `execArgv: []`.** The dashboard's SQLite worker thread is the case that
-   bit: it loads built JavaScript, and `new Worker()` inherits the parent's flags.
-   `packages/dashboard/src/worker/client.ts` now clears them, the same rule the desktop sidecar's
-   `fork` already followed in `supervisor/child-node.ts`. Any future nested Node spawn that loads a
-   workspace package needs the same treatment — this is the one sharp edge of the arrangement.
+## Why not an export condition
 
-A silent half is worth knowing about: the condition is inert until it is wired. With the key present
-in `exports` but nothing in `ssr.resolve.conditions`, a specifier whose `dist` file exists resolves
-to **stale `dist` without failing** (measured: `@mlx-node/lm` loaded 42 exports from `dist` instead
-of the source build's 41), while a specifier whose `dist` file is missing fails outright.
+The obvious alternative is to wire the condition into the resolver instead: add it to
+`ssr.resolve.conditions` (the only key that reaches the test resolver; the root `resolve.conditions`
+key configures the client environment and does not) and let Vite match `@mlx-node/source` itself.
+That was built and measured, and it is wrong for this repo:
+
+- **Vitest mirrors `ssr.resolve.conditions` onto its Node processes as real `--conditions` flags**
+  (`resolveConditions()` → `execArgv`). With the condition wired, every Vitest process carried
+  `--conditions @mlx-node/source`, so *Node's own* resolution of `@mlx-node/*` returned TypeScript
+  files — not just the bundler's.
+- **Node can only run the TypeScript it can strip**, and this repo's source is not all erasable:
+  `packages/server/src/host/index.ts` uses a parameter property. Two loads died on it:
+  - the dashboard's SQLite worker thread (which inherits `execArgv`), taking 82 dashboard tests with
+    it — fixed at the time with `execArgv: []`;
+  - the acceptance test's fork of the built desktop sidecar entry, taking all four
+    `sidecar-e2e.test.ts` cases with it — a defect an adversarial review caught and this change then
+    removed at the source.
+- A condition also cannot be scope-limited: `environments.ssr.resolve.conditions` is mirrored back
+  into `ssr.resolve`, and `resolve.conditions` does not reach the test resolver at all.
+
+Resolving inside Vite keeps the whole mechanism on the bundler side, where it belongs: Node,
+`oxnode`, the published `exports` map and every spawned process see exactly what they saw before.
+The `resolveId`-with-`enforce: 'pre'` shape is also the direction Vite itself points at — an
+`resolve.alias` entry with a `customResolver` is deprecated in favour of it.
 
 ## Rules that follow from the mechanics
 
-- **Never pass `@mlx-node/source` to Node.** Node refuses to strip types for files under a
-  `node_modules` path (`ERR_UNSUPPORTED_NODE_MODULES_TYPE_STRIPPING`), and workspace packages are
-  linked into `node_modules`. The condition is for bundlers and test runners only.
+- **The condition is data, not a wired condition.** Nothing sets `@mlx-node/source` as a resolution
+  condition, so nothing Node loads can select it. Do not add it to `resolve.conditions` or
+  `ssr.resolve.conditions`: that is what reintroduces the failure described above.
 - **`types` still points at `dist`.** Type-checking is unchanged: `tsc` reads the published
   declaration files and project references keep reordering builds. `customConditions` was
-  deliberately _not_ adopted — it would move type-checking onto `src` for every project, which in
-  the composite packages (`rootDir: src`) risks pulling files from outside `rootDir`, and it would
-  stop exercising the published `.d.ts` surface at all. Revisit only together with a published-types
-  gate (below).
+  deliberately *not* adopted — it would move type-checking onto `src` for every project, which in the
+  composite packages (`rootDir: src`) risks pulling files outside `rootDir`, and it would stop
+  exercising the published `.d.ts` surface at all. Revisit only together with a published-types gate.
+- **`import.meta.resolve` in-process is not a Vite oracle.** The runner carries
+  `--experimental-import-meta-resolve`, so that call reports Node's resolution (`dist`), not the
+  plugin's. To observe what the test runtime actually loads, import the module and check a
+  source-only value; to observe what a consumer sees, use a child `node` process.
 - **The map stays ESM-only.** `@mlx-node/core` publishes `require` because it is CJS; the TypeScript
   packages declare `types` + `import` (+ `default` on some entries) and nothing else, so a CJS
   consumer calling `require('@mlx-node/lm')` gets `ERR_PACKAGE_PATH_NOT_EXPORTED`. That is
   pre-existing behaviour, not a consequence of this change.
-- **Inside the test runtime, `require.resolve` and `import.meta.resolve` are piped through Vite.**
-  They report the source path, so they cannot be used to check what a consumer sees — use a child
-  `node` process for that.
 - **One alias remains**, and it crosses no package boundary: the dashboard SPA's `@/` →
   `packages/dashboard/ui/src`, repeated in the root config because 29 test imports use the same
-  specifiers the SPA's own `vite.config.ts` resolves. `@mlx-node/core` no longer has an alias either:
-  its `exports` already point `import` and `require` at the same `packages/core/index.cjs`, so the
-  alias was resolving to exactly the file the package boundary resolves to.
+  specifiers the SPA's own `vite.config.ts` resolves. `@mlx-node/core` has no alias either: its
+  `exports` already point `import` and `require` at the same `packages/core/index.cjs`, so an alias
+  was resolving to exactly the file the package boundary resolves to.
 
 ## Published surface
 
@@ -129,31 +133,32 @@ or `types` (pnpm rewrites both). A `prepack` rewrite of `package.json` is possib
 part between the repo manifest and the published one.
 
 Nothing enforces the map's consistency automatically, by choice: the checks are `yarn typecheck`
-(does every declared `types` target exist) and a build before tests in CI. If drift becomes a
-problem again, the candidates are, in increasing cost: a test that walks each package's `exports`
-and asserts every target exists on disk; `publint` for `exports` → `files` coverage;
-`@arethetypeswrong/cli` for the published type surface (its `--pack` flag is npm-only, so a Yarn
-repo must pack first, and any `exports` key containing `*` returns early as a wildcard).
+(does every declared `types` target exist) and a build before tests in CI. If drift becomes a problem
+again, the candidates are, in increasing cost: a test that walks each package's `exports` and asserts
+every target exists on disk; `publint` for `exports` → `files` coverage; `@arethetypeswrong/cli` for
+the published type surface (its `--pack` flag is npm-only, so a Yarn repo must pack first, and any
+`exports` key containing `*` returns early as a wildcard).
 
 ## Adding a subpath
 
 1. Add the module under `packages/<pkg>/src/`.
 2. Add the `exports` entry with `@mlx-node/source` first, then `types`, then `import`/`default`.
    Node treats key order as normative: `types` is matched before runtime conditions and a `default`
-   belongs last.
-3. Nothing else. There is no second list to update — that is the point of this arrangement.
-4. `yarn build:ts` so `dist` matches, otherwise the runtime and published paths for the new subpath
-   do not exist yet even though the map declares them.
+   belongs last. The plugin picks the entry up from the manifest — no config change.
+3. `yarn build:ts` so `dist` matches, otherwise the runtime and published paths for the new subpath do
+   not exist yet even though the map declares them.
 
 ## What was verified for this change
 
-- `yarn typecheck` (full `tsc -b`) clean; `yarn mlx --help` starts the CLI from source through
-  `exports` → `dist`, so the oxnode path is intact.
-- `packages/dashboard/__test__` 710/710 (it was 82 failures deep before the `execArgv` fix), and a
-  74-file / 1297-test slice across `agent`, `privacy`, `dashboard`, `server/host`, `models` and
-  `core` at 1289 passed / 8 skipped.
-- Resolution direction, not just pass/fail: with the condition wired, `import.meta.resolve` inside
-  Vitest reports `packages/*/src/**`, and a real child `node` process reports `packages/*/dist/**`.
+- `yarn typecheck` (full `tsc -b`) clean, and `yarn mlx --help` still starts the CLI from source
+  through `exports` → `dist`.
+- The two load paths that broke under the condition wiring: `packages/dashboard/__test__` 710/710 and
+  `packages/desktop/__test__/sidecar-e2e.test.ts` green.
+- Two slices covering the packages whose resolution changed plus the model-dependent suites:
+  80 files / 1375 tests, and 221 files / 3691 tests.
+- Resolution direction, not just pass/fail: a source-only marker added to a package module was
+  observable after importing it through the boundary, and no Vitest process carried a
+  `--conditions @mlx-node/source` flag.
 
 ## References
 
@@ -161,9 +166,9 @@ repo must pack first, and any `exports` key containing `*` returns early as a wi
   patterns, condition ordering) and
   [Modules: TypeScript](https://nodejs.org/api/typescript.html) (type stripping is refused under
   `node_modules`).
-- Vite — `resolve.conditions`, `ssr.resolve.conditions`, `resolve.tsconfigPaths` (native but opt-in;
-  the `vite-tsconfig-paths` plugin is now redundant).
-- Vitest — `resolveConditions` → `execArgv`: the forwarding described above.
+- Vite — `resolve.conditions` (client environment), `ssr.resolve.conditions` (the key Vitest reads),
+  `resolve.alias[].customResolver` deprecation in favour of `enforce: 'pre'` `resolveId` plugins.
+- Vitest — `resolveConditions()` → `execArgv`: the forwarding described above.
 - TypeScript — `customConditions` (valid under `node16`/`nodenext`/`bundler`) and
   [paths](https://www.typescriptlang.org/tsconfig/paths.html), which never rewrites emitted
   specifiers and therefore cannot be the mechanism on its own.
@@ -171,5 +176,5 @@ repo must pack first, and any `exports` key containing `*` returns early as a wi
   just-in-time source exports require a transpiling consumer and cannot be cached; compiled packages
   pair a `types` condition with a built `default`.
 - Nx — [switch to workspaces and project references](https://nx.dev/docs/kb/switch-to-workspaces-project-references):
-  path aliases "were not designed for project linking"; imports should resolve through
-  `node_modules` with bundler conditions mirroring `customConditions`.
+  path aliases "were not designed for project linking"; imports should resolve through `node_modules`
+  with bundler conditions mirroring `customConditions`.
