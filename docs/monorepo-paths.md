@@ -7,12 +7,12 @@ in sync.
 
 The short version:
 
-| Surface | Mechanism | Lands on |
-| --- | --- | --- |
-| `tsc` (all projects) | `exports` → `types` | `packages/*/dist/**/*.d.ts` |
-| Vitest / Vite dev-server | `workspaceSource()` plugin, reading the `@mlx-node/source` entry in `exports` | `packages/*/src/**/*.ts` |
-| `oxnode` (`yarn mlx`, examples) | `exports` → `import` | `packages/*/dist/**/*.js` |
-| Node, published consumers | `exports` → `import` / `default` | `packages/*/dist/**/*.js` |
+| Surface                         | Mechanism                                                                     | Lands on                    |
+| ------------------------------- | ----------------------------------------------------------------------------- | --------------------------- |
+| `tsc` (all projects)            | `exports` → `types`                                                           | `packages/*/dist/**/*.d.ts` |
+| Vitest / Vite dev-server        | `workspaceSource()` plugin, reading the `@mlx-node/source` entry in `exports` | `packages/*/src/**/*.ts`    |
+| `oxnode` (`yarn mlx`, examples) | `exports` → `import`                                                          | `packages/*/dist/**/*.js`   |
+| Node, published consumers       | `exports` → `import` / `default`                                              | `packages/*/dist/**/*.js`   |
 
 ## What was there before, and what it cost
 
@@ -65,7 +65,7 @@ function workspaceSource(): Plugin {
     enforce: 'pre',
     resolveId(source) {
       // `@mlx-node/lm/model-discovery` -> pkg.exports['./model-discovery']['@mlx-node/source']
-      return /* absolute path to ./src/model-discovery.ts */;
+      return; /* absolute path to ./src/model-discovery.ts */
     },
   };
 }
@@ -73,6 +73,11 @@ function workspaceSource(): Plugin {
 
 So the subpath list exists exactly once — in the package that owns it — and adding a subpath needs no
 config change at all.
+
+The map is built at config load, and a workspace `package.json` is not a config file, so the plugin
+also restarts the dev server when one changes (verified: touching a manifest logs _server
+restarted_). Without that, a watch session would keep resolving a subpath that moved, miss one that
+is new, and fall back to `dist` for it.
 
 ## Why not an export condition
 
@@ -83,7 +88,7 @@ That was built and measured, and it is wrong for this repo:
 
 - **Vitest mirrors `ssr.resolve.conditions` onto its Node processes as real `--conditions` flags**
   (`resolveConditions()` → `execArgv`). With the condition wired, every Vitest process carried
-  `--conditions @mlx-node/source`, so *Node's own* resolution of `@mlx-node/*` returned TypeScript
+  `--conditions @mlx-node/source`, so _Node's own_ resolution of `@mlx-node/*` returned TypeScript
   files — not just the bundler's.
 - **Node can only run the TypeScript it can strip**, and this repo's source is not all erasable:
   `packages/server/src/host/index.ts` uses a parameter property. Two loads died on it:
@@ -107,7 +112,7 @@ The `resolveId`-with-`enforce: 'pre'` shape is also the direction Vite itself po
   `ssr.resolve.conditions`: that is what reintroduces the failure described above.
 - **`types` still points at `dist`.** Type-checking is unchanged: `tsc` reads the published
   declaration files and project references keep reordering builds. `customConditions` was
-  deliberately *not* adopted — it would move type-checking onto `src` for every project, which in the
+  deliberately _not_ adopted — it would move type-checking onto `src` for every project, which in the
   composite packages (`rootDir: src`) risks pulling files outside `rootDir`, and it would stop
   exercising the published `.d.ts` surface at all. Revisit only together with a published-types gate.
 - **`import.meta.resolve` in-process is not a Vite oracle.** The runner carries

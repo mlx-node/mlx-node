@@ -56,6 +56,16 @@ function workspaceSource(): Plugin {
       const target = typeof entry === 'string' ? undefined : entry?.[SOURCE_CONDITION];
       return target === undefined ? null : resolve(pkg.dir, target);
     },
+    // The map is built once, at config load, and these manifests are not config
+    // files: Vite restarts on a `vite.config.ts` edit but not on a package.json
+    // edit, so a watch session would keep resolving a subpath that moved, lost its
+    // source entry, or fall back to `dist` for one that is new.
+    configureServer(server) {
+      const restart = (file: string): void => {
+        if (file.startsWith(`${packagesRoot}/`) && file.endsWith('package.json')) void server.restart();
+      };
+      for (const event of ['add', 'change', 'unlink'] as const) server.watcher.on(event, restart);
+    },
   };
 }
 
