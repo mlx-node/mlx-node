@@ -175,9 +175,14 @@ describe('runAgent', () => {
     );
     if (!delegation || typeof delegation === 'function') throw new Error('Missing delegate extension');
     const on = vi.fn();
-    await delegation.factory({ on } as never);
+    const appendEntry = vi.fn();
+    await delegation.factory({ on, appendEntry } as never);
     const beforeStart = on.mock.calls.find(([name]) => name === 'before_agent_start')![1];
-    const prompt = beforeStart({ systemPrompt: 'Worker' }).systemPrompt;
+    const prompt = beforeStart(
+      { systemPrompt: 'Worker' },
+      { sessionManager: { getSessionId: () => 'delegate-session' } },
+    ).systemPrompt;
+    expect(appendEntry.mock.calls).toEqual([['mlx-delegate-session', { version: 1, sessionId: 'delegate-session' }]]);
     // The explicit path must reach the worker even when no Codex metadata exists.
     expect(prompt).toContain(approved ? 'caller explicitly approved' : 'No inherited caller');
   });
