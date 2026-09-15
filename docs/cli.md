@@ -677,9 +677,13 @@ A focused local worker for bounded investigations. It shares the `mlx agent`
 model, session, cache and thinking settings, defaults to print mode, and uses
 read/bash tools without project instructions, skills or nested agents.
 
+From a regular terminal, Claude Code, Grok or another caller, approve the bounded
+task and its tool execution before passing `--caller-approved`. This also applies
+when resuming a session. After approving these read-only investigations:
+
 ```bash
-mlx delegate github --repo owner/repo 'Inspect PR #42. Return failed checks, exact head SHA and evidence URLs.'
-mlx delegate --session SESSION 'Which failure applies to the current head? Return its evidence only.'
+mlx delegate github --caller-approved --repo owner/repo 'Inspect PR #42. Return failed checks, exact head SHA and evidence URLs.'
+mlx delegate --caller-approved --session SESSION 'Which failure applies to the current head? Return its evidence only.'
 ```
 
 Supply the PR, issue or run number, the requested fields, and any query budget
@@ -695,8 +699,8 @@ the full event stream for debugging; returning its reasoning and raw tool
 results to the caller can erase any token savings. Resolve a specific gap with
 a focused follow-up or the relevant evidence excerpt.
 
-Codex delegates inherit the caller's process sandbox. Other callers use
-`--caller-approved` after approving the bounded task and tool execution.
+Codex delegates can omit `--caller-approved`: tool execution inherits the caller's
+process sandbox. The flag does not copy another coding agent's tool approval rules.
 `--allow-write` supplies authorization context for GitHub changes already
 approved in the task; neither flag grants extra sandbox access. Failed or
 incomplete work returns a handoff for the caller to continue.
