@@ -1,0 +1,144 @@
+{
+  "date": "2026-09-15",
+  "status": "historical pre-cleanup build; not a post-rebase measurement",
+  "device": "Apple M5 Max, 128 GiB unified memory",
+  "checkpoint": "unsloth/Qwen3.8-Flash-Next-GGUF UD-Q4_K_XL",
+  "protocol": "Same loaded model; greedy AR; MTP off; no prefix reuse; 2 warmups per variant then ABBAAB; 128 output tokens; no detected compiler or large-model contention; OS cache, thermals and graphics load uncontrolled.",
+  "addonSha256": "3bf4863f11c2c9e86770ec208a9e2bb19b7f8903c434890826c44bbaa7f4688a",
+  "residency": {
+    "policy": "auto",
+    "weightBudgetBytes": 77309411328,
+    "hotWeightBytes": 83783503360,
+    "fullHotResidency": false,
+    "prefillChunkTokens": 1024,
+    "residentBankBytes": 5245160960,
+    "residentExpertLayers": 0,
+    "partialExpertSlots": 454,
+    "availableMemoryBytes": 99764174848,
+    "physicalMemoryBytes": 137438953472
+  },
+  "inputTokens": 1024,
+  "outputTokens": 128,
+  "outputSha256": "e9987578c1b7724ed4a9cf49f355c09600e9e4c04719154da85dd82d54f088a6",
+  "variants": {
+    "previous_path": {
+      "count": 3,
+      "prefillTps": {
+        "samples": [
+          1296.1591217999435,
+          1292.797212147452,
+          1287.2993898213463
+        ],
+        "median": 1292.797212147452,
+        "range": [
+          1287.2993898213463,
+          1296.1591217999435
+        ]
+      },
+      "decodeTps": {
+        "samples": [
+          21.37909349789544,
+          21.17053999337962,
+          21.179215500104988
+        ],
+        "median": 21.179215500104988,
+        "range": [
+          21.17053999337962,
+          21.37909349789544
+        ]
+      },
+      "ttftMs": {
+        "samples": [
+          790.026458,
+          792.080916,
+          795.46375
+        ],
+        "median": 792.080916,
+        "range": [
+          790.026458,
+          795.46375
+        ]
+      },
+      "turnSeconds": {
+        "samples": [
+          6.7328285830000025,
+          6.793515333999996,
+          6.794220791
+        ],
+        "median": 6.793515333999996,
+        "range": [
+          6.7328285830000025,
+          6.794220791
+        ]
+      }
+    },
+    "optimized_defaults": {
+      "count": 3,
+      "prefillTps": {
+        "samples": [
+          1320.8110675629841,
+          1320.1544923171082,
+          1309.1587136563942
+        ],
+        "median": 1320.1544923171082,
+        "range": [
+          1309.1587136563942,
+          1320.8110675629841
+        ]
+      },
+      "decodeTps": {
+        "samples": [
+          21.431030030568326,
+          21.389352855531097,
+          21.295780470758782
+        ],
+        "median": 21.389352855531097,
+        "range": [
+          21.295780470758782,
+          21.431030030568326
+        ]
+      },
+      "ttftMs": {
+        "samples": [
+          775.281208,
+          775.666792,
+          782.181709
+        ],
+        "median": 775.666792,
+        "range": [
+          775.281208,
+          782.181709
+        ]
+      },
+      "turnSeconds": {
+        "samples": [
+          6.703715874999994,
+          6.715468500000003,
+          6.747968124999999
+        ],
+        "median": 6.715468500000003,
+        "range": [
+          6.703715874999994,
+          6.747968124999999
+        ]
+      }
+    }
+  },
+  "guard": {
+    "exit_code": 0,
+    "completion_event_seen": true,
+    "peak_rss_bytes": 43981307904,
+    "rss_limit_bytes": 94489280512,
+    "peak_physical_footprint_bytes": 78851340296,
+    "physical_footprint_limit_bytes": 94489280512,
+    "seconds": 83.6709847500315,
+    "guard_stop_reason": null,
+    "other_process_threshold_bytes": 8589934592,
+    "competing_processes": []
+  },
+  "limitations": [
+    "The code-prompt comparison had overlapping ranges and opposing trends; no reliable code speedup established.",
+    "An earlier long standard run slowed severely over time; its medians were excluded.",
+    "mlx.fast used different checkpoint/storage and residency conditions; these are not matched scores."
+  ]
+}

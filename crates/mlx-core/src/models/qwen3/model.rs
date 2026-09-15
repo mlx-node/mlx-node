@@ -5552,6 +5552,7 @@ mod tests {
             generation_start: None,
             first_token_instant: None,
             generation_stream: Stream::default(DeviceType::Gpu),
+            _wired_context: None,
             profiler: crate::decode_profiler::DecodeProfiler::new("thinking-budget", "Qwen3"),
             emitter: None,
             turn_token_observer: None,

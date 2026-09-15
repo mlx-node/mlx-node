@@ -3,7 +3,7 @@
 /// Reads GGUF model files and converts tensors to MLX SafeTensors format.
 /// Supports:
 ///   * BF16/F16/F32 unquantized tensors, copied through;
-///   * Q4_1, repacked into MLX affine quantization — it stores a real
+///   * Q4_1 and Q5_1, repacked into MLX affine quantization — it stores a real
 ///     per-block minimum, so it keeps its `.biases` companion;
 ///   * Q4_0/Q8_0, symmetric (`w = d * (q - Z)`): the bias is `-Z * scale`
 ///     everywhere, so it is not written — `symmetric_zero_point` goes in
@@ -64,6 +64,7 @@ pub enum GgufTensorType {
     F16 = 1,
     Q4_0 = 2,
     Q4_1 = 3,
+    Q5_1 = 7,
     Q8_0 = 8,
     Q3K = 11,
     Q4K = 12,
@@ -82,6 +83,7 @@ impl GgufTensorType {
             1 => Some(Self::F16),
             2 => Some(Self::Q4_0),
             3 => Some(Self::Q4_1),
+            7 => Some(Self::Q5_1),
             8 => Some(Self::Q8_0),
             11 => Some(Self::Q3K),
             12 => Some(Self::Q4K),
@@ -99,12 +101,13 @@ impl GgufTensorType {
     /// ones. The K-quant sizes are `block_q4_K` / `block_q5_K` / `block_q6_K`
     /// from `crates/mlx-core/vendor/ggml/ggml_kquant_ref.h:41-73`, which the
     /// vendored C static-asserts against ggml's own structs.
-    fn type_size(&self) -> usize {
+    pub(crate) fn type_size(&self) -> usize {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::BF16 => 2,
             Self::Q4_0 => 18, // block size: 2 byte scale + 16 bytes (32 x 4-bit)
             Self::Q4_1 => 20, // 2 byte scale + 2 byte bias + 16 bytes
+            Self::Q5_1 => 24, // f16 scale/min, 32 high bits, 16 low-nibble bytes
             Self::Q8_0 => 34, // 2 byte scale + 32 bytes
             Self::Q3K | Self::IQ3S => 110,
             // f16 d + f16 dmin + 12 packed 6-bit (sub-scale, min) pairs +
@@ -127,10 +130,10 @@ impl GgufTensorType {
     /// through to 1 would take the non-quantized branch, oversize its tensor by
     /// a factor of `block_size`, and shift every later tensor offset in the file
     /// with no error raised anywhere.
-    fn block_size(&self) -> usize {
+    pub(crate) fn block_size(&self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0 => 32,
             Self::IQ4NL => 32,
             Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ3S | Self::IQ4XS => 256,
         }
@@ -148,7 +151,7 @@ impl GgufTensorType {
     /// per-16/32-value sub-scales need the K-quant array contract in
     /// `crate::utils::gguf_kquant`, not affine's one f16 scale per block.
     fn is_mlx_affine_quantized(&self) -> bool {
-        matches!(self, Self::Q4_0 | Self::Q4_1 | Self::Q8_0)
+        matches!(self, Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0)
     }
 
     /// The repacker format for the ggml K-quants, `None` for everything else.
@@ -156,7 +159,7 @@ impl GgufTensorType {
     /// Deliberately exhaustive for the same reason as `block_size()`: a K-quant
     /// added here but forgotten in `load_gguf_tensors` would be handed to the
     /// affine or the dense reader and decode to garbage.
-    fn k_quant_format(&self) -> Option<KQuantFormat> {
+    pub(crate) fn k_quant_format(&self) -> Option<KQuantFormat> {
         match self {
             Self::Q4K => Some(KQuantFormat::Q4K),
             Self::Q5K => Some(KQuantFormat::Q5K),
@@ -165,7 +168,13 @@ impl GgufTensorType {
             Self::IQ4NL => Some(KQuantFormat::IQ4NL),
             Self::IQ3S => Some(KQuantFormat::IQ3S),
             Self::IQ4XS => Some(KQuantFormat::IQ4XS),
-            Self::F32 | Self::F16 | Self::BF16 | Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => None,
+            Self::F32
+            | Self::F16
+            | Self::BF16
+            | Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_1
+            | Self::Q8_0 => None,
         }
     }
 
@@ -175,6 +184,7 @@ impl GgufTensorType {
             Self::F16 => "F16",
             Self::Q4_0 => "Q4_0",
             Self::Q4_1 => "Q4_1",
+            Self::Q5_1 => "Q5_1",
             Self::Q8_0 => "Q8_0",
             Self::Q3K => "Q3_K",
             Self::Q4K => "Q4_K",
@@ -247,6 +257,8 @@ pub enum GgufMetaValue {
     Float64(f64),
     ArrayU32(Vec<u32>),
     ArrayI32(Vec<i32>),
+    ArrayU64(Vec<u64>),
+    ArrayI64(Vec<i64>),
     ArrayF32(Vec<f32>),
     ArrayString(Vec<String>),
 }
@@ -254,6 +266,8 @@ pub enum GgufMetaValue {
 impl GgufMetaValue {
     pub fn as_u32(&self) -> Option<u32> {
         match self {
+            Self::Uint8(v) => Some(u32::from(*v)),
+            Self::Uint16(v) => Some(u32::from(*v)),
             Self::Uint32(v) => Some(*v),
             Self::Int32(v) => u32::try_from(*v).ok(),
             Self::Uint64(v) => u32::try_from(*v).ok(),
@@ -264,6 +278,8 @@ impl GgufMetaValue {
 
     pub fn as_u64(&self) -> Option<u64> {
         match self {
+            Self::Uint8(v) => Some(u64::from(*v)),
+            Self::Uint16(v) => Some(u64::from(*v)),
             Self::Uint64(v) => Some(*v),
             Self::Int64(v) => Some(*v as u64),
             Self::Uint32(v) => Some(*v as u64),
@@ -470,6 +486,20 @@ fn read_meta_array(r: &mut impl Read) -> std::io::Result<GgufMetaValue> {
             }
             Ok(GgufMetaValue::ArrayI32(v))
         }
+        GgufValueType::Uint64 => {
+            let mut v = Vec::with_capacity(len);
+            for _ in 0..len {
+                v.push(read_u64(r)?);
+            }
+            Ok(GgufMetaValue::ArrayU64(v))
+        }
+        GgufValueType::Int64 => {
+            let mut v = Vec::with_capacity(len);
+            for _ in 0..len {
+                v.push(read_i64(r)?);
+            }
+            Ok(GgufMetaValue::ArrayI64(v))
+        }
         GgufValueType::Float32 => {
             let mut v = Vec::with_capacity(len);
             for _ in 0..len {
@@ -571,7 +601,7 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
             Some(t) => t,
             None => {
                 return Err(Error::from_reason(format!(
-                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q8_0(8), Q4_K(12), Q5_K(13), Q6_K(14), BF16(30) are recognized. \
+                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q5_1(7), Q8_0(8), Q4_K(12), Q5_K(13), Q6_K(14), BF16(30) are recognized. \
                      Other K-quant and IQ formats require dequantization before conversion.",
                     name, type_u32
                 )));
@@ -797,6 +827,7 @@ pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
         GgufTensorType::Q4_0 => Some(8),
         GgufTensorType::Q8_0 => Some(128),
         GgufTensorType::Q4_1
+        | GgufTensorType::Q5_1
         | GgufTensorType::F32
         | GgufTensorType::F16
         | GgufTensorType::BF16
@@ -820,9 +851,9 @@ pub fn derived_symmetric_bias_bits(scale_bits: u16, zero_point: i32) -> u16 {
     half::f16::from_f32(-(zero_point as f32) * scale).to_bits()
 }
 
-/// Load a quantized tensor (Q4_0, Q4_1, Q8_0) into its MLX affine companions.
+/// Load a quantized tensor (Q4_0, Q4_1, Q5_1, Q8_0) into its MLX affine companions.
 ///
-/// Q4_1 yields the `(weight, scales, biases)` triplet its stored per-block
+/// Q4_1 and Q5_1 yield the `(weight, scales, biases)` triplet its stored per-block
 /// minimum requires. Q4_0 and Q8_0 yield `(weight, scales)` only: their offset
 /// is the constant `-Z * scale`, so it is reconstructed at load instead of
 /// stored (see [`symmetric_zero_point`]).
@@ -850,14 +881,18 @@ fn load_quantized_tensor(
     // Determine weights_per_byte for packed format
     let weights_per_byte: usize = match tensor.tensor_type {
         GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => 2, // 4-bit: 2 weights per byte
-        GgufTensorType::Q8_0 => 1,                        // 8-bit: 1 weight per byte
+        GgufTensorType::Q5_1 | GgufTensorType::Q8_0 => 1, // 8-bit: 1 weight per byte
         _ => unreachable!(),
     };
 
-    // Weight shape: last dim divided by (weights_per_byte * 4) for uint32 packing
+    // Q5_1 uses MLX's native five-bit bitstream: five u32 words per 32 codes.
     let mut w_shape = shape.clone();
     let last = *w_shape.last().unwrap();
-    *w_shape.last_mut().unwrap() = last / (weights_per_byte as i64 * 4);
+    *w_shape.last_mut().unwrap() = if tensor.tensor_type == GgufTensorType::Q5_1 {
+        last / 32 * 5
+    } else {
+        last / (weights_per_byte as i64 * 4)
+    };
 
     // Scales/biases shape: last dim divided by block_size
     let mut sb_shape = shape;
@@ -918,6 +953,25 @@ fn load_quantized_tensor(
                         packed |= ((unpacked[k * 8 + b] as u8 & 0x0F) as u32) << (b * 4);
                     }
                     weights_packed[base + k] = packed;
+                }
+            }
+        }
+        GgufTensorType::Q5_1 => {
+            // Preserve source codes and FP16 scale/minimum without requantization.
+            biases = vec![0u16; sb_elements];
+            for i in 0..n_blocks {
+                let block = &raw[i * type_size..(i + 1) * type_size];
+                scales[i] = u16::from_le_bytes([block[0], block[1]]);
+                biases[i] = u16::from_le_bytes([block[2], block[3]]);
+                let high = u32::from_le_bytes(block[4..8].try_into().unwrap());
+                for j in 0..32 {
+                    let low = (block[8 + j % 16] >> (4 * (j / 16))) & 15;
+                    let code = u32::from(low) | (((high >> j) & 1) << 4);
+                    let bit = j * 5;
+                    weights_packed[i * 5 + bit / 32] |= code << (bit % 32);
+                    if bit % 32 > 27 {
+                        weights_packed[i * 5 + bit / 32 + 1] |= code >> (32 - bit % 32);
+                    }
                 }
             }
         }
@@ -1241,7 +1295,7 @@ fn is_muse_glimmer_dflash_gguf(metadata: &HashMap<String, GgufMetaValue>) -> boo
 }
 
 /// The three names a quantized tensor group ships under. Both GGUF quant
-/// importers emit the same trio: `load_quantized_tensor` (affine Q4_0/Q4_1/Q8_0)
+/// importers emit the same trio: `load_quantized_tensor` (affine Q4_0/Q4_1/Q5_1/Q8_0)
 /// and `load_kquant_repack` (supported K/IQ formats) each write `{base}.weight` plus a
 /// `{base}.scales` / `{base}.biases` sidecar pair. Loaders probe the sidecar by
 /// name to decide a tensor is quantized (e.g. `embed_tokens.scales`), so a
@@ -2499,6 +2553,7 @@ impl SourceQuantProfile {
             // loader needs to rebuild the omitted `.biases`.
             GgufTensorType::Q4_0 => Some(Self::affine(4).symmetric(ty)),
             GgufTensorType::Q4_1 => Some(Self::affine(4)),
+            GgufTensorType::Q5_1 => Some(Self::affine(5)),
             GgufTensorType::Q8_0 => Some(Self::affine(8).symmetric(ty)),
             // `load_kquant_repack` keeps ggml's geometry verbatim, so the
             // triple is read off the repacker format rather than restated
@@ -2577,7 +2632,7 @@ impl SourceQuantProfile {
 
 /// Describe tensors that were already quantized in the GGUF source.
 ///
-/// Q4_0/Q4_1/Q8_0 go through `load_quantized_tensor` and — when the K-quant
+/// Q4_0/Q4_1/Q5_1/Q8_0 go through `load_quantized_tensor` and — when the K-quant
 /// import is on — supported K/IQ tensors go through `load_kquant_repack`. Neither path
 /// changes the source block geometry, so that geometry has to reach the output
 /// config even when the caller never asked for a `--quantize` pass; otherwise
@@ -3425,7 +3480,7 @@ pub struct GgufConversionResult {
     pub source_format: String,
 }
 
-fn write_embedded_gpt2_tokenizer(
+pub(crate) fn write_embedded_gpt2_tokenizer(
     metadata: &HashMap<String, GgufMetaValue>,
     output_dir: &Path,
 ) -> Result<bool> {
@@ -4395,7 +4450,7 @@ pub async fn convert_gguf_to_safetensors(
             config_json["quantization"] = quant_obj.clone();
             config_json["quantization_config"] = quant_obj;
         } else if let Some(quant_obj) = preserved_source_quantization(&gguf, import_k_quants)? {
-            // Source Q4_0/Q4_1/Q8_0 tensors were losslessly repacked into MLX
+            // Source Q4_0/Q4_1/Q5_1/Q8_0 tensors were losslessly repacked into MLX
             // affine groups of 32, and imported K-quants keep ggml's own
             // geometry. Record that even without an extra quantize request;
             // otherwise Gemma4 defaults to group_size 64 and decodes the exact

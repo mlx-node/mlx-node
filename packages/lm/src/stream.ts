@@ -9,6 +9,7 @@ import {
   Qwen3Model as Qwen3ModelNative,
   Qwen35Model as Qwen35ModelNative,
   Qwen35MoeModel as Qwen35MoeModelNative,
+  Qwen4ExpModel as Qwen4ExpModelNative,
 } from "@mlx-node/core";
 import type {
   ChatConfig,
@@ -958,3 +959,8 @@ function _assertPreservedNativeSurfaces(): void {
   void _nemotronH;
 }
 void _assertPreservedNativeSurfaces;
+
+/** Qwen3.8-Flash-Next with SSD-streamed experts and PLE embeddings. */
+export class Qwen4ExpModel extends makeStreamingModel(Qwen4ExpModelNative, {
+  recordModelPath: true,
+}) {}

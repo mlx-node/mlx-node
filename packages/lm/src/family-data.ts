@@ -315,6 +315,14 @@ export const MODEL_FAMILY_DATA = [
     },
   },
   {
+    id: 'qwen4_exp',
+    kind: 'loadable',
+    match: { rawModelTypes: ['qwen4_exp', 'qwen4_exp_text'] },
+    ggufArchitectures: ['qwen4exp'],
+    traits: { reasoning: true, fallbackContextWindow: 262144 },
+    launchPreset: { sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding, maxOutputTokens: 8192 },
+  },
+  {
     id: 'lfm2',
     kind: 'loadable',
     match: { rawModelTypes: ['lfm2'] },

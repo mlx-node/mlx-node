@@ -1,0 +1,549 @@
+#include "mlx_common.h"
+#include <cstring>
+#include <limits>
+#include <memory>
+#ifdef MLX_NODE_METAL_ENABLED
+namespace mlx::core::qwen4_preamble {
+const char *gemm();
+const char *quantized_utils();
+const char *kquant();
+} // namespace mlx::core::qwen4_preamble
+#include "mlx/primitives.h"
+#endif
+
+extern "C" {
+// Affine expert GEMV keeps the half precision scale/bias banks in place. The
+// generic gather promotes entire banks when BF16 activations meet F16 scales.
+// Promote only the small activation, and preserve MLX's per-row accumulation.
+mlx_array *mlx_qwen4_affine_expert_gemv(mlx_array *x, mlx_array *ids,
+                                        mlx_array *weight, mlx_array *scales,
+                                        mlx_array *biases, int experts,
+                                        int group, int bits) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!x || !ids || !weight || !scales || !biases || experts <= 0 ||
+        group != 32 || (bits != 5 && bits != 8))
+      return nullptr;
+    auto input = *reinterpret_cast<array *>(x),
+         selected = *reinterpret_cast<array *>(ids);
+    auto w = *reinterpret_cast<array *>(weight),
+         s = *reinterpret_cast<array *>(scales),
+         b = *reinterpret_cast<array *>(biases);
+    if (input.ndim() != 3 || input.shape(1) != 1 ||
+        selected.dtype() != mlx::core::uint32 || w.ndim() != 2 ||
+        w.shape(0) % experts || w.dtype() != mlx::core::uint32 ||
+        s.ndim() != 2 || s.dtype() != mlx::core::float16 ||
+        b.dtype() != s.dtype() || b.shape() != s.shape())
+      return nullptr;
+    int rows = input.shape(0), k = input.shape(2), n = w.shape(0) / experts;
+    if (rows <= 0 || rows > 80 || selected.size() != rows || k <= 0 ||
+        k % group || n <= 0 || w.shape(1) != k * bits / 32 ||
+        s.shape(0) != w.shape(0) || s.shape(1) != k / group)
+      return nullptr;
+    auto compute_type = mlx::core::promote_types(input.dtype(), s.dtype());
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "qwen4_affine_expert_gemv", {"x", "ids", "w", "scales", "biases"},
+        {"out"}, R"(
+      constexpr int VP = get_pack_factor<BITS,32>();
+      constexpr int BP = get_bytes_per_pack<BITS,32>();
+      constexpr int BLOCK = VP * 32;
+      uint assignment = threadgroup_position_in_grid.z;
+      uint expert = ids[assignment];
+      uint lane = thread_index_in_simdgroup;
+      uint first = threadgroup_position_in_grid.y * 4 + simdgroup_index_in_threadgroup * 2;
+      float result[2] = {0,0};
+      if (first >= N) return;
+      if (expert < E) {
+        for (int base = 0; base < K; base += BLOCK) {
+          int col = base + lane * VP;
+          if (col < K) {
+            float values[VP];
+            float sum = load_vector<C,float,VP,BITS>(x + size_t(assignment)*K + col,values);
+            for (int r = 0; r < 2 && first+r < N; ++r) {
+              size_t row = size_t(expert)*N + first+r;
+              auto codes = (const device uint8_t*)w + row*(K*BP/VP) + col*BP/VP;
+              size_t side = row*(K/GS) + col/GS;
+              result[r] += qdot<float,VP,BITS,false>(codes,values,float(scales[side]),float(biases[side]),sum);
+            }
+          }
+        }
+      }
+      for (int r = 0; r < 2 && first+r < N; ++r) {
+        float value = simd_sum(result[r]);
+        if (lane == 0) out[size_t(assignment)*N + first+r] = T(C(value));
+      }
+    )",
+        std::string(mlx::core::qwen4_preamble::gemm()) +
+            mlx::core::qwen4_preamble::quantized_utils() +
+            mlx::core::qwen4_preamble::kquant());
+    auto result = kernel(
+        {astype(input, compute_type), selected, w, s, b}, {{rows, 1, n}},
+        {input.dtype()}, {32, ((n + 3) / 4) * 2, rows}, {32, 2, 1},
+        {{"C", compute_type},
+         {"T", input.dtype()},
+         {"K", k},
+         {"N", n},
+         {"E", experts},
+         {"GS", group},
+         {"BITS", bits}},
+        std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
+    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 affine expert GEMV: " << e.what() << std::endl;
+    return nullptr;
+  }
+#else
+  return nullptr;
+#endif
+}
+
+mlx_array *mlx_qwen4_expert_gemv(mlx_array *x, mlx_array *ids,
+                                 mlx_array *weight, mlx_array *scales,
+                                 mlx_array *biases, int experts, int group,
+                                 int bits, const char *mode) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!x || !ids || !weight || !scales || !biases || !mode || experts <= 0)
+      return nullptr;
+    auto input = *reinterpret_cast<array *>(x),
+         selected = *reinterpret_cast<array *>(ids);
+    auto w = *reinterpret_cast<array *>(weight),
+         s = *reinterpret_cast<array *>(scales),
+         b = *reinterpret_cast<array *>(biases);
+    auto quant = mlx::core::string_to_quantization_mode(mode);
+    int ratio = mlx::core::quant_super_ratio(quant);
+    if (!ratio || input.ndim() != 3 || input.shape(1) != 1 ||
+        selected.dtype() != mlx::core::uint32 || w.ndim() != 2 ||
+        w.shape(0) % experts || b.dtype() != mlx::core::float16)
+      return nullptr;
+    int rows = input.shape(0), k = input.shape(2), n = w.shape(0) / experts;
+    if (rows > 80 || selected.size() != rows || k % group || n <= 0)
+      return nullptr;
+    static auto kernel = [] {
+      // Reuse the vendored MLX arithmetic. Only dimension arguments change
+      // from constant-buffer references to values for template specialization.
+      std::string header = std::string(mlx::core::qwen4_preamble::gemm()) +
+                           mlx::core::qwen4_preamble::quantized_utils() +
+                           mlx::core::qwen4_preamble::kquant();
+      for (const char *name : {"kquant_qmv_fast_impl", "kquant_qmv_impl"}) {
+        auto start = header.find(std::string("METAL_FUNC void ") + name);
+        auto end = header.find('{', start);
+        auto signature = header.substr(start, end - start);
+        for (size_t p = 0; (p = signature.find("const constant int&", p)) !=
+                           std::string::npos;)
+          signature.replace(p, std::string("const constant int&").size(),
+                            "const int");
+        header.replace(start, end - start, signature);
+      }
+      return mlx::core::fast::metal_kernel(
+          "qwen4_expert_gemv", {"x", "ids", "w", "scales", "biases"}, {"out"},
+          R"(
+        uint row = threadgroup_position_in_grid.z;
+        uint expert = ids[row];
+        if (expert >= E) return;
+        const device uint32_t* weights = w + size_t(expert) * WS;
+        auto scale = KQScales<float,BITS,SR,HM>((const device uint8_t*)scales + size_t(expert)*SS,
+          biases + size_t(expert)*BS);
+        auto input = x + size_t(row)*K;
+        auto output = out + size_t(row)*N;
+        uint3 tile = uint3(0,threadgroup_position_in_grid.y,0);
+        if (FAST) kquant_qmv_fast_impl<T,GS,BITS,SR,HM>(weights,scale,input,output,K,N,tile,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
+        else kquant_qmv_impl<T,GS,BITS,SR,HM>(weights,scale,input,output,K,N,tile,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
+      )",
+          header);
+    }();
+    auto result = kernel(
+        {input, selected, w, s, b}, {{rows, 1, n}}, {input.dtype()},
+        {32, ((n + 7) / 8) * 2, rows}, {32, 2, 1},
+        {{"T", input.dtype()},
+         {"K", k},
+         {"N", n},
+         {"E", experts},
+         {"GS", group},
+         {"BITS", bits},
+         {"SR", ratio},
+         {"HM", mlx::core::quant_has_sub_min(quant)},
+         {"FAST", n % 8 == 0 && k % 512 == 0},
+         {"WS", int(w.size() / experts)},
+         {"SS", int(s.nbytes() / experts)},
+         {"BS", int(b.size() / experts)}},
+        std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
+    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 expert GEMV: " << e.what() << std::endl;
+    return nullptr;
+  }
+#else
+  return nullptr;
+#endif
+}
+
+bool mlx_qwen4_gather_window(mlx_array *keys, mlx_array *values,
+                             mlx_array *table, mlx_array *tokens,
+                             mlx_array *fresh_k, mlx_array *fresh_v, int base,
+                             int block_size, mlx_array **out_k,
+                             mlx_array **out_v) {
+  try {
+    if (!keys || !values || !table || !tokens || !fresh_k || !fresh_v ||
+        !out_k || !out_v || base < 0 || block_size <= 0)
+      return false;
+    auto k = *reinterpret_cast<array *>(keys),
+         v = *reinterpret_cast<array *>(values);
+    auto blocks = *reinterpret_cast<array *>(table),
+         ids = *reinterpret_cast<array *>(tokens);
+    auto fk = *reinterpret_cast<array *>(fresh_k),
+         fv = *reinterpret_cast<array *>(fresh_v);
+    if (fk.ndim() != 4 || fk.shape() != fv.shape() ||
+        fk.dtype() != fv.dtype() || ids.ndim() != 1 ||
+        ids.dtype() != mlx::core::int32 || blocks.dtype() != mlx::core::int32 ||
+        k.dtype() != v.dtype() || k.size() != v.size() || fk.shape(0) != 1 ||
+        fk.shape(3) % 8)
+      return false;
+    int heads = fk.shape(1), dim = fk.shape(3), fresh = fk.shape(2),
+        count = ids.size();
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "qwen4_gather_window", {"keys", "values", "blocks", "ids", "fk", "fv"},
+        {"ko", "vo"}, R"(
+      uint i = thread_position_in_grid.x;
+      if (i >= H * N * D) return;
+      uint d = i % D, t = (i / D) % N, h = i / (D * N);
+      int token = ids[t];
+      if (token < 0 || token >= BASE + FRESH) { ko[i] = 0; vo[i] = 0; return; }
+      if (token >= BASE) {
+        size_t src = (size_t(h) * FRESH + uint(token - BASE)) * D + d;
+        ko[i] = fk[src]; vo[i] = fv[src];
+      } else {
+        int block = blocks[token / BS];
+        if (block < 0 || block >= POOL) { ko[i] = 0; vo[i] = 0; return; }
+        uint offset = token % BS;
+        size_t ki = (((size_t(block) * H + h) * (D / 8) + d / 8) * BS + offset) * 8 + d % 8;
+        size_t vi = ((size_t(block) * H + h) * D + d) * BS + offset;
+        ko[i] = keys[ki]; vo[i] = values[vi];
+      }
+    )");
+    auto result = kernel(
+        {k, v, blocks, ids, fk, fv},
+        {{1, heads, count, dim}, {1, heads, count, dim}},
+        {fk.dtype(), fk.dtype()}, {heads * count * dim, 1, 1}, {256, 1, 1},
+        {{"H", heads},
+         {"D", dim},
+         {"N", count},
+         {"BASE", base},
+         {"FRESH", fresh},
+         {"BS", block_size},
+         {"POOL", int(k.size() / (heads * dim * block_size))}},
+        std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
+    *out_k = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+    *out_v = reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 paged window: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+mlx_array *mlx_qwen4_norm(mlx_array *x, mlx_array *w, int group, double eps,
+                          bool centered) {
+  try {
+    if (!x || !w || group <= 0)
+      return nullptr;
+    auto input = *reinterpret_cast<array *>(x),
+         weight = *reinterpret_cast<array *>(w);
+    if (input.shape(-1) % group || weight.size() != input.shape(-1))
+      return nullptr;
+    auto shape = input.shape();
+    auto grouped = reshape(astype(input, mlx::core::float32),
+                           {-1, int(weight.size()) / group, group});
+    auto scale = astype(weight, mlx::core::float32);
+    if (centered)
+      scale = scale + array(1.0f);
+    scale = reshape(scale, {int(weight.size()) / group, group});
+    static auto fn = mlx::core::compile(
+        [](const std::vector<array> &a) {
+          auto normalized = a[0] / sqrt(mean(square(a[0]), {-1}, true) + a[2]);
+          return std::vector<array>{normalized * a[1]};
+        },
+        true);
+    auto result =
+        astype(reshape(fn({grouped, scale, array(float(eps))})[0], shape),
+               input.dtype());
+    return reinterpret_cast<mlx_array *>(new array(std::move(result)));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 normalization: " << e.what() << std::endl;
+    return nullptr;
+  }
+}
+
+// Fuse the prefill epilogue without storing intermediate F32 upcasts. Keep
+// both BF16 rounding boundaries and the original compiled norm/gate algebra.
+static std::vector<array>
+qwen4_gdn_epilogue_graph(const std::vector<array> &a) {
+  auto y = astype(astype(a[0], mlx::core::bfloat16), mlx::core::float32);
+  auto grouped = reshape(y, {-1, 1, 128});
+  static auto norm = mlx::core::compile(
+      [](const std::vector<array> &v) {
+        return std::vector<array>{
+            v[0] / sqrt(mean(square(v[0]), {-1}, true) + v[2]) * v[1]};
+      },
+      true);
+  auto n = astype(
+      reshape(norm({grouped, reshape(a[2], {1, 128}), a[3]})[0], y.shape()),
+      mlx::core::bfloat16);
+  static auto gate = mlx::core::compile(
+      [](const std::vector<array> &v) {
+        return std::vector<array>{v[1] * sigmoid(v[0])};
+      },
+      true);
+  return {astype(gate({astype(a[1], mlx::core::float32),
+                       astype(n, mlx::core::float32)})[0],
+                 mlx::core::bfloat16)};
+}
+
+mlx_array *mlx_qwen4_gdn_epilogue(mlx_array *out, mlx_array *z, mlx_array *norm,
+                                  double eps) {
+  try {
+    if (!out || !z || !norm || !std::isfinite(eps) || eps <= 0)
+      return nullptr;
+    auto x = *reinterpret_cast<array *>(out), g = *reinterpret_cast<array *>(z),
+         w = *reinterpret_cast<array *>(norm);
+    if (x.ndim() != 4 || x.shape(0) != 1 || x.shape(1) < 1 ||
+        x.shape(1) > 1024 || x.shape(3) != 128 ||
+        x.dtype() != mlx::core::float32 || g.shape() != x.shape() ||
+        g.dtype() != mlx::core::bfloat16 || w.size() != 128 ||
+        w.dtype() != mlx::core::float32)
+      return nullptr;
+    std::vector<array> a{x, g, w, array(float(eps))};
+    static auto fn = mlx::core::compile(qwen4_gdn_epilogue_graph);
+    auto y = fn(a)[0];
+    if (std::getenv("MLX_QWEN4_EPILOGUE_CHECK")) {
+      auto ref = qwen4_gdn_epilogue_graph(a)[0];
+      if (mlx::core::any(not_equal(y, ref)).item<bool>()) {
+        std::cerr << "QWEN4_EPILOGUE_CHECK_FAILED" << std::endl;
+        return nullptr;
+      }
+    }
+    return reinterpret_cast<mlx_array *>(new array(std::move(y)));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 GDN epilogue: " << e.what() << std::endl;
+    return nullptr;
+  }
+}
+
+bool mlx_qwen4_gdn_gates(mlx_array *a, mlx_array *b, mlx_array *scale,
+                         mlx_array *dt, mlx_array **decay, mlx_array **beta) {
+  try {
+    if (!a || !b || !scale || !dt || !decay || !beta)
+      return false;
+    static auto fn = mlx::core::compile(
+        [](const std::vector<array> &a) {
+          auto z = a[0] + a[3];
+          auto softplus = maximum(z, array(0.0f)) + log1p(exp(-abs(z)));
+          return std::vector<array>{exp(softplus * a[2]), sigmoid(a[1])};
+        },
+        true);
+    auto result =
+        fn({*reinterpret_cast<array *>(a), *reinterpret_cast<array *>(b),
+            *reinterpret_cast<array *>(scale), *reinterpret_cast<array *>(dt)});
+    *decay = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+    *beta = reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 GDN gates: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+mlx_array *mlx_qwen4_inject(mlx_array *x, mlx_array *y, mlx_array *g) {
+  try {
+    if (!x || !y || !g)
+      return nullptr;
+    static auto fn = mlx::core::compile(
+        [](const std::vector<array> &a) {
+          return std::vector<array>{a[0] + a[1] * a[2]};
+        },
+        true);
+    auto input = *reinterpret_cast<array *>(x),
+         branch = *reinterpret_cast<array *>(y),
+         gate = *reinterpret_cast<array *>(g);
+    auto residual = reshape(input, {input.shape(0), input.shape(1),
+                                    gate.shape(-1), branch.shape(-1)});
+    auto result = reshape(
+        fn({residual, expand_dims(branch, -2), expand_dims(gate, -1)})[0],
+        input.shape());
+    return reinterpret_cast<mlx_array *>(new array(std::move(result)));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 injection: " << e.what() << std::endl;
+    return nullptr;
+  }
+}
+
+// Stable bucket ordering inspired by mlxfast's TrackPrefillSort. Equal expert
+// ids retain assignment order, and inverse is written during the scatter.
+bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
+                          mlx_array **inverse, mlx_array **sorted_ids) {
+  try {
+    if (!ids || !order || !inverse || !sorted_ids || experts <= 0 ||
+        experts > 1024)
+      return false;
+    auto input = *reinterpret_cast<array *>(ids);
+    if (input.ndim() != 1 || input.dtype() != mlx::core::uint32 ||
+        input.size() < 256 || input.size() > 65536)
+      return false;
+    const int rows = input.size(), blocks = (rows + 255) / 256;
+    static auto count = mlx::core::fast::metal_kernel("qwen4_route_counts",
+                                                      {"ids"}, {"counts"}, R"(
+      threadgroup uint tile[256];
+      uint lane = thread_position_in_threadgroup.x, block = threadgroup_position_in_grid.x;
+      uint row = block * 256 + lane;
+      tile[lane] = row < R ? ids[row] : E;
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint expert = lane; expert < E; expert += 256) {
+        uint total = 0;
+        for (uint j = 0; j < 256; ++j) total += tile[j] == expert;
+        counts[block * E + expert] = total;
+      }
+    )");
+    static auto scatter =
+        mlx::core::fast::metal_kernel("qwen4_route_scatter", {"ids", "counts"},
+                                      {"order", "inverse", "sorted_ids"}, R"(
+      threadgroup uint tile[256], prefix[E], scratch[E], earlier[E];
+      uint lane = thread_position_in_threadgroup.x, block = threadgroup_position_in_grid.x;
+      uint row = block * 256 + lane;
+      tile[lane] = row < R ? ids[row] : E;
+      for (uint expert = lane; expert < E; expert += 256) {
+        uint total = 0, before = 0;
+        for (uint b = 0; b < NB; ++b) {
+          uint n = counts[b * E + expert]; total += n; if (b < block) before += n;
+        }
+        prefix[expert] = total; earlier[expert] = before;
+      }
+      threadgroup_barrier(mem_flags::mem_threadgroup);
+      for (uint stride = 1; stride < E; stride *= 2) {
+        for (uint e = lane; e < E; e += 256) scratch[e] = prefix[e] + (e >= stride ? prefix[e - stride] : 0);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint e = lane; e < E; e += 256) prefix[e] = scratch[e];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+      }
+      if (row >= R) return;
+      uint expert = tile[lane];
+      if (expert >= E) return; // ids are generated by the bounded router.
+      uint rank = earlier[expert] + (expert > 0 ? prefix[expert - 1] : 0);
+      for (uint j = 0; j < lane; ++j) rank += tile[j] == expert;
+      order[rank] = row; inverse[row] = rank; sorted_ids[rank] = expert;
+    )");
+    auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
+    auto counts =
+        count({input}, {{blocks * experts}}, {mlx::core::uint32},
+              {blocks * 256, 1, 1}, {256, 1, 1}, {{"E", experts}, {"R", rows}},
+              std::nullopt, false, stream);
+    auto result =
+        scatter({input, counts[0]}, {{rows}, {rows}, {rows}},
+                {mlx::core::uint32, mlx::core::uint32, mlx::core::uint32},
+                {blocks * 256, 1, 1}, {256, 1, 1},
+                {{"E", experts}, {"R", rows}, {"NB", blocks}}, std::nullopt,
+                false, stream);
+    *order = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+    *inverse = reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
+    *sorted_ids =
+        reinterpret_cast<mlx_array *>(new array(std::move(result[2])));
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 routing: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+// The caller owns these mutable slot banks exclusively and evaluates its last
+// bank-dependent output before reusing a slot. Validate all copies first, then
+// finish GPU work before touching shared CPU-visible storage. Sources retain
+// their arrays throughout the transaction. No caller may publish a new mapping
+// until this operation succeeds.
+bool mlx_qwen4_copy_weight_rows(mlx_array **destinations, mlx_array **sources,
+                                const uint32_t *slots, size_t arrays,
+                                size_t updates) {
+  try {
+    if (!destinations || !sources || !slots || !arrays || !updates ||
+        arrays > 12 || updates > 16)
+      return false;
+    std::vector<array> ready;
+    for (size_t a = 0; a < arrays; ++a) {
+      if (!destinations[a])
+        return false;
+      auto &d = *reinterpret_cast<array *>(destinations[a]);
+      if (d.ndim() != 2 || !d.flags().row_contiguous)
+        return false;
+      ready.push_back(d);
+      for (size_t u = 0; u < updates; ++u) {
+        if (!sources[u * arrays + a])
+          return false;
+        auto &s = *reinterpret_cast<array *>(sources[u * arrays + a]);
+        if (s.ndim() != 2 || !s.flags().row_contiguous ||
+            s.dtype() != d.dtype() || s.shape(1) != d.shape(1) ||
+            s.shape(0) <= 0)
+          return false;
+        if ((uint64_t(slots[u]) + 1) * uint64_t(s.shape(0)) >
+            uint64_t(d.shape(0)))
+          return false;
+        ready.push_back(s);
+      }
+    }
+    mlx::core::eval(ready);
+    mlx::core::synchronize(mlx::core::default_stream(mlx::core::Device::gpu));
+    for (size_t a = 0; a < arrays; ++a) {
+      auto &d = *reinterpret_cast<array *>(destinations[a]);
+      for (size_t u = 0; u < updates; ++u) {
+        auto &s = *reinterpret_cast<array *>(sources[u * arrays + a]);
+        std::memcpy(d.data<char>() + size_t(slots[u]) * s.nbytes(),
+                    s.data<char>(), s.nbytes());
+      }
+    }
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 expert slot update: " << e.what() << std::endl;
+    return false;
+  }
+}
+
+bool mlx_qwen4_gather_pages(mlx_array *keys, mlx_array *values,
+                            mlx_array *slots, int heads, int dim,
+                            int block_size, mlx_array **out_keys,
+                            mlx_array **out_values) {
+  try {
+    if (!keys || !values || !slots || !out_keys || !out_values || heads <= 0 ||
+        dim <= 0 || dim % 8 || block_size <= 0)
+      return false;
+    auto &k = *reinterpret_cast<array *>(keys);
+    auto &v = *reinterpret_cast<array *>(values);
+    auto &indices = *reinterpret_cast<array *>(slots);
+    if (indices.ndim() != 1 || indices.dtype() != mlx::core::int32 ||
+        k.dtype() != v.dtype() || k.size() != v.size())
+      return false;
+    const int count = indices.size();
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "qwen4_gather_pages", {"keys", "values", "slots"}, {"ko", "vo"}, R"(
+      const uint j = thread_position_in_grid.x;
+      if (j >= HC * TC * DC) return;
+      const uint d = j % DC;
+      const uint t = (j / DC) % TC;
+      const uint h = j / (DC * TC);
+      const uint slot = slots[t];
+      const uint block = slot / BS, offset = slot % BS;
+      const size_t ki = (((size_t(block) * HC + h) * (DC / 8) + d / 8) * BS + offset) * 8 + d % 8;
+      const size_t vi = ((size_t(block) * HC + h) * DC + d) * BS + offset;
+      ko[j] = keys[ki]; vo[j] = values[vi];
+    )");
+    auto result = kernel(
+        {k, v, indices}, {{1, heads, count, dim}, {1, heads, count, dim}},
+        {k.dtype(), k.dtype()}, {heads * count * dim, 1, 1}, {256, 1, 1},
+        {{"HC", heads}, {"TC", count}, {"DC", dim}, {"BS", block_size}},
+        std::nullopt, false, mlx::core::default_stream(mlx::core::Device::gpu));
+    *out_keys = reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+    *out_values =
+        reinterpret_cast<mlx_array *>(new array(std::move(result[1])));
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 page gather: " << e.what() << std::endl;
+    return false;
+  }
+}
+}

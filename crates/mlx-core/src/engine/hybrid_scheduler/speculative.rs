@@ -644,6 +644,7 @@ mod tests {
             generation_start: None,
             first_token_instant: None,
             generation_stream: Stream::default(DeviceType::Gpu),
+            _wired_context: None,
             profiler: DecodeProfiler::new("scheduled-test", "Gemma4"),
             emitter: None,
             turn_token_observer: None,

@@ -78,7 +78,7 @@ mod paged_turn;
 pub(crate) mod scheduled_mtp;
 mod state;
 mod training;
-mod vision_turn;
+pub(crate) mod vision_turn;
 
 // Facade: the names the seams publish back into this hub, so the hub, the
 // cousin seams and the `#[cfg(test)]` children keep resolving them unqualified.

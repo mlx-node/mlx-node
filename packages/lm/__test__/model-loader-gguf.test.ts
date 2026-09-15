@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { detectModelType, loadModel, MuseGlimmerModel, Qwen35Model } from '@mlx-node/lm';
+import { detectModelType, loadModel, MuseGlimmerModel, Qwen35Model, Qwen4ExpModel } from '@mlx-node/lm';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -52,6 +52,24 @@ async function writeStandaloneGguf(architecture: string): Promise<{ root: string
 }
 
 describe('standalone GGUF model detection', () => {
+  it('passes an explicit Qwen4 auxiliary checkpoint to the native loader', async () => {
+    const { modelPath } = await writeStandaloneGguf('qwen4exp');
+    const expected = {} as Qwen4ExpModel;
+    const loader = vi.spyOn(Qwen4ExpModel, 'load').mockResolvedValue(expected);
+    expect(await loadModel(modelPath, { auxiliaryModelPath: '/matching/hf', autoLoadDraft: false })).toBe(expected);
+    expect(loader).toHaveBeenCalledWith(modelPath, { auxiliaryModelPath: '/matching/hf' });
+  });
+
+  it('rejects Qwen4 auxiliary options for other model families', async () => {
+    const { modelPath } = await writeStandaloneGguf('qwen35');
+    await expect(loadModel(modelPath, { auxiliaryModelPath: '/matching/hf' })).rejects.toThrow('only supported by qwen4_exp');
+  });
+
+  it('detects Qwen3.8-Flash-Next as its own architecture', async () => {
+    const { modelPath } = await writeStandaloneGguf('qwen4exp');
+    expect(await detectModelType(modelPath)).toBe('qwen4_exp');
+  });
+
   it('loads a standalone Qwen target without attaching a companion above its directory', async () => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-standalone-companion-'));
     cleanups.push(() => rm(root, { recursive: true, force: true }));

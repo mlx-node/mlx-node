@@ -1219,9 +1219,13 @@ unsafe extern "C-unwind" {
     ///                   skipped (trace-count check still ran).
     pub fn mlx_paged_kv_write_compile_trace_smoke(num_tokens: i32) -> i32;
 
+    /// Cached paged writes must bind offset K/V and retain their backing arrays.
+    /// Returns 1 on exact pool parity, -3 without Metal, and <=0 on failure.
+    pub fn mlx_paged_kv_write_compile_offset_views_check() -> i32;
+
     // =============================================================================
     // Factory must reject non-row-contiguous or nonzero-offset views for
-    // ALL inputs.
+    // Mutable pools and metadata; read-only new K/V may have an offset.
     //
     // Each helper builds a real data-backed array, applies `slice` /
     // `transpose` to produce a non-row-contiguous or nonzero-offset
@@ -1968,3 +1972,196 @@ pub type LayerFunctionPtr = extern "C-unwind" fn(
     max_outputs: usize,
     context: *mut std::os::raw::c_void,
 ) -> usize;
+
+unsafe extern "C" {
+    /// Exclusive mutable expert-slot transaction. The caller must evaluate all
+    /// lazy readers of destination banks before recycling slots.
+    pub fn mlx_qwen4_copy_weight_rows(
+        destinations: *mut *mut mlx_array,
+        sources: *mut *mut mlx_array,
+        slots: *const u32,
+        arrays: usize,
+        updates: usize,
+    ) -> bool;
+    pub fn mlx_qwen4_gather_pages(
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        slots: *mut mlx_array,
+        heads: i32,
+        dim: i32,
+        block_size: i32,
+        out_keys: *mut *mut mlx_array,
+        out_values: *mut *mut mlx_array,
+    ) -> bool;
+}
+
+unsafe extern "C" {
+    pub fn mlx_qwen4_route_sort(
+        ids: *mut mlx_array,
+        experts: i32,
+        order: *mut *mut mlx_array,
+        inverse: *mut *mut mlx_array,
+        sorted_ids: *mut *mut mlx_array,
+    ) -> bool;
+}
+
+unsafe extern "C" {
+    pub fn mlx_qwen4_window_conv(
+        x: *mut mlx_array,
+        history: *mut mlx_array,
+        weight: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        next_history: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_gdn_epilogue(
+        out: *mut mlx_array,
+        z: *mut mlx_array,
+        norm: *mut mlx_array,
+        eps: f64,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_norm(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        group: i32,
+        eps: f64,
+        centered: bool,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_gdn_gates(
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        decay: *mut *mut mlx_array,
+        beta: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_inject(
+        x: *mut mlx_array,
+        y: *mut mlx_array,
+        g: *mut mlx_array,
+    ) -> *mut mlx_array;
+}
+
+unsafe extern "C" {
+    pub fn mlx_qwen4_gather_window(
+        keys: *mut mlx_array,
+        values: *mut mlx_array,
+        table: *mut mlx_array,
+        tokens: *mut mlx_array,
+        fresh_k: *mut mlx_array,
+        fresh_v: *mut mlx_array,
+        base: i32,
+        block_size: i32,
+        out_k: *mut *mut mlx_array,
+        out_v: *mut *mut mlx_array,
+    ) -> bool;
+}
+
+unsafe extern "C" {
+    pub fn mlx_qwen4_prefill_indirect(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        token_rows: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+        experts: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_expert_tiles(ids: *mut mlx_array, experts: i32) -> *mut mlx_array;
+    pub fn mlx_qwen4_sorted_combine(
+        values: *mut mlx_array,
+        scores: *mut mlx_array,
+        inverse: *mut mlx_array,
+        top: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_dense_prefill(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    pub fn mlx_qwen4_expert_prefill(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        tiles: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        experts: i32,
+        group: i32,
+        bits: i32,
+        mode: *const std::ffi::c_char,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_affine_expert_gemv(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        experts: i32,
+        group: i32,
+        bits: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_routed_experts(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        scores: *mut mlx_array,
+        wg: *mut mlx_array,
+        sg: *mut mlx_array,
+        bg: *mut mlx_array,
+        wu: *mut mlx_array,
+        su: *mut mlx_array,
+        bu: *mut mlx_array,
+        wd: *mut mlx_array,
+        sd: *mut mlx_array,
+        bd: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_expert_gemv(
+        x: *mut mlx_array,
+        ids: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        experts: i32,
+        group: i32,
+        bits: i32,
+        mode: *const std::ffi::c_char,
+    ) -> *mut mlx_array;
+}
+
+unsafe extern "C" {
+    pub fn mlx_qwen4_complete_gdn(
+        qkv: *mut mlx_array,
+        z: *mut mlx_array,
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        conv: *mut mlx_array,
+        history: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        state: *mut mlx_array,
+        norm: *mut mlx_array,
+        eps: f64,
+        out: *mut *mut mlx_array,
+        next: *mut *mut mlx_array,
+        next_history: *mut *mut mlx_array,
+    ) -> bool;
+
+    pub fn mlx_qwen4_gated_delta_kernel(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        g: *mut mlx_array,
+        beta: *mut mlx_array,
+        state: *mut mlx_array,
+        mask: *mut mlx_array,
+        out_y: *mut *mut mlx_array,
+        out_state: *mut *mut mlx_array,
+    ) -> bool;
+}

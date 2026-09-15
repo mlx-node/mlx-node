@@ -876,6 +876,7 @@ module.exports.Qwen3AsrModel = nativeBinding.Qwen3AsrModel;
 module.exports.Qwen3AsrStream = nativeBinding.Qwen3AsrStream;
 module.exports.Qwen3Model = nativeBinding.Qwen3Model;
 module.exports.Qwen3Tokenizer = nativeBinding.Qwen3Tokenizer;
+module.exports.Qwen4ExpModel = nativeBinding.Qwen4ExpModel;
 module.exports.ResponseStore = nativeBinding.ResponseStore;
 module.exports.SftTrainingEngine = nativeBinding.SftTrainingEngine;
 module.exports.Tensor = nativeBinding.Tensor;

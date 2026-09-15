@@ -1428,6 +1428,25 @@ mod metal_buffer {
         }
 
         #[test]
+        fn test_deep_copy_keeps_zero_offset_after_source_owners_drop() {
+            use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
+            let copied = {
+                let source = MxArray::from_float32(&[1., 2., 3., 4., 5., 6., 7., 8.], &[8])
+                    .unwrap()
+                    .astype(crate::array::DType::BFloat16)
+                    .unwrap();
+                MxArray::eval_arrays(&[&source]).unwrap();
+                source.slice(&[2], &[6]).unwrap().deep_copy().unwrap()
+            };
+            // No source/view handle survives to prevent buffer donation.
+            MxArray::eval_arrays(&[&copied]).unwrap();
+            synchronize_mlx();
+            let info = unsafe { MlxMetalBuffer::from_mlx_array(copied.as_raw_ptr()) }.unwrap();
+            assert_eq!(info.offset, 0);
+            assert_eq!(copied.to_float32().unwrap().as_ref(), &[3., 4., 5., 6.]);
+        }
+
+        #[test]
         fn test_deep_copy_owns_an_independent_metal_buffer() {
             use mlx_paged_attn::metal::{MlxMetalBuffer, synchronize_mlx};
 
