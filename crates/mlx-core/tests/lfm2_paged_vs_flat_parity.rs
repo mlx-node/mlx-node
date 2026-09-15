@@ -442,6 +442,15 @@ async fn lfm2_paged_vs_flat_length_exit_parity() {
 // rebuilds conv over the 23-token prefix via run_conv_only_prefill (the fixed
 // path).
 //
+// Turn 2 is ALSO budget-forced, for a reason the CI runner forced: with turn 2
+// left unforced the compared continuation opens with a free-form word inside
+// `<think>`, which is a near-tie, and the accepted ~1-ULP paged-vs-flat class
+// flipped it there ("keep" vs "what" at byte 23, identical across three
+// consecutive red `main` runs) while every count invariant and both turn-1
+// outputs matched. Budget-forcing turn 2 puts the same forced `</think>` at the
+// head of both arms, so byte parity is asserted over answer-region decisions
+// instead of over a coin flip.
+//
 // AUTHORITATIVE ORACLE:
 //   * FLAT two-turn — carries the incremental conv state across turns.
 //
@@ -515,6 +524,9 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
     // Echo r1.raw_text VERBATIM (not r1.text) so the re-rendered prompt is a
     // token-exact strict extension of the persisted history → ContinuedLivePrefix
     // fires and turn-2's suffix prefill RE-READS g_0's live partial-block slot.
+    // Budget-forced like turn 1: the first committed token is then the forced
+    // `</think>` on both arms, so the compared decisions are answer-region tokens
+    // instead of the near-tied word that opens a sentence inside `<think>`.
     let r2_warm = warm_model
         .chat_session_start(
             vec![
@@ -522,7 +534,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
                 assistant_message(&r1),
                 user_message(user2),
             ],
-            Some(parity_chat_config(MAX_NEW_TURN2)),
+            Some(budget_force_chat_config(MAX_NEW_TURN2)),
         )
         .await
         .expect("turn 2 (warm live-continue) paged chat_session_start failed");
@@ -575,7 +587,7 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
                 assistant_message(&f1),
                 user_message(user2),
             ],
-            Some(parity_chat_config(MAX_NEW_TURN2)),
+            Some(budget_force_chat_config(MAX_NEW_TURN2)),
         )
         .await
         .expect("flat turn 2 failed");
@@ -585,7 +597,54 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
     );
     drop(flat_model);
 
-    // THE BITE: warm paged continuation must equal the carried-state oracle.
+    // Host-independent carried-state invariants. These hold on any runner, so
+    // they are asserted rather than diagnosed: a mismatch means the two arms are
+    // not even comparable (a turn-1 disagreement, a different reuse length, a
+    // different committed length), which must fail loudly here instead of
+    // surfacing below as a mysterious byte diff.
+    assert_eq!(
+        r1.raw_text, f1.raw_text,
+        "the arms' turn 1 diverged BEFORE the boundary (warm={:?} flat={:?}). Turn 1 is cold, so \
+         no carried state is involved: this is a turn-1 sampling difference, not the warm-path bug \
+         this test exists to catch. Re-pin the fixture — do not debug the continue path.",
+        r1.raw_text, f1.raw_text,
+    );
+    assert_eq!(
+        r2_warm.cached_tokens, r2_flat.cached_tokens,
+        "the arms reused different prefix lengths (warm={} flat={}), so they are not comparing the \
+         same boundary",
+        r2_warm.cached_tokens, r2_flat.cached_tokens,
+    );
+    assert_eq!(
+        r2_warm.num_tokens, r2_flat.num_tokens,
+        "the arms committed different token counts (warm={} flat={})",
+        r2_warm.num_tokens, r2_flat.num_tokens,
+    );
+
+    // Byte parity of the free-running continuation is still THE BITE, asserted on
+    // a comparison whose decisions are not near-ties: both arms run turn 2
+    // budget-forced, so the first committed token is the same forced `</think>`
+    // and the compared tokens are answer-region ones rather than the word that
+    // opens a sentence inside `<think>`.
+    //
+    // Why that matters: the arms are different kernel stacks (fused SDPA over a
+    // flat KV vs the paged pool read with an explicit causal mask) and this file
+    // documents their accepted ~1-ULP class — see `models/lfm2/attention.rs` and
+    // the "Deliberately NOT asserted: byte-equality of the answer texts" note on
+    // the memory-probe test below. That class flips a *near-tied* greedy token.
+    // With turn 2 unforced, this assertion split at the first content word on the
+    // CI runner ("keep" vs "what", first_diff_byte=23, identical across three
+    // consecutive red `main` runs) while the same commit passed on a developer
+    // host and every count invariant held on both sides — it was measuring the
+    // runner rather than the carry path.
+    //
+    // A split again is evidence about the carry path; the invariants above say
+    // whether the arms are even comparable. The remaining sharpening — logits at
+    // turn-2's first forward within `test_support::bf16_scaled_tolerance` plus a
+    // top-two-gap margin, the instrument `models/qwen3/model.rs` uses for its
+    // mixed-step gate — needs a logits readout a test can reach (`ChatResult`
+    // carries none and `Lfm2Inner` is crate-private), so it stays a follow-up
+    // rather than a looser text comparison here.
     if r2_warm.raw_text != r2_flat.raw_text {
         let first_diff = r2_warm
             .raw_text
@@ -604,9 +663,9 @@ async fn lfm2_paged_budget_forced_warm_continue_parity() {
     }
 
     eprintln!(
-        "[PASS] paged carried-state continue == flat carried-state oracle on the budget-forced boundary \
-         (warm cached={})",
-        r2_warm.cached_tokens,
+        "[PASS] paged carried-state continue == flat carried-state oracle on the budget-forced \
+         boundary (warm cached={}, tokens={})",
+        r2_warm.cached_tokens, r2_warm.num_tokens,
     );
 }
 
