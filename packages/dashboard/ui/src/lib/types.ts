@@ -394,7 +394,13 @@ export type DelegationSummary =
     }
   | {
       status: 'incomplete' | 'unavailable';
-      reason: 'no-final-handoff' | 'no-evidence' | 'unsupported-content' | 'legacy' | 'partial-record';
+      reason:
+        | 'no-final-handoff'
+        | 'no-evidence'
+        | 'unsupported-content'
+        | 'legacy'
+        | 'partial-record'
+        | 'tokenizer-unavailable';
     };
 
 export interface SessionSummary {

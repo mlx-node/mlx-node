@@ -1601,7 +1601,6 @@ __metadata:
     class-variance-authority: "npm:^0.7.1"
     clsx: "npm:^2.1.1"
     drizzle-orm: "npm:1.0.0-rc.4"
-    gpt-tokenizer: "npm:4.0.0"
     happy-dom: "npm:20.12.0"
     lucide-react: "npm:^1.38.0"
     react: "npm:^19.2.8"
@@ -1614,6 +1613,7 @@ __metadata:
     sonner: "npm:^2.0.8"
     tailwind-merge: "npm:^3.6.0"
     tailwindcss: "npm:^4.3.3"
+    tokenizers: "npm:0.23.2"
     tw-animate-css: "npm:^1.4.0"
     typescript: "npm:^7.0.2"
     vite: "catalog:"
@@ -7597,13 +7597,6 @@ __metadata:
   languageName: node
   linkType: hard
 
-"gpt-tokenizer@npm:4.0.0":
-  version: 4.0.0
-  resolution: "gpt-tokenizer@npm:4.0.0"
-  checksum: 10c0/2a58a17237f6e4b1f65d28920c975d17e7e7faf0bf3e3f97abe59fcfa9b8362462a9587d4eb45d68227b945726e0efbdf81f2c3e1d5b2927afe22fc0b67cc469
-  languageName: node
-  linkType: hard
-
 "graceful-fs@npm:^4.1.6, graceful-fs@npm:^4.2.0, graceful-fs@npm:^4.2.11, graceful-fs@npm:^4.2.2, graceful-fs@npm:^4.2.4, graceful-fs@npm:^4.2.6":
   version: 4.2.11
   resolution: "graceful-fs@npm:4.2.11"
@@ -10773,6 +10766,13 @@ __metadata:
   version: 3.7.4
   resolution: "toad-cache@npm:3.7.4"
   checksum: 10c0/4a33f9c1e9eea84d0fc019805fe346c8f69e9820f44745f65b77a282d60928c61ad851c258d74e77ad3d2651a28d3d9c8129d1e8c1647902042220f54e7dd026
+  languageName: node
+  linkType: hard
+
+"tokenizers@npm:0.23.2":
+  version: 0.23.2
+  resolution: "tokenizers@npm:0.23.2"
+  checksum: 10c0/e1946c5b564981fbe0e367ecec8d0f68e441d0e69ac35b8ae9d080114f5dc9900f5081dbda374f3e620f81ccc6ad8ab6819aa3e4909d3b6eb291b0e133a2f576
   languageName: node
   linkType: hard
 

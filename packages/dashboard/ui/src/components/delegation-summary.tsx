@@ -20,6 +20,8 @@ function unavailableReason(summary: Exclude<DelegationSummary, { status: 'comple
       return 'This older delegate session has no recorded measurement boundary.';
     case 'partial-record':
       return 'The session record is incomplete or unavailable.';
+    case 'tokenizer-unavailable':
+      return 'The tokenizer could not be loaded or run, so savings cannot be estimated.';
   }
 }
 

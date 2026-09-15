@@ -411,7 +411,15 @@ export function stageApp(opts: {
   for (const name of external) {
     // `dereference` matters: Yarn's tree is full of symlinks, and a symlink that
     // escapes the bundle is both a broken app and a codesign failure.
-    cpSync(join(repoRoot, 'node_modules', name), join(modules, name), { recursive: true, dereference: true });
+    cpSync(join(repoRoot, 'node_modules', name), join(modules, name), {
+      recursive: true,
+      dereference: true,
+      // The tokenizers tarball bundles every OS/architecture in one package.
+      // package.ts targets darwin-arm64; its loader falls back from universal
+      // to this file. Do not ship foreign binaries or a second macOS slice.
+      filter: (source) =>
+        name !== 'tokenizers' || !source.endsWith('.node') || source.endsWith('/tokenizers.darwin-arm64.node'),
+    });
   }
 
   for (const name of workspace) {
@@ -425,6 +433,9 @@ export function stageApp(opts: {
     // second Electron) would sneak in.
     for (const dir of ['dist', 'web']) {
       if (existsSync(join(from, dir))) cpSync(join(from, dir), join(to, dir), { recursive: true, dereference: true });
+    }
+    if (name === '@mlx-node/dashboard') {
+      cpSync(join(from, 'assets'), join(to, 'assets'), { recursive: true, dereference: true });
     }
     for (const file of ['index.cjs', 'index.d.cts', 'index.js', 'index.d.ts']) {
       if (existsSync(join(from, file))) cpSync(join(from, file), join(to, file));

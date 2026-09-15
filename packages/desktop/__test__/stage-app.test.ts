@@ -111,6 +111,48 @@ describe('packaged update eligibility', () => {
   });
 });
 
+it('stages the offline vocabulary and only the macOS arm64 tokenizer binary', () => {
+  const root = mkdtempSync(join(tmpdir(), 'mlx-tokenizer-stage-'));
+  const desktop = join(root, 'desktop');
+  const stage = join(root, 'stage');
+  const dashboard = join(root, 'packages', 'dashboard');
+  try {
+    mkdirSync(join(desktop, 'dist'), { recursive: true });
+    mkdirSync(join(desktop, 'build'), { recursive: true });
+    for (const name of ['iconTemplate.png', 'iconTemplate@2x.png']) writeFileSync(join(desktop, 'build', name), name);
+    mkdirSync(join(dashboard, 'dist'), { recursive: true });
+    mkdirSync(join(dashboard, 'assets'), { recursive: true });
+    writeFileSync(
+      join(dashboard, 'package.json'),
+      JSON.stringify({ name: '@mlx-node/dashboard', dependencies: { tokenizers: '0.23.2', other: '1.0.0' } }),
+    );
+    writeFileSync(join(dashboard, 'assets', 'o200k_base.json.gz'), 'vocabulary');
+    writeFileSync(join(dashboard, 'assets', 'tiktoken-LICENSE'), 'license');
+    for (const name of ['tokenizers', 'other']) {
+      const dir = join(root, 'node_modules', name);
+      mkdirSync(dir, { recursive: true });
+      writeFileSync(join(dir, 'package.json'), JSON.stringify({ name }));
+      writeFileSync(join(dir, 'index.js'), 'module.exports = {};');
+      for (const file of [
+        'tokenizers.darwin-arm64.node',
+        'tokenizers.darwin-universal.node',
+        'tokenizers.linux-x64-gnu.node',
+      ])
+        writeFileSync(join(dir, file), file);
+    }
+    stageApp({ repoRoot: root, desktopDir: desktop, stageDir: stage, roots: ['@mlx-node/dashboard'] });
+    const modules = join(stage, 'node_modules');
+    expect(readdirSync(join(modules, 'tokenizers')).filter((name) => name.endsWith('.node'))).toEqual([
+      'tokenizers.darwin-arm64.node',
+    ]);
+    expect(readdirSync(join(modules, 'other')).filter((name) => name.endsWith('.node'))).toHaveLength(3);
+    expect(readFileSync(join(modules, '@mlx-node/dashboard/assets/o200k_base.json.gz'), 'utf8')).toBe('vocabulary');
+    expect(readFileSync(join(modules, '@mlx-node/dashboard/assets/tiktoken-LICENSE'), 'utf8')).toBe('license');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 describe('runtimeClosure', () => {
   it('keeps the complete CLI runtime, including lazy providers used by agent options', () => {
     const cli = runtimeClosure(repoRoot, [...ROOTS, '@mlx-node/cli']);
@@ -126,6 +168,8 @@ describe('runtimeClosure', () => {
     expect(closure.workspace).toContain('@mlx-node/dashboard');
     expect(closure.workspace).toContain('@mlx-node/server');
     expect(closure.external.length).toBeGreaterThan(0);
+    expect(closure.external).toContain('tokenizers');
+    expect(closure.external).not.toContain('gpt-tokenizer');
     expect(closure.external).toContain('electron-updater');
     expect(closure.external).not.toContain('app-builder-lib');
   });

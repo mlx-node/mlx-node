@@ -709,8 +709,10 @@ The dashboard labels recorded delegate invocations with a **Delegate** badge.
 Session rows show estimated tokens saved, or extra tokens when the handoff is
 larger. The detail page shows the evidence and handoff counts and their ratio.
 These compare unique successful tool-result text with the final handoff using
-the fixed `o200k_base` tokenizer. Repeated evidence is counted once across resumed
-invocations, while every completed handoff is counted. They exclude tool errors,
+the fixed `o200k_base` vocabulary through Hugging Face's native Node `tokenizers`
+binding. The vocabulary is bundled locally; measurement needs no network access.
+Repeated evidence is counted once across resumed invocations, while every
+completed handoff is counted. They exclude tool errors,
 caller invocation costs, reasoning, and transcript rereads, so they measure
 evidence compression and do not establish total coding-agent savings. Incomplete or non-text runs
 show an unavailable estimate. Older sessions without delegate metadata remain

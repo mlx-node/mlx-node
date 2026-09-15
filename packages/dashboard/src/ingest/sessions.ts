@@ -208,7 +208,7 @@ export function isValidSessionTopology(entries: FileEntry[]): boolean {
 }
 
 /** Fold parsed file entries into the row shapes the index stores. Returns null when unusable. */
-function deriveSession(entries: FileEntry[], completeFile: boolean): DerivedSession | null {
+async function deriveSession(entries: FileEntry[], completeFile: boolean): Promise<DerivedSession | null> {
   const header = entries.find((e) => e.type === 'session') as SessionHeader | undefined;
   if (!header || typeof header.id !== 'string') return null;
 
@@ -259,7 +259,7 @@ function deriveSession(entries: FileEntry[], completeFile: boolean): DerivedSess
     messageCount,
     firstMessage,
     turnRows,
-    delegation: deriveDelegation(entries, branch.at(-1)?.id, header.id, completeFile),
+    delegation: await deriveDelegation(entries, branch.at(-1)?.id, header.id, completeFile),
   };
 }
 
@@ -541,7 +541,7 @@ export async function ingestSessions(dash: DashboardDb, root?: string): Promise<
         continue;
       }
 
-      const derived = deriveSession(entries, countJsonlLines(raw) === entries.length);
+      const derived = await deriveSession(entries, countJsonlLines(raw) === entries.length);
       if (!derived) {
         warnings.push(`${filePath}: no valid session header`);
         if (quarantinePath(filePath)) removed++;

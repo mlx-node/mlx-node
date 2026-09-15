@@ -309,7 +309,7 @@ export async function handleSessionDetail(ctx: WorkerApiContext, req: ApiRequest
       // which the index derives from this same chain without sorting. `ts` is for
       // display only.
       const branch = activeBranchEntries(entries);
-      delegation = deriveDelegation(entries, branch.at(-1)?.id, row.id, completeFile);
+      delegation = await deriveDelegation(entries, branch.at(-1)?.id, row.id, completeFile);
       const callArgs = collectCallArgs(branch);
       transcript = branch.map((entry) => mapTranscriptEntry(entry, callArgs)).filter(isMessage);
     }

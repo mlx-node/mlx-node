@@ -1,5 +1,6 @@
 import type { FileEntry, SessionEntry } from '@earendil-works/pi-coding-agent';
-import { countTokens } from 'gpt-tokenizer/encoding/o200k_base';
+
+import { countDelegateTokens } from './tokenizer.js';
 
 export type DelegationSummary =
   | {
@@ -12,12 +13,14 @@ export type DelegationSummary =
     }
   | {
       status: 'incomplete' | 'unavailable';
-      reason: 'no-final-handoff' | 'no-evidence' | 'unsupported-content' | 'legacy' | 'partial-record';
+      reason:
+        | 'no-final-handoff'
+        | 'no-evidence'
+        | 'unsupported-content'
+        | 'legacy'
+        | 'partial-record'
+        | 'tokenizer-unavailable';
     };
-
-// Source text may contain strings such as <|endoftext|>; count them as ordinary
-// text, never control tokens. This is a fixed proxy, not a caller billing count.
-const TOKEN_OPTIONS = { disallowedSpecial: new Set<string>() };
 
 function textContent(content: unknown): string | null {
   if (typeof content === 'string') return content;
@@ -52,12 +55,12 @@ function fullBranch(entries: FileEntry[], leafId: string | undefined): SessionEn
  * The caller may reread transcripts or spend more tokens invoking/verifying the
  * worker; those costs are not observable in this session.
  */
-export function deriveDelegation(
+export async function deriveDelegation(
   entries: FileEntry[],
   leafId: string | undefined,
   sessionId: string,
   completeFile: boolean,
-): DelegationSummary | null {
+): Promise<DelegationSummary | null> {
   if (
     !entries.some(
       (entry) =>
@@ -75,14 +78,14 @@ export function deriveDelegation(
   let issue: Exclude<DelegationSummary, { status: 'complete' }> | undefined;
   // The UI reports unique evidence for the whole session, including follow-ups.
   const evidence = new Set<string>();
-  let handoffTokens = 0;
+  const handoffs: string[] = [];
   let run: { handoff: string | null; hasUser: boolean; unsupported: boolean; blocked: boolean } | undefined;
 
   const finish = (): void => {
     if (!run) return;
     if (run.unsupported) issue = { status: 'unavailable', reason: 'unsupported-content' };
     else if (run.blocked || !run.handoff?.trim()) issue = { status: 'incomplete', reason: 'no-final-handoff' };
-    else handoffTokens += countTokens(run.handoff, TOKEN_OPTIONS);
+    else handoffs.push(run.handoff);
     run = undefined;
   };
 
@@ -130,8 +133,16 @@ export function deriveDelegation(
   if (!identified) return legacy ? { status: 'unavailable', reason: 'legacy' } : null;
   if (!completeFile) return { status: 'incomplete', reason: 'partial-record' };
   if (issue) return issue;
-  let evidenceTokens = 0;
-  for (const text of evidence) evidenceTokens += countTokens(text, TOKEN_OPTIONS);
+  if (evidence.size === 0) return { status: 'unavailable', reason: 'no-evidence' };
+  let counts: number[];
+  try {
+    counts = await countDelegateTokens([...evidence, ...handoffs]);
+  } catch {
+    // A missing addon/asset must not hide the session or advertise false savings.
+    return { status: 'unavailable', reason: 'tokenizer-unavailable' };
+  }
+  const evidenceTokens = counts.slice(0, evidence.size).reduce((sum, count) => sum + count, 0);
+  const handoffTokens = counts.slice(evidence.size).reduce((sum, count) => sum + count, 0);
   if (evidenceTokens === 0) return { status: 'unavailable', reason: 'no-evidence' };
   const savedTokens = evidenceTokens - handoffTokens;
   return {
