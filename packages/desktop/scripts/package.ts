@@ -116,6 +116,18 @@ run('install_name_tool', [
   `@rpath/${keyringBinary}`,
   join(STAGE_APP, 'node_modules', '@napi-rs', 'keyring-darwin-arm64', keyringBinary),
 ]);
+// The dashboard's delegate token counter imports `tokenizers` lazily, and
+// stage-app ships exactly one slice of it (see the copy filter there). Its
+// upstream LC_ID_DYLIB carries the publisher's CI path —
+// /Users/runner/work/tokenizers/tokenizers/bindings/node/target/…/libnode.dylib —
+// which is the same defect mlx-core and keyring arrive with, and step [3/5] of
+// verify-bundle refuses it. Rewrite the staged copy, before packager/codesign.
+const tokenizersBinary = 'tokenizers.darwin-arm64.node';
+run('install_name_tool', [
+  '-id',
+  `@rpath/${tokenizersBinary}`,
+  join(STAGE_APP, 'node_modules', 'tokenizers', tokenizersBinary),
+]);
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
 console.log(`  pruned ${staged.prunedDirs} examples/docs/test dirs from staged packages`);
 console.log(`  pruned ${staged.prunedFiles} .d.ts / source-map / tsbuildinfo files`);
