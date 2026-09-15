@@ -98,6 +98,66 @@ describe('delegate evidence compression', () => {
     expect(measure([...entries, ...follow])).toMatchObject({ evidenceTokens: 3, handoffTokens: 2, savedTokens: 1 });
   });
 
+  it.each([false, true])('deduplicates evidence across resumed invocations (compacted: %s)', (compacted) => {
+    const entries: object[] = delegationFixture();
+    if (compacted)
+      entries.push({
+        type: 'compaction',
+        id: 'c',
+        parentId: 'f',
+        timestamp: '',
+        firstKeptEntryId: 'f',
+        summary: 'compacted',
+        tokensBefore: 50,
+      });
+    const follow = delegationFixture()
+      .slice(1)
+      .map((e) => ({
+        ...e,
+        id: `next-${e.id}`,
+        parentId: e.parentId ? `next-${e.parentId}` : compacted ? 'c' : 'f',
+      }));
+    expect(measure([...entries, ...follow])).toMatchObject({
+      evidenceTokens: 3,
+      handoffTokens: 2,
+      savedTokens: 1,
+      savingsRatio: 1 / 3,
+    });
+    // A changed result is new evidence even when the command is the same.
+    follow[3]!.message!.content = [{ type: 'text', text: 'OK' }];
+    expect(measure([...entries, ...follow])).toMatchObject({ evidenceTokens: 4, handoffTokens: 2, savedTokens: 2 });
+  });
+
+  it('does not inherit a legacy blocked delegate identity when a session is forked', () => {
+    const entries = delegationFixture();
+    entries.splice(1, 1);
+    entries[1]!.parentId = null;
+    entries.push({
+      type: 'custom',
+      id: 'blocked',
+      parentId: 'f',
+      timestamp: '',
+      customType: 'mlx-delegate-handoff',
+      data: { reason: 'permission denied', sessionFile: '/sessions/delegate.jsonl' },
+    });
+    expect(measure(entries)).toEqual({ status: 'unavailable', reason: 'legacy' });
+    const fork = [{ ...entries[0]!, id: 'fork-child', parentSession: '/sessions/delegate.jsonl' }, ...entries.slice(1)];
+    expect(measure(fork, true, 'fork-child')).toBeNull();
+    const ownRun = delegationFixture('fork-child')
+      .slice(1)
+      .map((e) => ({
+        ...e,
+        id: `own-${e.id}`,
+        parentId: e.parentId ? `own-${e.parentId}` : 'blocked',
+      }));
+    expect(measure([...fork, ...ownRun], true, 'fork-child')).toMatchObject({
+      status: 'complete',
+      evidenceTokens: 3,
+      handoffTokens: 1,
+      savedTokens: 2,
+    });
+  });
+
   it('retains pre-compaction evidence and ignores abandoned branches and detached rename metadata', () => {
     const entries: object[] = delegationFixture();
     entries.push({

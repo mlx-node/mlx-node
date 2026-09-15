@@ -66,23 +66,23 @@ export function deriveDelegation(
     )
   )
     return null;
+  const header = entries.find((entry) => entry.type === 'session');
+  // Legacy handoffs have no session ID and are copied verbatim by a fork.
+  // Only an unforked session can use one to establish its own delegate identity.
+  const canIdentifyLegacy = header?.id === sessionId && !header.parentSession;
   let identified = false;
   let legacy = false;
   let issue: Exclude<DelegationSummary, { status: 'complete' }> | undefined;
-  let evidenceTokens = 0;
+  // The UI reports unique evidence for the whole session, including follow-ups.
+  const evidence = new Set<string>();
   let handoffTokens = 0;
-  let run:
-    | { evidence: Set<string>; handoff: string | null; hasUser: boolean; unsupported: boolean; blocked: boolean }
-    | undefined;
+  let run: { handoff: string | null; hasUser: boolean; unsupported: boolean; blocked: boolean } | undefined;
 
   const finish = (): void => {
     if (!run) return;
     if (run.unsupported) issue = { status: 'unavailable', reason: 'unsupported-content' };
     else if (run.blocked || !run.handoff?.trim()) issue = { status: 'incomplete', reason: 'no-final-handoff' };
-    else {
-      for (const text of run.evidence) evidenceTokens += countTokens(text, TOKEN_OPTIONS);
-      handoffTokens += countTokens(run.handoff, TOKEN_OPTIONS);
-    }
+    else handoffTokens += countTokens(run.handoff, TOKEN_OPTIONS);
     run = undefined;
   };
 
@@ -93,12 +93,12 @@ export function deriveDelegation(
       if (data?.version === 1 && data.sessionId === sessionId) {
         finish();
         identified = true;
-        run = { evidence: new Set(), handoff: null, hasUser: false, unsupported: false, blocked: false };
+        run = { handoff: null, hasUser: false, unsupported: false, blocked: false };
       }
       continue;
     }
     if (entry.type === 'custom' && entry.customType === 'mlx-delegate-handoff') {
-      legacy = true;
+      if (canIdentifyLegacy) legacy = true;
       if (run) run.blocked = true;
       continue;
     }
@@ -118,7 +118,7 @@ export function deriveDelegation(
       if (msg.isError) continue;
       const text = textContent(msg.content);
       if (text === null) run.unsupported = true;
-      else if (text.trim()) run.evidence.add(text);
+      else if (text.trim()) evidence.add(text);
     } else if (msg.role === 'assistant') {
       const callsTools = Array.isArray(msg.content) && msg.content.some((b) => b?.type === 'toolCall');
       // Length-limited, aborted and failed generations are not completed handoffs.
@@ -130,6 +130,8 @@ export function deriveDelegation(
   if (!identified) return legacy ? { status: 'unavailable', reason: 'legacy' } : null;
   if (!completeFile) return { status: 'incomplete', reason: 'partial-record' };
   if (issue) return issue;
+  let evidenceTokens = 0;
+  for (const text of evidence) evidenceTokens += countTokens(text, TOKEN_OPTIONS);
   if (evidenceTokens === 0) return { status: 'unavailable', reason: 'no-evidence' };
   const savedTokens = evidenceTokens - handoffTokens;
   return {
