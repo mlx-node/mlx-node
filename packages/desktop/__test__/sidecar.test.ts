@@ -186,7 +186,11 @@ describe('the readiness handshake', () => {
   });
 
   it('says nothing at all when the host cannot start', async () => {
-    const h = harness(() => Promise.reject(new Error('No models discovered under /models.')));
+    // NoModelsDiscoveredError, restated structurally: importing the real class
+    // would map the native addon into this test process.
+    const noModels = new Error('No models discovered under /models.');
+    noModels.name = 'NoModelsDiscoveredError';
+    const h = harness(() => Promise.reject(noModels));
     await runSidecar(h.deps);
 
     expect(h.sent).toEqual([]);
@@ -195,6 +199,18 @@ describe('the readiness handshake', () => {
     // fast exit turns it into a visible `failed` with the reason attached.
     expect(h.exits).toEqual([EXIT_STARTUP_FAILED]);
     expect(h.stderr.join('\n')).toContain('No models discovered');
+  });
+
+  it('exits 1, not 78, for a startup failure a retry could clear', async () => {
+    // A locked responses.db rejects createHost exactly like an empty models
+    // dir does, but the lock is transient — 78 would tell the supervisor to
+    // give up permanently after a single attempt.
+    const h = harness(() => Promise.reject(new Error('database is locked')));
+    await runSidecar(h.deps);
+
+    expect(h.sent).toEqual([]);
+    expect(h.exits).toEqual([1]);
+    expect(h.stderr.join('\n')).toContain('database is locked');
   });
 });
 

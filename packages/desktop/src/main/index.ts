@@ -421,19 +421,30 @@ async function bootstrap(): Promise<void> {
   // has no models, and forking INFERENCE there is a guaranteed
   // NoModelsDiscoveredError exit — see auto-start.ts. `quitting` is re-checked
   // inside the callback: discovery can outlive a quit that started after it.
-  void discoverLocalChatModels(resolveModelsDir(settings.modelsDir ?? undefined))
-    .then((models) => {
-      const decision = decideAutoStart({ enabled: settings.autoStartInference, modelCount: models.length });
-      console.log(`[mlx] inference auto-start: ${decision.reason}`);
-      if (!decision.start || quitting || supervisor === null) return;
-      void supervisor.start().catch(reportInferenceFailure);
-    })
-    .catch((error: unknown) => {
-      const decision = decideAutoStart({ enabled: settings.autoStartInference, modelCount: null });
-      console.error(`[mlx] inference auto-start: ${decision.reason}:`, error);
-      if (!decision.start || quitting || supervisor === null) return;
-      void supervisor.start().catch(reportInferenceFailure);
-    });
+  // When the setting is off the pre-flight is skipped outright: its only
+  // consumer is this decision, so a machine with auto-start disabled must not
+  // pay (or fail) for a models-dir scan it will never use.
+  if (!settings.autoStartInference) {
+    console.log(`[mlx] inference auto-start: ${decideAutoStart({ enabled: false, modelCount: null }).reason}`);
+  } else {
+    // `resolveModelsDir` runs INSIDE the chain on purpose: it can throw
+    // synchronously (mkdirSync → EACCES/ENOTDIR), and outside the chain that
+    // rejection would escape into `bootstrap()`, whose handler is app.exit(1).
+    void Promise.resolve()
+      .then(() => discoverLocalChatModels(resolveModelsDir(settings.modelsDir ?? undefined)))
+      .then((models) => {
+        const decision = decideAutoStart({ enabled: true, modelCount: models.length });
+        console.log(`[mlx] inference auto-start: ${decision.reason}`);
+        if (!decision.start || quitting || supervisor === null) return;
+        void supervisor.start().catch(reportInferenceFailure);
+      })
+      .catch((error: unknown) => {
+        const decision = decideAutoStart({ enabled: true, modelCount: null });
+        console.error(`[mlx] inference auto-start: ${decision.reason}:`, error);
+        if (!decision.start || quitting || supervisor === null) return;
+        void supervisor.start().catch(reportInferenceFailure);
+      });
+  }
   // Materialise defaults whenever there was no usable file. Otherwise settings
   // exist only in memory until the user happens to move the window or toggle a
   // preference, and a crash before then silently loses the recovered state.
