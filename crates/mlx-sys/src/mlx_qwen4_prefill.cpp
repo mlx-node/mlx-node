@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include "mlx_qwen4_flags.h"
 #include <cstdlib>
 #ifdef MLX_NODE_METAL_ENABLED
 #include "mlx/backend/metal/device.h"
@@ -24,9 +25,166 @@ static const std::string &qwen4_prefill_header() {
     if (end == std::string::npos)
       throw std::runtime_error("Qwen4 NAX preamble boundary changed");
     source.resize(end);
-    return std::string(mlx::core::qwen4_preamble::nax()) + source;
+    return std::string(mlx::core::qwen4_preamble::nax()) + source +
+#include "metal/qwen4_packed_prefetch.metal.inc"
+        ;
   }();
   return header;
+}
+template <int BM, bool ACT = false, bool PREFETCH = false, bool COMPACT = false>
+static std::vector<array>
+qwen4_dense_prefill_graph(const std::vector<array> &a) {
+  const auto &x = a[0];
+  const auto &w = a[1];
+  const auto &s = a[2];
+  const auto &b = a[3];
+  int k = x.shape(-1), n = w.shape(0), rows = x.size() / k;
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "qwen4_dense_prefill", {"x", "w", "scales", "biases", "silu_table"},
+      {"out"},
+#include "metal/qwen4_dense_prefill.metal.inc"
+      , qwen4_prefill_header());
+  auto shape = x.shape();
+  shape.back() = n;
+  return kernel({x, w, s, b, ACT ? a[4] : x}, {shape}, {mlx::core::bfloat16},
+                {32 * (n / 64), 4 * ((rows + BM - 1) / BM), 1}, {32, 4, 1},
+                {{"WEIGHT_PREFETCH", PREFETCH},
+                 {"ACT", ACT},
+                 {"M_TILE", BM},
+                 {"C", COMPACT ? mlx::core::bfloat16 : mlx::core::float32},
+                 {"T", mlx::core::bfloat16},
+                 {"K", k},
+                 {"N", n},
+                 {"R", rows},
+                 {"GS", 32},
+                 {"BITS", 8}},
+                std::nullopt, false,
+                mlx::core::default_stream(mlx::core::Device::gpu));
+}
+
+template <int BM, bool ACT, bool COMPACT>
+static std::vector<array>
+qwen4_dense_prefill_variant(const std::vector<array> &a, bool cached) {
+  const auto setting = qwen4_env("MLX_QWEN4_PREFILL_Q8_PREFETCH");
+  if (!setting || std::string(setting) != "0") {
+    static auto compiled =
+        mlx::core::compile(qwen4_dense_prefill_graph<BM, ACT, true, COMPACT>);
+    return cached ? compiled(a)
+                  : qwen4_dense_prefill_graph<BM, ACT, true, COMPACT>(a);
+  }
+  static auto compiled =
+      mlx::core::compile(qwen4_dense_prefill_graph<BM, ACT, false, COMPACT>);
+  return cached ? compiled(a)
+                : qwen4_dense_prefill_graph<BM, ACT, false, COMPACT>(a);
+}
+
+// Experimental reference BF16 cooperative operands. The default retains
+// this GGUF checkpoint's FP32/TF32 arithmetic; callers must compare logits.
+template <int BM, bool ACT = false>
+static std::vector<array>
+qwen4_dense_prefill_dispatch(const std::vector<array> &a, bool cached) {
+  const auto compact = qwen4_env("MLX_QWEN4_PREFILL_REFERENCE_BF16");
+  return compact && std::string(compact) == "1"
+             ? qwen4_dense_prefill_variant<BM, ACT, true>(a, cached)
+             : qwen4_dense_prefill_variant<BM, ACT, false>(a, cached);
+}
+
+template <bool HOIST, bool STAGE, bool PACKED, bool COMPACT>
+static std::vector<array>
+qwen4_indirect_prefill_graph(const std::vector<array> &a) {
+  const auto &x = a[0];
+  const auto &ids = a[1];
+  const auto &rows = a[2];
+  const auto &table = a[3];
+  std::vector<array> w(a.begin() + 4, a.end());
+  int h = x.shape(1), r = ids.size(), experts = table.shape(0) - (r + 31) / 32;
+  int m = w[0].shape(0) / experts, gb = w[0].shape(1) * 32 / h,
+      db = w[6].shape(1) * 32 / m;
+  static auto gate_up = mlx::core::fast::metal_kernel(
+      "qwen4_prefill_indirect_gate_up",
+      {"x", "ids", "token_rows", "tiles", "wg", "sgs", "bg", "wu", "sus", "bu"},
+      {"out"},
+#include "metal/qwen4_prefill_gate_up.metal.inc"
+      , qwen4_prefill_header());
+  auto activated = gate_up(
+      {x, ids, rows, table, w[0], w[1], w[2], w[3], w[4], w[5]}, {{r, 1, m}},
+      {x.dtype()}, {32 * (m / 64), 4 * table.shape(0), 1}, {32, 4, 1},
+      {{"T", x.dtype()},
+       {"S", x.shape(0)},
+       {"R", r},
+       {"E", experts},
+       {"N", m},
+       {"K", h},
+       {"BITS", gb},
+       {"HOIST_ZERO", int(HOIST)},
+       {"PREFETCH", PACKED}},
+      std::nullopt, false,
+      mlx::core::default_stream(mlx::core::Device::gpu))[0];
+  static auto down = mlx::core::fast::metal_kernel(
+      "qwen4_prefill_indirect_down",
+      {"x", "ids", "tiles", "w", "scales", "biases"}, {"out"},
+#include "metal/qwen4_prefill_down.metal.inc"
+      , qwen4_prefill_header());
+  auto out =
+      down({activated, ids, table, w[6], w[7], w[8]}, {{r, 1, h}}, {x.dtype()},
+           {32 * (h / 128), 4 * table.shape(0), 1}, {32, 4, 1},
+           {{"T", x.dtype()},
+            {"R", r},
+            {"E", experts},
+            {"N", h},
+            {"K", m},
+            {"BITS", db},
+            {"STAGE", int(STAGE && !COMPACT)},
+            {"PREFETCH", PACKED},
+            {"C", COMPACT ? mlx::core::bfloat16 : mlx::core::float32}},
+           std::nullopt, false,
+           mlx::core::default_stream(mlx::core::Device::gpu))[0];
+  return {out};
+}
+
+template <bool HOIST, bool STAGE, bool COMPACT>
+static std::vector<array>
+qwen4_indirect_prefill_variant(const std::vector<array> &a, bool cached) {
+  const auto packed = qwen4_env("MLX_QWEN4_PREFILL_PACKED_EXPERTS");
+  if (!packed || std::string(packed) != "0") {
+    static auto compiled = mlx::core::compile(
+        qwen4_indirect_prefill_graph<HOIST, STAGE, true, COMPACT>);
+    return cached
+               ? compiled(a)
+               : qwen4_indirect_prefill_graph<HOIST, STAGE, true, COMPACT>(a);
+  }
+  static auto compiled = mlx::core::compile(
+      qwen4_indirect_prefill_graph<HOIST, STAGE, false, COMPACT>);
+  return cached ? compiled(a)
+                : qwen4_indirect_prefill_graph<HOIST, STAGE, false, COMPACT>(a);
+}
+
+template <bool HOIST, bool STAGE>
+static std::vector<array> qwen4_indirect_prefill(const std::vector<array> &a,
+                                                 bool cached) {
+  const auto compact = qwen4_env("MLX_QWEN4_PREFILL_REFERENCE_BF16");
+  return compact && std::string(compact) == "1"
+             ? qwen4_indirect_prefill_variant<HOIST, STAGE, true>(a, cached)
+             : qwen4_indirect_prefill_variant<HOIST, STAGE, false>(a, cached);
+}
+
+#endif
+
+#ifdef MLX_NODE_METAL_ENABLED
+// Activations::silu uses the native, unfused sigmoid and multiply. Retain
+// those BF16 results when porting TrackPrefillMixerAct's matrix epilogue.
+static const array &qwen4_native_silu_table() {
+  static const array table = [] {
+    std::vector<uint16_t> bits(65536);
+    for (size_t i = 0; i < bits.size(); ++i)
+      bits[i] = uint16_t(i);
+    auto values = mlx::core::view(
+        array(bits.data(), {65536}, mlx::core::uint16), mlx::core::bfloat16);
+    auto out = values * sigmoid(values);
+    mlx::core::eval({out});
+    return out;
+  }();
+  return table;
 }
 #endif
 
@@ -34,8 +192,9 @@ extern "C" {
 
 // Match the ordinary affine8 NAX matrix path while avoiding global F32 copies.
 // Split-K shapes keep their existing partitioning and reduction arithmetic.
-mlx_array *mlx_qwen4_dense_prefill(mlx_array *input, mlx_array *weight,
-                                   mlx_array *scales, mlx_array *biases) {
+static mlx_array *qwen4_dense_prefill_impl(mlx_array *input, mlx_array *weight,
+                                           mlx_array *scales, mlx_array *biases,
+                                           bool activate, bool shared = false) {
 #ifdef MLX_NODE_METAL_ENABLED
   try {
     if (!input || !weight || !scales || !biases)
@@ -60,8 +219,12 @@ mlx_array *mlx_qwen4_dense_prefill(mlx_array *input, mlx_array *weight,
     if (k % 64 || n <= 0 || n % 64)
       return nullptr;
     int rows = x.size() / k;
-    if ((n < 2048 && (rows < 1024 || k < 8192)) || w.shape(1) != k / 4 ||
-        s.shape(0) != n || s.shape(1) != k / 32)
+    // The reference's paired shared projection also uses plain NAX. Its
+    // 640/1280 output columns have the same independent 64-column tiles.
+    bool shared_shape = shared && rows >= 512 && rows <= 1024 && k == 2560 &&
+                        (n == 640 || n == 1280);
+    if ((n < 2048 && (rows < 1024 || k < 8192) && !shared_shape) ||
+        w.shape(1) != k / 4 || s.shape(0) != n || s.shape(1) != k / 32)
       return nullptr;
     // Same selection as QuantizedMatmul::qmm_splitk; it falls through to NAX
     // only when there is one partition. Shape tails remain bounds checked.
@@ -71,29 +234,41 @@ mlx_array *mlx_qwen4_dense_prefill(mlx_array *input, mlx_array *weight,
       --partitions;
     if (partitions > 1)
       return nullptr;
-    static auto kernel = mlx::core::fast::metal_kernel(
-        "qwen4_dense_prefill", {"x", "w", "scales", "biases"}, {"out"},
-#include "metal/qwen4_dense_prefill.metal.inc"
-        , qwen4_prefill_header());
-    auto shape = x.shape();
-    shape.back() = n;
-    auto result = kernel({x, w, s, b}, {shape}, {mlx::core::bfloat16},
-                         {32 * (n / 64), 4 * ((rows + 63) / 64), 1}, {32, 4, 1},
-                         {{"C", mlx::core::float32},
-                          {"T", mlx::core::bfloat16},
-                          {"K", k},
-                          {"N", n},
-                          {"R", rows},
-                          {"GS", 32},
-                          {"BITS", 8}},
-                         std::nullopt, false,
-                         mlx::core::default_stream(mlx::core::Device::gpu));
+    if (activate) {
+      if (n != 320 || k != 10240)
+        return nullptr;
+      auto out = qwen4_dense_prefill_dispatch<32, true>(
+          {x, w, s, b, qwen4_native_silu_table()}, true);
+      return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
+    }
+    const auto setting = qwen4_env("MLX_QWEN4_CACHED_PREFILL_GRAPHS");
+    const auto narrow = qwen4_env("MLX_QWEN4_PREFILL_MIXER_BM32");
+    const bool bm32 =
+        n == 320 && k == 10240 && (!narrow || std::string(narrow) != "0");
+    const bool cached = !setting || std::string(setting) != "0";
+    auto result = bm32 ? qwen4_dense_prefill_dispatch<32>({x, w, s, b}, cached)
+                       : qwen4_dense_prefill_dispatch<64>({x, w, s, b}, cached);
     return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 compact dense prefill: " << e.what() << std::endl;
   }
 #endif
   return nullptr;
+}
+
+mlx_array *mlx_qwen4_dense_prefill(mlx_array *input, mlx_array *weight,
+                                   mlx_array *scales, mlx_array *biases) {
+  const auto shared = qwen4_env("MLX_QWEN4_PREFILL_SHARED_Q8");
+  return qwen4_dense_prefill_impl(input, weight, scales, biases, false,
+                                  !shared || std::string(shared) != "0");
+}
+mlx_array *mlx_qwen4_shared_prefill(mlx_array *input, mlx_array *weight,
+                                    mlx_array *scales, mlx_array *biases) {
+  return qwen4_dense_prefill_impl(input, weight, scales, biases, false, true);
+}
+mlx_array *mlx_qwen4_prefill_mixer_act(mlx_array *input, mlx_array *weight,
+                                       mlx_array *scales, mlx_array *biases) {
+  return qwen4_dense_prefill_impl(input, weight, scales, biases, true);
 }
 
 // Address sorted rows directly, preserving col_reduce_small's eight-lane
@@ -342,45 +517,20 @@ extern "C" mlx_array *mlx_qwen4_prefill_indirect(
         reinterpret_cast<array *>(expert_tiles_impl(indices, experts, 32)));
     if (!table)
       return nullptr;
-    static auto gate_up =
-        mlx::core::fast::metal_kernel("qwen4_prefill_indirect_gate_up",
-                                      {"x", "ids", "token_rows", "tiles", "wg",
-                                       "sgs", "bg", "wu", "sus", "bu"},
-                                      {"out"},
-#include "metal/qwen4_prefill_gate_up.metal.inc"
-                                      , qwen4_prefill_header());
-    const char *hoist_flag = std::getenv("MLX_QWEN4_PREFILL_HOIST_ZERO");
-    const int hoist_zero =
-        !(hoist_flag && hoist_flag[0] == '0' && hoist_flag[1] == '\0');
-    auto activated = gate_up(
-        {x, ids, rows, *table, w[0], w[1], w[2], w[3], w[4], w[5]}, {{r, 1, m}},
-        {x.dtype()}, {32 * (m / 64), 4 * table->shape(0), 1}, {32, 4, 1},
-        {{"T", x.dtype()},
-         {"S", x.shape(0)},
-         {"R", r},
-         {"E", experts},
-         {"N", m},
-         {"K", h},
-         {"BITS", gb},
-         {"HOIST_ZERO", hoist_zero}},
-        std::nullopt, false,
-        mlx::core::default_stream(mlx::core::Device::gpu))[0];
-    static auto down = mlx::core::fast::metal_kernel(
-        "qwen4_prefill_indirect_down",
-        {"x", "ids", "tiles", "w", "scales", "biases"}, {"out"},
-#include "metal/qwen4_prefill_down.metal.inc"
-        , qwen4_prefill_header());
-    auto out =
-        down({activated, ids, *table, w[6], w[7], w[8]}, {{r, 1, h}},
-             {x.dtype()}, {32 * (h / 128), 4 * table->shape(0), 1}, {32, 4, 1},
-             {{"T", x.dtype()},
-              {"R", r},
-              {"E", experts},
-              {"N", h},
-              {"K", m},
-              {"BITS", db}},
-             std::nullopt, false,
-             mlx::core::default_stream(mlx::core::Device::gpu))[0];
+    const auto hoist_flag = qwen4_env("MLX_QWEN4_PREFILL_HOIST_ZERO");
+    const bool hoist = !(hoist_flag && std::string(hoist_flag) == "0");
+    const auto stage_flag = qwen4_env("MLX_QWEN4_PREFILL_DOWN_STAGING");
+    const bool stage = (!stage_flag || std::string(stage_flag) != "0");
+    const auto cached_flag = qwen4_env("MLX_QWEN4_CACHED_PREFILL_GRAPHS");
+    const bool cached = (!cached_flag || std::string(cached_flag) != "0");
+    std::vector<array> a{x, ids, rows, *table};
+    a.insert(a.end(), w.begin(), w.end());
+    auto result =
+        hoist ? (stage ? qwen4_indirect_prefill<true, true>(a, cached)
+                       : qwen4_indirect_prefill<true, false>(a, cached))
+              : (stage ? qwen4_indirect_prefill<false, true>(a, cached)
+                       : qwen4_indirect_prefill<false, false>(a, cached));
+    auto out = std::move(result[0]);
     return reinterpret_cast<mlx_array *>(new array(std::move(out)));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 indirect prefill: " << e.what() << std::endl;

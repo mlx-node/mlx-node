@@ -1,7 +1,12 @@
 #include "mlx_common.h"
+#include "mlx_qwen4_flags.h"
+#include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <memory>
+#include <optional>
+#include <string_view>
 #ifdef MLX_NODE_METAL_ENABLED
 namespace mlx::core::qwen4_preamble {
 const char *gemm();
@@ -11,7 +16,181 @@ const char *kquant();
 #include "mlx/primitives.h"
 #endif
 
+namespace {
+struct ForwardFlags {
+  size_t depth = 0;
+  bool enabled = false;
+  std::map<std::string, std::optional<std::string>, std::less<>> values;
+};
+thread_local ForwardFlags forward_flags;
+} // namespace
+
+const char *qwen4_env(const char *name) noexcept {
+  if (!name)
+    return nullptr;
+  if (!forward_flags.depth || !forward_flags.enabled)
+    return std::getenv(name);
+  try {
+    auto found = forward_flags.values.find(std::string_view(name));
+    if (found == forward_flags.values.end()) {
+      const auto raw = std::getenv(name);
+      found = forward_flags.values
+                  .emplace(name, raw ? std::optional<std::string>(raw)
+                                     : std::nullopt)
+                  .first;
+    }
+    return found->second ? found->second->c_str() : nullptr;
+  } catch (...) {
+    // Allocation failure must not cross the C ABI or change flag semantics.
+    return std::getenv(name);
+  }
+}
+
 extern "C" {
+
+void mlx_qwen4_flags_begin() noexcept {
+  if (forward_flags.depth++ == 0) {
+    const auto setting = std::getenv("MLX_QWEN4_CACHE_FLAGS");
+    forward_flags.enabled = !setting || std::strcmp(setting, "0") != 0;
+  }
+}
+
+void mlx_qwen4_flags_end() noexcept {
+  if (forward_flags.depth && --forward_flags.depth == 0) {
+    forward_flags.values.clear();
+    forward_flags.enabled = false;
+  }
+}
+
+bool mlx_qwen4_flag_equals(const char *name, const char *value) noexcept {
+  const auto setting = qwen4_env(name);
+  return setting && value && std::strcmp(setting, value) == 0;
+}
+
+// Singleton only: wider reductions use a different operation schedule.
+bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
+                                mlx_array **scores) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!logits || !ids || !scores)
+      return false;
+    const auto &x = *reinterpret_cast<array *>(logits);
+    if (x.shape() != mlx::core::Shape{1, 1, 512} ||
+        (x.dtype() != mlx::core::bfloat16 && x.dtype() != mlx::core::float32))
+      return false;
+    static auto graph = [](const std::vector<array> &in) {
+      const auto &x = in[0];
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_singleton_routes", {"logits"}, {"ids", "scores"},
+#include "metal/qwen4_singleton_routes.metal.inc"
+      );
+      return kernel({x}, {{1, 1, 10}, {1, 1, 10}},
+                    {mlx::core::uint32, x.dtype()}, {128, 1, 1}, {128, 1, 1},
+                    {{"T", x.dtype()}}, std::nullopt, false,
+                    mlx::core::default_stream(mlx::core::Device::gpu));
+    };
+    static auto compiled = mlx::core::compile(graph);
+    auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
+    const bool cached = (!setting || std::string(setting) != "0");
+    auto result = cached ? compiled({x}) : graph({x});
+    auto i = std::make_unique<array>(std::move(result[0]));
+    auto p = std::make_unique<array>(std::move(result[1]));
+    *ids = reinterpret_cast<mlx_array *>(i.release());
+    *scores = reinterpret_cast<mlx_array *>(p.release());
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 singleton routing: " << e.what() << std::endl;
+    return false;
+  }
+#else
+  return false;
+#endif
+}
+// TrackFastMoE.route: one independent threadgroup per prompt row.
+// Preserve this checkpoint's probability-first selection and normalization.
+bool mlx_qwen4_prefill_routes(mlx_array *logits, mlx_array **ids,
+                              mlx_array **scores) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!logits || !ids || !scores)
+      return false;
+    const auto &x = *reinterpret_cast<array *>(logits);
+    if ((x.ndim() != 3 || x.shape(0) != 1 || x.shape(1) < 9 ||
+         x.shape(1) > 1024 || x.shape(2) != 512) ||
+        (x.dtype() != mlx::core::bfloat16 && x.dtype() != mlx::core::float32))
+      return false;
+    static auto graph = [](const std::vector<array> &in) {
+      const auto &x = in[0];
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_prefill_routes", {"logits"}, {"ids", "scores"},
+#include "metal/qwen4_prefill_routes.metal.inc"
+      );
+      int rows = x.shape(1);
+      return kernel({x}, {{1, rows, 10}, {1, rows, 10}},
+                    {mlx::core::uint32, x.dtype()}, {128, rows, 1}, {128, 1, 1},
+                    {{"T", x.dtype()}}, std::nullopt, false,
+                    mlx::core::default_stream(mlx::core::Device::gpu));
+    };
+    static auto compiled = mlx::core::compile(graph);
+    auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
+    const bool cached = (!setting || std::string(setting) != "0");
+    auto result = cached ? compiled({x}) : graph({x});
+    auto i = std::make_unique<array>(std::move(result[0]));
+    auto p = std::make_unique<array>(std::move(result[1]));
+    *ids = reinterpret_cast<mlx_array *>(i.release());
+    *scores = reinterpret_cast<mlx_array *>(p.release());
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 prefill routing: " << e.what() << std::endl;
+    return false;
+  }
+#else
+  return false;
+#endif
+}
+// TrackFastPLE.convSource, adapted to the local F32 tap products and BF16
+// boundary. Keep SiLU/residual in their existing graph to preserve rounding.
+mlx_array *mlx_qwen4_prefill_ple_conv(mlx_array *full, mlx_array *weight) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!full || !weight)
+      return nullptr;
+    const auto &x = *reinterpret_cast<array *>(full);
+    const auto &w = *reinterpret_cast<array *>(weight);
+    if (x.ndim() != 2 || x.shape(0) < 18 || x.shape(0) > 1033 ||
+        x.shape(1) != 10240 || x.dtype() != mlx::core::bfloat16 ||
+        w.shape() != mlx::core::Shape{10240, 4} ||
+        w.dtype() != mlx::core::float32)
+      return nullptr;
+    static auto graph = [](const std::vector<array> &a) {
+      int rows = a[0].shape(0) - 9;
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_prefill_ple_conv", {"full", "weight"}, {"out"},
+          R"(
+          const uint c=thread_position_in_grid.x;
+          const uint t=thread_position_in_grid.y;
+          if(c>=10240) return;
+          float acc=0.0f;
+          for(int j=0;j<4;++j) {
+            volatile float product=float(full[size_t(t+j*3)*10240+c])*weight[c*4+j];
+            acc=product+acc;
+          }
+          out[size_t(t)*10240+c]=T(acc);
+        )");
+      return kernel(a, {{1, rows, 10240}}, {mlx::core::bfloat16},
+                    {10240, rows, 1}, {256, 1, 1}, {{"T", mlx::core::bfloat16}},
+                    std::nullopt, false,
+                    mlx::core::default_stream(mlx::core::Device::gpu));
+    };
+    static auto compiled = mlx::core::compile(graph);
+    auto out = compiled({x, w});
+    return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 reference PLE convolution: " << e.what() << std::endl;
+  }
+#endif
+  return nullptr;
+}
 // Affine expert GEMV keeps the half precision scale/bias banks in place. The
 // generic gather promotes entire banks when BF16 activations meet F16 scales.
 // Promote only the small activation, and preserve MLX's per-row accumulation.
@@ -242,6 +421,202 @@ bool mlx_qwen4_gather_window(mlx_array *keys, mlx_array *values,
   }
 }
 
+// Reference partial rotary epilogue with local BF16 operation boundaries.
+mlx_array *mlx_qwen4_rotary_window(mlx_array *input, mlx_array *cosine,
+                                    mlx_array *sine) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!input || !cosine || !sine)
+      return nullptr;
+    const auto &x = *reinterpret_cast<array *>(input);
+    const auto &c = *reinterpret_cast<array *>(cosine);
+    const auto &s = *reinterpret_cast<array *>(sine);
+    if (x.ndim() != 4 || x.shape(0) != 1 || x.shape(1) < 1 ||
+        x.shape(2) < 1 || x.shape(2) > 1024 || x.shape(3) < 1 ||
+        x.size() > std::numeric_limits<int>::max() ||
+        x.dtype() != mlx::core::bfloat16 || c.dtype() != x.dtype() ||
+        s.dtype() != x.dtype() || c.ndim() != 4 ||
+        c.shape(0) != 1 || c.shape(1) != 1 || c.shape(2) != x.shape(2) ||
+        c.shape(3) < 1 || c.shape(3) > x.shape(3) / 2 || s.shape() != c.shape())
+      return nullptr;
+    static auto graph = [](const std::vector<array> &a) {
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_rotary_window", {"x", "cosb", "sinb"}, {"out"},
+#include "metal/qwen4_rotary.metal.inc"
+      );
+      const auto &x = a[0];
+      return kernel(a, {x.shape()}, {x.dtype()}, {int(x.size()), 1, 1},
+                    {256, 1, 1}, {{"T", x.dtype()}, {"S", x.shape(2)},
+                                 {"D", x.shape(3)}, {"ROT", 2 * a[1].shape(3)},
+                                 {"COUNT", int(x.size())}},
+                    std::nullopt, false,
+                    mlx::core::default_stream(mlx::core::Device::gpu));
+    };
+    static auto compiled = mlx::core::compile(graph);
+    auto result = compiled({x, c, s});
+    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 rotary window: " << e.what() << std::endl;
+  }
+#endif
+  return nullptr;
+}
+
+// Reference attention prep, with the GGUF's F32 scales and reduction order.
+mlx_array *mlx_qwen4_attention_norm_rotary(mlx_array *input, mlx_array *weight,
+                                          mlx_array *cosine, mlx_array *sine,
+                                          double eps) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!input || !weight || !cosine || !sine || !std::isfinite(eps) || eps <= 0)
+      return nullptr;
+    const auto &x = *reinterpret_cast<array *>(input);
+    const auto &w = *reinterpret_cast<array *>(weight);
+    const auto &c = *reinterpret_cast<array *>(cosine);
+    const auto &s = *reinterpret_cast<array *>(sine);
+    if (x.ndim() != 4 || x.shape(0) != 1 || x.shape(1) < 1 ||
+        x.shape(2) < 1 || x.shape(2) > 1024 || x.shape(3) != 256 ||
+        x.size() > std::numeric_limits<int>::max() ||
+        x.dtype() != mlx::core::bfloat16 || w.size() != 256 ||
+        w.dtype() != mlx::core::float32 || c.dtype() != x.dtype() ||
+        s.dtype() != x.dtype() || c.ndim() != 4 ||
+        c.shape(0) != 1 || c.shape(1) != 1 || c.shape(2) != x.shape(2) ||
+        c.shape(3) < 1 || c.shape(3) > 128 || s.shape() != c.shape())
+      return nullptr;
+    static auto graph = [](const std::vector<array> &a) {
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_attention_norm_rotary", {"x", "w", "cosb", "sinb", "eps"},
+          {"out"},
+#include "metal/qwen4_attention_norm_rotary.metal.inc"
+          , "", false);
+      const auto &x = a[0];
+      return kernel(a, {x.shape()}, {x.dtype()},
+                    {32, int(x.size() / 256), 1}, {32, 1, 1},
+                    {{"T", x.dtype()}, {"S", x.shape(2)}, {"D", 256},
+                     {"ROT", 2 * a[2].shape(3)}},
+                    std::nullopt, false,
+                    mlx::core::default_stream(mlx::core::Device::gpu));
+    };
+    static auto compiled = mlx::core::compile(graph);
+    auto result = compiled({x, reshape(w, {256}), c, s, array(float(eps))});
+    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 attention normalization and rotary: " << e.what()
+              << std::endl;
+  }
+#endif
+  return nullptr;
+}
+
+// Reference wide normalization schedule, retaining this GGUF's arithmetic.
+static mlx_array *qwen4_hyper_norm(mlx_array *x, mlx_array *w, double eps,
+                                   bool decode) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!x || !w || !std::isfinite(eps) || eps <= 0)
+      return nullptr;
+    const auto &input = *reinterpret_cast<array *>(x);
+    const auto &weight = *reinterpret_cast<array *>(w);
+    if (input.ndim() != 3 || input.shape(0) != 1 ||
+        input.shape(1) < (decode ? 1 : 9) ||
+        input.shape(1) > (decode ? 8 : 1024) || input.shape(2) != 10240 ||
+        input.dtype() != mlx::core::bfloat16 || weight.size() != 10240 ||
+        weight.dtype() != mlx::core::float32)
+      return nullptr;
+    static auto graph = [](const std::vector<array> &a) {
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_prefill_norm", {"residual", "scale", "eps"}, {"normed"},
+#include "metal/qwen4_prefill_norm.metal.inc"
+      );
+      int rows = a[0].shape(1);
+      // Reference singleton schedule: 640 threads (20 simdgroups). Wide
+      // windows keep four simdgroups and the same 20 virtual partials.
+      int sg = rows <= 8 ? 20 : 4;
+      return kernel(
+          a, {{1, rows, 10240}}, {mlx::core::bfloat16}, {32 * sg, 4, rows},
+          {32 * sg, 1, 1},
+          {{"InT", mlx::core::bfloat16}, {"H", 2560}, {"W", 10240}, {"SG", sg}},
+          std::nullopt, false,
+          mlx::core::default_stream(mlx::core::Device::gpu));
+    };
+    static auto compiled = mlx::core::compile(graph);
+    auto result =
+        compiled({input, reshape(weight, {10240}), array(float(eps))});
+    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 reference prefill normalization: " << e.what()
+              << std::endl;
+  }
+#endif
+  return nullptr;
+}
+
+mlx_array *mlx_qwen4_prefill_norm(mlx_array *x, mlx_array *w, double eps) {
+  return qwen4_hyper_norm(x, w, eps, false);
+}
+mlx_array *mlx_qwen4_decode_norm(mlx_array *x, mlx_array *w, double eps) {
+  return qwen4_hyper_norm(x, w, eps, true);
+}
+
+bool mlx_qwen4_inject_norm(mlx_array *x, mlx_array *y, mlx_array *g,
+                           mlx_array *w, double eps, mlx_array **stream,
+                           mlx_array **normed) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!stream || !normed)
+      return false;
+    *stream = nullptr;
+    *normed = nullptr;
+    if (!x || !y || !g || !w || !std::isfinite(eps) || eps <= 0)
+      return false;
+    const auto &input = *reinterpret_cast<array *>(x);
+    const auto &branch = *reinterpret_cast<array *>(y);
+    const auto &gate = *reinterpret_cast<array *>(g);
+    const auto &weight = *reinterpret_cast<array *>(w);
+    if (input.ndim() != 3 || input.shape(0) != 1 || input.shape(1) < 1 ||
+        input.shape(1) > 1024 || input.shape(2) != 10240 ||
+        input.dtype() != mlx::core::bfloat16 ||
+        branch.dtype() != input.dtype() || gate.dtype() != input.dtype() ||
+        branch.shape() != Shape{1, input.shape(1), 2560} ||
+        gate.shape() != Shape{1, input.shape(1), 4} || weight.size() != 10240 ||
+        weight.dtype() != mlx::core::float32)
+      return false;
+    static auto graph = [](const std::vector<array> &a) {
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_inject_norm", {"residual", "branch", "inject", "scale", "eps"},
+          {"stream", "normed"},
+#include "metal/qwen4_inject_norm.metal.inc"
+      );
+      int rows = a[0].shape(1), sg = rows <= 8 ? 20 : 4;
+      return kernel(a, {{1, rows, 10240}, {1, rows, 10240}},
+                    {mlx::core::bfloat16, mlx::core::bfloat16},
+                    {32 * sg, 4, rows}, {32 * sg, 1, 1},
+                    {{"InT", mlx::core::bfloat16},
+                     {"H", 2560},
+                     {"W", 10240},
+                     {"HC", 4},
+                     {"HAS_INJECT", true},
+                     {"TILE", false},
+                     {"SG", sg}},
+                    std::nullopt, false,
+                    mlx::core::default_stream(mlx::core::Device::gpu));
+    };
+    static auto compiled = mlx::core::compile(graph);
+    auto result = compiled(
+        {input, branch, gate, reshape(weight, {10240}), array(float(eps))});
+    auto a = std::make_unique<array>(std::move(result[0]));
+    auto b = std::make_unique<array>(std::move(result[1]));
+    *stream = reinterpret_cast<mlx_array *>(a.release());
+    *normed = reinterpret_cast<mlx_array *>(b.release());
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 reference injection and normalization: " << e.what()
+              << std::endl;
+  }
+#endif
+  return false;
+}
+
 mlx_array *mlx_qwen4_norm(mlx_array *x, mlx_array *w, int group, double eps,
                           bool centered) {
   try {
@@ -251,6 +626,17 @@ mlx_array *mlx_qwen4_norm(mlx_array *x, mlx_array *w, int group, double eps,
          weight = *reinterpret_cast<array *>(w);
     if (input.shape(-1) % group || weight.size() != input.shape(-1))
       return nullptr;
+    const auto port = qwen4_env("MLX_QWEN4_PREFILL_NORM");
+    if (group == 2560 && !centered && (!port || std::string(port) != "0")) {
+      if (auto result = mlx_qwen4_prefill_norm(x, w, eps))
+        return result;
+    }
+    const auto decode_port = qwen4_env("MLX_QWEN4_DECODE_NORM");
+    if (group == 2560 && !centered &&
+        (!decode_port || std::string(decode_port) != "0")) {
+      if (auto result = mlx_qwen4_decode_norm(x, w, eps))
+        return result;
+    }
     auto shape = input.shape();
     auto grouped = reshape(astype(input, mlx::core::float32),
                            {-1, int(weight.size()) / group, group});
@@ -299,6 +685,42 @@ qwen4_gdn_epilogue_graph(const std::vector<array> &a) {
                  mlx::core::bfloat16)};
 }
 
+// Port of mlxfast TrackFastKernels2.gatedRMSSource (8981cef5). Retain our
+// checkpoint's F32 norm scale and single BF16 rounding after normalization.
+static std::vector<array> qwen4_gdn_norm_port(const std::vector<array> &a) {
+  static auto kernel = mlx::core::fast::metal_kernel(
+      "qwen4_prefill_gdn_norm", {"y", "proj", "w", "eps"}, {"out"}, R"(
+    constexpr int N_READS = 4;
+    const uint lid = thread_position_in_threadgroup.x;
+    const uint hv = thread_position_in_grid.y;
+    const uint row = thread_position_in_grid.z;
+    const uint base = (row * HV + hv) * 128;
+    float thread_x[N_READS];
+    float acc = 0.0f;
+    for (int i = 0; i < N_READS; ++i) {
+      thread_x[i] = float(T(y[base + lid * N_READS + i]));
+      // The unfused source rounds square before the sum; prevent an FMA.
+      volatile float squared = thread_x[i] * thread_x[i];
+      acc = squared + acc;
+    }
+    acc = simd_sum(acc);
+    const float denom = metal::precise::sqrt(acc / 128.0f + eps);
+    for (int i = 0; i < N_READS; ++i) {
+      const uint d = lid * N_READS + i;
+      T n = T((thread_x[i] / denom) * w[d]);
+      const float z = float(proj[base + d]);
+      const auto s = 1 / (1 + metal::exp(metal::abs(z)));
+      const float g = z < 0 ? s : 1 - s;
+      out[base + d] = T(g * float(n));
+    }
+  )");
+  return kernel(a, {a[0].shape()}, {mlx::core::bfloat16},
+                {32, a[0].shape(2), a[0].shape(1)}, {32, 1, 1},
+                {{"T", mlx::core::bfloat16}, {"HV", a[0].shape(2)}},
+                std::nullopt, false,
+                mlx::core::default_stream(mlx::core::Device::gpu));
+}
+
 mlx_array *mlx_qwen4_gdn_epilogue(mlx_array *out, mlx_array *z, mlx_array *norm,
                                   double eps) {
   try {
@@ -314,8 +736,12 @@ mlx_array *mlx_qwen4_gdn_epilogue(mlx_array *out, mlx_array *z, mlx_array *norm,
       return nullptr;
     std::vector<array> a{x, g, w, array(float(eps))};
     static auto fn = mlx::core::compile(qwen4_gdn_epilogue_graph);
-    auto y = fn(a)[0];
-    if (std::getenv("MLX_QWEN4_EPILOGUE_CHECK")) {
+    static auto port = mlx::core::compile(qwen4_gdn_norm_port);
+    const auto setting = qwen4_env("MLX_QWEN4_PREFILL_GDN_NORM");
+    auto y = (!setting || std::string(setting) != "0") && x.shape(1) > 8
+                 ? port(a)[0]
+                 : fn(a)[0];
+    if (qwen4_env("MLX_QWEN4_EPILOGUE_CHECK")) {
       auto ref = qwen4_gdn_epilogue_graph(a)[0];
       if (mlx::core::any(not_equal(y, ref)).item<bool>()) {
         std::cerr << "QWEN4_EPILOGUE_CHECK_FAILED" << std::endl;
@@ -390,19 +816,10 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
         input.size() < 256 || input.size() > 65536)
       return false;
     const int rows = input.size(), blocks = (rows + 255) / 256;
-    static auto count = mlx::core::fast::metal_kernel("qwen4_route_counts",
-                                                      {"ids"}, {"counts"}, R"(
-      threadgroup uint tile[256];
-      uint lane = thread_position_in_threadgroup.x, block = threadgroup_position_in_grid.x;
-      uint row = block * 256 + lane;
-      tile[lane] = row < R ? ids[row] : E;
-      threadgroup_barrier(mem_flags::mem_threadgroup);
-      for (uint expert = lane; expert < E; expert += 256) {
-        uint total = 0;
-        for (uint j = 0; j < 256; ++j) total += tile[j] == expert;
-        counts[block * E + expert] = total;
-      }
-    )");
+    static auto count =
+        mlx::core::fast::metal_kernel("qwen4_route_counts", {"ids"}, {"counts"},
+#include "metal/qwen4_route_counts.metal.inc"
+        );
     static auto scatter =
         mlx::core::fast::metal_kernel("qwen4_route_scatter", {"ids", "counts"},
                                       {"order", "inverse", "sorted_ids"}, R"(
@@ -434,7 +851,13 @@ bool mlx_qwen4_route_sort(mlx_array *ids, int experts, mlx_array **order,
     auto stream = mlx::core::default_stream(mlx::core::Device::gpu);
     auto counts =
         count({input}, {{blocks * experts}}, {mlx::core::uint32},
-              {blocks * 256, 1, 1}, {256, 1, 1}, {{"E", experts}, {"R", rows}},
+              {blocks * 256, 1, 1}, {256, 1, 1},
+              {{"E", experts},
+               {"R", rows},
+               {"BALLOT", experts > 256 && experts <= 512 &&
+                              (!qwen4_env("MLX_QWEN4_BALLOT_ROUTE_SORT") ||
+                               std::string(qwen4_env(
+                                   "MLX_QWEN4_BALLOT_ROUTE_SORT")) != "0")}},
               std::nullopt, false, stream);
     auto result =
         scatter({input, counts[0]}, {{rows}, {rows}, {rows}},

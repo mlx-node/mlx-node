@@ -1,4 +1,5 @@
 #include "mlx_common.h"
+#include "mlx_qwen4_flags.h"
 
 extern "C" int mlx_gpu_architecture_gen();
 extern "C" bool mlx_qwen4_gated_delta_kernel(mlx_array *, mlx_array *,
@@ -105,6 +106,66 @@ std::vector<array> complete_gdn(const std::vector<array> &in) {
 }
 } // namespace
 
+extern "C" bool mlx_qwen4_gdn_prepare(mlx_array *qkv, mlx_array *a,
+                                      mlx_array *b, mlx_array *conv,
+                                      mlx_array *history, mlx_array *scale,
+                                      mlx_array *dt, mlx_array **outputs) {
+  if (!outputs)
+    return false;
+  for (int i = 0; i < 6; ++i)
+    outputs[i] = nullptr;
+  try {
+    std::vector<array> in;
+    for (auto *p : {qkv, a, b, conv, history, scale, dt}) {
+      if (!p)
+        return false;
+      in.push_back(*reinterpret_cast<array *>(p));
+    }
+    const auto &x = in[0];
+    if (x.ndim() != 3 || x.shape(0) != 1 || x.shape(1) < 1 ||
+        x.shape(1) > 1024 || x.shape(2) != 10240 ||
+        x.dtype() != mlx::core::bfloat16)
+      return false;
+    int t = x.shape(1);
+    for (int i : {1, 2})
+      if (in[i].shape() != Shape{1, t, 48} ||
+          (in[i].dtype() != mlx::core::float32 &&
+           in[i].dtype() != mlx::core::bfloat16))
+        return false;
+    if (in[3].size() != 40960 || in[3].dtype() != mlx::core::float32 ||
+        in[4].shape() != Shape{3, 10240} || in[4].dtype() != x.dtype() ||
+        in[5].size() != 48 || in[5].dtype() != mlx::core::float32 ||
+        in[6].size() != 48 || in[6].dtype() != mlx::core::float32)
+      return false;
+    static auto fn = mlx::core::fast::metal_kernel(
+        "qwen4_gdn_prepare",
+        {"qkv", "a", "b", "conv", "history", "scale", "dt"},
+        {"q", "k", "v", "decay", "beta", "next_history"},
+#include "metal/qwen4_gdn_prepare.metal.inc"
+        , complete_gdn_header);
+    auto result = fn(in,
+                     {{1, t, 16, 128},
+                      {1, t, 16, 128},
+                      {1, t, 48, 128},
+                      {1, t, 48},
+                      {1, t, 48},
+                      {3, 10240}},
+                     {x.dtype(), x.dtype(), x.dtype(), mlx::core::float32,
+                      mlx::core::float32, x.dtype()},
+                     {32, 80, t}, {32, 4, 1}, {{"T", x.dtype()}, {"TOKENS", t}},
+                     std::nullopt, false, mlx::core::Device::gpu);
+    std::vector<std::unique_ptr<array>> owned;
+    for (auto &y : result)
+      owned.push_back(std::make_unique<array>(std::move(y)));
+    for (int i = 0; i < 6; ++i)
+      outputs[i] = reinterpret_cast<mlx_array *>(owned[i].release());
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 GDN preparation: " << e.what() << std::endl;
+    return false;
+  }
+}
+
 // Four-tap batched convolution with the same F32 products/reduction and BF16
 // SiLU boundaries as conv_sequence. No global tap-window or product arrays.
 extern "C" bool mlx_qwen4_window_conv(mlx_array *x, mlx_array *history,
@@ -171,12 +232,16 @@ mlx_qwen4_complete_gdn(mlx_array *qkv, mlx_array *z, mlx_array *a, mlx_array *b,
     // trace. MLX fuses pointwise work while preserving the recurrent primitive.
     static auto fn = mlx::core::compile(complete_gdn);
     static const int arch = mlx_gpu_architecture_gen();
-    auto setting = std::getenv("MLX_QWEN4_COMPLETE_GDN_METAL");
-    auto rows = std::getenv("MLX_QWEN4_GDN_4ROWS");
+    auto setting = qwen4_env("MLX_QWEN4_COMPLETE_GDN_METAL");
+    auto rows = qwen4_env("MLX_QWEN4_GDN_4ROWS");
     bool fused = arch >= 17 && (!setting || std::string(setting) != "0") &&
                  (!rows || std::string(rows) != "0") &&
-                 std::getenv("MLX_DISABLE_E47_GDN_2VCOL") == nullptr;
-    auto result = fused ? complete_gdn_metal(in) : fn(in);
+                 qwen4_env("MLX_DISABLE_E47_GDN_2VCOL") == nullptr;
+    static auto compiled_metal = mlx::core::compile(complete_gdn_metal);
+    auto cached_setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
+    const bool cached = (!cached_setting || std::string(cached_setting) != "0");
+    auto result =
+        fused ? (cached ? compiled_metal(in) : complete_gdn_metal(in)) : fn(in);
     auto y = std::make_unique<array>(std::move(result[0]));
     auto s = std::make_unique<array>(std::move(result[1]));
     auto h = std::make_unique<array>(std::move(result[2]));

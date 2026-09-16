@@ -62,7 +62,9 @@ describe('standalone GGUF model detection', () => {
 
   it('rejects Qwen4 auxiliary options for other model families', async () => {
     const { modelPath } = await writeStandaloneGguf('qwen35');
-    await expect(loadModel(modelPath, { auxiliaryModelPath: '/matching/hf' })).rejects.toThrow('only supported by qwen4_exp');
+    await expect(loadModel(modelPath, { auxiliaryModelPath: '/matching/hf' })).rejects.toThrow(
+      'only supported by qwen4_exp',
+    );
   });
 
   it('detects Qwen3.8-Flash-Next as its own architecture', async () => {

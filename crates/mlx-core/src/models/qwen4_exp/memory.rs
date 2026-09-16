@@ -1,5 +1,6 @@
 //! Admit hot weights against live system headroom. Preserve room for other
 //! applications, recurrent state, page pools and transient work.
+use crate::models::qwen4_exp::runtime_flags;
 use napi::{Error, Result};
 
 pub(super) const FREE_CACHE_BYTES: u64 = 512 << 20;
@@ -166,12 +167,12 @@ fn workspace_cache_bytes(physical: Option<u64>) -> u64 {
 }
 
 pub(super) fn maintain_freelist(physical: Option<u64>) {
-    let limit = if std::env::var("MLX_QWEN4_REUSE_WORKSPACE").as_deref() != Ok("0") {
+    let limit = if !runtime_flags::is_zero(c"MLX_QWEN4_REUSE_WORKSPACE") {
         workspace_cache_bytes(physical)
     } else {
         FREE_CACHE_BYTES
     };
-    if std::env::var("MLX_QWEN4_FLUSH_EVERY_LAYER").as_deref() == Ok("1")
+    if runtime_flags::is_one(c"MLX_QWEN4_FLUSH_EVERY_LAYER")
         || crate::array::memory::get_cache_memory() > limit as f64
     {
         crate::array::memory::clear_cache();

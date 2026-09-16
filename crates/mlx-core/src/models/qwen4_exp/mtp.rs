@@ -11,6 +11,7 @@ use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
 };
 use crate::engine::params::ChatParams;
+use crate::models::qwen4_exp::runtime_flags;
 use napi::{Error, Result};
 use std::collections::HashMap;
 
@@ -86,7 +87,7 @@ impl Inner {
             ));
         }
         let result = (|| {
-            if tokens.len() > 1 && std::env::var("MLX_QWEN4_MTP_PREFILL").as_deref() != Ok("0") {
+            if tokens.len() > 1 && !runtime_flags::is_zero(c"MLX_QWEN4_MTP_PREFILL") {
                 let skip = usize::from(owner.hidden.is_none());
                 let mut previous = Vec::with_capacity(tokens.len());
                 if let Some(h) = &owner.hidden {

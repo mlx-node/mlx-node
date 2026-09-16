@@ -1,4 +1,4 @@
-import { join } from "node:path";
+import { join } from 'node:path';
 
 import {
   Gemma4Model as Gemma4ModelNative,
@@ -10,7 +10,7 @@ import {
   Qwen35Model as Qwen35ModelNative,
   Qwen35MoeModel as Qwen35MoeModelNative,
   Qwen4ExpModel as Qwen4ExpModelNative,
-} from "@mlx-node/core";
+} from '@mlx-node/core';
 import type {
   ChatConfig,
   ChatMessage,
@@ -20,9 +20,9 @@ import type {
   PerformanceMetrics,
   ToolDefinition,
   ToolCallResult,
-} from "@mlx-node/core";
+} from '@mlx-node/core';
 
-import type { SessionCapableModel } from "./chat-session.js";
+import type { SessionCapableModel } from './chat-session.js';
 
 interface NativeChatSessionCall {
   cancel(): void;
@@ -30,30 +30,12 @@ interface NativeChatSessionCall {
 }
 
 interface NativeChatSessionOperations {
-  chatSessionStart?(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-  ): Promise<ChatResult>;
-  chatSessionContinue?(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-  ): Promise<ChatResult>;
-  chatSessionContinueTool?(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-  ): Promise<ChatResult>;
-  beginChatSessionStart?(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-  ): Promise<NativeChatSessionCall>;
-  beginChatSessionContinue?(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-  ): Promise<NativeChatSessionCall>;
-  beginChatSessionContinueTool?(
-    messages: ChatMessage[],
-    config?: ChatConfig | null,
-  ): Promise<NativeChatSessionCall>;
+  chatSessionStart?(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
+  chatSessionContinue?(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
+  chatSessionContinueTool?(messages: ChatMessage[], config?: ChatConfig | null): Promise<ChatResult>;
+  beginChatSessionStart?(messages: ChatMessage[], config?: ChatConfig | null): Promise<NativeChatSessionCall>;
+  beginChatSessionContinue?(messages: ChatMessage[], config?: ChatConfig | null): Promise<NativeChatSessionCall>;
+  beginChatSessionContinueTool?(messages: ChatMessage[], config?: ChatConfig | null): Promise<NativeChatSessionCall>;
 }
 
 export interface ChatStreamDelta {
@@ -116,7 +98,7 @@ export type ChatStreamEvent = ChatStreamDelta | ChatStreamFinal;
 const modelPathsForTokenizers = new WeakMap<object, string>();
 const tokenizerPromises = new WeakMap<object, Promise<Qwen3Tokenizer>>();
 
-type TemplateContentOrder = "textThenMedia" | "imagesThenText";
+type TemplateContentOrder = 'textThenMedia' | 'imagesThenText';
 
 interface TemplateContentPolicy {
   order: TemplateContentOrder;
@@ -140,7 +122,7 @@ interface PolicyAwareTokenizer {
 }
 
 function getNativeIsReasoning(chunk: ChatStreamChunk): boolean | undefined {
-  return typeof chunk.isReasoning === "boolean" ? chunk.isReasoning : undefined;
+  return typeof chunk.isReasoning === 'boolean' ? chunk.isReasoning : undefined;
 }
 
 async function applyChatTemplateFromModelPath(
@@ -154,15 +136,11 @@ async function applyChatTemplateFromModelPath(
 ): Promise<Uint32Array> {
   const modelPath = modelPathsForTokenizers.get(model);
   if (modelPath == null) {
-    throw new Error(
-      "applyChatTemplate unavailable: model path was not recorded when this model was loaded",
-    );
+    throw new Error('applyChatTemplate unavailable: model path was not recorded when this model was loaded');
   }
   let tokenizerPromise = tokenizerPromises.get(model);
   if (tokenizerPromise == null) {
-    tokenizerPromise = Qwen3Tokenizer.fromPretrained(
-      join(modelPath, "tokenizer.json"),
-    );
+    tokenizerPromise = Qwen3Tokenizer.fromPretrained(join(modelPath, 'tokenizer.json'));
     tokenizerPromises.set(model, tokenizerPromise);
   }
   const tokenizer = await tokenizerPromise;
@@ -226,9 +204,7 @@ async function applyChatTemplateFromModelPath(
  * public API — may change without notice.
  */
 export async function* _runChatStream(
-  startCall: (
-    callback: (err: Error | null, chunk: ChatStreamChunk) => void,
-  ) => Promise<ChatStreamHandle>,
+  startCall: (callback: (err: Error | null, chunk: ChatStreamChunk) => void) => Promise<ChatStreamHandle>,
   signal?: AbortSignal,
 ): AsyncGenerator<ChatStreamEvent> {
   // The native ThreadsafeFunction uses the same fixed ceiling. This JS-side
@@ -283,9 +259,7 @@ export async function* _runChatStream(
       // Keep the queue at its fixed ceiling while guaranteeing the consumer
       // eventually observes why the stream was cancelled.
       queue[queue.length - 1] = {
-        error: new Error(
-          `Native chat stream backlog exceeded ${maxBufferedEvents} buffered events`,
-        ),
+        error: new Error(`Native chat stream backlog exceeded ${maxBufferedEvents} buffered events`),
       };
       notify();
       return;
@@ -330,7 +304,7 @@ export async function* _runChatStream(
       triggerAbort();
     } else {
       onAbort = triggerAbort;
-      signal.addEventListener("abort", onAbort, { once: true });
+      signal.addEventListener('abort', onAbort, { once: true });
     }
   }
 
@@ -352,8 +326,8 @@ export async function* _runChatStream(
         if (item.error) throw item.error;
         const chunk = item.chunk!;
         if (chunk.done) {
-          if (typeof chunk.thinkingEnabled !== "boolean") {
-            throw new Error("Native terminal chat stream chunk is missing thinkingEnabled");
+          if (typeof chunk.thinkingEnabled !== 'boolean') {
+            throw new Error('Native terminal chat stream chunk is missing thinkingEnabled');
           }
           // The native `ChatStreamChunk` carries `cachedTokens` on the
           // terminal (`done == true`) chunk for every streaming entry
@@ -381,13 +355,13 @@ export async function* _runChatStream(
             rawText: chunk.rawText!,
             performance: chunk.performance ?? undefined,
           };
-          if (typeof chunkWithCached.cachedTokens === "number") {
+          if (typeof chunkWithCached.cachedTokens === 'number') {
             finalEvent.cachedTokens = chunkWithCached.cachedTokens;
           }
-          if (typeof chunkWithCached.publicRawText === "string") {
+          if (typeof chunkWithCached.publicRawText === 'string') {
             finalEvent.publicRawText = chunkWithCached.publicRawText;
           }
-          if (typeof chunkWithCached.textAuthoritative === "boolean") {
+          if (typeof chunkWithCached.textAuthoritative === 'boolean') {
             finalEvent.textAuthoritative = chunkWithCached.textAuthoritative;
           }
           yield finalEvent;
@@ -404,7 +378,7 @@ export async function* _runChatStream(
   } finally {
     if (signal != null && onAbort != null) {
       try {
-        signal.removeEventListener("abort", onAbort);
+        signal.removeEventListener('abort', onAbort);
       } catch {
         // removeEventListener shouldn't throw, but stay defensive —
         // a misbehaving signal must not leak out of the finally.
@@ -423,7 +397,7 @@ async function runChatSessionCall(
   startCall: () => Promise<NativeChatSessionCall>,
   signal: AbortSignal,
 ): Promise<ChatResult> {
-  if (signal.aborted) throw new Error("chat session cancelled");
+  if (signal.aborted) throw new Error('chat session cancelled');
   const call = await startCall();
   let cancelled = false;
   const cancelOnce = (): void => {
@@ -431,12 +405,12 @@ async function runChatSessionCall(
     cancelled = true;
     call.cancel();
   };
-  signal.addEventListener("abort", cancelOnce, { once: true });
+  signal.addEventListener('abort', cancelOnce, { once: true });
   if (signal.aborted) cancelOnce();
   try {
     return await call.result();
   } finally {
-    signal.removeEventListener("abort", cancelOnce);
+    signal.removeEventListener('abort', cancelOnce);
   }
 }
 
@@ -466,9 +440,7 @@ async function runChatSessionCall(
 export interface NativeStreamingInstance {
   chatStreamSessionStart: (...args: never[]) => Promise<ChatStreamHandle>;
   chatStreamSessionContinue: (...args: never[]) => Promise<ChatStreamHandle>;
-  chatStreamSessionContinueTool: (
-    ...args: never[]
-  ) => Promise<ChatStreamHandle>;
+  chatStreamSessionContinueTool: (...args: never[]) => Promise<ChatStreamHandle>;
 }
 
 /**
@@ -546,24 +518,24 @@ export type StreamingModel = SessionCapableModel;
 type ResolvedApplyTemplate<O extends StreamingModelOptions> = O extends {
   applyTemplate: boolean;
 }
-  ? O["applyTemplate"]
-  : O["recordModelPath"];
+  ? O['applyTemplate']
+  : O['recordModelPath'];
 
 /** @internal Method names whose callback ABI is replaced by the generator wrapper. */
 export type NativeStreamingMethod = keyof NativeStreamingInstance;
 
 type NativeSessionReplacementMethod =
-  | "chatSessionStart"
-  | "chatSessionContinue"
-  | "chatSessionContinueTool"
-  | "beginChatSessionStart"
-  | "beginChatSessionContinue"
-  | "beginChatSessionContinueTool";
+  | 'chatSessionStart'
+  | 'chatSessionContinue'
+  | 'chatSessionContinueTool'
+  | 'beginChatSessionStart'
+  | 'beginChatSessionContinue'
+  | 'beginChatSessionContinueTool';
 
 type StreamingReplacementMethod<O extends StreamingModelOptions> =
   | NativeStreamingMethod
   | NativeSessionReplacementMethod
-  | (ResolvedApplyTemplate<O> extends true ? "applyChatTemplate" : never);
+  | (ResolvedApplyTemplate<O> extends true ? 'applyChatTemplate' : never);
 
 /**
  * Instance surface of a generated streaming wrapper. Only methods replaced at
@@ -580,14 +552,12 @@ type StreamingReplacementMethod<O extends StreamingModelOptions> =
  *
  * @internal Concrete instance type returned by {@link makeStreamingModel}.
  */
-export type StreamingInstance<
-  C extends NativeStreamingCtor,
-  O extends StreamingModelOptions,
-> = Omit<InstanceType<C>, StreamingReplacementMethod<O>> &
+export type StreamingInstance<C extends NativeStreamingCtor, O extends StreamingModelOptions> = Omit<
+  InstanceType<C>,
+  StreamingReplacementMethod<O>
+> &
   SessionCapableModel &
-  (ResolvedApplyTemplate<O> extends true
-    ? Required<Pick<SessionCapableModel, "applyChatTemplate">>
-    : object);
+  (ResolvedApplyTemplate<O> extends true ? Required<Pick<SessionCapableModel, 'applyChatTemplate'>> : object);
 
 /**
  * Build the streaming-model subclass for a native chat model class.
@@ -606,10 +576,7 @@ export type StreamingInstance<
  * @internal Exported so the VLM wrapper (`@mlx-node/vlm`) builds its
  * `QianfanOCRModel` from the same factory. Not part of the public API.
  */
-export function makeStreamingModel<
-  C extends NativeStreamingCtor,
-  const O extends StreamingModelOptions,
->(
+export function makeStreamingModel<C extends NativeStreamingCtor, const O extends StreamingModelOptions>(
   NativeClass: C,
   opts: O,
 ): {
@@ -626,7 +593,7 @@ export function makeStreamingModel<
   // `[modelPath]` for most, `[modelPath, options?]` for Gemma4 and dense
   // Qwen3.5 external draft models.
   new (...args: ConstructorParameters<C>): StreamingInstance<C, O>;
-  load(...args: Parameters<C["load"]>): Promise<StreamingInstance<C, O>>;
+  load(...args: Parameters<C['load']>): Promise<StreamingInstance<C, O>>;
 } {
   const recordPath = opts.recordModelPath;
   const applyTemplate = opts.applyTemplate ?? recordPath;
@@ -637,17 +604,13 @@ export function makeStreamingModel<
   // overrides below shadow them on the prototype.
   const nativeStart = NativeClass.prototype.chatStreamSessionStart;
   const nativeContinue = NativeClass.prototype.chatStreamSessionContinue;
-  const nativeContinueTool =
-    NativeClass.prototype.chatStreamSessionContinueTool;
-  const nativeChat = NativeClass.prototype as NativeStreamingInstance &
-    NativeChatSessionOperations;
+  const nativeContinueTool = NativeClass.prototype.chatStreamSessionContinueTool;
+  const nativeChat = NativeClass.prototype as NativeStreamingInstance & NativeChatSessionOperations;
 
   // `NativeClass` is structurally a constructor; cast to a concrete
   // constructor type so `class extends` accepts it. Runtime behavior is
   // unchanged — we extend the real native class.
-  const Base = NativeClass as unknown as new (
-    ...args: never[]
-  ) => SessionCapableModel;
+  const Base = NativeClass as unknown as new (...args: never[]) => SessionCapableModel;
 
   class StreamingModelImpl extends Base {
     supportsReplayReasoningCapture(): boolean {
@@ -658,26 +621,19 @@ export function makeStreamingModel<
       return replayAssistantRawText;
     }
 
-    static async load(
-      modelPath: string,
-      ...rest: unknown[]
-    ): Promise<StreamingModel> {
+    static async load(modelPath: string, ...rest: unknown[]): Promise<StreamingModel> {
       // Forward any trailing family-specific load options verbatim (e.g.
       // Gemma4/Qwen3.5 `draftModelPath`); families whose
       // native `load` takes only the path receive no extras. The public
       // signature is re-narrowed per family via `Parameters<C['load']>` in
       // the factory return type below.
-      const instance = await (
-        NativeClass.load as (...args: unknown[]) => Promise<object>
-      )(modelPath, ...rest);
+      const instance = await (NativeClass.load as (...args: unknown[]) => Promise<object>)(modelPath, ...rest);
       // Use `this.prototype` (not `StreamingModelImpl.prototype`) so the
       // concrete subclass declared per family supplies the prototype and
       // `instanceof ConcreteSubclass` holds.
       Object.setPrototypeOf(instance, this.prototype);
       if (recordPath) {
-        const resolvedAssetsPath = (
-          instance as { modelAssetsPath?: () => string }
-        ).modelAssetsPath?.();
+        const resolvedAssetsPath = (instance as { modelAssetsPath?: () => string }).modelAssetsPath?.();
         modelPathsForTokenizers.set(instance, resolvedAssetsPath ?? modelPath);
       }
       return instance as unknown as StreamingModel;
@@ -690,17 +646,14 @@ export function makeStreamingModel<
     ): Promise<ChatResult> {
       if (signal == null) {
         if (nativeChat.chatSessionStart == null) {
-          throw new Error("Native model does not implement chatSessionStart");
+          throw new Error('Native model does not implement chatSessionStart');
         }
         return await nativeChat.chatSessionStart.call(this, messages, config);
       }
       if (nativeChat.beginChatSessionStart == null) {
-        throw new Error("Native model does not implement beginChatSessionStart");
+        throw new Error('Native model does not implement beginChatSessionStart');
       }
-      return await runChatSessionCall(
-        () => nativeChat.beginChatSessionStart!.call(this, messages, config),
-        signal,
-      );
+      return await runChatSessionCall(() => nativeChat.beginChatSessionStart!.call(this, messages, config), signal);
     }
 
     async chatSessionContinue(
@@ -710,17 +663,14 @@ export function makeStreamingModel<
     ): Promise<ChatResult> {
       if (signal == null) {
         if (nativeChat.chatSessionContinue == null) {
-          throw new Error("Native model does not implement chatSessionContinue");
+          throw new Error('Native model does not implement chatSessionContinue');
         }
         return await nativeChat.chatSessionContinue.call(this, messages, config);
       }
       if (nativeChat.beginChatSessionContinue == null) {
-        throw new Error("Native model does not implement beginChatSessionContinue");
+        throw new Error('Native model does not implement beginChatSessionContinue');
       }
-      return await runChatSessionCall(
-        () => nativeChat.beginChatSessionContinue!.call(this, messages, config),
-        signal,
-      );
+      return await runChatSessionCall(() => nativeChat.beginChatSessionContinue!.call(this, messages, config), signal);
     }
 
     async chatSessionContinueTool(
@@ -730,12 +680,12 @@ export function makeStreamingModel<
     ): Promise<ChatResult> {
       if (signal == null) {
         if (nativeChat.chatSessionContinueTool == null) {
-          throw new Error("Native model does not implement chatSessionContinueTool");
+          throw new Error('Native model does not implement chatSessionContinueTool');
         }
         return await nativeChat.chatSessionContinueTool.call(this, messages, config);
       }
       if (nativeChat.beginChatSessionContinueTool == null) {
-        throw new Error("Native model does not implement beginChatSessionContinueTool");
+        throw new Error('Native model does not implement beginChatSessionContinueTool');
       }
       return await runChatSessionCall(
         () => nativeChat.beginChatSessionContinueTool!.call(this, messages, config),
@@ -754,13 +704,7 @@ export function makeStreamingModel<
       signal?: AbortSignal,
     ): AsyncGenerator<ChatStreamEvent> {
       yield* _runChatStream(
-        (callback) =>
-          nativeStart.call(
-            this,
-            messages as never,
-            (config ?? null) as never,
-            callback as never,
-          ),
+        (callback) => nativeStart.call(this, messages as never, (config ?? null) as never, callback as never),
         signal,
       );
     }
@@ -771,13 +715,7 @@ export function makeStreamingModel<
       signal?: AbortSignal,
     ): AsyncGenerator<ChatStreamEvent> {
       yield* _runChatStream(
-        (callback) =>
-          nativeContinue.call(
-            this,
-            messages as never,
-            (config ?? null) as never,
-            callback as never,
-          ),
+        (callback) => nativeContinue.call(this, messages as never, (config ?? null) as never, callback as never),
         signal,
       );
     }
@@ -788,20 +726,14 @@ export function makeStreamingModel<
       signal?: AbortSignal,
     ): AsyncGenerator<ChatStreamEvent> {
       yield* _runChatStream(
-        (callback) =>
-          nativeContinueTool.call(
-            this,
-            messages as never,
-            (config ?? null) as never,
-            callback as never,
-          ),
+        (callback) => nativeContinueTool.call(this, messages as never, (config ?? null) as never, callback as never),
         signal,
       );
     }
   }
 
   if (applyTemplate) {
-    Object.defineProperty(StreamingModelImpl.prototype, "applyChatTemplate", {
+    Object.defineProperty(StreamingModelImpl.prototype, 'applyChatTemplate', {
       configurable: true,
       writable: true,
       value(
@@ -827,7 +759,7 @@ export function makeStreamingModel<
 
   return StreamingModelImpl as unknown as {
     new (...args: ConstructorParameters<C>): StreamingInstance<C, O>;
-    load(...args: Parameters<C["load"]>): Promise<StreamingInstance<C, O>>;
+    load(...args: Parameters<C['load']>): Promise<StreamingInstance<C, O>>;
   };
 }
 
@@ -908,18 +840,12 @@ function _assertSessionCapable(): void {
 }
 void _assertSessionCapable;
 
-type ExpandedPromptPlanner = Required<
-  Pick<SessionCapableModel, "expandedPromptTokenCount">
->;
+type ExpandedPromptPlanner = Required<Pick<SessionCapableModel, 'expandedPromptTokenCount'>>;
 
 /** Compile-time guard that both Qwen3.5 native classes and wrappers retain the exact media planner. */
 function _assertExpandedPromptPlannerSurfaces(): void {
-  const _nativeDense: ExpandedPromptPlanner = null as unknown as InstanceType<
-    typeof Qwen35ModelNative
-  >;
-  const _nativeMoe: ExpandedPromptPlanner = null as unknown as InstanceType<
-    typeof Qwen35MoeModelNative
-  >;
+  const _nativeDense: ExpandedPromptPlanner = null as unknown as InstanceType<typeof Qwen35ModelNative>;
+  const _nativeMoe: ExpandedPromptPlanner = null as unknown as InstanceType<typeof Qwen35MoeModelNative>;
   const _wrappedDense: ExpandedPromptPlanner = null as unknown as Qwen35Model;
   const _wrappedMoe: ExpandedPromptPlanner = null as unknown as Qwen35MoeModel;
   void _nativeDense;
@@ -936,20 +862,13 @@ type PreservedNativeSurface<C extends NativeStreamingCtor> = Omit<
 
 /** Compile-time guard for every native member the factory does not replace. */
 function _assertPreservedNativeSurfaces(): void {
-  const _qwen3: PreservedNativeSurface<typeof Qwen3ModelNative> =
-    null as unknown as Qwen3Model;
-  const _qwen35: PreservedNativeSurface<typeof Qwen35ModelNative> =
-    null as unknown as Qwen35Model;
-  const _moe: PreservedNativeSurface<typeof Qwen35MoeModelNative> =
-    null as unknown as Qwen35MoeModel;
-  const _lfm2: PreservedNativeSurface<typeof Lfm2ModelNative> =
-    null as unknown as Lfm2Model;
-  const _gemma4: PreservedNativeSurface<typeof Gemma4ModelNative> =
-    null as unknown as Gemma4Model;
-  const _museGlimmer: PreservedNativeSurface<typeof MuseGlimmerModelNative> =
-    null as unknown as MuseGlimmerModel;
-  const _nemotronH: PreservedNativeSurface<typeof NemotronHModelNative> =
-    null as unknown as NemotronHModel;
+  const _qwen3: PreservedNativeSurface<typeof Qwen3ModelNative> = null as unknown as Qwen3Model;
+  const _qwen35: PreservedNativeSurface<typeof Qwen35ModelNative> = null as unknown as Qwen35Model;
+  const _moe: PreservedNativeSurface<typeof Qwen35MoeModelNative> = null as unknown as Qwen35MoeModel;
+  const _lfm2: PreservedNativeSurface<typeof Lfm2ModelNative> = null as unknown as Lfm2Model;
+  const _gemma4: PreservedNativeSurface<typeof Gemma4ModelNative> = null as unknown as Gemma4Model;
+  const _museGlimmer: PreservedNativeSurface<typeof MuseGlimmerModelNative> = null as unknown as MuseGlimmerModel;
+  const _nemotronH: PreservedNativeSurface<typeof NemotronHModelNative> = null as unknown as NemotronHModel;
   void _qwen3;
   void _qwen35;
   void _moe;

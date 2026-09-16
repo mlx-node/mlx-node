@@ -2,6 +2,7 @@
 //! selected expert matrices and embedding rows are read on cache misses.
 //! Admitted hot banks can be prepared once; PLE stays row-addressable. Matrix chunks
 //! may reuse a bounded persistent cache of their losslessly packed arrays.
+use crate::models::qwen4_exp::runtime_flags;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
@@ -113,6 +114,112 @@ pub struct Weight {
     pub(super) mode: String,
 }
 impl Weight {
+    pub(super) fn mixer_act(&self, x: &MxArray) -> Result<Option<MxArray>> {
+        let decode = x.shape_at(1)? == 1;
+        let setting = if decode {
+            c"MLX_QWEN4_DECODE_MIXER_ACT"
+        } else {
+            c"MLX_QWEN4_PREFILL_MIXER_BM32"
+        };
+        if self.mode != "affine"
+            || self.bits != 8
+            || self.group != 32
+            || !crate::engine::persistence::compiled_forward_backend_available()
+            || runtime_flags::is_zero(setting)
+        {
+            return Ok(None);
+        }
+        let (Some(scales), Some(biases)) = (&self.scales, &self.biases) else {
+            return Ok(None);
+        };
+        let raw = unsafe {
+            let kernel = if decode {
+                mlx_sys::mlx_qwen4_decode_mixer_act
+            } else {
+                mlx_sys::mlx_qwen4_prefill_mixer_act
+            };
+            kernel(
+                x.as_raw_ptr(),
+                self.values.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+            )
+        };
+        if raw.is_null() {
+            Ok(None)
+        } else {
+            MxArray::from_handle(raw, "Qwen4 reference mixer activation").map(Some)
+        }
+    }
+
+    pub(super) fn hyper_up_inject(
+        &self,
+        x: &MxArray,
+        normed: &MxArray,
+        injection: &MxArray,
+    ) -> Result<Option<(MxArray, MxArray)>> {
+        if self.mode != "affine"
+            || self.bits != 8
+            || self.group != 32
+            || !runtime_flags::is_one(c"MLX_QWEN4_MIXER_INJECT")
+            || runtime_flags::is_zero(c"MLX_QWEN4_HYPER_UP")
+            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
+        {
+            return Ok(None);
+        }
+        let (Some(scales), Some(biases)) = (&self.scales, &self.biases) else {
+            return Ok(None);
+        };
+        let mut mixed = std::ptr::null_mut();
+        let mut gate = std::ptr::null_mut();
+        if !unsafe {
+            mlx_sys::mlx_qwen4_hyper_up_inject(
+                x.as_raw_ptr(),
+                self.values.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+                normed.as_raw_ptr(),
+                injection.as_raw_ptr(),
+                &mut mixed,
+                &mut gate,
+            )
+        } {
+            return Ok(None);
+        }
+        Ok(Some((
+            MxArray::from_handle(mixed, "Qwen4 mixer with injection")?,
+            MxArray::from_handle(gate, "Qwen4 mixer injection gate")?,
+        )))
+    }
+
+    pub(super) fn hyper_up(&self, x: &MxArray, normed: &MxArray) -> Result<Option<MxArray>> {
+        if self.mode != "affine"
+            || self.bits != 8
+            || self.group != 32
+            || runtime_flags::is_zero(c"MLX_QWEN4_HYPER_UP")
+            || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
+        {
+            return Ok(None);
+        }
+        let (Some(scales), Some(biases)) = (&self.scales, &self.biases) else {
+            return Ok(None);
+        };
+        let raw = unsafe {
+            mlx_sys::mlx_qwen4_hyper_up(
+                x.as_raw_ptr(),
+                self.values.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+                normed.as_raw_ptr(),
+            )
+        };
+        if raw.is_null() {
+            Ok(None)
+        } else {
+            MxArray::from_handle(raw, "Qwen4 hyper up").map(Some)
+        }
+    }
+
     pub(super) fn stack(weights: &[Arc<Self>]) -> Result<Option<Self>> {
         let Some(first) = weights.first() else {
             return Ok(None);
@@ -163,10 +270,32 @@ impl Weight {
     }
 
     pub fn linear(&self, x: &MxArray) -> Result<MxArray> {
+        if self.mode == "affine"
+            && self.bits == 8
+            && self.group == 32
+            && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_DECODE_STORAGE")
+            && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
+        {
+            let compact = unsafe {
+                mlx_sys::mlx_qwen4_dense_decode(
+                    x.as_raw_ptr(),
+                    self.values.as_raw_ptr(),
+                    scales.as_raw_ptr(),
+                    biases.as_raw_ptr(),
+                )
+            };
+            if !compact.is_null() {
+                let y = MxArray::from_handle(compact, "Qwen4 compact dense decode")?;
+                if runtime_flags::is_one(c"MLX_QWEN4_SYNC_PROJECTIONS") {
+                    MxArray::eval_arrays_with_context(&[&y], "qwen4::weights::y")?;
+                }
+                return Ok(y);
+            }
+        }
         let compact = if self.mode == "affine"
             && self.bits == 8
             && self.group == 32
-            && std::env::var("MLX_QWEN4_PREFILL_DENSE_STORAGE").as_deref() != Ok("0")
+            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_DENSE_STORAGE")
         {
             match (&self.scales, &self.biases) {
                 (Some(scales), Some(biases)) => unsafe {
@@ -198,7 +327,7 @@ impl Weight {
         } else {
             let values = if x.dtype()? == DType::BFloat16
                 && let Some(dense) = &self.dense_bf16
-                && std::env::var("MLX_QWEN4_DENSE_BF16_CACHE").as_deref() != Ok("0")
+                && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BF16_CACHE")
             {
                 dense
             } else {
@@ -226,7 +355,7 @@ impl Weight {
         // when an LRU entry is evicted. The decoder fences each expert output,
         // recurrent update and layer; these bounded groups can submit their
         // dependent projections together instead of blocking after each one.
-        if std::env::var("MLX_QWEN4_SYNC_PROJECTIONS").as_deref() == Ok("1") {
+        if runtime_flags::is_one(c"MLX_QWEN4_SYNC_PROJECTIONS") {
             MxArray::eval_arrays_with_context(&[&y], "qwen4::weights::y")?;
         }
         Ok(y)
@@ -298,6 +427,8 @@ pub struct Store {
     bank_bytes: u64,
     paired_banks: HashMap<(String, String), Arc<Weight>>,
     slots: HashMap<usize, expert_slots::ExpertSlots>,
+    wide_routes: HashMap<usize, Vec<u32>>,
+    deferred_reduction_layer: Option<usize>,
     slot_capacity: Option<usize>,
     slot_bytes: u64,
     pub slot_upload_bytes: u64,
@@ -332,13 +463,30 @@ impl Store {
         Ok(s)
     }
 
+    /// Tiny synthetic fixtures exercise IO and kernels without reserving the
+    /// multi-GiB working allowance required by a production checkpoint. Actual
+    /// payload reads still pass the ordinary live admission checks.
+    #[cfg(test)]
+    pub(in super::super) fn open_fixture(path: &Path, root: Option<&Path>) -> Result<Self> {
+        let mut store = Self::open_metadata(path, root)?;
+        // Logical ceiling includes the importer staging allowance; the
+        // synthetic tensors allocate only their actual payload sizes.
+        store.cache_limit = 1 << 30;
+        store.plan.budget = store.cache_limit;
+        store.plan.hot_bytes = store.hot_bytes()?;
+        Ok(store)
+    }
+
     /// Auxiliary source checkpoints contribute only descriptors, so their
     /// unrelated target tensors must not participate in residency admission.
     pub(super) fn open_metadata(path: &Path, root: Option<&Path>) -> Result<Self> {
         let cache_limit = CACHE_BYTES;
         let mut s = Self {
             tensors: HashMap::new(),
-            gguf: path.extension().is_some_and(|e| e == "gguf"),
+            gguf: path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf")),
             metadata: HashMap::new(),
             cache: HashMap::new(),
             order: VecDeque::new(),
@@ -363,6 +511,8 @@ impl Store {
             bank_bytes: 0,
             paired_banks: HashMap::new(),
             slots: HashMap::new(),
+            wide_routes: HashMap::new(),
+            deferred_reduction_layer: None,
             slot_capacity: None,
             slot_bytes: 0,
             slot_upload_bytes: 0,
@@ -385,7 +535,7 @@ impl Store {
         if s.tensors.is_empty() {
             return Err(err("No model tensors found"));
         }
-        if s.gguf && std::env::var("MLX_QWEN4_PACKED_CACHE").as_deref() != Ok("0") {
+        if s.gguf && !runtime_flags::is_zero(c"MLX_QWEN4_PACKED_CACHE") {
             let files = s.tensors.values().map(|t| t.path.clone()).collect();
             s.packed = match root {
                 Some(root) => super::packed_cache::PackedCache::new_at(root, files),
@@ -679,8 +829,7 @@ impl Store {
         &mut self,
         requests: &[(String, usize, usize)],
     ) -> Result<Vec<Arc<Weight>>> {
-        if self.packed.is_none() || std::env::var("MLX_QWEN4_PARALLEL_READS").as_deref() == Ok("0")
-        {
+        if self.packed.is_none() || runtime_flags::is_zero(c"MLX_QWEN4_PARALLEL_READS") {
             return requests
                 .iter()
                 .map(|(name, start, rows)| self.read(name, *start, *rows))
@@ -960,7 +1109,7 @@ impl Store {
                 || name == "embed_tokens.weight"
                 || name == "per_layer_token_embd.weight"
                 || name.contains("ngram_embedding"))
-            && std::env::var("MLX_QWEN4_CACHE_EMBEDDING_ROWS").as_deref() != Ok("0")
+            && !runtime_flags::is_zero(c"MLX_QWEN4_CACHE_EMBEDDING_ROWS")
         {
             self.lookup_misses += 1;
             Weight {
@@ -1025,6 +1174,23 @@ impl Store {
     /// Batch independent vectors while retaining the singleton projection's
     /// accumulation. PLE formerly used GEMV per token; ordinary prompt GEMM
     /// can round differently and change the subsequent greedy token stream.
+    /// mlxfast TrackFastModel.pleForward uses the ordinary projection for a
+    /// wide window. Keep its M/N/K matrix dispatch, with our existing GGUF
+    /// loader, rather than broadcasting one GEMV for every prompt token.
+    pub fn linear_ple_window(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
+        if self.gguf
+            && x.dtype()? == DType::BFloat16
+            && x.shape()?.len() == 3
+            && x.shape()?[0] == 1
+            && x.shape()?[1] > 8
+            && runtime_flags::is_one(c"MLX_QWEN4_PREFILL_PLE_GEMM")
+        {
+            self.linear(name, x)
+        } else {
+            self.linear_vector_window(name, x)
+        }
+    }
+
     pub fn linear_vector_window(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
         self.linear_impl(name, x, true)
     }
@@ -1100,6 +1266,101 @@ impl Store {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+    #[test]
+    fn reference_shared_prefill_pair_preserves_projections_and_storage() {
+        if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {
+            return;
+        }
+        let mut store = Store::open_metadata(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp"),
+            None,
+        )
+        .unwrap();
+        let (n, k) = (640i64, 2560i64);
+        let make = |offset: u32| {
+            Arc::new(Weight {
+                dense_bf16: None,
+                values: MxArray::from_uint32(
+                    &(0..n * k / 4)
+                        .map(|i| (i as u32).wrapping_mul(0x9e3779b9).wrapping_add(offset))
+                        .collect::<Vec<_>>(),
+                    &[n, k / 4],
+                )
+                .unwrap(),
+                scales: Some(
+                    MxArray::from_float32(
+                        &(0..n * k / 32)
+                            .map(|i| ((i % 19) as f32 + 1.) / 4096.)
+                            .collect::<Vec<_>>(),
+                        &[n, k / 32],
+                    )
+                    .unwrap()
+                    .astype(DType::Float16)
+                    .unwrap(),
+                ),
+                biases: Some(
+                    MxArray::from_float32(
+                        &(0..n * k / 32)
+                            .map(|i| -((i % 19) as f32 + 1.) / 32.)
+                            .collect::<Vec<_>>(),
+                        &[n, k / 32],
+                    )
+                    .unwrap()
+                    .astype(DType::Float16)
+                    .unwrap(),
+                ),
+                group: 32,
+                bits: 8,
+                mode: "affine".into(),
+            })
+        };
+        let banks = [make(13), make(97)];
+        let names = ["blk.0.ffn_gate_shexp.weight", "blk.0.ffn_up_shexp.weight"];
+        for (name, bank) in names.iter().zip(&banks) {
+            store.tensors.insert(
+                (*name).into(),
+                Tensor {
+                    path: PathBuf::new(),
+                    shape: vec![n as usize, k as usize],
+                    offset: 0,
+                    bytes: (n * k) as u64,
+                    encoding: Encoding::Gguf(GgufTensorType::Q8_0),
+                },
+            );
+            store.banks.insert((*name).into(), bank.clone());
+        }
+        let bytes = banks[0].bytes().unwrap() + banks[1].bytes().unwrap();
+        for rows in [511i64, 512, 1024] {
+            let x = MxArray::from_float32(
+                &(0..rows * k)
+                    .map(|i| ((i * 17 % 251) as f32 - 125.) / 128.)
+                    .collect::<Vec<_>>(),
+                &[1, rows, k],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let expected = [banks[0].linear(&x).unwrap(), banks[1].linear(&x).unwrap()];
+            let (a, b) = store.linear_pair(&x, names[0], names[1]).unwrap();
+            for (actual, want) in [&a, &b].into_iter().zip(&expected) {
+                assert_eq!(
+                    &*actual.to_float32().unwrap(),
+                    &*want.to_float32().unwrap(),
+                    "rows={rows}"
+                );
+            }
+            let key = (names[0].to_owned(), names[1].to_owned());
+            let enabled = !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_SHARED_PAIR")
+                && !runtime_flags::is_zero(c"MLX_QWEN4_PAIRED_PROJECTIONS")
+                && !runtime_flags::is_zero(c"MLX_ENABLE_TF32");
+            if rows < 512 {
+                assert!(!store.paired_banks.contains_key(&key));
+            } else if enabled {
+                assert_eq!(store.paired_banks[&key].bytes().unwrap(), bytes);
+            }
+        }
+    }
+
     #[test]
     fn quantized_ple_windows_preserve_singleton_projection_rounding() {
         let mut store = Store::open_metadata(
@@ -1212,8 +1473,8 @@ mod cache_tests {
             b.extend([row as u8; 16]);
         }
         fs::write(&path, b).unwrap();
-        let mut store = Store::open_with_packed_root(&path, Some(&dir)).unwrap();
-        let mut oracle = Store::open_with_packed_root(&path, Some(&dir)).unwrap();
+        let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
+        let mut oracle = Store::open_fixture(&path, Some(&dir)).unwrap();
         let ids = [3usize, 1, 3, 7];
         let expected = ids
             .iter()
@@ -1308,9 +1569,11 @@ mod cache_tests {
 
     #[test]
     fn expert_lru_preserves_recency_and_bounds_hot_hit_metadata() {
-        let mut store =
-            Store::open(&Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp"))
-                .unwrap();
+        let mut store = Store::open_fixture(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp"),
+            None,
+        )
+        .unwrap();
         let key = |row| ("embed_tokens.weight".to_string(), row, 1);
         store.read("embed_tokens.weight", 0, 1).unwrap();
         let row_bytes = store.cache_bytes;

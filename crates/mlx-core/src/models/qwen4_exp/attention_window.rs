@@ -1,6 +1,7 @@
 //! Window-wide causal attention. Pages remain the persistent storage; only
 //! the current window and a bounded view of its prefix feed SDPA.
 use super::*;
+use crate::models::qwen4_exp::runtime_flags;
 
 impl Decoder {
     pub(super) fn rope_window(&self, x: &MxArray, start: usize, count: usize) -> Result<MxArray> {
@@ -8,7 +9,7 @@ impl Decoder {
     }
 
     fn use_batch_rotary(&self) -> bool {
-        self.batch_rotary && std::env::var("MLX_QWEN4_PREFILL_ROTARY").as_deref() != Ok("0")
+        self.batch_rotary && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_ROTARY")
     }
 
     fn rope_window_positions(
@@ -16,6 +17,31 @@ impl Decoder {
         x: &MxArray,
         offsets: impl Iterator<Item = usize>,
     ) -> Result<MxArray> {
+        let (positions, sections, interleaved) = self.rotary_window_parameters(offsets);
+        if self.use_batch_rotary() {
+            return self.rotary_tables.borrow_mut().apply(
+                x,
+                positions,
+                self.config.rope_dims(),
+                self.config.rope_theta(),
+                sections,
+                interleaved,
+            );
+        }
+        math::mrope_window(
+            x,
+            &positions,
+            self.config.rope_dims(),
+            self.config.rope_theta(),
+            sections,
+            interleaved,
+        )
+    }
+
+    fn rotary_window_parameters(
+        &self,
+        offsets: impl Iterator<Item = usize>,
+    ) -> (Vec<[i64; 3]>, [usize; 3], bool) {
         let media = self.scope.is_empty() && !self.positions.is_empty();
         let positions: Vec<_> = offsets
             .map(|pos| {
@@ -37,24 +63,51 @@ impl Decoder {
                 0
             }
         });
-        if self.use_batch_rotary() {
-            return self.rotary_tables.borrow_mut().apply(
+        (
+            positions,
+            sections,
+            v["mrope_interleaved"].as_bool().unwrap_or(true),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn attention_norm_rotary(
+        &mut self,
+        x: &MxArray,
+        hf: &str,
+        gg: &str,
+        start: usize,
+        count: usize,
+        window: bool,
+    ) -> Result<MxArray> {
+        if self.gguf()
+            && self.config.head_dim == 256
+            && x.dtype()? == DType::BFloat16
+            && runtime_flags::is_one(c"MLX_QWEN4_ATTENTION_NORM_ROTARY")
+            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
+        {
+            let weight = self.dense(hf, gg)?;
+            let (positions, sections, interleaved) =
+                self.rotary_window_parameters(start..start + count);
+            if let Some(out) = self.rotary_tables.borrow_mut().apply_normalized(
                 x,
+                &weight,
                 positions,
                 self.config.rope_dims(),
                 self.config.rope_theta(),
                 sections,
-                v["mrope_interleaved"].as_bool().unwrap_or(true),
-            );
+                interleaved,
+                self.config.rms_norm_eps,
+            )? {
+                return Ok(out);
+            }
         }
-        math::mrope_window(
-            x,
-            &positions,
-            self.config.rope_dims(),
-            self.config.rope_theta(),
-            sections,
-            v["mrope_interleaved"].as_bool().unwrap_or(true),
-        )
+        let normalized = self.norm(x, hf, gg, self.config.head_dim, true)?;
+        if window {
+            self.rope_window(&normalized, start, count)
+        } else {
+            self.rope(&normalized, start)
+        }
     }
 
     pub(super) fn attention_window(
@@ -67,7 +120,7 @@ impl Decoder {
         let c = self.config.clone();
         let base = self.history.len();
         let t = x.shape()?[1] as usize;
-        if std::env::var("MLX_QWEN4_ATTENTION_WINDOW").as_deref() == Ok("0")
+        if runtime_flags::is_zero(c"MLX_QWEN4_ATTENTION_WINDOW")
             // F32 fixtures retain singleton SDPA accumulation (wide NAX uses TF32).
             || x.dtype()? == DType::Float32
             || base + t > c.indexer_budget || self.verification.is_some()
@@ -82,26 +135,25 @@ impl Decoder {
         let p = format!("layers.{i}.self_attn");
         let g = format!("blk.{i}");
         let qg = projections.qg.reshape(&[1, t as i64, nh, 2 * hd])?;
-        let q = self
-            .norm(
-                &qg.slice_axis(3, 0, hd)?,
-                &format!("{p}.q_norm.weight"),
-                &format!("{g}.attn_q_norm.weight"),
-                c.head_dim,
-                true,
-            )?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let k = self
-            .norm(
-                &projections.k.reshape(&[1, t as i64, kh, hd])?,
-                &format!("{p}.k_norm.weight"),
-                &format!("{g}.attn_k_norm.weight"),
-                c.head_dim,
-                true,
-            )?
-            .transpose(Some(&[0, 2, 1, 3]))?;
-        let q = self.rope_window(&q, base, t)?;
-        let k = self.rope_window(&k, base, t)?;
+        let q = self.attention_norm_rotary(
+            &qg.slice_axis(3, 0, hd)?.transpose(Some(&[0, 2, 1, 3]))?,
+            &format!("{p}.q_norm.weight"),
+            &format!("{g}.attn_q_norm.weight"),
+            base,
+            t,
+            true,
+        )?;
+        let k = self.attention_norm_rotary(
+            &projections
+                .k
+                .reshape(&[1, t as i64, kh, hd])?
+                .transpose(Some(&[0, 2, 1, 3]))?,
+            &format!("{p}.k_norm.weight"),
+            &format!("{g}.attn_k_norm.weight"),
+            base,
+            t,
+            true,
+        )?;
         let v = projections
             .v
             .reshape(&[1, t as i64, kh, hd])?

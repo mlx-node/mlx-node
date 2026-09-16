@@ -9,7 +9,7 @@ All language wrappers share a uniform `ChatSession<M>` surface (`send` / `sendSt
 | **Qwen3**                  |     yes      |     yes     | GRPO + SFT | Speculative decoding; paged attention                                            |
 | **Qwen3.5 Dense**          |     yes      |     yes     | GRPO + SFT | Hybrid GDN/attention; native MTP; Qwen3.8 DFlash2; VLM variant                   |
 | **Qwen3.5 MoE**            |     yes      |     yes     | GRPO + SFT | Compiled C++ forward with expert routing; VLM variant                            |
-| **Qwen3.8-Flash-Next**      |      —       |     yes     |     —      | Bounded SSD loading; native MTP, images, paged QSA and shared scheduling         |
+| **Qwen3.8-Flash-Next**     |      —       |     yes     |     —      | Bounded SSD loading; native MTP, images, paged QSA and shared scheduling         |
 | **Gemma4**                 |     yes      |     yes     |     —      | Hybrid sliding/global attention + MoE/PLE; DSpark + assistant-MTP spec. decoding |
 | **Muse-Glimmer**           |     yes      |     yes     |     —      | Text decoder; Q4_K import; DFlash; hybrid paged AR                               |
 | **LFM2.5**                 |     yes      |     yes     |     —      | Hybrid conv + attention                                                          |

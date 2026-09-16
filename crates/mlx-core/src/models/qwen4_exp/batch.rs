@@ -1,6 +1,7 @@
 //! Prompt-only matrix batching. Stateful attention/PLE still advance in token
 //! order; stateless HC/MLP work shares matrix loads across the prompt window.
 use super::*;
+use crate::models::qwen4_exp::runtime_flags;
 use std::collections::BTreeMap;
 
 impl Decoder {
@@ -11,7 +12,7 @@ impl Decoder {
         scores: &MxArray,
         i: usize,
     ) -> Result<Option<MxArray>> {
-        if !self.gguf() || std::env::var("MLX_QWEN4_RESIDENT_GATHER").as_deref() == Ok("0") {
+        if !self.gguf() || runtime_flags::is_zero(c"MLX_QWEN4_RESIDENT_GATHER") {
             return Ok(None);
         }
         let banks = ["gate", "up", "down"].map(|part| {
@@ -84,9 +85,10 @@ impl Decoder {
         experts: usize,
         active_experts: usize,
     ) -> Result<Option<(MxArray, MxArray)>> {
-        if std::env::var("MLX_QWEN4_PREFILL_INDIRECT").as_deref() == Ok("0")
+        if runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_INDIRECT")
             || ids.size()? < 256
-            || ids.size()? / active_experts.max(1) as u64 >= 32
+            || (ids.size()? / active_experts.max(1) as u64 >= 32
+                && runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_REFERENCE_INDIRECT"))
             || input.dtype()? != DType::BFloat16
         {
             return Ok(None);
@@ -138,7 +140,7 @@ impl Decoder {
             ids.clone()
         };
         let x = x.reshape(&[rows, 1, input.shape()?[1]])?;
-        let tiles = if sorted && std::env::var("MLX_QWEN4_EXPERT_TILES").as_deref() != Ok("0") {
+        let tiles = if sorted && !runtime_flags::is_zero(c"MLX_QWEN4_EXPERT_TILES") {
             math::expert_tiles(&selected, experts)?
         } else {
             None
@@ -229,7 +231,7 @@ impl Decoder {
             && c.moe_intermediate_size == 640
             && x.dtype()? == DType::BFloat16
             && ids.len() == x.shape()?[1] as usize * c.num_experts_per_tok
-            && std::env::var("MLX_QWEN4_FUSED_EXPERTS").as_deref() != Ok("0")
+            && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_EXPERTS")
             && ids
                 .iter()
                 .copied()
@@ -248,8 +250,8 @@ impl Decoder {
         }
         // Leave the experts used nearest the prompt boundary in the slots.
         // Router order is restored below, independently of SSD load order.
-        let linear_plan = x.shape_at(1)? > 8
-            && std::env::var("MLX_QWEN4_LINEAR_ROUTE_PLAN").as_deref() != Ok("0");
+        let linear_plan =
+            x.shape_at(1)? > 8 && !runtime_flags::is_zero(c"MLX_QWEN4_LINEAR_ROUTE_PLAN");
         let mut last = BTreeMap::new();
         let linear_order = if linear_plan {
             Some(
@@ -263,9 +265,17 @@ impl Decoder {
             None
         };
         let active_experts = linear_order.as_ref().map_or(last.len(), Vec::len);
+        if x.shape_at(1)? > 8 {
+            self.weights.note_prefill_routes(
+                i,
+                linear_order
+                    .clone()
+                    .unwrap_or_else(|| last.keys().copied().collect()),
+            );
+        }
         if active_experts <= capacity
             && x.shape_at(1)? > 8
-            && std::env::var("MLX_QWEN4_SINGLE_SLOT_GROUP").as_deref() != Ok("0")
+            && !runtime_flags::is_zero(c"MLX_QWEN4_SINGLE_SLOT_GROUP")
         {
             self.check_cancelled()?;
             let Some((banks, slots, count)) =
@@ -283,10 +293,21 @@ impl Decoder {
                 active_experts,
                 c.num_experts_per_tok,
             )?;
-            self.weights.finish_expert_slots(i, &out)?;
             let reduced =
                 math::combine_expert_rows(&out, scores, inverse.as_ref(), c.num_experts_per_tok)?;
-            self.weights.complete_expert_window(i, &reduced)?;
+            if self.verification.is_none()
+                && !runtime_flags::is_zero(c"MLX_QWEN4_DEFER_EXPERT_REDUCTION")
+                && !runtime_flags::is_zero(c"MLX_QWEN4_ASYNC_SUBMISSION")
+            {
+                // This one bank group has no intervening slot reuse. Keep
+                // its reduction as the lease, so the large assignment output
+                // is released after GPU execution. A later router/frontier
+                // completes it; misses fence the retained lease explicitly.
+                self.weights.defer_expert_reduction(i, &reduced)?;
+            } else {
+                self.weights.finish_expert_slots(i, &out)?;
+                self.weights.complete_expert_window(i, &reduced)?;
+            }
             return Ok(Some(reduced));
         }
         let groups = linear_order.unwrap_or_else(|| {
@@ -383,7 +404,7 @@ impl Decoder {
             return Ok(Some(out));
         }
         use super::super::weights::{MAX_READ_BYTES, Weight};
-        if !self.gguf() || std::env::var("MLX_QWEN4_BATCH_EXPERTS").as_deref() == Ok("0") {
+        if !self.gguf() || runtime_flags::is_zero(c"MLX_QWEN4_BATCH_EXPERTS") {
             return Ok(None);
         }
         let (h, m) = (self.config.hidden_size, self.config.moe_intermediate_size);
@@ -455,18 +476,35 @@ impl Decoder {
         i: usize,
         cache: &mut LayerCache,
     ) -> Result<MxArray> {
+        Ok(self
+            .attention_matrix_for_mlp(x, tokens, i, cache, false, None)?
+            .0)
+    }
+
+    pub(super) fn attention_matrix_for_mlp(
+        &mut self,
+        x: &MxArray,
+        tokens: &[u32],
+        i: usize,
+        cache: &mut LayerCache,
+        normalize: bool,
+        incoming_norm: Option<&MxArray>,
+    ) -> Result<(MxArray, Option<MxArray>)> {
         let base = self.history.len();
         let x = if self.config.ple_layer_ids.contains(&(i + 1)) {
             x.add(&self.ple_window(x, tokens, i, cache)?)?
         } else {
             x.clone()
         };
-        let (mixed, gate) = self.hyper(
+
+        let (mixed, gate) = self.hyper_with_norm(
             &x,
             &format!("layers.{i}.attn_hyper_connection"),
             &format!("blk.{i}.hc_attn"),
             true,
+            incoming_norm,
         )?;
+
         let branch = if self.config.linear(i) {
             self.gdn_batch(&mixed, i, cache)?
         } else {
@@ -496,9 +534,13 @@ impl Decoder {
                 &format!("blk.{i}.attn_output.weight"),
             )?
         };
-        let out = Self::inject(&x, &branch, &gate.unwrap())?;
-        self.submit(&[&out], "qwen4::batch::attention")?;
-        Ok(out)
+
+        let (out, normed) = self.inject_for_mlp(&x, &branch, &gate.unwrap(), i, normalize)?;
+        if !self.async_device_prefill() {
+            self.submit(&[&out], "qwen4::batch::attention")?;
+        }
+
+        Ok((out, normed))
     }
 
     fn gdn_batch(&mut self, x: &MxArray, i: usize, cache: &mut LayerCache) -> Result<MxArray> {
@@ -524,54 +566,46 @@ impl Decoder {
             ),
         )?;
         let z = z.reshape(&[1, t, nh, vd])?;
-        let a = self
-            .linear(
+        // TrackFastModel.bindGDN groups compatible projections. The GGUF
+        // gate matrices are dense F32, so pair them separately from Q8 QKV/Z.
+        let (a, b) = if self.gguf() && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_PAIR") {
+            self.linear_pair(
                 x,
-                &format!("{p}.in_proj_a.weight"),
-                &format!("{g}.ssm_alpha.weight"),
+                (
+                    &format!("{p}.in_proj_a.weight"),
+                    &format!("{g}.ssm_alpha.weight"),
+                ),
+                (
+                    &format!("{p}.in_proj_b.weight"),
+                    &format!("{g}.ssm_beta.weight"),
+                ),
             )?
-            .astype(DType::Float32)?;
-        let b = self
-            .linear(
-                x,
-                &format!("{p}.in_proj_b.weight"),
-                &format!("{g}.ssm_beta.weight"),
-            )?
-            .astype(DType::Float32)?;
+        } else {
+            (
+                self.linear(
+                    x,
+                    &format!("{p}.in_proj_a.weight"),
+                    &format!("{g}.ssm_alpha.weight"),
+                )?,
+                self.linear(
+                    x,
+                    &format!("{p}.in_proj_b.weight"),
+                    &format!("{g}.ssm_beta.weight"),
+                )?,
+            )
+        };
+        // TrackFastGDNDecode reads projected BF16 gates directly. Keep local
+        // F32 gate arithmetic inside the consumer, without two cast buffers.
+        let (a, b) = if self.gguf() && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_INPUTS") {
+            (a, b)
+        } else {
+            (a.astype(DType::Float32)?, b.astype(DType::Float32)?)
+        };
+
         let conv = self.dense(
             &format!("{p}.conv1d.weight"),
             &format!("{g}.ssm_conv1d.weight"),
         )?;
-        let qkv = math::conv_sequence(&qkv, &conv, &mut cache.conv, c.linear_conv_kernel_dim)?;
-        let q = math::l2(&qkv.slice_axis(2, 0, kh * kd)?.reshape(&[1, t, kh, kd])?)?
-            .mul_scalar((kd as f64).powf(-0.5))?;
-        let k = math::l2(
-            &qkv.slice_axis(2, kh * kd, 2 * kh * kd)?
-                .reshape(&[1, t, kh, kd])?,
-        )?;
-        let compact = x.dtype()? == DType::BFloat16
-            && kd >= 32
-            && kd % 32 == 0
-            && crate::engine::persistence::compiled_forward_backend_available()
-            && std::env::var("MLX_QWEN4_FUSED_GDN").as_deref() != Ok("0")
-            && std::env::var("MLX_QWEN4_PREFILL_GDN_BF16").as_deref() == Ok("1");
-        let storage = if compact {
-            DType::BFloat16
-        } else {
-            DType::Float32
-        };
-        let v = qkv
-            .slice_axis(2, 2 * kh * kd, 2 * kh * kd + nh * vd)?
-            .reshape(&[1, t, nh, vd])?
-            .astype(storage)?;
-        let (q, k) = if self.gguf() {
-            (q, k)
-        } else {
-            (
-                q.repeat((nh / kh) as i32, 2)?,
-                k.repeat((nh / kh) as i32, 2)?,
-            )
-        };
         let scale = self
             .dense(&format!("{p}.A_log"), &format!("{g}.ssm_a"))?
             .astype(DType::Float32)?;
@@ -583,24 +617,63 @@ impl Decoder {
         let dt = self
             .dense(&format!("{p}.dt_bias"), &format!("{g}.ssm_dt.bias"))?
             .astype(DType::Float32)?;
-        let (decay, beta) = math::gdn_gates(&a, &b, &scale, &dt)?;
+        let prepared = if self.gguf()
+            && c.linear_conv_kernel_dim == 4
+            && (kh, nh, kd, vd) == (16, 48, 128, 128)
+            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_GDN_PREP")
+        {
+            math::gdn_prepare(&qkv, &a, &b, &conv, &mut cache.conv, &scale, &dt)?
+        } else {
+            None
+        };
+        let [q, k, v, decay, beta] = if let Some(values) = prepared {
+            values
+        } else {
+            let qkv = math::conv_sequence(&qkv, &conv, &mut cache.conv, c.linear_conv_kernel_dim)?;
+            let q = math::l2(&qkv.slice_axis(2, 0, kh * kd)?.reshape(&[1, t, kh, kd])?)?
+                .mul_scalar((kd as f64).powf(-0.5))?;
+            let k = math::l2(
+                &qkv.slice_axis(2, kh * kd, 2 * kh * kd)?
+                    .reshape(&[1, t, kh, kd])?,
+            )?;
+            let compact = x.dtype()? == DType::BFloat16
+                && kd >= 32
+                && kd % 32 == 0
+                && crate::engine::persistence::compiled_forward_backend_available()
+                && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_GDN")
+                && runtime_flags::is_one(c"MLX_QWEN4_PREFILL_GDN_BF16");
+            let storage = if compact {
+                DType::BFloat16
+            } else {
+                DType::Float32
+            };
+            let v = qkv
+                .slice_axis(2, 2 * kh * kd, 2 * kh * kd + nh * vd)?
+                .reshape(&[1, t, nh, vd])?
+                .astype(storage)?;
+            let (q, k) = if self.gguf() {
+                (q, k)
+            } else {
+                (
+                    q.repeat((nh / kh) as i32, 2)?,
+                    k.repeat((nh / kh) as i32, 2)?,
+                )
+            };
+            let (decay, beta) = math::gdn_gates(&a, &b, &scale, &dt)?;
+            [q.astype(storage)?, k.astype(storage)?, v, decay, beta]
+        };
+
         let state = match &cache.recurrent {
             Some(s) => s.clone(),
             None => MxArray::zeros(&[1, nh, vd, kd], Some(DType::Float32))?,
         };
-        let (out, state) = math::recurrent_sequence(
-            &q.astype(storage)?,
-            &k.astype(storage)?,
-            &v,
-            &decay,
-            &beta,
-            &state,
-        )?;
-        self.submit(&[&state], "qwen4::batch::recurrent_state")?;
+        let (out, state) = math::recurrent_sequence(&q, &k, &v, &decay, &beta, &state)?;
+
+        self.submit_state(&[&state], "qwen4::batch::recurrent_state")?;
         cache.recurrent = Some(state);
         let norm = self.dense(&format!("{p}.norm.weight"), &format!("{g}.ssm_norm.weight"))?;
         let replay = if c.output_gate_type == "sigmoid"
-            && std::env::var("MLX_QWEN4_PREFILL_EPILOGUE").as_deref() != Ok("0")
+            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_EPILOGUE")
         {
             math::gdn_epilogue(&out, &z, &norm, c.rms_norm_eps)?
         } else {
@@ -626,11 +699,13 @@ impl Decoder {
 
             out.astype(x.dtype()?)?.reshape(&[1, t, nh * vd])?
         };
+
         let output = self.linear(
             &out,
             &format!("{p}.out_proj.weight"),
             &format!("{g}.ssm_out.weight"),
         )?;
+
         Ok(output)
     }
 
@@ -643,24 +718,49 @@ impl Decoder {
     }
 
     pub(super) fn mlp_matrix(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
-        let (mixed, gate) = self.hyper(
+        self.mlp_matrix_with_norm(x, i, None)
+    }
+
+    pub(super) fn mlp_matrix_with_norm(
+        &mut self,
+        x: &MxArray,
+        i: usize,
+        normed: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        Ok(self.mlp_matrix_for_attention(x, i, normed, false)?.0)
+    }
+
+    pub(super) fn mlp_matrix_for_attention(
+        &mut self,
+        x: &MxArray,
+        i: usize,
+        normed: Option<&MxArray>,
+        normalize_next: bool,
+    ) -> Result<(MxArray, Option<MxArray>)> {
+        let (mixed, gate) = self.hyper_with_norm(
             x,
             &format!("layers.{i}.mlp_hyper_connection"),
             &format!("blk.{i}.hc_ffn"),
             true,
+            normed,
         )?;
+
         let branch = self.moe_batch(&mixed, i)?;
 
-        let out = Self::inject(x, &branch, &gate.unwrap())?;
-        if self.async_prefill || std::env::var("MLX_QWEN4_PREFILL_DEFER_MLP").as_deref() == Ok("1")
-        {
+        let (out, next_norm) =
+            self.inject_for_next_attention(x, &branch, &gate.unwrap(), i, normalize_next)?;
+        if self.async_prefill || runtime_flags::is_one(c"MLX_QWEN4_PREFILL_DEFER_MLP") {
             // The next router readback (or final window output) fences this
             // graph. Slot-bank readers remain retained until their own fence.
-            self.submit(&[&out], "qwen4::batch::mlp")?;
+            // Reference schedule: first two layers, then groups of three.
+            if !self.async_device_prefill() || (i >= 1 && (i - 1).is_multiple_of(3)) {
+                self.submit(&[&out], "qwen4::batch::mlp")?;
+            }
         } else {
             MxArray::eval_arrays_with_context(&[&out], "qwen4::batch::mlp")?;
         }
-        Ok(out)
+
+        Ok((out, next_norm))
     }
 
     pub(super) fn moe_batch(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
@@ -673,18 +773,36 @@ impl Decoder {
             &format!("{p}.gate.weight"),
             &format!("{g}.ffn_gate_inp.weight"),
         )?;
-        let probs = Activations::softmax_precise(&logits, Some(-1))?;
         let top = c.num_experts_per_tok;
-        let selected = probs.argpartition(-(top as i32), Some(-1))?.slice_axis(
-            2,
-            (c.num_experts - top) as i64,
-            c.num_experts as i64,
-        )?;
-        let scores = probs.take_along_axis(&selected, -1)?;
-        let scores = scores
-            .div(&scores.sum(Some(&[-1]), Some(true))?)?
-            .reshape(&[1, (tokens * top) as i64, 1])?;
-        let resident = self.resident_experts(x, &selected, &scores, i)?;
+        let (selected, scores) = if let Some(routes) = math::prefill_routes(&logits, top)? {
+            routes
+        } else {
+            let probs = Activations::softmax_precise(&logits, Some(-1))?;
+            let selected = probs.argpartition(-(top as i32), Some(-1))?.slice_axis(
+                2,
+                (c.num_experts - top) as i64,
+                c.num_experts as i64,
+            )?;
+            let scores = probs.take_along_axis(&selected, -1)?;
+            let scores = scores.div(&scores.sum(Some(&[-1]), Some(true))?)?;
+            (selected, scores)
+        };
+        let scores = scores.reshape(&[1, (tokens * top) as i64, 1])?;
+
+        if self.device_routes.is_some()
+            && runtime_flags::is_one(c"MLX_QWEN4_PREFILL_SHARED_COMBINE")
+        {
+            let (shared, gate) = self.shared_expert_parts(x, i)?;
+            let out =
+                self.tentative_prefill_experts(x, &selected, &scores, i, Some((&shared, &gate)))?;
+
+            return Ok(out);
+        }
+        let resident = if self.device_routes.is_some() {
+            Some(self.tentative_prefill_experts(x, &selected, &scores, i, None)?)
+        } else {
+            self.resident_experts(x, &selected, &scores, i)?
+        };
         let sum = if let Some(sum) = resident {
             sum
         } else {
@@ -752,6 +870,18 @@ impl Decoder {
                 .sum(Some(&[2]), Some(false))?
             }
         };
+
+        let (shared, gate) = self.shared_expert_parts(x, i)?;
+        let output = sum
+            .astype(x.dtype()?)?
+            .add(&math::sigmoid_mul(&gate, &shared)?)?;
+
+        Ok(output)
+    }
+
+    fn shared_expert_parts(&mut self, x: &MxArray, i: usize) -> Result<(MxArray, MxArray)> {
+        let p = format!("layers.{i}.mlp");
+        let g = format!("blk.{i}");
         let (gate, up) = self.linear_pair(
             x,
             (
@@ -775,9 +905,6 @@ impl Decoder {
             &format!("{p}.shared_expert_gate.weight"),
             &format!("{g}.ffn_gate_inp_shexp.weight"),
         )?;
-        let output = sum
-            .astype(x.dtype()?)?
-            .add(&math::sigmoid_mul(&gate, &shared)?)?;
-        Ok(output)
+        Ok((shared, gate))
     }
 }

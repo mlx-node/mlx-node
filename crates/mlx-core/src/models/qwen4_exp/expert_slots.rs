@@ -2,6 +2,7 @@
 //! mutated only after their last lazy reader has completed. The ordinary LRU
 //! supplies bounded misses and releases imported chunks after the slot copy.
 use super::*;
+use crate::models::qwen4_exp::runtime_flags;
 
 pub(super) struct ExpertSlots {
     banks: [Arc<Weight>; 3],
@@ -9,6 +10,7 @@ pub(super) struct ExpertSlots {
     rows: [usize; 3],
     occupants: Vec<Option<u32>>,
     mapping: Vec<Option<usize>>,
+    device_mapping: Option<MxArray>,
     ages: Vec<u64>,
     tick: u64,
     readers: Vec<MxArray>,
@@ -58,7 +60,7 @@ impl Store {
         top: usize,
     ) -> Result<usize> {
         if !self.gguf
-            || std::env::var("MLX_QWEN4_EXPERT_SLOTS").as_deref() == Ok("0")
+            || runtime_flags::is_zero(c"MLX_QWEN4_EXPERT_SLOTS")
             || !crate::engine::persistence::compiled_forward_backend_available()
         {
             return Ok(0);
@@ -176,6 +178,7 @@ impl Store {
                 rows,
                 occupants: vec![None; capacity],
                 mapping: vec![None; experts],
+                device_mapping: None,
                 ages: vec![0; capacity],
                 tick: 0,
                 readers: Vec::new(),
@@ -191,6 +194,7 @@ impl Store {
             self.slot_hits += (wanted.len() - missing.len()) as u64;
             self.slot_misses += missing.len() as u64;
             if !missing.is_empty() {
+                slots.device_mapping = None;
                 MxArray::eval_arrays_with_context(
                     &slots.readers.iter().collect::<Vec<_>>(),
                     "qwen4::slots::complete_readers",
@@ -284,6 +288,139 @@ impl Store {
         result.map(Some)
     }
 
+    pub(in super::super) fn device_slots_ready(&self, layers: usize) -> bool {
+        (0..layers).all(|layer| self.slots.contains_key(&layer))
+    }
+
+    pub(in super::super) fn note_prefill_routes(&mut self, layer: usize, ids: Vec<u32>) {
+        self.wide_routes.insert(layer, ids);
+    }
+
+    /// Skip a tentative window if even the prior window's expert set no longer
+    /// fits the unchanged banks. This is only an eligibility hint, never a
+    /// prediction: every newly computed route is still validated at commit.
+    pub(in super::super) fn prefill_device_slots_ready(&self, layers: usize) -> bool {
+        (0..layers).all(|layer| {
+            self.slots.get(&layer).is_some_and(|slots| {
+                slots.occupants.first().is_some_and(Option::is_some)
+                    && self.wide_routes.get(&layer).is_some_and(|ids| {
+                        !ids.is_empty()
+                            && ids.iter().all(|&id| {
+                                slots.mapping.get(id as usize).is_some_and(Option::is_some)
+                            })
+                    })
+                    && matches!(slots.banks[0].mode.as_str(), "q4k" | "q5k")
+                    && slots.banks[1].mode == slots.banks[0].mode
+                    && slots.banks[2].mode == "affine"
+                    && matches!(slots.banks[2].bits, 5 | 8)
+                    && slots
+                        .banks
+                        .iter()
+                        .all(|w| w.group == 32 && w.scales.is_some() && w.biases.is_some())
+            })
+        })
+    }
+
+    /// Map absent experts to the initialized first slot while computing a
+    /// tentative window. The original IDs, not these safe placeholders, decide
+    /// commit. This keeps counting-sort permutations complete even on misses.
+    pub(in super::super) fn prefill_device_expert_slots(
+        &mut self,
+        layer: usize,
+        ids: &MxArray,
+    ) -> Result<([Arc<Weight>; 3], MxArray, usize)> {
+        let count = self
+            .slots
+            .get(&layer)
+            .filter(|s| s.occupants.first().is_some_and(Option::is_some))
+            .ok_or_else(|| err("Qwen4 tentative prefill has no initialized bank"))?
+            .occupants
+            .len();
+        let (banks, local) = self
+            .device_expert_slots(layer, ids)?
+            .ok_or_else(|| err("Qwen4 tentative prefill lost its bank"))?;
+        let bound = MxArray::from_uint32(&[count as u32], &[])?;
+        let zero = MxArray::from_uint32(&[0], &[])?;
+        let safe = local.less(&bound)?.where_(&local, &zero)?;
+        Ok((banks, safe, count))
+    }
+
+    /// The caller must validate every selected ID before publishing a result.
+    /// Missing IDs map to the capacity sentinel, which the fused expert kernels
+    /// handle without reading a bank. No bank or mapping may change during
+    /// this tentative token; ordinary miss handling resumes after completion.
+    pub(in super::super) fn device_expert_slots(
+        &mut self,
+        layer: usize,
+        ids: &MxArray,
+    ) -> Result<Option<([Arc<Weight>; 3], MxArray)>> {
+        let Some(slots) = self.slots.get_mut(&layer) else {
+            return Ok(None);
+        };
+        if slots.device_mapping.is_none() {
+            let mapping: Vec<_> = slots
+                .mapping
+                .iter()
+                .map(|slot| slot.unwrap_or(slots.occupants.len()) as u32)
+                .collect();
+            slots.device_mapping = Some(MxArray::from_uint32(&mapping, &[mapping.len() as i64])?);
+        }
+        let local = slots
+            .device_mapping
+            .as_ref()
+            .unwrap()
+            .take(&ids.reshape(&[-1])?, 0)?;
+        Ok(Some((slots.banks.clone(), local)))
+    }
+
+    /// Commit LRU ages only after the entire tentative token was a cache hit.
+    /// A miss changes neither the bank contents nor their host bookkeeping.
+    pub(in super::super) fn commit_device_routes(
+        &mut self,
+        layers: &[usize],
+        ids: &[u32],
+        top: usize,
+    ) -> Result<bool> {
+        if ids.len() != layers.len() * top || top == 0 {
+            return Err(err("Qwen4 device route tape has an invalid shape"));
+        }
+        for (&layer, selected) in layers.iter().zip(ids.chunks_exact(top)) {
+            let Some(slots) = self.slots.get(&layer) else {
+                return Ok(false);
+            };
+            if selected
+                .iter()
+                .any(|&e| slots.mapping.get(e as usize).is_none_or(Option::is_none))
+            {
+                return Ok(false);
+            }
+        }
+        for (&layer, selected) in layers.iter().zip(ids.chunks_exact(top)) {
+            let slots = self.slots.get_mut(&layer).unwrap();
+            for &e in selected {
+                let slot = slots.mapping[e as usize].unwrap();
+                slots.tick += 1;
+                slots.ages[slot] = slots.tick;
+            }
+            self.slot_hits += selected.iter().collect::<HashSet<_>>().len() as u64;
+        }
+        Ok(true)
+    }
+
+    /// The tentative token has completed without mutating a bank. Complete
+    /// every retained reader together, including independent earlier outputs,
+    /// before releasing their leases. This prevents periodic per-layer waits
+    /// on the eighth hit-only token and retains the ordinary miss protection.
+    pub(in super::super) fn complete_device_readers(&mut self) -> Result<()> {
+        let readers: Vec<_> = self.slots.values().flat_map(|s| s.readers.iter()).collect();
+        MxArray::eval_arrays_with_context(&readers, "qwen4::slots::device_readers")?;
+        for slots in self.slots.values_mut() {
+            slots.readers.clear();
+        }
+        self.deferred_reduction_layer = None;
+        Ok(())
+    }
+
     pub(in super::super) fn finish_expert_slots(
         &mut self,
         layer: usize,
@@ -320,6 +457,39 @@ impl Store {
         }
         Ok(())
     }
+
+    /// Submit one wide window while retaining only its compact reduction.
+    /// The caller must pass an output depending on every new bank reader.
+    /// Complete all earlier independent leases before replacing them; a miss
+    /// still completes this lease before any slot buffer is overwritten.
+    /// At most one deferred reduced window survives in the entire store, so
+    /// retained scratch does not grow with the checkpoint's layer count.
+    pub(in super::super) fn defer_expert_reduction(
+        &mut self,
+        layer: usize,
+        reduced: &MxArray,
+    ) -> Result<()> {
+        if let Some(previous) = self.deferred_reduction_layer.take()
+            && let Some(slots) = self.slots.get_mut(&previous)
+        {
+            MxArray::eval_arrays_with_context(
+                &slots.readers.iter().collect::<Vec<_>>(),
+                "qwen4::slots::previous_reduction",
+            )?;
+            slots.readers.clear();
+        }
+        if let Some(slots) = self.slots.get_mut(&layer) {
+            MxArray::eval_arrays_with_context(
+                &slots.readers.iter().collect::<Vec<_>>(),
+                "qwen4::slots::earlier_windows",
+            )?;
+            slots.readers.clear();
+            slots.readers.push(reduced.clone());
+            MxArray::async_eval_arrays(&[reduced]);
+            self.deferred_reduction_layer = Some(layer);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -349,6 +519,7 @@ mod tests {
                 rows: [1; 3],
                 occupants: vec![Some(0)],
                 mapping: vec![Some(0)],
+                device_mapping: None,
                 ages: vec![0],
                 tick: 0,
                 readers: Vec::new(),
@@ -373,6 +544,42 @@ mod tests {
         );
         assert!(store.slots[&0].readers.is_empty());
         assert!(reduced.to_float32().unwrap().iter().all(|&x| x == 1024.));
+        let previous = store.slots[&0].banks.clone();
+        store.slots.insert(
+            1,
+            ExpertSlots {
+                banks: previous,
+                names: Default::default(),
+                rows: [1; 3],
+                occupants: vec![Some(0)],
+                mapping: vec![Some(0)],
+                device_mapping: None,
+                ages: vec![0],
+                tick: 0,
+                readers: Vec::new(),
+            },
+        );
+        store.defer_expert_reduction(0, &reduced).unwrap();
+        let independent = reduced.add_scalar(1.).unwrap();
+        store.defer_expert_reduction(1, &independent).unwrap();
+        assert!(store.slots[&0].readers.is_empty());
+        assert_eq!(store.slots[&1].readers.len(), 1);
+        assert_eq!(store.deferred_reduction_layer, Some(1));
+        // Join independent leases from both layers, including an unevaluated
+        // reader that does not depend on the newest token's output.
+        let old = store.slots[&0].banks[0].values.add_scalar(7.).unwrap();
+        store.finish_expert_slots(0, &old).unwrap();
+        store.complete_device_readers().unwrap();
+        assert!(store.slots.values().all(|s| s.readers.is_empty()));
+        assert_eq!(store.deferred_reduction_layer, None);
+        assert_eq!(&*old.to_float32().unwrap(), &[7.]);
+        assert!(
+            independent
+                .to_float32()
+                .unwrap()
+                .iter()
+                .all(|&x| x == 1025.)
+        );
     }
     #[test]
     fn slot_budget_uses_attached_auxiliary_inventory_without_reading_weights() {
@@ -503,7 +710,7 @@ mod tests {
             b.extend([row as u8; 16]);
         }
         std::fs::write(&path, b).unwrap();
-        let mut store = Store::open_with_packed_root(&path, Some(&dir)).unwrap();
+        let mut store = Store::open_fixture(&path, Some(&dir)).unwrap();
         store.slot_capacity = Some(2);
         let x = MxArray::from_float32(
             &(0..64).map(|n| (n as f32 - 32.) / 64.).collect::<Vec<_>>(),
@@ -542,6 +749,34 @@ mod tests {
         {
             let uploads = store.slot_upload_bytes;
             let (banks, local, count) = store.expert_slots(0, 5, 2, ids).unwrap().unwrap();
+            let (_, device_local) = store
+                .device_expert_slots(0, &MxArray::from_uint32(ids, &[2]).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(&*device_local.to_uint32().unwrap(), &local);
+            assert!(store.commit_device_routes(&[0], ids, 2).unwrap());
+            let absent = (0..5u32).find(|e| !ids.contains(e)).unwrap();
+            let old_ages = store.slots[&0].ages.clone();
+            let (_, missing) = store
+                .device_expert_slots(0, &MxArray::from_uint32(&[absent], &[1]).unwrap())
+                .unwrap()
+                .unwrap();
+            assert_eq!(&*missing.to_uint32().unwrap(), &[count as u32]);
+            let (_, safe, safe_count) = store
+                .prefill_device_expert_slots(
+                    0,
+                    &MxArray::from_uint32(&[ids[0], absent, ids[1]], &[3]).unwrap(),
+                )
+                .unwrap();
+            assert_eq!(safe_count, count);
+            assert_eq!(&*safe.to_uint32().unwrap(), &[local[0], 0, local[1]]);
+            assert!(
+                !store
+                    .commit_device_routes(&[0], &[ids[0], absent, ids[1]], 3)
+                    .unwrap()
+            );
+            assert!(!store.commit_device_routes(&[0], &[absent], 1).unwrap());
+            assert_eq!(store.slots[&0].ages, old_ages);
             let output = banks[0]
                 .gather_rows(
                     &x,
@@ -550,7 +785,14 @@ mod tests {
                     false,
                 )
                 .unwrap();
-            store.finish_expert_slots(0, &output).unwrap();
+            if n == 1 || n == 3 {
+                // Replaces earlier independent readers on a hit, then
+                // protects an asynchronously submitted result across a miss.
+                store.defer_expert_reduction(0, &output).unwrap();
+                assert_eq!(store.slots[&0].readers.len(), 1);
+            } else {
+                store.finish_expert_slots(0, &output).unwrap();
+            }
             if n == 1 || n == 4 {
                 assert_eq!(
                     store.slot_upload_bytes, uploads,

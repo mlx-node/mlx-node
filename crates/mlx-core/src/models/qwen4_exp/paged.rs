@@ -6,6 +6,7 @@ use crate::engine::backend::{PagedBackend, PagedPrefix};
 use crate::engine::hybrid_scheduler::{
     HybridSchedulerBackend, HybridStepExecutor, NoRestoreTicket,
 };
+use crate::models::qwen4_exp::runtime_flags;
 use crate::stream::Stream;
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::{Error, Result};
@@ -53,7 +54,7 @@ pub(super) fn write_rows(
 ) -> Result<()> {
     let keys = keys.astype(crate::array::DType::BFloat16)?;
     let values = values.astype(crate::array::DType::BFloat16)?;
-    let views = std::env::var("MLX_QWEN4_PAGED_VIEWS").as_deref() != Ok("0");
+    let views = !runtime_flags::is_zero(c"MLX_QWEN4_PAGED_VIEWS");
     let keys = if views { keys } else { keys.deep_copy()? };
     let values = if views { values } else { values.deep_copy()? };
     adapter
@@ -292,7 +293,7 @@ impl HybridSchedulerBackend for Inner {
     type StepExecutor<'a> = HybridStepExecutor<'a, Self>;
     const SCHEDULER_NAME: &'static str = "qwen4_exp";
     fn scheduler_wired_bytes(&self) -> Option<usize> {
-        if std::env::var("MLX_QWEN4_PREFILL_WIRED").as_deref() == Ok("0") {
+        if runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_WIRED") {
             return None;
         }
         let pages = self.decoder.paged.as_ref().map_or(Some(0), |p| {
@@ -457,7 +458,7 @@ impl HybridSchedulerBackend for Inner {
                 "Qwen4 scheduled batch exceeds owner capacity",
             ));
         }
-        if rows.len() > 1 && std::env::var("MLX_QWEN4_BATCH_DECODE").as_deref() != Ok("0") {
+        if rows.len() > 1 && !runtime_flags::is_zero(c"MLX_QWEN4_BATCH_DECODE") {
             return self.decode_shared_layers(rows);
         }
         let mut logits = Vec::with_capacity(rows.len());

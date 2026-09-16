@@ -11,15 +11,8 @@ The GGUF fixtures represent the same tensors with the GGUF layout transforms
 unquantized to isolate layout correctness. Separate native tests construct packed
 quantized banks with known codes and compare kernel outputs.
 
-From the repository root, using a Python environment with MLX and the matching
-mlx-vlm checkout installed:
-
-```bash
-python scripts/generate-qwen4-reference.py
-python scripts/generate-qwen4-reference.py --bf16
-python scripts/generate-qwen4-reference.py --bf16 --paged
-python scripts/generate-qwen4-auxiliary-reference.py
-```
-
-No real model is loaded by these generators. Keep the generated weights and
-oracles together; do not update expected outputs merely to make a failing test pass.
+The development-only generators are retained with the local research archive,
+not shipped as runtime tooling. Keep generated weights and oracles together;
+do not update expected outputs merely to make a failing test pass. See the
+[research report](../../../../../docs/research/qwen38-flash-next.md) for the
+archive location and validation scope.

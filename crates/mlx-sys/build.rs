@@ -2,6 +2,65 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Port the reference's bounded Metal residency sets without changing the MLX
+/// gitlink. Derived host files live in OUT_DIR; the narrow replacements fail
+/// loudly if a future MLX update changes their integration points.
+fn metal_residency_overlay(manifest: &Path, mlx: &Path) -> PathBuf {
+    let write_changed = |path: PathBuf, bytes: &[u8]| {
+        if std::fs::read(&path).ok().as_deref() != Some(bytes) {
+            std::fs::write(path, bytes).unwrap();
+        }
+    };
+    let root = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("metal-residency");
+    let output = root.join("mlx/backend/metal");
+    std::fs::create_dir_all(&output).unwrap();
+    let source = mlx.join("mlx/backend/metal");
+    let port = manifest.join("metal-residency");
+    let replace = |text: &mut String, from: &str, to: &str| {
+        assert_eq!(
+            text.matches(from).count(),
+            1,
+            "MLX residency integration drift: {from}"
+        );
+        *text = text.replacen(from, to, 1);
+    };
+    for name in ["resident.h", "resident.cpp", "overlay.cmake"] {
+        println!("cargo:rerun-if-changed={}", port.join(name).display());
+    }
+    for name in ["resident.h", "resident.cpp"] {
+        write_changed(output.join(name), &std::fs::read(port.join(name)).unwrap());
+    }
+    for name in ["device.h", "device.cpp"] {
+        println!("cargo:rerun-if-changed={}", source.join(name).display());
+        let mut text = std::fs::read_to_string(source.join(name)).unwrap();
+        if name == "device.h" {
+            replace(
+                &mut text,
+                "  Device& device_;",
+                "  Device& device_;\n  ResidencySet& residency_set_;\n  uint64_t sets_attached_{0};",
+            );
+        } else {
+            replace(
+                &mut text,
+                "    : device_(d) {",
+                "    : device_(d), residency_set_(residency_set) {",
+            );
+            replace(
+                &mut text,
+                "  if (residency_set.mtl_residency_set()) {\n    queue_->addResidencySet(residency_set.mtl_residency_set());\n  }",
+                "  residency_set_.attach_new_sets(queue_.get(), sets_attached_);",
+            );
+            replace(
+                &mut text,
+                "void CommandEncoder::commit(std::function<void()> completion) {",
+                "void CommandEncoder::commit(std::function<void()> completion) {\n  // Metal fixes residency at commit, including sets created after this queue.\n  residency_set_.attach_new_sets(queue_.get(), sets_attached_);",
+            );
+        }
+        write_changed(output.join(name), text.as_bytes());
+    }
+    root
+}
+
 fn metal_toolchain_available() -> bool {
     Command::new("xcrun")
         .args(["-sdk", "macosx", "metal", "-v"])
@@ -270,6 +329,17 @@ fn main() {
     };
 
     let mut cfg = cmake::Config::new(&mlx_dir);
+    let residency_overlay = build_metal.then(|| metal_residency_overlay(&manifest_dir, &mlx_dir));
+    if let Some(overlay) = &residency_overlay {
+        cfg.define("MLX_NODE_RESIDENCY_OVERLAY", overlay);
+        cfg.define(
+            "CMAKE_PROJECT_INCLUDE",
+            manifest_dir.join("metal-residency/overlay.cmake"),
+        );
+    } else {
+        // Clear a cached include if this build directory switches to CPU-only.
+        cfg.define("CMAKE_PROJECT_INCLUDE", "");
+    }
     cfg.define("MLX_BUILD_TESTS", "OFF")
         .define("MLX_BUILD_EXAMPLES", "OFF")
         .define("MLX_BUILD_BENCHMARKS", "OFF")
@@ -341,6 +411,24 @@ fn main() {
             "CXX",
             &[default_cxx_compiler.as_str(), "/usr/bin/clang++", "clang++"],
         );
+        // Rust links with -nodefaultlibs. Clang 21's availability checks use
+        // __isPlatformVersionAtLeast from compiler-rt, which the C++ driver
+        // normally supplies automatically. Carry that runtime explicitly so
+        // native tests and addons targeting older macOS versions both link.
+        if let Ok(runtime) = Command::new(&cxx_compiler)
+            .arg("-print-file-name=libclang_rt.osx.a")
+            .output()
+            && runtime.status.success()
+        {
+            let path = PathBuf::from(String::from_utf8_lossy(&runtime.stdout).trim());
+            if path.is_absolute() && path.is_file() {
+                println!(
+                    "cargo:rustc-link-search=native={}",
+                    path.parent().unwrap().display()
+                );
+                println!("cargo:rustc-link-lib=static=clang_rt.osx");
+            }
+        }
         let ar = resolve_build_tool("AR", &[default_ar.as_str(), "/usr/bin/ar", "ar"]);
         let ranlib = resolve_build_tool(
             "RANLIB",
@@ -531,6 +619,11 @@ fn main() {
     let include_generated = dst.join("include");
 
     let mut bridge = cc::Build::new();
+    if let Some(overlay) = &residency_overlay {
+        // Device contains ResidencySet by value: all bridge code must see the
+        // same class layout as libmlx, before the original vendor headers.
+        bridge.include(overlay);
+    }
     bridge
         .cpp(true)
         .warnings(false)

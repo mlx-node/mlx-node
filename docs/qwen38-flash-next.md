@@ -104,52 +104,20 @@ accepted per rendered conversation, with a 16-megapixel / 32-MiB input limit per
 image and bounded preprocessing. Use `releaseCacheOwner()` or `resetCaches()` to
 release idle owners. Audio, video, and image-bearing MTP are unsupported.
 
-## Validation and benchmarking
+## Validation and performance
 
 Small checked-in fixtures compare SafeTensors/GGUF and F32/BF16 outputs against
 mlx-vlm, including sparse selection, paged continuation, MTP frontiers and media
 positions. Tests also cover slot lifetimes, source corruption, bounded reads,
-dynamic admission, cancellation, and specialized quantized kernels. Fixture
-provenance and regeneration are in
-[`tests/fixtures/qwen4-exp/README.md`](../crates/mlx-core/tests/fixtures/qwen4-exp/README.md).
+dynamic admission, cancellation, and specialized quantized kernels. See the
+[fixture provenance](../crates/mlx-core/tests/fixtures/qwen4-exp/README.md).
 
-The last pre-cleanup matched benchmark on an M5 Max with 128 GiB measured
-**1,320.2 prefill tok/s and 21.39 decode tok/s** on a 1,024-token synthetic prompt
-with 128 generated tokens, greedy AR, and no prefix reuse. Automatic weight
-admission was 72 GiB / 454 expert slots; peak guarded footprint was 73.44 GiB.
-Three measured samples followed two warmups per variant. The previous path
-measured 1,292.8 prefill tok/s under the same protocol. All outputs matched.
-These measurements describe that build and workload, not a 1,500-tok/s result
-or a matched comparison with mlx.fast. A code-prompt comparison was too variable
-to establish a reliable speedup. Compact evidence is in
-[`qwen38-flash-next-performance.json`](research/qwen38-flash-next-performance.json).
+The [consolidated research report](research/qwen38-flash-next.md) records the
+mlx.fast source ports, exact and experimental arithmetic, workload/caching
+conditions, correctness checks, and measurements. Historical macOS 26 runs
+exceeded 90% of the published reference prefill rate with experimental arithmetic
+enabled; the current macOS 27 recheck does not establish that target, and decode
+remains below it. The checkpoints and prompts differ from the private reference.
 
-Run the public-API benchmark against one built addon at a time. It records exact
-prompt IDs, outputs, warmups, environment, memory admission and per-turn metrics.
-Compare runs only with matching inputs, output lengths and residency, and keep
-other models/compilers stopped. OS file cache, thermals and desktop load remain
-uncontrolled.
-
-```bash
-MODEL_GUARD_RSS_GIB=88 MODEL_GUARD_OTHER_FOOTPRINT_GIB=8 \
-MODEL_GUARD_REQUIRE_EVENT=passed QWEN4_BENCH_INPUT_TOKENS=1024 \
-python3 scripts/guard-model-memory.py .cache/qwen4-benchmark.log \
-  oxnode scripts/benchmark-qwen4.ts /models/first-split.gguf .cache/qwen4-benchmark.json
-```
-
-The guard monitors its process group's RSS, macOS physical footprint, memory
-pressure and timeout, and stops only that group. Choose a ceiling appropriate to
-the device and admitted budget; 88 GiB is the example for this 128-GiB machine.
-
-For the optional full-checkpoint text, MTP, streaming, cancellation and image smoke:
-
-```bash
-MODEL_GUARD_RSS_GIB=48 MODEL_GUARD_REQUIRE_EVENT=passed \
-MLX_QWEN4_WEIGHT_CACHE_GIB=32 MLX_QWEN4_PREFILL_CHUNK=512 \
-python3 scripts/guard-model-memory.py .cache/qwen4-complete.log \
-  oxnode scripts/test-qwen4-complete.ts /models/first-split.gguf /models/original-hf
-```
-
-Use `QWEN4_SMOKE_MODE=basic` for two text turns without auxiliary weights.
 Full BF16 generation and real-model contexts beyond the 2,048-token sparse
 threshold remain unvalidated; the small fixtures exercise sparse boundaries.

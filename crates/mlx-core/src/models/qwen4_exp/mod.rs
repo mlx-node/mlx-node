@@ -10,6 +10,7 @@ mod mtp;
 mod packed_cache;
 mod paged;
 mod route_plan;
+mod runtime_flags;
 mod weights;
 
 const MAX_PREFILL_CHUNK: usize = 1024;
@@ -411,7 +412,7 @@ impl Qwen4ExpModel {
     }
     #[napi]
     pub fn max_concurrent_sequences(&self) -> u32 {
-        crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(4) as u32
+        scheduler_capacity()
     }
     #[napi]
     pub fn context_limits(&self) -> Qwen4ExpContextLimits {
@@ -435,6 +436,14 @@ crate::models::chat_napi::chat_napi_surface! {
     ts_stream_start: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
     ts_stream_continue: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
     ts_stream_continue_tool: "messages: ChatMessage[], config: ChatConfig | null, callback: (err: Error | null, chunk: ChatStreamChunk) => void",
+}
+
+fn scheduler_capacity() -> u32 {
+    if crate::engine::hybrid_scheduler::HybridSchedulerState::<Inner>::force_serial() {
+        1
+    } else {
+        crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for(4) as u32
+    }
 }
 
 #[cfg(test)]

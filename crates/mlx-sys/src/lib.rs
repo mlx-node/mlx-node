@@ -288,6 +288,8 @@ unsafe extern "C-unwind" {
         has_axis: bool,
     ) -> *mut mlx_array;
     pub fn mlx_array_eval(handle: *mut mlx_array);
+    /// Read readiness without evaluating or scheduling the array.
+    pub fn mlx_array_is_available(handle: *mut mlx_array) -> bool;
     pub fn mlx_async_eval(handles: *mut *mut mlx_array, count: usize);
     pub fn mlx_eval(handles: *mut *mut mlx_array, count: usize) -> bool;
     pub fn mlx_eval_with_error(
@@ -1974,6 +1976,13 @@ pub type LayerFunctionPtr = extern "C-unwind" fn(
 ) -> usize;
 
 unsafe extern "C" {
+    /// Forward-local runtime settings. Begin/end must run on the same thread.
+    pub fn mlx_qwen4_flags_begin();
+    pub fn mlx_qwen4_flags_end();
+    pub fn mlx_qwen4_flag_equals(
+        name: *const std::os::raw::c_char,
+        value: *const std::os::raw::c_char,
+    ) -> bool;
     /// Exclusive mutable expert-slot transaction. The caller must evaluate all
     /// lazy readers of destination banks before recycling slots.
     pub fn mlx_qwen4_copy_weight_rows(
@@ -1996,6 +2005,20 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+    pub fn mlx_qwen4_singleton_routes(
+        logits: *mut mlx_array,
+        ids: *mut *mut mlx_array,
+        scores: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_prefill_ple_conv(
+        full: *mut mlx_array,
+        weight: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_prefill_routes(
+        logits: *mut mlx_array,
+        ids: *mut *mut mlx_array,
+        scores: *mut *mut mlx_array,
+    ) -> bool;
     pub fn mlx_qwen4_route_sort(
         ids: *mut mlx_array,
         experts: i32,
@@ -2006,6 +2029,16 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+    pub fn mlx_qwen4_gdn_prepare(
+        qkv: *mut mlx_array,
+        a: *mut mlx_array,
+        b: *mut mlx_array,
+        conv: *mut mlx_array,
+        history: *mut mlx_array,
+        scale: *mut mlx_array,
+        dt: *mut mlx_array,
+        outputs: *mut *mut mlx_array,
+    ) -> bool;
     pub fn mlx_qwen4_window_conv(
         x: *mut mlx_array,
         history: *mut mlx_array,
@@ -2018,6 +2051,42 @@ unsafe extern "C" {
         z: *mut mlx_array,
         norm: *mut mlx_array,
         eps: f64,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_prefill_norm(x: *mut mlx_array, w: *mut mlx_array, eps: f64)
+    -> *mut mlx_array;
+    pub fn mlx_qwen4_rotary_window(
+        x: *mut mlx_array,
+        cosine: *mut mlx_array,
+        sine: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_attention_norm_rotary(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        cosine: *mut mlx_array,
+        sine: *mut mlx_array,
+        eps: f64,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_decode_norm(x: *mut mlx_array, w: *mut mlx_array, eps: f64) -> *mut mlx_array;
+    pub fn mlx_qwen4_inject_norm(
+        x: *mut mlx_array,
+        branch: *mut mlx_array,
+        gate: *mut mlx_array,
+        weight: *mut mlx_array,
+        eps: f64,
+        stream: *mut *mut mlx_array,
+        normed: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_decode_mixer_act(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_shared_prefill(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
     ) -> *mut mlx_array;
     pub fn mlx_qwen4_norm(
         x: *mut mlx_array,
@@ -2085,6 +2154,44 @@ unsafe extern "C" {
         scales: *mut mlx_array,
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
+    pub fn mlx_qwen4_dense_decode(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_prefill_mixer_act(
+        input: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_prefill_hc_mix(up: *mut mlx_array, normed: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_qwen4_hyper_up(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        normed: *mut mlx_array,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_hyper_up_inject(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        normed: *mut mlx_array,
+        injection: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        out_gate: *mut *mut mlx_array,
+    ) -> bool;
+    pub fn mlx_qwen4_sorted_shared_combine(
+        values: *mut mlx_array,
+        scores: *mut mlx_array,
+        inverse: *mut mlx_array,
+        shared: *mut mlx_array,
+        gate: *mut mlx_array,
+        top: i32,
+    ) -> *mut mlx_array;
 
     pub fn mlx_qwen4_expert_prefill(
         x: *mut mlx_array,
@@ -2107,6 +2214,10 @@ unsafe extern "C" {
         experts: i32,
         group: i32,
         bits: i32,
+    ) -> *mut mlx_array;
+    pub fn mlx_qwen4_routed_shared_experts(
+        inputs: *const *mut mlx_array,
+        count: usize,
     ) -> *mut mlx_array;
     pub fn mlx_qwen4_routed_experts(
         x: *mut mlx_array,

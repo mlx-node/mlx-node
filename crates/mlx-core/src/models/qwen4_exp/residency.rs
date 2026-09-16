@@ -2,6 +2,7 @@
 //! assemble fixed projections while experts, PLE/token rows and optional
 //! vision/MTP remain demand loaded. All source reads stay bounded.
 use super::*;
+use crate::models::qwen4_exp::runtime_flags;
 
 pub(super) fn is_auxiliary(name: &str) -> bool {
     ["mtp.", "visual.", "vision_tower.", "v.", "mm.", "nextn."]
@@ -32,7 +33,7 @@ impl Tensor {
     fn dense_projection_cache_bytes(&self, name: &str) -> Result<u64> {
         let f32 = matches!(&self.encoding, Encoding::Safe(t) if t == "F32")
             || matches!(self.encoding, Encoding::Gguf(GgufTensorType::F32));
-        if std::env::var("MLX_QWEN4_DENSE_BF16_CACHE").as_deref() == Ok("0")
+        if runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BF16_CACHE")
             || !f32
             || !is_fixed_projection(name, self)
             || name.contains("conv1d")
@@ -245,7 +246,23 @@ impl Store {
     }
 
     pub(in super::super) fn prepare_hot(&mut self) -> Result<()> {
-        self.prepare_hot_with_admission(&mut super::super::memory::admit)?;
+        self.prepare_hot_with_policy(
+            &mut super::super::memory::admit,
+            &mut super::super::memory::refresh_plan,
+        )
+    }
+
+    #[cfg(test)]
+    pub(in super::super) fn prepare_fixture_hot(&mut self) -> Result<()> {
+        self.prepare_hot_with_policy(&mut |_| Ok(()), &mut |_| Ok(()))
+    }
+
+    fn prepare_hot_with_policy(
+        &mut self,
+        admit: &mut impl FnMut(u64) -> Result<()>,
+        refresh: &mut impl FnMut(&mut super::super::memory::Plan) -> Result<()>,
+    ) -> Result<()> {
+        self.prepare_hot_with_admission(admit, refresh)?;
         self.plan.resident_expert_layers = self
             .tensors
             .keys()
@@ -276,6 +293,7 @@ impl Store {
     fn prepare_hot_with_admission(
         &mut self,
         admit: &mut impl FnMut(u64) -> Result<()>,
+        refresh: &mut impl FnMut(&mut super::super::memory::Plan) -> Result<()>,
     ) -> Result<()> {
         if !self.banks.is_empty() {
             return Ok(());
@@ -288,15 +306,14 @@ impl Store {
         // Pool creation happens after metadata bootstrap and is invisible to
         // MLX allocation counters. Reconcile against live headroom before IO.
         if self.cache_bytes == 0 && self.plan.available_bytes.is_some() {
-            super::super::memory::refresh_plan(&mut self.plan)?;
+            refresh(&mut self.plan)?;
             self.cache_limit = self.plan.budget;
         }
         let names = if self.plan.resident {
             let mut names: Vec<_> = self.tensors.keys().filter(|n| is_hot(n)).cloned().collect();
             names.sort();
             names
-        } else if self.plan.policy != "stream"
-            && std::env::var("MLX_QWEN4_DENSE_BANKS").as_deref() != Ok("0")
+        } else if self.plan.policy != "stream" && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BANKS")
         {
             self.projection_bank_names()?
         } else {
@@ -333,11 +350,11 @@ impl Store {
                 "Qwen4 full residency cannot preserve first-request headroom",
             ));
         }
-        super::super::memory::refresh_plan(&mut self.plan)?;
+        refresh(&mut self.plan)?;
         self.cache_limit = self.plan.budget;
         self.plan.resident = false;
         self.slot_capacity = None;
-        let names = if std::env::var("MLX_QWEN4_DENSE_BANKS").as_deref() == Ok("0") {
+        let names = if runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BANKS") {
             Vec::new()
         } else {
             self.projection_bank_names()?
@@ -458,7 +475,8 @@ impl Store {
 impl Store {
     /// Share one packed projection for small windows when layouts agree.
     /// Original bank entries become views into that allocation, so persistent
-    /// weight bytes do not grow. Wide GEMMs keep their original output shapes.
+    /// weight bytes do not grow. The reference's shared-expert prefill port
+    /// joins only the two 640-row projections with unchanged NAX column tiles.
     pub(in super::super) fn linear_pair(
         &mut self,
         x: &MxArray,
@@ -467,7 +485,56 @@ impl Store {
     ) -> Result<(MxArray, MxArray)> {
         let shape = x.shape()?;
         let rows = x.size()? / *shape.last().unwrap() as u64;
-        if rows <= 8 && std::env::var("MLX_QWEN4_PAIRED_PROJECTIONS").as_deref() != Ok("0") {
+        // mlxfast TrackFastModel.moeForwardShared, MLXFAST-SHAREDFUSE.
+        // N=640 and N=1280 both use one K partition for these windows. Each
+        // 64-column NAX tile retains its inputs and accumulation order.
+        let wide_shared = if (512..=1024).contains(&rows)
+            && shape.last() == Some(&2560)
+            && x.dtype()? == DType::BFloat16
+            && first.ends_with(".ffn_gate_shexp.weight")
+            && second.ends_with(".ffn_up_shexp.weight")
+            && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_SHARED_PAIR")
+            && !runtime_flags::is_zero(c"MLX_ENABLE_TF32")
+            && unsafe { mlx_sys::mlx_metal_is_nax_available() }
+        {
+            let eligible = |w: &Weight| -> Result<bool> {
+                Ok(w.mode == "affine"
+                    && w.bits == 8
+                    && w.group == 32
+                    && w.values.dtype()? == DType::Uint32
+                    && *w.values.shape()? == [640, 640]
+                    && w.scales.as_ref().is_some_and(|s| {
+                        s.dtype().ok() == Some(DType::Float16)
+                            && s.shape().is_ok_and(|shape| *shape == [640, 80])
+                    })
+                    && w.biases.as_ref().is_some_and(|b| {
+                        b.dtype().ok() == Some(DType::Float16)
+                            && b.shape().is_ok_and(|shape| *shape == [640, 80])
+                    }))
+            };
+            match (self.banks.get(first), self.banks.get(second)) {
+                (Some(a), Some(b)) => eligible(a)? && eligible(b)?,
+                _ => false,
+            }
+        } else {
+            false
+        };
+        // The reference groups QKV/Z/B/A projections. Here A/B are F32
+        // source matrices with cached BF16 compute weights, unlike Q8 QKV/Z.
+        let gate_pair =
+            first.ends_with(".ssm_alpha.weight") && second.ends_with(".ssm_beta.weight");
+        let dense_gates = gate_pair
+            && rows == 1
+            && x.dtype()? == DType::BFloat16
+            && shape.last() == Some(&2560)
+            && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_PAIR");
+        // A wider N changes MLX's matrix-multiply schedule for short windows.
+        // This must precede the paired-bank cache lookup: a bank prepared by
+        // singleton decoding must not opt a later verification window in.
+        if gate_pair && !dense_gates {
+            return Ok((self.linear(first, x)?, self.linear(second, x)?));
+        }
+        if (rows <= 8 || wide_shared) && !runtime_flags::is_zero(c"MLX_QWEN4_PAIRED_PROJECTIONS") {
             let key = (first.to_owned(), second.to_owned());
             if !self.paired_banks.contains_key(&key)
                 && let (Some(a), Some(b)) = (
@@ -475,14 +542,27 @@ impl Store {
                     self.banks.get(second).cloned(),
                 )
             {
-                let compatible = a.scales.is_some()
-                    && b.scales.is_some()
+                let storage_compatible = match (&a.scales, &b.scales) {
+                    (Some(a), Some(b)) => a.dtype()? == b.dtype()?,
+                    (None, None) => {
+                        dense_gates
+                            && a.values.dtype()? == DType::Float32
+                            && b.values.dtype()? == DType::Float32
+                            && *a.values.shape()? == [48, 2560]
+                            && *b.values.shape()? == [48, 2560]
+                            && a.dense_bf16.is_some()
+                            && b.dense_bf16.is_some()
+                            && a.biases.is_none()
+                            && b.biases.is_none()
+                    }
+                    _ => false,
+                };
+                let compatible = storage_compatible
                     && a.mode == b.mode
                     && a.bits == b.bits
                     && a.group == b.group
                     && a.values.shape()?[1] == b.values.shape()?[1]
                     && a.values.dtype()? == b.values.dtype()?
-                    && a.scales.as_ref().unwrap().dtype()? == b.scales.as_ref().unwrap().dtype()?
                     && a.biases.is_some() == b.biases.is_some();
                 let bytes = a.bytes()? + b.bytes()?;
                 if compatible && bytes <= MAX_READ_BYTES * 3 {
@@ -494,6 +574,7 @@ impl Store {
                     let joined = Arc::new(Weight::concatenate_rows(&[a.clone(), b.clone()])?);
                     let arrays: Vec<_> = [
                         Some(&joined.values),
+                        joined.dense_bf16.as_ref(),
                         joined.scales.as_ref(),
                         joined.biases.as_ref(),
                     ]
@@ -545,7 +626,7 @@ impl Weight {
             // The generic fast path uses a different accumulation for K%512=0.
             && x.shape()?.last().is_some_and(|k| k % 512 != 0)
             && crate::engine::persistence::compiled_forward_backend_available()
-            && std::env::var("MLX_QWEN4_AFFINE_GEMV").as_deref() != Ok("0")
+            && !runtime_flags::is_zero(c"MLX_QWEN4_AFFINE_GEMV")
         {
             let out = unsafe {
                 mlx_sys::mlx_qwen4_affine_expert_gemv(
@@ -565,7 +646,7 @@ impl Weight {
             && ids.size()? <= 80
             && let (Some(scales), Some(biases)) = (&self.scales, &self.biases)
             && crate::engine::persistence::compiled_forward_backend_available()
-            && std::env::var("MLX_QWEN4_DIRECT_GEMV").as_deref() != Ok("0")
+            && !runtime_flags::is_zero(c"MLX_QWEN4_DIRECT_GEMV")
         {
             let mode = std::ffi::CString::new(self.mode.as_str()).map_err(err)?;
             let out = unsafe {
@@ -742,6 +823,120 @@ mod tests {
     }
 
     #[test]
+    fn dense_gate_pair_preserves_projection_rows_and_cache_bytes() {
+        for phase in (0..16).map(|i| 0.3 + i as f32 * 0.7) {
+            let make = |shift: f32| {
+                let values = MxArray::from_float32(
+                    &(0..48 * 2560)
+                        .map(|i| (i as f32 * 0.131 + shift).sin() * 0.27)
+                        .collect::<Vec<_>>(),
+                    &[48, 2560],
+                )
+                .unwrap();
+                Weight {
+                    dense_bf16: Some(values.astype(DType::BFloat16).unwrap()),
+                    values,
+                    scales: None,
+                    biases: None,
+                    group: 0,
+                    bits: 0,
+                    mode: String::new(),
+                }
+            };
+            let a = Arc::new(make(phase));
+            let b = Arc::new(make(phase + 0.7));
+            let joined = Weight::concatenate_rows(&[a.clone(), b.clone()]).unwrap();
+            assert_eq!(
+                joined.bytes().unwrap(),
+                a.bytes().unwrap() + b.bytes().unwrap()
+            );
+            for rows in [1] {
+                let x = MxArray::from_float32(
+                    &(0..rows * 2560)
+                        .map(|i| (i as f32 * 0.017 + phase).cos())
+                        .collect::<Vec<_>>(),
+                    &[1, rows, 2560],
+                )
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+                let want = MxArray::concatenate_many(
+                    vec![&a.linear(&x).unwrap(), &b.linear(&x).unwrap()],
+                    Some(-1),
+                )
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+                let got = joined.linear(&x).unwrap();
+                assert_eq!(got.dtype().unwrap(), DType::BFloat16);
+                assert_eq!(
+                    got.to_float32().unwrap().to_vec(),
+                    want,
+                    "phase={phase} rows={rows}"
+                );
+                for (start, original) in [(0, &a), (48, &b)] {
+                    let view = joined.slice_rows(start, 48).unwrap();
+                    assert_eq!(
+                        view.linear(&x).unwrap().to_float32().unwrap().to_vec(),
+                        original.linear(&x).unwrap().to_float32().unwrap().to_vec()
+                    );
+                    assert_eq!(
+                        view.values.to_float32().unwrap().to_vec(),
+                        original.values.to_float32().unwrap().to_vec()
+                    );
+                }
+            }
+            // Reproduce the actual cache state after a singleton projection.
+            // Short verification windows must use the two original N=48
+            // matmuls even though the joined N=96 bank is already cached.
+            let mut store = Store::open_metadata(&fixture().join("model.gguf"), None).unwrap();
+            let first = "blk.0.ssm_alpha.weight";
+            let second = "blk.0.ssm_beta.weight";
+            for (name, start) in [(first, 0), (second, 48)] {
+                store
+                    .banks
+                    .insert(name.into(), Arc::new(joined.slice_rows(start, 48).unwrap()));
+                store.tensors.insert(
+                    name.into(),
+                    Tensor {
+                        // Cached banks satisfy every read; no tensor payload is opened.
+                        path: PathBuf::new(),
+                        shape: vec![48, 2560],
+                        offset: 0,
+                        bytes: 48 * 2560 * 4,
+                        encoding: Encoding::Gguf(GgufTensorType::F32),
+                    },
+                );
+            }
+            store
+                .paired_banks
+                .insert((first.into(), second.into()), Arc::new(joined));
+            for rows in [2, 8, 16] {
+                let x = MxArray::from_float32(
+                    &(0..rows * 2560)
+                        .map(|i| (i as f32 * 0.017 + phase).cos())
+                        .collect::<Vec<_>>(),
+                    &[1, rows, 2560],
+                )
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+                let (ga, gb) = store.linear_pair(&x, first, second).unwrap();
+                for (want, got) in [(&a, &ga), (&b, &gb)] {
+                    let want = want.linear(&x).unwrap().to_float32().unwrap().to_vec();
+                    let got = got.to_float32().unwrap().to_vec();
+                    let differences = want.iter().zip(&got).filter(|(a, b)| a != b).count();
+                    assert_eq!(
+                        differences, 0,
+                        "cached pair fallback phase={phase} rows={rows}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn failed_full_load_releases_banks_before_partial_retry() {
         for policy in ["auto", "full"] {
             let mut store = Store::open_metadata(&fixture().join("model.gguf"), None).unwrap();
@@ -749,17 +944,26 @@ mod tests {
             store.plan.resident = true;
             store.plan.policy = policy.into();
             let mut refused = false;
-            let result = store.prepare_hot_with_admission(&mut |bytes| {
-                // Simulate headroom loss only after the full bank set is
-                // complete. No large allocation or OS settings change needed.
-                if bytes == super::super::super::memory::WORKING_BYTES && !refused {
-                    refused = true;
-                    Err(err("simulated post-load headroom loss"))
-                } else {
+            let mut refreshed = false;
+            let result = store.prepare_hot_with_admission(
+                &mut |bytes| {
+                    // Simulate headroom loss only after the full bank set is
+                    // complete. No large allocation or OS settings change needed.
+                    if bytes == super::super::super::memory::WORKING_BYTES && !refused {
+                        refused = true;
+                        Err(err("simulated post-load headroom loss"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                &mut |plan| {
+                    refreshed = true;
+                    plan.budget = 1 << 30;
                     Ok(())
-                }
-            });
+                },
+            );
             assert!(refused);
+            assert_eq!(refreshed, policy == "auto");
             if policy == "full" {
                 assert!(result.is_err());
                 assert!(store.banks.is_empty());
@@ -811,7 +1015,7 @@ mod tests {
             // requesting tens of GiB from the machine running these tests.
             s.cache_limit = CACHE_BYTES;
             s.plan.policy = "auto".into();
-            s.prepare_hot().unwrap();
+            s.prepare_fixture_hot().unwrap();
             assert!(!s.plan.resident);
             assert_eq!(s.bank_bytes, bytes);
             assert_eq!(s.cache_bytes, bytes);
@@ -868,7 +1072,7 @@ mod tests {
             s.plan.resident = true;
             let hot = s.hot_bytes().unwrap();
             assert_eq!(s.bytes_read, 0);
-            s.prepare_hot().unwrap();
+            s.prepare_fixture_hot().unwrap();
             assert_eq!(s.cache_bytes, hot);
             assert!(s.cache.is_empty());
             assert!(s.banks.keys().all(|name| is_hot(name)));
@@ -918,7 +1122,7 @@ mod tests {
         d.shape = vec![1 << 30, 1];
         d.bytes = 4 << 30;
         assert!(
-            s.prepare_hot()
+            s.prepare_fixture_hot()
                 .unwrap_err()
                 .to_string()
                 .contains("1 GiB bank budget")

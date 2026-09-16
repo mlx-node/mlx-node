@@ -1,4 +1,5 @@
 use crate::array::{DType, MxArray};
+use crate::models::qwen4_exp::runtime_flags;
 use crate::nn::Activations;
 use napi::{Error, Result};
 
@@ -11,9 +12,9 @@ pub(super) fn routed_experts(
     banks: &[std::sync::Arc<super::weights::Weight>; 3],
 ) -> Result<Option<MxArray>> {
     let shape = x.shape()?;
-    if std::env::var("MLX_QWEN4_FUSED_EXPERTS").as_deref() == Ok("0")
-        || std::env::var("MLX_QWEN4_DIRECT_GEMV").as_deref() == Ok("0")
-        || std::env::var("MLX_QWEN4_AFFINE_GEMV").as_deref() == Ok("0")
+    if runtime_flags::is_zero(c"MLX_QWEN4_FUSED_EXPERTS")
+        || runtime_flags::is_zero(c"MLX_QWEN4_DIRECT_GEMV")
+        || runtime_flags::is_zero(c"MLX_QWEN4_AFFINE_GEMV")
         || !crate::engine::persistence::compiled_forward_backend_available()
         || x.dtype()? != DType::BFloat16
         || shape.first() != Some(&1)
@@ -59,6 +60,58 @@ pub(super) fn routed_experts(
     }
 }
 
+/// The shared Q8 branch joins the two routed kernels without changing either
+/// branch's GEMV accumulation, activation rounding or final addition order.
+pub(super) fn routed_shared_experts(
+    x: &MxArray,
+    ids: &MxArray,
+    scores: &MxArray,
+    banks: &[std::sync::Arc<super::weights::Weight>; 3],
+    shared: &[std::sync::Arc<super::weights::Weight>; 3],
+    shared_gate: &MxArray,
+) -> Result<Option<MxArray>> {
+    if !crate::engine::persistence::compiled_forward_backend_available()
+        || *x.shape()? != [1, 1, 2560]
+        || x.dtype()? != DType::BFloat16
+        || *shared_gate.shape()? != [1, 1, 1]
+        || shared_gate.dtype()? != DType::BFloat16
+        || runtime_flags::is_zero(c"MLX_QWEN4_FUSED_EXPERTS")
+        || runtime_flags::is_zero(c"MLX_QWEN4_DIRECT_GEMV")
+        || runtime_flags::is_zero(c"MLX_QWEN4_AFFINE_GEMV")
+        || !matches!(banks[0].mode.as_str(), "q4k" | "q5k")
+        || banks[0].mode != banks[1].mode
+        || banks[0].bits != banks[1].bits
+        || banks[2].mode != "affine"
+        || !matches!(banks[2].bits, 5 | 8)
+        || shared.iter().any(|w| w.mode != "affine" || w.bits != 8)
+        || banks
+            .iter()
+            .chain(shared)
+            .any(|w| w.group != 32 || w.scales.is_none() || w.biases.is_none())
+    {
+        return Ok(None);
+    }
+    let ids = ids.reshape(&[-1])?;
+    let mut inputs = vec![x.as_raw_ptr(), ids.as_raw_ptr(), scores.as_raw_ptr()];
+    for bank in banks.iter().chain(shared) {
+        inputs.extend([
+            bank.values.as_raw_ptr(),
+            bank.scales.as_ref().unwrap().as_raw_ptr(),
+            bank.biases.as_ref().unwrap().as_raw_ptr(),
+        ]);
+    }
+    inputs.push(shared_gate.as_raw_ptr());
+    let raw = unsafe { mlx_sys::mlx_qwen4_routed_shared_experts(inputs.as_ptr(), inputs.len()) };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    if runtime_flags::is_one(c"MLX_QWEN4_TRACE_SHARED_EXPERTS") {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| eprintln!("QWEN4_SHARED_EXPERTS singleton mixed K-quant/Q8 path"));
+    }
+    MxArray::from_handle(raw, "Qwen4 fused routed/shared experts").map(Some)
+}
+
 /// Wide sorted assignments read the original token matrix. Every bank and row
 /// map remains an explicit graph input, including mutable partial-residency banks.
 pub(super) fn prefill_indirect(
@@ -101,7 +154,7 @@ pub(super) fn prefill_indirect(
     if raw.is_null() {
         Ok(None)
     } else {
-        if std::env::var("MLX_QWEN4_TRACE_PREFILL_INDIRECT").as_deref() == Ok("1") {
+        if runtime_flags::is_one(c"MLX_QWEN4_TRACE_PREFILL_INDIRECT") {
             static TRACE: std::sync::Once = std::sync::Once::new();
             TRACE.call_once(|| {
                 eprintln!(
@@ -137,7 +190,7 @@ pub(super) fn combine_expert_rows(
     if let Some(inverse) = inverse
         && tokens > 8
         && crate::engine::persistence::compiled_forward_backend_available()
-        && std::env::var("MLX_QWEN4_SORTED_COMBINE").as_deref() != Ok("0")
+        && !runtime_flags::is_zero(c"MLX_QWEN4_SORTED_COMBINE")
     {
         let raw = unsafe {
             mlx_sys::mlx_qwen4_sorted_combine(
@@ -159,6 +212,39 @@ pub(super) fn combine_expert_rows(
         .reshape(&[1, tokens, top as i64, shape[1]])?
         .mul(&scores.reshape(&[1, tokens, top as i64, 1])?)?
         .sum(Some(&[2]), Some(false))
+}
+
+pub(super) fn combine_shared_expert_rows(
+    values: &MxArray,
+    scores: &MxArray,
+    inverse: &MxArray,
+    shared: &MxArray,
+    gate: &MxArray,
+    top: usize,
+) -> Result<MxArray> {
+    let raw = if crate::engine::persistence::compiled_forward_backend_available()
+        && !runtime_flags::is_zero(c"MLX_QWEN4_SORTED_COMBINE")
+        && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
+    {
+        unsafe {
+            mlx_sys::mlx_qwen4_sorted_shared_combine(
+                values.as_raw_ptr(),
+                scores.as_raw_ptr(),
+                inverse.as_raw_ptr(),
+                shared.as_raw_ptr(),
+                gate.as_raw_ptr(),
+                top as i32,
+            )
+        }
+    } else {
+        std::ptr::null_mut()
+    };
+    if !raw.is_null() {
+        return MxArray::from_handle(raw, "Qwen4 sorted routed and shared experts");
+    }
+    combine_expert_rows(values, scores, Some(inverse), top)?
+        .astype(shared.dtype()?)?
+        .add(&sigmoid_mul(gate, shared)?)
 }
 
 /// A complete singleton GGUF GDN graph. Histories are explicit inputs and fresh
@@ -225,7 +311,7 @@ pub(super) fn recurrent_step(
     if kd >= 32
         && kd % 32 == 0
         && crate::engine::persistence::compiled_forward_backend_available()
-        && std::env::var("MLX_QWEN4_FUSED_GDN").as_deref() != Ok("0")
+        && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_GDN")
     {
         let q = q.reshape(&[1, 1, shape[1], kd])?;
         let k = k.reshape(&[1, 1, shape[1], kd])?;
@@ -299,7 +385,7 @@ pub(super) fn recurrent_sequence(
     if kd >= 32
         && kd % 32 == 0
         && crate::engine::persistence::compiled_forward_backend_available()
-        && std::env::var("MLX_QWEN4_FUSED_GDN").as_deref() != Ok("0")
+        && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_GDN")
     {
         let mut out = std::ptr::null_mut();
         let mut next = std::ptr::null_mut();
@@ -348,6 +434,50 @@ pub(super) fn recurrent_sequence(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gdn_prepare(
+    qkv: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    conv: &MxArray,
+    state: &mut Option<MxArray>,
+    scale: &MxArray,
+    dt: &MxArray,
+) -> Result<Option<[MxArray; 5]>> {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return Ok(None);
+    }
+    let old = match state {
+        Some(s) => s.clone(),
+        None => MxArray::zeros(&[3, 10240], Some(DType::BFloat16))?,
+    };
+    let mut outputs = [std::ptr::null_mut(); 6];
+    if !unsafe {
+        mlx_sys::mlx_qwen4_gdn_prepare(
+            qkv.as_raw_ptr(),
+            a.as_raw_ptr(),
+            b.as_raw_ptr(),
+            conv.as_raw_ptr(),
+            old.as_raw_ptr(),
+            scale.as_raw_ptr(),
+            dt.as_raw_ptr(),
+            outputs.as_mut_ptr(),
+        )
+    } {
+        return Ok(None);
+    }
+    let [q, k, v, decay, beta, history] = outputs;
+    let values = [
+        MxArray::from_handle(q, "GDN prepared Q")?,
+        MxArray::from_handle(k, "GDN prepared K")?,
+        MxArray::from_handle(v, "GDN prepared V")?,
+        MxArray::from_handle(decay, "GDN prepared decay")?,
+        MxArray::from_handle(beta, "GDN prepared beta")?,
+    ];
+    *state = Some(MxArray::from_handle(history, "GDN prepared history")?);
+    Ok(Some(values))
+}
+
 pub(super) fn conv_sequence(
     x: &MxArray,
     weight: &MxArray,
@@ -358,7 +488,7 @@ pub(super) fn conv_sequence(
         && x.dtype()? == DType::BFloat16
         && weight.dtype()? == DType::Float32
         && crate::engine::persistence::compiled_forward_backend_available()
-        && std::env::var("MLX_QWEN4_WINDOW_CONV").as_deref() != Ok("0")
+        && !runtime_flags::is_zero(c"MLX_QWEN4_WINDOW_CONV")
     {
         let old = match state {
             Some(s) => s.clone(),
@@ -445,7 +575,7 @@ pub(super) fn gdn_epilogue(
 }
 
 pub fn norm(x: &MxArray, w: &MxArray, group: usize, eps: f64, centered: bool) -> Result<MxArray> {
-    if std::env::var("MLX_QWEN4_FUSED_POINTWISE").as_deref() != Ok("0")
+    if !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
         && crate::engine::persistence::compiled_forward_backend_available()
     {
         let out = unsafe {
@@ -561,6 +691,31 @@ impl RotaryWindowCache {
         self.0.clear();
     }
 
+    /// Reuse the same forward's tables for singleton attention and indexer
+    /// heads. The original shape can be [H,D] or [1,H,1,D].
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_singleton(
+        &mut self,
+        x: &MxArray,
+        position: [i64; 3],
+        dims: usize,
+        theta: f64,
+        sections: [usize; 3],
+        interleaved: bool,
+    ) -> Result<MxArray> {
+        let shape = x.shape()?;
+        let width = *shape.last().unwrap();
+        self.apply(
+            &x.reshape(&[1, -1, 1, width])?,
+            vec![position],
+            dims,
+            theta,
+            sections,
+            interleaved,
+        )?
+        .reshape(&shape)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn apply(
         &mut self,
@@ -579,23 +734,51 @@ impl RotaryWindowCache {
             interleaved,
             dtype: x.dtype()?,
         };
+        let (cos, sin) = self.tables(key)?;
+        apply_rotary_window(x, dims, &cos, &sin)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn apply_normalized(
+        &mut self,
+        x: &MxArray,
+        weight: &MxArray,
+        positions: Vec<[i64; 3]>,
+        dims: usize,
+        theta: f64,
+        sections: [usize; 3],
+        interleaved: bool,
+        eps: f64,
+    ) -> Result<Option<MxArray>> {
+        let key = RotaryKey {
+            positions,
+            dims,
+            theta: theta.to_bits(),
+            sections,
+            interleaved,
+            dtype: x.dtype()?,
+        };
+        let (cos, sin) = self.tables(key)?;
+        fused_attention_norm_rotary(x, weight, &cos, &sin, eps)
+    }
+
+    fn tables(&mut self, key: RotaryKey) -> Result<(MxArray, MxArray)> {
         if let Some((_, cos, sin)) = self.0.iter().find(|(old, _, _)| *old == key) {
-            return apply_rotary_window(x, dims, cos, sin);
+            return Ok((cos.clone(), sin.clone()));
         }
         let (cos, sin) = rotary_tables(
             &key.positions,
-            dims,
-            theta,
-            sections,
-            interleaved,
+            key.dims,
+            f64::from_bits(key.theta),
+            key.sections,
+            key.interleaved,
             key.dtype,
         )?;
-        let out = apply_rotary_window(x, dims, &cos, &sin)?;
         if self.0.len() == 2 {
             self.0.remove(0);
         }
-        self.0.push((key, cos, sin));
-        Ok(out)
+        self.0.push((key, cos.clone(), sin.clone()));
+        Ok((cos, sin))
     }
 }
 
@@ -616,6 +799,46 @@ fn rotary_tables(
     Ok((angles.cos()?.astype(dtype)?, angles.sin()?.astype(dtype)?))
 }
 
+fn fused_attention_norm_rotary(
+    x: &MxArray,
+    weight: &MxArray,
+    cos: &MxArray,
+    sin: &MxArray,
+    eps: f64,
+) -> Result<Option<MxArray>> {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return Ok(None);
+    }
+    let raw = unsafe {
+        mlx_sys::mlx_qwen4_attention_norm_rotary(
+            x.as_raw_ptr(),
+            weight.as_raw_ptr(),
+            cos.as_raw_ptr(),
+            sin.as_raw_ptr(),
+            eps,
+        )
+    };
+    if raw.is_null() {
+        Ok(None)
+    } else {
+        MxArray::from_handle(raw, "Qwen4 attention normalization and rotary").map(Some)
+    }
+}
+
+fn fused_rotary_window(x: &MxArray, cos: &MxArray, sin: &MxArray) -> Result<Option<MxArray>> {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return Ok(None);
+    }
+    let raw = unsafe {
+        mlx_sys::mlx_qwen4_rotary_window(x.as_raw_ptr(), cos.as_raw_ptr(), sin.as_raw_ptr())
+    };
+    if raw.is_null() {
+        Ok(None)
+    } else {
+        MxArray::from_handle(raw, "Qwen4 fused rotary window").map(Some)
+    }
+}
+
 fn apply_rotary_window(x: &MxArray, dims: usize, cos: &MxArray, sin: &MxArray) -> Result<MxArray> {
     let shape = x.shape()?;
     if shape.len() != 4
@@ -624,6 +847,11 @@ fn apply_rotary_window(x: &MxArray, dims: usize, cos: &MxArray, sin: &MxArray) -
         || dims as i64 > shape[3]
     {
         return Err(Error::from_reason("Qwen4 rotary window shape mismatch"));
+    }
+    if runtime_flags::is_one(c"MLX_QWEN4_FUSED_ROTARY")
+        && let Some(out) = fused_rotary_window(x, cos, sin)?
+    {
+        return Ok(out);
     }
     let half = dims as i64 / 2;
     let a = x.slice_axis(3, 0, half)?;
@@ -658,6 +886,109 @@ mod compact_recurrence_tests {
             .unwrap()
             .astype(DType::BFloat16)
             .unwrap()
+    }
+
+    #[test]
+    fn prepared_gdn_matches_separate_ops_across_short_and_wide_history() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let conv = input(&[10240, 4], 0.2).astype(DType::Float32).unwrap();
+        let scale = input(&[48], 0.8)
+            .astype(DType::Float32)
+            .unwrap()
+            .sub_scalar(0.5)
+            .unwrap();
+        let dt = input(&[48], 1.3).astype(DType::Float32).unwrap();
+        let mut expected_state = Some(input(&[3, 10240], 2.4));
+        let mut actual_state = expected_state.clone();
+        let mut compact_state = expected_state.clone();
+        for tokens in [1, 2, 7, 1024, 3] {
+            let x = input(&[1, tokens, 10240], 0.1);
+            let a = input(&[1, tokens, 48], 0.7).astype(DType::Float32).unwrap();
+            let b = input(&[1, tokens, 48], 1.1).astype(DType::Float32).unwrap();
+            let y = conv_sequence(&x, &conv, &mut expected_state, 4).unwrap();
+            let q = l2(&y
+                .slice_axis(2, 0, 2048)
+                .unwrap()
+                .reshape(&[1, tokens, 16, 128])
+                .unwrap())
+            .unwrap()
+            .mul_scalar(128f64.powf(-0.5))
+            .unwrap();
+            let k = l2(&y
+                .slice_axis(2, 2048, 4096)
+                .unwrap()
+                .reshape(&[1, tokens, 16, 128])
+                .unwrap())
+            .unwrap();
+            let v = y
+                .slice_axis(2, 4096, 10240)
+                .unwrap()
+                .reshape(&[1, tokens, 48, 128])
+                .unwrap();
+            let (decay, beta) = gdn_gates(&a, &b, &scale, &dt).unwrap();
+            let actual = gdn_prepare(&x, &a, &b, &conv, &mut actual_state, &scale, &dt)
+                .unwrap()
+                .unwrap();
+            let compact = gdn_prepare(
+                &x,
+                &a.astype(DType::BFloat16).unwrap(),
+                &b.astype(DType::BFloat16).unwrap(),
+                &conv,
+                &mut compact_state,
+                &scale,
+                &dt,
+            )
+            .unwrap()
+            .unwrap();
+            for (field, (want, got)) in actual.iter().zip(&compact).enumerate() {
+                assert_eq!(want.dtype().unwrap(), got.dtype().unwrap());
+                assert_eq!(
+                    want.to_float32().unwrap().to_vec(),
+                    got.to_float32().unwrap().to_vec(),
+                    "compact gate preparation field={field}, tokens={tokens}"
+                );
+            }
+            assert_eq!(
+                actual_state
+                    .as_ref()
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+                    .to_vec(),
+                compact_state
+                    .as_ref()
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+                    .to_vec()
+            );
+            for (field, (want, got)) in [q, k, v, decay, beta].iter().zip(&actual).enumerate() {
+                assert_eq!(want.dtype().unwrap(), got.dtype().unwrap());
+                assert_eq!(
+                    &*want.astype(DType::Float32).unwrap().to_float32().unwrap(),
+                    &*got.astype(DType::Float32).unwrap().to_float32().unwrap(),
+                    "GDN preparation field={field}, tokens={tokens}"
+                );
+            }
+            assert_eq!(
+                &*expected_state
+                    .as_ref()
+                    .unwrap()
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap(),
+                &*actual_state
+                    .as_ref()
+                    .unwrap()
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap()
+            );
+        }
     }
 
     #[test]
@@ -718,11 +1049,168 @@ mod rotary_window_tests {
     use super::*;
 
     #[test]
+    fn attention_norm_rotary_matches_separate_gguf_ops_and_changing_inputs() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let mut cache = RotaryWindowCache::default();
+        for seed in [1., 7., 37., 113.] {
+            for count in [1_i64, 8, 1024] {
+                for heads in [1_i64, 2, 8, 24] {
+                    let data: Vec<_> = (0..heads * (count + 1) * 256)
+                        .map(|i| (i as f32 * 0.013 * seed).sin() * 3.1)
+                        .collect();
+                    let x = MxArray::from_float32(&data, &[1, heads, count + 1, 256])
+                        .unwrap()
+                        .astype(DType::BFloat16)
+                        .unwrap()
+                        .slice_axis(2, 1, count + 1)
+                        .unwrap();
+                    let x = if heads == 2 || heads == 24 {
+                        // Real Q/gate layout: gate lanes separate head rows,
+                        // and token/head axes are transposed before rotation.
+                        let data: Vec<_> = (0..(count + 1) * heads * 512)
+                            .map(|i| (i as f32 * 0.013 * seed).sin() * 3.1)
+                            .collect();
+                        MxArray::from_float32(&data, &[1, count + 1, heads, 512])
+                            .unwrap()
+                            .astype(DType::BFloat16)
+                            .unwrap()
+                            .slice_axis(1, 1, count + 1)
+                            .unwrap()
+                            .slice_axis(3, 0, 256)
+                            .unwrap()
+                            .transpose(Some(&[0, 2, 1, 3]))
+                            .unwrap()
+                    } else {
+                        x
+                    };
+                    let weights: Vec<_> = (0..256)
+                        .map(|i| (i as f32 * 0.071 * seed).sin() * 0.35 + 1.)
+                        .collect();
+                    let w = MxArray::from_float32(&weights, &[256]).unwrap();
+                    let positions: Vec<_> = (0..count)
+                        .map(|i| [1023 + i, 11 + i / 7, i / 3 - 5])
+                        .collect();
+                    for (dims, interleaved) in [(64, true), (256, false)] {
+                        let n = norm(&x, &w, 256, 1e-6, false).unwrap();
+                        let expected = mrope_window(
+                            &n,
+                            &positions,
+                            dims,
+                            10_000_000.,
+                            [16, 8, 8],
+                            interleaved,
+                        )
+                        .unwrap();
+                        let got = cache
+                            .apply_normalized(
+                                &x,
+                                &w,
+                                positions.clone(),
+                                dims,
+                                10_000_000.,
+                                [16, 8, 8],
+                                interleaved,
+                                1e-6,
+                            )
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(
+                            &*got.astype(DType::Float32).unwrap().to_float32().unwrap(),
+                            &*expected
+                                .astype(DType::Float32)
+                                .unwrap()
+                                .to_float32()
+                                .unwrap(),
+                            "seed={seed} count={count} heads={heads} dims={dims}",
+                        );
+                        assert!(cache.0.len() <= 2);
+                    }
+                }
+            }
+        }
+        let x = MxArray::from_float32(&[1.; 256], &[1, 1, 1, 256]).unwrap();
+        let w = MxArray::from_float32(&[1.; 256], &[256]).unwrap();
+        let (cos, sin) =
+            rotary_tables(&[[0; 3]], 64, 10_000_000., [0; 3], true, DType::BFloat16).unwrap();
+        assert!(
+            fused_attention_norm_rotary(&x, &w, &cos, &sin, 1e-6)
+                .unwrap()
+                .is_none()
+        );
+        let x = x.astype(DType::BFloat16).unwrap();
+        assert!(
+            fused_attention_norm_rotary(&x, &w, &cos, &sin, 0.)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fused_attention_norm_rotary(&x, &w.astype(DType::BFloat16).unwrap(), &cos, &sin, 1e-6)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn singleton_tables_preserve_head_views_media_axes_and_positions() {
+        let mut cache = RotaryWindowCache::default();
+        for dtype in [DType::BFloat16, DType::Float32] {
+            for interleaved in [true, false] {
+                for position in [[0, 0, 0], [1023, 89, -4], [2048, 2048, 2048]] {
+                    for shape in [vec![1, 256], vec![4, 128], vec![1, 8, 1, 256]] {
+                        let n: i64 = shape.iter().product();
+                        let values: Vec<_> = (0..n + shape.last().unwrap())
+                            .map(|i| (i as f32 * 0.13).sin() * 4.1)
+                            .collect();
+                        let x = MxArray::from_float32(&values, &[values.len() as i64])
+                            .unwrap()
+                            .slice_axis(0, *shape.last().unwrap(), values.len() as i64)
+                            .unwrap()
+                            .reshape(&shape)
+                            .unwrap()
+                            .astype(dtype)
+                            .unwrap();
+                        let expected =
+                            mrope(&x, position, 64, 10_000_000., [16, 8, 8], interleaved).unwrap();
+                        for _ in 0..2 {
+                            let got = cache
+                                .apply_singleton(
+                                    &x,
+                                    position,
+                                    64,
+                                    10_000_000.,
+                                    [16, 8, 8],
+                                    interleaved,
+                                )
+                                .unwrap();
+                            assert_eq!(&*got.shape().unwrap(), shape.as_slice());
+                            assert_eq!(
+                                &*got.astype(DType::Float32).unwrap().to_float32().unwrap(),
+                                &*expected
+                                    .astype(DType::Float32)
+                                    .unwrap()
+                                    .to_float32()
+                                    .unwrap(),
+                                "{dtype:?}, {interleaved}, {position:?}, {shape:?}"
+                            );
+                        }
+                        assert!(cache.0.len() <= 2);
+                    }
+                }
+            }
+        }
+        cache.clear();
+        assert!(cache.0.is_empty());
+    }
+
+    #[test]
     fn shared_tables_preserve_scalar_rounding_and_media_axes() {
         let mut cache = RotaryWindowCache::default();
         for dtype in [DType::BFloat16, DType::Float32] {
             for interleaved in [true, false] {
-                for (count, stride, base) in [(7, 4, 1), (256, 4, 2045), (1024, 1, 0)] {
+                for (count, stride, base) in [(1, 1, 1023), (7, 4, 1), (256, 4, 2045), (1024, 1, 0)]
+                {
                     let positions: Vec<_> = (0..count)
                         .map(|i| {
                             let p = base + i * stride;
@@ -764,6 +1252,29 @@ mod rotary_window_tests {
                             .collect();
                         let expected =
                             MxArray::concatenate_many(rows.iter().collect(), Some(2)).unwrap();
+                        let (cos, sin) = rotary_tables(
+                            &positions,
+                            64,
+                            10_000_000.,
+                            [16, 8, 8],
+                            interleaved,
+                            dtype,
+                        )
+                        .unwrap();
+                        if dtype == DType::BFloat16
+                            && crate::engine::persistence::compiled_forward_backend_available()
+                        {
+                            let fused = fused_rotary_window(&x, &cos, &sin).unwrap().unwrap();
+                            assert_eq!(
+                                &*fused.astype(DType::Float32).unwrap().to_float32().unwrap(),
+                                &*expected
+                                    .astype(DType::Float32)
+                                    .unwrap()
+                                    .to_float32()
+                                    .unwrap(),
+                                "fused rotary {interleaved}, {count}, {width}"
+                            );
+                        }
                         assert_eq!(
                             &*got.astype(DType::Float32).unwrap().to_float32().unwrap(),
                             &*expected
@@ -792,6 +1303,17 @@ pub fn conv(
     kernel: usize,
     dilation: usize,
 ) -> Result<MxArray> {
+    conv_with_completion(x, weight, state, kernel, dilation, false)
+}
+
+fn conv_with_completion(
+    x: &MxArray,
+    weight: &MxArray,
+    state: &mut Option<MxArray>,
+    kernel: usize,
+    dilation: usize,
+    defer_state: bool,
+) -> Result<MxArray> {
     let width = *x.shape()?.last().unwrap();
     let keep = (kernel - 1) * dilation;
     let old = match state {
@@ -816,7 +1338,9 @@ pub fn conv(
         .astype(x.dtype()?)?
         .reshape(&[1, 1, width])?;
     let next = input.slice_axis(0, 1, keep as i64 + 1)?.deep_copy()?;
-    MxArray::eval_arrays_with_context(&[&next], "qwen4::math::next")?;
+    if !defer_state {
+        MxArray::eval_arrays_with_context(&[&next], "qwen4::math::next")?;
+    }
     *state = Some(next);
     Activations::silu(&output)
 }
@@ -830,10 +1354,23 @@ pub(super) fn conv_window(
     kernel: usize,
     dilation: usize,
 ) -> Result<MxArray> {
+    conv_window_with_completion(x, weight, state, kernel, dilation, false)
+}
+
+// A tentative window owns immutable banks until its final output/state join.
+// Keep the tiny history copy lazy within that window, as TrackFastModel does.
+pub(super) fn conv_window_with_completion(
+    x: &MxArray,
+    weight: &MxArray,
+    state: &mut Option<MxArray>,
+    kernel: usize,
+    dilation: usize,
+    defer_state: bool,
+) -> Result<MxArray> {
     let shape = x.shape()?;
     let (tokens, width) = (shape[1], shape[2]);
     if tokens == 1 {
-        return conv(x, weight, state, kernel, dilation);
+        return conv_with_completion(x, weight, state, kernel, dilation, defer_state);
     }
     let keep = ((kernel - 1) * dilation) as i64;
     let old = match state {
@@ -841,24 +1378,56 @@ pub(super) fn conv_window(
         None => MxArray::zeros(&[keep, width], Some(x.dtype()?))?,
     };
     let input = MxArray::concatenate(&old, &x.reshape(&[tokens, width])?, 0)?;
-    let indices = (0..tokens)
-        .flat_map(|t| (0..kernel).map(move |k| t as i32 + (k * dilation) as i32))
-        .collect::<Vec<_>>();
-    let selected = input
-        .take(&MxArray::from_int32(&indices, &[indices.len() as i64])?, 0)?
-        .reshape(&[tokens, kernel as i64, width])?
-        .astype(DType::Float32)?;
-    let weights = weight
-        .reshape(&[width, kernel as i64])?
-        .transpose(None)?
-        .astype(DType::Float32)?;
-    let out = selected
-        .mul(&weights)?
-        .sum(Some(&[1]), Some(false))?
-        .astype(x.dtype()?)?
-        .reshape(&shape)?;
+    let ported = if kernel == 4
+        && dilation == 3
+        && width == 10240
+        && (9..=1024).contains(&tokens)
+        && x.dtype()? == DType::BFloat16
+        && weight.dtype()? == DType::Float32
+        && crate::engine::persistence::compiled_forward_backend_available()
+        && !runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_PLE_CONV")
+    {
+        let raw = unsafe {
+            mlx_sys::mlx_qwen4_prefill_ple_conv(
+                input.as_raw_ptr(),
+                weight.reshape(&[width, 4])?.as_raw_ptr(),
+            )
+        };
+        if raw.is_null() {
+            None
+        } else {
+            Some(MxArray::from_handle(
+                raw,
+                "Qwen4 reference PLE convolution",
+            )?)
+        }
+    } else {
+        None
+    };
+    let out = if let Some(out) = ported {
+        out
+    } else {
+        let indices = (0..tokens)
+            .flat_map(|t| (0..kernel).map(move |k| t as i32 + (k * dilation) as i32))
+            .collect::<Vec<_>>();
+        let selected = input
+            .take(&MxArray::from_int32(&indices, &[indices.len() as i64])?, 0)?
+            .reshape(&[tokens, kernel as i64, width])?
+            .astype(DType::Float32)?;
+        let weights = weight
+            .reshape(&[width, kernel as i64])?
+            .transpose(None)?
+            .astype(DType::Float32)?;
+        selected
+            .mul(&weights)?
+            .sum(Some(&[1]), Some(false))?
+            .astype(x.dtype()?)?
+            .reshape(&shape)?
+    };
     let tail = input.slice_axis(0, tokens, tokens + keep)?.deep_copy()?;
-    MxArray::eval_arrays_with_context(&[&tail], "qwen4::ple::conv_tail")?;
+    if !defer_state {
+        MxArray::eval_arrays_with_context(&[&tail], "qwen4::ple::conv_tail")?;
+    }
     *state = Some(tail);
     Activations::silu(&out)
 }
@@ -908,6 +1477,51 @@ pub fn hash_ids(
     Ok(ids)
 }
 
+pub(super) fn singleton_routes(logits: &MxArray, top: usize) -> Result<Option<(MxArray, MxArray)>> {
+    if top != 10
+        || *logits.shape()? != [1, 1, 512]
+        || !matches!(logits.dtype()?, DType::BFloat16 | DType::Float32)
+        || !crate::engine::persistence::compiled_forward_backend_available()
+        || runtime_flags::is_zero(c"MLX_QWEN4_SINGLETON_ROUTER")
+    {
+        return Ok(None);
+    }
+    let (mut ids, mut scores) = (std::ptr::null_mut(), std::ptr::null_mut());
+    let ok =
+        unsafe { mlx_sys::mlx_qwen4_singleton_routes(logits.as_raw_ptr(), &mut ids, &mut scores) };
+    if !ok {
+        return Err(Error::from_reason("Qwen4 singleton routing kernel failed"));
+    }
+    Ok(Some((
+        MxArray::from_handle(ids, "singleton route IDs")?,
+        MxArray::from_handle(scores, "singleton route scores")?,
+    )))
+}
+
+pub(super) fn prefill_routes(logits: &MxArray, top: usize) -> Result<Option<(MxArray, MxArray)>> {
+    if top != 10
+        || logits.ndim()? != 3
+        || logits.shape_at(0)? != 1
+        || !(9..=1024).contains(&logits.shape_at(1)?)
+        || logits.shape_at(2)? != 512
+        || !matches!(logits.dtype()?, DType::BFloat16 | DType::Float32)
+        || !crate::engine::persistence::compiled_forward_backend_available()
+        || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_ROUTER")
+    {
+        return Ok(None);
+    }
+    let (mut ids, mut scores) = (std::ptr::null_mut(), std::ptr::null_mut());
+    let ok =
+        unsafe { mlx_sys::mlx_qwen4_prefill_routes(logits.as_raw_ptr(), &mut ids, &mut scores) };
+    if !ok {
+        return Err(Error::from_reason("Qwen4 prefill routing kernel failed"));
+    }
+    Ok(Some((
+        MxArray::from_handle(ids, "prefill route IDs")?,
+        MxArray::from_handle(scores, "prefill route scores")?,
+    )))
+}
+
 pub(super) fn route_sort(
     ids: &MxArray,
     experts: usize,
@@ -918,7 +1532,7 @@ pub(super) fn route_sort(
         || ids.dtype()? != DType::Uint32
         || ids.ndim()? != 1
         || !crate::engine::persistence::compiled_forward_backend_available()
-        || std::env::var("MLX_QWEN4_COUNTING_SORT").as_deref() == Ok("0")
+        || runtime_flags::is_zero(c"MLX_QWEN4_COUNTING_SORT")
     {
         return Ok(None);
     }
@@ -952,7 +1566,11 @@ pub(super) fn gdn_gates(
     scale: &MxArray,
     dt: &MxArray,
 ) -> Result<(MxArray, MxArray)> {
-    if std::env::var("MLX_QWEN4_FUSED_POINTWISE").as_deref() != Ok("0")
+    // Fallback consumers retain the original F32 gate arithmetic even when
+    // complete GDN/preparation receives compact projection storage.
+    let a = a.astype(DType::Float32)?;
+    let b = b.astype(DType::Float32)?;
+    if !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE")
         && crate::engine::persistence::compiled_forward_backend_available()
     {
         let (mut decay, mut beta) = (std::ptr::null_mut(), std::ptr::null_mut());
@@ -976,19 +1594,19 @@ pub(super) fn gdn_gates(
     }
     Ok((
         Activations::softplus(&a.add(dt)?)?.mul(scale)?.exp()?,
-        Activations::sigmoid(b)?,
+        Activations::sigmoid(&b)?,
     ))
 }
 
 pub(super) fn swiglu(gate: &MxArray, up: &MxArray) -> Result<MxArray> {
-    if std::env::var("MLX_QWEN4_FUSED_POINTWISE").as_deref() == Ok("0") {
+    if runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE") {
         Activations::silu(gate)?.mul(up)
     } else {
         Activations::swiglu_compiled(gate, up)
     }
 }
 pub(super) fn sigmoid_mul(gate: &MxArray, value: &MxArray) -> Result<MxArray> {
-    if std::env::var("MLX_QWEN4_FUSED_POINTWISE").as_deref() == Ok("0") {
+    if runtime_flags::is_zero(c"MLX_QWEN4_FUSED_POINTWISE") {
         value.mul(&Activations::sigmoid(gate)?)
     } else {
         Activations::sigmoid_mul_compiled(gate, value)
