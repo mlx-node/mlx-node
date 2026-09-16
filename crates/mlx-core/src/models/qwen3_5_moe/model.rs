@@ -324,6 +324,10 @@ pub struct Qwen3_5MoeModel {
     pub(crate) image_processor: Option<Arc<Qwen35VLImageProcessor>>,
     pub(crate) spatial_merge_size: i32,
     pub(crate) context_limits: Qwen3_5ContextLimits,
+    /// Directory containing tokenizer/config assets for this loaded model.
+    /// For direct GGUF loads this is the lossless native-packed cache rather
+    /// than the source file path.
+    pub(crate) model_assets_path: String,
     /// RAII: unregisters this model's baseline from the cache-limit
     /// coordinator on drop.
     pub(crate) _cache_limit_guard: crate::cache_limit::CacheLimitGuard,
@@ -338,6 +342,14 @@ pub struct Qwen3_5MoeModel {
 
 #[napi]
 impl Qwen3_5MoeModel {
+    /// Resolved directory containing this model's tokenizer/config assets.
+    /// Streaming wrappers use it after a direct GGUF load so chat templating
+    /// reads the reconstructed sidecars from the native-packed cache.
+    #[napi]
+    pub fn model_assets_path(&self) -> String {
+        self.model_assets_path.clone()
+    }
+
     /// Whether the block-paged KV cache adapter is active on this model
     /// instance.
     ///
@@ -437,9 +449,23 @@ impl Qwen3_5MoeModel {
         .await
     }
 
-    /// Load a pretrained model from a directory.
+    /// Load a pretrained model from a directory, or a `.gguf` file.
+    ///
+    /// A direct GGUF file is first converted into the lossless native-packed
+    /// cache (mirroring the dense Qwen3.5 loader), and the cache directory is
+    /// what the model thread reads.
     #[napi]
     pub async fn load(path: String) -> Result<Qwen3_5MoeModel> {
+        let source = std::path::Path::new(&path);
+        if source.is_file()
+            && source
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("gguf"))
+        {
+            let cache = crate::utils::gguf::prepare_qwen35_moe_native_gguf(source).await?;
+            return persistence::load_with_thread(&cache.to_string_lossy()).await;
+        }
         persistence::load_with_thread(&path).await
     }
 

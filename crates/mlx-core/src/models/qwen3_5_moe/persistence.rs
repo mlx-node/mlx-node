@@ -1528,7 +1528,11 @@ fn pin_sym8_to_flat_kv_cache(
 /// All model state lives on the spawned thread. Returns a thin NAPI shell
 /// with the thread handle and model configuration.
 pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
-    let model_path = model_path.to_string();
+    // Retained for the public wrapper: a direct GGUF load hands this loader the
+    // native-packed cache, and the TS streaming wrappers read the tokenizer
+    // from here rather than from the `.gguf` source path.
+    let model_assets_path = model_path.to_string();
+    let model_path = model_assets_path.clone();
 
     let (thread, init_rx) = crate::model_thread::ModelThread::spawn_with_scheduler(
         move || {
@@ -1978,6 +1982,7 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
         image_processor,
         spatial_merge_size,
         context_limits,
+        model_assets_path,
         _cache_limit_guard: cache_limit_guard,
         pool_cache_limit_guard,
     })
@@ -2642,6 +2647,136 @@ mod tests {
             }
             _ => panic!("layer 0 must be MoE (decoder_sparse_step = 1)"),
         }
+    }
+
+    /// A pre-stacked 3-D K-quant `switch_mlp.*` trio — exactly what the native
+    /// GGUF importer writes for `ffn_{gate,up,down}_exps` — must load through
+    /// the quantized switch backend, and a truncated group (`.scales` without
+    /// `.biases`) must fail loud instead of installing packed bytes as dense
+    /// expert weights.
+    #[test]
+    fn prestacked_q4k_expert_trio_installs_through_moe_loader() {
+        let mut config = tiny_sym8_moe_cfg();
+        // Expert width = hidden = 256 so every K-quant companion carries its
+        // real ggml geometry: Q4_K packs 256 values per super-block, so
+        // `.weight` keeps k*4/32 columns, `.scales` 2*(k/32) and `.biases`
+        // 2*(k/256).
+        config.hidden_size = 256;
+        config.intermediate_size = 256;
+        config.num_heads = 4;
+        config.head_dim = 64;
+        let mut inner =
+            Qwen35MoeInner::new(config.clone()).expect("Qwen35MoeInner::new must succeed");
+
+        let q4k_group = |params: &mut HashMap<String, MxArray>, prefix: &str| {
+            params.insert(
+                format!("{prefix}.weight"),
+                MxArray::from_uint32(&vec![0u32; 4 * 256 * 32], &[4, 256, 32]).expect("weight"),
+            );
+            params.insert(
+                format!("{prefix}.scales"),
+                MxArray::from_float32(&vec![1.0f32; 4 * 256 * 16], &[4, 256, 16])
+                    .expect("scales")
+                    .astype(DType::Uint8)
+                    .expect("uint8 scales"),
+            );
+            params.insert(
+                format!("{prefix}.biases"),
+                MxArray::from_float16(
+                    &vec![half::f16::from_f32(0.5).to_bits(); 4 * 256 * 2],
+                    &[4, 256, 2],
+                )
+                .expect("biases"),
+            );
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 8 * 256], &[8, 256]).expect("embedding"),
+        );
+        params.insert(
+            "final_norm.weight".to_string(),
+            MxArray::from_float32(&vec![1.0f32; 256], &[256]).expect("final_norm"),
+        );
+        params.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            // The attended projection carries the query gate: 2 * heads * head_dim.
+            MxArray::from_float32(&vec![0.0f32; 512 * 256], &[512, 256]).expect("q_proj"),
+        );
+        params.insert(
+            "layers.0.mlp.gate.weight".to_string(),
+            MxArray::from_float32(&vec![0.0f32; 4 * 256], &[4, 256]).expect("router gate"),
+        );
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            q4k_group(&mut params, &format!("layers.0.mlp.switch_mlp.{proj}"));
+        }
+
+        let mut per_layer_quant: HashMap<String, PerLayerQuant> = HashMap::new();
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            per_layer_quant.insert(
+                format!("layers.0.mlp.switch_mlp.{proj}"),
+                PerLayerQuant {
+                    bits: 4,
+                    group_size: 32,
+                    mode: PerLayerMode::Q4K,
+                    input_amax: None,
+                },
+            );
+        }
+
+        apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect("a pre-stacked Q4_K expert trio must load");
+
+        match &inner.layers[0].mlp {
+            MLPType::MoE(moe) => {
+                let switch = moe.get_switch_mlp();
+                assert!(
+                    switch.is_quantized(),
+                    "the Q4_K trio must install the quantized SwitchGLU backend"
+                );
+                for (proj, weight) in [
+                    ("gate_proj", switch.get_gate_proj_weight()),
+                    ("up_proj", switch.get_up_proj_weight()),
+                    ("down_proj", switch.get_down_proj_weight()),
+                ] {
+                    assert_eq!(
+                        weight.dtype().unwrap(),
+                        DType::Uint32,
+                        "{proj} must stay packed"
+                    );
+                    assert_eq!(weight.shape().unwrap().to_vec(), vec![4, 256, 32]);
+                }
+            }
+            _ => panic!("layer 0 must be MoE (decoder_sparse_step = 1)"),
+        }
+
+        params.remove("layers.0.mlp.switch_mlp.up_proj.biases");
+        let error = apply_weights_moe_inner(
+            &mut inner,
+            &params,
+            &config,
+            4,
+            32,
+            None,
+            &per_layer_quant,
+            /* has_vision */ false,
+        )
+        .expect_err("a K-quant group without its ggml `d` sidecar must fail loud");
+        assert!(
+            error.reason.contains("biases missing"),
+            "the truncated group must name the missing companion: {}",
+            error.reason
+        );
     }
 
     /// T13: the MoE expert stacker keys per-expert companions on the three
