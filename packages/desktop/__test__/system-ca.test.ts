@@ -44,14 +44,17 @@ function trustDump(
 }
 
 /** A `security`/`plutil` stand-in: canned per-keychain certs and canned trust dumps. */
-function fakeExec(opts: { certs: Readonly<Record<string, string>>; trust?: string }): ExecText {
+function fakeExec(opts: { certs: Readonly<Record<string, string>>; trust?: string; trustExportFails?: boolean }): ExecText {
   return async (cmd, args) => {
     if (cmd === 'security' && args[0] === 'find-certificate') {
       const output = opts.certs[args[args.length - 1]];
       if (output === undefined) throw new Error('keychain unreadable');
       return output;
     }
-    if (cmd === 'security' && args[0] === 'trust-settings-export') return '';
+    if (cmd === 'security' && args[0] === 'trust-settings-export') {
+      if (opts.trustExportFails === true) throw new Error('export timed out');
+      return '';
+    }
     if (cmd === 'plutil') return opts.trust ?? EMPTY_DUMP;
     throw new Error(`unexpected call: ${cmd} ${args.join(' ')}`);
   };
@@ -139,6 +142,43 @@ describe('parseTrustSettingsDump', () => {
     expect(decisions.get('F'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
     expect(decisions.get('0'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
   });
+
+  it('ignores application- and key-usage-constrained records', () => {
+    // A record with ANY key beyond the policy OID, its name and the result
+    // is scoped to something this process-wide bundle cannot express (an
+    // application, a key usage, an allowed error, a future schema addition):
+    // fail closed by ignoring it. This is the live-export shape of an
+    // application-scoped trust.
+    const dump = `{
+  "trustList" => {
+    "1111111111111111111111111111111111111111" => {
+      "trustSettings" => [
+        0 => {
+          "kSecTrustSettingsPolicy" => {length = 9, bytes = 0x2a864886f763640103}
+          "kSecTrustSettingsPolicyName" => "sslServer"
+          "kSecTrustSettingsApplication" => {length = 42, bytes = 0xdeadbeef}
+          "kSecTrustSettingsResult" => 1
+        }
+      ]
+    }
+    "2222222222222222222222222222222222222222" => {
+      "trustSettings" => [
+        0 => {
+          "kSecTrustSettingsPolicy" => {length = 9, bytes = 0x2a864886f763640103}
+          "kSecTrustSettingsPolicyName" => "sslServer"
+          "kSecTrustSettingsKeyUsage" => 16
+          "kSecTrustSettingsResult" => 1
+        }
+      ]
+    }
+  }
+  "trustVersion" => 1
+}
+`;
+    const decisions = parseTrustSettingsDump(dump);
+    expect(decisions.get('1'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
+    expect(decisions.get('2'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
+  });
 });
 
 describe('keychainCaRootsPem', () => {
@@ -222,6 +262,22 @@ describe('keychainCaRootsPem', () => {
 });
 
 describe('prepareExtraCaBundle', () => {
+  it('ships no keychain roots when a trust domain cannot be read', async () => {
+    // Decisions merge allow-OR/deny-OR across the user and admin domains, so
+    // exporting with only the domains that read successfully would keep their
+    // allows while silently dropping the failed domain's denies — restoring a
+    // trust the user explicitly revoked. The whole keychain bundle is
+    // abandoned instead (startup itself is unaffected).
+    const dir = tmpDir();
+    const result = await prepareExtraCaBundle({
+      platform: 'darwin',
+      dir,
+      exec: fakeExec({ certs: { [SYSTEM_ROOTS]: ROOT_CA }, trustExportFails: true }),
+      keychains: [SYSTEM_ROOTS],
+    });
+    expect(result).toBeNull();
+  });
+
   it('is a no-op off macOS', async () => {
     const result = await prepareExtraCaBundle({
       platform: 'linux',

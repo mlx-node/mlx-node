@@ -44,9 +44,10 @@
  * else that ever opens a TLS socket in that process.
  *
  * Async throughout — MAIN never blocks (`index.ts`'s header is the rule).
- * Failures degrade to `null` (no env var), never to a launch failure. Trust
- * exports that fail to READ degrade to no records for that domain (fail
- * closed: a root we cannot prove trusted is not exported), with a warning.
+ * Failures degrade to `null` (no env var), never to a launch failure. A trust
+ * domain that fails to READ voids the entire keychain bundle (see
+ * loadTrustDecisions): exporting the surviving domains' allows without the
+ * failed domain's denies could restore a trust the user explicitly revoked.
  */
 
 import { execFile } from 'node:child_process';
@@ -134,12 +135,15 @@ export interface TrustDecision {
  *     cert" (SecTrustSettings.h: "An empty Trust Settings array is definitely
  *     not the same as *no* Trust Settings").
  *
- * Constrained records are IGNORED for this process-wide decision: a
- * `kSecTrustSettingsPolicyString` scopes the record (e.g. sslServer trust
- * valid for one hostname only), and exporting that CA unconditionally would
- * broaden a narrow trust into an any-host anchor. NODE_EXTRA_CA_CERTS cannot
- * carry the constraint, so the record is skipped in both directions — a
- * hostname-scoped "never trust" must not remove a good root either.
+ * Constrained records are IGNORED for this process-wide decision. A record
+ * carries a constraint whenever it has ANY key beyond the policy OID, the
+ * policy name and the result — `kSecTrustSettingsPolicyString` (hostname),
+ * `kSecTrustSettingsApplication`, `kSecTrustSettingsKeyUsage`, and anything
+ * schema adds later. Exporting such a CA unconditionally would broaden a
+ * narrow trust (SSL for one host, one app, one usage) into an any-host
+ * anchor. NODE_EXTRA_CA_CERTS cannot carry constraints, so the record is
+ * skipped in both directions — a scoped "never trust" must not remove a
+ * good root either.
  *
  * The `-p` format is undocumented but has been stable for years, and it is the
  * only export form that avoids shipping a plist parser for three calls per
@@ -207,7 +211,13 @@ export function parseTrustSettingsDump(text: string): Map<string, TrustDecision>
       if (item !== null) item.policy = policy[1];
       continue;
     }
-    if (/"kSecTrustSettingsPolicyString"/.test(line)) {
+    // Any other kSecTrustSettings* key on the item is a constraint this
+    // process-wide bundle cannot honor (hostname, application, key usage,
+    // allowed errors, future schema additions) — fail closed by ignoring
+    // the record entirely. The negative lookahead whitelists the three keys
+    // an unconstrained record is made of: the policy OID blob, its name,
+    // and the result.
+    if (/"kSecTrustSettings(?!Policy"|PolicyName"|Result")[A-Za-z]+"/.test(line)) {
       if (item !== null) item.constrained = true;
       continue;
     }
@@ -260,6 +270,15 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
  * domains. The system domain is not exported: its entries are the Apple
  * system roots themselves, whose trust is the implicit default already
  * encoded by `systemRoots` on the candidate.
+ *
+ * A domain that fails to READ rejects the whole load — this is the one
+ * failure in this module that must NOT degrade locally. Decisions are merged
+ * as allow-OR / deny-OR across domains, so proceeding with only the domains
+ * that read successfully would silently drop the failed domain's DENIES while
+ * keeping the others' allows: a root the user explicitly revoked would be
+ * exported on the admin domain's say-so. Rejecting propagates to
+ * `prepareExtraCaBundle`'s catch, which ships no keychain roots at all (the
+ * inherited NODE_EXTRA_CA_CERTS still applies, and startup is unaffected).
  */
 async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDecision>> {
   const merged = new Map<string, TrustDecision>();
@@ -267,18 +286,13 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
   try {
     for (const args of [[], ['-d']]) {
       const plist = join(tmp, `trust${args[0] ?? '-user'}.plist`);
-      try {
-        await exec('security', ['trust-settings-export', ...args, plist]);
-        const dump = await exec('plutil', ['-p', plist]);
-        for (const [sha1, decision] of parseTrustSettingsDump(dump)) {
-          const entry = merged.get(sha1) ?? { allowForSsl: false, denyForSsl: false };
-          entry.allowForSsl ||= decision.allowForSsl;
-          entry.denyForSsl ||= decision.denyForSsl;
-          merged.set(sha1, entry);
-        }
-      } catch (error) {
-        // Fail closed for this domain: its roots are simply not exported.
-        console.warn(`[mlx] could not read trust settings (${args[0] ?? 'user'} domain):`, error);
+      await exec('security', ['trust-settings-export', ...args, plist]);
+      const dump = await exec('plutil', ['-p', plist]);
+      for (const [sha1, decision] of parseTrustSettingsDump(dump)) {
+        const entry = merged.get(sha1) ?? { allowForSsl: false, denyForSsl: false };
+        entry.allowForSsl ||= decision.allowForSsl;
+        entry.denyForSsl ||= decision.denyForSsl;
+        merged.set(sha1, entry);
       }
     }
   } finally {
