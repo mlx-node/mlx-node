@@ -1206,12 +1206,19 @@ describe('DownloadManager', () => {
   });
 
   it('errors when the only matched GGUF is a companion artifact, not the target', async () => {
-    // Gemma's globs include mmproj-BF16.gguf. A partial upstream upload (or a
-    // renamed target) can leave the manifest with the projector and nothing
-    // else; publishing that would certify a directory discovery never lists —
-    // "Installed" with no loadable model.
+    // The GEMMA entry is the one whose globs select a companion by name
+    // (`mmproj-BF16.gguf`, for the vision tower). A partial upstream upload (or
+    // a renamed target) can leave the manifest with the projector and nothing
+    // else: publishing that would certify a directory model-discovery never
+    // lists — "Installed" with no loadable model. (The Qwen3.8 entry cannot
+    // express this: its globs filter a companion out before the gate runs.)
+    const gemma = MODEL_CATALOG.find((entry) => entry.label === 'Gemma-4-26B-A4B')!;
+    const gemmaRepo = catalogRepo(gemma);
+    const gemmaSlug = gemmaRepo.split('/').pop()!.toLowerCase();
+    expect(gemma.globs).toContain('mmproj-BF16.gguf');
+
     hub.manifest = [{ type: 'file', path: 'mmproj-BF16.gguf', size: 44 }];
-    hub.manifests[ASSETS_REPO] = [
+    hub.manifests[gemma.assetsRepo!] = [
       { type: 'file', path: 'config.json', size: 12 },
       { type: 'file', path: 'tokenizer.json', size: 20 },
     ];
@@ -1222,13 +1229,13 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'mmproj-BF16.gguf': 44, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(gemmaRepo);
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error' || event.type === 'done'));
 
     expect(events.some((event) => event.type === 'error')).toBe(true);
     expect(events.some((event) => event.type === 'done')).toBe(false);
-    expect(existsSync(finalDir())).toBe(false);
+    expect(existsSync(join(modelsDir, gemmaSlug))).toBe(false);
     await waitFor(() => jobStagingDirs().length === 0);
   });
 

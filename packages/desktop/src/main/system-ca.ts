@@ -442,10 +442,14 @@ export async function keychainCaRootsPem(exec: ExecText, keychains: readonly str
     const untrustworthy = candidate.keychain === SYSTEM_KEYCHAIN
       ? // System-keychain membership IS trust (admin-gated; profile-driven
         // trust lives here), so an explicit deny is what vetoes it — and a
-        // deny is exactly what an UNREADABLE domain hides. "Never Trust" is
-        // settable on a System item, so shipping one while its domain's
-        // denies are unknown would bypass a revocation the user performed.
-        // Such candidates are withheld too until every domain reads.
+        // deny is exactly what an UNREADABLE domain hides. Measured on a real
+        // keychain: records for System.keychain certificates appear in the
+        // ADMIN domain's export (both of this machine's admin records point
+        // at System-keychain certs; the system domain carries only bare
+        // default entries, zero per-policy items) — so a failed admin read is
+        // precisely when a System item's "Never Trust" is unknowable.
+        // Shipping such a root then would bypass a revocation the user
+        // performed, so it is withheld until every domain reads.
         denied || trust.unreadable
       : // Every other candidate comes from the user's login keychain, where
         // membership is NOT trust: an explicit, unconstrained sslServer
