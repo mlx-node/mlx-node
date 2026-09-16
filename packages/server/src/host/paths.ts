@@ -13,6 +13,7 @@
  */
 
 import { mkdirSync, readFileSync } from 'node:fs';
+import { mkdir, readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -51,6 +52,31 @@ export function resolveModelsDir(explicit?: string): string {
   return ensureDir(join(resolveMlxNodeHome(), 'models'));
 }
 
+/**
+ * Async twin of {@link resolveModelsDir} with the identical resolution order.
+ * Use it where synchronous filesystem I/O is off limits — the desktop MAIN
+ * process's event loop, where a `readFileSync`/`mkdirSync` on a stalled mount
+ * would freeze window IPC, the tray, and quit handling until it returned.
+ */
+export async function resolveModelsDirAsync(explicit?: string): Promise<string> {
+  if (explicit && explicit.length > 0) {
+    return ensureDirAsync(resolve(explicit));
+  }
+
+  const envDir = process.env.MLX_MODELS_DIR;
+  if (envDir && envDir.length > 0) {
+    return ensureDirAsync(resolve(envDir));
+  }
+
+  const configPath = join(resolveMlxNodeHome(), 'config.json');
+  const fromConfig = await readModelsDirFromConfigAsync(configPath);
+  if (fromConfig) {
+    return ensureDirAsync(resolve(fromConfig));
+  }
+
+  return ensureDirAsync(join(resolveMlxNodeHome(), 'models'));
+}
+
 function readModelsDirFromConfig(configPath: string): string | undefined {
   let raw: string;
   try {
@@ -59,6 +85,21 @@ function readModelsDirFromConfig(configPath: string): string | undefined {
     // Missing / unreadable file: fall through to default.
     return undefined;
   }
+  return parseModelsDirConfig(raw, configPath);
+}
+
+async function readModelsDirFromConfigAsync(configPath: string): Promise<string | undefined> {
+  let raw: string;
+  try {
+    raw = await readFile(configPath, 'utf-8');
+  } catch {
+    // Missing / unreadable file: fall through to default.
+    return undefined;
+  }
+  return parseModelsDirConfig(raw, configPath);
+}
+
+function parseModelsDirConfig(raw: string, configPath: string): string | undefined {
   try {
     const parsed = JSON.parse(raw) as { modelsDir?: unknown };
     if (typeof parsed.modelsDir === 'string' && parsed.modelsDir.length > 0) {
@@ -73,5 +114,10 @@ function readModelsDirFromConfig(configPath: string): string | undefined {
 
 function ensureDir(path: string): string {
   mkdirSync(path, { recursive: true });
+  return path;
+}
+
+async function ensureDirAsync(path: string): Promise<string> {
+  await mkdir(path, { recursive: true });
   return path;
 }

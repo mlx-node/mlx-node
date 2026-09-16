@@ -21,7 +21,7 @@ import { join } from 'node:path';
 
 import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
-import { resolveModelsDir } from '@mlx-node/server/host/paths';
+import { resolveModelsDirAsync } from '@mlx-node/server/host/paths';
 import { app, autoUpdater, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
 import electronUpdater from 'electron-updater';
 
@@ -441,17 +441,33 @@ async function bootstrap(): Promise<void> {
   if (!settings.autoStartInference) {
     console.log(`[mlx] inference auto-start: ${decideAutoStart({ enabled: false, modelCount: null }).reason}`);
   } else {
-    // `resolveModelsDir` runs INSIDE the chain on purpose: it can throw
-    // synchronously (mkdirSync → EACCES/ENOTDIR), and outside the chain that
-    // rejection would escape into `bootstrap()`, whose handler is app.exit(1).
+    // All of the preflight's filesystem work is async — `resolveModelsDirAsync`
+    // rather than the sync `resolveModelsDir`, and the now-async discovery —
+    // because every sync read on MAIN is an event-loop stall. The scan is
+    // DEADLINED too: a stalled network/FUSE mount would leave readdir pending
+    // forever, so neither then nor catch would ever run and auto-start would
+    // silently stay off for the whole launch. A throw or the deadline both
+    // collapse to "couldn't look" (modelCount null), which fails open — the
+    // sidecar's own discovery is authoritative.
+    const AUTO_START_PREFLIGHT_DEADLINE_MS = 10_000;
     void Promise.resolve()
-      .then(async () => {
+      .then(async (): Promise<number | null> => {
         let incomplete = false;
-        const models = await discoverLocalChatModels(resolveModelsDir(settings.modelsDir ?? undefined), {
-          onEntryFailure: () => {
-            incomplete = true;
-          },
-        });
+        const scan = (async () => {
+          const modelsDir = await resolveModelsDirAsync(settings.modelsDir ?? undefined);
+          return discoverLocalChatModels(modelsDir, {
+            onEntryFailure: () => {
+              incomplete = true;
+            },
+          });
+        })();
+        const models = await Promise.race([
+          scan,
+          new Promise<typeof TIMED_OUT>((resolve) =>
+            setTimeout(() => resolve(TIMED_OUT), AUTO_START_PREFLIGHT_DEADLINE_MS),
+          ),
+        ]);
+        if (models === TIMED_OUT) return null;
         // An incomplete scan's empty result is not "no models": report it like
         // a discovery error so the decision fails open and the sidecar stays
         // authoritative.
