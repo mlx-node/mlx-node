@@ -1,6 +1,13 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { catalogRepo, catalogRepoFor, MODEL_CATALOG, visibleCatalog } from '../src/catalog.js';
+import {
+  type CatalogEntry,
+  catalogEntryForRepo,
+  catalogRepo,
+  catalogRepoFor,
+  MODEL_CATALOG,
+  visibleCatalog,
+} from '../src/catalog.js';
 
 describe('MODEL_CATALOG', () => {
   it('is non-empty', () => {
@@ -13,31 +20,73 @@ describe('MODEL_CATALOG', () => {
     expect(defaults[0]!.label).toBe('Qwen3.8-27B');
   });
 
-  it('resolves the CUDA build on linux and the Metal build everywhere else', () => {
+  it('resolves one repo per entry, with the CUDA build only when an entry carries one', () => {
     // The whole platform split rides on this. Getting it wrong is silent: the
     // wrong-platform repo is a real, downloadable checkpoint, so nothing errors
     // — the user simply installs the build this catalog exists to steer them
     // away from. It also silently breaks every provenance test that writes a
     // marker naming `hfRepo` instead of the resolved repo.
-    const withCuda = MODEL_CATALOG.find((entry) => entry.hfRepoCuda !== undefined);
-    expect(withCuda, 'at least one entry must carry a CUDA build').toBeDefined();
+    //
     // Via the pure helper, never by mutating `process.platform`: that global is
     // shared with every test file on this worker, and stubbing it here made a
     // sibling suite's download allowlist reject its own module-level repo.
-    expect(catalogRepoFor(withCuda!, 'linux')).toBe(withCuda!.hfRepoCuda);
-    expect(catalogRepoFor(withCuda!, 'darwin')).toBe(withCuda!.hfRepo);
-    // An entry with no CUDA build serves both platforms from `hfRepo`.
-    const noCuda = MODEL_CATALOG.find((entry) => entry.hfRepoCuda === undefined);
-    if (noCuda !== undefined) {
-      expect(catalogRepoFor(noCuda, 'linux')).toBe(noCuda.hfRepo);
+    const withCuda: CatalogEntry = { label: 't', hfRepo: 'a/metal', hfRepoCuda: 'a/cuda', sizeGb: 1, description: 't' };
+    expect(catalogRepoFor(withCuda, 'linux')).toBe('a/cuda');
+    expect(catalogRepoFor(withCuda, 'darwin')).toBe('a/metal');
+    // Every CURRENT entry is single-repo (the UD-Q4_K_XL GGUF build runs
+    // identically on Metal and CUDA), so both platforms install `hfRepo`.
+    for (const entry of MODEL_CATALOG) {
+      expect(entry.hfRepoCuda, entry.label).toBeUndefined();
+      expect(catalogRepoFor(entry, 'linux'), entry.label).toBe(entry.hfRepo);
+      expect(catalogRepoFor(entry, 'darwin'), entry.label).toBe(entry.hfRepo);
+      // And the live resolver agrees with the helper on THIS platform.
+      expect(catalogRepo(entry), entry.label).toBe(catalogRepoFor(entry, process.platform));
     }
-    // And the live resolver agrees with the helper on THIS platform.
-    expect(catalogRepo(withCuda!)).toBe(catalogRepoFor(withCuda!, process.platform));
   });
 
-  it('every hfRepo is a Brooooooklyn HF slug', () => {
+  it('pins the three visible entries to their verified unsloth GGUF repos + sidecar sources', () => {
+    // Load-bearing strings: a typo here is a 404 at best and the wrong weights
+    // at worst. Verified on Hugging Face — the GGUF repos ship the UD-Q4_K_XL
+    // variant (plus MTP/mmproj where globbed in), the assetsRepos ship the
+    // tokenizer/config files the GGUF repos lack (ungated, unlike google/*).
+    expect(visibleCatalog().map((entry) => [entry.hfRepo, entry.assetsRepo])).toEqual([
+      ['unsloth/Qwen3.8-27B-GGUF', 'Qwen/Qwen3.8-27B'],
+      ['unsloth/Qwen-AgentWorld-35B-A3B-GGUF', 'Qwen/Qwen-AgentWorld-35B-A3B'],
+      ['unsloth/gemma-4-26B-A4B-it-GGUF', 'unsloth/gemma-4-26B-A4B-it'],
+    ]);
+  });
+
+  it('every hfRepo is a plausible HF slug', () => {
     for (const entry of MODEL_CATALOG) {
-      expect(entry.hfRepo, entry.label).toMatch(/^Brooooooklyn\/[A-Za-z0-9._-]+$/);
+      expect(entry.hfRepo, entry.label).toMatch(/^[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/);
+    }
+  });
+
+  it('every visible entry carries a glob filter that selects exactly one weight variant', () => {
+    // Without the filter the downloader takes every .gguf in a multi-variant
+    // unsloth repo — 100+ GB of quants the user never asked for.
+    for (const entry of visibleCatalog()) {
+      expect(entry.globs, entry.label).toBeDefined();
+      expect(entry.globs!.length, entry.label).toBeGreaterThan(0);
+      expect(entry.globs!.some((glob) => glob.includes('UD-Q4_K_XL')), entry.label).toBe(true);
+    }
+  });
+
+  it('every visible entry names an assetsRepo for tokenizer sidecars', () => {
+    // The GGUF repos ship no tokenizer files; without the official sidecars
+    // the native runtime extracts the embedded tokenizer and tool calling
+    // silently breaks (see the assetsRepo field comment).
+    for (const entry of visibleCatalog()) {
+      expect(entry.assetsRepo, entry.label).toMatch(/^[A-Za-z0-9_-]+\/[A-Za-z0-9._-]+$/);
+    }
+  });
+
+  it('no entry carries a separate draft companion — Qwen3.8-27B MTP ships in-repo', () => {
+    // The `MTP/*` glob pulls the MTP weights out of the same unsloth repo and
+    // the native loader auto-detects them, so the z-lab DFlash2 download is no
+    // longer part of the catalog (still usable manually; see docs/cli.md).
+    for (const entry of MODEL_CATALOG) {
+      expect(entry.draft, entry.label).toBeUndefined();
     }
   });
 
@@ -50,6 +99,32 @@ describe('MODEL_CATALOG', () => {
     for (const entry of MODEL_CATALOG) {
       expect(entry.sizeGb, entry.label).toBeGreaterThan(0);
       expect(entry.description.trim().length, entry.label).toBeGreaterThan(0);
+    }
+  });
+});
+
+describe('catalogEntryForRepo', () => {
+  it('finds an entry by its resolved repo on any platform', () => {
+    // Current entries are single-repo, so the platform argument cannot change
+    // the answer; it exists for the day a platform-split entry returns.
+    const entry = MODEL_CATALOG.find((candidate) => candidate.isDefault)!;
+    expect(catalogEntryForRepo(entry.hfRepo, 'darwin')).toBe(entry);
+    expect(catalogEntryForRepo(entry.hfRepo, 'linux')).toBe(entry);
+  });
+
+  it('returns undefined for a repo the catalog does not carry', () => {
+    expect(catalogEntryForRepo('someone/not-in-catalog', process.platform)).toBeUndefined();
+  });
+
+  it('matches through catalogRepoFor, never a raw hfRepo comparison', () => {
+    // The matching rule matters the day a platform-split entry returns: a
+    // lookup must resolve against the repo THIS platform installs. Pinned
+    // with the pure helper since no current entry carries the split.
+    const split: CatalogEntry = { label: 't', hfRepo: 'a/metal', hfRepoCuda: 'a/cuda', sizeGb: 1, description: 't' };
+    expect(catalogRepoFor(split, 'linux')).toBe('a/cuda');
+    expect(catalogRepoFor(split, 'darwin')).toBe('a/metal');
+    for (const entry of MODEL_CATALOG) {
+      expect(catalogEntryForRepo(catalogRepoFor(entry, 'linux'), 'linux'), entry.label).toBe(entry);
     }
   });
 });
