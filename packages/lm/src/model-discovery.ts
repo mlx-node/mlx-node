@@ -56,8 +56,8 @@ function requiresGgufAssets(modelType: ModelType): boolean {
   return modelType === 'gemma4' || modelType === 'muse_glimmer';
 }
 
-function matchesGgufFamily(path: string, modelType: ModelType): boolean {
-  const architecture = readGgufArchitecture(path);
+async function matchesGgufFamily(path: string, modelType: ModelType): Promise<boolean> {
+  const architecture = await readGgufArchitecture(path);
   return MODEL_FAMILY_DATA.some(
     (family) =>
       family.id === modelType &&
@@ -66,11 +66,12 @@ function matchesGgufFamily(path: string, modelType: ModelType): boolean {
   );
 }
 
-async function hasGgufAssets(modelDir: string): Promise<boolean> {
+async function hasGgufAssets(modelDir: string, onIoFailure?: (error: unknown) => void): Promise<boolean> {
   try {
     const assets = await Promise.all(['config.json', 'tokenizer.json'].map((name) => stat(join(modelDir, name))));
     return assets.every((asset) => asset.isFile());
-  } catch {
+  } catch (error) {
+    onIoFailure?.(error);
     return false;
   }
 }
@@ -159,6 +160,37 @@ async function readDiscoveryMetadata(
 }
 
 /**
+ * Walk the cause chain for an errno. An "absent" code (ENOENT/ENOTDIR) is a
+ * definitive answer — the config or asset does not exist — not a failure, and
+ * a code-free error (bad GGUF header, corrupt JSON, unsupported family) is a
+ * definitive "not this model". Only a real I/O errno means the entry could
+ * not be evaluated at all and MIGHT be a model missing from the result.
+ */
+function isEvaluationFailure(error: unknown): boolean {
+  let current: unknown = error;
+  while (current instanceof Error) {
+    const code = (current as NodeJS.ErrnoException).code;
+    if (code !== undefined) return code !== 'ENOENT' && code !== 'ENOTDIR';
+    current = current.cause;
+  }
+  return false;
+}
+
+/** Options for {@link discoverLocalChatModels}. */
+export interface DiscoveryScanOptions {
+  /**
+   * Called when a directory entry or GGUF file could not be evaluated and may
+   * have been omitted from the result — the scan was INCOMPLETE. Per-entry
+   * failures are still swallowed so one corrupt model never kills discovery
+   * for the server host, agent provider, and dashboard that share this code;
+   * the callback only exposes that the result is not evidence of emptiness.
+   * Lets callers separate "scan completed, zero models" from "couldn't look" —
+   * a permanent versus retryable empty result.
+   */
+  onEntryFailure?: (error: unknown, entryPath: string) => void;
+}
+
+/**
  * Scan `modelsDir` for chat-capable model subdirectories, Gemma4/Muse GGUFs, and
  * dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` files. GGUF files may live directly
  * under `modelsDir` or one level inside a downloaded GGUF repository. Each is
@@ -169,11 +201,20 @@ async function readDiscoveryMetadata(
  * decide those differently (the desktop supervisor treats confirmed-empty as
  * permanent and stops retrying; an I/O error may clear on the next attempt).
  * Entries with an undetectable config, a non-generative type, or no launch
- * preset are skipped silently (warnings only when `MLX_DEBUG` is set). No
- * weights are loaded. Results are sorted by name.
+ * preset are skipped silently (warnings only when `MLX_DEBUG` is set) — but an
+ * entry the scan could not even evaluate is reported through
+ * `opts.onEntryFailure`, so an empty result carries evidence of whether it
+ * means "nothing installed" or "couldn't check". No weights are loaded.
+ * Results are sorted by name.
  */
-export async function discoverLocalChatModels(modelsDir: string): Promise<LocalChatModel[]> {
+export async function discoverLocalChatModels(
+  modelsDir: string,
+  opts?: DiscoveryScanOptions,
+): Promise<LocalChatModel[]> {
   const debug = Boolean(process.env.MLX_DEBUG);
+  const reportFailure = (error: unknown, entryPath: string): void => {
+    if (isEvaluationFailure(error)) opts?.onEntryFailure?.(error, entryPath);
+  };
 
   let entries: Dirent[];
   try {
@@ -247,8 +288,8 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
         const modelType = await detectModelType(full);
         // A shared sibling config can describe another target or a projector.
         // Never advertise a file under a loader that disagrees with its header.
-        if (!matchesGgufFamily(full, modelType)) continue;
-        if (requiresGgufAssets(modelType) && !(await hasGgufAssets(modelsDir))) {
+        if (!(await matchesGgufFamily(full, modelType))) continue;
+        if (requiresGgufAssets(modelType) && !(await hasGgufAssets(modelsDir, (e) => reportFailure(e, full)))) {
           if (debug)
             console.warn(
               `[mlx] skip ${full}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`,
@@ -265,6 +306,7 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
           console.warn(`[mlx] skip ${full}: no supported direct GGUF target for ${modelType}`);
         }
       } catch (err) {
+        reportFailure(err, full);
         if (debug) console.warn(`[mlx] skip ${full}: ${(err as Error).message}`);
       }
       continue;
@@ -276,6 +318,7 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
     try {
       modelType = await detectModelType(full);
     } catch (err) {
+      reportFailure(err, full);
       if (debug) console.warn(`[mlx] skip ${full}: ${(err as Error).message}`);
       continue;
     }
@@ -283,7 +326,7 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
     const inventory = await modelFileInventory(full);
     const hasModelWeights = requiresGgufAssets(modelType) ? inventory.hasPrimarySafetensors : inventory.hasSafetensors;
     if (requiresGgufAssets(modelType) && !hasModelWeights && inventory.targetGgufs.length > 0) {
-      if (!(await hasGgufAssets(full))) {
+      if (!(await hasGgufAssets(full, (e) => reportFailure(e, full)))) {
         if (debug)
           console.warn(`[mlx] skip ${full}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`);
         continue;
@@ -291,9 +334,10 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
       for (const gguf of inventory.targetGgufs) {
         const path = join(full, gguf);
         try {
-          if (!matchesGgufFamily(path, modelType)) continue;
+          if (!(await matchesGgufFamily(path, modelType))) continue;
           await append(ggufModelName(gguf), path, full, modelType, entry.name);
         } catch (err) {
+          reportFailure(err, path);
           if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
         }
       }
@@ -310,8 +354,10 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
       for (const gguf of xlGgufs) {
         const path = join(full, gguf);
         try {
-          if (matchesGgufFamily(path, modelType)) await append(ggufModelName(gguf), path, full, modelType, entry.name);
+          if (await matchesGgufFamily(path, modelType))
+            await append(ggufModelName(gguf), path, full, modelType, entry.name);
         } catch (err) {
+          reportFailure(err, path);
           if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
         }
       }

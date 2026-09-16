@@ -445,9 +445,20 @@ async function bootstrap(): Promise<void> {
     // synchronously (mkdirSync → EACCES/ENOTDIR), and outside the chain that
     // rejection would escape into `bootstrap()`, whose handler is app.exit(1).
     void Promise.resolve()
-      .then(() => discoverLocalChatModels(resolveModelsDir(settings.modelsDir ?? undefined)))
-      .then((models) => {
-        const decision = decideAutoStart({ enabled: true, modelCount: models.length });
+      .then(async () => {
+        let incomplete = false;
+        const models = await discoverLocalChatModels(resolveModelsDir(settings.modelsDir ?? undefined), {
+          onEntryFailure: () => {
+            incomplete = true;
+          },
+        });
+        // An incomplete scan's empty result is not "no models": report it like
+        // a discovery error so the decision fails open and the sidecar stays
+        // authoritative.
+        return models.length > 0 ? models.length : incomplete ? null : 0;
+      })
+      .then((modelCount) => {
+        const decision = decideAutoStart({ enabled: true, modelCount });
         console.log(`[mlx] inference auto-start: ${decision.reason}`);
         if (!decision.start || quitting || supervisor === null) return;
         void supervisor.start().catch(reportInferenceFailure);

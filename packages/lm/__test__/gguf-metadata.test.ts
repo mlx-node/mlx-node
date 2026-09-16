@@ -51,7 +51,7 @@ describe('native-free GGUF metadata', () => {
     [10, 8],
     [11, 8],
     [12, 8],
-  ])('matches native detection past scalar and array type %i', (type, size) => {
+  ])('matches native detection past scalar and array type %i', async (type, size) => {
     writeFileSync(
       path,
       header([
@@ -60,11 +60,11 @@ describe('native-free GGUF metadata', () => {
         architecture(),
       ]),
     );
-    expect(readGgufArchitecture(path)).toBe('qwen35');
-    expect(readGgufArchitecture(path)).toBe(ggufArchitecture(path));
+    await expect(readGgufArchitecture(path)).resolves.toBe('qwen35');
+    await expect(readGgufArchitecture(path)).resolves.toBe(ggufArchitecture(path));
   });
 
-  it('skips tokenizer strings across buffer boundaries and honors the last architecture', () => {
+  it('skips tokenizer strings across buffer boundaries and honors the last architecture', async () => {
     writeFileSync(
       path,
       header([
@@ -78,8 +78,8 @@ describe('native-free GGUF metadata', () => {
         entry('trailing-metadata', 8, str('more')),
       ]),
     );
-    expect(readGgufArchitecture(path)).toBe('muse-glimmer');
-    expect(readGgufArchitecture(path)).toBe(ggufArchitecture(path));
+    await expect(readGgufArchitecture(path)).resolves.toBe('muse-glimmer');
+    await expect(readGgufArchitecture(path)).resolves.toBe(ggufArchitecture(path));
   });
 
   it.each([
@@ -96,14 +96,14 @@ describe('native-free GGUF metadata', () => {
     ['invalid array type', header([entry('bad', 9, Buffer.concat([u32(99), u64(0)]))])],
     ['oversized string', header([entry('bad', 8, u64(2n ** 63n))])],
     ['oversized array', header([entry('bad', 9, Buffer.concat([u32(4), u64(2n ** 63n)]))])],
-  ])('rejects %s without allocation or unbounded reads', (_name, data) => {
+  ])('rejects %s without allocation or unbounded reads', async (_name, data) => {
     writeFileSync(path, data);
-    expect(() => readGgufArchitecture(path)).toThrow();
+    await expect(readGgufArchitecture(path)).rejects.toThrow();
   });
 
   it.skipIf(process.platform === 'win32')('refuses FIFO metadata files without blocking discovery', async () => {
     execFileSync('mkfifo', [path]);
-    expect(() => readGgufArchitecture(path)).toThrow('regular file');
+    await expect(readGgufArchitecture(path)).rejects.toThrow('regular file');
     execFileSync('mkfifo', [join(root, 'config.json')]);
     await expect(detectModelType(root)).rejects.toThrow('Cannot detect model type');
   });
