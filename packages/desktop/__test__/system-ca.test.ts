@@ -439,6 +439,30 @@ describe('keychainCaRootsPem', () => {
     expect(scopedDeny).toBe('');
   });
 
+  it('keeps System-keychain roots when a trust domain cannot be read, but never login-keychain ones', async () => {
+    // A managed Mac can refuse the trust-settings export (MDM policy). The old
+    // behavior voided the whole bundle — including System-keychain roots that
+    // need no trust record at all — so the app fell back to the exact
+    // pre-fix failure on the networks this module exists for.
+    const systemRoot = await keychainCaRootsPem(
+      fakeExec({ certs: { [SYSTEM_KEYCHAIN]: ROOT_CA }, userExport: 'fail' }),
+      [SYSTEM_KEYCHAIN],
+    );
+    expect(systemRoot).toContain(ROOT_CA);
+
+    // The login keychain is the sensitive direction: an unreadable domain's
+    // denys are unknown, and membership there was never trust to begin with.
+    const loginRoot = await keychainCaRootsPem(
+      fakeExec({
+        certs: { [LOGIN_KEYCHAIN]: ROOT_CA },
+        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }] }]),
+        adminExport: 'fail',
+      }),
+      [LOGIN_KEYCHAIN],
+    );
+    expect(loginRoot).toBe('');
+  });
+
   it('still requires an explicit record for the login keychain, where membership is not trust', async () => {
     const loginOnly = await keychainCaRootsPem(fakeExec({ certs: { [LOGIN_KEYCHAIN]: ROOT_CA } }), [LOGIN_KEYCHAIN]);
     expect(loginOnly).toBe('');
@@ -558,11 +582,12 @@ describe('prepareExtraCaBundle', () => {
   });
 
   it('ships no keychain roots when a trust domain cannot be read', async () => {
-    // Decisions merge allow-OR/deny-OR across the user and admin domains, so
-    // exporting with only the domains that read successfully would keep their
-    // allows while silently dropping the failed domain's denies — restoring a
-    // trust the user explicitly revoked. The whole keychain bundle is
-    // abandoned instead (startup itself is unaffected).
+    // Decisions merge allow-OR/deny-OR across the user and admin domains, so a
+    // non-System-keychain root must not be licensed by the domains that DID
+    // read: their allows would ride along while the failed domain's denies are
+    // silently dropped — restoring a trust the user explicitly revoked.
+    // (System-keychain roots are the deliberate exception: they need no trust
+    // record, see the unreadable-domain test above.) Startup is unaffected.
     const dir = tmpDir();
     const result = await prepareExtraCaBundle({
       platform: 'darwin',

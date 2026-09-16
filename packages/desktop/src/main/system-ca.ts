@@ -51,9 +51,12 @@
  *
  * Async throughout — MAIN never blocks (`index.ts`'s header is the rule).
  * Failures degrade to `null` (no env var), never to a launch failure. A trust
- * domain that fails to READ voids the entire keychain bundle (see
- * loadTrustDecisions): exporting the surviving domains' allows without the
- * failed domain's denies could restore a trust the user explicitly revoked.
+ * domain that fails to READ does not void the whole bundle (see
+ * loadTrustDecisions): the surviving domains' allows cannot be joined to the
+ * failed domain's denys, so such a load is confined to the candidates whose
+ * trust does not hinge on a record — System-keychain roots. The old
+ * void-everything rule meant one managed-Mac export failure emptied the
+ * bundle exactly where an intercepting proxy is most likely.
  */
 
 import { execFile } from 'node:child_process';
@@ -339,20 +342,29 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
  * domains. The system domain is not read: its entries concern the Apple
  * system roots, which this module no longer exports (see macosKeychains).
  *
- * A domain that fails to READ rejects the whole load — this is the one
- * failure in this module that must NOT degrade locally. Decisions are merged
- * as allow-OR / deny-OR across domains, so proceeding with only the domains
- * that read successfully would silently drop the failed domain's DENIES while
- * keeping the others' allows: a root the user explicitly revoked would be
- * exported on the admin domain's say-so. Rejecting propagates to
- * `prepareExtraCaBundle`'s catch, which ships no keychain roots at all (the
- * inherited NODE_EXTRA_CA_CERTS still applies, and startup is unaffected).
+ * A domain that fails to READ is reported in `unreadable` rather than
+ * rejecting the load outright. Decisions are merged as allow-OR / deny-OR
+ * across domains, so continuing with only the domains that read successfully
+ * would silently drop the failed domain's DENIES while keeping the others'
+ * allows: a root the user explicitly revoked could be exported on the admin
+ * domain's say-so. Callers therefore get the flag and must confine an
+ * unreadable result to candidates whose trust does not depend on a record:
+ * System-keychain roots (see {@link keychainCaRootsPem}). Rejecting outright,
+ * the old behavior, meant one managed-Mac export failure emptied the whole
+ * bundle — including roots that needed no trust record at all.
  * One exception: a domain that has NO records at all exits the export with
  * errSecNoTrustSettings, which means "empty", not "unreadable" — that domain
  * contributes nothing and the other domain still loads.
  */
-async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDecision>> {
+interface TrustDecisions {
+  decisions: Map<string, TrustDecision>;
+  /** True when at least one domain's export failed for a reason other than "no records". */
+  unreadable: boolean;
+}
+
+async function loadTrustDecisions(exec: ExecText): Promise<TrustDecisions> {
   const merged = new Map<string, TrustDecision>();
+  let unreadable = false;
   const tmp = await mkdtemp(join(tmpdir(), 'mlx-trust-'));
   try {
     for (const args of [[], ['-d']]) {
@@ -364,10 +376,12 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
         // trust-settings-export` exits 1 with "SecTrustSettingsCreateExternal-
         // Representation: No Trust Settings were found." (errSecNoTrustSettings)
         // when the domain has no records at all — the normal state on a
-        // machine whose user never touched Keychain Access trust. Only that
-        // specific failure means "no records"; anything else rejects the
-        // whole load per the docstring above.
-        if (!/No Trust Settings were found|errSecNoTrustSettings/.test(String(error))) throw error;
+        // machine whose user never touched Keychain Access trust. Any other
+        // failure marks the load UNREADABLE and keeps parsing the rest.
+        if (!/No Trust Settings were found|errSecNoTrustSettings/.test(String(error))) {
+          console.warn('[mlx] trust-settings export failed; treating that domain as unreadable:', error);
+          unreadable = true;
+        }
         continue;
       }
       const dump = await exec('plutil', ['-p', plist]);
@@ -382,7 +396,7 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
   } finally {
     await rm(tmp, { recursive: true, force: true });
   }
-  return merged;
+  return { decisions: merged, unreadable };
 }
 
 /** The admin-writable keychain: where an MDM-managed or installer-placed root lives. */
@@ -411,7 +425,8 @@ const SYSTEM_KEYCHAIN = '/Library/Keychains/System.keychain';
  *     Battle.net-style junk cert lives there, and it stays excluded.
  */
 export async function keychainCaRootsPem(exec: ExecText, keychains: readonly string[]): Promise<string> {
-  const [candidates, decisions] = await Promise.all([collectCandidates(exec, keychains), loadTrustDecisions(exec)]);
+  const [candidates, trust] = await Promise.all([collectCandidates(exec, keychains), loadTrustDecisions(exec)]);
+  const { decisions } = trust;
   const seen = new Set<string>();
   const roots: string[] = [];
   for (const candidate of candidates) {
@@ -421,14 +436,17 @@ export async function keychainCaRootsPem(exec: ExecText, keychains: readonly str
     // SCOPED deny makes the root ineligible because the bundle cannot
     // express the scope (it would grant trust for exactly the denied host).
     const denied = decision?.denyForSsl === true || decision?.scopedDenyForSsl === true;
-    const trusted =
-      !denied &&
-      (candidate.keychain === SYSTEM_KEYCHAIN ||
-        // Every other candidate comes from the user's login keychain, where
+    const untrustworthy = candidate.keychain === SYSTEM_KEYCHAIN
+      ? // System-keychain membership IS trust (admin-gated; profile-driven
+        // trust lives here), so only an explicit deny can veto it.
+        denied
+      : // Every other candidate comes from the user's login keychain, where
         // membership is NOT trust: an explicit, unconstrained sslServer
-        // allow is required.
-        decision?.allowForSsl === true);
-    if (!trusted) continue;
+        // allow is required, and an UNREADABLE trust domain cannot supply
+        // it — an unreadable domain's denies are unknown, so only the
+        // admin-gated keychain may rely on absence of records.
+        denied || decision?.allowForSsl !== true || trust.unreadable;
+    if (untrustworthy) continue;
     seen.add(candidate.sha256);
     roots.push(candidate.pem);
   }
