@@ -44,7 +44,12 @@ function trustDump(
 }
 
 /** A `security`/`plutil` stand-in: canned per-keychain certs and canned trust dumps. */
-function fakeExec(opts: { certs: Readonly<Record<string, string>>; trust?: string; trustExportFails?: boolean }): ExecText {
+function fakeExec(opts: {
+  certs: Readonly<Record<string, string>>;
+  trust?: string;
+  /** true: a read failure. 'empty': the domain has no records (errSecNoTrustSettings exit-1 shape). */
+  trustExportFails?: boolean | 'empty';
+}): ExecText {
   return async (cmd, args) => {
     if (cmd === 'security' && args[0] === 'find-certificate') {
       const output = opts.certs[args[args.length - 1]];
@@ -53,6 +58,9 @@ function fakeExec(opts: { certs: Readonly<Record<string, string>>; trust?: strin
     }
     if (cmd === 'security' && args[0] === 'trust-settings-export') {
       if (opts.trustExportFails === true) throw new Error('export timed out');
+      if (opts.trustExportFails === 'empty') {
+        throw new Error('Command failed: security trust-settings-export\nSecTrustSettingsCreateExternalRepresentation: No Trust Settings were found.');
+      }
       return '';
     }
     if (cmd === 'plutil') return opts.trust ?? EMPTY_DUMP;
@@ -105,11 +113,16 @@ describe('parseTrustSettingsDump', () => {
     const dump = trustDump([
       { sha1: 'A'.repeat(40), settings: [{ policy: 'sslServer', result: 3 }] },
       { sha1: 'B'.repeat(40), settings: [{ policy: 'smime', result: 1 }] },
+      // basicX509 is a distinct policy scope, not SSL authorization:
+      // Chromium's trust_store_mac.cc evaluates SSL trust settings against
+      // the sslServer policy only.
+      { sha1: 'E'.repeat(40), settings: [{ policy: 'basicX509', result: 1 }] },
       { sha1: 'C'.repeat(40), settings: [{ result: 1 }] }, // no policy: applies to all
     ]);
     const decisions = parseTrustSettingsDump(dump);
     expect(decisions.get('A'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: true });
     expect(decisions.get('B'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
+    expect(decisions.get('E'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
     expect(decisions.get('C'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false });
   });
 
@@ -262,6 +275,23 @@ describe('keychainCaRootsPem', () => {
 });
 
 describe('prepareExtraCaBundle', () => {
+  it('treats an empty trust domain as no records, not a read failure', async () => {
+    // `security trust-settings-export` exits 1 with "No Trust Settings were
+    // found." (errSecNoTrustSettings) for a domain with zero records — the
+    // normal state on a machine whose user never edited trust settings. That
+    // must not void the bundle, or the fix dies on exactly the stock machines
+    // it targets. Apple system roots are implicitly trusted regardless.
+    const dir = tmpDir();
+    const result = await prepareExtraCaBundle({
+      platform: 'darwin',
+      dir,
+      exec: fakeExec({ certs: { [SYSTEM_ROOTS]: ROOT_CA }, trustExportFails: 'empty' }),
+      keychains: [SYSTEM_ROOTS],
+    });
+    expect(result).toBe(join(dir, 'system-ca-roots.pem'));
+    expect(readFileSync(result!, 'utf8')).toContain(ROOT_CA);
+  });
+
   it('ships no keychain roots when a trust domain cannot be read', async () => {
     // Decisions merge allow-OR/deny-OR across the user and admin domains, so
     // exporting with only the domains that read successfully would keep their

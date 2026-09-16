@@ -27,11 +27,11 @@
  *     domains), which keys records by the cert's SHA-1 and carries
  *     `kSecTrustSettingsResult` per policy. Apple's System Roots are trusted
  *     implicitly (that's what the keychain means); anything else needs an
- *     explicit allow record for `sslServer` or `basicX509` (the pair
- *     mkcert-style tools set), and a deny record always wins. Verified against
- *     a live keychain: an installed cert with zero trust records (Blizzard
- *     Battle.net Local Cert) is NOT effectively trusted, an mkcert root with
- *     `sslServer → TrustRoot` IS.
+ *     explicit, unconstrained allow record for the `sslServer` policy
+ *     (mkcert-style tools set one), and a deny record always wins. Verified
+ *     against a live keychain: an installed cert with zero trust records
+ *     (Blizzard Battle.net Local Cert) is NOT effectively trusted, an
+ *     mkcert root with `sslServer → TrustRoot` IS.
  *
  * `verify-cert -p ssl` was tried and rejected as the trust oracle: it
  * evaluates the candidate AS A LEAF, which even Apple's own system roots fail
@@ -73,10 +73,14 @@ const SYSTEM_ROOTS_KEYCHAIN = '/System/Library/Keychains/SystemRootCertificates.
 const TRUST_ROOT = 1;
 const TRUST_AS_ROOT = 2;
 const DENY = 3;
-// The policies SSL evaluation consults: the SSL policy itself, and the basic
-// X.509 policy it is layered on. An allow for e.g. S/MIME alone does NOT make
-// a cert an SSL anchor.
-const SSL_POLICIES = new Set(['sslServer', 'basicX509']);
+// The only policy whose allow record authorizes TLS server verification.
+// basicX509 is NOT on the list: it is a distinct policy scope (Chromium's
+// trust_store_mac.cc evaluates SSL trust settings against the sslServer
+// policy only), so a basic-only allow must not promote a CA into a TLS
+// anchor. An allow for e.g. S/MIME alone does not count either. A record
+// with NO policy name (older exports) applies to every policy and is
+// handled in the parser, not here.
+const SSL_POLICIES = new Set(['sslServer']);
 
 /**
  * The three places a TLS-inspecting root can land. The System Roots keychain is
@@ -279,6 +283,9 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
  * exported on the admin domain's say-so. Rejecting propagates to
  * `prepareExtraCaBundle`'s catch, which ships no keychain roots at all (the
  * inherited NODE_EXTRA_CA_CERTS still applies, and startup is unaffected).
+ * One exception: a domain that has NO records at all exits the export with
+ * errSecNoTrustSettings, which means "empty", not "unreadable" — that domain
+ * contributes nothing and the other domain still loads.
  */
 async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDecision>> {
   const merged = new Map<string, TrustDecision>();
@@ -286,7 +293,19 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
   try {
     for (const args of [[], ['-d']]) {
       const plist = join(tmp, `trust${args[0] ?? '-user'}.plist`);
-      await exec('security', ['trust-settings-export', ...args, plist]);
+      try {
+        await exec('security', ['trust-settings-export', ...args, plist]);
+      } catch (error) {
+        // An EMPTY domain is not a read failure: `security
+        // trust-settings-export` exits 1 with "SecTrustSettingsCreateExternal-
+        // Representation: No Trust Settings were found." (errSecNoTrustSettings)
+        // when the domain has no records at all — the normal state on a
+        // machine whose user never touched Keychain Access trust. Only that
+        // specific failure means "no records"; anything else rejects the
+        // whole load per the docstring above.
+        if (!/No Trust Settings were found|errSecNoTrustSettings/.test(String(error))) throw error;
+        continue;
+      }
       const dump = await exec('plutil', ['-p', plist]);
       for (const [sha1, decision] of parseTrustSettingsDump(dump)) {
         const entry = merged.get(sha1) ?? { allowForSsl: false, denyForSsl: false };
