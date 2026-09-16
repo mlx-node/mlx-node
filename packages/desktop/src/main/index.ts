@@ -19,12 +19,15 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
+import { resolveModelsDir } from '@mlx-node/server/host/paths';
 import { app, autoUpdater, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
 import electronUpdater from 'electron-updater';
 
 import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
 import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
+import { decideAutoStart } from './auto-start.js';
 import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
 import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
 import { electronBrokerDeps } from './control-panel-child.js';
@@ -414,9 +417,23 @@ async function bootstrap(): Promise<void> {
   refreshTray();
   updates.start();
 
-  if (settings.autoStartInference) {
-    void supervisor.start().catch(reportInferenceFailure);
-  }
+  // Auto-start is gated on there being something to serve: a fresh install
+  // has no models, and forking INFERENCE there is a guaranteed
+  // NoModelsDiscoveredError exit — see auto-start.ts. `quitting` is re-checked
+  // inside the callback: discovery can outlive a quit that started after it.
+  void discoverLocalChatModels(resolveModelsDir(settings.modelsDir ?? undefined))
+    .then((models) => {
+      const decision = decideAutoStart({ enabled: settings.autoStartInference, modelCount: models.length });
+      console.log(`[mlx] inference auto-start: ${decision.reason}`);
+      if (!decision.start || quitting || supervisor === null) return;
+      void supervisor.start().catch(reportInferenceFailure);
+    })
+    .catch((error: unknown) => {
+      const decision = decideAutoStart({ enabled: settings.autoStartInference, modelCount: null });
+      console.error(`[mlx] inference auto-start: ${decision.reason}:`, error);
+      if (!decision.start || quitting || supervisor === null) return;
+      void supervisor.start().catch(reportInferenceFailure);
+    });
   // Materialise defaults whenever there was no usable file. Otherwise settings
   // exist only in memory until the user happens to move the window or toggle a
   // preference, and a crash before then silently loses the recovered state.

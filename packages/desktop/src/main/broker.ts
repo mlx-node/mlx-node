@@ -198,7 +198,7 @@ export function createControlPanelBroker<Target>(
     consecutiveCrashes = nextCrashCount(policy, consecutiveCrashes, deps.now() - spawnedAtMs);
     deps.report({ type: 'control-panel-exited', code, consecutiveCrashes });
 
-    const decision = planRestart(policy, consecutiveCrashes);
+    const decision = planRestart(policy, consecutiveCrashes, { code, signal: null });
     if (decision.action === 'give-up') {
       gaveUp = true;
       deps.report({ type: 'control-panel-gave-up', consecutiveCrashes });

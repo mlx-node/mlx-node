@@ -578,7 +578,7 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
     emit({ type: 'crashed', exit: lastExit });
     const readyForMs = becameReady ? Date.now() - readyAtMs : 0;
     consecutiveCrashes = nextCrashCount(policy, consecutiveCrashes, readyForMs);
-    const decision = planRestart(policy, consecutiveCrashes);
+    const decision = planRestart(policy, consecutiveCrashes, exit);
     if (decision.action === 'give-up') {
       setLifecycle('failed');
       emit({ type: 'gave-up', consecutiveCrashes });

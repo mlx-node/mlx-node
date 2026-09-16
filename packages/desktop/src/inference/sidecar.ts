@@ -17,6 +17,12 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { EXIT_STARTUP_FAILED } from './exit-codes.js';
+
+// Re-exported so existing importers keep working; the definition and the rule
+// about who else may read it live in exit-codes.ts.
+export { EXIT_STARTUP_FAILED };
+
 /**
  * Where the sidecar binds. See {@link sidecarHostOptions} for what the entry
  * actually passes.
@@ -272,9 +278,6 @@ export interface SidecarDeps {
   logError(line: string): void;
   exit(code: number): void;
 }
-
-/** Startup failed. Distinct from 1 so a crash report can tell it from a throw. */
-export const EXIT_STARTUP_FAILED = 78;
 
 /**
  * Run the sidecar until it is told to stop.

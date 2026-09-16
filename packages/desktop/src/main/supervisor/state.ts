@@ -6,6 +6,7 @@
  * driven directly from a test instead of inferred from behaviour.
  */
 
+import { EXIT_STARTUP_FAILED } from '../../inference/exit-codes.js';
 import type { ChildExit, Lifecycle, SupervisorState } from './types.js';
 
 /**
@@ -112,8 +113,17 @@ export type RestartDecision =
  * Exponential from `baseDelayMs`, clamped at `maxDelayMs`, with no jitter: a
  * single local child has nothing to stampede against, and jitter would make the
  * give-up boundary untestable for the sake of a property nothing here needs.
+ *
+ * One exit is NEVER restarted, whatever the budget: `EXIT_STARTUP_FAILED` is
+ * the sidecar reporting that `createHost` rejected — a deterministic
+ * environment problem, classically `NoModelsDiscoveredError` on a machine
+ * with no downloaded models. The next fork inherits the same environment, so
+ * five attempts differ from one only in how long the user stares at a crash
+ * loop. `start()` resets the crash count, so a manual Start after the user
+ * fixes the cause (downloaded a model) always gets a fresh attempt.
  */
-export function planRestart(policy: RestartPolicy, consecutiveCrashes: number): RestartDecision {
+export function planRestart(policy: RestartPolicy, consecutiveCrashes: number, exit: ChildExit): RestartDecision {
+  if (exit.code === EXIT_STARTUP_FAILED) return { action: 'give-up', attempt: consecutiveCrashes };
   if (consecutiveCrashes >= policy.maxConsecutiveCrashes) return { action: 'give-up', attempt: consecutiveCrashes };
   const raw = policy.baseDelayMs * 2 ** (consecutiveCrashes - 1);
   return { action: 'restart', delayMs: Math.min(raw, policy.maxDelayMs), attempt: consecutiveCrashes };
