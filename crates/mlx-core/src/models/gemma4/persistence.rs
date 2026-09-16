@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use napi::bindgen_prelude::*;
 use serde_json::Value;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::array::{DType, MxArray};
 use crate::cold_tier::{resolve_persist_cold, shard_identities_stable, snapshot_shard_identities};
@@ -519,6 +519,18 @@ fn parse_eos_token_ids(value: &Value) -> Vec<i32> {
 /// pass validation — every quant builder then returned `None`, the dense
 /// branch found no `.weight` to load, and the model silently kept its
 /// constructor-RANDOM weights.
+/// Whether `key` belongs to one of the vision stacks a Gemma4 checkpoint can
+/// carry: the SigLIP tower, the unified encoder-free embedder, and the
+/// multimodal projection they share. The same prefixes `sanitize_weights`
+/// drops for a text-only config.
+fn is_gemma4_vision_weight_key(key: &str) -> bool {
+    key.starts_with("vision_tower.")
+        || key.starts_with("vision_encoder.")
+        || key.starts_with("vision_embedder.")
+        || key.starts_with("multi_modal_projector.")
+        || key.starts_with("embed_vision.")
+}
+
 fn validate_required_weights(
     params: &HashMap<String, MxArray>,
     config: &Gemma4Config,
@@ -720,7 +732,24 @@ fn validate_required_weights(
     // present; without a fail-closed check, a truncated vision shard leaves
     // constructor-initialized projections/norms (or unbounded clipping) while
     // the language model still loads successfully.
-    if let Some(vc) = config.vision_config.as_ref() {
+    //
+    // Required only when the checkpoint actually ships a vision stack. A config
+    // that DECLARES the SigLIP tower over a text-only file is the normal shape
+    // of the Unsloth UD GGUF repos — their `config.json` keeps `vision_config`
+    // (and `image_token_id`) while the GGUF carries text tensors only, and no
+    // mlx-node-supported mmproj exists to fill the tower in. The dense Qwen3.5
+    // loader resolves the same situation by tensor presence: `has_vision` is
+    // `raw_params.keys().any(strip_qwen35_vision_weight_prefix)` in
+    // `qwen3_5/persistence.rs:2076`, and a checkpoint without vision tensors
+    // simply loads text-only. Demanding the tower here would reject a load the
+    // dense family accepts.
+    //
+    // The unified media paths stay unconditionally required: their companion is
+    // resolved up front by `native_gguf_requires_media` + the native prepare
+    // preflight, so an absent sidecar there is a real error, not a text-only
+    // file.
+    let vision_weights_present = params.keys().any(|key| is_gemma4_vision_weight_key(key));
+    if let (Some(vc), true) = (config.vision_config.as_ref(), vision_weights_present) {
         for key in [
             "vision_tower.patch_embedder.input_proj.weight",
             "vision_tower.patch_embedder.position_embedding_table",
@@ -2706,6 +2735,26 @@ impl Gemma4Inner {
             top_level_mode,
             &per_layer_quant,
         )?;
+
+        // A config that declares the SigLIP tower over a checkpoint with no
+        // vision tensors loads TEXT-ONLY (the Unsloth UD GGUF shape; see
+        // `validate_required_weights`). The tower was constructed from the
+        // config, so it must be dropped rather than left unloaded: otherwise
+        // `image_path_loaded()` would report an image path whose projections are
+        // constructor-random. Dropping it makes the NAPI `supportsImages()`
+        // snapshot and the chat image guard reject image turns loudly, exactly
+        // as the dense Qwen3.5 loader leaves `vision_encoder = None` when the
+        // checkpoint carries no vision tensors.
+        if !params.keys().any(|key| is_gemma4_vision_weight_key(key))
+            && config.vision_config.is_some()
+        {
+            warn!(
+                "Gemma4: config declares a vision tower but the checkpoint ships no vision \
+                 tensors — loading text-only; image turns will be rejected. Supply the \
+                 model's supported media projector to enable them."
+            );
+            inner.drop_vision_stack();
+        }
 
         // Apply the encoder-free audio projection (unified checkpoints only).
         apply_audio_weights(
@@ -5841,6 +5890,161 @@ mod tests {
         p.retain(|k, _| !k.starts_with("vision_embedder.") && !k.starts_with("embed_vision."));
         validate_required_weights(&p, &text_only)
             .expect("text-only config must not require unified vision keys");
+    }
+
+    /// A SigLIP-declaring config over a text-only checkpoint is the Unsloth UD
+    /// GGUF shape (their `config.json` keeps `vision_config`; the GGUF carries
+    /// text tensors only, and no mlx-node-supported mmproj exists to fill the
+    /// tower). It loads text-only, exactly like a dense Qwen3.5 checkpoint
+    /// without vision tensors — but a checkpoint that *does* ship vision
+    /// tensors still has to ship the whole tower, and the text weights stay
+    /// fail-closed either way.
+    #[test]
+    fn siglip_vision_config_without_vision_tensors_validates_text_only() {
+        // Minimal SigLIP vision config, matching `Gemma4VisionConfig::from_json`.
+        let config: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 16,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 16,
+            "intermediate_size": 16,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            "vision_config": {
+                "hidden_size": 16,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-6,
+                "patch_size": 2,
+                "position_embedding_size": 4,
+                "default_output_length": 4,
+                "pooling_kernel_size": 1,
+                "use_clipped_linears": false,
+                "rope_theta": 100.0,
+                "standardize": false,
+            },
+        }))
+        .expect("Gemma4Config with a SigLIP vision_config");
+        assert!(
+            config.vision_config.is_some(),
+            "the fixture must declare the dense SigLIP tower"
+        );
+
+        // The validator only checks key presence, so a 1-element dummy works.
+        let dummy = || MxArray::from_float32(&[0.0], &[1]).expect("dummy");
+        let text_only = || -> HashMap<String, MxArray> {
+            let mut p: HashMap<String, MxArray> = HashMap::new();
+            for key in [
+                "embed_tokens.weight",
+                "norm.weight",
+                "lm_head.weight",
+                "layers.0.self_attn.q_proj.weight",
+                "layers.0.self_attn.k_proj.weight",
+                "layers.0.self_attn.v_proj.weight",
+                "layers.0.self_attn.o_proj.weight",
+                "layers.0.self_attn.q_norm.weight",
+                "layers.0.self_attn.k_norm.weight",
+                "layers.0.layer_scalar",
+                "layers.0.mlp.gate_proj.weight",
+                "layers.0.mlp.up_proj.weight",
+                "layers.0.mlp.down_proj.weight",
+                "layers.0.input_layernorm.weight",
+                "layers.0.post_attention_layernorm.weight",
+                "layers.0.pre_feedforward_layernorm.weight",
+                "layers.0.post_feedforward_layernorm.weight",
+            ] {
+                p.insert(key.to_string(), dummy());
+            }
+            p
+        };
+
+        // The declared tower does not exist in the checkpoint: text-only.
+        validate_required_weights(&text_only(), &config)
+            .expect("a vision-declaring text-only checkpoint must validate");
+
+        // One vision tensor makes the whole tower required again — a truncated
+        // vision stack must never load as constructor-random weights.
+        let mut partial = text_only();
+        partial.insert(
+            "vision_tower.patch_embedder.input_proj.weight".to_string(),
+            dummy(),
+        );
+        let err = validate_required_weights(&partial, &config)
+            .expect_err("a partially present vision tower must fail closed");
+        assert!(
+            format!("{err}").contains("vision_tower.patch_embedder.position_embedding_table"),
+            "the truncated tower must name its first missing key, got: {err}"
+        );
+
+        // Text weights stay fail-closed with no vision tensors at all.
+        let mut missing_text = text_only();
+        missing_text.remove("norm.weight");
+        let err = validate_required_weights(&missing_text, &config)
+            .expect_err("a missing text weight must still fail");
+        assert!(
+            format!("{err}").contains("Missing required weight: norm.weight"),
+            "got: {err}"
+        );
+    }
+
+    /// `drop_vision_stack` is what keeps a text-only load from running image
+    /// turns on constructor-random weights: `new` builds the tower from the
+    /// config alone, and `image_path_loaded` trusts a `Some` tower.
+    #[test]
+    fn drop_vision_stack_clears_every_config_built_component() {
+        let config: Gemma4Config = serde_json::from_value(serde_json::json!({
+            "vocab_size": 8,
+            "hidden_size": 32,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 1,
+            "num_key_value_heads": 1,
+            "head_dim": 32,
+            "intermediate_size": 32,
+            "rms_norm_eps": 1e-6,
+            "tie_word_embeddings": false,
+            "max_position_embeddings": 64,
+            "vision_config": {
+                "hidden_size": 16,
+                "intermediate_size": 16,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "rms_norm_eps": 1e-6,
+                "patch_size": 2,
+                "position_embedding_size": 4,
+                "default_output_length": 4,
+                "pooling_kernel_size": 1,
+                "use_clipped_linears": false,
+                "rope_theta": 100.0,
+                "standardize": false,
+            },
+        }))
+        .expect("Gemma4Config with a SigLIP vision_config");
+
+        let mut inner = Gemma4Inner::new(config).expect("Gemma4Inner::new");
+        assert!(
+            inner.vision_tower.is_some()
+                && inner.embed_vision.is_some()
+                && inner.image_processor.is_some(),
+            "the constructor must build the tower the config declares"
+        );
+
+        inner.drop_vision_stack();
+        assert!(inner.vision_tower.is_none());
+        assert!(inner.unified_vision_embedder.is_none());
+        assert!(inner.embed_vision.is_none());
+        assert!(inner.image_processor.is_none());
+        assert!(
+            !inner.image_path_loaded(),
+            "a dropped vision stack must not report a loadable image path"
+        );
     }
 
     /// An mxfp8-mode embedding whose resolved PLQ still carries the affine

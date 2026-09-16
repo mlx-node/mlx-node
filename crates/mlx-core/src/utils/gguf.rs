@@ -6061,6 +6061,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn gemma_native_prepares_a_vision_declaring_text_only_checkpoint() {
+        // `unsloth/gemma-4-26B-A4B-it-GGUF` shape: the sibling config.json keeps
+        // a SigLIP `vision_config`, the text GGUF carries text tensors only, and
+        // the projector beside it declares `clip.vision.projector_type =
+        // "gemma4v"` — a tower mlx-node has no importer for. The text model must
+        // still convert, and must not claim media it cannot execute.
+        let root = GemmaNativeTestDir::new();
+        let source = root.path().join("source");
+        let input = gemma_native_fixture(&source);
+        fs::write(
+            source.join("config.json"),
+            serde_json::json!({
+                "model_type": "gemma4",
+                "image_token_id": 262144,
+                "text_config": {"num_hidden_layers": 0},
+                "vision_config": {
+                    "model_type": "gemma4_vision",
+                    "hidden_size": 1152,
+                    "num_hidden_layers": 27,
+                    "num_attention_heads": 16,
+                    "head_dim": 72,
+                    "patch_size": 16,
+                    "position_embedding_size": 10240,
+                    "use_clipped_linears": false,
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // An unsupported projector type: not a Gemma4 media companion, so it is
+        // neither required nor converted.
+        fs::write(
+            source.join("mmproj-BF16.gguf"),
+            build_minimal_gguf(
+                &[
+                    ("general.architecture", GgufMetaValue::String("clip".into())),
+                    (
+                        "clip.vision.projector_type",
+                        GgufMetaValue::String("gemma4v".into()),
+                    ),
+                ],
+                &[(
+                    "v.patch_embd.weight",
+                    &[2, 2],
+                    GgufTensorType::BF16,
+                    &[0; 8],
+                )],
+            ),
+        )
+        .unwrap();
+
+        let cache = root.path().join("cache");
+        let output = prepare_gemma4_native_gguf_in(&input, &cache)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a vision-declaring text-only Gemma4 checkpoint must convert: {}",
+                    error.reason
+                )
+            });
+        assert!(
+            !output.join("vision.safetensors").exists(),
+            "no supported projector was present, so no media sidecar may be published"
+        );
+        let marker = fs::read_to_string(output.join(".complete")).unwrap();
+        assert!(
+            marker.contains("companion_sha256=none\n"),
+            "the text cache must record that it has no media companion"
+        );
+        // The unsupported projector must not change the cache identity either.
+        assert_eq!(
+            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            output
+        );
+    }
+
+    #[tokio::test]
     async fn gemma_native_unified_media_requires_companion_for_both_family_markers() {
         let root = GemmaNativeTestDir::new();
         for mut config in [
@@ -8202,11 +8279,8 @@ mod tests {
         );
         params.insert(
             "layers.0.experts.down_proj.biases".to_string(),
-            MxArray::from_float16(
-                &[half::f16::from_f32(-0.25).to_bits(); 2 * 4],
-                &[2, 4, 1],
-            )
-            .expect("expert biases"),
+            MxArray::from_float16(&[half::f16::from_f32(-0.25).to_bits(); 2 * 4], &[2, 4, 1])
+                .expect("expert biases"),
         );
         // The guards the Gemma4 loader runs before its switch builders must all
         // accept the group the importer wrote: float sidecars for an affine

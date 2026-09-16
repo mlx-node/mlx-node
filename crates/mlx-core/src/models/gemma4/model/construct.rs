@@ -456,6 +456,21 @@ impl Gemma4Inner {
         })
     }
 
+    /// Drop the config-constructed vision stack so this instance reports an
+    /// absent image path.
+    ///
+    /// `new` builds the tower/embedder/image processor from `vision_config`
+    /// alone, and `image_path_loaded` reports the image path as available
+    /// whenever they are `Some`. A checkpoint that declares vision but ships no
+    /// vision tensors must therefore shed them explicitly: left in place, image
+    /// turns would run on constructor-random weights instead of being rejected.
+    pub(crate) fn drop_vision_stack(&mut self) {
+        self.vision_tower = None;
+        self.unified_vision_embedder = None;
+        self.embed_vision = None;
+        self.image_processor = None;
+    }
+
     /// Whether the complete physical image execution path is loaded.
     ///
     /// This is the single authority for both `ExecutionPlan.media.images` and
