@@ -5,7 +5,13 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { keychainCaRootsPem, macosKeychains, parseTrustSettingsDump, prepareExtraCaBundle, type ExecText } from '../src/main/system-ca.js';
+import {
+  keychainCaRootsPem,
+  macosKeychains,
+  parseTrustSettingsDump,
+  prepareExtraCaBundle,
+  type ExecText,
+} from '../src/main/system-ca.js';
 
 const FIXTURES = join(__dirname, 'fixtures');
 const ROOT_CA = readFileSync(join(FIXTURES, 'test-root-ca.pem'), 'utf8').trim();
@@ -115,9 +121,17 @@ describe('parseTrustSettingsDump', () => {
 }
 `;
     const decisions = parseTrustSettingsDump(real);
-    expect(decisions.get('9C29EB274CB463788ACFC21705615CBE81EDB0AA')).toEqual({ allowForSsl: true, denyForSsl: false, scopedDenyForSsl: false });
+    expect(decisions.get('9C29EB274CB463788ACFC21705615CBE81EDB0AA')).toEqual({
+      allowForSsl: true,
+      denyForSsl: false,
+      scopedDenyForSsl: false,
+    });
     // Present in the keychain with NO trust records: installed, but not trusted.
-    expect(decisions.get('21261EB01273C866A943ACBD51E04D3CBFDC395B')).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
+    expect(decisions.get('21261EB01273C866A943ACBD51E04D3CBFDC395B')).toEqual({
+      allowForSsl: false,
+      denyForSsl: false,
+      scopedDenyForSsl: false,
+    });
   });
 
   it('records a deny, and ignores allows for non-SSL policies', () => {
@@ -142,7 +156,11 @@ describe('parseTrustSettingsDump', () => {
     // policy and NO kSecTrustSettingsResult; verify-cert confirms such a cert
     // is trusted, so the schema default is allow.
     const dump = trustDump([{ sha1: 'D'.repeat(40), settings: [{ policy: 'sslServer' }] }]);
-    expect(parseTrustSettingsDump(dump).get('D'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false, scopedDenyForSsl: false });
+    expect(parseTrustSettingsDump(dump).get('D'.repeat(40))).toEqual({
+      allowForSsl: true,
+      denyForSsl: false,
+      scopedDenyForSsl: false,
+    });
   });
 
   it('reads an explicitly empty trustSettings array as always-trust', () => {
@@ -150,7 +168,11 @@ describe('parseTrustSettingsDump', () => {
     // result TrustRoot — and is "definitely not the same as *no* Trust
     // Settings". Corporate roots added without a policy export this shape.
     const dump = trustDump([{ sha1: 'E'.repeat(40), settings: [] }]);
-    expect(parseTrustSettingsDump(dump).get('E'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false, scopedDenyForSsl: false });
+    expect(parseTrustSettingsDump(dump).get('E'.repeat(40))).toEqual({
+      allowForSsl: true,
+      denyForSsl: false,
+      scopedDenyForSsl: false,
+    });
   });
 
   it('ignores hostname-constrained records in both directions', () => {
@@ -206,6 +228,122 @@ describe('parseTrustSettingsDump', () => {
     expect(decisions.get('1'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
     expect(decisions.get('2'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
   });
+
+  it('fails closed on a policy OID the export did not name', () => {
+    // Every built-in policy exports kSecTrustSettingsPolicyName, so a record
+    // carrying an OID but no name is an unidentifiable scope — NOT "applies
+    // to every policy". Its allow grants nothing; its deny still counts.
+    const dump = `{
+  "trustList" => {
+    "3333333333333333333333333333333333333333" => {
+      "trustSettings" => [
+        0 => {
+          "kSecTrustSettingsPolicy" => {length = 9, bytes = 0x010203040506070809}
+          "kSecTrustSettingsResult" => 1
+        }
+      ]
+    }
+    "4444444444444444444444444444444444444444" => {
+      "trustSettings" => [
+        0 => {
+          "kSecTrustSettingsPolicy" => {length = 9, bytes = 0x010203040506070809}
+          "kSecTrustSettingsResult" => 3
+        }
+      ]
+    }
+  }
+  "trustVersion" => 1
+}
+`;
+    const decisions = parseTrustSettingsDump(dump);
+    expect(decisions.get('3'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
+    expect(decisions.get('4'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: true, scopedDenyForSsl: false });
+  });
+
+  it('judges a record only after the item closes, whatever the key order', () => {
+    // `plutil -p` emits keys sorted today, but the order is not contractual:
+    // a Result seen before the policy name or a constraint must not be
+    // applied to a half-read item. Verdicts land at closeItem.
+    const dump = `{
+  "trustList" => {
+    "5555555555555555555555555555555555555555" => {
+      "trustSettings" => [
+        0 => {
+          "kSecTrustSettingsResult" => 1
+          "kSecTrustSettingsPolicyName" => "smime"
+        }
+      ]
+    }
+    "6666666666666666666666666666666666666666" => {
+      "trustSettings" => [
+        0 => {
+          "kSecTrustSettingsResult" => 1
+          "kSecTrustSettingsPolicy" => {length = 9, bytes = 0x2a864886f763640103}
+          "kSecTrustSettingsPolicyName" => "sslServer"
+          "kSecTrustSettingsPolicyString" => "internal.example.com"
+        }
+      ]
+    }
+  }
+  "trustVersion" => 1
+}
+`;
+    const decisions = parseTrustSettingsDump(dump);
+    // smime allow: not SSL regardless of field order.
+    expect(decisions.get('5'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
+    // sslServer allow scoped to a hostname: the late constraint still applies.
+    expect(decisions.get('6'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
+  });
+
+  it('ignores a stray Result line outside any item', () => {
+    const dump = `{
+  "trustList" => {
+    "7777777777777777777777777777777777777777" => {
+      "trustSettings" => [
+        0 => {
+          "kSecTrustSettingsPolicy" => {length = 9, bytes = 0x2a864886f763640103}
+          "kSecTrustSettingsPolicyName" => "smime"
+        }
+        "kSecTrustSettingsResult" => 1
+      ]
+    }
+  }
+  "trustVersion" => 1
+}
+`;
+    expect(parseTrustSettingsDump(dump).get('7'.repeat(40))).toEqual({
+      allowForSsl: false,
+      denyForSsl: false,
+      scopedDenyForSsl: false,
+    });
+  });
+
+  it('treats an unrecognised schema key with digits as a constraint', () => {
+    // The constraint detector matches any kSecTrustSettings* key beyond the
+    // three whitelist entries — including hypothetical future keys carrying
+    // digits, which a [A-Za-z]+ pattern would have let slip through.
+    const dump = `{
+  "trustList" => {
+    "8888888888888888888888888888888888888888" => {
+      "trustSettings" => [
+        0 => {
+          "kSecTrustSettingsPolicy" => {length = 9, bytes = 0x2a864886f763640103}
+          "kSecTrustSettingsPolicyName" => "sslServer"
+          "kSecTrustSettingsPolicy2" => 1
+          "kSecTrustSettingsResult" => 1
+        }
+      ]
+    }
+  }
+  "trustVersion" => 1
+}
+`;
+    expect(parseTrustSettingsDump(dump).get('8'.repeat(40))).toEqual({
+      allowForSsl: false,
+      denyForSsl: false,
+      scopedDenyForSsl: false,
+    });
+  });
 });
 
 describe('keychainCaRootsPem', () => {
@@ -232,7 +370,13 @@ describe('keychainCaRootsPem', () => {
       fakeExec({
         certs: { [SYSTEM_ROOTS]: ROOT_CA },
         trust: trustDump([
-          { sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }, { policy: 'sslServer', result: 3 }] },
+          {
+            sha1: ROOT_SHA1,
+            settings: [
+              { policy: 'sslServer', result: 1 },
+              { policy: 'sslServer', result: 3 },
+            ],
+          },
         ]),
       }),
       [SYSTEM_ROOTS],
@@ -285,7 +429,13 @@ describe('keychainCaRootsPem', () => {
       fakeExec({
         certs: { '/k/System': ROOT_CA },
         trust: trustDump([
-          { sha1: ROOT_SHA1, settings: [{ policy: 'basicX509', result: 1 }, { policy: 'sslServer', result: 3 }] },
+          {
+            sha1: ROOT_SHA1,
+            settings: [
+              { policy: 'basicX509', result: 1 },
+              { policy: 'sslServer', result: 3 },
+            ],
+          },
         ]),
       }),
       ['/k/System'],

@@ -77,9 +77,19 @@ const DENY = 3;
 // trust_store_mac.cc evaluates SSL trust settings against the sslServer
 // policy only), so a basic-only allow must not promote a CA into a TLS
 // anchor. An allow for e.g. S/MIME alone does not count either. A record
-// with NO policy name (older exports) applies to every policy and is
-// handled in the parser, not here.
+// with NO policy OID at all (the oldest export shape) applies to every
+// policy and is handled in the parser, not here.
 const SSL_POLICIES = new Set(['sslServer']);
+
+/**
+ * Marker for a record carrying `kSecTrustSettingsPolicy` (a policy OID blob)
+ * but NO `kSecTrustSettingsPolicyName`. Every built-in policy exports its
+ * name, so an unnamed OID is a custom or unrecognised policy scope — not
+ * "applies to every policy". The parser fails closed on it: an allow with an
+ * unidentifiable scope grants nothing, while a deny still counts (denying is
+ * the safe direction under ambiguity).
+ */
+const UNNAMED_POLICY = 'unnamed-policy-oid';
 
 /**
  * The two places a TLS-inspecting root can land: System.keychain is where an
@@ -94,10 +104,7 @@ const SSL_POLICIES = new Set(['sslServer']);
  * 2024-11-15). Exporting it would broaden trust beyond both stores.
  */
 export function macosKeychains(): string[] {
-  return [
-    '/Library/Keychains/System.keychain',
-    join(homedir(), 'Library', 'Keychains', 'login.keychain-db'),
-  ];
+  return ['/Library/Keychains/System.keychain', join(homedir(), 'Library', 'Keychains', 'login.keychain-db')];
 }
 
 const execFileAsync = promisify(execFile);
@@ -144,8 +151,11 @@ export interface TrustDecision {
  *     schema default. `security add-trusted-cert -r trustRoot` exports exactly
  *     such an item, and `security verify-cert -p ssl` confirms the cert is
  *     trusted while the key is absent;
- *   - a result with NO policy name applies to every policy (older records),
- *     so it counts for SSL too;
+ *   - a record with NO policy OID at all (the oldest export shape) applies to
+ *     every policy, so it counts for SSL too. A record carrying a policy OID
+ *     but no `kSecTrustSettingsPolicyName` is the opposite case: built-in
+ *     policies always export their name, so an unnamed OID is a scope this
+ *     bundle cannot identify — its allows do not count (see UNNAMED_POLICY);
  *   - an entry whose `trustSettings` array is EMPTY means "always trust this
  *     cert" (SecTrustSettings.h: "An empty Trust Settings array is definitely
  *     not the same as *no* Trust Settings").
@@ -164,6 +174,11 @@ export interface TrustDecision {
  *     flagged non-system root at all — an unconditional export would grant
  *     trust for exactly the host the user distrusted.
  *
+ * The verdict is applied only when an item CLOSES: `-p` output is
+ * undocumented and dictionary order is not part of the contract, so a Result
+ * seen before the policy name or a constraint key must not be judged on a
+ * half-read item.
+ *
  * The `-p` format is undocumented but has been stable for years, and it is the
  * only export form that avoids shipping a plist parser for three calls per
  * launch.
@@ -171,22 +186,37 @@ export interface TrustDecision {
 export function parseTrustSettingsDump(text: string): Map<string, TrustDecision> {
   const decisions = new Map<string, TrustDecision>();
   let current: (TrustDecision & { items: number; sawArray: boolean }) | null = null;
-  let item: { policy: string | null; sawResult: boolean; constrained: boolean } | null = null;
+  let item: {
+    policy: string | null;
+    sawPolicyOid: boolean;
+    result: number | null;
+    constrained: boolean;
+  } | null = null;
   const apply = (result: number, policy: string | null, constrained: boolean): void => {
     if (current === null) return;
-    if (policy !== null && !SSL_POLICIES.has(policy)) return;
+    const isDeny = result === DENY;
+    if (policy !== null) {
+      // Scope check. `null` (record carried no policy OID — the oldest shape)
+      // and a named sslServer both count. UNNAMED_POLICY counts for DENIES
+      // only: an allow needs a scope the bundle can positively identify,
+      // while a deny is the safe direction under ambiguity.
+      if (!SSL_POLICIES.has(policy) && !(policy === UNNAMED_POLICY && isDeny)) return;
+    }
     if (constrained) {
       // Not applied verbatim (see the docstring): a scoped allow grants
       // nothing, but a scoped deny still flags the cert as not
       // unambiguously trusted.
-      if (result === DENY) current.scopedDenyForSsl = true;
+      if (isDeny) current.scopedDenyForSsl = true;
       return;
     }
     if (result === TRUST_ROOT || result === TRUST_AS_ROOT) current.allowForSsl = true;
-    if (result === DENY) current.denyForSsl = true;
+    if (isDeny) current.denyForSsl = true;
   };
   const closeItem = (): void => {
-    if (item !== null && !item.sawResult) apply(TRUST_ROOT, item.policy, item.constrained);
+    if (item !== null) {
+      const policy = item.policy ?? (item.sawPolicyOid ? UNNAMED_POLICY : null);
+      apply(item.result ?? TRUST_ROOT, policy, item.constrained);
+    }
     item = null;
   };
   let currentSha1: string | null = null;
@@ -222,7 +252,7 @@ export function parseTrustSettingsDump(text: string): Map<string, TrustDecision>
     if (/^\s{8}\d+ => \{$/.test(line)) {
       closeItem();
       current.items += 1;
-      item = { policy: null, sawResult: false, constrained: false };
+      item = { policy: null, sawPolicyOid: false, result: null, constrained: false };
       continue;
     }
     if (/^\s{8}\}/.test(line)) {
@@ -238,20 +268,25 @@ export function parseTrustSettingsDump(text: string): Map<string, TrustDecision>
       if (item !== null) item.policy = policy[1];
       continue;
     }
+    if (/"kSecTrustSettingsPolicy" =>/.test(line)) {
+      if (item !== null) item.sawPolicyOid = true;
+      continue;
+    }
     // Any other kSecTrustSettings* key on the item is a constraint this
     // process-wide bundle cannot honor (hostname, application, key usage,
     // allowed errors, future schema additions) — fail closed by ignoring
     // the record entirely. The negative lookahead whitelists the three keys
     // an unconstrained record is made of: the policy OID blob, its name,
     // and the result.
-    if (/"kSecTrustSettings(?!Policy"|PolicyName"|Result")[A-Za-z]+"/.test(line)) {
+    if (/"kSecTrustSettings(?!Policy"|PolicyName"|Result")[^"]+"/.test(line)) {
       if (item !== null) item.constrained = true;
       continue;
     }
     const result = /"kSecTrustSettingsResult" => (\d+)/.exec(line);
     if (result !== null) {
-      if (item !== null) item.sawResult = true;
-      apply(Number(result[1]), item?.policy ?? null, item?.constrained ?? false);
+      // Buffered, not applied: the verdict is judged at closeItem once every
+      // field of the record has been seen.
+      if (item !== null) item.result = Number(result[1]);
     }
   }
   return decisions;
@@ -266,14 +301,14 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
   const outputs = await Promise.all(
     keychains.map(async (keychain) => {
       try {
-        return { keychain, output: await exec('security', ['find-certificate', '-a', '-p', keychain]) };
+        return { output: await exec('security', ['find-certificate', '-a', '-p', keychain]) };
       } catch {
-        return { keychain, output: '' };
+        return { output: '' };
       }
     }),
   );
   const candidates: Candidate[] = [];
-  for (const { keychain, output } of outputs) {
+  for (const { output } of outputs) {
     for (const block of output.match(PEM_BLOCK_RE) ?? []) {
       try {
         const cert = new X509Certificate(block);
@@ -366,7 +401,8 @@ export async function keychainCaRootsPem(exec: ExecText, keychains: readonly str
     // membership alone is NOT trust: an explicit, unconstrained sslServer
     // allow is required, any global deny vetoes, and any scoped deny makes
     // the root ineligible (the bundle cannot express the scope).
-    const trusted = decision?.allowForSsl === true && decision?.denyForSsl !== true && decision?.scopedDenyForSsl !== true;
+    const trusted =
+      decision?.allowForSsl === true && decision?.denyForSsl !== true && decision?.scopedDenyForSsl !== true;
     if (!trusted) continue;
     seen.add(candidate.sha256);
     roots.push(candidate.pem);

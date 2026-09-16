@@ -36,7 +36,6 @@ import { viewMenuTemplate } from './menu-policy.js';
 import { resolveAppPaths, type AppPaths } from './paths.js';
 import { installAppProtocol, registerAppScheme } from './protocol.js';
 import { createQuitHandler } from './quit.js';
-import { prepareExtraCaBundle, securityText } from './system-ca.js';
 import {
   DEFAULT_SETTINGS,
   loadSettings,
@@ -47,6 +46,7 @@ import {
 } from './settings.js';
 import { utilityChildTransport } from './supervisor/child-utility.js';
 import { createSupervisor, type Supervisor } from './supervisor/index.js';
+import { prepareExtraCaBundle, securityText } from './system-ca.js';
 import { claudeConnectCommand, codexConnectCommand } from './tray-view.js';
 import { createTray, type TrayController } from './tray.js';
 import { canAutoUpdate, createDesktopUpdater, presentUpdate, type DesktopUpdater } from './updates.js';
@@ -316,7 +316,21 @@ async function bootstrap(): Promise<void> {
     .prepare()
     .catch((error: unknown) => console.error('[mlx] command setup:', error));
 
-  const extraCaBundlePath = await extraCaBundle;
+  // Whole-operation deadline: each `security`/`plutil` call is individually
+  // bounded (10 s), but up to four run sequentially inside the export, so a
+  // pathologically hung keychain stack could stall the window, broker and tray
+  // behind ~40 s of subprocess waits. Past the deadline we proceed without the
+  // optional bundle — the pre-fix behavior — rather than delay first paint.
+  const CA_BUNDLE_DEADLINE_MS = 10_000;
+  const TIMED_OUT = 'timed-out';
+  const extraCaBundleResult = await Promise.race([
+    extraCaBundle,
+    new Promise<typeof TIMED_OUT>((resolve) => setTimeout(() => resolve(TIMED_OUT), CA_BUNDLE_DEADLINE_MS)),
+  ]);
+  if (extraCaBundleResult === TIMED_OUT) {
+    console.warn('[mlx] keychain CA export exceeded its deadline; continuing without it');
+  }
+  const extraCaBundlePath = extraCaBundleResult === TIMED_OUT ? null : extraCaBundleResult;
   if (quitting) return;
 
   broker = createControlPanelBroker<WebContents>({
