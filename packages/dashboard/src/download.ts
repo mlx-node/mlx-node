@@ -1052,10 +1052,15 @@ export class DownloadManager {
         this.emit({ type: 'cancelled', id: job.id });
       } else {
         job.state = 'error';
-        // The full stack goes to the child's stderr (MAIN forwards it as
-        // `[mlx] control panel: …`); the event carries the cause chain, since
-        // the raw message alone is undici's content-free "fetch failed".
-        console.error(`[downloads] job ${job.id} (${job.repo}) failed:`, error);
+        // The stack goes to the child's stderr (MAIN forwards it as
+        // `[mlx] control panel: …`) — bounded like the event text, since a hub
+        // error can embed an unbounded remote body inside `message` and stderr
+        // is forwarded verbatim. The event carries the cause chain, since the
+        // raw message alone is undici's content-free "fetch failed".
+        console.error(
+          `[downloads] job ${job.id} (${job.repo}) failed:`,
+          truncateMessage(error instanceof Error ? (error.stack ?? error.message) : String(error)),
+        );
         this.emit({ type: 'error', id: job.id, message: truncateMessage(describeFailure(error)) });
       }
     } finally {
