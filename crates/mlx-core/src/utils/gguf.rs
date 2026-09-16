@@ -1366,8 +1366,17 @@ fn gemma4_name_to_hf(name: &str) -> Option<String> {
     // the infix rules that would otherwise swallow them into `router.proj.*` /
     // `experts.down_proj.*`: `ffn_gate_inp.scale` is the `[hidden]` learnable
     // rms vector and `ffn_down_exps.scale` the `[num_experts]` routing scale.
-    result = result.replace(".ffn_gate_inp.scale", ".router.scale");
-    result = result.replace(".ffn_down_exps.scale", ".router.per_expert_scale");
+    // Suffix-anchored, not an infix replace: `.ffn_down_exps.scales` is the
+    // quant group's own sidecar and a substring match would rename it too,
+    // stranding the expert stack without its scales.
+    for (from, to) in [
+        (".ffn_gate_inp.scale", ".router.scale"),
+        (".ffn_down_exps.scale", ".router.per_expert_scale"),
+    ] {
+        if result.ends_with(from) {
+            result.replace_range(result.len() - from.len().., to);
+        }
+    }
     result = result.replace(".ffn_gate_inp.", ".router.proj.");
     result = result.replace(".ffn_gate_up_exps.", ".experts.gate_up_proj.");
     result = result.replace(".ffn_down_exps.", ".experts.down_proj.");
@@ -8110,6 +8119,12 @@ mod tests {
                 "blk.0.ffn_down_exps.weight",
                 "model.layers.0.experts.down_proj.weight",
             ),
+            // The `.scales` sidecar shares its prefix with the `.scale`
+            // buffer, so the buffer's rule must not touch it.
+            (
+                "blk.0.ffn_down_exps.scales",
+                "model.layers.0.experts.down_proj.scales",
+            ),
             (
                 "blk.0.ffn_down_exps.biases",
                 "model.layers.0.experts.down_proj.biases",
@@ -8288,6 +8303,34 @@ mod tests {
                 mapped.contains(name),
                 "{name} missing from the mapped namespace"
             );
+        }
+
+        // A quantized source tensor's sidecars are derived at import time
+        // (`{prefix}.scales`, plus `.biases` for the asymmetric formats) and
+        // then renamed by the same table as its `.weight`. A rule that moves
+        // the `.scale` buffer but not those (or vice versa) strands the packed
+        // weight, and the failure is silent until load.
+        for tensor in &gguf.tensors {
+            if !tensor.tensor_type.is_quantized() {
+                continue;
+            }
+            let Some(source_prefix) = tensor.name.strip_suffix(".weight") else {
+                continue;
+            };
+            let mapped = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata)
+                .expect("a quantized tensor must map");
+            let mapped_prefix = mapped.strip_suffix(".weight").unwrap_or(&mapped);
+            for suffix in [".scales", ".biases"] {
+                let derived = format!("{source_prefix}{suffix}");
+                let Some(renamed) = gguf_name_to_hf_for_metadata(&derived, &gguf.metadata) else {
+                    continue;
+                };
+                assert_eq!(
+                    renamed,
+                    format!("{mapped_prefix}{suffix}"),
+                    "derived sidecar '{derived}' must follow its packed weight"
+                );
+            }
         }
     }
 
