@@ -51,12 +51,12 @@
  *
  * Async throughout — MAIN never blocks (`index.ts`'s header is the rule).
  * Failures degrade to `null` (no env var), never to a launch failure. A trust
- * domain that fails to READ does not void the whole bundle (see
- * loadTrustDecisions): the surviving domains' allows cannot be joined to the
- * failed domain's denys, so such a load is confined to the candidates whose
- * trust does not hinge on a record — System-keychain roots. The old
- * void-everything rule meant one managed-Mac export failure emptied the
- * bundle exactly where an intercepting proxy is most likely.
+ * domain that fails to READ voids the keychain bundle (see
+ * loadTrustDecisions): exporting without the failed domain's denies could
+ * restore a trust the user explicitly revoked — System-keychain candidates
+ * included, since "Never Trust" is settable on a System item. The refusal is
+ * logged by name; an inherited NODE_EXTRA_CA_CERTS still applies, so a
+ * managed Mac can be unblocked by exporting its proxy root manually.
  */
 
 import { execFile } from 'node:child_process';
@@ -346,12 +346,13 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
  * rejecting the load outright. Decisions are merged as allow-OR / deny-OR
  * across domains, so continuing with only the domains that read successfully
  * would silently drop the failed domain's DENIES while keeping the others'
- * allows: a root the user explicitly revoked could be exported on the admin
- * domain's say-so. Callers therefore get the flag and must confine an
- * unreadable result to candidates whose trust does not depend on a record:
- * System-keychain roots (see {@link keychainCaRootsPem}). Rejecting outright,
- * the old behavior, meant one managed-Mac export failure emptied the whole
- * bundle — including roots that needed no trust record at all.
+ * allows: a root the user explicitly revoked could be exported on the other
+ * domain's say-so. Callers therefore get the flag and must WITHHOLD every
+ * candidate whose export depends on a deny being absent — which is every
+ * candidate, System-keychain roots included ("Never Trust" is settable on a
+ * System item). The flag still exists rather than a plain throw so the
+ * refusal is one decision with one log line, and so a future caller may
+ * confine it more precisely than "ship nothing".
  * One exception: a domain that has NO records at all exits the export with
  * errSecNoTrustSettings, which means "empty", not "unreadable" — that domain
  * contributes nothing and the other domain still loads.
@@ -410,10 +411,12 @@ const SYSTEM_KEYCHAIN = '/Library/Keychains/System.keychain';
  *     advisory here anyway — the bundle is ADDITIVE to Node's Mozilla
  *     store, which already carries the same roots);
  *   - a CA:TRUE root in the SYSTEM keychain: included unless denied (global
- *     or scoped). System-keychain membership IS trust for this purpose —
- *     writing there needs admin rights, and corporate/MDM roots routinely
- *     carry NO explicit trust record at all: profile-driven trust does not
- *     surface in `trust-settings-export`, so the old
+ *     or scoped), and only when every trust domain READ — an unreadable
+ *     domain's denies are unknown, and a System-item deny is exactly the
+ *     kind that hides there. System-keychain membership IS trust for this
+ *     purpose — writing there needs admin rights, and corporate/MDM roots
+ *     routinely carry NO explicit trust record at all: profile-driven trust
+ *     does not surface in `trust-settings-export`, so the old
  *     explicit-allow-record rule silently omitted exactly the middlebox
  *     roots this module exists to add (measured: a Zscaler-style fleet
  *     root in the System keychain with zero user/admin records);
@@ -438,13 +441,16 @@ export async function keychainCaRootsPem(exec: ExecText, keychains: readonly str
     const denied = decision?.denyForSsl === true || decision?.scopedDenyForSsl === true;
     const untrustworthy = candidate.keychain === SYSTEM_KEYCHAIN
       ? // System-keychain membership IS trust (admin-gated; profile-driven
-        // trust lives here), so only an explicit deny can veto it.
-        denied
+        // trust lives here), so an explicit deny is what vetoes it — and a
+        // deny is exactly what an UNREADABLE domain hides. "Never Trust" is
+        // settable on a System item, so shipping one while its domain's
+        // denies are unknown would bypass a revocation the user performed.
+        // Such candidates are withheld too until every domain reads.
+        denied || trust.unreadable
       : // Every other candidate comes from the user's login keychain, where
         // membership is NOT trust: an explicit, unconstrained sslServer
         // allow is required, and an UNREADABLE trust domain cannot supply
-        // it — an unreadable domain's denies are unknown, so only the
-        // admin-gated keychain may rely on absence of records.
+        // one.
         denied || decision?.allowForSsl !== true || trust.unreadable;
     if (untrustworthy) continue;
     seen.add(candidate.sha256);

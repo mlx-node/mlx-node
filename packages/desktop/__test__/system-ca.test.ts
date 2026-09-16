@@ -439,19 +439,26 @@ describe('keychainCaRootsPem', () => {
     expect(scopedDeny).toBe('');
   });
 
-  it('keeps System-keychain roots when a trust domain cannot be read, but never login-keychain ones', async () => {
-    // A managed Mac can refuse the trust-settings export (MDM policy). The old
-    // behavior voided the whole bundle — including System-keychain roots that
-    // need no trust record at all — so the app fell back to the exact
-    // pre-fix failure on the networks this module exists for.
+  it('withholds every root when a trust domain cannot be read, System keychain included', async () => {
+    // An unreadable domain hides its DENIES, and "Never Trust" is settable on
+    // a System-keychain item — so shipping such a root while its domain
+    // cannot be read would bypass a revocation the user performed. The
+    // System-keychain rule therefore only applies to fully readable
+    // trust settings:
     const systemRoot = await keychainCaRootsPem(
       fakeExec({ certs: { [SYSTEM_KEYCHAIN]: ROOT_CA }, userExport: 'fail' }),
       [SYSTEM_KEYCHAIN],
     );
-    expect(systemRoot).toContain(ROOT_CA);
+    expect(systemRoot).toBe('');
 
-    // The login keychain is the sensitive direction: an unreadable domain's
-    // denys are unknown, and membership there was never trust to begin with.
+    // The same root WITHOUT the unreadable domain is exported (the rule this
+    // guards), so the assertion above is about the flag, not about the cert.
+    const readable = await keychainCaRootsPem(
+      fakeExec({ certs: { [SYSTEM_KEYCHAIN]: ROOT_CA } }),
+      [SYSTEM_KEYCHAIN],
+    );
+    expect(readable).toContain(ROOT_CA);
+
     const loginRoot = await keychainCaRootsPem(
       fakeExec({
         certs: { [LOGIN_KEYCHAIN]: ROOT_CA },

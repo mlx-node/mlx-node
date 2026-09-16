@@ -833,3 +833,25 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(false);
   });
 });
+
+describe('isWeightFile — companion GGUFs are not a model payload', () => {
+  it('rejects companion names that discovery also excludes', async () => {
+    const { isWeightFile } = await import('../src/models.js');
+    // A Gemma-style manifest can carry mmproj without the UD target (partial
+    // upstream upload, renamed file). Publishing on the projector alone would
+    // certify a directory model-discovery never lists as a model.
+    // Exactly the names discovery excludes (its GGUF_COMPANION_NAME list) —
+    // kept in sync deliberately: a name discovery treats as a candidate is a
+    // legitimate payload here too, or the two would disagree.
+    expect(isWeightFile('mmproj-BF16.gguf')).toBe(false);
+    expect(isWeightFile('imatrix_unsloth.gguf')).toBe(false);
+    expect(isWeightFile('draft-qwen3.8-27b.gguf')).toBe(false);
+    expect(isWeightFile('something.dflash.gguf')).toBe(false);
+
+    // The real targets and non-GGUF weights stay payloads.
+    expect(isWeightFile('gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf')).toBe(true);
+    expect(isWeightFile('Qwen3.8-27B-UD-Q4_K_XL.gguf')).toBe(true);
+    expect(isWeightFile('model.safetensors')).toBe(true);
+    expect(isWeightFile('model.pdiparams')).toBe(true);
+  });
+});

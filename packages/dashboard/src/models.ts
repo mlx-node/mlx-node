@@ -24,7 +24,7 @@ import {
   statSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
 import { matchFamily } from '@mlx-node/agent/catalog';
 
@@ -74,13 +74,26 @@ export interface DownloadCompletion {
 }
 
 /**
+ * GGUF companion artifacts — projector, calibration, draft — that share the
+ * extension with real weights but are NOT a model payload. Kept in sync with
+ * `@mlx-node/lm`'s `GGUF_COMPANION_NAME` (model-discovery.ts): discovery
+ * excludes these names from candidate enumeration, so a publish gate that
+ * counted one as the payload would certify a directory the loader never
+ * lists — "Installed", no loadable model.
+ */
+const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft)(?:[-_.]|$)/i;
+
+/**
  * A file that carries a model's weights: safetensors, GGUF, or PaddlePaddle
  * params. The single source of truth for "is this a weight payload" — shared
  * with the download runner (`download.ts` imports it) so the publish-time
- * payload gate and the install check agree on the same extension set.
+ * payload gate and the install check agree. A companion GGUF does not count:
+ * a Gemma-style manifest carrying only `mmproj-BF16.gguf` (partial upstream
+ * upload, renamed target) must fail the payload gate rather than publish.
  */
 export function isWeightFile(path: string): boolean {
-  return path.endsWith('.safetensors') || path.endsWith('.gguf') || path.endsWith('.pdiparams');
+  if (path.endsWith('.gguf')) return !GGUF_COMPANION_NAME.test(basename(path));
+  return path.endsWith('.safetensors') || path.endsWith('.pdiparams');
 }
 
 /**

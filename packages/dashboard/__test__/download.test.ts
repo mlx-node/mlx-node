@@ -1205,6 +1205,33 @@ describe('DownloadManager', () => {
     await waitFor(() => jobStagingDirs().length === 0);
   });
 
+  it('errors when the only matched GGUF is a companion artifact, not the target', async () => {
+    // Gemma's globs include mmproj-BF16.gguf. A partial upstream upload (or a
+    // renamed target) can leave the manifest with the projector and nothing
+    // else; publishing that would certify a directory discovery never lists —
+    // "Installed" with no loadable model.
+    hub.manifest = [{ type: 'file', path: 'mmproj-BF16.gguf', size: 44 }];
+    hub.manifests[ASSETS_REPO] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'mmproj-BF16.gguf': 44, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error' || event.type === 'done'));
+
+    expect(events.some((event) => event.type === 'error')).toBe(true);
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+    expect(existsSync(finalDir())).toBe(false);
+    await waitFor(() => jobStagingDirs().length === 0);
+  });
+
   it('does not re-download verified sidecars on a second job over the same revision', async () => {
     hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
     hub.manifests[ASSETS_REPO] = [
