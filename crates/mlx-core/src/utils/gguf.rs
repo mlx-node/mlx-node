@@ -64,6 +64,7 @@ pub enum GgufTensorType {
     F16 = 1,
     Q4_0 = 2,
     Q4_1 = 3,
+    Q5_1 = 7,
     Q8_0 = 8,
     Q3K = 11,
     Q4K = 12,
@@ -82,6 +83,7 @@ impl GgufTensorType {
             1 => Some(Self::F16),
             2 => Some(Self::Q4_0),
             3 => Some(Self::Q4_1),
+            7 => Some(Self::Q5_1),
             8 => Some(Self::Q8_0),
             11 => Some(Self::Q3K),
             12 => Some(Self::Q4K),
@@ -105,6 +107,8 @@ impl GgufTensorType {
             Self::F16 | Self::BF16 => 2,
             Self::Q4_0 => 18, // block size: 2 byte scale + 16 bytes (32 x 4-bit)
             Self::Q4_1 => 20, // 2 byte scale + 2 byte bias + 16 bytes
+            // f16 scale + f16 bias + 4 bytes of high bits + 16 nibble bytes.
+            Self::Q5_1 => 24,
             Self::Q8_0 => 34, // 2 byte scale + 32 bytes
             Self::Q3K | Self::IQ3S => 110,
             // f16 d + f16 dmin + 12 packed 6-bit (sub-scale, min) pairs +
@@ -130,7 +134,7 @@ impl GgufTensorType {
     fn block_size(&self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::BF16 => 1,
-            Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => 32,
+            Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0 => 32,
             Self::IQ4NL => 32,
             Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K | Self::IQ3S | Self::IQ4XS => 256,
         }
@@ -148,7 +152,7 @@ impl GgufTensorType {
     /// per-16/32-value sub-scales need the K-quant array contract in
     /// `crate::utils::gguf_kquant`, not affine's one f16 scale per block.
     fn is_mlx_affine_quantized(&self) -> bool {
-        matches!(self, Self::Q4_0 | Self::Q4_1 | Self::Q8_0)
+        matches!(self, Self::Q4_0 | Self::Q4_1 | Self::Q5_1 | Self::Q8_0)
     }
 
     /// The repacker format for the ggml K-quants, `None` for everything else.
@@ -165,7 +169,13 @@ impl GgufTensorType {
             Self::IQ4NL => Some(KQuantFormat::IQ4NL),
             Self::IQ3S => Some(KQuantFormat::IQ3S),
             Self::IQ4XS => Some(KQuantFormat::IQ4XS),
-            Self::F32 | Self::F16 | Self::BF16 | Self::Q4_0 | Self::Q4_1 | Self::Q8_0 => None,
+            Self::F32
+            | Self::F16
+            | Self::BF16
+            | Self::Q4_0
+            | Self::Q4_1
+            | Self::Q5_1
+            | Self::Q8_0 => None,
         }
     }
 
@@ -175,6 +185,7 @@ impl GgufTensorType {
             Self::F16 => "F16",
             Self::Q4_0 => "Q4_0",
             Self::Q4_1 => "Q4_1",
+            Self::Q5_1 => "Q5_1",
             Self::Q8_0 => "Q8_0",
             Self::Q3K => "Q3_K",
             Self::Q4K => "Q4_K",
@@ -571,7 +582,7 @@ pub fn parse_gguf<P: AsRef<Path>>(path: P) -> Result<GgufFile> {
             Some(t) => t,
             None => {
                 return Err(Error::from_reason(format!(
-                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q8_0(8), Q4_K(12), Q5_K(13), Q6_K(14), BF16(30) are recognized. \
+                    "Tensor '{}' has unsupported GGUF type {} — only F32(0), F16(1), Q4_0(2), Q4_1(3), Q5_1(7), Q8_0(8), Q4_K(12), Q5_K(13), Q6_K(14), BF16(30) are recognized. \
                      Other K-quant and IQ formats require dequantization before conversion.",
                     name, type_u32
                 )));
@@ -796,7 +807,9 @@ pub fn symmetric_zero_point(ty: GgufTensorType) -> Option<i32> {
     match ty {
         GgufTensorType::Q4_0 => Some(8),
         GgufTensorType::Q8_0 => Some(128),
-        GgufTensorType::Q4_1
+        // Q5_1 stores a real per-block minimum beside its scale, like Q4_1.
+        GgufTensorType::Q5_1
+        | GgufTensorType::Q4_1
         | GgufTensorType::F32
         | GgufTensorType::F16
         | GgufTensorType::BF16
@@ -847,17 +860,21 @@ fn load_quantized_tensor(
     let block_size: usize = 32;
     let n_blocks = num_elements / block_size;
 
-    // Determine weights_per_byte for packed format
-    let weights_per_byte: usize = match tensor.tensor_type {
-        GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => 2, // 4-bit: 2 weights per byte
-        GgufTensorType::Q8_0 => 1,                        // 8-bit: 1 weight per byte
+    // Words one 32-value block occupies. 4- and 8-bit codes divide a word
+    // evenly; Q5_1's 5-bit codes do not (8 codes span 40 bits), so its block is
+    // 5 whole words — the same LSB-first bitstream MLX's own writer produces,
+    // which is why the codes cross over unchanged.
+    let words_per_block: usize = match tensor.tensor_type {
+        GgufTensorType::Q4_0 | GgufTensorType::Q4_1 => 4, // 32 x 4-bit = 128 bits
+        GgufTensorType::Q5_1 => 5,                        // 32 x 5-bit = 160 bits
+        GgufTensorType::Q8_0 => 8,                        // 32 x 8-bit = 256 bits
         _ => unreachable!(),
     };
 
-    // Weight shape: last dim divided by (weights_per_byte * 4) for uint32 packing
+    // Weight shape: the innermost dimension shrinks to its packed word count.
     let mut w_shape = shape.clone();
     let last = *w_shape.last().unwrap();
-    *w_shape.last_mut().unwrap() = last / (weights_per_byte as i64 * 4);
+    *w_shape.last_mut().unwrap() = last / block_size as i64 * words_per_block as i64;
 
     // Scales/biases shape: last dim divided by block_size
     let mut sb_shape = shape;
@@ -888,7 +905,7 @@ fn load_quantized_tensor(
                     unpacked[16 + j] = (block[2 + j] >> 4) as i8;
                 }
                 // Pack 8 values per u32 (4 bits each)
-                let base = i * (block_size / (weights_per_byte * 4));
+                let base = i * words_per_block;
                 for k in 0..(block_size / 8) {
                     let mut packed: u32 = 0;
                     for b in 0..8 {
@@ -911,7 +928,7 @@ fn load_quantized_tensor(
                     unpacked[j] = (block[4 + j] & 0x0F) as i8;
                     unpacked[16 + j] = (block[4 + j] >> 4) as i8;
                 }
-                let base = i * (block_size / (weights_per_byte * 4));
+                let base = i * words_per_block;
                 for k in 0..(block_size / 8) {
                     let mut packed: u32 = 0;
                     for b in 0..8 {
@@ -921,6 +938,46 @@ fn load_quantized_tensor(
                 }
             }
         }
+        GgufTensorType::Q5_1 => {
+            // Block: 2 bytes f16 scale (d), 2 bytes f16 bias (m), 4 bytes of
+            // high bits (qh, one bit per weight), 16 nibble bytes (qs). ggml
+            // packs the 32 values as two halves: value `j` (0..16) takes the
+            // LOW nibble of `qs[j]` and bit `j` of `qh`; value `j + 16` takes
+            // the HIGH nibble and bit `j + 16`. Each code is `d * q + m` with
+            // q in 0..32 — exactly MLX's affine contract at 5 bits, so only
+            // the container changes and the dequantized values are identical.
+            biases = vec![0u16; sb_elements];
+            for i in 0..n_blocks {
+                let block = &raw[i * type_size..(i + 1) * type_size];
+                scales[i] = u16::from_le_bytes([block[0], block[1]]);
+                biases[i] = u16::from_le_bytes([block[2], block[3]]);
+                let qh = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+                let qs = &block[8..24];
+
+                let base = i * words_per_block;
+                let mut acc: u64 = 0;
+                let mut pending: u32 = 0;
+                let mut word = base;
+                for value in 0..block_size {
+                    let (nibble, bit) = if value < block_size / 2 {
+                        (qs[value] & 0x0F, (qh >> value) & 1)
+                    } else {
+                        let j = value - block_size / 2;
+                        (qs[j] >> 4, (qh >> (j + block_size / 2)) & 1)
+                    };
+                    acc |= u64::from(u32::from(nibble) | (bit << 4)) << pending;
+                    pending += 5;
+                    while pending >= 32 {
+                        weights_packed[word] = acc as u32;
+                        acc >>= 32;
+                        pending -= 32;
+                        word += 1;
+                    }
+                }
+                debug_assert_eq!(pending, 0, "a 32-value 5-bit block is 5 whole words");
+                debug_assert_eq!(word, base + words_per_block);
+            }
+        }
         GgufTensorType::Q8_0 => {
             // Block: 2 bytes f16 scale, 32 bytes (32 x 8-bit signed weights)
             for i in 0..n_blocks {
@@ -928,7 +985,7 @@ fn load_quantized_tensor(
                 scales[i] = u16::from_le_bytes([block[0], block[1]]);
 
                 // Convert signed int8 to unsigned (add 128 / flip sign bit) then pack into u32
-                let base = i * (block_size / 4); // 8 bits per weight, 4 per u32
+                let base = i * words_per_block; // 8 bits per weight, 4 per u32
                 for k in 0..(block_size / 4) {
                     let mut packed: u32 = 0;
                     for b in 0..4 {
@@ -1303,11 +1360,28 @@ fn gemma4_name_to_hf(name: &str) -> Option<String> {
     result = result.replace(".ffn_down.", ".mlp.down_proj.");
     result = result.replace(".ffn_up.", ".mlp.up_proj.");
 
+    // Sparse layers (gemma-4-26B-A4B) put the router and the expert stacks in
+    // their own namespaces, not under `mlp.`. llama.cpp names the two router
+    // buffers after the projection they sit beside, so they are matched before
+    // the infix rules that would otherwise swallow them into `router.proj.*` /
+    // `experts.down_proj.*`: `ffn_gate_inp.scale` is the `[hidden]` learnable
+    // rms vector and `ffn_down_exps.scale` the `[num_experts]` routing scale.
+    result = result.replace(".ffn_gate_inp.scale", ".router.scale");
+    result = result.replace(".ffn_down_exps.scale", ".router.per_expert_scale");
+    result = result.replace(".ffn_gate_inp.", ".router.proj.");
+    result = result.replace(".ffn_gate_up_exps.", ".experts.gate_up_proj.");
+    result = result.replace(".ffn_down_exps.", ".experts.down_proj.");
+
     result = result.replace(".attn_norm.", ".input_layernorm.");
     result = result.replace(".post_attention_norm.", ".post_attention_layernorm.");
     result = result.replace(".ffn_norm.", ".pre_feedforward_layernorm.");
     result = result.replace(".post_ffw_norm.", ".post_feedforward_layernorm.");
     result = result.replace(".layer_output_scale.weight", ".layer_scalar");
+    // Sparse layers carry the second feed-forward norm pair under numbered
+    // names, which the unnumbered rules above cannot see.
+    result = result.replace(".pre_ffw_norm_2.", ".pre_feedforward_layernorm_2.");
+    result = result.replace(".post_ffw_norm_1.", ".post_feedforward_layernorm_1.");
+    result = result.replace(".post_ffw_norm_2.", ".post_feedforward_layernorm_2.");
 
     // Global tensors rename whole-string, so they carry the quant-group suffix
     // explicitly (a quantized `token_embd`/`output` ships `.scales`/`.biases`
@@ -2594,6 +2668,8 @@ impl SourceQuantProfile {
             // loader needs to rebuild the omitted `.biases`.
             GgufTensorType::Q4_0 => Some(Self::affine(4).symmetric(ty)),
             GgufTensorType::Q4_1 => Some(Self::affine(4)),
+            // 5-bit codes with a stored per-block minimum, like Q4_1.
+            GgufTensorType::Q5_1 => Some(Self::affine(5)),
             GgufTensorType::Q8_0 => Some(Self::affine(8).symmetric(ty)),
             // `load_kquant_repack` keeps ggml's geometry verbatim, so the
             // triple is read off the repacker format rather than restated
@@ -7891,6 +7967,328 @@ mod tests {
         .unwrap();
         fs::remove_file(&tmp).ok();
         weights
+    }
+
+    /// Hand-build one ggml `block_q5_1`: f16 `d`, f16 `m`, 4 high-bit bytes,
+    /// 16 nibble bytes — the layout Unsloth's UD recipes put the expert down
+    /// projections in.
+    fn pack_q5_1_block(codes: &[u8; 32], d: f32, m: f32) -> [u8; 24] {
+        let mut block = [0u8; 24];
+        block[0..2].copy_from_slice(&half::f16::from_f32(d).to_le_bytes());
+        block[2..4].copy_from_slice(&half::f16::from_f32(m).to_le_bytes());
+        let mut qh = 0u32;
+        for j in 0..16 {
+            assert!(codes[j] < 32 && codes[j + 16] < 32, "5-bit codes only");
+            // Low nibble of `qs[j]` holds value `j`, its high nibble value
+            // `j + 16`; the fifth bit of each lives in `qh` at the same index.
+            block[8 + j] = (codes[j] & 0x0F) | ((codes[j + 16] & 0x0F) << 4);
+            qh |= u32::from((codes[j] >> 4) & 1) << j;
+            qh |= u32::from((codes[j + 16] >> 4) & 1) << (j + 16);
+        }
+        block[4..8].copy_from_slice(&qh.to_le_bytes());
+        block
+    }
+
+    /// A Q5_1 block repacks losslessly: the 5-bit codes survive value-for-value
+    /// in MLX's LSB-first stream and `d`/`m` become the affine scale/bias, so
+    /// MLX's affine dequantize at (group 32, 5 bits) reproduces `d*q + m`
+    /// exactly.
+    #[test]
+    fn q5_1_import_round_trips_codes_scales_biases_and_values() {
+        let mut codes = [0u8; 32];
+        for (v, code) in codes.iter_mut().enumerate() {
+            // Spans both nibble halves and both `qh` bit ranges, so a
+            // half-swap or a missing fifth bit cannot pass.
+            *code = ((v as u32 * 7 + 3) % 32) as u8;
+        }
+        let block = pack_q5_1_block(&codes, 0.5, -0.25);
+        // 256 values is eight 32-value blocks, each a whole number of words.
+        let payload: Vec<u8> = (0..8).flat_map(|_| block.iter().copied()).collect();
+        let weights = load_single_kquant_block(GgufTensorType::Q5_1, &payload);
+
+        let weight = weights.get("blk.0.ffn_down.weight").expect("packed weight");
+        assert_eq!(weight.dtype().unwrap(), DType::Uint32);
+        // 256 values at 5 bits = 40 uint32 words.
+        assert_eq!(weight.shape().unwrap().to_vec(), vec![1, 40]);
+        let packed: Vec<u32> = weight.to_uint32().unwrap().iter().copied().collect();
+        let want_codes: Vec<u32> = (0..8)
+            .flat_map(|_| codes.iter().map(|&c| u32::from(c)))
+            .collect();
+        assert_eq!(unpack_lsb_codes(&packed, 5, 256), want_codes);
+
+        let scales = weights.get("blk.0.ffn_down.scales").expect("scales");
+        assert_eq!(scales.dtype().unwrap(), DType::Float16);
+        assert_eq!(scales.shape().unwrap().to_vec(), vec![1, 8]);
+        assert_eq!(
+            scales.to_uint16_native().unwrap(),
+            vec![half::f16::from_f32(0.5).to_bits(); 8]
+        );
+        // Q5_1 stores a real per-block minimum, so its group keeps a `.biases`
+        // companion (unlike the symmetric Q4_0/Q8_0 forms).
+        let biases = weights.get("blk.0.ffn_down.biases").expect("biases");
+        assert_eq!(biases.dtype().unwrap(), DType::Float16);
+        assert_eq!(
+            biases.to_uint16_native().unwrap(),
+            vec![half::f16::from_f32(-0.25).to_bits(); 8]
+        );
+
+        // The value contract: MLX's own affine dequantize must reproduce
+        // `d * q + m` for every code, which is what makes this repack
+        // lossless rather than an approximation.
+        let dequantized = dequantize_affine(
+            &weights["blk.0.ffn_down.weight"],
+            &weights["blk.0.ffn_down.scales"],
+            &weights["blk.0.ffn_down.biases"],
+            5,
+            32,
+        );
+        let want: Vec<f32> = (0..8)
+            .flat_map(|_| {
+                let d = half::f16::from_f32(0.5).to_f32();
+                let m = half::f16::from_f32(-0.25).to_f32();
+                codes.iter().map(move |&q| d * f32::from(q) + m)
+            })
+            .collect();
+        assert_eq!(dequantized, want);
+    }
+
+    /// Dequantize an MLX affine group through the same FFI the loaders use.
+    fn dequantize_affine(
+        weight: &MxArray,
+        scales: &MxArray,
+        biases: &MxArray,
+        bits: u32,
+        group_size: usize,
+    ) -> Vec<f32> {
+        let mode = std::ffi::CString::new("affine").unwrap();
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                weight.as_raw_ptr(),
+                scales.as_raw_ptr(),
+                biases.as_raw_ptr(),
+                group_size as i32,
+                bits as i32,
+                -1,
+                mode.as_ptr(),
+            )
+        };
+        assert!(!handle.is_null(), "affine dequantize failed");
+        let array = MxArray::from_handle(handle, "q5_1_dequant").unwrap();
+        array.eval();
+        array.to_float32().unwrap().to_vec()
+    }
+
+    /// llama.cpp's sparse Gemma4 names map onto the router/expert namespace the
+    /// loader reads, including the two `.scale` buffers whose HF names are not
+    /// an infix rewrite of their GGUF ones.
+    #[test]
+    fn gemma4_sparse_rename_table_covers_router_and_expert_stacks() {
+        let metadata = HashMap::from([(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("gemma4".to_string()),
+        )]);
+
+        for (gguf_name, hf) in [
+            (
+                "blk.0.ffn_gate_inp.weight",
+                "model.layers.0.router.proj.weight",
+            ),
+            ("blk.0.ffn_gate_inp.scale", "model.layers.0.router.scale"),
+            (
+                "blk.0.ffn_down_exps.scale",
+                "model.layers.0.router.per_expert_scale",
+            ),
+            (
+                "blk.0.ffn_gate_up_exps.weight",
+                "model.layers.0.experts.gate_up_proj.weight",
+            ),
+            (
+                "blk.0.ffn_gate_up_exps.scales",
+                "model.layers.0.experts.gate_up_proj.scales",
+            ),
+            (
+                "blk.0.ffn_down_exps.weight",
+                "model.layers.0.experts.down_proj.weight",
+            ),
+            (
+                "blk.0.ffn_down_exps.biases",
+                "model.layers.0.experts.down_proj.biases",
+            ),
+            // The dense Gemma4 projections keep their existing mapping.
+            (
+                "blk.0.ffn_gate.weight",
+                "model.layers.0.mlp.gate_proj.weight",
+            ),
+            (
+                "blk.0.ffn_down.weight",
+                "model.layers.0.mlp.down_proj.weight",
+            ),
+        ] {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(gguf_name, &metadata).as_deref(),
+                Some(hf),
+                "{gguf_name} must map to {hf}"
+            );
+        }
+    }
+
+    /// A 3-D Q5_1 expert stack becomes an affine 5-bit group in the written
+    /// quantization metadata, and the loader's affine switch builder accepts
+    /// that group at the real ggml geometry (group 32, 5 bits).
+    #[test]
+    fn q5_1_expert_stack_publishes_affine_five_bit_metadata_the_loader_accepts() {
+        let mut gguf = source_quant_fixture(&[
+            ("blk.0.ffn_down_exps.weight", GgufTensorType::Q5_1),
+            // The real UD recipe mixes formats, which is what makes the writer
+            // spell out an entry per tensor instead of one top-level triple.
+            ("blk.0.ffn_gate_up_exps.weight", GgufTensorType::Q4K),
+            ("blk.1.ffn_down_exps.weight", GgufTensorType::Q8_0),
+        ]);
+        gguf.metadata.insert(
+            "general.architecture".into(),
+            GgufMetaValue::String("gemma4".into()),
+        );
+        gguf.metadata
+            .insert("gemma4.expert_count".into(), GgufMetaValue::Uint32(2));
+
+        let quant = preserved_source_quantization(&gguf, true)
+            .unwrap()
+            .expect("a Q5_1 tensor must publish a quantization block");
+        let entry = &quant["language_model.model.layers.0.experts.down_proj"];
+        assert_eq!(entry["bits"], serde_json::json!(5));
+        assert_eq!(entry["group_size"], serde_json::json!(32));
+        assert_eq!(entry["mode"], serde_json::json!("affine"));
+        assert!(
+            entry.get(SYMMETRIC_ZERO_POINT_KEY).is_none(),
+            "Q5_1 stores a real per-block minimum; it is not symmetric"
+        );
+
+        let (_, _, _, per_layer) =
+            crate::models::quant_dispatch::parse_quant_settings(Some(&quant), 4, 64)
+                .expect("the published block must parse");
+        let plq = per_layer["layers.0.experts.down_proj"];
+        assert_eq!(plq.bits, 5);
+        assert_eq!(plq.group_size, 32);
+        assert_eq!(
+            plq.mode,
+            crate::models::quant_dispatch::PerLayerMode::Affine
+        );
+
+        // Real ggml geometry: K = 256 → 5-bit codes pack into 40 words.
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert(
+            "layers.0.experts.down_proj.weight".to_string(),
+            MxArray::from_uint32(&[0u32; 2 * 4 * 40], &[2, 4, 40]).expect("packed experts"),
+        );
+        params.insert(
+            "layers.0.experts.down_proj.scales".to_string(),
+            MxArray::from_float16(&[half::f16::from_f32(0.5).to_bits(); 2 * 4 * 8], &[2, 4, 8])
+                .expect("expert scales"),
+        );
+        params.insert(
+            "layers.0.experts.down_proj.biases".to_string(),
+            MxArray::from_float16(
+                &[half::f16::from_f32(-0.25).to_bits(); 2 * 4 * 1],
+                &[2, 4, 1],
+            )
+            .expect("expert biases"),
+        );
+        // The guards the Gemma4 loader runs before its switch builders must all
+        // accept the group the importer wrote: float sidecars for an affine
+        // mode, and a `.biases` companion (affine dequantize requires one).
+        crate::models::quant_dispatch::ensure_kquant_storage_resolves_kquant(
+            &params,
+            "layers.0.experts.down_proj",
+            plq.mode,
+            "gemma4",
+        )
+        .expect("float-only affine sidecars must not read as K-quant storage");
+        crate::models::quant_dispatch::ensure_affine_biases_present(
+            &params,
+            "layers.0.experts.down_proj",
+            plq.mode,
+            "gemma4",
+        )
+        .expect("Q5_1 keeps its stored minimum as the group's .biases");
+        let built = crate::models::gemma4::quantized_linear::try_build_quantized_switch_linear(
+            &params,
+            "layers.0.experts.down_proj",
+            plq.group_size,
+            plq.bits,
+        );
+        assert!(
+            built.is_some(),
+            "an affine 5-bit expert stack must build through the Gemma4 switch builder"
+        );
+    }
+
+    /// Real-file oracle for `unsloth/gemma-4-26B-A4B-it-GGUF`
+    /// (`gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf`): the sparse Gemma4 header must map
+    /// into the router/expert namespace with nothing left behind.
+    #[test]
+    #[ignore = "requires the official Gemma4 26B-A4B GGUF (MLX_TEST_GEMMA4_SPARSE_GGUF)"]
+    fn real_gemma4_sparse_descriptors_map_into_the_runtime_namespace() {
+        let input = std::env::var("MLX_TEST_GEMMA4_SPARSE_GGUF")
+            .expect("set MLX_TEST_GEMMA4_SPARSE_GGUF to the UD-Q4_K_XL checkpoint");
+        let gguf = parse_gguf(Path::new(&input)).expect("real GGUF header must parse");
+
+        let mut mapped = std::collections::BTreeSet::new();
+        for tensor in &gguf.tensors {
+            let Some(hf) = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata) else {
+                continue;
+            };
+            assert!(
+                mapped.insert(hf.clone()),
+                "{hf} is produced by two source tensors"
+            );
+        }
+        // Only the derived RoPE frequency table is dropped.
+        assert_eq!(mapped.len(), gguf.tensors.len() - 1);
+
+        let block_count = gguf
+            .metadata
+            .get("gemma4.block_count")
+            .and_then(GgufMetaValue::as_u64)
+            .expect("block_count") as usize;
+        for layer in 0..block_count {
+            let prefix = format!("model.layers.{layer}");
+            for suffix in [
+                "router.proj.weight",
+                "router.scale",
+                "router.per_expert_scale",
+                "experts.gate_up_proj.weight",
+                "experts.down_proj.weight",
+                "pre_feedforward_layernorm_2.weight",
+                "post_feedforward_layernorm_1.weight",
+                "post_feedforward_layernorm_2.weight",
+            ] {
+                assert!(
+                    mapped.contains(&format!("{prefix}.{suffix}")),
+                    "{prefix}.{suffix} missing from the mapped namespace"
+                );
+            }
+        }
+        for hf in &mapped {
+            assert!(
+                !hf.contains("_exps")
+                    && !hf.contains("ffn_gate_inp")
+                    && !hf.contains("pre_ffw_norm")
+                    && !hf.contains("post_ffw_norm")
+                    && !hf.contains("blk."),
+                "{hf} still carries a ggml-only name"
+            );
+        }
+        for name in [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "model.layers.0.router.proj.weight",
+            "model.layers.29.experts.down_proj.weight",
+        ] {
+            assert!(
+                mapped.contains(name),
+                "{name} missing from the mapped namespace"
+            );
+        }
     }
 
     #[test]
