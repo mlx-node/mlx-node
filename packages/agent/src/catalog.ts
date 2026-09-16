@@ -99,13 +99,17 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     description: 'Agent-tuned MoE, fast decode',
   },
   {
+    // `mmproj-BF16.gguf` carries the vision tower; the repo's `mtp-*.gguf`
+    // files are deliberately NOT globbed — mlx-node's Gemma speculative
+    // decode is the DSpark draft path, nothing pairs those llama.cpp MTP
+    // artifacts, and they would add ~2.5 GB of dead weight per install.
     label: 'Gemma-4-26B-A4B',
     hfRepo: 'unsloth/gemma-4-26B-A4B-it-GGUF',
-    globs: ['*UD-Q4_K_XL*', 'mtp-*.gguf', 'mmproj-BF16.gguf', 'config.json'],
+    globs: ['*UD-Q4_K_XL*', 'mmproj-BF16.gguf', 'config.json'],
     // The license-gated google/gemma-4-26B-A4B-it would 401 for most users;
     // unsloth's mirror ships the same tokenizer/config files ungated.
     assetsRepo: 'unsloth/gemma-4-26B-A4B-it',
-    sizeGb: 18.7,
+    sizeGb: 18.2,
     description: 'MoE, fast decode',
   },
   {

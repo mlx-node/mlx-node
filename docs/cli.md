@@ -808,7 +808,7 @@ When no local model exists, an interactive terminal shows a first-run wizard ove
 | Gemma-4-26B-A4B       | `unsloth/gemma-4-26B-A4B-it-GGUF`      | ~19 GB  | MoE, fast decode             |
 
 Each entry installs its Unsloth **UD-Q4_K_XL** GGUF (`-g "*UD-Q4_K_XL*"`, plus
-the repo's MTP weights and, for Gemma, `mmproj`), one variant out of the dozens
+Qwen3.8-27B's `MTP/` weights and Gemma's `mmproj` projector), one variant out of the dozens
 the repos carry. The same repo serves every platform — Apple Silicon and Linux
 NVIDIA CUDA alike — and the wizard passes each entry's `--assets-repo`
 (`Qwen/Qwen3.8-27B`, `Qwen/Qwen-AgentWorld-35B-A3B`,
