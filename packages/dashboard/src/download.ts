@@ -1032,13 +1032,22 @@ export class DownloadManager {
       // byte total. On a mismatch, fall through to download the resolved revision;
       // publish's `isDownloaderOwned`-guarded owned-swap then replaces the stale one
       // (an UNOWNED dir without our marker is still refused there, never destroyed).
+      //
+      // The marker pins only the PRIMARY repo, so the planned sidecars are
+      // verified against their freshly resolved assets manifest before reading
+      // this as done: a tokenizer/template fix upstream (the assets repo moves
+      // on its own revision; the update sweep probes primary repos only, so no
+      // badge fires) still lands the next time a job runs, instead of being
+      // skipped forever. A missing or stale sidecar falls through to the full
+      // path, which re-fetches it through the plan.
       const installed = readCompletion(finalDir);
       if (
         installed !== undefined &&
         installed.repo === job.repo &&
         installed.revision === revision &&
         isModelInstalled(finalDir) &&
-        (job.repo !== QWEN38_DFLASH2.hfRepo || isDFlash2Companion(finalDir))
+        (job.repo !== QWEN38_DFLASH2.hfRepo || isDFlash2Companion(finalDir)) &&
+        (sidecarPlan === null || (await this.assetSidecarsCurrent(sidecarPlan, finalDir)))
       ) {
         job.receivedBytes = totalBytes;
         job.state = 'done';
@@ -1392,6 +1401,22 @@ export class DownloadManager {
       files.push(file);
     }
     return { repo, revision, files };
+  }
+
+  /**
+   * True when every file in an {@link planAssetSidecars} plan is already
+   * present in `dir` and matches the assets manifest's size/content hash —
+   * the precondition for treating an installed model as up to date without
+   * re-staging its sidecars.
+   */
+  private async assetSidecarsCurrent(
+    plan: { files: ListFileEntry[] },
+    dir: string,
+  ): Promise<boolean> {
+    for (const file of plan.files) {
+      if (!(await isStagedCopyComplete(join(dir, file.path), file))) return false;
+    }
+    return true;
   }
 
   /**

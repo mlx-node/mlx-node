@@ -1243,6 +1243,50 @@ describe('DownloadManager', () => {
     expect(republished.files).toEqual(expect.arrayContaining([WEIGHT, 'config.json', 'tokenizer.json']));
   });
 
+  it('re-fetches a sidecar that changed upstream while the primary revision stayed put', async () => {
+    // The completion marker pins only the PRIMARY repo and the update sweep
+    // probes primary repos only, so a tokenizer fix in the base model (the
+    // assets repo moves on its own revision) raises no badge — but a job that
+    // runs must still repair it instead of short-circuiting on the marker.
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+    hub.shaByRepo[ASSETS_REPO] = SHA_OLD;
+    const first = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const events1: DownloadEvent[] = [];
+    const id1 = first.start(REPO);
+    first.subscribe(id1, (event) => events1.push(event));
+    await waitFor(() => events1.some((event) => event.type === 'done'));
+    expect(readFileSync(join(finalDir(), 'tokenizer.json')).length).toBe(20);
+
+    // The base model re-uploads the tokenizer at a NEW revision; the primary
+    // repo (and therefore the marker) is untouched.
+    hub.manifests[ASSETS_REPO] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 30 },
+    ];
+    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+    hub.downloaded = [];
+    const second = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 30 }),
+    });
+    const events2: DownloadEvent[] = [];
+    const id2 = second.start(REPO);
+    second.subscribe(id2, (event) => events2.push(event));
+    await waitFor(() => events2.some((event) => event.type === 'done'));
+
+    expect(hub.downloaded).toContain('tokenizer.json');
+    expect(readFileSync(join(finalDir(), 'tokenizer.json')).length).toBe(30);
+  });
+
   // Finding #4: the install-skip gate must match the marker's repo AND revision,
   // not merely "a complete same-slug install exists". A same-slug install pinned to
   // the SAME resolved revision short-circuits (idempotent, no re-fetch).
