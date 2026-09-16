@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { detectModelType, loadModel, MuseGlimmerModel, Qwen35Model } from '@mlx-node/lm';
+import { detectModelType, loadModel, MuseGlimmerModel, Qwen35Model, Qwen35MoeModel } from '@mlx-node/lm';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 const cleanups: Array<() => Promise<void>> = [];
@@ -83,6 +83,15 @@ describe('standalone GGUF model detection', () => {
   it('maps the qwen35 header to qwen3_5 without config.json', async () => {
     const { modelPath } = await writeStandaloneGguf('qwen35');
     await expect(detectModelType(modelPath)).resolves.toBe('qwen3_5');
+  });
+
+  it('maps the sparse qwen35moe header to qwen3_5_moe and passes the file to its loader', async () => {
+    const { modelPath } = await writeStandaloneGguf('qwen35moe');
+    await expect(detectModelType(modelPath)).resolves.toBe('qwen3_5_moe');
+    const loaded = {} as Qwen35MoeModel;
+    const loadSpy = vi.spyOn(Qwen35MoeModel, 'load').mockResolvedValue(loaded);
+    await expect(loadModel(modelPath)).resolves.toBe(loaded);
+    expect(loadSpy).toHaveBeenCalledWith(modelPath);
   });
 
   it('recognizes a Gemma4 GGUF file without guessing from its filename', async () => {

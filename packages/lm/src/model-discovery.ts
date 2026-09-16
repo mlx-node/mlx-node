@@ -39,6 +39,8 @@ interface DiscoveryMetadata {
  * ordinary Q4_K_M files and companion artifacts such as imatrix/mmproj/draft.
  */
 const QWEN35_XL_GGUF = /(?:^|[-_.])Q\d+_K_XL\.gguf$/i;
+/** Dense and sparse Qwen3.5 both load a direct `Q<number>_K_XL.gguf` file. */
+const QWEN35_XL_GGUF_TYPES: readonly ModelType[] = ['qwen3_5', 'qwen3_5_moe'];
 const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft)(?:[-_.]|$)/i;
 // Match the native loaders' primary files/shards. A draft or projector
 // SafeTensors file beside a GGUF is not a converted target checkpoint.
@@ -299,7 +301,7 @@ export async function discoverLocalChatModels(
         if (
           modelType === 'gemma4' ||
           modelType === 'muse_glimmer' ||
-          (modelType === 'qwen3_5' && isQwen35XlGguf(entry.name))
+          (QWEN35_XL_GGUF_TYPES.includes(modelType) && isQwen35XlGguf(entry.name))
         ) {
           await append(ggufModelName(entry.name), full, modelsDir, modelType, basename(modelsDir));
         } else if (debug) {
@@ -345,7 +347,7 @@ export async function discoverLocalChatModels(
     }
     const { xlGgufs } = inventory;
     if (xlGgufs.length > 0 && !inventory.hasPrimarySafetensors) {
-      if (modelType !== 'qwen3_5') {
+      if (!QWEN35_XL_GGUF_TYPES.includes(modelType)) {
         if (debug) {
           console.warn(`[mlx] skip ${full}: direct XL GGUF loading is not supported for ${modelType}`);
         }
