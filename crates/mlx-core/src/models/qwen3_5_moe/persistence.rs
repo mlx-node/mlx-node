@@ -1523,6 +1523,90 @@ fn pin_sym8_to_flat_kv_cache(
     }
 }
 
+/// The float dtype the checkpoint's residual stream runs in.
+///
+/// `dtype` is the current Transformers spelling and `torch_dtype` the legacy
+/// one; when both are present the current one wins. Qwen3.5 checkpoints nest
+/// their text geometry under `text_config`, while the config a native GGUF
+/// cache synthesizes is flat, so both levels are read. Only the two 2-byte
+/// float dtypes are recognized: the paged KV pool templates on those, and a
+/// wider declaration is not something this loader can act on.
+fn declared_residual_dtype(raw: &Value) -> Option<DType> {
+    for level in [raw.get("text_config"), Some(raw)].into_iter().flatten() {
+        let Some(declared) = level
+            .get("dtype")
+            .or_else(|| level.get("torch_dtype"))
+            .and_then(Value::as_str)
+        else {
+            continue;
+        };
+        match declared.to_ascii_lowercase().as_str() {
+            "bfloat16" | "bf16" => return Some(DType::BFloat16),
+            "float16" | "f16" | "half" => return Some(DType::Float16),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The dtype the checkpoint's residual stream runs in: the dtype it declares,
+/// else the dtype of the dense weights the norms multiply (the native GGUF
+/// import writes those in the requested conversion dtype, and a synthesized
+/// standalone config declares nothing at all).
+fn residual_stream_dtype(raw: &Value, params: &HashMap<String, MxArray>) -> Option<DType> {
+    declared_residual_dtype(raw).or_else(|| {
+        ["layers.0.input_layernorm.weight", "final_norm.weight"]
+            .iter()
+            .find_map(|key| params.get(*key).and_then(|w| w.dtype().ok()))
+    })
+}
+
+/// Normalize an imported affine embedding group to the checkpoint's dtype.
+///
+/// ggml affine blocks store their scale in fp16, and MLX's affine dequantize
+/// returns `result_type(scales, biases)` — so a Q4_0/Q8_0 token table decodes
+/// to fp16 even when every dense tensor the native GGUF import wrote is bf16.
+/// `fast::rms_norm` then promotes its output to `result_type(x, weight)` =
+/// fp32, the residual stream follows, and the first paged KV write aborts with
+/// "input dtype Float32 not supported by LayerKVPool". The embedding is the
+/// only quantized tensor whose VALUE (not just a matmul output) becomes the
+/// residual stream, so it is the one group that has to match.
+///
+/// Integer sidecars mean a K/IQ group whatever the mode says; those decode to
+/// bf16 already and are left alone. Only the block scales are re-rounded
+/// (fp16 → bf16), never the packed codes.
+fn align_affine_embedding_dtype(
+    params: &mut HashMap<String, MxArray>,
+    target: Option<DType>,
+) -> Result<bool> {
+    let Some(target) = target.filter(|t| matches!(t, DType::BFloat16 | DType::Float16)) else {
+        return Ok(false);
+    };
+    for suffix in ["scales", "biases"] {
+        let key = format!("embedding.{suffix}");
+        let Some(sidecar) = params.get(&key).cloned() else {
+            continue;
+        };
+        if !matches!(sidecar.dtype()?, DType::Float16 | DType::Float32) {
+            return Ok(false);
+        }
+    }
+    let Some(scales) = params.get("embedding.scales").cloned() else {
+        return Ok(false);
+    };
+    if scales.dtype()? == target {
+        return Ok(false);
+    }
+
+    for suffix in ["scales", "biases"] {
+        let key = format!("embedding.{suffix}");
+        if let Some(sidecar) = params.get(&key).cloned() {
+            params.insert(key, sidecar.astype(target)?);
+        }
+    }
+    Ok(true)
+}
+
 /// Load a pretrained Qwen3.5 MoE model into a dedicated model thread.
 ///
 /// All model state lives on the spawned thread. Returns a thin NAPI shell
@@ -1696,7 +1780,17 @@ pub async fn load_with_thread(model_path: &str) -> Result<Qwen3_5MoeModel> {
                     parse_quant_settings(quant_cfg, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE)?;
 
                 // Sanitize weights
-                let params = sanitize_weights(text_raw_params, &config, &per_layer_quant)?;
+                let mut params = sanitize_weights(text_raw_params, &config, &per_layer_quant)?;
+                // The residual stream's dtype is the checkpoint's own: a
+                // declared `dtype`/`torch_dtype`, else the dtype of the dense
+                // weights the norms multiply.
+                let residual_dtype = residual_stream_dtype(&raw, &params);
+                if align_affine_embedding_dtype(&mut params, residual_dtype)? {
+                    info!(
+                        "Aligned the quantized embedding's affine sidecars with the \
+                         checkpoint's {residual_dtype:?} residual stream"
+                    );
+                }
                 let quantized = is_quantized_checkpoint(&params);
                 info!(
                     "Sanitized to {} parameters (quantized={})",
@@ -2213,11 +2307,184 @@ mod tests {
 
     use super::{
         AttentionType, DEFAULT_QUANT_BITS, DEFAULT_QUANT_GROUP_SIZE, DType, MLPType, MxArray,
-        PerLayerMode, PerLayerQuant, Qwen3_5MoeConfig, Qwen35MoeInner, apply_weights_moe_inner,
+        PerLayerMode, PerLayerQuant, Qwen3_5MoeConfig, Qwen35MoeInner,
+        align_affine_embedding_dtype, apply_weights_moe_inner, declared_residual_dtype,
         default_per_layer_quant, load_vision_encoder_moe, pin_sym8_to_flat_kv_cache,
-        sanitize_weights,
+        residual_stream_dtype, sanitize_weights,
     };
     use std::collections::HashMap;
+
+    /// `dtype` is the current Transformers spelling and `torch_dtype` the
+    /// legacy one; the current key wins, `null` and unknown spellings declare
+    /// nothing, and a flat (GGUF-synthesized) config is read too.
+    #[test]
+    fn declared_residual_dtype_reads_dtype_before_torch_dtype() {
+        assert_eq!(
+            declared_residual_dtype(&serde_json::json!({
+                "text_config": {"dtype": "bfloat16", "torch_dtype": "float16"}
+            })),
+            Some(DType::BFloat16)
+        );
+        assert_eq!(
+            declared_residual_dtype(&serde_json::json!({"text_config": {"torch_dtype": "F16"}})),
+            Some(DType::Float16)
+        );
+        assert_eq!(
+            declared_residual_dtype(&serde_json::json!({"dtype": "BFloat16"})),
+            Some(DType::BFloat16)
+        );
+        assert_eq!(
+            declared_residual_dtype(&serde_json::json!({
+                "text_config": {"dtype": null, "torch_dtype": "float8_e4m3fn"}
+            })),
+            None
+        );
+        assert_eq!(declared_residual_dtype(&serde_json::json!({})), None);
+    }
+
+    /// Regression for the AgentWorld UD-Q4_K_XL import: a Q8_0 `token_embd`
+    /// lands as an affine-8 group whose ggml block scales are fp16, while every
+    /// dense tensor the native import wrote is bf16. The dequantized table is
+    /// fp16, `fast::rms_norm` promotes its output to `result_type(x, weight)` =
+    /// fp32, and the residual stream never returns to a 2-byte dtype — the
+    /// first paged KV write then aborts with "input dtype Float32 not supported
+    /// by LayerKVPool". Aligning the group's sidecars at load keeps the stream
+    /// in the checkpoint's dtype.
+    #[test]
+    fn affine_fp16_embedding_sidecars_cannot_promote_the_residual_stream() {
+        let (vocab, hidden) = (8u32, 64u32);
+        let table = MxArray::from_float32(
+            &vec![0.01f32; (vocab * hidden) as usize],
+            &[vocab as i64, hidden as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        let (mut qw, mut qs, mut qb) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert!(unsafe {
+            mlx_sys::mlx_quantize(
+                table.as_raw_ptr(),
+                32,
+                8,
+                c"affine".as_ptr(),
+                &mut qw,
+                &mut qs,
+                &mut qb,
+            )
+        });
+        let weight = MxArray::from_handle(qw, "qw").unwrap();
+        // ggml stores the block scale in fp16 and MLX reports
+        // `result_type(scales, biases)` as the group's dequant dtype.
+        let scales = MxArray::from_handle(qs, "qs")
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+        let biases = MxArray::from_handle(qb, "qb")
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap();
+        // Every dense tensor the import wrote is bf16.
+        let norm_weight = MxArray::from_float32(&vec![1.0f32; hidden as usize], &[hidden as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        let stream_dtype = |scales: &MxArray, biases: &MxArray| -> DType {
+            let mut embedding = crate::nn::Embedding::new(vocab, hidden).unwrap();
+            embedding
+                .load_quantized(&weight, scales, Some(biases), 32, 8, "affine")
+                .unwrap();
+            let ids = MxArray::from_uint32(&[0, 1, 2], &[1, 3]).unwrap();
+            let embedded = embedding.forward(&ids).unwrap();
+            let mut norm = crate::nn::RMSNorm::new(hidden, Some(1e-6)).unwrap();
+            norm.set_weight(&norm_weight).unwrap();
+            norm.forward(&embedded).unwrap().dtype().unwrap()
+        };
+
+        // As the import lands today: fp16 sidecars → fp16 table → the bf16 norm
+        // weight promotes the residual stream to fp32.
+        assert_eq!(stream_dtype(&scales, &biases), DType::Float32);
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("embedding.weight".to_string(), weight.clone());
+        params.insert("embedding.scales".to_string(), scales);
+        params.insert("embedding.biases".to_string(), biases);
+        params.insert(
+            "layers.0.input_layernorm.weight".to_string(),
+            norm_weight.clone(),
+        );
+        // A GGUF-synthesized config declares no dtype; the checkpoint's own
+        // dense weights are the reference.
+        let target = residual_stream_dtype(&serde_json::json!({}), &params);
+        assert_eq!(target, Some(DType::BFloat16));
+        assert!(align_affine_embedding_dtype(&mut params, target).unwrap());
+        assert_eq!(params["embedding.scales"].dtype().unwrap(), DType::BFloat16);
+        assert_eq!(params["embedding.biases"].dtype().unwrap(), DType::BFloat16);
+
+        let aligned_scales = params["embedding.scales"].clone();
+        let aligned_biases = params["embedding.biases"].clone();
+        assert_eq!(
+            stream_dtype(&aligned_scales, &aligned_biases),
+            DType::BFloat16
+        );
+    }
+
+    /// Integer sidecars mean a K/IQ group whatever the quantization mode says,
+    /// and those decode to bf16 on their own; a group that already matches the
+    /// checkpoint dtype is left byte-identical.
+    #[test]
+    fn affine_embedding_alignment_ignores_integer_and_matching_sidecars() {
+        let mut kquant: HashMap<String, MxArray> = HashMap::new();
+        kquant.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_uint32(&[0u32; 16], &[8, 2]).unwrap(),
+        );
+        kquant.insert(
+            "embedding.scales".to_string(),
+            MxArray::from_float32(&[1.0f32; 16], &[8, 2])
+                .unwrap()
+                .astype(DType::Int8)
+                .unwrap(),
+        );
+        kquant.insert(
+            "embedding.biases".to_string(),
+            MxArray::from_float16(&[0u16; 8], &[8, 1]).unwrap(),
+        );
+        assert!(!align_affine_embedding_dtype(&mut kquant, Some(DType::BFloat16)).unwrap());
+        assert_eq!(
+            kquant["embedding.scales"].dtype().unwrap(),
+            DType::Int8,
+            "a K/IQ group's sidecars are not affine floats"
+        );
+
+        let mut aligned: HashMap<String, MxArray> = HashMap::new();
+        aligned.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_uint32(&[0u32; 16], &[8, 2]).unwrap(),
+        );
+        aligned.insert(
+            "embedding.scales".to_string(),
+            MxArray::from_float32(&[1.0f32; 16], &[8, 2])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap(),
+        );
+        assert!(!align_affine_embedding_dtype(&mut aligned, Some(DType::BFloat16)).unwrap());
+
+        // A dense embedding (no group at all) and a target the paged KV pool
+        // cannot hold are both no-ops.
+        let mut dense: HashMap<String, MxArray> = HashMap::new();
+        dense.insert(
+            "embedding.weight".to_string(),
+            MxArray::from_float32(&[0.0f32; 16], &[8, 2]).unwrap(),
+        );
+        assert!(!align_affine_embedding_dtype(&mut dense, Some(DType::BFloat16)).unwrap());
+        assert!(!align_affine_embedding_dtype(&mut kquant, Some(DType::Float32)).unwrap());
+    }
 
     #[test]
     fn native_tiled_gdn_layout_survives_moe_parse_and_dense_projection() {
