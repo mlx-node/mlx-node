@@ -60,14 +60,20 @@ const runtime = createDashboardRuntime({ modelsDir, dbPath });
 | Metrics        | Tokens/day (in/out/cached), tok/s + TTFT per model, MTP acceptance, model share                         | date range                                                               |
 | Cache          | Cold-tier disk usage vs quota, entry count + age histogram, hit/miss trend                              | clear all, evict older-than-N-days                                       |
 
-The Qwen3.8-27B download card groups an optional **DFlash2** companion beneath
-the target download, with a divider and its own install button. The roughly
-3.85 GB checkpoint is installed once as
-`qwen3.8-27b-dflash2` in the configured models directory. Compatible Qwen3.8-27B
-targets find it automatically on their next load. The companion has its own
-download progress, cancel, and update controls; it is not another chat model.
-Draft-only checkpoints are excluded from the local-model table and model counts.
-Their bytes still contribute to disk usage on Models and Overview. Expand
+Every catalog entry installs its Unsloth UD-Q4_K_XL GGUF (one variant out of
+the repo's dozens) plus the base-model tokenizer sidecars fetched from the
+entry's `assetsRepo`; the download runner glob-filters the manifest and stages
+the sidecars before publishing. No current entry carries a `draft` companion —
+Qwen3.8-27B ships its MTP speculative weights inside the same repo and the
+native loader auto-detects them. The card UI still renders a draft companion
+(with divider, own install button, progress, cancel, and update controls)
+whenever a catalog entry carries one, for example a manually installed
+**DFlash2** draft: the roughly 3.85 GB checkpoint lives at
+`qwen3.8-27b-dflash2` in the configured models directory, and compatible
+Qwen3.8-27B targets find it automatically on their next load. It is not another
+chat model. Draft-only checkpoints are excluded from the local-model table and
+model counts. Their bytes still contribute to disk usage on Models and
+Overview. Expand
 **Companion weights** in the local storage panel to inspect or delete them;
 deleting a separate companion leaves the target model in place.
 

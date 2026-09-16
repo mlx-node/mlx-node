@@ -156,6 +156,8 @@ The npm `darwin-arm64` binary has a macOS 26.0 deployment target. It does not lo
 
 The CUDA path has been tested with Qwen3.6 27B Dense and 35B-A3B MoE on GB10 / DGX Spark (`sm_121`, CUDA 13.0). It currently uses eager fallbacks and has no mlx-node-specific CUDA kernels. Training, speculative decoding, x86_64 Linux, and prebuilt CUDA binaries are not supported.
 
+The wizard's three default models (Qwen3.8-27B, Qwen-AgentWorld-35B-A3B, Gemma-4-26B-A4B) install Unsloth **UD-Q4_K_XL GGUF** files on every platform, CUDA included: one repo per model, one quantization variant, with base-model tokenizer sidecars fetched automatically (`--assets-repo`). K-quants are repacked losslessly into MLX layout at first load, so the GGUF artifact costs a one-time conversion into the native cache and then behaves like a converted checkpoint. The earlier MXFP4 (Metal) / NVFP4 (CUDA) split is gone — the CUDA PoC measured NVFP4 as a dequant fallback on GB10 rather than a native kernel path, so CUDA gives up no native advantage.
+
 Build it on an aarch64 glibc host with CUDA 13.0 and `nvcc` on `PATH`:
 
 ```bash

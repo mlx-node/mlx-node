@@ -52,10 +52,28 @@ replace the contents wholesale.
 | ---------------- | ---------------------- | ------------------------------------------------------ |
 | `-m`, `--model`  | `Qwen/Qwen3-0.6B`      | HuggingFace model id                                   |
 | `-g`, `--glob`   | —                      | Filename pattern filter (download only matching files) |
+| `--assets-repo`  | —                      | Base-model repo to fetch tokenizer/config sidecars from |
 | `--force`        | `false`                | Re-verify every file against upstream by content hash  |
 | `--cache-dir`    | `~/.cache/huggingface` | HuggingFace cache directory                            |
 | `--set-token`    | —                      | Store HuggingFace credentials                          |
 | `-o`, `--output` | —                      | Output directory                                       |
+
+`--assets-repo` exists because GGUF quantization repos ship weights only. When
+no sidecar `tokenizer.json` sits next to a `.gguf`, the native runtime extracts
+the tokenizer embedded in the GGUF, and that extraction marks
+`<tool_call>`/`</tool_call>` as special tokens — every decode path then skips
+them, the tool-call wrapper is stripped from the output, and tool calling
+silently breaks. The flag fetches the base model's `tokenizer.json`,
+`tokenizer_config.json`, `chat_template.jinja`, `config.json`, and processor
+configs (whichever the repo carries) beside the weights after the download; a
+file the GGUF repo itself shipped wins over the base repo's copy. It is
+idempotent, so re-running a command with it re-verifies the sidecars without
+re-downloading them:
+
+```bash
+mlx download model -m unsloth/Qwen3.8-27B-GGUF -g "*UD-Q4_K_XL*" -g "MTP/*" \
+  --assets-repo Qwen/Qwen3.8-27B
+```
 
 ### Datasets
 
@@ -783,15 +801,24 @@ On a fresh run (no explicit `--model`/`--provider`/session flag), it injects the
 
 When no local model exists, an interactive terminal shows a first-run wizard over a curated catalog and downloads the choice via `mlx download model`. In a non-interactive shell it prints the equivalent `mlx download model` commands instead. The catalog:
 
-| Model                 | HuggingFace repo                                 | Size   | Notes                        |
-| --------------------- | ------------------------------------------------ | ------ | ---------------------------- |
-| Qwen3.8-27B (default) | `Brooooooklyn/Qwen3.8-27B-MXFP4-mlx`                 | ~23 GB | Best tool use — recommended  |
-| Qwen-AgentWorld-35B   | `Brooooooklyn/Qwen-AgentWorld-35B-A3B-mxfp4-mlx`     | ~23 GB | Agent-tuned MoE, fast decode |
-| Gemma-4-26B-A4B       | `Brooooooklyn/Gemma-4-26B-A4B-Unsloth-MXFP4-mlx`     | ~16 GB | MoE, fast decode             |
+| Model                 | HuggingFace repo                       | Size    | Notes                        |
+| --------------------- | -------------------------------------- | ------- | ---------------------------- |
+| Qwen3.8-27B (default) | `unsloth/Qwen3.8-27B-GGUF`             | ~19 GB  | Best tool use — recommended  |
+| Qwen-AgentWorld-35B   | `unsloth/Qwen-AgentWorld-35B-A3B-GGUF` | ~22 GB  | Agent-tuned MoE, fast decode |
+| Gemma-4-26B-A4B       | `unsloth/gemma-4-26B-A4B-it-GGUF`      | ~19 GB  | MoE, fast decode             |
 
-The slugs above are what the wizard offers on Apple Silicon. On Linux + NVIDIA
-CUDA it offers the `nvfp4` build of the same model instead — see `catalogRepo`
-in `packages/agent/src/catalog.ts` for why.
+Each entry installs its Unsloth **UD-Q4_K_XL** GGUF (`-g "*UD-Q4_K_XL*"`, plus
+the repo's MTP weights and, for Gemma, `mmproj`), one variant out of the dozens
+the repos carry. The same repo serves every platform — Apple Silicon and Linux
+NVIDIA CUDA alike — and the wizard passes each entry's `--assets-repo`
+(`Qwen/Qwen3.8-27B`, `Qwen/Qwen-AgentWorld-35B-A3B`,
+`unsloth/gemma-4-26B-A4B-it`) so the tokenizer sidecars land beside the weights.
+K-quants are repacked losslessly into MLX layout on first load (the native GGUF
+cache), and Qwen3.8-27B auto-detects the MTP weights for speculative decoding;
+the Qwen3.8-27B default therefore carries no separate `draft` companion (the
+z-lab DFlash2 draft above remains manually installable for converted
+checkpoints). See `catalogRepo` in `packages/agent/src/catalog.ts` for why GGUF
+replaced the earlier MXFP4/NVFP4 split.
 
 A more compact Gemma-4-12B entry (mxfp4 MLP + mxfp8 attention, ~9 GB, for smaller machines) is coming and will appear in the wizard once it is published.
 

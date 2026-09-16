@@ -6,6 +6,8 @@
  * Hugging Face — use them verbatim.
  */
 
+import { QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
+
 export interface CatalogEntry {
   /** Wizard display name. */
   label: string;
@@ -73,12 +75,12 @@ export interface CatalogEntry {
 
 export const MODEL_CATALOG: readonly CatalogEntry[] = [
   {
-    // No separate `draft` companion: the MTP weights ship inside the same
-    // repo (`MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, matched by the `MTP/*` glob) and
-    // the native loader auto-detects them at load (validated:
-    // hasMtpWeights=true, ~4.8 tokens accepted per cycle). The standalone
-    // z-lab DFlash2 companion remains usable via a manual
-    // `mlx download model -m z-lab/Qwen3.8-27B-DFlash2` (docs/cli.md).
+    // The MTP weights ship inside the same repo
+    // (`MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, matched by the `MTP/*` glob) and the
+    // native loader auto-detects them at load (validated: hasMtpWeights=true,
+    // ~4.8 tokens accepted per cycle) — so the MTP path needs no companion
+    // download. The optional z-lab DFlash2 draft stays offered beside the
+    // target for checkpoints that pair with it; it is never auto-installed.
     label: 'Qwen3.8-27B',
     hfRepo: 'unsloth/Qwen3.8-27B-GGUF',
     globs: ['*UD-Q4_K_XL*', 'MTP/*', 'config.json'],
@@ -86,6 +88,7 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     sizeGb: 18.9,
     description: 'Best tool use — recommended default',
     isDefault: true,
+    draft: QWEN38_DFLASH2,
   },
   {
     label: 'Qwen-AgentWorld-35B-A3B',

@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
-import { catalogRepo, MODEL_CATALOG, visibleCatalog } from '@mlx-node/agent';
+import { type CatalogEntry, catalogRepo, MODEL_CATALOG, visibleCatalog } from '@mlx-node/agent';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { runFirstRunWizard, type WizardIO } from '../../packages/cli/src/commands/agent/wizard.js';
@@ -17,6 +17,21 @@ function shellSplit(renderedArgs: string): string[] {
   const words = out.toString('utf8').split('\0');
   words.pop(); // printf leaves a trailing NUL → one empty tail element
   return words;
+}
+
+/**
+ * The argv contract the wizard must hand `mlx download model` for one entry:
+ * the platform-resolved repo, the entry's globs, the sidecar assets repo, and
+ * (when a models dir is pinned) the output under `<modelsDir>/<slug>`. Written
+ * out literally — a change to the wizard's argv shape must fail here.
+ */
+function expectedArgv(entry: CatalogEntry, modelsDir?: string): string[] {
+  const repo = catalogRepo(entry);
+  const argv = ['-m', repo];
+  for (const glob of entry.globs ?? []) argv.push('-g', glob);
+  if (entry.assetsRepo !== undefined) argv.push('--assets-repo', entry.assetsRepo);
+  if (modelsDir !== undefined) argv.push('-o', join(modelsDir, repo.split('/').pop()!.toLowerCase()));
+  return argv;
 }
 
 interface SelectCall {
@@ -92,7 +107,8 @@ describe('runFirstRunWizard', () => {
 
   it('passes the chosen repo to download and returns it', async () => {
     const visible = visibleCatalog();
-    const chosen = catalogRepo(visible[visible.length - 1]!);
+    const entry = visible[visible.length - 1]!;
+    const chosen = catalogRepo(entry);
     const { io } = makeIO({ chosen });
     const { download, calls } = makeDownload();
 
@@ -100,18 +116,32 @@ describe('runFirstRunWizard', () => {
 
     expect(result).toBe(chosen);
     expect(calls).toHaveLength(1);
-    expect(calls[0]).toEqual(['-m', chosen]);
+    expect(calls[0]).toEqual(expectedArgv(entry));
+  });
+
+  it('carries the entry globs and assets repo into the download argv', async () => {
+    // The catalog must actually carry a multi-variant GGUF entry for this to
+    // mean anything: the wizard exists to install one UD-Q4_K_XL variant plus
+    // the base-model tokenizer sidecars, never every quant in the repo.
+    const entry = visibleCatalog().find((e) => e.globs !== undefined && e.assetsRepo !== undefined);
+    expect(entry).toBeDefined();
+    expect(entry!.globs!.length).toBeGreaterThan(0);
+    const { io } = makeIO({ chosen: catalogRepo(entry!) });
+    const { download, calls } = makeDownload();
+
+    await runFirstRunWizard({ io, download });
+
+    expect(calls[0]).toEqual(expectedArgv(entry!));
   });
 
   it('pins the download output under modelsDir when provided', async () => {
-    const chosen = catalogRepo(visibleCatalog()[0]!);
-    const { io } = makeIO({ chosen });
+    const entry = visibleCatalog()[0]!;
+    const { io } = makeIO({ chosen: catalogRepo(entry) });
     const { download, calls } = makeDownload();
 
     await runFirstRunWizard({ io, download, modelsDir: '/custom/models' });
 
-    const slug = chosen.split('/').pop()!.toLowerCase();
-    expect(calls[0]).toEqual(['-m', chosen, '-o', join('/custom/models', slug)]);
+    expect(calls[0]).toEqual(expectedArgv(entry, '/custom/models'));
   });
 
   it('throws without prompting or downloading when not a TTY', async () => {
@@ -145,8 +175,12 @@ describe('runFirstRunWizard', () => {
     } catch (error) {
       const message = (error as Error).message;
       for (const entry of visibleCatalog()) {
-        const slug = catalogRepo(entry).split('/').pop()!.toLowerCase();
-        expect(message).toContain(`mlx download model -m ${catalogRepo(entry)} -o ${join('/custom/models', slug)}`);
+        const line = message.split('\n').find((l) => l.includes(catalogRepo(entry)))!;
+        expect(line).toBeDefined();
+        const renderedArgs = line.trim().replace(/^mlx download model /, '');
+        // The hint must reconstruct the interactive argv exactly — including
+        // the globs and assets repo, so a headless user gets the same file set.
+        expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry, '/custom/models'));
       }
     }
     expect(calls).toHaveLength(0);
@@ -174,9 +208,9 @@ describe('runFirstRunWizard', () => {
       expect(line).toBeDefined();
       const renderedArgs = line!.trim().replace(/^mlx download model /, '');
       // Round-trip: a real POSIX shell parses the displayed command back
-      // into EXACTLY the argv the interactive path would pass — one `-o`
-      // word, `$HOME` unexpanded, `;`/`&` inert.
-      expect(shellSplit(renderedArgs)).toEqual(['-m', catalogRepo(entry), '-o', join(modelsDir, slug)]);
+      // into EXACTLY the argv the interactive path would pass — globs as
+      // single words, one `-o` word, `$HOME` unexpanded, `;`/`&` inert.
+      expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry, modelsDir));
       // Known-correct quoted form: safe words bare, unsafe -o value
       // single-quoted with the embedded quote escaped as '\''.
       expect(line).toContain(`-o '/tmp/My Models/it'\\''s;echo x&$HOME/${slug}'`);
@@ -195,12 +229,12 @@ describe('runFirstRunWizard', () => {
       const message = (error as Error).message;
       const entry = visibleCatalog()[0]!;
       const slug = catalogRepo(entry).split('/').pop()!.toLowerCase();
-      // Unchanged readable form for the common case...
-      expect(message).toContain(`mlx download model -m ${catalogRepo(entry)} -o /custom/models/${slug}`);
-      // ...and it still parses back to the intended argv.
+      // Safe paths stay readable: the -o value renders unquoted...
+      expect(message).toContain(`-o /custom/models/${slug}`);
+      // ...and the whole line still parses back to the intended argv.
       const line = message.split('\n').find((l) => l.includes(catalogRepo(entry)))!;
       const renderedArgs = line.trim().replace(/^mlx download model /, '');
-      expect(shellSplit(renderedArgs)).toEqual(['-m', catalogRepo(entry), '-o', `/custom/models/${slug}`]);
+      expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry, '/custom/models'));
     }
   });
 });

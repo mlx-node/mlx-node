@@ -226,6 +226,11 @@ Options:
   -o, --output <dir>      Output directory (default: ~/.mlx-node/models/<model-slug>;
                           honors MLX_MODELS_DIR env and ~/.mlx-node/config.json modelsDir)
   -g, --glob <pattern>    Filter files by glob pattern (can be repeated)
+  --assets-repo <repo>    Base-model repo to fetch tokenizer/config sidecar
+                          files from after the download. GGUF quantization
+                          repos ship weights only; without an official
+                          tokenizer the runtime extracts the embedded one,
+                          which strips the tool-call wrapper on decode.
   --force                 Re-sync against upstream even if the local copy
                           looks up to date (changed files re-download,
                           unchanged files are skipped by content hash)
@@ -253,6 +258,11 @@ Examples:
 
   # Download all .gguf files (skip everything else)
   mlx download model -m unsloth/Qwen3.5-9B-GGUF -g "*.gguf"
+
+  # One Unsloth Dynamic variant plus the base-model tokenizer sidecars that
+  # every GGUF quantization repo lacks (required for correct tool calling):
+  mlx download model -m unsloth/Qwen3.8-27B-GGUF -g "*UD-Q4_K_XL*" -g "MTP/*" \\
+    --assets-repo Qwen/Qwen3.8-27B
 `);
 }
 
@@ -263,6 +273,29 @@ const CORE_FILES = [
   'special_tokens_map.json',
   'vocab.json',
   'merges.txt',
+];
+
+/**
+ * Sidecar files a GGUF quantization repo typically lacks, fetched from
+ * `--assets-repo` (the base model's repo). Names absent from that repo are
+ * skipped, so one fixed list serves every model family.
+ *
+ * Mandatory for correct tool calling, not a nicety: when no sidecar
+ * `tokenizer.json` sits next to the `.gguf`, the native runtime extracts the
+ * embedded tokenizer, and that extraction marks `<tool_call>`/`</tool_call>`
+ * `special: true` (the official files mark them false) — every decode path
+ * then skips special tokens, the tool-call wrapper is stripped, and the model
+ * silently "answers" instead of calling tools.
+ */
+const ASSET_SIDECAR_CANDIDATES = [
+  'config.json',
+  'tokenizer.json',
+  'tokenizer_config.json',
+  'chat_template.jinja',
+  'generation_config.json',
+  'preprocessor_config.json',
+  'video_preprocessor_config.json',
+  'processor_config.json',
 ];
 
 /** Convert a simple glob pattern (with * wildcards) to a RegExp */
@@ -606,6 +639,81 @@ async function verifyDownload(outputDir: string, weightFiles: string[]): Promise
   return allPresent;
 }
 
+/** Root-level sidecar entries found in an assetsRepo listing. */
+export function pickAssetSidecars(allFiles: ListFileEntry[]): ListFileEntry[] {
+  // Candidate names are all root-level; a nested same-named file is not the
+  // base model's tokenizer/config. Order follows ASSET_SIDECAR_CANDIDATES so
+  // the log and the download order are deterministic.
+  const byName = new Map(allFiles.filter((file) => !file.path.includes('/')).map((file) => [file.path, file]));
+  return ASSET_SIDECAR_CANDIDATES.flatMap((name) => {
+    const file = byName.get(name);
+    return file === undefined ? [] : [file];
+  });
+}
+
+/**
+ * Top up the tokenizer/config sidecars a GGUF repo lacks, from `--assets-repo`.
+ *
+ * Runs after the primary download, is idempotent (a sidecar already on disk
+ * with the manifest size — content hash when the run is in verify mode — is
+ * skipped), and never overwrites a file the PRIMARY repo itself shipped:
+ * `config.json` from a GGUF repo describes its own quantization and wins over
+ * the base repo's. Files the primary repo did not ship (tokenizer.json,
+ * tokenizer_config.json, chat_template.jinja, …) are written from the assets
+ * repo at its resolved revision.
+ *
+ * Deliberately NOT recorded in the completion marker: marker entries are
+ * judged for pruning against the primary repo's remote tree only
+ * (`computePruneList`), so listing sidecars there would delete them on a
+ * later full sync. The top-up re-verifies them on every downloading run
+ * instead. (The dashboard records them because its prune judges the staging
+ * manifest, where an unlisted sidecar would be quarantined instead.)
+ */
+async function fetchAssetSidecars(opts: {
+  assetsRepo: string;
+  outputDir: string;
+  cacheDir: string;
+  accessToken: string | undefined;
+  verifyContent: boolean;
+}): Promise<string[]> {
+  const revision = (await resolveRemoteRevision(opts.assetsRepo, opts.accessToken)) ?? undefined;
+  const { allFiles } = await getModelFiles(opts.assetsRepo, opts.accessToken, undefined, revision);
+  const candidates = pickAssetSidecars(allFiles);
+  if (candidates.length === 0) {
+    console.warn(`  No tokenizer/config sidecars found in ${opts.assetsRepo}\n`);
+    return [];
+  }
+
+  console.log(`Fetching ${candidates.length} tokenizer/config sidecar(s) from ${opts.assetsRepo}...\n`);
+  const fetched: string[] = [];
+  for (const file of candidates) {
+    const destPath = join(opts.outputDir, file.path);
+    if (existsSync(destPath)) {
+      const upToDate = opts.verifyContent
+        ? await fileUpToDate(destPath, file)
+        : statSync(destPath).size === (file.size ?? -1);
+      if (upToDate) {
+        console.log(`  ${file.path} — already present, skipping`);
+        continue;
+      }
+    }
+    console.log(`  ${file.path} (${formatBytes(file.size)})...`);
+    const snapshotPath = await withRetries(`sidecar ${file.path}`, () =>
+      downloadFileToCacheDir({
+        repo: { type: 'model', name: opts.assetsRepo },
+        path: file.path,
+        cacheDir: opts.cacheDir,
+        accessToken: opts.accessToken,
+        revision,
+      }),
+    );
+    await copyFile(snapshotPath, destPath);
+    fetched.push(file.path);
+  }
+  console.log('');
+  return fetched;
+}
+
 export async function run(argv: string[]) {
   const { values: args } = parseArgs({
     args: argv,
@@ -623,6 +731,9 @@ export async function run(argv: string[]) {
         type: 'string',
         short: 'g',
         multiple: true,
+      },
+      'assets-repo': {
+        type: 'string',
       },
       force: {
         type: 'boolean',
@@ -655,6 +766,7 @@ export async function run(argv: string[]) {
 
   const modelName = args.model!;
   const globPatterns = args.glob;
+  const assetsRepo = args['assets-repo'];
   const modelSlug = modelName.split('/').pop()!.toLowerCase();
   const outputDir = resolve(args.output ?? join(resolveModelsDir(), modelSlug));
 
@@ -675,6 +787,9 @@ export async function run(argv: string[]) {
   console.log(`Model: ${modelName}`);
   if (globPatterns?.length) {
     console.log(`Filter: ${globPatterns.join(', ')}`);
+  }
+  if (assetsRepo !== undefined) {
+    console.log(`Assets: ${assetsRepo}`);
   }
   console.log(`Output: ${outputDir}\n`);
 
@@ -885,6 +1000,19 @@ export async function run(argv: string[]) {
     if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams') || file.path.endsWith('.gguf')) {
       weightFiles.push(file.path);
     }
+  }
+
+  // Sidecars land before the prune/marker step so the certified directory is
+  // exactly what the loader will open: GGUF weights plus the base-model
+  // tokenizer files the runtime needs (see ASSET_SIDECAR_CANDIDATES).
+  if (assetsRepo !== undefined) {
+    await fetchAssetSidecars({
+      assetsRepo,
+      outputDir,
+      cacheDir,
+      accessToken: HUGGINGFACE_TOKEN,
+      verifyContent,
+    });
   }
 
   // Prune + marker write, invoked ONLY from a SUCCESS path. Pruning any

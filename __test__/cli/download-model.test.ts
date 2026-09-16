@@ -2,6 +2,7 @@ import { mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
+import type { ListFileEntry } from '@huggingface/hub';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import {
@@ -11,7 +12,34 @@ import {
   isGlobVariantPresent,
   isLocalCopyComplete,
   isModelAlreadyDownloaded,
+  pickAssetSidecars,
 } from '../../packages/cli/src/commands/download-model.js';
+
+describe('pickAssetSidecars', () => {
+  const file = (path: string): ListFileEntry => ({ type: 'file', path, size: 1 });
+
+  it('keeps only root-level candidate names, in candidate order', () => {
+    const picked = pickAssetSidecars([
+      file('Qwen3.8-27B-UD-Q4_K_XL.gguf'),
+      file('tokenizer_config.json'),
+      // A nested same-named file is not the base model's tokenizer.
+      file('original/tokenizer.json'),
+      file('tokenizer.json'),
+      file('config.json'),
+      file('README.md'),
+    ]);
+    expect(picked.map((f) => f.path)).toEqual(['config.json', 'tokenizer.json', 'tokenizer_config.json']);
+  });
+
+  it('skips names the assets repo does not ship', () => {
+    const picked = pickAssetSidecars([file('config.json'), file('chat_template.jinja')]);
+    expect(picked.map((f) => f.path)).toEqual(['config.json', 'chat_template.jinja']);
+  });
+
+  it('returns an empty selection for a listing with no sidecars', () => {
+    expect(pickAssetSidecars([file('model-00001-of-00002.safetensors')])).toEqual([]);
+  });
+});
 
 describe('isDefaultModelDownloadPath', () => {
   it('keeps fresh full downloads root-only while re-verifying previously tracked nested sidecars', () => {

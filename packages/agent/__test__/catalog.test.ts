@@ -81,11 +81,16 @@ describe('MODEL_CATALOG', () => {
     }
   });
 
-  it('no entry carries a separate draft companion — Qwen3.8-27B MTP ships in-repo', () => {
-    // The `MTP/*` glob pulls the MTP weights out of the same unsloth repo and
-    // the native loader auto-detects them, so the z-lab DFlash2 download is no
-    // longer part of the catalog (still usable manually; see docs/cli.md).
+  it('Qwen3.8-27B keeps its optional DFlash2 companion beside the MTP weights', () => {
+    // MTP ships inside the unsloth repo (`MTP/*` glob, auto-detected at load)
+    // and covers the default path; the DFlash2 draft stays offered as an
+    // optional, never-auto-installed companion for checkpoints that pair
+    // with it, so the dashboard companion card and its download allowlist
+    // entry survive.
+    const qwen = MODEL_CATALOG.find((entry) => entry.label === 'Qwen3.8-27B');
+    expect(qwen?.draft?.hfRepo).toBe('z-lab/Qwen3.8-27B-DFlash2');
     for (const entry of MODEL_CATALOG) {
+      if (entry.label === 'Qwen3.8-27B') continue;
       expect(entry.draft, entry.label).toBeUndefined();
     }
   });
