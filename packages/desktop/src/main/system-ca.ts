@@ -28,12 +28,16 @@
  *     carries platform-restricted roots an additive bundle cannot honor;
  *   - trust comes from `security trust-settings-export` (user + admin
  *     domains), which keys records by the cert's SHA-1 and carries
- *     `kSecTrustSettingsResult` per policy. A candidate needs an explicit,
- *     unconstrained allow record for the `sslServer` policy (mkcert-style
- *     tools set one), a deny record always wins, and any scoped deny makes
- *     the root ineligible. Verified against a live keychain: an installed
- *     cert with zero trust records (Blizzard Battle.net Local Cert) is NOT
- *     effectively trusted, an mkcert root with `sslServer → TrustRoot` IS.
+ *     `kSecTrustSettingsResult` per policy — PLUS keychain provenance for
+ *     the System keychain itself: a CA:TRUE root there is trusted unless
+ *     denied, because profile-driven (MDM/corporate) trust does not appear
+ *     in `trust-settings-export` and the explicit-record rule therefore
+ *     omitted exactly the intercepting roots this module exists to add.
+ *     Verified against a live keychain: an installed cert with zero trust
+ *     records in the LOGIN keychain (Blizzard Battle.net Local Cert) is NOT
+ *     effectively trusted and stays excluded, an mkcert root with
+ *     `sslServer → TrustRoot` IS trusted, and a deny or scoped deny vetoes
+ *     a root in either keychain.
  *
  * `verify-cert -p ssl` was tried and rejected as the trust oracle: it
  * evaluates the candidate AS A LEAF, which even Apple's own system roots fail
@@ -125,6 +129,8 @@ interface Candidate {
   sha1: string;
   /** SHA-256, used only for dedupe. */
   sha256: string;
+  /** The keychain this cert was read from — decides which trust rule applies. */
+  keychain: string;
 }
 
 /** One cert's explicit SSL-trust verdict, OR'd across the user and admin domains. */
@@ -308,7 +314,8 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
     }),
   );
   const candidates: Candidate[] = [];
-  for (const { output } of outputs) {
+  for (const [index, { output }] of outputs.entries()) {
+    const keychain = keychains[index] ?? '';
     for (const block of output.match(PEM_BLOCK_RE) ?? []) {
       try {
         const cert = new X509Certificate(block);
@@ -317,6 +324,7 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
           pem: block,
           sha1: cert.fingerprint.replaceAll(':', ''),
           sha256: cert.fingerprint256,
+          keychain,
         });
       } catch {
         // Not a parseable certificate block (or a format Node rejects): skip it.
@@ -377,6 +385,9 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
   return merged;
 }
 
+/** The admin-writable keychain: where an MDM-managed or installer-placed root lives. */
+const SYSTEM_KEYCHAIN = '/Library/Keychains/System.keychain';
+
 /**
  * Concatenated PEM of every effectively SSL-trusted CA root found in the
  * given keychains, deduped by fingerprint. The selection rule:
@@ -384,11 +395,20 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
  *   - Apple system roots: included unless explicitly denied (denial is
  *     advisory here anyway — the bundle is ADDITIVE to Node's Mozilla
  *     store, which already carries the same roots);
- *   - anything else: included only with an unconstrained sslServer allow
- *     record, never when denied, and never when a SCOPED deny exists —
- *     the bundle cannot express "trusted except for host X", so a root the
- *     user distrusted for any host is not exported at all. Keychain
- *     membership alone is not trust.
+ *   - a CA:TRUE root in the SYSTEM keychain: included unless denied (global
+ *     or scoped). System-keychain membership IS trust for this purpose —
+ *     writing there needs admin rights, and corporate/MDM roots routinely
+ *     carry NO explicit trust record at all: profile-driven trust does not
+ *     surface in `trust-settings-export`, so the old
+ *     explicit-allow-record rule silently omitted exactly the middlebox
+ *     roots this module exists to add (measured: a Zscaler-style fleet
+ *     root in the System keychain with zero user/admin records);
+ *   - anything else (the login keychain): included only with an
+ *     unconstrained sslServer allow record, never when denied, and never
+ *     when a SCOPED deny exists — the bundle cannot express "trusted except
+ *     for host X", so a root the user distrusted for any host is not
+ *     exported at all. Login-keychain membership alone is not trust — the
+ *     Battle.net-style junk cert lives there, and it stays excluded.
  */
 export async function keychainCaRootsPem(exec: ExecText, keychains: readonly string[]): Promise<string> {
   const [candidates, decisions] = await Promise.all([collectCandidates(exec, keychains), loadTrustDecisions(exec)]);
@@ -397,12 +417,17 @@ export async function keychainCaRootsPem(exec: ExecText, keychains: readonly str
   for (const candidate of candidates) {
     if (seen.has(candidate.sha256)) continue;
     const decision = decisions.get(candidate.sha1);
-    // Every candidate here comes from a user/admin keychain, so keychain
-    // membership alone is NOT trust: an explicit, unconstrained sslServer
-    // allow is required, any global deny vetoes, and any scoped deny makes
-    // the root ineligible (the bundle cannot express the scope).
+    // Any deny vetoes everywhere: a global deny is explicit distrust, and a
+    // SCOPED deny makes the root ineligible because the bundle cannot
+    // express the scope (it would grant trust for exactly the denied host).
+    const denied = decision?.denyForSsl === true || decision?.scopedDenyForSsl === true;
     const trusted =
-      decision?.allowForSsl === true && decision?.denyForSsl !== true && decision?.scopedDenyForSsl !== true;
+      !denied &&
+      (candidate.keychain === SYSTEM_KEYCHAIN ||
+        // Every other candidate comes from the user's login keychain, where
+        // membership is NOT trust: an explicit, unconstrained sslServer
+        // allow is required.
+        decision?.allowForSsl === true);
     if (!trusted) continue;
     seen.add(candidate.sha256);
     roots.push(candidate.pem);
@@ -449,7 +474,15 @@ export async function prepareExtraCaBundle(opts: {
     console.warn('[mlx] could not export keychain CA roots:', error);
   }
   const pem = parts.join('\n').trim();
-  if (pem === '') return null;
+  const rootCount = (pem.match(/BEGIN CERTIFICATE/g) ?? []).length;
+  if (pem === '') {
+    // Named, not silent: an emptied bundle is the difference between a
+    // downloading app and a TLS error on an intercepting network, and this
+    // line is the only place that fact is observable (see the module
+    // docstring for why the child's failures carry no such detail).
+    console.warn('[mlx] no extra CA roots to bundle (keychains contributed none)');
+    return null;
+  }
   const bundlePath = join(opts.dir, EXTRA_CA_BUNDLE_FILE);
   try {
     await mkdir(opts.dir, { recursive: true });
@@ -457,5 +490,6 @@ export async function prepareExtraCaBundle(opts: {
   } catch {
     return null;
   }
+  console.log(`[mlx] extra CA bundle: ${rootCount} root(s) → ${bundlePath}`);
   return bundlePath;
 }

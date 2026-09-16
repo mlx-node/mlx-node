@@ -18,8 +18,10 @@ const ROOT_CA = readFileSync(join(FIXTURES, 'test-root-ca.pem'), 'utf8').trim();
 const LEAF = readFileSync(join(FIXTURES, 'test-leaf.pem'), 'utf8').trim();
 const ROOT_SHA1 = new X509Certificate(ROOT_CA).fingerprint.replaceAll(':', '');
 
-/** An arbitrary keychain path stand-in; candidates from ANY keychain now require explicit trust. */
+/** An arbitrary keychain path stand-in; candidates from it require explicit trust. */
 const SYSTEM_ROOTS = '/k/some-keychain';
+/** The two real keychain paths, in `macosKeychains()` order — the trust rules branch on them. */
+const [SYSTEM_KEYCHAIN, LOGIN_KEYCHAIN] = macosKeychains() as [string, string];
 
 const EMPTY_DUMP = `{
   "trustList" => {
@@ -398,6 +400,57 @@ describe('keychainCaRootsPem', () => {
     // records — must NOT become an anchor.
     const installedOnly = await keychainCaRootsPem(fakeExec({ certs: { '/k/System': ROOT_CA } }), ['/k/System']);
     expect(installedOnly).toBe('');
+  });
+
+  it('trusts a System-keychain CA root with no trust record, but never one a deny covers', async () => {
+    // Profile-driven (MDM/corporate MITM) roots land in the System keychain
+    // WITHOUT any `trust-settings-export` record, so the explicit-record rule
+    // silently omitted exactly the roots an intercepting network needs.
+    // System-keychain membership is admin-gated and therefore trust here.
+    const noRecords = await keychainCaRootsPem(
+      fakeExec({ certs: { [SYSTEM_KEYCHAIN]: ROOT_CA } }),
+      [SYSTEM_KEYCHAIN],
+    );
+    expect(noRecords).toContain(ROOT_CA);
+
+    // The vetoes still apply: an explicit global deny…
+    const denied = await keychainCaRootsPem(
+      fakeExec({
+        certs: { [SYSTEM_KEYCHAIN]: ROOT_CA },
+        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 3 }] }]),
+      }),
+      [SYSTEM_KEYCHAIN],
+    );
+    expect(denied).toBe('');
+
+    // …and a scoped one, which this bundle cannot express.
+    const scopedDeny = await keychainCaRootsPem(
+      fakeExec({
+        certs: { [SYSTEM_KEYCHAIN]: ROOT_CA },
+        trust: trustDump([
+          {
+            sha1: ROOT_SHA1,
+            settings: [{ policy: 'sslServer', result: 3, policyString: 'huggingface.co' }],
+          },
+        ]),
+      }),
+      [SYSTEM_KEYCHAIN],
+    );
+    expect(scopedDeny).toBe('');
+  });
+
+  it('still requires an explicit record for the login keychain, where membership is not trust', async () => {
+    const loginOnly = await keychainCaRootsPem(fakeExec({ certs: { [LOGIN_KEYCHAIN]: ROOT_CA } }), [LOGIN_KEYCHAIN]);
+    expect(loginOnly).toBe('');
+
+    const withRecord = await keychainCaRootsPem(
+      fakeExec({
+        certs: { [LOGIN_KEYCHAIN]: ROOT_CA },
+        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }] }]),
+      }),
+      [LOGIN_KEYCHAIN],
+    );
+    expect(withRecord).toContain(ROOT_CA);
   });
 
   it('excludes a root with a scoped deny even when another record allows it', async () => {
