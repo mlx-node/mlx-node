@@ -1101,6 +1101,44 @@ fn is_gemma4_text_qmm_prefix(prefix: &str) -> bool {
     )
 }
 
+/// Retarget the packed embedding's affine sidecars to the declared text dtype.
+///
+/// `widen_bf16_affine_text_qmm_sidecars` deliberately skips `embed_tokens`: its
+/// token lookup calls `mlx_dequantize` directly, so widening FP16 sidecars to
+/// FP32 would change the lookup's output dtype instead of hoisting a QMM cast
+/// that already happens. The opposite direction is a real defect for a BF16
+/// checkpoint: the lookup returns FP16 while every dense tensor the import wrote
+/// (norms, projections) is BF16, so `fast::rms_norm` promotes its output to
+/// `result_type(x, weight)` = FP32, the residual stream follows, and the first
+/// paged KV write aborts with "input dtype Float32 not supported by
+/// LayerKVPool". Traced on `gemma-4-26B-A4B-it-UD-Q4_K_XL`: the embedding left
+/// FP16 and the layer 0 output FP32. Integer sidecars mean a K/IQ group and are
+/// left alone — those already decode to bf16.
+fn align_bf16_affine_embedding_sidecars(params: &mut HashMap<String, MxArray>) -> Result<bool> {
+    let Some(scales) = params.get("embed_tokens.scales").cloned() else {
+        return Ok(false);
+    };
+    for suffix in ["scales", "biases"] {
+        let key = format!("embed_tokens.{suffix}");
+        if let Some(sidecar) = params.get(&key)
+            && !matches!(sidecar.dtype()?, DType::Float16 | DType::Float32)
+        {
+            return Ok(false);
+        }
+    }
+    if scales.dtype()? == DType::BFloat16 {
+        return Ok(false);
+    }
+
+    for suffix in ["scales", "biases"] {
+        let key = format!("embed_tokens.{suffix}");
+        if let Some(sidecar) = params.get(&key).cloned() {
+            params.insert(key, sidecar.astype(DType::BFloat16)?);
+        }
+    }
+    Ok(true)
+}
+
 /// Hoist MLX affine QMM's lossless FP16->FP32 sidecar casts out of every
 /// inference call and perform them once while loading a BF16 Gemma text model.
 ///
@@ -2706,6 +2744,15 @@ impl Gemma4Inner {
             &parsed_config.symmetric_zero_points,
         )?;
 
+        // The embedding is the one quantized tensor whose VALUE becomes the
+        // residual stream, so it is the one group the widening above leaves
+        // alone and this retargets.
+        if text_config_explicitly_bfloat16 && align_bf16_affine_embedding_sidecars(&mut params)? {
+            info!(
+                "Aligned the packed embedding's affine sidecars with the checkpoint's bf16 text dtype"
+            );
+        }
+
         // gemma-4-E2B's `embed_tokens_per_layer.weight` is a single ~4GB tensor
         // that can exceed the Metal per-buffer cap on memory-constrained
         // devices, where the whole-tensor materialize eval below would fail to
@@ -4061,6 +4108,79 @@ mod tests {
             DType::Float16,
             "a non-packed sibling must be excluded"
         );
+    }
+
+    /// The embedding is the one group the widening above leaves at FP16, and the
+    /// one group that turns the residual stream into FP32 when the checkpoint is
+    /// bf16. Only its float sidecars are retargeted, and only when the text
+    /// config declares bf16.
+    #[test]
+    fn embedding_sidecar_alignment_retargets_only_float_embedding_sidecars() {
+        let packed = || MxArray::zeros(&[2, 4], Some(DType::Uint32)).expect("packed weight");
+        let f16 = || {
+            MxArray::from_float32(&[0.03125, 0.0625], &[2, 1])
+                .expect("sidecar")
+                .astype(DType::Float16)
+                .expect("f16 sidecar")
+        };
+        let bf16 = || {
+            MxArray::from_float32(&[0.03125, 0.0625], &[2, 1])
+                .expect("sidecar")
+                .astype(DType::BFloat16)
+                .expect("bf16 sidecar")
+        };
+
+        let mut params: HashMap<String, MxArray> = HashMap::new();
+        params.insert("embed_tokens.weight".into(), packed());
+        params.insert("embed_tokens.scales".into(), f16());
+        params.insert("embed_tokens.biases".into(), f16());
+        // A text projection's FP16 sidecars are the widening function's business
+        // and must not be touched here.
+        params.insert("layers.0.self_attn.q_proj.scales".into(), f16());
+
+        assert!(
+            align_bf16_affine_embedding_sidecars(&mut params).expect("align"),
+            "an FP16 affine embedding group must be retargeted"
+        );
+        assert_eq!(
+            params["embed_tokens.scales"].dtype().unwrap(),
+            DType::BFloat16
+        );
+        assert_eq!(
+            params["embed_tokens.biases"].dtype().unwrap(),
+            DType::BFloat16
+        );
+        assert_eq!(
+            params["layers.0.self_attn.q_proj.scales"].dtype().unwrap(),
+            DType::Float16,
+            "the text QMM projections belong to the widening pass"
+        );
+        // Idempotent: an already-bf16 group is left byte-identical.
+        assert!(!align_bf16_affine_embedding_sidecars(&mut params).expect("align"));
+
+        // Integer scales mean a K/IQ group whatever the mode says — those decode
+        // to bf16 on their own and must keep their sidecars untouched.
+        let mut kquant: HashMap<String, MxArray> = HashMap::new();
+        kquant.insert("embed_tokens.weight".into(), packed());
+        kquant.insert(
+            "embed_tokens.scales".into(),
+            MxArray::from_float32(&[1.0, 1.0], &[2, 1])
+                .expect("scales")
+                .astype(DType::Int8)
+                .expect("int8 scales"),
+        );
+        kquant.insert("embed_tokens.biases".into(), f16());
+        assert!(!align_bf16_affine_embedding_sidecars(&mut kquant).expect("align"));
+        assert_eq!(
+            kquant["embed_tokens.biases"].dtype().unwrap(),
+            DType::Float16,
+            "a K/IQ group must be left alone"
+        );
+
+        // A dense embedding (no group) is a no-op, as is an already-bf16 one.
+        let mut dense: HashMap<String, MxArray> = HashMap::new();
+        dense.insert("embed_tokens.weight".into(), bf16());
+        assert!(!align_bf16_affine_embedding_sidecars(&mut dense).expect("align"));
     }
 
     #[test]
