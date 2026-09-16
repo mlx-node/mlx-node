@@ -816,6 +816,31 @@ export async function run(argv: string[]) {
   // matches `remoteSha`, or the user forced a re-verify. A fresh dir or a
   // current-marker dir only ever needs the cheap size check.
   let verifyContent = false;
+  const cacheDir = args['cache-dir'] ? resolve(args['cache-dir']) : DEFAULT_CACHE_DIR;
+
+  /**
+   * Run the requested assetsRepo sidecar pass before an early success return.
+   *
+   * The completion short-circuits below return without ever reaching the
+   * download loop, so without this a run whose only remaining work is the
+   * tokenizer sidecars — a retry after a sidecar fetch failed, or a
+   * directory installed before `--assets-repo` existed — would print success
+   * and keep the broken tool-calling state the flag exists to fix.
+   * Idempotent: present files are skipped by size (by hash under `--force`).
+   */
+  const repairSidecarsBeforeReturn = async (): Promise<void> => {
+    if (assetsRepo === undefined) return;
+    cachedManifest ??= await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
+    await fetchAssetSidecars({
+      assetsRepo,
+      outputDir,
+      cacheDir,
+      accessToken: HUGGINGFACE_TOKEN,
+      verifyContent: force,
+      primaryPaths: new Set(cachedManifest.allFiles.map((file) => file.path)),
+    });
+  };
+
   if (existsSync(outputDir)) {
     existingTopLevelFiles = await readdir(outputDir);
     const hasGguf = existingTopLevelFiles.some((f) => f.endsWith('.gguf'));
@@ -826,6 +851,7 @@ export async function run(argv: string[]) {
       // Legacy local-only behavior, byte-for-byte: without a resolvable
       // upstream revision there is nothing to compare against.
       if (isModelAlreadyDownloaded(outputDir, existingTopLevelFiles)) {
+        await repairSidecarsBeforeReturn();
         console.log('Model already downloaded!\n');
         console.log('To re-download, delete the output directory first:');
         console.log(`   rm -rf ${outputDir}\n`);
@@ -841,6 +867,7 @@ export async function run(argv: string[]) {
         cachedManifest = await getModelFiles(modelName, HUGGINGFACE_TOKEN, globPatterns);
         const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
         if (isGgufRepoComplete(existingTopLevelFiles, remoteBasenames)) {
+          await repairSidecarsBeforeReturn();
           console.log('GGUF file(s) already downloaded!\n');
           console.log('To re-download, delete the output directory first:');
           console.log(`   rm -rf ${outputDir}\n`);
@@ -868,6 +895,7 @@ export async function run(argv: string[]) {
         }
         const remoteBasenames = cachedManifest.allFiles.map((f) => f.path.split('/').pop() ?? f.path);
         if (isGlobMatchedSetComplete(existingTopLevelFiles, remoteBasenames, globPatterns)) {
+          await repairSidecarsBeforeReturn();
           console.log('Matched files already downloaded!\n');
           console.log('To re-download, delete the output directory first:');
           console.log(`   rm -rf ${outputDir}\n`);
@@ -898,6 +926,7 @@ export async function run(argv: string[]) {
         !globPatterns?.length &&
         canShortCircuitFullRun(completion!, outputDir, isModelAlreadyDownloaded(outputDir, existingTopLevelFiles))
       ) {
+        await repairSidecarsBeforeReturn();
         console.log(`Model already up to date (revision ${remoteSha.slice(0, 7)}).\n`);
         console.log('Use --force to re-verify every file against upstream.\n');
         return;
@@ -974,7 +1003,6 @@ export async function run(argv: string[]) {
   const sizeStr = formatBytes(totalSize);
   console.log(`Downloading ${filesToDownload.length} file(s) (~${sizeStr})...\n`);
 
-  const cacheDir = args['cache-dir'] ? resolve(args['cache-dir']) : DEFAULT_CACHE_DIR;
   const weightFiles: string[] = [];
 
   const total = filesToDownload.length;

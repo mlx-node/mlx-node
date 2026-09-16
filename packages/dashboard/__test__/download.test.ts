@@ -1079,13 +1079,14 @@ describe('DownloadManager', () => {
     await waitFor(() => events.some((event) => event.type === 'done'));
 
     // Exactly the two glob-matched primary files moved, in manifest order. The
-    // `start` frame carries the PRIMARY manifest's total only — the sidecar bytes
-    // are folded into the job total after it, once the assets listing is known.
+    // `start` frame carries the FULL total — primary manifest plus the assets
+    // repo's config.json sidecar (333 + 12) — because the sidecar plan is
+    // resolved before `start` so the UI's byte bar never overshoots.
     expect(events.find((event) => event.type === 'start')).toMatchObject({
       type: 'start',
       repo: REPO,
-      totalBytes: 333,
-      fileCount: 2,
+      totalBytes: 345,
+      fileCount: 3,
     });
     expect([...hub.downloaded].sort()).toEqual([MTP, WEIGHT, 'config.json'].sort());
 
@@ -1198,7 +1199,9 @@ describe('DownloadManager', () => {
     expect(events.some((event) => event.type === 'error')).toBe(true);
     expect(events.some((event) => event.type === 'done')).toBe(false);
     expect(existsSync(finalDir())).toBe(false);
-    expect(jobStagingDirs()).toEqual([]);
+    // `processJob` emits `error` BEFORE its `finally` awaits the staging rm, so
+    // a bare assertion here races the cleanup; wait for the directory to go.
+    await waitFor(() => jobStagingDirs().length === 0);
   });
 
   it('does not re-download verified sidecars on a second job over the same revision', async () => {
