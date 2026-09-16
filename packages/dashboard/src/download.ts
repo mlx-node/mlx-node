@@ -146,7 +146,7 @@ function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
  * metadata always included, exactly the CLI's `--glob` semantics), else the
  * no-glob default.
  */
-function isWantedFileFor(catalogEntry: CatalogEntry | undefined, path: string, globs: RegExp[] | undefined): boolean {
+function isWantedFileFor(path: string, globs: RegExp[] | undefined): boolean {
   if (globs === undefined) return isWantedFile(path);
   const basename = path.split('/').pop() ?? path;
   return matchesAnyGlob(basename, globs) || matchesAnyGlob(path, globs) || CORE_FILES.has(path);
@@ -977,7 +977,7 @@ export class DownloadManager {
       const files: ListFileEntry[] = [];
       let totalBytes = 0;
       for await (const file of listFiles({ repo, recursive: true, revision, fetch: this.wrappedFetch })) {
-        if (file.type !== 'directory' && isWantedFileFor(catalogEntry, file.path, globs)) {
+        if (file.type !== 'directory' && isWantedFileFor(file.path, globs)) {
           // Defense-in-depth: `file.path` is a third-party string about to become
           // a `join(stagingDir, file.path)` write/read/verify/publish target (every
           // downstream site derives from this `files[]` array). Refuse — fail
@@ -1083,6 +1083,16 @@ export class DownloadManager {
       if (catalogEntry?.assetsRepo !== undefined) {
         const sidecars = await this.downloadAssetSidecars(catalogEntry.assetsRepo, stagingDir, stagingReal, files, job);
         files.push(...sidecars);
+        // `hasModelPayload` waived the config.json requirement on the promise
+        // that the sidecar fetch supplies it. Verify that promise here: a GGUF
+        // repo without a config.json whose base repo turns out not to carry
+        // one either must fail the job, not publish a weights-only install
+        // that renders as not-installed and only a re-run recovers.
+        if (!files.some((file) => file.path === 'config.json')) {
+          throw new Error(
+            `Repo "${job.repo}" is not a complete model (neither it nor its assets repo "${catalogEntry.assetsRepo}" provides a config.json)`,
+          );
+        }
       }
 
       // Quarantine any staged entry not in the current manifest (a stale file

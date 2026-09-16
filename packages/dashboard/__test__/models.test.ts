@@ -601,6 +601,14 @@ const RECOMMENDED_SLUG = catalogSlug(RECOMMENDED);
  * names the macOS build and silently fails every one of these tests on Linux.
  */
 const RECOMMENDED_REPO = catalogRepo(RECOMMENDED);
+/**
+ * A repo that holds the SAME model but is not the one this platform installs:
+ * the pre-UD-Q4_K_XL CUDA build the catalog used to recommend for this entry.
+ * Every current entry resolves to one GGUF repo on every platform, so provenance
+ * equivalence between two builds of one model can only be asserted against a
+ * literal here.
+ */
+const RETIRED_PLATFORM_ALIAS = 'Brooooooklyn/Qwen3.8-27B-NVFP4-mlx';
 
 /** The catalog row for `label`, from a fresh scan of the temp models dir. */
 function catalogItem(label: string): CatalogItem {
@@ -694,19 +702,23 @@ describe('catalogWithState — a recommended model is identified by download pro
     expect(item.localRevision).toBeNull();
   });
 
-  it("does NOT mark present for the OTHER platform's build of the same model", () => {
+  it('does NOT mark present for a build of the same model that came from a DIFFERENT repo', () => {
     // Regression: the catalog recommended the nvfp4 builds to EVERY platform
     // before it became platform-conditional, so an existing macOS install is
     // exactly the CUDA alias. Counting it renders the card "Installed" with
     // `installed` false — no Install button and no update affordance — which
     // permanently strands the users this change exists to move onto the
     // Metal-native build.
-    const mine = catalogRepo(RECOMMENDED);
-    const other = mine === RECOMMENDED.hfRepo ? RECOMMENDED.hfRepoCuda : RECOMMENDED.hfRepo;
-    expect(other, 'the default entry must carry both platform builds').toBeDefined();
-    expect(other).not.toBe(mine);
+    //
+    // The current catalog serves ONE UD-Q4_K_XL GGUF per model on every platform
+    // (no entry sets `hfRepoCuda`), so the "other platform's build" is now any
+    // OTHER repo holding the same model — the retired platform alias below. The
+    // assertion is unchanged: provenance matching is per RESOLVED repo, so a
+    // checkpoint from a repo this platform does not install is never "present".
+    const other = RETIRED_PLATFORM_ALIAS;
+    expect(other).not.toBe(RECOMMENDED_REPO);
     writeModel(modelsDir, 'other-platform-build', QWEN_27B_MXFP4, 2048);
-    writeCompletion('other-platform-build', other!);
+    writeCompletion('other-platform-build', other);
     const item = catalogItem(RECOMMENDED.label);
     expect(item.present).toBe(false);
     expect(item.installed).toBe(false);
