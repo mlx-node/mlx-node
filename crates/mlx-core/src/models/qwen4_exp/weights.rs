@@ -114,6 +114,51 @@ pub struct Weight {
     pub(super) mode: String,
 }
 impl Weight {
+    pub(super) fn mixer_down_inject(
+        &self,
+        x: &MxArray,
+        injection: &Self,
+    ) -> Result<Option<(MxArray, MxArray)>> {
+        if !runtime_flags::is_one(c"MLX_QWEN4_MIXER_DOWN_INJECT")
+            || runtime_flags::is_zero(c"MLX_QWEN4_DECODE_MIXER_ACT")
+            || !crate::engine::persistence::compiled_forward_backend_available()
+            || [self, injection]
+                .iter()
+                .any(|w| w.mode != "affine" || w.bits != 8 || w.group != 32)
+        {
+            return Ok(None);
+        }
+        let (Some(sd), Some(bd), Some(si), Some(bi)) = (
+            &self.scales,
+            &self.biases,
+            &injection.scales,
+            &injection.biases,
+        ) else {
+            return Ok(None);
+        };
+        let mut out = std::ptr::null_mut();
+        let mut gate = std::ptr::null_mut();
+        if !unsafe {
+            mlx_sys::mlx_qwen4_mixer_down_inject(
+                x.as_raw_ptr(),
+                self.values.as_raw_ptr(),
+                sd.as_raw_ptr(),
+                bd.as_raw_ptr(),
+                injection.values.as_raw_ptr(),
+                si.as_raw_ptr(),
+                bi.as_raw_ptr(),
+                &mut out,
+                &mut gate,
+            )
+        } {
+            return Ok(None);
+        }
+        Ok(Some((
+            MxArray::from_handle(out, "Qwen4 mixer activation with injection")?,
+            MxArray::from_handle(gate, "Qwen4 mixer injection projection")?,
+        )))
+    }
+
     pub(super) fn mixer_act(&self, x: &MxArray) -> Result<Option<MxArray>> {
         let decode = x.shape_at(1)? == 1;
         let setting = if decode {

@@ -39,10 +39,25 @@ if constexpr (!FAST) {
 }
 if constexpr (MIX) {
   T total = T(0);
-  for (int r = 0; r < RPS; ++r) {
-    const T value = T(simd_sum(result[r]));
-    const T product = T(sigmoid_table[as_type<ushort>(value)] * normed[first + r * (N / 4)]);
-    total = T(total + product);
+  if constexpr (MIX == 2) {
+    // TrackFastMixer.upMixSource: independent stream products run in four
+    // lanes. Keep this kernel's one-column SIMD ownership and BF16 fold.
+    static_assert(RPS == 4, "four mixer streams");
+    for (int r = 0; r < RPS; ++r) result[r] = simd_sum(result[r]);
+    float product = 0;
+    if (lane < 4) {
+      const float low = metal::select(result[0], result[1], (lane & 1u) != 0);
+      const float high = metal::select(result[2], result[3], (lane & 1u) != 0);
+      const T value = T(metal::select(low, high, (lane & 2u) != 0));
+      product = float(T(sigmoid_table[as_type<ushort>(value)] * normed[first + lane * (N / 4)]));
+    }
+    for (int r = 0; r < RPS; ++r) total = T(total + T(simd_shuffle(product, r)));
+  } else {
+    for (int r = 0; r < RPS; ++r) {
+      const T value = T(simd_sum(result[r]));
+      const T product = T(sigmoid_table[as_type<ushort>(value)] * normed[first + r * (N / 4)]);
+      total = T(total + product);
+    }
   }
   if (lane == 0) out[first] = T(total * T(0.25f));
 } else {

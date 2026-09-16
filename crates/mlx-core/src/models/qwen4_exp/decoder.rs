@@ -65,7 +65,9 @@ pub struct Decoder {
     pub async_prefill: bool,
     pub batch_rotary: bool,
     pub prefill_chunk_size: usize,
-    pub config: Config,
+    // Like TrackFastModel's retained configuration, share immutable metadata
+    // across forward helpers instead of copying its strings/lists per layer.
+    pub config: Arc<Config>,
     pub weights: Store,
     pub caches: Vec<LayerCache>,
     pub history: Vec<u32>,
@@ -102,7 +104,7 @@ impl Decoder {
             caches: (0..config.num_hidden_layers)
                 .map(|_| LayerCache::default())
                 .collect(),
-            config,
+            config: Arc::new(config),
             weights,
             history: Vec::new(),
             positions: Vec::new(),
@@ -614,7 +616,33 @@ impl Decoder {
                 true,
             )?
         };
-        let activated = if self.gguf()
+        let paired = if runtime_flags::is_one(c"MLX_QWEN4_MIXER_DOWN_INJECT")
+            && inject
+            && self.gguf()
+            && c.hc_count == 4
+            && c.hidden_size == 2560
+            && x.shape()?[1] == 1
+        {
+            let down_key = self.key(
+                &format!("{hf}.input_mix_weight_down.weight"),
+                &format!("{gg}_down.weight"),
+            );
+            let inject_key = self.key(
+                &format!("{hf}.block_inject_weight.weight"),
+                &format!("{gg}_inject.weight"),
+            );
+            match (
+                self.weights.resident_bank(&down_key),
+                self.weights.resident_bank(&inject_key),
+            ) {
+                (Some(down), Some(injection)) => down.mixer_down_inject(&n, &injection)?,
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let activated = if paired.is_none()
+            && self.gguf()
             && c.hc_count == 4
             && c.hidden_size == 2560
             && (x.shape()?[1] >= 1024 || x.shape()?[1] == 1)
@@ -631,8 +659,10 @@ impl Decoder {
         } else {
             None
         };
-        let is_activated = activated.is_some();
-        let (down, inject_projection) = if let Some(activated) = activated {
+        let is_activated = paired.is_some() || activated.is_some();
+        let (down, inject_projection) = if let Some((down, gate)) = paired {
+            (down, Some(gate))
+        } else if let Some(activated) = activated {
             let gate = if inject {
                 Some(self.linear(
                     &n,

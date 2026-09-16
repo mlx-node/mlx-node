@@ -240,6 +240,13 @@ mlx_qwen4_complete_gdn(mlx_array *qkv, mlx_array *z, mlx_array *a, mlx_array *b,
     static auto compiled_metal = mlx::core::compile(complete_gdn_metal);
     auto cached_setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
     const bool cached = (!cached_setting || std::string(cached_setting) != "0");
+    if (!fused) {
+      // Compact gate storage is a Metal-kernel port. Keep the older-GPU and
+      // explicit rollback graph's original F32 inputs: putting these casts
+      // inside compile changes pointwise fusion and its rounding.
+      in[2] = astype(in[2], mlx::core::float32);
+      in[3] = astype(in[3], mlx::core::float32);
+    }
     auto result =
         fused ? (cached ? compiled_metal(in) : complete_gdn_metal(in)) : fn(in);
     auto y = std::make_unique<array>(std::move(result[0]));

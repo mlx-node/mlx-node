@@ -1,6 +1,6 @@
 R"metal(
 // Shared Q8 gate/up uses the same fast GEMV walk as the separate projection.
-template <typename T>
+template <typename T, bool LANES>
 METAL_FUNC void q4_shared_gu(const device T* x,
  const device uint* wg,const device half* sg,const device half* bg,
  const device uint* wu,const device half* su,const device half* bu,
@@ -16,9 +16,14 @@ METAL_FUNC void q4_shared_gu(const device T* x,
    u[r]+=qdot<float,8,8,false>((const device uchar*)wu+row*2560+col,values,float(su[side]),float(bu[side]),sum);
   }
  }
+ if constexpr (LANES) {
+  for(int r=0;r<4;++r){g[r]=simd_sum(g[r]);u[r]=simd_sum(u[r]);}
+  if(lane<4){T gate=T(g[lane]),up=T(u[lane]);T silu=T(sigmoid_table[as_type<ushort>(gate)]*gate);out[10*640+first+lane]=float(T(silu*up));}
+ } else {
  for(int r=0;r<4;++r){
   T gate=T(simd_sum(g[r])),up=T(simd_sum(u[r]));
   if(lane==0){T silu=T(sigmoid_table[as_type<ushort>(gate)]*gate);out[10*640+first+r]=float(T(silu*up));}
+ }
  }
 }
 

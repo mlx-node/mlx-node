@@ -2076,6 +2076,17 @@ unsafe extern "C" {
         stream: *mut *mut mlx_array,
         normed: *mut *mut mlx_array,
     ) -> bool;
+    pub fn mlx_qwen4_mixer_down_inject(
+        input: *mut mlx_array,
+        down: *mut mlx_array,
+        down_scales: *mut mlx_array,
+        down_biases: *mut mlx_array,
+        inject: *mut mlx_array,
+        inject_scales: *mut mlx_array,
+        inject_biases: *mut mlx_array,
+        out: *mut *mut mlx_array,
+        out_inject: *mut *mut mlx_array,
+    ) -> bool;
     pub fn mlx_qwen4_decode_mixer_act(
         x: *mut mlx_array,
         w: *mut mlx_array,

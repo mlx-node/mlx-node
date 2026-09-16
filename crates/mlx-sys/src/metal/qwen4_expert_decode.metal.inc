@@ -6,7 +6,7 @@ template <typename T> METAL_FUNC T q4_sigmoid(T x) {
 
 // Same lane ownership and K walk as kquant_qmv_fast_impl. Both projections
 // reuse the activation load; each retains its independent F32 accumulator.
-template <typename T, int BITS, int H, int M, int E, int TOP>
+template <typename T, int BITS, int H, int M, int E, int TOP, bool LANES>
 METAL_FUNC void q4_gate_up(
     const device T* x, const device uint* ids,
     const device uint* wg, const device uchar* sg, const device half* bg,
@@ -40,6 +40,16 @@ METAL_FUNC void q4_gate_up(
       gs.advance(BLOCK / 32); us.advance(BLOCK / 32); input += BLOCK;
     }
   }
+  if constexpr (LANES) {
+    // TrackFastMoE gate/up staging (8981cef5): reductions broadcast each
+    // complete row to all lanes. Assign one identical epilogue to each lane.
+    for (int r = 0; r < 4; ++r) { g[r] = simd_sum(g[r]); u[r] = simd_sum(u[r]); }
+    if (lane < 4) {
+      T gate = T(g[lane]), up = T(u[lane]);
+      T silu = T(q4_sigmoid(gate) * gate);
+      out[size_t(assignment) * M + first + lane] = float(T(silu * up));
+    }
+  } else {
   for (int r = 0; r < 4; ++r) {
     T gate = T(simd_sum(g[r])), up = T(simd_sum(u[r]));
     if (lane == 0) {
@@ -47,11 +57,12 @@ METAL_FUNC void q4_gate_up(
       out[size_t(assignment) * M + first + r] = float(T(silu * up));
     }
   }
+  }
 }
 
 // Same affine5/8 qdot walk as qwen4_affine_expert_gemv. Experts are split
 // across SIMD groups, then folded in the original eight-lane reduction order.
-template <typename T, typename P, int BITS, int H, int M, int E, int TOP, int RPS, int KSG>
+template <typename T, typename P, int BITS, int H, int M, int E, int TOP, int RPS, int KSG, bool LANES>
 METAL_FUNC void q4_down_combine(
     const device float* x, const device uint* ids, const device P* scores,
     const device uint* w, const device half* scales, const device half* biases,
@@ -81,12 +92,20 @@ METAL_FUNC void q4_down_combine(
         }
       }
     }
+    if constexpr (LANES) {
+      for (int r = 0; r < RPS; ++r) result[r] = simd_sum(result[r]);
+      if (lane < RPS) {
+        volatile float product = float(P(T(result[lane]))) * float(scores[assignment]);
+        products[slot * RPS + lane] = P(product);
+      }
+    } else {
     for (int r = 0; r < RPS; ++r) {
       T value = T(simd_sum(result[r]));
       if (lane == 0) {
         volatile float product = float(P(value)) * float(scores[assignment]);
         products[slot * RPS + r] = P(product);
       }
+    }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);

@@ -711,6 +711,110 @@ fn fused_recurrence_sequence_matches_varying_stepwise_inputs_and_continuation() 
 }
 
 #[test]
+fn vector_recurrence_preserves_outputs_state_and_continuation() {
+    use crate::array::DType;
+    const CHILD: &str = "MLX_QWEN4_VECTOR_RECURRENCE_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "models::qwen4_exp::tests::vector_recurrence_preserves_outputs_state_and_continuation",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env_remove("MLX_DISABLE_E47_GDN_2VCOL")
+            .env("MLX_QWEN4_GDN_4ROWS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let make = |shape: &[i64], phase: f32, scale: f32, dtype: DType, strided: bool, offset: i64| {
+        let n = shape.iter().product::<i64>();
+        let data = (0..(n + offset) * if strided { 2 } else { 1 })
+            .map(|i| ((i as f32 + phase) * 0.017).sin() * scale)
+            .collect::<Vec<_>>();
+        let x = MxArray::from_float32(&data, &[n + offset, if strided { 2 } else { 1 }])
+            .unwrap()
+            .astype(dtype)
+            .unwrap();
+        let x = x.slice_axis(0, offset, n + offset).unwrap();
+        let x = if strided {
+            x.slice_axis(1, 0, 1).unwrap()
+        } else {
+            x
+        };
+        x.reshape(shape).unwrap()
+    };
+    for dtype in [DType::Float32, DType::BFloat16] {
+        for (strided, offset) in [(false, 0), (true, 0), (false, 1), (true, 1)] {
+            let initial = make(
+                &[1, 48, 128, 128],
+                7.0,
+                0.1,
+                DType::Float32,
+                strided,
+                offset,
+            );
+            let snapshot = initial.to_float32().unwrap().to_vec();
+            let mut control = initial.clone();
+            let mut candidate = initial.clone();
+            for tokens in [7, 9, 1024, 1] {
+                // Compact tiled GGUF key heads: this catches an accidental port
+                // of the reference's consecutive, rather than modulo, mapping.
+                let q = make(&[1, tokens, 16, 128], 1.0, 0.05, dtype, strided, offset);
+                let k = make(&[1, tokens, 16, 128], 3.0, 0.06, dtype, strided, offset);
+                let v = make(&[1, tokens, 48, 128], 9.0, 0.2, dtype, strided, offset);
+                let g = make(&[1, tokens, 48], 2.0, 0.03, DType::Float32, strided, offset)
+                    .add_scalar(0.95)
+                    .unwrap();
+                let b = make(&[1, tokens, 48], 5.0, 0.2, DType::Float32, strided, offset)
+                    .add_scalar(0.5)
+                    .unwrap();
+                // Only this test runs in the child. Fully evaluate each graph
+                // before changing the flag, then compare every output/state bit.
+                unsafe { std::env::set_var("MLX_QWEN4_GDN_VECTOR_ROWS", "0") };
+                let (want, next_control) =
+                    math::recurrent_sequence(&q, &k, &v, &g, &b, &control).unwrap();
+                let expected = [
+                    want.to_float32().unwrap().to_vec(),
+                    next_control.to_float32().unwrap().to_vec(),
+                ];
+                unsafe { std::env::set_var("MLX_QWEN4_GDN_VECTOR_ROWS", "1") };
+                let (got, next_candidate) =
+                    math::recurrent_sequence(&q, &k, &v, &g, &b, &candidate).unwrap();
+                for (actual, expected) in [
+                    got.to_float32().unwrap(),
+                    next_candidate.to_float32().unwrap(),
+                ]
+                .iter()
+                .zip(&expected)
+                {
+                    assert_eq!(actual.len(), expected.len());
+                    for (index, (&actual, &expected)) in actual.iter().zip(expected).enumerate() {
+                        assert!(
+                            actual.is_finite() && actual.to_bits() == expected.to_bits(),
+                            "tokens={tokens}, strided={strided}, offset={offset}, index={index}: {actual} != {expected}"
+                        );
+                    }
+                }
+                control = next_control;
+                candidate = next_candidate;
+            }
+            assert_eq!(initial.to_float32().unwrap().as_ref(), snapshot.as_slice());
+        }
+    }
+}
+
+#[test]
 fn batched_causal_convolution_matches_stepwise_history() {
     use crate::array::DType;
     for dtype in [DType::Float32, DType::BFloat16] {
@@ -1653,6 +1757,32 @@ fn fused_routed_experts_preserve_mixed_formats_and_changing_inputs() {
     if !crate::engine::persistence::compiled_forward_backend_available() {
         return;
     }
+    const CHILD: &str = "MLX_QWEN4_EXPERT_STAGING_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        // Exercise both epilogues against the ordinary projections, including
+        // mixed quantization, changing routes, missing slots and shared experts.
+        // Process isolation avoids mutating settings used by other GPU tests.
+        for (lanes, schedule) in [("0", "0"), ("1", "0"), ("1", "1")] {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "models::qwen4_exp::tests::fused_routed_experts_preserve_mixed_formats_and_changing_inputs",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .env("MLX_QWEN4_EXPERT_LANE_STAGING", lanes)
+                .env("MLX_QWEN4_REFERENCE_DOWN_SCHEDULE", schedule)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "lanes={lanes}, schedule={schedule}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
     use crate::array::DType;
     use std::sync::Arc;
     let (e, h, m) = (3usize, 2560usize, 640usize);
@@ -2382,6 +2512,32 @@ fn compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding() {
 }
 
 #[test]
+fn parallel_mixer_products_preserve_projection_and_halfway_rounding() {
+    // Reuse the independent GEMV/normalization references with the lane port
+    // enabled in isolated processes, including fused injection output.
+    for test in [
+        "compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding",
+        "hyper_up_preserves_native_sigmoid_halfway_rounding",
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("models::qwen4_exp::tests::{test}"),
+                "--test-threads=1",
+            ])
+            .env("MLX_QWEN4_MIXER_LANE_PRODUCTS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{test}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
 fn hyper_up_preserves_native_sigmoid_halfway_rounding() {
     use crate::array::DType;
     use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
@@ -2753,6 +2909,20 @@ impl CompleteGdnInputs {
             .unwrap();
         (out, next, history.unwrap())
     }
+}
+
+#[test]
+fn complete_gdn_compact_gates_preserve_fallback_rounding() {
+    // Exercise the older-GPU graph on every Metal host. A forced rollback
+    // used to fuse the BF16 gate casts differently from its F32 control.
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "models::qwen4_exp::tests::complete_gdn_replay_preserves_outputs_and_independent_histories",
+            "--exact", "--test-threads=1",
+        ])
+        .env("MLX_QWEN4_COMPLETE_GDN_METAL", "0")
+        .status().unwrap();
+    assert!(status.success(), "complete GDN fallback regression failed");
 }
 
 #[test]
@@ -3416,6 +3586,112 @@ fn reference_prefill_hc_mix_preserves_bf16_boundaries_and_views() {
         unsafe { mlx_sys::mlx_qwen4_prefill_hc_mix(short.as_raw_ptr(), short.as_raw_ptr()) }
             .is_null()
     );
+}
+
+#[test]
+fn mixer_down_injection_matches_independent_projections() {
+    use crate::array::DType;
+    use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
+    use crate::nn::Activations;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    for phase in [3usize, 17] {
+        let k = 10240;
+        // Offset views and changing weight values catch cached-graph captures.
+        let make = |n: usize| {
+            let w = MxArray::from_uint32(
+                &(0..(n + 1) * k / 4)
+                    .map(|i| {
+                        (i as u32)
+                            .wrapping_mul(0x9e3779b9)
+                            .wrapping_add(phase as u32)
+                    })
+                    .collect::<Vec<_>>(),
+                &[(n + 1) as i64, (k / 4) as i64],
+            )
+            .unwrap()
+            .slice_axis(0, 1, (n + 1) as i64)
+            .unwrap();
+            let s = MxArray::from_float32(
+                &(0..(n + 1) * k / 32)
+                    .map(|i| ((i * 13 + phase) % 61 + 1) as f32 / 65536.)
+                    .collect::<Vec<_>>(),
+                &[(n + 1) as i64, (k / 32) as i64],
+            )
+            .unwrap()
+            .astype(DType::Float16)
+            .unwrap()
+            .slice_axis(0, 1, (n + 1) as i64)
+            .unwrap();
+            let b = s.mul_scalar(-128.).unwrap().astype(DType::Float16).unwrap();
+            (w, s, b)
+        };
+        let (wd, sd, bd) = make(320);
+        let (wi, si, bi) = make(4);
+        let x = MxArray::from_float32(
+            &(0..2 * k)
+                .map(|i| ((i * 17 + phase) % 251) as f32 / 128. - 1.)
+                .collect::<Vec<_>>(),
+            &[2, k as i64],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+        .slice_axis(0, 1, 2)
+        .unwrap()
+        .reshape(&[1, 1, k as i64])
+        .unwrap();
+        let project = |w: &MxArray, s: &MxArray, b: &MxArray| {
+            QuantizedLinear::new(
+                w.clone(),
+                s.clone(),
+                Some(b.clone()),
+                None,
+                32,
+                8,
+                "affine".into(),
+            )
+            .forward(&x)
+            .unwrap()
+        };
+        let expected_act =
+            Activations::silu(&project(&wd, &sd, &bd).div_scalar(4.).unwrap()).unwrap();
+        let expected_gate = project(&wi, &si, &bi);
+        let call = |input: &MxArray, out: &mut _, gate: &mut _| unsafe {
+            mlx_sys::mlx_qwen4_mixer_down_inject(
+                input.as_raw_ptr(),
+                wd.as_raw_ptr(),
+                sd.as_raw_ptr(),
+                bd.as_raw_ptr(),
+                wi.as_raw_ptr(),
+                si.as_raw_ptr(),
+                bi.as_raw_ptr(),
+                out,
+                gate,
+            )
+        };
+        let (mut out, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
+        assert!(call(&x, &mut out, &mut gate));
+        let out = MxArray::from_handle(out, "fused down activation").unwrap();
+        let gate = MxArray::from_handle(gate, "fused injection projection").unwrap();
+        assert_eq!(
+            &*out.to_float32().unwrap(),
+            &*expected_act.to_float32().unwrap()
+        );
+        assert_eq!(
+            &*gate.to_float32().unwrap(),
+            &*expected_gate.to_float32().unwrap()
+        );
+        for unsupported in [
+            x.astype(DType::Float32).unwrap(),
+            x.broadcast_to(&[1, 2, k as i64]).unwrap(),
+        ] {
+            let (mut out, mut gate) = (x.as_raw_ptr(), x.as_raw_ptr());
+            assert!(!call(&unsupported, &mut out, &mut gate));
+            assert!(out.is_null() && gate.is_null());
+        }
+    }
 }
 
 #[test]

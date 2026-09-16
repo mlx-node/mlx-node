@@ -95,6 +95,7 @@ const array &native_bf16_inject_table() {
 
 // All changing weights, slot mappings, scores and activations are inputs.
 // Shapes specialize the two supported gate formats and two down formats.
+template <bool LANES>
 std::vector<array> routed_experts(const std::vector<array> &a) {
   int tokens = a[0].shape(1), experts = a[3].shape(0) / 640;
   int gate_bits = a[3].shape(1) * 32 / 2560;
@@ -102,21 +103,24 @@ std::vector<array> routed_experts(const std::vector<array> &a) {
   static auto gu = mlx::core::fast::metal_kernel(
       "qwen4_gate_up_decode", {"x", "ids", "wg", "sg", "bg", "wu", "su", "bu"},
       {"out"}, R"(
-    q4_gate_up<T,BITS,2560,640,E,10>(x,ids,wg,sg,bg,wu,su,bu,out,
+    q4_gate_up<T,BITS,2560,640,E,10,LANES>(x,ids,wg,sg,bg,wu,su,bu,out,
       threadgroup_position_in_grid.z,threadgroup_position_in_grid.y,
       simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
   )",
       expert_header());
-  auto hidden = gu(
-      {a[0], a[1], a[3], a[4], a[5], a[6], a[7], a[8]}, {{tokens * 10, 1, 640}},
-      {mlx::core::float32}, {32, 160, tokens * 10}, {32, 2, 1},
-      {{"T", mlx::core::bfloat16}, {"BITS", gate_bits}, {"E", experts}},
-      std::nullopt, false, mlx::core::Device::gpu)[0];
+  auto hidden = gu({a[0], a[1], a[3], a[4], a[5], a[6], a[7], a[8]},
+                   {{tokens * 10, 1, 640}}, {mlx::core::float32},
+                   {32, 160, tokens * 10}, {32, 2, 1},
+                   {{"T", mlx::core::bfloat16},
+                    {"BITS", gate_bits},
+                    {"E", experts},
+                    {"LANES", LANES}},
+                   std::nullopt, false, mlx::core::Device::gpu)[0];
   static auto down = mlx::core::fast::metal_kernel(
       "qwen4_down_combine_decode",
       {"x", "ids", "scores", "w", "scales", "biases"}, {"out"}, R"(
     threadgroup P products[10*4];
-    q4_down_combine<T,P,BITS,2560,640,E,10,4,5>(x,ids,scores,w,scales,biases,out,products,
+    q4_down_combine<T,P,BITS,2560,640,E,10,4,5,LANES>(x,ids,scores,w,scales,biases,out,products,
       threadgroup_position_in_grid.z,threadgroup_position_in_grid.y,
       simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
   )",
@@ -126,6 +130,7 @@ std::vector<array> routed_experts(const std::vector<array> &a) {
            {a[2].dtype()}, {32, 640 * 5, tokens}, {32, 5, 1},
            {{"T", mlx::core::bfloat16},
             {"P", a[2].dtype()},
+            {"LANES", LANES},
             {"BITS", down_bits},
             {"E", experts}},
            std::nullopt, false, mlx::core::Device::gpu)[0];
@@ -139,7 +144,7 @@ const std::string &shared_expert_header() {
   return header;
 }
 
-template <int RPS, bool STAGE>
+template <int RPS, bool STAGE, bool LANES>
 std::vector<array> routed_shared_experts(const std::vector<array> &a) {
   const int experts = a[3].shape(0) / 640;
   const int gate_bits = a[3].shape(1) * 32 / 2560;
@@ -150,11 +155,11 @@ std::vector<array> routed_shared_experts(const std::vector<array> &a) {
        "swu", "ssu", "sbu", "sigmoid_table"},
       {"out"}, R"(
     if (threadgroup_position_in_grid.z < 10) {
-      q4_gate_up<T,BITS,2560,640,E,10>(x,ids,wg,sg,bg,wu,su,bu,out,
+      q4_gate_up<T,BITS,2560,640,E,10,LANES>(x,ids,wg,sg,bg,wu,su,bu,out,
         threadgroup_position_in_grid.z,threadgroup_position_in_grid.y,
         simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
     } else {
-      q4_shared_gu<T>(x,swg,ssg,sbg,swu,ssu,sbu,sigmoid_table,out,
+      q4_shared_gu<T,LANES>(x,swg,ssg,sbg,swu,ssu,sbu,sigmoid_table,out,
         threadgroup_position_in_grid.y,simdgroup_index_in_threadgroup,thread_index_in_simdgroup);
     }
   )",
@@ -163,7 +168,10 @@ std::vector<array> routed_shared_experts(const std::vector<array> &a) {
       gu({a[0], a[1], a[3], a[4], a[5], a[6], a[7], a[8], a[12], a[13], a[14],
           a[15], a[16], a[17], a[22]},
          {{11, 1, 640}}, {mlx::core::float32}, {32, 160, 11}, {32, 2, 1},
-         {{"T", mlx::core::bfloat16}, {"BITS", gate_bits}, {"E", experts}},
+         {{"T", mlx::core::bfloat16},
+          {"BITS", gate_bits},
+          {"E", experts},
+          {"LANES", LANES}},
          std::nullopt, false, mlx::core::Device::gpu)[0];
   static auto down = mlx::core::fast::metal_kernel(
       "qwen4_routed_shared_down",
@@ -179,10 +187,12 @@ std::vector<array> routed_shared_experts(const std::vector<array> &a) {
       shared_expert_header());
   return down({hidden, a[1], a[2], a[9], a[10], a[11], a[18], a[19], a[20],
                a[21], a[22]},
-              {{1, 1, 2560}}, {mlx::core::bfloat16}, {32, (2560 / RPS) * 6, 1}, {32, 6, 1},
+              {{1, 1, 2560}}, {mlx::core::bfloat16}, {32, (2560 / RPS) * 6, 1},
+              {32, 6, 1},
               {{"T", mlx::core::bfloat16},
                {"P", a[2].dtype()},
-               {"RPS", RPS}, {"STAGE", STAGE},
+               {"RPS", RPS},
+               {"STAGE", STAGE || LANES},
                {"BITS", down_bits},
                {"E", experts}},
               std::nullopt, false, mlx::core::Device::gpu);
@@ -339,6 +349,61 @@ extern "C" mlx_array *mlx_qwen4_decode_mixer_act(mlx_array *input,
   return nullptr;
 }
 
+// Fuse the two projections without concatenating or retaining another bank.
+extern "C" bool mlx_qwen4_mixer_down_inject(
+    mlx_array *input, mlx_array *down, mlx_array *down_scales,
+    mlx_array *down_biases, mlx_array *inject, mlx_array *inject_scales,
+    mlx_array *inject_biases, mlx_array **out, mlx_array **out_inject) {
+  if (!out || !out_inject)
+    return false;
+  *out = nullptr;
+  *out_inject = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!input || !down || !down_scales || !down_biases || !inject ||
+        !inject_scales || !inject_biases)
+      return false;
+    const auto &x = *reinterpret_cast<array *>(input);
+    const auto &wd = *reinterpret_cast<array *>(down);
+    const auto &sd = *reinterpret_cast<array *>(down_scales);
+    const auto &bd = *reinterpret_cast<array *>(down_biases);
+    const auto &wi = *reinterpret_cast<array *>(inject);
+    const auto &si = *reinterpret_cast<array *>(inject_scales);
+    const auto &bi = *reinterpret_cast<array *>(inject_biases);
+    auto valid = [](const array &w, const array &s, const array &b, int n) {
+      return w.shape() == Shape{n, 2560} && w.dtype() == mlx::core::uint32 &&
+             s.shape() == Shape{n, 320} && s.dtype() == mlx::core::float16 &&
+             b.shape() == s.shape() && b.dtype() == s.dtype();
+    };
+    if (x.shape() != Shape{1, 1, 10240} || x.dtype() != mlx::core::bfloat16 ||
+        !valid(wd, sd, bd, 320) || !valid(wi, si, bi, 4))
+      return false;
+    static auto compiled = mlx::core::compile([](const std::vector<array> &a) {
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_mixer_down_inject",
+          {"x", "wd", "sd", "bd", "wi", "si", "bi", "silu_table"},
+          {"act", "injection"},
+#include "metal/qwen4_mixer_down_inject.metal.inc"
+          , qmv_header());
+      return kernel(a, {{1, 1, 320}, {1, 1, 4}},
+                    {mlx::core::bfloat16, mlx::core::bfloat16}, {32, 324, 1},
+                    {32, 2, 1}, {{"T", mlx::core::bfloat16}}, std::nullopt,
+                    false, mlx::core::Device::gpu);
+    });
+    auto result =
+        compiled({x, wd, sd, bd, wi, si, bi, native_bf16_silu_table()});
+    auto activation = std::make_unique<array>(std::move(result[0]));
+    auto injection = std::make_unique<array>(std::move(result[1]));
+    *out = reinterpret_cast<mlx_array *>(activation.release());
+    *out_inject = reinterpret_cast<mlx_array *>(injection.release());
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 mixer down/injection: " << e.what() << std::endl;
+  }
+#endif
+  return false;
+}
+
 extern "C" mlx_array *mlx_qwen4_hyper_up(mlx_array *input, mlx_array *weight,
                                          mlx_array *scales, mlx_array *biases,
                                          mlx_array *normed) {
@@ -357,7 +422,7 @@ extern "C" mlx_array *mlx_qwen4_hyper_up(mlx_array *input, mlx_array *weight,
         s.shape() != Shape{10240, 10} || s.dtype() != mlx::core::float16 ||
         b.shape() != s.shape() || b.dtype() != s.dtype())
       return nullptr;
-    static auto graph = [](const std::vector<array> &in) {
+    static auto graph = [](const std::vector<array> &in, bool parallel) {
       const auto &x = in[0], &w = in[1], &s = in[2], &b = in[3], &n = in[4];
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_hyper_up",
@@ -372,15 +437,21 @@ extern "C" mlx_array *mlx_qwen4_hyper_up(mlx_array *input, mlx_array *weight,
                      {"FAST", false},
                      {"RPS", 4},
                      {"ACT", false},
-                     {"MIX", true}},
+                     {"MIX", parallel ? 2 : 1}},
                     std::nullopt, false, mlx::core::Device::gpu);
     };
-    static auto compiled = mlx::core::compile(graph);
+    static auto compiled = mlx::core::compile(
+        [](const std::vector<array> &a) { return graph(a, false); });
+    static auto parallel_compiled = mlx::core::compile(
+        [](const std::vector<array> &a) { return graph(a, true); });
+    const auto lanes = qwen4_env("MLX_QWEN4_MIXER_LANE_PRODUCTS");
+    const bool parallel = lanes && std::string(lanes) == "1";
     auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
     const bool cached = (!setting || std::string(setting) != "0");
     const auto &table = native_bf16_sigmoid_table();
-    auto result = cached ? compiled({x, w, s, b, n, table})
-                         : graph({x, w, s, b, n, table});
+    auto result = cached ? (parallel ? parallel_compiled
+                                     : compiled)({x, w, s, b, n, table})
+                         : graph({x, w, s, b, n, table}, parallel);
     return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
   } catch (const std::exception &e) {
     std::cerr << "Qwen4 hyper up: " << e.what() << std::endl;
@@ -415,7 +486,7 @@ extern "C" bool mlx_qwen4_hyper_up_inject(
         s.shape() != Shape{10240, 10} || s.dtype() != mlx::core::float16 ||
         b.shape() != s.shape() || b.dtype() != s.dtype())
       return false;
-    static auto graph = [](const std::vector<array> &a) {
+    static auto graph = [](const std::vector<array> &a, bool parallel) {
       static const std::string source = std::string(
 #include "metal/qwen4_dense_decode.metal.inc"
           ) + R"(
@@ -430,15 +501,26 @@ extern "C" bool mlx_qwen4_hyper_up_inject(
            "inject_projection", "inject_table"},
           {"out", "inject_out"}, source, qmv_header());
       return kernel(a, {{1, 1, 2560}, {1, 1, 4}},
-                    {mlx::core::bfloat16, mlx::core::bfloat16},
-                    {32, 2560, 1}, {32, 2, 1},
-                    {{"T", mlx::core::bfloat16}, {"K", 320}, {"N", 10240},
-                     {"FAST", false}, {"RPS", 4}, {"ACT", false}, {"MIX", true}},
+                    {mlx::core::bfloat16, mlx::core::bfloat16}, {32, 2560, 1},
+                    {32, 2, 1},
+                    {{"T", mlx::core::bfloat16},
+                     {"K", 320},
+                     {"N", 10240},
+                     {"FAST", false},
+                     {"RPS", 4},
+                     {"ACT", false},
+                     {"MIX", parallel ? 2 : 1}},
                     std::nullopt, false, mlx::core::Device::gpu);
     };
-    static auto compiled = mlx::core::compile(graph);
-    auto result = compiled({x, w, s, b, n, native_bf16_sigmoid_table(),
-                            g, native_bf16_inject_table()});
+    static auto compiled = mlx::core::compile(
+        [](const std::vector<array> &a) { return graph(a, false); });
+    static auto parallel_compiled = mlx::core::compile(
+        [](const std::vector<array> &a) { return graph(a, true); });
+    const auto lanes = qwen4_env("MLX_QWEN4_MIXER_LANE_PRODUCTS");
+    const bool parallel = lanes && std::string(lanes) == "1";
+    auto result = (parallel ? parallel_compiled : compiled)(
+        {x, w, s, b, n, native_bf16_sigmoid_table(), g,
+         native_bf16_inject_table()});
     auto mixed = std::make_unique<array>(std::move(result[0]));
     auto gate = std::make_unique<array>(std::move(result[1]));
     *out = reinterpret_cast<mlx_array *>(mixed.release());
@@ -545,8 +627,15 @@ extern "C" mlx_array *mlx_qwen4_routed_experts(mlx_array *x, mlx_array *ids,
         a[10].dtype() != mlx::core::float16 || a[11].shape() != a[10].shape() ||
         a[11].dtype() != mlx::core::float16)
       return nullptr;
-    static auto fn = mlx::core::compile(routed_experts);
-    auto out = fn(a)[0];
+    const auto lanes = qwen4_env("MLX_QWEN4_EXPERT_LANE_STAGING");
+    auto out = [&] {
+      if (lanes && std::string(lanes) == "1") {
+        static auto fn = mlx::core::compile(routed_experts<true>);
+        return fn(a)[0];
+      }
+      static auto fn = mlx::core::compile(routed_experts<false>);
+      return fn(a)[0];
+    }();
     // Opt-in evidence that a real decode reaches this specialization. All
     // changing inputs remain graph arguments; no model arrays are captured.
     static const bool trace =
@@ -623,12 +712,25 @@ extern "C" mlx_array *mlx_qwen4_routed_shared_experts(mlx_array *const *inputs,
     // TrackFastMoE's singleton two-row tiles and distributed staging.
     // Keep the four-row schedule available for a paired whole-model check.
     const auto schedule = qwen4_env("MLX_QWEN4_REFERENCE_DOWN_SCHEDULE");
+    const auto lanes = qwen4_env("MLX_QWEN4_EXPERT_LANE_STAGING");
     array out = [&] {
-      if (schedule && std::string(schedule) == "1") {
-        static auto compiled = mlx::core::compile(routed_shared_experts<2, true>);
+      if (lanes && std::string(lanes) == "1") {
+        if (schedule && std::string(schedule) == "1") {
+          static auto compiled =
+              mlx::core::compile(routed_shared_experts<2, true, true>);
+          return compiled(a)[0];
+        }
+        static auto compiled =
+            mlx::core::compile(routed_shared_experts<4, false, true>);
         return compiled(a)[0];
       }
-      static auto compiled = mlx::core::compile(routed_shared_experts<4, false>);
+      if (schedule && std::string(schedule) == "1") {
+        static auto compiled =
+            mlx::core::compile(routed_shared_experts<2, true, false>);
+        return compiled(a)[0];
+      }
+      static auto compiled =
+          mlx::core::compile(routed_shared_experts<4, false, false>);
       return compiled(a)[0];
     }();
     return reinterpret_cast<mlx_array *>(new array(std::move(out)));

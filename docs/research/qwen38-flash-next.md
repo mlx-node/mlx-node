@@ -20,11 +20,12 @@ result reliably, including when the unchanged control is repeated.
 | Historical v14 candidate, six samples      |         2317.060 |          52.934 |
 | Historical v16 candidate, three samples    |         2302.827 |          53.989 |
 | macOS 27 v24 control, pooled two processes |         2092.288 |          49.875 |
-| Latest ordinary v25 prefill-only median    |         1502.858 |               — |
+| 17 September three-port exact candidate    |         1962.355 |          52.313 |
+| 17 September candidate with BF16/fusions   |         2250.736 |          53.764 |
 
 These are measurements of particular builds and configurations, not a matched
-engine comparison or a promise for the cleaned PR. The v24 control above is
-about 83.3%/78.8% of the published rates. A subsequent diagnostic returned to
+engine comparison or a promise for the cleaned PR. The latest BF16/fusion candidate is
+about 89.6%/85.0% of the published rates, still below both thresholds. A subsequent diagnostic returned to
 about 2117 prefill tokens/s, but diagnostic timings are excluded from ordinary
 throughput claims. No experimental arithmetic or later optional decode fusion
 has been promoted on the basis of these drifting measurements.
@@ -364,6 +365,135 @@ Rejected or unpromoted research includes:
 Full BF16 checkpoint generation, real-model contexts beyond 2048 tokens, audio,
 video and image-bearing MTP remain unvalidated or unsupported as stated in the
 runtime guide. Sparse thresholds are covered by small fixtures.
+
+## Follow-up source audit, 17 September
+
+Starting from the cleaned `f76ee4be` build, the renewed audit follows the
+winning PR's source and mechanism list directly. Its four-row GDN schedule,
+indirect expert tile table, packed NAX prefetch, split wide projection inputs,
+route sorting, and first-two/then-three-layer submission schedule already
+exist locally. The remaining exact candidates identified in this pass are:
+
+| Reference mechanism                     | Local gap and port                                                                                                                                                                                                                                                                                                                                                                                                              |
+| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TrackFastKernels.leanRowsSource`       | The local four-row recurrence still used scalar loads, six pointer increments, and a scalar-array sequence length. `MLX_QWEN4_GDN_VECTOR_ROWS=1` uses vector loads, three shared offsets, and a template sequence length. It retains modulo head mapping, ordinary FP32 reductions, FP32 output, and FP32 state. The reference's Kahan arithmetic and consecutive head mapping are deliberately not copied into this GGUF path. |
+| `TrackFastMoE` gate/up and down staging | Routed and shared gate/up activation writes were still serialized on lane zero. `MLX_QWEN4_EXPERT_LANE_STAGING=1` distributes complete reduced rows across lanes and independently enables distributed down-result staging at the existing four-row geometry. The older two-row schedule remains a separate choice.                                                                                                             |
+| `TrackFastMixer.upMixSource`            | `MLX_QWEN4_MIXER_LANE_PRODUCTS=1` computes the four independent stream products in four lanes, then retains this checkout's ascending BF16 sum and division by four. It keeps the current weight layout and one-column SIMD ownership.                                                                                                                                                                                          |
+| `TrackFastMixer.downInjectSource`       | `MLX_QWEN4_MIXER_DOWN_INJECT=1` fuses singleton mixer down/SiLU and injection projections into one dispatch, keeping the local affine8 lane walks and BF16 boundaries. It reads the existing two banks and adds no resident weights.                                                                                                                                                                                            |
+
+These switches remain off pending repeatable full-model comparisons. The
+recurrence regression checks every output and state bit for F32/BF16 inputs,
+contiguous/strided/offset storage, modulo-tiled key heads, 7/9/1024-token windows and
+one-token continuation. It passed on this host. Expert and mixer regressions
+reuse ordinary projections and the native sigmoid halfway cases as independent
+references. All 98 Qwen4 native tests passed on the complete three-port candidate (39.35 seconds).
+The later down/injection fusion passed its independent projection regression,
+including changed weights, offset views and unsupported-input fallback; the
+expanded 99-test Qwen4 suite passed in 57.40 seconds.
+
+A four-process, uncontended control/vector/vector/control check passed all
+hashes and guards at the required 63 GiB/393-slot plan. Process medians were
+1959.888/52.156, 1974.653/52.093, 1955.831/52.080, and 1932.010/52.212
+(prefill/decode tokens/s). The small prefill change is insufficient to approach
+90%; decode is unchanged. An isolated 1024-token recurrence probe matched
+all outputs and final states exactly for both input dtypes. After its first
+control block, FP32 control blocks took 1.463/1.444 ms versus candidate
+1.382/1.394/1.404 ms; BF16 block times overlap. These kernel timings do not
+replace the complete-request comparison.
+
+The first same-binary combined check measured 1951.665/51.256 for its control
+and 1962.355/52.313 for the three-port candidate (three measured requests per
+process; 63 GiB/393 slots; hashes and guards passed). The control's last
+prefill sample dropped to 1665.860, so this pair alone is insufficient for
+promotion. Two subsequent optional-fusion runs stopped before loading because
+another worktree was running Vitest. Those runs have no throughput result.
+The later down/injection fusion is not included in this initial comparison.
+
+With all three ports, the earlier optional fusions, BF16 prefill operands and
+wide PLE enabled, an ordinary guarded run measured
+2247.148/2250.736/2260.135 prefill and 53.851/53.764/53.403 decode tokens/s.
+Its medians are 89.6%/85.0% of the published rates, still below both thresholds.
+The standard output hash matched on every request; the prior BF16 numerical
+limits still apply. This run also predates the down/injection fusion.
+
+The following minimal-fusion run overlapped a `k2-horizon` Rust build and is
+excluded from optimization comparisons. One-second telemetry reaches full
+CPU utilization during that run. The guard now also rejects competing
+mlx-node compilers; it had previously checked only model footprints and MLX
+tests. This is evidence of contention in that particular run, not a measured
+regression from disabling fusions.
+
+A separate singleton GDN prototype ports the reference's first-state-row
+prefetch and register-cached q/k values. It matched all three outputs for two
+input phases. Warm control blocks took 153.474/153.187/153.607 microseconds;
+candidate blocks took 155.159/150.237/150.881 microseconds. This small,
+overlapping result does not justify another production variant. The prototype
+remains in the external evidence archive.
+
+A separate CPU-side audit found repeated deep clones of the immutable model
+configuration in forward helpers. The decoder now shares that configuration
+through `Arc`, matching the reference's retained configuration without changing
+any tensor or arithmetic. Its measurement is separate from the kernel ports.
+
+The shared-configuration candidate passed all 99 Qwen4 tests and the broader
+core release suite (3561 passed, 122 ignored, three existing debug-only
+assertions excluded). Its full-checkpoint smoke passed all 11 requests and
+released all 1365 pages and state reservations. Smoke used its actual
+63 GiB/366-slot auxiliary-model plan and a 65.21 GB peak physical footprint.
+This was correctness-only validation under the memory/pressure guard; other
+small tests/builds were allowed, so its timings are not throughput evidence.
+The canonical addon build and strict all-target Clippy also passed.
+
+PR #154's previous-head CI exposed a compact-gate rounding difference in the
+older-GPU compiled GDN fallback. Forcing that fallback on this M5 reproduced
+it: the compact recurrent state differed in 203922 elements by at most
+1.8626451e-9 at the first step. The fallback now promotes gate inputs to F32
+before entering the compiled graph, restoring the original input signature;
+the fused Metal path remains unchanged. A child-process regression explicitly
+forces this fallback on every Metal host, with the existing exact output,
+state and history assertions intact. Both the original replay test and the new forced-fallback regression passed
+with zero differences in outputs, states and retained histories.
+
+A later four-process candidate/control/control/candidate check retained the
+same 63 GiB/393-slot plan, guards and standard hash. The two three-port control
+processes measured medians of 2244.979/53.939 and 2238.188/53.818 tokens/s.
+The down/injection plus shared-config candidate measured 1939.126/52.888 and
+2207.549/53.514. The first candidate's prefill slowdown did not repeat at that
+magnitude, but this comparison does not demonstrate a gain from the new fusion.
+A preceding 20-leg same-process feature screen also passed all hashes and the
+guard, but had large within-variant timing swings and cannot establish a winner.
+Those samples are retained rather than selected for a favorable result.
+
+A separate packed-mixer probe ports the reference's two-column threadgroup,
+eight-product staging and reordered rows, with a control retaining the local
+layout. All outputs matched bit-for-bit for two changing input/weight sets.
+Repeated warm blocks overlapped: control 141.5–151.2 microseconds, unpacked
+reference geometry 143.3–150.3, packed geometry 140.9–167.2. This includes
+per-dispatch evaluation overhead; it is not a full-model gain. No duplicate
+mixer banks or associated residency change are added based on this result.
+
+The reference also uses source/compile-option hashes as Metal library keys.
+Our backend compares sources under the kernel name. A literal hash-key port
+still scans the source on every evaluation; source inspection alone does not
+establish it as a warm-dispatch speedup. It has not been promoted. The
+reference's packed mixer-row layout additionally retains reordered weights;
+that is a separate residency/accounting change from the parallel-product port.
+
+The first fresh default run was admitted at 386 expert slots rather than 393,
+so it is excluded from fixed-budget comparisons (prefill
+1951.314/1893.519/1666.196; decode 52.043/52.018/51.285 tokens/s). A subsequent
+BF16 run overlapped another worktree's native MLX GPU suite and is also excluded
+(prefill 905.610/859.015/874.646; decode 41.203/41.414/40.927). Its low rates are
+not evidence of a BF16 regression. The external harness now requires exactly
+63 GiB/393 slots/1024-token windows and stops on competing native MLX tests,
+including tests below the existing 8 GiB memory threshold. It stops only its
+own child group. This observed interference applies to these runs; it does
+not retroactively establish the cause of earlier timing drift.
+
+New local evidence lives in
+`~/Library/Caches/mlx-node/qwen4-reference-gap-20260917/`, including immutable
+control/candidate builds, invocation records, memory guards, telemetry, and
+external probes. No harness or temporary file is added to the repository.
 
 ## PR cleanup and validation
 
