@@ -32,6 +32,7 @@ import { createLaunchVisibility } from './launch-visibility.js';
 import { resolveAppPaths, type AppPaths } from './paths.js';
 import { installAppProtocol, registerAppScheme } from './protocol.js';
 import { createQuitHandler } from './quit.js';
+import { prepareExtraCaBundle, securityText } from './system-ca.js';
 import {
   DEFAULT_SETTINGS,
   loadSettings,
@@ -157,17 +158,31 @@ function wire(): void {
 }
 
 async function bootstrap(): Promise<void> {
+  // Captured as well as passed: AppPaths derives per-file locations from it
+  // but keeps no handle to the directory, and the CA bundle needs one.
+  const userData = app.getPath('userData');
   paths = resolveAppPaths({
     appPath: app.getAppPath(),
     resourcesPath: process.resourcesPath,
     packaged: app.isPackaged,
-    userData: app.getPath('userData'),
+    userData,
   });
 
   // Synchronously, before the first await: a window created by anything that
   // races ahead of us (an `activate` at launch) would otherwise load `app://`
   // with no handler installed and fail as a blank frame.
   installAppProtocol(paths.wwwRoot);
+
+  // Kicked off here, awaited where the CONTROL PANEL env is assembled below:
+  // the three `security` keychain reads overlap settings/update setup instead
+  // of adding to startup latency. See system-ca.ts for what this fixes
+  // (TLS-inspecting networks) and why the child can only receive it at fork.
+  const extraCaBundle = prepareExtraCaBundle({
+    platform: process.platform,
+    dir: userData,
+    exec: securityText,
+    inheritedPath: process.env.NODE_EXTRA_CA_CERTS,
+  });
 
   // An accessory app has no menu bar of its own, but the standard roles still
   // carry the Edit key equivalents the Control Panel window needs — a text field with no
@@ -294,6 +309,9 @@ async function bootstrap(): Promise<void> {
     .prepare()
     .catch((error: unknown) => console.error('[mlx] command setup:', error));
 
+  const extraCaBundlePath = await extraCaBundle;
+  if (quitting) return;
+
   broker = createControlPanelBroker<WebContents>({
     ...electronBrokerDeps({
       getInferenceConnection: async () => {
@@ -308,6 +326,9 @@ async function bootstrap(): Promise<void> {
       entry: paths.controlPanelEntry,
       env: {
         ...process.env,
+        // After `...process.env` on purpose: the bundle already MERGED any
+        // inherited NODE_EXTRA_CA_CERTS, so this replaces rather than duplicates.
+        ...(extraCaBundlePath === null ? {} : { NODE_EXTRA_CA_CERTS: extraCaBundlePath }),
         ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir }),
         MLX_DESKTOP_CLI: JSON.stringify(cliConfig),
       } as Record<string, string>,
