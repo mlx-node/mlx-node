@@ -1222,10 +1222,10 @@ fn is_muse_glimmer_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool 
         == Some("muse-glimmer")
 }
 
-/// llama.cpp writes the sparse Qwen3.5 family under its own architecture tag.
-/// The dense `qwen35` tag cannot carry `expert_count`, so requiring this tag
-/// keeps a mis-dispatched dense file out of the MoE loader (and vice versa)
-/// with a header-only check.
+/// llama.cpp writes the sparse Qwen3.5 family under its own architecture tag
+/// and only that tag carries `expert_count`. Requiring it keeps a
+/// mis-dispatched dense file out of the MoE loader (and vice versa) with a
+/// header-only check.
 fn is_qwen35_moe_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
     metadata
         .get("general.architecture")
@@ -1740,8 +1740,9 @@ fn validate_qwen35_standalone_geometry(metadata: &HashMap<String, GgufMetaValue>
 fn qwen35_moe_name_to_hf(name: &str, metadata: &HashMap<String, GgufMetaValue>) -> String {
     let mut result = name.to_string();
     if result.starts_with("blk.") {
-        // `ffn_gate_inp_shexp` first: the shared-expert gate is a prefix of the
-        // router gate's infix, and only the longer form may claim the name.
+        // `ffn_gate_inp_shexp` first: the router gate's infix is a prefix of
+        // the shared-expert gate's, so the longer form must claim the name
+        // before the shorter rule can see it.
         result = result.replace(".ffn_gate_inp_shexp.", ".mlp.shared_expert_gate.");
         result = result.replace(".ffn_gate_inp.", ".mlp.gate.");
         result = result.replace(".ffn_gate_exps.", ".mlp.switch_mlp.gate_proj.");
@@ -2054,8 +2055,9 @@ fn fixup_shapes(weights: &mut HashMap<String, MxArray>) -> Result<()> {
 /// whose `set_weight` accepts exactly `[1, hidden]` — a 1-D array fails the
 /// load with "Weight shape mismatch: expected [1, hidden]". The reshape is
 /// rank-preserving, so only the 1-D form is touched: a writer that already
-/// emits the 2-D row, and a quantized group (which the loader reads through
-/// `try_build_ql` instead of `Linear::set_weight`), stay byte-identical.
+/// emits the 2-D row stays byte-identical, and a quantized group is left alone
+/// because the loader reads it through `try_build_ql` (reshaping its packed
+/// `.weight` while its `.scales` stayed put would divorce the pair).
 fn fixup_qwen35_moe_shared_expert_gate(
     weights: &mut HashMap<String, MxArray>,
     metadata: &HashMap<String, GgufMetaValue>,
@@ -2067,6 +2069,10 @@ fn fixup_qwen35_moe_shared_expert_gate(
     let keys: Vec<String> = weights
         .keys()
         .filter(|key| key.ends_with(".mlp.shared_expert_gate.weight"))
+        .filter(|key| {
+            let prefix = key.strip_suffix(".weight").unwrap_or(key);
+            !weights.contains_key(&format!("{prefix}.scales"))
+        })
         .cloned()
         .collect();
     for key in keys {
