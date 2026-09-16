@@ -104,7 +104,10 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     description: 'Agent-tuned MoE, fast decode',
   },
   {
-    // `mmproj-BF16.gguf` carries the vision tower; the repo's `mtp-*.gguf`
+    // `mmproj-BF16.gguf` is the vision tower — fetched for the planned
+    // gemma4v projector import; until that lands the checkpoint loads
+    // text-only (same as the dense Qwen3.8 GGUF, which is also a VLM
+    // architecture shipping no vision tensors). The repo's `mtp-*.gguf`
     // files are deliberately NOT globbed — mlx-node's Gemma speculative
     // decode is the DSpark draft path, nothing pairs those llama.cpp MTP
     // artifacts, and they would add ~2.5 GB of dead weight per install.
