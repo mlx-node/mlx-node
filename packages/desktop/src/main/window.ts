@@ -165,6 +165,9 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
       reveal(created);
     });
 
+    // Accessory app: no menu, so no ⌘⌥I. `MLX_DEVTOOLS=1` is the debugging entry.
+    if (process.env.MLX_DEVTOOLS === '1') created.webContents.openDevTools({ mode: 'detach' });
+
     created.on('resize', persistBounds);
     created.on('move', persistBounds);
 

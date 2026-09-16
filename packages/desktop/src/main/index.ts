@@ -29,6 +29,7 @@ import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
 import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
 import { electronBrokerDeps } from './control-panel-child.js';
 import { createLaunchVisibility } from './launch-visibility.js';
+import { viewMenuTemplate } from './menu-policy.js';
 import { resolveAppPaths, type AppPaths } from './paths.js';
 import { installAppProtocol, registerAppScheme } from './protocol.js';
 import { createQuitHandler } from './quit.js';
@@ -206,6 +207,9 @@ async function bootstrap(): Promise<void> {
         ],
       },
       { role: 'editMenu' },
+      // Dev access is gated (menu-policy.ts): an unpackaged run or
+      // `MLX_DEVTOOLS=1` adds Reload / Toggle Developer Tools to the View menu.
+      viewMenuTemplate(!app.isPackaged || process.env.MLX_DEVTOOLS === '1'),
       { role: 'windowMenu' },
     ] as MenuItemConstructorOptions[]),
   );
