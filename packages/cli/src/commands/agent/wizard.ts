@@ -10,7 +10,7 @@
 
 import { join } from 'node:path';
 
-import { type CatalogEntry, catalogRepo, visibleCatalog } from '@mlx-node/agent';
+import { type CatalogEntry, catalogRepo, catalogSelectionForRepo, visibleCatalog } from '@mlx-node/agent';
 
 export interface WizardIO {
   select: (opts: { message: string; choices: Array<{ name: string; value: string }> }) => Promise<string>;
@@ -42,20 +42,23 @@ function repoSlug(hfRepo: string): string {
  * copy-pasted hint would download to the DEFAULT dir and a re-run under
  * a custom `--models-dir` would still find nothing.
  *
- * The entry's `globs` and `assetsRepo` ride along so the wizard installs
- * exactly the same file set the dashboard does: one UD-Q4_K_XL variant out
- * of a multi-quant GGUF repo, plus the base-model tokenizer sidecars that
- * GGUF repos lack (without them the runtime falls back to its embedded
- * tokenizer extraction and tool calling silently breaks).
+ * The GGUF selection fields ride along so the wizard installs exactly the
+ * same file set the dashboard does: one UD-Q4_K_XL variant out of a
+ * multi-quant GGUF repo, plus the base-model tokenizer sidecars that GGUF
+ * repos lack (without them the runtime falls back to its embedded tokenizer
+ * extraction and tool calling silently breaks). Both fields describe the
+ * GGUF build only — a platform override (the pre-converted CUDA repo)
+ * installs as a plain safetensors directory.
  */
 function downloadModelArgv(entry: CatalogEntry, modelsDir: string | undefined): string[] {
   const hfRepo = catalogRepo(entry);
+  const selection = catalogSelectionForRepo(entry, hfRepo);
   const argv = ['-m', hfRepo];
-  for (const glob of entry.globs ?? []) {
+  for (const glob of selection.globs ?? []) {
     argv.push('-g', glob);
   }
-  if (entry.assetsRepo !== undefined) {
-    argv.push('--assets-repo', entry.assetsRepo);
+  if (selection.assetsRepo !== undefined) {
+    argv.push('--assets-repo', selection.assetsRepo);
   }
   if (modelsDir) {
     argv.push('-o', join(modelsDir, repoSlug(hfRepo)));

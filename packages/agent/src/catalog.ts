@@ -11,16 +11,17 @@ import { QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 export interface CatalogEntry {
   /** Wizard display name. */
   label: string;
-  /** HF slug for `mlx download model` — the UD-Q4_K_XL GGUF build, all platforms. */
+  /** HF slug for `mlx download model` — the UD-Q4_K_XL GGUF, every platform. */
   hfRepo: string;
   /**
    * HF slug on Linux + NVIDIA CUDA, when a platform-specific build exists.
    *
-   * Absent means the entry has no CUDA-specific build and {@link hfRepo}
-   * serves both — the case for every current entry, since the UD-Q4_K_XL
-   * GGUF build runs identically on Metal and CUDA. Retained for future
-   * platform-specific builds. Resolve with {@link catalogRepo}, never by
-   * reading the field.
+   * Absent means {@link hfRepo} serves both — the case for every current
+   * entry: all platforms install the Unsloth UD quant from one GGUF repo.
+   * Retained for future platform-specific builds; {@link globs} and
+   * {@link assetsRepo} describe {@link hfRepo} only and never apply to an
+   * override repo. Resolve with {@link catalogRepo}, never by reading the
+   * field.
    */
   hfRepoCuda?: string;
   /**
@@ -30,11 +31,15 @@ export interface CatalogEntry {
    * always included. Mirrors the `mlx download model --glob` semantics so the
    * wizard, the dashboard downloader, and a manual CLI run select the same
    * file set out of a repo that ships dozens of quantization variants.
+   *
+   * Applies to {@link hfRepo} only — the pre-converted CUDA repo has no
+   * quantization variants to filter.
    */
   globs?: string[];
   /**
    * Base-model HF repo supplying the tokenizer/config/processor sidecar files
    * a GGUF repo lacks (GGUF quantization repos ship weights, no tokenizer).
+   * Applies to {@link hfRepo} only.
    *
    * Mandatory for correct tool calling, not a nicety: when no sidecar
    * `tokenizer.json` sits next to the `.gguf`, the native GGUF runtime
@@ -163,24 +168,24 @@ export function catalogDownloadRepos(): string[] {
 /**
  * The repo THIS platform installs for `entry`.
  *
- * Every current entry serves ONE repo on all platforms: the Unsloth
- * UD-Q4_K_XL GGUF build. The earlier MXFP4 (Metal) / NVFP4 (CUDA) split is
- * gone because:
+ * All platforms take the Unsloth UD-Q4_K_XL GGUF: Unsloth Dynamic quants
+ * keep embeddings and `lm_head` at high precision, which measured as the best
+ * output quality AND 1.44× decode over MXFP4 on Qwen3.8-27B with MTP — with
+ * smaller downloads on top — and ggml K-quants are losslessly repacked into
+ * MLX layout at first load, so the GGUF is as native as a pre-converted
+ * safetensors repo once cached. GGUF quantization repos ship no tokenizer
+ * files, so each entry pairs its repo with {@link CatalogEntry.assetsRepo}
+ * sidecars — required for correct tool calling (see that field's comment).
  *
- * - Unsloth Dynamic quants keep embeddings and `lm_head` at high precision,
- *   which measured as the best output quality AND 1.44× decode over MXFP4 on
- *   Qwen3.8-27B with MTP — with smaller downloads on top.
- * - K-quants are losslessly repacked into MLX layout at first load (the
- *   native GGUF cache), so the GGUF artifact is as native as a pre-converted
- *   safetensors repo once cached.
- * - The CUDA PoC showed NVFP4 dequantizes on GB10 rather than running a
- *   native-path kernel, so CUDA loses nothing by taking the same GGUF.
- * - GGUF quantization repos ship no tokenizer files, so every entry pairs
- *   its repo with {@link CatalogEntry.assetsRepo} sidecars — required for
- *   correct tool calling (see that field's comment).
- *
- * `hfRepoCuda` stays in the interface for future platform-specific builds;
- * no current entry sets it.
+ * CUDA caveat, measured not assumed: the native import repacks K-quants into
+ * the `q4k`/`q5k`/`q6k` modes, and the CUDA backend's `QuantizedMatmul`,
+ * `GatherQMM`, and dequantize currently throw
+ * `"Quantization mode … is not implemented on the CUDA backend"`
+ * (`reject_kquant`, `crates/mlx-sys/mlx/mlx/backend/cuda/quantized/
+ * quantized.cpp`). Linux inference on these checkpoints therefore waits on
+ * CUDA K-quant kernels; the DGX Spark PoC instead converted its GGUF with the
+ * NVIDIA recipes (see README "CUDA preview"), which produce CUDA-executable
+ * affine/NVFP4 layouts.
  *
  * Every consumer that turns a catalog entry into a download, a slug, or an
  * allowlist check must go through here. Reading `entry.hfRepo` directly
@@ -188,6 +193,24 @@ export function catalogDownloadRepos(): string[] {
  */
 export function catalogRepo(entry: CatalogEntry): string {
   return catalogRepoFor(entry, process.platform);
+}
+
+/**
+ * The file-selection fields that apply to `repo` when it is `entry`'s GGUF
+ * repo: {@link CatalogEntry.globs} and {@link CatalogEntry.assetsRepo}.
+ *
+ * Both describe the multi-variant GGUF artifact only. A platform-specific
+ * override repo (the pre-converted CUDA build) is a plain safetensors layout:
+ * globbing it would filter out every weight, and its config/tokenizer files
+ * are its own. Consumers must resolve selection through here rather than
+ * reading the entry fields directly.
+ */
+export function catalogSelectionForRepo(
+  entry: CatalogEntry,
+  repo: string,
+): { globs?: readonly string[]; assetsRepo?: string } {
+  if (repo !== entry.hfRepo) return {};
+  return { globs: entry.globs, assetsRepo: entry.assetsRepo };
 }
 
 /**

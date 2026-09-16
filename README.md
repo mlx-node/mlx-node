@@ -156,7 +156,9 @@ The npm `darwin-arm64` binary has a macOS 26.0 deployment target. It does not lo
 
 The CUDA path has been tested with Qwen3.6 27B Dense and 35B-A3B MoE on GB10 / DGX Spark (`sm_121`, CUDA 13.0). It currently uses eager fallbacks and has no mlx-node-specific CUDA kernels. Training, speculative decoding, x86_64 Linux, and prebuilt CUDA binaries are not supported.
 
-The wizard's three default models (Qwen3.8-27B, Qwen-AgentWorld-35B-A3B, Gemma-4-26B-A4B) install Unsloth **UD-Q4_K_XL GGUF** files on every platform, CUDA included: one repo per model, one quantization variant, with base-model tokenizer sidecars fetched automatically (`--assets-repo`). K-quants are repacked losslessly into MLX layout at first load, so the GGUF artifact costs a one-time conversion into the native cache and then behaves like a converted checkpoint. The earlier MXFP4 (Metal) / NVFP4 (CUDA) split is gone — the CUDA PoC measured NVFP4 as a dequant fallback on GB10 rather than a native kernel path, so CUDA gives up no native advantage.
+The wizard's three default models (Qwen3.8-27B, Qwen-AgentWorld-35B-A3B, Gemma-4-26B-A4B) install Unsloth **UD-Q4_K_XL GGUF** files on every platform — one repo per model, one quantization variant, with base-model tokenizer sidecars fetched automatically (`--assets-repo`). K-quants are repacked losslessly into MLX layout at first load, so the GGUF artifact costs a one-time conversion into the native cache and then behaves like a converted checkpoint.
+
+One CUDA caveat is measured, not assumed: the K-quant modes that import produces (`q4k`/`q5k`/`q6k`) have no CUDA kernels yet — `QuantizedMatmul`, `GatherQMM`, and dequantize throw `"Quantization mode … is not implemented on the CUDA backend"` (`reject_kquant` in `crates/mlx-sys/mlx/mlx/backend/cuda/quantized/quantized.cpp`). On DGX Spark today, convert the same GGUF with the NVIDIA recipes (`mlx convert --q-recipe nvidia`, `docs/cuda-poc-benchmark.md`) to get a CUDA-executable affine/NVFP4 layout; running the raw K-quant import on CUDA waits on kernel support.
 
 Build it on an aarch64 glibc host with CUDA 13.0 and `nvcc` on `PATH`:
 

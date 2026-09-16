@@ -662,6 +662,12 @@ export function pickAssetSidecars(allFiles: ListFileEntry[]): ListFileEntry[] {
  * tokenizer_config.json, chat_template.jinja, …) are written from the assets
  * repo at its resolved revision.
  *
+ * The primary repo's own manifest (`primaryPaths`) is authoritative for
+ * everything it ships: a path it lists is never fetched from the assets repo,
+ * regardless of content differences — the same precedence the dashboard
+ * downloader applies. Without that rule a `--force` run would overwrite a
+ * GGUF repo's customized config or template with the base model's copy.
+ *
  * Deliberately NOT recorded in the completion marker: marker entries are
  * judged for pruning against the primary repo's remote tree only
  * (`computePruneList`), so listing sidecars there would delete them on a
@@ -675,10 +681,13 @@ async function fetchAssetSidecars(opts: {
   cacheDir: string;
   accessToken: string | undefined;
   verifyContent: boolean;
+  primaryPaths: ReadonlySet<string>;
 }): Promise<string[]> {
   const revision = (await resolveRemoteRevision(opts.assetsRepo, opts.accessToken)) ?? undefined;
   const { allFiles } = await getModelFiles(opts.assetsRepo, opts.accessToken, undefined, revision);
-  const candidates = pickAssetSidecars(allFiles);
+  const candidates = pickAssetSidecars(allFiles).filter(
+    (file) => !opts.primaryPaths.has(file.path),
+  );
   if (candidates.length === 0) {
     console.warn(`  No tokenizer/config sidecars found in ${opts.assetsRepo}\n`);
     return [];
@@ -1012,6 +1021,7 @@ export async function run(argv: string[]) {
       cacheDir,
       accessToken: HUGGINGFACE_TOKEN,
       verifyContent,
+      primaryPaths: new Set(allFiles.map((file) => file.path)),
     });
   }
 

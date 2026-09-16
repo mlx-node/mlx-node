@@ -820,6 +820,16 @@ z-lab DFlash2 draft above remains manually installable for converted
 checkpoints). See `catalogRepo` in `packages/agent/src/catalog.ts` for why GGUF
 replaced the earlier MXFP4/NVFP4 split.
 
+> **CUDA caveat (measured):** the K-quant modes the GGUF import repacks into
+> (`q4k`/`q5k`/`q6k`) are not implemented in the CUDA backend yet —
+> `QuantizedMatmul`/`GatherQMM`/dequantize throw
+> `"Quantization mode … is not implemented on the CUDA backend"`
+> (`reject_kquant`). Linux inference on these defaults therefore lands with
+> CUDA K-quant kernel support; today's DGX Spark path is to convert the GGUF
+> with the NVIDIA recipes (`mlx convert --q-recipe nvidia`, see
+> docs/cuda-poc-benchmark.md), which yields CUDA-executable affine/NVFP4
+> layouts.
+
 A more compact Gemma-4-12B entry (mxfp4 MLP + mxfp8 attention, ~9 GB, for smaller machines) is coming and will appear in the wizard once it is published.
 
 ### Config home

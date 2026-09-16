@@ -43,7 +43,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
 import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
-import { type CatalogEntry, catalogDownloadRepos, catalogEntryForRepo } from '@mlx-node/agent/catalog';
+import { catalogDownloadRepos, catalogEntryForRepo, catalogSelectionForRepo } from '@mlx-node/agent/catalog';
 import { isDFlash2Companion, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 
 /** How long a resolved set of catalog shas is reused before re-dialling HF. */
@@ -178,12 +178,14 @@ const ASSET_SIDECAR_CANDIDATES = [
  * than publish a hollow, one-sided "installed" directory that `loadModel` would
  * then fail to open while the catalog reports it Installed with retry disabled.
  *
- * When the catalog entry names an `assetsRepo`, the config half is satisfied
- * by the sidecar fetch that runs before publish (GGUF quantization repos ship
- * weights only), so the manifest itself only needs to prove a weight payload.
+ * When the job's selection names an `assetsRepo` FOR THIS REPO, the config
+ * half is satisfied by the sidecar fetch that runs before publish (GGUF
+ * quantization repos ship weights only), so the manifest itself only needs to
+ * prove a weight payload. A platform override repo carries no such selection
+ * even when the entry's GGUF build has one.
  */
-function hasModelPayload(files: ListFileEntry[], catalogEntry: CatalogEntry | undefined): boolean {
-  const hasConfig = catalogEntry?.assetsRepo !== undefined || files.some((file) => file.path === 'config.json');
+function hasModelPayload(files: ListFileEntry[], waivesConfigRequirement: boolean): boolean {
+  const hasConfig = waivesConfigRequirement || files.some((file) => file.path === 'config.json');
   return hasConfig && files.some((file) => isWeightFile(file.path));
 }
 
@@ -966,13 +968,16 @@ export class DownloadManager {
       // and removed on both success and failure.
       stagingDir = join(this.modelsDir, '.staging', `${slug}@${revision}.${process.pid}.${randomUUID()}`);
 
-      // The catalog entry this job installs: carries the `globs` file filter
-      // for multi-variant GGUF repos and the `assetsRepo` tokenizer-sidecar
-      // source. `start` already allowlisted the repo against the catalog, so
-      // an undefined entry is only a theoretical catalog-edit race — treat it
-      // as no globs and no sidecars, the pre-filter behavior.
+      // The catalog entry this job installs, and the file-selection fields
+      // that apply to THIS repo: `globs`/`assetsRepo` describe the GGUF build
+      // only, so a platform-specific override repo (the pre-converted CUDA
+      // build) gets neither — globbing safetensors shards would filter out
+      // every weight. `start` already allowlisted the repo against the
+      // catalog, so an undefined entry is only a theoretical catalog-edit
+      // race — treat it as no globs and no sidecars, the pre-filter behavior.
       const catalogEntry = catalogEntryForRepo(job.repo, process.platform);
-      const globs = catalogEntry?.globs?.map(globToRegex);
+      const selection = catalogEntry === undefined ? {} : catalogSelectionForRepo(catalogEntry, job.repo);
+      const globs = selection.globs?.map(globToRegex);
 
       const files: ListFileEntry[] = [];
       let totalBytes = 0;
@@ -992,9 +997,9 @@ export class DownloadManager {
         }
       }
 
-      if (!hasModelPayload(files, catalogEntry)) {
+      if (!hasModelPayload(files, selection.assetsRepo !== undefined)) {
         const need =
-          catalogEntry?.assetsRepo !== undefined
+          selection.assetsRepo !== undefined
             ? 'at least one weight file (config.json comes from the assetsRepo sidecar fetch)'
             : 'both a config.json and a weight file';
         throw new Error(`Repo "${job.repo}" is not a complete model (needs ${need})`);
@@ -1080,8 +1085,8 @@ export class DownloadManager {
       // no tokenizer). Staged BEFORE the prune/verify below so the sidecars are
       // covered by both AND land in the completion marker's file list — resume
       // and update verification then cover them like any primary file.
-      if (catalogEntry?.assetsRepo !== undefined) {
-        const sidecars = await this.downloadAssetSidecars(catalogEntry.assetsRepo, stagingDir, stagingReal, files, job);
+      if (selection.assetsRepo !== undefined) {
+        const sidecars = await this.downloadAssetSidecars(selection.assetsRepo, stagingDir, stagingReal, files, job);
         files.push(...sidecars);
         // `hasModelPayload` waived the config.json requirement on the promise
         // that the sidecar fetch supplies it. Verify that promise here: a GGUF
@@ -1090,7 +1095,7 @@ export class DownloadManager {
         // that renders as not-installed and only a re-run recovers.
         if (!files.some((file) => file.path === 'config.json')) {
           throw new Error(
-            `Repo "${job.repo}" is not a complete model (neither it nor its assets repo "${catalogEntry.assetsRepo}" provides a config.json)`,
+            `Repo "${job.repo}" is not a complete model (neither it nor its assets repo "${selection.assetsRepo}" provides a config.json)`,
           );
         }
       }
