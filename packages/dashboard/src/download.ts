@@ -43,7 +43,7 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve, sep } from 'node:path';
 
 import { downloadFileToCacheDir, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
-import { catalogDownloadRepos } from '@mlx-node/agent/catalog';
+import { type CatalogEntry, catalogDownloadRepos, catalogEntryForRepo } from '@mlx-node/agent/catalog';
 import { isDFlash2Companion, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 
 /** How long a resolved set of catalog shas is reused before re-dialling HF. */
@@ -123,6 +123,53 @@ function isWantedFile(path: string): boolean {
   );
 }
 
+// Glob matching below is byte-identical to the CLI's (`globToRegex` /
+// `matchesAnyGlob` in `packages/cli/src/commands/download-model.ts`). The CLI
+// does not export them and the dashboard must not depend on the CLI package,
+// so the mirror lives here — keep the two in sync: a divergence would make
+// the wizard's `mlx download model -g …` select a different file set than a
+// dashboard install of the same catalog entry.
+/** Convert a simple glob pattern (with * wildcards) to a RegExp. */
+function globToRegex(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp(`^${escaped}$`, 'i');
+}
+
+/** Check if a filename matches any of the glob patterns. */
+function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
+  return patterns.some((re) => re.test(filename));
+}
+
+/**
+ * The manifest filter for one job: the catalog entry's `globs` when it carries
+ * them (multi-variant GGUF repos — match on basename OR full repo path, core
+ * metadata always included, exactly the CLI's `--glob` semantics), else the
+ * no-glob default.
+ */
+function isWantedFileFor(catalogEntry: CatalogEntry | undefined, path: string, globs: RegExp[] | undefined): boolean {
+  if (globs === undefined) return isWantedFile(path);
+  const basename = path.split('/').pop() ?? path;
+  return matchesAnyGlob(basename, globs) || matchesAnyGlob(path, globs) || CORE_FILES.has(path);
+}
+
+/**
+ * Sidecar files a GGUF quantization repo typically lacks, fetched from the
+ * catalog entry's `assetsRepo` (the base model's repo). Names absent from the
+ * assetsRepo are skipped, so one fixed list serves every model family. See
+ * {@link CatalogEntry.assetsRepo} for why these are mandatory for tool
+ * calling rather than optional metadata.
+ */
+const ASSET_SIDECAR_CANDIDATES = [
+  'config.json',
+  'tokenizer.json',
+  'tokenizer_config.json',
+  'chat_template.jinja',
+  'generation_config.json',
+  'preprocessor_config.json',
+  'video_preprocessor_config.json',
+  'processor_config.json',
+] as const;
+
 /**
  * True when the manifest actually describes a loadable model: it must carry a
  * `config.json` AND at least one weight file. A repo that resolves to a
@@ -130,9 +177,14 @@ function isWantedFile(path: string): boolean {
  * mid-re-upload with the config committed before the weights) must error rather
  * than publish a hollow, one-sided "installed" directory that `loadModel` would
  * then fail to open while the catalog reports it Installed with retry disabled.
+ *
+ * When the catalog entry names an `assetsRepo`, the config half is satisfied
+ * by the sidecar fetch that runs before publish (GGUF quantization repos ship
+ * weights only), so the manifest itself only needs to prove a weight payload.
  */
-function hasModelPayload(files: ListFileEntry[]): boolean {
-  return files.some((file) => file.path === 'config.json') && files.some((file) => isWeightFile(file.path));
+function hasModelPayload(files: ListFileEntry[], catalogEntry: CatalogEntry | undefined): boolean {
+  const hasConfig = catalogEntry?.assetsRepo !== undefined || files.some((file) => file.path === 'config.json');
+  return hasConfig && files.some((file) => isWeightFile(file.path));
 }
 
 /** Streaming hex digest of a file's raw bytes (no git header). */
@@ -914,10 +966,18 @@ export class DownloadManager {
       // and removed on both success and failure.
       stagingDir = join(this.modelsDir, '.staging', `${slug}@${revision}.${process.pid}.${randomUUID()}`);
 
+      // The catalog entry this job installs: carries the `globs` file filter
+      // for multi-variant GGUF repos and the `assetsRepo` tokenizer-sidecar
+      // source. `start` already allowlisted the repo against the catalog, so
+      // an undefined entry is only a theoretical catalog-edit race — treat it
+      // as no globs and no sidecars, the pre-filter behavior.
+      const catalogEntry = catalogEntryForRepo(job.repo, process.platform);
+      const globs = catalogEntry?.globs?.map(globToRegex);
+
       const files: ListFileEntry[] = [];
       let totalBytes = 0;
       for await (const file of listFiles({ repo, recursive: true, revision, fetch: this.wrappedFetch })) {
-        if (file.type !== 'directory' && isWantedFile(file.path)) {
+        if (file.type !== 'directory' && isWantedFileFor(catalogEntry, file.path, globs)) {
           // Defense-in-depth: `file.path` is a third-party string about to become
           // a `join(stagingDir, file.path)` write/read/verify/publish target (every
           // downstream site derives from this `files[]` array). Refuse — fail
@@ -932,8 +992,12 @@ export class DownloadManager {
         }
       }
 
-      if (!hasModelPayload(files)) {
-        throw new Error(`Repo "${job.repo}" is not a complete model (needs both a config.json and a weight file)`);
+      if (!hasModelPayload(files, catalogEntry)) {
+        const need =
+          catalogEntry?.assetsRepo !== undefined
+            ? 'at least one weight file (config.json comes from the assetsRepo sidecar fetch)'
+            : 'both a config.json and a weight file';
+        throw new Error(`Repo "${job.repo}" is not a complete model (needs ${need})`);
       }
 
       job.totalBytes = totalBytes;
@@ -1011,6 +1075,15 @@ export class DownloadManager {
       // `catch` reclassifies this throw as a clean `cancelled` terminal and the
       // `finally` removes the private staging dir.
       if (job.cancelled) throw new Error('Download cancelled');
+
+      // Tokenizer/config sidecars from the entry's assetsRepo (GGUF repos ship
+      // no tokenizer). Staged BEFORE the prune/verify below so the sidecars are
+      // covered by both AND land in the completion marker's file list — resume
+      // and update verification then cover them like any primary file.
+      if (catalogEntry?.assetsRepo !== undefined) {
+        const sidecars = await this.downloadAssetSidecars(catalogEntry.assetsRepo, stagingDir, stagingReal, files, job);
+        files.push(...sidecars);
+      }
 
       // Quarantine any staged entry not in the current manifest (a stale file
       // from an earlier interrupted run), so the published set is exactly the
@@ -1245,6 +1318,110 @@ export class DownloadManager {
       }
     }
     throw new Error(`Downloaded file "${file.path}" failed content verification after ${MAX_VERIFY_ATTEMPTS} attempts`);
+  }
+
+  /**
+   * Fetch the tokenizer/config sidecar files a GGUF repo lacks from the
+   * catalog entry's `assetsRepo` into staging, pinned to ONE resolved commit
+   * of that repo (the same immutable-snapshot discipline as the primary
+   * repo). Returns the manifest entries actually downloaded, which the caller
+   * appends to the job's file list so the prune, the whole-set re-verify, and
+   * the completion marker all cover them.
+   *
+   * Selection per {@link ASSET_SIDECAR_CANDIDATES} name: skipped when the name
+   * is absent from the assetsRepo; skipped when the primary repo already
+   * staged the same path — identical content is a pure duplicate, and on a
+   * content conflict the PRIMARY repo's own file wins (it is the repo the
+   * user asked for; the assetsRepo only fills gaps). Downloads go through
+   * {@link downloadVerifiedFile}, so path safety, bounded retries, and
+   * content verification against the assetsRepo manifest are identical to a
+   * primary file, and a cancel unwinds the same way.
+   *
+   * Provenance: the completion marker stays uniform — it pins only the
+   * PRIMARY repo+revision, with sidecar paths folded into its file list.
+   * Sidecar bytes are content-verified here against the assetsRepo manifest,
+   * but their upstream identity is not recorded, so a sidecar-only upstream
+   * change (a tokenizer tweak in the base repo) does not raise an update
+   * badge for an installed model.
+   *
+   * A sidecar listing/fetch failure fails the job rather than publishing
+   * without them: a GGUF without the official tokenizer sidecars is exactly
+   * the broken-tool-calling state the fetch exists to prevent (see
+   * {@link CatalogEntry.assetsRepo}).
+   */
+  private async downloadAssetSidecars(
+    assetsRepo: string,
+    stagingDir: string,
+    stagingReal: string,
+    files: ListFileEntry[],
+    job: JobState,
+  ): Promise<ListFileEntry[]> {
+    const repo = { type: 'model' as const, name: assetsRepo };
+    const revision = await this.resolveRevision(assetsRepo);
+    const byName = new Map<string, ListFileEntry>();
+    for await (const file of listFiles({ repo, recursive: true, revision, fetch: this.wrappedFetch })) {
+      if (file.type === 'directory') continue;
+      // Candidates are all root-level names; a nested same-named file is not
+      // the base model's tokenizer/config.
+      if (!file.path.includes('/')) byName.set(file.path, file);
+    }
+
+    const downloaded: ListFileEntry[] = [];
+    const planned: ListFileEntry[] = [];
+    for (const name of ASSET_SIDECAR_CANDIDATES) {
+      const file = byName.get(name);
+      if (file === undefined) continue; // this family does not ship that file
+      if (files.some((staged) => staged.path === name)) continue; // primary repo already staged it — primary wins
+      planned.push(file);
+    }
+
+    // Count the sidecar bytes in the job total up front. The `start` frame
+    // already went out with the primary manifest's total, so a live byte bar
+    // overshoots by at most this (small) amount at the very end; the `jobs()`
+    // listing reflects the adjusted total immediately.
+    let sidecarBytes = 0;
+    for (const file of planned) if (file.size > 0) sidecarBytes += file.size;
+    job.totalBytes += sidecarBytes;
+
+    for (let index = 0; index < planned.length; index++) {
+      // Stop promptly between files when cancelled; the `finally` removes the
+      // staging dir. Same boundary discipline as the primary loop.
+      if (job.cancelled) throw new Error('Download cancelled');
+      const file = planned[index];
+      // The candidate names are fixed constants, but the staged path is still
+      // derived from third-party manifest data — re-assert containment against
+      // the canonical staging dir, identical to the primary write boundary.
+      if (!isSafeRelPath(file.path)) {
+        throw new Error(`Refusing to download "${file.path}" from "${assetsRepo}": path is not a safe relative path`);
+      }
+      const destResolved = resolve(stagingReal, file.path);
+      if (destResolved !== stagingReal && !destResolved.startsWith(stagingReal + sep)) {
+        throw new Error(`Refusing to write "${file.path}" outside the staging directory`);
+      }
+      const destPath = join(stagingDir, file.path);
+      const jobBaseBytes = job.receivedBytes;
+      const fileIndex = files.length + index;
+      const fileCount = files.length + planned.length;
+
+      if (await isStagedCopyComplete(destPath, file)) {
+        const fileBytes = file.size > 0 ? file.size : 0;
+        job.receivedBytes = jobBaseBytes + fileBytes;
+        this.emitFileProgress(job, file.path, fileBytes, file.size, fileIndex, fileCount);
+        downloaded.push(file);
+        continue;
+      }
+
+      const context = await this.downloadVerifiedFile(repo, revision, file, destPath, {
+        jobBaseBytes,
+        fileIndex,
+        fileCount,
+      });
+      const fileBytes = file.size > 0 ? file.size : context.received;
+      job.receivedBytes = jobBaseBytes + fileBytes;
+      this.emitFileProgress(job, file.path, fileBytes, file.size, fileIndex, fileCount);
+      downloaded.push(file);
+    }
+    return downloaded;
   }
 
   /** Remove staged files absent from the manifest (our marker is exempt). */
