@@ -8203,7 +8203,7 @@ mod tests {
         params.insert(
             "layers.0.experts.down_proj.biases".to_string(),
             MxArray::from_float16(
-                &[half::f16::from_f32(-0.25).to_bits(); 2 * 4 * 1],
+                &[half::f16::from_f32(-0.25).to_bits(); 2 * 4],
                 &[2, 4, 1],
             )
             .expect("expert biases"),
