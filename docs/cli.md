@@ -71,7 +71,7 @@ idempotent, so re-running a command with it re-verifies the sidecars without
 re-downloading them:
 
 ```bash
-mlx download model -m unsloth/Qwen3.8-27B-GGUF -g "*UD-Q4_K_XL*" -g "MTP/*" \
+mlx download model -m unsloth/Qwen3.8-27B-GGUF -g "*UD-Q4_K_XL*" \
   --assets-repo Qwen/Qwen3.8-27B
 ```
 
@@ -803,18 +803,20 @@ When no local model exists, an interactive terminal shows a first-run wizard ove
 
 | Model                 | HuggingFace repo                       | Size    | Notes                        |
 | --------------------- | -------------------------------------- | ------- | ---------------------------- |
-| Qwen3.8-27B (default) | `unsloth/Qwen3.8-27B-GGUF`             | ~19 GB  | Best tool use — recommended  |
+| Qwen3.8-27B (default) | `unsloth/Qwen3.8-27B-GGUF`             | ~18 GB  | Best tool use — recommended  |
 | Qwen-AgentWorld-35B   | `unsloth/Qwen-AgentWorld-35B-A3B-GGUF` | ~22 GB  | Agent-tuned MoE, fast decode |
 | Gemma-4-26B-A4B       | `unsloth/gemma-4-26B-A4B-it-GGUF`      | ~19 GB  | MoE, fast decode             |
 
 Each entry installs its Unsloth **UD-Q4_K_XL** GGUF (`-g "*UD-Q4_K_XL*"`, plus
-Qwen3.8-27B's `MTP/` weights and Gemma's `mmproj` projector), one variant out of the dozens
+Gemma's `mmproj` projector), one variant out of the dozens
 the repos carry. The same repo serves every platform — Apple Silicon and Linux
 NVIDIA CUDA alike — and the wizard passes each entry's `--assets-repo`
 (`Qwen/Qwen3.8-27B`, `Qwen/Qwen-AgentWorld-35B-A3B`,
 `unsloth/gemma-4-26B-A4B-it`) so the tokenizer sidecars land beside the weights.
 K-quants are repacked losslessly into MLX layout on first load (the native GGUF
-cache), and Qwen3.8-27B auto-detects the MTP weights for speculative decoding;
+cache), and Qwen3.8-27B's MTP layer is converted inline from its final GGUF
+block (the repo's separate `MTP/*.gguf` is not downloaded — nothing pairs a
+GGUF MTP sidecar) so speculative decoding activates automatically;
 the Qwen3.8-27B default therefore carries no separate `draft` companion (the
 z-lab DFlash2 draft above remains manually installable for converted
 checkpoints). See `catalogRepo` in `packages/agent/src/catalog.ts` for why GGUF

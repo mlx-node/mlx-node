@@ -326,7 +326,7 @@ const ASSETS_REPO = MODEL_CATALOG[0]!.assetsRepo!;
 /**
  * The single UD-Q4_K_XL weight variant `MODEL_CATALOG[0].globs` selects out of the
  * multi-variant repo. Entry-based jobs stage THIS name: the entry ships its
- * weights as a `.gguf` and its globs (`*UD-Q4_K_XL*`, `MTP/*`, `config.json`)
+ * weights as a `.gguf` and its globs (`*UD-Q4_K_XL*`, `config.json`)
  * match no `.safetensors` path at all, so a safetensors fixture would be filtered
  * out of the manifest and the job would fail the weight-payload gate.
  */
@@ -1050,7 +1050,7 @@ describe('DownloadManager', () => {
 
   it('downloads only the glob-matched variants of a multi-variant GGUF repo', async () => {
     // A real Unsloth repo ships dozens of quantization variants side by side. The
-    // entry's globs (`*UD-Q4_K_XL*`, `MTP/*`, `config.json`) must select exactly the
+    // entry's globs (`*UD-Q4_K_XL*`, `config.json`) must select exactly the
     // one build the wizard installs — never the whole multi-hundred-GB repo.
     const OTHER_QUANT = 'Qwen3.8-27B-UD-Q8_K_XL.gguf';
     const NON_UD = 'Qwen3.8-27B-Q4_K_M.gguf';
@@ -1078,26 +1078,27 @@ describe('DownloadManager', () => {
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
-    // Exactly the two glob-matched primary files moved, in manifest order. The
-    // `start` frame carries the FULL total — primary manifest plus the assets
-    // repo's config.json sidecar (333 + 12) — because the sidecar plan is
-    // resolved before `start` so the UI's byte bar never overshoots.
+    // Exactly the glob-matched primary file moved (the MTP artifact is NOT
+    // globbed: the UD file carries its MTP layer inline, nothing pairs a GGUF
+    // MTP sidecar). The `start` frame carries the FULL total — the primary
+    // weight plus the assets repo's config.json sidecar (300 + 12) — because
+    // the sidecar plan is resolved before `start` so the byte bar never
+    // overshoots.
     expect(events.find((event) => event.type === 'start')).toMatchObject({
       type: 'start',
       repo: REPO,
-      totalBytes: 345,
-      fileCount: 3,
+      totalBytes: 312,
+      fileCount: 2,
     });
-    expect([...hub.downloaded].sort()).toEqual([MTP, WEIGHT, 'config.json'].sort());
+    expect([...hub.downloaded].sort()).toEqual([WEIGHT, 'config.json'].sort());
 
     // The unmatched variants were never fetched and never published…
-    for (const path of [OTHER_QUANT, NON_UD, MMPROJ, README]) {
+    for (const path of [OTHER_QUANT, NON_UD, MTP, MMPROJ, README]) {
       expect(hub.downloaded, `${path} must not be fetched`).not.toContain(path);
       expect(existsSync(join(finalDir(), path)), `${path} must not be published`).toBe(false);
     }
-    // …while the selected build, the MTP weights and the core metadata all landed.
+    // …while the selected build and the core metadata landed.
     expect(existsSync(join(finalDir(), WEIGHT))).toBe(true);
-    expect(existsSync(join(finalDir(), MTP))).toBe(true);
     expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
     expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
   });

@@ -680,7 +680,6 @@ async function fetchAssetSidecars(opts: {
   outputDir: string;
   cacheDir: string;
   accessToken: string | undefined;
-  verifyContent: boolean;
   primaryPaths: ReadonlySet<string>;
 }): Promise<string[]> {
   const revision = (await resolveRemoteRevision(opts.assetsRepo, opts.accessToken)) ?? undefined;
@@ -697,14 +696,13 @@ async function fetchAssetSidecars(opts: {
   const fetched: string[] = [];
   for (const file of candidates) {
     const destPath = join(opts.outputDir, file.path);
-    if (existsSync(destPath)) {
-      const upToDate = opts.verifyContent
-        ? await fileUpToDate(destPath, file)
-        : statSync(destPath).size === (file.size ?? -1);
-      if (upToDate) {
-        console.log(`  ${file.path} — already present, skipping`);
-        continue;
-      }
+    // ALWAYS content-verify a present sidecar, independent of the primary
+    // repo's marker: the assets repo evolves on its own revision, so a
+    // tokenizer/template fix that keeps the same byte length is invisible to
+    // a size check and would otherwise stay stale forever.
+    if (existsSync(destPath) && (await fileUpToDate(destPath, file))) {
+      console.log(`  ${file.path} — already present and verified, skipping`);
+      continue;
     }
     console.log(`  ${file.path} (${formatBytes(file.size)})...`);
     const snapshotPath = await withRetries(`sidecar ${file.path}`, () =>
@@ -836,8 +834,10 @@ export async function run(argv: string[]) {
       outputDir,
       cacheDir,
       accessToken: HUGGINGFACE_TOKEN,
-      verifyContent: force,
-      primaryPaths: new Set(cachedManifest.allFiles.map((file) => file.path)),
+      // Only the paths this run's selection ACTUALLY stages count as primary
+      // supplied: a file the repo lists but the globs/CORE_FILES do not select
+      // is not on disk, so excluding it would lose the sidecar entirely.
+      primaryPaths: new Set(cachedManifest.filesToDownload.map((file) => file.path)),
     });
   };
 
@@ -1048,8 +1048,7 @@ export async function run(argv: string[]) {
       outputDir,
       cacheDir,
       accessToken: HUGGINGFACE_TOKEN,
-      verifyContent,
-      primaryPaths: new Set(allFiles.map((file) => file.path)),
+      primaryPaths: new Set(filesToDownload.map((file) => file.path)),
     });
   }
 

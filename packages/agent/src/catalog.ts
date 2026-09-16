@@ -80,17 +80,20 @@ export interface CatalogEntry {
 
 export const MODEL_CATALOG: readonly CatalogEntry[] = [
   {
-    // The MTP weights ship inside the same repo
-    // (`MTP/mtp-Qwen3.8-27B-Q4_0.gguf`, matched by the `MTP/*` glob) and the
-    // native loader auto-detects them at load (validated: hasMtpWeights=true,
-    // ~4.8 tokens accepted per cycle) — so the MTP path needs no companion
-    // download. The optional z-lab DFlash2 draft stays offered beside the
-    // target for checkpoints that pair with it; it is never auto-installed.
+    // The UD-Q4_K_XL file carries its MTP layer INLINE (block 64 of 65,
+    // `blk.64.nextn.*`), which the native prepare converts to `mtp.*` in the
+    // cache — hasMtpWeights() is true from the primary file alone (validated:
+    // ~4.8 tokens accepted per cycle). The repo's separate
+    // `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` is deliberately NOT globbed: nothing
+    // in the runtime pairs a GGUF MTP sidecar (`mtp_sidecar_candidates` is
+    // safetensors-only), so it would be 1.28 GB of dead weight per install.
+    // The optional z-lab DFlash2 draft stays offered beside the target for
+    // checkpoints that pair with it; it is never auto-installed.
     label: 'Qwen3.8-27B',
     hfRepo: 'unsloth/Qwen3.8-27B-GGUF',
-    globs: ['*UD-Q4_K_XL*', 'MTP/*', 'config.json'],
+    globs: ['*UD-Q4_K_XL*', 'config.json'],
     assetsRepo: 'Qwen/Qwen3.8-27B',
-    sizeGb: 18.9,
+    sizeGb: 17.6,
     description: 'Best tool use — recommended default',
     isDefault: true,
     draft: QWEN38_DFLASH2,
