@@ -1583,6 +1583,12 @@ export type Qwen3_5Model = Qwen35Model;
  */
 export declare class Qwen35MoeModel {
   /**
+   * Resolved directory containing this model's tokenizer/config assets.
+   * Streaming wrappers use it after a direct GGUF load so chat templating
+   * reads the reconstructed sidecars from the native-packed cache.
+   */
+  modelAssetsPath(): string;
+  /**
    * Whether the block-paged KV cache adapter is active on this model
    * instance.
    *
@@ -1630,7 +1636,13 @@ export declare class Qwen35MoeModel {
    * rendered prompt and complete message history.
    */
   expandedPromptTokenCount(promptTokens: Uint32Array, messages: Array<ChatMessage>): Promise<number>;
-  /** Load a pretrained model from a directory. */
+  /**
+   * Load a pretrained model from a directory, or a `.gguf` file.
+   *
+   * A direct GGUF file is first converted into the lossless native-packed
+   * cache (mirroring the dense Qwen3.5 loader), and the cache directory is
+   * what the model thread reads.
+   */
   static load(path: string): Promise<Qwen35MoeModel>;
   /** Generate text from a prompt token sequence. */
   generate(promptTokens: MxArray, config: Qwen35MoeGenerationConfig): Promise<Qwen35MoeGenerationResult>;
