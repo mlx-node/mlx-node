@@ -19,19 +19,21 @@
  * Effective anchor trust is therefore computed, per candidate, from BOTH
  * sources:
  *
- *   - candidates come from `security find-certificate` over the three
- *     keychains, filtered to `X509Certificate.ca` (CA:TRUE) — measured on a
- *     real System.keychain: its first entry is a self-signed identity with
- *     `ca: false`, so subject===issuer is not a usable proxy;
+ *   - candidates come from `security find-certificate` over the user and
+ *     admin keychains, filtered to `X509Certificate.ca` (CA:TRUE) — measured
+ *     on a real System.keychain: its first entry is a self-signed identity
+ *     with `ca: false`, so subject===issuer is not a usable proxy. Apple's
+ *     System Roots keychain is excluded (see `macosKeychains`): Node's
+ *     Mozilla store already covers the public web PKI, and Apple's keychain
+ *     carries platform-restricted roots an additive bundle cannot honor;
  *   - trust comes from `security trust-settings-export` (user + admin
  *     domains), which keys records by the cert's SHA-1 and carries
- *     `kSecTrustSettingsResult` per policy. Apple's System Roots are trusted
- *     implicitly (that's what the keychain means); anything else needs an
- *     explicit, unconstrained allow record for the `sslServer` policy
- *     (mkcert-style tools set one), and a deny record always wins. Verified
- *     against a live keychain: an installed cert with zero trust records
- *     (Blizzard Battle.net Local Cert) is NOT effectively trusted, an
- *     mkcert root with `sslServer → TrustRoot` IS.
+ *     `kSecTrustSettingsResult` per policy. A candidate needs an explicit,
+ *     unconstrained allow record for the `sslServer` policy (mkcert-style
+ *     tools set one), a deny record always wins, and any scoped deny makes
+ *     the root ineligible. Verified against a live keychain: an installed
+ *     cert with zero trust records (Blizzard Battle.net Local Cert) is NOT
+ *     effectively trusted, an mkcert root with `sslServer → TrustRoot` IS.
  *
  * `verify-cert -p ssl` was tried and rejected as the trust oracle: it
  * evaluates the candidate AS A LEAF, which even Apple's own system roots fail
@@ -64,9 +66,6 @@ const PEM_BLOCK_RE = /-----BEGIN CERTIFICATE-----\r?\n[\s\S]+?-----END CERTIFICA
 
 export const EXTRA_CA_BUNDLE_FILE = 'system-ca-roots.pem';
 
-/** Apple's own roots: trusted by construction; only an explicit deny can remove one. */
-const SYSTEM_ROOTS_KEYCHAIN = '/System/Library/Keychains/SystemRootCertificates.keychain';
-
 // `kSecTrustSettingsResult` values (SecTrustSettings.h). Only the two allow
 // results and the deny one matter here; Unspecified (4) is treated as no
 // record, matching the system's own default-deny.
@@ -83,13 +82,19 @@ const DENY = 3;
 const SSL_POLICIES = new Set(['sslServer']);
 
 /**
- * The three places a TLS-inspecting root can land. The System Roots keychain is
- * Apple-shipped; System.keychain is where an admin-installed (corp/MDM) root
- * lives; login.keychain-db is where a user-accepted one does.
+ * The two places a TLS-inspecting root can land: System.keychain is where an
+ * admin-installed (corp/MDM) root lives; login.keychain-db is where a
+ * user-accepted one does.
+ *
+ * Apple's SystemRootCertificates.keychain is deliberately NOT exported: the
+ * bundle is ADDITIVE to Node's Mozilla store, which already carries the
+ * public web PKI, and Apple's keychain also holds roots under platform
+ * restrictions an unconditional export cannot honor (e.g. Entrust Root CA
+ * G2, which Apple — and Node — distrust for certificates issued after
+ * 2024-11-15). Exporting it would broaden trust beyond both stores.
  */
 export function macosKeychains(): string[] {
   return [
-    SYSTEM_ROOTS_KEYCHAIN,
     '/Library/Keychains/System.keychain',
     join(homedir(), 'Library', 'Keychains', 'login.keychain-db'),
   ];
@@ -113,7 +118,6 @@ interface Candidate {
   sha1: string;
   /** SHA-256, used only for dedupe. */
   sha256: string;
-  systemRoots: boolean;
 }
 
 /** One cert's explicit SSL-trust verdict, OR'd across the user and admin domains. */
@@ -278,7 +282,6 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
           pem: block,
           sha1: cert.fingerprint.replaceAll(':', ''),
           sha256: cert.fingerprint256,
-          systemRoots: keychain === SYSTEM_ROOTS_KEYCHAIN,
         });
       } catch {
         // Not a parseable certificate block (or a format Node rejects): skip it.
@@ -290,9 +293,8 @@ async function collectCandidates(exec: ExecText, keychains: readonly string[]): 
 
 /**
  * Effective SSL-anchor decisions from the user and admin trust-settings
- * domains. The system domain is not exported: its entries are the Apple
- * system roots themselves, whose trust is the implicit default already
- * encoded by `systemRoots` on the candidate.
+ * domains. The system domain is not read: its entries concern the Apple
+ * system roots, which this module no longer exports (see macosKeychains).
  *
  * A domain that fails to READ rejects the whole load — this is the one
  * failure in this module that must NOT degrade locally. Decisions are merged
@@ -360,9 +362,11 @@ export async function keychainCaRootsPem(exec: ExecText, keychains: readonly str
   for (const candidate of candidates) {
     if (seen.has(candidate.sha256)) continue;
     const decision = decisions.get(candidate.sha1);
-    const trusted = candidate.systemRoots
-      ? decision?.denyForSsl !== true
-      : decision?.allowForSsl === true && decision?.denyForSsl !== true && decision?.scopedDenyForSsl !== true;
+    // Every candidate here comes from a user/admin keychain, so keychain
+    // membership alone is NOT trust: an explicit, unconstrained sslServer
+    // allow is required, any global deny vetoes, and any scoped deny makes
+    // the root ineligible (the bundle cannot express the scope).
+    const trusted = decision?.allowForSsl === true && decision?.denyForSsl !== true && decision?.scopedDenyForSsl !== true;
     if (!trusted) continue;
     seen.add(candidate.sha256);
     roots.push(candidate.pem);

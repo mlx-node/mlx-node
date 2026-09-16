@@ -5,15 +5,15 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { keychainCaRootsPem, parseTrustSettingsDump, prepareExtraCaBundle, type ExecText } from '../src/main/system-ca.js';
+import { keychainCaRootsPem, macosKeychains, parseTrustSettingsDump, prepareExtraCaBundle, type ExecText } from '../src/main/system-ca.js';
 
 const FIXTURES = join(__dirname, 'fixtures');
 const ROOT_CA = readFileSync(join(FIXTURES, 'test-root-ca.pem'), 'utf8').trim();
 const LEAF = readFileSync(join(FIXTURES, 'test-leaf.pem'), 'utf8').trim();
 const ROOT_SHA1 = new X509Certificate(ROOT_CA).fingerprint.replaceAll(':', '');
 
-/** Must match the constant in system-ca.ts: the keychain whose roots are implicitly trusted. */
-const SYSTEM_ROOTS = '/System/Library/Keychains/SystemRootCertificates.keychain';
+/** An arbitrary keychain path stand-in; candidates from ANY keychain now require explicit trust. */
+const SYSTEM_ROOTS = '/k/some-keychain';
 
 const EMPTY_DUMP = `{
   "trustList" => {
@@ -44,12 +44,19 @@ function trustDump(
 }
 
 /** A `security`/`plutil` stand-in: canned per-keychain certs and canned trust dumps. */
+/** How one trust-settings domain's export behaves: ok (dump follows), empty (errSecNoTrustSettings exit-1 shape), or a read failure. */
+type DomainBehavior = 'ok' | 'empty' | 'fail';
+
 function fakeExec(opts: {
   certs: Readonly<Record<string, string>>;
+  /** Dump for both domains, unless overridden per domain. */
   trust?: string;
-  /** true: a read failure. 'empty': the domain has no records (errSecNoTrustSettings exit-1 shape). */
-  trustExportFails?: boolean | 'empty';
+  trustUser?: string;
+  trustAdmin?: string;
+  userExport?: DomainBehavior;
+  adminExport?: DomainBehavior;
 }): ExecText {
+  let domain: 'user' | 'admin' = 'user';
   return async (cmd, args) => {
     if (cmd === 'security' && args[0] === 'find-certificate') {
       const output = opts.certs[args[args.length - 1]];
@@ -57,13 +64,17 @@ function fakeExec(opts: {
       return output;
     }
     if (cmd === 'security' && args[0] === 'trust-settings-export') {
-      if (opts.trustExportFails === true) throw new Error('export timed out');
-      if (opts.trustExportFails === 'empty') {
-        throw new Error('Command failed: security trust-settings-export\nSecTrustSettingsCreateExternalRepresentation: No Trust Settings were found.');
+      domain = args.includes('-d') ? 'admin' : 'user';
+      const behavior = (domain === 'admin' ? opts.adminExport : opts.userExport) ?? 'ok';
+      if (behavior === 'fail') throw new Error('export timed out');
+      if (behavior === 'empty') {
+        throw new Error(
+          'Command failed: security trust-settings-export\nSecTrustSettingsCreateExternalRepresentation: No Trust Settings were found.',
+        );
       }
       return '';
     }
-    if (cmd === 'plutil') return opts.trust ?? EMPTY_DUMP;
+    if (cmd === 'plutil') return (domain === 'admin' ? opts.trustAdmin : opts.trustUser) ?? opts.trust ?? EMPTY_DUMP;
     throw new Error(`unexpected call: ${cmd} ${args.join(' ')}`);
   };
 }
@@ -198,16 +209,31 @@ describe('parseTrustSettingsDump', () => {
 });
 
 describe('keychainCaRootsPem', () => {
-  it('includes Apple system roots with no trust records (implicitly trusted)', async () => {
-    const pem = await keychainCaRootsPem(fakeExec({ certs: { [SYSTEM_ROOTS]: ROOT_CA } }), [SYSTEM_ROOTS]);
-    expect(pem).toContain(ROOT_CA);
+  it("does not read Apple's system-roots keychain at all", async () => {
+    // The bundle is ADDITIVE to Node's Mozilla store, which already covers
+    // the public web PKI. Apple's keychain additionally carries roots under
+    // platform restrictions an unconditional export cannot honor (Entrust
+    // Root CA G2 is distrusted for post-2024-11-15 certificates), so the
+    // keychain is not even consulted.
+    expect(macosKeychains().some((k) => k.includes('SystemRootCertificates'))).toBe(false);
+    const seen: string[] = [];
+    const exec: ExecText = async (cmd, args) => {
+      seen.push(args.join(' '));
+      if (cmd === 'security' && args[0] === 'find-certificate') throw new Error('keychain unreadable');
+      if (cmd === 'security' && args[0] === 'trust-settings-export') throw new Error('empty');
+      throw new Error('unexpected');
+    };
+    await keychainCaRootsPem(exec, macosKeychains()).catch(() => undefined);
+    expect(seen.some((a) => a.includes('SystemRootCertificates'))).toBe(false);
   });
 
-  it('excludes a system root the user or admin explicitly denied', async () => {
+  it('excludes a CA the user or admin explicitly denied, even with another allow', async () => {
     const pem = await keychainCaRootsPem(
       fakeExec({
         certs: { [SYSTEM_ROOTS]: ROOT_CA },
-        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 3 }] }]),
+        trust: trustDump([
+          { sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }, { policy: 'sslServer', result: 3 }] },
+        ]),
       }),
       [SYSTEM_ROOTS],
     );
@@ -284,17 +310,22 @@ describe('keychainCaRootsPem', () => {
   });
 
   it('dedupes a root present in several keychains and skips unreadable ones', async () => {
-    const pem = await keychainCaRootsPem(fakeExec({ certs: { [SYSTEM_ROOTS]: ROOT_CA, '/k/a': `${ROOT_CA}\n` } }), [
-      SYSTEM_ROOTS,
-      '/k/missing',
-      '/k/a',
-    ]);
+    const pem = await keychainCaRootsPem(
+      fakeExec({
+        certs: { [SYSTEM_ROOTS]: ROOT_CA, '/k/a': `${ROOT_CA}\n` },
+        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }] }]),
+      }),
+      [SYSTEM_ROOTS, '/k/missing', '/k/a'],
+    );
     expect(pem.match(/BEGIN CERTIFICATE/g)).toHaveLength(1);
   });
 
   it('skips unparseable blocks', async () => {
     const pem = await keychainCaRootsPem(
-      fakeExec({ certs: { [SYSTEM_ROOTS]: '-----BEGIN CERTIFICATE-----\nnot-a-cert\n-----END CERTIFICATE-----\n' + ROOT_CA } }),
+      fakeExec({
+        certs: { [SYSTEM_ROOTS]: '-----BEGIN CERTIFICATE-----\nnot-a-cert\n-----END CERTIFICATE-----\n' + ROOT_CA },
+        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }] }]),
+      }),
       [SYSTEM_ROOTS],
     );
     expect(pem.match(/BEGIN CERTIFICATE/g)).toHaveLength(1);
@@ -305,14 +336,18 @@ describe('prepareExtraCaBundle', () => {
   it('treats an empty trust domain as no records, not a read failure', async () => {
     // `security trust-settings-export` exits 1 with "No Trust Settings were
     // found." (errSecNoTrustSettings) for a domain with zero records — the
-    // normal state on a machine whose user never edited trust settings. That
-    // must not void the bundle, or the fix dies on exactly the stock machines
-    // it targets. Apple system roots are implicitly trusted regardless.
+    // normal state on a machine whose user never edited trust settings. The
+    // admin-installed corp root must still be exported, or the fix dies on
+    // exactly the stock machines it targets.
     const dir = tmpDir();
     const result = await prepareExtraCaBundle({
       platform: 'darwin',
       dir,
-      exec: fakeExec({ certs: { [SYSTEM_ROOTS]: ROOT_CA }, trustExportFails: 'empty' }),
+      exec: fakeExec({
+        certs: { [SYSTEM_ROOTS]: ROOT_CA },
+        userExport: 'empty',
+        trustAdmin: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }] }]),
+      }),
       keychains: [SYSTEM_ROOTS],
     });
     expect(result).toBe(join(dir, 'system-ca-roots.pem'));
@@ -329,7 +364,11 @@ describe('prepareExtraCaBundle', () => {
     const result = await prepareExtraCaBundle({
       platform: 'darwin',
       dir,
-      exec: fakeExec({ certs: { [SYSTEM_ROOTS]: ROOT_CA }, trustExportFails: true }),
+      exec: fakeExec({
+        certs: { [SYSTEM_ROOTS]: ROOT_CA },
+        userExport: 'fail',
+        trustAdmin: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }] }]),
+      }),
       keychains: [SYSTEM_ROOTS],
     });
     expect(result).toBeNull();
@@ -350,7 +389,10 @@ describe('prepareExtraCaBundle', () => {
     const result = await prepareExtraCaBundle({
       platform: 'darwin',
       dir,
-      exec: fakeExec({ certs: { [SYSTEM_ROOTS]: `${ROOT_CA}\n${LEAF}` } }),
+      exec: fakeExec({
+        certs: { [SYSTEM_ROOTS]: `${ROOT_CA}\n${LEAF}` },
+        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }] }]),
+      }),
       keychains: [SYSTEM_ROOTS],
     });
     expect(result).toBe(join(dir, 'system-ca-roots.pem'));
@@ -367,7 +409,10 @@ describe('prepareExtraCaBundle', () => {
     const result = await prepareExtraCaBundle({
       platform: 'darwin',
       dir,
-      exec: fakeExec({ certs: { [SYSTEM_ROOTS]: ROOT_CA } }),
+      exec: fakeExec({
+        certs: { [SYSTEM_ROOTS]: ROOT_CA },
+        trust: trustDump([{ sha1: ROOT_SHA1, settings: [{ policy: 'sslServer', result: 1 }] }]),
+      }),
       inheritedPath: inherited,
       keychains: [SYSTEM_ROOTS],
     });
