@@ -34,19 +34,29 @@ threadgroup_barrier(mem_flags::mem_threadgroup);
 if(sg!=0)return;
 float p[16];bool taken[16];
 for(int i=0;i<16;++i){p[i]=float(probs[lane+i*32]);taken[i]=false;}
-T selected[10];uint indices[10];
+// TrackFastMoE ROUTEREG: each output lane retains its own winner.
+// Shuffles below retain the local ascending BF16 normalization order.
+constexpr int KEPT=REG?1:10;
+T selected[KEPT]={};uint indices[KEPT]={};
 for(int i=0;i<10;++i){
  float best=-INFINITY;uint id=0;
  for(int j=0;j<16;++j){uint e=lane+j*32;if(!taken[j] && (p[j]>best || (p[j]==best && e>id))){best=p[j];id=e;}}
  float maximum=simd_max(best);
  uint winner=simd_max(best==maximum?id:0u);
  if(isnan(normalizer))winner=511-i;
- indices[9-i]=winner;selected[9-i]=probs[winner];
+ if constexpr(REG) {
+  if(lane==uint(9-i)){indices[0]=winner;selected[0]=probs[winner];}
+ } else {indices[9-i]=winner;selected[9-i]=probs[winner];}
  for(int j=0;j<16;++j)if(lane+j*32==winner)taken[j]=true;
 }
 T denominator=T(0);
-for(int i=0;i<10;++i)denominator=T(selected[i]+denominator);
-if(lane<10){ids[row*10+lane]=indices[lane];scores[row*10+lane]=T(selected[lane]/denominator);}
+for(int i=0;i<10;++i){
+ T term;
+ if constexpr(REG) term=T(simd_shuffle(float(selected[0]),i));
+ else term=selected[i];
+ denominator=T(term+denominator);
+}
+if(lane<10){ids[row*10+lane]=indices[REG?0:lane];scores[row*10+lane]=T(selected[REG?0:lane]/denominator);}
 
 
 )metal"

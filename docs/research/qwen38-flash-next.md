@@ -7,28 +7,66 @@ macOS 27 recheck. The [runtime guide](../qwen38-flash-next.md) covers usage.
 
 ## Result and limits
 
-**The requested 90% throughput target is not established on the current host.**
-Historical macOS 26.6.2 runs repeatedly exceeded the prefill threshold with
-experimental BF16 operands and wide PLE projections enabled. Decode remained
-below its threshold. Recent macOS 27 comparisons do not reproduce that prefill
-result reliably, including when the unchanged control is repeated.
+**The latest optional configuration exceeds 90% of both published rates.**
+Six measured requests across two fresh processes used the supplied checkpoint,
+1024 input tokens, 128 generated tokens, two warmups per process, and the same
+63 GiB/393-slot memory plan. Every measured request exceeded both thresholds
+and preserved the standard output hash; both process guards passed.
 
-| Measurement                                | Prefill tokens/s | Decode tokens/s |
-| ------------------------------------------ | ---------------: | --------------: |
-| Published reference                        |          2512.69 |           63.26 |
-| 90% threshold                              |         2261.421 |          56.934 |
-| Historical v14 candidate, six samples      |         2317.060 |          52.934 |
-| Historical v16 candidate, three samples    |         2302.827 |          53.989 |
-| macOS 27 v24 control, pooled two processes |         2092.288 |          49.875 |
-| 17 September three-port exact candidate    |         1962.355 |          52.313 |
-| 17 September candidate with BF16/fusions   |         2250.736 |          53.764 |
+| Measurement                         |  Prefill tokens/s | Decode tokens/s |
+| ----------------------------------- | ----------------: | --------------: |
+| Published reference                 |           2512.69 |           63.26 |
+| 90% threshold                       |          2261.421 |          56.934 |
+| Latest candidate, six-sample median |      **2412.472** |      **58.078** |
+| Percentage of published reference   |         **96.0%** |       **91.8%** |
+| Six-sample range                    | 2398.751–2416.677 |   57.915–58.248 |
 
-These are measurements of particular builds and configurations, not a matched
-engine comparison or a promise for the cleaned PR. The latest BF16/fusion candidate is
-about 89.6%/85.0% of the published rates, still below both thresholds. A subsequent diagnostic returned to
-about 2117 prefill tokens/s, but diagnostic timings are excluded from ordinary
-throughput claims. No experimental arithmetic or later optional decode fusion
-has been promoted on the basis of these drifting measurements.
+The two process medians were 2411.633/58.111 and 2413.311/57.939. This is an
+ordinary local workload comparison with the published rates, not a matched
+engine comparison: the reference uses a different checkpoint and private
+prompt. Earlier configurations and repeated controls sometimes slowed sharply
+with falling GPU clocks; those results remain below. The latest result does
+not establish performance under every thermal or desktop-load condition.
+
+The measured configuration uses **optional BF16 prefill operands and wide PLE
+GEMM**, which can change arithmetic and continuation. They remain off by
+default. Native exactness tests for the new load/routing ports do not erase
+those separately documented numerical differences.
+
+### Measured configuration
+
+Use these settings before starting the process. Other Qwen4 controls retain
+their documented defaults; the measured mixer down/injection fusion is disabled.
+The supplied GGUF codes, system reserves and admission rules are unchanged.
+
+```sh
+export MLX_METAL_HASH_KERNEL_CACHE=1
+export MLX_QWEN4_ATTENTION_NORM_ROTARY=1
+export MLX_QWEN4_DECODE_ASYNC_PLE=1
+export MLX_QWEN4_EXPERT_LANE_STAGING=1
+export MLX_QWEN4_FUSED_ROTARY=1
+export MLX_QWEN4_GDN_GATE_INPUTS=1
+export MLX_QWEN4_GDN_GATE_PAIR=1
+export MLX_QWEN4_GDN_VECTOR_ROWS=1
+export MLX_QWEN4_INJECT_NEXT_NORM=1
+export MLX_QWEN4_MIXER_DOWN_INJECT=0
+export MLX_QWEN4_MIXER_INJECT=1
+export MLX_QWEN4_MIXER_LANE_PRODUCTS=1
+export MLX_QWEN4_PREFILL_PLE_GEMM=1
+export MLX_QWEN4_PREFILL_REFERENCE_BF16=1
+export MLX_QWEN4_PREFILL_SHARED_COMBINE=1
+export MLX_QWEN4_REFERENCE_DOWN_SCHEDULE=1
+export MLX_QWEN4_ROTARY_TABLES=1
+export MLX_QWEN4_ROUTER_ROW_SCHEDULE=1
+export MLX_QWEN4_ROUTE_REGISTER_RESULTS=1
+export MLX_QWEN4_WEIGHT_CACHE_GIB=63
+```
+
+Evidence: `register-reference-a` and `register-reference-b` under
+`~/Library/Caches/mlx-node/qwen4-reference-gap-20260917/`. The immutable addon
+SHA-256 is `c08e3947deecb7171db7122cac98ca88f46b764c737760f703da7ff598c50f0e`.
+Invocation records contain the harness hash, environment, model path, output
+hashes, timing windows, power snapshots and memory-guard results.
 
 ## Reference, checkpoint, and method
 
@@ -428,7 +466,11 @@ prefetch and register-cached q/k values. It matched all three outputs for two
 input phases. Warm control blocks took 153.474/153.187/153.607 microseconds;
 candidate blocks took 155.159/150.237/150.881 microseconds. This small,
 overlapping result does not justify another production variant. The prototype
-remains in the external evidence archive.
+remains in the external evidence archive. A follow-up 64-step chained probe
+also matched every output, recurrent-state and history bit for two input phases.
+Its timing ranges still overlapped (control 18.6–36.3 and prefetch 19.4–39.2
+microseconds per step). A compiler was active during that diagnostic, so these
+are not isolated GPU performance measurements or grounds for integration.
 
 A separate CPU-side audit found repeated deep clones of the immutable model
 configuration in forward helpers. The decoder now shares that configuration
@@ -469,15 +511,130 @@ eight-product staging and reordered rows, with a control retaining the local
 layout. All outputs matched bit-for-bit for two changing input/weight sets.
 Repeated warm blocks overlapped: control 141.5–151.2 microseconds, unpacked
 reference geometry 143.3–150.3, packed geometry 140.9–167.2. This includes
-per-dispatch evaluation overhead; it is not a full-model gain. No duplicate
-mixer banks or associated residency change are added based on this result.
+per-dispatch evaluation overhead; it is not a full-model gain. A follow-up
+64-step chain used 64 distinct weight banks and dependent changing inputs.
+Both reference geometries matched the final outputs for two weight/input
+phases. Ranges still overlapped: control 12.74–16.15 microseconds per step,
+unpacked reference geometry 12.91–15.79, packed geometry 12.69–13.49. No duplicate
+mixer banks or associated residency change are added based on these results.
 
-The reference also uses source/compile-option hashes as Metal library keys.
-Our backend compares sources under the kernel name. A literal hash-key port
-still scans the source on every evaluation; source inspection alone does not
-establish it as a warm-dispatch speedup. It has not been promoted. The
-reference's packed mixer-row layout additionally retains reordered weights;
-that is a separate residency/accounting change from the parallel-product port.
+The next backend port follows the reference's source/compile-option hashes
+as Metal library keys. `MLX_METAL_HASH_KERNEL_CACHE=1` selects it at process
+start. The immutable key is computed with the custom primitive, avoiding
+repeated source scans for retained compiled graphs. It is off by default and
+has no established throughput gain yet. This uses the parent-owned Metal
+overlay, with the same generated class header in CMake, the bridge and installed
+headers. A compile-definition change invalidates old objects when that header
+is first introduced. The initial incremental-build mismatch was caught by the
+external correctness probe before any model benchmark; the rebuilt probe
+passed 90 same-name source/options/strided-input comparisons and 100 changing
+compiled calls in each cache mode. The cache-enabled broader release suite
+passed 3562 tests with 122 ignored and the same three debug-only exclusions;
+strict all-target Clippy passed. Its first full-checkpoint smoke was interrupted
+before load completed when another task's K2 model exceeded 8 GiB; that attempt
+provides neither checkpoint validation nor a throughput result.
+
+The cache's four-process ABBA comparison passed all guards and standard hashes.
+Control medians were 2272.210/54.574 and 717.399/35.424; cache-enabled medians
+were 2255.924/54.688 and 743.040/33.489. GPU clocks fell from approximately
+1.62 GHz in the early processes to 0.4–0.95 GHz in the later ones. AC High
+Power mode remained enabled. This comparison is inconclusive; the slow repeated
+control prevents attributing the decline to the cache implementation.
+
+A further `TrackFastMoE` FULLTAIL audit found that compact dense decode still
+used runtime-length helpers for its final packs. The native entry point admits
+only K multiples of 32, so every participating tail lane owns a complete pack.
+The port uses the ordinary fixed-size helpers inside the same lane guard,
+preserving the walk, sum order, scales, biases and output rounding. The isolated
+mixer comparison matched all output bits for two changing weight/input sets.
+The permanent independent quantized-projection regression now includes
+288/320/352/384-wide inputs, covering every admitted tail length of the normal
+128-column walk. All 100 Qwen native tests passed on this build. Its contribution
+has not been isolated from the later combined measurements.
+
+The AVEC audit also found that `STAGE && !COMPACT` disabled the existing
+prefetch when BF16 down-projection operands were selected. The port stages eight
+BF16 values with aligned `uint4` loads/stores, matching
+`TrackPrefillIndirectMetal.swift`'s AVEC implementation. The F32 staging retains
+its existing conversions. The native entry point and padded rows guarantee
+16-byte alignment. A child-process regression compares the staged BF16 path
+against scalar loads for mixed gate4/5 and down5/8 banks, two changing inputs,
+permuted token rows, and expert counts 0/15/16/17/31/32/33/63/64/65. All 101 Qwen
+native tests passed. This proves equivalence of the load change within the
+BF16 experiment; it does not make BF16 and the default F32 arithmetic equivalent.
+
+The AVEC candidate/control/control/candidate comparison used the content-key
+cache, reference RPS2 down schedule, earlier optional fusions, and identical
+63 GiB/393-slot/1024-token admission. All four processes passed guards and
+output hashes:
+
+| Process                       | Prefill median | Decode median |
+| ----------------------------- | -------------: | ------------: |
+| AVEC candidate A              |       2339.489 |        55.409 |
+| Scalar BF16 staging control B |       2275.841 |        55.327 |
+| Repeated control C            |        706.664 |        37.326 |
+| Repeated AVEC candidate D     |        841.309 |        42.804 |
+
+The first candidate's prefill samples were 2339.489/2349.059/2338.355; decode
+was 55.302/55.409/55.709. Early GPU clocks were approximately 1.62 GHz; later
+samples included 0.56–0.58 GHz. The first pair suggests a staging improvement,
+but the full comparison does not establish a repeatable gain. These observations
+do not identify the cause of the clock change.
+
+The follow-up port extends the reference's invariant inactive-row initialization
+to down projections: each inactive stage slice is cleared once before the K
+walk. `MLX_QWEN4_PREFILL_HOIST_ZERO=0` retains the repeated-zero control.
+The reference's `MLXFAST-ROUTERRPS1` is also adapted to the local BF16 router:
+one row per SIMD group, unchanged four-value K walk, F32 accumulation,
+shuffle-down reduction and final BF16 rounding. It uses the already-accounted
+BF16 weight cache and is selected by `MLX_QWEN4_ROUTER_ROW_SCHEDULE=1`.
+The router matches native matrix multiplication bit-for-bit for four changing
+input/weight sets, including offset and strided views; unsupported F32 inputs
+fall back. All 102 Qwen native tests passed, including the BF16 staging/zero
+comparison and the older-GPU fallback regression. The canonical addon build,
+Rust formatting and strict all-target Clippy passed. The exact optional-fusion
+configuration passed all 11 full-checkpoint smoke requests, including changed
+images and continuation, and released all 1365 pages with no state reservations.
+That auxiliary-model run used 63 GiB/366 slots and peaked at 65,242,335,344 bytes
+of physical memory; its timings are correctness-only.
+
+The 20-leg router schedule screen used two warmups and three measurements for
+four variants. Median prefill/decode rates were 1985.536/54.366 for the prior
+reference configuration, 2005.320/55.050 with router row scheduling,
+1997.683/55.369 with the mixer down/injection pair disabled, and
+2001.270/54.746 with the four-row expert down schedule. All hashes and guards
+passed; GPU clocks varied within these runs. This screen motivated the final
+configuration, but does not isolate a precise gain for each switch.
+
+The final ROUTEREG port retains one winner per output lane instead of ten
+winner values and indices in every lane. SIMD shuffles reconstruct the same
+ascending ten-term score sum. Both singleton and prefill retain probability
+rounding, the local tie rule, NaN handling and output order. Separate cached
+graphs specialize the control and register variants; every changing tensor
+remains an input. `MLX_QWEN4_ROUTE_REGISTER_RESULTS=1` selects this path. Its
+child regression runs the existing independent probability/tie tests in both
+prefill and decode; all 103 Qwen native tests passed.
+
+The final content-key cache replay again passed all 190 same-name source,
+compile-option, strided-input and changing-invocation checks in each mode.
+The content-key cache also avoids hashing or allocating its derived key when
+disabled. The process-start setting is captured when a custom primitive is
+first constructed. Its enabled key and dispatch semantics are unchanged.
+
+The final combined build and configuration produced the six above-threshold
+samples reported at the start of this document. No per-port percentage is
+inferred from that combined result. The final exact-arithmetic coding run
+retained the expected `fa17b454...45a96` hash across five 1023-input/128-output
+requests. Its three measured rates were 1099.361/1101.709/1085.064 prefill and
+30.576/30.378/30.363 decode tokens/s. That distinct prompt and precision
+configuration does not inherit the standard-workload 90% result. The faster BF16/PLE configuration was also run on that
+coding prompt, with five deterministic requests and a distinct output hash,
+`40d938a34d8106a2caed48e11fcaa08b15118668ad3d5cbac361466ddd5e9329`.
+Its measured prefill was 1188.054/1181.745/1179.404 and decode was
+30.100/30.224/30.423 tokens/s. These coding results are retained as workload
+limits; the standard benchmark's 90% result is not generalized to them. A combined routing/shared-gate prototype
+also matched 256 changing route/weight cases, but overlapping diagnostic timing
+ranges did not justify another runtime variant; it remains outside the PR.
 
 The first fresh default run was admitted at 386 expert slots rather than 393,
 so it is excluded from fixed-budget comparisons (prefill
@@ -509,13 +666,37 @@ Their regressions exercise renamed GGUF fixtures through logits and isolated
 processes reading the real scheduler policy. The TypeScript chat-family assertion
 now includes `qwen4_exp`.
 
+CI at `cb10e804` later failed two scheduled-owner tests with
+`Qwen4 stopped weight growth to preserve system headroom`. Their MTP observation
+path enters `prefill_chunk`, whose forward reserve check still queried the live
+runner even for tiny fixtures. Explicit unit-fixture stores now skip that
+forward-only reserve check under `cfg(test)`. Production stores still execute
+it; actual payload admission and weight-growth checks are unchanged. An
+injected failing check verifies both fixture isolation and production rejection. The production guard still runs at the same forward
+boundary; this follow-up changes fixture isolation, not kernel arithmetic.
+
+Before the fixture-isolation follow-up, the broader release suite passed
+**3565 tests**, with 122 ignored and the same three debug-only exclusions. After
+that follow-up, all **104 Qwen native tests** passed, including both previously
+failing scheduled-owner tests and the injected production-headroom regression.
+The final canonical addon build, packaged metallib checks and strict all-target
+Clippy passed. The final addon is archived as `fixture-headroom-build`, SHA-256
+`5d3d746a2b82186f583b94865789c142ffdbfd982e779146428f78f99481dfa4`.
+Its production forward guard still calls the original check, and its kernel
+sources match the measured `route-register-build`; performance was not rerun
+after this fixture-only follow-up. A final BF16/PLE full-checkpoint smoke attempt was stopped during load
+when the Devin process reached 8.80 GB, above the unchanged competing-process
+limit. It supplies no additional smoke result. The earlier 11-request smoke,
+the six above-threshold standard requests and both coding checks remain
+separately identified above.
+
 Tiny unit fixtures use an explicit bounded fixture store and injected bank-load
 admission/refresh callbacks. They no longer request the production multi-GiB
 working reservation from a busy CI runner. Actual payload reads still use live
 checks; production plan/reserve behavior is unchanged, and planner snapshot tests
 retain its insufficient-headroom coverage.
 
-Post-cleanup local validation (17 September):
+Earlier cleanup validation (17 September; later port checks are above):
 
 - Canonical native addon build and packaged metallib smoke checks passed.
 - Qwen native suite: 96 passed, zero ignored. Broader release core suite: 3558

@@ -24,16 +24,19 @@ for (; base < (FAST ? K : K - BLOCK); base += BLOCK) {
   }
 }
 if constexpr (!FAST) {
+  // TrackFastMoE's FULLTAIL: admitted K values are multiples of 32, so
+  // every live tail lane owns a complete pack. Use the identical fixed-size
+  // arithmetic instead of runtime-indexed helpers that can spill registers.
+  static_assert(K % VP == 0, "dense tail lanes must own complete packs");
   const int col = base + lane * VP;
-  const int remaining = clamp(K - col, 0, VP);
-  if (remaining > 0) {
+  if (col < K) {
     float values[VP];
-    const float sum = load_vector_safe<T,float,VP,8>(x + col, values, remaining);
+    const float sum = load_vector<T,float,VP,8>(x + col, values);
     for (int r = 0; r < RPS; ++r) {
       const size_t row = first + r * (MIX ? N / 4 : 1);
       const auto codes = reinterpret_cast<const device uchar*>(w) + row * K + col;
       const size_t side = row * (K / 32) + col / 32;
-      result[r] += qdot_safe<float,VP,8,false>(codes, values, float(scales[side]), float(biases[side]), sum, remaining);
+      result[r] += qdot<float,VP,8,false>(codes, values, float(scales[side]), float(biases[side]), sum);
     }
   }
 }

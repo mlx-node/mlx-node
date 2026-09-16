@@ -2409,6 +2409,10 @@ fn compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding() {
         (10240, 320),
         (20, 640),
         (64, 288),
+        // Together with 288/320, cover each admitted tail length in the
+        // ordinary 128-column walk, including a completely full final block.
+        (64, 352),
+        (64, 384),
     ] {
         let codes: Vec<u32> = (0..n * k / 4)
             .map(|i| (i as u32).wrapping_mul(2654435761).wrapping_add(0x89abcdef))
@@ -3144,11 +3148,33 @@ fn convolution_history_releases_wide_prefill_storage() {
 }
 
 #[test]
+fn bf16_indirect_prefill_staging_preserves_scalar_load_results() {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "models::qwen4_exp::tests::indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding",
+            "--test-threads=1",
+        ])
+        .env("QWEN4_TEST_BF16_STAGING", "1")
+        .env("MLX_QWEN4_PREFILL_REFERENCE_BF16", "1")
+        .status()
+        .unwrap();
+    assert!(status.success(), "BF16 staging changed an output bit");
+}
+
+#[test]
 fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
     use crate::array::DType;
     use std::sync::Arc;
     let counts = [0usize, 15, 16, 17, 31, 32, 33, 63, 64, 65];
     let e = counts.len();
+    // This mode runs only in the isolated child above. The scalar-load path
+    // is the oracle for an address-only BF16 prefetch change, not for the
+    // separate BF16-vs-F32 arithmetic experiment.
+    let check_bf16_staging = std::env::var_os("QWEN4_TEST_BF16_STAGING").is_some();
     let (h, m, tokens) = (256usize, 128usize, 53usize);
     let ids: Vec<u32> = counts
         .iter()
@@ -3245,6 +3271,36 @@ fn indirect_prefill_preserves_mixed_formats_rows_and_tail_rounding() {
                 bank(m, h, gb, false, 197),
                 bank(h, m, db, true, 13),
             ];
+            if check_bf16_staging {
+                for phase in [0., 0.125] {
+                    let input = source
+                        .add_scalar(phase)
+                        .unwrap()
+                        .astype(DType::BFloat16)
+                        .unwrap();
+                    // The child's main thread alone changes the switch, and
+                    // each graph is fully evaluated before the next change.
+                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_DOWN_STAGING", "0") };
+                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_HOIST_ZERO", "0") };
+                    let expected = math::prefill_indirect(&input, &ids, &token_rows, &banks, e)
+                        .unwrap()
+                        .expect("supported scalar BF16 path")
+                        .to_float32()
+                        .unwrap();
+                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_DOWN_STAGING", "1") };
+                    unsafe { std::env::set_var("MLX_QWEN4_PREFILL_HOIST_ZERO", "1") };
+                    let actual = math::prefill_indirect(&input, &ids, &token_rows, &banks, e)
+                        .unwrap()
+                        .expect("supported staged BF16 path")
+                        .to_float32()
+                        .unwrap();
+                    assert_eq!(
+                        &*actual, &*expected,
+                        "BF16 stage gate={gb} down={db} phase={phase}"
+                    );
+                }
+                continue;
+            }
             let gate = banks[0]
                 .tiled_expert_rows(&expanded, &ids, &tiles, e)
                 .unwrap()
@@ -3481,6 +3537,90 @@ fn compact_dense_prefill_preserves_affine_rounding_views_and_fallbacks() {
         .is_null(),
         "two-partition accumulation must retain the existing fallback"
     );
+}
+
+#[test]
+fn route_register_results_preserve_probability_ties_and_scores() {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["router_preserves_probability", "--test-threads=1"])
+        .env("MLX_QWEN4_ROUTE_REGISTER_RESULTS", "1")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "register routing changed IDs or score bits"
+    );
+}
+
+#[test]
+fn singleton_router_row_schedule_preserves_native_gemv() {
+    use crate::array::DType;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    for phase in 0..4 {
+        let x = MxArray::from_float32(
+            &(0..5120)
+                .map(|i| ((i * 131 + phase * 53) as f32 * 0.017).sin())
+                .collect::<Vec<_>>(),
+            &[1, 1, 5120],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+        // Offset and strided inputs exercise the custom primitive's copies.
+        let x = if phase % 2 == 0 {
+            x.slice_axis(2, 2560, 5120).unwrap()
+        } else {
+            x.reshape(&[2560, 2])
+                .unwrap()
+                .slice_axis(1, 1, 2)
+                .unwrap()
+                .reshape(&[1, 1, 2560])
+                .unwrap()
+        };
+        let w = MxArray::from_float32(
+            &(0..513 * 2560)
+                .map(|i| ((i * 37 + phase * 101) as f32 * 0.0031).cos() * 0.125)
+                .collect::<Vec<_>>(),
+            &[513, 2560],
+        )
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap()
+        .slice_axis(0, 1, 513)
+        .unwrap();
+        let expected = x
+            .matmul(&w.transpose(None).unwrap())
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let raw = unsafe { mlx_sys::mlx_qwen4_router_decode(x.as_raw_ptr(), w.as_raw_ptr()) };
+        assert!(!raw.is_null(), "supported router shape");
+        let actual = MxArray::from_handle(raw, "router regression")
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        for (i, (actual, expected)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "router phase={phase} row={i}"
+            );
+        }
+        assert!(
+            unsafe {
+                mlx_sys::mlx_qwen4_router_decode(
+                    x.astype(DType::Float32).unwrap().as_raw_ptr(),
+                    w.as_raw_ptr(),
+                )
+            }
+            .is_null()
+        );
+    }
 }
 
 #[test]

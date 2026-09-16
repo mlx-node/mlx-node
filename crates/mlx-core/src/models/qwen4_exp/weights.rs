@@ -378,6 +378,18 @@ impl Weight {
             } else {
                 &self.values
             };
+            if runtime_flags::is_one(c"MLX_QWEN4_ROUTER_ROW_SCHEDULE") {
+                let compact = unsafe {
+                    mlx_sys::mlx_qwen4_router_decode(x.as_raw_ptr(), values.as_raw_ptr())
+                };
+                if !compact.is_null() {
+                    let y = MxArray::from_handle(compact, "Qwen4 router row schedule")?;
+                    if runtime_flags::is_one(c"MLX_QWEN4_SYNC_PROJECTIONS") {
+                        MxArray::eval_arrays_with_context(&[&y], "qwen4::weights::y")?;
+                    }
+                    return Ok(y);
+                }
+            }
             let weight = values.transpose(None)?.astype(x.dtype()?)?;
             let shape = x.shape()?;
             if x.dtype()? == DType::Float32 && x.size()? / *shape.last().unwrap() as u64 > 1 {
@@ -456,6 +468,8 @@ impl Weight {
 }
 
 pub struct Store {
+    #[cfg(test)]
+    fixture: bool,
     pub tensors: HashMap<String, Tensor>,
     pub gguf: bool,
     pub metadata: HashMap<String, GgufMetaValue>,
@@ -497,6 +511,20 @@ struct SafeDescriptor {
 }
 
 impl Store {
+    pub(super) fn check_forward_headroom(&self) -> Result<()> {
+        self.check_forward_headroom_with(super::memory::check_growth_headroom)
+    }
+
+    fn check_forward_headroom_with(&self, check: impl FnOnce() -> Result<()>) -> Result<()> {
+        // Only explicitly opened unit fixtures skip the production forward
+        // reserve. Payload admission and the growth check in read() remain live.
+        #[cfg(test)]
+        if self.fixture {
+            return Ok(());
+        }
+        check()
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         Self::open_with_packed_root(path, None)
     }
@@ -514,6 +542,7 @@ impl Store {
     #[cfg(test)]
     pub(in super::super) fn open_fixture(path: &Path, root: Option<&Path>) -> Result<Self> {
         let mut store = Self::open_metadata(path, root)?;
+        store.fixture = true;
         // Logical ceiling includes the importer staging allowance; the
         // synthetic tensors allocate only their actual payload sizes.
         store.cache_limit = 1 << 30;
@@ -527,6 +556,8 @@ impl Store {
     pub(super) fn open_metadata(path: &Path, root: Option<&Path>) -> Result<Self> {
         let cache_limit = CACHE_BYTES;
         let mut s = Self {
+            #[cfg(test)]
+            fixture: false,
             tensors: HashMap::new(),
             gguf: path
                 .extension()
@@ -1311,6 +1342,23 @@ impl Store {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[test]
+    fn fixture_forward_headroom_isolated_from_production_guard() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp");
+        let fixture = Store::open_fixture(&path, None).unwrap();
+        let production = Store::open_metadata(&path, None).unwrap();
+        let checked = std::cell::Cell::new(0);
+        let unavailable = || {
+            checked.set(checked.get() + 1);
+            Err(err("simulated exhausted system headroom"))
+        };
+        fixture.check_forward_headroom_with(unavailable).unwrap();
+        assert_eq!(checked.get(), 0, "tiny fixture queried production reserves");
+        assert!(production.check_forward_headroom_with(unavailable).is_err());
+        assert_eq!(checked.get(), 1, "production skipped its headroom check");
+    }
+
     #[test]
     fn reference_shared_prefill_pair_preserves_projections_and_storage() {
         if !unsafe { mlx_sys::mlx_metal_is_nax_available() } {

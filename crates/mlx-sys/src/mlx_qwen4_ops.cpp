@@ -67,6 +67,36 @@ bool mlx_qwen4_flag_equals(const char *name, const char *value) noexcept {
   return setting && value && std::strcmp(setting, value) == 0;
 }
 
+mlx_array *mlx_qwen4_router_decode(mlx_array *input, mlx_array *weight) {
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!input || !weight)
+      return nullptr;
+    const auto &x = *reinterpret_cast<array *>(input);
+    const auto &w = *reinterpret_cast<array *>(weight);
+    if (x.shape() != mlx::core::Shape{1, 1, 2560} ||
+        w.shape() != mlx::core::Shape{512, 2560} ||
+        x.dtype() != mlx::core::bfloat16 || w.dtype() != x.dtype())
+      return nullptr;
+    static auto graph = [](const std::vector<array> &a) {
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_router_decode", {"x", "w"}, {"out"},
+#include "metal/qwen4_router_decode.metal.inc"
+      );
+      return kernel(a, {{1, 1, 512}}, {mlx::core::bfloat16}, {32 * 128, 1, 4},
+                    {32, 1, 4}, {{"T", mlx::core::bfloat16}}, std::nullopt,
+                    false, mlx::core::Device::gpu);
+    };
+    static auto compiled = mlx::core::compile(graph);
+    auto result = compiled({x, w});
+    return reinterpret_cast<mlx_array *>(new array(std::move(result[0])));
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 router decode: " << e.what() << std::endl;
+  }
+#endif
+  return nullptr;
+}
+
 // Singleton only: wider reductions use a different operation schedule.
 bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
                                 mlx_array **scores) {
@@ -78,21 +108,30 @@ bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
     if (x.shape() != mlx::core::Shape{1, 1, 512} ||
         (x.dtype() != mlx::core::bfloat16 && x.dtype() != mlx::core::float32))
       return false;
-    static auto graph = [](const std::vector<array> &in) {
-      const auto &x = in[0];
-      static auto kernel = mlx::core::fast::metal_kernel(
-          "qwen4_singleton_routes", {"logits"}, {"ids", "scores"},
+    static auto make_graph = [](bool registers) {
+      return [registers](const std::vector<array> &in) {
+        const auto &x = in[0];
+        static auto kernel = mlx::core::fast::metal_kernel(
+            "qwen4_singleton_routes", {"logits"}, {"ids", "scores"},
 #include "metal/qwen4_singleton_routes.metal.inc"
-      );
-      return kernel({x}, {{1, 1, 10}, {1, 1, 10}},
-                    {mlx::core::uint32, x.dtype()}, {128, 1, 1}, {128, 1, 1},
-                    {{"T", x.dtype()}}, std::nullopt, false,
-                    mlx::core::default_stream(mlx::core::Device::gpu));
+        );
+        return kernel({x}, {{1, 1, 10}, {1, 1, 10}},
+                      {mlx::core::uint32, x.dtype()}, {128, 1, 1}, {128, 1, 1},
+                      {{"T", x.dtype()}, {"REG", registers}}, std::nullopt, false,
+                      mlx::core::default_stream(mlx::core::Device::gpu));
+      };
     };
+    static auto graph = make_graph(false);
+    static auto register_graph = make_graph(true);
     static auto compiled = mlx::core::compile(graph);
+    static auto register_compiled = mlx::core::compile(register_graph);
     auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
     const bool cached = (!setting || std::string(setting) != "0");
-    auto result = cached ? compiled({x}) : graph({x});
+    const auto reg = qwen4_env("MLX_QWEN4_ROUTE_REGISTER_RESULTS");
+    const bool registers = reg && std::string(reg) == "1";
+    auto result = registers
+                      ? (cached ? register_compiled({x}) : register_graph({x}))
+                      : (cached ? compiled({x}) : graph({x}));
     auto i = std::make_unique<array>(std::move(result[0]));
     auto p = std::make_unique<array>(std::move(result[1]));
     *ids = reinterpret_cast<mlx_array *>(i.release());
@@ -119,22 +158,31 @@ bool mlx_qwen4_prefill_routes(mlx_array *logits, mlx_array **ids,
          x.shape(1) > 1024 || x.shape(2) != 512) ||
         (x.dtype() != mlx::core::bfloat16 && x.dtype() != mlx::core::float32))
       return false;
-    static auto graph = [](const std::vector<array> &in) {
-      const auto &x = in[0];
-      static auto kernel = mlx::core::fast::metal_kernel(
-          "qwen4_prefill_routes", {"logits"}, {"ids", "scores"},
+    static auto make_graph = [](bool registers) {
+      return [registers](const std::vector<array> &in) {
+        const auto &x = in[0];
+        static auto kernel = mlx::core::fast::metal_kernel(
+            "qwen4_prefill_routes", {"logits"}, {"ids", "scores"},
 #include "metal/qwen4_prefill_routes.metal.inc"
-      );
-      int rows = x.shape(1);
-      return kernel({x}, {{1, rows, 10}, {1, rows, 10}},
-                    {mlx::core::uint32, x.dtype()}, {128, rows, 1}, {128, 1, 1},
-                    {{"T", x.dtype()}}, std::nullopt, false,
-                    mlx::core::default_stream(mlx::core::Device::gpu));
+        );
+        int rows = x.shape(1);
+        return kernel({x}, {{1, rows, 10}, {1, rows, 10}},
+                      {mlx::core::uint32, x.dtype()}, {128, rows, 1}, {128, 1, 1},
+                      {{"T", x.dtype()}, {"REG", registers}}, std::nullopt, false,
+                      mlx::core::default_stream(mlx::core::Device::gpu));
+      };
     };
+    static auto graph = make_graph(false);
+    static auto register_graph = make_graph(true);
     static auto compiled = mlx::core::compile(graph);
+    static auto register_compiled = mlx::core::compile(register_graph);
     auto setting = qwen4_env("MLX_QWEN4_CACHED_KERNEL_GRAPHS");
     const bool cached = (!setting || std::string(setting) != "0");
-    auto result = cached ? compiled({x}) : graph({x});
+    const auto reg = qwen4_env("MLX_QWEN4_ROUTE_REGISTER_RESULTS");
+    const bool registers = reg && std::string(reg) == "1";
+    auto result = registers
+                      ? (cached ? register_compiled({x}) : register_graph({x}))
+                      : (cached ? compiled({x}) : graph({x}));
     auto i = std::make_unique<array>(std::move(result[0]));
     auto p = std::make_unique<array>(std::move(result[1]));
     *ids = reinterpret_cast<mlx_array *>(i.release());

@@ -1685,7 +1685,7 @@ impl Decoder {
     ) -> Result<MxArray> {
         let _flags = runtime_flags::scope();
         if cfg!(target_os = "macos") {
-            super::memory::check_growth_headroom()?;
+            self.weights.check_forward_headroom()?;
         }
         self.rotary_tables.get_mut().clear();
         let result = self

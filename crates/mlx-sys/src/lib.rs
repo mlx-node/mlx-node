@@ -2165,6 +2165,9 @@ unsafe extern "C" {
         scales: *mut mlx_array,
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
+    pub fn mlx_qwen4_router_decode(input: *mut mlx_array, weight: *mut mlx_array)
+    -> *mut mlx_array;
+
     pub fn mlx_qwen4_dense_decode(
         x: *mut mlx_array,
         weight: *mut mlx_array,

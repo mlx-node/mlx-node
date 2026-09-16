@@ -2,8 +2,8 @@ use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Port the reference's bounded Metal residency sets without changing the MLX
-/// gitlink. Derived host files live in OUT_DIR; the narrow replacements fail
+/// Port the reference's Metal residency and custom-kernel cache without changing
+/// the MLX gitlink. Derived host files live in OUT_DIR; the narrow replacements fail
 /// loudly if a future MLX update changes their integration points.
 fn metal_residency_overlay(manifest: &Path, mlx: &Path) -> PathBuf {
     let write_changed = |path: PathBuf, bytes: &[u8]| {
@@ -58,6 +58,43 @@ fn metal_residency_overlay(manifest: &Path, mlx: &Path) -> PathBuf {
         }
         write_changed(output.join(name), text.as_bytes());
     }
+    // The reference keys custom libraries by name, source and compile options.
+    // Compute that immutable key with the primitive, so cached graphs do not
+    // rescan the complete Metal source on every dispatch. Every CMake/bridge
+    // translation unit must see this same generated class layout.
+    let header = mlx.join("mlx/fast_primitives.h");
+    println!("cargo:rerun-if-changed={}", header.display());
+    let mut text = std::fs::read_to_string(header).unwrap();
+    replace(
+        &mut text,
+        "#include <optional>",
+        "#include <cstdlib>\n#include <functional>\n#include <optional>",
+    );
+    replace(
+        &mut text,
+        "        compile_options_(compile_options) {}",
+        "        compile_options_(compile_options),\n        library_name_(hash_cache_enabled() ? name_ + \"_mlx_node_\" +\n            std::to_string(std::hash<std::string>{}(source_)) + \"_\" +\n            std::to_string(compile_options_) : std::string{}) {}",
+    );
+    replace(
+        &mut text,
+        "  CompileOptions::Data compile_options_;",
+        "  CompileOptions::Data compile_options_;\n  std::string library_name_;\n  static bool hash_cache_enabled() {\n    static const bool enabled = [] {\n      const char* value = std::getenv(\"MLX_METAL_HASH_KERNEL_CACHE\");\n      return value && std::string(value) == \"1\";\n    }();\n    return enabled;\n  }",
+    );
+    write_changed(root.join("mlx/fast_primitives.h"), text.as_bytes());
+    let kernel = source.join("custom_kernel.cpp");
+    println!("cargo:rerun-if-changed={}", kernel.display());
+    let mut text = std::fs::read_to_string(kernel).unwrap();
+    replace(
+        &mut text,
+        "  {\n    // Clear kernels from the device library cache if needed",
+        "  // Process-start experiment; an empty key retains the original cache.\n  const bool hashed = !library_name_.empty();\n  if (!hashed) {\n    // Clear kernels from the device library cache if needed",
+    );
+    replace(
+        &mut text,
+        "      name_, compile_options_, [this] { return metal::utils() + source_; });",
+        "      hashed ? library_name_ : name_, compile_options_,\n      [this] { return metal::utils() + source_; });",
+    );
+    write_changed(output.join("custom_kernel.cpp"), text.as_bytes());
     root
 }
 

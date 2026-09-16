@@ -33,10 +33,25 @@ uint ar=tid/4,ac=(tid%4)*8;
 // Keep the original FP32 cooperative operands and accumulation schedule.
 bool live=begin+ar<end;
 float4 av[2]={float4(0),float4(0)};
+uint4 compact_av=uint4(0);
+// TrackPrefillIndirect: inactive rows own the same stage slice throughout
+// the K walk. Publish zeros once, before the first loop barrier.
+if constexpr(HOIST_ZERO) {
+  if(!live) {
+    for(int j=0;j<8;++j) As[ar*PAD+ac+j]=C(0);
+  }
+}
 if constexpr(STAGE) {
   if(live) {
-    auto src=(const device vec<T,4>*)(x+size_t(begin+ar)*K+ac);
-    av[0]=float4(src[0]); av[1]=float4(src[1]);
+    if constexpr(sizeof(C)==2) {
+      // MLXFAST-AVEC: eight BF16 values move as one aligned 16-byte slice.
+      // K, ac and the padded threadgroup row all preserve this alignment.
+      static_assert(metal::is_same_v<T,C>, "compact staging copies unchanged bits");
+      compact_av=*((const device uint4*)(x+size_t(begin+ar)*K+ac));
+    } else {
+      auto src=(const device vec<T,4>*)(x+size_t(begin+ar)*K+ac);
+      av[0]=float4(src[0]); av[1]=float4(src[1]);
+    }
   }
 }
 QwenPackedGroup32<BITS> pw;
@@ -57,18 +72,28 @@ for(int base=0;base<K;base+=BK) {
     for(int j=0;j<VP;++j) Ws[tid*PAD+k+j]=C(values[j]);
   }
   }
+  if(live || !HOIST_ZERO) {
   if constexpr(STAGE) {
-    auto dst=(threadgroup float4*)(As+ar*PAD+ac);
-    dst[0]=av[0]; dst[1]=av[1];
+    if constexpr(sizeof(C)==2) {
+      *((threadgroup uint4*)(As+ar*PAD+ac))=compact_av;
+    } else {
+      auto dst=(threadgroup float4*)(As+ar*PAD+ac);
+      dst[0]=av[0]; dst[1]=av[1];
+    }
   } else {
   STEEL_PRAGMA_UNROLL
   for(int j=0;j<8;++j) As[ar*PAD+ac+j]=begin+ar<end?C(x[size_t(begin+ar)*K+base+ac+j]):C(0);
   }
+  }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   if constexpr(STAGE) {
     if(live && base+BK<K) {
-      auto src=(const device vec<T,4>*)(x+size_t(begin+ar)*K+base+BK+ac);
-      av[0]=float4(src[0]); av[1]=float4(src[1]);
+      if constexpr(sizeof(C)==2) {
+        compact_av=*((const device uint4*)(x+size_t(begin+ar)*K+base+BK+ac));
+      } else {
+        auto src=(const device vec<T,4>*)(x+size_t(begin+ar)*K+base+BK+ac);
+        av[0]=float4(src[0]); av[1]=float4(src[1]);
+      }
     }
   }
   if constexpr(PREFETCH) {
