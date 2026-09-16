@@ -120,6 +120,13 @@ interface Candidate {
 export interface TrustDecision {
   allowForSsl: boolean;
   denyForSsl: boolean;
+  /**
+   * A DENY record exists but is scoped (hostname, application, usage) in a
+   * way a process-wide bundle cannot express. Such a CA is not
+   * unambiguously trusted: the user explicitly distrusted it for some host,
+   * and an unconditional export would grant trust for exactly that host.
+   */
+  scopedDenyForSsl: boolean;
 }
 
 /**
@@ -139,15 +146,19 @@ export interface TrustDecision {
  *     cert" (SecTrustSettings.h: "An empty Trust Settings array is definitely
  *     not the same as *no* Trust Settings").
  *
- * Constrained records are IGNORED for this process-wide decision. A record
- * carries a constraint whenever it has ANY key beyond the policy OID, the
- * policy name and the result — `kSecTrustSettingsPolicyString` (hostname),
+ * Constrained records are never applied verbatim. A record carries a
+ * constraint whenever it has ANY key beyond the policy OID, the policy name
+ * and the result — `kSecTrustSettingsPolicyString` (hostname),
  * `kSecTrustSettingsApplication`, `kSecTrustSettingsKeyUsage`, and anything
- * schema adds later. Exporting such a CA unconditionally would broaden a
- * narrow trust (SSL for one host, one app, one usage) into an any-host
- * anchor. NODE_EXTRA_CA_CERTS cannot carry constraints, so the record is
- * skipped in both directions — a scoped "never trust" must not remove a
- * good root either.
+ * schema adds later. NODE_EXTRA_CA_CERTS cannot carry constraints, so:
+ *
+ *   - a constrained ALLOW is ignored: exporting it would broaden a narrow
+ *     trust (SSL for one host, one app, one usage) into an any-host anchor;
+ *   - a constrained DENY does not remove the root globally (it may be
+ *     distrusted for one host only), but it DOES flag the cert via
+ *     `scopedDenyForSsl`, and `keychainCaRootsPem` refuses to export a
+ *     flagged non-system root at all — an unconditional export would grant
+ *     trust for exactly the host the user distrusted.
  *
  * The `-p` format is undocumented but has been stable for years, and it is the
  * only export form that avoids shipping a plist parser for three calls per
@@ -160,9 +171,13 @@ export function parseTrustSettingsDump(text: string): Map<string, TrustDecision>
   const apply = (result: number, policy: string | null, constrained: boolean): void => {
     if (current === null) return;
     if (policy !== null && !SSL_POLICIES.has(policy)) return;
-    // A constrained record proves nothing about other hosts: no allow, and no
-    // global deny either (see the docstring above).
-    if (constrained) return;
+    if (constrained) {
+      // Not applied verbatim (see the docstring): a scoped allow grants
+      // nothing, but a scoped deny still flags the cert as not
+      // unambiguously trusted.
+      if (result === DENY) current.scopedDenyForSsl = true;
+      return;
+    }
     if (result === TRUST_ROOT || result === TRUST_AS_ROOT) current.allowForSsl = true;
     if (result === DENY) current.denyForSsl = true;
   };
@@ -178,7 +193,11 @@ export function parseTrustSettingsDump(text: string): Map<string, TrustDecision>
     // trustSettings key at all, which is installed-but-untrusted.
     if (current !== null && current.sawArray && current.items === 0) current.allowForSsl = true;
     if (current !== null && currentSha1 !== null) {
-      decisions.set(currentSha1, { allowForSsl: current.allowForSsl, denyForSsl: current.denyForSsl });
+      decisions.set(currentSha1, {
+        allowForSsl: current.allowForSsl,
+        denyForSsl: current.denyForSsl,
+        scopedDenyForSsl: current.scopedDenyForSsl,
+      });
     }
     current = null;
     currentSha1 = null;
@@ -187,7 +206,7 @@ export function parseTrustSettingsDump(text: string): Map<string, TrustDecision>
     const key = /^\s{4}"([0-9A-F]{40})" => \{$/.exec(line);
     if (key !== null) {
       closeEntry();
-      current = { allowForSsl: false, denyForSsl: false, items: 0, sawArray: false };
+      current = { allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false, items: 0, sawArray: false };
       currentSha1 = key[1];
       continue;
     }
@@ -308,9 +327,10 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
       }
       const dump = await exec('plutil', ['-p', plist]);
       for (const [sha1, decision] of parseTrustSettingsDump(dump)) {
-        const entry = merged.get(sha1) ?? { allowForSsl: false, denyForSsl: false };
+        const entry = merged.get(sha1) ?? { allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false };
         entry.allowForSsl ||= decision.allowForSsl;
         entry.denyForSsl ||= decision.denyForSsl;
+        entry.scopedDenyForSsl ||= decision.scopedDenyForSsl;
         merged.set(sha1, entry);
       }
     }
@@ -324,9 +344,14 @@ async function loadTrustDecisions(exec: ExecText): Promise<Map<string, TrustDeci
  * Concatenated PEM of every effectively SSL-trusted CA root found in the
  * given keychains, deduped by fingerprint. The selection rule:
  *
- *   - Apple system roots: included unless explicitly denied;
- *   - anything else: included only with an explicit SSL/basicX509 allow
- *     record, and never when denied — keychain membership alone is not trust.
+ *   - Apple system roots: included unless explicitly denied (denial is
+ *     advisory here anyway — the bundle is ADDITIVE to Node's Mozilla
+ *     store, which already carries the same roots);
+ *   - anything else: included only with an unconstrained sslServer allow
+ *     record, never when denied, and never when a SCOPED deny exists —
+ *     the bundle cannot express "trusted except for host X", so a root the
+ *     user distrusted for any host is not exported at all. Keychain
+ *     membership alone is not trust.
  */
 export async function keychainCaRootsPem(exec: ExecText, keychains: readonly string[]): Promise<string> {
   const [candidates, decisions] = await Promise.all([collectCandidates(exec, keychains), loadTrustDecisions(exec)]);
@@ -335,7 +360,9 @@ export async function keychainCaRootsPem(exec: ExecText, keychains: readonly str
   for (const candidate of candidates) {
     if (seen.has(candidate.sha256)) continue;
     const decision = decisions.get(candidate.sha1);
-    const trusted = candidate.systemRoots ? decision?.denyForSsl !== true : decision?.allowForSsl === true && decision?.denyForSsl !== true;
+    const trusted = candidate.systemRoots
+      ? decision?.denyForSsl !== true
+      : decision?.allowForSsl === true && decision?.denyForSsl !== true && decision?.scopedDenyForSsl !== true;
     if (!trusted) continue;
     seen.add(candidate.sha256);
     roots.push(candidate.pem);

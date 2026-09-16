@@ -104,9 +104,9 @@ describe('parseTrustSettingsDump', () => {
 }
 `;
     const decisions = parseTrustSettingsDump(real);
-    expect(decisions.get('9C29EB274CB463788ACFC21705615CBE81EDB0AA')).toEqual({ allowForSsl: true, denyForSsl: false });
+    expect(decisions.get('9C29EB274CB463788ACFC21705615CBE81EDB0AA')).toEqual({ allowForSsl: true, denyForSsl: false, scopedDenyForSsl: false });
     // Present in the keychain with NO trust records: installed, but not trusted.
-    expect(decisions.get('21261EB01273C866A943ACBD51E04D3CBFDC395B')).toEqual({ allowForSsl: false, denyForSsl: false });
+    expect(decisions.get('21261EB01273C866A943ACBD51E04D3CBFDC395B')).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
   });
 
   it('records a deny, and ignores allows for non-SSL policies', () => {
@@ -120,10 +120,10 @@ describe('parseTrustSettingsDump', () => {
       { sha1: 'C'.repeat(40), settings: [{ result: 1 }] }, // no policy: applies to all
     ]);
     const decisions = parseTrustSettingsDump(dump);
-    expect(decisions.get('A'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: true });
-    expect(decisions.get('B'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
-    expect(decisions.get('E'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
-    expect(decisions.get('C'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false });
+    expect(decisions.get('A'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: true, scopedDenyForSsl: false });
+    expect(decisions.get('B'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
+    expect(decisions.get('E'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
+    expect(decisions.get('C'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false, scopedDenyForSsl: false });
   });
 
   it('treats a missing result key as TrustRoot (the add-trusted-cert export shape)', () => {
@@ -131,7 +131,7 @@ describe('parseTrustSettingsDump', () => {
     // policy and NO kSecTrustSettingsResult; verify-cert confirms such a cert
     // is trusted, so the schema default is allow.
     const dump = trustDump([{ sha1: 'D'.repeat(40), settings: [{ policy: 'sslServer' }] }]);
-    expect(parseTrustSettingsDump(dump).get('D'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false });
+    expect(parseTrustSettingsDump(dump).get('D'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false, scopedDenyForSsl: false });
   });
 
   it('reads an explicitly empty trustSettings array as always-trust', () => {
@@ -139,7 +139,7 @@ describe('parseTrustSettingsDump', () => {
     // result TrustRoot — and is "definitely not the same as *no* Trust
     // Settings". Corporate roots added without a policy export this shape.
     const dump = trustDump([{ sha1: 'E'.repeat(40), settings: [] }]);
-    expect(parseTrustSettingsDump(dump).get('E'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false });
+    expect(parseTrustSettingsDump(dump).get('E'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false, scopedDenyForSsl: false });
   });
 
   it('ignores hostname-constrained records in both directions', () => {
@@ -152,8 +152,11 @@ describe('parseTrustSettingsDump', () => {
       { sha1: '0'.repeat(40), settings: [{ policy: 'sslServer', policyString: 'evil.example.com', result: 3 }] },
     ]);
     const decisions = parseTrustSettingsDump(dump);
-    expect(decisions.get('F'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
-    expect(decisions.get('0'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
+    expect(decisions.get('F'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
+    // A scoped deny is not a global removal, but it flags the cert: the
+    // bundle cannot express "trusted except for host X", so a root with ANY
+    // scoped distrust is not exported (see the keychainCaRootsPem test).
+    expect(decisions.get('0'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: true });
   });
 
   it('ignores application- and key-usage-constrained records', () => {
@@ -189,8 +192,8 @@ describe('parseTrustSettingsDump', () => {
 }
 `;
     const decisions = parseTrustSettingsDump(dump);
-    expect(decisions.get('1'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
-    expect(decisions.get('2'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
+    expect(decisions.get('1'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
+    expect(decisions.get('2'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false, scopedDenyForSsl: false });
   });
 });
 
@@ -225,6 +228,30 @@ describe('keychainCaRootsPem', () => {
     // records — must NOT become an anchor.
     const installedOnly = await keychainCaRootsPem(fakeExec({ certs: { '/k/System': ROOT_CA } }), ['/k/System']);
     expect(installedOnly).toBe('');
+  });
+
+  it('excludes a root with a scoped deny even when another record allows it', async () => {
+    // Cross-record composition: an unconditional sslServer allow in one
+    // record plus a hostname-scoped deny ("never trust for huggingface.co")
+    // in another. Exporting unconditionally would grant trust for exactly
+    // the denied host — the download host. The bundle cannot carry the
+    // scope, so the root is not exported at all.
+    const pem = await keychainCaRootsPem(
+      fakeExec({
+        certs: { '/k/System': ROOT_CA },
+        trust: trustDump([
+          {
+            sha1: ROOT_SHA1,
+            settings: [
+              { policy: 'sslServer', result: 1 },
+              { policy: 'sslServer', policyString: 'huggingface.co', result: 3 },
+            ],
+          },
+        ]),
+      }),
+      ['/k/System'],
+    );
+    expect(pem).toBe('');
   });
 
   it('lets a deny beat an allow on another SSL policy', async () => {
