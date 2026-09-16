@@ -129,7 +129,17 @@ export interface TrustDecision {
  *     such an item, and `security verify-cert -p ssl` confirms the cert is
  *     trusted while the key is absent;
  *   - a result with NO policy name applies to every policy (older records),
- *     so it counts for SSL too.
+ *     so it counts for SSL too;
+ *   - an entry whose `trustSettings` array is EMPTY means "always trust this
+ *     cert" (SecTrustSettings.h: "An empty Trust Settings array is definitely
+ *     not the same as *no* Trust Settings").
+ *
+ * Constrained records are IGNORED for this process-wide decision: a
+ * `kSecTrustSettingsPolicyString` scopes the record (e.g. sslServer trust
+ * valid for one hostname only), and exporting that CA unconditionally would
+ * broaden a narrow trust into an any-host anchor. NODE_EXTRA_CA_CERTS cannot
+ * carry the constraint, so the record is skipped in both directions — a
+ * hostname-scoped "never trust" must not remove a good root either.
  *
  * The `-p` format is undocumented but has been stable for years, and it is the
  * only export form that avoids shipping a plist parser for three calls per
@@ -137,30 +147,51 @@ export interface TrustDecision {
  */
 export function parseTrustSettingsDump(text: string): Map<string, TrustDecision> {
   const decisions = new Map<string, TrustDecision>();
-  let current: TrustDecision | null = null;
-  let item: { policy: string | null; sawResult: boolean } | null = null;
-  const apply = (result: number, policy: string | null): void => {
+  let current: (TrustDecision & { items: number; sawArray: boolean }) | null = null;
+  let item: { policy: string | null; sawResult: boolean; constrained: boolean } | null = null;
+  const apply = (result: number, policy: string | null, constrained: boolean): void => {
     if (current === null) return;
     if (policy !== null && !SSL_POLICIES.has(policy)) return;
+    // A constrained record proves nothing about other hosts: no allow, and no
+    // global deny either (see the docstring above).
+    if (constrained) return;
     if (result === TRUST_ROOT || result === TRUST_AS_ROOT) current.allowForSsl = true;
     if (result === DENY) current.denyForSsl = true;
   };
   const closeItem = (): void => {
-    if (item !== null && !item.sawResult) apply(TRUST_ROOT, item.policy);
+    if (item !== null && !item.sawResult) apply(TRUST_ROOT, item.policy, item.constrained);
     item = null;
+  };
+  let currentSha1: string | null = null;
+  const closeEntry = (): void => {
+    closeItem();
+    // An explicitly EMPTY trust-settings array is Apple's "always trust this
+    // cert" (TrustRoot) encoding — and is NOT the same as an entry with no
+    // trustSettings key at all, which is installed-but-untrusted.
+    if (current !== null && current.sawArray && current.items === 0) current.allowForSsl = true;
+    if (current !== null && currentSha1 !== null) {
+      decisions.set(currentSha1, { allowForSsl: current.allowForSsl, denyForSsl: current.denyForSsl });
+    }
+    current = null;
+    currentSha1 = null;
   };
   for (const line of text.split('\n')) {
     const key = /^\s{4}"([0-9A-F]{40})" => \{$/.exec(line);
     if (key !== null) {
-      closeItem();
-      current = { allowForSsl: false, denyForSsl: false };
-      decisions.set(key[1], current);
+      closeEntry();
+      current = { allowForSsl: false, denyForSsl: false, items: 0, sawArray: false };
+      currentSha1 = key[1];
       continue;
     }
     if (current === null) continue;
+    if (/"trustSettings" => \[/.test(line)) {
+      current.sawArray = true;
+      continue;
+    }
     if (/^\s{8}\d+ => \{$/.test(line)) {
       closeItem();
-      item = { policy: null, sawResult: false };
+      current.items += 1;
+      item = { policy: null, sawResult: false, constrained: false };
       continue;
     }
     if (/^\s{8}\}/.test(line)) {
@@ -168,8 +199,7 @@ export function parseTrustSettingsDump(text: string): Map<string, TrustDecision>
       continue;
     }
     if (/^\s{4}\}/.test(line)) {
-      closeItem();
-      current = null;
+      closeEntry();
       continue;
     }
     const policy = /"kSecTrustSettingsPolicyName" => "([^"]+)"/.exec(line);
@@ -177,10 +207,14 @@ export function parseTrustSettingsDump(text: string): Map<string, TrustDecision>
       if (item !== null) item.policy = policy[1];
       continue;
     }
+    if (/"kSecTrustSettingsPolicyString"/.test(line)) {
+      if (item !== null) item.constrained = true;
+      continue;
+    }
     const result = /"kSecTrustSettingsResult" => (\d+)/.exec(line);
     if (result !== null) {
       if (item !== null) item.sawResult = true;
-      apply(Number(result[1]), item?.policy ?? null);
+      apply(Number(result[1]), item?.policy ?? null, item?.constrained ?? false);
     }
   }
   return decisions;
@@ -279,7 +313,10 @@ export async function keychainCaRootsPem(exec: ExecText, keychains: readonly str
 /**
  * Write the extra-CA bundle for the CONTROL PANEL child and return its path,
  * or `null` when there is nothing to add (non-macOS, no trusted roots, no
- * inherited bundle, or a write failure).
+ * inherited bundle, or ANY failure). The caller awaits this inside
+ * `bootstrap()`, whose rejection handler is `app.exit(1)` — an optional TLS
+ * convenience must never be a fatal startup dependency, so every failure
+ * mode collapses to `null` here rather than rejecting.
  *
  * An inherited `NODE_EXTRA_CA_CERTS` (a developer's shell can carry one into an
  * unpackaged run) is MERGED into the bundle rather than dropped: the variable
@@ -303,7 +340,14 @@ export async function prepareExtraCaBundle(opts: {
       // A dangling inherited path is not ours to fix; the keychain roots still apply.
     }
   }
-  parts.push(await keychainCaRootsPem(opts.exec, opts.keychains ?? macosKeychains()));
+  try {
+    // Whole call inside the catch: collectCandidates swallows per-keychain
+    // errors, but loadTrustDecisions' mkdtemp/cleanup can still reject
+    // (ENOSPC), and that rejection must not escape.
+    parts.push(await keychainCaRootsPem(opts.exec, opts.keychains ?? macosKeychains()));
+  } catch (error) {
+    console.warn('[mlx] could not export keychain CA roots:', error);
+  }
   const pem = parts.join('\n').trim();
   if (pem === '') return null;
   const bundlePath = join(opts.dir, EXTRA_CA_BUNDLE_FILE);

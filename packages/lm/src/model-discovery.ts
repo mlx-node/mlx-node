@@ -164,9 +164,13 @@ async function readDiscoveryMetadata(
  * under `modelsDir` or one level inside a downloaded GGUF repository. Each is
  * registered by filename stem so quant variants remain independently selectable.
  *
- * An unreadable dir yields `[]`. Entries with an undetectable config, a
- * non-generative type, or no launch preset are skipped silently (warnings only
- * when `MLX_DEBUG` is set). No weights are loaded. Results are sorted by name.
+ * A MISSING dir yields `[]` — nothing is installed. A dir that exists but
+ * cannot be read THROWS: "scan failed" is not "confirmed empty", and callers
+ * decide those differently (the desktop supervisor treats confirmed-empty as
+ * permanent and stops retrying; an I/O error may clear on the next attempt).
+ * Entries with an undetectable config, a non-generative type, or no launch
+ * preset are skipped silently (warnings only when `MLX_DEBUG` is set). No
+ * weights are loaded. Results are sorted by name.
  */
 export async function discoverLocalChatModels(modelsDir: string): Promise<LocalChatModel[]> {
   const debug = Boolean(process.env.MLX_DEBUG);
@@ -174,8 +178,9 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
   let entries: Dirent[];
   try {
     entries = await readdir(modelsDir, { withFileTypes: true });
-  } catch {
-    return [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
   }
   // Collision resolution below gives the first occurrence the bare filename
   // stem. Directory enumeration order is unspecified, so sort before assigning

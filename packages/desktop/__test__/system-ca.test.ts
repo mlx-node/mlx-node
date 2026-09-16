@@ -23,14 +23,18 @@ const EMPTY_DUMP = `{
 `;
 
 /** plutil -p shaped trust dump, built with real cert SHA-1s. A missing `result` omits the key entirely. */
-function trustDump(entries: Array<{ sha1: string; settings: Array<{ policy?: string; result?: number }> }>): string {
+function trustDump(
+  entries: Array<{ sha1: string; settings: Array<{ policy?: string; policyString?: string; result?: number }> }>,
+): string {
   const body = entries
     .map(({ sha1, settings }) => {
       const items = settings
         .map((s, i) => {
           const policyLine = s.policy === undefined ? '' : `          "kSecTrustSettingsPolicyName" => "${s.policy}"\n`;
+          const stringLine =
+            s.policyString === undefined ? '' : `          "kSecTrustSettingsPolicyString" => "${s.policyString}"\n`;
           const resultLine = s.result === undefined ? '' : `          "kSecTrustSettingsResult" => ${s.result}\n`;
-          return `        ${i} => {\n${policyLine}${resultLine}        }`;
+          return `        ${i} => {\n${policyLine}${stringLine}${resultLine}        }`;
         })
         .join(',\n');
       return `    "${sha1}" => {\n      "trustSettings" => [\n${items}\n      ]\n    }`;
@@ -112,6 +116,28 @@ describe('parseTrustSettingsDump', () => {
     // is trusted, so the schema default is allow.
     const dump = trustDump([{ sha1: 'D'.repeat(40), settings: [{ policy: 'sslServer' }] }]);
     expect(parseTrustSettingsDump(dump).get('D'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false });
+  });
+
+  it('reads an explicitly empty trustSettings array as always-trust', () => {
+    // SecTrustSettings.h: an empty array means "always trust this cert" with
+    // result TrustRoot — and is "definitely not the same as *no* Trust
+    // Settings". Corporate roots added without a policy export this shape.
+    const dump = trustDump([{ sha1: 'E'.repeat(40), settings: [] }]);
+    expect(parseTrustSettingsDump(dump).get('E'.repeat(40))).toEqual({ allowForSsl: true, denyForSsl: false });
+  });
+
+  it('ignores hostname-constrained records in both directions', () => {
+    // kSecTrustSettingsPolicyString scopes the record (sslServer trust valid
+    // for one hostname). NODE_EXTRA_CA_CERTS is process-wide and cannot carry
+    // the constraint: exporting the allow would broaden a narrow trust into
+    // an any-host anchor, and exporting the deny would strip a good root.
+    const dump = trustDump([
+      { sha1: 'F'.repeat(40), settings: [{ policy: 'sslServer', policyString: 'internal.example.com', result: 1 }] },
+      { sha1: '0'.repeat(40), settings: [{ policy: 'sslServer', policyString: 'evil.example.com', result: 3 }] },
+    ]);
+    const decisions = parseTrustSettingsDump(dump);
+    expect(decisions.get('F'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
+    expect(decisions.get('0'.repeat(40))).toEqual({ allowForSsl: false, denyForSsl: false });
   });
 });
 
