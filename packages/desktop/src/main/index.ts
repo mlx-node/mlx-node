@@ -19,16 +19,20 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
+import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
+import { resolveModelsDirAsync } from '@mlx-node/server/host/paths';
 import { app, autoUpdater, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
 import electronUpdater from 'electron-updater';
 
 import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
 import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
+import { decideAutoStart } from './auto-start.js';
 import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
 import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
 import { electronBrokerDeps } from './control-panel-child.js';
 import { createLaunchVisibility } from './launch-visibility.js';
+import { viewMenuTemplate } from './menu-policy.js';
 import { resolveAppPaths, type AppPaths } from './paths.js';
 import { installAppProtocol, registerAppScheme } from './protocol.js';
 import { createQuitHandler } from './quit.js';
@@ -42,6 +46,7 @@ import {
 } from './settings.js';
 import { utilityChildTransport } from './supervisor/child-utility.js';
 import { createSupervisor, type Supervisor } from './supervisor/index.js';
+import { prepareExtraCaBundle, securityText } from './system-ca.js';
 import { claudeConnectCommand, codexConnectCommand } from './tray-view.js';
 import { createTray, type TrayController } from './tray.js';
 import { canAutoUpdate, createDesktopUpdater, presentUpdate, type DesktopUpdater } from './updates.js';
@@ -157,17 +162,31 @@ function wire(): void {
 }
 
 async function bootstrap(): Promise<void> {
+  // Captured as well as passed: AppPaths derives per-file locations from it
+  // but keeps no handle to the directory, and the CA bundle needs one.
+  const userData = app.getPath('userData');
   paths = resolveAppPaths({
     appPath: app.getAppPath(),
     resourcesPath: process.resourcesPath,
     packaged: app.isPackaged,
-    userData: app.getPath('userData'),
+    userData,
   });
 
   // Synchronously, before the first await: a window created by anything that
   // races ahead of us (an `activate` at launch) would otherwise load `app://`
   // with no handler installed and fail as a blank frame.
   installAppProtocol(paths.wwwRoot);
+
+  // Kicked off here, awaited where the CONTROL PANEL env is assembled below:
+  // the three `security` keychain reads overlap settings/update setup instead
+  // of adding to startup latency. See system-ca.ts for what this fixes
+  // (TLS-inspecting networks) and why the child can only receive it at fork.
+  const extraCaBundle = prepareExtraCaBundle({
+    platform: process.platform,
+    dir: userData,
+    exec: securityText,
+    inheritedPath: process.env.NODE_EXTRA_CA_CERTS,
+  });
 
   // An accessory app has no menu bar of its own, but the standard roles still
   // carry the Edit key equivalents the Control Panel window needs — a text field with no
@@ -191,6 +210,9 @@ async function bootstrap(): Promise<void> {
         ],
       },
       { role: 'editMenu' },
+      // Dev access is gated (menu-policy.ts): an unpackaged run or
+      // `MLX_DEVTOOLS=1` adds Reload / Toggle Developer Tools to the View menu.
+      viewMenuTemplate(!app.isPackaged || process.env.MLX_DEVTOOLS === '1'),
       { role: 'windowMenu' },
     ] as MenuItemConstructorOptions[]),
   );
@@ -294,6 +316,23 @@ async function bootstrap(): Promise<void> {
     .prepare()
     .catch((error: unknown) => console.error('[mlx] command setup:', error));
 
+  // Whole-operation deadline: each `security`/`plutil` call is individually
+  // bounded (10 s), but up to four run sequentially inside the export, so a
+  // pathologically hung keychain stack could stall the window, broker and tray
+  // behind ~40 s of subprocess waits. Past the deadline we proceed without the
+  // optional bundle — the pre-fix behavior — rather than delay first paint.
+  const CA_BUNDLE_DEADLINE_MS = 10_000;
+  const TIMED_OUT = 'timed-out';
+  const extraCaBundleResult = await Promise.race([
+    extraCaBundle,
+    new Promise<typeof TIMED_OUT>((resolve) => setTimeout(() => resolve(TIMED_OUT), CA_BUNDLE_DEADLINE_MS)),
+  ]);
+  if (extraCaBundleResult === TIMED_OUT) {
+    console.warn('[mlx] keychain CA export exceeded its deadline; continuing without it');
+  }
+  const extraCaBundlePath = extraCaBundleResult === TIMED_OUT ? null : extraCaBundleResult;
+  if (quitting) return;
+
   broker = createControlPanelBroker<WebContents>({
     ...electronBrokerDeps({
       getInferenceConnection: async () => {
@@ -308,6 +347,9 @@ async function bootstrap(): Promise<void> {
       entry: paths.controlPanelEntry,
       env: {
         ...process.env,
+        // After `...process.env` on purpose: the bundle already MERGED any
+        // inherited NODE_EXTRA_CA_CERTS, so this replaces rather than duplicates.
+        ...(extraCaBundlePath === null ? {} : { NODE_EXTRA_CA_CERTS: extraCaBundlePath }),
         ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir }),
         MLX_DESKTOP_CLI: JSON.stringify(cliConfig),
       } as Record<string, string>,
@@ -389,8 +431,60 @@ async function bootstrap(): Promise<void> {
   refreshTray();
   updates.start();
 
-  if (settings.autoStartInference) {
-    void supervisor.start().catch(reportInferenceFailure);
+  // Auto-start is gated on there being something to serve: a fresh install
+  // has no models, and forking INFERENCE there is a guaranteed
+  // NoModelsDiscoveredError exit — see auto-start.ts. `quitting` is re-checked
+  // inside the callback: discovery can outlive a quit that started after it.
+  // When the setting is off the pre-flight is skipped outright: its only
+  // consumer is this decision, so a machine with auto-start disabled must not
+  // pay (or fail) for a models-dir scan it will never use.
+  if (!settings.autoStartInference) {
+    console.log(`[mlx] inference auto-start: ${decideAutoStart({ enabled: false, modelCount: null }).reason}`);
+  } else {
+    // All of the preflight's filesystem work is async — `resolveModelsDirAsync`
+    // rather than the sync `resolveModelsDir`, and the now-async discovery —
+    // because every sync read on MAIN is an event-loop stall. The scan is
+    // DEADLINED too: a stalled network/FUSE mount would leave readdir pending
+    // forever, so neither then nor catch would ever run and auto-start would
+    // silently stay off for the whole launch. A throw or the deadline both
+    // collapse to "couldn't look" (modelCount null), which fails open — the
+    // sidecar's own discovery is authoritative.
+    const AUTO_START_PREFLIGHT_DEADLINE_MS = 10_000;
+    void Promise.resolve()
+      .then(async (): Promise<number | null> => {
+        let incomplete = false;
+        const scan = (async () => {
+          const modelsDir = await resolveModelsDirAsync(settings.modelsDir ?? undefined);
+          return discoverLocalChatModels(modelsDir, {
+            onEntryFailure: () => {
+              incomplete = true;
+            },
+          });
+        })();
+        const models = await Promise.race([
+          scan,
+          new Promise<typeof TIMED_OUT>((resolve) =>
+            setTimeout(() => resolve(TIMED_OUT), AUTO_START_PREFLIGHT_DEADLINE_MS),
+          ),
+        ]);
+        if (models === TIMED_OUT) return null;
+        // An incomplete scan's empty result is not "no models": report it like
+        // a discovery error so the decision fails open and the sidecar stays
+        // authoritative.
+        return models.length > 0 ? models.length : incomplete ? null : 0;
+      })
+      .then((modelCount) => {
+        const decision = decideAutoStart({ enabled: true, modelCount });
+        console.log(`[mlx] inference auto-start: ${decision.reason}`);
+        if (!decision.start || quitting || supervisor === null) return;
+        void supervisor.start().catch(reportInferenceFailure);
+      })
+      .catch((error: unknown) => {
+        const decision = decideAutoStart({ enabled: true, modelCount: null });
+        console.error(`[mlx] inference auto-start: ${decision.reason}:`, error);
+        if (!decision.start || quitting || supervisor === null) return;
+        void supervisor.start().catch(reportInferenceFailure);
+      });
   }
   // Materialise defaults whenever there was no usable file. Otherwise settings
   // exist only in memory until the user happens to move the window or toggle a

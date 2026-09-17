@@ -285,9 +285,16 @@ describe('INFERENCE is the one that does', () => {
 describe('MAIN never links the native addon', () => {
   const graph = walk(src('main/index.ts'));
 
-  it('reaches only the addon-free leaf of @mlx-node/server', () => {
+  it('reaches only the addon-free leaves of @mlx-node/server', () => {
     expect({ offenders: reachesAddon(graph.packages) }).toMatchObject({ offenders: [] });
-    expect(graph.packages).toEqual(['@mlx-node/server/host/env-policy']);
+    // env-policy: engine env without the host. paths + model-discovery: where
+    // models live and whether any do, for the auto-start gate — both are
+    // native-free leaves (ADDON_FREE_SUBPATHS), walked into, never offenders.
+    expect(graph.packages).toEqual([
+      '@mlx-node/lm/model-discovery',
+      '@mlx-node/server/host/env-policy',
+      '@mlx-node/server/host/paths',
+    ]);
   });
 });
 

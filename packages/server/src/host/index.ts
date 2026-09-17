@@ -261,8 +261,16 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
   }
 
   const modelsDir = resolveModelsDir(opts.modelsDir);
-  const models = await discoverModels(modelsDir);
-  if (models.length === 0) throw new NoModelsDiscoveredError(modelsDir);
+  let firstScanError: unknown;
+  const models = await discoverModels(modelsDir, { onEntryFailure: (error) => (firstScanError ??= error) });
+  if (models.length === 0) {
+    // NoModelsDiscoveredError means "a completed scan found nothing" — the
+    // desktop sidecar maps it to a permanent exit. An INCOMPLETE scan's empty
+    // result carries no such evidence, so the underlying I/O error propagates
+    // instead and stays inside the supervisor's bounded crash retries.
+    if (firstScanError !== undefined) throw firstScanError;
+    throw new NoModelsDiscoveredError(modelsDir);
+  }
 
   // Precedence: explicit option > ANTHROPIC_MODEL > discovered[0].
   const requestedModel = opts.model ?? process.env.ANTHROPIC_MODEL;

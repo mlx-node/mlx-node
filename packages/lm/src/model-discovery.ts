@@ -63,11 +63,12 @@ function supportedGgufName(name: string, modelType: ModelType): boolean {
   return policy.variants === 'all' || isQwen35XlGguf(name);
 }
 
-async function hasGgufAssets(modelDir: string): Promise<boolean> {
+async function hasGgufAssets(modelDir: string, onIoFailure?: (error: unknown) => void): Promise<boolean> {
   try {
     const assets = await Promise.all(['config.json', 'tokenizer.json'].map((name) => stat(join(modelDir, name))));
     return assets.every((asset) => asset.isFile());
-  } catch {
+  } catch (error) {
+    onIoFailure?.(error);
     return false;
   }
 }
@@ -79,20 +80,14 @@ interface ModelFileInventory {
 }
 
 async function modelFileInventory(modelDir: string): Promise<ModelFileInventory> {
-  try {
-    const files = (await readdir(modelDir, { withFileTypes: true }))
-      .filter((entry) => entry.isFile())
-      .map((entry) => entry.name);
-    return {
-      targetGgufs: files
-        .filter((name) => name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(name))
-        .sort(),
-      hasGguf: files.some((name) => name.toLowerCase().endsWith('.gguf')),
-      hasPrimarySafetensors: files.some((name) => PRIMARY_SAFETENSORS.test(name)),
-    };
-  } catch {
-    return { targetGgufs: [], hasGguf: false, hasPrimarySafetensors: false };
-  }
+  const files = (await readdir(modelDir, { withFileTypes: true }))
+    .filter((entry) => entry.isFile())
+    .map((entry) => entry.name);
+  return {
+    targetGgufs: files.filter((name) => name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(name)).sort(),
+    hasGguf: files.some((name) => name.toLowerCase().endsWith('.gguf')),
+    hasPrimarySafetensors: files.some((name) => PRIMARY_SAFETENSORS.test(name)),
+  };
 }
 
 function positiveInteger(value: unknown): number | undefined {
@@ -149,23 +144,68 @@ async function readDiscoveryMetadata(
 }
 
 /**
- * Scan `modelsDir` for chat-capable model subdirectories, Gemma4/Muse GGUFs, and
+ * Walk the cause chain for an errno. An "absent" code (ENOENT/ENOTDIR) is a
+ * definitive answer — the config or asset does not exist — not a failure, and
+ * a code-free error (bad GGUF header, corrupt JSON, unsupported family) is a
+ * definitive "not this model". Only a real I/O errno means the entry could
+ * not be evaluated at all and MIGHT be a model missing from the result.
+ */
+function isEvaluationFailure(error: unknown): boolean {
+  let current: unknown = error;
+  while (current instanceof Error) {
+    const code = (current as NodeJS.ErrnoException).code;
+    if (code !== undefined) return code !== 'ENOENT' && code !== 'ENOTDIR';
+    current = current.cause;
+  }
+  return false;
+}
+
+/** Options for {@link discoverLocalChatModels}. */
+export interface DiscoveryScanOptions {
+  /**
+   * Called when a directory entry or GGUF file could not be evaluated and may
+   * have been omitted from the result — the scan was INCOMPLETE. Per-entry
+   * failures are still swallowed so one corrupt model never kills discovery
+   * for the server host, agent provider, and dashboard that share this code;
+   * the callback only exposes that the result is not evidence of emptiness.
+   * Lets callers separate "scan completed, zero models" from "couldn't look" —
+   * a permanent versus retryable empty result.
+   */
+  onEntryFailure?: (error: unknown, entryPath: string) => void;
+}
+
+/**
+ * Scan `modelsDir` for chat-capable model subdirectories, Gemma4/Muse/Qwen4 GGUFs, and
  * dense Qwen3.5/Qwen3.8 `Q<number>_K_XL.gguf` files. GGUF files may live directly
  * under `modelsDir` or one level inside a downloaded GGUF repository. Each is
  * registered by filename stem so quant variants remain independently selectable.
  *
- * An unreadable dir yields `[]`. Entries with an undetectable config, a
- * non-generative type, or no launch preset are skipped silently (warnings only
- * when `MLX_DEBUG` is set). No weights are loaded. Results are sorted by name.
+ * A MISSING dir yields `[]` — nothing is installed. A dir that exists but
+ * cannot be read THROWS: "scan failed" is not "confirmed empty", and callers
+ * decide those differently (the desktop supervisor treats confirmed-empty as
+ * permanent and stops retrying; an I/O error may clear on the next attempt).
+ * Entries with an undetectable config, a non-generative type, or no launch
+ * preset are skipped silently (warnings only when `MLX_DEBUG` is set) — but an
+ * entry the scan could not even evaluate is reported through
+ * `opts.onEntryFailure`, so an empty result carries evidence of whether it
+ * means "nothing installed" or "couldn't check". No weights are loaded.
+ * Results are sorted by name.
  */
-export async function discoverLocalChatModels(modelsDir: string): Promise<LocalChatModel[]> {
+export async function discoverLocalChatModels(
+  modelsDir: string,
+  opts?: DiscoveryScanOptions,
+): Promise<LocalChatModel[]> {
   const debug = Boolean(process.env.MLX_DEBUG);
+  const reportFailure = (error: unknown, entryPath: string): void => {
+    if (isEvaluationFailure(error)) opts?.onEntryFailure?.(error, entryPath);
+  };
 
   let entries: Dirent[];
   try {
     entries = await readdir(modelsDir, { withFileTypes: true });
-  } catch {
-    return [];
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
+    throw error;
   }
   // Collision resolution below gives the first occurrence the bare filename
   // stem. Directory enumeration order is unspecified, so sort before assigning
@@ -232,14 +272,18 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
       const family = familyDataFor(modelType);
       if (!supportedGgufName(name, modelType)) return;
       // A sibling config must agree with the target header, never a projector.
-      if (!family?.ggufArchitectures?.includes(readGgufArchitecture(path))) return;
-      if (family.ggufDiscovery?.requiresAssets && !(await hasGgufAssets(metadataRoot))) {
+      if (!family?.ggufArchitectures?.includes(await readGgufArchitecture(path))) return;
+      if (
+        family.ggufDiscovery?.requiresAssets &&
+        !(await hasGgufAssets(metadataRoot, (error) => reportFailure(error, path)))
+      ) {
         if (debug)
           console.warn(`[mlx] skip ${path}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`);
         return;
       }
       await append(ggufModelName(name), path, metadataRoot, modelType, scopeName);
     } catch (err) {
+      reportFailure(err, path);
       if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
     }
   };
@@ -251,18 +295,19 @@ export async function discoverLocalChatModels(modelsDir: string): Promise<LocalC
     }
     if (!entry.isDirectory()) continue;
     const full = join(modelsDir, entry.name);
-    const inventory = await modelFileInventory(full);
-    // Prefer converted targets over retained source files or companion weights.
-    // Each native GGUF variant is otherwise a separate entry. Header detection
-    // also handles Qwen4 split directories with no config/tokenizer sidecars.
-    if (inventory.hasGguf && !inventory.hasPrimarySafetensors) {
-      for (const name of inventory.targetGgufs) await appendGguf(name, full, entry.name);
-      continue;
-    }
     try {
+      const inventory = await modelFileInventory(full);
+      // Prefer converted targets over retained source files or companion weights.
+      // Each native GGUF variant is otherwise a separate entry. Header detection
+      // also handles Qwen4 split directories with no config/tokenizer sidecars.
+      if (inventory.hasGguf && !inventory.hasPrimarySafetensors) {
+        for (const name of inventory.targetGgufs) await appendGguf(name, full, entry.name);
+        continue;
+      }
       const modelType = await detectModelType(full);
       await append(entry.name, full, full, modelType, entry.name);
     } catch (err) {
+      reportFailure(err, full);
       if (debug) console.warn(`[mlx] skip ${full}: ${(err as Error).message}`);
     }
   }

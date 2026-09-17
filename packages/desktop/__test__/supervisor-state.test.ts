@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vite-plus/test';
 
+import { EXIT_STARTUP_FAILED } from '../src/inference/exit-codes.js';
 import { buildChildEnv } from '../src/main/supervisor/env.js';
 import {
   assessExit,
@@ -82,28 +83,43 @@ describe('assessExit', () => {
 
 describe('planRestart', () => {
   const policy: RestartPolicy = { maxConsecutiveCrashes: 5, baseDelayMs: 100, maxDelayMs: 400, healthyForMs: 1_000 };
+  // An ordinary crash exit: non-zero, restartable.
+  const crash = { code: 1, signal: null };
 
   it('backs off exponentially from the base delay', () => {
-    expect(planRestart(policy, 1)).toEqual({ action: 'restart', delayMs: 100, attempt: 1 });
-    expect(planRestart(policy, 2)).toEqual({ action: 'restart', delayMs: 200, attempt: 2 });
-    expect(planRestart(policy, 3)).toEqual({ action: 'restart', delayMs: 400, attempt: 3 });
+    expect(planRestart(policy, 1, crash)).toEqual({ action: 'restart', delayMs: 100, attempt: 1 });
+    expect(planRestart(policy, 2, crash)).toEqual({ action: 'restart', delayMs: 200, attempt: 2 });
+    expect(planRestart(policy, 3, crash)).toEqual({ action: 'restart', delayMs: 400, attempt: 3 });
   });
 
   it('clamps at the ceiling instead of growing without bound', () => {
-    expect(planRestart(policy, 4)).toEqual({ action: 'restart', delayMs: 400, attempt: 4 });
+    expect(planRestart(policy, 4, crash)).toEqual({ action: 'restart', delayMs: 400, attempt: 4 });
   });
 
   // The boundary, stated exactly: maxConsecutiveCrashes 5 means four restarts
   // and then a resting `failed` state. A sidecar that dies instantly must not
   // spin forever.
   it('gives up on the Nth crash, not the Nth+1', () => {
-    expect(planRestart(policy, 5)).toEqual({ action: 'give-up', attempt: 5 });
-    expect(planRestart(policy, 6)).toEqual({ action: 'give-up', attempt: 6 });
+    expect(planRestart(policy, 5, crash)).toEqual({ action: 'give-up', attempt: 5 });
+    expect(planRestart(policy, 6, crash)).toEqual({ action: 'give-up', attempt: 6 });
   });
 
   it('ships a give-up by default rather than an unbounded loop', () => {
     expect(Number.isFinite(DEFAULT_RESTART_POLICY.maxConsecutiveCrashes)).toBe(true);
-    expect(planRestart(DEFAULT_RESTART_POLICY, DEFAULT_RESTART_POLICY.maxConsecutiveCrashes).action).toBe('give-up');
+    expect(planRestart(DEFAULT_RESTART_POLICY, DEFAULT_RESTART_POLICY.maxConsecutiveCrashes, crash).action).toBe(
+      'give-up',
+    );
+  });
+
+  // `EXIT_STARTUP_FAILED` is `createHost` rejecting — classically
+  // NoModelsDiscoveredError. Deterministic: the next fork sees the same empty
+  // models dir, so the first crash is already the verdict.
+  it('never restarts a startup failure, however much budget remains', () => {
+    const startupFailed = { code: EXIT_STARTUP_FAILED, signal: null };
+    expect(planRestart(policy, 1, startupFailed)).toEqual({ action: 'give-up', attempt: 1 });
+    expect(planRestart(policy, 4, startupFailed)).toEqual({ action: 'give-up', attempt: 4 });
+    // And the rule reads the code, not the count: other codes still restart.
+    expect(planRestart(policy, 1, { code: 79, signal: null }).action).toBe('restart');
   });
 });
 

@@ -17,6 +17,12 @@
 
 import { randomBytes } from 'node:crypto';
 
+import { EXIT_STARTUP_FAILED } from './exit-codes.js';
+
+// Re-exported so existing importers keep working; the definition and the rule
+// about who else may read it live in exit-codes.ts.
+export { EXIT_STARTUP_FAILED };
+
 /**
  * Where the sidecar binds. See {@link sidecarHostOptions} for what the entry
  * actually passes.
@@ -178,6 +184,22 @@ export class NoParentChannelError extends Error {
   }
 }
 
+/**
+ * Whether a `createHost` rejection means "retrying can never help".
+ *
+ * Structural (`name`), deliberately NOT `instanceof`: the class lives in
+ * `@mlx-node/server/host`, whose module graph value-imports `@mlx-node/lm` —
+ * the addon this file is forbidden from mapping (see the module docstring).
+ * The class sets `this.name` in its constructor, so the string is stable.
+ *
+ * Only a confirmed "nothing to serve" qualifies. An unclassified rejection —
+ * a locked `responses.db`, a schema-init failure, an I/O error — may clear on
+ * its own, so it exits 1 and the supervisor's bounded crash retries apply.
+ */
+export function isPermanentStartupFailure(error: unknown): boolean {
+  return error instanceof Error && error.name === 'NoModelsDiscoveredError';
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Request handling
@@ -273,9 +295,6 @@ export interface SidecarDeps {
   exit(code: number): void;
 }
 
-/** Startup failed. Distinct from 1 so a crash report can tell it from a throw. */
-export const EXIT_STARTUP_FAILED = 78;
-
 /**
  * Run the sidecar until it is told to stop.
  *
@@ -284,10 +303,12 @@ export const EXIT_STARTUP_FAILED = 78;
  * shutdown — `deps.exit` ends the process.
  *
  * A `createHost` rejection exits immediately instead of waiting out the
- * supervisor's 60 s readiness budget. The common cause is
- * `NoModelsDiscoveredError`, which no amount of waiting fixes, and a fast exit
- * turns it into a visible `failed` state with the reason in the crash report
- * rather than a minute of "starting" per restart.
+ * supervisor's 60 s readiness budget. The exit code is classified: a
+ * permanent startup failure (see {@link isPermanentStartupFailure}) is
+ * `EXIT_STARTUP_FAILED`, which the supervisor will not retry; anything else
+ * exits 1 and stays inside the supervisor's bounded crash-restart policy,
+ * because a transient rejection (a locked `responses.db`, an I/O hiccup) is
+ * exactly what those retries exist for.
  */
 export async function runSidecar(deps: SidecarDeps): Promise<void> {
   const { channel } = deps;
@@ -341,7 +362,7 @@ export async function runSidecar(deps: SidecarDeps): Promise<void> {
     started = await deps.createHost();
   } catch (error) {
     deps.logError(`[mlx] inference host failed to start: ${describe(error)}`);
-    deps.exit(EXIT_STARTUP_FAILED);
+    deps.exit(isPermanentStartupFailure(error) ? EXIT_STARTUP_FAILED : 1);
     return;
   }
   if (stopping) {

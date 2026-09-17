@@ -153,7 +153,7 @@ function describe(snapshot: SupervisorSnapshot): Described {
       return {
         indicator: 'error',
         title: '✕',
-        statusLabel: `Inference: failed after ${snapshot.consecutiveCrashes} crashes`,
+        statusLabel: `Inference: failed after ${snapshot.consecutiveCrashes} ${snapshot.consecutiveCrashes === 1 ? 'crash' : 'crashes'}`,
         detail: snapshot.lastExit === null ? null : snapshot.lastExit.reason,
       };
 

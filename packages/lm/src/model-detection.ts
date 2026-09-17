@@ -27,7 +27,7 @@ export async function readModelConfig(modelDir: string): Promise<unknown> {
 /** The loader can supply its native header validator without changing family selection. */
 export async function detectModelType(
   modelPath: string,
-  readArchitecture: (path: string) => string = readGgufArchitecture,
+  readArchitecture: (path: string) => string | Promise<string> = readGgufArchitecture,
 ): Promise<ModelType> {
   const isGguf = extname(modelPath).toLowerCase() === '.gguf';
   let config: unknown;
@@ -35,12 +35,14 @@ export async function detectModelType(
     config = await readModelConfig(isGguf ? dirname(modelPath) : modelPath);
   } catch (error) {
     if (isGguf && (error as NodeJS.ErrnoException).code === 'ENOENT') {
-      const architecture = readArchitecture(modelPath);
+      const architecture = await readArchitecture(modelPath);
       const type = GGUF_ARCHITECTURE_MODEL_TYPES.get(architecture);
       if (type === undefined) throw new Error(`Unsupported GGUF architecture "${architecture}" in ${modelPath}`);
       return type;
     }
-    throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`);
+    // `cause` preserves the real errno: an EACCES here is "couldn't look",
+    // not "not found" — discovery's onEntryFailure distinguishes the two.
+    throw new Error(`Cannot detect model type: config.json not found in ${modelPath}`, { cause: error });
   }
   return matchFamily(modelPath, config);
 }

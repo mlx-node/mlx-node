@@ -292,6 +292,28 @@ function truncateMessage(message: string): string {
 }
 
 /**
+ * The user-facing failure text for a job error. undici reports EVERY transport
+ * failure as `TypeError: fetch failed` and hides the reason in `error.cause`
+ * (ENETUNREACH, ETIMEDOUT, ECONNRESET, SELF_SIGNED_CERT_IN_CHAIN, EPERM …), so
+ * without unwrapping, a blocked network, a TLS-inspecting proxy, and a dead DNS
+ * all render as the same useless "fetch failed". Walk the cause chain and
+ * append each link's code, so the toast names the actual reason.
+ */
+function describeFailure(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const parts: string[] = [error.message];
+  const seen = new Set<unknown>([error]);
+  let current: unknown = error.cause;
+  while (current instanceof Error && !seen.has(current)) {
+    seen.add(current);
+    const code = (current as NodeJS.ErrnoException).code;
+    parts.push(code !== undefined ? `${current.message} [${code}]` : current.message);
+    current = current.cause;
+  }
+  return parts.join(' → ');
+}
+
+/**
  * Thrown by {@link DownloadManager.start} once {@link DownloadManager.shutdown}
  * has begun. Distinct from the catalog rejection (a bad request) so the API can
  * answer 503 — the repo is fine, the server is just going away.
@@ -1030,7 +1052,16 @@ export class DownloadManager {
         this.emit({ type: 'cancelled', id: job.id });
       } else {
         job.state = 'error';
-        this.emit({ type: 'error', id: job.id, message: truncateMessage((error as Error).message) });
+        // The stack goes to the child's stderr (MAIN forwards it as
+        // `[mlx] control panel: …`) — bounded like the event text, since a hub
+        // error can embed an unbounded remote body inside `message` and stderr
+        // is forwarded verbatim. The event carries the cause chain, since the
+        // raw message alone is undici's content-free "fetch failed".
+        console.error(
+          `[downloads] job ${job.id} (${job.repo}) failed:`,
+          truncateMessage(error instanceof Error ? (error.stack ?? error.message) : String(error)),
+        );
+        this.emit({ type: 'error', id: job.id, message: truncateMessage(describeFailure(error)) });
       }
     } finally {
       // Job-private staging is scratch: a successful publish already renamed it

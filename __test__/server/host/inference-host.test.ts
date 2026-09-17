@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { createServer as createNetServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -259,6 +259,24 @@ describe('createInferenceHost — discovery and model binding', () => {
     scratchDirs.push(modelsDir);
     await expect(start({ modelsDir })).rejects.toBeInstanceOf(NoModelsDiscoveredError);
   });
+
+  it.skipIf(process.platform === 'win32' || process.getuid?.() === 0)(
+    'propagates an unreadable entry instead of claiming no models',
+    async () => {
+      // A scan that could not evaluate its only entry is INCOMPLETE, not
+      // empty: the I/O error propagates so the desktop supervisor's bounded
+      // crash retries apply, instead of the permanent NoModelsDiscoveredError
+      // exit. config.json is made unreadable; the file is restored by the
+      // scratch-dir cleanup.
+      const modelsDir = await makeModelsDir(['alpha']);
+      const config = join(modelsDir, 'alpha', 'config.json');
+      await chmod(config, 0o000);
+      const error = await start({ modelsDir }).catch((e: unknown) => e);
+      expect(error).toBeInstanceOf(Error);
+      expect(error).not.toBeInstanceOf(NoModelsDiscoveredError);
+      await chmod(config, 0o600);
+    },
+  );
 
   it('throws ModelNotFoundError rather than silently falling back', async () => {
     const modelsDir = await makeModelsDir(['alpha']);
