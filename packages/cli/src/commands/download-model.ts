@@ -703,9 +703,7 @@ async function fetchAssetSidecars(opts: {
   }
   const revision = resolved ?? undefined;
   const { allFiles } = await getModelFiles(opts.assetsRepo, opts.accessToken, undefined, revision);
-  const candidates = pickAssetSidecars(allFiles).filter(
-    (file) => !opts.primaryPaths.has(file.path),
-  );
+  const candidates = pickAssetSidecars(allFiles).filter((file) => !opts.primaryPaths.has(file.path));
   if (candidates.length === 0) {
     console.warn(`  No tokenizer/config sidecars found in ${opts.assetsRepo}\n`);
     return { ensured: [], repo: opts.assetsRepo, revision: revision ?? null };
@@ -1034,6 +1032,24 @@ export async function run(argv: string[]) {
   // genuinely marker-less/invalid legacy directories for finalization.
   const previousCompletion = sameRepoCompletion(completion, modelName);
 
+  // The marker was downgraded to `partial` above so a mid-sync CRASH cannot
+  // satisfy completion gates — but a deterministic refusal or a selection
+  // with no weights is not a crash: the install it found is still valid, and
+  // leaving `partial` would strand it as present-but-uncertified with no
+  // update affordance. A run that certifies nothing restores the found
+  // marker instead: installed at its previous revision, out of date, and
+  // repairable through the normal update path. Best-effort — a failed
+  // restore must not mask the error the caller is reporting (the dir then
+  // keeps the partial marker, same as an interrupted run).
+  const restoreCompletionMarker = async (): Promise<void> => {
+    if (previousCompletion === null) return;
+    try {
+      await writeCompletion(outputDir, previousCompletion);
+    } catch {
+      // Best-effort only — see above.
+    }
+  };
+
   await ensureDir(outputDir);
 
   // Reuse the manifest fetched during the GGUF completeness check if we
@@ -1064,6 +1080,9 @@ export async function run(argv: string[]) {
         console.log(`\nTry: mlx download model -m ${modelName} -g "<pattern>"`);
       }
     }
+    // Nothing was downloaded, so the install this run found is still valid —
+    // don't leave its marker downgraded (see restoreCompletionMarker).
+    await restoreCompletionMarker();
     process.exit(1);
   }
 
@@ -1175,8 +1194,7 @@ export async function run(argv: string[]) {
     // quant the user once downloaded here) survive as "proven on remote" while
     // the marker claims the new revision — an unverified file riding along that
     // discovery can then expose as a loadable model.
-    const scopedPaths =
-      args.complete === true ? [...filesToDownload.map((f) => f.path), ...sidecarPaths] : remotePaths;
+    const scopedPaths = args.complete === true ? [...filesToDownload.map((f) => f.path), ...sidecarPaths] : remotePaths;
     const pruneList =
       previousCompletion !== null
         ? computePruneList(previousCompletion.files, scopedPaths, outputDir, !fullSemantics, exemptFromPrune)
@@ -1186,10 +1204,7 @@ export async function run(argv: string[]) {
     const certified = buildMarkerFiles(
       previousCompletion,
       scopedPaths,
-      [
-        ...filesToDownload.map((f) => f.path),
-        ...sidecarPaths.filter((path) => existsSync(join(outputDir, path))),
-      ],
+      [...filesToDownload.map((f) => f.path), ...sidecarPaths.filter((path) => existsSync(join(outputDir, path)))],
       outputDir,
       !fullSemantics,
       exemptFromPrune,
@@ -1221,6 +1236,11 @@ export async function run(argv: string[]) {
       // that case — fail with everything unchanged.
       const remaining = certified.filter((file) => !pruneList.includes(file));
       if (!remaining.includes('config.json') || !remaining.some(loadableWeight)) {
+        // "Unchanged" is only honest if the marker goes back too: this run
+        // already downgraded it to `partial` before downloading, so refusing
+        // here would strand the install as present-but-uncertified with no
+        // update affordance (see restoreCompletionMarker).
+        await restoreCompletionMarker();
         throw new Error(
           `Refusing to sync "${modelName}": removing ${pruneList.join(', ')} would leave no loadable checkpoint ` +
             `(missing ${remaining.includes('config.json') ? 'model weights' : 'config.json'}). ` +
@@ -1277,7 +1297,10 @@ export async function run(argv: string[]) {
     // Skip model verification — and leave no completion marker: a marker is
     // what makes a directory an INSTALL, and a selection with no model weights
     // is not one. Certifying it would let the dashboard present a directory
-    // nothing can load.
+    // nothing can load. For an EXISTING install the found marker is restored
+    // instead: this run certified nothing, so the directory keeps its last
+    // valid certification rather than a downgrade that reads as uninstalled.
+    await restoreCompletionMarker();
     console.warn('  No model weights in the selection — nothing was certified as installed.');
     console.log(`\nDownload complete! ${filesToDownload.length} non-weight file(s) saved to ${outputDir}\n`);
   } else {

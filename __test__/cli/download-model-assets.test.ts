@@ -85,18 +85,7 @@ describe('download model --assets-repo', () => {
     // otherwise return before any fetch.
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
 
-    await run([
-      '-m',
-      PRIMARY,
-      '-o',
-      outputDir,
-      '-g',
-      '*UD-Q4_K_XL*',
-      '--assets-repo',
-      ASSETS,
-      '--cache-dir',
-      cacheDir,
-    ]);
+    await run(['-m', PRIMARY, '-o', outputDir, '-g', '*UD-Q4_K_XL*', '--assets-repo', ASSETS, '--cache-dir', cacheDir]);
 
     expect(hub.listedRepos).toContain(ASSETS);
     expect([...hub.downloaded].sort()).toEqual(['config.json', 'tokenizer.json']);
@@ -354,18 +343,16 @@ describe('download model --assets-repo', () => {
     hub.shas[PRIMARY] = 'c'.repeat(40);
     hub.shas[ASSETS] = 'b'.repeat(40);
     hub.manifests[ASSETS] = [{ type: 'file', path: 'tokenizer.json', size: 20 }]; // config.json gone upstream
-    writeFileSync(
-      join(outputDir, '.mlx-download-complete.json'),
-      JSON.stringify({
-        repo: PRIMARY,
-        revision: 'a'.repeat(40),
-        files: [GGUF, 'config.json', 'tokenizer.json'],
-        scope: 'full',
-        assetsRepo: ASSETS,
-        assetsRevision: 'b'.repeat(40),
-        completedAt: new Date().toISOString(),
-      }),
-    );
+    const seeded = {
+      repo: PRIMARY,
+      revision: 'a'.repeat(40),
+      files: [GGUF, 'config.json', 'tokenizer.json'],
+      scope: 'full',
+      assetsRepo: ASSETS,
+      assetsRevision: 'b'.repeat(40),
+      completedAt: new Date().toISOString(),
+    };
+    writeFileSync(join(outputDir, '.mlx-download-complete.json'), JSON.stringify(seeded));
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
     writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
     writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
@@ -393,6 +380,10 @@ describe('download model --assets-repo', () => {
       files: string[];
     };
     expect(marker.files).toContain('config.json');
+    // The run downgrades the marker to `partial` BEFORE downloading, so the
+    // refusal must restore what it found: a `partial` scope would flip
+    // isModelInstalled false and strand the install with no update path.
+    expect(marker).toEqual(seeded);
   });
 
   it('prunes an unselected variant during a complete sync (prescription, not the whole tree)', async () => {
