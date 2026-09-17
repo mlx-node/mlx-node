@@ -363,6 +363,30 @@ describe('TurnEmitter', () => {
     expect(finalMessage(events).stopReason).toBe('stop');
   });
 
+  it('drops parked leading whitespace that the trimmed final text no longer carries', async () => {
+    const { emitter, stream } = makeEmitter();
+    // Whitespace-only chunks park in pendingLeadingWhitespace instead of
+    // reaching the wire; the sentinel then suppresses everything else.
+    emitter.onDelta(delta('\n\n'));
+    emitter.onDelta(delta('<|tool_call_start|>[f()]<|tool_call_end|>after'));
+    // The authoritative final text is outer-trimmed — the \n\n prefix is
+    // gone, so the recovered tail must not re-prepend the parked bytes.
+    emitter.onFinal(
+      makeFinal({
+        text: 'after',
+        finishReason: 'tool_calls',
+        toolCalls: [okCall('call_1', 'f', {})],
+      }),
+    );
+
+    const events = await collect(stream);
+    expect(emittedText(events)).toBe('after');
+    expect(finalMessage(events).content).toEqual([
+      { type: 'text', text: 'after' },
+      { type: 'toolCall', id: 'call_1', name: 'f', arguments: {} },
+    ]);
+  });
+
   it('emits one toolcall trio per parsed call and stops with toolUse', async () => {
     const { emitter, stream } = makeEmitter();
     emitter.onFinal(

@@ -823,7 +823,7 @@ impl<'a> PyLiteralParser<'a> {
                                 while self
                                     .s
                                     .get(self.pos)
-                                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                                    .is_some_and(|c| (*c as char).is_digit(radix) || *c == b'_')
                                 {
                                     self.pos += 1;
                                 }
@@ -1330,7 +1330,12 @@ impl<'a> PyLiteralParser<'a> {
             } else {
                 text
             };
-            normalized.parse::<f64>().map(Value::from).map_err(|_| ())
+            match normalized.parse::<f64>() {
+                // Overflow parses to ±inf and Value::from(inf) serializes
+                // as null — no exact JSON form → verbatim, like huge ints.
+                Ok(f) if f.is_finite() => Ok(Value::from(f)),
+                _ => Err(()),
+            }
         } else {
             text.parse::<i128>().ok().and_then(i128_to_value).ok_or(())
         }
@@ -1361,7 +1366,13 @@ impl<'a> PyLiteralParser<'a> {
                     Value::Number(n) => {
                         if neg {
                             if let Some(i) = n.as_i64() {
-                                Ok(Value::from(-i))
+                                // `-i64::MIN` overflows i64 (double negation
+                                // like `--9223372036854775808`) — the positive
+                                // fits u64 exactly.
+                                Ok(match i.checked_neg() {
+                                    Some(v) => Value::from(v),
+                                    None => Value::from(i.unsigned_abs()),
+                                })
                             } else if let Some(u) = n.as_u64() {
                                 // Negating a u64: exact i64::MIN edge or a
                                 // value that fits in i64 — anything larger
@@ -4237,6 +4248,10 @@ The weather in Tokyo is sunny."#;
             "f(.5e)",     // same hole on the `.`-led float path
             "f(5.e)",     // `5.` then `e` — juxtaposed name, SyntaxError
             "f(.5.5)",    // second `.` in a `.`-led float
+            "f(0xg)",     // no hex digits at all
+            "f(0x1g)",    // non-hex letter glued to the digit run
+            "f(0b12)",    // digit outside the selected radix
+            "f(0o18)",
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4281,6 +4296,9 @@ The weather in Tokyo is sunny."#;
             ("f(5.e3, x=1)", "{\"x\":1}"),
             ("f(1_0e1_0, x=1)", "{\"x\":1}"),
             ("f(.5_0e1, x=1)", "{\"x\":1}"),
+            ("f(0x1e5, x=1)", "{\"x\":1}"), // `e` is a hex digit here
+            ("f(0o17, x=1)", "{\"x\":1}"),
+            ("f(0b101, x=1)", "{\"x\":1}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
@@ -4405,7 +4423,8 @@ The weather in Tokyo is sunny."#;
             assert!(calls.is_empty(), "{inner} must not promote a call");
         }
 
-        // The exact-boundary values still parse.
+        // The exact-boundary values still parse — including the double
+        // negation that routes -i64::MIN through the u64 edge.
         for (inner, want_args) in [
             (
                 "f(id=18446744073709551615)",
@@ -4416,6 +4435,41 @@ The weather in Tokyo is sunny."#;
                 "{\"id\":-9223372036854775808}",
             ), // i64::MIN
             ("f(id=0xffffffffffffffff)", "{\"id\":18446744073709551615}"),
+            (
+                "f(id=--9223372036854775808)",
+                "{\"id\":9223372036854775808}",
+            ), // -(i64::MIN) = 2^63
+            ("f(id=--5)", "{\"id\":5}"),
+            ("f(id=+-5)", "{\"id\":-5}"),
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(calls.len(), 1, "{inner} must produce one call");
+            assert_eq!(calls[0].arguments.to_string(), want_args, "{inner}");
+            assert_eq!(text, "", "{inner}");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_nonfinite_float_rejected() {
+        // Overflowing float literals parse to ±inf and serde_json turns
+        // Value::from(inf) into Null — an ok call with `count: null`
+        // corrupts the argument. Verbatim, like the huge-int path.
+        for inner in [
+            "f(count=1e999)",  // +inf
+            "f(count=-1e999)", // -inf
+            "f(count=1e309)",  // past f64::MAX (~1.8e308)
+            "f(count=.5e999)",
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+        // Underflow to 0.0 and ordinary finite values still parse.
+        for (inner, want_args) in [
+            ("f(count=1e-999)", "{\"count\":0.0}"),
+            ("f(count=1e308)", "{\"count\":1e+308}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
