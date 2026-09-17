@@ -395,22 +395,44 @@ fn parse_config(model_path: &Path) -> Result<Gemma4Config> {
     Ok(parse_config_with_load_metadata(model_path)?.config)
 }
 
-/// Whether this checkpoint needs the converted GGUF media sidecar.
+/// Whether the config's declared media makes the converted GGUF companion a
+/// load-time REQUIREMENT. Only the unified encoder-free stacks do: their
+/// weights live exclusively in `vision.safetensors`, so an absent companion
+/// is a preflight error rather than a text-only degrade.
+fn requires_unified_media(config: &Gemma4Config) -> bool {
+    config.is_unified && (config.unified_vision_config.is_some() || config.has_audio)
+}
+
+/// Whether this checkpoint may read the converted GGUF media sidecar.
 ///
 /// `vision.safetensors` contains the unified model's encoder-free vision and
-/// audio projection tensors. Gate loading on the parsed media capabilities,
-/// not merely `model_type`, so a text-only unified config and every plain
-/// Gemma checkpoint retain the existing main-checkpoint-only behavior.
+/// audio projection tensors, or — for a plain `vision_config` paired with a
+/// `gemma4v` mmproj — the SigLIP tower. Gate loading on the parsed media
+/// capabilities, not merely `model_type`, so a text-only unified config and
+/// every plain Gemma checkpoint retain the existing main-checkpoint-only
+/// behavior; the append is a no-op when no sidecar was produced.
 fn should_load_media_sidecar(config: &Gemma4Config) -> bool {
-    config.is_unified && (config.unified_vision_config.is_some() || config.has_audio)
+    requires_unified_media(config) || config.vision_config.is_some()
 }
 
 /// Use the runtime's parsed capabilities for GGUF companion preflight too.
 /// Plain Gemma's legacy audio settings and SigLIP config do not require the
 /// unified media sidecar; either unified family marker enables its media gate.
+/// The gemma4v tower is deliberately NOT a requirement here — see
+/// `native_gguf_declares_vision_tower`.
 pub(crate) fn native_gguf_requires_media(model_path: &Path) -> Result<bool> {
     let parsed = parse_config_with_load_metadata(model_path)?;
-    Ok(should_load_media_sidecar(&parsed.config))
+    Ok(requires_unified_media(&parsed.config))
+}
+
+/// Whether the config declares the standard SigLIP vision tower — the shape a
+/// `gemma4v` mmproj fills. Unlike `native_gguf_requires_media` this pairs
+/// opportunistically in the native prepare: the companion converts when
+/// present and the checkpoint degrades to text-only when absent, matching the
+/// presence-gated contract on `validate_required_weights`.
+pub(crate) fn native_gguf_declares_vision_tower(model_path: &Path) -> Result<bool> {
+    let parsed = parse_config_with_load_metadata(model_path)?;
+    Ok(parsed.config.vision_config.is_some())
 }
 
 /// Parse `layer_types` array from config.
@@ -736,9 +758,11 @@ fn validate_required_weights(
     // Required only when the checkpoint actually ships a vision stack. A config
     // that DECLARES the SigLIP tower over a text-only file is the normal shape
     // of the Unsloth UD GGUF repos — their `config.json` keeps `vision_config`
-    // (and `image_token_id`) while the GGUF carries text tensors only, and no
-    // mlx-node-supported mmproj exists to fill the tower in. The dense Qwen3.5
-    // loader resolves the same situation by tensor presence: `has_vision` is
+    // (and `image_token_id`) while the GGUF carries text tensors only, and the
+    // `gemma4v` mmproj that could fill the tower pairs opportunistically: it
+    // converts when present beside the text GGUF and the load degrades to
+    // text-only when it is absent. The dense Qwen3.5 loader resolves the same
+    // situation by tensor presence: `has_vision` is
     // `raw_params.keys().any(strip_qwen35_vision_weight_prefix)` in
     // `qwen3_5/persistence.rs:2076`, and a checkpoint without vision tensors
     // simply loads text-only. Demanding the tower here would reject a load the
@@ -2590,8 +2614,11 @@ impl Gemma4Inner {
         }
 
         // Converted unified checkpoints keep the encoder-free vision/audio
-        // tensors from GGUF mmproj in `vision.safetensors`. Plain Gemma and
-        // text-only unified configs continue loading only the main checkpoint.
+        // tensors from GGUF mmproj in `vision.safetensors`; a plain
+        // `vision_config` reads the gemma4v tower from the same file when the
+        // native prepare produced it. Text-only unified configs and plain
+        // Gemma checkpoints without a `vision_config` continue loading only
+        // the main checkpoint.
         // Cold-tier persistence intent, resolved BEFORE the mmap so the
         // shard-identity bracket can open on the pre-mmap snapshot.
         // Precedence: explicit config > `MLX_PERSIST_PAGED_CACHE` > off.
@@ -3293,6 +3320,46 @@ mod tests {
         assert!(
             !should_load_media_sidecar(&cfg),
             "plain gemma4 must not request vision.safetensors"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A plain `gemma4` config carrying the SigLIP `vision_config` (the
+    /// `unsloth/gemma-4-26B-A4B-it-GGUF` shape) is the one case where
+    /// `should_load_media_sidecar` and `native_gguf_requires_media` diverge:
+    /// the checkpoint reads `vision.safetensors` when the prepare stage
+    /// produced one, but the companion stays opportunistic — never a
+    /// preflight requirement.
+    #[test]
+    fn plain_siglip_vision_config_loads_but_does_not_require_sidecar() {
+        let siglip = serde_json::json!({
+            "model_type": "gemma4",
+            "text_config": { "hidden_size": 3840 },
+            "vision_config": {
+                "hidden_size": 1152,
+                "num_hidden_layers": 27,
+                "num_attention_heads": 16,
+                "head_dim": 72,
+                "patch_size": 16,
+                "position_embedding_size": 10240,
+            },
+        });
+        let (cfg, dir) = parse_config_from_json(siglip);
+        assert!(
+            cfg.vision_config.is_some(),
+            "plain gemma4 must populate the SigLIP vision_config"
+        );
+        assert!(
+            should_load_media_sidecar(&cfg),
+            "SigLIP vision_config must request vision.safetensors when present"
+        );
+        assert!(
+            !native_gguf_requires_media(&dir).expect("requires_media"),
+            "the gemma4v companion is optional — never a preflight requirement"
+        );
+        assert!(
+            native_gguf_declares_vision_tower(&dir).expect("declares_vision_tower"),
+            "the same config must report the opportunistic pairing probe"
         );
         let _ = fs::remove_dir_all(&dir);
     }
@@ -6013,12 +6080,12 @@ mod tests {
     }
 
     /// A SigLIP-declaring config over a text-only checkpoint is the Unsloth UD
-    /// GGUF shape (their `config.json` keeps `vision_config`; the GGUF carries
-    /// text tensors only, and no mlx-node-supported mmproj exists to fill the
-    /// tower). It loads text-only, exactly like a dense Qwen3.5 checkpoint
-    /// without vision tensors — but a checkpoint that *does* ship vision
-    /// tensors still has to ship the whole tower, and the text weights stay
-    /// fail-closed either way.
+    /// GGUF shape (their `config.json` keeps `vision_config` while the GGUF
+    /// carries text tensors only, and the `gemma4v` mmproj that could fill the
+    /// tower is absent). It loads text-only, exactly like a dense Qwen3.5
+    /// checkpoint without vision tensors — but a checkpoint that *does* ship
+    /// vision tensors still has to ship the whole tower, and the text weights
+    /// stay fail-closed either way.
     #[test]
     fn siglip_vision_config_without_vision_tensors_validates_text_only() {
         // Minimal SigLIP vision config, matching `Gemma4VisionConfig::from_json`.

@@ -1298,6 +1298,22 @@ fn is_gemma4_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
                 == Some("gemma4ua"))
 }
 
+/// The plain-Gemma4 SigLIP tower projector llama.cpp ships beside the dense
+/// GGUFs (`mmproj-BF16.gguf` in the Unsloth UD repos). Kept a separate
+/// predicate from the unified `gemma4uv`/`gemma4ua` media file: the tower
+/// encodes patches itself and maps onto `vision_tower.*`, a namespace the
+/// unified embedder names never touch.
+fn is_gemma4v_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
+    metadata
+        .get("general.architecture")
+        .and_then(GgufMetaValue::as_str)
+        == Some("clip")
+        && metadata
+            .get("clip.vision.projector_type")
+            .and_then(GgufMetaValue::as_str)
+            == Some("gemma4v")
+}
+
 fn is_muse_glimmer_main_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
     metadata
         .get("general.architecture")
@@ -1465,6 +1481,59 @@ fn gemma4_mmproj_name_to_hf(name: &str) -> Option<String> {
     Some(mapped.to_string())
 }
 
+/// Map the `gemma4v` SigLIP tower mmproj (`mmproj-BF16.gguf` beside the dense
+/// Unsloth GGUFs) onto the `vision_tower.*` checkpoint namespace that
+/// `apply_vision_weights` consumes.
+///
+/// Unlike the unified mmproj mapper this returns `None` for anything outside
+/// the tower's fixed inventory rather than falling through to
+/// `gguf_name_to_hf`: that fallback spells vision keys in the Qwen-VL merger
+/// namespace (`vision_tower.blocks.*`, `vision_tower.patch_embed.proj.*`), so
+/// an unrecognized tensor would land under names no Gemma4 consumer reads —
+/// dropped is honest, mislabeled is not.
+fn gemma4v_mmproj_name_to_hf(name: &str) -> Option<String> {
+    // Whole-string match, so a quantized projection keeps its `.scales`/
+    // `.biases` sidecars attached through the rename (the same contract the
+    // unified mapper's `mm.input_projection` arm follows).
+    if let Some(renamed) = rename_global_quant_group(
+        name,
+        "mm.input_projection",
+        "model.embed_vision.embedding_projection",
+    ) {
+        return Some(renamed);
+    }
+    if let Some(rest) = name.strip_prefix("v.blk.") {
+        let (index, suffix) = rest.split_once('.')?;
+        let mapped = match suffix {
+            "attn_q.weight" => "self_attn.q_proj.weight",
+            "attn_k.weight" => "self_attn.k_proj.weight",
+            "attn_v.weight" => "self_attn.v_proj.weight",
+            "attn_out.weight" => "self_attn.o_proj.weight",
+            "attn_q_norm.weight" => "self_attn.q_norm.weight",
+            "attn_k_norm.weight" => "self_attn.k_norm.weight",
+            "ln1.weight" => "input_layernorm.weight",
+            "attn_post_norm.weight" => "post_attention_layernorm.weight",
+            "ln2.weight" => "pre_feedforward_layernorm.weight",
+            "ffn_post_norm.weight" => "post_feedforward_layernorm.weight",
+            "ffn_gate.weight" => "mlp.gate_proj.weight",
+            "ffn_up.weight" => "mlp.up_proj.weight",
+            "ffn_down.weight" => "mlp.down_proj.weight",
+            _ => return None,
+        };
+        return Some(format!(
+            "model.vision_tower.encoder.layers.{index}.{mapped}"
+        ));
+    }
+    let mapped = match name {
+        "v.patch_embd.weight" => "model.vision_tower.patch_embedder.input_proj.weight",
+        "v.position_embd.weight" => "model.vision_tower.patch_embedder.position_embedding_table",
+        "v.std_bias" => "model.vision_tower.std_bias",
+        "v.std_scale" => "model.vision_tower.std_scale",
+        _ => return None,
+    };
+    Some(mapped.to_string())
+}
+
 /// Map the official Meta Muse-Glimmer text GGUF onto the canonical
 /// `MuseGlimmerForConditionalGeneration` SafeTensors namespace.
 ///
@@ -1590,6 +1659,8 @@ fn gguf_name_to_hf_for_metadata(
         gemma4_name_to_hf(name)
     } else if is_gemma4_mmproj_gguf(metadata) {
         gemma4_mmproj_name_to_hf(name)
+    } else if is_gemma4v_mmproj_gguf(metadata) {
+        gemma4v_mmproj_name_to_hf(name)
     } else if is_muse_glimmer_main_gguf(metadata) {
         muse_glimmer_name_to_hf(name)
     } else if is_muse_glimmer_mmproj_gguf(metadata) {
@@ -2099,6 +2170,54 @@ fn fixup_gemma4_mmproj_layout(
             position_key.to_string(),
             position.transpose(Some(&[1, 0, 2]))?,
         );
+    }
+
+    Ok(())
+}
+
+/// GGUF stores the `gemma4v` tower's patch projection as the conv kernel
+/// `[patch_w, patch_h, channels, hidden]` in ggml dim order, which
+/// `parse_gguf` already reverses into row-major `[hidden, channels, patch_h,
+/// patch_w]` (see `GgufTensorInfo::mlx_shape`). The checkpoint's `input_proj`
+/// is a `Linear` over HWC-flattened patches — `[hidden, patch*patch*channels]`
+/// with the channel index varying fastest — so the fixup is the same
+/// (0,2,3,1)-transpose-then-flatten the unified CHW→HWC path applies.
+///
+/// The position table is stored `[hidden, positions, 2]` in ggml order, which
+/// reverses to `[2, positions, hidden]` — already the checkpoint's
+/// `position_embedding_table` layout, so it only needs a shape check. Every
+/// other `gemma4v` tensor is a 1-D/2-D passthrough.
+fn fixup_gemma4v_mmproj_layout(
+    weights: &mut HashMap<String, MxArray>,
+    metadata: &HashMap<String, GgufMetaValue>,
+) -> Result<()> {
+    if !is_gemma4v_mmproj_gguf(metadata) {
+        return Ok(());
+    }
+
+    let patch_key = "model.vision_tower.patch_embedder.input_proj.weight";
+    if let Some(weight) = weights.remove(patch_key) {
+        let shape = weight.shape()?.to_vec();
+        if shape.len() != 4 {
+            return Err(Error::from_reason(format!(
+                "Gemma4v mmproj tensor '{patch_key}' must be 4-D [hidden, channels, patch_h, patch_w], got {shape:?}"
+            )));
+        }
+        let (out, channels, patch_h, patch_w) = (shape[0], shape[1], shape[2], shape[3]);
+        let transformed = weight
+            .transpose(Some(&[0, 2, 3, 1]))?
+            .reshape(&[out, patch_h * patch_w * channels])?;
+        weights.insert(patch_key.to_string(), transformed);
+    }
+
+    let position_key = "model.vision_tower.patch_embedder.position_embedding_table";
+    if let Some(position) = weights.get(position_key) {
+        let shape = position.shape()?.to_vec();
+        if shape.len() != 3 || shape[0] != 2 {
+            return Err(Error::from_reason(format!(
+                "Gemma4v mmproj tensor '{position_key}' must have shape [2, positions, hidden], got {shape:?}"
+            )));
+        }
     }
 
     Ok(())
@@ -4190,8 +4309,10 @@ pub async fn convert_gguf_to_safetensors(
     weights = remap_keys(weights, &gguf.metadata)?;
 
     // Unified Gemma4 mmproj tensors need name-aware CHW→HWC and position-table
-    // permutations after remapping, before the generic shape fixups run.
+    // permutations after remapping, before the generic shape fixups run. The
+    // gemma4v SigLIP tower needs its own conv-kernel→Linear reshape.
     fixup_gemma4_mmproj_layout(&mut weights, &gguf.metadata)?;
+    fixup_gemma4v_mmproj_layout(&mut weights, &gguf.metadata)?;
 
     // Fix shapes that differ between GGUF and HF format
     fixup_shapes(&mut weights)?;
@@ -5019,20 +5140,79 @@ fn resolve_native_gguf_source(
     }
 }
 
-fn gemma4_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
+/// Which Gemma4 media projector a config pairs with, chosen by the parsed
+/// config — not by whatever `mmproj-*.gguf` happens to sit beside the text
+/// file. The unified checkpoint consumes the encoder-free `gemma4uv`/`gemma4ua`
+/// media tensors; a plain `vision_config` consumes the `gemma4v` SigLIP tower.
+/// Filtering on the projector type keeps a gemma4v file beside a unified
+/// config (and a gemma4uv file beside a plain one) invisible to the pairing,
+/// so it is ignored rather than paired into a namespace the loader drops.
+#[derive(Clone, Copy)]
+enum Gemma4MmprojKind {
+    /// Unified encoder-free media projector (`gemma4uv` / `gemma4ua`).
+    UnifiedMedia,
+    /// Standard SigLIP vision tower (`gemma4v`).
+    SigLipVision,
+}
+
+impl Gemma4MmprojKind {
+    fn matches(self, metadata: &HashMap<String, GgufMetaValue>) -> bool {
+        match self {
+            Self::UnifiedMedia => is_gemma4_mmproj_gguf(metadata),
+            Self::SigLipVision => is_gemma4v_mmproj_gguf(metadata),
+        }
+    }
+}
+
+/// Deterministic dtype preference among same-kind projector candidates, read
+/// off the filename: `BF16` > `F16` > `F32` > anything else (case-insensitive
+/// substring). Multi-dtype repos — the real `unsloth/gemma-4-26B-A4B-it-GGUF`
+/// ships all three gemma4v towers — must resolve to a single companion rather
+/// than hard-error on ambiguity, and BF16 wins because it is what the model
+/// computes in and what upstream labels primary. ("bf16" itself contains
+/// "f16", so the order of these checks IS the order of the preference.)
+fn mmproj_dtype_tier(path: &Path) -> u8 {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if name.contains("bf16") {
+        0
+    } else if name.contains("f16") {
+        1
+    } else if name.contains("f32") {
+        2
+    } else {
+        3
+    }
+}
+
+fn gemma4_native_mmproj(input: &Path, kind: Gemma4MmprojKind) -> Result<Option<PathBuf>> {
     let parent = input.parent().unwrap_or(Path::new("."));
     let exact = parent.join(format!(
         "mmproj-{}",
         input.file_name().unwrap().to_string_lossy()
     ));
     if exact.is_file() {
-        if !is_gemma4_mmproj_gguf(&parse_gguf(&exact)?.metadata) {
+        let metadata = parse_gguf(&exact)?.metadata;
+        if kind.matches(&metadata) {
+            return Ok(Some(exact));
+        }
+        // A file that is not a Gemma4 projector at all earns the loud pairing
+        // error. A parseable Gemma4 projector of the OTHER kind is simply not
+        // this config's companion — it must not shadow the directory scan, so
+        // fall through and let a right-kind `mmproj-*.gguf` elsewhere pair.
+        if !is_gemma4_mmproj_gguf(&metadata) && !is_gemma4v_mmproj_gguf(&metadata) {
             return Err(Error::from_reason(format!(
                 "Matching media companion '{}' is not a Gemma4 projector",
                 exact.display()
             )));
         }
-        return Ok(Some(exact));
+        info!(
+            "Gemma4 media companion '{}' is a projector type this config cannot consume; scanning for a matching one",
+            exact.display()
+        );
     }
     let mut candidates = Vec::new();
     for entry in fs::read_dir(parent)? {
@@ -5042,7 +5222,7 @@ fn gemma4_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
             && name.starts_with("mmproj-")
             && name.to_ascii_lowercase().ends_with(".gguf")
         {
-            if !is_gemma4_mmproj_gguf(&parse_gguf(&path)?.metadata) {
+            if !kind.matches(&parse_gguf(&path)?.metadata) {
                 continue;
             }
             candidates.push(path);
@@ -5051,17 +5231,53 @@ fn gemma4_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
     match candidates.len() {
         0 => Ok(None),
         1 => Ok(candidates.pop()),
-        _ => Err(Error::from_reason(format!(
-            "Ambiguous Gemma4 media projectors beside '{}'; name the matching companion '{}'",
-            input.display(),
-            exact.display()
-        ))),
+        _ => {
+            // Multi-dtype repos are the normal case, not an ambiguity: prefer
+            // the best dtype class the filenames advertise, and only keep the
+            // ambiguity error when the preference still leaves a tie.
+            let best = candidates
+                .iter()
+                .map(|path| mmproj_dtype_tier(path))
+                .min()
+                .unwrap();
+            let mut preferred: Vec<PathBuf> = candidates
+                .iter()
+                .filter(|path| mmproj_dtype_tier(path) == best)
+                .cloned()
+                .collect();
+            if preferred.len() > 1 {
+                return Err(Error::from_reason(format!(
+                    "Ambiguous Gemma4 media projectors beside '{}'; name the matching companion '{}'",
+                    input.display(),
+                    exact.display()
+                )));
+            }
+            let chosen = preferred.pop().unwrap();
+            let skipped: Vec<String> = candidates
+                .iter()
+                .filter(|path| *path != &chosen)
+                .map(|path| {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            info!(
+                "Multiple Gemma4 media projectors beside '{}'; chose '{}' over {}",
+                input.display(),
+                chosen.display(),
+                skipped.join(", ")
+            );
+            Ok(Some(chosen))
+        }
     }
 }
 
 /// Prepare a complete, losslessly packed Gemma checkpoint in the application
-/// cache. The source directory remains read-only; the matching unified media
-/// projector is converted in the same transaction as the text model.
+/// cache. The source directory remains read-only; the matching media
+/// projector — required for unified media configs, opportunistic for a plain
+/// `vision_config` — is converted in the same transaction as the text model.
 pub(crate) async fn prepare_gemma4_native_gguf(input: &Path) -> Result<PathBuf> {
     let root = native_gguf_cache_root()?;
     prepare_gemma4_native_gguf_in(input, &root).await
@@ -5086,16 +5302,24 @@ async fn prepare_gemma4_native_gguf_in(input: &Path, root: &Path) -> Result<Path
     }
     let needs_media = crate::models::gemma4::persistence::native_gguf_requires_media(parent)?;
     let companion = if needs_media {
-        gemma4_native_mmproj(&input)?
+        let found = gemma4_native_mmproj(&input, Gemma4MmprojKind::UnifiedMedia)?;
+        if found.is_none() {
+            return Err(Error::from_reason(format!(
+                "Gemma4 config declares media inputs but no matching mmproj GGUF was found beside '{}'",
+                input.display()
+            )));
+        }
+        found
+    } else if crate::models::gemma4::persistence::native_gguf_declares_vision_tower(parent)? {
+        // A plain SigLIP `vision_config` pairs opportunistically: convert the
+        // gemma4v tower when it sits beside the text GGUF, degrade to
+        // text-only when it does not — the validator only demands the tower
+        // once vision tensors are present, so absent means text-only, never
+        // an error.
+        gemma4_native_mmproj(&input, Gemma4MmprojKind::SigLipVision)?
     } else {
         None
     };
-    if needs_media && companion.is_none() {
-        return Err(Error::from_reason(format!(
-            "Gemma4 config declares media inputs but no matching mmproj GGUF was found beside '{}'",
-            input.display()
-        )));
-    }
     let root = initialize_native_gguf_cache_root(root)?;
     prepare_native_gguf_inner(
         &input,
@@ -5943,6 +6167,58 @@ mod tests {
         input
     }
 
+    /// A minimal `gemma4v` SigLIP tower mmproj written to `path`: the two
+    /// layout-relevant tensors (4-D conv patch kernel, 3-D position table),
+    /// one encoder block weight, the standardize pair, and the multimodal
+    /// projection. Conversion does not demand the full 356-tensor inventory,
+    /// so this exercises every code path the real `mmproj-BF16.gguf` drives.
+    fn gemma4v_mmproj_fixture(path: &Path) {
+        fs::write(
+            path,
+            build_minimal_gguf(
+                &[
+                    ("general.architecture", GgufMetaValue::String("clip".into())),
+                    (
+                        "clip.vision.projector_type",
+                        GgufMetaValue::String("gemma4v".into()),
+                    ),
+                ],
+                &[
+                    // ggml dims: [patch_w, patch_h, channels, hidden] → MLX
+                    // [1, 3, 2, 2] → input_proj [1, 12] after the fixup.
+                    (
+                        "v.patch_embd.weight",
+                        &[2, 2, 3, 1],
+                        GgufTensorType::F32,
+                        &[0; 48],
+                    ),
+                    // ggml dims: [hidden, positions, 2] → MLX [2, 2, 1].
+                    (
+                        "v.position_embd.weight",
+                        &[1, 2, 2],
+                        GgufTensorType::F32,
+                        &[0; 16],
+                    ),
+                    (
+                        "v.blk.0.attn_q.weight",
+                        &[2, 2],
+                        GgufTensorType::BF16,
+                        &[0; 8],
+                    ),
+                    ("v.std_bias", &[1], GgufTensorType::F32, &[0; 4]),
+                    ("v.std_scale", &[1], GgufTensorType::F32, &[0; 4]),
+                    (
+                        "mm.input_projection.weight",
+                        &[2, 2],
+                        GgufTensorType::BF16,
+                        &[0; 8],
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn gemma_native_directory_resolution_is_unambiguous_and_preserves_safetensors() {
         let root = GemmaNativeTestDir::new();
@@ -5974,10 +6250,13 @@ mod tests {
         let root = GemmaNativeTestDir::new();
         let input = gemma_native_fixture(root.path());
         let first = root.path().join("mmproj-gemma.gguf");
-        assert_eq!(gemma4_native_mmproj(&input).unwrap(), Some(first.clone()));
+        assert_eq!(
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::UnifiedMedia).unwrap(),
+            Some(first.clone())
+        );
         fs::copy(&first, root.path().join("mmproj-other.gguf")).unwrap();
         assert!(
-            gemma4_native_mmproj(&input)
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::UnifiedMedia)
                 .unwrap_err()
                 .reason
                 .contains("Ambiguous")
@@ -5987,7 +6266,10 @@ mod tests {
             input.file_name().unwrap().to_string_lossy()
         ));
         fs::copy(first, &exact).unwrap();
-        assert_eq!(gemma4_native_mmproj(&input).unwrap(), Some(exact));
+        assert_eq!(
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::UnifiedMedia).unwrap(),
+            Some(exact)
+        );
     }
 
     #[tokio::test]
@@ -6137,34 +6419,107 @@ mod tests {
         }
     }
 
+    /// The `unsloth/gemma-4-26B-A4B-it` config.json shape: a plain `gemma4`
+    /// model_type with the SigLIP `vision_config` the gemma4v mmproj fills.
+    fn gemma4_siglip_vision_config() -> serde_json::Value {
+        serde_json::json!({
+            "model_type": "gemma4",
+            "image_token_id": 258880,
+            "text_config": {"num_hidden_layers": 0},
+            "vision_config": {
+                "model_type": "gemma4_vision",
+                "hidden_size": 1152,
+                "num_hidden_layers": 27,
+                "num_attention_heads": 16,
+                "head_dim": 72,
+                "patch_size": 16,
+                "position_embedding_size": 10240,
+                "use_clipped_linears": false,
+                "standardize": true,
+            },
+        })
+    }
+
     #[tokio::test]
-    async fn gemma_native_prepares_a_vision_declaring_text_only_checkpoint() {
+    async fn gemma_native_converts_the_gemma4v_siglip_tower_when_present() {
         // `unsloth/gemma-4-26B-A4B-it-GGUF` shape: the sibling config.json keeps
         // a SigLIP `vision_config`, the text GGUF carries text tensors only, and
-        // the projector beside it declares `clip.vision.projector_type =
-        // "gemma4v"` — a tower mlx-node has no importer for. The text model must
-        // still convert, and must not claim media it cannot execute.
+        // `mmproj-BF16.gguf` declares `clip.vision.projector_type = "gemma4v"`.
+        // The tower converts into `vision.safetensors` and the cache records
+        // the companion identity. The fixture's gemma4uv file stays in place
+        // to prove a unified media projector beside a plain config is ignored.
         let root = GemmaNativeTestDir::new();
         let source = root.path().join("source");
         let input = gemma_native_fixture(&source);
         fs::write(
             source.join("config.json"),
-            serde_json::json!({
-                "model_type": "gemma4",
-                "image_token_id": 262144,
-                "text_config": {"num_hidden_layers": 0},
-                "vision_config": {
-                    "model_type": "gemma4_vision",
-                    "hidden_size": 1152,
-                    "num_hidden_layers": 27,
-                    "num_attention_heads": 16,
-                    "head_dim": 72,
-                    "patch_size": 16,
-                    "position_embedding_size": 10240,
-                    "use_clipped_linears": false,
-                },
-            })
-            .to_string(),
+            gemma4_siglip_vision_config().to_string(),
+        )
+        .unwrap();
+        gemma4v_mmproj_fixture(&source.join("mmproj-BF16.gguf"));
+
+        let cache = root.path().join("cache");
+        let output = prepare_gemma4_native_gguf_in(&input, &cache)
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "a gemma4v-paired Gemma4 checkpoint must convert: {}",
+                    error.reason
+                )
+            });
+        let media =
+            crate::utils::safetensors::load_safetensors_lazy(output.join("vision.safetensors"))
+                .unwrap();
+        for key in [
+            "model.vision_tower.patch_embedder.input_proj.weight",
+            "model.vision_tower.patch_embedder.position_embedding_table",
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.weight",
+            "model.vision_tower.std_bias",
+            "model.vision_tower.std_scale",
+            "model.embed_vision.embedding_projection.weight",
+        ] {
+            assert!(media.contains_key(key), "missing converted tower key {key}");
+        }
+        // The conv kernel lands flattened to the Linear's [hidden, C*p*p].
+        assert_eq!(
+            media["model.vision_tower.patch_embedder.input_proj.weight"]
+                .shape()
+                .unwrap()
+                .as_ref(),
+            &[1, 12]
+        );
+        assert_eq!(
+            media["model.vision_tower.patch_embedder.position_embedding_table"]
+                .shape()
+                .unwrap()
+                .as_ref(),
+            &[2, 2, 1]
+        );
+        let marker = fs::read_to_string(output.join(".complete")).unwrap();
+        assert!(
+            !marker.contains("companion_sha256=none\n"),
+            "the gemma4v companion must be recorded in the cache marker"
+        );
+        assert_eq!(
+            prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
+            output
+        );
+    }
+
+    #[tokio::test]
+    async fn gemma_native_prepares_a_vision_declaring_text_only_checkpoint() {
+        // Same `unsloth/gemma-4-26B-A4B-it-GGUF` shape — a SigLIP
+        // `vision_config` over text-only tensors — but the projector beside it
+        // declares a projector_type mlx-node has no importer for. The text
+        // model must still convert, and must not claim media it cannot
+        // execute.
+        let root = GemmaNativeTestDir::new();
+        let source = root.path().join("source");
+        let input = gemma_native_fixture(&source);
+        fs::remove_file(source.join("mmproj-gemma.gguf")).unwrap();
+        fs::write(
+            source.join("config.json"),
+            gemma4_siglip_vision_config().to_string(),
         )
         .unwrap();
         // An unsupported projector type: not a Gemma4 media companion, so it is
@@ -6176,7 +6531,7 @@ mod tests {
                     ("general.architecture", GgufMetaValue::String("clip".into())),
                     (
                         "clip.vision.projector_type",
-                        GgufMetaValue::String("gemma4v".into()),
+                        GgufMetaValue::String("gemma4z".into()),
                     ),
                 ],
                 &[(
@@ -6211,6 +6566,131 @@ mod tests {
         assert_eq!(
             prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap(),
             output
+        );
+    }
+
+    #[tokio::test]
+    async fn gemma_native_ignores_projector_types_the_config_cannot_consume() {
+        let root = GemmaNativeTestDir::new();
+
+        // A gemma4v tower beside a unified-media config cannot fill the
+        // encoder-free media slots: the required-companion error fires exactly
+        // as if no mmproj were present — the file is invisible to the pairing.
+        let source = root.path().join("source-unified");
+        let input = gemma_native_fixture(&source);
+        fs::remove_file(source.join("mmproj-gemma.gguf")).unwrap();
+        gemma4v_mmproj_fixture(&source.join("mmproj-BF16.gguf"));
+        let cache = root.path().join("cache-unified");
+        assert!(
+            prepare_gemma4_native_gguf_in(&input, &cache)
+                .await
+                .unwrap_err()
+                .reason
+                .contains("no matching mmproj"),
+            "a gemma4v file must not satisfy a unified-media config"
+        );
+        assert!(!cache.exists());
+
+        // A gemma4uv projector beside a plain `vision_config` is likewise the
+        // wrong kind: ignored, not converted, and the cache records no
+        // companion — its unified media tensors belong to a namespace the
+        // SigLIP tower never reads.
+        let source = root.path().join("source-plain");
+        let input = gemma_native_fixture(&source);
+        fs::write(
+            source.join("config.json"),
+            gemma4_siglip_vision_config().to_string(),
+        )
+        .unwrap();
+        let cache = root.path().join("cache-plain");
+        let output = prepare_gemma4_native_gguf_in(&input, &cache).await.unwrap();
+        assert!(!output.join("vision.safetensors").exists());
+        let marker = fs::read_to_string(output.join(".complete")).unwrap();
+        assert!(marker.contains("companion_sha256=none\n"));
+    }
+
+    #[test]
+    fn gemma_native_projector_kind_filter_matches_the_config_namespace() {
+        let root = GemmaNativeTestDir::new();
+        let input = gemma_native_fixture(root.path());
+        // The fixture's mmproj-gemma.gguf is gemma4uv: invisible to the
+        // SigLIP probe, paired for the unified one.
+        assert_eq!(
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::SigLipVision).unwrap(),
+            None
+        );
+        let exact = root.path().join(format!(
+            "mmproj-{}",
+            input.file_name().unwrap().to_string_lossy()
+        ));
+        gemma4v_mmproj_fixture(&exact);
+        assert_eq!(
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::SigLipVision).unwrap(),
+            Some(exact)
+        );
+        // A wrong-kind file at the exact-name slot is ignored rather than
+        // paired or errored — and it must NOT shadow the scan: the gemma4uv
+        // file beside it still satisfies the unified probe.
+        let root2 = GemmaNativeTestDir::new();
+        let input2 = gemma_native_fixture(root2.path());
+        let exact2 = root2.path().join(format!(
+            "mmproj-{}",
+            input2.file_name().unwrap().to_string_lossy()
+        ));
+        gemma4v_mmproj_fixture(&exact2);
+        assert_eq!(
+            gemma4_native_mmproj(&input2, Gemma4MmprojKind::UnifiedMedia).unwrap(),
+            Some(root2.path().join("mmproj-gemma.gguf"))
+        );
+        // Fall through to an empty scan and the probe reports absent, not an
+        // error — same as if no mmproj file existed at all.
+        fs::remove_file(root2.path().join("mmproj-gemma.gguf")).unwrap();
+        assert_eq!(
+            gemma4_native_mmproj(&input2, Gemma4MmprojKind::UnifiedMedia).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn gemma_native_projector_selection_prefers_bf16_among_same_kind_dtypes() {
+        // The real `unsloth/gemma-4-26B-A4B-it-GGUF` repo ships gemma4v towers
+        // at BF16/F16/F32: a full-repo download must resolve deterministically
+        // to BF16 rather than hard-error on ambiguity.
+        let root = GemmaNativeTestDir::new();
+        let input = gemma_native_fixture(root.path());
+        fs::remove_file(root.path().join("mmproj-gemma.gguf")).unwrap();
+        for name in ["mmproj-F32.gguf", "mmproj-F16.gguf", "mmproj-BF16.gguf"] {
+            gemma4v_mmproj_fixture(&root.path().join(name));
+        }
+        assert_eq!(
+            gemma4_native_mmproj(&input, Gemma4MmprojKind::SigLipVision).unwrap(),
+            Some(root.path().join("mmproj-BF16.gguf"))
+        );
+
+        // The preference applies to the unified kind too — and a non-BF16
+        // best tier still wins (F16 > F32 > unnamed like mmproj-gemma.gguf).
+        let root2 = GemmaNativeTestDir::new();
+        let input2 = gemma_native_fixture(root2.path());
+        let unified = root2.path().join("mmproj-gemma.gguf");
+        for name in ["mmproj-F16.gguf", "mmproj-F32.gguf"] {
+            fs::copy(&unified, root2.path().join(name)).unwrap();
+        }
+        assert_eq!(
+            gemma4_native_mmproj(&input2, Gemma4MmprojKind::UnifiedMedia).unwrap(),
+            Some(root2.path().join("mmproj-F16.gguf"))
+        );
+
+        // Two candidates in the same preferred tier are still ambiguous.
+        let root3 = GemmaNativeTestDir::new();
+        let input3 = gemma_native_fixture(root3.path());
+        fs::remove_file(root3.path().join("mmproj-gemma.gguf")).unwrap();
+        gemma4v_mmproj_fixture(&root3.path().join("mmproj-BF16-a.gguf"));
+        gemma4v_mmproj_fixture(&root3.path().join("mmproj-BF16-b.gguf"));
+        assert!(
+            gemma4_native_mmproj(&input3, Gemma4MmprojKind::SigLipVision)
+                .unwrap_err()
+                .reason
+                .contains("Ambiguous")
         );
     }
 
@@ -9581,6 +10061,19 @@ mod tests {
         ])
     }
 
+    fn gemma4v_mmproj_metadata() -> HashMap<String, GgufMetaValue> {
+        HashMap::from([
+            (
+                "general.architecture".to_string(),
+                GgufMetaValue::String("clip".to_string()),
+            ),
+            (
+                "clip.vision.projector_type".to_string(),
+                GgufMetaValue::String("gemma4v".to_string()),
+            ),
+        ])
+    }
+
     fn muse_glimmer_metadata() -> HashMap<String, GgufMetaValue> {
         HashMap::from([(
             "general.architecture".to_string(),
@@ -11168,6 +11661,131 @@ mod tests {
         );
         assert!(weights.contains_key("model.embed_vision.embedding_projection.weight"));
         assert!(weights.contains_key("model.embed_audio.embedding_projection.weight"));
+    }
+
+    #[test]
+    fn gemma4v_mmproj_mapping_covers_the_tower_and_drops_unknown_tensors() {
+        let metadata = gemma4v_mmproj_metadata();
+        for (suffix, mapped) in [
+            ("attn_q.weight", "self_attn.q_proj.weight"),
+            ("attn_k.weight", "self_attn.k_proj.weight"),
+            ("attn_v.weight", "self_attn.v_proj.weight"),
+            ("attn_out.weight", "self_attn.o_proj.weight"),
+            ("attn_q_norm.weight", "self_attn.q_norm.weight"),
+            ("attn_k_norm.weight", "self_attn.k_norm.weight"),
+            ("ln1.weight", "input_layernorm.weight"),
+            ("attn_post_norm.weight", "post_attention_layernorm.weight"),
+            ("ln2.weight", "pre_feedforward_layernorm.weight"),
+            ("ffn_post_norm.weight", "post_feedforward_layernorm.weight"),
+            ("ffn_gate.weight", "mlp.gate_proj.weight"),
+            ("ffn_up.weight", "mlp.up_proj.weight"),
+            ("ffn_down.weight", "mlp.down_proj.weight"),
+        ] {
+            let source = format!("v.blk.26.{suffix}");
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(&source, &metadata),
+                Some(format!("model.vision_tower.encoder.layers.26.{mapped}")),
+                "mapping mismatch for {source}"
+            );
+        }
+        let cases = [
+            (
+                "v.patch_embd.weight",
+                Some("model.vision_tower.patch_embedder.input_proj.weight"),
+            ),
+            (
+                "v.position_embd.weight",
+                Some("model.vision_tower.patch_embedder.position_embedding_table"),
+            ),
+            ("v.std_bias", Some("model.vision_tower.std_bias")),
+            ("v.std_scale", Some("model.vision_tower.std_scale")),
+            (
+                "mm.input_projection.weight",
+                Some("model.embed_vision.embedding_projection.weight"),
+            ),
+            (
+                "mm.input_projection.scales",
+                Some("model.embed_vision.embedding_projection.scales"),
+            ),
+            (
+                "mm.input_projection.biases",
+                Some("model.embed_vision.embedding_projection.biases"),
+            ),
+            // Outside the tower's fixed inventory: dropped, not mislabeled
+            // into the Qwen-VL merger names the generic fallback would emit.
+            ("v.blk.0.attn_q.scales", None),
+            ("v.blk.0.attn_qkv.weight", None),
+            ("v.blk.0", None),
+            ("v.pre_ln.weight", None),
+            ("v.post_ln.weight", None),
+            ("v.patch_embd.bias", None),
+            ("mm.0.weight", None),
+            ("mm.a.input_projection.weight", None),
+            ("token_embd.weight", None),
+            ("blk.0.attn_q.weight", None),
+        ];
+        for (source, expected) in cases {
+            assert_eq!(
+                gguf_name_to_hf_for_metadata(source, &metadata).as_deref(),
+                expected,
+                "mapping mismatch for {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn gemma4v_mmproj_layout_flattens_the_conv_kernel_and_keeps_positions() {
+        let metadata = gemma4v_mmproj_metadata();
+        // `parse_gguf` reverses ggml dims (`mlx_shape`), so the file's
+        // [2, 2, 3, 1] conv kernel arrives as row-major [1, 3, 2, 2] =
+        // [hidden, channels, patch_h, patch_w].
+        let mut weights = HashMap::from([
+            (
+                "model.vision_tower.patch_embedder.input_proj.weight".to_string(),
+                MxArray::from_float32(
+                    &(0..12).map(|v| v as f32).collect::<Vec<_>>(),
+                    &[1, 3, 2, 2],
+                )
+                .unwrap(),
+            ),
+            (
+                "model.vision_tower.patch_embedder.position_embedding_table".to_string(),
+                MxArray::from_float32(&[0.0, 1.0, 2.0, 3.0], &[2, 2, 1]).unwrap(),
+            ),
+        ]);
+        fixup_gemma4v_mmproj_layout(&mut weights, &metadata).unwrap();
+
+        let patch = weights
+            .get("model.vision_tower.patch_embedder.input_proj.weight")
+            .unwrap();
+        // [out, C, H, W] → [out, H, W, C] → flatten to the HWC-ordered
+        // [hidden, patch*patch*channels] Linear contract.
+        assert_eq!(patch.shape().unwrap().as_ref(), &[1, 12]);
+        assert_eq!(
+            patch
+                .to_float32()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.0, 4.0, 8.0, 1.0, 5.0, 9.0, 2.0, 6.0, 10.0, 3.0, 7.0, 11.0]
+        );
+
+        // ggml [hidden, positions, 2] already reverses to the checkpoint's
+        // [2, positions, hidden] — value order is a strict passthrough.
+        let position = weights
+            .get("model.vision_tower.patch_embedder.position_embedding_table")
+            .unwrap();
+        assert_eq!(position.shape().unwrap().as_ref(), &[2, 2, 1]);
+        assert_eq!(
+            position
+                .to_float32()
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![0.0, 1.0, 2.0, 3.0]
+        );
     }
 
     #[test]
