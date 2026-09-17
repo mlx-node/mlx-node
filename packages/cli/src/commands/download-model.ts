@@ -864,13 +864,38 @@ export async function run(argv: string[]) {
     // can never clear. Only ever touches an existing marker (this is a repair,
     // not a first install).
     if (completion !== null && (sidecarPaths.length > 0 || sidecarSource !== null)) {
+      const primaryNames = new Set(cachedManifest.filesToDownload.map((file) => file.path));
+      const planned = new Set(sidecarPaths);
+      // Obsolete candidates go too: initializing from every old entry would
+      // keep a file the assets repo REMOVED on disk and listed while the new
+      // revision is recorded — discovery reports current and the runtime keeps
+      // consuming it.
+      const stale = completion.files.filter(
+        (file) => ASSET_SIDECAR_CANDIDATES.includes(file) && !primaryNames.has(file) && !planned.has(file),
+      );
       const listed = new Set(completion.files);
       for (const path of sidecarPaths) {
         if (existsSync(join(outputDir, path))) listed.add(path);
       }
+      for (const file of stale) listed.delete(file);
+      const surviving = [...listed].sort();
+      const loadableWeight = (file: string): boolean =>
+        file.endsWith('.safetensors') ||
+        file.endsWith('.pdiparams') ||
+        (file.endsWith('.gguf') && !isGgufCompanionName(basename(file)));
+      if (stale.length > 0 && (!surviving.includes('config.json') || !surviving.some(loadableWeight))) {
+        throw new Error(
+          `Refusing to apply "${assetsRepo}" sidecar removals: they would leave no loadable checkpoint. ` +
+            `The installed directory is unchanged.`,
+        );
+      }
+      // Delete BEFORE publishing the updated marker, same rule as the
+      // dashboard: a failure must leave the marker able to derive the same set
+      // again.
+      for (const file of stale) await rm(join(outputDir, file), { force: true });
       await writeCompletion(outputDir, {
         ...completion,
-        files: [...listed].sort(),
+        files: surviving,
         ...(sidecarSource !== null ? { assetsRepo: sidecarSource.repo, assetsRevision: sidecarSource.revision } : {}),
       });
     }
@@ -1128,10 +1153,48 @@ export async function run(argv: string[]) {
       // of lingering while the revision advances past it.
       for (const name of ASSET_SIDECAR_CANDIDATES) exemptFromPrune.add(name);
     }
+    // A --complete run prunes and carries against the PRESCRIPTION, not the
+    // whole remote tree: `allFiles` would let an unselected variant (another
+    // quant the user once downloaded here) survive as "proven on remote" while
+    // the marker claims the new revision — an unverified file riding along that
+    // discovery can then expose as a loadable model.
+    const scopedPaths =
+      args.complete === true ? [...filesToDownload.map((f) => f.path), ...sidecarPaths] : remotePaths;
     const pruneList =
       previousCompletion !== null
-        ? computePruneList(previousCompletion.files, remotePaths, outputDir, !fullSemantics, exemptFromPrune)
-        : computeLegacyWeightPruneList(existingTopLevelFiles, remotePaths, outputDir, !fullSemantics);
+        ? computePruneList(previousCompletion.files, scopedPaths, outputDir, !fullSemantics, exemptFromPrune)
+        : computeLegacyWeightPruneList(existingTopLevelFiles, scopedPaths, outputDir, !fullSemantics);
+    // The exact file list this run will certify — computed BEFORE the prune so
+    // the guard and the marker agree on one set.
+    const certified = buildMarkerFiles(
+      previousCompletion,
+      scopedPaths,
+      [
+        ...filesToDownload.map((f) => f.path),
+        ...sidecarPaths.filter((path) => existsSync(join(outputDir, path))),
+      ],
+      outputDir,
+      !fullSemantics,
+      exemptFromPrune,
+    );
+    if (pruneList.length > 0) {
+      // Pruning must never destroy the install: the surviving manifest has to
+      // keep a config and a weight. Upstream dropping the LAST config.json (a
+      // weight-only GGUF repo relies on the assets repo for it) is exactly
+      // that case — fail with everything unchanged.
+      const remaining = certified.filter((file) => !pruneList.includes(file));
+      const loadableWeight = (file: string): boolean =>
+        file.endsWith('.safetensors') ||
+        file.endsWith('.pdiparams') ||
+        (file.endsWith('.gguf') && !isGgufCompanionName(basename(file)));
+      if (!remaining.includes('config.json') || !remaining.some(loadableWeight)) {
+        throw new Error(
+          `Refusing to sync "${modelName}": removing ${pruneList.join(', ')} would leave no loadable checkpoint ` +
+            `(missing ${remaining.includes('config.json') ? 'model weights' : 'config.json'}). ` +
+            `The installed directory is unchanged.`,
+        );
+      }
+    }
     for (const rel of pruneList) {
       console.log(`  Removing ${rel} (no longer in the upstream repo)`);
       // A stale standard weight can take precedence over the newly downloaded
@@ -1141,17 +1204,9 @@ export async function run(argv: string[]) {
     await writeCompletion(outputDir, {
       repo: modelName,
       revision: markerRevisionToClaim(previousCompletion, remoteSha, !fullSemantics),
-      files: buildMarkerFiles(
-        previousCompletion,
-        remotePaths,
-        // The primary selection AND the sidecars: a mandatory tokenizer that
-        // vanishes later must invalidate the marker (deleting an unlisted file
-        // cannot), and the assets provenance alone would not notice.
-        [...filesToDownload.map((f) => f.path), ...sidecarPaths.filter((path) => existsSync(join(outputDir, path)))],
-        outputDir,
-        !fullSemantics,
-        exemptFromPrune,
-      ),
+      // The set the guard above validated (primary selection AND sidecars: a
+      // mandatory tokenizer that vanishes later must invalidate the marker).
+      files: certified,
       scope: isGlobRun && !args.complete ? 'partial' : 'full',
       // Provenance for update discovery, same as the dashboard's marker: a
       // tokenizer fix in the base repo moves nothing in the primary repo.

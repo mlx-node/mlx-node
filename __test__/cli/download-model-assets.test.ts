@@ -369,6 +369,153 @@ describe('download model --assets-repo', () => {
     expect(marker.assetsRevision).toBe('b'.repeat(40));
   });
 
+  it('refuses to prune away the last config on the sync path', async () => {
+    // A weight-only GGUF repo relies on the assets repo for config.json. When
+    // upstream drops it and this sync would prune the installed copy, the run
+    // must fail with everything unchanged — the alternative is certifying a
+    // directory nothing can load.
+    hub.shas[PRIMARY] = 'c'.repeat(40);
+    hub.manifests[ASSETS] = [{ type: 'file', path: 'tokenizer.json', size: 20 }]; // config.json gone upstream
+    writeFileSync(
+      join(outputDir, '.mlx-download-complete.json'),
+      JSON.stringify({
+        repo: PRIMARY,
+        revision: 'a'.repeat(40),
+        files: [GGUF, 'config.json', 'tokenizer.json'],
+        scope: 'full',
+        assetsRepo: ASSETS,
+        assetsRevision: 'b'.repeat(40),
+        completedAt: new Date().toISOString(),
+      }),
+    );
+    writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
+    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
+
+    await expect(
+      run([
+        '-m',
+        PRIMARY,
+        '-o',
+        outputDir,
+        '-g',
+        '*UD-Q4_K_XL*',
+        '--assets-repo',
+        ASSETS,
+        '--complete',
+        '--cache-dir',
+        cacheDir,
+      ]),
+    ).rejects.toThrow(/no loadable checkpoint/);
+
+    // Nothing was mutated: the installation still loads, and the marker still
+    // lists the config it has.
+    expect(existsSync(join(outputDir, 'config.json'))).toBe(true);
+    const marker = JSON.parse(readFileSync(join(outputDir, '.mlx-download-complete.json'), 'utf-8')) as {
+      files: string[];
+    };
+    expect(marker.files).toContain('config.json');
+  });
+
+  it('prunes an unselected variant during a complete sync (prescription, not the whole tree)', async () => {
+    // Full-run semantics alone compare old entries against the WHOLE remote
+    // tree, so another quant still published upstream would be retained and
+    // carried into the marker while the new revision is claimed — a file this
+    // run neither selected nor verified, which discovery can expose as a
+    // loadable model.
+    hub.shas[PRIMARY] = 'c'.repeat(40);
+    hub.manifests[PRIMARY] = [
+      { type: 'file', path: GGUF, size: 300 },
+      { type: 'file', path: 'Tiny-UD-Q8_K_XL.gguf', size: 900 }, // published, NOT in the glob prescription
+      { type: 'file', path: 'config.json', size: 12 },
+    ];
+    hub.manifests[ASSETS] = [{ type: 'file', path: 'tokenizer.json', size: 20 }];
+    writeFileSync(
+      join(outputDir, '.mlx-download-complete.json'),
+      JSON.stringify({
+        repo: PRIMARY,
+        revision: 'a'.repeat(40),
+        files: [GGUF, 'Tiny-UD-Q8_K_XL.gguf', 'config.json', 'tokenizer.json'],
+        scope: 'full',
+        assetsRepo: ASSETS,
+        assetsRevision: 'b'.repeat(40),
+        completedAt: new Date().toISOString(),
+      }),
+    );
+    writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
+    writeFileSync(join(outputDir, 'Tiny-UD-Q8_K_XL.gguf'), 'x'.repeat(900));
+    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
+
+    await run([
+      '-m',
+      PRIMARY,
+      '-o',
+      outputDir,
+      '-g',
+      '*UD-Q4_K_XL*',
+      '--assets-repo',
+      ASSETS,
+      '--complete',
+      '--cache-dir',
+      cacheDir,
+    ]);
+
+    expect(existsSync(join(outputDir, 'Tiny-UD-Q8_K_XL.gguf'))).toBe(false);
+    const marker = JSON.parse(readFileSync(join(outputDir, '.mlx-download-complete.json'), 'utf-8')) as {
+      files: string[];
+      revision: string;
+    };
+    expect(marker.files).not.toContain('Tiny-UD-Q8_K_XL.gguf');
+    expect(marker.revision).toBe('c'.repeat(40));
+  });
+
+  it('prunes a removed candidate on the repair-return path', async () => {
+    // Reachable with an unresolvable primary revision and a complete-looking
+    // glob set: the repair runs, and preserving every old marker entry would
+    // keep a removed tokenizer on disk and listed while the new assets
+    // revision is recorded — reported current forever.
+    hub.shas[ASSETS] = 'b'.repeat(40); // PRIMARY unresolved -> legacy repair path
+    hub.manifests[ASSETS] = [{ type: 'file', path: 'config.json', size: 12 }]; // tokenizer.json gone
+    writeFileSync(
+      join(outputDir, '.mlx-download-complete.json'),
+      JSON.stringify({
+        repo: PRIMARY,
+        revision: 'a'.repeat(40),
+        files: [GGUF, 'config.json', 'tokenizer.json'],
+        scope: 'full',
+        assetsRepo: ASSETS,
+        assetsRevision: 'a'.repeat(40),
+        completedAt: new Date().toISOString(),
+      }),
+    );
+    writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
+    writeFileSync(join(outputDir, 'config.json'), 'x'.repeat(12));
+    writeFileSync(join(outputDir, 'tokenizer.json'), 'x'.repeat(20));
+
+    await run([
+      '-m',
+      PRIMARY,
+      '-o',
+      outputDir,
+      '-g',
+      '*UD-Q4_K_XL*',
+      '--assets-repo',
+      ASSETS,
+      '--complete',
+      '--cache-dir',
+      cacheDir,
+    ]);
+
+    expect(existsSync(join(outputDir, 'tokenizer.json'))).toBe(false);
+    const marker = JSON.parse(readFileSync(join(outputDir, '.mlx-download-complete.json'), 'utf-8')) as {
+      files: string[];
+      assetsRevision?: string;
+    };
+    expect(marker.files).not.toContain('tokenizer.json');
+    expect(marker.assetsRevision).toBe('b'.repeat(40));
+  });
+
   it('does not touch the assets repo when the flag is absent', async () => {
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
 
