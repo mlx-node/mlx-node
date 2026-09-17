@@ -175,6 +175,9 @@ const ASSET_SIDECAR_CANDIDATES = [
   'processor_config.json',
 ] as const;
 
+/** Membership test for the candidate list above (insertion order is the fetch order). */
+const ASSET_SIDECAR_CANDIDATE_SET: ReadonlySet<string> = new Set(ASSET_SIDECAR_CANDIDATES);
+
 /**
  * True when the manifest actually describes a loadable model: it must carry a
  * `config.json` AND at least one weight file. A repo that resolves to a
@@ -1047,10 +1050,9 @@ export class DownloadManager {
       // The marker pins only the PRIMARY repo, so the planned sidecars are
       // verified against their freshly resolved assets manifest before reading
       // this as done: a tokenizer/template fix upstream (the assets repo moves
-      // on its own revision; the update sweep probes primary repos only, so no
-      // badge fires) still lands the next time a job runs, instead of being
-      // skipped forever. A missing or stale sidecar falls through to the full
-      // path, which re-fetches it through the plan.
+      // on its own revision) still lands the next time a job runs, instead of
+      // being skipped forever. A missing or stale sidecar falls through to the
+      // full path, which re-fetches it through the plan.
       const installed = readCompletion(finalDir);
       if (
         installed !== undefined &&
@@ -1058,7 +1060,7 @@ export class DownloadManager {
         installed.revision === revision &&
         isModelInstalled(finalDir) &&
         (job.repo !== QWEN38_DFLASH2.hfRepo || isDFlash2Companion(finalDir)) &&
-        (sidecarPlan === null || (await this.assetSidecarsCurrent(sidecarPlan, finalDir)))
+        (sidecarPlan === null || (await this.refreshInstalledAssets(sidecarPlan, finalDir, files, installed)))
       ) {
         job.receivedBytes = totalBytes;
         job.state = 'done';
@@ -1415,18 +1417,51 @@ export class DownloadManager {
   }
 
   /**
-   * True when every file in an {@link planAssetSidecars} plan is already
-   * present in `dir` and matches the assets manifest's size/content hash —
-   * the precondition for treating an installed model as up to date without
-   * re-staging its sidecars.
+   * Decide whether an installed model's sidecars are already up to date, and
+   * bring its bookkeeping up to date when they are. Returns false when a
+   * planned sidecar is missing or stale — the caller falls through to the full
+   * re-fetch path. When every planned sidecar verifies:
+   *
+   *   - sidecars the marker records that the assets repo no longer supplies
+   *     (its candidate name vanished from the listing) are dropped from the
+   *     marker and deleted: a repo that deleted a file must not leave that
+   *     file installed forever;
+   *   - the marker's `assetsRevision` is rewritten to the revision just
+   *     verified against. Update discovery compares revisions, so an
+   *     assets-repo advance that changed nothing installable (README, model
+   *     weights) would otherwise raise a badge that can never clear: the job
+   *     verifies the bytes, finds them current, and used to return without
+   *     recording that verification — the card offered the same update again.
+   *
+   * The marker is written BEFORE the deletions, so it never lists a file that
+   * is already gone.
    */
-  private async assetSidecarsCurrent(
-    plan: { files: ListFileEntry[] },
+  private async refreshInstalledAssets(
+    plan: { repo: { type: 'model'; name: string }; revision: string; files: ListFileEntry[] },
     dir: string,
+    primaryFiles: readonly ListFileEntry[],
+    installed: DownloadCompletion,
   ): Promise<boolean> {
     for (const file of plan.files) {
       if (!(await isStagedCopyComplete(join(dir, file.path), file))) return false;
     }
+    const plannedNames = new Set(plan.files.map((file) => file.path));
+    const primaryNames = new Set(primaryFiles.map((file) => file.path));
+    // Only the fixed sidecar-candidate names, only files the primary repo does
+    // not supply, and only ones the assets repo no longer offers: a user's own
+    // file, or a file another install path contributed, is never touched.
+    const stale = installed.files.filter(
+      (file) => ASSET_SIDECAR_CANDIDATE_SET.has(file) && !primaryNames.has(file) && !plannedNames.has(file),
+    );
+    if (stale.length === 0 && installed.assetsRevision === plan.revision) return true;
+    const next: DownloadCompletion = {
+      ...installed,
+      ...(stale.length === 0 ? {} : { files: installed.files.filter((file) => !stale.includes(file)) }),
+      assetsRepo: plan.repo.name,
+      assetsRevision: plan.revision,
+    };
+    await writeFile(join(dir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(next, null, 2)}\n`);
+    for (const file of stale) await rm(join(dir, file), { force: true });
     return true;
   }
 

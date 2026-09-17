@@ -172,6 +172,7 @@ export function computePruneList(
   remotePaths: string[],
   outputDir: string,
   isGlobRun: boolean,
+  exempt: ReadonlySet<string> = new Set(),
 ): string[] {
   // A glob run verifies only its selection. Even when a disappeared old file
   // is proven absent remotely, deleting it here can break the old checkpoint
@@ -180,7 +181,10 @@ export function computePruneList(
   const remote = new Set(remotePaths);
   const out: string[] = [];
   for (const rel of previousFiles) {
-    if (remote.has(rel)) continue;
+    // `remotePaths` is the PRIMARY repo's tree; a file another source
+    // supplied (the assetsRepo sidecars) is judged by THAT source, never
+    // deleted here for being absent from a repo that never had it.
+    if (remote.has(rel) || exempt.has(rel)) continue;
     if (!isSafeOutputRelativePath(outputDir, rel)) continue;
     out.push(rel);
   }
@@ -225,12 +229,14 @@ export function buildMarkerFiles(
   selectedPaths: string[],
   outputDir: string,
   isGlobRun: boolean,
+  /** Same set {@link computePruneList} exempts: a file another source supplied is neither pruned nor dropped. */
+  exempt: ReadonlySet<string> = new Set(),
 ): string[] {
   const files = new Set(selectedPaths);
   if (previous !== null) {
     const remote = new Set(remotePaths);
     for (const file of previous.files) {
-      const provenOnRemote = isGlobRun || remote.has(file);
+      const provenOnRemote = isGlobRun || remote.has(file) || exempt.has(file);
       if (provenOnRemote && existsSync(join(outputDir, file))) files.add(file);
     }
   }

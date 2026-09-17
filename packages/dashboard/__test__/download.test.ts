@@ -1254,6 +1254,96 @@ describe('DownloadManager', () => {
     await waitFor(() => jobStagingDirs().length === 0);
   });
 
+  it('records the verified assets revision so a vacuous assets advance cannot loop the badge', async () => {
+    // An assets-repo advance that changed nothing installable (README, model
+    // weights) raises the badge — discovery compares revisions. The job then
+    // verifies the sidecar BYTES, finds them current, and used to return done
+    // without recording that verification: the card offered the same update
+    // forever. Verifying must also record what was verified.
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+    hub.shaByRepo[ASSETS_REPO] = SHA_OLD;
+    const first = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const events1: DownloadEvent[] = [];
+    const id1 = first.start(REPO);
+    first.subscribe(id1, (event) => events1.push(event));
+    await waitFor(() => events1.some((event) => event.type === 'done'));
+
+    // The base repo moves; the sidecar bytes do not.
+    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+    hub.downloaded = [];
+    const second = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const events2: DownloadEvent[] = [];
+    const id2 = second.start(REPO);
+    second.subscribe(id2, (event) => events2.push(event));
+    await waitFor(() => events2.some((event) => event.type === 'done'));
+
+    // Nothing re-downloaded, and the marker now names the revision it verified.
+    expect(hub.downloaded).toEqual([]);
+    const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+      assetsRepo?: string;
+      assetsRevision?: string;
+    };
+    expect(marker.assetsRepo).toBe(ASSETS_REPO);
+    expect(marker.assetsRevision).toBe(SHA_NEW);
+  });
+
+  it('drops and deletes a sidecar the assets repo no longer supplies', async () => {
+    // A repo that deleted a tokenizer file must not leave it installed (and
+    // listed) forever: the verified-done path prunes what the assets listing
+    // no longer carries, marker first, then the file.
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+    hub.shaByRepo[ASSETS_REPO] = SHA_OLD;
+    const first = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const events1: DownloadEvent[] = [];
+    const id1 = first.start(REPO);
+    first.subscribe(id1, (event) => events1.push(event));
+    await waitFor(() => events1.some((event) => event.type === 'done'));
+    expect(existsSync(join(finalDir(), 'tokenizer.json'))).toBe(true);
+
+    // Upstream drops the tokenizer from its listing entirely.
+    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'config.json', size: 12 }];
+    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+    hub.downloaded = [];
+    const second = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
+    });
+    const events2: DownloadEvent[] = [];
+    const id2 = second.start(REPO);
+    second.subscribe(id2, (event) => events2.push(event));
+    await waitFor(() => events2.some((event) => event.type === 'done'));
+
+    expect(existsSync(join(finalDir(), 'tokenizer.json'))).toBe(false);
+    const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+      files: string[];
+      assetsRevision?: string;
+    };
+    expect(marker.files).not.toContain('tokenizer.json');
+    expect(marker.files).toContain('config.json');
+    expect(marker.assetsRevision).toBe(SHA_NEW);
+  });
+
   it('does not re-download verified sidecars on a second job over the same revision', async () => {
     hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
     hub.manifests[ASSETS_REPO] = [

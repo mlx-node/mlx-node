@@ -1091,9 +1091,18 @@ export async function run(argv: string[]) {
     // of THIS repo's marker.
     const remotePaths = allFiles.map((f) => f.path);
     const isGlobRun = Boolean(globPatterns?.length);
+    // Files the marker attributes to the assetsRepo are exempt: the primary
+    // tree cannot prove anything about them (they were never in it), so
+    // pruning them here would delete the tool-calling sidecars this very run
+    // just verified — and an install that HAS such provenance must keep its
+    // candidate names exempt even when this run passed no --assets-repo.
+    const exemptFromPrune = new Set<string>(sidecarPaths);
+    if (previousCompletion?.assetsRepo !== undefined) {
+      for (const name of ASSET_SIDECAR_CANDIDATES) exemptFromPrune.add(name);
+    }
     const pruneList =
       previousCompletion !== null
-        ? computePruneList(previousCompletion.files, remotePaths, outputDir, isGlobRun)
+        ? computePruneList(previousCompletion.files, remotePaths, outputDir, isGlobRun, exemptFromPrune)
         : computeLegacyWeightPruneList(existingTopLevelFiles, remotePaths, outputDir, isGlobRun);
     for (const rel of pruneList) {
       console.log(`  Removing ${rel} (no longer in the upstream repo)`);
@@ -1110,14 +1119,22 @@ export async function run(argv: string[]) {
         // The primary selection AND the sidecars: a mandatory tokenizer that
         // vanishes later must invalidate the marker (deleting an unlisted file
         // cannot), and the assets provenance alone would not notice.
-        [...filesToDownload.map((f) => f.path), ...sidecarPaths],
+        [...filesToDownload.map((f) => f.path), ...sidecarPaths.filter((path) => existsSync(join(outputDir, path)))],
         outputDir,
         isGlobRun,
+        exemptFromPrune,
       ),
       scope: isGlobRun && !args.complete ? 'partial' : 'full',
       // Provenance for update discovery, same as the dashboard's marker: a
       // tokenizer fix in the base repo moves nothing in the primary repo.
-      ...(sidecarSource !== null ? { assetsRepo: sidecarSource.repo, assetsRevision: sidecarSource.revision } : {}),
+      // This run's source wins; otherwise CARRY the previous marker's — a plain
+      // re-sync that passed no --assets-repo touched nothing there, and erasing
+      // the pair would silently disable update discovery for the install.
+      ...(sidecarSource !== null
+        ? { assetsRepo: sidecarSource.repo, assetsRevision: sidecarSource.revision }
+        : previousCompletion?.assetsRepo !== undefined
+          ? { assetsRepo: previousCompletion.assetsRepo, assetsRevision: previousCompletion.assetsRevision }
+          : {}),
       completedAt: new Date().toISOString(),
     });
   };

@@ -27,6 +27,14 @@ export interface DownloadCompletion {
    * compatibility with dashboard and CLI markers written before this field.
    */
   scope?: DownloadScope;
+  /**
+   * Base-model repo this install's tokenizer/config sidecars came from, and
+   * the commit they were pinned to. Optional (pre-provenance markers lack it);
+   * update discovery and prune exemptions both key off it, so it must
+   * round-trip through {@link readCompletion}.
+   */
+  assetsRepo?: string;
+  assetsRevision?: string;
   /** ISO timestamp of the last successful download/sync. */
   completedAt: string;
 }
@@ -57,7 +65,9 @@ export async function readCompletion(dir: string): Promise<DownloadCompletion | 
     typeof marker.completedAt !== 'string' ||
     !Array.isArray(marker.files) ||
     !marker.files.every((file) => typeof file === 'string') ||
-    (marker.scope !== undefined && marker.scope !== 'full' && marker.scope !== 'partial')
+    (marker.scope !== undefined && marker.scope !== 'full' && marker.scope !== 'partial') ||
+    (marker.assetsRepo !== undefined && typeof marker.assetsRepo !== 'string') ||
+    (marker.assetsRevision !== undefined && typeof marker.assetsRevision !== 'string')
   ) {
     return null;
   }
@@ -66,6 +76,8 @@ export async function readCompletion(dir: string): Promise<DownloadCompletion | 
     revision: marker.revision,
     files: marker.files as string[],
     scope: marker.scope as DownloadScope | undefined,
+    ...(typeof marker.assetsRepo === 'string' ? { assetsRepo: marker.assetsRepo } : {}),
+    ...(typeof marker.assetsRevision === 'string' ? { assetsRevision: marker.assetsRevision } : {}),
     completedAt: marker.completedAt,
   };
 }
