@@ -1054,21 +1054,24 @@ export class DownloadManager {
       // being skipped forever. A missing or stale sidecar falls through to the
       // full path, which re-fetches it through the plan.
       const installed = readCompletion(finalDir);
-      if (
+      const installedIsCurrent =
         installed !== undefined &&
         installed.repo === job.repo &&
         installed.revision === revision &&
         isModelInstalled(finalDir) &&
         (job.repo !== QWEN38_DFLASH2.hfRepo || isDFlash2Companion(finalDir)) &&
-        (sidecarPlan === null || (await this.refreshInstalledAssets(sidecarPlan, finalDir, files, installed)))
-      ) {
+        (sidecarPlan === null || (await this.refreshInstalledAssets(sidecarPlan, finalDir, files, installed)));
+      // `refreshInstalledAssets` is the one pre-publish path that mutates the
+      // live install (stale-sidecar deletes, marker rewrite). A cancel accepted
+      // during that await must still win over the done branch — and over the
+      // fall-through below, which this single check also covers.
+      if (job.cancelled) throw new Error('Download cancelled');
+      if (installedIsCurrent) {
         job.receivedBytes = totalBytes;
         job.state = 'done';
         this.emit({ type: 'done', id: job.id, outputDir: finalDir });
         return;
       }
-
-      if (job.cancelled) throw new Error('Download cancelled');
 
       await mkdir(stagingDir, { recursive: true });
       // Canonicalize the staging dir ONCE (it now exists as a real dir under the

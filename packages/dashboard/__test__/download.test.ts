@@ -154,7 +154,10 @@ vi.mock('node:fs/promises', async (importActual) => {
       return actual.rename(from, to);
     },
     writeFile: async (path: string, data: string | Uint8Array) => {
-      if (raceHook.onMarkerWrite !== null && String(path).endsWith(MARKER_FILE)) {
+      // `includes` catches the atomic writer too: `writeMarkerAtomically` puts
+      // the marker's bytes in `<marker>.<pid>.<uuid>.tmp` before the rename, so
+      // a refresh-time hook fires on the temp write, not the final path.
+      if (raceHook.onMarkerWrite !== null && String(path).includes(MARKER_FILE)) {
         const hook = raceHook.onMarkerWrite;
         raceHook.onMarkerWrite = null;
         hook();
@@ -1295,6 +1298,54 @@ describe('DownloadManager', () => {
       assetsRevision?: string;
     };
     expect(marker.assetsRepo).toBe(ASSETS_REPO);
+    expect(marker.assetsRevision).toBe(SHA_NEW);
+  });
+
+  it('honours a cancel accepted while installed sidecars are being refreshed', async () => {
+    // `refreshInstalledAssets` mutates the live install (deletes, marker
+    // rewrite) while the job still reads `running`, so `cancel()` accepts.
+    // Without a recheck between that await and the success branch the job
+    // emitted `done` after the UI reported the cancel — cancelling during the
+    // marker rewrite (the hook below) lands exactly in that window.
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+    hub.shaByRepo[ASSETS_REPO] = SHA_OLD;
+    const first = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const events1: DownloadEvent[] = [];
+    const id1 = first.start(REPO);
+    first.subscribe(id1, (event) => events1.push(event));
+    await waitFor(() => events1.some((event) => event.type === 'done'));
+
+    // Same verify-clean refresh shape as the test above: the assets revision
+    // moved, the bytes did not, so the refresh rewrites the marker — the hook
+    // cancels inside that write, before the success branch runs.
+    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+    const second = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const events2: DownloadEvent[] = [];
+    const id2 = second.start(REPO);
+    second.subscribe(id2, (event) => events2.push(event));
+    raceHook.onMarkerWrite = () => second.cancel(id2);
+    await waitFor(() => events2.some((event) => event.type === 'cancelled' || event.type === 'done'));
+
+    expect(events2.some((event) => event.type === 'done')).toBe(false);
+    expect(events2.some((event) => event.type === 'cancelled')).toBe(true);
+    // The refresh itself completed before the cancel won: the marker records
+    // the revision it verified, so the install stays consistent rather than
+    // half-rewritten.
+    const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+      assetsRevision?: string;
+    };
     expect(marker.assetsRevision).toBe(SHA_NEW);
   });
 
