@@ -1403,6 +1403,52 @@ describe('DownloadManager', () => {
     }
   });
 
+  it('refuses to prune away the last config, leaving the install intact', async () => {
+    // The primary GGUF repo ships no config.json (AgentWorld's doesn't): the
+    // sidecar is the ONLY one. Upstream dropping it must not delete the live
+    // install into an unloadable shape — the refresh fails instead, marker and
+    // files untouched.
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+    hub.shaByRepo[ASSETS_REPO] = SHA_OLD;
+    const first = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const events1: DownloadEvent[] = [];
+    const id1 = first.start(REPO);
+    first.subscribe(id1, (event) => events1.push(event));
+    await waitFor(() => events1.some((event) => event.type === 'done'));
+    expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
+
+    // Upstream renames its config away; only tokenizer.json remains supplied.
+    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'tokenizer.json', size: 20 }];
+    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+    hub.downloaded = [];
+    const second = new DownloadManager({ modelsDir, cacheDir, fetchImpl: makeFetchImpl({ [WEIGHT]: 300 }) });
+    const events2: DownloadEvent[] = [];
+    const id2 = second.start(REPO);
+    second.subscribe(id2, (event) => events2.push(event));
+    await waitFor(() => events2.some((event) => event.type === 'error' || event.type === 'done'));
+
+    expect(events2.some((event) => event.type === 'error')).toBe(true);
+    expect(events2.some((event) => event.type === 'done')).toBe(false);
+    // Nothing was mutated: the installation still loads.
+    expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
+    const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+      files: string[];
+      assetsRevision?: string;
+    };
+    expect(marker.files).toContain('config.json');
+    expect(marker.assetsRevision).toBe(SHA_OLD);
+    // And no temp marker residue from the atomic writer.
+    expect(readdirSync(finalDir()).filter((name) => name.includes(DOWNLOAD_COMPLETE_MARKER) && name.endsWith('.tmp'))).toEqual([]);
+  });
+
   it('does not re-download verified sidecars on a second job over the same revision', async () => {
     hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
     hub.manifests[ASSETS_REPO] = [

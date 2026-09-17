@@ -1455,6 +1455,23 @@ export class DownloadManager {
       (file) => ASSET_SIDECAR_CANDIDATE_SET.has(file) && !primaryNames.has(file) && !plannedNames.has(file),
     );
     if (stale.length === 0 && installed.assetsRevision === plan.revision) return true;
+    if (stale.length > 0) {
+      // Pruning must never destroy the install. The resulting manifest has to
+      // stay loadable — a config and a weight — and the case that matters is
+      // upstream dropping its config.json while the PRIMARY repo ships none
+      // (the GGUF repos often don't): deleting it would leave a directory the
+      // loader cannot open, and the marker would certify exactly that. Fail
+      // without mutating anything; the next fix has to come from upstream.
+      const remaining = installed.files.filter((file) => !stale.includes(file));
+      const lostConfig = !remaining.includes('config.json');
+      const lostWeight = !remaining.some((file) => isWeightFile(file));
+      if (lostConfig || lostWeight) {
+        throw new Error(
+          `Refusing to apply "${plan.repo.name}" sidecar removals: they would leave no loadable checkpoint ` +
+            `(missing ${lostConfig ? 'config.json' : 'model weights'}). The installed directory is unchanged.`,
+        );
+      }
+    }
     // Delete BEFORE publishing the updated marker. The `stale` set is derived
     // from the marker, so an interrupted refresh must leave the marker still
     // listing what is still on disk: dropping the entry first and dying before
@@ -1471,8 +1488,30 @@ export class DownloadManager {
       assetsRepo: plan.repo.name,
       assetsRevision: plan.revision,
     };
-    await writeFile(join(dir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(next, null, 2)}\n`);
+    await this.writeMarkerAtomically(dir, next);
     return true;
+  }
+
+  /**
+   * Publish `marker` over the live completion marker ATOMICALLY (unique temp
+   * file + rename in the same directory), mirroring the CLI's writer. A plain
+   * in-place write truncates the only ownership record first: a crash, ENOSPC,
+   * or short I/O failure leaves invalid JSON, and `isDownloaderOwned()` then
+   * classifies an otherwise intact model directory as FOREIGN — every later
+   * repair or update job refuses to replace it.
+   */
+  private async writeMarkerAtomically(dir: string, marker: DownloadCompletion): Promise<void> {
+    const path = join(dir, DOWNLOAD_COMPLETE_MARKER);
+    const temp = `${path}.${process.pid}.${randomUUID().slice(0, 12)}.tmp`;
+    await writeFile(temp, `${JSON.stringify(marker, null, 2)}\n`, { flag: 'wx' });
+    try {
+      await rename(temp, path);
+    } catch (error) {
+      // Never leave the temp behind: an orphan in the model dir would be
+      // pruned by a later sync and is noise in every listing.
+      await rm(temp, { force: true });
+      throw error;
+    }
   }
 
   /**

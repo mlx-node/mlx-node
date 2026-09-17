@@ -857,6 +857,23 @@ export async function run(argv: string[]) {
     });
     sidecarSource = topUp.revision !== null ? { repo: topUp.repo, revision: topUp.revision } : null;
     sidecarPaths = topUp.ensured;
+    // The repair just wrote (or verified) files inside an install whose marker
+    // the caller is about to accept as current: without re-finalizing, those
+    // files stay UNLISTED — a deletion would not invalidate the marker — and an
+    // advanced assets revision stays unpinned, which is the update badge that
+    // can never clear. Only ever touches an existing marker (this is a repair,
+    // not a first install).
+    if (completion !== null && (sidecarPaths.length > 0 || sidecarSource !== null)) {
+      const listed = new Set(completion.files);
+      for (const path of sidecarPaths) {
+        if (existsSync(join(outputDir, path))) listed.add(path);
+      }
+      await writeCompletion(outputDir, {
+        ...completion,
+        files: [...listed].sort(),
+        ...(sidecarSource !== null ? { assetsRepo: sidecarSource.repo, assetsRevision: sidecarSource.revision } : {}),
+      });
+    }
   };
 
   if (existsSync(outputDir)) {
