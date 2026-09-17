@@ -23,6 +23,7 @@ use crate::model_thread::ModelThread;
 use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::ChatMessage;
 use crate::tokenizer::Qwen3Tokenizer;
+use crate::vision::qwen::prompt::IMAGE_TOKEN_ID;
 use napi::bindgen_prelude::Uint32Array;
 use napi::{Error, Result};
 use napi_derive::napi;
@@ -116,11 +117,15 @@ impl ChatBackend for Inner {
                 .iter()
                 .take(self.decoder.positions.len())
                 .enumerate()
-                .filter(|(_, t)| **t == 248056)
+                .filter(|(_, t)| **t == IMAGE_TOKEN_ID as u32)
                 .map(|(i, _)| (i as u32, 0))
                 .collect()
         };
-        crate::engine::cache::collapse_cached_media_placeholder_runs(tokens, 248056, &positions)
+        crate::engine::cache::collapse_cached_media_placeholder_runs(
+            tokens,
+            IMAGE_TOKEN_ID as u32,
+            &positions,
+        )
     }
     fn family_name(&self) -> &'static str {
         "qwen4_exp"

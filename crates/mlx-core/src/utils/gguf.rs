@@ -4648,7 +4648,8 @@ fn qwen35_native_asset_digest(parent: &Path) -> Result<String> {
         .collect())
 }
 
-fn qwen35_native_source_identity_digest(input_path: &Path, metadata: &fs::Metadata) -> String {
+/// Fingerprint a canonical source path and its metadata without reading weight payloads.
+pub(crate) fn source_file_identity_digest(input_path: &Path, metadata: &fs::Metadata) -> String {
     let mut hasher = Sha256::new();
     let path = input_path.as_os_str().as_encoded_bytes();
     hasher.update((path.len() as u64).to_le_bytes());
@@ -5067,9 +5068,7 @@ impl NativeGgufFamily {
 
 fn native_gguf_companion_digest(companion: Option<&Path>) -> Result<String> {
     companion
-        .map(|path| {
-            fs::metadata(path).map(|metadata| qwen35_native_source_identity_digest(path, &metadata))
-        })
+        .map(|path| fs::metadata(path).map(|metadata| source_file_identity_digest(path, &metadata)))
         .transpose()
         .map(|digest| digest.unwrap_or_else(|| "none".to_string()))
         .map_err(Into::into)
@@ -5134,7 +5133,7 @@ async fn prepare_native_gguf_inner(
         .take(32)
         .collect::<String>();
     let parent = input_path.parent().unwrap_or(Path::new("."));
-    let source_identity_digest = qwen35_native_source_identity_digest(&input_path, &metadata);
+    let source_identity_digest = source_file_identity_digest(&input_path, &metadata);
     let asset_digest = qwen35_native_asset_digest(parent)?;
     let companion_digest = native_gguf_companion_digest(companion)?;
     let native_qwen35_layout = family == NativeGgufFamily::Qwen35;
@@ -5195,8 +5194,7 @@ async fn prepare_native_gguf_inner(
             input_path.display()
         ))
     })?;
-    if qwen35_native_source_identity_digest(&input_path, &locked_metadata) != source_identity_digest
-    {
+    if source_file_identity_digest(&input_path, &locked_metadata) != source_identity_digest {
         return Err(Error::from_reason(
             "GGUF source changed while acquiring the native cache lock; retry the load".to_string(),
         ));
@@ -5295,8 +5293,7 @@ async fn prepare_native_gguf_inner(
             )));
         }
     };
-    if qwen35_native_source_identity_digest(&input_path, &final_metadata) != source_identity_digest
-    {
+    if source_file_identity_digest(&input_path, &final_metadata) != source_identity_digest {
         fs::remove_dir_all(&staging_dir).ok();
         return Err(Error::from_reason(
             "GGUF source changed during native preparation; discarded the staged cache, \

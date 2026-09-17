@@ -1294,8 +1294,8 @@ mod rotary_window_tests {
     }
 }
 
-/// Stateful depthwise causal convolution; the state contains only the finite
-/// input window, and each output is evaluated before the next SSD weight read.
+/// Stateful depthwise causal convolution. Complete the owned finite history
+/// before returning the lazy activation to its caller.
 pub fn conv(
     x: &MxArray,
     weight: &MxArray,
@@ -1683,7 +1683,7 @@ pub(super) fn sigmoid_mul(gate: &MxArray, value: &MxArray) -> Result<MxArray> {
 }
 
 #[cfg(test)]
-mod window_conv_tests {
+mod attention_gate_tests {
     use super::*;
 
     #[test]

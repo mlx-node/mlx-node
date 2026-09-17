@@ -527,11 +527,7 @@ impl Store {
     }
 
     pub fn open(path: &Path) -> Result<Self> {
-        Self::open_with_packed_root(path, None)
-    }
-
-    pub(super) fn open_with_packed_root(path: &Path, root: Option<&Path>) -> Result<Self> {
-        let mut s = Self::open_metadata(path, root)?;
+        let mut s = Self::open_metadata(path, None)?;
         s.plan = super::memory::plan(s.hot_bytes()?)?;
         s.cache_limit = s.plan.budget;
         Ok(s)

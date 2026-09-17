@@ -109,13 +109,14 @@ impl Drop for StreamContext {
 
 /// Wired Limit Context Manager (RAII pattern)
 ///
-/// Matches mlx-lm's `wired_limit` context manager (generate.py lines 219-256).
-/// Temporarily sets the wired memory limit for Metal GPU operations.
+/// Temporarily requests wired memory for Metal GPU operations, following
+/// mlx-lm's `wired_limit` policy or an independently admitted working-set bound.
 ///
 /// When created:
 /// - Checks if Metal is available
 /// - Calculates model size and compares to max_recommended_working_set_size
-/// - Sets wired limit to max_recommended_working_set_size
+/// - Requests the selected limit, capped at max_recommended_working_set_size
+/// - Keeps the largest request while overlapping contexts are active
 /// - Stores streams to synchronize on exit
 ///
 /// When dropped:
@@ -264,9 +265,7 @@ fn set_wired_limit(requested: usize) -> Option<usize> {
     if unsafe { sys::mlx_set_wired_limit(requested as u64, &mut previous) } != 0 {
         return None;
     }
-    if std::env::var("MLX_QWEN4_TRACE_WIRED").as_deref() == Ok("1") {
-        eprintln!("MLX_WIRED_LIMIT previous={previous} requested={requested}");
-    }
+    tracing::debug!(previous, requested, "Updated Metal wired memory limit");
     Some(previous as usize)
 }
 

@@ -25,6 +25,13 @@ struct AttentionProjections {
     iq: MxArray,
     ik: MxArray,
 }
+
+struct GdnProjections {
+    qkv: MxArray,
+    z: MxArray,
+    a: MxArray,
+    b: MxArray,
+}
 impl AttentionProjections {
     fn row(&self, row: usize) -> Result<Self> {
         let slice = |a: &MxArray| a.slice_axis(1, row as i64, row as i64 + 1);
@@ -55,7 +62,6 @@ pub struct DecoderState {
     positions: Vec<[i64; 3]>,
     rope_delta: i64,
     media_digests: Vec<crate::engine::cache::ImageCacheDigest>,
-    last_hidden: Option<MxArray>,
     last_chunk_hidden: Vec<MxArray>,
     cancelled: Option<Arc<AtomicBool>>,
 }
@@ -83,7 +89,6 @@ pub struct Decoder {
     verification: Option<Vec<DecoderState>>,
     device_routes: Option<Vec<(usize, MxArray)>>,
     device_route_cooldown: usize,
-    pub last_hidden: Option<MxArray>,
     pub last_chunk_hidden: Vec<MxArray>,
 }
 impl Decoder {
@@ -119,7 +124,6 @@ impl Decoder {
             verification: None,
             device_routes: None,
             device_route_cooldown: 0,
-            last_hidden: None,
             last_chunk_hidden: Vec::new(),
         };
         d.preflight()?;
@@ -132,7 +136,6 @@ impl Decoder {
             positions: self.positions.clone(),
             rope_delta: self.rope_delta,
             media_digests: self.media_digests.clone(),
-            last_hidden: self.last_hidden.clone(),
             last_chunk_hidden: self.last_chunk_hidden.clone(),
             cancelled: self.cancelled.clone(),
         }
@@ -144,7 +147,6 @@ impl Decoder {
             positions: std::mem::take(&mut self.positions),
             rope_delta: self.rope_delta,
             media_digests: self.media_digests.clone(),
-            last_hidden: self.last_hidden.take(),
             last_chunk_hidden: std::mem::take(&mut self.last_chunk_hidden),
             cancelled: self.cancelled.take(),
         };
@@ -158,7 +160,6 @@ impl Decoder {
         self.positions = state.positions;
         self.rope_delta = state.rope_delta;
         self.media_digests = state.media_digests;
-        self.last_hidden = state.last_hidden;
         self.last_chunk_hidden = state.last_chunk_hidden;
         self.cancelled = state.cancelled;
     }
@@ -171,7 +172,6 @@ impl Decoder {
         self.positions.clear();
         self.rope_delta = 0;
         self.media_digests.clear();
-        self.last_hidden = None;
         self.last_chunk_hidden.clear();
         self.caches = (0..self.config.num_hidden_layers)
             .map(|_| LayerCache::default())
@@ -882,15 +882,7 @@ impl Decoder {
                 .reshape(&x.shape()?)?,
         )
     }
-    fn gdn(&mut self, x: &MxArray, i: usize, cache: &mut LayerCache) -> Result<MxArray> {
-        let c = self.config.clone();
-        let p = format!("layers.{i}.linear_attn");
-        let g = format!("blk.{i}");
-        let nh = c.linear_num_value_heads as i64;
-        let kh = c.linear_num_key_heads as i64;
-        let kd = c.linear_key_head_dim as i64;
-        let vd = c.linear_value_head_dim as i64;
-        let keydim = kh * kd;
+    fn gdn_projections(&mut self, x: &MxArray, p: &str, g: &str) -> Result<GdnProjections> {
         let (qkv, z) = self.linear_pair(
             x,
             (
@@ -902,7 +894,12 @@ impl Decoder {
                 &format!("{g}.attn_gate.weight"),
             ),
         )?;
-        let z = z.reshape(&[1, 1, nh, vd])?;
+        let z = z.reshape(&[
+            1,
+            x.shape_at(1)?,
+            self.config.linear_num_value_heads as i64,
+            self.config.linear_value_head_dim as i64,
+        ])?;
         // TrackFastModel.bindGDN groups compatible projections. The GGUF
         // gate matrices are dense F32, so pair them separately from Q8 QKV/Z.
         let (a, b) = if self.gguf() && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_PAIR") {
@@ -938,6 +935,19 @@ impl Decoder {
         } else {
             (a.astype(DType::Float32)?, b.astype(DType::Float32)?)
         };
+        Ok(GdnProjections { qkv, z, a, b })
+    }
+
+    fn gdn(&mut self, x: &MxArray, i: usize, cache: &mut LayerCache) -> Result<MxArray> {
+        let c = self.config.clone();
+        let p = format!("layers.{i}.linear_attn");
+        let g = format!("blk.{i}");
+        let nh = c.linear_num_value_heads as i64;
+        let kh = c.linear_num_key_heads as i64;
+        let kd = c.linear_key_head_dim as i64;
+        let vd = c.linear_value_head_dim as i64;
+        let keydim = kh * kd;
+        let GdnProjections { qkv, z, a, b } = self.gdn_projections(x, &p, &g)?;
         let conv = self.dense(
             &format!("{p}.conv1d.weight"),
             &format!("{g}.ssm_conv1d.weight"),
@@ -1334,6 +1344,18 @@ impl Decoder {
             MxArray::concatenate_many(weighted.iter().collect(), Some(1))?
                 .sum(Some(&[1]), Some(true))?
         };
+        let (shared, gate) = self.shared_expert_parts(x, i, shared_gate)?;
+        sum.astype(x.dtype()?)?
+            .add(&math::sigmoid_mul(&gate, &shared)?)
+    }
+    fn shared_expert_parts(
+        &mut self,
+        x: &MxArray,
+        i: usize,
+        precomputed_gate: Option<MxArray>,
+    ) -> Result<(MxArray, MxArray)> {
+        let p = format!("layers.{i}.mlp");
+        let g = format!("blk.{i}");
         let (gate, up) = self.linear_pair(
             x,
             (
@@ -1345,12 +1367,14 @@ impl Decoder {
                 &format!("{g}.ffn_up_shexp.weight"),
             ),
         )?;
+        let activation = math::swiglu(&gate, &up)?;
         let shared = self.linear(
-            &math::swiglu(&gate, &up)?,
+            &activation,
             &format!("{p}.shared_expert.down_proj.weight"),
             &format!("{g}.ffn_down_shexp.weight"),
         )?;
-        let gate = match shared_gate {
+        drop(activation);
+        let gate = match precomputed_gate {
             Some(gate) => gate,
             None => self.linear(
                 x,
@@ -1358,9 +1382,9 @@ impl Decoder {
                 &format!("{g}.ffn_gate_inp_shexp.weight"),
             )?,
         };
-        sum.astype(x.dtype()?)?
-            .add(&math::sigmoid_mul(&gate, &shared)?)
+        Ok((shared, gate))
     }
+
     fn ple(
         &mut self,
         x: &MxArray,
@@ -1598,13 +1622,9 @@ impl Decoder {
         Ok((hidden, logits))
     }
     pub fn step(&mut self, token: u32) -> Result<MxArray> {
-        self.forward_token(token, true)
-    }
-
-    pub fn forward_token(&mut self, token: u32, project_logits: bool) -> Result<MxArray> {
         let _flags = runtime_flags::scope();
         self.rotary_tables.get_mut().clear();
-        let result = self.forward_with_device_routes(token, project_logits);
+        let result = self.forward_with_device_routes(token, true);
         self.rotary_tables.get_mut().clear();
         // A read failure or cancellation can happen after earlier layers have
         // advanced. Discard the entire prefix instead of reusing partial state.
@@ -1692,9 +1712,9 @@ impl Decoder {
             .reshape(&[1, 1, self.config.hidden_size as i64])
     }
 
-    /// Traverse a bounded prompt chunk layer by layer. Keeping each layer's
-    /// selected matrices hot amortizes SSD import without changing the scalar
-    /// reduction shapes used by the reference decoder.
+    /// Traverse a bounded prompt chunk layer by layer, sharing weight reads
+    /// and projections across its tokens. Verification retains singleton
+    /// arithmetic and captures state at every accepted frontier.
     pub fn prefill_chunk(
         &mut self,
         tokens: &[u32],
@@ -1706,22 +1726,7 @@ impl Decoder {
             self.weights.check_forward_headroom()?;
         }
         self.rotary_tables.get_mut().clear();
-        let result = self
-            .prefill_with_device_routes(tokens, embeddings, project_logits)
-            .and_then(|logits| {
-                // Optional diagnostic export for comparing reference arithmetic ports.
-                // Only the final prompt logits are written; ordinary execution has no IO.
-                if tokens.len() > 8
-                    && project_logits
-                    && let Ok(path) = std::env::var("MLX_QWEN4_PREFILL_LOGITS_PATH")
-                {
-                    let values = logits.astype(DType::Float32)?.to_float32()?;
-                    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    std::fs::write(path, bytes)
-                        .map_err(|e| Error::from_reason(format!("Qwen4 diagnostic logits: {e}")))?;
-                }
-                Ok(logits)
-            });
+        let result = self.prefill_with_device_routes(tokens, embeddings, project_logits);
         self.rotary_tables.get_mut().clear();
         if result.is_err() {
             self.reset();
@@ -1831,7 +1836,6 @@ impl Decoder {
                         positions: self.positions.clone(),
                         rope_delta: self.rope_delta,
                         media_digests: self.media_digests.clone(),
-                        last_hidden: None,
                         last_chunk_hidden: Vec::new(),
                         cancelled: self.cancelled.clone(),
                     })
@@ -1971,18 +1975,12 @@ impl Decoder {
         }
         if let Some(states) = &mut self.verification {
             for (state, h) in states.iter_mut().zip(&hidden) {
-                state.last_hidden = Some(h.clone());
                 state.last_chunk_hidden = vec![h.clone()];
             }
         }
-        self.last_hidden = hidden.last().cloned();
+        let last_hidden = hidden.last().unwrap().clone();
         self.last_chunk_hidden = hidden;
-        let (mixed, _) = self.hyper(
-            &self.last_hidden.clone().unwrap(),
-            "hyper_connection_mixer",
-            "output_hc",
-            false,
-        )?;
+        let (mixed, _) = self.hyper(&last_hidden, "hyper_connection_mixer", "output_hc", false)?;
         let logits = if project_logits {
             self.linear(&mixed, "lm_head.weight", "output.weight")?
         } else {
@@ -2032,7 +2030,6 @@ impl Decoder {
             // Keep reusable buffers bounded after all layer consumers complete.
             super::memory::maintain_freelist(self.weights.plan.physical_bytes);
         }
-        self.last_hidden = Some(x.clone());
         self.last_chunk_hidden = vec![x.clone()];
         let (hidden, _) = self.hyper(&x, "hyper_connection_mixer", "output_hc", false)?;
         let logits = if project_logits {

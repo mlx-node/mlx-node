@@ -692,8 +692,6 @@ bool mlx_qwen4_inject_norm(mlx_array *x, mlx_array *y, mlx_array *g,
                      {"H", 2560},
                      {"W", 10240},
                      {"HC", 4},
-                     {"HAS_INJECT", true},
-                     {"TILE", false},
                      {"SG", sg}},
                     std::nullopt, false,
                     mlx::core::default_stream(mlx::core::Device::gpu));

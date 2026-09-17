@@ -2105,12 +2105,6 @@ unsafe extern "C" {
         scales: *mut mlx_array,
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
-    pub fn mlx_qwen4_shared_prefill(
-        x: *mut mlx_array,
-        w: *mut mlx_array,
-        scales: *mut mlx_array,
-        biases: *mut mlx_array,
-    ) -> *mut mlx_array;
     pub fn mlx_qwen4_norm(
         x: *mut mlx_array,
         w: *mut mlx_array,

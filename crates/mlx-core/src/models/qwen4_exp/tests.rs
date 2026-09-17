@@ -4564,7 +4564,9 @@ fn reference_hyper_norm_preserves_mean_boundaries_and_offset_views() {
 fn shared_prefill_preserves_q8_values_companions_and_row_tails() {
     use crate::array::DType;
     use crate::models::qwen3_5::quantized_linear::QuantizedLinear;
-    if std::env::var("MLX_ENABLE_TF32").as_deref() == Ok("0") {
+    if std::env::var("MLX_ENABLE_TF32").as_deref() == Ok("0")
+        || runtime_flags::is_zero(c"MLX_QWEN4_PREFILL_SHARED_Q8")
+    {
         return;
     }
     let ids = MxArray::from_uint32(&vec![0; 256], &[256]).unwrap();
@@ -4622,7 +4624,7 @@ fn shared_prefill_preserves_q8_values_companions_and_row_tails() {
                     "affine".into(),
                 );
                 let raw = unsafe {
-                    mlx_sys::mlx_qwen4_shared_prefill(
+                    mlx_sys::mlx_qwen4_dense_prefill(
                         x.as_raw_ptr(),
                         w.as_raw_ptr(),
                         scales.as_raw_ptr(),
@@ -4639,7 +4641,7 @@ fn shared_prefill_preserves_q8_values_companions_and_row_tails() {
             let short = x.slice_axis(1, 0, 511).unwrap();
             assert!(
                 unsafe {
-                    mlx_sys::mlx_qwen4_shared_prefill(
+                    mlx_sys::mlx_qwen4_dense_prefill(
                         short.as_raw_ptr(),
                         w.as_raw_ptr(),
                         scales.as_raw_ptr(),

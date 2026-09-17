@@ -8,6 +8,7 @@
 #include <atomic>
 #include <cstdint>
 #include <mutex>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -25,7 +26,7 @@ namespace mlx::core::metal {
 // size of each set bounds the cost of one such event. Every set holds a
 // standing requestResidency() and is attached to every command queue.
 //
-// MLX_RESIDENCY_SET_MAX_PCT (env::residency_set_max_pct) sets the per-set cap.
+// MLX_RESIDENCY_SET_MAX_PCT sets the per-set cap.
 // The total wired budget is unaffected by it: that is still `set_wired_limit`.
 class ResidencySet {
  public:
@@ -49,27 +50,6 @@ class ResidencySet {
   // thread before every command-buffer commit, because Metal locks a command
   // buffer's residency at commit time.
   void attach_new_sets(MTL::CommandQueue* q, uint64_t& attached);
-
-  // Total bytes currently wired across all sets.
-  size_t wired_size() const {
-    std::lock_guard<std::mutex> lk(mtx_);
-    return total_wired_;
-  }
-  size_t num_sets() const {
-    return num_sets_.load(std::memory_order_acquire);
-  }
-
-  // Testing only: sets the per-set cap for subsequent inserts, bypassing the
-  // size floor so tests can reach the multi-set paths cheaply. 0 selects the
-  // single-set layout.
-  void set_max_bytes_per_set(size_t bytes) {
-    std::lock_guard<std::mutex> lk(mtx_);
-    max_bytes_per_set_ = bytes;
-  }
-  size_t max_bytes_per_set() const {
-    std::lock_guard<std::mutex> lk(mtx_);
-    return max_bytes_per_set_;
-  }
 
  private:
   // A set id of kNoSet means the allocation is tracked but is not in any
@@ -99,7 +79,7 @@ class ResidencySet {
   // gave us a set; the new set is the last one. add_to_set_locked returns the
   // set it used. Neither it nor remove_from_set_locked commits, so a bulk
   // resize costs one commit per set instead of one per allocation.
-  bool add_set_locked(NS::Error** error = nullptr);
+  bool add_set_locked(std::string* error = nullptr);
   uint32_t choose_set_locked(size_t bytes);
   uint32_t add_to_set_locked(const MTL::Allocation* buf, Placement& at);
   void remove_from_set_locked(const MTL::Allocation* buf, Placement& at);
@@ -120,7 +100,7 @@ class ResidencySet {
   // sets_.size(), published so a queue can check for new sets without
   // taking the lock.
   std::atomic<uint64_t> num_sets_{0};
-  mutable std::mutex mtx_;
+  std::mutex mtx_;
 };
 
 } // namespace mlx::core::metal

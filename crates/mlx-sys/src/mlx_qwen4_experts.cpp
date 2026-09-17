@@ -1,8 +1,10 @@
 #include "mlx_common.h"
 #include "mlx_qwen4_flags.h"
 #ifdef MLX_NODE_METAL_ENABLED
+#include "metal/common/native_activations.h"
 #include "metal/common/quantized.h"
 namespace {
+using mlx::core::metal::native_bf16_silu_table;
 using mlx::core::quantized_preamble::qmv_header;
 
 const std::string &expert_header() {
@@ -33,22 +35,6 @@ const array &native_bf16_sigmoid_table() {
         true);
     auto result =
         fn({values, mlx::core::ones({65536}, mlx::core::bfloat16)})[0];
-    mlx::core::eval({result});
-    return result;
-  }();
-  return table;
-}
-
-// Activations::silu uses a native, uncompiled sigmoid and multiply. Keep
-// that table separate from the compiled sigmoid_mul approximation above.
-const array &native_bf16_silu_table() {
-  static const array table = [] {
-    std::vector<uint16_t> bits(65536);
-    for (size_t i = 0; i < bits.size(); ++i)
-      bits[i] = uint16_t(i);
-    auto values = mlx::core::view(
-        array(bits.data(), {65536}, mlx::core::uint16), mlx::core::bfloat16);
-    auto result = values * mlx::core::sigmoid(values);
     mlx::core::eval({result});
     return result;
   }();

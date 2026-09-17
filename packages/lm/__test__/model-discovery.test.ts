@@ -55,6 +55,25 @@ describe('discoverLocalChatModels', () => {
     expect(failures).toEqual([]);
   });
 
+  it('ignores generated GGUF asset directories while discovering the source checkpoint', async () => {
+    const dir = join(tmp, 'gguf-assets');
+    mkdirSync(dir);
+    const gguf = join(dir, 'Qwen3.8-Flash-Next.gguf');
+    writeFileSync(gguf, minimalGguf('qwen4exp'));
+    for (const name of ['.mlx-qwen4-assets-v2-0123456789abcdef', '.mlx-qwen4-assets-tmp-publishing']) {
+      const assets = join(dir, name);
+      mkdirSync(assets);
+      writeFileSync(join(assets, 'config.json'), JSON.stringify({ model_type: 'qwen4_exp' }));
+      writeFileSync(join(assets, 'tokenizer.json'), '{}');
+      if (!name.includes('-tmp-')) writeFileSync(join(assets, 'complete'), '1');
+    }
+    const failures: string[] = [];
+    expect(await discoverLocalChatModels(dir, { onEntryFailure: (_e, path) => failures.push(path) })).toEqual([
+      expect.objectContaining({ path: gguf, modelType: 'qwen4_exp' }),
+    ]);
+    expect(failures).toEqual([]);
+  });
+
   it.skipIf(!canChmod)('reports an entry it could not evaluate via onEntryFailure', async () => {
     // config.json exists but cannot be opened (EACCES): the entry may be a
     // model missing from the result, so the scan is incomplete — exactly the

@@ -48,12 +48,12 @@ ResidencySet::ResidencySet(MTL::Device* d) {
     std::lock_guard<std::mutex> lk(mtx_);
     // Set 0 always exists and is the fallback when a later set cannot be
     // made, so failing to create it is fatal.
-    NS::Error* error = nullptr;
+    std::string error;
     if (!add_set_locked(&error)) {
       std::ostringstream msg;
       msg << "[metal::Device] Unable to construct residency set.\n";
-      if (error) {
-        msg << error->localizedDescription()->utf8String() << "\n";
+      if (!error.empty()) {
+        msg << error << "\n";
       }
       throw std::runtime_error(msg.str());
     }
@@ -62,7 +62,7 @@ ResidencySet::ResidencySet(MTL::Device* d) {
 
 ResidencySet::~ResidencySet() = default;
 
-bool ResidencySet::add_set_locked(NS::Error** error_out) {
+bool ResidencySet::add_set_locked(std::string* error_out) {
   NS::SharedPtr<MTL::ResidencySet> set;
   if (__builtin_available(macOS 15, iOS 18, *)) {
     auto pool = new_scoped_memory_pool();
@@ -73,8 +73,9 @@ bool ResidencySet::add_set_locked(NS::Error** error_out) {
       // A standing request, so allocations added to this set later are
       // covered without requesting residency again on every insert.
       set->requestResidency();
-    } else if (error_out) {
-      *error_out = error;
+    } else if (error_out && error) {
+      // NSError is autoreleased; copy its message before this pool drains.
+      *error_out = error->localizedDescription()->utf8String();
     }
   }
   if (!set) {

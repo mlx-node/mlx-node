@@ -15,8 +15,7 @@ R"METAL(
         const uint sgi = simdgroup_index_in_threadgroup;
         threadgroup float local_sums[32];
         const uint base = row * W + hc * H;
-        InT inj_t = InT(0);
-        if (HAS_INJECT) { inj_t = inject[row * HC + hc]; }
+        const InT inj_t = inject[row * HC + hc];
         if (sgi == 0 && lane >= simd_groups) { local_sums[lane] = 0; }
         // Each simdgroup keeps the stream values it wrote, so the normalise
         // pass reads registers instead of re-reading the stream row.
@@ -30,12 +29,9 @@ R"METAL(
             if (lid < NT) {
                 for (int i = 0; i < N_READS; ++i) {
                     const uint d = lid * N_READS + i;
-                    const uint src = TILE ? (row * H + d) : (base + d);
-                    InT r = residual[src];
-                    if (HAS_INJECT) {
-                        InT sp = branch[row * H + d] * inj_t;
-                        r = r + sp;
-                    }
+                    InT r = residual[base + d];
+                    InT sp = branch[row * H + d] * inj_t;
+                    r = r + sp;
                     stream[base + d] = r;
                     kept[si * N_READS + i] = r;
                     const float xf = static_cast<float>(r);

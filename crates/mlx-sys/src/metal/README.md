@@ -6,7 +6,8 @@ Organize them by their mathematical and storage contracts:
 - `common/`: reusable operations. A kernel may specialize a dtype, tile size,
   quantization format, reduction order, or head mapping without belonging to a
   model family. `quantized.h` provides the host-side MLX preambles shared by
-  these operations.
+  these operations. `native_activations.h` shares the evaluated BF16 SiLU
+  lookup while preserving the native sigmoid and multiplication rounding.
 - `qwen4/`: checkpoint-specific fusions and dispatch assumptions: 512-way
   top-10 routing, fixed shared-expert packing, 16 key / 48 value heads, and
   four-stream hyper-connection mixing. The dense projection kernels also

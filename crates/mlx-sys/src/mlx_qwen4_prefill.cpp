@@ -5,10 +5,12 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/primitives.h"
 #include "mlx/utils.h"
+#include "metal/common/native_activations.h"
 #include "metal/common/quantized.h"
 #endif
 
 #ifdef MLX_NODE_METAL_ENABLED
+using mlx::core::metal::native_bf16_silu_table;
 using mlx::core::quantized_preamble::nax_header;
 
 template <int BM, bool ACT = false, bool PREFETCH = false, bool COMPACT = false>
@@ -151,24 +153,6 @@ static std::vector<array> qwen4_indirect_prefill(const std::vector<array> &a,
 
 #endif
 
-#ifdef MLX_NODE_METAL_ENABLED
-// Activations::silu uses the native, unfused sigmoid and multiply. Retain
-// those BF16 results when porting TrackPrefillMixerAct's matrix epilogue.
-static const array &qwen4_native_silu_table() {
-  static const array table = [] {
-    std::vector<uint16_t> bits(65536);
-    for (size_t i = 0; i < bits.size(); ++i)
-      bits[i] = uint16_t(i);
-    auto values = mlx::core::view(
-        array(bits.data(), {65536}, mlx::core::uint16), mlx::core::bfloat16);
-    auto out = values * sigmoid(values);
-    mlx::core::eval({out});
-    return out;
-  }();
-  return table;
-}
-#endif
-
 extern "C" {
 
 // Match the ordinary affine8 NAX matrix path while avoiding global F32 copies.
@@ -219,7 +203,7 @@ static mlx_array *qwen4_dense_prefill_impl(mlx_array *input, mlx_array *weight,
       if (n != 320 || k != 10240)
         return nullptr;
       auto out = qwen4_dense_prefill_dispatch<32, true>(
-          {x, w, s, b, qwen4_native_silu_table()}, true);
+          {x, w, s, b, native_bf16_silu_table()}, true);
       return reinterpret_cast<mlx_array *>(new array(std::move(out[0])));
     }
     const auto setting = qwen4_env("MLX_QWEN4_CACHED_PREFILL_GRAPHS");
@@ -242,10 +226,6 @@ mlx_array *mlx_qwen4_dense_prefill(mlx_array *input, mlx_array *weight,
   const auto shared = qwen4_env("MLX_QWEN4_PREFILL_SHARED_Q8");
   return qwen4_dense_prefill_impl(input, weight, scales, biases, false,
                                   !shared || std::string(shared) != "0");
-}
-mlx_array *mlx_qwen4_shared_prefill(mlx_array *input, mlx_array *weight,
-                                    mlx_array *scales, mlx_array *biases) {
-  return qwen4_dense_prefill_impl(input, weight, scales, biases, false, true);
 }
 mlx_array *mlx_qwen4_prefill_mixer_act(mlx_array *input, mlx_array *weight,
                                        mlx_array *scales, mlx_array *biases) {

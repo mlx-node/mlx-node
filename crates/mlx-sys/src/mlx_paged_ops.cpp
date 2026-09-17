@@ -5124,7 +5124,7 @@ int mlx_paged_kv_write_compile_cached_non_contiguous_throws() {
 /// call it again with the SAME shapes / dtypes but with `block_table`
 /// substituted by a sliced (nonzero-offset) view of a wider table.
 /// Cache HIT bypasses the factory; `PagedAttention::eval_gpu`'s mirrored
-/// `require_row_contiguous` check MUST throw on the second
+/// `require_row_contiguous_zero_offset` check MUST throw on the second
 /// eval.
 ///
 /// Layout matches `mlx_paged_attention_compile_cached_oob_throws`:

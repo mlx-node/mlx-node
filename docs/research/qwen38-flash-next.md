@@ -5,6 +5,49 @@ Research: 15–17 September 2026. Starting revision:
 initial performance record, mlx.fast investigation, prefill port log, and
 macOS 27 recheck. The [runtime guide](../qwen38-flash-next.md) covers usage.
 
+## Whole-branch review, 17 September
+
+Three independent reviews covered the native bridge/shaders, decoder/scheduler,
+and storage/media paths. The integration review covered shared vision, stream
+residency, TypeScript discovery/loading, documentation and live PR findings.
+Caller tracing retained the active fallback implementations, optional kernels,
+and independent F32/BF16, paged, MTP and M-RoPE oracle fixtures.
+
+The review fixes three defects:
+
+- Residency-set creation now copies the Metal error description before its
+  autorelease pool drains, avoiding a dangling error pointer on failure.
+- Qwen4 tokenizer assets use the shared GGUF source identity (path, file size,
+  and Unix device/inode/change time). A same-size checkpoint
+  replacement preserving modification time therefore generates fresh assets.
+- Model discovery ignores the generated asset and temporary publication
+  directories, which contain config/tokenizer files but no model weights.
+
+Cleanup removes duplicated hidden-state bookkeeping, unused residency inspection
+hooks, a test-only shared-prefill FFI export, unreachable injection shader modes,
+obsolete forwarding wrappers, and the one-off inference logit file export.
+GDN projections and shared-expert setup now each have one implementation; a
+common native BF16 SiLU table replaces two retained copies. Shared image-token
+constants and ordinary tracing replace copied literals and a family-specific
+wired-limit diagnostic switch. Stale runtime descriptions and a misnamed test
+module now match the current execution paths. Existing numerical regression
+coverage remains, including shared-prefill parity through production dispatch.
+
+The source-replacement regression publishes and rebuilds real tokenizer assets
+using a tiny fixture with no tensor reads. The discovery regression checks both
+completed and in-progress asset directories alongside the source GGUF.
+
+Validation passed: canonical native build and both packaged Metal-library smoke
+checks; **3577 core unit tests**, with 122 ignored and three existing
+debug-assertion-only cases excluded in release mode; strict all-target Clippy;
+workspace TypeScript checking; **150 tests across ten loader/discovery/registry
+and session suites**, plus **47 Metal-library selection tests**. Batched-prefill
+parity also passed with each GDN gate switch enabled separately and both enabled
+together. No checkpoint load or throughput comparison was needed for this review cleanup. The residency
+failure-path ownership fix was inspected and compiled; a driver allocation
+failure was not forced. Logs remain outside the repository under
+`~/Library/Caches/mlx-node/branch-review-20260917/`.
+
 ## Architecture review, 17 September
 
 The Metal shader audit separates implementation provenance from model-specific

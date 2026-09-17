@@ -80,7 +80,6 @@ impl Decoder {
         x: &MxArray,
         token: u32,
     ) -> Result<MxArray> {
-        self.last_hidden = Some(x.clone());
         self.last_chunk_hidden = vec![x.clone()];
         let (mixed, _) = self.hyper(x, "hyper_connection_mixer", "output_hc", false)?;
         let logits = self.linear(&mixed, "lm_head.weight", "output.weight")?;

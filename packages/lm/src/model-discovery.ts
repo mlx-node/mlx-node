@@ -293,7 +293,9 @@ export async function discoverLocalChatModels(
       await appendGguf(entry.name, modelsDir, basename(modelsDir));
       continue;
     }
-    if (!entry.isDirectory()) continue;
+    // Native Qwen4 GGUF loads publish tokenizer/config sidecars here, including
+    // temporary directories during publication. They contain no model weights.
+    if (!entry.isDirectory() || entry.name.startsWith('.mlx-qwen4-assets-')) continue;
     const full = join(modelsDir, entry.name);
     try {
       const inventory = await modelFileInventory(full);

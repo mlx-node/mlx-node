@@ -4,7 +4,7 @@ use super::{Inner, config::Config, weights::Store};
 use crate::array::MxArray;
 use crate::engine::backend::{PagedBackend, TurnOutput, WholeTurnArgs};
 use crate::vision::qwen::prompt::{
-    compute_image_token_counts_per_image, get_rope_index, inject_image_placeholders,
+    IMAGE_TOKEN_ID, compute_image_token_counts_per_image, get_rope_index, inject_image_placeholders,
 };
 use crate::vision::qwen::{
     encoder::{QwenVisionConfig, QwenVisionEncoder},
@@ -212,7 +212,7 @@ impl Inner {
             MxArray::concatenate_many(features.iter().collect(), Some(0))?.astype(text_dtype)?;
         let grid = MxArray::concatenate_many(grids.iter().collect(), Some(0))?;
         let ids = MxArray::from_uint32(&tokens, &[1, tokens.len() as i64])?;
-        let (positions, delta) = get_rope_index(&ids, Some(&grid), 2, 248056)?;
+        let (positions, delta) = get_rope_index(&ids, Some(&grid), 2, IMAGE_TOKEN_ID)?;
         let positions = positions.to_int32()?;
         let axes = (0..tokens.len())
             .map(|i| {
@@ -226,7 +226,7 @@ impl Inner {
         let mut embeddings = Vec::with_capacity(tokens.len());
         let mut feature_row = 0;
         for &token in &tokens {
-            let embedding = if token == 248056 {
+            let embedding = if token == IMAGE_TOKEN_ID as u32 {
                 let row = features
                     .slice_axis(0, feature_row, feature_row + 1)?
                     .expand_dims(0)?;

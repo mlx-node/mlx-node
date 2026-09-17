@@ -1,5 +1,5 @@
-//! Prompt-only matrix batching. Stateful attention/PLE still advance in token
-//! order; stateless HC/MLP work shares matrix loads across the prompt window.
+//! Matrix batching for prompt windows and scheduled decode rows. Stateful
+//! attention/PLE preserve each owner's order; stateless HC/MLP share weights.
 use super::*;
 use crate::models::qwen4_exp::runtime_flags;
 use std::collections::BTreeMap;
@@ -554,53 +554,7 @@ impl Decoder {
             c.linear_key_head_dim as i64,
             c.linear_value_head_dim as i64,
         );
-        let (qkv, z) = self.linear_pair(
-            x,
-            (
-                &format!("{p}.in_proj_qkv.weight"),
-                &format!("{g}.attn_qkv.weight"),
-            ),
-            (
-                &format!("{p}.in_proj_z.weight"),
-                &format!("{g}.attn_gate.weight"),
-            ),
-        )?;
-        let z = z.reshape(&[1, t, nh, vd])?;
-        // TrackFastModel.bindGDN groups compatible projections. The GGUF
-        // gate matrices are dense F32, so pair them separately from Q8 QKV/Z.
-        let (a, b) = if self.gguf() && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_PAIR") {
-            self.linear_pair(
-                x,
-                (
-                    &format!("{p}.in_proj_a.weight"),
-                    &format!("{g}.ssm_alpha.weight"),
-                ),
-                (
-                    &format!("{p}.in_proj_b.weight"),
-                    &format!("{g}.ssm_beta.weight"),
-                ),
-            )?
-        } else {
-            (
-                self.linear(
-                    x,
-                    &format!("{p}.in_proj_a.weight"),
-                    &format!("{g}.ssm_alpha.weight"),
-                )?,
-                self.linear(
-                    x,
-                    &format!("{p}.in_proj_b.weight"),
-                    &format!("{g}.ssm_beta.weight"),
-                )?,
-            )
-        };
-        // TrackFastGDNDecode reads projected BF16 gates directly. Keep local
-        // F32 gate arithmetic inside the consumer, without two cast buffers.
-        let (a, b) = if self.gguf() && runtime_flags::is_one(c"MLX_QWEN4_GDN_GATE_INPUTS") {
-            (a, b)
-        } else {
-            (a.astype(DType::Float32)?, b.astype(DType::Float32)?)
-        };
+        let GdnProjections { qkv, z, a, b } = self.gdn_projections(x, &p, &g)?;
 
         let conv = self.dense(
             &format!("{p}.conv1d.weight"),
@@ -718,16 +672,7 @@ impl Decoder {
     }
 
     pub(super) fn mlp_matrix(&mut self, x: &MxArray, i: usize) -> Result<MxArray> {
-        self.mlp_matrix_with_norm(x, i, None)
-    }
-
-    pub(super) fn mlp_matrix_with_norm(
-        &mut self,
-        x: &MxArray,
-        i: usize,
-        normed: Option<&MxArray>,
-    ) -> Result<MxArray> {
-        Ok(self.mlp_matrix_for_attention(x, i, normed, false)?.0)
+        Ok(self.mlp_matrix_for_attention(x, i, None, false)?.0)
     }
 
     pub(super) fn mlp_matrix_for_attention(
@@ -792,7 +737,7 @@ impl Decoder {
         if self.device_routes.is_some()
             && runtime_flags::is_one(c"MLX_QWEN4_PREFILL_SHARED_COMBINE")
         {
-            let (shared, gate) = self.shared_expert_parts(x, i)?;
+            let (shared, gate) = self.shared_expert_parts(x, i, None)?;
             let out =
                 self.tentative_prefill_experts(x, &selected, &scores, i, Some((&shared, &gate)))?;
 
@@ -871,40 +816,11 @@ impl Decoder {
             }
         };
 
-        let (shared, gate) = self.shared_expert_parts(x, i)?;
+        let (shared, gate) = self.shared_expert_parts(x, i, None)?;
         let output = sum
             .astype(x.dtype()?)?
             .add(&math::sigmoid_mul(&gate, &shared)?)?;
 
         Ok(output)
-    }
-
-    fn shared_expert_parts(&mut self, x: &MxArray, i: usize) -> Result<(MxArray, MxArray)> {
-        let p = format!("layers.{i}.mlp");
-        let g = format!("blk.{i}");
-        let (gate, up) = self.linear_pair(
-            x,
-            (
-                &format!("{p}.shared_expert.gate_proj.weight"),
-                &format!("{g}.ffn_gate_shexp.weight"),
-            ),
-            (
-                &format!("{p}.shared_expert.up_proj.weight"),
-                &format!("{g}.ffn_up_shexp.weight"),
-            ),
-        )?;
-        let activation = math::swiglu(&gate, &up)?;
-        let shared = self.linear(
-            &activation,
-            &format!("{p}.shared_expert.down_proj.weight"),
-            &format!("{g}.ffn_down_shexp.weight"),
-        )?;
-        drop(activation);
-        let gate = self.linear(
-            x,
-            &format!("{p}.shared_expert_gate.weight"),
-            &format!("{g}.ffn_gate_inp_shexp.weight"),
-        )?;
-        Ok((shared, gate))
     }
 }
