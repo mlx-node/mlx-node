@@ -1477,6 +1477,43 @@ pub fn hash_ids(
     Ok(ids)
 }
 
+pub(super) fn routes_shared_gate(
+    logits: &MxArray,
+    x: &MxArray,
+    weight: &MxArray,
+    top: usize,
+) -> Result<Option<(MxArray, MxArray, MxArray)>> {
+    if top != 10
+        || !runtime_flags::is_one(c"MLX_QWEN4_ROUTE_SHARED_GATE")
+        || runtime_flags::is_zero(c"MLX_QWEN4_SINGLETON_ROUTER")
+        || !crate::engine::persistence::compiled_forward_backend_available()
+    {
+        return Ok(None);
+    }
+    let (mut ids, mut scores, mut gate) = (
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+        std::ptr::null_mut(),
+    );
+    if !unsafe {
+        mlx_sys::mlx_qwen4_routes_shared_gate(
+            logits.as_raw_ptr(),
+            x.as_raw_ptr(),
+            weight.as_raw_ptr(),
+            &mut ids,
+            &mut scores,
+            &mut gate,
+        )
+    } {
+        return Ok(None);
+    }
+    Ok(Some((
+        MxArray::from_handle(ids, "combined route IDs")?,
+        MxArray::from_handle(scores, "combined route scores")?,
+        MxArray::from_handle(gate, "combined shared gate")?,
+    )))
+}
+
 pub(super) fn singleton_routes(logits: &MxArray, top: usize) -> Result<Option<(MxArray, MxArray)>> {
     if top != 10
         || *logits.shape()? != [1, 1, 512]

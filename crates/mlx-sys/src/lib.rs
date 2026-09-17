@@ -2005,6 +2005,14 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
+    pub fn mlx_qwen4_routes_shared_gate(
+        logits: *mut mlx_array,
+        input: *mut mlx_array,
+        weight: *mut mlx_array,
+        ids: *mut *mut mlx_array,
+        scores: *mut *mut mlx_array,
+        gate: *mut *mut mlx_array,
+    ) -> bool;
     pub fn mlx_qwen4_singleton_routes(
         logits: *mut mlx_array,
         ids: *mut *mut mlx_array,

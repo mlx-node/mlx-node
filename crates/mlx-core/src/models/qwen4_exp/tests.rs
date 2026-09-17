@@ -2492,6 +2492,26 @@ fn compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding() {
                         normed.as_raw_ptr(),
                     )
                 };
+                if super::runtime_flags::is_one(c"MLX_QWEN4_MIXER_UP_COLUMNS") {
+                    let injection = MxArray::zeros(&[1, 1, 4], Some(DType::BFloat16)).unwrap();
+                    let (mut mixed, mut gate) = (std::ptr::null_mut(), std::ptr::null_mut());
+                    assert!(unsafe {
+                        mlx_sys::mlx_qwen4_hyper_up_inject(
+                            x.as_raw_ptr(),
+                            w.as_raw_ptr(),
+                            s.as_raw_ptr(),
+                            b.as_raw_ptr(),
+                            normed.as_raw_ptr(),
+                            injection.as_raw_ptr(),
+                            &mut mixed,
+                            &mut gate,
+                        )
+                    });
+                    let mixed = MxArray::from_handle(mixed, "two-column mixer").unwrap();
+                    let gate = MxArray::from_handle(gate, "two-column injection").unwrap();
+                    assert_eq!(&*mixed.to_float32().unwrap(), &*want.to_float32().unwrap());
+                    assert_eq!(&*gate.to_float32().unwrap(), &[1.; 4]);
+                }
                 let got = MxArray::from_handle(raw, "hyper up specialization must run").unwrap();
                 assert_eq!(
                     &*got.to_float32().unwrap(),
@@ -2530,6 +2550,30 @@ fn parallel_mixer_products_preserve_projection_and_halfway_rounding() {
                 "--test-threads=1",
             ])
             .env("MLX_QWEN4_MIXER_LANE_PRODUCTS", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{test}: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+#[test]
+fn two_column_mixer_preserves_projections_and_halfway_rounding() {
+    for test in [
+        "compact_q8_decode_preserves_promoted_gemv_and_bf16_rounding",
+        "hyper_up_preserves_native_sigmoid_halfway_rounding",
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                &format!("models::qwen4_exp::tests::{test}"),
+                "--test-threads=1",
+            ])
+            .env("MLX_QWEN4_MIXER_UP_COLUMNS", "1")
             .output()
             .unwrap();
         assert!(
@@ -2927,6 +2971,22 @@ fn complete_gdn_compact_gates_preserve_fallback_rounding() {
         .env("MLX_QWEN4_COMPLETE_GDN_METAL", "0")
         .status().unwrap();
     assert!(status.success(), "complete GDN fallback regression failed");
+}
+
+#[test]
+fn complete_gdn_prefetch_preserves_outputs_and_independent_histories() {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "models::qwen4_exp::tests::complete_gdn_replay_preserves_outputs_and_independent_histories", "--test-threads=1"])
+        .env("MLX_QWEN4_GDN_DECODE_PREFETCH", "1")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "GDN prefetch changed output, state or history bits"
+    );
 }
 
 #[test]
@@ -3687,6 +3747,136 @@ fn singleton_router_preserves_probability_rounding_ties_and_normalization() {
 }
 
 #[test]
+fn combined_routes_preserve_probability_ties_dense_gate_and_changing_views() {
+    use crate::array::DType;
+    use crate::nn::Activations;
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    const CHILD: &str = "MLX_QWEN4_COMBINED_ROUTE_TEST_CHILD";
+    if std::env::var(CHILD).as_deref() != Ok("1") {
+        for cached in ["0", "1"] {
+            for registers in ["0", "1"] {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", "models::qwen4_exp::tests::combined_routes_preserve_probability_ties_dense_gate_and_changing_views", "--test-threads=1"])
+                    .env(CHILD, "1")
+                    .env("MLX_QWEN4_CACHED_KERNEL_GRAPHS", cached)
+                    .env("MLX_QWEN4_ROUTE_REGISTER_RESULTS", registers)
+                    .output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "cached={cached}, registers={registers}: {}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+        }
+        return;
+    }
+    for case in 0..64 {
+        // Select alternating columns: real strided views with changing input
+        // and weight storage catch accidental graph constant captures.
+        let view = |values: &[f32], width: i64| {
+            MxArray::from_float32(values, &[width, 2])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap()
+                .slice_axis(1, case % 2, case % 2 + 1)
+                .unwrap()
+                .transpose(None)
+                .unwrap()
+        };
+        let l: Vec<f32> = (0..1024)
+            .map(|i| match case {
+                0 => 0.,
+                1 => (i % 4) as f32,
+                2 => f32::NEG_INFINITY,
+                3 => f32::INFINITY,
+                4 if i == 14 => f32::NAN,
+                5 if i == 1023 => f32::INFINITY,
+                _ => ((i * 131 + case * 53) as f32 * 0.017).sin() * case as f32 * 0.3,
+            })
+            .collect();
+        let l = view(&l, 512).reshape(&[1, 1, 512]).unwrap();
+        let values: Vec<f32> = (0..5120)
+            .map(|i| ((i * 19 + case * 37) % 257) as f32 / 128. - 1.)
+            .collect();
+        let weights: Vec<f32> = (0..5120)
+            .map(|i| ((i * 31 + case * 13) % 511) as f32 / 256. - 1.)
+            .collect();
+        let x = view(&values, 2560).reshape(&[1, 1, 2560]).unwrap();
+        let w = view(&weights, 2560);
+        let probs = Activations::softmax_precise(&l, Some(-1)).unwrap();
+        let want_ids = probs
+            .argpartition(-10, Some(-1))
+            .unwrap()
+            .slice_axis(2, 502, 512)
+            .unwrap();
+        let want_scores = probs.take_along_axis(&want_ids, -1).unwrap();
+        let want_scores = want_scores
+            .div(&want_scores.sum(Some(&[-1]), Some(true)).unwrap())
+            .unwrap();
+        let want_gate = x.matmul(&w.transpose(None).unwrap()).unwrap();
+        let (mut ids, mut scores, mut gate) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert!(unsafe {
+            mlx_sys::mlx_qwen4_routes_shared_gate(
+                l.as_raw_ptr(),
+                x.as_raw_ptr(),
+                w.as_raw_ptr(),
+                &mut ids,
+                &mut scores,
+                &mut gate,
+            )
+        });
+        let ids = MxArray::from_handle(ids, "combined IDs").unwrap();
+        let scores = MxArray::from_handle(scores, "combined scores").unwrap();
+        let gate = MxArray::from_handle(gate, "combined gate").unwrap();
+        assert_eq!(
+            &*ids.to_uint32().unwrap(),
+            &*want_ids.to_uint32().unwrap(),
+            "IDs case={case}"
+        );
+        for (a, b) in scores
+            .to_float32()
+            .unwrap()
+            .iter()
+            .zip(want_scores.to_float32().unwrap().iter())
+        {
+            assert!(
+                a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan()),
+                "scores case={case}: {a} vs {b}"
+            );
+        }
+        assert_eq!(
+            &*gate.to_float32().unwrap(),
+            &*want_gate.to_float32().unwrap(),
+            "gate case={case}"
+        );
+        let unsupported = l.astype(DType::Float32).unwrap();
+        let (mut ids, mut scores, mut gate) = (
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+        assert!(!unsafe {
+            mlx_sys::mlx_qwen4_routes_shared_gate(
+                unsupported.as_raw_ptr(),
+                x.as_raw_ptr(),
+                w.as_raw_ptr(),
+                &mut ids,
+                &mut scores,
+                &mut gate,
+            )
+        });
+        assert!(ids.is_null() && scores.is_null() && gate.is_null());
+    }
+}
+
+#[test]
 fn reference_prefill_hc_mix_preserves_bf16_boundaries_and_views() {
     use crate::array::DType;
     if !crate::engine::persistence::compiled_forward_backend_available() {
@@ -3725,6 +3915,26 @@ fn reference_prefill_hc_mix_preserves_bf16_boundaries_and_views() {
     assert!(
         unsafe { mlx_sys::mlx_qwen4_prefill_hc_mix(short.as_raw_ptr(), short.as_raw_ptr()) }
             .is_null()
+    );
+}
+
+#[test]
+fn mixer_split_k_preserves_independent_projections() {
+    if !crate::engine::persistence::compiled_forward_backend_available() {
+        return;
+    }
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "mixer_down_injection_matches_independent_projections",
+            "--test-threads=1",
+        ])
+        .env("MLX_QWEN4_MIXER_SPLIT_K", "1")
+        .env("MLX_QWEN4_MIXER_DOWN_INJECT", "0")
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "ordered split-K mixer changed projection bits"
     );
 }
 
@@ -3798,6 +4008,29 @@ fn mixer_down_injection_matches_independent_projections() {
         let expected_act =
             Activations::silu(&project(&wd, &sd, &bd).div_scalar(4.).unwrap()).unwrap();
         let expected_gate = project(&wi, &si, &bi);
+        if std::env::var("MLX_QWEN4_MIXER_SPLIT_K").as_deref() == Ok("1") {
+            let weight = |w: &MxArray, s: &MxArray, b: &MxArray| weights::Weight {
+                values: w.clone(),
+                dense_bf16: None,
+                scales: Some(s.clone()),
+                biases: Some(b.clone()),
+                group: 32,
+                bits: 8,
+                mode: "affine".into(),
+            };
+            let (actual, gate) = weight(&wd, &sd, &bd)
+                .mixer_down_inject(&x, &weight(&wi, &si, &bi))
+                .unwrap()
+                .expect("split-K independently enables its eligible mixer path");
+            assert_eq!(
+                &*actual.to_float32().unwrap(),
+                &*expected_act.to_float32().unwrap()
+            );
+            assert_eq!(
+                &*gate.to_float32().unwrap(),
+                &*expected_gate.to_float32().unwrap()
+            );
+        }
         let call = |input: &MxArray, out: &mut _, gate: &mut _| unsafe {
             mlx_sys::mlx_qwen4_mixer_down_inject(
                 input.as_raw_ptr(),

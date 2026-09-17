@@ -616,7 +616,8 @@ impl Decoder {
                 true,
             )?
         };
-        let paired = if runtime_flags::is_one(c"MLX_QWEN4_MIXER_DOWN_INJECT")
+        let paired = if (runtime_flags::is_one(c"MLX_QWEN4_MIXER_DOWN_INJECT")
+            || runtime_flags::is_one(c"MLX_QWEN4_MIXER_SPLIT_K"))
             && inject
             && self.gguf()
             && c.hc_count == 4
@@ -1247,22 +1248,39 @@ impl Decoder {
             &format!("{p}.gate.weight"),
             &format!("{g}.ffn_gate_inp.weight"),
         )?;
-        let (selected, scores) =
-            if let Some(routes) = math::singleton_routes(&logits, c.num_experts_per_tok)? {
-                routes
-            } else {
-                let probs = Activations::softmax_precise(&logits, Some(-1))?;
-                let ne = c.num_experts as i64;
-                let top = c.num_experts_per_tok as i64;
-                let selected =
-                    probs
-                        .argpartition(-(top as i32), Some(-1))?
-                        .slice_axis(2, ne - top, ne)?;
-                let scores = probs.take_along_axis(&selected, -1)?;
-                let scores = scores.div(&scores.sum(Some(&[-1]), Some(true))?)?;
-                (selected, scores)
-            };
-        if let Some(out) = self.tentative_shared_experts(x, &selected, &scores, i)? {
+        let combined = if self.gguf()
+            && runtime_flags::is_one(c"MLX_QWEN4_ROUTE_SHARED_GATE")
+            && !runtime_flags::is_zero(c"MLX_QWEN4_DENSE_BF16_CACHE")
+            && let Some(weight) = self
+                .weights
+                .resident_bank(&format!("{g}.ffn_gate_inp_shexp.weight"))
+            && let Some(dense) = &weight.dense_bf16
+        {
+            math::routes_shared_gate(&logits, x, dense, c.num_experts_per_tok)?
+        } else {
+            None
+        };
+        let mut shared_gate = None;
+        let (selected, scores) = if let Some((selected, scores, gate)) = combined {
+            shared_gate = Some(gate);
+            (selected, scores)
+        } else if let Some(routes) = math::singleton_routes(&logits, c.num_experts_per_tok)? {
+            routes
+        } else {
+            let probs = Activations::softmax_precise(&logits, Some(-1))?;
+            let ne = c.num_experts as i64;
+            let top = c.num_experts_per_tok as i64;
+            let selected =
+                probs
+                    .argpartition(-(top as i32), Some(-1))?
+                    .slice_axis(2, ne - top, ne)?;
+            let scores = probs.take_along_axis(&selected, -1)?;
+            let scores = scores.div(&scores.sum(Some(&[-1]), Some(true))?)?;
+            (selected, scores)
+        };
+        if let Some(out) =
+            self.tentative_shared_experts(x, &selected, &scores, shared_gate.as_ref(), i)?
+        {
             return Ok(out);
         }
         let device = self.tentative_experts(x, &selected, &scores, i)?;
@@ -1335,11 +1353,14 @@ impl Decoder {
             &format!("{p}.shared_expert.down_proj.weight"),
             &format!("{g}.ffn_down_shexp.weight"),
         )?;
-        let gate = self.linear(
-            x,
-            &format!("{p}.shared_expert_gate.weight"),
-            &format!("{g}.ffn_gate_inp_shexp.weight"),
-        )?;
+        let gate = match shared_gate {
+            Some(gate) => gate,
+            None => self.linear(
+                x,
+                &format!("{p}.shared_expert_gate.weight"),
+                &format!("{g}.ffn_gate_inp_shexp.weight"),
+            )?,
+        };
         sum.astype(x.dtype()?)?
             .add(&math::sigmoid_mul(&gate, &shared)?)
     }

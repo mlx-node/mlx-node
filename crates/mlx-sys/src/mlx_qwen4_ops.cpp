@@ -145,6 +145,59 @@ bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
   return false;
 #endif
 }
+// Keep the shared-gate projection alongside route selection, as in
+// TrackFastMoE. Every changing tensor remains a compiled-graph argument.
+bool mlx_qwen4_routes_shared_gate(mlx_array *logits, mlx_array *input,
+                                 mlx_array *weight, mlx_array **ids,
+                                 mlx_array **scores, mlx_array **gate) {
+  if (!ids || !scores || !gate) return false;
+  *ids = nullptr;
+  *scores = nullptr;
+  *gate = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    if (!logits || !input || !weight) return false;
+    const auto &l = *reinterpret_cast<array *>(logits);
+    const auto &x = *reinterpret_cast<array *>(input);
+    const auto &w = *reinterpret_cast<array *>(weight);
+    if (l.shape() != mlx::core::Shape{1, 1, 512} ||
+        x.shape() != mlx::core::Shape{1, 1, 2560} ||
+        w.shape() != mlx::core::Shape{1, 2560} ||
+        l.dtype() != mlx::core::bfloat16 || x.dtype() != l.dtype() ||
+        w.dtype() != x.dtype()) return false;
+    static auto graph = [](const std::vector<array> &a, bool registers) {
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_routes_shared_gate", {"logits", "x", "wg"},
+          {"ids", "scores", "gate"},
+#include "metal/qwen4_routes_shared_gate.metal.inc"
+      );
+      return kernel(a, {{1, 1, 10}, {1, 1, 10}, {1, 1, 1}},
+                    {mlx::core::uint32, mlx::core::bfloat16, mlx::core::bfloat16},
+                    {384, 1, 1}, {384, 1, 1},
+                    {{"T", mlx::core::bfloat16}, {"REG", registers}},
+                    std::nullopt, false, mlx::core::Device::gpu);
+    };
+    static auto compiled = mlx::core::compile(
+        [](const std::vector<array> &a) { return graph(a, false); });
+    static auto register_compiled = mlx::core::compile(
+        [](const std::vector<array> &a) { return graph(a, true); });
+    const bool registers = mlx_qwen4_flag_equals("MLX_QWEN4_ROUTE_REGISTER_RESULTS", "1");
+    const bool cached = !mlx_qwen4_flag_equals("MLX_QWEN4_CACHED_KERNEL_GRAPHS", "0");
+    auto result = cached ? (registers ? register_compiled : compiled)({l, x, w})
+                         : graph({l, x, w}, registers);
+    auto i = std::make_unique<array>(std::move(result[0]));
+    auto s = std::make_unique<array>(std::move(result[1]));
+    auto g = std::make_unique<array>(std::move(result[2]));
+    *ids = reinterpret_cast<mlx_array *>(i.release());
+    *scores = reinterpret_cast<mlx_array *>(s.release());
+    *gate = reinterpret_cast<mlx_array *>(g.release());
+    return true;
+  } catch (const std::exception &e) {
+    std::cerr << "Qwen4 routes/shared gate: " << e.what() << std::endl;
+  }
+#endif
+  return false;
+}
 // TrackFastMoE.route: one independent threadgroup per prompt row.
 // Preserve this checkpoint's probability-first selection and normalization.
 bool mlx_qwen4_prefill_routes(mlx_array *logits, mlx_array **ids,

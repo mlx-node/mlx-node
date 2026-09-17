@@ -5,9 +5,157 @@ Research: 15–17 September 2026. Starting revision:
 initial performance record, mlx.fast investigation, prefill port log, and
 macOS 27 recheck. The [runtime guide](../qwen38-flash-next.md) covers usage.
 
-## Result and limits
+## 95% follow-up: refreshed reference
 
-**The latest optional configuration exceeds 90% of both published rates.**
+The 17 September follow-up inspected the new promoted tree
+[`05944553`](https://github.com/Layr-Labs/mlxfast-qwen38-125b-a6b-engine/tree/05944553c77666f74651f5c20d6cb4b8b132b7d9),
+including [PR #763](https://github.com/Layr-Labs/mlxfast-qwen38-125b-a6b-engine/pull/763)
+and [PR #828](https://github.com/Layr-Labs/mlxfast-qwen38-125b-a6b-engine/pull/828).
+The latter's official run, `35120094932`, reports candidate-leg times of
+0.000398337728515625 seconds per prefill token and 0.01558816650390625 seconds
+per decode token. Their reciprocals are **2510.433 / 64.151 tokens/s**, making
+this pass's 95% targets **2384.911 / 60.944 tokens/s**. The live leaderboard
+renders a different decode figure; this comparison uses the explicit raw
+seconds-per-token fields. The artifact still reports serial mode, depth zero,
+and 64 checked steps. The older reference and results below remain historical.
+
+The source delta contains three mechanisms:
+
+- **Ordered split-K mixer:** four SIMD groups calculate separate input blocks,
+  retain each block's result, and restore the original ascending fold before
+  the SIMD reduction. This addresses the long, narrow mixer down/injection
+  projections. The local port retains affine8 packs, FP16 companions, BF16
+  projection/division/activation boundaries, and the existing weight banks.
+- **PLE host context mirror:** our decoder already builds n-gram IDs from its
+  owned host token history, so it does not have the GPU history readback this
+  reference change removes.
+- **Compiled MLP replay:** the reference keeps this disabled by default because
+  its local gain did not improve the ranked result. Capturing complete expert
+  banks is also inappropriate for our mutable bounded slots; any local graph
+  replay must retain slot arguments, reader ownership, and route validation.
+
+A fresh unchanged `2b66b088` baseline (`target95-baseline`) passed the existing
+63 GiB/393-slot guard and all five standard output hashes. Its three measured
+prefill rates were 2318.489/2304.872/2336.590, and decode rates were
+54.955/55.209/55.204 tokens/s. This slower baseline is retained; a new candidate
+must be compared with contemporaneous controls. A separate 256-output CPU
+sample showed substantial waiting for expert route readbacks, but that longer
+continuation is not pooled with the standard 128-output timing comparison.
+
+The first ordered split-K native check matched independent projections and the
+105-test Qwen suite passed. A ten-request control/split comparison passed all
+hashes and guards, but its GPU temperature rose from 56.3 C to 98.1 C and both
+variants slowed. Control medians were 1942.223/50.841 and split medians were
+1757.375/53.114 tokens/s. A separate per-request 60 C gate also passed hashes
+and guards, but produced low, variable clock/rate observations: control medians
+730.645/38.267 and split medians 814.072/48.165. Neither run establishes a stable
+speedup or the 95% target. Both are retained in `target95-split-comparisons.json`.
+The user subsequently agreed to leave browser/video activity idle for new
+comparisons; that does not retroactively isolate these runs.
+
+The next candidate also ports `TrackFastGDNDecode`'s initial state-row prefetch,
+register-held q/k vectors, and vector state loads/stores. Each value row retains
+its original ascending FP32 products, SIMD sum, modulo head mapping and BF16
+output boundary; recurrent state and convolution history remain separate owned
+outputs. Earlier standalone probes are recorded above/below as diagnostics, not
+a demonstrated full-model gain. `MLX_QWEN4_GDN_DECODE_PREFETCH=1` selects it only
+inside the already eligible M5 singleton fused path.
+
+After adding the GDN port and checking the split-mixer switch through the
+weight wrapper, all **106 Qwen native tests passed** (43.77 seconds). The GDN
+regression interleaves two owners and changing inputs/weights across 24 steps
+for convolution kernels of lengths 2, 4 and 8, comparing all output, recurrent
+state and history values against the independent operation sequence.
+
+### Fresh-process verification and remaining dispatch work
+
+The `target95-next-build` addon (SHA-256
+`2077d758e1ea45ad6413f6f8eaed04ca54830f18fb8a157673212ca951a8e5b2`)
+passed its canonical build. Four fresh processes ran control/candidate/candidate/control,
+each with two warmups and three measured requests. Both variants used the same
+binary, 1024/128 token counts and 63 GiB/393-slot plan. All 20 output hashes and
+all four memory/pressure guards passed.
+
+| Process                      | Prefill median | Decode median |
+| ---------------------------- | -------------: | ------------: |
+| Control A                    |       2321.043 |        55.576 |
+| Split mixer + GDN prefetch A |       2256.194 |        56.129 |
+| Split mixer + GDN prefetch B |        785.992 |        40.699 |
+| Control B                    |        828.839 |        43.390 |
+
+These runs do **not** demonstrate a repeatable gain or 95% performance. Median
+GPU frequency among samples with over 90% GPU activity changed from 1618/1609 MHz
+in the first pair to 844/830 MHz in the second. Maximum reported GPU temperature
+was 85.4/91.8/73.4/62.2 C respectively. AC power and mode 2 remained selected;
+macOS reported no recorded thermal/performance warning, and swap usage did not
+increase. These observations do not establish why GPU clocks fell. Full results
+are retained in `target95-next-abba.json`; slower samples are not discarded.
+
+A separate diagnostic, `target95-next-profile128`, used the actual 128-token
+continuation and traced route commits while sampling the host stack. Each of
+requests 1–4 recorded 127 hits and zero replays. Only cold request 0 missed,
+at positions 1024/1041/1058/1075/1092/1109/1126/1143. Thus the earlier 256-token
+readback profile does not explain this warmed workload. Of 3182 model-thread
+samples, 1276 were under asynchronous submission, including 782 waiting for MLX
+scheduler completion. This profile ran at the lower observed clocks and its
+timings are excluded from ordinary comparisons.
+
+The next source ports retain the existing weight storage and memory admission:
+
+- `MLX_QWEN4_ROUTE_SHARED_GATE=1` combines singleton route selection with the
+  shared gate, following the reference's combined-dispatch pattern. The reference
+  combines a quantized gate; our BF16 gate instead keeps MLX's existing small-N
+  GEMV lane walk, reduction and BF16 output. Probability-first route rounding,
+  stable ties and normalization remain unchanged. Existing resident BF16 gate
+  weights are graph arguments; unsupported shapes/dtypes retain the original path.
+- `MLX_QWEN4_MIXER_UP_COLUMNS=1` uses `TrackFastMixer.upMixSource`'s two-column
+  group and eight independent stream products. It reads the original row layout,
+  adds no packed-bank copy, and preserves affine8 products, BF16 sigmoid/mean and
+  injection boundaries. It applies to the existing eligible fused injection path.
+
+Both remain opt-in. All **108 Qwen native tests passed** (38.64 seconds),
+including the combined route/gate test under all four cached-graph/register
+settings with 64 changing, strided input/weight cases each. The mixer tests
+compare independent projections and native sigmoid halfway cases. Full-model
+validation follows separately. These kernel patterns are separate from the
+reference's disabled-by-default full MLP graph capture.
+
+The final four-port addon (`target95-dispatch-build`, SHA-256
+`7f75c23f2e7657b23bbf4fe1ff21416828f2f007f5a600842fb0370fc8d86475`)
+passed the canonical package build and strict all-target Clippy for `mlx-core`
+and `mlx-sys`. Its exact-arithmetic complete-checkpoint smoke passed all **11
+requests**: AR, streaming continuation, native/adaptive MTP, concurrent owner
+continuation, cancellation recovery and image replacement. All 1365 pages and
+state reservations were released. The auxiliary-model plan remained 63 GiB /
+366 slots, peak physical footprint 65,203,291,888 bytes. Memory and pressure
+guards passed; the smoke allowed concurrent compilation and supplies no
+throughput evidence. BF16 prefill/PLE were disabled for this exactness smoke.
+
+The next candidate/control/control/candidate sequence (`target95-dispatch-abba`)
+again used four fresh processes, two warmups and three measurements each,
+1024 input / 128 output tokens, and 63 GiB / 393 slots. Every hash and guard
+passed. No compilation or native GPU tests overlapped these measurements.
+
+| Process               | Prefill median | Decode median |
+| --------------------- | -------------: | ------------: |
+| Four-port candidate A |       2331.351 |        56.323 |
+| Control A             |       2259.056 |        54.002 |
+| Control B             |       2257.018 |        54.347 |
+| Four-port candidate B |       2243.066 |        54.255 |
+
+The six-sample control medians were 2258.037/54.032; candidate medians were
+2294.530/55.364 tokens/s. Candidate ranges were 2224.398–2336.896 prefill and
+54.188–56.779 decode. The candidate's first-process advantage did not repeat
+against the second control, so this is not grounds for default promotion.
+Against the refreshed raw reference, candidate medians are **91.4% prefill /
+86.3% decode**; **the 95% objective is not achieved**. These measurements use
+the optional BF16 prefill/PLE configuration, with its existing numerical limits.
+The earlier 90% result remains a separately dated result, not a substitute for
+these contemporaneous measurements.
+
+## Previous 90% result and limits
+
+**The previous optional configuration exceeded 90% of both then-published rates.**
 Six measured requests across two fresh processes used the supplied checkpoint,
 1024 input tokens, 128 generated tokens, two warmups per process, and the same
 63 GiB/393-slot memory plan. Every measured request exceeded both thresholds
@@ -465,8 +613,8 @@ A separate singleton GDN prototype ports the reference's first-state-row
 prefetch and register-cached q/k values. It matched all three outputs for two
 input phases. Warm control blocks took 153.474/153.187/153.607 microseconds;
 candidate blocks took 155.159/150.237/150.881 microseconds. This small,
-overlapping result does not justify another production variant. The prototype
-remains in the external evidence archive. A follow-up 64-step chained probe
+overlapping result did not justify integration in that pass. The original probe
+remains in the external evidence archive; the later 95% follow-up tests an opt-in port. A follow-up 64-step chained probe
 also matched every output, recurrent-state and history bit for two input phases.
 Its timing ranges still overlapped (control 18.6–36.3 and prefetch 19.4–39.2
 microseconds per step). A compiler was active during that diagnostic, so these

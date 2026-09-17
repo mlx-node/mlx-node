@@ -390,8 +390,21 @@ extern "C" bool mlx_qwen4_mixer_down_inject(
                     {32, 2, 1}, {{"T", mlx::core::bfloat16}}, std::nullopt,
                     false, mlx::core::Device::gpu);
     });
-    auto result =
-        compiled({x, wd, sd, bd, wi, si, bi, native_bf16_silu_table()});
+    static auto split_compiled = mlx::core::compile([](const std::vector<array> &a) {
+      static auto kernel = mlx::core::fast::metal_kernel(
+          "qwen4_mixer_split_k",
+          {"x", "wd", "sd", "bd", "wi", "si", "bi", "silu_table"},
+          {"act", "injection"},
+#include "metal/qwen4_mixer_split_k.metal.inc"
+          , qmv_header());
+      return kernel(a, {{1, 1, 320}, {1, 1, 4}},
+                    {mlx::core::bfloat16, mlx::core::bfloat16}, {32, 656, 1},
+                    {32, 4, 1}, {{"T", mlx::core::bfloat16}}, std::nullopt,
+                    false, mlx::core::Device::gpu);
+    });
+    const auto split = qwen4_env("MLX_QWEN4_MIXER_SPLIT_K");
+    auto result = (split && std::string(split) == "1" ? split_compiled : compiled)(
+        {x, wd, sd, bd, wi, si, bi, native_bf16_silu_table()});
     auto activation = std::make_unique<array>(std::move(result[0]));
     auto injection = std::make_unique<array>(std::move(result[1]));
     *out = reinterpret_cast<mlx_array *>(activation.release());
@@ -486,21 +499,31 @@ extern "C" bool mlx_qwen4_hyper_up_inject(
         s.shape() != Shape{10240, 10} || s.dtype() != mlx::core::float16 ||
         b.shape() != s.shape() || b.dtype() != s.dtype())
       return false;
-    static auto graph = [](const std::vector<array> &a, bool parallel) {
-      static const std::string source = std::string(
-#include "metal/qwen4_dense_decode.metal.inc"
-          ) + R"(
+    static auto graph = [](const std::vector<array> &a, int mode) {
+      static const std::string epilogue = R"(
         if (threadgroup_position_in_grid.y == 0 &&
             simdgroup_index_in_threadgroup == 0 && lane < 4) {
           inject_out[lane] = inject_table[as_type<ushort>(inject_projection[lane])];
         }
       )";
+      static const std::string source = std::string(
+#include "metal/qwen4_dense_decode.metal.inc"
+          ) + epilogue;
+      static const std::string columns_source = std::string(
+#include "metal/qwen4_mixer_up_columns.metal.inc"
+          ) + epilogue;
+      static auto columns_kernel = mlx::core::fast::metal_kernel(
+          "qwen4_mixer_up_columns",
+          {"x", "w", "scales", "biases", "normed", "sigmoid_table",
+           "inject_projection", "inject_table"},
+          {"out", "inject_out"}, columns_source, qmv_header());
       static auto kernel = mlx::core::fast::metal_kernel(
           "qwen4_hyper_up_inject",
           {"x", "w", "scales", "biases", "normed", "sigmoid_table",
            "inject_projection", "inject_table"},
           {"out", "inject_out"}, source, qmv_header());
-      return kernel(a, {{1, 1, 2560}, {1, 1, 4}},
+      auto &selected = mode == 2 ? columns_kernel : kernel;
+      return selected(a, {{1, 1, 2560}, {1, 1, 4}},
                     {mlx::core::bfloat16, mlx::core::bfloat16}, {32, 2560, 1},
                     {32, 2, 1},
                     {{"T", mlx::core::bfloat16},
@@ -509,16 +532,21 @@ extern "C" bool mlx_qwen4_hyper_up_inject(
                      {"FAST", false},
                      {"RPS", 4},
                      {"ACT", false},
-                     {"MIX", parallel ? 2 : 1}},
+                     {"MIX", mode == 1 ? 2 : 1}},
                     std::nullopt, false, mlx::core::Device::gpu);
     };
     static auto compiled = mlx::core::compile(
-        [](const std::vector<array> &a) { return graph(a, false); });
+        [](const std::vector<array> &a) { return graph(a, 0); });
     static auto parallel_compiled = mlx::core::compile(
-        [](const std::vector<array> &a) { return graph(a, true); });
+        [](const std::vector<array> &a) { return graph(a, 1); });
+    static auto columns_compiled = mlx::core::compile(
+        [](const std::vector<array> &a) { return graph(a, 2); });
+    const auto columns = qwen4_env("MLX_QWEN4_MIXER_UP_COLUMNS");
+    const bool two_columns = columns && std::string(columns) == "1";
     const auto lanes = qwen4_env("MLX_QWEN4_MIXER_LANE_PRODUCTS");
     const bool parallel = lanes && std::string(lanes) == "1";
-    auto result = (parallel ? parallel_compiled : compiled)(
+    auto result = (two_columns ? columns_compiled
+                               : (parallel ? parallel_compiled : compiled))(
         {x, w, s, b, n, native_bf16_sigmoid_table(), g,
          native_bf16_inject_table()});
     auto mixed = std::make_unique<array>(std::move(result[0]));

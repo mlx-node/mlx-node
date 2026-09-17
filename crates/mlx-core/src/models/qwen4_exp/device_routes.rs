@@ -210,6 +210,7 @@ impl Decoder {
         x: &MxArray,
         selected: &MxArray,
         scores: &MxArray,
+        shared_gate: Option<&MxArray>,
         layer: usize,
     ) -> Result<Option<MxArray>> {
         if self.device_routes.is_none()
@@ -229,11 +230,14 @@ impl Decoder {
         let Some((banks, local)) = self.weights.device_expert_slots(layer, selected)? else {
             return Ok(None);
         };
-        let shared_gate = self.linear(
-            x,
-            &format!("layers.{layer}.mlp.shared_expert_gate.weight"),
-            &format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
-        )?;
+        let shared_gate = match shared_gate {
+            Some(gate) => gate.clone(),
+            None => self.linear(
+                x,
+                &format!("layers.{layer}.mlp.shared_expert_gate.weight"),
+                &format!("blk.{layer}.ffn_gate_inp_shexp.weight"),
+            )?,
+        };
         let Some(out) =
             math::routed_shared_experts(x, &local, scores, &banks, &shared, &shared_gate)?
         else {

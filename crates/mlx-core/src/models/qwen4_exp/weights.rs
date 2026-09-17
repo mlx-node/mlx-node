@@ -119,7 +119,8 @@ impl Weight {
         x: &MxArray,
         injection: &Self,
     ) -> Result<Option<(MxArray, MxArray)>> {
-        if !runtime_flags::is_one(c"MLX_QWEN4_MIXER_DOWN_INJECT")
+        if !(runtime_flags::is_one(c"MLX_QWEN4_MIXER_DOWN_INJECT")
+            || runtime_flags::is_one(c"MLX_QWEN4_MIXER_SPLIT_K"))
             || runtime_flags::is_zero(c"MLX_QWEN4_DECODE_MIXER_ACT")
             || !crate::engine::persistence::compiled_forward_backend_available()
             || [self, injection]

@@ -10,6 +10,9 @@ R"(
     threadgroup float q_shared[128], k_shared[128], v_shared[128];
     threadgroup float gates[2];
     threadgroup T y_shared[128];
+    float4 prefetched;
+    if constexpr (PREFETCH)
+        prefetched = *reinterpret_cast<const device float4*>(state + (hv * 128 + sg * 4) * 128 + 4 * lane);
     if (sg < 3) {
         uint vec = sg == 0 ? hk : (sg == 1 ? 16 + hk : 32 + hv);
         float values[4];
@@ -58,6 +61,32 @@ R"(
         gates[1] = qwen4_sigmoid(float(b[hv]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
+    // TrackFastGDNDecode: retain local FP32 arithmetic and modulo heads.
+    if constexpr (PREFETCH) {
+    const float4 local_q = *reinterpret_cast<const threadgroup float4*>(q_shared + 4 * lane);
+    const float4 local_k = *reinterpret_cast<const threadgroup float4*>(k_shared + 4 * lane);
+    const float decay = gates[0], beta = gates[1];
+    for (uint r = 0; r < 4; ++r) {
+        const uint row = (hv * 128 + sg * 4 + r) * 128 + 4 * lane;
+        const float4 current = prefetched;
+        if (r + 1 < 4) prefetched = *reinterpret_cast<const device float4*>(state + row + 128);
+        float s[4], memory = 0;
+        for (uint i = 0; i < 4; ++i) {
+            s[i] = current[i] * decay;
+            memory += s[i] * local_k[i];
+        }
+        memory = simd_sum(memory);
+        const float delta = (v_shared[sg * 4 + r] - memory) * beta;
+        float result = 0;
+        for (uint i = 0; i < 4; ++i) {
+            s[i] = s[i] + local_k[i] * delta;
+            result += s[i] * local_q[i];
+        }
+        *reinterpret_cast<device float4*>(next + row) = float4(s[0], s[1], s[2], s[3]);
+        result = simd_sum(result);
+        if (lane == 0) y_shared[sg * 4 + r] = T(result);
+    }
+    } else {
     // Use the same four-row per-lane accumulation as gated_delta_step_4vcol.
     float s[4][4];
     float memory[4] = {0,0,0,0};
@@ -87,6 +116,7 @@ R"(
     for (uint r = 0; r < 4; ++r) {
         result[r] = simd_sum(result[r]);
         if (lane == 0) y_shared[sg * 4 + r] = T(result[r]);
+    }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (sg == 0) {
