@@ -7,6 +7,8 @@
 //! product of that pipeline is [`VisionMerge`] — the embeddings + positions
 //! that feed the language-model paged prefill.
 
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 use crate::array::MxArray;
 
 /// The output of the vision encode + image-feature merge + M-RoPE position

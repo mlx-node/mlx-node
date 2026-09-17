@@ -182,7 +182,11 @@ impl PackedCache {
         }
         let mut prefix = [0u8; 44];
         file.read_exact(&mut prefix).map_err(err)?;
-        let header_len = u32::from_le_bytes(prefix[8..12].try_into().unwrap()) as usize;
+        let header_len = u32::from_le_bytes(
+            prefix[8..12]
+                .try_into()
+                .map_err(|_| err("Invalid packed chunk header length field"))?,
+        ) as usize;
         if &prefix[..8] != MAGIC || header_len > MAX_HEADER || 44 + header_len as u64 > len {
             return Err(err("Invalid packed chunk header"));
         }
@@ -343,11 +347,22 @@ impl VerifiedChunk {
             data,
             file_len,
         } = self;
+        if !(2..=3).contains(&header.arrays.len()) {
+            return Err(err(
+                "Packed chunk requires values, scales and optional biases",
+            ));
+        }
         let mut arrays = Vec::with_capacity(3);
-        let mut offset = 0;
+        let mut remaining = data.as_slice();
         for info in &header.arrays {
-            arrays.push(decode_array(info, &data[offset..offset + info.bytes])?);
-            offset += info.bytes;
+            let (bytes, tail) = remaining
+                .split_at_checked(info.bytes)
+                .ok_or_else(|| err("Truncated packed chunk array payload"))?;
+            arrays.push(decode_array(info, bytes)?);
+            remaining = tail;
+        }
+        if !remaining.is_empty() {
+            return Err(err("Packed chunk has trailing array payload"));
         }
         let biases = if arrays.len() == 3 {
             arrays.pop()
@@ -355,7 +370,9 @@ impl VerifiedChunk {
             None
         };
         let scales = arrays.pop();
-        let values = arrays.pop().unwrap();
+        let values = arrays
+            .pop()
+            .ok_or_else(|| err("Packed chunk is missing its values array"))?;
         Ok((
             Weight {
                 dense_bf16: None,
@@ -460,6 +477,30 @@ fn decode_array(a: &ArrayInfo, bytes: &[u8]) -> Result<MxArray> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_verified_chunks_are_rejected_before_array_creation() {
+        for (count, data) in [(0, Vec::new()), (1, Vec::new()), (2, vec![0; 3])] {
+            let chunk = VerifiedChunk {
+                header: Header {
+                    key: "malformed".into(),
+                    group: 32,
+                    bits: 4,
+                    mode: "affine".into(),
+                    arrays: (0..count)
+                        .map(|_| ArrayInfo {
+                            dtype: "U32".into(),
+                            shape: vec![1],
+                            bytes: 4,
+                        })
+                        .collect(),
+                },
+                data,
+                file_len: 0,
+            };
+            assert!(chunk.into_weight().is_err());
+        }
+    }
 
     struct Temp(PathBuf);
     impl Temp {

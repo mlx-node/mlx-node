@@ -500,20 +500,20 @@ impl Decoder {
                 let mut rows = 0usize;
                 if self.gguf() {
                     let table = self.weights.descriptor("per_layer_token_embd.weight")?;
-                    if table.shape.len() != 2 || table.width() != c.ple_embed_dim / heads {
+                    if table.shape.len() != 2 || table.width()? != c.ple_embed_dim / heads {
                         return Err(Error::from_reason("Invalid GGUF PLE shape"));
                     }
-                    rows = table.rows();
+                    rows = table.rows()?;
                 } else {
                     for shard in 0..c.split_ngram_parts {
                         let table = self.weights.descriptor(&format!(
                             "{p}.ple.ple_embedding.ngram_embedding.shard_{shard}.weight"
                         ))?;
-                        if table.shape.len() != 2 || table.width() != c.ple_embed_dim / heads {
+                        if table.shape.len() != 2 || table.width()? != c.ple_embed_dim / heads {
                             return Err(Error::from_reason("Invalid PLE shard shape"));
                         }
                         rows = rows
-                            .checked_add(table.rows())
+                            .checked_add(table.rows()?)
                             .ok_or_else(|| Error::from_reason("PLE row count overflow"))?;
                     }
                 }
@@ -746,7 +746,9 @@ impl Decoder {
             }
         };
         let gate = if inject {
-            let w = inject_projection.unwrap();
+            let w = inject_projection.ok_or_else(|| {
+                Error::from_reason("Qwen4 hyper-connection is missing its injection projection")
+            })?;
             Some(Activations::sigmoid(&w.div_scalar(c.hc_count as f64)?)?.mul_scalar(2.0)?)
         } else {
             None
@@ -1454,7 +1456,7 @@ impl Decoder {
                 let mut found = false;
                 for shard in 0..c.split_ngram_parts {
                     let key = format!("{p}.ple_embedding.ngram_embedding.shard_{shard}.weight");
-                    let count = self.weights.descriptor(&key)?.rows();
+                    let count = self.weights.descriptor(&key)?.rows()?;
                     if local < count {
                         let (rows, positions) = groups.entry(key).or_default();
                         rows.push(local);
@@ -1475,7 +1477,15 @@ impl Decoder {
                     rows[position] = Some(bank.slice_axis(0, row as i64, row as i64 + 1)?);
                 }
             }
-            MxArray::concatenate_many(rows.iter().map(|r| r.as_ref().unwrap()).collect(), Some(0))?
+            let rows = rows
+                .iter()
+                .map(|row| {
+                    row.as_ref().ok_or_else(|| {
+                        Error::from_reason("Qwen4 PLE lookup did not populate every embedding row")
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            MxArray::concatenate_many(rows, Some(0))?
         };
         let emb = emb
             .reshape(&[1, t, c.ple_embed_dim as i64])?
@@ -1599,10 +1609,15 @@ impl Decoder {
                     .reshape(&[1, 1, (c.hc_count * c.hidden_size) as i64])?;
             let (input, inject) = self.hyper(&x, "layers.0.attn_hyper_connection", "", true)?;
             let attn = self.attention(&input, 0, cache)?;
-            x = Self::inject(&x, &attn, &inject.unwrap())?;
+            let inject = inject.ok_or_else(|| {
+                Error::from_reason("Qwen4 MTP attention is missing its injection gate")
+            })?;
+            x = Self::inject(&x, &attn, &inject)?;
             let (input, inject) = self.hyper(&x, "layers.0.mlp_hyper_connection", "", true)?;
             let mlp = self.moe(&input, 0)?;
-            x = Self::inject(&x, &mlp, &inject.unwrap())?;
+            let inject = inject
+                .ok_or_else(|| Error::from_reason("Qwen4 MTP MLP is missing its injection gate"))?;
+            x = Self::inject(&x, &mlp, &inject)?;
             MxArray::eval_arrays_with_context(&[&x], "qwen4::decoder::x")?;
             let (mixed, _) = self.hyper(&x, "hyper_connection_mixer", "", false)?;
             Ok((x, mixed))
@@ -1662,7 +1677,9 @@ impl Decoder {
             normed.as_ref(),
         )?;
         let branch = self.moe(&mixed, i)?;
-        self.inject_for_next_attention(&x, &branch, &gate.unwrap(), i, normalize_next)
+        let gate =
+            gate.ok_or_else(|| Error::from_reason("Qwen4 MLP is missing its injection gate"))?;
+        self.inject_for_next_attention(&x, &branch, &gate, i, normalize_next)
     }
 
     fn attention_block(
@@ -1701,7 +1718,9 @@ impl Decoder {
         } else {
             self.attention(&mixed, i, cache)?
         };
-        self.inject_for_mlp(&x, &branch, &gate.unwrap(), i, normalize)
+        let gate = gate
+            .ok_or_else(|| Error::from_reason("Qwen4 attention is missing its injection gate"))?;
+        self.inject_for_mlp(&x, &branch, &gate, i, normalize)
     }
 
     pub fn embed_token(&mut self, token: u32) -> Result<MxArray> {
@@ -1740,7 +1759,9 @@ impl Decoder {
         }
         self.verification = Some(Vec::new());
         self.prefill_chunk(tokens, None, false)?;
-        let states = self.verification.take().unwrap();
+        let states = self.verification.take().ok_or_else(|| {
+            Error::from_reason("Qwen4 verification lost its accepted-frontier snapshots")
+        })?;
         let mut logits = Vec::with_capacity(tokens.len());
         for h in self.last_chunk_hidden.clone() {
             let (mixed, _) = self.hyper(&h, "hyper_connection_mixer", "output_hc", false)?;
@@ -1805,8 +1826,11 @@ impl Decoder {
             None
         };
         let mut window = if carry {
+            let embeddings = embeddings.or(window_embedding.as_ref()).ok_or_else(|| {
+                Error::from_reason("Qwen4 prefill window is missing its token embeddings")
+            })?;
             Some(MxArray::tile(
-                embeddings.or(window_embedding.as_ref()).unwrap(),
+                embeddings,
                 &[1, 1, self.config.hc_count as i32],
             )?)
         } else {
@@ -1850,8 +1874,11 @@ impl Decoder {
             // Verification retains the singleton arithmetic and a state at
             // every accepted frontier. Only ordinary prompt MLPs are batched.
             if carry {
+                let input = window
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("Qwen4 attention lost its prefill window"))?;
                 let (stream, normed) = self.attention_matrix_for_mlp(
-                    window.as_ref().unwrap(),
+                    input,
                     tokens,
                     i,
                     &mut cache,
@@ -1906,12 +1933,11 @@ impl Decoder {
             }
             self.history.truncate(base);
             if carry {
-                let (stream, normed) = self.mlp_matrix_for_attention(
-                    window.as_ref().unwrap(),
-                    i,
-                    mlp_normed.as_ref(),
-                    true,
-                )?;
+                let input = window
+                    .as_ref()
+                    .ok_or_else(|| Error::from_reason("Qwen4 MLP lost its prefill window"))?;
+                let (stream, normed) =
+                    self.mlp_matrix_for_attention(input, i, mlp_normed.as_ref(), true)?;
                 window = Some(stream);
                 attention_normed = normed;
             } else if batched {
@@ -1924,7 +1950,7 @@ impl Decoder {
                 let k = cache
                     .keys
                     .take()
-                    .unwrap()
+                    .ok_or_else(|| Error::from_reason("Qwen4 prefill produced no attention keys"))?
                     .transpose(Some(&[0, 2, 1, 3]))?
                     .reshape(&[
                         tokens.len() as i64,
@@ -1934,7 +1960,9 @@ impl Decoder {
                 let v = cache
                     .values
                     .take()
-                    .unwrap()
+                    .ok_or_else(|| {
+                        Error::from_reason("Qwen4 prefill produced no attention values")
+                    })?
                     .transpose(Some(&[0, 2, 1, 3]))?
                     .reshape(&[
                         tokens.len() as i64,
@@ -1978,7 +2006,10 @@ impl Decoder {
                 state.last_chunk_hidden = vec![h.clone()];
             }
         }
-        let last_hidden = hidden.last().unwrap().clone();
+        let last_hidden = hidden
+            .last()
+            .ok_or_else(|| Error::from_reason("Qwen4 prefill produced no hidden rows"))?
+            .clone();
         self.last_chunk_hidden = hidden;
         let (mixed, _) = self.hyper(&last_hidden, "hyper_connection_mixer", "output_hc", false)?;
         let logits = if project_logits {

@@ -5,6 +5,38 @@ Research: 15–17 September 2026. Starting revision:
 initial performance record, mlx.fast investigation, prefill port log, and
 macOS 27 recheck. The [runtime guide](../qwen38-flash-next.md) covers usage.
 
+## Production error-handling audit, 17 September
+
+The production `unwrap`/`expect` audit covers the new Qwen4 runtime,
+the extracted Qwen vision code, shared GGUF changes, scheduler/stream integration,
+and native build additions. Three subagents independently reviewed runtime state,
+weight/cache storage, and shared/native integration. Production assumptions now
+use validated pattern matching or contextual errors: missing gates or state,
+invalid tensor dimensions, incomplete route/embedding rows, slot mappings,
+packed payloads and split-file selection. Optional kernels retain their existing
+fallback behavior when quantization companions are absent.
+
+Non-test Clippy guards prohibit `unwrap` and `expect` in the Qwen4, shared Qwen
+vision, stream and engine-vision modules, with scoped guards on the shared GGUF
+and build helpers. Test assertions remain in test-only code. Native build source
+and preamble errors propagate with file context. The focused regressions use
+small malformed inputs and fixtures; they do not load the released checkpoint.
+
+A production-only Clippy run, matched against the PR diff from
+`ae9ea3b65c92ab7b0b0489704909768e9083ef50`, reported no `unwrap_used` or
+`expect_used` diagnostics on added Rust lines. The three source reviews also
+covered inactive conditional paths and new build helpers. Existing calls outside
+the PR remain outside this audit.
+
+Validation after the audit passed: canonical native build and both packaged
+Metal-library smoke checks; **3583 core unit tests** (122 ignored and the same
+three debug-assertion-only cases excluded in release); strict all-target Clippy;
+workspace TypeScript checking; and **197 tests across eleven selected loader,
+discovery, registry, session and Metal-library suites**. All six new malformed-input
+and state regressions passed. Generated declaration copies still match. Logs and
+the compiler-to-diff audit are retained outside the repository under
+`~/Library/Caches/mlx-node/unwrap-audit-20260917/`.
+
 ## Whole-branch review, 17 September
 
 Three independent reviews covered the native bridge/shaders, decoder/scheduler,

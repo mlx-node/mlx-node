@@ -1,4 +1,6 @@
 //! Qwen3.8-Flash-Next with SSD-streamed experts and hashed PLE rows.
+#![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
 mod auxiliary;
 mod config;
 mod decoder;

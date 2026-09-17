@@ -163,7 +163,9 @@ impl Inner {
                 self.decoder
                     .draft_step(&hidden, token, start + i, &mut cache, true)?;
             hidden = next;
-            let logits = logits.unwrap().reshape(&[-1])?;
+            let logits = logits
+                .ok_or_else(|| Error::from_reason("Qwen4 MTP draft step produced no logits"))?
+                .reshape(&[-1])?;
             let id = if greedy {
                 logits.argmax(-1, None)?.astype(DType::Int32)?
             } else {
@@ -246,7 +248,7 @@ impl Inner {
                 self.decoder
                     .paged
                     .as_mut()
-                    .unwrap()
+                    .ok_or_else(|| Error::from_reason("Qwen4 verifier commit has no paged cache"))?
                     .rollback_last_tokens((pending.tokens.len() - row.keep) as u32)
                     .map_err(Error::from_reason)?;
                 let state = if row.keep == 0 {

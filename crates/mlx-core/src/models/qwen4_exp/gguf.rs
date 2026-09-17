@@ -27,6 +27,11 @@ pub fn integers(m: &HashMap<String, GgufMetaValue>, key: &str) -> Result<Vec<u64
 }
 pub fn config(store: &Store) -> Result<Config> {
     let m = &store.metadata;
+    let integer = |key: &str| {
+        m.get(key)
+            .and_then(GgufMetaValue::as_u64)
+            .ok_or_else(|| Error::from_reason(format!("Missing GGUF metadata {key}")))
+    };
     let mut text = serde_json::Map::new();
     for (hf, gg) in [
         ("hidden_size", "embedding_length"),
@@ -58,10 +63,7 @@ pub fn config(store: &Store) -> Result<Config> {
         ("eos_token_id", "ple.eos_token_id"),
     ] {
         let key = format!("qwen4exp.{gg}");
-        let n = m
-            .get(&key)
-            .and_then(GgufMetaValue::as_u64)
-            .ok_or_else(|| Error::from_reason(format!("Missing GGUF metadata {key}")))?;
+        let n = integer(&key)?;
         text.insert(hf.into(), json!(n));
     }
     let ratios = integers(m, "qwen4exp.attention.compress_ratios")?;
@@ -70,7 +72,7 @@ pub fn config(store: &Store) -> Result<Config> {
         .find(|&&n| n > 0)
         .copied()
         .ok_or_else(|| Error::from_reason("Missing QSA compression ratio"))?;
-    if ratios.len() != text["num_hidden_layers"].as_u64().unwrap() as usize
+    if ratios.len() as u64 != integer("qwen4exp.block_count")?
         || ratios.iter().any(|&r| r != 0 && r != ratio)
     {
         return Err(Error::from_reason(
@@ -91,7 +93,7 @@ pub fn config(store: &Store) -> Result<Config> {
                 .collect::<Vec<_>>()
         ),
     );
-    let vheads = text["linear_num_value_heads"].as_u64().unwrap();
+    let vheads = integer("qwen4exp.ssm.time_step_rank")?;
     let inner = m
         .get("qwen4exp.ssm.inner_size")
         .and_then(GgufMetaValue::as_u64)
@@ -113,7 +115,14 @@ pub fn config(store: &Store) -> Result<Config> {
         .get("qwen4exp.rope.freq_base")
         .and_then(GgufMetaValue::as_f32)
         .ok_or_else(|| Error::from_reason("Missing RoPE base"))?;
-    text.insert("rope_parameters".into(),json!({"rope_theta":theta,"partial_rotary_factor":dims as f64/text["head_dim"].as_u64().unwrap() as f64}));
+    let head_dim = integer("qwen4exp.attention.key_length")?;
+    if head_dim == 0 {
+        return Err(Error::from_reason("Invalid GGUF attention head dimension"));
+    }
+    text.insert(
+        "rope_parameters".into(),
+        json!({"rope_theta":theta,"partial_rotary_factor":dims as f64/head_dim as f64}),
+    );
     text.insert(
         "ple_layer_ids".into(),
         json!(
@@ -133,11 +142,11 @@ pub fn config(store: &Store) -> Result<Config> {
     text.insert("split_ngram_parts".into(), json!(1));
     text.insert(
         "ple_embed_dim".into(),
-        json!(store.descriptor("per_layer_token_embd.weight")?.width() * sizes.len()),
+        json!(store.descriptor("per_layer_token_embd.weight")?.width()? * sizes.len()),
     );
     text.insert(
         "vocab_size".into(),
-        json!(store.descriptor("token_embd.weight")?.rows()),
+        json!(store.descriptor("token_embd.weight")?.rows()?),
     );
     Config::parse(&json!({"model_type":"qwen4_exp","text_config":Value::Object(text)}))
 }
@@ -149,19 +158,16 @@ pub fn assets(first: &Path, store: &Store, c: &Config) -> Result<PathBuf> {
         .map_err(|e| Error::from_reason(e.to_string()))?;
     let metadata = std::fs::metadata(&source).map_err(|e| Error::from_reason(e.to_string()))?;
     let identity = source_file_identity_digest(&source, &metadata);
-    let dir = first
+    let parent = first
         .parent()
-        .unwrap()
-        .join(format!(".mlx-qwen4-assets-v2-{identity}"));
+        .ok_or_else(|| Error::from_reason("Qwen4 GGUF source has no parent directory"))?;
+    let dir = parent.join(format!(".mlx-qwen4-assets-v2-{identity}"));
     if dir.join("complete").exists() {
         return Ok(dir);
     }
     // Publish a complete directory in one rename. Simultaneous loads may race,
     // but neither reader can observe another load's partly written tokenizer.
-    let temp = first
-        .parent()
-        .unwrap()
-        .join(format!(".mlx-qwen4-assets-tmp-{}", uuid::Uuid::new_v4()));
+    let temp = parent.join(format!(".mlx-qwen4-assets-tmp-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir(&temp).map_err(|e| Error::from_reason(e.to_string()))?;
     let result = (|| -> Result<PathBuf> {
         if !write_embedded_gpt2_tokenizer(&store.metadata, &temp)? {

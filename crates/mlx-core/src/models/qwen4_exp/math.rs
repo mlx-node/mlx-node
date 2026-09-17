@@ -30,12 +30,28 @@ pub(super) fn routed_experts(
         || gate.bits != up.bits
         || down.mode != "affine"
         || !matches!(down.bits, 5 | 8)
-        || banks
-            .iter()
-            .any(|w| w.group != 32 || w.scales.is_none() || w.biases.is_none())
+        || banks.iter().any(|w| w.group != 32)
     {
         return Ok(None);
     }
+    let (
+        Some(gate_scales),
+        Some(gate_biases),
+        Some(up_scales),
+        Some(up_biases),
+        Some(down_scales),
+        Some(down_biases),
+    ) = (
+        &gate.scales,
+        &gate.biases,
+        &up.scales,
+        &up.biases,
+        &down.scales,
+        &down.biases,
+    )
+    else {
+        return Ok(None);
+    };
     let indices = ids.reshape(&[-1])?;
     let raw = unsafe {
         mlx_sys::mlx_qwen4_routed_experts(
@@ -43,14 +59,14 @@ pub(super) fn routed_experts(
             indices.as_raw_ptr(),
             scores.as_raw_ptr(),
             gate.values.as_raw_ptr(),
-            gate.scales.as_ref().unwrap().as_raw_ptr(),
-            gate.biases.as_ref().unwrap().as_raw_ptr(),
+            gate_scales.as_raw_ptr(),
+            gate_biases.as_raw_ptr(),
             up.values.as_raw_ptr(),
-            up.scales.as_ref().unwrap().as_raw_ptr(),
-            up.biases.as_ref().unwrap().as_raw_ptr(),
+            up_scales.as_raw_ptr(),
+            up_biases.as_raw_ptr(),
             down.values.as_raw_ptr(),
-            down.scales.as_ref().unwrap().as_raw_ptr(),
-            down.biases.as_ref().unwrap().as_raw_ptr(),
+            down_scales.as_raw_ptr(),
+            down_biases.as_raw_ptr(),
         )
     };
     if raw.is_null() {
@@ -94,10 +110,13 @@ pub(super) fn routed_shared_experts(
     let ids = ids.reshape(&[-1])?;
     let mut inputs = vec![x.as_raw_ptr(), ids.as_raw_ptr(), scores.as_raw_ptr()];
     for bank in banks.iter().chain(shared) {
+        let (Some(scales), Some(biases)) = (&bank.scales, &bank.biases) else {
+            return Ok(None);
+        };
         inputs.extend([
             bank.values.as_raw_ptr(),
-            bank.scales.as_ref().unwrap().as_raw_ptr(),
-            bank.biases.as_ref().unwrap().as_raw_ptr(),
+            scales.as_raw_ptr(),
+            biases.as_raw_ptr(),
         ]);
     }
     inputs.push(shared_gate.as_raw_ptr());
@@ -128,26 +147,42 @@ pub(super) fn prefill_indirect(
         || gate.bits != up.bits
         || down.mode != "affine"
         || !matches!(down.bits, 5 | 8)
-        || banks
-            .iter()
-            .any(|w| w.group != 32 || w.scales.is_none() || w.biases.is_none())
+        || banks.iter().any(|w| w.group != 32)
     {
         return Ok(None);
     }
+    let (
+        Some(gate_scales),
+        Some(gate_biases),
+        Some(up_scales),
+        Some(up_biases),
+        Some(down_scales),
+        Some(down_biases),
+    ) = (
+        &gate.scales,
+        &gate.biases,
+        &up.scales,
+        &up.biases,
+        &down.scales,
+        &down.biases,
+    )
+    else {
+        return Ok(None);
+    };
     let raw = unsafe {
         mlx_sys::mlx_qwen4_prefill_indirect(
             x.as_raw_ptr(),
             ids.as_raw_ptr(),
             token_rows.as_raw_ptr(),
             gate.values.as_raw_ptr(),
-            gate.scales.as_ref().unwrap().as_raw_ptr(),
-            gate.biases.as_ref().unwrap().as_raw_ptr(),
+            gate_scales.as_raw_ptr(),
+            gate_biases.as_raw_ptr(),
             up.values.as_raw_ptr(),
-            up.scales.as_ref().unwrap().as_raw_ptr(),
-            up.biases.as_ref().unwrap().as_raw_ptr(),
+            up_scales.as_raw_ptr(),
+            up_biases.as_raw_ptr(),
             down.values.as_raw_ptr(),
-            down.scales.as_ref().unwrap().as_raw_ptr(),
-            down.biases.as_ref().unwrap().as_raw_ptr(),
+            down_scales.as_raw_ptr(),
+            down_biases.as_raw_ptr(),
             experts as i32,
         )
     };
@@ -307,15 +342,25 @@ pub(super) fn recurrent_step(
     state: &MxArray,
 ) -> Result<(MxArray, MxArray)> {
     let shape = q.shape()?;
-    let kd = *shape.last().unwrap();
+    let [1, query_heads, 1, kd] = &*shape else {
+        return Err(Error::from_reason(
+            "Qwen4 recurrent query must have shape [1, heads, 1, key_dim]",
+        ));
+    };
+    if *query_heads <= 0 || *kd <= 0 {
+        return Err(Error::from_reason(
+            "Qwen4 recurrent query heads and key dimension must be positive",
+        ));
+    }
+    let (query_heads, kd) = (*query_heads, *kd);
     if kd >= 32
         && kd % 32 == 0
         && crate::engine::persistence::compiled_forward_backend_available()
         && !runtime_flags::is_zero(c"MLX_QWEN4_FUSED_GDN")
     {
-        let q = q.reshape(&[1, 1, shape[1], kd])?;
-        let k = k.reshape(&[1, 1, shape[1], kd])?;
-        let heads = state.shape()?[1];
+        let q = q.reshape(&[1, 1, query_heads, kd])?;
+        let k = k.reshape(&[1, 1, query_heads, kd])?;
+        let heads = state.shape_at(1)?;
         let v = v.reshape(&[1, 1, heads, -1])?;
         let decay = decay.reshape(&[1, 1, heads])?;
         let beta = beta.reshape(&[1, 1, heads])?;
@@ -342,7 +387,7 @@ pub(super) fn recurrent_step(
             MxArray::from_handle(next, "Qwen4 recurrent state")?,
         ));
     }
-    let repeats = state.shape()?[1] / shape[1];
+    let repeats = state.shape_at(1)? / query_heads;
     recurrent_step_reference(
         &MxArray::tile(q, &[1, repeats as i32, 1, 1])?,
         &MxArray::tile(k, &[1, repeats as i32, 1, 1])?,
@@ -611,17 +656,21 @@ pub fn mrope(
     sections: [usize; 3],
     interleaved: bool,
 ) -> Result<MxArray> {
-    let width = *x.shape()?.last().unwrap();
+    let shape = x.shape()?;
+    let (&width, axes) = shape
+        .split_last()
+        .ok_or_else(|| Error::from_reason("Qwen4 rotary input must have a feature dimension"))?;
+    let axis = axes.len();
     let half = dims as i64 / 2;
     let angles = rotary_angles(positions, dims, theta, sections, interleaved);
     let angles = MxArray::from_float32(&angles, &[half])?;
     let cos = angles.cos()?.astype(x.dtype()?)?;
     let sin = angles.sin()?.astype(x.dtype()?)?;
-    let a = x.slice_axis(x.shape()?.len() - 1, 0, half)?;
-    let b = x.slice_axis(x.shape()?.len() - 1, half, dims as i64)?;
+    let a = x.slice_axis(axis, 0, half)?;
+    let b = x.slice_axis(axis, half, dims as i64)?;
     let left = a.mul(&cos)?.sub(&b.mul(&sin)?)?;
     let right = b.mul(&cos)?.add(&a.mul(&sin)?)?;
-    let tail = x.slice_axis(x.shape()?.len() - 1, dims as i64, width)?;
+    let tail = x.slice_axis(axis, dims as i64, width)?;
     MxArray::concatenate_many(vec![&left, &right, &tail], Some(-1))
 }
 
@@ -704,7 +753,9 @@ impl RotaryWindowCache {
         interleaved: bool,
     ) -> Result<MxArray> {
         let shape = x.shape()?;
-        let width = *shape.last().unwrap();
+        let width = shape.last().copied().ok_or_else(|| {
+            Error::from_reason("Qwen4 cached rotary input must have a feature dimension")
+        })?;
         self.apply(
             &x.reshape(&[1, -1, 1, width])?,
             vec![position],
@@ -871,6 +922,51 @@ pub fn l2(x: &MxArray) -> Result<MxArray> {
             .sqrt()?,
     )?
     .astype(x.dtype()?)
+}
+
+#[cfg(test)]
+mod input_validation_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_inputs_return_shape_errors_without_changing_convolution_history() {
+        let scalar = MxArray::from_float32(&[1.], &[]).unwrap();
+        let rotary_error = mrope(&scalar, [0; 3], 2, 10_000., [0; 3], true)
+            .err()
+            .expect("scalar rotary input must be rejected");
+        assert_eq!(
+            rotary_error.reason,
+            "Qwen4 rotary input must have a feature dimension"
+        );
+        let mut tables = RotaryWindowCache::default();
+        let cached_error = tables
+            .apply_singleton(&scalar, [0; 3], 2, 10_000., [0; 3], true)
+            .err()
+            .expect("scalar cached rotary input must be rejected");
+        assert_eq!(
+            cached_error.reason,
+            "Qwen4 cached rotary input must have a feature dimension"
+        );
+        assert!(tables.0.is_empty());
+
+        let recurrent_error = recurrent_step(&scalar, &scalar, &scalar, &scalar, &scalar, &scalar)
+            .err()
+            .expect("scalar recurrent input must be rejected");
+        assert_eq!(
+            recurrent_error.reason,
+            "Qwen4 recurrent query must have shape [1, heads, 1, key_dim]"
+        );
+
+        let mut history = Some(MxArray::from_float32(&[2., 3.], &[2, 1]).unwrap());
+        let convolution_error = conv(&scalar, &scalar, &mut history, 3, 1)
+            .err()
+            .expect("scalar convolution input must be rejected");
+        assert_eq!(
+            convolution_error.reason,
+            "Qwen4 convolution input must have a feature dimension"
+        );
+        assert_eq!(&*history.as_ref().unwrap().to_float32().unwrap(), &[2., 3.]);
+    }
 }
 
 #[cfg(test)]
@@ -1314,7 +1410,9 @@ fn conv_with_completion(
     dilation: usize,
     defer_state: bool,
 ) -> Result<MxArray> {
-    let width = *x.shape()?.last().unwrap();
+    let width = x.shape()?.last().copied().ok_or_else(|| {
+        Error::from_reason("Qwen4 convolution input must have a feature dimension")
+    })?;
     let keep = (kernel - 1) * dilation;
     let old = match state {
         Some(s) => s.clone(),

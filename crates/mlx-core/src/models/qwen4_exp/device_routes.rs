@@ -74,7 +74,7 @@ impl Decoder {
         self.weights.finish_expert_slots(layer, &reduced)?;
         self.device_routes
             .as_mut()
-            .unwrap()
+            .ok_or_else(|| Error::from_reason("Qwen4 tentative prefill lost its route tape"))?
             .push((layer, selected.reshape(&[-1])?));
         Ok(reduced)
     }
@@ -111,8 +111,10 @@ impl Decoder {
         let base = self.snapshot();
         self.device_routes = Some(Vec::with_capacity(self.config.num_hidden_layers));
         let tentative = self.prefill_chunk_inner(tokens, embeddings, project);
-        let routes = self.device_routes.take().unwrap();
+        let routes = self.device_routes.take();
         let output = tentative?;
+        let routes = routes
+            .ok_or_else(|| Error::from_reason("Qwen4 tentative prefill lost its route tape"))?;
         if routes.len() != self.config.num_hidden_layers {
             return Err(Error::from_reason(
                 "Qwen4 tentative prefill has an incomplete route tape",
@@ -246,7 +248,7 @@ impl Decoder {
         self.weights.finish_expert_slots(layer, &out)?;
         self.device_routes
             .as_mut()
-            .unwrap()
+            .ok_or_else(|| Error::from_reason("Qwen4 tentative decode lost its route tape"))?
             .push((layer, selected.reshape(&[-1])?));
         Ok(Some(out))
     }
@@ -270,7 +272,7 @@ impl Decoder {
         self.weights.finish_expert_slots(layer, &out)?;
         self.device_routes
             .as_mut()
-            .unwrap()
+            .ok_or_else(|| Error::from_reason("Qwen4 tentative decode lost its route tape"))?
             .push((layer, selected.reshape(&[-1])?));
         Ok(Some(out))
     }
@@ -309,8 +311,10 @@ impl Decoder {
         self.device_routes = Some(Vec::with_capacity(self.config.num_hidden_layers));
         let tentative = self.ordinary_token(token, project);
         // Always leave tentative mode, including cancellation or a read error.
-        let routes = self.device_routes.take().unwrap();
+        let routes = self.device_routes.take();
         let out = tentative?;
+        let routes = routes
+            .ok_or_else(|| Error::from_reason("Qwen4 tentative decode lost its route tape"))?;
         if routes.is_empty() {
             return Ok(out);
         }

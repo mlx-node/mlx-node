@@ -85,7 +85,10 @@ impl Store {
                 && !super::residency::is_auxiliary(name)
                 && !self.banks.contains_key(name)
             {
-                let layer = name.split(".ffn_").next().unwrap();
+                let layer = match name.split_once(".ffn_") {
+                    Some((layer, _)) => layer,
+                    None => name.as_str(),
+                };
                 let bytes = layer_bytes.entry(layer).or_default();
                 *bytes = bytes.saturating_add(tensor.runtime_bytes()?);
             }
@@ -274,12 +277,25 @@ impl Store {
             let local: Vec<u32> = ids
                 .iter()
                 .map(|&e| {
-                    let slot = slots.mapping[e as usize].expect("reserved expert");
-                    slots.tick += 1;
-                    slots.ages[slot] = slots.tick;
-                    slot as u32
+                    let slot = slots
+                        .mapping
+                        .get(e as usize)
+                        .copied()
+                        .flatten()
+                        .filter(|&slot| slot < slots.ages.len())
+                        .ok_or_else(|| err("Qwen4 reserved expert has no valid slot mapping"))?;
+                    u32::try_from(slot)
+                        .map_err(|_| err("Qwen4 expert slot exceeds device index range"))
                 })
-                .collect();
+                .collect::<Result<_>>()?;
+            for &slot in &local {
+                let age = slots
+                    .ages
+                    .get_mut(slot as usize)
+                    .ok_or_else(|| err("Qwen4 reserved expert age slot disappeared"))?;
+                slots.tick += 1;
+                *age = slots.tick;
+            }
             Ok((slots.banks.clone(), local, capacity))
         })();
         // Retain the bank/accounting even on a failed source read. Already
@@ -368,7 +384,7 @@ impl Store {
         let local = slots
             .device_mapping
             .as_ref()
-            .unwrap()
+            .ok_or_else(|| err("Qwen4 device expert mapping was not initialized"))?
             .take(&ids.reshape(&[-1])?, 0)?;
         Ok(Some((slots.banks.clone(), local)))
     }
@@ -388,19 +404,35 @@ impl Store {
             let Some(slots) = self.slots.get(&layer) else {
                 return Ok(false);
             };
-            if selected
-                .iter()
-                .any(|&e| slots.mapping.get(e as usize).is_none_or(Option::is_none))
-            {
+            if selected.iter().any(|&e| {
+                slots
+                    .mapping
+                    .get(e as usize)
+                    .copied()
+                    .flatten()
+                    .is_none_or(|slot| slot >= slots.ages.len())
+            }) {
                 return Ok(false);
             }
         }
         for (&layer, selected) in layers.iter().zip(ids.chunks_exact(top)) {
-            let slots = self.slots.get_mut(&layer).unwrap();
+            let slots = self
+                .slots
+                .get_mut(&layer)
+                .ok_or_else(|| err("Qwen4 device route layer disappeared during commit"))?;
             for &e in selected {
-                let slot = slots.mapping[e as usize].unwrap();
+                let slot = slots
+                    .mapping
+                    .get(e as usize)
+                    .copied()
+                    .flatten()
+                    .ok_or_else(|| err("Qwen4 device route mapping disappeared during commit"))?;
+                let age = slots
+                    .ages
+                    .get_mut(slot)
+                    .ok_or_else(|| err("Qwen4 device route has an invalid age slot"))?;
                 slots.tick += 1;
-                slots.ages[slot] = slots.tick;
+                *age = slots.tick;
             }
             self.slot_hits += selected.iter().collect::<HashSet<_>>().len() as u64;
         }
@@ -495,6 +527,46 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_device_route_mapping_does_not_commit_earlier_layer_ages() {
+        let mut store = Store::open_metadata(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/qwen4-exp"),
+            None,
+        )
+        .unwrap();
+        let weight = Arc::new(Weight {
+            values: MxArray::zeros(&[1, 1], Some(DType::Float32)).unwrap(),
+            dense_bf16: None,
+            scales: None,
+            biases: None,
+            group: 0,
+            bits: 0,
+            mode: String::new(),
+        });
+        for (layer, mapping) in [vec![Some(0)], vec![None, Some(2)]].into_iter().enumerate() {
+            store.slots.insert(
+                layer,
+                ExpertSlots {
+                    banks: [weight.clone(), weight.clone(), weight.clone()],
+                    names: ["gate".into(), "up".into(), "down".into()],
+                    rows: [1; 3],
+                    occupants: vec![Some(layer as u32)],
+                    mapping,
+                    device_mapping: None,
+                    ages: vec![0],
+                    tick: 0,
+                    readers: Vec::new(),
+                },
+            );
+        }
+        assert!(!store.commit_device_routes(&[0, 1], &[0, 1], 1).unwrap());
+        assert_eq!(store.slot_hits, 0);
+        for slots in store.slots.values() {
+            assert_eq!(slots.tick, 0);
+            assert_eq!(slots.ages, [0]);
+        }
+    }
     #[test]
     fn completed_expert_window_releases_large_reader_storage() {
         let mut store = Store::open_metadata(

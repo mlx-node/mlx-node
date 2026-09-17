@@ -51,8 +51,8 @@ pub struct Prepared {
 /// than one staging read. Assemble it without relaxing the store's read cap.
 pub(super) fn load_vision_tensor(store: &mut Store, name: &str) -> Result<MxArray> {
     let d = store.descriptor(name)?;
-    let rows = d.rows();
-    let width = d.width();
+    let rows = d.rows()?;
+    let width = d.width()?;
     if !name.starts_with("visual.") || rows as u128 * width as u128 * 4 > (2u128 << 30) {
         return Err(Error::from_reason(
             "Qwen4 vision tensor exceeds its materialization budget",
@@ -186,6 +186,11 @@ impl Inner {
             ));
         }
         self.vision.load(&mut self.decoder.weights)?;
+        let encoder = self
+            .vision
+            .encoder
+            .as_ref()
+            .ok_or_else(|| Error::from_reason("Qwen4 vision encoder was not initialized"))?;
         let mut grids = Vec::new();
         let mut features = Vec::new();
         for bytes in refs {
@@ -193,12 +198,7 @@ impl Inner {
             let image = processor.process_many(&[bytes])?;
             let grid = image.grid_thw();
             let actual = compute_image_token_counts_per_image(&grid, 2)?;
-            let feature = self
-                .vision
-                .encoder
-                .as_ref()
-                .unwrap()
-                .forward(&image.pixel_values().expand_dims(0)?, &grid)?;
+            let feature = encoder.forward(&image.pixel_values().expand_dims(0)?, &grid)?;
             MxArray::eval_arrays_with_context(&[&feature], "qwen4::media::feature")?;
             if feature.shape_at(0)? as usize != actual[0] {
                 return Err(Error::from_reason("Qwen4 vision feature count mismatch"));

@@ -46,29 +46,45 @@ pub struct Tensor {
     encoding: Encoding,
 }
 impl Tensor {
-    pub fn width(&self) -> usize {
-        *self.shape.last().unwrap()
+    pub fn width(&self) -> Result<usize> {
+        self.shape
+            .last()
+            .copied()
+            .filter(|&width| width > 0)
+            .ok_or_else(|| err("SSD tensor requires a positive row width"))
     }
-    pub fn rows(&self) -> usize {
-        self.shape.iter().product::<usize>() / self.width()
+    pub fn rows(&self) -> Result<usize> {
+        let width = self.width()?;
+        let elements = self
+            .shape
+            .iter()
+            .try_fold(1usize, |n, &d| if d == 0 { None } else { n.checked_mul(d) })
+            .ok_or_else(|| err("Invalid or overflowing SSD tensor dimensions"))?;
+        Ok(elements / width)
     }
-    fn row_bytes(&self) -> u64 {
-        self.bytes / self.rows() as u64
+    fn row_bytes(&self) -> Result<u64> {
+        Ok(self.bytes / self.rows()? as u64)
     }
     fn range(&self, start: usize, rows: usize) -> Result<(u64, u64)> {
-        if rows == 0 || start.checked_add(rows).is_none_or(|end| end > self.rows()) {
+        let total_rows = self.rows()?;
+        if rows == 0 || start.checked_add(rows).is_none_or(|end| end > total_rows) {
             return Err(err("SSD tensor row range is outside the descriptor"));
         }
         let bytes = self
-            .row_bytes()
+            .row_bytes()?
             .checked_mul(rows as u64)
             .ok_or_else(|| err("SSD read size overflow"))?;
-        if bytes > MAX_READ_BYTES || (rows as u64 * self.width() as u64 * 4) > MAX_READ_BYTES {
+        if bytes > MAX_READ_BYTES
+            || (rows as u64)
+                .saturating_mul(self.width()? as u64)
+                .saturating_mul(4)
+                > MAX_READ_BYTES
+        {
             return Err(err(
                 "SSD tensor read exceeds the 64 MiB staging budget; use row chunks",
             ));
         }
-        Ok((self.offset + self.row_bytes() * start as u64, bytes))
+        Ok((self.offset + self.row_bytes()? * start as u64, bytes))
     }
     fn packed_key(&self, name: &str, start: usize, rows: usize) -> Result<Option<String>> {
         let (offset, bytes) = self.range(start, rows)?;
@@ -92,7 +108,7 @@ impl Tensor {
                     offset,
                     bytes,
                     rows,
-                    self.width(),
+                    self.width()?,
                     ty as u32,
                 ))
             }
@@ -294,21 +310,30 @@ impl Weight {
                 }
             }
         }
+        let Some(scales) = weights
+            .iter()
+            .map(|w| w.scales.as_ref())
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let biases = if first.biases.is_some() {
+            let Some(biases) = weights
+                .iter()
+                .map(|w| w.biases.as_ref())
+                .collect::<Option<Vec<_>>>()
+            else {
+                return Ok(None);
+            };
+            Some(MxArray::stack(biases, Some(0))?)
+        } else {
+            None
+        };
         Ok(Some(Self {
             values: MxArray::stack(weights.iter().map(|w| &w.values).collect(), Some(0))?,
             dense_bf16: None,
-            scales: Some(MxArray::stack(
-                weights.iter().map(|w| w.scales.as_ref().unwrap()).collect(),
-                Some(0),
-            )?),
-            biases: if first.biases.is_some() {
-                Some(MxArray::stack(
-                    weights.iter().map(|w| w.biases.as_ref().unwrap()).collect(),
-                    Some(0),
-                )?)
-            } else {
-                None
-            },
+            scales: Some(MxArray::stack(scales, Some(0))?),
+            biases,
             bits: first.bits,
             group: first.group,
             mode: first.mode.clone(),
@@ -393,17 +418,21 @@ impl Weight {
             }
             let weight = values.transpose(None)?.astype(x.dtype()?)?;
             let shape = x.shape()?;
-            if x.dtype()? == DType::Float32 && x.size()? / *shape.last().unwrap() as u64 > 1 {
+            let (&width, outer_shape) = shape
+                .split_last()
+                .filter(|(width, _)| **width > 0)
+                .ok_or_else(|| err("Qwen4 projection input requires a positive final dimension"))?;
+            if x.dtype()? == DType::Float32 && x.size()? / width as u64 > 1 {
                 // MLX enables TF32 GEMMs by default on NAX hardware. Preserve
                 // the F32 source's GEMV arithmetic without changing global
                 // process settings or lowering the fixture's accuracy gate.
-                let rows = x.reshape(&[-1, *shape.last().unwrap()])?;
+                let rows = x.reshape(&[-1, width])?;
                 let mut outputs = Vec::new();
                 for row in 0..rows.shape()?[0] {
                     outputs.push(rows.slice_axis(0, row, row + 1)?.matmul(&weight)?);
                 }
-                let mut shape = shape.to_vec();
-                *shape.last_mut().unwrap() = self.values.shape()?[0];
+                let mut shape = outer_shape.to_vec();
+                shape.push(self.values.shape_at(0)?);
                 MxArray::concatenate_many(outputs.iter().collect(), Some(0))?.reshape(&shape)?
             } else {
                 x.matmul(&weight)?
@@ -664,7 +693,7 @@ impl Store {
         {
             return Err(err(format!("Invalid/truncated SSD tensor {name}")));
         }
-        if !t.bytes.is_multiple_of(t.rows() as u64) {
+        if !t.bytes.is_multiple_of(t.rows()? as u64) {
             return Err(err(format!("Unaligned SSD rows: {name}")));
         }
         // Relative, absolute and symlink aliases must share the same prepared
@@ -904,7 +933,7 @@ impl Store {
             }
             let d = self.descriptor(name)?;
             if let Some(key) = d.packed_key(name, *start, *rows)? {
-                let bytes = (d.runtime_bytes()? / d.rows() as u64).saturating_mul(*rows as u64);
+                let bytes = (d.runtime_bytes()? / d.rows()? as u64).saturating_mul(*rows as u64);
                 total = total.saturating_add(bytes);
                 jobs.push((key, bytes));
                 indices.push(i);
@@ -923,7 +952,11 @@ impl Store {
         self.evict_to(self.cache_limit.saturating_sub(staging_bytes))?;
         super::memory::maintain_freelist(self.plan.physical_bytes);
         super::memory::admit(staging_bytes)?;
-        let verified = self.packed.as_ref().unwrap().read_batch(&jobs)?;
+        let cache = self
+            .packed
+            .as_ref()
+            .ok_or_else(|| err("Qwen4 packed cache disappeared before the prepared batch read"))?;
+        let verified = cache.read_batch(&jobs)?;
         let mut prepared: Vec<_> = (0..requests.len()).map(|_| None).collect();
         for (i, chunk) in indices.into_iter().zip(verified) {
             prepared[i] = Some(chunk);
@@ -940,11 +973,12 @@ impl Store {
     /// Store-owned LRU and its byte accounting, so no second cache is reserved.
     pub fn lookup_rows(&mut self, name: &str, ids: &[usize]) -> Result<MxArray> {
         let d = self.descriptor(name)?;
+        let total_rows = d.rows()?;
         if ids.is_empty()
             || ids.len() > 65536
-            || ids.iter().any(|&id| id >= d.rows())
+            || ids.iter().any(|&id| id >= total_rows)
             || (ids.len() as u64)
-                .saturating_mul(d.width() as u64)
+                .saturating_mul(d.width()? as u64)
                 .saturating_mul(4)
                 > MAX_READ_BYTES
         {
@@ -1022,7 +1056,7 @@ impl Store {
                 .and_then(|key| self.packed.as_ref()?.read(key).ok().flatten()),
         };
         let prepared_hit = prepared.is_some();
-        let shape = [rows as i64, d.width() as i64];
+        let shape = [rows as i64, d.width()? as i64];
         let weight = if let Some((weight, bytes)) = prepared {
             self.packed_hits += 1;
             self.packed_bytes_read += bytes;
@@ -1080,7 +1114,7 @@ impl Store {
                     let tensor = GgufTensorInfo {
                         name: "weight".into(),
                         n_dims: 2,
-                        dims: vec![d.width() as u64, rows as u64],
+                        dims: vec![d.width()? as u64, rows as u64],
                         tensor_type: *ty,
                         offset: 0,
                     };
@@ -1222,7 +1256,7 @@ impl Store {
     pub fn dense(&mut self, name: &str) -> Result<MxArray> {
         let d = self.descriptor(name)?;
         let shape = d.shape.iter().map(|&i| i as i64).collect::<Vec<_>>();
-        let rows = d.rows();
+        let rows = d.rows()?;
         self.read(name, 0, rows)?.dense()?.reshape(&shape)
     }
     pub fn linear(&mut self, name: &str, x: &MxArray) -> Result<MxArray> {
@@ -1255,10 +1289,12 @@ impl Store {
 
     fn linear_impl(&mut self, name: &str, x: &MxArray, vectors: bool) -> Result<MxArray> {
         let d = self.descriptor(name)?;
-        let rows = d.rows();
+        let rows = d.rows()?;
         let shape = x.shape()?.to_vec();
-        let width = *shape.last().unwrap();
-        if width != d.width() as i64 {
+        let (&width, outer_shape) = shape
+            .split_last()
+            .ok_or_else(|| err("Qwen4 projection input has no final dimension"))?;
+        if width != d.width()? as i64 {
             return Err(err(format!("Projection shape mismatch: {name}")));
         }
         let count = x.size()? as i64 / width;
@@ -1282,8 +1318,8 @@ impl Store {
                     .collect::<Result<Vec<_>>>()?;
                 MxArray::concatenate_many(parts.iter().collect(), Some(0))?
             };
-            let mut out_shape = shape.clone();
-            *out_shape.last_mut().unwrap() = w.values.shape()?[0];
+            let mut out_shape = outer_shape.to_vec();
+            out_shape.push(w.values.shape_at(0)?);
             output.reshape(&out_shape)
         };
         // Staging chunks bound SSD reads. A resident matrix can use a single
@@ -1292,7 +1328,7 @@ impl Store {
         if let Some(bank) = self.banks.get(name) {
             return project(bank);
         }
-        let chunk = (MAX_READ_BYTES as usize / (d.width() * 4)).clamp(1, 4096);
+        let chunk = (MAX_READ_BYTES as usize / (d.width()? * 4)).clamp(1, 4096);
         let mut outputs = Vec::new();
         for start in (0..rows).step_by(chunk) {
             let weight = self.read(name, start, (rows - start).min(chunk))?;
@@ -1324,6 +1360,25 @@ impl Store {
 #[cfg(test)]
 mod cache_tests {
     use super::*;
+
+    #[test]
+    fn descriptor_dimensions_reject_empty_zero_and_overflowing_shapes() {
+        let mut tensor = Tensor {
+            path: PathBuf::from("unused.safetensors"),
+            shape: vec![2, 3],
+            offset: 0,
+            bytes: 24,
+            encoding: Encoding::Safe("F32".into()),
+        };
+        assert_eq!(tensor.width().unwrap(), 3);
+        assert_eq!(tensor.rows().unwrap(), 2);
+        assert_eq!(tensor.range(1, 1).unwrap(), (12, 12));
+        for shape in [vec![], vec![0], vec![0, 3], vec![2, 0], vec![usize::MAX, 2]] {
+            tensor.shape = shape;
+            assert!(tensor.rows().is_err());
+            assert!(tensor.range(0, 1).is_err());
+        }
+    }
 
     #[test]
     fn fixture_forward_headroom_isolated_from_production_guard() {
@@ -1607,7 +1662,7 @@ mod cache_tests {
         for i in 0..32 {
             let name = format!("mtp.test_norm_{i}.weight");
             store.tensors.insert(name.clone(), descriptor.clone());
-            store.read(&name, 0, descriptor.rows()).unwrap();
+            store.read(&name, 0, descriptor.rows().unwrap()).unwrap();
         }
         assert!(store.protected_bytes > 0);
         assert!(store.protected_bytes <= 768);
@@ -1630,7 +1685,7 @@ mod cache_tests {
         for i in 0..32 {
             let name = format!("mtp.test_norm_{i}.weight");
             store.tensors.insert(name.clone(), descriptor.clone());
-            store.read(&name, 0, descriptor.rows()).unwrap();
+            store.read(&name, 0, descriptor.rows().unwrap()).unwrap();
         }
         assert!(store.protected_bytes > 0);
         assert!(store.protected_bytes <= 768);

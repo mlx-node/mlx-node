@@ -47,18 +47,20 @@ impl Decoder {
             let k = cache
                 .keys
                 .take()
-                .unwrap()
+                .ok_or_else(|| Error::from_reason("Qwen4 scheduled attention produced no keys"))?
                 .transpose(Some(&[0, 2, 1, 3]))?
                 .reshape(&shape)?
                 .astype(DType::BFloat16)?;
             let v = cache
                 .values
                 .take()
-                .unwrap()
+                .ok_or_else(|| Error::from_reason("Qwen4 scheduled attention produced no values"))?
                 .transpose(Some(&[0, 2, 1, 3]))?
                 .reshape(&shape)?
                 .astype(DType::BFloat16)?;
-            let adapter = self.paged.as_mut().unwrap();
+            let adapter = self.paged.as_mut().ok_or_else(|| {
+                Error::from_reason("Qwen4 scheduled attention has no paged cache")
+            })?;
             super::super::paged::write_rows(adapter, index, &k, &v, self.history.len() as u32)?;
             // Owners share the pool. Complete the write before activating another.
             adapter

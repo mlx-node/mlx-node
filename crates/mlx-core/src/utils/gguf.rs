@@ -857,6 +857,7 @@ pub fn derived_symmetric_bias_bits(scale_bits: u16, zero_point: i32) -> u16 {
 /// minimum requires. Q4_0 and Q8_0 yield `(weight, scales)` only: their offset
 /// is the constant `-Z * scale`, so it is reconstructed at load instead of
 /// stored (see [`symmetric_zero_point`]).
+#[cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 fn load_quantized_tensor(
     reader: &mut (impl Read + Seek),
     gguf: &GgufFile,
@@ -886,17 +887,23 @@ fn load_quantized_tensor(
     };
 
     // Q5_1 uses MLX's native five-bit bitstream: five u32 words per 32 codes.
-    let mut w_shape = shape.clone();
-    let last = *w_shape.last().unwrap();
-    *w_shape.last_mut().unwrap() = if tensor.tensor_type == GgufTensorType::Q5_1 {
+    let (&last, leading_dims) = shape.split_last().ok_or_else(|| {
+        Error::from_reason(format!(
+            "Quantized tensor '{}' must have at least one dimension",
+            tensor.name
+        ))
+    })?;
+    let packed_width = if tensor.tensor_type == GgufTensorType::Q5_1 {
         last / 32 * 5
     } else {
         last / (weights_per_byte as i64 * 4)
     };
+    let mut w_shape = leading_dims.to_vec();
+    w_shape.push(packed_width);
 
     // Scales/biases shape: last dim divided by block_size
-    let mut sb_shape = shape;
-    *sb_shape.last_mut().unwrap() = last / block_size as i64;
+    let mut sb_shape = leading_dims.to_vec();
+    sb_shape.push(last / block_size as i64);
 
     let w_elements: usize = w_shape.iter().map(|&d| d as usize).product();
     let sb_elements: usize = sb_shape.iter().map(|&d| d as usize).product();
@@ -963,7 +970,16 @@ fn load_quantized_tensor(
                 let block = &raw[i * type_size..(i + 1) * type_size];
                 scales[i] = u16::from_le_bytes([block[0], block[1]]);
                 biases[i] = u16::from_le_bytes([block[2], block[3]]);
-                let high = u32::from_le_bytes(block[4..8].try_into().unwrap());
+                let high_bytes = block
+                    .get(4..8)
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "Invalid Q5_1 high bits in tensor '{}' block {i}",
+                            tensor.name
+                        ))
+                    })?;
+                let high = u32::from_le_bytes(high_bytes);
                 for j in 0..32 {
                     let low = (block[8 + j % 16] >> (4 * (j / 16))) & 15;
                     let code = u32::from(low) | (((high >> j) & 1) << 4);
@@ -4753,6 +4769,7 @@ fn qwen35_native_cache_is_current(
 /// Resolve every split by its declared ordinal, accepting any GGUF extension
 /// casing while rejecting ambiguous sibling names. Payload validation remains
 /// the caller's responsibility; this reads directory entries only.
+#[cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 pub(crate) fn resolve_gguf_shards(first: &Path, count: u32) -> Result<Vec<PathBuf>> {
     if !(1..=1024).contains(&count) {
         return Err(Error::from_reason("Invalid GGUF split count"));
@@ -4791,13 +4808,13 @@ pub(crate) fn resolve_gguf_shards(first: &Path, count: u32) -> Result<Vec<PathBu
     for ordinal in 2..=count {
         let stem = format!("{prefix}-{ordinal:05}-of-{count:05}");
         let candidates = siblings.remove(&stem).unwrap_or_default();
-        if candidates.len() != 1 {
-            return Err(Error::from_reason(format!(
+        let [candidate] = <[PathBuf; 1]>::try_from(candidates).map_err(|candidates| {
+            Error::from_reason(format!(
                 "Expected one GGUF split {stem}, found {}",
                 candidates.len()
-            )));
-        }
-        paths.push(candidates.into_iter().next().unwrap());
+            ))
+        })?;
+        paths.push(candidate);
     }
     Ok(paths)
 }
@@ -7627,6 +7644,31 @@ mod tests {
             probed.contains_key("embed_tokens.scales"),
             "the packed-embedding probe key must exist after the `model.` strip"
         );
+    }
+
+    #[test]
+    fn affine_quantized_import_rejects_missing_dimensions() {
+        let tensor = GgufTensorInfo {
+            name: "blk.0.ffn_down.weight".to_string(),
+            n_dims: 0,
+            dims: vec![],
+            tensor_type: GgufTensorType::Q5_1,
+            offset: 0,
+        };
+        let gguf = GgufFile {
+            version: GGUF_VERSION_3,
+            tensor_count: 1,
+            metadata: HashMap::new(),
+            tensors: vec![tensor.clone()],
+            alignment: GGUF_DEFAULT_ALIGNMENT,
+            data_offset: 0,
+        };
+        let mut cursor = std::io::Cursor::new(Vec::<u8>::new());
+        let error = load_quantized_tensor(&mut cursor, &gguf, &tensor)
+            .err()
+            .expect("dimensionless quantized tensor must be rejected");
+        assert!(error.reason.contains("must have at least one dimension"));
+        assert!(error.reason.contains(&tensor.name));
     }
 
     #[test]

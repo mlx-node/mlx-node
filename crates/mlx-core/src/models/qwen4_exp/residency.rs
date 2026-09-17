@@ -127,7 +127,9 @@ impl Weight {
     }
 
     pub(in super::super) fn concatenate_rows(weights: &[Arc<Self>]) -> Result<Self> {
-        let first = &weights[0];
+        let first = weights
+            .first()
+            .ok_or_else(|| err("Cannot concatenate an empty resident weight list"))?;
         if weights.iter().any(|w| {
             w.mode != first.mode
                 || w.bits != first.bits
@@ -140,18 +142,22 @@ impl Weight {
         let values =
             MxArray::concatenate_many(weights.iter().map(|w| &w.values).collect(), Some(0))?;
         let scales = if first.scales.is_some() {
-            Some(MxArray::concatenate_many(
-                weights.iter().map(|w| w.scales.as_ref().unwrap()).collect(),
-                Some(0),
-            )?)
+            let arrays = weights
+                .iter()
+                .map(|w| w.scales.as_ref())
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| err("Resident weight chunk is missing scales"))?;
+            Some(MxArray::concatenate_many(arrays, Some(0))?)
         } else {
             None
         };
         let biases = if first.biases.is_some() {
-            Some(MxArray::concatenate_many(
-                weights.iter().map(|w| w.biases.as_ref().unwrap()).collect(),
-                Some(0),
-            )?)
+            let arrays = weights
+                .iter()
+                .map(|w| w.biases.as_ref())
+                .collect::<Option<Vec<_>>>()
+                .ok_or_else(|| err("Resident weight chunk is missing biases"))?;
+            Some(MxArray::concatenate_many(arrays, Some(0))?)
         } else {
             None
         };
@@ -160,17 +166,12 @@ impl Weight {
             scales,
             biases,
             // Never retain a cached view of only the first input's rows.
-            dense_bf16: if weights.iter().all(|w| w.dense_bf16.is_some()) {
-                Some(MxArray::concatenate_many(
-                    weights
-                        .iter()
-                        .map(|w| w.dense_bf16.as_ref().unwrap())
-                        .collect(),
-                    Some(0),
-                )?)
-            } else {
-                None
-            },
+            dense_bf16: weights
+                .iter()
+                .map(|w| w.dense_bf16.as_ref())
+                .collect::<Option<Vec<_>>>()
+                .map(|arrays| MxArray::concatenate_many(arrays, Some(0)))
+                .transpose()?,
             ..first.as_ref().clone()
         })
     }
@@ -413,7 +414,7 @@ impl Store {
             {
                 return Ok(false);
             }
-            let staging_rows = (MAX_READ_BYTES as usize / (d.width() * 4)).clamp(1, 4096);
+            let staging_rows = (MAX_READ_BYTES as usize / (d.width()? * 4)).clamp(1, 4096);
             // Share exact prepared-cache keys with streamed expert reads.
             // Otherwise full-bank loading creates overlapping 4096-row files
             // and can fill the disk budget with duplicate representations.
@@ -423,9 +424,10 @@ impl Store {
                 staging_rows
             };
             let mut chunks = Vec::new();
-            let requests: Vec<_> = (0..d.rows())
+            let rows = d.rows()?;
+            let requests: Vec<_> = (0..rows)
                 .step_by(chunk)
-                .map(|start| (name.clone(), start, (d.rows() - start).min(chunk)))
+                .map(|start| (name.clone(), start, (rows - start).min(chunk)))
                 .collect();
             for batch in requests.chunks(8) {
                 chunks.extend(self.read_expert_batch(batch)?);
@@ -484,7 +486,14 @@ impl Store {
         second: &str,
     ) -> Result<(MxArray, MxArray)> {
         let shape = x.shape()?;
-        let rows = x.size()? / *shape.last().unwrap() as u64;
+        let width = shape
+            .last()
+            .copied()
+            .filter(|&width| width > 0)
+            .ok_or_else(|| {
+                err("Qwen4 paired projection input requires a positive final dimension")
+            })?;
+        let rows = x.size()? / width as u64;
         // mlxfast TrackFastModel.moeForwardShared, MLXFAST-SHAREDFUSE.
         // N=640 and N=1280 both use one K partition for these windows. Each
         // 64-column NAX tile retains its inputs and accumulation order.
@@ -597,7 +606,7 @@ impl Store {
             }
             if let Some(bank) = self.paired_banks.get(&key) {
                 let output = bank.linear(x)?;
-                let n = self.descriptor(first)?.rows() as i64;
+                let n = self.descriptor(first)?.rows()? as i64;
                 let axis = output.ndim()? as usize - 1;
                 return Ok((
                     output.slice_axis(axis, 0, n)?,
@@ -671,6 +680,11 @@ impl Weight {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_resident_weight_concatenation_returns_an_error() {
+        assert!(Weight::concatenate_rows(&[]).is_err());
+    }
     #[test]
     fn affine_direct_experts_preserve_promoted_arithmetic_and_tail_rows() {
         if !crate::engine::persistence::compiled_forward_backend_available() {
@@ -1030,7 +1044,7 @@ mod tests {
             let loaded = (s.bytes_read, s.packed_bytes_read);
             let mut control = Store::open_metadata(&path, None).unwrap();
             for name in names {
-                let rows = s.descriptor(&name).unwrap().rows();
+                let rows = s.descriptor(&name).unwrap().rows().unwrap();
                 for start in [0, rows - 1] {
                     let got = s
                         .read(&name, start, 1)
@@ -1080,7 +1094,7 @@ mod tests {
             let reads = (s.bytes_read, s.packed_hits, s.packed_bytes_read);
             let mut reference = Store::open_metadata(&path, None).unwrap();
             for name in s.banks.keys().cloned().collect::<Vec<_>>() {
-                let rows = s.descriptor(&name).unwrap().rows();
+                let rows = s.descriptor(&name).unwrap().rows().unwrap();
                 for start in [0, rows - 1] {
                     let a = s
                         .read(&name, start, 1)

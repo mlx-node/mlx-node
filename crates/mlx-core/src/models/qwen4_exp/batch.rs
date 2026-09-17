@@ -535,7 +535,10 @@ impl Decoder {
             )?
         };
 
-        let (out, normed) = self.inject_for_mlp(&x, &branch, &gate.unwrap(), i, normalize)?;
+        let gate = gate.ok_or_else(|| {
+            Error::from_reason("Qwen4 batched attention is missing its injection gate")
+        })?;
+        let (out, normed) = self.inject_for_mlp(&x, &branch, &gate, i, normalize)?;
         if !self.async_device_prefill() {
             self.submit(&[&out], "qwen4::batch::attention")?;
         }
@@ -692,8 +695,10 @@ impl Decoder {
 
         let branch = self.moe_batch(&mixed, i)?;
 
+        let gate = gate
+            .ok_or_else(|| Error::from_reason("Qwen4 batched MLP is missing its injection gate"))?;
         let (out, next_norm) =
-            self.inject_for_next_attention(x, &branch, &gate.unwrap(), i, normalize_next)?;
+            self.inject_for_next_attention(x, &branch, &gate, i, normalize_next)?;
         if self.async_prefill || runtime_flags::is_one(c"MLX_QWEN4_PREFILL_DEFER_MLP") {
             // The next router readback (or final window output) fences this
             // graph. Slot-bank readers remain retained until their own fence.
@@ -807,12 +812,17 @@ impl Decoder {
                 // Restore each token's original router order before reduction. Sorting
                 // expert loads must not reorder the floating-point accumulation.
 
-                MxArray::concatenate_many(
-                    weighted.iter().map(|w| w.as_ref().unwrap()).collect(),
-                    Some(1),
-                )?
-                .reshape(&[1, tokens as i64, top as i64, c.hidden_size as i64])?
-                .sum(Some(&[2]), Some(false))?
+                let weighted = weighted
+                    .iter()
+                    .map(|row| {
+                        row.as_ref().ok_or_else(|| {
+                            Error::from_reason("Qwen4 MoE did not populate every routed output row")
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                MxArray::concatenate_many(weighted, Some(1))?
+                    .reshape(&[1, tokens as i64, top as i64, c.hidden_size as i64])?
+                    .sum(Some(&[2]), Some(false))?
             }
         };
 

@@ -121,7 +121,9 @@ pub(crate) fn inject_image_placeholders(
     for &token in tokens {
         if token == IMAGE_TOKEN_ID as u32 {
             // The length validator established one placeholder per image.
-            let count = *counts.next().unwrap();
+            let count = *counts.next().ok_or_else(|| {
+                Error::from_reason("image placeholder has no matching image token count")
+            })?;
             expanded.extend(std::iter::repeat_n(token, count));
         } else {
             expanded.push(token);

@@ -147,7 +147,11 @@ impl PagedBackend for Inner {
             self.decoder.reset();
             self.saved_history.clear();
         }
-        let adapter = self.decoder.paged.as_mut().unwrap();
+        let adapter = self
+            .decoder
+            .paged
+            .as_mut()
+            .ok_or_else(|| Error::from_reason("Qwen4 prefix preparation has no paged cache"))?;
         // skip_lookup disallows KV-only prefix restores: recurrent/indexer/PLE
         // state cannot be reconstructed from attention pages.
         let plan = adapter
@@ -338,7 +342,7 @@ impl HybridSchedulerBackend for Inner {
             .decoder
             .paged
             .as_mut()
-            .unwrap()
+            .ok_or_else(|| Error::from_reason("Qwen4 speculative reservation has no paged cache"))?
             .reserve_rows(queries as u32)
             .is_ok())
     }
