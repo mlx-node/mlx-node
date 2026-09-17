@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   existsSync,
@@ -19,7 +20,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 
 import { catalogWithState } from '../src/catalog.js';
 import { type DownloadEvent, DownloadManager, pidAlive } from '../src/download.js';
-import { DOWNLOAD_COMPLETE_MARKER } from '../src/models.js';
+import { DOWNLOAD_COMPLETE_MARKER, isModelInstalled } from '../src/models.js';
 
 /** Filename of the atomic-publish completion marker (kept in sync with models.ts). */
 const MARKER_FILE = '.mlx-download-complete.json';
@@ -1342,6 +1343,64 @@ describe('DownloadManager', () => {
     expect(marker.files).not.toContain('tokenizer.json');
     expect(marker.files).toContain('config.json');
     expect(marker.assetsRevision).toBe(SHA_NEW);
+  });
+
+  // macOS-only: the immutable flag is the one way to keep a file regular (so
+  // the install still reads as installed and the refresh path really runs)
+  // while making `rm` refuse it.
+  it.skipIf(process.platform !== 'darwin')('leaves the marker untouched when a stale sidecar cannot be deleted', async () => {
+    // The stale set is derived FROM the marker, so dropping an entry before its
+    // file is actually gone would make an interrupted refresh unrecoverable:
+    // the file stays, nothing derives it again, and it is reported current
+    // forever. Deletion must fail with the marker still listing it, so the
+    // next run retries.
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+    hub.shaByRepo[ASSETS_REPO] = SHA_OLD;
+    const first = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
+    });
+    const idOne = first.start(REPO);
+    const eventsOne: DownloadEvent[] = [];
+    first.subscribe(idOne, (event) => eventsOne.push(event));
+    await waitFor(() => eventsOne.some((event) => event.type === 'done'));
+
+    // Upstream drops tokenizer.json; locally the file becomes immutable.
+    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'config.json', size: 12 }];
+    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+    const tokenizerPath = join(finalDir(), 'tokenizer.json');
+    execFileSync('/usr/bin/chflags', ['uchg', tokenizerPath]);
+    try {
+      const second = new DownloadManager({
+        modelsDir,
+        cacheDir,
+        fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
+      });
+      const idTwo = second.start(REPO);
+      const eventsTwo: DownloadEvent[] = [];
+      second.subscribe(idTwo, (event) => eventsTwo.push(event));
+      await waitFor(() => eventsTwo.some((event) => event.type === 'error' || event.type === 'done'));
+
+      // The install still reads as installed (the file IS a regular file), so
+      // this really exercised the refresh path — not the full re-stage one.
+      expect(isModelInstalled(finalDir())).toBe(true);
+      expect(eventsTwo.some((event) => event.type === 'error')).toBe(true);
+      const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+        files: string[];
+        assetsRevision?: string;
+      };
+      // Untouched: still listed, still pinned to the old revision — the next run
+      // derives the same stale set and tries again.
+      expect(marker.files).toContain('tokenizer.json');
+      expect(marker.assetsRevision).toBe(SHA_OLD);
+    } finally {
+      execFileSync('/usr/bin/chflags', ['nouchg', tokenizerPath]);
+    }
   });
 
   it('does not re-download verified sidecars on a second job over the same revision', async () => {

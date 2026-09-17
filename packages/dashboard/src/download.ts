@@ -1433,8 +1433,9 @@ export class DownloadManager {
    *     verifies the bytes, finds them current, and used to return without
    *     recording that verification — the card offered the same update again.
    *
-   * The marker is written BEFORE the deletions, so it never lists a file that
-   * is already gone.
+   * The deletions run BEFORE the marker is published, so an interrupted
+   * refresh fails with the marker untouched and retries (see the ordering note
+   * in the body).
    */
   private async refreshInstalledAssets(
     plan: { repo: { type: 'model'; name: string }; revision: string; files: ListFileEntry[] },
@@ -1454,6 +1455,16 @@ export class DownloadManager {
       (file) => ASSET_SIDECAR_CANDIDATE_SET.has(file) && !primaryNames.has(file) && !plannedNames.has(file),
     );
     if (stale.length === 0 && installed.assetsRevision === plan.revision) return true;
+    // Delete BEFORE publishing the updated marker. The `stale` set is derived
+    // from the marker, so an interrupted refresh must leave the marker still
+    // listing what is still on disk: dropping the entry first and dying before
+    // the delete would leave the file in place with nothing left to derive it
+    // from — reported current forever, and still consumed. This way a failure
+    // (a throwing `rm` included) happens with the marker untouched, so the
+    // next run derives the same set and retries; and if the marker write
+    // itself fails, the marker lists a file that is gone, which reads as
+    // not-installed and sends the next job down the full re-stage path.
+    for (const file of stale) await rm(join(dir, file), { force: true });
     const next: DownloadCompletion = {
       ...installed,
       ...(stale.length === 0 ? {} : { files: installed.files.filter((file) => !stale.includes(file)) }),
@@ -1461,7 +1472,6 @@ export class DownloadManager {
       assetsRevision: plan.revision,
     };
     await writeFile(join(dir, DOWNLOAD_COMPLETE_MARKER), `${JSON.stringify(next, null, 2)}\n`);
-    for (const file of stale) await rm(join(dir, file), { force: true });
     return true;
   }
 
