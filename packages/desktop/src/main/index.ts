@@ -178,8 +178,9 @@ async function bootstrap(): Promise<void> {
   installAppProtocol(paths.wwwRoot);
 
   // Kicked off here, awaited where the CONTROL PANEL env is assembled below:
-  // the three `security` keychain reads overlap settings/update setup instead
-  // of adding to startup latency. See system-ca.ts for what this fixes
+  // the platform trust-store read (keychain `security` calls on macOS, the
+  // OpenSSL store paths on Linux) overlaps settings/update setup instead of
+  // adding to startup latency. See system-ca.ts for what this fixes
   // (TLS-inspecting networks) and why the child can only receive it at fork.
   const extraCaBundle = prepareExtraCaBundle({
     platform: process.platform,
@@ -316,11 +317,13 @@ async function bootstrap(): Promise<void> {
     .prepare()
     .catch((error: unknown) => console.error('[mlx] command setup:', error));
 
-  // Whole-operation deadline: each `security`/`plutil` call is individually
-  // bounded (10 s), but up to four run sequentially inside the export, so a
-  // pathologically hung keychain stack could stall the window, broker and tray
-  // behind ~40 s of subprocess waits. Past the deadline we proceed without the
-  // optional bundle — the pre-fix behavior — rather than delay first paint.
+  // Whole-operation deadline: on macOS each `security`/`plutil` call is
+  // individually bounded (10 s), but up to four run sequentially inside the
+  // export, so a pathologically hung keychain stack could stall the window,
+  // broker and tray behind ~40 s of subprocess waits; on Linux the reads are
+  // local files, bounded only by the filesystem. Past the deadline we proceed
+  // without the optional bundle — the pre-fix behavior — rather than delay
+  // first paint.
   const CA_BUNDLE_DEADLINE_MS = 10_000;
   const TIMED_OUT = 'timed-out';
   const extraCaBundleResult = await Promise.race([
@@ -328,7 +331,7 @@ async function bootstrap(): Promise<void> {
     new Promise<typeof TIMED_OUT>((resolve) => setTimeout(() => resolve(TIMED_OUT), CA_BUNDLE_DEADLINE_MS)),
   ]);
   if (extraCaBundleResult === TIMED_OUT) {
-    console.warn('[mlx] keychain CA export exceeded its deadline; continuing without it');
+    console.warn('[mlx] system CA export exceeded its deadline; continuing without it');
   }
   const extraCaBundlePath = extraCaBundleResult === TIMED_OUT ? null : extraCaBundleResult;
   if (quitting) return;
