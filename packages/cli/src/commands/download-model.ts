@@ -1,12 +1,13 @@
 import { existsSync, readFileSync, statSync } from 'node:fs';
 import { readdir, copyFile, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { join, resolve, dirname } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { listFiles, downloadFileToCacheDir, modelInfo, type ListFileEntry } from '@huggingface/hub';
 // Leaf subpath on purpose: `@mlx-node/server/host` would dlopen the native
 // addon, and downloading a model must work before any of that is needed.
+import { isGgufCompanionName } from '@mlx-node/lm/model-discovery';
 import { resolveModelsDir } from '@mlx-node/server/host/paths';
 
 import { ensureDir, formatBytes } from '../utils.js';
@@ -686,7 +687,7 @@ async function fetchAssetSidecars(opts: {
   cacheDir: string;
   accessToken: string | undefined;
   primaryPaths: ReadonlySet<string>;
-}): Promise<{ fetched: string[]; repo: string; revision: string | null }> {
+}): Promise<{ ensured: string[]; repo: string; revision: string | null }> {
   const revision = (await resolveRemoteRevision(opts.assetsRepo, opts.accessToken)) ?? undefined;
   const { allFiles } = await getModelFiles(opts.assetsRepo, opts.accessToken, undefined, revision);
   const candidates = pickAssetSidecars(allFiles).filter(
@@ -694,10 +695,12 @@ async function fetchAssetSidecars(opts: {
   );
   if (candidates.length === 0) {
     console.warn(`  No tokenizer/config sidecars found in ${opts.assetsRepo}\n`);
-    return { fetched: [], repo: opts.assetsRepo, revision: revision ?? null };
+    return { ensured: [], repo: opts.assetsRepo, revision: revision ?? null };
   }
 
   console.log(`Fetching ${candidates.length} tokenizer/config sidecar(s) from ${opts.assetsRepo}...\n`);
+  // Every candidate that ends up on disk — downloaded or already current — is
+  // part of this install and must reach the completion marker.
   const fetched: string[] = [];
   for (const file of candidates) {
     const destPath = join(opts.outputDir, file.path);
@@ -707,6 +710,7 @@ async function fetchAssetSidecars(opts: {
     // a size check and would otherwise stay stale forever.
     if (existsSync(destPath) && (await fileUpToDate(destPath, file))) {
       console.log(`  ${file.path} — already present and verified, skipping`);
+      fetched.push(file.path);
       continue;
     }
     console.log(`  ${file.path} (${formatBytes(file.size)})...`);
@@ -723,7 +727,7 @@ async function fetchAssetSidecars(opts: {
     fetched.push(file.path);
   }
   console.log('');
-  return { fetched, repo: opts.assetsRepo, revision: revision ?? null };
+  return { ensured: fetched, repo: opts.assetsRepo, revision: revision ?? null };
 }
 
 export async function run(argv: string[]) {
@@ -824,6 +828,8 @@ export async function run(argv: string[]) {
   let verifyContent = false;
   /** Resolved sidecar source, recorded in the completion marker when present. */
   let sidecarSource: { repo: string; revision: string } | null = null;
+  /** Sidecar paths installed from that source, listed in the completion marker. */
+  let sidecarPaths: string[] = [];
   const cacheDir = args['cache-dir'] ? resolve(args['cache-dir']) : DEFAULT_CACHE_DIR;
 
   /**
@@ -850,6 +856,7 @@ export async function run(argv: string[]) {
       primaryPaths: new Set(cachedManifest.filesToDownload.map((file) => file.path)),
     });
     sidecarSource = topUp.revision !== null ? { repo: topUp.repo, revision: topUp.revision } : null;
+    sidecarPaths = topUp.ensured;
   };
 
   if (existsSync(outputDir)) {
@@ -1045,7 +1052,12 @@ export async function run(argv: string[]) {
       await ensureDir(dirname(destPath));
       await copyFile(snapshotPath, destPath);
     }
-    if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams') || file.path.endsWith('.gguf')) {
+    if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams')) {
+      weightFiles.push(file.path);
+    } else if (file.path.endsWith('.gguf') && !isGgufCompanionName(basename(file.path))) {
+      // A companion (mmproj/imatrix/dflash/draft) is never the payload: a
+      // selection of only a projector must not finalize a marker — the same
+      // rule the dashboard's publish gate applies.
       weightFiles.push(file.path);
     }
   }
@@ -1064,6 +1076,7 @@ export async function run(argv: string[]) {
     // Record the pair only when the revision resolved: an unresolved source is
     // unknown provenance, and an empty string would compare unequal forever.
     sidecarSource = topUp.revision !== null ? { repo: topUp.repo, revision: topUp.revision } : null;
+    sidecarPaths = topUp.ensured;
   }
 
   // Prune + marker write, invoked ONLY from a SUCCESS path. Pruning any
@@ -1094,7 +1107,10 @@ export async function run(argv: string[]) {
       files: buildMarkerFiles(
         previousCompletion,
         remotePaths,
-        filesToDownload.map((f) => f.path),
+        // The primary selection AND the sidecars: a mandatory tokenizer that
+        // vanishes later must invalidate the marker (deleting an unlisted file
+        // cannot), and the assets provenance alone would not notice.
+        [...filesToDownload.map((f) => f.path), ...sidecarPaths],
         outputDir,
         isGlobRun,
       ),
@@ -1123,9 +1139,13 @@ export async function run(argv: string[]) {
       console.error('Check the pattern and available files in the repository.');
       process.exit(1);
     }
-    // Glob filter matched non-weight files (e.g. imatrix, calibration data).
-    // Skip model verification — user is downloading auxiliary files.
-    await finalizeSync();
+    // Glob filter matched non-weight files (e.g. imatrix, calibration data, or
+    // a companion-only projection when the real target is missing upstream).
+    // Skip model verification — and leave no completion marker: a marker is
+    // what makes a directory an INSTALL, and a selection with no model weights
+    // is not one. Certifying it would let the dashboard present a directory
+    // nothing can load.
+    console.warn('  No model weights in the selection — nothing was certified as installed.');
     console.log(`\nDownload complete! ${filesToDownload.length} non-weight file(s) saved to ${outputDir}\n`);
   } else {
     console.log(`Format: Base model (needs MLX conversion)`);

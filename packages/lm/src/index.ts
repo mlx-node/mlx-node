@@ -149,3 +149,4 @@ export * from './tools/index.js';
 
 // Profiling API
 export { enableProfiling, disableProfiling } from './profiling.js';
+export { isGgufCompanionName } from './model-discovery.js';

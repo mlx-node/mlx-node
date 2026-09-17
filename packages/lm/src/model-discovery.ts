@@ -42,6 +42,16 @@ const QWEN35_XL_GGUF = /(?:^|[-_.])Q\d+_K_XL\.gguf$/i;
 /** Dense and sparse Qwen3.5 both load a direct `Q<number>_K_XL.gguf` file. */
 const QWEN35_XL_GGUF_TYPES: readonly ModelType[] = ['qwen3_5', 'qwen3_5_moe'];
 const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft)(?:[-_.]|$)/i;
+
+/**
+ * True when a `.gguf` filename is a companion artifact (projector, calibration,
+ * draft) rather than a loadable model payload. Discovery, the dashboard's
+ * publish gate, and the CLI's weight classification all key off this one rule —
+ * a file any of them certifies as weights is a file the others must accept.
+ */
+export function isGgufCompanionName(fileName: string): boolean {
+  return GGUF_COMPANION_NAME.test(fileName);
+}
 // Match the native loaders' primary files/shards. A draft or projector
 // SafeTensors file beside a GGUF is not a converted target checkpoint.
 const PRIMARY_SAFETENSORS = /^(?:model|weights)\.safetensors$|^model(?:-|\.safetensors-).+-of-.+\.safetensors$/;
