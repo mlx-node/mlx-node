@@ -579,7 +579,23 @@ impl<'a> PyLiteralParser<'a> {
     /// comparison spelling (`f(5=3)`) reject the call, matching the
     /// `SyntaxError` `ast.parse` would raise.
     fn skip_expression(&mut self) -> Result<(), ()> {
+        self.skip_ws();
         let start = self.pos;
+        // The skipped text must at least START like an expression —
+        // identifiers, numbers, strings, containers, unary ops,
+        // `.5`/ellipsis literals, or non-ASCII (Unicode identifiers).
+        // Anything else (`@@@`, `?x`, `!y`) is a `SyntaxError` in
+        // `ast.parse` → the whole block stays verbatim, no call.
+        match self.peek() {
+            Some(b)
+                if b.is_ascii_alphanumeric()
+                    || b >= 0x80
+                    || matches!(
+                        b,
+                        b'_' | b'\'' | b'"' | b'(' | b'[' | b'{' | b'-' | b'+' | b'~' | b'.'
+                    ) => {}
+            _ => return Err(()),
+        }
         let mut depth = 0usize;
         while let Some(&b) = self.s.get(self.pos) {
             match b {
@@ -612,6 +628,17 @@ impl<'a> PyLiteralParser<'a> {
                     }
                     self.pos += 1;
                 }
+                b'!' => {
+                    // Only `!=` is legal; a bare `!` is a SyntaxError.
+                    if self.s.get(self.pos + 1) != Some(&b'=') {
+                        return Err(());
+                    }
+                    self.pos += 1;
+                }
+                // Bytes that can never appear inside a call's positional
+                // expression (quoted strings are already consumed above):
+                // `?` `` ` `` `;` `#` `$` `\` are a SyntaxError to ast.parse.
+                b'?' | b'`' | b';' | b'#' | b'$' | b'\\' => return Err(()),
                 _ => self.pos += 1,
             }
         }
@@ -1312,8 +1339,8 @@ fn escape_lfm2_nested_quotes(text: &str) -> Option<String> {
     None
 }
 
-/// Parse the LFM2 sentinel block: first `<|tool_call_start|>` … first
-/// `<|tool_call_end|>` (or end of text when the stream cut mid-call).
+/// Parse LFM2 sentinel blocks: every `<|tool_call_start|>` …
+/// `<|tool_call_end|>` pair (or end of text when the stream cut mid-call).
 /// Returns (cleaned_text, calls). Parse failure returns the ORIGINAL text
 /// verbatim with no calls (vLLM `content=model_output` semantics).
 fn parse_lfm2_tool_calls(text: &str) -> (String, Vec<ToolCallResult>) {
@@ -1332,65 +1359,76 @@ fn parse_lfm2_tool_calls(text: &str) -> (String, Vec<ToolCallResult>) {
             (open, end)
         })
         .collect();
-    let mut search_from = 0;
-    let start_idx = loop {
-        let Some(rel) = text[search_from..].find(LFM2_TOOL_CALL_START) else {
+    let unprotected = |p: usize| !protected.iter().any(|&(s, e)| p >= s && p < e);
+    let next_start = |from: usize| -> Option<usize> {
+        let mut search_from = from;
+        loop {
+            let idx = search_from + text[search_from..].find(LFM2_TOOL_CALL_START)?;
+            if unprotected(idx) {
+                return Some(idx);
+            }
+            search_from = idx + LFM2_TOOL_CALL_START.len();
+        }
+    };
+
+    // Success content strips each sentinel block VERBATIM — the streamed
+    // path emits the surrounding fragments byte-for-byte, so a rewritten
+    // join (e.g. vLLM's "\n") would make the done-path suffix recovery
+    // see the finalized text as entirely unsent and emit it twice.
+    let mut calls: Vec<ToolCallResult> = Vec::new();
+    let mut cleaned = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while let Some(start_idx) = next_start(cursor) {
+        cleaned.push_str(&text[cursor..start_idx]);
+        let inner_start = start_idx + LFM2_TOOL_CALL_START.len();
+        let (inner, block_end) = match text[inner_start..].find(LFM2_TOOL_CALL_END) {
+            Some(e) => {
+                let end = inner_start + e + LFM2_TOOL_CALL_END.len();
+                (&text[inner_start..inner_start + e], end)
+            }
+            None => (&text[inner_start..], text.len()),
+        };
+        let tool_text = inner.trim();
+        // vLLM `TOOL_CALL_REGEX`: bracketed list only.
+        if !(tool_text.starts_with('[') && tool_text.ends_with(']')) {
+            return (text.to_string(), Vec::new());
+        }
+        let inner_body = &tool_text[1..tool_text.len() - 1];
+        // Direct parse first; on failure, the nested-quote recovery
+        // rewrites `command='sed -n '1,9p' f.py'` shapes and re-parses
+        // (vLLM runs `escape_nested_quotes_in_strings` over the ast.parse
+        // failure). The recovery sees the BRACKETED text — the trailing
+        // `)]` is what makes the outer quote a plausible close.
+        let Some(parsed_calls) = parse_lfm2_call_list(inner_body).or_else(|| {
+            escape_lfm2_nested_quotes(tool_text).and_then(|fixed| {
+                let f = fixed.trim();
+                if f.starts_with('[') && f.ends_with(']') {
+                    parse_lfm2_call_list(&f[1..f.len() - 1])
+                } else {
+                    None
+                }
+            })
+        }) else {
             return (text.to_string(), Vec::new());
         };
-        let idx = search_from + rel;
-        if !protected.iter().any(|&(s, e)| idx >= s && idx < e) {
-            break idx;
-        }
-        search_from = idx + LFM2_TOOL_CALL_START.len();
-    };
-    let inner_start = start_idx + LFM2_TOOL_CALL_START.len();
-    let (inner, block_end, raw_after) = match text[inner_start..].find(LFM2_TOOL_CALL_END) {
-        Some(e) => {
-            let end = inner_start + e + LFM2_TOOL_CALL_END.len();
-            (&text[inner_start..inner_start + e], end, &text[end..])
-        }
-        None => (&text[inner_start..], text.len(), ""),
-    };
-    let tool_text = inner.trim();
-    // vLLM `TOOL_CALL_REGEX`: bracketed list only.
-    if !(tool_text.starts_with('[') && tool_text.ends_with(']')) {
+        let raw = &text[start_idx..block_end];
+        calls.extend(
+            parsed_calls
+                .into_iter()
+                .map(|(name, args)| ToolCallResult::ok(name, args, raw.to_string())),
+        );
+        // The echo region runs from this block's end to the NEXT
+        // unprotected start sentinel (or EOF): drop everything through
+        // the last orphan `<|tool_call_end|>` inside it, keep the prose.
+        let next = next_start(block_end).unwrap_or(text.len());
+        cleaned.push_str(strip_lfm2_echo(&text[block_end..next]));
+        cursor = next;
+    }
+    if calls.is_empty() {
         return (text.to_string(), Vec::new());
     }
-    let inner_body = &tool_text[1..tool_text.len() - 1];
-    // Direct parse first; on failure, the nested-quote recovery rewrites
-    // `command='sed -n '1,9p' f.py'` shapes and re-parses (vLLM runs
-    // `escape_nested_quotes_in_strings` over the ast.parse failure). The
-    // recovery sees the BRACKETED text — the trailing `)]` is what makes the
-    // outer quote a syntactically plausible close.
-    let Some(parsed_calls) = parse_lfm2_call_list(inner_body).or_else(|| {
-        escape_lfm2_nested_quotes(tool_text).and_then(|fixed| {
-            let f = fixed.trim();
-            if f.starts_with('[') && f.ends_with(']') {
-                parse_lfm2_call_list(&f[1..f.len() - 1])
-            } else {
-                None
-            }
-        })
-    }) else {
-        return (text.to_string(), Vec::new());
-    };
-    let raw = &text[start_idx..block_end];
-    let calls: Vec<ToolCallResult> = parsed_calls
-        .into_iter()
-        .map(|(name, args)| ToolCallResult::ok(name, args, raw.to_string()))
-        .collect();
-
-    // Success: content is the text BEFORE the sentinel joined with the
-    // echo-stripped trailing text (vLLM joins non-empty parts with "\n").
-    let before = text[..start_idx].trim();
-    let after = strip_lfm2_echo(raw_after).trim();
-    let content = match (before.is_empty(), after.is_empty()) {
-        (false, false) => format!("{before}\n{after}"),
-        (false, true) => before.to_string(),
-        (true, false) => after.to_string(),
-        (true, true) => String::new(),
-    };
-    (content, calls)
+    cleaned.push_str(&text[cursor..]);
+    (cleaned.trim().to_string(), calls)
 }
 
 // ---------------------------------------------------------------------------
@@ -3678,7 +3716,45 @@ The weather in Tokyo is sunny."#;
             "Check: <|tool_call_start|>[f(x=1)]<|tool_call_end|>[f(x=1)]<|tool_call_end|>Done.";
         let (text, calls) = parse_tool_calls(input);
         assert_eq!(calls.len(), 1);
-        assert_eq!(text, "Check:\nDone.");
+        // Byte-identical to the streamed fragments ("Check: " + "Done.") —
+        // a "\n" join would make the done-path recovery re-emit the text.
+        assert_eq!(text, "Check: Done.");
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_content_matches_streamed_fragments() {
+        // Visible text on BOTH sides of a successful call: the cleaned text
+        // must equal the bytes the ToolCallTagBuffer streams (original
+        // whitespace kept), otherwise the done-path suffix overlap finds no
+        // common edge and emits the whole finalized text a second time.
+        let input = "before <|tool_call_start|>[f(x=1)]<|tool_call_end|>after";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(text, "before after");
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_multiple_sentinel_blocks() {
+        // Two separate sentinel blocks: both calls survive and the prose
+        // between them is kept (a single-block read would swallow the
+        // second call AND the middle text into the echo strip).
+        let input = "a <|tool_call_start|>[f(x=1)]<|tool_call_end|> mid <|tool_call_start|>[g(y=2)]<|tool_call_end|> b";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "f");
+        assert_eq!(calls[1].name, "g");
+        assert_eq!(text, "a  mid  b");
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_second_block_malformed_keeps_verbatim() {
+        // A malformed second block fails the whole output verbatim (vLLM
+        // ast.parse failure → content=model_output), discarding even the
+        // first block's call.
+        let input = "<|tool_call_start|>[f(x=1)]<|tool_call_end|> <|tool_call_start|>[f(@@@)]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(text, input);
+        assert!(calls.is_empty());
     }
 
     #[test]
