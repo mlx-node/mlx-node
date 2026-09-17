@@ -572,77 +572,407 @@ impl<'a> PyLiteralParser<'a> {
     }
 
     /// Skip one positional argument's expression text. vLLM ignores
-    /// `call.args` entirely, so the content is dropped — but the argument
-    /// boundary must still be found correctly: a top-level `,` or `)` with
-    /// `()[]{}` nesting and quoted strings respected. Empty positionals
-    /// (`f(,x)`), unbalanced closers (`f(a +]`), and a bare `=` outside a
-    /// comparison spelling (`f(5=3)`) reject the call, matching the
-    /// `SyntaxError` `ast.parse` would raise.
+    /// `call.args` entirely, so the content is dropped — but the skipped
+    /// text must still be a plausible Python expression: anything
+    /// `ast.parse` would `SyntaxError` (`@@@`, `1 +`, `a b`, `f(,)`,
+    /// unbalanced closers, bare `=`/`!`) rejects the WHOLE block verbatim
+    /// instead of promoting an `ok` call built from the remaining kwargs.
+    ///
+    /// The scan is a small operand/operator automaton, not a full grammar:
+    /// `Need` requires a value (identifier, literal, number, string,
+    /// container opener, unary `- + ~ not`, `*` spread); `Have` requires a
+    /// binary operator, a postfix (`(` `[` `.`), or the top-level `,`/`)`
+    /// argument boundary. `Lambda` covers `lambda …:` parameter lists.
+    /// Deliberate residuals (rare invalid forms still accepted, e.g.
+    /// `a.5`, `a ~ b`): skipping is a boundary check, not codegen — the
+    /// goal is keeping obviously-malformed text from promoting a call.
     fn skip_expression(&mut self) -> Result<(), ()> {
-        self.skip_ws();
-        let start = self.pos;
-        // The skipped text must at least START like an expression —
-        // identifiers, numbers, strings, containers, unary ops,
-        // `.5`/ellipsis literals, or non-ASCII (Unicode identifiers).
-        // Anything else (`@@@`, `?x`, `!y`) is a `SyntaxError` in
-        // `ast.parse` → the whole block stays verbatim, no call.
-        match self.peek() {
-            Some(b)
-                if b.is_ascii_alphanumeric()
-                    || b >= 0x80
-                    || matches!(
-                        b,
-                        b'_' | b'\'' | b'"' | b'(' | b'[' | b'{' | b'-' | b'+' | b'~' | b'.'
-                    ) => {}
-            _ => return Err(()),
+        #[derive(Clone, Copy, PartialEq)]
+        enum St {
+            Need,
+            Have,
+            Lambda,
         }
-        let mut depth = 0usize;
-        while let Some(&b) = self.s.get(self.pos) {
+        // Identifiers that can never appear where an operand is expected.
+        fn reject_keyword(id: &[u8]) -> bool {
+            matches!(
+                id,
+                b"and"
+                    | b"or"
+                    | b"in"
+                    | b"is"
+                    | b"if"
+                    | b"else"
+                    | b"for"
+                    | b"elif"
+                    | b"while"
+                    | b"return"
+                    | b"def"
+                    | b"class"
+                    | b"import"
+                    | b"from"
+                    | b"as"
+                    | b"with"
+                    | b"try"
+                    | b"except"
+                    | b"finally"
+                    | b"raise"
+                    | b"pass"
+                    | b"break"
+                    | b"continue"
+                    | b"global"
+                    | b"nonlocal"
+                    | b"del"
+                    | b"assert"
+                    | b"yield"
+                    | b"await"
+                    | b"async"
+            )
+        }
+        // Python string-literal prefixes (r'x' b'x' f'x' rb'x' …).
+        fn string_prefix(id: &[u8]) -> bool {
+            id.iter()
+                .all(|c| matches!(c, b'r' | b'R' | b'u' | b'U' | b'b' | b'B' | b'f' | b'F'))
+                && id.len() <= 2
+        }
+        fn ident_end(s: &[u8], mut p: usize) -> usize {
+            while s
+                .get(p)
+                .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_' || *c >= 0x80)
+            {
+                p += 1;
+            }
+            p
+        }
+        let mut st = St::Need;
+        let mut stack: Vec<u8> = Vec::new(); // open brackets — closers must match
+        // `not` consumed as an operator (`x not in y`): `in`/`is` may follow.
+        let mut after_not_op = false;
+        // Implicit-concat / string-prefix tracking: a quote after an
+        // operand is legal only directly glued to a prefix identifier
+        // (`rb"x"` — one literal) or after a string literal (`"a" "b"`).
+        let mut last_str = false;
+        let mut prefix_end = usize::MAX;
+        loop {
+            let Some(&b) = self.s.get(self.pos) else {
+                return Err(()); // ran out of text — unterminated
+            };
             match b {
-                b'(' | b'[' | b'{' => {
-                    depth += 1;
-                    self.pos += 1;
+                b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
+                // Top-level argument boundary — valid only after an operand
+                // (not inside `lambda` params, where `,` separates names).
+                b')' | b',' if stack.is_empty() && st != St::Lambda => {
+                    return if st == St::Have { Ok(()) } else { Err(()) };
                 }
-                b')' | b',' if depth == 0 => {
-                    return if self.pos > start { Ok(()) } else { Err(()) };
-                }
-                b']' | b'}' if depth == 0 => return Err(()), // unbalanced closer
-                b')' | b']' | b'}' => {
-                    depth -= 1;
-                    self.pos += 1;
-                }
-                b'\'' | b'"' => self.skip_quoted()?,
-                b'=' => {
-                    // A bare `=` can't appear inside an expression (kwargs
-                    // take the `ident =` path): allow only the comparison
-                    // spellings `==`, `<=`, `>=`, `!=`.
-                    let mut p = self.pos;
-                    while p > start && self.s[p - 1] == b' ' {
-                        p -= 1;
-                    }
-                    let prev = (p > start).then(|| self.s[p - 1]);
-                    if self.s.get(self.pos + 1) != Some(&b'=')
-                        && !matches!(prev, Some(b'=' | b'<' | b'>' | b'!'))
-                    {
-                        return Err(());
-                    }
-                    self.pos += 1;
-                }
-                b'!' => {
-                    // Only `!=` is legal; a bare `!` is a SyntaxError.
-                    if self.s.get(self.pos + 1) != Some(&b'=') {
-                        return Err(());
-                    }
-                    self.pos += 1;
-                }
-                // Bytes that can never appear inside a call's positional
-                // expression (quoted strings are already consumed above):
-                // `?` `` ` `` `;` `#` `$` `\` are a SyntaxError to ast.parse.
-                b'?' | b'`' | b';' | b'#' | b'$' | b'\\' => return Err(()),
-                _ => self.pos += 1,
+                _ => match st {
+                    St::Need => match b {
+                        b'(' | b'[' | b'{' => {
+                            stack.push(b);
+                            self.pos += 1;
+                        }
+                        // Empty container (`()` `[]` `{}`) or a close after
+                        // `,`/`:` inside brackets (`(a,)` `a[1:]`) — never
+                        // after an operator (`(a +)` is a SyntaxError).
+                        b')' | b']' | b'}' => {
+                            let mut p = self.pos;
+                            while p > 0 && matches!(self.s[p - 1], b' ' | b'\t' | b'\n' | b'\r') {
+                                p -= 1;
+                            }
+                            let trailing_ok =
+                                p > 0 && matches!(self.s[p - 1], b'(' | b'[' | b'{' | b',' | b':');
+                            if !trailing_ok {
+                                return Err(());
+                            }
+                            match stack.pop() {
+                                Some(o)
+                                    if matches!(
+                                        (o, b),
+                                        (b'(', b')') | (b'[', b']') | (b'{', b'}')
+                                    ) =>
+                                {
+                                    self.pos += 1;
+                                    st = St::Have;
+                                    last_str = false;
+                                    prefix_end = usize::MAX;
+                                }
+                                _ => return Err(()),
+                            }
+                        }
+                        b'\'' | b'"' => {
+                            self.skip_quoted()?;
+                            st = St::Have;
+                            last_str = true;
+                            prefix_end = usize::MAX;
+                        }
+                        b'-' | b'+' | b'~' | b'*' => self.pos += 1, // unary / spread
+                        b'.' => {
+                            // `...` ellipsis or `.5` float — nothing else.
+                            if self.s.get(self.pos + 1) == Some(&b'.')
+                                && self.s.get(self.pos + 2) == Some(&b'.')
+                            {
+                                self.pos += 3;
+                                st = St::Have;
+                            } else if self.s.get(self.pos + 1).is_some_and(|c| c.is_ascii_digit()) {
+                                self.pos += 2;
+                                while self
+                                    .s
+                                    .get(self.pos)
+                                    .is_some_and(|c| c.is_ascii_digit() || *c == b'.')
+                                {
+                                    self.pos += 1;
+                                }
+                                st = St::Have;
+                            } else {
+                                return Err(());
+                            }
+                            last_str = false;
+                            prefix_end = usize::MAX;
+                        }
+                        b':' if !stack.is_empty() => self.pos += 1, // `a[:…]` `{…:…}`
+                        _ if b.is_ascii_alphabetic() || b == b'_' || b >= 0x80 => {
+                            let id_start = self.pos;
+                            self.pos = ident_end(self.s, self.pos);
+                            let id = &self.s[id_start..self.pos];
+                            // Compound `not in` / `not is` — `in`/`is` is
+                            // still an operator here, not the operand.
+                            if after_not_op && matches!(id, b"in" | b"is") {
+                                after_not_op = false;
+                                continue;
+                            }
+                            if reject_keyword(id) {
+                                return Err(());
+                            }
+                            after_not_op = false;
+                            match id {
+                                b"not" => {} // unary — still need an operand
+                                b"lambda" => st = St::Lambda,
+                                _ => {
+                                    st = St::Have;
+                                    last_str = false;
+                                    prefix_end = if string_prefix(id) {
+                                        self.pos
+                                    } else {
+                                        usize::MAX
+                                    };
+                                }
+                            }
+                        }
+                        // Number operand: digits with optional `0x`/`0o`/`0b`
+                        // radix, fraction, exponent, `_` separators, `j`. A
+                        // letter glued straight on (`5x`) is a SyntaxError.
+                        _ if b.is_ascii_digit() => {
+                            if b == b'0'
+                                && matches!(
+                                    self.s.get(self.pos + 1),
+                                    Some(c) if matches!(c, b'x' | b'X' | b'o' | b'O' | b'b' | b'B')
+                                )
+                            {
+                                self.pos += 2;
+                                while self
+                                    .s
+                                    .get(self.pos)
+                                    .is_some_and(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                                {
+                                    self.pos += 1;
+                                }
+                            } else {
+                                while self
+                                    .s
+                                    .get(self.pos)
+                                    .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
+                                {
+                                    self.pos += 1;
+                                }
+                                if self.s.get(self.pos) == Some(&b'.') {
+                                    self.pos += 1;
+                                    while self
+                                        .s
+                                        .get(self.pos)
+                                        .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
+                                    {
+                                        self.pos += 1;
+                                    }
+                                }
+                                if matches!(
+                                    self.s.get(self.pos),
+                                    Some(c) if matches!(c, b'e' | b'E')
+                                ) {
+                                    self.pos += 1;
+                                    if matches!(
+                                        self.s.get(self.pos),
+                                        Some(c) if matches!(c, b'+' | b'-')
+                                    ) {
+                                        self.pos += 1;
+                                    }
+                                    while self
+                                        .s
+                                        .get(self.pos)
+                                        .is_some_and(|c| c.is_ascii_digit() || *c == b'_')
+                                    {
+                                        self.pos += 1;
+                                    }
+                                }
+                                if matches!(
+                                    self.s.get(self.pos),
+                                    Some(c) if matches!(c, b'j' | b'J')
+                                ) {
+                                    self.pos += 1;
+                                }
+                            }
+                            if self.s.get(self.pos).is_some_and(|c| {
+                                c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80
+                            }) {
+                                return Err(());
+                            }
+                            st = St::Have;
+                            last_str = false;
+                            prefix_end = usize::MAX;
+                        }
+                        _ => return Err(()),
+                    },
+                    St::Have => match b {
+                        b'(' | b'[' => {
+                            // Postfix call / index.
+                            stack.push(b);
+                            self.pos += 1;
+                            st = St::Need;
+                        }
+                        b')' | b']' | b'}' => match stack.pop() {
+                            Some(o)
+                                if matches!((o, b), (b'(', b')') | (b'[', b']') | (b'{', b'}')) =>
+                            {
+                                self.pos += 1;
+                            }
+                            _ => return Err(()),
+                        },
+                        b',' if !stack.is_empty() => {
+                            self.pos += 1;
+                            st = St::Need;
+                        }
+                        b':' if !stack.is_empty() => {
+                            // Slice / dict-entry separator.
+                            self.pos += 1;
+                            st = St::Need;
+                        }
+                        b':' if self.s.get(self.pos + 1) == Some(&b'=') => {
+                            self.pos += 2; // `:=` walrus
+                            st = St::Need;
+                        }
+                        b'.' => match self.s.get(self.pos + 1) {
+                            // `5.`/`5.5` float continuation (also admits
+                            // `a.5` — a residual, see the doc).
+                            Some(c) if c.is_ascii_digit() => {
+                                self.pos += 2;
+                                while self
+                                    .s
+                                    .get(self.pos)
+                                    .is_some_and(|c| c.is_ascii_digit() || *c == b'.')
+                                {
+                                    self.pos += 1;
+                                }
+                            }
+                            // Attribute access `a.b`.
+                            Some(c) if c.is_ascii_alphabetic() || *c == b'_' || *c >= 0x80 => {
+                                let id_start = self.pos + 1;
+                                self.pos = ident_end(self.s, id_start);
+                                if reject_keyword(&self.s[id_start..self.pos]) {
+                                    return Err(());
+                                }
+                            }
+                            // Trailing-dot float `5.` before a boundary.
+                            Some(b')' | b']' | b'}' | b',' | b' ' | b'\t' | b'\n' | b'\r') => {
+                                self.pos += 1;
+                            }
+                            _ => return Err(()),
+                        },
+                        b'\'' | b'"' => {
+                            // `rb"x"` (glued prefix → one literal) or
+                            // implicit concat `"a" "b"` — nothing else.
+                            if !last_str && self.pos != prefix_end {
+                                return Err(());
+                            }
+                            self.skip_quoted()?;
+                            last_str = true;
+                            prefix_end = usize::MAX;
+                        }
+                        // Two-character operators are consumed greedily so
+                        // `==`/`<=`/`!=`/`**`/`//`/`<<`/`>>` stay one token.
+                        b'=' if self.s.get(self.pos + 1) == Some(&b'=') => {
+                            self.pos += 2;
+                            st = St::Need;
+                        }
+                        b'!' if self.s.get(self.pos + 1) == Some(&b'=') => {
+                            self.pos += 2;
+                            st = St::Need;
+                        }
+                        b'<' | b'>' => {
+                            self.pos += 1;
+                            if matches!(
+                                self.s.get(self.pos),
+                                Some(c) if *c == b || *c == b'='
+                            ) {
+                                self.pos += 1;
+                            }
+                            st = St::Need;
+                        }
+                        b'*' | b'/' => {
+                            self.pos += 1;
+                            if self.s.get(self.pos) == Some(&b) {
+                                self.pos += 1; // `**` `//`
+                            }
+                            st = St::Need;
+                        }
+                        b'+' | b'-' | b'%' | b'|' | b'&' | b'^' | b'@' => {
+                            self.pos += 1;
+                            st = St::Need;
+                        }
+                        _ if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 => {
+                            // Only word operators may follow an operand —
+                            // juxtaposed operands (`a b`) are a SyntaxError.
+                            let id_start = self.pos;
+                            self.pos = ident_end(self.s, self.pos);
+                            match &self.s[id_start..self.pos] {
+                                b"and" | b"or" | b"in" | b"is" | b"if" | b"else" | b"for" => {
+                                    st = St::Need;
+                                }
+                                b"not" => {
+                                    after_not_op = true;
+                                    st = St::Need;
+                                }
+                                _ => return Err(()),
+                            }
+                        }
+                        _ => return Err(()),
+                    },
+                    St::Lambda => match b {
+                        // The lambda's own `:` ends its parameter list.
+                        b':' if stack.is_empty() => {
+                            self.pos += 1;
+                            st = St::Need;
+                        }
+                        b':' => self.pos += 1, // inside default-expr brackets
+                        b'(' | b'[' | b'{' => {
+                            stack.push(b);
+                            self.pos += 1;
+                        }
+                        b')' | b']' | b'}' if !stack.is_empty() => match stack.pop() {
+                            Some(o)
+                                if matches!((o, b), (b'(', b')') | (b'[', b']') | (b'{', b'}')) =>
+                            {
+                                self.pos += 1;
+                            }
+                            _ => return Err(()),
+                        },
+                        b'\'' | b'"' => self.skip_quoted()?,
+                        // Param names, separators, defaults, `*`, unary
+                        // signs and dots in default expressions.
+                        b',' | b'=' | b'*' | b'/' | b'-' | b'+' | b'~' | b'.' => self.pos += 1,
+                        _ if b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 => self.pos += 1,
+                        _ => return Err(()),
+                    },
+                },
             }
         }
-        Err(()) // ran out of text — unterminated
     }
 
     /// Parse a string literal: `'…'` `"…"` `'''…'''` `"""…"""` with
@@ -3755,6 +4085,73 @@ The weather in Tokyo is sunny."#;
         let (text, calls) = parse_tool_calls(input);
         assert_eq!(text, input);
         assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_trailing_operator_positional_rejected() {
+        // `1 +` is an incomplete expression: ast.parse raises SyntaxError,
+        // so the block must stay verbatim — the surviving `confirmed=True`
+        // kwarg must NOT promote an ok call.
+        let input = "<|tool_call_start|>[dangerous_action(1 +, confirmed=True)]<|tool_call_end|>";
+        let (text, calls) = parse_tool_calls(input);
+        assert_eq!(text, input);
+        assert!(calls.is_empty());
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_malformed_positionals_rejected() {
+        // Each of these is a SyntaxError to ast.parse — verbatim, no call.
+        for inner in [
+            "f(x and)",   // trailing word operator
+            "f(a b)",     // juxtaposed operands
+            "f((a +))",   // trailing operator inside a group
+            "f((,))",     // empty first element
+            "f(5x)",      // letter glued to a number
+            "f(a ! b)",   // bare `!` is not a Python operator
+            "f(b 'x')",   // spaced string prefix is a name, not a literal
+            "f(x not)",   // `not` with no operand
+            "f(a > b <)", // trailing operator
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_valid_expressions_still_dropped() {
+        // Real Python expressions stay droppable positionals — the call is
+        // promoted from its kwargs exactly like before.
+        for (inner, want_args) in [
+            ("f(a or b, x=1)", "{\"x\":1}"),
+            ("f(x if c else y, x=1)", "{\"x\":1}"),
+            ("f([i for i in xs], x=1)", "{\"x\":1}"),
+            ("f(a not in b, x=1)", "{\"x\":1}"),
+            ("f(a is not None, x=1)", "{\"x\":1}"),
+            ("f(-x, x=1)", "{\"x\":1}"),
+            ("f(a.b[c], x=1)", "{\"x\":1}"),
+            ("f(g(x), x=1)", "{\"x\":1}"),
+            ("f(\"a\" \"b\", x=1)", "{\"x\":1}"),
+            ("f(rb\"x\", x=1)", "{\"x\":1}"),
+            ("f(0x1f + 1e5, x=1)", "{\"x\":1}"),
+            ("f(x := 1, y=2)", "{\"y\":2}"),
+            ("f(a == b, x=1)", "{\"x\":1}"),
+            ("f(a <= b, x=1)", "{\"x\":1}"),
+            ("f(*args, x=1)", "{\"x\":1}"),
+            ("f(lambda v: v * 2, x=1)", "{\"x\":1}"),
+            ("f((a, b), x=1)", "{\"x\":1}"),
+            ("f(a[1:], x=1)", "{\"x\":1}"),
+            ("f({1: 2}, x=1)", "{\"x\":1}"),
+            ("f(5. + .5, x=1)", "{\"x\":1}"),
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(calls.len(), 1, "{inner} must produce one call");
+            assert_eq!(calls[0].name, "f", "{inner}");
+            assert_eq!(calls[0].arguments.to_string(), want_args, "{inner}");
+            assert_eq!(text, "", "{inner}");
+        }
     }
 
     #[test]

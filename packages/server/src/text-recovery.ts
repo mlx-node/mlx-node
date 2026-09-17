@@ -16,26 +16,10 @@
  *     the streamed text can have a trailing space that `finalText` lacks
  *     (also no overlap — emit `finalText` whole).
  *
+ * The implementation lives in `@mlx-node/lm` next to `ToolCallTagBuffer`
+ * (the suppression that creates the prefix invariant this relies on) so
+ * non-server consumers — the pi agent `TurnEmitter` — share one source.
+ *
  * Internal-only — not exported from `packages/server/src/index.ts`.
  */
-
-/**
- * Find the largest k such that `streamed.endsWith(final.slice(0, k))`.
- *
- * Returns 0 when there is no overlap (caller emits `final` whole).
- * Returns `final.length` when `final` is fully contained as a suffix of
- * `streamed` (caller emits nothing).
- *
- * Used by the `/v1/messages` and `/v1/responses` streaming tool-call
- * recovery branches to decide how much of `finalText` is already on the
- * wire when native-side normalization (e.g. `.trim()`, post-`</think>`
- * whitespace stripping) makes the streamed prefix diverge from the
- * `finalText` prefix verbatim.
- */
-export function longestSuffixPrefixOverlap(streamed: string, final: string): number {
-  const max = Math.min(streamed.length, final.length);
-  for (let k = max; k > 0; k--) {
-    if (streamed.endsWith(final.slice(0, k))) return k;
-  }
-  return 0;
-}
+export { longestSuffixPrefixOverlap } from '@mlx-node/lm';

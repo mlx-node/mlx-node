@@ -116,8 +116,11 @@ describe('ToolCallTagBuffer', () => {
   });
 
   // LFM2 cases mirror __test__/server/tool-call-buffer.test.ts — both
-  // exercise the shared ToolCallTagBuffer (now in @mlx-node/lm).
-  it('suppresses LFM2 sentinel-wrapped calls and releases post-call prose', () => {
+  // exercise the shared ToolCallTagBuffer (now in @mlx-node/lm). Once the
+  // start sentinel lands, EVERYTHING after it is suppressed: the streamed
+  // text stays a verbatim prefix of the raw output so the terminal
+  // recovery can emit the right tail whether the call parses or not.
+  it('suppresses LFM2 sentinel blocks and everything after them', () => {
     const buffer = new ToolCallTagBuffer();
 
     expect(buffer.push('The weather in Paris is ')).toEqual({
@@ -136,60 +139,49 @@ describe('ToolCallTagBuffer', () => {
       tagFound: true,
       cleanPrefix: '',
     });
-    // Interior text is suppressed; the end sentinel can arrive with prose.
+    // Interior, the end sentinel, AND post-call prose are all suppressed —
+    // the terminal recovery emits the post-call text from `finalText`.
     expect(buffer.push('"Paris")]<|tool_call_end|>sunny today.')).toEqual({
-      safeText: 'sunny today.',
+      safeText: '',
       tagFound: false,
       cleanPrefix: '',
     });
     expect(buffer.flush()).toBe('');
   });
 
-  it('suppresses the LFM2 post-call echo through the second end sentinel', () => {
+  it('suppresses the LFM2 post-call echo and prose to stream end', () => {
     const buffer = new ToolCallTagBuffer();
 
     buffer.push('<|tool_call_start|>[get_weather(location="Paris")]');
-    const mid = buffer.push('<|tool_call_end|>[get_weather(location="Paris")]');
-    expect(mid.safeText).toBe('');
-    // The echo resolves only once its own end sentinel lands.
+    expect(buffer.push('<|tool_call_end|>[get_weather(location="Paris")]').safeText).toBe('');
+    // Echo bytes and trailing prose are held alike — nothing leaks.
     expect(buffer.push('<|tool_call_end|>done.')).toEqual({
-      safeText: 'done.',
+      safeText: '',
       tagFound: false,
       cleanPrefix: '',
     });
     expect(buffer.flush()).toBe('');
   });
 
-  it('drops held LFM2 echo text at flush when no resolving end arrives', () => {
-    const buffer = new ToolCallTagBuffer();
-
-    buffer.push('<|tool_call_start|>[f(x=1)]<|tool_call_end|>');
-    expect(buffer.push('[f(x=1)]').safeText).toBe('');
-    // Held suspect text is markup, never released.
-    expect(buffer.flush()).toBe('');
-  });
-
-  it('releases post-call prose when the whole LFM2 block lands in one final delta', () => {
+  it('holds a whole LFM2 block landing in one delta to the end', () => {
     const buffer = new ToolCallTagBuffer();
 
     const pushed = buffer.push('intro <|tool_call_start|>[f()]<|tool_call_end|>outro');
     expect(pushed.tagFound).toBe(true);
     expect(pushed.cleanPrefix).toBe('intro ');
-    // The end sentinel and prose were still buffered behind the tagFound
-    // early-return — flush() must resolve them, not drop the prose with
-    // the suppressed call body.
-    expect(buffer.flush()).toBe('outro');
+    // The trailing prose is recovered from `finalText` by the terminal
+    // path, not released by the buffer itself.
+    expect(buffer.flush()).toBe('');
   });
 
-  it('re-enters suppression on a second LFM2 start sentinel after prose', () => {
+  it('keeps later LFM2 sentinel blocks suppressed too', () => {
     const buffer = new ToolCallTagBuffer();
 
     buffer.push('<|tool_call_start|>[f()]<|tool_call_end|>');
-    // A second call block re-enters interior mode; the genuine prose
-    // before it is released through cleanPrefix.
+    // A second block's prose and interior stay suppressed — a malformed
+    // later block must not leave released text ahead of the raw tail.
     const second = buffer.push('between <|tool_call_start|>[g()');
-    expect(second).toEqual({ safeText: '', tagFound: true, cleanPrefix: 'between ' });
-    // The unclosed second body is held markup — dropped at flush.
+    expect(second).toEqual({ safeText: '', tagFound: false, cleanPrefix: '' });
     expect(buffer.flush()).toBe('');
   });
 });

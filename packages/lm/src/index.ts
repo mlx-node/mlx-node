@@ -90,7 +90,7 @@ export type { NativeStreamingInstance, NativeStreamingMethod, StreamingInstance,
 // `ChatSession<M>`; exported so the VLM wrapper can pin a compile-time
 // conformance assertion.
 export { ChatSession, ContextCapacityError, isContextCapacityError } from './chat-session.js';
-export { ToolCallTagBuffer } from './tool-call-buffer.js';
+export { ToolCallTagBuffer, longestSuffixPrefixOverlap } from './tool-call-buffer.js';
 export type { ChatSessionOptions, SendOptions, SessionCapableModel, SessionContextLimits } from './chat-session.js';
 
 // Model utilities (TypeScript-only)
