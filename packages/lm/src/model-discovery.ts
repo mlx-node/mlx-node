@@ -41,11 +41,16 @@ interface DiscoveryMetadata {
 const QWEN35_XL_GGUF = /(?:^|[-_.])Q\d+_K_XL\.gguf$/i;
 /** Dense and sparse Qwen3.5 both load a direct `Q<number>_K_XL.gguf` file. */
 const QWEN35_XL_GGUF_TYPES: readonly ModelType[] = ['qwen3_5', 'qwen3_5_moe'];
-const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft)(?:[-_.]|$)/i;
+// `mtp` joins the rule because the catalog ships MTP weights BESIDE a target
+// (Qwen3.8's `MTP/mtp-*.gguf`, Gemma's `mtp-*.gguf`) and nothing in the runtime
+// pairs a standalone GGUF MTP file: counting one as weights certifies a
+// directory the loader cannot open, and discovery would enumerate the sidecar
+// as a model.
+const GGUF_COMPANION_NAME = /(?:^|[-_.])(?:imatrix|mmproj|dflash|draft|mtp)(?:[-_.]|$)/i;
 
 /**
  * True when a `.gguf` filename is a companion artifact (projector, calibration,
- * draft) rather than a loadable model payload. Discovery, the dashboard's
+ * draft, MTP) rather than a loadable model payload. Discovery, the dashboard's
  * publish gate, and the CLI's weight classification all key off this one rule —
  * a file any of them certifies as weights is a file the others must accept.
  */

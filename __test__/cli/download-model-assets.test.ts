@@ -516,6 +516,18 @@ describe('download model --assets-repo', () => {
     expect(marker.assetsRevision).toBe('b'.repeat(40));
   });
 
+  it('does not certify a selection whose only GGUF is an MTP sidecar', async () => {
+    // MTP weights ship beside a target and nothing pairs a standalone GGUF MTP
+    // file — the same rule as a projector, so the same outcome: files land, no
+    // completion marker.
+    hub.manifests[PRIMARY] = [{ type: 'file', path: 'mtp-Qwen3.8-27B-Q4_0.gguf', size: 44 }];
+    hub.shas[PRIMARY] = 'a'.repeat(40);
+    await run(['-m', PRIMARY, '-o', outputDir, '-g', 'mtp-*.gguf', '--cache-dir', cacheDir]);
+
+    expect(existsSync(join(outputDir, 'mtp-Qwen3.8-27B-Q4_0.gguf'))).toBe(true);
+    expect(existsSync(join(outputDir, '.mlx-download-complete.json'))).toBe(false);
+  });
+
   it('does not touch the assets repo when the flag is absent', async () => {
     writeFileSync(join(outputDir, GGUF), 'x'.repeat(300));
 

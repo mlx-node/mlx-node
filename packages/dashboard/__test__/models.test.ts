@@ -890,7 +890,7 @@ describe('isModelPresent — a companion GGUF is not a loadable checkpoint', () 
   });
 });
 
-describe('isWeightFile — companion GGUFs are not a model payload', () => {
+describe('isWeightFile — companion GGUFs (projector, calibration, draft, MTP) are not a model payload', () => {
   it('rejects companion names that discovery also excludes', async () => {
     const { isWeightFile } = await import('../src/models.js');
     // A Gemma-style manifest can carry mmproj without the UD target (partial
@@ -903,6 +903,11 @@ describe('isWeightFile — companion GGUFs are not a model payload', () => {
     expect(isWeightFile('imatrix_unsloth.gguf')).toBe(false);
     expect(isWeightFile('draft-qwen3.8-27b.gguf')).toBe(false);
     expect(isWeightFile('something.dflash.gguf')).toBe(false);
+    // The catalog ships MTP weights BESIDE a target and nothing pairs a
+    // standalone GGUF MTP file: counting one as weights certifies a directory
+    // the loader cannot open.
+    expect(isWeightFile('mtp-gemma-4-26B-A4B-it.gguf')).toBe(false);
+    expect(isWeightFile('MTP/mtp-Qwen3.8-27B-Q4_0.gguf')).toBe(false);
 
     // The real targets and non-GGUF weights stay payloads.
     expect(isWeightFile('gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf')).toBe(true);
