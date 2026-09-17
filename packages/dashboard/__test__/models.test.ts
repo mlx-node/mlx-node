@@ -871,6 +871,25 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
   });
 });
 
+describe('isModelPresent — a companion GGUF is not a loadable checkpoint', () => {
+  it('does not count a projector-only directory as present', () => {
+    // After the CLI refuses to certify a companion-only selection, the files it
+    // downloaded still sit in the canonical slug dir. Counting the projector as
+    // present rendered the card Installed-and-disabled for a directory the
+    // loader never lists; the directory should read as an occupied unowned one
+    // (actionable) instead.
+    const dir = join(modelsDir, 'projector-only');
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'config.json'), CONFIG_A);
+    writeFileSync(join(dir, 'mmproj-BF16.gguf'), Buffer.alloc(64));
+    expect(isModelPresent(dir)).toBe(false);
+
+    // The real target beside it still counts.
+    writeFileSync(join(dir, 'gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'), Buffer.alloc(64));
+    expect(isModelPresent(dir)).toBe(true);
+  });
+});
+
 describe('isWeightFile — companion GGUFs are not a model payload', () => {
   it('rejects companion names that discovery also excludes', async () => {
     const { isWeightFile } = await import('../src/models.js');

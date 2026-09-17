@@ -1091,19 +1091,30 @@ export async function run(argv: string[]) {
     // of THIS repo's marker.
     const remotePaths = allFiles.map((f) => f.path);
     const isGlobRun = Boolean(globPatterns?.length);
+    // A --complete run's selection IS the prescribed model, so it carries
+    // FULL-run semantics: the new revision is claimed (a glob run deliberately
+    // under-claims, which for a catalog install left the dashboard offering an
+    // update the CLI had already applied, forever) and the directory is pruned
+    // to the prescription like the dashboard's own publish swap.
+    const fullSemantics = !isGlobRun || args.complete === true;
     // Files the marker attributes to the assetsRepo are exempt: the primary
     // tree cannot prove anything about them (they were never in it), so
     // pruning them here would delete the tool-calling sidecars this very run
     // just verified — and an install that HAS such provenance must keep its
     // candidate names exempt even when this run passed no --assets-repo.
     const exemptFromPrune = new Set<string>(sidecarPaths);
-    if (previousCompletion?.assetsRepo !== undefined) {
+    if (assetsRepo === undefined && previousCompletion?.assetsRepo !== undefined) {
+      // No assets manifest was consulted this run, so the sidecars' state is
+      // unknown: every candidate name stays exempt (and recorded). When the
+      // manifest WAS consulted, only the names it still supplies are exempt —
+      // a candidate it dropped is pruned and dropped from the marker, instead
+      // of lingering while the revision advances past it.
       for (const name of ASSET_SIDECAR_CANDIDATES) exemptFromPrune.add(name);
     }
     const pruneList =
       previousCompletion !== null
-        ? computePruneList(previousCompletion.files, remotePaths, outputDir, isGlobRun, exemptFromPrune)
-        : computeLegacyWeightPruneList(existingTopLevelFiles, remotePaths, outputDir, isGlobRun);
+        ? computePruneList(previousCompletion.files, remotePaths, outputDir, !fullSemantics, exemptFromPrune)
+        : computeLegacyWeightPruneList(existingTopLevelFiles, remotePaths, outputDir, !fullSemantics);
     for (const rel of pruneList) {
       console.log(`  Removing ${rel} (no longer in the upstream repo)`);
       // A stale standard weight can take precedence over the newly downloaded
@@ -1112,7 +1123,7 @@ export async function run(argv: string[]) {
     }
     await writeCompletion(outputDir, {
       repo: modelName,
-      revision: markerRevisionToClaim(previousCompletion, remoteSha, isGlobRun),
+      revision: markerRevisionToClaim(previousCompletion, remoteSha, !fullSemantics),
       files: buildMarkerFiles(
         previousCompletion,
         remotePaths,
@@ -1121,7 +1132,7 @@ export async function run(argv: string[]) {
         // cannot), and the assets provenance alone would not notice.
         [...filesToDownload.map((f) => f.path), ...sidecarPaths.filter((path) => existsSync(join(outputDir, path)))],
         outputDir,
-        isGlobRun,
+        !fullSemantics,
         exemptFromPrune,
       ),
       scope: isGlobRun && !args.complete ? 'partial' : 'full',

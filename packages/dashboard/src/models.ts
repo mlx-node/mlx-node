@@ -165,7 +165,16 @@ export function isModelPresent(modelDir: string): boolean {
   if (isRegularFile(join(modelDir, 'model.safetensors'))) return true;
   if (isRegularFile(join(modelDir, 'weights.safetensors'))) return true;
   if (isRegularFile(join(modelDir, 'inference.pdiparams'))) return true;
-  if (entries.some((file) => file.endsWith('.gguf') && isRegularFile(join(modelDir, file)))) return true;
+  // A companion `.gguf` (mmproj/imatrix/dflash/draft) is NOT a loadable model:
+  // counting one as present disables Install on the card for a directory the
+  // loader never lists.
+  if (
+    entries.some(
+      (file) => file.endsWith('.gguf') && !isGgufCompanionName(file) && isRegularFile(join(modelDir, file)),
+    )
+  ) {
+    return true;
+  }
   // Sharded safetensors: every shard the index references must exist on disk —
   // otherwise an interrupted download that landed the index + only the first
   // shard would falsely read as present (matches the CLI's completeness check,
