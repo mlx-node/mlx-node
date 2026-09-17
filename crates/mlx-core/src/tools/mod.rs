@@ -629,11 +629,18 @@ impl<'a> PyLiteralParser<'a> {
                     | b"async"
             )
         }
-        // Python string-literal prefixes (r'x' b'x' f'x' rb'x' …).
+        // Python string-literal prefixes: r/u/f/b alone, or the r-pairs
+        // rb/br/rf/fr — anything else (`rr`, `uf`, `bu` …) is a plain
+        // identifier, so a glued quote after it is a SyntaxError.
         fn string_prefix(id: &[u8]) -> bool {
-            id.iter()
-                .all(|c| matches!(c, b'r' | b'R' | b'u' | b'U' | b'b' | b'B' | b'f' | b'F'))
-                && id.len() <= 2
+            match id.len() {
+                1 => matches!(id[0].to_ascii_lowercase(), b'r' | b'u' | b'b' | b'f'),
+                2 => matches!(
+                    (id[0].to_ascii_lowercase(), id[1].to_ascii_lowercase()),
+                    (b'r', b'b') | (b'b', b'r') | (b'r', b'f') | (b'f', b'r')
+                ),
+                _ => false,
+            }
         }
         fn ident_end(s: &[u8], mut p: usize) -> usize {
             while s
@@ -1038,14 +1045,15 @@ impl<'a> PyLiteralParser<'a> {
     fn parse_string(&mut self) -> Result<String, ()> {
         let mut raw_mode = false;
         let mut f_mode = false;
-        // Optional letter prefix (r/u/f and combinations like fr/rf). The
-        // dispatch guard guarantees a quote within the two-byte lookahead,
-        // so this loop always lands on one — a non-quote after the letters
-        // is unreachable here.
+        // Optional letter prefix — Python admits r/u/f/b alone and the
+        // r-pairs rb/br/rf/fr only (`rr`, `uf`, `bu` … are SyntaxErrors).
+        // The dispatch guard guarantees a quote within the two-byte
+        // lookahead, so the prefix is at most two letters here.
         if matches!(
             self.peek(),
             Some(b'r' | b'R' | b'u' | b'U' | b'f' | b'F' | b'b' | b'B')
         ) {
+            let pstart = self.pos;
             while matches!(
                 self.peek(),
                 Some(b'r' | b'R' | b'u' | b'U' | b'f' | b'F' | b'b' | b'B')
@@ -1057,6 +1065,21 @@ impl<'a> PyLiteralParser<'a> {
                     _ => {}
                 }
                 self.pos += 1;
+            }
+            let prefix = &self.s[pstart..self.pos];
+            let valid = match prefix.len() {
+                1 => true, // single r/u/f (b already returned above)
+                2 => matches!(
+                    (
+                        prefix[0].to_ascii_lowercase(),
+                        prefix[1].to_ascii_lowercase()
+                    ),
+                    (b'r', b'f') | (b'f', b'r') | (b'r', b'b') | (b'b', b'r')
+                ),
+                _ => false,
+            };
+            if !valid {
+                return Err(());
             }
         }
         let quote = match self.peek() {
@@ -1262,7 +1285,7 @@ impl<'a> PyLiteralParser<'a> {
                 return Err(());
             }
             let v = i128::from_str_radix(&digits, radix).map_err(|_| ())?;
-            return Ok(i128_to_value(v));
+            return i128_to_value(v).ok_or(());
         }
         let mut is_float = false;
         while let Some(&d) = self.s.get(self.pos) {
@@ -1309,7 +1332,7 @@ impl<'a> PyLiteralParser<'a> {
             };
             normalized.parse::<f64>().map(Value::from).map_err(|_| ())
         } else {
-            text.parse::<i128>().map(i128_to_value).map_err(|_| ())
+            text.parse::<i128>().ok().and_then(i128_to_value).ok_or(())
         }
     }
 
@@ -1340,7 +1363,12 @@ impl<'a> PyLiteralParser<'a> {
                             if let Some(i) = n.as_i64() {
                                 Ok(Value::from(-i))
                             } else if let Some(u) = n.as_u64() {
-                                // Negating a u64 that fits in i64
+                                // Negating a u64: exact i64::MIN edge or a
+                                // value that fits in i64 — anything larger
+                                // has no exact serde_json form → reject.
+                                if u == (i64::MAX as u64) + 1 {
+                                    return Ok(Value::from(i64::MIN));
+                                }
                                 let i = i64::try_from(u).map_err(|_| ())?;
                                 Ok(Value::from(-i))
                             } else {
@@ -1602,13 +1630,17 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
-fn i128_to_value(v: i128) -> Value {
+fn i128_to_value(v: i128) -> Option<Value> {
     if let Ok(i) = i64::try_from(v) {
-        Value::from(i)
+        Some(Value::from(i))
     } else if let Ok(u) = u64::try_from(v) {
-        Value::from(u)
+        Some(Value::from(u))
     } else {
-        Value::from(v as f64)
+        // serde_json holds no exact representation past u64::MAX — f64
+        // rounding would silently corrupt the argument (IDs, counters,
+        // monetary units), so the block stays verbatim like every other
+        // non-JSON-representable literal (`b'..'`, `1j`).
+        None
     }
 }
 
@@ -4301,6 +4333,89 @@ The weather in Tokyo is sunny."#;
             ("f(count=0o7_7)", "{\"count\":63}"),
             ("f(1_000, x=1)", "{\"x\":1}"),
             ("f(0x_ff, x=1)", "{\"x\":1}"),
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(calls.len(), 1, "{inner} must produce one call");
+            assert_eq!(calls[0].arguments.to_string(), want_args, "{inner}");
+            assert_eq!(text, "", "{inner}");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_string_prefixes() {
+        // Only r/u/f/b alone and the r-pairs are real Python prefixes —
+        // any other combination makes the glued quote a SyntaxError, so
+        // the whole block stays verbatim (kwarg and positional paths).
+        for inner in [
+            "f(v=rr'x')", // repeated prefix
+            "f(v=uu'x')", // repeated prefix
+            "f(v=ff'x')", // repeated prefix
+            "f(v=uf'x')", // u pairs with nothing
+            "f(v=fu'x')",
+            "f(v=ru'x')",
+            "f(v=ur'x')",
+            "f(rr'x', y=1)", // positional path via string_prefix
+            "f(uf'x', y=1)",
+            "f(u 'x', y=1)", // spaced prefix is a name, not a literal
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+
+        // Legal prefixes still parse; b-family stays rejected for
+        // JSON-representability (pre-existing behavior, unchanged).
+        for (inner, want_args) in [
+            ("f(v=r'x')", "{\"v\":\"x\"}"),
+            ("f(v=u'x')", "{\"v\":\"x\"}"),
+            ("f(v=f'x')", "{\"v\":\"x\"}"),
+            ("f(v=rf'x')", "{\"v\":\"x\"}"),
+            ("f(v=fr'x')", "{\"v\":\"x\"}"),
+            ("f(v=Rf'x')", "{\"v\":\"x\"}"),
+            ("f(r'x', y=1)", "{\"y\":1}"),
+            ("f(rb'x', y=1)", "{\"y\":1}"), // positional b'..' is valid Python
+            ("f(fr'x', y=1)", "{\"y\":1}"),
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(calls.len(), 1, "{inner} must produce one call");
+            assert_eq!(calls[0].arguments.to_string(), want_args, "{inner}");
+            assert_eq!(text, "", "{inner}");
+        }
+    }
+
+    #[test]
+    fn test_lfm2_tool_call_huge_integer_rejected() {
+        // Past u64::MAX serde_json holds no exact representation — the old
+        // f64 fallback turned 18446744073709551617 into
+        // 18446744073709551616 while still returning an ok call. Now the
+        // block stays verbatim like every non-JSON-representable literal.
+        for inner in [
+            "f(id=18446744073709551617)",                    // u64::MAX + 1
+            "f(id=-18446744073709551617)",                   // magnitude past u64::MAX
+            "f(id=-9223372036854775809)",                    // i64::MIN - 1 (u64 fits, i64 doesn't)
+            "f(id=0x1_0000_0000_0000_0000)",                 // 2^64 via radix
+            "f(id=340282366920938463463374607431768211455)", // i128::MAX
+        ] {
+            let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
+            let (text, calls) = parse_tool_calls(&input);
+            assert_eq!(text, input, "{inner} must stay verbatim");
+            assert!(calls.is_empty(), "{inner} must not promote a call");
+        }
+
+        // The exact-boundary values still parse.
+        for (inner, want_args) in [
+            (
+                "f(id=18446744073709551615)",
+                "{\"id\":18446744073709551615}",
+            ), // u64::MAX
+            (
+                "f(id=-9223372036854775808)",
+                "{\"id\":-9223372036854775808}",
+            ), // i64::MIN
+            ("f(id=0xffffffffffffffff)", "{\"id\":18446744073709551615}"),
         ] {
             let input = format!("<|tool_call_start|>[{inner}]<|tool_call_end|>");
             let (text, calls) = parse_tool_calls(&input);
