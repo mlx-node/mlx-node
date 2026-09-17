@@ -1221,6 +1221,15 @@ export async function run(argv: string[]) {
     // install; this gate exists for the case with nothing to prune.
     if (previousCompletion === null && (args.complete === true || assetsRepo !== undefined)) {
       if (!certified.includes('config.json') || !certified.some(loadableWeight)) {
+        // The refusal cannot leave what it downloaded: a markerless directory
+        // of loadable weights reads as a PRESENT but foreign install — the
+        // dashboard renders a disabled card it is not allowed to repair. When
+        // nothing predates this run (the directory is new, or was empty), the
+        // honest "nothing was published" is removing it; a pre-existing
+        // markerless directory keeps its files, which are the user's to mix.
+        if (existingTopLevelFiles.length === 0) {
+          await rm(outputDir, { recursive: true, force: true });
+        }
         throw new Error(
           `Refusing to certify "${modelName}": the selection has no ` +
             `${certified.includes('config.json') ? 'model weights' : 'config.json'}` +

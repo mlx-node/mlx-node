@@ -523,7 +523,11 @@ describe('download model --assets-repo', () => {
       ]),
     ).rejects.toThrow(/no config[.]json/);
 
-    expect(existsSync(join(outputDir, '.mlx-download-complete.json'))).toBe(false);
+    // The refusal cannot leave its downloads behind: a markerless directory of
+    // loadable weights renders as a PRESENT but foreign install — a disabled
+    // card the dashboard cannot repair. Nothing predated this run, so the
+    // honest "nothing was published" removes the directory entirely.
+    expect(existsSync(outputDir)).toBe(false);
   });
 
   it('refuses to install sidecars when their revision cannot be pinned', async () => {
